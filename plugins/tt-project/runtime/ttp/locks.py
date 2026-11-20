@@ -1,0 +1,1969 @@
+# SPDX-FileCopyrightText: © 2026 Tenstorrent USA, Inc.
+# SPDX-License-Identifier: Apache-2.0
+"""Slots of a shared resource (a device, a remote build directory) as OS file locks.
+
+Every holder takes one slot file under state/locks: `ttp lock` for one command, the run supervisor
+of an `exclusive:<name>` task for its whole run. A lock ends with the process that holds it, so a
+crash or a reboot never leaves a resource taken.
+
+Waiters queue in arrival order (a ticket file per waiting process under <resource>.queue): only the
+first `slots` live tickets may take a slot, so a waiter is never starved by later arrivals. A ticket
+whose process is gone is dropped.
+
+A landing waiter (a `ttp lock` run inside the checks of a landing: `ttp push` to the push branch, the
+push queue's batch checks, `ttp land`, in any project) goes ahead of other waiters, in arrival order
+within each class, except that an urgent waiter (task priority URGENT_PRIORITY or better) goes ahead of
+a routine landing: urgent landings, then urgent non-landing waiters, then routine landings. Only the
+harness marks one: the check runner (push._run_one for `ttp push` and `ttp
+land`, batch._stream for the push queue's batches) holds a landing mark (landmark.py) and
+`ttp lock` counts as landing only if that mark is held by one of its own ancestors, so a forged
+environment gets normal ordering. The bound: a waiter that has waited LANDING_AGE_S is no longer
+passed by later landings. A landing never preempts a holder; it only moves up the queue. A waiting
+`ttp lock`'s wait line names each holder's project (from its record's project_root) and whether it is a
+landing (holder_kind).
+
+A shared holder (`ttp lock --shared`, for read-only work) takes a read lock on every slot instead
+of one slot's write lock, and labels itself in <resource>.shared: shared holders run together, and
+any slot's exclusive holder keeps them all out, as they keep it out. The queue stays in arrival
+order across modes: a shared waiter goes only once no exclusive waiter is ahead of it, and an
+exclusive one only once no shared waiter is.
+
+Resources named in config `device.locks` are one device: they all map to the first name's lock, so
+at most one command at a time is in the device phase, whatever name it locks by.
+
+An exclusive task that finds every slot held reserves the resource: new `ttp lock` commands wait
+until it has its slot, so commands that keep taking the lock in turn cannot starve it. Whoever
+reserves refreshes the reservation while it waits; one not refreshed for RESERVE_STALE_S no longer
+counts, so a crashed daemon or supervisor never wedges the resource.
+"""
+from __future__ import annotations
+
+import contextlib
+import fcntl
+import hashlib
+import json
+import math
+import os
+import re
+import shlex
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+from . import liveness, timefmt
+from .project import FOLDER, durable_write, ps_rows, zombie
+
+RESERVE_STALE_S = 120
+
+
+def _device_list(cfg: dict) -> list[str]:
+    return [str(x) for x in ((cfg.get("device") or {}).get("locks") or [])]
+
+
+def device_locks(cfg: dict) -> set[str]:
+    return set(_device_list(cfg))
+
+
+def canonical(cfg: dict, resource: str) -> str:
+    """The lock a resource name is held by: every device name shares the first one's lock."""
+    dev = _device_list(cfg)
+    return dev[0] if resource in dev else resource
+
+
+def slot_paths(locks_dir: Path, resource: str, slots: int) -> list[Path]:
+    return [Path(locks_dir) / f"{resource}.{i}.lock" for i in range(max(int(slots or 1), 1))]
+
+
+def try_take(paths: list[Path], holder: str, what: str = "", key: str = "", extra: dict | None = None):
+    """The open file of the first free slot, now held and labelled with its holder (and `key`, what
+    the holder runs, when given, and the fields of `extra`, such as job_fields); None if all are taken.
+    A slot file keeps its last holder's label after release, so the label is built before the take and
+    the old one cut right after it: a reader (hold.covers) sees the old holder on the newly held slot only
+    for that one step, then no holder (held all the same) until the new label is written."""
+    label = {"holder": holder, "since": time.time(), "command": what[:300], **({"key": key} if key else {}),
+             **(extra or {}), **run_ids(), **taker()}
+    for path in paths:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        _make_probe_gate(path)
+        f = open(path, "a+")
+        try:
+            fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            f.close()
+            continue
+        os.ftruncate(f.fileno(), 0)
+        write_label(f, label)
+        return f
+    return None
+
+
+def relabel(f, fields: dict) -> None:
+    """Add `fields` to the label of the held slot file `f` (try_take's), keeping the rest."""
+    try:
+        f.seek(0)
+        h = json.loads(f.read() or "{}")
+        write_label(f, {**(h if isinstance(h, dict) else {}), **fields})
+    except (OSError, ValueError, TypeError):
+        pass
+
+
+def write_label(f, label: dict) -> None:
+    """Writes `label` as the label of the held slot file `f` (opened "a+", as try_take does) without
+    ever leaving it empty or cut: the new text, padded with spaces to the old one's length (JSON
+    whitespace), goes over the old from offset 0, then the file is cut to the new text. A reader
+    (held_labels, hold.covers, holders) sees the old label or the new one, never an empty one it would
+    take for no holder: a truncate before the write left that window open."""
+    data = json.dumps(label).encode()
+    f.flush()
+    fd = f.fileno()
+    fl = fcntl.fcntl(fd, fcntl.F_GETFL)
+    if fl & os.O_APPEND:   # pwrite on an O_APPEND file writes at its end, not at 0
+        fcntl.fcntl(fd, fcntl.F_SETFL, fl & ~os.O_APPEND)
+    os.pwrite(fd, data + b" " * max(os.fstat(fd).st_size - len(data), 0), 0)
+    os.ftruncate(fd, len(data))
+    f.seek(0)
+
+
+def _pid_ns() -> str | None:
+    """This process's PID namespace ("" on hosts without them); None when it cannot tell."""
+    if not sys.platform.startswith("linux"):
+        return ""
+    try:
+        if int(os.readlink("/proc/self")) != os.getpid():
+            return None
+        return os.readlink("/proc/self/ns/pid")
+    except (OSError, ValueError):
+        return None
+
+
+def start_time(pid, proc: str = "/proc") -> str | None:
+    """When process `pid` started, as text that differs for another process later given the same pid:
+    its starttime in clock ticks since boot (/proc/<pid>/stat field 22) on Linux, `ps -o lstart=`
+    elsewhere (macOS). None when it is gone or this cannot tell."""
+    try:
+        pid = int(pid)
+    except (TypeError, ValueError):
+        return None
+    if pid <= 0:
+        return None
+    if sys.platform.startswith("linux"):
+        try:
+            return Path(f"{proc}/{pid}/stat").read_text().rsplit(")", 1)[1].split()[19]
+        except (OSError, IndexError):
+            return None
+    if (rows := ps_rows()) is not None:   # inside a ps_snapshot: its one `ps`, never one per pid
+        if pid in rows:
+            return rows[pid][1]
+        try:   # not in the snapshot: gone, or started since it was taken (then asked alone)
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return None
+        except OSError:
+            pass
+    try:
+        out = subprocess.run(["ps", "-o", "lstart=", "-p", str(pid)], capture_output=True, text=True,
+                             timeout=5).stdout.strip()
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return out or None
+
+
+def _owner(pid: int) -> dict:
+    """The fields a slot label gives the process that holds it: its pid and start time (start_time: a
+    reader tells a reused pid from it), and where that pid means something (host and PID namespace), so
+    a reader elsewhere does not judge it."""
+    return {"pid": int(pid), "pid_start": start_time(pid), "node": os.uname().nodename, "pidns": _pid_ns()}
+
+
+PF_KTHREAD = 0x00200000   # /proc/<pid>/stat flags: a kernel thread
+
+
+def kthread(pid, proc: str = "/proc") -> bool:
+    """Whether `pid` is a kernel thread in this process's /proc (PF_KTHREAD in its stat flags): it lives
+    for the whole boot, so it never names a lock's holder. False when it is gone or this cannot tell."""
+    try:
+        return bool(int(Path(f"{proc}/{int(pid)}/stat").read_text().rsplit(")", 1)[1].split()[6]) & PF_KTHREAD)
+    except (OSError, IndexError, ValueError, TypeError):
+        return False
+
+
+def _pgid(pid: int) -> int | None:
+    try:
+        return os.getpgid(pid)
+    except OSError:
+        return None
+
+
+def taker(env=None) -> dict:
+    """The fields a take gives the process that owns its hold (a slot label, the activity log): pid,
+    pgid, node and pidns. That is this process, except in a PID namespace other than its run's (TTP_PIDNS),
+    where its own pid (often 2 or 13: a kernel thread's on the host) means nothing to a
+    reader there: it names the run's agent instead (child.pid in TTP_RUN_DIR, the leader of its own
+    process group, with the start time the runner recorded there as pid_start) and keeps its own as ns_pid and ns_pidns. A candidate that is a kernel thread is never
+    named: the fields fall back to this process and say so in owner_fallback."""
+    env = os.environ if env is None else env
+    me = os.getpid()
+    out = {**_owner(me), "pgid": _pgid(me)}
+    run_ns = env.get("TTP_PIDNS")
+    if not run_ns or run_ns == out["pidns"] or not env.get("TTP_RUN_DIR"):
+        return out
+    try:
+        agent, *started = (Path(env["TTP_RUN_DIR"]) / "child.pid").read_text().split("\n", 1)
+        agent = int(agent)
+    except (OSError, ValueError, IndexError):
+        return out
+    if agent <= 2 or kthread(agent):
+        return {**out, "owner_fallback": f"the run's agent pid {agent} is a kernel thread"}
+    # the agent's start time as the runner saw it (child.pid's second line; empty from an older runner)
+    started = started[0].strip() if started else ""
+    return {**out, "pid": agent, "pid_start": started or None, "pgid": agent, "pidns": run_ns, "ns_pid": me,
+            "ns_pidns": out["pidns"]}
+
+
+def run_ids(env=None) -> dict:
+    """The run, task and project a taker works for (TTP_RUN_ID, TTP_TASK, TTP_PROJECT), as run_id,
+    task_id, project (its registered name, as `ttp list` shows it, with project_from "registry"; left out
+    when the registry does not name it) and project_root (its resolved path, which tells projects apart):
+    a stale-lock sweep (lockreap) reaps a process left holding the lock only when it is of that same run
+    and the sweeping project's own."""
+    from .procowner import base_of
+    env = os.environ if env is None else env
+    root = base_of(env.get("TTP_PROJECT"))
+    name = registered_name(root) if root else None
+    out = {"run_id": env.get("TTP_RUN_ID"), "task_id": env.get("TTP_TASK"), "project": name,
+           "project_from": "registry" if name else None, "project_root": str(root) if root else None}
+    return {k: v for k, v in out.items() if v}
+
+
+def registered_name(base) -> str | None:
+    """The registry's name for the project on this host whose tt-project folder is `base` (or whose
+    root it is); None when no entry names it."""
+    from .procowner import base_of
+    from .project import hostname, load_registry
+    want = base_of(base)
+    if want is None:
+        return None
+    here = hostname()
+    try:   # an unreadable or malformed registry names nobody; it never fails a lock
+        entries = sorted((load_registry().get("projects") or {}).items())
+    except Exception:
+        return None
+    for name, e in entries:
+        if isinstance(e, dict) and e.get("host") in (None, here) and e.get("dir") and base_of(e["dir"]) == want:
+            return str(name)
+    return None
+
+
+def project_of(h: dict, locks_dir=None) -> str | None:
+    """Which project lock record `h` (a slot label or shared hold) works for: the registered name of its
+    project_root, or for an older record without one, of the project whose state/locks is `locks_dir`;
+    a name recorded from the registry (project_from) when the registry no longer has that root; else
+    "unknown project at <root>", never the folder name an older record kept as its project. None for a
+    record taken outside any project."""
+    if not isinstance(h, dict) or not (h.get("project") or h.get("project_root")):
+        return None
+    root = h.get("project_root")
+    d = Path(locks_dir) if locks_dir else None
+    if not root and d is not None and d.name == "locks" and d.parent.name in ("state", "state.noindex") \
+            and d.parent.parent.name == FOLDER:
+        root = str(d.parent.parent)
+    name = registered_name(root) if root else None
+    if name:
+        return name
+    if h.get("project_from") == "registry" and h.get("project"):
+        return str(h["project"])
+    return f"unknown project at {Path(root).parent if Path(root).name == FOLDER else root}" if root \
+        else "unknown project"
+
+
+def job_fields(env=None) -> dict:
+    """What a slot label adds for a taker inside a `ttp detach` job (TTP_DETACHED and the job's .rc in
+    TTP_DETACH_RC): the job's name, its .rc and the pid `ttp detach` recorded for it (its wrapper's, from
+    its .started file) as job, job_rc and job_pid; {} anywhere else."""
+    from .progress import JOB_ENV
+    env = os.environ if env is None else env
+    rc = env.get(JOB_ENV)
+    if not rc or not env.get("TTP_DETACHED"):
+        return {}
+    from .detach import started
+    try:
+        pid = int(started(Path(rc)).read_text().split()[0])
+    except (OSError, ValueError, IndexError):
+        pid = 0
+    return {"job": Path(rc).stem, "job_rc": str(rc), **({"job_pid": pid} if pid > 1 else {})}
+
+
+def _job_note(h: dict) -> str:
+    """" (detached job <name>, job pid N)" for a label job_fields filled, else ""."""
+    if not h.get("job"):
+        return ""
+    return f" (detached job {h['job']}" + (f", job pid {h['job_pid']}" if h.get("job_pid") else "") + ")"
+
+
+def label_pid(f, pid: int, via: str = "keeper") -> None:
+    """Names `pid` as the holder process of the held slot file `f`: a keeper it was handed to (or the
+    command a `ttp lock` runs: via "command"). "pid" stays the live holder's, so whoever judges it sees
+    the keeper, not the taker that exited; the label adds via and the taker's pid as taker_pid."""
+    try:
+        f.seek(0)
+        h = json.loads(f.read() or "{}")
+        taker = h.get("ns_pid") or h.get("pid")
+        h = {k: v for k, v in h.items() if k not in ("ns_pid", "ns_pidns", "owner_fallback")}   # the taker's
+        write_label(f, {**h, **_owner(pid), "pgid": _pgid(pid), "via": via,
+                        **({"taker_pid": taker} if taker and taker != pid else {})})
+    except (OSError, ValueError, TypeError):
+        pass
+
+
+def hold_fds(held: list) -> list[int]:
+    """The fds of the open files that hold the locks in `held` (try_take's files, SharedHolds), for the
+    keeper of a `ttp lock` (keep_open, Popen pass_fds): a flock lives on the open file, so the lock stays
+    held while the command lives even when `ttp lock` itself is killed (SIGKILL, the OOM killer). Never
+    for the command itself: a process it leaves running would inherit them and keep the lock after the
+    command, its process group and `ttp lock` are all gone (open files are close-on-exec otherwise)."""
+    return [g.fileno() for x in held for g in (x.files if isinstance(x, SharedHold) else [x])]
+
+
+_KEEP_OPEN = (
+    "import os, select, signal, sys, time\n"
+    "for s in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):\n"
+    "    signal.signal(s, signal.SIG_IGN)\n"
+    "pid, pfd = int(sys.argv[1]), int(sys.argv[2])\n"
+    "if pfd >= 0:\n"
+    "    select.select([pfd], [], [])\n"
+    "else:\n"
+    "    while True:\n"
+    "        try:\n"
+    "            os.kill(pid, 0)\n"
+    "        except ProcessLookupError:\n"
+    "            break\n"
+    "        except OSError:\n"
+    "            pass\n"
+    "        time.sleep(0.5)\n")
+
+
+def keep_open(held: list, pid: int) -> subprocess.Popen | None:
+    """A small process that holds the open files of `held` (hold_fds) until the command `pid` ends, which
+    the command itself never gets: the lock then outlives a killed `ttp lock`, never the command.
+    It ignores SIGINT, SIGTERM and SIGHUP and waits on a pidfd of the command (a 0.5 s poll where there
+    is none); the `ttp lock` that started it ends it once the command has ended. None if it cannot start."""
+    try:
+        pfd = os.pidfd_open(pid)
+    except (AttributeError, OSError):
+        pfd = -1
+    try:
+        return subprocess.Popen([sys.executable, "-I", "-S", "-c", _KEEP_OPEN, str(pid), str(pfd)],
+                                pass_fds=hold_fds(held) + ([pfd] if pfd >= 0 else []), stdin=subprocess.DEVNULL,
+                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except OSError:
+        return None
+    finally:
+        if pfd >= 0:
+            os.close(pfd)
+
+
+_GATE = (
+    "import os, signal, sys\n"
+    "if signal.getsignal(signal.SIGINT) is signal.default_int_handler:\n"
+    "    signal.signal(signal.SIGINT, signal.SIG_DFL)\n"
+    "fd = int(sys.argv[1])\n"
+    "go = os.read(fd, 1)\n"
+    "os.close(fd)\n"
+    "if not go:\n"
+    "    sys.exit(125)\n"
+    "for s in ('SIGPIPE', 'SIGXFSZ'):\n"
+    "    if hasattr(signal, s):\n"
+    "        signal.signal(getattr(signal, s), signal.SIG_DFL)\n"
+    "try:\n"
+    "    os.execvp(sys.argv[2], sys.argv[2:])\n"
+    "except OSError as e:\n"
+    "    print(f'ttp lock: cannot run {sys.argv[2]}: {e.strerror}', file=sys.stderr)\n"
+    "    sys.exit(126 if isinstance(e, PermissionError) else 127)\n")
+
+
+def start_gated(cmd: list, env: dict) -> tuple[subprocess.Popen, int]:
+    """Starts `cmd` behind a gate that execs it (same pid) only once let_go writes to the returned fd, so
+    the keeper (keep_open) and the label (hand_to_command) are in place before the command runs: a
+    SIGKILL of `ttp lock` in between never leaves the command running with the lock free or named for the
+    dead `ttp lock`. The gate reads EOF then and exits 125 without running the command."""
+    r, w = os.pipe()
+    try:
+        proc = subprocess.Popen([sys.executable, "-I", "-S", "-c", _GATE, str(r), *cmd], env=env, pass_fds=[r])
+    except BaseException:
+        os.close(w)
+        raise
+    finally:
+        os.close(r)
+    return proc, w
+
+
+def let_go(fd: int) -> None:
+    """Lets the command start_gated holds back run."""
+    try:
+        os.write(fd, b"1")
+    except OSError:
+        pass
+    finally:
+        os.close(fd)
+
+
+def hand_to_command(held: list, pid: int) -> None:
+    """Names the command `pid` a `ttp lock` runs (and hands hold_fds to) as the holder process of each
+    hold in `held` (label_pid, via "command"), so a hold whose `ttp lock` died reads as held by its live
+    command, never as gone. Only a label naming this process: one naming its run's agent (a taker in a
+    sandbox, taker()) keeps it."""
+    for x in held:
+        f = x.files[-1] if isinstance(x, SharedHold) else x
+        try:
+            f.seek(0)
+            h = json.loads(f.read() or "{}")
+        except (OSError, ValueError):
+            continue
+        if isinstance(h, dict) and h.get("pid") == os.getpid() and "ns_pid" not in h:
+            label_pid(f, pid, via="command")
+
+
+LEFT_OPEN = "; its command ended, a process it left running keeps the lock"
+
+
+def _left_open(h: dict) -> str:
+    """LEFT_OPEN for a hold handed to a command (hand_to_command) whose command is gone: what still has
+    the lock taken is a process it left running (hold_fds), else ""."""
+    return LEFT_OPEN if h.get("via") == "command" and pid_alive(h) is False else ""
+
+
+def _pid_note(h: dict) -> str:
+    """", pid N alive" (or "gone") for a label naming its holder process; only the pid when this
+    process cannot judge it (another host, or a label from before pids). A pid from another PID
+    namespace on this host is not meaningful here: the note says so and judges the process it names
+    through that namespace (_foreign_pid), or says why it cannot."""
+    try:
+        pid = int(h.get("pid") or 0)
+    except (TypeError, ValueError):
+        return ""
+    if pid <= 0:
+        return ""
+    if _judgeable(h):
+        if kthread(pid):
+            return f", pid {pid} {UNVERIFIABLE}"
+        return f", pid {pid}" + (" alive" if _alive(pid) else " gone")
+    if (got := _foreign_pid(h)) is None:
+        return f", pid {pid}"
+    here, why = got
+    if why == TAKER:
+        return f", pid {pid} (from another PID namespace; its taker is pid {here} here) alive"
+    return (f", pid {pid} (from another PID namespace; pid {here} here) alive" if here else
+            f", pid {pid} (from another PID namespace, which no longer has it) gone" if here == 0 else
+            f", pid {pid} (from another PID namespace, not meaningful here; alive unknown: {why})")
+
+
+def pid_alive(h: dict) -> bool | None:
+    """Whether the process a label or record names (its "pid": a keeper's once handed to one) lives; None
+    when it names none or this process cannot judge it (_judgeable; one of another PID namespace on this
+    host through _foreign_pid)."""
+    try:
+        pid = int(h.get("pid") or 0)
+    except (TypeError, ValueError):
+        return None
+    if pid <= 0:
+        return None
+    if _judgeable(h):
+        return None if kthread(pid) else _alive(pid)
+    here = (_foreign_pid(h) or (None, ""))[0]
+    return None if here is None else here > 0
+
+
+UNVERIFIABLE = "is a kernel thread here: holder unverifiable"   # a label from a taker in another PID namespace
+_PROC = "/proc"
+TAKER = "taker"   # _foreign_pid's why for a label judged through its taker's own pid (ns_pid) in this namespace
+
+
+def _foreign_pid(h: dict) -> tuple[int | None, str] | None:
+    """For a label whose pid was seen in another PID namespace on this host (a taker or keeper in a
+    sandbox): that process as this one sees it, read from /proc: (its pid here, ""), (0, "") when its
+    namespace still has processes but none with that pid, or (None, why) when this cannot tell (its
+    namespace has no process visible from here: one beside or above this one). None for any other label
+    (this host and namespace, another host, or a side that cannot tell its namespace). Only held slots
+    are judged, so a namespace with nothing visible holds the slot from where this cannot see. A taker
+    that named its run's agent (taker: in a sandbox) and shares this namespace is judged by its own pid
+    there (ns_pid): alive is (that pid, TAKER); gone proves nothing, the agent may live on."""
+    ns, mine = h.get("pidns"), _pid_ns()
+    if h.get("node") != os.uname().nodename or not ns or not isinstance(ns, str) or not mine or ns == mine:
+        return None
+    try:
+        own = int(h.get("ns_pid") or 0) if h.get("ns_pidns") == mine else 0
+    except (TypeError, ValueError):
+        own = 0
+    if own > 0 and not kthread(own, _PROC) and _alive(own):
+        return own, TAKER
+    try:
+        pid, names = int(h.get("pid") or 0), os.listdir(_PROC)
+    except (OSError, TypeError, ValueError) as e:
+        return None, f"cannot read {_PROC} ({e})"
+    seen = False
+    for n in names:
+        if not n.isdigit():
+            continue
+        try:
+            if os.readlink(f"{_PROC}/{n}/ns/pid") != ns:
+                continue
+            seen = True
+            status = Path(f"{_PROC}/{n}/status").read_text().splitlines()
+        except OSError:
+            continue
+        nspid = next((x.split()[1:] for x in status if x.startswith("NSpid:")), [])
+        state = next((x.split()[1:2] for x in status if x.startswith("State:")), [])
+        if nspid and nspid[-1] == str(pid) and state != ["Z"]:
+            return int(n), ""
+    return (0, "") if seen else (None, "no process of its PID namespace is visible from here")
+
+
+def _judgeable(h: dict) -> bool:
+    """Whether this process can judge the pid a label or record names: it was seen on this host and in
+    this PID namespace (another's pid may be any process here)."""
+    return h.get("node") == os.uname().nodename and h.get("pidns") is not None and h.get("pidns") == _pid_ns()
+
+
+def _worker_note(run: dict, run_id) -> tuple[str, bool]:
+    """A run's worker pid and whether it lives, as _pid_note judges a label's: only when the run was
+    recorded on this boot, host and PID namespace (its note's "pid_where", or this host for a record from
+    before it), else "unknown", never alive: a pid from an earlier boot or another namespace may be
+    reused by any process."""
+    from .runner import same_boot
+    wp = int(run.get("pid") or 0)
+    try:
+        where = json.loads(run.get("note") or "{}").get("pid_where")
+    except (ValueError, TypeError, AttributeError):
+        where = None
+    if not same_boot(run.get("boot_id")):
+        return f", pid {wp} unknown (run {run_id}'s worker, recorded on an earlier boot)", False
+    if isinstance(where, dict) and not _judgeable(where):
+        return f", pid {wp} unknown (run {run_id}'s worker, seen on another host or PID namespace)", False
+    live = _alive(wp)
+    return f", pid {wp} {'alive' if live else 'gone'} (run {run_id}'s worker)", live
+
+
+_BEAT_STALE_S = 180   # as the daemon's LEASE_STALE_S: a run's lease or keeper's beat older than this proves nothing
+
+
+def _through_run(h: dict, lbl: dict, run: dict | None) -> tuple[bool | None, str]:
+    """Whether the holder pid of a label lives when it is another PID namespace's and none of that
+    namespace's processes is visible here (a probe in one sandbox, the holder on the host or in another
+    sandbox), judged through what the label's run keeps in its folder, which every namespace on this host
+    reads: a keeper of detached jobs (via "keeper") lives while its run's hold.json names it, still
+    holding, and its hold.beat is fresh, and is gone once that record ended the hold; a run's agent
+    (child.pid) or supervisor (runner.pid) lives while the run's lease is fresh, and the agent is gone once
+    the run wrote exit.json. A stale beat or lease alone never makes it gone (the slot is still held).
+    (verdict, how) with verdict None and how naming the route tried and why it cannot tell."""
+    from . import hold
+    from .runner import same_boot
+    if not run or not run.get("dir"):
+        return None, f"no record of run {lbl['run']} to judge it through"
+    if not same_boot(run.get("boot_id")):
+        return None, f"run {lbl['run']} was recorded on an earlier boot"
+    rd, r = Path(run["dir"]), lbl["run"]
+    try:
+        pid = int(h.get("pid") or 0)
+    except (TypeError, ValueError):
+        pid = 0
+
+    def age(name: str) -> float | None:
+        try:
+            return max(0.0, time.time() - (rd / name).stat().st_mtime)
+        except OSError:
+            return None
+
+    def first(name: str) -> int:
+        try:
+            return int((rd / name).read_text().split()[0])
+        except (OSError, ValueError, IndexError):
+            return 0
+
+    if h.get("via") == "keeper":
+        rec = hold.read(rd) or {}
+        if rec.get("keeper") != pid:
+            return None, f"run {r}'s hold record names no keeper pid {pid}"
+        if rec.get("state") != "holding":
+            return False, f"run {r}'s keeper ended its hold ({rec.get('state') or 'no state'})"
+        a = age(hold.BEAT)
+        if a is not None and a <= _BEAT_STALE_S:
+            return True, f"run {r}'s keeper beat {int(a)} s ago"
+        return None, f"run {r}'s keeper beat is " + ("missing" if a is None else f"{int(a)} s old")
+    if pid > 0 and pid == first("child.pid"):
+        if (rd / "exit.json").exists():
+            return False, f"run {r}'s agent exited"
+        who = "agent"
+    elif pid > 0 and pid == first("runner.pid"):
+        who = "supervisor"
+    else:
+        return None, f"pid {pid} is not run {r}'s agent, supervisor or keeper"
+    a = age("lease")
+    if a is not None and a <= _BEAT_STALE_S:
+        return True, f"run {r}'s {who}, its lease renewed {int(a)} s ago"
+    return None, f"run {r}'s {who}, its lease is " + ("missing" if a is None else f"{int(a)} s old")
+
+
+def _holder_note(h: dict, where=None, verdict: dict | None = None) -> str:
+    """What follows a holder's label and since when in a busy or wait line: its pid and whether it lives
+    (_pid_note), never nothing. Where `where` is the holder's project, a task's hold is looked up in its
+    run record: one with no pid in its label (from before pids) names its run's worker pid instead, else
+    "pid unknown" and whether the run is still active or ended; the keeper of a task's detached jobs also
+    names each job's own pid and whether it still runs. A hold whose task is done and that has no live
+    pid (its own, its run's worker or a job's) is marked stale: it is not a live holder, though the lock
+    stays taken until whatever process has its file open lets go. A pid of another PID namespace this one
+    cannot see is judged through its run (_through_run); `verdict`, when given, gets that answer as
+    "alive"."""
+    from . import detach, hold
+    from .project import Project
+    note, lbl = _pid_note(h), hold.parse(h.get("holder"))
+    if not isinstance(where, Project) or not lbl or lbl["project"] not in (None, where.name):
+        if "alive unknown: " in note:
+            note = note.removesuffix(")") + "; no run of this project's to judge it through)"
+        return (note or ", pid unknown") + _job_note(h) + _left_open(h)
+    try:   # an unreadable database or a run id that is not a number: only what the label says
+        run = where.db.one("SELECT pid, status, dir, boot_id, note FROM runs WHERE id=?", (int(lbl["run"]),))
+        task = where.db.one("SELECT status FROM tasks WHERE id=?", (lbl["task"],))
+    except Exception:
+        run = task = None
+    live = note.endswith(" alive")
+    unknown = "alive unknown: " in note   # another PID namespace's, not judged dead
+    if unknown:   # none of that namespace is visible here: what its run keeps on disk says
+        alive, how = _through_run(h, lbl, run)
+        if alive is None:
+            note = note.removesuffix(")") + f"; {how})"
+        else:
+            note = f", pid {h.get('pid')} (from another PID namespace, not visible here; {how}) " \
+                   + ("alive" if alive else "gone")
+            unknown, live = False, alive
+            if verdict is not None:
+                verdict["alive"] = alive
+    if UNVERIFIABLE in note:   # its run's worker says instead; with none to ask, neither alive nor dead
+        unknown = not (run and int(run.get("pid") or 0) > 0)
+        if not unknown:
+            worker, live = _worker_note(run, lbl["run"])
+            note += ";" + worker.removeprefix(",")
+    if not note:
+        wp = int(run.get("pid") or 0) if run else 0
+        if wp > 0:
+            note, live = _worker_note(run, lbl["run"])
+        else:
+            note = ", pid unknown" + (f" (run {lbl['run']} {'active' if run['status'] == 'running' else 'ended'})"
+                                      if run else f" (no record of run {lbl['run']})")
+    if lbl["kind"] == hold.LABEL and run and run["dir"]:
+        jobs = []
+        for rc in (hold.read(Path(run["dir"])) or {}).get("jobs") or []:
+            rc = Path(rc)
+            pid, runs = detach._entry(rc).get("pid"), not job_ended(rc)
+            live = live or runs
+            jobs.append(f"job {rc.stem} pid {pid if isinstance(pid, int) and pid > 1 else 'unknown'} "
+                        f"{'running' if runs else 'ended'}")
+        if jobs:
+            note += "; " + ", ".join(jobs[:3]) + (f" +{len(jobs) - 3} more" if len(jobs) > 3 else "")
+    note += _job_note(h) + _left_open(h)
+    if task and task["status"] == "done" and not live and not unknown:
+        note += f"; stale: task #{lbl['task']} is done"
+    return note
+
+
+SHARED_MARK = " (shared)"   # ends a shared holder's label
+
+
+def shared_dir(paths: list[Path]) -> Path:
+    """Where the shared holders of the resource whose slots are `paths` label themselves."""
+    return paths[0].parent / f"{paths[0].name.rsplit('.', 2)[0]}.shared"
+
+
+class SharedHold:
+    """A shared hold: read locks on every slot and the holder's label; close() ends it."""
+
+    def __init__(self, files: list, label: Path):
+        self.files, self.label = files, label
+
+    def close(self) -> None:
+        # The label goes only once nobody has it open: a process the command left running (hold_fds)
+        # keeps the hold, and its label stays to name it.
+        for f in self.files:
+            f.close()
+        if not _ticket_live(self.label):
+            try:
+                self.label.unlink()
+            except OSError:
+                pass
+
+
+def try_take_shared(paths: list[Path], holder: str, what: str = "", extra: dict | None = None) -> SharedHold | None:
+    """A shared hold of the resource: a read lock on every slot, so no exclusive holder has one;
+    None if one has. The label ends in SHARED_MARK."""
+    files = []
+    for path in paths:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        f = open(path, "a+")
+        try:
+            fcntl.flock(f, fcntl.LOCK_SH | fcntl.LOCK_NB)
+        except OSError:
+            f.close()
+            for g in files:
+                g.close()
+            return None
+        files.append(f)
+    d = shared_dir(paths)
+    try:
+        d.mkdir(parents=True, exist_ok=True)
+        name = f"{time.time():017.6f}-{os.getpid()}"
+        # Locked under a hidden name first, then renamed in: a reader never sees it unlocked.
+        tmp = d / f".{name}.tmp"
+        lf = open(tmp, "a+")
+        fcntl.flock(lf, fcntl.LOCK_EX)
+        lf.write(json.dumps({"holder": holder + SHARED_MARK, "since": time.time(), "command": what[:300],
+                             **(extra or {}), **run_ids(), **taker()}))
+        lf.flush()
+        os.rename(tmp, d / name)
+    except OSError:
+        for g in files:
+            g.close()
+        raise
+    return SharedHold(files + [lf], d / name)
+
+
+def shared_holders(paths: list[Path]) -> list[dict]:
+    """The labels ({holder, since, command}) of the resource's live shared holders, oldest first;
+    labels whose process is gone are removed."""
+    d, out = shared_dir(paths), []
+    try:
+        names = sorted(n for n in os.listdir(d) if not n.startswith("."))
+    except OSError:
+        return out
+    for name in names:
+        path = d / name
+        if not _ticket_live(path):
+            try:
+                path.unlink()
+            except OSError:
+                pass
+            continue
+        try:
+            out.append(json.loads(path.read_text() or "{}"))
+        except (OSError, ValueError):
+            continue
+    return out
+
+
+def free_state(path: Path) -> bool | None:
+    """Whether the slot at path is free right now; None when its lock file does not open: unknown.
+    Testing never creates the file, and takes the slot for an instant; a `ttp lock` that tries in that
+    instant just retries. It opens the file for writing (NFS takes an exclusive lock only on a writable
+    file) and read-only where writing is refused, as in a worker sandbox reading another project's
+    status or on a read-only filesystem."""
+    fd = None
+    for flags in (os.O_WRONLY | os.O_APPEND, os.O_RDONLY):
+        try:
+            fd = os.open(path, flags)
+            break
+        except FileNotFoundError:
+            return True
+        except OSError:   # refused for writing (read-only folder or filesystem): try read-only
+            continue
+    if fd is None:
+        return None
+    try:
+        with probe_gate(path):
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            finally:
+                os.close(fd)
+    except BlockingIOError:
+        return False
+    except OSError:
+        return None if flags == os.O_RDONLY else False
+    return True
+
+
+def any_free(paths: list[Path]) -> bool:
+    """Whether some slot is free right now (free_state); a slot of unknown state counts as taken."""
+    return any(free_state(path) for path in paths)
+
+
+def holders(paths: list[Path], where=None, pids: bool = False) -> list[str]:
+    """Each slot's holder label and since when, in the zone of `where` (the project; None is UTC),
+    with its holder's pid and whether it lives when `pids`. A free slot keeps its last label: for who
+    holds a slot now, use holders_now."""
+    out = []
+    for path in paths:
+        try:
+            h = json.loads(path.read_text() or "{}")
+        except (OSError, ValueError):
+            continue
+        if isinstance(h, dict) and h:
+            out.append(f"{h.get('holder')} since {timefmt.short(float(h.get('since') or 0), where)}"
+                       + (_holder_note(h, where) if pids else ""))
+    return out
+
+
+def held_labels(paths: list[Path]) -> list[str]:
+    """The holder labels of the slots among paths whose lock is taken right now, then the
+    resource's shared holders."""
+    return _slot_labels(paths) + [str(h.get("holder") or "") for h in shared_holders(paths)] if paths else []
+
+
+def holders_now(paths: list[Path], where=None) -> list[str]:
+    """`holders` with pids (_holder_note), of only the slots whose lock is taken right now, then the shared
+    holders: what a wait or busy message names."""
+    out = holders([x for x in paths if _slot_labels([x])], where, pids=True)
+    return out + [f"{h.get('holder')} since {timefmt.short(float(h.get('since') or 0), where)}{_holder_note(h, where)}"
+                  for h in (shared_holders(paths) if paths else [])]
+
+
+def holder_records(paths: list[Path], where=None) -> list[dict]:
+    """holders_now as data (`ttp lock --probe --json`): each slot taken right now, then each shared holder
+    (shared: true), as its label's fields (holder, since, command, pid, node, pidns; a slot handed to a
+    keeper names the keeper in pid, with via "keeper" and taker_pid), plus alive (pid_alive), note
+    (_holder_note's text) and stale (a done task's hold with no live pid)."""
+    out = []
+    for path in paths:
+        if not _slot_labels([path]):
+            continue
+        try:
+            h = json.loads(path.read_text() or "{}")
+        except (OSError, ValueError):
+            continue
+        if isinstance(h, dict) and h:
+            out.append((h, False))
+    out += [(h, True) for h in (shared_holders(paths) if paths else []) if isinstance(h, dict)]
+    recs = []
+    for h, sh in out:
+        got: dict = {}
+        note = _holder_note(h, where, got)
+        recs.append({**h, "shared": sh, "alive": got.get("alive", pid_alive(h)), "note": note.removeprefix(", "),
+                     "stale": "; stale: " in note})
+    return recs
+
+
+_REDIRECT = re.compile(r"^\d*(?:>>?|<|>&|&>)")
+
+
+def lock_probe_parts(cmd: str) -> tuple[list[tuple[str, bool]], list[str]]:
+    """A wait probe's `ttp lock --probe [--shared] <resource>...` commands (joined by &&, || or ;, output
+    redirections allowed) as (resource, shared), and its other commands as their text."""
+    found, rest = [], []
+    for part in re.split(r"&&|\|\||;", str(cmd or "")):
+        try:
+            w = shlex.split(part)
+        except ValueError:
+            return [], [str(cmd)]
+        words, skip = [], False
+        for x in w:
+            if skip:
+                skip = False
+            elif _REDIRECT.match(x):
+                skip = bool(_REDIRECT.fullmatch(x))   # `> file`: the file is the next word
+            else:
+                words.append(x)
+        names = [x for x in words[2:] if not x.startswith("-")]
+        if words[:2] == ["ttp", "lock"] and "--probe" in words and "--timeout" not in words and len(names) == 1:
+            found += [(n, "--shared" in words) for n in names[0].split(",") if n]   # `--probe A,B`: each of them
+        elif part.strip():
+            rest.append(part.strip())
+    return found, rest
+
+
+def probe_resources(cmd: str) -> list[str]:
+    """The resources a wait probe checks when it is only `ttp lock --probe <resource>` commands, else []."""
+    found, rest = lock_probe_parts(cmd)
+    return [] if rest else [r for r, _ in found]
+
+
+LABEL_READS = 20   # read_label's reads of a label caught mid-rewrite, 1 ms apart
+
+
+def read_label(path: Path) -> dict:
+    """The label of slot file `path` ({} when empty or not an object). A read that catches its rewrite
+    (write_label) mid-copy does not parse: it is read again, LABEL_READS times at most; ValueError if it
+    never parses."""
+    for i in range(LABEL_READS):
+        text = Path(path).read_text()
+        try:
+            h = json.loads(text or "{}")
+        except ValueError:
+            if i == LABEL_READS - 1:
+                raise
+            time.sleep(0.001)
+            continue
+        return h if isinstance(h, dict) else {}
+    return {}
+
+
+PROBE_TRIES = 4      # slot_taken's probes of a slot whose label names no live holder
+PROBE_GAP_S = 0.015  # between them: an ungated reader's probe holds a free slot for microseconds
+PROBE_GATE = ".probe.gate"   # in a lock file's folder: the momentary probes of its lock files take it
+
+
+def _make_probe_gate(path: Path) -> None:
+    """Makes the probe gate of lock file `path`'s folder: its takers do (try_take, clear_stale), as a
+    probe writes nothing."""
+    with contextlib.suppress(OSError):
+        (path.parent / PROBE_GATE).touch()
+
+
+@contextlib.contextmanager
+def probe_gate(path: Path):
+    """Held around a momentary probe of lock file `path` (a non-blocking flock, let go before the gate
+    is): probes of one folder's lock files take turns, so a lock seen taken under the gate is a real holder's,
+    never another reader's probe. Waits for the gate (held for microseconds by a probe, never across
+    a wait). Opened for writing where it can be (an NFS exclusive lock needs it), never made: a folder
+    without one probes ungated."""
+    fd = None
+    for flags in (os.O_WRONLY | os.O_APPEND, os.O_RDONLY):
+        try:
+            fd = os.open(path.parent / PROBE_GATE, flags)
+            break
+        except OSError:
+            continue
+    try:
+        if fd is not None:
+            with contextlib.suppress(OSError):
+                fcntl.flock(fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        if fd is not None:
+            os.close(fd)
+
+
+def holder_live(h: dict) -> bool:
+    """Whether the process a slot label names lives and is the one that took it (on Linux its start time
+    matches pid_start, when the label recorded one). False for no pid, a gone or reused one, or one this
+    process cannot judge (another host or PID namespace). Cheap on purpose (no `ps`): a reader asks it of
+    every taken slot."""
+    if not _judgeable(h):
+        return False
+    try:
+        pid = int(h.get("pid") or 0)
+    except (TypeError, ValueError):
+        return False
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        pass
+    except OSError:
+        return False
+    rec = h.get("pid_start")
+    if rec and sys.platform.startswith("linux"):
+        return str(start_time(pid) or "") == str(rec)
+    return True
+
+
+def _probe_taken(path: Path) -> bool | None:
+    try:
+        with probe_gate(path), open(path) as f:
+            try:
+                fcntl.flock(f, fcntl.LOCK_SH | fcntl.LOCK_NB)
+                return False
+            except OSError:
+                return True
+    except OSError:
+        return None
+
+
+def slot_taken(path: Path) -> tuple[bool | None, dict | None]:
+    """(taken, label) for slot file `path`: taken when its lock is held right now (None when it cannot be
+    opened), with the label read once (None while not read; {} when it does not parse). A slot keeps its
+    last label after release. Readers of this release probe under probe_gate, so their probes never make
+    a free slot look taken; a reader of an older release probes ungated, so a failed probe on a slot whose
+    label names no live holder (holder_live) is retried PROBE_TRIES times: one free in any of them is
+    free. A lock that stays taken is held (a dead taker's lock kept by a process it left counts)."""
+    h = None
+    for i in range(PROBE_TRIES):
+        got = _probe_taken(path)
+        if not got:
+            return got, h
+        if h is None:
+            try:
+                h = read_label(path)
+            except ValueError:
+                h = {}
+            except OSError:
+                return None, None
+            if holder_live(h):
+                return True, h
+        if i < PROBE_TRIES - 1:
+            time.sleep(PROBE_GAP_S)
+    return True, h
+
+
+def _slot_labels(paths: list[Path]) -> list[str]:
+    """The holder labels of the slots among paths whose lock is taken right now (slot_taken; not
+    shared); "" for a taken slot whose label does not read: it is held all the same."""
+    out = []
+    for path in paths:
+        taken, h = slot_taken(path)
+        if taken:
+            out.append(str((h or {}).get("holder") or ""))
+    return out
+
+
+def clear_stale(paths: list[Path]) -> list[dict]:
+    """Clears the label of each slot among paths that is free and still names a holder that is gone
+    (pid_alive False, or its pid now another process's): the label becomes {} (what every release reads
+    as no holder). Only while holding that slot's lock (taken non-blocking, released at once), so a real
+    taker is never raced: one taking it meanwhile finds it taken and tries the next slot, and a slot
+    taken already is left alone. Returns the cleared labels."""
+    out = []
+    for path in paths:
+        try:
+            f = open(path, "a+")
+        except OSError:
+            continue
+        _make_probe_gate(path)
+        with probe_gate(path), f:
+            try:
+                fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except OSError:
+                continue
+            try:
+                f.seek(0)
+                h = json.loads(f.read() or "{}")
+            except (OSError, ValueError):
+                continue
+            if not isinstance(h, dict) or not h or pid_alive(h) is None or holder_live(h):
+                continue
+            try:
+                write_label(f, {})
+            except OSError:
+                continue
+            out.append({**h, "path": str(path)})
+    return out
+
+
+PROC_LOCKS = "/proc/locks"   # the kernel's table of held locks (Linux): flock_pids
+HOLDER_READS = 20   # reads of PROC_LOCKS before a taken lock counts as unfound (flock_pids)
+
+
+def _proc_locks() -> list[str]:
+    with open(PROC_LOCKS) as f:
+        return f.readlines()
+
+
+def flock_pids(paths: list[Path], read: Callable[[], list[str]] | None = None) -> dict[Path, list[int]] | None:
+    """The pids holding each of `paths`' flock locks right now, from the kernel's lock table (PROC_LOCKS),
+    never from the lock file's record, which keeps a released holder's JSON. A lock names the superblock's
+    device, which on btrfs differs from the st_dev stat gives: an exact device match wins, else the one pid
+    on that inode number. The kernel hands the table out a page per read, so a line can slip between two
+    pages while other locks come and go: a read that misses one of `paths` is retried, up to HOLDER_READS
+    reads (callers pass taken locks only). A path still unfound maps to []. None when the table cannot be
+    read (no /proc: macOS). The pid is the one that took the lock: it may have exited while a child keeps
+    the inherited descriptor (callers check _alive)."""
+    want = {}
+    for p in paths:
+        try:
+            st = os.stat(p)
+        except OSError:
+            continue
+        want[Path(p)] = ((os.major(st.st_dev), os.minor(st.st_dev)), str(st.st_ino))
+    out: dict[Path, list[int]] = {}
+    read = read or _proc_locks
+    for _ in range(HOLDER_READS):
+        try:
+            lines = read()
+        except OSError:
+            return None
+        exact: dict[Path, set] = {}
+        loose: dict[Path, set] = {}
+        for line in lines:
+            parts = line.split()   # N: FLOCK ADVISORY WRITE <pid> MAJ:MIN:INODE 0 EOF ("->" marks a blocked waiter)
+            if len(parts) < 6 or parts[1] != "FLOCK" or not parts[4].isdigit() or int(parts[4]) <= 0:
+                continue
+            where = parts[5].split(":")
+            if len(where) != 3:
+                continue
+            try:
+                dev = (int(where[0], 16), int(where[1], 16))
+            except ValueError:
+                continue
+            for p, (d, ino) in want.items():
+                if where[2] == ino:
+                    (exact if dev == d else loose).setdefault(p, set()).add(int(parts[4]))
+        for p in want:
+            if not out.get(p):
+                got = exact.get(p) or (loose[p] if len(loose.get(p) or ()) == 1 else set())
+                out[p] = sorted(got)
+        if all(out.values()):
+            break
+    return out
+
+
+def held(locks_dir: Path, where=None) -> list[str]:
+    """Who holds each resource right now, and who has one reserved: "device: task #N (run 9) since
+    10:02 UTC" (in the zone of `where`, the project). A slot file keeps its label after release, so only slots whose lock is taken count;
+    testing takes a free one for an instant, which a `ttp lock` trying then just retries."""
+    out, locks_dir = [], Path(locks_dir)
+    try:
+        slots = sorted(locks_dir.glob("*.lock"))
+        marks = sorted(locks_dir.glob("*.reserved"))
+    except OSError:
+        return out
+    for path in slots:
+        if not _probe_taken(path):
+            continue
+        out += [f"{path.name.rsplit('.', 2)[0]}: {h}" for h in holders([path], where)]
+    try:
+        groups = sorted(locks_dir.glob("*.shared"))
+    except OSError:
+        groups = []
+    for d in groups:
+        res = d.name[:-len(".shared")]
+        out += [f"{res}: {h.get('holder')} since {timefmt.short(float(h.get('since') or 0), where)}"
+                for h in shared_holders([d.parent / f"{res}.0.lock"])]
+    for path in marks:
+        who = reserved_by(path)
+        if who:
+            out.append(f"{path.name[:-len('.reserved')]}: reserved for {who}")
+    return out
+
+
+def reserve_path(locks_dir: Path, resource: str) -> Path:
+    return Path(locks_dir) / f"{resource}.reserved"
+
+
+def reserve(path: Path, holder: str) -> None:
+    """Reserve for holder, or refresh its reservation. A fresh one by another holder stays."""
+    other = reserved_by(path)
+    if other and other != holder:
+        return
+    try:
+        since = json.loads(path.read_text()).get("since") if other else None
+    except (OSError, ValueError):
+        since = None
+    path.parent.mkdir(parents=True, exist_ok=True)
+    durable_write(path, json.dumps({"holder": holder, "since": since or time.time(), "ts": time.time()}))
+
+
+def reserved_by(path: Path) -> str | None:
+    """The holder of a live reservation; None when there is none or it went stale."""
+    try:
+        r = json.loads(path.read_text() or "{}")
+    except (OSError, ValueError):
+        return None
+    age = time.time() - float(r.get("ts") or 0)
+    # A stamp from the future means the clock went back; trusting it would hold the resource
+    # until the clock caught up.
+    if age > RESERVE_STALE_S or age < -5:
+        return None
+    return str(r.get("holder") or "") or None
+
+
+def unreserve(path: Path, holder: str) -> None:
+    try:
+        if json.loads(path.read_text() or "{}").get("holder") == holder:
+            path.unlink()
+    except (OSError, ValueError):
+        pass
+
+
+WAITS_FILE = "lock_waits.json"
+_WAITS_HELD: dict[tuple[str, str], int] = {}   # this process's open waits: the fd locking each one's live file
+
+
+def _live_name(key: str) -> str:
+    return f"{WAITS_FILE}.{hashlib.sha256(key.encode()).hexdigest()[:16]}.live"
+
+
+def record_wait(run_dir: Path, key: str, start: float, end: float | None,
+                locks: list[str] | None = None) -> None:
+    """Record one `ttp lock` wait of a run: open (end None) while it waits, closed once it ends.
+    Several commands of one run may wait at once; the flock keeps their updates from overwriting
+    each other, and the rename keeps readers from seeing half a file. While open, the waiter holds an
+    exclusive flock on a live file of its own, which ends with its process: readers test that, never
+    its pid, which inside a PID namespace other than the run's names another process outside.
+    `locks`: the canonical locks it waits on (wait_rows), kept when the closing call leaves them out;
+    none for a wait that is not on a resource lock (a checks lane, a push)."""
+    run_dir = Path(run_dir)
+    held = (str(run_dir), key)
+    try:
+        with open(run_dir / f"{WAITS_FILE}.lock", "a") as guard:
+            fcntl.flock(guard, fcntl.LOCK_EX)
+            try:
+                waits = json.loads((run_dir / WAITS_FILE).read_text())
+            except (OSError, ValueError):
+                waits = {}
+            rec = {"start": start, "end": end, "pid": os.getpid()}
+            prev = waits.get(key) if isinstance(waits, dict) else None
+            if locks is None and isinstance(prev, dict) and isinstance(prev.get("locks"), list):
+                locks = prev["locks"]
+            if locks:
+                rec["locks"] = [str(x) for x in locks]
+            if end is None:
+                try:
+                    if held not in _WAITS_HELD:
+                        fd = os.open(run_dir / _live_name(key), os.O_RDWR | os.O_CREAT | os.O_CLOEXEC, 0o600)
+                        fcntl.flock(fd, fcntl.LOCK_EX)
+                        _WAITS_HELD[held] = fd
+                    rec["live"] = _live_name(key)
+                except OSError:
+                    pass    # no live file: readers fall back to the pid
+            waits[key] = rec
+            durable_write(run_dir / WAITS_FILE, json.dumps(waits))
+    except OSError:
+        pass    # a missing record only costs the run its extension, never the command
+    if end is not None and (fd := _WAITS_HELD.pop(held, None)) is not None:
+        # Released only after the closed record is written: a reader that finds the lock free
+        # re-reads the record and sees it closed (wait_spans).
+        try:
+            os.unlink(run_dir / _live_name(key))
+        except OSError:
+            pass
+        os.close(fd)
+
+
+def _wait_alive(run_dir: Path, w: dict) -> bool:
+    """An open wait's process still waits: it holds its live file's flock (any PID namespace)."""
+    live = w.get("live")
+    if not isinstance(live, str) or "/" in live:
+        return _alive(int(w.get("pid") or 0))   # a record without one (an older ttp)
+    try:
+        fd = os.open(Path(run_dir) / live, os.O_RDONLY | os.O_CLOEXEC)
+    except OSError:
+        return False
+    try:
+        fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
+        return False
+    except OSError:
+        return True
+    finally:
+        os.close(fd)
+
+
+def wait_spans(run_dir: Path) -> list[tuple[float, float | None]]:
+    """(start, end) of each wait recorded in `run_dir`: end None while it waits; an open one whose
+    process is gone ends at its start (counts nothing). Rows with bad fields are skipped."""
+    return [(start, end) for start, end, _ in wait_rows(run_dir)]
+
+
+def wait_rows(run_dir: Path) -> list[tuple[float, float | None, list[str]]]:
+    """wait_spans with the locks each wait is on (record_wait's `locks`; [] when it named none)."""
+    def read() -> dict:
+        try:
+            waits = json.loads((Path(run_dir) / WAITS_FILE).read_text())
+        except (OSError, ValueError):
+            return {}
+        return waits if isinstance(waits, dict) else {}
+    waits, again, out = read(), None, []
+    for key, w in waits.items():
+        try:
+            start, end = float(w["start"]), w.get("end")
+            if end is None and not _wait_alive(run_dir, w):
+                # It may have closed between the read and the test: its closed record is written first.
+                again = read() if again is None else again
+                w2 = again.get(key)
+                end = w2.get("end") if isinstance(w2, dict) and w2.get("end") is not None else start
+            on = w.get("locks")
+            out.append((start, None if end is None else float(end),
+                        [str(x) for x in on] if isinstance(on, list) else []))
+        except (KeyError, TypeError, ValueError, AttributeError):
+            continue
+    return out
+
+
+def waited(run_dir: Path, now: float | None = None) -> float:
+    """Seconds the run has spent waiting in `ttp lock`, overlapping waits counted once. A wait still
+    going counts up to now; one whose process died without closing it counts nothing."""
+    now = time.time() if now is None else now
+    spans = [(start, min(now if end is None else end, now)) for start, end in wait_spans(run_dir)]
+    total, reach = 0.0, float("-inf")
+    for start, end in sorted(spans):
+        if end > reach:
+            total += end - max(start, reach)
+            reach = end
+    return total
+
+
+def _alive(pid: int) -> bool:
+    return liveness.pid_alive(pid) and not zombie(pid)
+
+
+def queue_dir(locks_dir: Path, resource: str) -> Path:
+    return Path(locks_dir) / f"{resource}.queue"
+
+
+_TICKETS: dict[Path, object] = {}   # this process's tickets: the open file that holds each one's lock
+# Set where a process outlives the run whose TTP_RUN_DIR it carries (the detached `ttp checks`): no run ties its tickets
+OUTLIVES_RUN_ENV = "TTP_OUTLIVES_RUN"
+_TICKET_RUNS: dict[Path, str] = {}   # and the folder of the run each waits for ("" for none: _waits_for_run)
+
+
+SHARED_TICKET = "-shared"   # ends a shared waiter's ticket name
+GROUP_TICKET = ".g"         # then a fair queue's group id: <arrival>-<pid>[.p<priority>].g<id>
+MULTI_TICKET = ".m"         # after the pid, a waiter for several resources at once (`ttp lock A,B`)
+PRIORITY_TICKET = ".p"      # before it, the waiter's task priority (lowest first; checkcap uses 0 for obligation owners)
+LANDING_TICKET = ".l"       # right after the pid, a waiter inside a landing's checks (landmark.verified; landing_first)
+REQUEUED_TICKET = ".r"      # after the pid, a waiter that gave its slot up to a more urgent one and queued again (fair_order)
+SMALL_TICKET = ".s"         # after the pid, a short run (checkcap.is_small): first among its group's at its priority
+LANDING_AGE_S = 3600.0      # a waiter that has waited this long is no longer passed by later landings (landing_first)
+SERVED_KEEP_S = 86400.0     # a group's last-served time older than this no longer changes its turn
+
+
+def group_id(group: str | None) -> str:
+    """The short id a fair queue's ticket carries for its group (a project); "" for none."""
+    return hashlib.sha256(group.encode()).hexdigest()[:12] if group else ""
+
+
+def enqueue(locks_dir: Path, resource: str, holder: str, since: float | None = None,
+            shared: bool = False, group: str | None = None, priority: int | None = None,
+            multi: bool = False, landing: bool = False, requeued: bool = False, small: bool = False) -> Path:
+    """A ticket for this process in the resource's arrival queue. Like a slot, it is an OS file lock
+    held by this process, so it ends with it (a crash, a kill, a reboot) whatever its pid becomes.
+    Not written durably: a power cut ends every waiter with it. Remove it with `dequeue`. `since`
+    is the arrival time to queue at (default now): a waiter that hands over keeps its place.
+    A shared waiter's ticket name ends in SHARED_TICKET. `group` (a project) is what a fair queue
+    (fair_order) takes turns between; waiters without one form their own group. `priority` (the task's;
+    lower first) orders the waiters within a group; it goes before the group id, so older runtimes
+    still read the group. `multi`: one of the tickets of a waiter for several resources at once
+    (MULTI_TICKET after the pid), which a waiter that holds locks already does not wait behind (my_turn).
+    `landing`: a waiter inside a landing's checks (LANDING_TICKET); only a verified one (landmark.verified).
+    `requeued`: a waiter that gave its slot up (preempted) and queues again at `since` (REQUEUED_TICKET).
+    `small`: a short run (SMALL_TICKET), which fair_order serves first among its group's waiters at its priority."""
+    d = queue_dir(locks_dir, resource)
+    d.mkdir(parents=True, exist_ok=True)
+    gid = group_id(group)
+    prio = f"{PRIORITY_TICKET}{int(priority)}" if priority is not None else ""
+    name = (f"{time.time() if since is None else since:017.6f}-{os.getpid()}{LANDING_TICKET if landing else ''}"
+            f"{MULTI_TICKET if multi else ''}{REQUEUED_TICKET if requeued else ''}{SMALL_TICKET if small else ''}{prio}"
+            f"{GROUP_TICKET + gid if gid else ''}{SHARED_TICKET if shared else ''}")
+    # Locked under a hidden name first, then renamed in: `queued` never sees it unlocked.
+    tmp = d / f".{name}.tmp"
+    f = open(tmp, "a+")
+    fcntl.flock(f, fcntl.LOCK_EX)
+    f.write(holder)
+    f.flush()
+    path = d / name
+    os.rename(tmp, path)
+    _TICKETS[path] = f
+    owner = _ticket_owner()
+    _TICKET_RUNS[path] = owner.get("run_dir") or ""
+    try:   # written once the ticket is in: a ticket read without its record is judged by its lock alone;
+        # unsynced: the record matters only while its waiter holds the ticket's lock, which a power cut ends
+        durable_write(_owner_file(path), json.dumps(owner), sync=False)
+    except OSError:
+        pass
+    return path
+
+
+def dequeue(ticket: Path | None) -> None:
+    if ticket is None:
+        return
+    for path in (ticket, _owner_file(ticket)):
+        try:
+            path.unlink()
+        except OSError:
+            pass
+    _TICKET_RUNS.pop(ticket, None)
+    f = _TICKETS.pop(ticket, None)
+    if f is not None:
+        f.close()
+
+
+OWNER_TICKET = ".who"   # beside a ticket, hidden (".<ticket>.who"): its waiter's owner record (_ticket_owner)
+
+
+def _owner_file(ticket: Path) -> Path:
+    return ticket.with_name(f".{ticket.name}{OWNER_TICKET}")
+
+
+def _ticket_owner(env=None) -> dict:
+    """What a ticket records of its waiter, so a reader drops it once that waiter can no longer take its
+    turn (_waiter_gone), though its lock is still held (a child that inherited the open file): this process
+    (_owner: pid, start time, node, PID namespace) and the folder of the run it waits for (_waits_for_run)."""
+    out = _owner(os.getpid())
+    if (run := _waits_for_run(env)):
+        out["run_dir"] = run
+    try:   # the waiter's task and project only label it; an unreadable registry never fails a ticket
+        out |= waiter_ids(env)
+    except Exception:
+        pass
+    return out
+
+
+IDENTITY: dict = {}   # the task, run and project root a process with no TTP_TASK adopted (checkcap.adopt_identity)
+
+
+def waiter_ids(env=None) -> dict:
+    """The task, run and project a waiter queues for, for its ticket's record (ticket_task): run_ids, else the
+    adopted IDENTITY's task and run (a `ttp checks` with no TTP_TASK started under a project run)."""
+    env = os.environ if env is None else env
+    out = run_ids(env)
+    if not str(env.get("TTP_TASK") or "").isdigit() and str(IDENTITY.get("task") or "").isdigit():
+        out = {**out, "task_id": IDENTITY["task"], **({"run_id": IDENTITY["run"]} if IDENTITY.get("run") else {})}
+    return out
+
+
+_TASK_RE = re.compile(r"task #(\d+)")
+
+
+def ticket_task(ticket: Path) -> str:
+    """The task a queue ticket waits for: its text's "task #N", else its record's task_id (waiter_ids); ""
+    when neither names one."""
+    try:
+        if m := _TASK_RE.search(ticket.read_text()):
+            return m.group(1)
+    except OSError:
+        return ""
+    try:
+        task = str(json.loads(_owner_file(ticket).read_text()).get("task_id") or "")
+    except (OSError, ValueError, AttributeError):
+        return ""
+    return task if task.isdigit() else ""
+
+
+def _waits_for_run(env=None) -> str:
+    """The folder of the run this process waits for (TTP_RUN_DIR) while that run is going; "" in a `ttp
+    detach` job or detached `ttp checks` (OUTLIVES_RUN_ENV: they outlive their run by design) and where the
+    run had ended already when it began (a hand-off's check the daemon runs later with the run's variables)."""
+    env = os.environ if env is None else env
+    run = "" if env.get("TTP_DETACHED") or env.get(OUTLIVES_RUN_ENV) else str(env.get("TTP_RUN_DIR") or "")
+    return "" if not run or (Path(run) / "exit.json").exists() else run
+
+
+def run_ended(ticket: Path | None) -> bool:
+    """Whether the run a ticket of this process was queued for has ended since (exit.json in its folder)."""
+    run = _TICKET_RUNS.get(ticket) if ticket is not None else ""
+    return bool(run) and (Path(run) / "exit.json").exists()
+
+
+def _waiter_gone(ticket: Path) -> bool:
+    """Whether a ticket whose lock is held has no waiter left: its record (_ticket_owner) is of this host and
+    names a run that has ended (exit.json in its folder), or a process of this PID namespace that is gone or
+    whose pid another process now has (another start time). False whenever it cannot tell (no record,
+    another host or namespace, a process this one may not see): a live waiter is never dropped."""
+    try:
+        rec = json.loads(_owner_file(ticket).read_text())
+    except (OSError, ValueError):
+        return False
+    if not isinstance(rec, dict) or rec.get("node") != os.uname().nodename:
+        return False
+    run = rec.get("run_dir")
+    if isinstance(run, str) and run and (Path(run) / "exit.json").exists():
+        return True
+    if not rec.get("pidns") or rec["pidns"] != _pid_ns() or not rec.get("pid_start"):
+        return False
+    now = start_time(rec.get("pid"))
+    if now is None:   # not in /proc: gone, or hidden from this user (then it answers the signal test)
+        try:
+            return not _alive(int(rec.get("pid") or 0))
+        except (TypeError, ValueError):
+            return False
+    return now != str(rec["pid_start"])
+
+
+def dropped(ticket: Path | None) -> bool:
+    """Whether a ticket of this process was taken out of its queue under it (queued: its run ended)."""
+    return ticket is not None and ticket in _TICKETS and not os.path.lexists(ticket)
+
+
+def _ticket_live(path: Path) -> bool:
+    try:
+        with open(path) as f:
+            try:
+                fcntl.flock(f, fcntl.LOCK_SH | fcntl.LOCK_NB)
+            except OSError:
+                return True
+            return False
+    except OSError:
+        return False
+
+
+def queued(locks_dir: Path, resource: str) -> list[Path]:
+    """Live tickets in arrival order; tickets whose waiter is gone are removed: its lock is free, or its
+    owner record says its process or run has ended though another process keeps the lock (_waiter_gone).
+    So are owner records left without their ticket."""
+    d = queue_dir(locks_dir, resource)
+    out = []
+    try:
+        names = sorted(os.listdir(d))
+    except OSError:
+        return out
+    for name in names:
+        path = d / name
+        if name.startswith("."):
+            if name.endswith(OWNER_TICKET) and not os.path.lexists(d / name[1:-len(OWNER_TICKET)]):
+                try:
+                    path.unlink()
+                except OSError:
+                    pass
+            continue
+        if path in _TICKETS or (_ticket_live(path) and not _waiter_gone(path)):
+            out.append(path)
+        else:
+            for f in (path, _owner_file(path)):
+                try:
+                    f.unlink()
+                except OSError:
+                    pass
+    return out
+
+
+def is_multi(ticket: Path) -> bool:
+    return MULTI_TICKET in ticket.name.partition(PRIORITY_TICKET)[0].partition(GROUP_TICKET)[0]
+
+
+def is_requeued(ticket: Path) -> bool:
+    return REQUEUED_TICKET in ticket.name.partition(PRIORITY_TICKET)[0].partition(GROUP_TICKET)[0]
+
+
+def is_small(ticket: Path) -> bool:
+    return SMALL_TICKET in ticket.name.partition(PRIORITY_TICKET)[0].partition(GROUP_TICKET)[0]
+
+
+def is_landing(ticket: Path) -> bool:
+    head = ticket.name.removesuffix(SHARED_TICKET).split("-", 1)[-1]
+    return LANDING_TICKET in head.partition(GROUP_TICKET)[0].partition(PRIORITY_TICKET)[0]
+
+
+def holder_kind(h: dict) -> str:
+    """Whether lock record `h` (holder_records) is a landing's, and the project it works for, as a wait line
+    names it: from the record's own project_root (the project's resolved path), never its project field,
+    which may name only the harness folder. Text only: nothing stops, requeues or preempts that holder."""
+    root = h.get("project_root")
+    whose = (f"project at {Path(root).parent if Path(root).name == FOLDER else root}" if root
+             else "no project recorded")
+    return f"{'a landing' if h.get('landing') else 'not a landing'}, {whose}"
+
+
+def landing_first(q: list[Path], now: float | None = None) -> list[Path]:
+    """`q` with landing waiters (is_landing) moved ahead of the rest, by arrival, along with every waiter
+    that has waited LANDING_AGE_S or longer (first): a later landing never passes it, so no waiter waits
+    on a stream of landings without a bound. Urgent waiters (_urgent) join the front ahead of routine
+    landings, urgent landings first: an urgent run never waits behind routine work. The rest keep their
+    order. Without a landing waiting, `q` (urgent ones already lead it: my_turn)."""
+    if not any(map(is_landing, q)):
+        return q
+    edge = (time.time() if now is None else now) - LANDING_AGE_S
+    front = sorted((t for t in q if is_landing(t) or _urgent(t) or _arrival(t) <= edge),
+                   key=lambda t: (_arrival(t) > edge, not _urgent(t), not is_landing(t), _arrival(t)))
+    return front + [t for t in q if t not in front]
+
+
+def shared_behind(q: list[Path]) -> list[Path]:
+    """`q` with each shared waiter moved to just after the last exclusive waiter there that arrived before
+    it: urgency, landing and fairness order exclusive waiters among themselves and shared ones among
+    themselves, but a shared waiter never passes an older exclusive one (its hold would keep that one
+    out for as long as shared holders keep coming). Exclusive waiters keep their places, so none waits
+    on a shared one held back behind it."""
+    q = list(q)
+    for s in [t for t in q if is_shared(t)]:
+        i = q.index(s)
+        older = [j for j, t in enumerate(q) if j > i and not is_shared(t) and _arrival(t) < _arrival(s)]
+        if older:
+            q.insert(older[-1], q.pop(i))
+    return q
+
+
+def is_shared(ticket: Path) -> bool:
+    return ticket.name.endswith(SHARED_TICKET)
+
+
+def ticket_group(ticket: Path) -> str:
+    """A ticket's group id ("" for none)."""
+    name = ticket.name.removesuffix(SHARED_TICKET)
+    return name.rpartition(GROUP_TICKET)[2] if GROUP_TICKET in name else ""
+
+
+def ticket_priority(ticket: Path) -> float:
+    """A ticket's task priority; one without (older runtimes, no task) sorts after every priority."""
+    name = ticket.name.removesuffix(SHARED_TICKET).partition(GROUP_TICKET)[0]
+    try:
+        return float(int(name.rpartition(PRIORITY_TICKET)[2])) if PRIORITY_TICKET in name else math.inf
+    except ValueError:
+        return math.inf
+
+
+def _arrival(ticket: Path) -> float:
+    try:
+        return float(ticket.name.split("-", 1)[0])
+    except ValueError:
+        return 0.0
+
+
+def served_dir(locks_dir: Path, resource: str) -> Path:
+    return Path(locks_dir) / f"{resource}.served"
+
+
+def mark_served(locks_dir: Path, resource: str, group: str | None) -> None:
+    """Record that `group` just got the resource, so a fair queue serves the other groups first.
+    Only a time: a stale or lost record just makes that group look longer unserved."""
+    d = served_dir(locks_dir, resource)
+    now = time.time()
+    try:
+        d.mkdir(parents=True, exist_ok=True)
+        f = d / (group_id(group) or "none")
+        f.touch()
+        os.utime(f, (now, now))
+        for old in d.iterdir():
+            if now - old.stat().st_mtime > SERVED_KEEP_S:
+                old.unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
+def _served(locks_dir: Path, resource: str) -> dict[str, float]:
+    out = {}
+    try:
+        for f in served_dir(locks_dir, resource).iterdir():
+            out["" if f.name == "none" else f.name] = f.stat().st_mtime
+    except OSError:
+        pass
+    return out
+
+
+def fair_order(locks_dir: Path, resource: str, q: list[Path] | None = None, urgent_max: int = 0,
+               aged_before: float | None = None, aged_turns: int | None = None,
+               bare_last: bool = False, share: tuple[int, dict[str, int]] | None = None) -> list[Path]:
+    """The waiters in the order a fair queue serves them: each next turn goes to the oldest waiter
+    of the group that has waited longest since it last got the resource (since its oldest waiter
+    arrived, if later), so one group's burst cannot starve the others. Within a group by task priority
+    (ticket_priority), then short runs (is_small) first, then arrival: a stream of short runs holds a
+    longer one only until it ages past `aged_before` below. A waiter below URGENT_PRIORITY (a user-ordered urgent task's,
+    urgent.queue_priority, or an open obligation's owner) goes before the other groups' waiters too.
+
+    `urgent_max` > 0: urgent waiters (task priority URGENT_PRIORITY or better) go first, taking turns
+    by group among themselves, but at most `urgent_max` turns in a row (counting the ones already
+    served, mark_turn) while other waiters wait; then the next other waiter goes. Tickets without a
+    priority (older runtimes) are never urgent, so a queue without urgent waiters keeps this order.
+
+    Known gap: while some projects on a host still run a runtime from before fair ordering
+    (arrival-order my_turn) or before urgent turns next to newer waiters, the orders can disagree on
+    who goes first, so one slot may sit idle until another frees; this ends once every project on the
+    host is upgraded.
+
+    `aged_before` (an epoch time): waiters that arrived at or before it have waited past their bound and go
+    first, by arrival, ahead of every turn above. Under urgent turns (`urgent_max` > 0 or URGENT_FIRST) only
+    routine ones do, and only ahead of routine waiters: they take the routine turns, so urgent ones keep
+    theirs and the `urgent_max` bound still lets a routine one go.
+
+    `urgent_max` URGENT_FIRST: every urgent waiter goes first, whatever its project or the others' arrival
+    (aged ones included), the most urgent priority first, then by the turns above among projects; the rest
+    follow in the order above. `aged_turns` N: once N urgent turns went in a row while a routine waiter
+    waited (mark_turn), the oldest aged routine waiter goes first, so it starts within N urgent turns of
+    aging. None: no such turn (accepted gap: a steady stream of urgent runs holds routine ones back).
+
+    A requeued waiter (REQUEUED_TICKET: it gave its slot up to a more urgent one) keeps its place over all of
+    these turns: it goes ahead of the waiters before it that arrived after it at its priority or a less urgent
+    one (requeued_place), so its project's turn spent on the run that took its slot never sends it back.
+
+    `bare_last`: waiters with no group (a run with no project) go after every grouped one, by priority then
+    arrival, aged or not (accepted gap: they wait while any project's waiter does).
+
+    `share` (cap N, {group id: slots it holds now}): the routine turns go first to groups below their fair
+    share of the cap (fair_share), so one group's backlog cannot hold every slot while another waits."""
+    q = queued(locks_dir, resource) if q is None else q
+    if bare_last and (bare := [t for t in q if not ticket_group(t)]):
+        rest = [t for t in q if ticket_group(t)]
+        return (fair_order(locks_dir, resource, rest, urgent_max, aged_before, aged_turns, share=share)
+                if rest else []) + \
+            sorted(bare, key=lambda t: (ticket_priority(t), _arrival(t)))
+    first = urgent_max == URGENT_FIRST
+    aged = sorted((t for t in q if _arrival(t) <= aged_before and not ((first or urgent_max > 0) and _urgent(t))),
+                  key=_arrival) if aged_before is not None else []
+    if aged:
+        q = [t for t in q if t not in aged]
+    groups: dict[str, list[Path]] = {}
+    for t in q:
+        groups.setdefault(ticket_group(t), []).append(t)
+    served = _served(locks_dir, resource)
+    key = {g: (0, max(served.get(g, 0.0), _arrival(ts[0])), ts[0].name) for g, ts in groups.items()}
+    for ts in groups.values():
+        ts.sort(key=lambda t: (ticket_priority(t), not is_small(t)))   # stable: then arrival order
+    hot = sum(map(_urgent, q)) if urgent_max > 0 or first else 0
+    cold = len(q) - hot + len(aged)   # aged ones are routine here, or there are no urgent turns (hot 0)
+    streak = _streak(locks_dir, resource) if hot and cold else 0
+    run = 0 if first else streak
+    owed = bool(first and aged and aged_turns is not None and streak >= aged_turns)
+    out = []
+    while groups or aged:
+        want = (True if hot else None) if first else (run < urgent_max if hot and cold else None)  # None: either
+        # a routine turn: the aged ones first, by arrival; a user-ordered waiter still goes before an owed one
+        ordered = owed and any(ticket_priority(t) < URGENT_PRIORITY for ts in groups.values() for t in ts)
+        if aged and ((owed and not ordered) or not hot or want is False):
+            out.append(aged.pop(0))
+            cold, run, owed = cold - 1, 0, False
+            continue
+        cand = [g for g, ts in groups.items() if want is None or any(_urgent(t) == want for t in ts)]
+        if want is not False:   # a user-ordered waiter (below URGENT_PRIORITY) goes first, in any group
+            best = min(ticket_priority(groups[g][0]) for g in cand)
+            if best < URGENT_PRIORITY:
+                cand = [g for g in cand if ticket_priority(groups[g][0]) == best]
+        rank = ((lambda g: (min(ticket_priority(t) for t in groups[g] if _urgent(t)), key[g])) if first and want
+                else key.__getitem__)
+        g = min(cand, key=rank)
+        ts = groups[g]
+        t = ts.pop(0 if want is None else next(i for i, t in enumerate(ts) if _urgent(t) == want))
+        out.append(t)
+        if hot and _urgent(t):
+            hot, run = hot - 1, run + 1
+        else:
+            cold, run = cold - 1, 0
+        if ts:
+            key[g] = (1, len(out), "")
+        else:
+            del groups[g]
+    return requeued_place(fair_share(out, *share) if share else out)
+
+
+def share_of(cap: int, groups: int) -> int:
+    """A group's fair share of `cap` slots while `groups` groups run or wait: max(1, cap // groups)."""
+    return max(1, int(cap) // max(1, int(groups)))
+
+
+def fair_share(q: list[Path], cap: int, running: dict[str, int]) -> list[Path]:
+    """`q` (fair_order's) with its routine turns (not _urgent) given first to groups below their fair share
+    (share_of over the groups that hold a slot or wait), counting each turn before as one more slot of its
+    group; with none below it, the next routine waiter in `q`'s order (work-conserving). Urgent and
+    requeued (preempted: requeued_place) waiters keep their places, so urgent and owed runs and preemption
+    keep their order and the routine turns stay where they were. It only orders the queue: a running holder
+    is never stopped for a share."""
+    if not cap or cap <= 0:
+        return q
+    held = {g: n for g, n in running.items() if n > 0}
+    share = share_of(cap, len(set(held) | {ticket_group(t) for t in q}))
+    pinned = lambda t: _urgent(t) or is_requeued(t)
+    routine = [t for t in q if not pinned(t)]
+    out = []
+    for t in q:
+        if pinned(t):
+            pick = t
+        else:
+            pick = next((r for r in routine if held.get(ticket_group(r), 0) < share), routine[0])
+            routine.remove(pick)
+        out.append(pick)
+        held[ticket_group(pick)] = held.get(ticket_group(pick), 0) + 1
+    return out
+
+
+def requeued_place(q: list[Path]) -> list[Path]:
+    """`q` with each requeued waiter (is_requeued) moved ahead of the waiters just before it that arrived after
+    it at its priority or a less urgent one (ticket_priority), up to the first one it may not pass."""
+    out = list(q)
+    for t in [t for t in out if is_requeued(t)]:
+        i = j = out.index(t)
+        while j and _arrival(out[j - 1]) > _arrival(t) and ticket_priority(out[j - 1]) >= ticket_priority(t):
+            j -= 1
+        out.insert(j, out.pop(i))
+    return out
+
+
+URGENT_PRIORITY = 1   # a waiter at this task priority or better is urgent in fair_order with urgent_max
+URGENT_FIRST = -1     # fair_order's urgent_max: urgent waiters always first, by priority then project turns
+
+
+def _urgent(ticket: Path) -> bool:
+    return ticket_priority(ticket) <= URGENT_PRIORITY
+
+
+def urgent_order(q: list[Path]) -> list[Path]:
+    """`q` with its urgent waiters (_urgent) first, the most urgent priority first, then by arrival; the
+    rest after them by arrival. Tickets without a priority (older runtimes) are routine."""
+    return sorted(q, key=lambda t: (not _urgent(t), ticket_priority(t) if _urgent(t) else 0, _arrival(t)))
+
+
+def streak_path(locks_dir: Path, resource: str) -> Path:
+    return Path(locks_dir) / f"{resource}.urgent"
+
+
+def _streak(locks_dir: Path, resource: str) -> int:
+    try:
+        return max(int(streak_path(locks_dir, resource).read_text().strip() or 0), 0)
+    except (OSError, ValueError):
+        return 0
+
+
+def mark_turn(locks_dir: Path, resource: str, ticket: Path | None) -> None:
+    """Record a turn for fair_order's `urgent_max`: one more urgent turn in a row when `ticket` is
+    urgent and another waiter that is not still waits, else none. Call it once the ticket took the
+    resource, before dequeue; None for a take with nobody queued. Only a count: a lost or raced write
+    shifts the bound by a turn, never stops the queue."""
+    n = 0
+    if ticket is not None and _urgent(ticket):
+        if any(not _urgent(t) for t in queued(locks_dir, resource) if t != ticket):
+            n = _streak(locks_dir, resource) + 1
+    if n == _streak(locks_dir, resource):
+        return
+    path = streak_path(locks_dir, resource)
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    try:
+        tmp.write_text(str(n))
+        os.replace(tmp, path)
+    except OSError:
+        tmp.unlink(missing_ok=True)
+
+
+def my_turn(locks_dir: Path, resource: str, ticket: Path, slots: int, fair: bool = False,
+            urgent_max: int = 0, past_multi: bool = False, aged_before: float | None = None,
+            aged_turns: int | None = None, bare_last: bool = False,
+            share: tuple[int, dict[str, int]] | None = None) -> bool:
+    """Whether this ticket may take the resource now. An exclusive one: among the first `slots`
+    waiters (urgent tickets, task priority URGENT_PRIORITY or better, before the rest), one per free
+    slot, with no shared waiter ahead. A shared one: no exclusive waiter
+    ahead, and never ahead of an older exclusive one, urgent or landing or not (shared_behind). `fair`: waiters are counted in fair_order (with `urgent_max`), not
+    arrival order (and `aged_before`, `aged_turns`, `bare_last`, `share` as there). Either way landing waiters go first (landing_first). `past_multi`
+    (a waiter that holds locks already): waiters for several resources at
+    once ahead are not counted, as one of them may wait for a lock this waiter's holder has: waiting
+    behind it would never end."""
+    q = queued(locks_dir, resource)
+    if ticket not in q:   # none queued, unless it was this process's and was dropped (its run ended): never
+        return not dropped(ticket)
+    if fair:
+        q = fair_order(locks_dir, resource, q, urgent_max, aged_before, aged_turns, bare_last, share)
+    else:   # urgent waiters (an urgent task's) first, a user-ordered one (priority 0) before them, arrival
+        q = sorted(q, key=lambda t: min(ticket_priority(t), URGENT_PRIORITY + 1))   # order within: plain arrival
+    q = shared_behind(landing_first(q))
+    ahead = [t for t in q[:q.index(ticket)] if not (past_multi and is_multi(t))]
+    if is_shared(ticket):
+        return all(is_shared(t) for t in ahead)
+    return not any(is_shared(t) for t in ahead) and len(ahead) < max(int(slots or 0), 0)
+
+
+def take_in_turn(locks_dir: Path, resource: str, ticket: Path, paths: list[Path], holder: str, what: str = "",
+                 fair: bool = False, past_multi: bool = False, extra: dict | None = None):
+    """try_take (try_take_shared for a shared ticket), but only when this ticket's turn has come
+    (my_turn), so a later waiter never takes the one slot an earlier one is about to."""
+    if not turn(locks_dir, resource, ticket, paths, fair, past_multi):
+        return None
+    return (try_take_shared(paths, holder, what, extra=extra) if is_shared(ticket)
+            else try_take(paths, holder, what, extra=extra))
+
+
+def turn(locks_dir: Path, resource: str, ticket: Path, paths: list[Path], fair: bool = False,
+         past_multi: bool = False) -> bool:
+    """my_turn with the resource's free slots counted now: what take_in_turn checks before it takes."""
+    if is_shared(ticket):
+        return my_turn(locks_dir, resource, ticket, 0, past_multi=past_multi)
+    return my_turn(locks_dir, resource, ticket, len(paths) - len(held_labels(paths)), fair, past_multi=past_multi)
+
+
+def probe(locks_dir: Path, resource: str, paths: list[Path], shared: bool = False) -> bool:
+    """Free now, nobody waiting and not reserved: a task that gave up waiting can come back. For a
+    shared taker: no exclusive holder, no exclusive waiter and not reserved."""
+    if reserved_by(reserve_path(locks_dir, resource)):
+        return False
+    if shared:
+        return not _slot_labels(paths) and all(is_shared(t) for t in queued(locks_dir, resource))
+    return any_free(paths) and not queued(locks_dir, resource)
+
+
+def job_lock(rc: Path) -> Path:
+    """The lock a `ttp detach` job holds while any of its processes lives, next to its .rc file."""
+    return Path(rc).with_suffix(".lock")
+
+
+def job_ended(rc: Path) -> bool:
+    """Whether a detached job ended: it wrote its exit code, or it is gone without one (detach.state);
+    one the daemon is yet to start has not."""
+    from .detach import state
+    return state(Path(rc))[0] in ("ended", "lost")
+
+
+def job_probe(rcs: list, ttp: str = "ttp") -> str:
+    """A `retry_when` that exits 0 once every one of these detached jobs ended with exit 0, 4 once all
+    ended but one failed or is gone (detach.FAILED_RC), 1 before."""
+    return f"{ttp} detach --check " + " ".join(shlex.quote(str(r)) for r in rcs)
+
+
+def _parent(pid: int) -> int | None:
+    """The parent of process pid; None if it is gone or this cannot tell."""
+    try:   # Linux: field 4
+        return int(Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[1])
+    except (OSError, IndexError, ValueError):
+        pass
+    try:
+        out = subprocess.run(["ps", "-o", "ppid=", "-p", str(pid)], capture_output=True, text=True,
+                             timeout=5).stdout.strip()
+        return int(out) if out else None
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return None
+
+
+def in_run(run_dir: Path | None) -> bool:
+    """Whether this process still runs under the run's agent (child.pid in the run's folder), so the
+    run supervises it. A background (`nohup ... &`) driver is re-parented once its shell exits and then is not.
+    True whenever it cannot tell: another PID namespace (a sandbox), no record, an unreadable parent."""
+    try:
+        agent = int((run_dir / "child.pid").read_text().split()[0])
+    except (OSError, ValueError, IndexError, TypeError):
+        return True
+    if (ns := os.environ.get("TTP_PIDNS")):
+        try:
+            if os.readlink("/proc/self/ns/pid") != ns:
+                return True
+        except OSError:
+            pass
+    pid = os.getpid()
+    for _ in range(256):
+        if pid == agent:
+            return True
+        if pid <= 1:
+            return False
+        nxt = _parent(pid)
+        if nxt is None:
+            return True
+        pid = nxt
+    return True
+
+
+def other_pid_ns() -> bool:
+    """Whether this process may run in a PID namespace other than its run's agent's: in another
+    namespace than TTP_PIDNS, under a /proc of another namespace, or where it cannot tell. Hosts other
+    than Linux have no PID namespaces."""
+    if not sys.platform.startswith("linux"):
+        return False
+    try:
+        if int(os.readlink("/proc/self")) != os.getpid():
+            return True
+        ns = os.readlink("/proc/self/ns/pid")
+    except (OSError, ValueError):
+        return True
+    return bool((run_ns := os.environ.get("TTP_PIDNS")) and run_ns != ns)
+
+
+def _ancestors() -> set[int]:
+    """The pids above this process, up to and with init (this process too): an agent may be its PID
+    namespace's init (a container's first process, or a test's parent in a PID namespace other than the run's)."""
+    out, pid = set(), os.getpid()
+    while pid > 0 and pid not in out and len(out) < 256:
+        out.add(pid)
+        pid = _parent(pid) or 0
+    return out
+
+
+def under_run_agent(dbs: list[Path] | None = None) -> bool:
+    """Whether a live run's agent is an ancestor of this process: the child.pid of a running run of
+    this machine's projects (or of `dbs`, project databases), with the start token it recorded. A
+    worker can unset TTP_RUN_ID and the like, but not change which process started it. A run whose
+    agent's tools were re-parented (`nohup ... &` after its shell exited) is not seen. In a PID
+    namespace other than the run's (TTP_PIDNS) the walk stops at the
+    namespace's init and cannot see the agent: True there, and whenever the namespace cannot be read."""
+    if other_pid_ns():
+        return True
+    import sqlite3
+    from .globalcap import connect_ro, local_projects
+    from .runner import proc_start
+    above = _ancestors()
+    for db in (dbs if dbs is not None else [d for _, d in local_projects()]):
+        try:
+            conn = connect_ro(db)
+            try:
+                rows = conn.execute("SELECT id, dir FROM runs WHERE status='running'").fetchall()
+            finally:
+                conn.close()
+        except sqlite3.Error:
+            continue
+        for rid, d in rows:
+            try:
+                pid_text, _, started = (Path(d or Path(db).parent / "runs" / str(rid)) / "child.pid").read_text().partition("\n")
+                pid = int(pid_text)
+            except (OSError, ValueError):
+                continue
+            if pid in above and (not started.strip() or proc_start(pid) == started.strip()):
+                return True
+    return False

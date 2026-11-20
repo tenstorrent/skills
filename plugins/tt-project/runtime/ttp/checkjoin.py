@@ -1,0 +1,382 @@
+# SPDX-FileCopyrightText: © 2026 Tenstorrent USA, Inc.
+# SPDX-License-Identifier: Apache-2.0
+"""One suite per tree and commands: `ttp checks` joins the same checks already queued or running.
+
+Each full `ttp checks` run of a task records itself in the project's state (FOLDER/<id>.json): task,
+head, the commit's time, its key (repository, the head's tree, commands, purpose and environment), its
+group (the task, repository, commands, purpose and environment, whatever the head), pid, arrival and
+phase (waiting, running, joined, superseded). A run that is still waiting looks at the others (target)
+and stops waiting when
+
+- the same checks on the same tree wait ahead of it or run now, in any task of the project (a worker's
+  own run, its detached rerun, the daemon's review precheck, a reviewer's run): it joins them;
+- the same task queued the same checks, or as a worker run any checks in the same lane (lane: repository
+  and purpose, whatever the commands), on a newer head (a later commit time) that runs, waits or ended
+  while this one waited: it is superseded (a newer head that ended before this run queued is not), and
+  that newer run took its place in the queue (displaced).
+
+Either way it leaves the queue, follows that run (through any run it joined in turn) and reports that
+run's outcome (finish) as its own: passed, failed or timed out. A joined run reports it for its own
+head (the same tree ran), a superseded one names the newer head that ran, never a pass of its own head.
+A joined run whose outcome is of another tree (the run it joined was superseded; ran_key) queues again.
+A run that has started is stopped only when the same task starts checks of the same purpose in the
+same repository on a newer head in
+another worker run (replaced; cli._checks_replace): that newer run takes its place in the queue, so one
+task never holds two of the repository's lanes; a review precheck is never stopped this way. A different tree, command, environment,
+purpose or repository is never a duplicate. A failed outcome is only passed to the runs that joined
+while it ran: a later request for the same key runs again (only passes are recorded and reused). When the followed run ends without an
+outcome (killed, handed over, cancelled), the follower queues again. `ttp checks status` and `ttp status`
+list the followers (status_lines), so they are not taken for lost runs."""
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+import time
+import uuid
+from pathlib import Path
+
+from .checkwall import CEILING_S
+from .project import ps_snapshot
+
+FOLDER = "checks-joins"
+KEEP_S = 6 * 3600.0     # a record with an outcome stays this long for its followers
+# A record without an outcome whose liveness this process cannot judge (another PID namespace) is
+# dropped once its last write is this old: a run's commands end within the default wall cap (at most
+# checkwall.CEILING_S after it starts running), and a follower's leader within that plus its own slot
+# wait; four times the ceiling (24 h) leaves room for a long queue before either. A run still alive
+# past it (a raised checks.wall_cap_s) only loses its record: its followers queue again.
+FOREIGN_S = 4 * CEILING_S
+DEPTH = 8               # the longest chain of followers resolved
+WAITING, RUNNING, JOINED, SUPERSEDED = "waiting", "running", "joined", "superseded"
+PARKED = "parked"   # parked out of the queue (checksqueue): never a leader to join; waiting again on resume
+
+
+class Yield(Exception):
+    """Raised out of a slot wait: this run stops waiting and follows `target` (`how`: joined or superseded)."""
+
+    def __init__(self, target: dict, how: str):
+        super().__init__(how)
+        self.target, self.how = target, how
+
+
+def _digest(*parts) -> str:
+    return hashlib.sha256(json.dumps([str(x) for x in parts]).encode()).hexdigest()[:24]
+
+
+def key(repo: str, tree: str, cmds_hash: str, purpose: str, envs) -> str:
+    """What makes two runs the same checks, whichever task asks: repository, tree, commands, purpose and
+    environment (pushpass.check_envs: interpreter, dependencies, the variables a check reads)."""
+    return _digest("key", repo, tree, cmds_hash, purpose, json.dumps(envs or []))
+
+
+def group(task: str, repo: str, cmds_hash: str, purpose: str, envs) -> str:
+    """The same checks of one task in one repository, whatever the head: a newer head supersedes."""
+    return _digest("group", task, repo, cmds_hash, purpose, json.dumps(envs or []))
+
+
+def lane(task: str, repo: str, purpose: str) -> str:
+    """One task's checks of one purpose in one repository, whatever the head, commands or environment:
+    of these, a newer head's run replaces an older running one (replaced)."""
+    return _digest("lane", task, repo, purpose)
+
+
+def folder(state: Path) -> Path:
+    return Path(state) / FOLDER
+
+
+def _write(path: Path, rec: dict) -> None:
+    from .project import durable_write
+    durable_write(path, json.dumps(rec))
+
+
+def _pid_ns() -> str:
+    try:
+        return os.readlink("/proc/self/ns/pid")
+    except OSError:
+        return ""
+
+
+def register(state: Path, *, task: str, head: str, commit_ts: float, key: str, group: str, run: str,
+             arrived: float, pid: int | None = None, now: float | None = None, lane: str = "") -> Path:
+    """This run's record, phase waiting. Raises OSError when the state folder cannot be written."""
+    from .runner import proc_start
+    pid = os.getpid() if pid is None else pid
+    d = folder(state)
+    d.mkdir(parents=True, exist_ok=True)
+    rid = f"{pid}-{uuid.uuid4().hex[:12]}"
+    path = d / f"{rid}.json"
+    _write(path, {"id": rid, "pid": pid, "started": proc_start(pid), "pidns": _pid_ns(), "task": str(task),
+                  "head": head, "commit_ts": float(commit_ts), "key": key, "group": group, "run": str(run),
+                  "arrived": float(arrived), "ts": time.time() if now is None else now, "phase": WAITING,
+                  **({"lane": lane} if lane else {})})
+    return path
+
+
+def read(path: Path) -> dict | None:
+    try:
+        rec = json.loads(Path(path).read_text())
+    except (OSError, ValueError):
+        return None
+    return rec if isinstance(rec, dict) else None
+
+
+def update(path: Path | None, **fields) -> None:
+    """Change this run's own record (only its own process writes it); a failed write is ignored."""
+    if path is None or (rec := read(path)) is None:
+        return
+    try:
+        _write(Path(path), {**rec, **fields})
+    except OSError:
+        pass
+
+
+def alive(rec: dict) -> bool | None:
+    """Whether the record's process still runs (same pid and start), or None when this process cannot
+    tell: the record was written in another PID namespace (a sandboxed worker's `ttp checks` reading a
+    host run's record, or the reverse). Such a run is never pruned, counted lost or joined."""
+    from .liveness import DEAD, UNKNOWN, pid_state
+    from .runner import proc_start
+    pid = rec.get("pid")
+    if not isinstance(pid, int):
+        return False
+    state = pid_state(pid, ns=rec.get("pidns") or None)   # no /proc (macOS): no namespace, judged here
+    if state == UNKNOWN:
+        return None
+    return state != DEAD and rec.get("started") is not None and proc_start(pid) == rec.get("started")
+
+
+def _orphan(rec: dict, now: float) -> bool:
+    """A record without an outcome of another PID namespace, last written more than FOREIGN_S ago: its run
+    was killed before writing one (a sandbox gone), and nothing that could see its pid is left to prune it."""
+    last = max(float(rec.get(k) or 0) for k in ("ts", "since", "run_since"))
+    return rec.get("alive") is None and not rec.get("outcome") and now - last > FOREIGN_S
+
+
+@ps_snapshot()   # one `ps` for every record's pid where there is no /proc
+def records(state: Path, now: float | None = None, prune: bool = True) -> list[dict]:
+    """Every record, each with "alive" (True, False, or None: unknown here). With `prune`, records of dead runs without an outcome, of
+    another PID namespace's runs without one past FOREIGN_S (_orphan) and outcomes older than KEEP_S are removed."""
+    now = time.time() if now is None else now
+    out = []
+    try:
+        paths = sorted(folder(state).glob("*.json"))
+    except OSError:
+        return []
+    for path in paths:
+        rec = read(path)
+        if rec is None:
+            continue
+        rec["alive"] = alive(rec)
+        done = rec.get("outcome")
+        stale = (not done and (rec["alive"] is False or _orphan(rec, now))) or \
+            (done and now - float(done.get("ts") or 0) > KEEP_S)
+        if stale and prune:
+            path.unlink(missing_ok=True)
+            continue
+        out.append(rec)
+    return out
+
+
+def forget(state: Path, pid: int | None = None) -> int:
+    """Remove the records of the live process `pid` (default this one) that have no outcome, before it
+    re-executes as the same pid (cli._checks_reexec): left behind, its old record would look alive and
+    the re-executed run, registered again at the same arrival, would join it and wait for ever. Its
+    followers then find their lead gone and queue again (behind it). Returns how many it removed."""
+    pid = os.getpid() if pid is None else pid
+    n = 0
+    for rec in records(state, prune=False):
+        if rec.get("pid") == pid and rec.get("alive") and not rec.get("outcome") and rec.get("id"):
+            try:
+                (folder(state) / f"{rec['id']}.json").unlink(missing_ok=True)
+                n += 1
+            except OSError:
+                pass
+    return n
+
+
+def _order(r: dict) -> tuple:
+    return (float(r.get("arrived") or 0), float(r.get("ts") or 0), str(r.get("id") or ""))
+
+
+def _while_waiting(r: dict, me: dict) -> bool:
+    """Whether run r was live while `me` waited: no outcome yet and alive, or an outcome recorded after
+    `me` registered (it ran and ended between two polls). One that ended before `me` queued is not."""
+    if done := r.get("outcome"):
+        return float(done.get("ts") or 0) > float(me.get("ts") or 0)
+    return r.get("alive") is True
+
+
+def target(me: dict, recs: list[dict]) -> tuple[dict, str] | None:
+    """(the run this waiting run should follow, joined or superseded), or None to keep waiting.
+    Superseded: the same task's group, or its lane when both are worker runs (whatever their commands),
+    on another head with a later commit time, live now or ended
+    while this run waited (never one that ended before it queued: that older head runs its own checks).
+    Joined: the same key (any task's), waiting ahead of it or running now (a running one first), never a
+    parked one (PARKED: it holds nothing until it resumes, so nobody waits behind it). A run
+    whose liveness is unknown here (another PID namespace) is never followed: if it died, nothing here
+    would see it end, so this run queues on its own."""
+    if not me.get("task"):
+        return None
+    every = [r for r in recs if r.get("id") != me.get("id")]
+    others = [r for r in every if r.get("task") == me.get("task")]
+    newer = [r for r in others if (r.get("group") == me.get("group") or _same_lane(r, me))
+             and r.get("head") != me.get("head") and float(r.get("commit_ts") or 0) > float(me.get("commit_ts") or 0)
+             and _while_waiting(r, me)]
+    if newer:
+        return max(newer, key=lambda r: (float(r.get("commit_ts") or 0), _order(r))), SUPERSEDED
+    same = [r for r in every if r.get("key") == me.get("key") and r.get("alive") is True and not r.get("outcome")
+            and r.get("phase") in (WAITING, RUNNING)]
+    if running := [r for r in same if r.get("phase") == RUNNING]:
+        return min(running, key=_order), JOINED
+    if ahead := [r for r in same if _order(r) < _order(me)]:
+        return min(ahead, key=_order), JOINED
+    return None
+
+
+def worker_run(rec: dict) -> bool:
+    """Whether a record is a worker run's own checks (a numeric run token, its run folder state/runs/<id>),
+    never a daemon review precheck (run folder prechecks/t<id>-<head>) or a run outside a worker."""
+    return str(rec.get("run") or "").isdigit()
+
+
+def _same_lane(r: dict, me: dict) -> bool:
+    """Whether r and me are worker runs' own checks in the same lane (task, repository and purpose)."""
+    return bool(me.get("lane")) and r.get("lane") == me.get("lane") and worker_run(r) and worker_run(me)
+
+
+def displaced(me: dict, recs: list[dict]) -> list[dict]:
+    """The waiting checks this newly queued run `me` displaces: the same task's worker-run checks in its
+    lane (whatever their commands) on another head no newer than its own, live, waiting and queued before
+    it. They yield to `me` by themselves (target, superseded); `me` takes their place in the queue. Read only."""
+    if not me.get("task"):
+        return []
+    return [r for r in recs if r.get("id") != me.get("id") and r.get("task") == me.get("task") and _same_lane(r, me)
+            and r.get("head") != me.get("head") and r.get("phase") == WAITING and r.get("alive")
+            and not r.get("outcome") and float(r.get("commit_ts") or 0) < float(me.get("commit_ts") or 0)
+            and _order(r) < _order(me)]
+
+
+def replaced(me: dict, recs: list[dict]) -> list[dict]:
+    """The running checks this newly queued run `me` replaces: the same task's checks of the same purpose
+    in the same repository (lane; whatever their commands), in another worker run, on another head no
+    newer than its own (commit time), live and started before it.
+    Both must be worker runs' own checks (worker_run): a review precheck is never replaced nor replaces.
+    A waiting one is not here: it yields by itself (target). The same head is never replaced (its same
+    checks are joined: target). Read only."""
+    if not me.get("task") or not worker_run(me):
+        return []
+    return [r for r in recs if r.get("id") != me.get("id") and r.get("task") == me.get("task")
+            and me.get("lane") and r.get("lane") == me.get("lane") and worker_run(r)
+            and str(r.get("run")) != str(me.get("run"))
+            and r.get("head") != me.get("head") and r.get("phase") == RUNNING and r.get("alive")
+            and not r.get("outcome") and float(r.get("commit_ts") or 0) <= float(me.get("commit_ts") or 0)
+            and _order(r) < _order(me)]
+
+
+def resolve(rid: str, recs: list[dict]) -> tuple[str, dict | None]:
+    """Where the run `rid` stands, through the runs it follows: ("done", its record with the outcome),
+    ("wait", the record still to end) or ("lost", None): it ended without an outcome or is gone. A run
+    it follows that lost its own lead still runs and queues again itself: that is a wait, not lost."""
+    by = {r.get("id"): r for r in recs}
+    first = by.get(rid)
+    for _ in range(DEPTH):
+        r = by.get(rid)
+        if r is None or not (r.get("outcome") or r.get("alive") is not False):
+            break
+        if r.get("outcome"):
+            return "done", r
+        if r.get("alive") is None:   # another PID namespace's: maybe alive, never lost
+            return "wait", r
+        if r.get("phase") in (JOINED, SUPERSEDED) and r.get("follows"):
+            rid = r["follows"]
+            continue
+        return "wait", r
+    if first is not None and first.get("alive") is not False and not first.get("outcome"):
+        return "wait", first
+    return "lost", None
+
+
+def finish(path: Path | None, *, passed: bool, head: str, rc: int, failed: str = "", timed_out: bool = False,
+           summary: str = "", log: str = "", ran_key: str = "", commands: list | None = None) -> None:
+    """Record this run's outcome for its followers (a run that ran its checks, or followed another;
+    `ran_key`: the key of the run that ran them, when not this run's own; `commands`: the commands that ran)."""
+    update(path, outcome={"passed": bool(passed), "head": head, "rc": int(rc), "failed": failed,
+                          "timed_out": bool(timed_out), "summary": summary[-4000:], "log": log, "ts": time.time(),
+                          **({"key": ran_key} if ran_key else {}),
+                          **({"commands": [str(c) for c in commands]} if commands is not None else {})})
+
+
+def ran_commands(me: dict, leader: dict, mine: list) -> tuple[list, list]:
+    """(the commands the run `leader` ran, those of this follower's own `mine` it did not run). A lead
+    of another group (a superseding run in the lane, other commands) that recorded none ran none of them."""
+    cmds = (leader.get("outcome") or {}).get("commands")
+    if cmds is None:
+        cmds = [str(c) for c in mine] if leader.get("group") == me.get("group") else []
+    cmds = [str(c) for c in cmds]
+    return cmds, [str(c) for c in mine if str(c) not in cmds]
+
+
+def ran_key(rec: dict) -> str:
+    """The key of the checks whose outcome `rec` holds: the one recorded with it, else its own key (a
+    superseded run's without one is another tree's, never its own: "")."""
+    o = rec.get("outcome") or {}
+    if o.get("key"):
+        return str(o["key"])
+    return "" if rec.get("phase") == SUPERSEDED else str(rec.get("key") or "")
+
+
+def said(how: str, mine: str, leader: dict) -> str:
+    """The line a follower prints when it stops waiting."""
+    who = f"run {leader.get('run') or '?'} of #{leader.get('task') or '?'} (pid {leader.get('pid')})"
+    if how == SUPERSEDED:
+        return (f"superseded: this task queued the same checks on a newer head {str(leader.get('head'))[:12]} in "
+                f"{who}; these on {mine[:12]} leave the queue unrun and report that run's result")
+    return (f"joined: the same checks on the tree of {mine[:12]} {'run' if leader.get('phase') == RUNNING else 'wait'} "
+            f"in {who}; waiting for their result instead of running a second suite")
+
+
+def result_line(how: str, mine: str, leader: dict, not_run: list | None = None) -> str:
+    """The outcome a follower reports: the run it followed; a superseded one's is never a pass of its own head,
+    nor of its own commands that run did not run (`not_run`)."""
+    o = leader.get("outcome") or {}
+    ran = str(o.get("head") or leader.get("head") or "")
+    what = ("passed" if o.get("passed") else "TIMED OUT" if o.get("timed_out")
+            else f"FAILED ({o['failed']!r})" if o.get("failed") else "FAILED")
+    base = f"run {leader.get('run') or '?'}'s checks {what} on {ran[:12]}"
+    if how == SUPERSEDED:
+        base += f"; {mine[:12]} itself was not checked (superseded by that newer head)"
+        if not_run:
+            base += f"; that run had other commands: {', '.join(not_run)} did not run"
+    else:
+        base += (f", the same tree as {mine[:12]}" if ran and not ran.startswith(mine[:12]) else "") + \
+            " (joined: no second suite ran)"
+    return base + (f" (full output: {o['log']})" if o.get("log") else "")
+
+
+def status_lines(state: Path, now: float | None = None) -> list[str]:
+    """One line per live follower (joined or superseded), for `ttp checks status` and `ttp status`; one
+    whose liveness this process cannot judge (another PID namespace) is named so."""
+    from .liveness import FOREIGN
+    now = time.time() if now is None else now
+    recs = records(state, now, prune=False)
+    by = {r.get("id"): r for r in recs}
+    out = []
+    for r in recs:
+        if r.get("alive") is False or r.get("outcome") or r.get("phase") not in (JOINED, SUPERSEDED) or \
+                _orphan(r, now):
+            continue
+        lead = by.get(r.get("follows")) or {}
+        who = f"#{r.get('task')} run {r.get('run') or '?'} pid {r.get('pid')}" + \
+            (f" {FOREIGN}" if r.get("alive") is None else "")
+        waited = max(0.0, now - float(r.get("since") or r.get("ts") or now))
+        if r.get("phase") == JOINED:
+            out.append(f"  joined: {who} on {str(r.get('head'))[:12]} follows run {lead.get('run') or '?'} "
+                       f"of #{lead.get('task') or '?'} (same tree and commands, {lead.get('phase') or 'ended'}), "
+                       f"{int(waited // 60)} min; "
+                       f"no second suite runs")
+        else:
+            out.append(f"  superseded: {who} on {str(r.get('head'))[:12]} by newer head "
+                       f"{str(lead.get('head') or '?')[:12]} in run {lead.get('run') or '?'}, {int(waited // 60)} "
+                       f"min; it reports that run's result")
+    return out

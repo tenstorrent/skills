@@ -1,0 +1,5 @@
+---
+"tt-project": patch
+---
+
+`tt-project`: `ttp checks park|cancel|resume <run>` (or `--task <id>`) parks, cancels or resumes a checks run waiting in the queue, and `ttp checks queue` lists the project's waiting runs (run, task, priority, owed, push batch or review precheck). A parked run holds no queue place and queues again at its first arrival once `ttp checks resume` runs or its `--until` probe passes; a cancelled run leaves the queue and its task keeps its commits and worktree. Neither spends an attempt. Each action is logged with who, why and when in the run folder, the project's events and the waiting task's `--result` note. The coordinator may run them (a read-only session coordinator with quoted reasons and read-only probes), as may an urgent or priority-1 worker whose spec gives the order. Runs holding a slot, push batches' runs and other projects' runs are refused. A daemon review precheck counts as read only while its review is queued, running or waiting: `ttp checks cancel` and `ttp detach --stop` refuse it while it is read, and `ttp checks cancel` also until a review names it.

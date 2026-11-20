@@ -60,5 +60,8 @@ them across resumes; re-resolve deliberately for new runs or requested migration
 5. If changing a canonical review skill, run `python3 scripts/sync_review_plugin.py`.
 6. Run the package-sync and version checks and `pytest tests/`; also run host plugin validators
    when available.
+7. Large test files may split into area case files (for tt-project,
+   `tests/test_tt_project_runtime.py` runs `tests/tt_project_runtime/<area>_cases.py`): new tests
+   for an area go in its case file.
 
 Do not claim tests, model quality, hardware behavior, or performance that was not measured.

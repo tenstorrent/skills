@@ -1,0 +1,7 @@
+---
+"tt-project": patch
+---
+
+`tt-project`: more eligible work runs on GLM in wave projects. The policy-files pin is dropped there: a code task naming a listed file or policy term no longer stays on Claude, and a GLM branch that changes a listed file is no longer bounced to Opus. Its review (Opus, ponytail lane) is told which listed files the change touches and to read them line by line. Also removed for covered projects: the conclusion floor on non-review work, the verdict-wording stay, mention-only person matches (an instruction to or about a person still stays), and the tier-up retry after an infrastructure failure (timeout or failed run); infrastructure fallbacks no longer count as lineage misses, and a covered follow-up of a non-holdout Claude change is decided afresh. `ttp stats --glm-share` now breaks the hours held off GLM down by the rule that kept them and marks the user's own rules (deep thinking, optimization, human interaction, reviews). A fix task on an unlanded stack that waits on `ttp landed --task <ancestor>` of a task in its own stack is handed off done instead of sleeping (the head's review approves the stack); the worker prompt says so. `ttp ci --branch` on the workstation gh route reads the pull request's checks with `gh pr view` (exit 75 while any is queued or running, 0 once all completed), since `gh run list` is not routed there.
+
+why this size: one change touches the route, the breakdown and their tests together (the code is about 150 lines; the rest is tests).

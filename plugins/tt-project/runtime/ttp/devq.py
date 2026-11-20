@@ -1,0 +1,1962 @@
+# SPDX-FileCopyrightText: © 2026 Tenstorrent USA, Inc.
+# SPDX-License-Identifier: Apache-2.0
+"""One serial device-job runner per device host: a queue instead of one detached driver per task.
+
+A project's config names each runner under `device.runners.<name>` (see RUNNER_DEFAULTS): the host it
+runs on (ssh alias; "" = this machine), its state folder there, a health gate and a drop check. Tasks
+queue jobs with `ttp devq submit`, then hand off `waiting` on `ttp devq probe <name> <id>`; the runner
+takes the jobs one at a time in arrival order, each only after the health gate passes, and writes a
+done marker per job. A job a device drop or a host reboot killed is run again; once one config dropped
+max_drops times in a row its jobs are skipped and marked so, until `ttp devq clear`. A job whose output
+matches one of its wedge_patterns (a device hang signature) is stopped at once and marked wedged.
+On a host with the device broker (`tt-device-mcp` on PATH, or `broker: "on"`) each job goes through it
+as a preemptable broker job (`run-bg --preemptable -t <limit>`, at most BROKER_MAX_S), so a serving
+workload and our jobs step aside for each other. A job the broker preempted, or one that wrote the
+yield marker (setup-box preempt.py), is run again at once with TTP_DEVQ_PREEMPTS=<n>: no drop and no
+failure, up to max_preempts times; its done marker records the count.
+Every job carries a build stamp (build_stamp: the workdir's repo, branch, commit, dirty flag and the
+built artifact's size, time and hash), taken at submit and again at start, in its spec and done marker.
+
+This file is also the runner itself: `ttp devq` copies it to the host's state folder and runs it there
+with that host's python3, so it uses the standard library only and runs on Linux and macOS alike.
+Layout of the state folder: queue/<seq>-<id>.json (waiting, in name order), running/<id>.json and
+<id>.state.json (the job under way), done/<id>.json (the marker), logs/<id>.<attempt>.log, configs/<config>
+(the config's drops in a row), drops.log, runner.log, state (what the runner does now), runner.lock
+(held for the runner's life), config.json (the runner's settings, rewritten by every submit and start).
+"""
+from __future__ import annotations
+
+import contextlib
+import fcntl
+import hashlib
+import json
+import os
+import re
+import shlex
+import shutil
+import signal
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+# Fatal hang signatures tt-metal and tt-umd print once a device is wedged and will not recover without a
+# reset: tt-metal's dispatch timeouts ("TIMEOUT: device timeout ..., potential hang detected[, the device
+# is unrecoverable]"), tt-umd's all-ones PCIe read ("Read 0xffffffff over PCIe ...: the board should be
+# reset.") and its ARC message queue timeout. A job whose output matches one is stopped early instead of
+# holding the device until its time limit.
+WEDGE_PATTERNS = [
+    r"potential hang detected",
+    r"the device is unrecoverable",
+    r"the board should be reset",
+    r"Timeout waiting for ARC msg request queue",
+]
+
+RUNNER_DEFAULTS = {
+    "host": "",                # ssh alias of the device host; "" = this machine
+    "dir": "",                 # state folder on that host; "" = ~/.tt-project/devq/<name>
+    "python": "python3",       # the host's python
+    "health": "",              # shell command; exit 0 = safe to start a job ("" = no gate)
+    "health_timeout_s": 300,   # one health check longer than this counts as a refusal
+    "health_poll_s": 60,       # between health checks while the gate refuses
+    "health_wait_s": 7200,     # a job the gate kept out this long is skipped (0 = wait for ever)
+    "drop_check": "",          # shell command run after a job failed; exit 0 = it was a device drop
+    "max_drops": 2,            # drops in a row of one config before its jobs are skipped
+    "job_timeout_s": 0,        # default per-job limit (0 = none); a job's own timeout_s wins
+    # The box's reservation cap (0 = none): the longest a job may hold the device. Submit refuses a job
+    # whose limit (its timeout_s, else job_timeout_s) is above it, a job queued before the cap was set or
+    # lowered is failed unstarted, and a job with no limit of its own gets the cap as its limit.
+    "reservation_cap_s": 0,
+    "idle_exit_s": 1800,       # the runner exits after this long with nothing queued; submit restarts it
+    "poll_s": 10,              # between checks on a running job
+    # Regexes on a running job's output that mean the device is wedged: on the first match the job is
+    # stopped (TERM, then KILL after a short grace) and marked "wedged" with the pattern and the line, so
+    # the caller can recover the device. A job's own wedge_patterns replace these ([] = no check).
+    "wedge_patterns": WEDGE_PATTERNS,
+    # A regex matching the command line of an outside device user to wait for ("" = none): a process
+    # of this user that drives the device outside the runner. While one matches, the runner does not
+    # start and starts no job, and the probe keeps a task with a pending job asleep: both checking
+    # "no other job of ours" at once could pass. The old key name `legacy_driver` is still read.
+    "outside_user": "",
+    # The job guard, run on the host by every submit (see guard); each part is off until set. It is the
+    # host's policy, so --no-lint does not skip it.
+    "script_lint": "",         # "refuse" or "warn": process-group isolation and a disk guard before downloads
+    "netfs_prefixes": [],      # network-filesystem mount prefixes no weight or cache path may resolve under
+    "netfs_policy": "warn",    # "warn" or "refuse" for such a path
+    "disk_max_pct": 0,         # refuse a submit, and hold the queue, while a disk is fuller than this (0 = off)
+    "disk_paths": [],          # the disks disk_max_pct watches ([] = / and the runner's state folder)
+    # The built binary or library jobs load (relative to a job's workdir, or absolute; "" = none): its size,
+    # time and hash go in each job's build stamp. A job's own artifact (`--artifact`) wins.
+    "build_artifact": "",
+    # The device broker: "auto" (used where `tt-device-mcp` is on PATH), "on" or "off". Through it each
+    # job runs preemptable with a limit of at most BROKER_MAX_S (job_timeout_s, else that); the broker,
+    # not the runner, ends it, and only once another job waits past its limit.
+    "broker": "auto",
+    "max_preempts": 20,        # a job preempted (or that yielded) more often than this is failed
+    # A prewarm/build command run on the host before the job claims the device ("" = none): compile, fetch or
+    # warm caches here, so the claim is spent running. It runs in the job's workdir, once per job (a rerun
+    # after a preemption or drop skips it), and must not claim the device itself (config_problems refuses a
+    # broker call in it). TTP_DEVQ_JOB, TTP_DEVQ_CONFIG and TTP_DEVQ_WORKDIR name the job.
+    "prewarm": "",
+    "prewarm_timeout_s": 1800,  # longer than this counts as a failed prewarm
+    "prewarm_policy": "warn",  # on a failed prewarm: "warn" (log it, run the job) or "refuse" (fail it unstarted)
+}
+_CHOICES = {"script_lint": ("", "warn", "refuse"), "netfs_policy": ("warn", "refuse"),
+            "broker": ("auto", "on", "off"), "prewarm_policy": ("warn", "refuse")}
+BROKER = "tt-device-mcp"
+BROKER_MAX_S = 1500   # the broker's longest job limit: a longer run is split into shorter jobs
+PREEMPTED_RE = re.compile(r"finished: preempted\b")   # `tt-device-mcp wait`'s end line for a preempted job
+RUNNER_DOWN_RC = 3   # probe: the job is pending and no runner is alive (the daemon restarts it)
+START_WAIT_S = 120   # start: longest wait for a runner still starting up (a loaded host is slow, not broken)
+CANCEL = ".cancel"   # running/<job>.cancel: drop asked the runner to stop the job (its text: why)
+CAN_CANCEL = "runner.cancel"   # the live runner's pid: it honours CANCEL (an older runner never writes it)
+ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,99}")
+NAME_RE = ID_RE
+STATUSES = ("done", "failed", "skipped", "wedged")
+
+
+_ALIASES = {"legacy_driver": "outside_user"}   # old key name -> the key it still sets (see settings)
+
+
+def config_problems(name: str, cfg) -> list:
+    """One line per problem in config device.runners.<name>."""
+    where = f"device.runners.{name}"
+    if not NAME_RE.fullmatch(str(name)):
+        return [f"{where}: a runner name is letters, digits, . _ -"]
+    if not isinstance(cfg, dict):
+        return [f"{where}: not a table of settings"]
+    out = [f"{where}.{k}: unknown key" for k in cfg if _ALIASES.get(k, k) not in RUNNER_DEFAULTS]
+    for k, v in cfg.items():
+        if _ALIASES.get(k, k) not in RUNNER_DEFAULTS:
+            continue
+        default = RUNNER_DEFAULTS[_ALIASES.get(k, k)]
+        if isinstance(default, int) and (isinstance(v, bool) or not isinstance(v, (int, float)) or v < 0):
+            out.append(f"{where}.{k}: {v!r} is not a number >= 0")
+        elif isinstance(default, str) and not isinstance(v, str):
+            out.append(f"{where}.{k}: {v!r} is not a string")
+        elif k in _CHOICES and v not in _CHOICES[k]:
+            out.append(f"{where}.{k}: {v!r} is not one of {', '.join(repr(c) for c in _CHOICES[k])}")
+        elif k == "wedge_patterns":
+            out += [f"{where}.{k}: {x}" for x in pattern_problems(v)]
+        elif isinstance(default, list):
+            ok = isinstance(v, list) and all(isinstance(x, str) and x.startswith(("/", "~")) for x in v)
+            if not ok or (k == "netfs_prefixes" and any(x.rstrip("/") in ("", "~") for x in v)):
+                out.append(f"{where}.{k}: {v!r} is not a list of absolute paths (and not / or ~ itself)")
+    if isinstance(cfg.get("disk_max_pct"), (int, float)) and cfg["disk_max_pct"] > 100:
+        out.append(f"{where}.disk_max_pct: {cfg['disk_max_pct']} is above 100")
+    for key in ("outside_user", "legacy_driver"):
+        if isinstance(cfg.get(key), str) and cfg[key]:
+            try:
+                re.compile(cfg[key])
+            except re.error as e:
+                out.append(f"{where}.{key}: not a regex ({e})")
+    cap, default = cfg.get("reservation_cap_s"), cfg.get("job_timeout_s")
+    if all(isinstance(x, (int, float)) and not isinstance(x, bool) for x in (cap, default)) and 0 < cap < default:
+        out.append(f"{where}.job_timeout_s: {default} is above reservation_cap_s {cap}")
+    if isinstance(cfg.get("host"), str) and cfg["host"].startswith("-"):
+        out.append(f"{where}.host: must not start with '-'")
+    if isinstance(cfg.get("prewarm"), str):
+        out += [f"{where}.prewarm: {x}" for x in prewarm_problems(cfg["prewarm"])]
+    return out
+
+
+# A prewarm command runs before the job claims the device, so it must not claim the device itself: any
+# mention of the broker's tool other than a read-only subcommand is refused (a guard against mistakes; a
+# command built to hide the name is not something a text check can stop).
+_BROKER_READONLY = re.compile(rf"{re.escape(BROKER)}[\"']?\s+[\"']?(?:status|--help|--version)\b")
+
+
+def prewarm_problems(cmd: str) -> list:
+    """Why the prewarm command may not run before the claim, one line each ([] when it may)."""
+    out = []
+    if BROKER in cmd and len(re.findall(re.escape(BROKER), cmd)) > len(_BROKER_READONLY.findall(cmd)):
+        out.append(f"it calls {BROKER}: a prewarm runs before the claim and must not hold the device "
+                   "(only `status` is allowed); put the device step in the job itself")
+    return out
+
+
+def pattern_problems(patterns) -> list:
+    """Why `patterns` is not a list of regexes, one line each ([] when it is)."""
+    if not isinstance(patterns, list) or not all(isinstance(x, str) and x for x in patterns):
+        return [f"{patterns!r} is not a list of non-empty regexes"]
+    out = []
+    for x in patterns:
+        try:
+            re.compile(x)
+        except re.error as e:
+            out.append(f"{x!r} is not a regex ({e})")
+    return out
+
+
+def wedge_patterns(spec: dict, cfg: dict) -> list:
+    """The job's wedge patterns: its own list when it has one, else the runner's."""
+    own = spec.get("wedge_patterns")
+    return own if isinstance(own, list) else cfg["wedge_patterns"]
+
+
+def scan_wedge(path: Path, offset: int, patterns: list) -> tuple:
+    """(offset, (pattern, line) or None): the first line of `path` from `offset` on that matches one of
+    `patterns`, and how far the scan got. A line not yet ended is left for the next call, unless it is
+    longer than one read."""
+    try:
+        with open(path, "rb") as f:
+            f.seek(offset)
+            chunk = f.read(1 << 22)
+    except OSError:
+        return offset, None
+    end = chunk.rfind(b"\n") + 1
+    if not end and len(chunk) < 1 << 22:
+        return offset, None
+    chunk = chunk[:end] if end else chunk
+    for raw in chunk.splitlines():
+        line = raw.decode("utf-8", "replace")
+        for pat in patterns:
+            if pat.search(line):
+                return offset + len(chunk), (pat.pattern, line.strip()[:300])
+    return offset + len(chunk), None
+
+
+def settings(cfg: dict | None) -> dict:
+    cfg = cfg or {}
+    for old, new in _ALIASES.items():
+        if old in cfg and new not in cfg:
+            cfg = {**cfg, new: cfg[old]}
+    return {**RUNNER_DEFAULTS, **{k: v for k, v in cfg.items() if k in RUNNER_DEFAULTS}}
+
+
+# project side: how `ttp devq` reaches a runner -------------------------------------------------------
+def runner_dir(name: str, cfg: dict) -> str:
+    return settings(cfg)["dir"] or f"~/.tt-project/devq/{name}"
+
+
+def _shell_path(path: str) -> str:
+    """`path` as one shell word, a leading ~ still expanded by the host's shell."""
+    import shlex
+    if path == "~" or path.startswith("~/"):
+        return '"$HOME"' + (("/" + shlex.quote(path[2:])) if path[2:] else "")
+    return shlex.quote(path)
+
+
+def host_call(name: str, cfg: dict, op: str, args: list, install: bool) -> list:
+    """The argv that runs `devq.py <op> <dir> <args>` on the runner's host, with this file's source on its
+    stdin. `install` first copies the source into the state folder (the runner runs from that copy);
+    without it the host's python reads the source from stdin and nothing is written by the call."""
+    import shlex
+    s = settings(cfg)
+    d, py = _shell_path(runner_dir(name, s)), shlex.quote(s["python"])
+    words = " ".join(shlex.quote(str(x)) for x in args)
+    if install:
+        script = (f"mkdir -p {d} && cat > {d}/.devq.py.$$ && mv -f {d}/.devq.py.$$ {d}/devq.py && "
+                  f"exec {py} {d}/devq.py {op} {d} {words}")
+    else:
+        script = f"exec {py} - {op} {d} {words}"
+    if s["host"]:
+        return ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=20", s["host"], script]
+    return ["/bin/sh", "-c", script]
+
+
+def source() -> str:
+    return Path(__file__).read_text()
+
+
+# project side: `ttp devq submit` lints a job's command before it takes a slot ------------------------
+_SHELLS = {"bash", "sh", "dash", "zsh", "ksh"}
+_PYTHONS = re.compile(r"python[0-9.]*$")
+_WRAPPERS = {"exec", "nohup", "time", "nice", "setsid", "env", "timeout", "stdbuf", "command"}
+_KEYWORDS = {"then", "do", "else", "elif", "if", "while", "until", "!", "{", "}", "done", "fi"}
+_OPS = {"&&", "||", ";", "|", "&", "(", ")", ";;", "|&", ";&"}
+_REDIRECTS = re.compile(r"[0-9]*[<>]+&?$")
+_UNKNOWN = re.compile(r"[$`*?\[{]")
+_TASK_ID = re.compile(r"(?<![A-Za-z0-9])(?:t|task)[-_]?([0-9]+)(?![A-Za-z0-9])")
+
+
+def _words(cmd: str) -> list:
+    import shlex
+    lex = shlex.shlex(cmd.replace("\n", " ; "), posix=True, punctuation_chars=True)
+    lex.whitespace_split = True
+    try:
+        return list(lex)
+    except ValueError:
+        return []
+
+
+def _split_ops(w: str) -> list:
+    """Glued operators apart (`);` -> `)`, `;`); a word that is not all operators is returned as is."""
+    if not set(w) <= set("();|&"):              # a word, or one quoted that only starts with an operator
+        return [w]
+    out = []
+    while w:
+        op = next(o for o in sorted(_OPS, key=len, reverse=True) if w.startswith(o))
+        out.append(op)
+        w = w[len(op):]
+    return out
+
+
+def _segments(cmd: str) -> list:
+    """Simple commands of `cmd`, in order; a subshell's `(` and `)` come as segments of their own."""
+    out, cur = [], []
+    for w in (x for word in _words(cmd) for x in _split_ops(word)):
+        if w in _OPS:
+            out.append(cur)
+            out.append([w] if w in ("(", ")") else [])
+            cur = []
+        else:
+            cur.append(w)
+    return [s for s in out + [cur] if s]
+
+
+# Options that take a value; a short option is matched only on its own (`-n 5`, not `-n5`).
+_WRAPPER_ARGS = {"env": "uC", "timeout": "sk", "nice": "n", "stdbuf": "ioe", "exec": "a"}
+_WRAPPER_LONG_ARGS = {"--unset", "--chdir", "--signal", "--kill-after", "--adjustment", "--input",
+                      "--output", "--error"}
+_SH_FLAGS, _SH_ARGS = set("abefhkmnptuvxBCEHPTlirD"), set("oO")
+_PY_FLAGS, _PY_ARGS = set("bBdEiIOqsSuvxPR"), set("WXQ")
+_SH_LONG = {"--norc", "--noprofile", "--login", "--posix", "--verbose", "--restricted", "--noediting",
+            "--debugger", "--protected"}
+
+
+def _interpreter_args(args: list, kind: str) -> tuple:
+    """(operands, command string or None) of a shell's ("sh") or python's ("file") arguments. Option
+    words are dropped with the values they take (`-o pipefail`, `-W ignore`); a shell's `c` in any
+    short-option word (`-lc`, `-xec`) makes its first operand the command string. Anything not
+    understood (an unknown option, stdin, `-m`, python's `-c`) gives no operands: the check is skipped
+    rather than a valid command refused."""
+    rest, command = list(args), False
+    while rest and rest[0][:1] in "-+" and rest[0] not in ("-", "+"):
+        opt, rest = rest[0], rest[1:]
+        if opt == "--":
+            break
+        if opt.startswith("--"):
+            if kind == "sh" and opt in ("--rcfile", "--init-file") and rest:
+                rest = rest[1:]
+            elif not (kind == "sh" and opt in _SH_LONG):
+                return [], None
+            continue
+        if kind == "file" and opt[0] == "+":
+            return [], None
+        letters = opt[1:]
+        for j, ch in enumerate(letters):
+            if kind == "sh" and ch == "c":
+                command = True
+            elif kind == "sh" and ch in _SH_ARGS:
+                if not rest:
+                    return [], None
+                rest = rest[1:]
+            elif kind == "sh" and ch in _SH_FLAGS:
+                pass
+            elif kind == "file" and ch in _PY_ARGS:
+                if j == len(letters) - 1:        # `-W ignore`; `-Wignore` carries its value
+                    if not rest:
+                        return [], None
+                    rest = rest[1:]
+                break
+            elif kind == "file" and ch in _PY_FLAGS:
+                pass
+            else:                                # -s (stdin), python -c/-m, or not known
+                return [], None
+    if command:
+        return [], (rest[0] if rest else None)
+    return ([], None) if rest[:1] == ["-"] else (rest, None)
+
+
+def _join(cwd: str | None, path: str) -> str | None:
+    import posixpath
+    if path.startswith("/") or path == "~" or path.startswith("~/"):
+        return posixpath.normpath(path) if path.startswith("/") else path
+    return posixpath.normpath(posixpath.join(cwd, path)) if cwd is not None else None
+
+
+def called_scripts(cmd: str, workdir: str = "", depth: int = 0) -> list:
+    """(path, kind) for each script `cmd` runs or hands to an interpreter, as the host's runner will look
+    for it: relative paths are joined to the job's start folder (its workdir, else ~) or to a literal
+    `cd` earlier in the command. kind is "sh" (a shell script), "?" (run directly: a shell script only if
+    its #! line says so) or "file" (another interpreter's script). Words whose value only the host knows
+    ($VAR, `...`, globs) are left out, as are bare names found through PATH."""
+    found, cwd, saved = [], workdir or "~", []
+    for seg in _segments(cmd):
+        if seg == ["("]:                          # a subshell: a cd inside it ends with it
+            saved.append(cwd)
+            continue
+        if seg == [")"]:                          # unmatched (a case pattern): the folder is unknown
+            cwd = saved.pop() if saved else None
+            continue
+        words, i = [], 0
+        while i < len(seg):                      # drop redirections and their targets
+            if _REDIRECTS.match(seg[i]):
+                i += 2
+                continue
+            words.append(seg[i])
+            i += 1
+        while words and (words[0] in _KEYWORDS or re.match(r"[A-Za-z_][A-Za-z0-9_]*=", words[0])):
+            words = words[1:]
+        here = cwd                               # env -C changes the folder for this command only
+        while words and words[0].rsplit("/", 1)[-1] in _WRAPPERS:
+            wrapper, words = words[0].rsplit("/", 1)[-1], words[1:]
+            takes = _WRAPPER_ARGS.get(wrapper, "")
+            while words and (words[0].startswith("-") or (wrapper == "env" and "=" in words[0])):
+                opt, words = words[0], words[1:]
+                if wrapper == "env" and (opt.startswith("-S") or opt.startswith("--split")):
+                    words = []                   # its command is one string: not looked into
+                    continue
+                chdir = None
+                if wrapper == "env" and opt.startswith("--chdir="):
+                    chdir = opt.split("=", 1)[1]
+                elif ((not opt.startswith("--") and len(opt) == 2 and opt[1] in takes)
+                      or opt in _WRAPPER_LONG_ARGS):
+                    if wrapper == "env" and opt in ("-C", "--chdir"):
+                        chdir = words[0] if words else ""
+                    words = words[1:]            # the option's value
+                elif wrapper == "env" and opt.startswith("-C") and not opt.startswith("--"):
+                    chdir = opt[2:]
+                if chdir is not None:
+                    here = None if not chdir or _UNKNOWN.search(chdir) else _join(here, chdir)
+            if wrapper == "timeout" and words:
+                words = words[1:]                # its duration
+        if not words or words[0] in ("for", "case", "function"):
+            continue
+        head, base = words[0], words[0].rsplit("/", 1)[-1]
+        if head in ("cd", "pushd"):
+            target = words[1] if len(words) > 1 else "~"
+            if head == "pushd":
+                saved.append(cwd)
+            cwd = (None if _UNKNOWN.search(target) or target.startswith(("-", "+")) or (head == "pushd" and
+                   len(words) < 2) else _join(cwd, target))
+            continue
+        if head == "popd":
+            cwd = saved.pop() if saved and len(words) == 1 else None
+            continue
+        if _UNKNOWN.search(head):
+            continue
+        script, kind = None, "?"
+        if head in ("source", "."):
+            script, kind = (words[1] if len(words) > 1 and not words[1].startswith("-") else None), "sh"
+        elif base in _SHELLS or _PYTHONS.match(base):
+            kind = "file" if _PYTHONS.match(base) else "sh"
+            rest, command = _interpreter_args(words[1:], kind)
+            if command is not None and depth < 2 and here is not None:
+                found += [x for x in called_scripts(command, here, depth + 1) if x not in found]
+            script = rest[0] if rest else None
+        elif "/" in head:
+            script = head
+        if not script or _UNKNOWN.search(script) or (script.startswith("~") and not
+                                                      (script == "~" or script.startswith("~/"))):
+            continue
+        if kind == "?" and script.endswith((".sh", ".bash")):
+            kind = "sh"
+        path = _join(here, script)
+        if path and (path, kind) not in found:
+            found.append((path, kind))
+    return found
+
+
+def _check_script(path: str, kind: str, i: int) -> str:
+    """Shell that prints `M <i>` if the file is missing and `S <i> <error>` if bash -n refuses it."""
+    test = ("[ x = x ]" if kind == "sh" else "[ x = y ]" if kind == "file" else
+            "head -n 1 \"$f\" 2>/dev/null | grep -Eq '^#!.*[/ ]((ba|da|k|z)?sh)([[:space:]]|$)'")
+    return (f'f={_shell_path(path)}; if [ ! -f "$f" ]; then echo "M {i}"; '
+            f'elif [ -n "$b" ] && {test}; then e=$(bash -n "$f" 2>&1) || '
+            f'echo "S {i} $(printf %s "$e" | head -n 3 | tr "\\n" " ")"; fi')
+
+
+def lint(cmd: str, cfg: dict, job: str = "", workdir: str = "", task: str = "") -> tuple:
+    """(errors, warnings) for a job's command before `ttp devq submit` queues it. Errors: the command is
+    not valid shell (bash -n), or a script it calls is missing on the runner's host or not valid shell
+    there. The host is asked over ssh (BatchMode, a short timeout, read-only); an unreachable host is a
+    warning, and shell scripts present here under the same absolute path are checked here instead.
+    Warnings: a task id in a script path, the job id or the workdir that is not the submitting task's."""
+    errors, warnings = [], []
+    try:
+        r = subprocess.run(["bash", "-n", "-c", cmd], capture_output=True, text=True, timeout=30)
+        if r.returncode:
+            errors.append(f"the command is not valid shell (bash -n): {' '.join(r.stderr.split())[:300]}")
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+    scripts = called_scripts(cmd, workdir)
+    if scripts:
+        s = settings(cfg)
+        snippet = "command -v bash >/dev/null 2>&1 && b=1; " + "; ".join(
+            _check_script(p, k, i) for i, (p, k) in enumerate(scripts)) + "; exit 0"
+        argv = (["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", s["host"], snippet] if s["host"]
+                else ["/bin/sh", "-c", snippet])
+        where = f"host {s['host']}" if s["host"] else "this machine"
+        try:
+            r = subprocess.run(argv, capture_output=True, text=True, timeout=30, stdin=subprocess.DEVNULL)
+            ok = r.returncode == 0
+        except (OSError, subprocess.TimeoutExpired):
+            r, ok = None, False
+        if ok:
+            for line in r.stdout.splitlines():
+                tag, _, rest = line.partition(" ")
+                n, _, msg = rest.partition(" ")
+                if tag in ("M", "S") and n.isdigit() and int(n) < len(scripts):
+                    path = scripts[int(n)][0]
+                    errors.append(f"{path} does not exist on {where}" if tag == "M" else
+                                  f"{path} is not valid shell (bash -n on {where}): {msg.strip()[:300]}")
+        else:
+            why = f"exit {r.returncode}: {' '.join(r.stderr.split())[:200]}" if r else "no answer in 30 s"
+            warnings.append(f"could not check the scripts on {where} ({why}); they were not checked there")
+            for path, kind in scripts:
+                if kind != "file" and path.startswith("/") and Path(path).is_file() and (
+                        kind == "sh" or re.match(r"#!.*[/ ]((ba|da|k|z)?sh)(\s|$)",
+                                                 Path(path).read_text(errors="replace").split("\n", 1)[0])):
+                    try:
+                        r2 = subprocess.run(["bash", "-n", path], capture_output=True, text=True, timeout=30)
+                    except (OSError, subprocess.TimeoutExpired):
+                        continue
+                    if r2.returncode:
+                        errors.append(f"{path} is not valid shell (bash -n on this machine): "
+                                      f"{' '.join(r2.stderr.split())[:300]}")
+    if task:
+        for label, text in ([("job id", job), ("workdir", workdir)] + [("script", p) for p, _ in scripts]):
+            identity = text or ""
+            if label != "job id":
+                # Temporary ancestors belong to the launcher, not the submitted job. Keep
+                # ids below that prefix (and in job names), including real task worktrees.
+                prefixes = {os.environ[k] for k in ("TMPDIR", "TMP", "TEMP") if os.environ.get(k)}
+                for prefix in sorted(prefixes, key=len, reverse=True):
+                    if not Path(prefix).is_absolute() or Path(prefix) == Path("/"):
+                        continue
+                    try:
+                        identity = str(Path(identity).relative_to(prefix))
+                        break
+                    except ValueError:
+                        pass
+            other = sorted({m for m in _TASK_ID.findall(identity) if m.lstrip("0") != str(task).lstrip("0")})
+            if other:
+                warnings.append(f"the {label} {text} names task {', '.join(other)}, but this is task {task}: "
+                                f"copied from another task? (ignore this if it is not a task id)")
+    return errors, warnings
+
+
+# host side: everything below runs on the device host ------------------------------------------------
+def job_limit(spec: dict, cfg: dict) -> float:
+    """The job's time limit in seconds (0 = none): its timeout_s, else job_timeout_s, else the cap; through
+    the broker at most BROKER_MAX_S, which is also the limit of a job with none."""
+    limit = float(spec.get("timeout_s") or cfg["job_timeout_s"] or cfg["reservation_cap_s"] or 0)
+    return min(limit or BROKER_MAX_S, BROKER_MAX_S) if broker_on(cfg) else limit
+
+
+def broker_on(cfg: dict) -> bool:
+    """Whether this host's jobs go through the device broker (setting broker)."""
+    mode = cfg.get("broker", "auto")
+    return mode == "on" or (mode == "auto" and shutil.which(BROKER) is not None)
+
+
+def calls_broker(spec: dict) -> bool:
+    """Whether the job's command (or a script it calls) queues itself on the broker."""
+    return any(re.search(rf"\b{BROKER}\s+(run|run-bg)\b", code) for _, code in _job_texts(spec))
+
+
+def broker_call_problems(spec: dict) -> list:
+    """Why the job's own broker calls may block a serving workload too long: each must be --preemptable
+    with a -t of at most BROKER_MAX_S."""
+    out = []
+    for label, code in _job_texts(spec):
+        for m in re.finditer(rf"\b{BROKER}\s+(run|run-bg)\b[^\n;|&]*", code):
+            call = m.group(0)
+            t = re.search(r"(?:-t|--timeout)[ =](\d+)", call)
+            if "--preemptable" not in call:
+                out.append(f"{label}: `{call[:80]}` lacks --preemptable")
+            if not t or int(t.group(1)) > BROKER_MAX_S:
+                out.append(f"{label}: `{call[:80]}` needs -t {BROKER_MAX_S} or less")
+    return out
+
+
+def chunk_advice(limit: float = BROKER_MAX_S) -> str:
+    """How to run a longer job through the broker: in chunks that each fit its limit."""
+    return (f"split the run into shorter jobs of at most {limit:.0f} s each: have the job write a checkpoint "
+            "(or its progress) when a chunk ends and resume from it, and submit each next chunk as its own "
+            "job once the previous one is done")
+
+
+_TLIMIT = re.compile(r"(?:^|\s)(?:-t|--timeout)(?:[ =]\s*|(?=\d))[\"']?(\d+)(?![\w.])")
+
+
+def chunk_problems(spec: dict) -> list:
+    """The job's own broker calls whose -t is a number above BROKER_MAX_S (the broker would end them, or
+    hold a serving workload that long), one line each with the checkpoint advice. A -t that is not a plain
+    number (a variable) is for broker_call_problems to warn about."""
+    out = []
+    for label, code in _job_texts(spec):
+        for m in re.finditer(rf"\b{BROKER}\s+(run|run-bg)\b[^\n;|&]*", code):
+            # only the broker's own flags: what follows ` -- ` belongs to the command it runs
+            for t in _TLIMIT.findall(re.split(r"\s--(?:\s|$)", m.group(0), maxsplit=1)[0]):
+                if int(t) > BROKER_MAX_S:
+                    out.append(f"{label}: `{m.group(0)[:80]}` asks for -t {t}, above the broker's limit of "
+                               f"{BROKER_MAX_S} s; {chunk_advice()}")
+    return out
+
+
+def over_cap(spec: dict, cfg: dict) -> str:
+    """Why the job may not run under the box's reservation cap, or ""."""
+    cap, limit = float(cfg["reservation_cap_s"] or 0), job_limit(spec, cfg)
+    if cap and limit > cap:
+        return (f"its limit of {limit:.0f} s is above this box's reservation cap of {cap:.0f} s; "
+                f"submit it again with --timeout {cap:.0f} or less")
+    return ""
+
+
+# host side: the job guard (config script_lint, netfs_prefixes, disk_max_pct; a job's inputs) ----------
+# A job's child that outlives its script, a weight or cache path on a hung network mount, or caches that
+# fill the host's disk can take down more than the job: the guard refuses such a job at submit.
+_GROUP_ISOLATION = re.compile(r"(?<![\w-])setsid(?![\w-])")
+_TRAP = re.compile(r"""(?<![\w-])trap\s+(?:--\s+)?('[^']*'|"[^"]*"|[^\s'"]+)((?:[ \t]+[A-Za-z0-9_]+)+)""")
+_FUNC = re.compile(r"(?:^|[\s;])(?:function\s+([A-Za-z_][\w-]*)\s*(?:\(\s*\))?|([A-Za-z_][\w-]*)\s*\(\s*\))\s*\{")
+_KILL = re.compile(r"(?<![\w-])kill((?:[ \t]+[^\s;&|)]+)+)")
+_QUOTES = "\"'"
+_SIGNALS = {"0": "EXIT", "1": "HUP", "2": "INT", "15": "TERM"}
+_DOWNLOAD = re.compile(
+    r"(?<![\w-])(?:wget|aria2c|rsync|scp|rclone\s+(?:copy|sync)|(?:huggingface-cli|hf)\s+download|"
+    r"snapshot_download|hf_hub_download|git\s+clone|git\s+lfs\s+(?:pull|fetch)|aws\s+s3\s+(?:cp|sync)|"
+    r"gsutil\s+(?:-m\s+)?(?:cp|rsync)|curl\b[^\n]*\s(?:-[A-Za-z]*[oO]\b|--output|--remote-name))")
+_CACHE_WRITE = re.compile(r"(?<![\w-])(?:cp|mv|tar|unzip|rsync)\s[^\n]*cache", re.I)
+_DISK_GUARD = re.compile(r"(?<![\w-])(?:df|du)(?![\w-])")
+_CACHE_NAME = r"[A-Za-z_]*(?:CACHE|WEIGHT|MODEL|CKPT|CHECKPOINT|HF_HOME|TORCH_HOME|ARTIFACT)[A-Za-z0-9_]*"
+_CACHE_VAR = re.compile(r"(?<![\w-])(" + _CACHE_NAME + r")=(\"[^\"]*\"|'[^']*'|[^\s;&|)]+)", re.I)
+_CACHE_OPT = re.compile(r"(?<![\w-])--[\w-]*(?:cache|weight|model|ckpt|checkpoint)[\w-]*(?:=|\s+)"
+                        r"(\"[^\"]*\"|'[^']*'|[^\s;&|)]+)", re.I)
+_ASSIGN = re.compile(r"(?<![\w-])([A-Za-z_][A-Za-z0-9_]*)=(\"[^\"`]*\"|'[^']*'|[^\s;&|)\"'`]+)")
+
+
+def _code(text: str) -> str:
+    """`text` without its comment lines (the #! line too)."""
+    return "\n".join(x for x in text.splitlines() if not x.lstrip().startswith("#"))
+
+
+def _job_texts(spec: dict) -> list:
+    """(label, code) for the job's command and each shell script it calls that is readable here."""
+    out = [("the command", _code(spec["cmd"]))]
+    for path, kind in called_scripts(spec["cmd"], spec.get("workdir") or ""):
+        f = Path(os.path.expanduser(path))
+        try:
+            with open(f, errors="replace") as fh:
+                text = fh.read(1 << 20)
+        except OSError:
+            continue
+        if kind == "sh" or (kind == "?" and re.match(r"#!.*[/ ]((ba|da|k|z)?sh)(\s|$)", text)):
+            out.append((path, _code(text)))
+    return out
+
+
+def _kills_group(text: str) -> bool:
+    """A kill of a process group in `text`: a negative pid (`kill -- -$pgid`, `kill -TERM -$$`) or 0."""
+    for m in _KILL.finditer(text):
+        words = [re.sub("[\"']", "", w) for w in m.group(1).split()]
+        if words[:1] == ["-s"] or words[:1] == ["-n"]:
+            words = words[2:]
+        elif words and words[0].startswith("-") and words[0] != "--" and len(words) > 1:
+            words = words[1:]                    # the signal (kill takes one)
+        if any(w == "0" or (w[:1] == "-" and w[1:2] and w[1:2] in "$0123456789") for w in words):
+            return True
+    return False
+
+
+def _function_bodies(text: str) -> dict:
+    """name -> body of each shell function defined in `text` (braces counted, quotes not)."""
+    out = {}
+    for m in _FUNC.finditer(text):
+        depth, i = 1, m.end()
+        while i < len(text) and depth:
+            depth += {"{": 1, "}": -1}.get(text[i], 0)
+            i += 1
+        out[m.group(1) or m.group(2)] = text[m.end():i]
+    return out
+
+
+def _isolation_problem(code: str) -> str:
+    """Why the job's processes could outlive it, or "": it needs setsid, and traps on EXIT, TERM and INT
+    whose action (or a function it calls) kills the process group."""
+    bodies, covered = _function_bodies(code), set()
+    for m in _TRAP.finditer(code):
+        action = m.group(1).strip(_QUOTES)
+        called = [b for name, b in bodies.items() if re.search(rf"(?<![\w-]){re.escape(name)}(?![\w-])", action)]
+        if _kills_group(action) or any(_kills_group(b) for b in called):
+            for sig in m.group(2).split():
+                sig = sig.upper()
+                covered.add(_SIGNALS.get(sig, sig[3:] if sig.startswith("SIG") else sig))
+    missing = [x for x in ("setsid",) if not _GROUP_ISOLATION.search(code)]
+    missing += [f"a trap on {s}" for s in ("EXIT", "TERM", "INT") if s not in covered]
+    if not missing:
+        return ""
+    return ("no process-group isolation: it lacks " + ", ".join(missing) + " (run the work under `setsid`, "
+            "and `trap 'kill -TERM -- -$pgid' EXIT TERM INT` with its process group, so no child outlives the job)")
+
+
+def _download_problem(code: str) -> str:
+    m = _DOWNLOAD.search(code) or _CACHE_WRITE.search(code)
+    if not m or _DISK_GUARD.search(code):
+        return ""
+    return (f"it downloads or writes a cache ({' '.join(m.group(0).split())[:60]!r}) without a disk guard "
+            f"(check free space with `df` or the cache's size with `du` first, and stop when it is short)")
+
+
+def _expand(value: str, known: dict) -> str | None:
+    """A path word with ~ and $VAR / ${VAR} / ${VAR:-x} filled in from `known`; None if one is unknown."""
+    v = value.strip(_QUOTES)
+    v = re.sub(r"\$\{([A-Za-z_]\w*):?-([^}]*)\}", lambda m: known.get(m.group(1)) or m.group(2), v)
+    v = re.sub(r"\$\{?([A-Za-z_]\w*)\}?", lambda m: known.get(m.group(1), "\0"), v)
+    if "\0" in v or re.search(r"[$`*?]", v):
+        return None
+    return os.path.expanduser(v)
+
+
+def _under(path: str, prefixes: list) -> str:
+    for pre in prefixes:
+        pre = os.path.expanduser(pre).rstrip("/")
+        if path == pre or path.startswith(pre + "/"):
+            return pre
+    return ""
+
+
+def resolve_local(path: str, prefixes: list) -> tuple:
+    """(path with its symlinks resolved, the network prefix it lies under or ""). Nothing under a prefix
+    is looked at (a hung mount would hang the lint): once the path so far is under one, the rest is joined
+    as written. Only absolute paths are taken."""
+    import posixpath
+    parts, cur, hops = [x for x in path.split("/") if x], "/", 0
+    while parts:
+        if _under(cur, prefixes):
+            break
+        comp = parts.pop(0)
+        if comp in (".", ".."):
+            cur = posixpath.dirname(cur) if comp == ".." else cur
+            continue
+        nxt = posixpath.join(cur, comp)
+        if _under(nxt, prefixes):
+            cur = nxt
+            break
+        try:
+            target = os.readlink(nxt)
+        except OSError:                          # not a link, or not there: kept as written
+            cur = nxt
+            continue
+        hops += 1
+        if hops > 40:
+            cur = nxt
+            break
+        parts = [x for x in target.split("/") if x] + parts
+        cur = "/" if target.startswith("/") else cur
+    out = posixpath.normpath(posixpath.join(cur, *parts)) if parts else cur
+    return out, _under(out, prefixes)
+
+
+def _netfs_problems(code: str, prefixes: list) -> list:
+    known = {"HOME": str(Path.home()), **{k: v for k, v in os.environ.items()}}
+    for m in _ASSIGN.finditer(code):              # in order: a later assignment wins
+        val = _expand(m.group(2), known)
+        if val is not None:
+            known[m.group(1)] = val
+    out = []
+    for m in list(_CACHE_VAR.finditer(code)) + list(_CACHE_OPT.finditer(code)):
+        word = m.group(m.lastindex)
+        path = _expand(word, known)
+        if not path or not path.startswith("/"):
+            continue
+        real, pre = resolve_local(path, prefixes)
+        if pre:
+            name = m.group(1) if m.re is _CACHE_VAR else m.group(0).split("=")[0].split()[0]
+            line = (f"{name} {word.strip(_QUOTES)} resolves to {real}, on the network filesystem {pre} "
+                    f"(netfs_prefixes): a hung mount hangs the job; keep weights and caches on a local disk")
+            if line not in out:
+                out.append(line)
+    return out
+
+
+def disk_full(cfg: dict, d: Path) -> str:
+    """Why a disk disk_max_pct watches is too full, or "" (also when the cap is off)."""
+    import shutil
+    cap = float(cfg.get("disk_max_pct") or 0)
+    if not cap:
+        return ""
+    for path in cfg.get("disk_paths") or ["/", str(d)]:
+        try:
+            u = shutil.disk_usage(os.path.expanduser(path))
+        except OSError:
+            continue
+        pct = 100.0 * u.used / ((u.used + u.free) or 1)
+        if pct > cap:
+            return (f"the disk holding {path} is {pct:.0f}% full, above the cap of {cap:.0f}% "
+                    f"(disk_max_pct); free space there first")
+    return ""
+
+
+def _readable(path: str, timeout: float = 20) -> str:
+    """"" if `path` can be read here, else why. Asked in a child, so a hung mount costs `timeout`."""
+    try:
+        p = subprocess.Popen(["/bin/sh", "-c", 'test -r "$1"', "sh", path], stdin=subprocess.DEVNULL,
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+        rc = p.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        _kill_group(p.pid)
+        return f"no answer in {timeout:.0f} s (a hung mount?)"
+    except OSError as e:
+        return str(e)
+    return "" if rc == 0 else "missing or not readable"
+
+
+def guard(d: Path, cfg: dict, spec: dict) -> tuple:
+    """(errors, warnings) of the job guard, on the host at submit. Each part is off until configured:
+    script_lint checks the command and the shell scripts it calls for process-group isolation (setsid,
+    and EXIT/TERM/INT traps that kill the group) and for a df/du guard before downloads or cache writes;
+    netfs_prefixes flags weight and cache paths that resolve onto a network filesystem (netfs_policy);
+    disk_max_pct refuses while a watched disk is fuller. A job's declared inputs must be readable here, and
+    a declared cold start longer than its limit is a warning."""
+    cfg = settings(cfg)
+    errors, warnings = [], []
+    full = disk_full(cfg, d)
+    if full:
+        errors.append(full)
+    texts = _job_texts(spec) if cfg["script_lint"] or cfg["netfs_prefixes"] else []
+    if cfg["script_lint"]:
+        found = [p for p in (_isolation_problem("\n".join(c for _, c in texts)),
+                             _download_problem("\n".join(c for _, c in texts))) if p]
+        (errors if cfg["script_lint"] == "refuse" else warnings).extend(found)
+    if cfg["netfs_prefixes"]:
+        found = [f"{label}: {x}" for label, c in texts for x in _netfs_problems(c, cfg["netfs_prefixes"])]
+        (errors if cfg["netfs_policy"] == "refuse" else warnings).extend(found)
+    base = spec.get("workdir") or str(Path.home())
+    for path in spec.get("inputs") or []:
+        full_path = os.path.join(base, os.path.expanduser(str(path)))
+        why = _readable(full_path)
+        if why:
+            errors.append(f"input {path}: {why} on this host")
+    cold, limit = float(spec.get("cold_start_s") or 0), job_limit(spec, cfg)
+    if cold and limit and cold > limit:
+        warnings.append(f"its declared cold start of {cold:.0f} s is longer than its limit of {limit:.0f} s: "
+                        f"it would time out before it does any work")
+    return errors, warnings
+
+
+_SOURCES = (".c", ".cc", ".cpp", ".cxx", ".h", ".hh", ".hpp", ".hxx", ".cu", ".S")
+HASH_MAX_BYTES = 1 << 30   # an artifact larger than this is stamped by size and time only
+
+
+def _git(wd: str, *args: str) -> str | None:
+    try:
+        r = subprocess.run(["git", "-C", wd, *args], capture_output=True, timeout=30)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    return r.stdout.decode(errors="replace") if r.returncode == 0 else None
+
+
+def _changed(wd: str, porcelain: str) -> list:
+    """Paths `git status --porcelain -z` names, relative to the checkout's top (a rename's old name skipped)."""
+    out, parts = [], porcelain.split("\0")
+    i = 0
+    while i < len(parts):
+        e = parts[i]
+        i += 1
+        if len(e) > 3:
+            out.append(e[3:])
+            if e[0] in "RC":
+                i += 1
+    return out
+
+
+def _sha256(path: Path) -> str:
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def build_stamp(workdir: str, artifact: str = "") -> dict:
+    """What a job runs: the workdir's git repo (origin without credentials, else its top folder), branch,
+    commit, whether the tree is dirty and a hash of its uncommitted changes, and the built artifact's size,
+    time and sha256 (its build id). `stale` lists changed C/C++ sources newer than the artifact: the job
+    would run an old build. Read-only; a workdir outside git gets repo, commit and dirty None."""
+    wd = os.path.expanduser(workdir or "~")
+    stamp = {"workdir": wd, "repo": None, "branch": None, "commit": None, "dirty": None, "diff_sha256": None,
+             "artifact": None, "stale": [], "stamped_utc": _utc()}
+    top = (_git(wd, "rev-parse", "--show-toplevel") or "").strip()
+    if top:
+        url = (_git(wd, "config", "--get", "remote.origin.url") or "").strip()
+        status = _git(wd, "status", "--porcelain", "-z", "--untracked-files=all")
+        diff = _git(wd, "diff", "HEAD", "--binary")
+        stamp.update(repo=re.sub(r"^([a-z+]+://)[^/@]*@", r"\1", url) or top,
+                     branch=(_git(wd, "rev-parse", "--abbrev-ref", "HEAD") or "").strip() or None,
+                     commit=(_git(wd, "rev-parse", "HEAD") or "").strip() or None,
+                     dirty=None if status is None else bool(status.strip("\0")))
+        if stamp["dirty"]:
+            stamp["diff_sha256"] = hashlib.sha256(((diff or "") + "\0" + status).encode()).hexdigest()
+    if artifact:
+        a = Path(wd, os.path.expanduser(artifact))
+        try:
+            st = a.stat()
+        except OSError:
+            stamp["artifact"] = {"path": str(a), "missing": True}
+            return stamp
+        stamp["artifact"] = {"path": str(a), "size": st.st_size, "mtime": st.st_mtime, "mtime_utc": _utc(st.st_mtime),
+                             "sha256": _sha256(a) if a.is_file() and st.st_size <= HASH_MAX_BYTES else None}
+        if stamp["dirty"]:
+            for rel in _changed(wd, status or ""):
+                f = Path(top, rel)
+                with contextlib.suppress(OSError):
+                    if f.suffix in _SOURCES and f.stat().st_mtime > st.st_mtime:
+                        stamp["stale"].append(rel)
+    return stamp
+
+
+def stamp_line(stamp) -> str:
+    """One line for a person: `<commit12>[+dirty] on <branch> artifact <sha12> built <utc>`."""
+    if not isinstance(stamp, dict):
+        return "no build stamp"
+    words = [f"{(stamp.get('commit') or 'no-git')[:12]}{'+dirty' if stamp.get('dirty') else ''}"]
+    if stamp.get("branch"):
+        words.append(f"on {stamp['branch']}")
+    a = stamp.get("artifact") or {}
+    if a.get("missing"):
+        words.append(f"artifact {a['path']} missing")
+    elif a:
+        words.append(f"artifact {(a.get('sha256') or 'unhashed')[:12]} built {a.get('mtime_utc')}")
+    if stamp.get("stale"):
+        words.append(f"STALE: {len(stamp['stale'])} changed source(s) newer than the artifact")
+    return " ".join(words)
+
+
+_STAMP_KEYS = ("commit", "dirty", "diff_sha256")
+
+
+def stamp_changes(before, after) -> dict:
+    """What differs between the stamp at submit and at start (commit, uncommitted changes, artifact)."""
+    if not isinstance(before, dict) or not isinstance(after, dict):
+        return {}
+    out = {k: [before.get(k), after.get(k)] for k in _STAMP_KEYS if before.get(k) != after.get(k)}
+    a, b = before.get("artifact") or {}, after.get("artifact") or {}
+    for k in ("sha256", "size", "mtime", "missing"):
+        if a.get(k) != b.get(k):
+            out[f"artifact.{k}"] = [a.get(k), b.get(k)]
+    return out
+
+
+def _now() -> float:
+    return time.time()
+
+
+def _utc(t: float | None = None) -> str:
+    return time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(_now() if t is None else t))
+
+
+def _write(path: Path, text: str) -> None:
+    """project.durable_write's standard-library twin (this file runs alone on the device host): a power
+    cut leaves the old content or the new, never a half-written file."""
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    with open(tmp, "w") as f:
+        f.write(text)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, path)
+    _sync_dir(path.parent)
+
+
+def _sync_dir(d: Path) -> None:
+    try:
+        fd = os.open(d, os.O_RDONLY)
+    except OSError:
+        return
+    try:
+        os.fsync(fd)
+    except OSError:
+        pass
+    finally:
+        os.close(fd)
+
+
+def _append(path: Path, line: str) -> None:
+    """Append one line and sync it: the drop counts decide when a config's jobs are skipped."""
+    with open(path, "a") as f:
+        f.write(line)
+        f.flush()
+        os.fsync(f.fileno())
+
+
+def _load(path: Path) -> dict:
+    try:
+        v = json.loads(path.read_text())
+        return v if isinstance(v, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def _rm(path: Path) -> None:
+    try:
+        path.unlink()
+    except FileNotFoundError:
+        pass
+
+
+GATE = ".probe.gate"   # made by _dirs: each try of a lock file in its folder holds it (_probe_gate)
+
+
+def _dirs(d: Path) -> None:
+    for sub in ("queue", "running", "done", "logs", "configs"):
+        (d / sub).mkdir(parents=True, exist_ok=True)
+    with contextlib.suppress(OSError):
+        (d / GATE).touch()
+
+
+@contextlib.contextmanager
+def _probe_gate(lock: Path):
+    """Held around each non-blocking try of a lock file in its folder (_free's probe, which lets go inside
+    it, and a runner's take): they take turns, so a starting runner never finds runner.lock taken by
+    start's poll of it. Opened read-only (a probe writes nothing); a folder without one is ungated."""
+    try:
+        fd = os.open(lock.parent / GATE, os.O_RDONLY)
+    except OSError:
+        fd = None
+    try:
+        if fd is not None:
+            with contextlib.suppress(OSError):
+                fcntl.flock(fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        if fd is not None:
+            os.close(fd)
+
+
+def _take_lock(lock) -> bool:
+    """Take an open lock file's lock if nobody holds it, under _probe_gate."""
+    with _probe_gate(Path(lock.name)):
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return True
+        except OSError:
+            return False
+
+
+def _free(lock: Path) -> bool:
+    """Whether nobody holds this lock file (a missing one is free). Opens it read-only: no writes."""
+    with _probe_gate(lock):
+        try:
+            f = open(lock)
+        except OSError:
+            return True
+        try:
+            fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return True
+        except OSError:
+            return False
+        finally:
+            f.close()
+
+
+def _queued(d: Path, job: str) -> list:
+    return sorted(q for q in (d / "queue").glob(f"*-{job}.json") if q.stem.split("-", 1)[1] == job)
+
+
+def _running(d: Path) -> list:
+    return sorted(f.stem for f in (d / "running").glob("*.json") if not f.name.endswith(".state.json"))
+
+
+def where_is(d: Path, job: str) -> str:
+    """done, running, queued or unknown."""
+    if (d / "done" / f"{job}.json").exists():
+        return "done"
+    if (d / "running" / f"{job}.json").exists():
+        return "running"
+    return "queued" if _queued(d, job) else "unknown"
+
+
+def runner_alive(d: Path) -> bool:
+    return not _free(d / "runner.lock")
+
+
+def outside_users(d: Path, pattern: str) -> list:
+    """This user's processes whose command line matches `pattern`: "<pid> <command>" each. Leaves out
+    this process and its ancestors (whose command lines may carry the pattern as config), the runner's
+    own processes and its jobs (their process groups)."""
+    if not pattern:
+        return []
+    try:
+        rx = re.compile(pattern)
+        out = subprocess.run(["ps", "-ww", "-U", str(os.getuid()), "-o", "pid=", "-o", "ppid=", "-o", "pgid=",
+                              "-o", "command="], capture_output=True, text=True, timeout=30).stdout
+    except (OSError, re.error, subprocess.SubprocessError):
+        return []
+    procs = {}
+    for line in out.splitlines():
+        parts = line.split(None, 3)
+        if len(parts) == 4 and all(x.isdigit() for x in parts[:3]):
+            procs[int(parts[0])] = (int(parts[1]), int(parts[2]), parts[3])
+    mine, pid = set(), os.getpid()
+    while pid and pid not in mine:
+        mine.add(pid)
+        pid = procs.get(pid, (0,))[0]
+    jobs = set()
+    for st in (d / "running").glob("*.state.json"):
+        cur = _load(st).get("cur") or {}
+        if isinstance(cur.get("pid"), int):
+            jobs.add(cur["pid"])
+    return [f"{p} {cmd[:160]}" for p, (_, pgid, cmd) in sorted(procs.items())
+            if p not in mine and pgid not in jobs and "devq.py" not in cmd and rx.search(cmd)]
+
+
+def probe(d: Path, job: str) -> int:
+    """retry_when probe, read-only: 0 once job's marker exists or the job is unknown; 1 while a live
+    runner has it (or an outside device user still runs); RUNNER_DOWN_RC while it is pending with no
+    runner alive: the project's daemon then runs `ttp devq start` itself and the task sleeps on."""
+    at = where_is(d, job)
+    if at == "done":
+        m = _load(d / "done" / f"{job}.json")
+        print(f"{job}: {m.get('status', '?')} rc={m.get('rc')} log={m.get('log', '')}"
+              + (f" build={stamp_line(m['build'])}" if m.get("build") else "")
+              + (" (the build changed between submit and start: " + ", ".join(m["build_changed"]) + ")"
+                 if m.get("build_changed") else "")
+              + (f" ({m.get('reason', '')}; recover the device before running it again)"
+                 if m.get("status") == "wedged" else ""))
+        return 0
+    if at == "unknown":
+        print(f"{job}: unknown to the runner in {d}")
+        return 0
+    if not runner_alive(d):
+        outside = outside_users(d, settings(_load(d / "config.json"))["outside_user"])
+        if outside:
+            print(f"{job}: {at}; no runner yet: an outside device user still runs ({outside[0]})")
+            return 1
+        print(f"{job}: {at}, but no runner is alive (runner down): `ttp devq start` brings it back")
+        return RUNNER_DOWN_RC
+    print(wait_line(d, job) if at == "queued" else f"{job}: {at}")
+    return 1
+
+
+WAIT_RE = re.compile(r"^(?P<job>\S+): queued (?P<waited>\d+) s, (?P<ahead>\d+) ahead; running: (?:none|(?P<rid>\S+)"
+                     r"(?: task #(?P<task>\d+))?(?: for (?P<run>\d+) s)?(?:, pid (?P<pid>\d+) (?P<alive>alive|gone|unknown))?)$")
+
+
+def _pid_alive(pid: int) -> str:
+    """liveness.pid_state: "unknown" from a sandbox with a PID namespace other than the daemon's."""
+    from .liveness import pid_state
+    return pid_state(pid)
+
+
+def wait_line(d: Path, job: str) -> str:
+    """The probe's line for a queued job (parse_wait reads it back): how long it has queued, how many jobs
+    are ahead of it, and the job the runner runs now with its task, run time and whether its pid lives."""
+    q, now = _queued(d, job), _now()
+    try:
+        arrived = int(q[0].name.split("-", 1)[0]) / 1e9 if q else now
+    except ValueError:
+        arrived = now
+    ahead = sum(1 for f in (d / "queue").glob("*.json") if q and f.name < q[0].name)
+    running = _running(d)
+    out = f"{job}: queued {max(0, int(now - arrived))} s, {ahead + len(running)} ahead; running: "
+    if not running:
+        return out + "none"
+    rid = running[0]
+    spec, st = _load(d / "running" / f"{rid}.json"), _load(d / "running" / f"{rid}.state.json")
+    cur = st.get("cur") or {}
+    out += rid + (f" task #{spec['task']}" if str(spec.get("task") or "").isdigit() else "")
+    started = cur.get("started") or st.get("started")
+    if isinstance(started, (int, float)):
+        out += f" for {max(0, int(now - started))} s"
+    if isinstance(cur.get("pid"), int) and cur["pid"] > 0:
+        seen = {"alive": "alive", "dead": "gone"}.get(_pid_alive(cur["pid"]), "unknown")
+        out += f", pid {cur['pid']} {seen}"
+    return out
+
+
+def parse_wait(text: str):
+    """What a probe's wait_line says, else None: {"job", "waited_s", "ahead", "holder": None or {"job",
+    "task", "run_s", "pid", "alive"}}. The last such line counts."""
+    for line in reversed(str(text or "").splitlines()):
+        m = WAIT_RE.match(line.strip())
+        if not m:
+            continue
+        holder = None
+        if m["rid"]:
+            holder = {"job": m["rid"], "task": m["task"], "run_s": int(m["run"]) if m["run"] else None,
+                      "pid": int(m["pid"]) if m["pid"] else None,
+                      "alive": {"alive": True, "gone": False}.get(m["alive"] or "")}
+        return {"job": m["job"], "waited_s": int(m["waited"]), "ahead": int(m["ahead"]), "holder": holder}
+    return None
+
+
+def _urgent_job(f: Path) -> bool:
+    """Whether a queued job's spec marks it urgent; an unreadable one is not."""
+    try:
+        return json.loads(f.read_text()).get("urgent") is True
+    except (OSError, ValueError, AttributeError):
+        return False
+
+
+def submit(d: Path, cfg: dict, spec: dict) -> int:
+    """Validate and queue one job spec, then start the runner if it is not up. Exit 2 on a bad spec."""
+    _dirs(d)
+    job = str(spec.get("id") or "")
+    if not ID_RE.fullmatch(job):
+        print("devq submit: id missing or not letters, digits, . _ - (at most 100)", file=sys.stderr)
+        return 2
+    spec.setdefault("config", job)
+    if not ID_RE.fullmatch(str(spec["config"])):
+        print("devq submit: config must be letters, digits, . _ -", file=sys.stderr)
+        return 2
+    if not isinstance(spec.get("cmd"), str) or not spec["cmd"].strip():
+        print("devq submit: cmd missing", file=sys.stderr)
+        return 2
+    if spec.get("wedge_patterns") is not None:
+        bad = pattern_problems(spec["wedge_patterns"])
+        if bad:
+            print("devq submit: wedge_patterns: " + "; ".join(bad), file=sys.stderr)
+            return 2
+    wd = spec.get("workdir") or ""
+    if wd and not Path(wd).is_dir():
+        print(f"devq submit: workdir {wd} does not exist on this host", file=sys.stderr)
+        return 2
+    too_long = over_cap(spec, settings(cfg))
+    if too_long:
+        print(f"devq submit: refused: {too_long}", file=sys.stderr)
+        return 2
+    if broker_on(settings(cfg)):
+        if float(spec.get("timeout_s") or 0) > BROKER_MAX_S:
+            print(f"devq submit: refused: --timeout {spec['timeout_s']} is above the device broker's limit of "
+                  f"{BROKER_MAX_S} s; {chunk_advice()}", file=sys.stderr)
+            return 2
+        too_big = chunk_problems(spec) if calls_broker(spec) else []
+        if too_big:
+            print("devq submit: refused: " + "; ".join(too_big), file=sys.stderr)
+            return 2
+        for w in broker_call_problems(spec) if calls_broker(spec) else []:
+            print(f"devq submit: warning: {w} (a job that is not preemptable blocks a serving workload)",
+                  file=sys.stderr)
+    errors, warnings = guard(d, cfg, spec)
+    for w in warnings:
+        print(f"devq submit: warning: {w}", file=sys.stderr)
+    if errors:
+        print("devq submit: refused by this host's job guard (config device.runners): " + "; ".join(errors),
+              file=sys.stderr)
+        return 2
+    if where_is(d, job) != "unknown":
+        print(f"devq submit: id {job} was already used here; pick a new one (e.g. {job}-r2)", file=sys.stderr)
+        return 2
+    if not isinstance(spec.get("artifact", ""), str):
+        print("devq submit: artifact must be a path", file=sys.stderr)
+        return 2
+    spec["build"] = build_stamp(wd, spec.get("artifact") or settings(cfg)["build_artifact"])
+    print(f"build: {stamp_line(spec['build'])}")
+    if spec["build"]["dirty"]:
+        print("devq submit: warning: the workdir has uncommitted changes; the result is tied to its diff hash "
+              "only (commit first to make it reproducible)", file=sys.stderr)
+    if spec["build"]["stale"]:
+        print("devq submit: warning: changed sources are newer than the built artifact (rebuild before "
+              "queueing?): " + ", ".join(spec["build"]["stale"][:5]), file=sys.stderr)
+    if (spec["build"]["artifact"] or {}).get("missing"):
+        print(f"devq submit: warning: build artifact {spec['build']['artifact']['path']} does not exist",
+              file=sys.stderr)
+    spec["submitted"] = _now()
+    # The settings go down before the job: an idle runner may dequeue it at once and must see them
+    # (it rereads them for each job it takes, see loop).
+    _write(d / "config.json", json.dumps(settings(cfg), indent=1))
+    _write(d / "queue" / f"{time.time_ns():020d}-{job}.json", json.dumps(spec, indent=1))
+    ahead = len(list((d / "queue").glob("*.json"))) - 1 + len(_running(d))
+    print(f"queued {job} ({ahead} ahead)")
+    rc = start(d, cfg)
+    return 0 if rc == 3 else rc
+
+
+# A run on a machine tagged `device` sees no device when it opens one directly: tt-umd (docs/
+# TT_VISIBLE_DEVICES.md) enumerates no device when TT_VISIBLE_DEVICES is set and empty. The broker
+# documents no per-process switch of its own (TTDEV_LOCK=1 locks a whole host at install).
+DEVICE_MASK = {"TT_VISIBLE_DEVICES": ""}
+# Names the variables the mask set, with what they held before (null: unset), so a command run through
+# a device lock or this queue gets them back. The broker needs nothing: its CLI forwards only
+# TT_METAL_*, PYTHONPATH, PYTHON_ENV_DIR, VIRTUAL_ENV, MESH_DEVICE, HF_HUB_CACHE, TT_CACHE_PATH and
+# VLLM_* to a job, which runs in the broker's own environment.
+MASK_RECORD = "TTP_DEVICE_MASK"
+
+
+def unmask_devices(env: dict) -> dict:
+    """`env` with the device mask taken off (each variable back as it was), for a command run through
+    a device lock or queue, the sanctioned ways to a device."""
+    if MASK_RECORD not in env:
+        return env
+    out = dict(env)
+    try:
+        before = json.loads(out.pop(MASK_RECORD))
+    except ValueError:
+        before = None
+    before = before if isinstance(before, dict) else {}
+    for k in DEVICE_MASK:
+        if isinstance(before.get(k), str):
+            out[k] = before[k]
+        else:
+            out.pop(k, None)
+    return out
+
+
+def broker_wrap(cmd: str, env: dict, limit: int, idf: str) -> str:
+    """`cmd` as a preemptable broker job: queue it with `run-bg`, keep its id in `idf`, follow it with `wait`
+    (whose exit is the job's), and cancel it on the broker if this wrapper is stopped."""
+    inner = "export " + " ".join(f"{k}={shlex.quote(v)}" for k, v in env.items()) + "; " + cmd
+    b = BROKER
+    return (f'out=$({b} run-bg --preemptable -t {limit} {shlex.quote(inner)} 2>&1); e=$?; printf "%s\\n" "$out"; '
+            '[ $e = 0 ] || exit $e; '
+            'id=$(printf "%s\\n" "$out" | sed -n "s/^Job \\([^ ]*\\) queued.*/\\1/p" | head -n 1); '
+            '[ -n "$id" ] || { echo "devq: no job id in the broker\'s answer"; exit 1; }; '
+            f'echo "$id" >{shlex.quote(idf)}; '
+            f'trap \'{b} kill "$id" >/dev/null 2>&1; exit 143\' TERM INT HUP; {b} wait "$id" & w=$!; wait $w')
+
+
+def broker_kill(cur: dict) -> None:
+    """Cancel the attempt's broker job, if it has one (killing its `wait` would leave it holding the device)."""
+    try:
+        bid = Path(cur["rc"]).with_name(Path(cur["rc"]).name[:-3] + ".broker").read_text().strip()
+    except (OSError, KeyError):
+        return
+    if cur.get("broker") and bid:
+        with contextlib.suppress(OSError, subprocess.SubprocessError):
+            subprocess.run([BROKER, "kill", bid], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                           stderr=subprocess.DEVNULL, timeout=30)
+
+
+def _env(**extra: str) -> dict:
+    """The environment for the runner and its jobs: never a submitting run's `TTP_NO_DEVICE` or device
+    mask (the runner is the device path, and outlives that run)."""
+    return {**unmask_devices({k: v for k, v in os.environ.items() if k != "TTP_NO_DEVICE"}), **extra}
+
+
+def start(d: Path, cfg: dict) -> int:
+    """Start the runner unless one is up. Safe to call any number of times."""
+    _dirs(d)
+    _write(d / "config.json", json.dumps(settings(cfg), indent=1))
+    if runner_alive(d):
+        print(f"runner already running (pid {(d / 'runner.pid').read_text().strip() if (d / 'runner.pid').exists() else '?'})")
+        return 0
+    outside = outside_users(d, settings(cfg)["outside_user"])
+    if outside:
+        print(f"runner not started: an outside device user still runs ({outside[0]}); the probe keeps the task "
+              "asleep until it ends, and the runner starts on the first wake after that")
+        return 3
+    with open(d / "runner.out", "a") as out:
+        proc = subprocess.Popen([sys.executable, str(Path(__file__).resolve()), "run", str(d)], cwd=str(d),
+                                stdin=subprocess.DEVNULL, stdout=out, stderr=out, start_new_session=True, env=_env())
+    # wait for the runner's lock while it is still starting; its exit ends the wait at once
+    deadline = time.monotonic() + START_WAIT_S
+    while time.monotonic() < deadline:
+        if runner_alive(d):
+            print(f"runner started (pid {proc.pid})")
+            return 0
+        if proc.poll() is not None:
+            break
+        time.sleep(0.05)
+    if runner_alive(d):     # another start won the race
+        print("runner already running")
+        return 0
+    print(f"runner did not start; see {d / 'runner.out'}", file=sys.stderr)
+    return 1
+
+
+def _owned(spec: dict, project: str, task: str) -> bool:
+    """Whether a job spec is this project's task's: both must match (a job queued before submit recorded
+    its project names none, and is never dropped, since another project may share the runner)."""
+    return bool(task) and str(spec.get("task") or "") == task and bool(project) and spec.get("project") == project
+
+
+def drop(d: Path, project: str, task: str, why: str) -> int:
+    """Drop every job of `project`'s task `task` (the project's daemon calls this once the task ended:
+    taskreap): a queued one ends `cancelled` before it starts, a running one gets a CANCEL marker that
+    its runner honours within poll_s (it stops the job's group and ends it `cancelled`). Prints the jobs
+    as JSON: [{"id", "was": "queued" | "running" | "running-unsupported"}]: the last when the live runner
+    predates CANCEL (no CAN_CANCEL naming its pid), so the job runs on; a runner started later honours it."""
+    _dirs(d)
+    out = []
+    for q in sorted((d / "queue").glob("*.json")):
+        spec = _load(q)
+        if not _owned(spec, project, task):
+            continue
+        job = q.stem.split("-", 1)[1]
+        try:
+            q.replace(d / "done" / f"{job}.spec.json")
+        except FileNotFoundError:
+            continue   # the runner took it meanwhile: it is among the running ones below
+        marker = {"id": job, "status": "cancelled", "rc": None, "log": "", "reason": f"dropped before it started: {why}",
+                  "task": task, "config": spec.get("config", job), "attempts": 0, "drops": [], "started": None,
+                  "finished": _now(), "finished_utc": _utc(), "build": spec.get("build")}
+        _write(d / "done" / f"{job}.json", json.dumps(marker, indent=1))
+        _append(d / "runner.log", f"{_utc()} {job}: cancelled before it started: {why}\n")
+        out.append({"id": job, "was": "queued"})
+    honoured = True
+    if runner_alive(d):
+        try:
+            honoured = (d / CAN_CANCEL).read_text().strip() == (d / "runner.pid").read_text().strip() != ""
+        except OSError:
+            honoured = False
+    for job in _running(d):
+        if _owned(_load(d / "running" / f"{job}.json"), project, task):
+            _write(d / "running" / f"{job}{CANCEL}", why)
+            out.append({"id": job, "was": "running" if honoured else "running-unsupported"})
+    print(json.dumps(out))
+    return 0
+
+
+def clear(d: Path, config: str) -> int:
+    f = d / "configs" / config
+    if f.exists():
+        f.unlink()
+        print(f"cleared the drops of {config}")
+    else:
+        print(f"no drops recorded for {config}")
+    return 0
+
+
+def status(d: Path, job: str = "") -> int:
+    if job:
+        at = where_is(d, job)
+        print(f"{job}: {at}")
+        if at == "done":
+            print((d / "done" / f"{job}.json").read_text().rstrip())
+        elif at == "running":
+            print((d / "running" / f"{job}.state.json").read_text().rstrip()
+                  if (d / "running" / f"{job}.state.json").exists() else "")
+        return 0
+    state = (d / "state").read_text().strip() if (d / "state").exists() else "never ran"
+    print(f"runner: {'alive' if runner_alive(d) else 'not running'}; {state}")
+    for job_ in _running(d):
+        print(f"running: {job_}")
+    for f in sorted((d / "queue").glob("*.json")):
+        print(f"queued:  {f.stem.split('-', 1)[1]}")
+    for f in sorted((d / "configs").glob("*")):
+        print(f"config {f.name}: {len(f.read_text().splitlines())} drop(s) in a row")
+    if (d / "drops.log").exists():
+        print("recent drops:\n" + "".join((d / "drops.log").read_text().splitlines(keepends=True)[-5:]).rstrip())
+    return 0
+
+
+class Runner:
+    """The loop, holding runner.lock for its life."""
+
+    def __init__(self, d: Path):
+        self.d = d
+        self.cfg = settings(_load(d / "config.json"))
+        self._child = None
+        self._keeper = None     # the keeper of the current attempt's lock (keep_lock)
+        self._helper = None     # the health or drop check under way: ended with the runner
+
+    def stop(self, signum, frame) -> None:
+        """TERM, INT or HUP: end the health or drop check under way (its own process group) and exit at
+        once, so nothing of the runner outlives it. Jobs keep running: the next runner adopts them."""
+        if self._helper is not None:
+            _kill_group(self._helper.pid)
+        self.log(f"runner stopped by signal {signum}")
+        raise SystemExit(0)
+
+    @contextlib.contextmanager
+    def steady(self):
+        """Hold off TERM, INT and HUP while the queue's files move, so a stop never leaves a job half moved
+        or started without a record; a signal that came meanwhile acts on the way out."""
+        sigs = {signal.SIGTERM, signal.SIGINT, signal.SIGHUP}
+        old = signal.pthread_sigmask(signal.SIG_BLOCK, sigs)
+        try:
+            yield
+        finally:
+            signal.pthread_sigmask(signal.SIG_SETMASK, old)
+
+    def log(self, msg: str) -> None:
+        with open(self.d / "runner.log", "a") as f:
+            f.write(f"{_utc()} {msg}\n")
+
+    def set_state(self, msg: str) -> None:
+        _write(self.d / "state", f"{_utc()} {msg}\n")
+
+    def sh(self, cmd: str, timeout: float, env: dict | None = None, cwd: str | None = None) -> tuple:
+        """(exit code, last output line) of a shell command in its own group, killed at the timeout."""
+        try:
+            p = subprocess.Popen(["/bin/sh", "-c", cmd], cwd=cwd or str(self.d), stdin=subprocess.DEVNULL,
+                                 stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+                                 env=_env(**(env or {})), start_new_session=True)
+        except OSError as e:
+            return 127, str(e)
+        self._helper = p
+        try:
+            out, _ = p.communicate(timeout=timeout or None)
+        except subprocess.TimeoutExpired:
+            _kill_group(p.pid)
+            p.communicate()
+            return 124, f"timed out after {timeout:.0f} s"
+        finally:
+            self._helper = None
+        lines = [x for x in (out or "").splitlines() if x.strip()]
+        return p.returncode, (lines[-1][:300] if lines else "")
+
+    def healthy(self, need: int, job: str) -> str:
+        """Wait until `need` health checks in a row pass and no disk is over disk_max_pct: "" then, else why
+        the gate gave up."""
+        cmd = self.cfg["health"]
+        t0, passes, last = _now(), 0, None
+        while True:
+            full = disk_full(self.cfg, self.d)        # a disk over disk_max_pct holds the queue too
+            if not full and not cmd.strip():
+                return ""
+            rc, out = (1, "") if full else self.sh(cmd, self.cfg["health_timeout_s"], {"TTP_DEVQ_JOB": job})
+            if rc == 0:
+                passes += 1
+                if passes >= need:
+                    self.set_state(f"{job}: health ok")
+                    return ""
+            else:
+                passes = 0
+                why = full or f"health check exit {rc}" + (f": {out}" if out else "")
+                if why != last:
+                    self.log(f"{job}: waiting: {why}")
+                last = why
+                self.set_state(f"{job}: waiting: {why}")
+                if self.cfg["health_wait_s"] and _now() - t0 >= self.cfg["health_wait_s"]:
+                    return f"the health gate refused for {self.cfg['health_wait_s']:.0f} s ({why})"
+            time.sleep(self.cfg["health_poll_s"])
+
+    def prewarm(self, job: str, spec: dict, st: dict) -> str:
+        """Run the host's prewarm command once for this job, off the device and before the claim: "" when it
+        passed, was skipped or only warned, else why the job is failed unstarted (prewarm_policy refuse)."""
+        cmd = str(self.cfg["prewarm"] or "").strip()
+        if not cmd or st.get("prewarmed"):
+            return ""
+        bad = prewarm_problems(cmd)
+        if bad:
+            return "not started: prewarm " + "; ".join(bad)
+        self.set_state(f"{job}: prewarm")
+        wd = spec.get("workdir") or ""
+        rc, out = self.sh(cmd, self.cfg["prewarm_timeout_s"] or 1800,
+                          {"TTP_DEVQ_JOB": job, "TTP_DEVQ_CONFIG": str(spec.get("config") or job),
+                           "TTP_DEVQ_WORKDIR": wd}, cwd=wd if wd and Path(wd).is_dir() else None)
+        with self.steady():
+            st["prewarmed"] = True
+            self.save(job, st)
+        if rc == 0:
+            return ""
+        why = f"prewarm exit {rc}" + (f": {out}" if out else "")
+        self.log(f"{job}: {why}")
+        return f"not started: {why}" if self.cfg["prewarm_policy"] == "refuse" else ""
+
+    def no_outside_user(self, job: str) -> None:
+        """Wait while an outside device user runs: it may start a device job of its own at any time."""
+        told = False
+        while True:
+            outside = outside_users(self.d, self.cfg["outside_user"])
+            if not outside:
+                return
+            if not told:
+                self.log(f"{job}: waiting: an outside device user still runs ({outside[0]})")
+                told = True
+            self.set_state(f"{job}: waiting: an outside device user still runs ({outside[0]})")
+            time.sleep(self.cfg["health_poll_s"])
+
+    def finish(self, job: str, st: dict, status: str, rc, reason: str, **extra) -> None:
+        with self.steady():
+            self._finish(job, st, status, rc, reason, **extra)
+
+    def _finish(self, job: str, st: dict, status: str, rc, reason: str, **extra) -> None:
+        spec = _load(self.d / "running" / f"{job}.json")
+        marker = {"id": job, "status": status, "rc": rc, "log": st.get("log", ""), "reason": reason,
+                  "task": spec.get("task", ""), "config": spec.get("config", job),
+                  "attempts": st.get("attempts", 0), "drops": st.get("drops", []),
+                  "started": st.get("started"), "finished": _now(), "finished_utc": _utc(),
+                  "build": spec.get("build"), "preempts": st.get("preempts", 0), **extra}
+        changed = stamp_changes(spec.get("build"), st.get("build_at_start"))
+        if changed:
+            marker["build_changed"] = changed
+        _write(self.d / "done" / f"{job}.json.t", json.dumps(marker, indent=1))
+        (self.d / "running" / f"{job}.json").replace(self.d / "done" / f"{job}.spec.json")
+        for leftover in [self.d / "running" / f"{job}.state.json", self.d / "running" / f"{job}{CANCEL}",
+                         self.d / "running" / f"{job}.yielded", *(self.d / "running").glob(f"{job}.*.broker"),
+                         *(self.d / "running").glob(f"{job}.*.rc"),
+                         *(self.d / "running").glob(f"{job}.*.lock")]:
+            _rm(leftover)
+        (self.d / "done" / f"{job}.json.t").replace(self.d / "done" / f"{job}.json")
+        self.log(f"{job}: {status} rc={rc} {reason}")
+
+    def save(self, job: str, st: dict) -> None:
+        _write(self.d / "running" / f"{job}.state.json", json.dumps(st, indent=1))
+
+    def launch(self, job: str, spec: dict, st: dict) -> None:
+        with self.steady():
+            self._launch(job, spec, st)
+
+    def _launch(self, job: str, spec: dict, st: dict) -> None:
+        """Start one attempt in a session of its own. A keeper holds its lock while its wrapper lives, so a
+        runner started after this one died can tell a job still running from one a reboot killed. The
+        job never gets the lock: a process it left running (a server, a `setsid ... &`) would keep it
+        after the job, and the next runner would wait on a job long gone. The attempt is recorded before
+        the job starts, so a runner that dies at any point leaves its successor a job to adopt, never one
+        it cannot see; the job writes its pid into the lock file."""
+        n = st.get("attempts", 0) + 1
+        logf, rcf, lockf = (self.d / "logs" / f"{job}.{n}.log", self.d / "running" / f"{job}.{n}.rc",
+                            self.d / "running" / f"{job}.{n}.lock")
+        lock = open(lockf, "a")
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        wrapper = ('o="$1" r="$2" c="$3" l="$4"; echo $$ >"$l"; /bin/sh -c "$c" >>"$o" 2>&1 </dev/null; e=$?; '
+                   'echo $e >"$r.tmp"; mv "$r.tmp" "$r"')
+        before = {k: st[k] for k in ("attempts", "log", "cur") if k in st}
+        env = {"TTP_DEVQ_JOB": job, "TTP_DEVQ_CONFIG": str(spec["config"]),
+               "TTP_DEVQ_TIMEOUT_S": str(int(self.limit(spec))), "TTP_DEVQ_PREEMPTS": str(st.get("preempts", 0)),
+               "TTP_DEVQ_YIELD_FILE": str((self.d / "running" / f"{job}.yielded").absolute())}
+        cmd, brokered = spec["cmd"], broker_on(self.cfg) and not calls_broker(spec)
+        if brokered:   # the broker passes on only its own env names: ours go in the command
+            cmd = broker_wrap(cmd, env, int(self.limit(spec)), str(self.d / "running" / f"{job}.{n}.broker"))
+        st.update(attempts=n, log=str(logf), cur={"n": n, "pid": None, "rc": str(rcf), "lock": str(lockf),
+                                                  "log": str(logf), "started": _now(), "broker": brokered})
+        try:
+            self.save(job, st)
+            p = subprocess.Popen(["/bin/sh", "-c", wrapper, "sh", str(logf), str(rcf), cmd, str(lockf)],
+                                 cwd=spec.get("workdir") or str(Path.home()), stdin=subprocess.DEVNULL,
+                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True,
+                                 env=_env(**env))
+            self._keeper = keep_lock(lock, p.pid)
+            if self._keeper is None:
+                _kill_group(p.pid)
+                p.wait()
+                raise OSError("could not start the keeper of its lock")
+        except OSError:
+            for k in ("attempts", "log", "cur"):
+                st.pop(k, None)
+            st.update(before)
+            raise
+        finally:
+            lock.close()
+        st["cur"]["pid"] = p.pid
+        self.save(job, st)
+        self.log(f"{job}: attempt {n} started (pid {p.pid})")
+        self.set_state(f"{job}: running attempt {n}")
+        self._child = p
+
+    def limit(self, spec: dict) -> float:
+        """A job's time limit in seconds (0 = none): its own timeout_s, else the runner's job_timeout_s,
+        else the box's reservation cap. The job sees it as TTP_DEVQ_TIMEOUT_S, to size the timeouts of
+        what it starts within it."""
+        return job_limit(spec, self.cfg)
+
+    def wait(self, job: str, spec: dict, st: dict) -> tuple:
+        """(rc, how) of the current attempt: how is "" (it ended), "timeout", "wedged" (its output matched
+        a wedge pattern, recorded in cur["wedge"]; it was stopped), "cancelled" (drop asked for it; it was
+        stopped) or "interrupted" (it is gone without an exit code: killed, or the host restarted)."""
+        cur = st["cur"]
+        rcf, lockf = Path(cur["rc"]), Path(cur["lock"])
+        limit = self.limit(spec)
+        child = self._child
+        patterns, seen = [], 0
+        for x in wedge_patterns(spec, self.cfg) or []:
+            try:
+                patterns.append(re.compile(x))
+            except (re.error, TypeError) as e:
+                self.log(f"{job}: wedge pattern {x!r} ignored: {e}")
+        while True:
+            if child is not None:
+                child.poll()      # reap it (its keeper releases the lock once it ends)
+            if self._keeper is not None:
+                self._keeper.poll()
+            if self.cancelled(job) is not None and not rcf.exists():
+                broker_kill(cur)
+                pid = cur.get("pid") or _lock_pid(lockf)
+                if pid and not _free(lockf):
+                    _kill_group(pid)
+                if child is not None:
+                    child.poll()
+                return None, "cancelled"
+            if rcf.exists():
+                try:
+                    return int(rcf.read_text().strip()), ""
+                except ValueError:
+                    return 1, ""
+            if _free(lockf):
+                if rcf.exists():
+                    continue
+                return None, "interrupted"
+            if patterns:
+                seen, hit = scan_wedge(Path(cur["log"]), seen, patterns)
+                if hit:
+                    broker_kill(cur)
+                    pid = cur.get("pid") or _lock_pid(lockf)
+                    if pid:
+                        _kill_group(pid)
+                    if child is not None:
+                        child.poll()
+                    cur["wedge"] = {"pattern": hit[0], "line": hit[1]}
+                    return None, "wedged"
+            if limit and not cur.get("broker") and _now() - cur["started"] >= limit:   # the broker ends its own
+                pid = cur.get("pid") or _lock_pid(lockf)
+                if pid:
+                    _kill_group(pid)
+                return 124, "timeout"
+            time.sleep(self.cfg["poll_s"])
+
+    def preempted(self, job: str, st: dict) -> bool:
+        """Whether the attempt that just ended yielded the device: it wrote the yield marker, or the broker
+        preempted it (the end line `tt-device-mcp wait` logs)."""
+        if (self.d / "running" / f"{job}.yielded").exists():
+            return True
+        try:
+            with open(st["cur"]["log"], "rb") as f:
+                f.seek(max(0, os.path.getsize(st["cur"]["log"]) - 65536))
+                return bool(PREEMPTED_RE.search(f.read().decode(errors="replace")))
+        except OSError:
+            return False
+
+    def cancelled(self, job: str) -> str | None:
+        """The reason of a drop asked for this job (drop), else None."""
+        try:
+            return (self.d / "running" / f"{job}{CANCEL}").read_text().strip() or "its task ended"
+        except OSError:
+            return None
+
+    def drops_in_a_row(self, config: str) -> list:
+        f = self.d / "configs" / config
+        return f.read_text().splitlines() if f.exists() else []
+
+    def record_drop(self, job: str, spec: dict, st: dict, rc, how: str, evidence: str) -> None:
+        line = (f"utc={_utc()} job={job} task={spec.get('task', '')} config={spec['config']} attempt={st['cur']['n']} "
+                f"rc={rc} kind={how or 'drop'} evidence=\"{evidence[:300]}\"")
+        _append(self.d / "drops.log", line + "\n")
+        _append(self.d / "configs" / spec["config"], f"{_utc()} {job} attempt {st['cur']['n']}\n")
+        st.setdefault("drops", []).append(f"{_utc()} attempt {st['cur']['n']} rc={rc} {how or 'drop'}")
+        self.log(f"{job}: DROP attempt {st['cur']['n']} rc={rc} {how or ''} {evidence[:200]}")
+
+    def run_job(self, job: str) -> None:
+        spec = _load(self.d / "running" / f"{job}.json")
+        if not spec.get("cmd"):
+            self.finish(job, {}, "failed", None, "the job spec is unreadable")
+            return
+        spec.setdefault("config", job)
+        st = _load(self.d / "running" / f"{job}.state.json")
+        st.setdefault("started", _now())
+        need = 1
+        if st.get("cur"):
+            self.log(f"{job}: resuming after a runner restart")
+            if not st["cur"].get("pid") and _lock_pid(Path(st["cur"]["lock"])):
+                st["cur"]["pid"] = _lock_pid(Path(st["cur"]["lock"]))
+                self.save(job, st)
+        while True:
+            if not st.get("cur"):
+                why = self.cancelled(job)
+                if why is not None:
+                    self.finish(job, st, "cancelled", None, f"dropped before it started: {why}")
+                    return
+                too_long = over_cap(spec, self.cfg)
+                if too_long:
+                    self.finish(job, st, "failed", None, f"not started: {too_long}")
+                    return
+                drops = self.drops_in_a_row(spec["config"])
+                if len(drops) >= int(self.cfg["max_drops"] or 0) > 0:
+                    self.finish(job, st, "skipped", None,
+                                f"config {spec['config']} dropped {len(drops)} times in a row; "
+                                f"`ttp devq clear <runner> {spec['config']}` allows it again")
+                    return
+                why = self.prewarm(job, spec, st)
+                if why:
+                    self.finish(job, st, "failed", None, why)
+                    return
+                self.no_outside_user(job)
+                why = self.healthy(need, job)
+                if why:
+                    self.finish(job, st, "skipped", None, why)
+                    return
+                if "build" in spec:   # the build as the job starts: the tree may have moved since submit
+                    st["build_at_start"] = build_stamp(spec.get("workdir") or "",
+                                                       spec.get("artifact") or self.cfg["build_artifact"])
+                try:
+                    self.launch(job, spec, st)
+                except OSError as e:
+                    self.finish(job, st, "failed", None, f"could not start the job: {e}")
+                    return
+            rc, how = self.wait(job, spec, st)
+            self._child = None
+            if self._keeper is not None:   # it ends with the wrapper: reaped, never left a zombie
+                with contextlib.suppress(subprocess.TimeoutExpired):
+                    self._keeper.wait(timeout=10)
+                self._keeper = None
+            if how == "cancelled":
+                self.finish(job, st, "cancelled", None, f"stopped: {self.cancelled(job) or 'its task ended'}")
+                return
+            if how == "" and self.preempted(job, st):   # rerun at once, ahead of the queue: no drop, no failure
+                with self.steady():
+                    st["preempts"] = st.get("preempts", 0) + 1
+                    _rm(self.d / "running" / f"{job}.yielded")
+                    st["cur"] = None
+                    self.save(job, st)
+                if st["preempts"] > int(self.cfg["max_preempts"] or 0):
+                    self.finish(job, st, "failed", rc, f"preempted {st['preempts']} times (max_preempts)")
+                    return
+                self.log(f"{job}: preempted ({st['preempts']} so far); running it again")
+                continue
+            evidence = ""
+            if how == "interrupted":
+                evidence = "the job is gone without an exit code (killed, or the host restarted)"
+            elif rc != 0 and self.cfg["drop_check"].strip():
+                drc, out = self.sh(self.cfg["drop_check"], self.cfg["health_timeout_s"],
+                                   {"TTP_DEVQ_JOB": job, "TTP_DEVQ_RC": str(rc), "TTP_DEVQ_LOG": st["cur"]["log"],
+                                    "TTP_DEVQ_STARTED": str(int(st["cur"]["started"])),
+                                    "TTP_DEVQ_CONFIG": spec["config"]})
+                evidence = out if drc == 0 else ""
+                how = "drop" if drc == 0 else how
+            if how in ("interrupted", "drop"):
+                with self.steady():
+                    self.record_drop(job, spec, st, rc, how, evidence)
+                    st["cur"] = None
+                    self.save(job, st)
+                need = 2
+                continue
+            if how == "wedged":
+                w = st["cur"]["wedge"]
+                _append(self.d / "drops.log", f"utc={_utc()} job={job} task={spec.get('task', '')} "
+                        f"config={spec['config']} attempt={st['cur']['n']} kind=wedged "
+                        f"pattern=\"{w['pattern']}\" evidence=\"{w['line'][:300]}\"\n")
+                self.finish(job, st, "wedged", None, f"wedged: output matched {w['pattern']!r}: {w['line'][:200]}",
+                            wedge=w)
+                return
+            _rm(self.d / "configs" / spec["config"])
+            if how == "timeout":
+                self.finish(job, st, "failed", rc, f"timed out after {self.limit(spec):.0f} s")
+            elif rc == 0:
+                self.finish(job, st, "done", 0, "completed")
+            else:
+                self.finish(job, st, "failed", rc, f"exit {rc}")
+            return
+
+    def next_job(self) -> str:
+        """The job to run now: one left running (its runner died), else the oldest queued urgent one (an
+        urgent task's, spec `urgent`), else the oldest queued. A running job is never interrupted."""
+        running = _running(self.d)
+        if running:
+            return running[0]
+        for q in sorted((self.d / "queue").glob("*.json"), key=lambda f: (not _urgent_job(f), f.name)):
+            job = q.stem.split("-", 1)[1]
+            with self.steady():
+                try:
+                    q.replace(self.d / "running" / f"{job}.json")
+                except FileNotFoundError:
+                    continue   # dropped meanwhile (drop)
+                self.log(f"{job}: dequeued")
+            return job
+        return ""
+
+    def loop(self) -> int:
+        _dirs(self.d)
+        lock = open(self.d / "runner.lock", "a")
+        if not _take_lock(lock):
+            return 0
+        for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+            signal.signal(sig, self.stop)
+        _write(self.d / "runner.pid", f"{os.getpid()}\n")
+        _write(self.d / CAN_CANCEL, f"{os.getpid()}\n")   # drop: this runner honours CANCEL
+        self.log(f"runner started (pid {os.getpid()})")
+        idle_since = _now()
+        while True:
+            self.cfg = settings(_load(self.d / "config.json"))
+            job = self.next_job()
+            if job:
+                self.cfg = settings(_load(self.d / "config.json"))  # as of the dequeue, not the poll before it
+                # Read again after the dequeue: submit writes the settings before the job, so a job
+                # queued since the read above runs with the settings of its own submit.
+                self.cfg = settings(_load(self.d / "config.json"))
+                self.cfg = settings(_load(self.d / "config.json"))   # as written by the submit that queued it
+                self.run_job(job)
+                idle_since = _now()
+                continue
+            self.set_state("idle")
+            if _now() - idle_since >= self.cfg["idle_exit_s"]:
+                # A submit that queued a job after the look above, while this runner still held its lock,
+                # found it alive and started none. Let the lock go first, then look again: a job queued by
+                # then is this runner's to run (the lock taken back), unless the runner its submit
+                # started holds the lock already. Either this look or that submit's start sees the other.
+                lock.close()
+                if not _running(self.d) and not any((self.d / "queue").glob("*.json")):
+                    self.log(f"idle {self.cfg['idle_exit_s']:.0f} s, exiting")
+                    return 0
+                lock = open(self.d / "runner.lock", "a")
+                if not _take_lock(lock):
+                    self.log(f"idle {self.cfg['idle_exit_s']:.0f} s, exiting: another runner took the queue")
+                    return 0
+                _write(self.d / "runner.pid", f"{os.getpid()}\n")
+                _write(self.d / CAN_CANCEL, f"{os.getpid()}\n")
+                self.log("a job came as this runner went idle: running on")
+                idle_since = _now()
+                continue
+            time.sleep(self.cfg["poll_s"])
+
+
+_KEEPER = (
+    "import os, select, signal, sys, time\n"
+    "for s in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):\n"
+    "    signal.signal(s, signal.SIG_IGN)\n"
+    "pid, pfd = int(sys.argv[1]), int(sys.argv[2])\n"
+    "if pfd >= 0:\n"
+    "    select.select([pfd], [], [])\n"
+    "else:\n"
+    "    while True:\n"
+    "        try:\n"
+    "            os.kill(pid, 0)\n"
+    "        except ProcessLookupError:\n"
+    "            break\n"
+    "        except OSError:\n"
+    "            pass\n"
+    "        time.sleep(0.5)\n")
+
+
+def keep_lock(lock, pid: int):
+    """A process of its own session that holds the open file `lock` until process `pid` ends (a pidfd,
+    else a 0.5 s poll), ignoring SIGINT, SIGTERM and SIGHUP, so the lock outlives the runner but never
+    `pid`: the runner's job lock (as locks.keep_open does for `ttp lock`). None if it cannot start."""
+    try:
+        pfd = os.pidfd_open(pid)
+    except (AttributeError, OSError):
+        pfd = -1
+    try:
+        # own session: the keeper must outlive the runner it guards and ignores its signals; it ends with `pid`
+        return subprocess.Popen([sys.executable, "-I", "-S", "-c", _KEEPER, str(pid), str(pfd)],
+                                pass_fds=(lock.fileno(), *([pfd] if pfd >= 0 else [])), stdin=subprocess.DEVNULL,
+                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+    except OSError:
+        return None
+    finally:
+        if pfd >= 0:
+            os.close(pfd)
+
+
+def _lock_pid(lock: Path) -> int | None:
+    """The pid a job wrote into its lock file: the one record of it when its runner died before saving it."""
+    try:
+        return int(lock.read_text().strip()) or None
+    except (OSError, ValueError):
+        return None
+
+
+def _kill_group(pid: int) -> None:
+    for sig, pause in ((signal.SIGTERM, 5.0), (signal.SIGKILL, 0)):
+        try:
+            os.killpg(pid, sig)
+        except OSError:
+            return
+        end = _now() + pause
+        while _now() < end:
+            try:
+                os.killpg(pid, 0)
+            except OSError:
+                return
+            time.sleep(0.1)
+
+
+def main(argv: list) -> int:
+    """python3 devq.py <run|start|submit|probe|status|clear|drop> <dir> [args]: the host side of `ttp devq`."""
+    if len(argv) < 2:
+        print(main.__doc__, file=sys.stderr)
+        return 2
+    op, d = argv[0], Path(os.path.expanduser(argv[1]))
+    rest = argv[2:]
+    if op == "run":
+        return Runner(d).loop()
+    if op == "start":
+        return start(d, json.loads(rest[0]) if rest else {})
+    if op == "submit":
+        return submit(d, json.loads(rest[0]), json.loads(rest[1]))
+    if op == "probe":
+        return probe(d, rest[0])
+    if op == "status":
+        return status(d, rest[0] if rest else "")
+    if op == "clear":
+        return clear(d, rest[0])
+    if op == "drop":
+        return drop(d, rest[0], rest[1], rest[2] if len(rest) > 2 else "its task ended")
+    print(f"devq: unknown op {op}", file=sys.stderr)
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

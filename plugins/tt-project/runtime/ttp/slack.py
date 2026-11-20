@@ -1,0 +1,263 @@
+# SPDX-FileCopyrightText: © 2026 Tenstorrent USA, Inc.
+# SPDX-License-Identifier: Apache-2.0
+"""Slack as a notification and inbox channel, with the standard library only.
+
+One Slack app per user, shared by all of that user's projects. The bot DMs the user; messages
+the user sends to the bot are polled from that DM (no public endpoint, no websocket, works from
+any on-prem box). Routing between projects:
+- the bot posts every project message as `[<project>] ...`;
+- a reply in that message's thread belongs to that project;
+- a top-level DM starting with `<project>:` goes to that project;
+- a top-level DM without a prefix goes to the only project, or is answered with a list of names.
+Each daemon only consumes messages routed to its own project, so several projects on several
+machines can share one bot without a central server.
+"""
+from __future__ import annotations
+
+import json
+import re
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+from typing import Any
+
+API = "https://slack.com/api/"
+THREAD_WINDOW_S = 7 * 86400   # replies to posts older than this are not looked for
+THREAD_SCAN_S = 60            # how often all posts of that window are checked for new replies
+MAX_PAGES = 20
+
+
+class SlackError(Exception):
+    def __init__(self, msg: str, method: str = "", code: str | None = None):
+        super().__init__(msg)
+        self.method = method
+        self.code = code   # Slack's `error` from an ok=false reply; None for HTTP and network errors
+
+
+# chat.postMessage errors caused by the message itself: retrying the same message cannot succeed.
+# Auth, rate-limit and service errors are left out so an outage never drops a message.
+REJECTED_MESSAGE = frozenset({
+    "no_text", "msg_too_long", "msg_blocks_too_long", "invalid_blocks", "invalid_blocks_format",
+    "invalid_attachments", "too_many_attachments", "invalid_metadata_format",
+    "invalid_metadata_schema", "metadata_too_large", "markdown_text_conflict"})
+
+
+class Slack:
+    def __init__(self, bot_token: str, user_id: str | None = None, user_email: str | None = None):
+        self.token = bot_token
+        self.user_id = user_id
+        self.user_email = user_email
+        self._dm: str | None = None
+        self._bot: str | None = None
+
+    def call(self, method: str, **params: Any) -> dict:
+        data = urllib.parse.urlencode({k: v if isinstance(v, str) else json.dumps(v)
+                                       for k, v in params.items() if v is not None}).encode()
+        req = urllib.request.Request(API + method, data=data, headers={
+            "Authorization": f"Bearer {self.token}",
+            "Content-Type": "application/x-www-form-urlencoded"})
+        for attempt in range(3):
+            try:
+                with urllib.request.urlopen(req, timeout=20) as r:
+                    out = json.loads(r.read().decode())
+            except urllib.error.HTTPError as e:
+                if e.code == 429 and attempt < 2:
+                    time.sleep(int(e.headers.get("Retry-After", "5")))
+                    continue
+                raise SlackError(f"HTTP {e.code} on {method}", method) from None
+            if not out.get("ok"):
+                raise SlackError(f"{method}: {out.get('error')}", method, out.get("error"))
+            return out
+        raise SlackError(f"{method}: rate limited", method)
+
+    def resolve_user(self) -> str:
+        if not self.user_id:
+            if not self.user_email:
+                raise SlackError("no Slack user id or email configured")
+            self.user_id = self.call("users.lookupByEmail", email=self.user_email)["user"]["id"]
+        return self.user_id
+
+    def bot_id(self) -> str | None:
+        """The bot id of this token's app: its own posts carry it as `bot_id`."""
+        if not self._bot:
+            self._bot = self.call("auth.test").get("bot_id")
+        return self._bot
+
+    def dm_channel(self) -> str:
+        if not self._dm:
+            self._dm = self.call("conversations.open", users=self.resolve_user())["channel"]["id"]
+        return self._dm
+
+    @staticmethod
+    def _body(project: str, text: str, thread_ts: str | None) -> str:
+        from .outscan import mask_shapes
+        from .redact import scrub
+        return mask_shapes(scrub(text if thread_ts else f"[{project}] {text}"))[:39000]
+
+    def post(self, project: str, text: str, thread_ts: str | None = None) -> str:
+        return self.call("chat.postMessage", channel=self.dm_channel(), text=self._body(project, text, thread_ts),
+                         thread_ts=thread_ts, unfurl_links=False)["ts"]
+
+    def find_post(self, project: str, text: str, thread_ts: str | None = None, since: float = 0.0,
+                  known: Any = ()) -> str | None:
+        """The ts of this bot's post of `text`, as post() sends it, from `since` on (a minute's slack for
+        clock skew) and not in `known` (posts already recorded); None if there is none. A sender that died
+        between a post and recording it looks here before posting again."""
+        from .prguard import _slack_plain
+        want = " ".join(self._body(project, text, thread_ts).split())
+        oldest = f"{since - 60:.6f}"
+        if thread_ts:
+            msgs = self._pages("conversations.replies", channel=self.dm_channel(), ts=thread_ts, oldest=oldest)
+        else:
+            msgs = self._pages("conversations.history", channel=self.dm_channel(), oldest=oldest)
+        bot = self.bot_id()
+        for m in sorted(msgs, key=lambda m: float(m["ts"])):
+            if (m.get("bot_id") and m.get("bot_id") == bot and m["ts"] != thread_ts and m["ts"] not in known
+                    and want in (" ".join(t.split()) for t in _slack_plain(m.get("text") or ""))):
+                return m["ts"]
+        return None
+
+    @staticmethod
+    def rejected_message(e: Exception) -> bool:
+        """Whether Slack refused this particular message, as opposed to being unreachable."""
+        return isinstance(e, SlackError) and e.method == "chat.postMessage" and e.code in REJECTED_MESSAGE
+
+    @staticmethod
+    def not_posted(e: Exception) -> bool:
+        """Whether a failed post surely posted nothing: Slack answered it with ok=false. A network or
+        HTTP error leaves that open (the post may have gone through before the answer was lost)."""
+        return isinstance(e, SlackError) and e.method == "chat.postMessage" and e.code is not None
+
+    def poll(self, oldest: str) -> tuple[list[dict], list[dict]]:
+        """Top-level messages the user wrote in the DM after `oldest`, oldest first, and every post
+        after `oldest` (thread parents). A backlog longer than one page is read whole."""
+        posts = self._pages("conversations.history", channel=self.dm_channel(), oldest=oldest)
+        uid = self.resolve_user()
+        top = [m for m in posts if m.get("user") == uid and m.get("thread_ts") in (None, m["ts"])]
+        return sorted(top, key=lambda m: float(m["ts"])), posts
+
+    def recent_posts(self) -> list[dict]:
+        """The DM's posts of the last THREAD_WINDOW_S. A reply never moves its parent, so threads with
+        new replies are looked for among all of these, not only among posts after the read cursor."""
+        return self._pages("conversations.history", channel=self.dm_channel(),
+                           oldest=f"{time.time() - THREAD_WINDOW_S:.6f}")
+
+    def new_replies(self, parents: list[dict], read: dict[str, str], floor: str) -> list[tuple[str, list[dict]]]:
+        """(parent ts, replies oldest first) for each thread with replies after its own read position,
+        `read[parent ts]`, or `floor` for a thread not read yet. Every thread keeps its own position,
+        so a reply is never skipped because a newer message elsewhere was read first."""
+        ch, out = self.dm_channel(), []
+        for parent in {m["ts"]: m for m in parents}.values():
+            pos = read.get(parent["ts"], floor)
+            if parent.get("reply_count") and float(parent.get("latest_reply", "0")) > float(pos):
+                reps = [r for r in self._pages("conversations.replies", channel=ch, ts=parent["ts"], oldest=pos)
+                        if r["ts"] != parent["ts"] and float(r["ts"]) > float(pos)]
+                if reps:
+                    out.append((parent["ts"], sorted(reps, key=lambda r: float(r["ts"]))))
+        return out
+
+    def message(self, ts: str) -> dict | None:
+        """The DM message with this ts, top-level or in a thread, as Slack has it now; None if none."""
+        try:
+            got = self.call("conversations.replies", channel=self.dm_channel(), ts=ts, oldest=ts, latest=ts,
+                            inclusive=True, limit=10)
+        except SlackError as e:
+            if e.code in ("thread_not_found", "message_not_found"):
+                return None
+            raise
+        for m in got.get("messages", []):
+            if m.get("ts") == ts:
+                return m
+        return None
+
+    def _pages(self, method: str, **params: Any) -> list[dict]:
+        msgs: list[dict] = []
+        cursor = None
+        for _ in range(MAX_PAGES):
+            page = self.call(method, limit=200, cursor=cursor, **params)
+            msgs += page.get("messages", [])
+            cursor = (page.get("response_metadata") or {}).get("next_cursor")
+            if not cursor:
+                break
+        return msgs
+
+
+def from_config(cfg: dict) -> Slack | None:
+    """The user's Slack client when this project uses Slack, else None."""
+    if not cfg.get("notify", {}).get("slack"):
+        return None
+    from .project import load_secrets
+    sec = load_secrets().get("slack") or {}
+    return Slack(sec["bot_token"], sec.get("user_id"), sec.get("user_email")) if sec.get("bot_token") else None
+
+
+# Slack is optional: how a user sets it up, said wherever its state is shown.
+SETUP = ("`ttp secret slack --email <your Slack email>` saves a bot token for this user; "
+         "`ttp config <project> notify.slack true` turns it on for a project")
+
+
+def status(cfg: dict, last_error: dict | None = None) -> dict:
+    """Slack for one project, for the web app and `ttp doctor`: {"state", "line"}. state is on, error
+    (on, but its last send failed: `last_error`, cleared by the next good send), off (a bot is saved
+    but this project does not use it), no_token (on in the config, no bot saved), not_configured or
+    unreadable (the secrets store cannot be read here, as in a worker sandbox)."""
+    from .project import SecretsUnreadable, load_secrets
+    try:
+        saved = bool((load_secrets().get("slack") or {}).get("bot_token"))
+    except SecretsUnreadable:   # read-only status in a worker sandbox: skip what it cannot read
+        return {"state": "unreadable", "line": "Slack: unknown here (the secrets store cannot be read)"}
+    notify = cfg.get("notify") or {}
+    if notify.get("slack") and saved:
+        line = f"Slack: on; messages at {notify.get('slack_min_severity', 'high')} severity and above go to your Slack DM"
+        if last_error:
+            return {"state": "error", "line": f"{line}; the last send failed: {last_error.get('error')}",
+                    "since": last_error.get("ts")}
+        return {"state": "on", "line": line}
+    if saved:
+        return {"state": "off", "line": "Slack: a bot is saved but this project does not use it (optional): "
+                                        "`ttp config <project> notify.slack true` turns it on"}
+    if notify.get("slack"):
+        return {"state": "no_token", "line": "Slack: on in this project's config but no bot token is saved on "
+                                             "this machine: `ttp secret slack --email <your Slack email>`"}
+    return {"state": "not_configured", "line": f"Slack: not configured (optional). {SETUP}"}
+
+
+def send_test(project: str = "tt-project") -> tuple[bool, str]:
+    """Post one test message to the user's Slack DM with the saved bot: (sent, what happened, with
+    Slack's exact error when it failed)."""
+    from .project import load_secrets
+    sec = load_secrets().get("slack") or {}
+    if not sec.get("bot_token"):
+        return False, f"Slack is not configured (optional): {SETUP}"
+    s = Slack(sec["bot_token"], sec.get("user_id"), sec.get("user_email"))
+    try:
+        s.call("auth.test")
+        s.post(project, "Test message: tt-project notifications reach you on Slack.")
+    except SlackError as e:
+        return False, f"Slack test failed: {e}"
+    except (OSError, ValueError) as e:   # no network, a TLS or proxy fault, a reply that is not JSON
+        return False, f"Slack test failed: could not reach Slack: {e}"
+    return True, f"sent a test message to your Slack DM (user {s.user_id})"
+
+
+PREFIX = re.compile(r"^\s*([A-Za-z0-9][A-Za-z0-9._-]{0,62})\s*:\s*(.+)$", re.S)
+BOT_TAG = re.compile(r"^\[([A-Za-z0-9][A-Za-z0-9._-]{0,62})\] ")
+
+
+def projects_in_dm(history: list[dict]) -> list[str]:
+    """Every project that has posted in this DM, so each daemon knows its siblings on other
+    machines without a shared server. The first name alphabetically answers ambiguous messages."""
+    return sorted({m.group(1) for h in history if h.get("bot_id") and (m := BOT_TAG.match(h.get("text", "")))})
+
+
+def route(msg: dict, project: str, own_threads: set[str], all_projects: list[str]) -> str | None:
+    """Return the message text if it belongs to `project`, else None."""
+    text = (msg.get("text") or "").strip()
+    thread = msg.get("thread_ts")
+    if thread and thread != msg.get("ts"):
+        return text if thread in own_threads else None
+    m = PREFIX.match(text)
+    if m and m.group(1).lower() in {p.lower() for p in all_projects}:
+        return m.group(2).strip() if m.group(1).lower() == project.lower() else None
+    return text if len(all_projects) == 1 and all_projects[0] == project else None

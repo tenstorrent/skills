@@ -1,0 +1,1476 @@
+# Planned host cycle tests of tests/test_tt_project_runtime.py, which runs this file in its own
+# namespace (see _include_cases there): helpers, fixtures and imports come from that file, and pytest
+# collects these tests under its name. Add new host-cycle hold tests here, not there.
+from __future__ import annotations
+
+
+def _hold_setup(env, monkeypatch):
+    """Two projects on this host (testhost, listed in `ttp machines`): `demo` drains for a reboot,
+    `other` is a co-tenant."""
+    from ttp import machines as mm
+    p, q = make(env), _second_project(env)
+    mm.add("testhost")
+    for k in ("TTP_PROJECT", "TTP_RUN_ID", "TTP_RUN_DIR", "TTP_TASK"):
+        monkeypatch.delenv(k, raising=False)
+    return p, q
+
+
+def _hold_daemon(base, calls):
+    """A Daemon whose dispatch and start_pushes only record that they ran."""
+    from ttp.daemon import Daemon
+    d = Daemon(base)
+    d.dispatch = lambda: calls.append("dispatch")
+    d.start_pushes = lambda: calls.append("push")
+    d.maybe_coordinate = lambda: calls.append("coordinate")
+    return d
+
+
+def test_drain_reboot_holds_new_runs_checks_and_pushes_in_every_project_on_the_host(env, monkeypatch, capsys, tmp_path):
+    from ttp import cli, hostcycle
+    from ttp import coordinator as coord
+    from ttp import machine_ledger as ml
+    from ttp.runner import boot_id
+    p, q = _hold_setup(env, monkeypatch)
+    calls: list[str] = []
+    d = _hold_daemon(q.base, calls)
+    d.tick()
+    assert "dispatch" in calls and "push" in calls, "no cycle announced: work starts as usual"
+    now = time.time()
+    cli.main(["drain", "demo", "--reboot", "firmware update"])
+    out = capsys.readouterr().out
+    (c,) = ml.changes(["testhost"])
+    assert c["kind"] == ml.POWER_CYCLE and c["by"] == "demo" and c["boot"] == boot_id() \
+        and c["reason"] == "firmware update" and c["at"] == pytest.approx(now + 1, abs=5)
+    assert f"machine change #{c['id']}" in out and "planned host cycle recorded" in out
+    (f,) = (p.state / hostcycle.FOLDER).glob("*/record.json")
+    assert json.loads(f.read_text())["intent"] == c["id"]
+    cli.main(["drain", "demo", "--reboot", "firmware update"])
+    assert "already announced by demo" in capsys.readouterr().out and len(ml.changes()) == 1, "one intent per cycle"
+    # The co-tenant's daemon starts no worker run or push; its coordinator still runs.
+    calls.clear()
+    d.tick()
+    assert "coordinate" in calls and "dispatch" not in calls and "push" not in calls, calls
+    # Status and digest say so.
+    line = hostcycle.hold_line(c, q)
+    assert line.startswith("holding new runs: planned host cycle by demo at ") and line.endswith("(firmware update)")
+    assert line in cli.status_text(q) and line in coord.digest(q, {}, [], [])
+    # `ttp checks` starts nothing new.
+    monkeypatch.setenv("TTP_PROJECT", str(q.base))
+    monkeypatch.setenv("TTP_RUN_DIR", str(tmp_path))
+    with pytest.raises(SystemExit) as e:
+        cli.main(["checks", "--", "true"])
+    assert e.value.code == 75 and "ttp checks: not started, holding new runs" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("lift", ["timeout", "closed", "new_boot", "no_reboot"])
+def test_the_host_cycle_hold_lifts(env, monkeypatch, capsys, lift):
+    """The hold ends once the intent closes, a new boot is seen, its record says no reboot (the daemon
+    closes it), or POWER_CYCLE_LEAD_S after its time; that last adds one low feed line."""
+    from ttp import cli, hostcycle, runner
+    from ttp import machine_ledger as ml
+    p, q = _hold_setup(env, monkeypatch)
+    cli.main(["drain", "demo", "--reboot", "bus reset", "--wait", "0"])
+    capsys.readouterr()
+    (c,) = ml.changes()
+    calls: list[str] = []
+    d = _hold_daemon(q.base, calls)
+    now = c["at"]
+    assert d.host_cycle_held(now)["id"] == c["id"]
+    assert hostcycle.hold(q, c["at"] - ml.POWER_CYCLE_LEAD_S - 1) is None, "not due yet"
+    if lift == "timeout":
+        now = c["at"] + ml.POWER_CYCLE_LEAD_S
+    elif lift == "closed":
+        ml.close_change(c["id"], "done")
+    elif lift == "new_boot":
+        monkeypatch.setattr(runner, "boot_ids", lambda: ("a-later-boot", "a-later-boot"))
+    else:
+        (f,) = (p.state / hostcycle.FOLDER).glob("*/record.json")
+        f.write_text(json.dumps({**json.loads(f.read_text()), "rebooted": False}))
+    feed = "SELECT text FROM messages WHERE kind='info' AND severity='low' AND text LIKE '%did not come%'"
+    assert d.host_cycle_held(now) is None and hostcycle.hold(q, now) is None
+    assert d.host_cycle_held(now) is None
+    assert len(q.db.q(feed)) == (1 if lift == "timeout" else 0), "one low feed line, only on a timeout lift"
+    if lift == "no_reboot":
+        assert not ml.changes() and "no reboot" in ml.changes(open_only=False)[0]["closed_why"]
+    if lift != "timeout":   # the tick reads the real clock, still inside the timeout's window
+        calls.clear()
+        d.tick()
+        assert "dispatch" in calls and "push" in calls
+
+
+def test_drain_reboot_waits_for_and_lists_other_projects_runs_with_its_own_exit_code(env, monkeypatch, capsys):
+    from ttp import cli
+    from ttp.project import Project
+    p, q = _hold_setup(env, monkeypatch)
+    rid = q.db.x("INSERT INTO runs(task,role,provider,started,status) VALUES(7,'worker','claude',?,'running')",
+                 (time.time(),))
+    t0 = time.time()
+    cli.main(["drain", "demo", "--reboot", "kernel update", "--wait", "0.3"])   # exit 0: its own runs decide
+    out = capsys.readouterr().out
+    assert time.time() - t0 >= 0.3, "the wait lasts while another project's run is in flight"
+    assert "other projects on this host: 1 run(s) or push(es) in flight" in out and f"other run {rid} (worker, task #7)" in out
+    # The other project's run ends during the wait: drain returns early.
+    p.db.set_paused(False)
+    threading.Timer(0.2, lambda: Project(q.base).db.x("UPDATE runs SET status='done', ended=? WHERE id=?",
+                                                      (time.time(), rid))).start()
+    t0 = time.time()
+    cli.main(["drain", "demo", "--reboot", "kernel update", "--wait", "10"])
+    assert time.time() - t0 < 8 and "other projects on this host" not in capsys.readouterr().out
+    # Its own run still decides the exit code: 1 at the timeout.
+    p.db.x("INSERT INTO runs(role,provider,started,status) VALUES('worker','claude',?,'running')", (time.time(),))
+    with pytest.raises(SystemExit) as e:
+        cli.main(["drain", "demo", "--reboot", "kernel update", "--wait", "0.1"])
+    assert e.value.code == 1
+
+
+def test_drain_reboot_on_an_unlisted_host_records_the_cycle_and_says_others_are_not_held(env, monkeypatch, capsys):
+    from ttp import cli, hostcycle
+    from ttp import machine_ledger as ml
+    p = make(env)
+    cli.main(["drain", "demo", "--reboot", "firmware update"])
+    cap = capsys.readouterr()
+    assert "no entry in `ttp machines list`" in cap.err and "planned host cycle recorded" in cap.out
+    assert not ml.changes() and hostcycle.hold(p) is None
+
+
+def test_a_drain_intent_holds_and_steers_from_its_start_and_after_an_early_return(env, monkeypatch, capsys, tmp_path):
+    """--wait longer than POWER_CYCLE_LEAD_S: the co-tenant is held and its workers told from the drain's
+    start, not only POWER_CYCLE_LEAD_S before the drain's end; a drain that returns early moves the
+    cycle to then, so the hold covers it."""
+    from ttp import cli, hostcycle
+    from ttp import machine_ledger as ml
+    p, q = _hold_setup(env, monkeypatch)
+    t0 = time.time()
+    c, wrote, _ = hostcycle.open_intent(p, "firmware update", 1200, now=t0)
+    assert wrote and c["at"] == t0 + 1200 and c["hold_from"] == t0
+    assert ml.cycle_window(c)[0] == t0
+    for t in (t0, t0 + 1, t0 + 599):
+        assert hostcycle.hold(q, t)["id"] == c["id"], t
+    assert hostcycle.hold(q, t0 - 1) is None, "not before the drain began"
+    tid = q.db.add_task("co-tenant work", "s", kind="code", origin="user")
+    (tmp_path / "w").mkdir()
+    rid = q.db.x("INSERT INTO runs(task,role,started,status,dir) VALUES(?,?,?,?,?)",
+                 (tid, "worker", t0, "running", str(tmp_path / "w")))
+    _hold_daemon(q.base, []).power_cycle_notices(t0 + 1)
+    assert f"machine change #{c['id']}" in (tmp_path / "w" / "steer.md").read_text(), "told at the drain's start"
+    ml.close_change(c["id"], "test")
+    q.db.x("UPDATE runs SET status='done', ended=? WHERE id=?", (time.time(), rid))
+    # The CLI: an idle host drains at once, and the cycle is due then.
+    t1 = time.time()
+    cli.main(["drain", "demo", "--reboot", "firmware update", "--wait", "1200"])
+    capsys.readouterr()
+    (c,) = ml.changes()
+    assert c["at"] == pytest.approx(t1, abs=5), "the cycle is recorded now, not at the end of the wait"
+    assert hostcycle.hold(q)["id"] == c["id"] and not hostcycle.lapsed()
+    assert hostcycle.hold(q, c["at"] + ml.POWER_CYCLE_LEAD_S) is None
+
+
+def test_a_drain_does_not_reuse_an_intent_planned_for_later(env, monkeypatch, capsys):
+    from ttp import cli, hostcycle
+    from ttp import machine_ledger as ml
+    p, q = _hold_setup(env, monkeypatch)
+    later = ml.add_power_cycle("testhost", "2d", "other", "planned maintenance")
+    cli.main(["drain", "demo", "--reboot", "kernel update", "--wait", "0"])
+    assert "already announced" not in capsys.readouterr().out
+    mine = [c for c in ml.changes() if c["id"] != later["id"]]
+    assert len(mine) == 1 and mine[0]["by"] == "demo"
+    assert hostcycle.hold(q)["id"] == mine[0]["id"], "held now, by the drain's own intent"
+    assert next(c for c in ml.changes() if c["id"] == later["id"])["at"] == later["at"], "the later one is untouched"
+
+
+def test_a_retried_drain_does_not_lapse_before_its_record(env, monkeypatch):
+    """The recipe retries a drain that timed out: each retry reuses the due intent and pushes it on, and
+    the record brings it to the cycle itself, so the hold never lapses mid-drain."""
+    from ttp import hostcycle
+    from ttp import machine_ledger as ml
+    p, q = _hold_setup(env, monkeypatch)
+    t0 = time.time()
+    c, wrote, _ = hostcycle.open_intent(p, "bus reset", 1200, now=t0)
+    hostcycle.cycle_now(p, c, now=t0 + 1200)          # timed out: recorded, retried at once
+    c2, wrote2, line = hostcycle.open_intent(p, "bus reset", 1200, now=t0 + 1201)
+    assert not wrote2 and c2["id"] == c["id"] and c2["at"] == t0 + 2401 and "already announced" in line
+    for t in (t0 + 1800, t0 + 2400):   # past the first try's lapse
+        assert hostcycle.hold(q, t)["id"] == c["id"] and not hostcycle.lapsed(t), t
+    hostcycle.cycle_now(p, c2, now=t0 + 2000)          # drained early this time
+    (c3,) = ml.changes()
+    assert c3["at"] == t0 + 2000 and c3["expires"] == t0 + 2000 + ml.POWER_CYCLE_AFTER_S
+    assert [e["by"] for e in c3["edits"]] == ["demo"] * 3
+    assert hostcycle.hold(q, t0 + 2599) and hostcycle.lapsed(t0 + 2600) == [ml.changes()[0]]
+
+
+def test_resume_withdraws_an_intent_its_own_drain_never_recorded(env, monkeypatch, capsys):
+    from ttp import cli, hostcycle
+    from ttp import machine_ledger as ml
+    p, q = _hold_setup(env, monkeypatch)
+    theirs = ml.add_power_cycle("testhost", "2d", "other", "their cycle")
+    c, wrote, _ = hostcycle.open_intent(p, "firmware update", 1200)   # the drain was stopped: no record
+    assert wrote and c["id"] != theirs["id"]
+    cli.main(["resume", "demo"])
+    assert f"planned host cycle withdrawn (machine change #{c['id']})" in capsys.readouterr().out
+    assert [x["id"] for x in ml.changes()] == [theirs["id"]], "only its own unrecorded intent closes"
+    # One its drain recorded stays.
+    cli.main(["drain", "demo", "--reboot", "firmware update", "--wait", "0"])
+    capsys.readouterr()
+    cli.main(["resume", "demo"])
+    assert "withdrawn" not in capsys.readouterr().out and len(ml.changes()) == 2
+
+
+def test_drain_reboot_waits_for_other_projects_pushes_but_not_their_coordinators(env, monkeypatch, capsys):
+    from ttp import cli
+    p, q = _hold_setup(env, monkeypatch)
+    rid = q.db.x("INSERT INTO runs(role,provider,started,status) VALUES('coordinator','claude',?,'running')",
+                 (time.time(),))
+    t0 = time.time()
+    cli.main(["drain", "demo", "--reboot", "kernel update", "--wait", "10"])
+    out = capsys.readouterr().out
+    assert time.time() - t0 < 8, "another project's coordinator run is not waited for"
+    assert f"other run {rid} (coordinator)" in out, "but it is listed"
+    tid = q.db.add_task("t", "s")
+    q.db.x("UPDATE tasks SET status='pushing' WHERE id=?", (tid,))
+    t0 = time.time()
+    cli.main(["drain", "demo", "--reboot", "kernel update", "--wait", "0.3"])
+    assert time.time() - t0 >= 0.3 and f"other push of task #{tid}" in capsys.readouterr().out
+
+
+def test_a_drain_that_takes_up_a_due_intent_keeps_holding(env, monkeypatch):
+    """A drain reuses an intent `ttp machines change ... power-cycle` wrote (no hold_from) and pushes it on
+    past POWER_CYCLE_LEAD_S: the co-tenant stays held before, during and after the reuse, until the cycle;
+    a resume does not withdraw the intent the drain only took up."""
+    from ttp import hostcycle
+    from ttp import machine_ledger as ml
+    p, q = _hold_setup(env, monkeypatch)
+    t0 = time.time()
+    c = ml.add_power_cycle("testhost", "5m", "demo", "planned maintenance", now=t0)
+    assert hostcycle.hold(q, t0)["id"] == c["id"]
+    c2, wrote, _ = hostcycle.open_intent(p, "kernel update", 1200, now=t0)
+    assert not wrote and c2["id"] == c["id"] and c2["at"] == t0 + 1200
+    assert c2["hold_from"] == t0 - ml.POWER_CYCLE_LEAD_S + 300, "no later than its window began"
+    for t in (t0, t0 + 1, t0 + 600, t0 + 1199):
+        assert hostcycle.hold(q, t)["id"] == c["id"], t
+    hostcycle.cycle_now(p, c2, now=t0 + 900)
+    assert hostcycle.hold(q, t0 + 900 + ml.POWER_CYCLE_LEAD_S - 1)["id"] == c["id"]
+    assert hostcycle.hold(q, t0 + 900 + ml.POWER_CYCLE_LEAD_S + 1) is None
+    assert hostcycle.release(p) == [] and ml.changes()[0]["id"] == c["id"]
+
+
+def test_a_dry_run_drain_puts_back_the_time_of_an_intent_it_took_up(env, monkeypatch, capsys):
+    """A drain takes up another project's planned cycle (`ttp machines change ... power-cycle`: no `boot`),
+    pushes it on and brings it to the drain's end; its record then says no reboot. The intent keeps its
+    own time and window again (once, also seen before the daemon writes it), so the co-tenants are not
+    held past that cycle's own window, and it stays open as the planned cycle it is."""
+    from ttp import cli, hostcycle
+    from ttp import machine_ledger as ml
+    p, q = _hold_setup(env, monkeypatch)
+
+    def no_reboot():
+        for f in (p.state / hostcycle.FOLDER).glob("*/record.json"):
+            f.write_text(json.dumps({**json.loads(f.read_text()), "rebooted": False}))
+
+    t0 = time.time()
+    c = ml.add_power_cycle("testhost", "5m", "other", "planned maintenance", now=t0)
+    orig = {k: c.get(k) for k in ml.RETIMED}
+    c2, wrote, _ = hostcycle.open_intent(p, "kernel update", 1200, now=t0)
+    assert not wrote and c2["at"] == t0 + 1200
+    hostcycle.record(p, "kernel update", [], [], intent=c["id"], intent_was=hostcycle.before(c2, p.name, t0))
+    hostcycle.cycle_now(p, c2, now=t0 + 900)          # the drain ended after the intent's own time
+    late = t0 + 900 + ml.POWER_CYCLE_LEAD_S - 1
+    assert hostcycle.hold(q, late)["id"] == c["id"], "a real cycle holds until its recorded time"
+    no_reboot()
+    assert hostcycle.hold(q, late) is None and ml.changes()[0]["at"] == t0 + 900, "read only, already not held"
+    assert hostcycle.hold(q, late, settle=True) is None
+    (c3,) = ml.changes()
+    assert {k: c3.get(k) for k in ml.RETIMED} == orig and "hold_from" not in c3
+    assert hostcycle.hold(q, t0 + 300, settle=True)["id"] == c["id"], "its own window still holds"
+    assert hostcycle.hold(q, t0 + 300 + ml.POWER_CYCLE_LEAD_S) is None
+    assert len(ml.changes()[0]["edits"]) == len(c3["edits"]) == 3, "undone once"
+    assert hostcycle.lapsed(t0 + 300 + ml.POWER_CYCLE_LEAD_S) == ml.changes()
+    # The same through `ttp drain`, whose wait ends at once.
+    ml.close_change(c["id"], "done")
+    for f in (p.state / hostcycle.FOLDER).glob("*/record.json"):
+        f.unlink()
+    t1 = time.time()
+    c = ml.add_power_cycle("testhost", "5m", "other", "planned maintenance", now=t1)
+    orig = {k: c.get(k) for k in ml.RETIMED}
+    cli.main(["drain", "demo", "--reboot", "kernel update", "--wait", "1200"])
+    assert "already announced by other" in capsys.readouterr().out and ml.changes()[0]["at"] < t1 + 300
+    no_reboot()
+    assert hostcycle.hold(q, settle=True)["id"] == c["id"]
+    (c4,) = ml.changes()
+    assert {k: c4.get(k) for k in ml.RETIMED} == orig
+
+
+def _take_up(p, c, since, wait=1200):
+    """Project p's drain, started at `since`, takes up intent c (open_intent pushes it on): its intent_was
+    and since, as `ttp drain` gives them to record. The record is written later (_record_takeup)."""
+    from ttp import hostcycle
+    c2, wrote, _ = hostcycle.open_intent(p, "kernel update", wait, now=since)
+    assert not wrote and c2["id"] == c["id"]
+    return {"intent": c["id"], "intent_was": hostcycle.before(c2, p.name, since), "since": since}
+
+
+def _record_takeup(p, took, end, rebooted=None):
+    """The drain of _take_up ends at `end`: it records the cycle and brings the intent to then; with
+    `rebooted` False its record then says no reboot."""
+    from ttp import hostcycle
+    from ttp import machine_ledger as ml
+    f = hostcycle.record(p, "kernel update", [], [], **took)
+    hostcycle.cycle_now(p, ml.changes()[0], now=end, since=took["since"])
+    if rebooted is False:
+        _no_reboot_record(f)
+    return f
+
+
+def _no_reboot_record(f):
+    f.write_text(json.dumps({**json.loads(f.read_text()), "rebooted": False}))
+
+
+def _undos(c):
+    return [e for e in c.get("edits") or [] if e.get("undo")]
+
+
+def test_take_ups_marked_out_of_order_end_at_the_intents_own_time(env, monkeypatch):
+    """Drains A then B take up one planned cycle. A says no reboot first: nothing is put back while B
+    waits (or has recorded a cycle that is still coming), since that would drop B's time; once B also
+    says no reboot, the intent is back at its own fields, not at A's retime, in one undo."""
+    from ttp import hostcycle
+    from ttp import machine_ledger as ml
+    p, q = _hold_setup(env, monkeypatch)
+    b = _second_project(env, "third")
+    t0 = time.time()
+    c = ml.add_power_cycle("testhost", "5m", "other", "planned maintenance", now=t0)
+    orig = {k: c.get(k) for k in ml.RETIMED}
+    a_took = _take_up(p, c, t0)
+    b_took = _take_up(b, c, t0 + 60)
+    b_time = {k: ml.changes()[0].get(k) for k in ml.RETIMED}
+    assert b_time["at"] == t0 + 60 + 1200
+    fa = _record_takeup(p, a_took, t0 + 120)
+    b_time = {k: ml.changes()[0].get(k) for k in ml.RETIMED}
+    _no_reboot_record(fa)
+    assert hostcycle.hold(q, t0 + 130, settle=True)["id"] == c["id"], "B still waits: held"
+    assert {k: ml.changes()[0].get(k) for k in ml.RETIMED} == b_time and not _undos(ml.changes()[0])
+    fb = _record_takeup(b, b_took, t0 + 180)
+    hostcycle.hold(q, t0 + 190, settle=True)
+    assert not _undos(ml.changes()[0]), "B's cycle is still coming"
+    _no_reboot_record(fb)
+    assert hostcycle.hold(q, t0 + 400, settle=False)["at"] == orig["at"], "read only: its own time"
+    hostcycle.hold(q, t0 + 400, settle=True)
+    hostcycle.hold(b, t0 + 400, settle=True)
+    (c2,) = ml.changes()
+    assert {k: c2.get(k) for k in ml.RETIMED} == orig and len(_undos(c2)) == 1
+
+
+def test_take_ups_marked_in_order_are_undone_newest_first(env, monkeypatch):
+    """A and B took up one intent and both say no reboot: the edit trail is walked back newest first, so
+    the read-only view and the settled ledger both show the intent's own fields, written once."""
+    from ttp import hostcycle
+    from ttp import machine_ledger as ml
+    p, q = _hold_setup(env, monkeypatch)
+    b = _second_project(env, "third")
+    t0 = time.time()
+    c = ml.add_power_cycle("testhost", "5m", "other", "planned maintenance", now=t0)
+    orig = {k: c.get(k) for k in ml.RETIMED}
+    a_took = _take_up(p, c, t0)
+    b_took = _take_up(b, c, t0 + 60)
+    _record_takeup(p, a_took, t0 + 120, rebooted=False)
+    _record_takeup(b, b_took, t0 + 180, rebooted=False)
+    records = hostcycle._no_reboot_records(q, c)
+    assert [r["project"] for _, r in records] == ["third", "demo"], "newest first"
+    seen = hostcycle._undo_takeups(q, ml.changes()[0], records, False, t0 + 200)
+    assert {k: seen.get(k) for k in ml.RETIMED if seen.get(k) is not None} == {k: v for k, v in orig.items() if v is not None}
+    hostcycle.hold(q, t0 + 200, settle=True)
+    hostcycle.hold(q, t0 + 200, settle=True)
+    (c2,) = ml.changes()
+    assert {k: c2.get(k) for k in ml.RETIMED} == orig and len(_undos(c2)) == 1
+
+
+def test_a_later_drain_of_the_same_project_keeps_its_retime(env, monkeypatch):
+    """A project's first drain took the intent up and said no reboot; its second drain takes it up again
+    and still waits: that retime is the second drain's (its edit's `drain`), so it stands."""
+    from ttp import hostcycle
+    from ttp import machine_ledger as ml
+    p, q = _hold_setup(env, monkeypatch)
+    t0 = time.time()
+    c = ml.add_power_cycle("testhost", "5m", "other", "planned maintenance", now=t0)
+    first = _take_up(p, c, t0)
+    _record_takeup(p, first, t0 + 120, rebooted=False)
+    _take_up(p, c, t0 + 200)
+    waiting = {k: ml.changes()[0].get(k) for k in ml.RETIMED}
+    assert hostcycle.hold(q, t0 + 210, settle=True)["id"] == c["id"]
+    assert {k: ml.changes()[0].get(k) for k in ml.RETIMED} == waiting and not _undos(ml.changes()[0])
+
+
+def test_a_take_up_by_a_project_listed_under_another_key_is_undone_once(env, monkeypatch):
+    """The drain's project is registered under a key other than its name: its own daemon and a co-tenant's
+    both settle, and the intent is put back once."""
+    from ttp import hostcycle
+    from ttp import machine_ledger as ml
+    from ttp.project import load_registry, register, unregister
+    p, q = _hold_setup(env, monkeypatch)
+    b = _second_project(env, "third")
+    entry = load_registry()["projects"]["third"]
+    unregister("third")
+    register("third-elsewhere", {"host": entry["host"], "dir": entry["dir"]})
+    t0 = time.time()
+    c = ml.add_power_cycle("testhost", "5m", "other", "planned maintenance", now=t0)
+    orig = {k: c.get(k) for k in ml.RETIMED}
+    _record_takeup(b, _take_up(b, c, t0), t0 + 120, rebooted=False)
+    for proj in (b, q, p, b, q):
+        hostcycle.hold(proj, t0 + 200, settle=True)
+    (c2,) = ml.changes()
+    assert {k: c2.get(k) for k in ml.RETIMED} == orig and len(_undos(c2)) == 1
+
+
+def test_a_take_up_that_says_no_reboot_does_not_close_the_owners_intent(env, monkeypatch):
+    """A co-tenant's drain wrote the intent; this project's drain took it up and says no reboot. The
+    intent stays open at its writer's time (that cycle is still coming); the writer's own no-reboot
+    record closes it."""
+    from ttp import hostcycle
+    from ttp import machine_ledger as ml
+    p, q = _hold_setup(env, monkeypatch)
+    t0 = time.time()
+    c, wrote, _ = hostcycle.open_intent(q, "firmware update", 600, now=t0)
+    assert wrote
+    orig = {k: c.get(k) for k in ml.RETIMED}
+    _record_takeup(p, _take_up(p, c, t0 + 60), t0 + 120, rebooted=False)
+    assert hostcycle.hold(q, t0 + 130, settle=True)["id"] == c["id"], "the writer's own window holds"
+    (c2,) = ml.changes()
+    assert not c2.get("closed") and {k: c2.get(k) for k in ml.RETIMED} == orig
+    own = hostcycle.record(q, "firmware update", [], [], intent=c["id"], since=t0)
+    _no_reboot_record(own)
+    assert hostcycle.hold(q, t0 + 140, settle=True) is None and ml.changes() == []
+
+
+def test_no_take_up_is_undone_after_a_real_reboot(env, monkeypatch):
+    from ttp import hostcycle
+    from ttp import machine_ledger as ml
+    p, q = _hold_setup(env, monkeypatch)
+    t0 = time.time()
+    c = ml.add_power_cycle("testhost", "5m", "other", "planned maintenance", now=t0)
+    _record_takeup(p, _take_up(p, c, t0), t0 + 120, rebooted=False)
+    moved = {k: ml.changes()[0].get(k) for k in ml.RETIMED}
+    monkeypatch.setattr(hostcycle, "_rebooted_since", lambda c: True)
+    assert hostcycle.hold(q, t0 + 130, settle=True) is None
+    (c2,) = ml.changes()
+    assert {k: c2.get(k) for k in ml.RETIMED} == moved and not _undos(c2)
+
+
+def test_a_take_up_undo_after_the_intent_closed_is_skipped(env, monkeypatch):
+    from ttp import hostcycle
+    from ttp import machine_ledger as ml
+    p, q = _hold_setup(env, monkeypatch)
+    t0 = time.time()
+    c = ml.add_power_cycle("testhost", "5m", "other", "planned maintenance", now=t0)
+    _record_takeup(p, _take_up(p, c, t0), t0 + 120, rebooted=False)
+    stale = ml.changes()[0]
+    records = hostcycle._no_reboot_records(q, stale)
+    ml.close_change(c["id"], "done")
+    assert hostcycle._undo_takeups(q, stale, records, True, t0 + 130) is stale
+    (closed,) = ml.changes(open_only=False)
+    assert closed["closed"] and not _undos(closed)
+
+
+def test_a_drain_intent_quiets_outages_only_around_the_cycle(env, monkeypatch):
+    """hold_from holds and steers from the drain's start, but expects_now ('down') starts only
+    POWER_CYCLE_LEAD_S before the cycle, so a real outage during the wait is not quieted."""
+    from ttp import hostcycle
+    from ttp import machine_ledger as ml
+    p, q = _hold_setup(env, monkeypatch)
+    t0 = time.time()
+    c, wrote, _ = hostcycle.open_intent(p, "firmware update", 1800, now=t0)
+    assert wrote and hostcycle.hold(q, t0)["id"] == c["id"]
+    for t in (t0, t0 + 600, t0 + 1800 - ml.POWER_CYCLE_LEAD_S - 1):
+        assert ml.expects_now(c, t) == [], t
+    assert ml.expects_now(c, t0 + 1800 - ml.POWER_CYCLE_LEAD_S) == ["down"]
+    hostcycle.cycle_now(p, c, now=t0 + 300)
+    (c,) = ml.changes()
+    assert ml.expects_now(c, t0 + 300 - ml.POWER_CYCLE_LEAD_S - 1) == []
+    for t in (t0 + 300 - ml.POWER_CYCLE_LEAD_S, t0 + 300, t0 + 600):
+        assert ml.expects_now(c, t) == ["down"], t
+
+
+def _abrupt_reboot_held(p, d, held, shutdown="abrupt", boot="an-earlier-boot"):
+    """The record of an abrupt reboot that ended `boot`, with `held` at its last heartbeat."""
+    p.db.set_kv("boot_prev", {"boot": d.boot, "prev_boot": boot, "held": held, "shutdown": shutdown})
+
+
+def test_held_by_task_names_only_the_tasks_own_device_and_machine_locks():
+    from ttp.daemon import held_by_task
+    held = ["board: task #7 (run 3) since 10:02 PDT", "box-device: demo task #7 (run ?) since 10:02 PDT",
+            "push:origin%2Fmain: task #7 (run 3) since 10:00 PDT", "harness-upgrade: task #7 (run 3) since 10:00 PDT",
+            "rig: reserved for task #7 (run 3)", "board2: task #70 (run 3) since 10:02 PDT",
+            "box: other task #7 (run 3) since 10:02 PDT", "bench: task #7 (run 3) since 10:01 PDT",
+            "rack: task #7 (run 3), whole run since 10:03 PDT", "probe: demo task #7 (run 4), detached jobs since 10:04 PDT",
+            "rack2: other task #7 (run 3), whole run since 10:03 PDT"]
+    assert held_by_task(held, 7, "demo") == ["board", "box-device", "bench", "rack", "probe"]
+    assert held_by_task(held, 8, "demo") == [] and held_by_task(None, 7, "demo") == []
+
+
+def test_every_hold_label_form_round_trips_through_the_one_parser():
+    from ttp import hold
+    for kind in ("", hold.WHOLE_RUN, hold.LABEL):
+        for run in ("3", 41, None):
+            lbl = hold.label(hold.who(7), run, kind)
+            assert hold.task_of(lbl) == 7 and hold.task_of(lbl, "demo") == 7, lbl
+            shared_lbl = hold.label(f"demo {hold.who(7)}", run, kind)
+            assert hold.task_of(shared_lbl, "demo") == 7 and hold.task_of(shared_lbl, "other") is None, shared_lbl
+            assert hold.own_keeper(lbl, hold.who(7)) is (kind == hold.LABEL)
+            assert not hold.own_keeper(lbl, hold.who(70)) and not hold.own_keeper(shared_lbl, hold.who(7))
+    # Foreign or malformed labels name no task.
+    for lbl in (None, "", "task #7", "task #7 (run 3", "task #? (run 3)", "task #7 (run 3), lunch", "reserved for task #7",
+                "keeper of run 3", "no project task #7 (run 1)", "a b task #7 (run 3)", "task #7 (run 3) since 10:02 PDT",
+                "xtask #7 (run 3)", "task #7x (run 3)", " task #7 (run 3)"):
+        assert hold.task_of(lbl) is None and hold.parse(lbl) is None, lbl
+    assert hold.who(None) == "task #?" and hold.task_of(hold.label(hold.who(None), None)) is None
+
+
+def _heartbeat_held(p):
+    """What the daemon's heartbeat records as held right now (shared.held), as JSON from a subprocess."""
+    return ["python3", "-c", "import json, sys; from ttp import shared; from ttp.project import Project; "
+            "print('HELD=' + json.dumps(shared.held(Project(sys.argv[1]))))", str(p.base)]
+
+
+def test_a_ttp_lock_hold_is_found_by_held_by_task(env):
+    p = make(env)
+    from ttp.daemon import held_by_task
+    out = subprocess.run([sys.executable, str(TTP), "lock", "board", "--", *_heartbeat_held(p)],
+                         env=dict(os.environ, TTP_PROJECT=str(p.base), TTP_TASK="7", TTP_RUN_ID="12",
+                                  PYTHONPATH=str(RUNTIME)), capture_output=True, text=True, timeout=60)
+    assert out.returncode == 0, out.stderr
+    held = json.loads(out.stdout.split("HELD=", 1)[1])
+    assert any(x.startswith("board: task #7 (run 12) since ") for x in held), held
+    assert held_by_task(held, 7, p.name) == ["board"] and held_by_task(held, 8, p.name) == []
+
+
+def test_a_whole_run_hold_is_found_by_held_by_task(env, tmp_path):
+    p = make(env)
+    from ttp import shared
+    from ttp.daemon import held_by_task
+    release = tmp_path / "release"
+    proc, _ = _hold_exclusive(p, tmp_path, release)
+    try:
+        held = shared.held(p)
+    finally:
+        release.touch()
+    assert proc.wait(timeout=60) == 0
+    assert any(x.startswith("board: task #7 (run ?), whole run since ") for x in held), held
+    assert held_by_task(held, 7, p.name) == ["board"] and held_by_task(held, 8, p.name) == []
+
+
+def test_a_detached_jobs_keepers_hold_is_found_by_held_by_task(env, tmp_path):
+    p = make(env)
+    from ttp import shared
+    from ttp.daemon import held_by_task
+    mine = _board_task(p, "flash")
+    run_dir, release = p.runs / "41", tmp_path / "release"
+    _exclusive_run_detaching(p, mine["id"], 41, run_dir, _until(release))
+    try:
+        held = shared.held(p)
+    finally:
+        release.touch()
+    assert _until_true(lambda: (run_dir / "job.rc").exists())
+    assert any(x.startswith(f"board: task #{mine['id']} (run 41), detached jobs since ") for x in held), held
+    assert held_by_task(held, mine["id"], p.name) == ["board"] and held_by_task(held, mine["id"] + 1, p.name) == []
+
+
+def test_a_run_lost_to_an_abrupt_reboot_while_its_task_held_a_device_is_not_retried(env, tmp_path):
+    p = make(env)
+    from ttp.daemon import Daemon
+    d = Daemon(p.base)
+    dev = p.db.add_task("flash the board", "s", kind="work", tier="light", origin="user")
+    calm = p.db.add_task("edit docs", "s", kind="work", tier="light", origin="user")
+    push = p.db.add_task("review and push", "s", kind="work", tier="light", origin="user")
+    _abrupt_reboot_held(p, d, [f"board: task #{dev} (run 1) since 10:02 PDT",
+                               f"push:origin%2Fmain: task #{push} (run 2) since 10:01 PDT",
+                               f"rig: reserved for task #{calm} (run 3)"])
+    for tid in (dev, calm, push):
+        _lost_to_reboot(p, d, tmp_path, tid, name=f"lost{tid}")
+    t = p.db.task(dev)
+    assert t["status"] == "blocked" and t["attempts"] == 0, dict(t)
+    assert t["blocked_reason"].startswith("the host rebooted abruptly while this task held board"), t["blocked_reason"]
+    assert json.loads(t["result"])["reboot"]["held"] == ["board"]
+    ev = p.db.q("SELECT severity, status FROM events WHERE kind='task_blocked' AND task=?", (dev,))
+    assert ev and ev[-1]["severity"] == "high" and ev[-1]["status"] == "queued", ev
+    # Nothing held, a push lock or a reservation: today's resume, at once and without an attempt.
+    for tid in (calm, push):
+        t = p.db.task(tid)
+        assert t["status"] == "queued" and t["attempts"] == 0 and tid in [x["id"] for x in p.db.ready_tasks()], dict(t)
+
+
+@pytest.mark.parametrize("case", ["orderly", "planned", "other machine", "other machine's lease", "other boot"])
+def test_a_hold_at_a_reboot_the_task_did_not_cause_keeps_the_retry(env, tmp_path, monkeypatch, case):
+    p = make(env)
+    from ttp import machines as mm
+    from ttp.daemon import Daemon
+    d = Daemon(p.base)
+    tid = p.db.add_task("flash the board", "s", kind="work", tier="light", origin="user")
+    res = "board"
+    if case == "other machine":
+        mm.add("farbox")
+        res = "farbox-device"   # held over ssh: a job there cannot reset this host
+    if case == "other machine's lease":
+        mm.add("farbox")
+        res = "probe:farbox"    # a lease of that machine, as a rollout driver takes one
+    if case == "planned":
+        monkeypatch.setattr(d, "_planned_cycle", lambda boot: {"reason": "firmware", "path": "x"})
+    _abrupt_reboot_held(p, d, [f"{res}: task #{tid} (run 1) since 10:02 PDT"],
+                        shutdown="orderly" if case == "orderly" else "abrupt",
+                        boot="yet-another-boot" if case == "other boot" else "an-earlier-boot")
+    _lost_to_reboot(p, d, tmp_path, tid)
+    assert p.db.task(tid)["status"] == "queued", dict(p.db.task(tid))
+
+
+def test_a_lock_named_after_this_host_still_counts(env, tmp_path):
+    p = make(env)
+    from ttp import machines as mm
+    from ttp.daemon import Daemon
+    from ttp.project import hostname
+    mm.add(hostname())
+    d = Daemon(p.base)
+    tid = p.db.add_task("flash the board", "s", kind="work", tier="light", origin="user")
+    _abrupt_reboot_held(p, d, [f"{hostname()}-device: task #{tid} (run 1) since 10:02 PDT"])
+    _lost_to_reboot(p, d, tmp_path, tid)
+    assert p.db.task(tid)["status"] == "blocked"
+
+
+def test_a_resource_names_another_machine_only_by_its_alias_or_a_prefixed_lease_of_it():
+    from ttp.daemon import _names_machine
+    others = ["farbox", "rack-2"]
+    for res in ("farbox", "farbox-device", "probe:farbox", "probe:farbox-device", "a:b:farbox", "lease:rack-2"):
+        assert _names_machine(res, others), res
+    for res in ("board", "farboxes", "fleet-rollout", "probe:board", "farbox:probe", "probe:", ":", "rack", ""):
+        assert not _names_machine(res, others), res
+    assert not _names_machine("probe:farbox", []) and not _names_machine("farbox", [""])
+
+
+@pytest.mark.parametrize("case", ["notice", "no notice", "notice long before"])
+def test_an_abrupt_reboot_the_device_broker_announced_relaunches_the_task_that_held_a_device(
+        env, tmp_path, monkeypatch, case):
+    """The heartbeat records the broker's power-cycle notice (cyclenotice.py); the next boot reads a
+    reboot that followed it as planned, so the run it cut short is requeued, not blocked. No notice, or
+    one seen only long before the reboot, keeps the abrupt path, which blocks a device holder."""
+    from ttp import hostcycle
+    from ttp.daemon import Daemon
+    p = make(env)
+    tid = p.db.add_task("flash the board", "s", kind="work", tier="light", origin="user")
+    notice = Path(os.environ["TTP_TEST_CYCLE_NOTICES"].split(os.pathsep)[0])
+    if case != "no notice":
+        notice.write_text(json.dumps({"state": "requested", "fault_class": "tray_drop", "reason": "tray 2 dropped",
+                                      "updated_at": time.time()}))
+    _boot_as(monkeypatch, "an-earlier-boot")
+    before = Daemon(p.base)
+    before._beat()
+    hb = p.state / "heartbeat"
+    rec = json.loads(hb.read_text())
+    assert (rec.get("cycle_notice") or {}).get("state") == (None if case == "no notice" else "requested"), rec
+    # The task's lock at the last heartbeat (the cycle ended it), then the reboot.
+    hb.write_text(json.dumps({**rec, "held": [f"board: task #{tid} (run 1) since 10:02 PDT"]}))
+    booted = time.time() - 60
+    last = booted - (hostcycle.WINDOW_S + 600 if case == "notice long before" else 120)
+    os.utime(hb, (last, last))
+    if notice.exists():
+        notice.unlink()   # gone with the cycle
+    _boot_as(monkeypatch, "boot-b", booted)
+    d = Daemon(p.base)
+    prev = p.db.kv("boot_prev")
+    assert prev["prev_boot"] == "an-earlier-boot" and prev["shutdown"] == "abrupt", prev
+    assert ("cycle_notice" in prev) is (case != "no notice"), prev
+    _lost_to_reboot(p, d, tmp_path, tid)
+    t = p.db.task(tid)
+    assert t["attempts"] == 0, dict(t)
+    if case == "notice":
+        assert t["status"] == "queued" and tid in [x["id"] for x in p.db.ready_tasks()], dict(t)
+        cycle = d._planned_cycle("an-earlier-boot")
+        assert "device broker" in cycle["planner"] and "tray 2 dropped" in cycle["reason"], cycle
+    else:
+        assert t["status"] == "blocked" and "held board" in t["blocked_reason"], dict(t)
+        assert d._planned_cycle("an-earlier-boot") is None
+
+
+@pytest.mark.parametrize("survives", [False, True])
+def test_a_waiting_task_whose_job_held_a_device_at_an_abrupt_reboot_is_blocked_not_woken(env, monkeypatch, survives):
+    p = make(env)
+    from ttp import coordinator as coord
+    from ttp.daemon import Daemon
+    tid = p.db.add_task("soak test", "s", kind="work", tier="light", origin="user")
+    _waiting_from_before_the_boot(p, tid)
+    if survives:
+        p.db.update_task(tid, result=json.dumps({**json.loads(p.db.task(tid)["result"]), "survives_reboot": True}))
+    d = Daemon(p.base)
+    d.boot_at = time.time() - 300
+    _abrupt_reboot_held(p, d, [f"board: task #{tid} (run 1) since 10:02 PDT"])
+    monkeypatch.setattr(d, "_relaunch_jobs", lambda *a: pytest.fail("a job that held the device was relaunched"))
+    d.wake_after_reboot()
+    t = p.db.task(tid)
+    assert t["status"] == "blocked" and "held board" in t["blocked_reason"], dict(t)
+    ev = p.db.q("SELECT severity FROM events WHERE kind='task_blocked' AND task=?", (tid,))
+    assert ev and ev[-1]["severity"] == "normal"   # high only for an urgent task or an ask (alerts.raise_blocked)
+    # The coordinator's requeue is its word that the attempt was not implicated: the next reboot
+    # without a hold wakes it as before.
+    assert coord.apply(p, [{"type": "task_update", "id": tid, "status": "queued"}]) == []
+    _waiting_from_before_the_boot(p, tid)
+    d = Daemon(p.base)
+    d.boot_at = time.time() - 300
+    _abrupt_reboot_held(p, d, [])
+    d.wake_after_reboot()
+    t = p.db.task(tid)
+    assert t["status"] == "queued" and (survives or json.loads(t["result"]).get("woke") == "the host rebooted"), dict(t)
+
+
+def _down_since(p, d, age_s, boot=None):
+    """The heartbeat a daemon left `age_s` ago on `boot` (this boot by default)."""
+    hb = p.state / "heartbeat"
+    hb.write_text(json.dumps({"pid": 1, "boot": boot or d.boot, "held": []}))
+    os.utime(hb, (time.time() - age_s, time.time() - age_s))
+
+
+def _down_notices(p):
+    return p.db.q("SELECT text, severity, kind FROM messages WHERE direction='out' AND text LIKE '%daemon was down%'")
+
+
+def _late_watch(p, late_s):
+    from ttp import schedule as sched
+    sched.upsert(p.db, "watch", "command", "30m", payload={"command": "true", "timeout_s": 30})
+    now = time.time()
+    p.db.x("UPDATE schedules SET last_run=?, next_run=? WHERE name='watch'", (now - late_s - 1800, now - late_s))
+
+
+def test_a_daemon_back_after_a_long_stop_posts_one_notice(env, tmp_path):
+    from ttp.daemon import Daemon
+    p = make(env)
+    d = Daemon(p.base)
+    _late_watch(p, 3 * 3600)
+    tid = p.db.add_task("build", "s", kind="work", tier="light", origin="user")
+    run_dir = tmp_path / "gone"
+    run_dir.mkdir()
+    (run_dir / "lease").touch()
+    os.utime(run_dir / "lease", (time.time() - 4 * 3600, time.time() - 4 * 3600))
+    p.db.x("INSERT INTO runs(task,role,provider,started,status,dir,boot_id) VALUES(?,?,?,?,?,?,?)",
+           (tid, "worker", "fake", time.time() - 5 * 3600, "running", str(run_dir), d.boot))
+    _down_since(p, d, 3 * 3600 + 300)
+    d._last_stop = {"boot": d.boot, "ts": time.time() - 3 * 3600 - 200}
+    d._note_down()
+    d.reap_runs()
+    (msg,) = _down_notices(p)
+    assert msg["severity"] == "normal" and msg["kind"] == "info", msg
+    assert "down for 3.1 h" in msg["text"] and "the daemon was stopped." in msg["text"], msg["text"]
+    assert "6 schedule run(s) were missed; 1 run(s) were cut short" in msg["text"], msg["text"]
+    d.reap_runs()
+    assert len(_down_notices(p)) == 1, "told twice"
+
+
+def test_a_long_stop_later_on_the_same_boot_is_no_reboot(env):
+    # boot_prev stays for every start on this boot: a later long stop is the daemon's, not a reboot.
+    from ttp.daemon import Daemon
+    p = make(env)
+    d = Daemon(p.base)
+    _abrupt_reboot_held(p, d, [])
+    p.db.set_kv("reboot_told", d.boot)
+    _down_since(p, d, 3 * 3600)
+    d._last_stop = {"boot": d.boot, "ts": time.time() - 3 * 3600 + 60}
+    d._note_down()
+    d.reap_runs()
+    (msg,) = _down_notices(p)
+    assert "the daemon was stopped." in msg["text"] and "rebooted" not in msg["text"], msg["text"]
+
+
+@pytest.mark.parametrize("told", [False, True])
+def test_an_old_heartbeat_with_no_boot_id_is_a_reboot_only_until_it_is_told(env, told):
+    from ttp.daemon import Daemon
+    p = make(env)
+    d = Daemon(p.base)
+    _abrupt_reboot_held(p, d, [])
+    if told:
+        p.db.set_kv("reboot_told", d.boot)
+    hb = p.state / "heartbeat"
+    hb.write_text(json.dumps({"pid": 1, "held": []}))
+    os.utime(hb, (time.time() - 2 * 3600, time.time() - 2 * 3600))
+    d._note_down()
+    d.reap_runs()
+    (msg,) = _down_notices(p)
+    assert ("the host rebooted (abrupt)" in msg["text"]) != told, msg["text"]
+
+
+def test_a_short_restart_posts_no_down_notice(env):
+    from ttp.daemon import Daemon
+    p = make(env)
+    d = Daemon(p.base)
+    _late_watch(p, 3 * 3600)   # schedule runs missed alone are the schedule-gap check's to tell
+    _down_since(p, d, 600)
+    d._note_down()
+    d.reap_runs()
+    assert not _down_notices(p)
+
+
+def test_a_threshold_from_config_and_a_notice_kept_across_a_second_start(env):
+    from ttp import downtime
+    from ttp.daemon import Daemon
+    p = make(env)
+    d = Daemon(p.base)
+    d.cfg = {**d.cfg, "daemon": {"down_notice_s": 600}}
+    _down_since(p, d, 900)
+    d._note_down()
+    # It died before its first tick; the next start finds a fresh heartbeat but keeps the notice.
+    e = Daemon(p.base)
+    _down_since(p, e, 5)
+    e._note_down()
+    assert p.db.kv(downtime.DOWN_KEY)
+    e.reap_runs()
+    (msg,) = _down_notices(p)
+    assert "down for 15 min" in msg["text"] and "without a clean stop" in msg["text"], msg["text"]
+
+
+def test_a_long_reboot_downtime_joins_the_reboot_notice_in_one_message(env, tmp_path):
+    from ttp.daemon import Daemon
+    p = make(env)
+    d = Daemon(p.base)
+    tid = p.db.add_task("build", "s", kind="work", tier="light", origin="user")
+    _abrupt_reboot_held(p, d, [])
+    _down_since(p, d, 6 * 3600, boot="an-earlier-boot")
+    d._note_down()
+    _lost_to_reboot(p, d, tmp_path, tid)
+    out = p.db.q("SELECT text, severity, ref FROM messages WHERE direction='out' AND kind='info'")
+    assert len(out) == 1, out
+    text = out[0]["text"]
+    assert text.startswith("The daemon was down for 6.0 h") and "the host rebooted (abrupt)" in text, text
+    assert "The host rebooted (abrupt; 1st reboot in 24 h); 1 run(s) were cut short" in text, text
+    assert out[0]["severity"] == "normal" and out[0]["ref"] == f"reboot:{d.boot}"
+    d.reap_runs()
+    assert len(p.db.q("SELECT id FROM messages WHERE direction='out' AND kind='info'")) == 1
+
+
+def test_a_long_reboot_downtime_with_no_run_cut_short_still_posts_the_notice(env):
+    from ttp.daemon import Daemon
+    p = make(env)
+    d = Daemon(p.base)
+    _abrupt_reboot_held(p, d, [], shutdown="orderly")
+    _down_since(p, d, 2 * 3600, boot="an-earlier-boot")
+    d._note_down()
+    d.reap_runs()
+    (msg,) = _down_notices(p)
+    assert "the host rebooted (orderly)" in msg["text"] and "0 run(s) were cut short" in msg["text"], msg["text"]
+
+
+# Who started the shutdown that ended the previous boot (initiator.py): fixture journal output only,
+# never the real journalctl (the env fixture sets TTP_TEST_NO_JOURNAL).
+_SUDO_REBOOT = ("Oct 25 21:59:58 testhost sudo[4242]:  someuser : TTY=pts/3 ; PWD=/home/someuser ; USER=root ; "
+                "COMMAND=/usr/sbin/reboot\n"
+                "Oct 25 21:59:59 testhost systemd-logind[812]: System is rebooting.\n")
+_PKEXEC_POWEROFF = ("Oct 25 21:59:58 testhost pkexec[51]: someuser: Executing command [USER=root] [TTY=/dev/pts/0] "
+                    "[CWD=/home/someuser] [COMMAND=/usr/bin/systemctl poweroff]\n")
+_POWER_KEY = ("Oct 25 21:59:50 testhost systemd-logind[812]: Power key pressed short.\n"
+              "Oct 25 21:59:51 testhost systemd-logind[812]: Powering off...\n")
+_HIDDEN = (0, "", "Hint: You are currently not seeing messages from other users and the system.\n")
+
+
+def _newest_first(got, args):
+    """journalctl's answer as `args` give it: `-r` the lines newest first, `-n N` only the last N lines (with
+    -r the first N, the newest)."""
+    if not got or got[1] is None:
+        return got
+    lines = got[1].splitlines()
+    if "-r" in args:
+        lines.reverse()
+    n = next((int(args[i + 1]) for i in range(len(args) - 1) if args[i] == "-n" and args[i + 1].isdigit()), None)
+    if n is not None:
+        lines = lines[:n] if "-r" in args else lines[-n:]
+    return got[0], "".join(line + "\n" for line in lines), got[2]
+
+
+def _journalctl(text, args):
+    """A fake journalctl over the JSON lines `text`: FIELD=value matches (one field's values ORed, fields
+    ANDed, `+` ORs groups), --since/--until @epoch, then -r and -n as _newest_first."""
+    groups, cur = [], {}
+    for a in [*args, "+"]:
+        if a == "+":
+            groups, cur = groups + ([cur] if cur else []), {}
+        elif "=" in a and not a.startswith("-"):
+            k, v = a.split("=", 1)
+            cur.setdefault(k, set()).add(v)
+    bound = {k: float(args[args.index(k) + 1][1:]) for k in ("--since", "--until") if k in args}
+    keep = []
+    for line in text.splitlines():
+        e = json.loads(line)
+        ts = int(e["__REALTIME_TIMESTAMP"]) / 1e6
+        if groups and not any(all(e.get(k) in vs for k, vs in g.items()) for g in groups):
+            continue
+        if ts < bound.get("--since", ts) or ts > bound.get("--until", ts):
+            continue
+        keep.append(line)
+    return _newest_first((0, "\n".join(keep), ""), args)
+
+
+def _initiator_reboot(p, tmp_path, monkeypatch, journal, last_heartbeat_ago=600):
+    """A new boot after one that cut a run short, with run_journal answering `journal`; the reboot notice."""
+    from ttp import initiator
+    from ttp.daemon import Daemon
+    calls = []
+    monkeypatch.setattr(initiator, "run_journal", lambda boot, extra=(), sudo=False: calls.append(boot) or _newest_first(
+        journal, extra))
+    _boot_as(monkeypatch, "boot-0")
+    Daemon(p.base).tick()
+    p.db.set_kv("paused", True)
+    _lost_deep_runs(p, tmp_path, "boot-0", costs=(1.0,))
+    _boot_as(monkeypatch, "boot-1", time.time() - 60)
+    d = Daemon(p.base)
+    d.tick()
+    d.tick()
+    assert set(calls) <= {"boot-0"} and 1 <= len(calls) <= 4, "the journal is read once per boot (markers, kernel, " \
+        "commands, then the window before the marker), for the boot that ended"
+    (n,) = _reboot_notices(p)
+    ev = p.db.one("SELECT text, data FROM events WHERE source='host' AND kind='boot' ORDER BY id DESC LIMIT 1")
+    return n["text"], ev["text"], json.loads(ev["data"])["initiator"]
+
+
+@pytest.mark.parametrize("journal,said", [
+    ((0, _SUDO_REBOOT, ""), "Initiator: someuser ran `reboot` via sudo (journal)."),
+    ((0, _PKEXEC_POWEROFF, ""), "Initiator: someuser ran `systemctl poweroff` via pkexec (journal)."),
+    ((0, _POWER_KEY, ""), "Initiator: the power key (journal)."),
+    ((0, "Oct 25 21:59:59 testhost systemd-logind[812]: System is powering down.\n", ""),
+     "Initiator: a request to systemd-logind that names no user (journal: System is powering down.)."),
+    ((0, "", ""), "Initiator: unknown (journal not readable: no system entries visible for the previous boot and "
+                  "no passwordless sudo for journalctl)."),
+    (_HIDDEN, "Initiator: unknown (journal not readable: user not in systemd-journal and no passwordless sudo for journalctl)."),
+    ((1, "", "No journal files were opened due to insufficient permissions.\n"),
+     "Initiator: unknown (journal not readable: user not in systemd-journal and no passwordless sudo for journalctl)."),
+    (None, "Initiator: unknown (journal not readable: journalctl did not answer, missing or timed out)."),   # journalctl missing or timed out
+])
+def test_the_reboot_notice_names_who_started_the_shutdown_from_the_journal(env, tmp_path, monkeypatch, journal, said):
+    p = make(env)
+    feed, record, got = _initiator_reboot(p, tmp_path, monkeypatch, journal)
+    assert said in feed, feed
+    assert record.endswith("; " + said[:-1].replace("Initiator", "initiator")), record
+    assert got["source"] == ("unknown" if "unknown" in said else "journal"), got
+
+
+def test_the_reboot_notice_names_a_host_cycle_record_of_another_project(env, tmp_path, monkeypatch):
+    from ttp import initiator
+    p, q = make(env), _second_project(env)
+    rec = q.state / "host-cycle" / "rec-a" / "record.json"
+    rec.parent.mkdir(parents=True)
+    rec.write_text(json.dumps({"id": "rec-a", "boot_id": "boot-0", "started": time.time() - 300,
+                               "dry_run": False, "reason": "firmware update", "by": "ttp drain"}))
+    got = initiator.find(p, "boot-0", time.time() - 60, time.time() - 600, journal=_HIDDEN)
+    assert got["source"] == "host-cycle" and got["project"] == q.name, got
+    assert got["text"] == f"`ttp drain --reboot` in project {q.name} (host-cycle record rec-a: firmware update)", got
+    # A planned cycle's notice already names its record: the clause is not repeated there.
+    feed, record, stored = _initiator_reboot(p, tmp_path, monkeypatch, _HIDDEN)
+    assert stored == {**got, "record": str(rec)} and "Initiator:" not in feed and "initiator:" not in record, feed
+    assert "It was a planned host cycle (host-cycle record rec-a" in feed, feed
+    # A host-cycle record of an earlier boot, or a dry run, names nothing.
+    assert initiator.find(p, "boot-9", time.time(), None, journal=_HIDDEN)["source"] == "unknown"
+
+
+def test_the_reboot_notice_names_a_ledger_entry_recorded_just_before_the_shutdown(env, tmp_path, monkeypatch):
+    from ttp import machine_ledger as ml
+    from ttp import machines as mm
+    p = make(env)
+    mm.add("testhost")
+    mm.add("otherhost")
+    now = time.time()
+    ml.add_change("testhost", "raised the fan curve", "none: kept", "other", expires="2h", now=now - 900)
+    ml.add_change("otherhost", "power cycled it via the BMC", "none: done", "other", expires="2h", now=now - 400)
+    ml.add_change("testhost", "power cycled it via the BMC", "none: done", "other", expires="2h",
+                  now=now - 4 * 3600)   # long before the shutdown
+    hit = ml.add_change("testhost", "power-cycled the host via the BMC: chips off the bus", "none: done", "other",
+                        expires="2h", now=now - 300)
+    feed, record, got = _initiator_reboot(p, tmp_path, monkeypatch, _HIDDEN)
+    assert got == {"source": "ledger", "by": "other", "entry": hit["id"],
+                   "text": f"machine-change ledger entry #{hit['id']} by project other: "
+                           f"power-cycled the host via the BMC: chips off the bus",
+                   "unreadable": "user not in systemd-journal and no passwordless sudo for journalctl"}, got
+    assert f"Initiator: machine-change ledger entry #{hit['id']} by project other: power-cycled" in feed \
+        and "(abrupt;" in feed, feed
+
+
+def test_the_initiator_search_never_raises_and_never_waits_long(env, monkeypatch):
+    import subprocess as sp
+    from ttp import hostcycle, initiator, machines
+    p = make(env)
+    monkeypatch.delenv("TTP_TEST_NO_JOURNAL")
+    seen = []
+
+    def run(cmd, **kw):
+        seen.append((cmd, kw.get("timeout")))
+        raise sp.TimeoutExpired(cmd, kw.get("timeout"))
+    monkeypatch.setattr(initiator.subprocess, "run", run)
+    boom = lambda *a, **k: (_ for _ in ()).throw(RuntimeError("broken"))
+    monkeypatch.setattr(hostcycle, "planned", boom)
+    monkeypatch.setattr(machines, "here", boom)
+    assert initiator.find(p, "0123456789abcdef0123456789abcdef", time.time(), None) == \
+        {"source": "unknown", "text": "unknown (journal not readable: journalctl did not answer, missing or timed out)",
+         "unreadable": "journalctl did not answer, missing or timed out"}
+    (cmd, timeout), = seen
+    assert cmd[:3] == ["journalctl", "-b", "0123456789abcdef0123456789abcdef"] and timeout == initiator.JOURNAL_TIMEOUT_S
+    monkeypatch.setattr(initiator.subprocess, "run", lambda *a, **k: (_ for _ in ()).throw(FileNotFoundError()))
+    assert initiator.run_journal("boot-0") is None
+    assert initiator.find(p, "b", None, None, journal=(0, None, None))["text"] == \
+        "unknown (journal not readable: no system entries visible for the previous boot and no passwordless sudo for journalctl)"
+
+
+def test_journal_lines_that_do_not_stop_the_host_name_no_initiator():
+    from ttp import initiator
+    for line in ["sudo[1]:  someuser : 3 incorrect password attempts ; TTY=pts/1 ; USER=root ; COMMAND=/usr/sbin/reboot",
+                 "sudo[1]:  someuser : TTY=pts/1 ; USER=root ; COMMAND=/usr/bin/vim /etc/reboot.conf",
+                 "sudo[1]:  someuser : TTY=pts/1 ; USER=root ; COMMAND=/usr/bin/systemctl status reboot.target",
+                 "sudo[1]:  someuser : TTY=pts/1 ; USER=root ; COMMAND=/usr/local/bin/rebootctl",
+                 "pkexec[1]: someuser: Error executing command as another user: Not authorized [COMMAND=/usr/sbin/reboot]",
+                 "cron[1]: (root) CMD (/usr/sbin/shutdown -r now)",
+                 "systemd-logind[1]: New session 4 of user someuser."]:
+        assert initiator.parse(f"Oct 25 10:00:00 testhost {line}\n") == (None, None), line
+    # The last stop in the boot wins: a hung `shutdown` followed by the power key is the power key.
+    two = ("Oct 25 10:00:00 testhost sudo[1]:  someuser : TTY=pts/1 ; USER=root ; COMMAND=/sbin/shutdown -h now\n"
+           "Oct 25 10:09:00 testhost systemd-logind[2]: Power key pressed.\n")
+    assert initiator.parse(two)[0] == "the power key (journal)"
+    assert initiator.parse(two.splitlines()[0])[0] == "someuser ran `shutdown -h now` via sudo (journal)"
+
+
+# The previous boot's journal as JSON (journalctl -o json), generic names only: a system service that
+# power-cycles the host, and how the read falls back to `sudo -n` when this user sees only its own entries.
+_T0 = 1_760_000_000
+
+
+def _j(dt, msg, unit="", ident="", uid="0", about=""):
+    e = {"__REALTIME_TIMESTAMP": str(int((_T0 + dt) * 1e6)), "MESSAGE": msg, "_UID": uid}
+    for k, v in (("_SYSTEMD_UNIT", unit), ("SYSLOG_IDENTIFIER", ident), ("UNIT", about)):
+        if v:
+            e[k] = v
+    return json.dumps(e)
+
+
+_BROKER = "example-broker.service"
+_CYCLE = "\n".join([
+    _j(-900, "power-cycle requested long ago", _BROKER, "example-broker"),   # outside the 10 min window
+    _j(-120, "job 41 finished", _BROKER, "example-broker"),
+    _j(-30, "Started example-broker-recover.service - Example recovery.", "init.scope", "systemd",
+       about="example-broker-recover.service"),
+    _j(-5, "power-cycle a hung shutdown: running example-power-cycle --now", "example-broker-recover.service",
+       "example-recover"),
+    _j(-1, "nothing to do", "systemd-timesyncd.service", "systemd-timesyncd"),
+    _j(0, "System is rebooting.", "systemd-logind.service", "systemd-logind"),
+    _j(3, "Stopping example-broker.service - Example broker...", "init.scope", "systemd", about=_BROKER),
+    _j(9, "Reached target reboot.target - System Reboot.", "init.scope", "systemd"),
+]) + "\n"
+_OWN_ONLY = (0, _j(-60, "my own user unit line", "user@1000.service", "example-user-app", uid=str(os.getuid())) + "\n",
+             "Hint: You are currently not seeing messages from other users and the system.\n")
+
+
+def test_the_reboot_notice_names_the_unit_that_power_cycled_the_host_from_a_readable_journal(env, tmp_path,
+                                                                                               monkeypatch):
+    from ttp import initiator
+    p = make(env)
+    monkeypatch.setattr(initiator, "sudo_ok", lambda: pytest.fail("the user's read was enough"))
+    feed, record, got = _initiator_reboot(p, tmp_path, monkeypatch, (0, _CYCLE, ""))
+    said = ("Initiator: example-broker-recover.service (power-cycle a hung shutdown: running example-power-cycle "
+            "--now).")
+    assert said in feed and got == {"source": "journal", "text": said[len("Initiator: "):-1]}, (feed, got)
+    assert initiator.doctor_line(p) == ""
+    # Logged text that reads like a journalctl hint is no hint: the read still counts as the system's.
+    noisy = _j(-9, "open /dev/example0: permission denied; no journal files were found", _BROKER, "x") + "\n"
+    assert initiator.read("boot-0", (0, noisy + _CYCLE, ""), False)[2:] == ("user", "")
+    # A 'Reached target reboot.target' line alone is a marker too; with no stop words before it, the unit
+    # started nearest before it stands in, and a stop line older than the window names nothing.
+    lines = _CYCLE.splitlines()
+    quiet = "\n".join(line for line in lines if "hung shutdown" not in line and "System is rebooting" not in line)
+    assert initiator.parse(quiet, full=True) == (
+        None, "example-broker-recover.service (Started example-broker-recover.service - Example recovery.)")
+    assert initiator.parse("\n".join([lines[0], lines[1], lines[5]]), full=True) == \
+        (None, f"{_BROKER} (job 41 finished)")
+
+
+@pytest.mark.parametrize("target", [True, False])
+def test_the_unit_systemd_started_just_before_the_marker_is_found_however_long_the_shutdown(monkeypatch, target):
+    from ttp import initiator
+    # More Stopping/Stopped lines after the marker than any bounded read holds: the marker read (logind,
+    # systemd about the shutdown targets) still finds it, the window read then holds the 10 min before it,
+    # where systemd started the unit that did it. With or without systemd's 'Reached target' line.
+    n = initiator.MARK_ENTRIES + 1000
+    boot = [
+        _j(-200, "Started example-health.service - Example health probe.", "init.scope", "systemd",
+           about="example-health.service"),
+        _j(-190, "probe ok", "example-health.service", "example-health"),
+        _j(-100, "someuser : TTY=pts/1 ; USER=root ; COMMAND=/usr/bin/true", ident="sudo"),
+        _j(-2, "Started Example recovery: power-cycle a hung shutdown.", "init.scope", "systemd",
+           about="example-broker-recover.service"),
+        _j(0, "System is rebooting.", "systemd-logind.service", "systemd-logind"),
+        *(_j(2 + k / (2 * n), f"Stopped example-{k}.service.", "init.scope", "systemd", about=f"example-{k}.service")
+          for k in range(n)),
+        *([_j(9, "Reached target reboot.target - System Reboot.", "init.scope", "systemd", about="reboot.target")]
+          if target else []),
+    ]
+    text = "\n".join(boot) + "\n"
+    reads = []
+    monkeypatch.setattr(initiator, "run_journal", lambda boot, extra=(), sudo=False: reads.append(list(extra)) or
+                        _journalctl(text, extra))
+    got = initiator.find(None, "boot-0", None, None)
+    # It logged nothing of its own after its start: armed, not fired; logind's request is the cause.
+    end = 11 if target else 4
+    assert got == {"source": "journal", "text": "a request to systemd-logind that names no user (journal: System is "
+                   "rebooting.); example-broker-recover.service (Example recovery: power-cycle a hung shutdown) "
+                   f"armed, not fired: it logged nothing of its own before the boot's journal ended {end} s later"}, got
+    assert [r[:2] for r in reads] == [["-n", str(initiator.MARK_ENTRIES)], ["-n", str(initiator.KERNEL_ENTRIES)],
+                                      ["-n", str(initiator.MARK_ENTRIES)], ["--since", f"@{_T0 - 600}"],
+                                      ["-n", str(initiator.UNIT_ENTRIES)], ["-n", "1"]], reads
+    assert reads[0] == initiator.marker_args() and reads[1] == initiator.kernel_args() \
+        and reads[2] == initiator.command_args(), reads
+    assert reads[4] == initiator.unit_args("example-broker-recover.service") and reads[5] == initiator.end_args()
+
+
+# A shutdown watchdog systemd-run started just before the reboot request, to power-cycle the host if the
+# shutdown hangs: generic unit names only.
+_WATCHDOG = "run-u42.service"
+_ARMED = [
+    _j(-60, "job 7 finished", _BROKER, "example-broker"),
+    _j(-0.014, f"Started {_WATCHDOG} - power-cycle a hung shutdown.", "init.scope", "systemd", about=_WATCHDOG),
+    _j(0, "System is rebooting.", "systemd-logind.service", "systemd-logind"),
+    _j(3, f"Stopping {_BROKER} - Example broker...", "init.scope", "systemd", about=_BROKER),
+    _j(88, "Reached target reboot.target - System Reboot.", "init.scope", "systemd", about="reboot.target"),
+]
+
+
+def _find_over(monkeypatch, boot, reads=None, unit_rc=0):
+    from ttp import initiator
+    text = "\n".join(boot) + "\n"
+
+    def run(b, extra=(), sudo=False):
+        (reads if reads is not None else []).append(list(extra))
+        return (1, "", "journalctl: failed") if unit_rc and any(a.startswith("_SYSTEMD_UNIT=") for a in extra) \
+            else _journalctl(text, extra)
+    monkeypatch.setattr(initiator, "run_journal", run)
+    return initiator.find(None, "boot-0", None, None)
+
+
+def test_a_watchdog_systemd_only_started_before_the_request_is_armed_not_the_initiator(env, monkeypatch):
+    from ttp import hostcycle, initiator
+    reads = []
+    got = _find_over(monkeypatch, _ARMED, reads)
+    assert got == {"source": "journal", "text": "a request to systemd-logind that names no user (journal: System is "
+                   f"rebooting.); {_WATCHDOG} (power-cycle a hung shutdown) armed, not fired: it logged nothing of "
+                   "its own before the boot's journal ended 88 s later"}, got
+    assert reads[4:] == [initiator.unit_args(_WATCHDOG), initiator.end_args()], reads
+    # Its lines from before this start (an earlier run of the same name) are no sign it fired.
+    early = [_j(-300, "ready", _WATCHDOG, "example-watchdog"), *_ARMED]
+    assert _find_over(monkeypatch, early)["text"] == got["text"]
+    # Its 'Starting' and 'Started' lines read its own lines once.
+    both = [_ARMED[0], _j(-0.02, f"Starting {_WATCHDOG} - power-cycle a hung shutdown...", "init.scope", "systemd",
+                          about=_WATCHDOG), *_ARMED[1:]]
+    reads.clear()
+    assert _find_over(monkeypatch, both, reads)["text"] == got["text"] and len(reads) == 6, reads
+    # The request names nobody, so a host-cycle record for the boot still wins over it.
+    monkeypatch.setattr(hostcycle, "planned", lambda p, boot, at: {"path": "/x/rec/cycle.json", "id": "c1",
+                                                                   "project": "other", "reason": "kernel update"})
+    assert _find_over(monkeypatch, _ARMED)["source"] == "host-cycle"
+    # An earlier unit line that names a power cycle is the initiator, the armed watchdog noted after it.
+    real = [_j(-5, "power-cycle the host now", "example-recover.service", "example-recover"), *_ARMED]
+    monkeypatch.setattr(hostcycle, "planned", lambda p, boot, at: None)
+    assert _find_over(monkeypatch, real)["text"] == (
+        f"example-recover.service (power-cycle the host now); {_WATCHDOG} (power-cycle a hung shutdown) armed, "
+        "not fired: it logged nothing of its own before the boot's journal ended 88 s later")
+
+
+def test_a_unit_that_only_logged_a_skip_is_not_the_initiator(env, monkeypatch):
+    from ttp import hostcycle
+    monkeypatch.setattr(hostcycle, "planned", lambda p, boot, at: None)
+    probe = "example-health.service"
+    skip = "example-health: skip: device held (no power-cycle)"
+    # A health probe that names a power cycle only to say it skipped one, then the armed watchdog: no
+    # unit is the initiator; logind's request is, with both noted.
+    boot = [_j(-40, skip, probe, "example-health"), *_ARMED]
+    got = _find_over(monkeypatch, boot)
+    assert got == {"source": "journal", "text": "a request to systemd-logind that names no user (journal: System is "
+                   f"rebooting.); {_WATCHDOG} (power-cycle a hung shutdown) armed, not fired: it logged nothing of "
+                   "its own before the boot's journal ended 88 s later; "
+                   f"{probe} logged only a skip ({skip})"}, got
+    # Other skip wordings, with or without a tag, likewise; a real stop line before it still wins.
+    for msg in ("Skipping power cycle: device busy", "skipped reboot (hold active)"):
+        text = _find_over(monkeypatch, [_j(-40, msg, probe, "example-health"), *_ARMED])["text"]
+        assert text.startswith("a request to systemd-logind") and text.endswith(f"{probe} logged only a skip ({msg})")
+    real = [_j(-90, "power-cycle the host now", "example-recover.service", "example-recover"), *boot]
+    assert _find_over(monkeypatch, real)["text"].startswith("example-recover.service (power-cycle the host now)")
+    # A line that only mentions skipping later in it is no skip line.
+    acted = [_j(-40, "power-cycling the host: skip list empty", probe, "example-health"), *_ARMED]
+    assert _find_over(monkeypatch, acted)["text"].startswith(f"{probe} (power-cycling the host")
+    # A unit systemd started whose own lines after its start only skipped did not fire.
+    started = [*_ARMED[:3], _j(1, "skip: shutdown finished in time", _WATCHDOG, "example-watchdog"), *_ARMED[3:]]
+    assert _find_over(monkeypatch, started)["text"] == (
+        "a request to systemd-logind that names no user (journal: System is rebooting.); "
+        f"{_WATCHDOG} (power-cycle a hung shutdown) armed, not fired: it logged only a skip "
+        "(skip: shutdown finished in time)")
+
+
+def test_a_watchdog_that_logged_after_its_start_is_still_the_initiator(monkeypatch):
+    from ttp import initiator
+    said = f"{_WATCHDOG} (Started {_WATCHDOG} - power-cycle a hung shutdown.)"
+    fired = [*_ARMED[:-1], _j(45, "shutdown hung: power-cycling the host", _WATCHDOG, "example-watchdog"),
+             _ARMED[-1]]
+    reads = []
+    assert _find_over(monkeypatch, fired, reads) == {"source": "journal", "text": said}
+    assert initiator.unit_args(_WATCHDOG) in reads, reads
+    # Its own lines not readable: no claim it did not fire, named as before.
+    assert _find_over(monkeypatch, _ARMED, unit_rc=1) == {"source": "journal", "text": said}
+
+
+def test_a_unit_line_that_is_no_systemd_start_is_the_initiator_without_reading_its_lines(monkeypatch):
+    from ttp import initiator
+    plain = [_j(-60, "job 7 finished", _BROKER, "example-broker"),
+             _j(-2, "power-cycle requested by the operator console", _BROKER, "example-broker"),
+             *_ARMED[2:]]
+    reads = []
+    assert _find_over(monkeypatch, plain, reads) == {
+        "source": "journal", "text": f"{_BROKER} (power-cycle requested by the operator console)"}
+    assert len(reads) == 4 and initiator.unit_args(_BROKER) not in reads and initiator.end_args() not in reads, reads
+    # A unit line that reads like a start (not systemd's) is the unit's own line: named, nothing more read.
+    own = [_j(-2, f"Started {_WATCHDOG} - power-cycle a hung shutdown.", _BROKER, "example-broker"), *_ARMED[2:]]
+    reads.clear()
+    assert _find_over(monkeypatch, own, reads)["text"].startswith(f"{_BROKER} (Started ")
+    assert len(reads) == 4 and initiator.unit_args(_WATCHDOG) not in reads, reads
+
+
+def test_a_full_marker_read_with_no_marker_never_claims_no_clean_shutdown(monkeypatch):
+    from ttp import initiator
+    # As many logind lines as the marker read holds and no marker among them: the marker may lie before them.
+    text = "\n".join([_j(-3, "Started example-health.service.", "init.scope", "systemd", about="example-health.service"),
+                      *(_j(k / 1000, f"Removed session {k}.", "systemd-logind.service", "systemd-logind")
+                        for k in range(initiator.MARK_ENTRIES + 10))]) + "\n"
+    monkeypatch.setattr(initiator, "run_journal", lambda boot, extra=(), sudo=False: _journalctl(text, extra))
+    got = initiator.find(None, "boot-0", None, None)
+    assert got == {"source": "journal", "text": initiator.NO_MARKER}, got
+    assert "no clean shutdown" not in got["text"] and str(initiator.MARK_ENTRIES) in got["text"]
+    full = _journalctl(text, initiator.marker_args())[1]
+    assert initiator.parse(full, full=True) == (None, initiator.NO_MARKER)
+    # One line fewer is the whole boot: a boot with no marker in it did not shut down cleanly.
+    short = "".join(line + "\n" for line in full.splitlines()[1:])
+    assert initiator.parse(short, short, full=True)[1].startswith(initiator.NO_SHUTDOWN)
+
+
+def test_a_permission_limited_journal_is_read_through_sudo_n_never_prompting(env, tmp_path, monkeypatch):
+    import subprocess as sp
+    from ttp import initiator
+    p = make(env)
+    monkeypatch.delenv("TTP_TEST_NO_JOURNAL")
+    calls = []
+
+    def run(cmd, **kw):
+        calls.append((cmd, kw.get("timeout"), kw.get("stdin")))
+        if cmd[0] == "journalctl":
+            return sp.CompletedProcess(cmd, *_OWN_ONLY)
+        if cmd == ["sudo", "-n", "-l", "journalctl"]:
+            return sp.CompletedProcess(cmd, 0, "", "")
+        return sp.CompletedProcess(cmd, *_newest_first((0, _CYCLE, ""), cmd))
+    monkeypatch.setattr(initiator.subprocess, "run", run)
+    got = initiator.find(p, "0123456789abcdef0123456789abcdef", time.time(), None)
+    assert got["source"] == "journal" and got["read"] == "sudo" \
+        and got["text"].startswith("example-broker-recover.service (power-cycle a hung shutdown"), got
+    user, check, sudo, kernel, commands, window = (c[0] for c in calls)
+    assert user[:3] == ["journalctl", "-b", "0123456789abcdef0123456789abcdef"] and "json" in user \
+        and "SYSLOG_IDENTIFIER=systemd-logind" in user
+    assert check == ["sudo", "-n", "-l", "journalctl"] and sudo == ["sudo", "-n", *user]
+    k = initiator.kernel_args()
+    assert kernel[:2] == ["sudo", "-n"] and kernel[-len(k):] == k, kernel
+    assert commands[:2] == ["sudo", "-n"] and commands[-2:] == ["SYSLOG_IDENTIFIER=sudo", "SYSLOG_IDENTIFIER=pkexec"]
+    assert window[:2] == ["sudo", "-n"] and window[window.index("--since") + 1] == f"@{_T0 - 600}" \
+        and window[window.index("--until") + 1] == f"@{_T0 + 1}", window   # the 10 min before the marker
+    assert all(t <= 10 and stdin == sp.DEVNULL for _, t, stdin in calls), calls   # bounded, never prompts
+    # Only the user's own entries and no hint is limited too; no passwordless sudo: one silent probe, no read.
+    calls.clear()
+    own = (0, _OWN_ONLY[1], "")
+    monkeypatch.setattr(initiator.subprocess, "run", lambda cmd, **kw: calls.append(cmd) or sp.CompletedProcess(
+        cmd, *(own if cmd[0] == "journalctl" else (1, "", "sudo: a password is required\n"))))
+    got = initiator.find(p, "boot-0", time.time(), None)
+    assert calls[0][:3] == ["journalctl", "-b", "-1"] and calls[1:] == [["sudo", "-n", "-l", "journalctl"]], calls
+    assert got["text"] == "unknown (journal not readable: user not in systemd-journal and no passwordless sudo for journalctl)"
+    # sudo works but its read is refused: said so, never retried with a password.
+    monkeypatch.setattr(initiator.subprocess, "run", lambda cmd, **kw: sp.CompletedProcess(
+        cmd, *(own if cmd[0] == "journalctl" else (0, "", "") if cmd[:3] == ["sudo", "-n", "-l"]
+               else (1, "", "sudo: a password is required\n"))))
+    assert initiator.find(p, "boot-0", time.time(), None)["unreadable"] == \
+        "user not in systemd-journal, and sudo -n journalctl did not read it either"
+
+
+def test_an_unreadable_journal_gives_its_reason_once_in_doctor_not_a_command_to_run(env, tmp_path, monkeypatch):
+    from ttp import initiator
+    p = make(env)
+    feed, record, got = _initiator_reboot(p, tmp_path, monkeypatch, _OWN_ONLY)
+    why = "user not in systemd-journal and no passwordless sudo for journalctl"
+    assert f"Initiator: unknown (journal not readable: {why})." in feed and feed.count("Initiator:") == 1, feed
+    assert got == {"source": "unknown", "text": f"unknown (journal not readable: {why})", "unreadable": why}
+    line = initiator.doctor_line(p)
+    assert line.startswith(f"reboot causes: the last reboot's journal was not readable ({why}).") \
+        and "systemd-journal group" in line and "setup-box" in line and "`" not in line, line
+    r = subprocess.run([sys.executable, "-m", "ttp", "doctor", p.name], capture_output=True, text=True,
+                       env={**os.environ, "PYTHONPATH": str(RUNTIME)}, timeout=60)
+    assert r.stdout.count("reboot causes:") == 1, r.stdout + r.stderr
+    # A missing persistent journal is no group problem: sudo is not tried and no group fix is offered.
+    stored = initiator.find(p, "boot-0", None, None, journal=(1, "", "Specifying boot ID or boot offset has no "
+                                                                      "effect, no persistent journal was found.\n"),
+                            sudo=(0, _CYCLE, ""))   # sudo would read it: never asked
+    assert stored == {"source": "unknown", "unreadable": "no persistent journal kept for the previous boot",
+                      "text": "unknown (journal not readable: no persistent journal kept for the previous boot)"}
+    p.db.set_kv("boot_prev", {**p.db.kv("boot_prev"), "initiator": stored})
+    assert "(no persistent journal" in initiator.doctor_line(p) and "group" not in initiator.doctor_line(p)
+
+
+def test_a_boot_with_no_shutdown_marker_says_no_clean_shutdown_and_names_the_last_unit_lines(env, tmp_path,
+                                                                                             monkeypatch):
+    from ttp import initiator
+    p = make(env)
+    cut = "\n".join(line for line in _CYCLE.splitlines()[:3]) + "\n" + _j(-2, "kernel line", ident="kernel") + "\n"
+    feed, record, got = _initiator_reboot(p, tmp_path, monkeypatch, (0, cut, ""))
+    said = (f"Initiator: no clean shutdown logged (power loss, hard reset or watchdog); last unit lines: "
+            f"{_BROKER}: power-cycle requested long ago; {_BROKER}: job 41 finished.")
+    assert said in feed and got["source"] == "journal", (feed, got)
+    # No unit lines at all: the wording alone. A limited read never claims an unclean boot.
+    assert initiator.parse(_j(-2, "kernel line", ident="kernel"), full=True) == (None, initiator.NO_SHUTDOWN)
+    assert initiator.parse(cut, full=False) == (None, None)
+
+
+def _wtmp(path, records):
+    """A wtmp fixture: (ut_type, ut_user, seconds) records in the Linux utmp layout."""
+    from ttp import shutrec
+    with open(path, "wb") as f:
+        for kind, user, sec in records:
+            f.write(shutrec._UTMP.pack(kind, 0, b"~", b"~~", user.encode(), b"6.8.0", 0, 0, 0, int(sec), 0,
+                                       0, 0, 0, 0, b""))
+    return path
+
+
+def test_wtmp_shutdown_reads_only_a_shutdown_record_in_the_window_and_never_raises(tmp_path):
+    from ttp import shutrec
+    now = time.time()
+    path = _wtmp(tmp_path / "wtmp", [(2, "reboot", now - 9000), (1, "shutdown", now - 5000),
+                                     (7, "user", now - 400), (2, "reboot", now - 100)])
+    assert shutrec.wtmp_shutdown(now - 6000, now, str(path)) == float(int(now - 5000))
+    assert shutrec.wtmp_shutdown(now - 4000, now, str(path)) is None   # only a login and a boot since
+    assert shutrec.wtmp_shutdown(now - 6000, now - 5500, str(path)) is None   # after this boot: not the one before it
+    with open(path, "ab") as f:
+        f.write(b"\0" * 100)   # a torn last record is skipped
+    assert shutrec.wtmp_shutdown(now - 6000, now, str(path)) == float(int(now - 5000))
+    (tmp_path / "dir").mkdir()
+    for bad in (tmp_path / "missing", tmp_path / "dir", _wtmp(tmp_path / "empty", [])):
+        assert shutrec.wtmp_shutdown(0, None, str(bad)) is None
+
+
+@pytest.mark.parametrize("cell", ["wtmp-shutdown", "orderly-stop", "no-record", "wtmp-unreadable",
+                                  "wtmp-stale", "stop-then-restart"])
+def test_a_reboot_after_a_shutdown_record_requeues_the_cut_short_run_that_held_a_device(env, tmp_path, monkeypatch, cell):
+    """A shutdown that outlived the daemon's stop timeout leaves no clean-stop record: wtmp's shutdown
+    record or the daemon's own stop-signal record still make the reboot orderly, so the run it cut
+    short is requeued. Neither (or an unreadable wtmp, a record from before the last heartbeat, a
+    restart on the same boot after the signal) keeps the abrupt path, which blocks a device holder."""
+    import signal
+    from ttp.daemon import CLEAN_STOP_KEY, Daemon
+    p = make(env)
+    tid = p.db.add_task("flash the board", "s", kind="work", tier="light", origin="user")
+    now = time.time()
+    last, booted = now - 600, now - 60
+    if cell == "orderly-stop" or cell == "stop-then-restart":
+        _boot_as(monkeypatch, "an-earlier-boot")
+        d0 = Daemon(p.base)
+        d0._on_stop_signal(signal.SIGTERM)   # then killed past its stop timeout: no clean-stop record
+        if cell == "stop-then-restart":
+            _run_once(Daemon(p.base), monkeypatch, crash=True)
+    if cell == "wtmp-shutdown":
+        monkeypatch.setenv("TTP_TEST_WTMP", str(_wtmp(tmp_path / "wtmp", [(2, "reboot", now - 90000),
+                                                                           (1, "shutdown", last + 5)])))
+    elif cell == "wtmp-stale":
+        monkeypatch.setenv("TTP_TEST_WTMP", str(_wtmp(tmp_path / "wtmp", [(1, "shutdown", now - 90000),
+                                                                           (2, "reboot", now - 89000)])))
+    elif cell == "wtmp-unreadable":
+        (tmp_path / "wtmp").mkdir()
+        monkeypatch.setenv("TTP_TEST_WTMP", str(tmp_path / "wtmp"))
+    hb = p.state / "heartbeat"
+    hb.write_text(json.dumps({"boot": "an-earlier-boot", "held": [f"board: task #{tid} (run 1) since 10:02 PDT"]}))
+    os.utime(hb, (last, last))
+    assert p.db.kv(CLEAN_STOP_KEY) is None
+    _boot_as(monkeypatch, "boot-b", booted)
+    d = Daemon(p.base)
+    rec = p.db.kv("boot_prev")
+    orderly = cell in ("wtmp-shutdown", "orderly-stop")
+    assert rec["prev_boot"] == "an-earlier-boot" and rec["shutdown"] == ("orderly" if orderly else "abrupt"), rec
+    assert rec.get("orderly_by") == {"wtmp-shutdown": "wtmp shutdown record",
+                                     "orderly-stop": "stop signal (SIGTERM)"}.get(cell), rec
+    run_dir = _lost_to_reboot(p, d, tmp_path, tid)
+    t = p.db.task(tid)
+    assert t["attempts"] == 0, dict(t)
+    if orderly:
+        assert t["status"] == "queued" and tid in [x["id"] for x in p.db.ready_tasks()], dict(t)
+        assert run_dir.is_dir()   # its folder and notes stay for the resume
+    else:
+        assert t["status"] == "blocked", dict(t)
+        assert t["blocked_reason"].startswith("the host rebooted abruptly while this task held board"), t
+
+
+# A kernel fault before the reboot (initiator.kernel_fault): fixture journal text only.
+@pytest.mark.parametrize("ident,msg,label", [
+    ("kernel", "Kernel panic - not syncing: Fatal exception", "kernel panic"),
+    ("kernel", "Out of memory: Killed process 4242 (python3)", "out of memory"),
+    ("systemd-oomd", "Killed /user.slice/x.scope due to memory pressure", "out of memory"),
+    ("kernel", "mce: [Hardware Error]: Machine check: Processor context corrupt, fatal", "machine check"),
+    ("kernel", "mce: [Hardware Error]: Machine check events logged", ""),     # corrected errors: routine
+    ("kernel", "watchdog: BUG: soft lockup - CPU#3 stuck for 22s!", "lockup"),
+    ("kernel", "watchdog: watchdog0: watchdog did not stop!", ""),             # a normal shutdown
+    ("systemd", "Started Shutdown watchdog.", ""),                             # not the kernel's own line
+    ("example-app", "Out of memory: Killed process 1", ""),                    # an app quoting it
+])
+def test_the_kernel_fault_read_names_only_the_kernels_own_fault_lines(ident, msg, label):
+    from ttp import initiator
+    got = initiator.kernel_fault(_j(-40, msg, ident=ident) + "\n", _T0)
+    assert got.startswith(label + ": ") if label else got == "", got
+
+
+@pytest.mark.parametrize("dt,named", [(-40, True), (-3 * 3600, False), (-2 * 86400, False)])
+def test_a_kernel_fault_counts_only_in_the_window_before_the_shutdown(dt, named):
+    from ttp import initiator
+    oom = _j(dt, "Out of memory: Killed process 4242 (python3)", ident="kernel")
+    later = _j(-10, "e1000e: link down", ident="kernel")
+    for at in (_T0, None):     # the marker's time, else the newest line read
+        got = initiator.kernel_fault(oom + "\n" + later + "\n", at)
+        assert got.startswith("out of memory: ") if named else got == "", (dt, at, got)
+    assert initiator.kernel_fault(oom + "\n", None).startswith("out of memory"), "alone, it is the newest line"
+
+
+@pytest.mark.parametrize("panic_dt,named", [(0, True), (-3 * 3600, False)])
+def test_a_crash_with_no_shutdown_marker_anchors_the_kernel_window_to_the_boots_end(monkeypatch, panic_dt, named):
+    """No marker: the window ends at the newest line of any read, not the marker read's old logind line."""
+    from ttp import initiator
+    marker = _j(-3 * 3600, "New session 7 of user someuser.", "systemd-logind.service", "systemd-logind") + "\n"
+    kern = "\n".join([_j(panic_dt - 30, "watchdog: BUG: soft lockup - CPU#3 stuck for 22s!", ident="kernel"),
+                      _j(panic_dt, "Kernel panic - not syncing: Fatal exception", ident="kernel"),
+                      *([_j(0, "e1000e: link down", ident="kernel")] if panic_dt else [])]) + "\n"
+
+    def run(boot, extra=(), sudo=False):     # one answer per read: `journal=` would answer all the same
+        extra = list(extra)
+        return (0, kern if extra == initiator.kernel_args() else marker if extra == initiator.marker_args()
+                else "", "")
+    monkeypatch.setattr(initiator, "run_journal", run)
+    got = initiator.find(None, "boot-0", None, None)
+    assert got.get("kernel", "").startswith("kernel panic: ") if named else "kernel" not in got, got
+
+
+def test_the_kernel_read_selects_kernel_and_oomd_lines_of_the_ended_boot(env, monkeypatch):
+    from ttp import initiator
+    p = make(env)
+    oom = json.dumps({"__REALTIME_TIMESTAMP": str(int((_T0 - 40) * 1e6)), "_TRANSPORT": "kernel",
+                      "SYSLOG_IDENTIFIER": "kernel", "MESSAGE": "Out of memory: Killed process 4242 (python3)"})
+    quoted = _j(-20, "Out of memory: Killed process 1", "example.service", "example-app")
+    text = "\n".join([oom, quoted, *_CYCLE.splitlines()]) + "\n"
+    monkeypatch.setattr(initiator, "run_journal", lambda boot, extra=(), sudo=False: _journalctl(text, extra))
+    got = initiator.find(p, "boot-0", _T0 + 60, _T0 - 60)
+    assert got["source"] == "journal" and got["kernel"] == "out of memory: Out of memory: Killed process 4242 (python3)"
+
+
+def test_the_reboot_record_and_host_line_say_when_in_the_home_zone_and_why(env, tmp_path, monkeypatch):
+    from ttp import db as dbm
+    from ttp import timefmt
+    p = make(env)
+    p.set_config(timefmt.KEY, "America/Los_Angeles")
+    # the kernel read is JSON: a fault counts only with its time, in the window before the shutdown
+    oom = _j(-30, "Out of memory: Killed process 4242 (python3)", ident="kernel") + "\n"
+    feed, record, got = _initiator_reboot(p, tmp_path, monkeypatch, (0, oom + _SUDO_REBOOT, ""))
+    assert got["kernel"].startswith("out of memory: ") and "someuser ran `reboot`" in got["text"], got
+    boot = p.db.boots(0)[-1]
+    back = timefmt.short(float(boot["boot_time"]), p)
+    assert back.endswith(("PST", "PDT")), back
+    assert f"; back up at {back}; " in record and "kernel fault before it: out of memory" in record, record
+    assert "Kernel fault before it: out of memory" in feed or "kernel fault before it: out of memory" in feed, feed
+    line = dbm.host_line(p.db.boots(0), p)
+    assert f"(last {back}: someuser ran `reboot` via sudo (journal); kernel: out of memory: " in line, line

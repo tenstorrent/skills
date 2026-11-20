@@ -1,0 +1,5 @@
+---
+"tt-project": patch
+---
+
+`tt-project`: a model-free progress and stall check in the daemon tick raises a keyed `no_progress` or `stall` event when running work yields no result past its threshold, a probe keeps saying not yet, runs keep failing the same way, or a schedule keeps failing the same way; it flags a wait on what the task itself fixes. It shares `progress.py` and one reader with `ttp progress report` (rotated reports still count), leaves refusal streaks to that report check and own-daily-cap skips to the schedule-budget observation, and clears a key only after it stays healthy for 3 checks spanning 30 min, so a key that flaps does not wake the coordinator again. It judges only work that has run: a task's clock starts at its running run's start (or its last result, if later), and a queued task that never started is left to the daemon's stall check, so a task released after a long wait behind a dependency, a start time, a pause or a full worker slot is never reported stuck before it runs. Settings: `coordinator.progress_check`.

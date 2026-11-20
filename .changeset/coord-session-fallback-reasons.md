@@ -1,0 +1,5 @@
+---
+"tt-project": patch
+---
+
+`tt-project`: `ttp stats --coord-session` names why each coordinator wake did not resume, per day: resumed, handover, rollover (with the mean context size that triggered it), a new session and its cause (no session, prompt/charter/schema change, model or effort change, last wake failed, transcript gone), spend guard, failed resume rerun, pause after failed resumes, decide failed. The fallback-to-stateless rate counts only wakes with the session mode on; wakes with it off are listed apart by their recorded cause ("mode off", a provider that cannot resume; older wakes "off, not recorded"). Failed session wakes are listed with their transcript's error (e.g. `error_max_budget_usd`), and a stateless rerun of a failed resume records that resume's error. The session spend guard withdraws a trip whose own window now re-reads at or under the allowance it was judged against (its resumed turns were re-netted to their own cost since): session turns resume at once and the trip leaves the 7-day count, instead of a false trip forcing hours of stateless wakes.

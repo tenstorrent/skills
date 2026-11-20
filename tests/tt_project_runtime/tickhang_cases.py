@@ -1,0 +1,548 @@
+# Cases for tests/test_tt_project_runtime.py: a daemon stalled in one tick step is restarted by its
+# watchdog, and the restarted daemon never re-enters the same hang by reaping the same run again
+# (see _include_cases there): helpers, fixtures and imports come from that file.
+from __future__ import annotations
+
+
+def _tickhang_watchdog(p, monkeypatch, pid=424242):
+    """A live 'daemon' pid whose heartbeat stopped WATCHDOG_S + 100 s ago; restarts are recorded, not run."""
+    from ttp import watchdog
+    restarts = []
+    monkeypatch.setattr(watchdog, "_is_daemon", lambda q: q == pid)
+    monkeypatch.setattr(watchdog, "_alive", lambda q: q == pid)
+    monkeypatch.setattr(watchdog, "save_dump", lambda p, q, now, mins, wait: p.state / "incidents" / "dump.log")
+    monkeypatch.setattr(watchdog, "_restart", lambda p, q, grace: (restarts.append(q), (True, "restarted"))[1])
+    (p.state / "daemon.pid").write_text(str(pid))
+    hb = p.state / "heartbeat"
+    hb.write_text(json.dumps({"pid": pid, "started": time.time() - 3600}))
+    since = time.time() - watchdog.WATCHDOG_S - 100
+    os.utime(hb, (since, since))
+    return restarts, since
+
+
+def test_a_daemon_stalled_in_a_named_step_is_restarted_at_twice_the_stale_threshold(env, monkeypatch):
+    from ttp import daemon as dm
+    from ttp import watchdog
+    p = make(env)
+    assert watchdog.WATCHDOG_S == 2 * dm.HEARTBEAT_STALE_S < watchdog.settings(p)["hang_s"]
+    restarts, since = _tickhang_watchdog(p, monkeypatch)
+    now = time.time()
+    # No stall report, one from another pid, one from before the last progress, a torn file: hang_s holds.
+    for stall in (None, {"pid": 7, "step": "reap_runs", "at": now}, {"pid": 424242, "step": "reap_runs",
+                  "at": since - 5}, "{torn"):
+        if stall is not None:
+            (p.state / dm.STALL_FILE).write_text(stall if isinstance(stall, str) else json.dumps(stall))
+        assert watchdog.check(p, now=now) == "stale"
+        assert watchdog.check(p, now=now + watchdog.CONFIRM_S) == "stale", stall
+        (p.state / "watchdog.json").unlink(missing_ok=True)
+    assert not restarts
+    # The daemon's own tick watch said it stalled in reap_runs after that progress: restarted now.
+    (p.state / dm.STALL_FILE).write_text(json.dumps({"pid": 424242, "step": "reap_runs", "at": since + 300}))
+    assert watchdog.check(p, now=now) == "stale"
+    assert watchdog.check(p, now=now + watchdog.CONFIRM_S) == "restarted" and restarts == [424242]
+    assert "stalled in tick step reap_runs" in (p.logs / "daemon.log").read_text()
+    told = p.db.q("SELECT severity, text FROM messages WHERE ref='daemon-hang' AND kind='alert'")
+    assert len(told) == 1 and told[0]["severity"] == "low" and "reap_runs" in told[0]["text"]
+    # A repeat within the window waits twice as long.
+    assert watchdog.threshold(p, watchdog.settings(p), now, True) == 2 * watchdog.WATCHDOG_S
+
+
+def test_a_stalled_tick_writes_the_stall_report_the_watchdog_reads(env):
+    from ttp import daemon as dm
+    from ttp import watchdog
+    p = make(env)
+    d = dm.Daemon(p.base)
+    d.cfg = p.config()
+    t = time.monotonic()
+    d._tick_began, d._moved, d._step_name = t, t, "reap_runs"
+    assert d.check_overrun(t + 10) is None and not (p.state / dm.STALL_FILE).exists()
+    before = time.time()
+    assert d.check_overrun(t + dm.TICK_STALL_S + 1)["stalled"]
+    rec = json.loads((p.state / dm.STALL_FILE).read_text())
+    assert rec["pid"] == os.getpid() and rec["step"] == "reap_runs" and rec["at"] >= before
+    assert watchdog.stalled_step(p, os.getpid(), before - 1) == "reap_runs"
+    assert watchdog.stalled_step(p, os.getpid(), rec["at"] + 1) is None   # it moved since
+
+
+class _CutOff(BaseException):
+    """What killing the daemon mid-step looks like to the code under it: nothing below catches it."""
+
+
+def _coordinator_run(p, tmp_path, actions):
+    run_dir = tmp_path / "coord-run"
+    run_dir.mkdir()
+    (run_dir / "output.jsonl").write_text(json.dumps({"actions": actions, "_cost": 0.25}))
+    (run_dir / "exit.json").write_text(json.dumps({"rc": 0, "ended": time.time()}))
+    return p.db.x("INSERT INTO runs(role,provider,started,status,dir,boot_id,note) VALUES(?,?,?,?,?,?,?)",
+                  ("coordinator", "fake", time.time(), "running", str(run_dir), "x", "{}"))
+
+
+def test_a_reap_cut_off_in_a_slow_step_is_retried_once_lean_and_applied_once(env, tmp_path, monkeypatch):
+    from ttp import coordinator as coord
+    from ttp import daemon as dm
+    p = make(env)
+    rid = _coordinator_run(p, tmp_path, [{"type": "task_add", "title": "label the numbers", "spec": "s",
+                                          "kind": "work", "tier": "light"}])
+    real, seen = coord.apply, []
+
+    def apply(*a, **kw):
+        seen.append(kw.get("lean"))
+        if not kw.get("lean"):
+            raise _CutOff()   # the slow optional step: the watchdog kills the daemon in it
+        return real(*a, **kw)
+    monkeypatch.setattr(coord, "apply", apply)
+    with pytest.raises(_CutOff):
+        dm.Daemon(p.base).reap_runs()
+    run = p.db.one("SELECT status, cost_usd FROM runs WHERE id=?", (rid,))
+    assert run["status"] == "running" and not run["cost_usd"], "a cut-off reap committed part of the run's end"
+    assert p.db.kv(dm.REAP_KEY)[str(rid)]["lean"] is False
+    # The restarted daemon reaps it once more, lean: the turn is applied once and booked once.
+    dm.Daemon(p.base).reap_runs()
+    assert seen == [False, True]
+    run = p.db.one("SELECT status, cost_usd FROM runs WHERE id=?", (rid,))
+    assert run["status"] == "ok" and run["cost_usd"] == 0.25
+    assert len(p.db.q("SELECT id FROM tasks WHERE title='label the numbers'")) == 1
+    assert not p.db.kv(dm.REAP_KEY)
+    assert p.db.one("SELECT id FROM messages WHERE ref=?", (f"reap-lean:{rid}",))
+    assert "never finished" in (p.logs / "daemon.log").read_text()
+
+
+def test_a_lean_reap_of_a_coordinator_without_tool_hooks_still_runs_the_whole_wake_guard(env, tmp_path):
+    """An earlier daemon cut off before the wake guard: the lean retry still puts back a charter the
+    wake changed outside ttp's writers and records it; only the coordwrites report is skipped."""
+    from ttp import coordtools
+    from ttp import daemon as dm
+    p = make(env)
+    rid = _coordinator_run(p, tmp_path, [])
+    before = p.charter_path.read_text()
+    coordtools.wake_snapshot(tmp_path / "coord-run", coordtools.protected_paths(p))
+    p.charter_path.write_text(before + "\n- loosened\n")
+    p.db.set_kv(dm.REAP_KEY, {str(rid): {"pid": 1, "started": 0, "lean": False, "at": time.time()}})
+    dm.Daemon(p.base).reap_runs()
+    assert p.db.one("SELECT id FROM messages WHERE ref=?", (f"reap-lean:{rid}",)), "reaped lean"
+    assert p.charter_path.read_text() == before
+    assert p.db.q("SELECT id FROM events WHERE kind='coord_protected_write'")
+
+
+def test_a_lean_reap_cut_off_too_quarantines_the_run_instead_of_looping(env, tmp_path, monkeypatch):
+    from ttp import coordinator as coord
+    from ttp import daemon as dm
+    p = make(env)
+    rid = _coordinator_run(p, tmp_path, [{"type": "memory_add", "text": "x", "memory_kind": "preference"}])
+    calls = []
+    monkeypatch.setattr(coord, "apply", lambda *a, **kw: (calls.append(kw.get("lean")), (_ for _ in ()).throw(_CutOff()))[1])
+    for _ in range(2):
+        with pytest.raises(_CutOff):
+            dm.Daemon(p.base).reap_runs()
+    assert calls == [False, True]
+    dm.Daemon(p.base).reap_runs()   # the third daemon never enters the step again
+    assert calls == [False, True]
+    run = p.db.one("SELECT status FROM runs WHERE id=?", (rid,))
+    assert run["status"] == "failed" and not p.db.kv(dm.REAP_KEY)
+    assert p.db.one("SELECT id FROM messages WHERE ref=?", (f"reap-quarantine:{rid}",))
+    assert "quarantined" in (p.logs / "daemon.log").read_text()
+
+
+def test_a_lean_reap_that_raises_is_quarantined_at_once_and_a_full_one_keeps_its_three_tries(env, tmp_path, monkeypatch):
+    from ttp import coordinator as coord
+    from ttp import daemon as dm
+    p = make(env)
+    rid = _coordinator_run(p, tmp_path, [{"type": "memory_add", "text": "x", "memory_kind": "preference"}])
+    calls, cut = [], [True]
+
+    def apply(*a, **kw):
+        calls.append(kw.get("lean"))
+        if cut:   # only the first reap is cut off
+            cut.clear()
+            raise _CutOff()
+        raise RuntimeError("bad action")
+    monkeypatch.setattr(coord, "apply", apply)
+    with pytest.raises(_CutOff):
+        dm.Daemon(p.base).reap_runs()
+    d = dm.Daemon(p.base)
+    d.reap_runs()
+    assert calls == [False, True]
+    assert p.db.one("SELECT status FROM runs WHERE id=?", (rid,))["status"] == "failed"
+    assert p.db.one("SELECT id FROM messages WHERE ref=?", (f"reap-quarantine:{rid}",))
+    # A full reap that raises (no cut-off before it) is no hang: it keeps the old three tries.
+    rid2 = p.db.x("INSERT INTO runs(role,provider,started,status,dir,boot_id,note) VALUES(?,?,?,?,?,?,?)",
+                  ("coordinator", "fake", time.time(), "running", p.db.one("SELECT dir FROM runs WHERE id=?",
+                                                                           (rid,))["dir"], "x", "{}"))
+    calls.clear()
+    d.reap_runs()
+    d.reap_runs()
+    assert calls == [False, False] and p.db.one("SELECT status FROM runs WHERE id=?", (rid2,))["status"] == "running"
+    assert not p.db.kv(dm.REAP_KEY)
+    d.reap_runs()
+    assert p.db.one("SELECT status FROM runs WHERE id=?", (rid2,))["status"] == "failed"
+
+
+def test_a_lean_apply_skips_the_restriction_checks_and_notes_it(env):
+    """The same narrowing that queues a restriction_tools task applied lean: the charter changes the
+    same, no tool scan runs, and the next digest's notes say the checks were skipped."""
+    from ttp import coordinator as coord
+    p, tasks = _soak_guard(env)
+    mids, src = _turn_said(p, "the soak test may run on a shared rack at night")
+    act = {"type": "charter_update", "section": "Restrictions", "quote": _GUARD_SOAK + " (user msg #7)",
+           "text": "Run the soak test on a shared rack only at night.", "source": src}
+    assert coord.apply(p, [act], turn=1, user_turn=True, messages=mids, lean=True) == []
+    assert "only at night" in p.charter_path.read_text()
+    assert tasks() == [] and not p.db.q("SELECT id FROM events WHERE kind='restriction_tools'")
+    assert any("restriction checks skipped" in n for n in p.db.kv(coord.NOTES_KEY, []))
+
+
+def test_reap_runs_stops_at_its_step_budget_and_the_rest_are_reaped_once_on_later_ticks(env, tmp_path, monkeypatch):
+    """Several runs ending together, each end slow, once held reap_runs (and every worker start) for 9 min:
+    past STEP_BUDGET_S it stops, the rest stay running on record with their exit.json on disk, and later
+    ticks, or a restarted daemon, reap each of them exactly once."""
+    from ttp import daemon as dm
+    p = make(env)
+    rids = []
+    for n in range(4):
+        run_dir = tmp_path / f"coord-run-{n}"
+        run_dir.mkdir()
+        (run_dir / "output.jsonl").write_text(json.dumps({"actions": [
+            {"type": "task_add", "title": f"slow end {n}", "spec": "s", "kind": "work", "tier": "light"}],
+            "_cost": 0.1}))
+        (run_dir / "exit.json").write_text(json.dumps({"rc": 0, "ended": time.time()}))
+        rids.append(p.db.x("INSERT INTO runs(role,provider,started,status,dir,boot_id,note) VALUES(?,?,?,?,?,?,?)",
+                           ("coordinator", "fake", time.time(), "running", str(run_dir), "x", "{}")))
+    real, ends = dm.Daemon.finish_run, []
+
+    def slow_finish(self, r, exit_info):
+        time.sleep(0.3)   # one run's end work on a loaded host
+        ends.append(r["id"])
+        return real(self, r, exit_info)
+    monkeypatch.setattr(dm.Daemon, "finish_run", slow_finish)
+    monkeypatch.setattr(dm, "STEP_BUDGET_S", 0.2)
+
+    def running():
+        return [r["id"] for r in p.db.q("SELECT id FROM runs WHERE status='running' ORDER BY id")]
+    d = dm.Daemon(p.base)
+    t0 = time.monotonic()
+    d._run_step(d.reap_runs)
+    assert time.monotonic() - t0 < 0.9, "the step ran past its budget by more than one run's end"
+    assert ends == rids[:1] and running() == rids[1:]
+    d._run_step(d.reap_runs)
+    assert ends == rids[:2] and running() == rids[2:], "the next tick resumes after the last one reaped"
+    d = dm.Daemon(p.base)   # a restart in between loses none of the deferred ends
+    for _ in range(3):
+        d._run_step(d.reap_runs)
+    assert ends == rids and not running()
+    assert all(p.db.one("SELECT status FROM runs WHERE id=?", (i,))["status"] == "ok" for i in rids)
+    for n in range(4):
+        assert len(p.db.q("SELECT id FROM tasks WHERE title=?", (f"slow end {n}",))) == 1, "applied once"
+
+
+def test_a_finish_warm_up_with_hung_git_ends_at_its_budget_and_the_run_is_still_reaped(env, monkeypatch):
+    """A failed review's area once read git for minutes in _prefetch_git, inside reap_runs: all its git
+    together now ends within gitmemo.PREFETCH_GIT_S, every spawn has a timeout, and the hand-off is
+    still judged and recorded."""
+    import subprocess
+    from ttp import daemon as dm
+    from ttp import gitmemo, reviewcap
+    p = make(env)
+    tid = p.db.add_task("review the change", "spec", kind="review", tier="standard", origin="coordinator")
+    real_spawn, spawned = gitmemo._spawn, []
+
+    def hung_spawn(argv, t, kw):
+        if not any("hung-ref" in str(a) for a in argv):
+            return real_spawn(argv, t, kw)
+        spawned.append(t)
+        assert t is not None, "a git spawn with no timeout"
+        time.sleep(min(t, 0.2))
+        raise subprocess.TimeoutExpired(argv, t)
+
+    def slow_area(p_, cfg, review, now=None):   # one git read per failed review in its window, each hung
+        for n in range(50):   # each a different read: the memo keeps a timed-out answer
+            try:
+                gitmemo.run(["git", "-C", str(p_.root), "rev-parse", f"hung-ref-{n}"], capture_output=True, read=True)
+            except subprocess.TimeoutExpired:
+                pass
+        return None
+    monkeypatch.setattr(gitmemo, "_spawn", hung_spawn)
+    monkeypatch.setattr(reviewcap, "area", slow_area)
+    monkeypatch.setattr(gitmemo, "PREFETCH_GIT_S", 0.5, raising=False)
+    d = dm.Daemon(p.base)
+    t0 = time.monotonic()
+    d._run_step(lambda: d._prefetch_git(p.db.task(tid), {"status": "failed", "summary": "changes needed"}),
+                "reap_runs")
+    assert time.monotonic() - t0 < 3, "the warm-up ran past its budget"
+    assert len(spawned) <= 5 and max(spawned) <= 0.5 + 0.01, spawned   # past the deadline: no new spawn
+    assert "reading git before finishing stopped at its" in (p.logs / "daemon.log").read_text()
+    assert tid in d._git_memo, "the finish still gets its warm-up's memo"
+
+
+def test_finish_rounds_learning_hung_git_end_at_their_wall_and_the_last_round_still_applies(env, monkeypatch):
+    """Each miss a finish round learned outside the lock once had TICK_GIT_S of its own, past the
+    rounds' FINISH_WALL_S: one run's end could hold reap_runs for minutes. The reads it learns now end
+    by the wall, every spawn has a timeout, and the final round (which never aborts) still applies."""
+    import subprocess
+    from ttp import daemon as dm
+    from ttp import gitmemo
+    p = make(env)
+    tid = p.db.add_task("finish behind slow git", "spec", kind="code", tier="standard", origin="coordinator")
+    real_spawn, spawned = gitmemo._spawn, []
+
+    def hung_spawn(argv, t, kw):
+        if not any("hung-ref" in str(a) for a in argv):
+            return real_spawn(argv, t, kw)
+        spawned.append(t)
+        assert t is not None, "a git spawn with no timeout"
+        time.sleep(min(t, 2.0))
+        raise subprocess.TimeoutExpired(argv, t)
+    monkeypatch.setattr(gitmemo, "_spawn", hung_spawn)
+    monkeypatch.setattr(gitmemo, "FINISH_WALL_S", 0.5)
+    d = dm.Daemon(p.base)
+    t0, finals = time.monotonic(), []
+    for n, rnd in enumerate(d._finish_rounds(tid)):
+        with rnd:
+            if not rnd.final:   # every abortable round misses a read, as a cold memo under load does
+                raise gitmemo.GitMiss(["git", "-C", str(p.root), "rev-parse", f"hung-ref-{n}"], {"capture_output": True},
+                                      None, True, "test miss", True)
+            finals.append(n)
+            d.p.db.conn.execute("UPDATE tasks SET status='done' WHERE id=?", (tid,))
+    assert time.monotonic() - t0 < 1.5, "the finish ran past its wall"
+    assert spawned and max(spawned) <= 0.5 + 0.01, spawned
+    assert len(finals) == 1 and d.p.db.task(tid)["status"] == "done", "the last round did not apply"
+
+
+def _titles(p, *titles):
+    return [len(p.db.q("SELECT id FROM tasks WHERE title=?", (t,))) for t in titles]
+
+
+def _adds(*titles):
+    return [{"type": "task_add", "title": t, "spec": "s", "kind": "work", "tier": "light"} for t in titles]
+
+
+def test_a_coordinator_reap_past_the_step_budget_is_never_cut_off_and_applies_every_action_once(env, tmp_path,
+                                                                                               monkeypatch):
+    from ttp import coordinator as coord
+    from ttp import daemon as dm
+    p = make(env)
+    rid = _coordinator_run(p, tmp_path, _adds("first", "second", "third"))
+    monkeypatch.setattr(dm, "STEP_BUDGET_S", 0.05)
+    monkeypatch.setattr(dm, "STEP_HARD_SLACK_S", 0.05)
+    real, slow = coord.apply, []
+
+    def apply(*a, **kw):
+        inner = kw["on_action"]
+
+        def on(i):
+            inner(i)
+            if i is not None:
+                slow.append(i)
+                time.sleep(0.2)   # each action alone runs past the budget and its slack
+        return real(*a, **{**kw, "on_action": on})
+    monkeypatch.setattr(coord, "apply", apply)
+    d = dm.Daemon(p.base)
+    d._run_step(d.reap_runs)
+    assert p.db.one("SELECT status FROM runs WHERE id=?", (rid,))["status"] == "ok"
+    assert slow == [0, 1, 2] and _titles(p, "first", "second", "third") == [1, 1, 1]
+    assert json.loads((tmp_path / "coord-run" / dm.COORD_JOURNAL).read_text())["on"] is None
+    d._run_step(d.reap_runs)   # nothing is applied twice
+    assert _titles(p, "first", "second", "third") == [1, 1, 1]
+
+
+def test_a_coordinator_reap_cut_off_twice_on_one_action_skips_only_it_and_is_never_quarantined(env, tmp_path,
+                                                                                              monkeypatch):
+    from ttp import coordinator as coord
+    from ttp import daemon as dm
+    p = make(env)
+    rid = _coordinator_run(p, tmp_path, _adds("before", "hangs", "after"))
+    real, seen = coord.apply, []
+
+    def apply(*a, **kw):
+        inner = kw["on_action"]
+
+        def on(i):
+            inner(i)
+            seen.append(i)
+            if i == 1:
+                raise _CutOff()   # the daemon is killed while applying action 1
+        return real(*a, **{**kw, "on_action": on})
+    monkeypatch.setattr(coord, "apply", apply)
+    for _ in range(2):
+        with pytest.raises(_CutOff):
+            dm.Daemon(p.base).reap_runs()
+        assert p.db.one("SELECT status FROM runs WHERE id=?", (rid,))["status"] == "running"
+        assert _titles(p, "before", "hangs", "after") == [0, 0, 0], "a cut-off reap committed part of the turn"
+    dm.Daemon(p.base).reap_runs()   # a lean retry cut off too: retried, not quarantined
+    assert p.db.one("SELECT status FROM runs WHERE id=?", (rid,))["status"] == "ok"
+    assert _titles(p, "before", "hangs", "after") == [1, 0, 1] and seen == [0, 1, 0, 1, 0, 2, None]
+    assert not p.db.one("SELECT id FROM messages WHERE ref=?", (f"reap-quarantine:{rid}",))
+    assert json.loads((tmp_path / "coord-run" / dm.COORD_JOURNAL).read_text())["cuts"] == {"1": 2}
+    assert any("cut off twice" in x for x in p.db.kv(coord.REJECTED_KEY, [])), "refused back to the coordinator"
+
+
+def test_a_coordinator_run_that_answered_is_never_runaway_waste_when_its_reap_fails(env, tmp_path, monkeypatch):
+    from ttp import budget as bud
+    from ttp import coordinator as coord
+    from ttp import daemon as dm
+    p = make(env)
+    rid = _coordinator_run(p, tmp_path, _adds("x"))
+    p.db.x("UPDATE runs SET cost_usd=10.69 WHERE id=?", (rid,))
+    monkeypatch.setattr(coord, "apply", lambda *a, **kw: (_ for _ in ()).throw(RuntimeError("bad state")))
+    d = dm.Daemon(p.base)
+    for _ in range(3):
+        d.reap_runs()
+    run = p.db.one("SELECT * FROM runs WHERE id=?", (rid,))
+    assert run["status"] == "failed" and not bud.wasted(run)
+    [ev] = p.db.q("SELECT * FROM events WHERE kind='coordinator_reap_failed'")
+    assert ev["status"] == "handled" and str(rid) in ev["text"]
+    # One that did not answer (rc 1) still counts.
+    (tmp_path / "coord-run" / "exit.json").write_text(json.dumps({"rc": 1, "ended": time.time()}))
+    rid2 = p.db.x("INSERT INTO runs(role,provider,started,status,dir,boot_id,note,cost_usd) VALUES(?,?,?,?,?,?,?,?)",
+                  ("coordinator", "fake", time.time(), "running", str(tmp_path / "coord-run"), "x", "{}", 3.0))
+    d._abandon_run(p.db.one("SELECT * FROM runs WHERE id=?", (rid2,)))
+    assert bud.wasted(p.db.one("SELECT * FROM runs WHERE id=?", (rid2,)))
+    assert len(p.db.q("SELECT id FROM events WHERE kind='coordinator_reap_failed'")) == 1
+
+
+def test_watchdog_step_budget_s_is_a_known_config_key():
+    from ttp import project
+    assert project.unknown_key_hint("watchdog.step_budget_s") is None
+    assert project.unknown_key_hint("watchdog.step_budget") is not None
+
+
+def test_a_step_stopped_on_the_same_item_three_times_in_a_row_raises_one_stuck_event(env, monkeypatch):
+    p = make(env)
+    from ttp import daemon as dmod
+    d = dmod.Daemon(p.base)
+    monkeypatch.setattr(dmod, "STEP_BUDGET_S", 0.05)
+    monkeypatch.setattr(dmod, "STEP_HARD_SLACK_S", 0.05)
+    monkeypatch.setattr(dmod, "STEP_LONG_PASS_AFTER", 99)   # the long pass has its own test
+
+    def on(item):
+        def step():
+            d._step_over(item, 7)
+            time.sleep(30)
+        return step
+
+    def stuck():
+        return p.db.q("SELECT * FROM events WHERE kind='tick_step_stuck'")
+    for item in ("run 1's end", "run 1's end", "run 2's end", "run 2's end"):
+        d._run_step(on(item), "rows")
+    assert not stuck(), "two in a row, then another item: not stuck"
+    d._run_step(on("run 2's end"), "rows")
+    [ev] = stuck()
+    assert "run 2's end" in ev["text"] and "rows" in ev["text"] and ev["status"] == "handled" and ev["task"] == 7
+    d._run_step(on("run 2's end"), "rows")
+    assert len(stuck()) == 1, "raised once per run of stops"
+    d._run_step(lambda: None, "rows")   # a step that finishes resets it
+    for _ in range(3):
+        d._run_step(on("run 2's end"), "rows")
+    assert len(stuck()) == 2
+
+
+def test_an_item_stopped_at_the_step_budget_twice_in_a_row_gets_one_long_pass(env, monkeypatch):
+    """Run 247: reaping one run's end took longer than the step budget, so the step was stopped on it and
+    started over every tick for 40 minutes. The second stop in a row on one item buys one long pass."""
+    p = make(env)
+    from ttp import daemon as dmod
+    d = dmod.Daemon(p.base)
+    monkeypatch.setattr(dmod, "STEP_BUDGET_S", 0.05)
+    monkeypatch.setattr(dmod, "STEP_HARD_SLACK_S", 0.05)
+    monkeypatch.setattr(dmod, "STEP_LONG_PASS_S", 3.0)
+    done = []
+
+    def slow(item, secs=0.6):
+        def step():
+            d._step_over(item, 7)
+            time.sleep(secs)
+            done.append(item)
+        return step
+    d._run_step(slow("run 1's end"), "reap")
+    d._run_step(slow("run 1's end"), "reap")
+    assert not done and d._step_stuck["reap"] == ("run 1's end", 2)
+    d._run_step(slow("run 1's end"), "reap")
+    assert done == ["run 1's end"], "the long pass let the item finish"
+    assert "reap" not in d._step_stuck and "reap" not in d._step_long and d._step_allow is None
+    # One long pass per run of stops: an item that outlasts it too is stopped again at the plain budget.
+    for _ in range(3):
+        d._run_step(slow("run 2's end", 30), "reap")
+    t = time.monotonic()
+    d._run_step(slow("run 2's end", 30), "reap")
+    assert time.monotonic() - t < 1.5 and d._step_stuck["reap"] == ("run 2's end", 4)
+    # The configured budget applies when it is longer than the long pass.
+    p.set_config("watchdog.step_budget_s", 3600)
+    d.cfg = p.config()
+    d._step_stuck["reap"], d._step_long = ("run 3's end", 2), {}
+    assert d._step_allowance("reap") == 3600
+
+
+def test_a_coordinator_turn_whose_run_dir_is_missing_writes_no_apply_journal(env, tmp_path, monkeypatch):
+    from ttp import daemon as dm
+    from types import SimpleNamespace
+    p = make(env)
+    monkeypatch.chdir(tmp_path)
+    turn = SimpleNamespace(structured={"actions": _adds("only"), "summary": ""}, error="", final_text="")
+    dm.Daemon(p.base)._finish_coordinator({"dir": "gone"}, turn, "ok", {})
+    assert _titles(p, "only") == [1]
+    assert not (tmp_path / "gone").exists(), "the reap created a run dir to journal into"
+
+
+def test_a_finish_round_rolled_back_by_a_git_miss_is_never_counted_as_a_cut_off_action(env, tmp_path, monkeypatch):
+    from ttp import coordinator as coord
+    from ttp import daemon as dm
+    from ttp import gitmemo
+    p = make(env)
+    rid = _coordinator_run(p, tmp_path, _adds("before", "misses", "after"))
+    real, misses = coord.apply, []
+
+    def apply(*a, **kw):
+        inner = kw["on_action"]
+
+        def on(i):
+            inner(i)
+            if i == 1 and len(misses) < 2:   # a cold git cache in action 1, twice in one live reap
+                misses.append(i)
+                raise gitmemo.GitMiss(["git", "-C", str(p.base), "rev-parse", "HEAD"], {"capture_output": True},
+                                      None, True, "miss", True)
+        return real(*a, **{**kw, "on_action": on})
+    monkeypatch.setattr(coord, "apply", apply)
+    dm.Daemon(p.base).reap_runs()
+    assert misses == [1, 1]
+    assert p.db.one("SELECT status FROM runs WHERE id=?", (rid,))["status"] == "ok"
+    assert _titles(p, "before", "misses", "after") == [1, 1, 1], "a rolled-back round lost an action"
+    assert not any("cut off twice" in x for x in p.db.kv(coord.REJECTED_KEY, []))
+    assert not json.loads((tmp_path / "coord-run" / dm.COORD_JOURNAL).read_text()).get("cuts")
+
+
+def test_a_step_stopped_at_its_budget_naming_no_item_names_the_code_line_it_was_on(env, monkeypatch):
+    """The case behind it: run_schedules hit its budget every tick in pure Python and the slow event said
+    only 'it names no item it works on'. A stop with no item and no child command names the innermost
+    line of the runtime it was stopped on, in the slow event and the stuck record."""
+    p = make(env)
+    from ttp import daemon as dmod, deslop, slop
+    d = dmod.Daemon(p.base)
+    monkeypatch.setattr(dmod, "STEP_BUDGET_S", 0.05)
+    monkeypatch.setattr(dmod, "STEP_HARD_SLACK_S", 0.05)
+    monkeypatch.setattr(slop, "scan_files", lambda *a, **k: time.sleep(30))
+    d._run_step(lambda: deslop.plan(p, {"deslop": {"enabled": True}}), "slow_plan")
+    [ev] = p.db.q("SELECT * FROM events WHERE kind='tick_step_slow'")
+    assert "held longest by code at deslop.py:" in ev["text"] and "in plan" in ev["text"], ev["text"]
+    assert d._step_stuck["slow_plan"][0].startswith("code at deslop.py:")
+
+
+def test_a_step_stop_python_swallowed_in_a_weakref_callback_fires_again_outside_it():
+    """The case behind it: under load the stop landed in a garbage-collector weakref callback, which
+    swallows exceptions, and the step ran on for 30 s past its budget."""
+    import weakref
+    from ttp import stepclock
+
+    class Obj:
+        pass
+    hook, stopped = sys.unraisablehook, []
+    stepclock.begin("gc_step", 600, 600)
+    stepclock._arm(600)   # begin() arms only on the main thread; a worker thread's test arms the same way
+    try:
+        o = Obj()
+        r = weakref.ref(o, lambda _: stepclock._on_alarm(signal.SIGALRM, None))   # the stop, in the callback
+        del o
+        time.sleep(30)
+    except stepclock.StepBudgetSpent:
+        stopped.append(r)
+    finally:
+        stepclock.end()
+    assert stopped and sys.unraisablehook is hook

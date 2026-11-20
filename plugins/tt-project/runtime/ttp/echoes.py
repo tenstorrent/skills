@@ -1,0 +1,1012 @@
+"""Retired-rule echoes: text the user retired that still binds through a leftover copy.
+
+When a charter_update replaces text (`quote`, `replaces`), a memory_add `supersedes` entries or a
+user Correction fact names a wrong value, `record` keeps the retired text's distinctive phrases (its
+quoted spans, config keys and identifiers, its first sentence; for a Correction, the wrong part when
+it is prose). Each coordinator turn `digest_lines` searches, model-free, every project-local place
+the old text can still bind (live memory entries, charter sections, schedules' payloads with their
+prechecks and heal checks, open tasks' specs and start_when probes, config values, and the project's own
+files: harness scripts, tools, hooks and prompts, the project's skills and agent instructions, and the
+paths in coordinator.echo_paths) and lists the hits under RETIRED_HEADER, which carries its own
+instruction; memory entries that hit are also named on one line for memory_forget, so they do not pile up. It is a notice only: no event, wake, hold or model call. Not searched: the replacing
+text itself (its entry, or its words wherever they stand), the charter's Brief (the user's verbatim words,
+never an echo), the archives (memory/archive, the charter history), and harness files the project never edited (equal to the harness's `upstream` snapshot or the
+plugin template): only a project-tuned copy can be fixed. A phrase the replacing text keeps, or a live entry
+superseding the retired one (directly or down its chain) still carries, is no phrase of the retired rule, nor is plugin vocabulary (one identifier or `ttp <command>` name found in the runtime source or an
+unedited template file, such as `start_when` or `ttp list`; never the plugin's prose, nor a Correction's
+wrong part): alone it matches unrelated text. A hit still there a turn
+after it was first shown is marked. An audit record that only preserves an old assertion is declared
+historical in HISTORICAL_INDEX (its path, sha256 and the retirement's id): while its bytes still hash
+to that value and the retirement is live, that retirement's hit on it is counted, not listed; any
+mismatch lists it as before. Binding places (prompts, harness tools, skills, agent instructions,
+executables) are never historical. A task whose subject is the detector itself (`ttp echoes` or the echo
+detector named in its title or spec opening: _about_echoes) quotes matches only to discuss them: its hit is
+advisory. Accepted gap: any other task whose spec quotes the retired rule in order to remove it is listed too.
+
+Each retirement has a KIND: WITHDRAWN (the user withdrew or replaced a governing instruction: a
+charter_update `quote` or `replaces`, a user Correction, a memory change whose `why` cites the user's
+words, or one on the user's turn that cites or quotes their words or whose message names the old rule:
+coordinator._withdrawn; a dedupe on the user's turn is not one), COMPACTED (a factual entry merged or shortened) or SUPERSEDED (one
+coordinator decision superseded by another). Only a WITHDRAWN retirement's hit on a governing phrase
+is a directive; a hit of the other kinds, or one resting only on a filename, path, version or evidence
+fragment (_weak, or an identifier the retired text holds only inside such a token: _fragment), is
+advisory: counted on one line, never a fix order. A fourth kind, UNVERIFIED (its origin unknown: nothing
+shows the user withdrew that rule), is advisory too: a record stored before kinds existed gets one from
+its source (_kind), and an unknown kind or source is UNVERIFIED. A hit of an unsourced Restrictions item dropped (by the coordinator or
+the user, with `over` or not: restriction_source.drops_unsourced) is advisory while the Brief or a sourced item still states it (restriction_audit.still_stated):
+that rule still binds, so its copies are right. Likewise a memory entry's retirement (superseded or withdrawn)
+never retires a phrase a current Restrictions item with its source (a user cite, origin: Brief or harness gate)
+or its heading states (_states: holds it whole, or as one run of its words apart from naming words and cites,
+such as 'the X restriction' or a heading quoted with its item): a hit on it is advisory, its `why` naming the item
+(_current: "Restrictions item N (...)"), wherever it stands. So is a phrase a live memory entry holds whole (_live_holds): its superseder anywhere, itself included,
+or another entry anywhere but in that entry itself (an older copy of current words). One only part of it holds,
+or only the retired entry, keeps its class, and so does a live entry's own copy of words the user withdrew,
+unless it is the superseder (that copy is the one to fix). Accepted gap: while such a stale live copy stands,
+other places quoting the same words get no fix order from that retirement. A charter retirement likewise
+never retires a phrase a current sourced Restrictions item states (_states; sourced also by its structured
+record, restriction_source.recorded_items) or a memory entry written after it holds whole, that entry included:
+a rewording is no withdrawal. For both, a phrase that only cites user messages (_cite_only: an entry's
+citation header) is advisory while live memory or the charter still cites each of them (_msgs). A memory
+retirement likewise never retires a phrase a memory entry written after it holds whole, that entry included,
+even with no supersede record linking the two (a superseder keeping every phrase stores none): the newer
+entry restates the rule. Accepted gap, as for the charter: a new entry wrongly restating withdrawn words gets
+no fix order. And no retirement of any kind retires a phrase a user message newer than it holds whole and not
+negated (_repeated: the user's own verbatim words, relay.split, never a relayer's context or a harness post):
+the user said it again, so it is live. A user
+Correction keeps its fix orders, and so does a charter replacement on every other phrase. A supersede whose only user cite names
+messages older than the entry it retires (where a rule came from, such as a current item's source) is one
+coordinator entry replacing another: SUPERSEDED (coordinator._withdrawn `since`). One the coordinator dropped on its own is SUPERSEDED, never
+WITHDRAWN, and one a record stored before the flag holds is UNVERIFIED (_unsourced). `export` is the read-only full list
+behind `ttp echoes`. Accepted gaps (settled weak-token set): a dashed config-style name with a decimal
+suffix ('max-ratio-1.5') counts as weak; a version joined by '_', '=' or '+' counts as strong (over-flag).
+
+A false positive (code using a name the retired text also holds) can be acknowledged: `ttp echoes --ack
+<retirement> <place>` (acknowledge, ACK_KEY) keeps that one match out of the digest's fix orders while the
+place holds the same phrases of that retirement (_line_sha): lines that only re-quote an acked phrase keep
+it; it is still counted and listed as acknowledged, and a new or changed phrase lists it again.
+`ttp echoes --ack-phrase <retirement> <phrase>` (acknowledge_phrase) covers one phrase of one
+retirement at every place it matches, while the retirement lives. The strong/weak rules are untouched by it.
+
+A coordinator's own decision (a memory decision entry citing no user words) retired without the user's
+explicit word (a cite or a quote of theirs, not only a phrase their message happens to hold) is advisory
+whatever its kind (_own_decision): no user rule was withdrawn. A systemd unit name (*.service, *.timer, ...)
+is weak like a file name. Accepted gap: how many places use a name is no sign it is right (a retired command
+copied into many scripts is an echo), so a name current code uses widely still matches; acknowledge it by
+phrase.
+"""
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+import re
+import subprocess
+import time
+from pathlib import Path
+from typing import Any
+
+RETIRED_KEY = "retired_rules"        # kv: [{"id", "at", "source", "old", "new", "phrases", "skip", "negated", "kind"}]
+SEEN_KEY = "retired_echo_seen"       # kv: {"turn": last_coordinator_turn, "hits": {hit key: turns shown},
+                                     #      "historical": hits declared historical, not listed,
+                                     #      "advisory": advisory hits, counted, not listed}
+WITHDRAWN, COMPACTED, SUPERSEDED = "withdrawn", "compacted", "superseded"   # retirement kinds (see the top)
+ACK_KEY = "retired_echo_acks"       # kv: {hit key: sha256 of the phrases the place held when acknowledged}
+ACK_KEEP = 200
+ACK_PHRASE = "phrase"                # ACK_KEY value of "<retirement>:phrase:<phrase>": that phrase, at every place
+UNVERIFIED = "unverified"
+KINDS = (WITHDRAWN, COMPACTED, SUPERSEDED, UNVERIFIED)
+HISTORICAL_INDEX = "echo_historical.json"   # harness/: {"historical": [{"path", "sha256", "retirement"}]}
+HISTORICAL_MAX = 200                 # index entries read
+_BINDING_DIRS = {"bin", "prompts", "hooks", "tools"}   # harness/ folders of live scripts and prompts
+_INSTRUCTIONS = {"CLAUDE.md", "AGENTS.md", "SKILL.md"}
+_SHA256 = re.compile(r"[0-9a-f]{64}")
+_BRIEF = re.compile(r"charter:brief\b", re.I)   # the Brief, whatever its heading adds
+RETIRED_DAYS = 30
+RETIRED_KEEP = 50
+MAX_PHRASES = 8
+SECTION_LINES = 10                   # the whole section, its header included
+LINE_CHARS = 160
+FILE_MAX = 400                       # files read per scan
+FILE_BYTES = 256 * 1024              # a bigger file is read up to here
+# harness/ entries not read as files: searched in their own form (memory entries, charter sections,
+# schedules, config), archives, or the installed runtime and run state.
+HARNESS_SKIP = {"memory", "runtime", "CHARTER.md", "CHARTER.history.md", "MEMORY.md", "project.json",
+                "schedules.json", "settled_areas.json", ".git", "__pycache__", "node_modules"}
+# Below the project root: the project's own skills, hooks and agent instructions.
+ROOT_PATHS = (".claude/skills", ".claude/hooks", ".claude/commands", ".claude/agents", ".agents/skills",
+              "CLAUDE.md", "AGENTS.md")
+_TEMPLATE = Path(__file__).resolve().parents[2] / "template"   # the plugin template, when run from the plugin
+_RUNTIME: dict[str, set[str]] = {}   # "vocab": the runtime source's and plugin template's identifiers, read once
+RETIRED_HEADER = ("## Retired-rule echoes (text the user retired still binds here; fix each this turn: memory_forget "
+                  "or memory_add `supersedes`, charter_update `quote`, schedule_set, task_update, config_set; a "
+                  "notice, it never waits)")
+
+_QUOTED = re.compile(r'"([^"\n]{6,300})"|“([^”\n]{6,300})”|`([^`\n]{4,200})`'
+                     r"|(?:(?<=\s)|^)'([^'\n]{12,300})'(?=[\s.,;:)]|$)")
+_IDENT = re.compile(r"\b[a-z][a-z0-9]*(?:[._][a-z0-9]+)+\b", re.I)
+_TTP_CMD = re.compile(r"\bttp [a-z][a-z-]*[a-z]\b")
+_SENTENCE = re.compile(r"(?<=[.!?])\s+")
+# A phrase that alone names no rule: a file name, a path, a version, a hash or an evidence reference.
+_FILEISH = re.compile(r"[\w.-]*\.(?:md|markdown|txt|json|jsonl|ya?ml|toml|py|sh|bash|js|ts|log|csv|tsv|html?|ini"
+                      r"|cfg|conf|lock|db|sqlite|patch|diff|out|err|rc|pdf|png|tar|gz|zip"
+                      r"|service|timer|socket|mount|automount|slice|scope)(?::\d+)*")   # systemd unit names too
+_VERSION = re.compile(r"v?\d+(?:\.\d+)+(?:[-+][\w.]+)?")
+# A name joined to a version by '-' or '@' only (tool-1.2.3, pkg@1.2.3); a config key=value or key_1.5 never is.
+_VERSIONED = re.compile(r"[\w.]*[-@]v?\d+(?:\.\d+)+(?:[-+][\w.]+)?")
+# Words that only say a version or build is in use ('running 0.2.646'): no rule beside a weak token.
+_STATE = {"running", "runs", "using", "uses", "version", "versions", "release", "build", "installed", "deployed",
+          "currently"}
+# A state word glued to its version (no space before it) reads as the spaced form; no other word is split.
+# A command's scaffolding around a script it names ('bash tests/x.sh --quick'): an interpreter or test runner and
+# option flags say no rule beside a weak token either.
+_RUNNER = {"bash", "zsh", "python", "python3", "pytest", "node", "perl", "ruby", "source", "exec"}
+_FLAG = re.compile(r"--?[a-z][\w-]*(?:=\S*)?")
+_STATE_GLUED = re.compile(r"\b(" + "|".join(sorted(_STATE, key=len, reverse=True)) + r")(v?\d+(?:\.\d+)+)\b", re.I)
+_EVIDENCE = re.compile(r"(?:#\d+|[0-9a-f]*\d[0-9a-f]*|(?:msgs?|tasks?|runs?|notes?|pr|issue)\s*#?\d+|https?:\S*)")
+_NEGATION = re.compile(r"\b(?:not|never|no longer|instead of|rather than|isn't|aren't|wasn't|weren't|retires)\s*$")
+
+
+def _flat(text: Any) -> str:
+    return " ".join(str(text or "").split()).lower()
+
+
+def phrases(old: str, new: str = "") -> list[str]:
+    """The distinctive phrases of retired text `old`, lower-case: quoted and backticked spans, config
+    keys and identifiers (a dot or underscore inside), and its first sentence (its first 12 words), at
+    most MAX_PHRASES. One the replacing text `new` holds too is left out: both rules say it."""
+    keep = _flat(new)
+    found: list[str] = []
+    for m in _QUOTED.finditer(old or ""):
+        found.append(next(g for g in m.groups() if g))
+    found += [m.group() for m in _IDENT.finditer(old or "") if len(m.group()) >= 8]
+    first = _SENTENCE.split(" ".join((old or "").split()), 1)[0].rstrip(".!?")
+    words = first.split()
+    if len(words) >= 4:
+        found.append(" ".join(words[:12]))
+    out: list[str] = []
+    for f in map(_flat, found):
+        f = f.strip(" .,;:")
+        if len(f) >= 6 and f not in out and f not in keep:
+            out.append(f)
+    return out[:MAX_PHRASES]
+
+
+def _weak_token(tok: str) -> bool:
+    tok = tok.strip("`'\"()[]{}<>,;:!?")
+    tok = tok.rstrip(".")
+    return (not tok or "/" in tok or bool(_FILEISH.fullmatch(tok) or _VERSION.fullmatch(tok)
+            or _VERSIONED.fullmatch(tok) or _EVIDENCE.fullmatch(tok) or (len(tok) >= 7 and re.fullmatch(r"[0-9a-f]+", tok)
+                                            and re.search(r"\d", tok))) or not re.search(r"[a-z]", tok))
+
+
+def _weak(ph: str) -> bool:
+    """Whether phrase `ph` names no rule alone: each of its words of 4+ characters (all of them when none
+    is) is a file name, path, version, hash, number or evidence reference ('msg #N', a commit), or, beside
+    at least one such, a word that only says it is in use (_STATE: 'running 0.2.646') or a command's
+    interpreter or option flag (_RUNNER, _FLAG: 'bash tests/x.sh --quick')."""
+    s = _STATE_GLUED.sub(r"\1 \2", ph.strip("`'\" "))
+    for pair in re.findall(r"(?:msgs?|tasks?|runs?|notes?|pr|issue)\s+#?\d+", s):   # 'msg #N' is one reference
+        s = s.replace(pair, pair.replace(" ", ""))
+    words = s.split()
+    long = [w for w in words if len(w.strip("`'\"()[]{}<>,;:.!?")) >= 4] or words
+    weak = [w for w in long if _weak_token(w)]
+    return bool(weak) and all(w in weak or _filler(w.strip("`'\"()[]{}<>,;:.!?").lower()) for w in long)
+
+
+def _filler(w: str) -> bool:
+    return w in _STATE or w in _RUNNER or bool(_FLAG.fullmatch(w))
+
+
+def _fragment(ph: str, old: str) -> bool:
+    """Whether identifier `ph` stands in retired text `old` only inside longer weak tokens (a path, a URL, a
+    versioned name: a file name at the end of a path): it keeps that token's weakness. False when it
+    stands alone there even once, spans words, or is not found (the text kept is cut at 600 characters)."""
+    if not ph or " " in ph:
+        return False
+    flat, found = _flat(old), False
+    i = flat.find(ph)
+    while i >= 0:
+        start, end = flat.rfind(" ", 0, i) + 1, flat.find(" ", i + len(ph))
+        tok = flat[start:end if end >= 0 else len(flat)]
+        if tok.strip("`'\"()[]{}<>,;:!?").rstrip(".") == ph or not _weak_token(tok):
+            return False
+        found, i = True, flat.find(ph, i + 1)
+    return found
+
+
+def _kind(rec: dict) -> str:
+    """Retirement `rec`'s kind: its own when it is one of KINDS, UNVERIFIED for any other. A record without
+    one (stored before kinds) from its source: WITHDRAWN only where the source itself shows the user's
+    withdrawal (a charter text replaced, a user correction); a memory entry superseded by another is
+    SUPERSEDED, or UNVERIFIED when its text cites the user (where the rule came from, not who retired it);
+    anything else (a memory_forget then recorded on a user turn alone, an unknown source) is UNVERIFIED."""
+    k = rec.get("kind")
+    if k is not None:
+        return k if k in KINDS else UNVERIFIED
+    from .project import USER_CITE
+    source = rec.get("source") or ""
+    if re.fullmatch(r"charter '.*' (?:quote|section) replaced|memory \[[^\]]+\] \(user correction\)", source):
+        return WITHDRAWN
+    if re.match(r"memory \[[^\]]+\] superseded by \[", source):
+        return UNVERIFIED if USER_CITE.search(rec.get("old") or "") else SUPERSEDED
+    return UNVERIFIED
+
+
+def _own_decision(rec: dict) -> bool:
+    """Whether retirement `rec` retired one of the coordinator's own decisions, no user rule: a memory
+    decision entry whose text cites no user words (USER_CITE), retired without the user's explicit word
+    (`explicit`: the change cited or quoted the user, coordinator._withdrawn; a record stored before the
+    flag has none, so it counts as the coordinator's own)."""
+    from .project import USER_CITE
+    return (bool(re.match(r"memory \[decision-[^\]]*\] (?:superseded by \[|withdrawn$)", rec.get("source") or ""))
+            and not USER_CITE.search(rec.get("old") or "") and not rec.get("explicit"))
+
+
+def _store(db, rec: dict, now: float) -> None:
+    recs = [r for r in db.kv(RETIRED_KEY, []) or [] if now - r.get("at", 0) < RETIRED_DAYS * 86400
+            and r.get("id") != rec["id"]]
+    db.set_kv(RETIRED_KEY, (recs + [rec])[-RETIRED_KEEP:])
+
+
+def record(db, source: str, old: str, new: str = "", skip: list[str] = (), now: float | None = None,
+           negated: bool = False, found: list[str] | None = None, kind: str = WITHDRAWN,
+           unsourced: bool = False, explicit: bool | None = None) -> dict | None:
+    """Keep retired text `old` (replaced by `new`) to search for. `skip`: place keys (see places) never
+    searched for it, such as the replacing entry. `found`: the phrases, when the caller has them.
+    `negated`: a match right after a negation ('never <phrase>') agrees with the change, so is no hit.
+    `kind`: one of KINDS (an unknown one counts as UNVERIFIED). `unsourced`: `old` is an advisory charter
+    Restrictions item the coordinator dropped (scan checks whether a binding section still states it).
+    `explicit`: a memory entry retired on the user's explicit word (see _own_decision). None (nothing kept) when the text has no distinctive phrase."""
+    now = time.time() if now is None else now
+    ps = phrases(old, new) if found is None else [p for p in map(_flat, found) if len(p) >= 6][:MAX_PHRASES]
+    if not ps:
+        return None
+    rec = {"id": hashlib.sha256(f"{source}\n{_flat(old)}".encode()).hexdigest()[:10], "at": now,
+           "source": " ".join(source.split())[:200], "old": " ".join((old or "").split())[:600],
+           "new": _flat(new)[:4000], "phrases": ps, "skip": list(skip), "negated": negated,
+           "kind": kind if kind in KINDS else UNVERIFIED}
+    rec["unsourced"] = bool(unsourced)   # stored either way: a record without it predates the flag (_unsourced)
+    if explicit is not None:
+        rec["explicit"] = bool(explicit)
+    _store(db, rec, now)
+    return rec
+
+
+def record_correction(db, name: str, text: str, now: float | None = None) -> dict | None:
+    """A user Correction entry `name`: its wrong parts (after 'not', 'never', 'no longer', ...) that are
+    prose, at least 3 words, are retired text. A bare value ('not low') is left to correction.repeated."""
+    from .correction import _HEAD, _WRONG, _WRONG_END
+    head = _HEAD.match(text or "")
+    if not head:
+        return None
+    body = text[head.end():]
+    wrong = [_WRONG_END.split(m.group(1))[0].strip() for m in _WRONG.finditer(body)]
+    wrong = [w for w in wrong if len(w.split()) >= 3]
+    return record(db, f"memory [{name}] (user correction)", "; ".join(wrong), skip=[f"memory:{name}"], now=now,
+                  negated=True, found=wrong) if wrong else None
+
+
+def places(p, pristine: list[str] | None = None) -> list[tuple[str, str, str]]:
+    """Every project-local place retired text can still bind, as (key, label, text): live memory entries
+    (the one store both workers' and the coordinator's copies come from), charter sections, schedules'
+    payload strings and descriptions, open tasks' live specs (coordinator.live_spec: a replaced or withdrawn
+    step's earlier text is no place) and start_when probes, config string values, and the project's files.
+    Harness files equal to the template are no place; their text goes to `pristine`."""
+    from .coordinator import live_spec
+    from .db import TERMINAL_TASK_STATES, deferral
+    from .prompts import charter_sections
+    out: list[tuple[str, str, str]] = []
+    for e in p._memory_entries():
+        out.append((f"memory:{e['name']}", f"memory [{e['name']}]", e["body"]))
+    try:
+        charter = p.charter_path.read_text()
+    except OSError:
+        charter = ""
+    for head, body in charter_sections(charter):
+        name = head.lstrip("#").strip() or "(top)"
+        out.append((f"charter:{name}", f"charter section '{name}'", "\n".join(body)))
+
+    def walk(key: str, label: str, val: Any, path: str) -> None:
+        if isinstance(val, str):
+            out.append((f"{key}:{path}", f"{label} {path}".strip(), val))
+        elif isinstance(val, dict):
+            for k, v in val.items():
+                walk(key, label, v, f"{path}.{k}" if path else str(k))
+        elif isinstance(val, list):
+            for i, v in enumerate(val):
+                walk(key, label, v, f"{path}[{i}]")
+    for s in p.db.q("SELECT name, description, payload FROM schedules ORDER BY name"):
+        try:
+            payload = json.loads(s["payload"] or "{}")
+        except ValueError:
+            payload = s["payload"]
+        walk(f"schedule:{s['name']}", f"schedule {s['name']}", {"description": s["description"] or "",
+                                                                  "payload": payload}, "")
+    for t in p.db.q(f"SELECT id, spec, labels FROM tasks WHERE status NOT IN "
+                    f"({','.join('?' * len(TERMINAL_TASK_STATES))}) ORDER BY id", TERMINAL_TASK_STATES):
+        out.append((f"task:{t['id']}:spec", f"task #{t['id']} spec", live_spec(t["spec"] or "")))
+        when = deferral(t).get("when")
+        if when:
+            out.append((f"task:{t['id']}:start_when", f"task #{t['id']} start_when", when))
+    try:
+        cfg = p.config()
+    except Exception:   # a broken config is reported elsewhere; the notice never fails the turn
+        cfg = {}
+    walk("config", "config", cfg, "")
+    extra = (cfg.get("coordinator") or {}).get("echo_paths") if isinstance(cfg, dict) else None
+    out += _files(p, [x for x in extra if isinstance(x, str)] if isinstance(extra, list) else [],
+                  pristine if pristine is not None else [])
+    return out
+
+
+def _upstream(harness: Path) -> dict[str, str]:
+    """The harness's `upstream` snapshot (the pristine template) as {path: blob sha}; {} without one."""
+    from . import gitmemo
+    args = ("ls-tree", "-r", "upstream")
+    try:
+        r = gitmemo.run(["git", "-C", str(harness), *args], capture_output=True, text=True,
+                        timeout=10)
+    except (OSError, subprocess.SubprocessError):
+        return {}
+    out = {}
+    for ln in r.stdout.splitlines() if r.returncode == 0 else ():
+        meta, _, path = ln.partition("\t")
+        if meta.split()[1:2] == ["blob"]:
+            out[path] = meta.split()[2]
+    return out
+
+
+def _template_copy(harness: Path, upstream: dict[str, str], real: Path, data: bytes) -> bool:
+    """Whether harness file `real` (all of it in `data`) is the template unedited: its upstream blob or
+    the plugin template's file (prompts/ and bin/ come from template/prompts and template/bin)."""
+    try:
+        rel = real.relative_to(harness.resolve()).as_posix()
+    except ValueError:
+        return False
+    if upstream.get(rel) == hashlib.sha1(b"blob %d\0" % len(data) + data).hexdigest():
+        return True
+    try:
+        return (_TEMPLATE / rel).read_bytes() == data
+    except OSError:
+        return False
+
+
+def _files(p, extra: list[str], pristine: list[str]) -> list[tuple[str, str, str]]:
+    """The project's own text files as places (key "file:<path>"): harness/ less HARNESS_SKIP, ROOT_PATHS
+    and `extra` (relative to the project root, never outside it), at most FILE_MAX files of FILE_BYTES.
+    A harness file equal to the template is no place (the project cannot fix it): its text goes to
+    `pristine`, as plugin vocabulary."""
+    root = Path(p.root).resolve()
+    hroot = Path(p.harness)
+    upstream = _upstream(hroot)
+    starts = [(Path(p.harness), True)] + [(root / x, False) for x in (*ROOT_PATHS, *extra)]
+    out: list[tuple[str, str, str]] = []
+    seen: set[Path] = set()
+
+    def take(path: Path) -> bool:
+        if len(out) >= FILE_MAX:
+            return False
+        try:
+            real = path.resolve()
+            if real in seen or not real.is_relative_to(root) or not path.is_file():
+                return True
+            seen.add(real)
+            with open(path, "rb") as fh:
+                data = fh.read(FILE_BYTES)
+        except OSError:
+            return True
+        if b"\0" in data[:4096]:
+            return True
+        if len(data) < FILE_BYTES and _template_copy(hroot, upstream, real, data):
+            pristine.append(_flat(data.decode("utf-8", "replace")))
+            return True
+        rel = real.relative_to(root).as_posix()
+        out.append((f"file:{rel}", f"file {rel}", data.decode("utf-8", "replace")))
+        return True
+
+    for start, harness in starts:
+        try:
+            if not start.exists() or not start.resolve().is_relative_to(root):   # never walk outside the root
+                continue
+        except OSError:
+            continue
+        if start.is_file():
+            if not take(start):
+                break
+            continue
+        for d, dirs, names in os.walk(start):
+            top = Path(d) == start
+            dirs[:] = sorted(x for x in dirs if x not in (HARNESS_SKIP if harness and top else {".git", "__pycache__",
+                                                                                                "node_modules"}))
+            for n in sorted(names):
+                if harness and top and n in HARNESS_SKIP:
+                    continue
+                if not take(Path(d) / n):
+                    return out
+    return out
+
+
+def _line(text: str, phrase: str) -> str:
+    """The line of `text` holding `phrase`, clipped around it."""
+    for ln in text.splitlines():
+        if phrase in _flat(ln):
+            ln = " ".join(ln.split())
+            break
+    else:
+        ln = " ".join(text.split())
+    at = ln.lower().find(phrase.split()[0]) if phrase.split() else 0
+    start = max(0, min(at - 40, len(ln) - LINE_CHARS)) if len(ln) > LINE_CHARS else 0
+    cut = ln[start:start + LINE_CHARS]
+    return ("..." if start else "") + cut + ("..." if start + LINE_CHARS < len(ln) else "")
+
+
+def _line_sha(text: str, phrases_: list[str]) -> str:
+    """The sha256 of which of `phrases_` `text` holds (a phrase across lines too), not of the lines: an
+    acknowledgement holds while that set is unchanged, so an added line or edit that only re-quotes an acked
+    phrase keeps it, and a new or changed phrase of the retirement in the place lists the match again."""
+    flat = _flat(text)
+    return hashlib.sha256("\n".join(sorted({ph for ph in phrases_ if ph in flat})).encode()).hexdigest()
+
+
+def _legacy_line_sha(text: str, phrases_: list[str]) -> str:
+    """The sha256 an ack stored before acks were keyed by phrase (every line holding a phrase, in order),
+    so those acks hold until their place changes; new acks store _line_sha."""
+    lines = [" ".join(ln.split()) for ln in text.splitlines() if any(ph in _flat(ln) for ph in phrases_)]
+    return hashlib.sha256("\n".join(lines or [" ".join(text.split())]).encode()).hexdigest()
+
+
+def _lineno(text: str, phrase: str) -> int:
+    """The 1-based line of `text` holding `phrase` (1 when it spans lines)."""
+    for i, ln in enumerate(text.splitlines(), 1):
+        if phrase in _flat(ln):
+            return i
+    return 1
+
+
+def _vocab(text: str) -> set[str]:
+    """The plugin identifiers in flattened `text`: names with a dot or underscore inside (action types,
+    config keys, task and schedule fields) and `ttp <command>` names. Never its prose."""
+    return {m.group() for m in _IDENT.finditer(text)} | {m.group() for m in _TTP_CMD.finditer(text)}
+
+
+def _generic(ph: str, extra: set[str] | list[str] = ()) -> bool:
+    """Whether phrase `ph` is plugin vocabulary: one identifier or `ttp <command>` name found in the
+    runtime source or the plugin template, or in `extra` (the unedited template files' _vocab)."""
+    ph = ph.strip("`'\" ")
+    if len(ph.split()) > 2 or not (_IDENT.fullmatch(ph) or _TTP_CMD.fullmatch(ph)):
+        return False
+    if "vocab" not in _RUNTIME:   # read once per process
+        src = []
+        for f in [*sorted(Path(__file__).resolve().parent.glob("*.py")),
+                  *(sorted(_TEMPLATE.rglob("*")) if _TEMPLATE.is_dir() else [])]:
+            try:
+                if f.is_file() and f.stat().st_size < FILE_BYTES * 4:
+                    src.append(f.read_text(errors="replace"))
+            except OSError:
+                pass
+        _RUNTIME["vocab"] = _vocab(_flat("\n".join(src)))
+    return ph in _RUNTIME["vocab"] or ph in extra
+
+
+def _inside(flat: str, i: int, ph: str) -> bool:
+    """Whether `ph` at `flat[i:]` sits inside a longer word, name or path (a letter, digit or underscore
+    beside a word-character end of it), so it is not the phrase itself."""
+    before = flat[i - 1:i] if i else ""
+    after = flat[i + len(ph):i + len(ph) + 1]
+    return bool((re.match(r"\w", ph[:1]) and re.match(r"\w", before))
+                or (re.match(r"\w", ph[-1:]) and re.match(r"\w", after)))
+
+
+def _hit(rec: dict, flat: str, phrases_: list[str] | None = None) -> str:
+    """The first phrase of `rec` (or `phrases_`) found as a whole in flattened text `flat` outside its
+    replacing text ('' when none)."""
+    if rec.get("new") and len(rec["new"]) >= 6:
+        flat = flat.replace(rec["new"], " ")
+    for ph in rec.get("phrases") or [] if phrases_ is None else phrases_:
+        i = flat.find(ph)
+        while i >= 0:
+            if not (_inside(flat, i, ph) or rec.get("negated") and _NEGATION.search(flat[max(0, i - 20):i])):
+                return ph
+            i = flat.find(ph, i + 1)
+    return ""
+
+
+def _binding(real: Path, root: Path, harness: Path) -> bool:
+    """Whether project file `real` can still bind (never historical): an agent instruction or skill file, an
+    executable, a file below ROOT_PATHS, a top-level harness file or one in a harness folder of scripts and
+    prompts."""
+    if real.name in _INSTRUCTIONS or os.access(real, os.X_OK):
+        return True
+    rel = real.relative_to(root).as_posix()
+    if any(rel == x or rel.startswith(x + "/") for x in ROOT_PATHS):
+        return True
+    try:
+        parts = real.relative_to(harness).parts
+    except ValueError:
+        return False
+    return len(parts) == 1 or parts[0] in _BINDING_DIRS
+
+
+def historical_index(p, recs: list[dict]) -> dict[str, dict[str, set[str]]]:
+    """The well-formed entries of harness/HISTORICAL_INDEX as {"file:<path>": {retirement id: {sha256}}}.
+    An entry counts only with `path` the exact project-relative path of a regular, non-binding file (no
+    folder, pattern, `..`, symlink or absolute path), `sha256` 64 lower-case hex digits and `retirement`
+    the id of a live retirement in `recs`; anything else is ignored, so its hits stay listed."""
+    try:
+        data = json.loads((Path(p.harness) / HISTORICAL_INDEX).read_text())
+    except (OSError, ValueError):
+        return {}
+    entries = data.get("historical") if isinstance(data, dict) else None
+    if not isinstance(entries, list):
+        return {}
+    live = {r.get("id") for r in recs}
+    root = Path(p.root).resolve()
+    harness = Path(p.harness).resolve()
+    out: dict[str, dict[str, set[str]]] = {}
+    for e in entries[:HISTORICAL_MAX]:
+        if not isinstance(e, dict):
+            continue
+        rel, sha, rid = e.get("path"), e.get("sha256"), e.get("retirement")
+        if not (isinstance(rel, str) and isinstance(sha, str) and _SHA256.fullmatch(sha) and isinstance(rid, str)
+                and rid in live):
+            continue
+        path = root / rel
+        try:
+            real = path.resolve()
+            if (not real.is_relative_to(root) or real.relative_to(root).as_posix() != rel or path.is_symlink()
+                    or not path.is_file() or _binding(real, root, harness)):
+                continue
+        except (OSError, ValueError):
+            continue
+        out.setdefault(f"file:{rel}", {}).setdefault(rid, set()).add(sha)
+    return out
+
+
+def _sha256(path: Path) -> str:
+    """The sha256 of all of file `path` ('' when unreadable)."""
+    h = hashlib.sha256()
+    try:
+        with open(path, "rb") as fh:
+            for chunk in iter(lambda: fh.read(1 << 20), b""):
+                h.update(chunk)
+    except OSError:
+        return ""
+    return h.hexdigest()
+
+
+def _unsourced(rec: dict) -> bool:
+    """Whether retirement `rec` dropped only unsourced Restrictions items. A record stored before the flag
+    existed gets it from its source (a charter Restrictions quote or section replaced) and its retired
+    text (no item of it cites a source), and is UNVERIFIED (records): nothing shows the user dropped it."""
+    if "unsourced" in rec:
+        return bool(rec["unsourced"])
+    if not re.fullmatch(r"charter 'restriction[^']*' (?:quote|section) replaced", (rec.get("source") or "").lower()):
+        return False
+    from .restriction_source import sourced, split_items
+    items = [" ".join(" ".join(x).split()) for x in split_items(rec.get("old") or "")]
+    items = [x for x in items if x and not x.startswith("#")]
+    return bool(items) and not any(sourced(x) for x in items)
+
+
+_MEMORY_RETIRED = re.compile(r"memory \[[^\]]+\] (?:superseded by \[|withdrawn$)")
+_SUPERSEDED = re.compile(r"memory \[([^\]]+)\] superseded by \[([^\]]+)\]")
+
+
+def _superseders(rec: dict, recs: list[dict], live: dict[str, str]) -> str:
+    """The flattened text of the live entries superseding the memory entry `rec` retired (its source's
+    'superseded by [B]', and B's own superseders while B is retired too, from `recs`), '' when none is live:
+    a phrase one of them still carries is the current rule's, not a retired one."""
+    m = _SUPERSEDED.match(rec.get("source") or "")
+    later: dict[str, list[str]] = {}
+    for r in recs:
+        if n := _SUPERSEDED.match(r.get("source") or ""):
+            later.setdefault(n.group(1), []).append(n.group(2))
+    todo, seen, out = [m.group(2)] if m else [], set(), []
+    while todo:
+        name = todo.pop()
+        if name in seen:
+            continue
+        seen.add(name)
+        if name in live:
+            out.append(live[name])
+        else:
+            todo += later.get(name, [])
+    return " ".join(out)
+
+
+def _live_holds(live: dict[str, str], ph: str, rec: dict) -> set[str]:
+    """The live memory entries (place keys; `live` maps entry names to their flattened text) holding `ph`
+    whole that make it current for memory retirement `rec`: the superseder its source names counts everywhere
+    ("*"); any other entry counts everywhere but in itself, so the result is that entry's key alone when it is
+    the only one."""
+    m = re.search(r"superseded by \[([^\]]+)\]", rec.get("source") or "")
+    keys = {f"memory:{name}" for name, flat in live.items() if _hit({}, flat, [ph])}
+    return {"*"} if m and f"memory:{m.group(1)}" in keys else keys
+
+
+def _holder(live: dict[str, str], keys: set[str], rec: dict, key: str) -> str:
+    """The name of the live memory entry (`keys`, _live_holds) that makes a hit at place `key` current."""
+    m = re.search(r"superseded by \[([^\]]+)\]", rec.get("source") or "")
+    names = sorted(k[7:] for k in keys - {key} if k.startswith("memory:"))
+    return m.group(1) if "*" in keys and m else (names or ["?"])[0]
+
+
+def _current(charter: str, recorded: set[str] | frozenset = frozenset()) -> list[tuple[str, str]]:
+    """(who, flattened text) of each current Restrictions item that binds (restriction_source.sourced: a
+    user cite, the Brief or a harness gate, its own or its sub-heading's), with the heading (section or
+    sub-heading) it stands under, alone and followed by the item (`recorded`: restriction_source.recorded_items).
+    `who` names it: "Restrictions item N ('its first words')", N counting the Restrictions sections' items from 1, or "Restrictions heading '...'"."""
+    from .prompts import charter_sections
+    from .restriction_source import sourced, split_items
+    out: dict[str, str] = {}
+    n = 0
+    for head, body in charter_sections(charter):
+        name = head[3:].strip()
+        if not name.lower().startswith("restriction"):
+            continue
+        cited = False
+        for it in split_items("\n".join(body)):
+            text = " ".join(" ".join(it).split())
+            if text.startswith("#"):
+                name = text.lstrip("#").strip()
+                cited = sourced(name, recorded)   # a cite on the sub-heading itself covers its items
+                if cited:
+                    out.setdefault(_flat(name), f"Restrictions heading '{name[:60]}'")
+                continue
+            n += 1
+            if cited or sourced(text, recorded):
+                words = text.lstrip("-*+ ").split()
+                who = f"Restrictions item {n} ('{' '.join(words[:6])}{'...' if len(words) > 6 else ''}')"
+                for u in (_flat(text), _flat(name), _flat(f"{name} {text}")):
+                    out.setdefault(u, who)
+    return [(who, u) for u, who in out.items()]
+
+
+_WORD = re.compile(r"\w+(?:[-.']\w+)*")
+_NAMING = {"a", "an", "the", "of", "in", "on", "and", "or", "to", "for", "per", "under", "item", "items", "rule",
+           "rules", "restriction", "restrictions", "heading", "section"}   # words that name an item, not state one
+_CITE = re.compile(r"\([^()]*(?:\b(?:user|msgs?|origin|relayer)\b|#\d)[^()]*\)")   # '(user msg #N)', '(origin: Brief)'
+
+
+def _says(flat: str, ph: str) -> bool:
+    """Whether flattened text `flat` holds phrase `ph` as a whole (not inside a longer word or name)."""
+    i = flat.find(ph)
+    while i >= 0:
+        if not _inside(flat, i, ph):
+            return True
+        i = flat.find(ph, i + 1)
+    return False
+
+
+def _states(units: list[tuple[str, str]], ph: str) -> str:
+    """The current cited Restrictions item or heading (`units`, _current) that states phrase `ph`, by its
+    name ("" when none): one holding it whole, or holding its words as one run once the words that only
+    name an item (_NAMING: 'the X restriction') and cites (_CITE) are left out, such as a heading quoted
+    with its item: two words or more, or the unit's whole wording. Never a reordering or a run with other
+    words between."""
+    for who, u in units:
+        if _says(u, ph):
+            return who
+
+    def run(text: str) -> list[str]:
+        return [w for w in _WORD.findall(_CITE.sub(" ", text)) if w not in _NAMING]
+
+    words = run(ph)
+    n = len(words)
+    for who, u in units if words else ():
+        held = run(u)
+        if held == words or n >= 2 and any(held[i:i + n] == words for i in range(len(held) - n + 1)):
+            return who
+    return ""
+
+
+# A task whose subject is the echo detector itself (its title or spec opening names it): it quotes
+# matches only to discuss them.
+_ABOUT_ECHOES = re.compile(r"\bttp echoes\b|\becho(?:es)? detector\b|\bretired[- ]rule echo", re.I)
+ABOUT_CHARS = 300                    # the spec's opening read for its subject
+
+
+def _about_echoes(p, keys: list[str]) -> set[str]:
+    """The task spec places (`keys`, task:<id>:spec) whose task is about the echo detector (_ABOUT_ECHOES
+    in its title or the first ABOUT_CHARS of its spec)."""
+    ids = [int(k.split(":")[1]) for k in keys if re.fullmatch(r"task:\d+:spec", k)]
+    if not ids:
+        return set()
+    rows = p.db.q(f"SELECT id, title, spec FROM tasks WHERE id IN ({','.join('?' * len(ids))})", ids)
+    return {f"task:{r['id']}:spec" for r in rows
+            if _ABOUT_ECHOES.search(r["title"] or "") or _ABOUT_ECHOES.search((r["spec"] or "")[:ABOUT_CHARS])}
+
+
+# A cite of user messages: "user msg #N", "user messages #4, #5", "msg #N/#N" (the numbers, _msgs).
+_MSG_CITE = re.compile(r"\b(?:user(?:'s|s)?\s+(?:msgs?|messages?)?|msgs?|messages?)\s*(#\d+(?:\s*(?:,|/|&|and)\s*#\d+)*)")
+# What a phrase that only cites holds besides message numbers: cite words, dates and punctuation (_cite_only).
+_CITE_WORDS = re.compile(r"\b(?:user|users|owner|owners|agent|agents|relayer|relayer-ordered|msgs?|messages?|orders?|"
+                         r"words?|verbatim|via|per|by|from|in|the|and|cited?|cites|see|origin|s)\b|#\d+|"
+                         r"\d{4}-\d{2}-\d{2}|[^\w#]+")
+
+
+def _msgs(text: str) -> set[str]:
+    """The user message numbers `text` cites (_MSG_CITE)."""
+    return {n for m in _MSG_CITE.finditer(text.lower()) for n in re.findall(r"\d+", m.group(1))}
+
+
+def _cite_only(ph: str) -> bool:
+    """Whether phrase `ph` only cites user messages, such as an entry's citation header ("owner's order, user
+    msg #N"): message numbers, cite words and dates, nothing that states a rule."""
+    return bool(_msgs(ph)) and not _CITE_WORDS.sub("", ph).strip()
+
+
+def _said_after(p, since: float) -> list[tuple[int, float, str]]:
+    """(id, ts, flattened verbatim words) of the user's own chat messages (inbound, kind user, not posted by the
+    harness; relay.split: never a relayer's context) newer than epoch `since`, oldest first."""
+    from . import relay
+    try:
+        rows = p.db.q("SELECT id, ts, text, provenance FROM messages WHERE direction='in' AND kind='user' AND ts > ? "
+                      "ORDER BY ts, id", (since,))
+    except Exception:
+        return []
+    return [(int(r["id"]), float(r["ts"] or 0), _flat(relay.split(r.get("text") or "")[0]))
+            for r in rows if (r.get("provenance") or "") != "system"]
+
+
+def _repeated(said: list[tuple[int, float, str]], ph: str, at: float) -> int:
+    """The id of the first user message (`said`, _said_after) newer than `at` that holds phrase `ph` whole and
+    not negated ('never X' repeats no X), 0 when none: the user's newer word keeps it current."""
+    return next((mid for mid, ts, flat in said if ts > at and _hit({"negated": True}, flat, [ph])), 0)
+
+
+def records(p, now: float | None = None) -> list[dict]:
+    """The live retirements (kept RETIRED_DAYS), each with its kind (see _kind; _unsourced)."""
+    now = time.time() if now is None else now
+    return [dict(r, kind=UNVERIFIED if "unsourced" not in r and _unsourced(r) else _kind(r))
+            for r in p.db.kv(RETIRED_KEY, []) or []
+            if isinstance(r, dict) and now - r.get("at", 0) < RETIRED_DAYS * 86400]
+
+
+def scan(p, now: float | None = None, historical: list[dict] | None = None,
+         acked: list[dict] | None = None) -> list[dict]:
+    """The retired texts' echoes: [{"key", "label", "line", "phrase", "source", "retirement", "kind",
+    "class", "why"}], newest retirement first. `class` is "directive" (a WITHDRAWN retirement's governing
+    phrase: fix it) or "advisory" (another kind, only a _weak or _fragment phrase matched, or a dropped
+    unsourced Restrictions item the Brief or a sourced item still states: `why` says which). A hit on
+    a file the historical index declares historical for that retirement, with its bytes still hashing to
+    the recorded value, goes to `historical` instead (class "historical"); an acknowledged hit whose place
+    holds the same phrases (ACK_KEY) to `acked` (class "acknowledged")."""
+    recs = records(p, now)
+    if not recs:
+        return []
+    index = historical_index(p, recs)
+    acks = p.db.kv(ACK_KEY, {}) or {}
+    acks = acks if isinstance(acks, dict) else {}
+    digests: dict[str, str] = {}
+    pristine: list[str] = []
+    where = [(key, label, text, _flat(text)) for key, label, text in places(p, pristine)]   # flattened once
+    vocab = set().union(*map(_vocab, pristine))
+    try:
+        charter = p.charter_path.read_text()
+    except OSError:
+        charter = ""
+    from .project import _stamp_ts
+    from .restriction_source import history_items
+    units = _current(charter, history_items(p))
+    live = {key[7:]: flat for key, _, _, flat in where if key.startswith("memory:")}
+    born = {e["name"]: _stamp_ts(e.get("created") or "") for e in p._memory_entries()}
+    cited = _msgs(" ".join(live.values()) + " " + charter)   # messages live memory or the charter still cites
+    about = _about_echoes(p, [key for key, *_ in where])
+    said = _said_after(p, min(r.get("at", 0) for r in recs))   # the user's words since the oldest retirement
+    out, seen = [], set()
+    for rec in sorted(recs, key=lambda r: -r.get("at", 0)):
+        kept = _superseders(rec, recs, live)
+        own = [ph for ph in rec.get("phrases") or [] if (rec.get("negated") or not _generic(ph, vocab))
+               and ph not in kept]
+        if not own:
+            continue
+        stated = ""
+        if _unsourced(rec):   # a dropped advisory copy of a rule a binding section still states
+            from .restriction_audit import still_stated
+            stated = still_stated(charter, rec.get("old") or "")
+        weak = {ph for ph in own if _weak(ph) or _fragment(ph, rec.get("old") or "")}
+        # A memory entry's retirement never retires what a current cited Restrictions item or a live entry states;
+        # a charter one, what a current cited Restrictions item or a memory entry written after it states.
+        mem = bool(_MEMORY_RETIRED.match(rec.get("source") or ""))
+        chart = not mem and (rec.get("source") or "").lower().startswith("charter ")
+        stated_now = {ph: who for ph in own if (who := _states(units, ph))} if mem or chart else {}
+        later = {n: flat for n, flat in live.items() if born.get(n, 0) > rec.get("at", 0)}
+        held = ({ph: _live_holds(live, ph, rec) for ph in own if ph not in stated_now} if mem else
+                {ph: {"*"} if any(_hit({}, flat, [ph]) for flat in later.values()) else set()
+                 for ph in own if ph not in stated_now} if chart else {})
+        # A phrase that only cites user messages (a citation header) is current while live memory or the
+        # charter still cites every one of them: the rule that came from them lives on in another wording.
+        cites = {ph for ph in own if (mem or chart) and _cite_only(ph) and _msgs(ph) <= cited}
+        # A memory entry written after the retirement that holds the phrase whole restates it (a supersede whose
+        # chain no record links, such as one keeping every phrase), and a user message newer than the
+        # retirement repeating it is the user's word that it still holds: neither is an echo, of any kind.
+        restated = {ph: name for ph in own if mem and ph not in stated_now
+                    for name in sorted(n for n, flat in later.items() if _hit({}, flat, [ph]))[:1]}
+        repeated = {ph: mid for ph in own if (mid := _repeated(said, ph, rec.get("at", 0)))}
+        cur = set(stated_now) | cites | {ph for ph, keys in held.items() if keys} | set(restated) | set(repeated)
+        own.sort(key=lambda ph: ph in weak or ph in cur)   # a governing phrase first: a hit rests on it when it can
+        skip = set(rec.get("skip") or ())
+        mine = _own_decision(rec)
+        okd = {ph for ph in own if acks.get(f"{rec['id']}:{ACK_PHRASE}:{ph}") == ACK_PHRASE}   # acked phrases
+        for key, label, text, flat in where:
+            if key in skip or (rec["id"], key) in seen or _BRIEF.match(key):   # the user's own words, never one
+                continue
+            ph = _hit(rec, flat, [x for x in own if x not in okd]) or _hit(rec, flat, [x for x in own if x in okd])
+            if ph:
+                seen.add((rec["id"], key))
+                if key.startswith("file:"):
+                    label += f":{_lineno(text, ph)}"
+                why = (f"still stated in {stated}: no action" if stated else
+                       f"still stated by {stated_now[ph]}: no action" if ph in stated_now else
+                       f"repeated by user msg #{repeated[ph]} after it was retired: no action" if ph in repeated else
+                       f"still stated by memory [{_holder(live, held[ph], rec, key)}]: no action"
+                       if held.get(ph, set()) - {key} else
+                       f"restated by memory [{restated[ph]}], written after it was retired: no action"
+                       if ph in restated else
+                       "it only cites user messages live memory or the charter still cites: no action"
+                       if ph in cites else
+                       "a task about the echo detector, quoting its matches: no action" if key in about else
+                       "a coordinator's own decision retired, no user rule withdrawn: no action" if mine else
+                       "" if rec["kind"] == WITHDRAWN and ph not in weak else
+                       "origin not recorded: nothing shows the user withdrew this rule" if rec["kind"] == UNVERIFIED
+                       else f"retired as {rec['kind']}, not withdrawn by the user" if rec["kind"] != WITHDRAWN
+                       else "only a file name, path, version or evidence reference matches")
+                hit = {"key": f"{rec['id']}:{key}", "label": label, "line": _line(text, ph), "phrase": ph,
+                       "source": rec.get("source") or "", "retirement": rec["id"], "kind": rec["kind"],
+                       "class": "advisory" if why else "directive", "why": why, "sha": _line_sha(text, own)}
+                if acks.get(hit["key"]) in (hit["sha"], _legacy_line_sha(text, own)) or ph in okd:
+                    if acked is not None:
+                        acked.append(dict(hit, **{"class": "acknowledged"}))
+                    continue
+                shas = index.get(key, {}).get(rec["id"])
+                if shas:
+                    if key not in digests:
+                        digests[key] = _sha256(Path(p.root).resolve() / key[5:])
+                    if digests[key] in shas:
+                        if historical is not None:
+                            historical.append(dict(hit, **{"class": "historical"}))
+                        continue
+                out.append(hit)
+    return out
+
+
+def digest_lines(p, now: float | None = None) -> list[str]:
+    """The digest's Retired-rule echoes section, at most SECTION_LINES lines; [] when nothing echoes. A
+    hit already shown in an earlier turn is marked. Never posts, wakes or holds anything."""
+    hist: list[dict] = []
+    acked: list[dict] = []
+    try:
+        found = scan(p, now, hist, acked)
+    except (OSError, ValueError, TypeError, KeyError, AttributeError):   # a notice never fails the turn
+        return []
+    hits = [h for h in found if h["class"] == "directive"]
+    advisory = len(found) - len(hits)
+    db = p.db
+    turn = db.kv("last_coordinator_turn", 0) or 0
+    old = db.kv(SEEN_KEY, {}) or {}
+    before = old.get("hits") or {}
+    fresh = old.get("turn") != turn   # a second digest within one turn counts no turn
+    counts = {h["key"]: (before.get(h["key"], 0) + 1 if fresh else before.get(h["key"]) or 1) for h in hits}
+    if (counts != before or old.get("turn") != turn or (old.get("historical") or 0) != len(hist)
+            or (old.get("advisory") or 0) != advisory):
+        db.set_kv(SEEN_KEY, {"turn": turn, "hits": counts, "historical": len(hist), "advisory": advisory})
+    if not hits:   # advisory and historical hits alone order nothing: no section
+        return []
+    mem = list(dict.fromkeys(h["key"].split(":", 2)[2] for h in hits if h["key"].split(":", 2)[1] == "memory"))
+    room = SECTION_LINES - 1 - bool(mem) - bool(hist) - bool(advisory) - bool(acked)
+    shown = hits if len(hits) <= room else hits[:room - 1]
+    lines = [RETIRED_HEADER]
+    for h in shown:
+        n = counts[h["key"]]
+        rid = f", id {h['retirement']}" if h["key"].split(":", 2)[1] == "file" else ""   # for the historical index
+        lines.append(f"- {h['label']}: \"{h['line']}\" (retired: {h['source']}{rid}; matches \"{h['phrase'][:60]}\")"
+                     + (f" [still here, {n} turns]" if n >= 2 else ""))
+    if len(shown) < len(hits):
+        lines.append(f"- ... and {len(hits) - len(shown)} more; fix these and the rest show next turn")
+    if mem:   # every memory entry that still holds a retired rule, shown or not
+        names = ", ".join(f"[{n}]" for n in mem[:12]) + (f" and {len(mem) - 12} more" if len(mem) > 12 else "")
+        lines.append(f"- memory to retire (memory_forget, or memory_add `supersedes` to keep what is still right): {names}")
+    if hist:   # declared historical: counted, never silently dropped
+        try:
+            where = (Path(p.harness).resolve() / HISTORICAL_INDEX).relative_to(Path(p.root).resolve()).as_posix()
+        except ValueError:
+            where = HISTORICAL_INDEX
+        lines.append(f"- {len(hist)} historical line{'s' if len(hist) != 1 else ''} not shown (declared in {where})")
+    if acked:   # acknowledged as false positives: counted, never silently dropped
+        lines.append(f"- {len(acked)} acknowledged match{'es' if len(acked) != 1 else ''} not shown (`ttp echoes --ack`;"
+                     f" listed again once a new phrase shows there)")
+    if advisory:   # counted, never a fix order
+        lines.append(f"- {advisory} advisory match{'es' if advisory != 1 else ''} not shown: a compacted fact, a "
+                     f"coordinator's own decision, a retirement of unknown origin, a name a current cited "
+                     f"Restrictions item or a live memory entry states or only a file name, version "
+                     f"or evidence reference, never a rule the user withdrew; change nothing for them (all: "
+                     f"`ttp echoes`)")
+    return lines
+
+
+def acknowledge(p, retirement: str, where: str, now: float | None = None) -> dict:
+    """Acknowledge retirement `retirement`'s current match at `where` (a file's `<path>:<line>`, a place as
+    `ttp echoes` names it, or its key) as no echo: hidden while that place holds the same phrases of it, listed
+    again once a new or changed one shows there. Stored in the project's kv (ACK_KEY); acks of retirements no longer live are dropped.
+    Raises ValueError when no current match fits."""
+    where = " ".join(where.split())
+    acked: list[dict] = []
+    found = scan(p, now, [], acked)
+    for h in found + acked:
+        if h["retirement"] != retirement:
+            continue
+        place = h["key"].split(":", 1)[1]
+        label = h["label"][5:] if h["label"].startswith("file ") else h["label"]
+        if where in (h["label"], label, place):
+            live = {r.get("id") for r in records(p, now)}
+            acks = p.db.kv(ACK_KEY, {}) or {}
+            acks = {k: v for k, v in (acks if isinstance(acks, dict) else {}).items()
+                    if k.split(":", 1)[0] in live and k != h["key"]}
+            acks[h["key"]] = h["sha"]
+            p.db.set_kv(ACK_KEY, dict(list(acks.items())[-ACK_KEEP:]))
+            return h
+    raise ValueError(f"no current match of retirement {retirement} at {where} (see `ttp echoes`)")
+
+
+def acknowledge_phrase(p, retirement: str, phrase: str, now: float | None = None) -> list[dict]:
+    """Acknowledge phrase `phrase` of retirement `retirement` as no echo at every place it matches, now and
+    later (a name the project still uses rightly): its hits are listed as acknowledged while that retirement
+    lives; a place another phrase of it also matches still lists that one. Returns the matches it covers now.
+    Raises ValueError when the retirement is not live or holds no such phrase."""
+    ph = _flat(phrase).strip("`'\"")
+    rec = next((r for r in records(p, now) if r.get("id") == retirement), None)
+    if rec is None:
+        raise ValueError(f"no live retirement {retirement} (see `ttp echoes`)")
+    if ph not in (rec.get("phrases") or []):
+        raise ValueError(f"retirement {retirement} has no phrase \"{ph}\"; its phrases: "
+                         + "; ".join(f"\"{x}\"" for x in rec.get("phrases") or []))
+    live = {r.get("id") for r in records(p, now)}
+    acks = p.db.kv(ACK_KEY, {}) or {}
+    acks = {k: v for k, v in (acks if isinstance(acks, dict) else {}).items() if k.split(":", 1)[0] in live}
+    acks.pop(f"{retirement}:{ACK_PHRASE}:{ph}", None)
+    acks[f"{retirement}:{ACK_PHRASE}:{ph}"] = ACK_PHRASE
+    p.db.set_kv(ACK_KEY, dict(list(acks.items())[-ACK_KEEP:]))
+    acked: list[dict] = []
+    scan(p, now, [], acked)
+    return [h for h in acked if h["retirement"] == retirement and h["phrase"] == ph]
+
+
+def export(p, now: float | None = None) -> dict:
+    """Every live retirement and every hit, read-only (nothing stored, posted or counted):
+    {"retirements": [{"id", "kind", "at", "source", "retired", "replaced_by", "phrases"}],
+    "matches": [{"retirement", "where", "key", "phrase", "line", "class", "action", "why"}], "counts"}.
+    `action` is "fix" for a directive, "none" for an advisory, historical or acknowledged hit."""
+    hist: list[dict] = []
+    acked: list[dict] = []
+    found = scan(p, now, hist, acked)
+    recs = sorted(records(p, now), key=lambda r: -r.get("at", 0))
+    matches = [{"retirement": h["retirement"], "where": h["label"], "key": h["key"].split(":", 1)[1],
+                "phrase": h["phrase"], "line": h["line"], "class": h["class"],
+                "action": "fix" if h["class"] == "directive" else "none", "why": h.get("why") or ""}
+               for h in found + hist + acked]
+    counts = {c: sum(m["class"] == c for m in matches) for c in ("directive", "advisory", "historical", "acknowledged")}
+    return {"retirements": [{"id": r.get("id"), "kind": r["kind"], "at": r.get("at"), "source": r.get("source") or "",
+                             "retired": r.get("old") or "", "replaced_by": r.get("new") or "",
+                             "phrases": r.get("phrases") or []} for r in recs],
+            "matches": matches, "counts": counts}
+
+
+def export_text(data: dict, tz: str | None = None) -> str:
+    """`ttp echoes` without --json: each retirement, then its matches."""
+    from . import timefmt
+    if not data["retirements"]:
+        return "no live retirements"
+    c = data["counts"]
+    out = [f"{len(data['retirements'])} retirements; matches: {c['directive']} to fix, {c['advisory']} advisory, "
+           f"{c['historical']} historical" + (f", {c['acknowledged']} acknowledged" if c.get("acknowledged") else "")]
+    by: dict[str, list[dict]] = {}
+    for m in data["matches"]:
+        by.setdefault(m["retirement"], []).append(m)
+    for r in data["retirements"]:
+        at = timefmt.long(r["at"], tz) if isinstance(r.get("at"), (int, float)) else "?"
+        out.append(f"{r['id']} [{r['kind']}] {at} {r['source']}: \"{r['retired'][:160]}\"")
+        for m in by.get(r["id"], []):
+            out.append(f"  - {m['class']}: {m['where']}: \"{m['line']}\" (matches \"{m['phrase'][:60]}\")"
+                       + (f" ({m['why']})" if m["why"] else ""))
+    return "\n".join(out)

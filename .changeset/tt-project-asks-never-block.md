@@ -1,0 +1,5 @@
+---
+"tt-project": patch
+---
+
+`tt-project`: asks never block. Every ask stores its recommendation as its default and shows when it applies ("acts on X at HH:MM ZONE unless answered") in the chat, `ttp status`, the web app and the digest. Unanswered after `coordinator.ask_timeout_h` (default 0.5; 0 turns it off), the daemon resolves it to that default, tells the chat at low, records a decision memory and wakes the coordinator once per tick. A restriction stays as written unless the recommendation is a bare decline, and asks only the user can answer (review, merge, another person's request, acting as the user, a credential or money grant, an irreversible step) stay open without holding other work. The timer reads no prose for meaning: in irreversible and restriction asks only a recommendation that is wholly one bare decline (no, decline, skip, keep it, leave it, do nothing, no change) resolves. A model-free check raises an open ask with no default, or one past its timeout and still open, once per change.

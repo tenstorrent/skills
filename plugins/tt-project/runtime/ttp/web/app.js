@@ -1,0 +1,432 @@
+// SPDX-FileCopyrightText: © 2026 Tenstorrent USA, Inc.
+// SPDX-License-Identifier: Apache-2.0
+"use strict";
+const $ = (s) => document.querySelector(s);
+// Page updates go through render.js: unchanged parts are left alone, held ones wait for the user.
+const R = window.TTPRender, put = (el, html) => R.patch(el, html), text = (el, s) => R.text(el, s);
+const agoH = R.agoHtml;
+const esc = (s) => String(s == null ? "" : s).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+// A link only to an http(s) URL: any other value (javascript:, data:, ...) shows as plain text.
+const isHttp = (url) => /^https?:\/\//i.test(String(url || ""));
+const link = (url, label) => isHttp(url) ? `<a href="${esc(url)}" target="_blank" rel="noopener">${label}</a>` : label;
+const ago = R.ago;
+const money = (x) => `$${(+x || 0).toFixed(2)}`;
+// Every time is shown in the project's home zone (the daemon sends it), with its abbreviation: never
+// this browser's zone or the zone of the machine the project runs on.
+let ZONE = "UTC";
+const fmts = {};
+const zoneFmt = (day) => {
+  const key = `${ZONE}|${day}`;
+  if (!fmts[key]) {
+    const o = { timeZone: ZONE, hour: "2-digit", minute: "2-digit", hourCycle: "h23", timeZoneName: "short" };
+    try { fmts[key] = new Intl.DateTimeFormat(undefined, day ? { ...o, weekday: "short" } : o); }
+    catch (e) { ZONE = "UTC"; return zoneFmt(day); }   // a zone this browser does not know
+  }
+  return fmts[key];
+};
+const at = (ts) => ts ? zoneFmt(Math.abs(ts - Date.now() / 1000) >= 20 * 3600).format(new Date(ts * 1000)) : "—";
+
+let TOKEN = new URLSearchParams(location.hash.slice(1)).get("token") || sessionStorage.getItem("ttp_token") || "";
+// The token lives only in this tab's sessionStorage and goes out as the X-TTP-Token header, never
+// in a cookie (cookies are not scoped by port). Expire the cookie older versions wrote.
+document.cookie = "ttp_token=; Max-Age=0; SameSite=Strict; path=/";
+if (TOKEN) { sessionStorage.setItem("ttp_token", TOKEN); history.replaceState(null, "", location.pathname); }
+const api = async (path, body) => {
+  const r = await fetch(path, { method: body ? "POST" : "GET", headers: { "X-TTP-Token": TOKEN, "Content-Type": "application/json" }, body: body ? JSON.stringify(body) : undefined });
+  if (r.status === 401) { document.body.innerHTML = "<main><p>Open this page with the link printed by <code>ttp web</code> (it carries the access token).</p></main>"; throw new Error("auth"); }
+  return r.json();
+};
+
+document.querySelectorAll("#tabs button").forEach((b) => b.onclick = () => {
+  document.querySelectorAll("#tabs button, .tab").forEach((x) => x.classList.remove("on"));
+  b.classList.add("on"); $("#" + b.dataset.tab).classList.add("on");
+  if (b.dataset.tab === "chat") $("#msg").focus();
+  if (b.dataset.tab === "projects") projects();
+});
+
+// The Projects tab: /api/overview, the same lines as `ttp overview`. A name links only where the
+// registry gives the project a link.
+async function projects() {
+  const o = await api("/api/overview");
+  const name = (r) => link(r.url, esc(r.name));
+  put($("#projlist"), o.projects.length ? `<table><tr><th>Project</th><th>Daemon</th><th>Version</th><th>Open asks</th><th>Waiting on you</th><th>Running</th><th>Spend</th></tr>` +
+    o.projects.map((r) => !r.ok ? `<tr><td><b>${name(r)}</b></td><td colspan="6" class="meta">${esc(r.note)}</td></tr>`
+      : `<tr><td><b>${name(r)}</b></td><td><span class="pill ${r.daemon === "running" ? "" : "lv-red"}">${esc(r.daemon)}</span></td>` +
+        `<td>${esc(r.version)}${r.lag ? ` <span class="pill lv-orange">behind ${esc(r.lib)}</span>` : r.ahead ? ` <span class="meta">ahead of ${esc(r.lib)}</span>` : ""}</td>` +
+        `<td>${r.asks}</td><td>${r.waiting_on_user}</td><td>${r.running}</td><td>${esc(o.spend[r.name] || "")}</td></tr>`).join("") + `</table>`
+    : `<p class="muted">No projects registered on this machine.</p>`);
+  text($("#projfoot"), o.footer);
+  const m = await api("/api/machines");
+  const rows = (r) => [["projects", r.projects.join(", ") || "none name it"],
+    ["recovery owner", (r.owner || "none set") + (r.fallback ? `, fallback ${r.fallback}` : "")]]
+    .concat(r.pauses.map((p) => ["paused", `${p.resource} by ${p.project}${p.reason ? ` (${p.reason})` : ""}; ${p.end || "no end recorded"}`]),
+      r.conditions.map((c) => ["condition", c]), r.changes.map((c) => ["change", c]),
+      r.checks.length ? r.checks.map((c) => ["heal check", `${c.project}/${c.check}: ${c.status}`]) : [["heal checks", "none name it"]],
+      r.problems.map((x) => ["problem", x]), r.unread.length ? [["could not read", r.unread.join(", ")]] : []);
+  put($("#machlist"), m.machines.length ? m.machines.map((r) => `<div class="card"><b>${esc(r.alias)}</b>` +
+    (r.conditions.length || r.problems.length ? ` <span class="pill lv-red">trouble</span>` : r.pauses.length ? ` <span class="pill lv-yellow">paused</span>` : "") +
+    rows(r).map(([k, v]) => `<div class="row"><span class="meta">${esc(k)}</span> ${esc(v)}</div>`).join("") + `</div>`).join("")
+    : `<p class="muted">No machines recorded.</p>`);
+}
+
+function gateHtml(gates) {
+  const ks = Object.keys(gates || {});
+  if (!ks.length) return `<p class="muted">No readings yet.</p>`;
+  return ks.map((k) => { const g = gates[k], n = g.numbers || {};
+    const detail = g.detail || (g.regime === "windows" ? `${n.window}: ${n.utilization}% of account used · project stops at ${n.limit}%`
+      : `project ${n.daily_cap > 0 || n.weekly_cap > 0 ? "" : "no dollar cap: "}${money(n.spent_24h)}${n.daily_cap > 0 ? ` / ${money(n.daily_cap)}` : ""} per 24h${n.estimated_24h ? ` (~${money(n.estimated_24h)} estimated)` : ""} · ${money(n.spent_7d)}${n.weekly_cap > 0 ? ` / ${money(n.weekly_cap)}` : ""} per 7d`);
+    return `<div class="row"><b>${esc(k)}</b><span class="pill lv-${g.level}">${g.level}</span><span class="meta">${esc(detail)}</span>
+      <span class="meta">${esc((g.reasons || []).join("; "))}</span></div>`; }).join("");
+}
+
+// A queued task deferred by the coordinator waits for its start time or start_when probe.
+const deferred = (t) => t.status === "queued" && !!t.starts;
+
+// A queued task with a future retry time is waiting on a busy resource, not idle in the queue.
+const waiting = (t) => t.status === "queued" && !deferred(t) && t.not_before && t.not_before > Date.now() / 1000;
+
+// A queued task on a logged-out provider is held until a run on it works again; one on a provider
+// whose API host does not resolve is held until it does.
+const heldAs = (t) => t.status !== "queued" ? "" : (t.blocked_reason || "").startsWith("held: logged out") ? "held: logged out"
+  : (t.blocked_reason || "").startsWith("held: network,") ? "held: network" : "";
+const held = (t) => !!heldAs(t);
+// A queued task whose dependencies have not finished waits on them, not on a worker slot.
+const depWait = (t) => { const on = t.status === "queued" ? (t.waits_on || []).filter((i) => i != null) : [];
+  return on.length ? "waits on " + on.map((i) => "#" + i).join(", ") : ""; };
+// Budget top-ups of an urgent or user-ordered task (topup.words): "budget topped up 2x (+$16.00)".
+const topupWords = (c) => c && c.n ? `budget topped up ${c.n}x (+$${Number(c.usd || 0).toFixed(2)})` : "";
+
+// A chain's metric across its runs (continues, fixes, re-reviews): run, time, value and delta.
+const num = (v) => Math.abs(v) >= 1000 || Number.isInteger(v) ? String(Math.round(v * 100) / 100) : String(+v.toPrecision(4));
+function trendHtml(series) {
+  return (series || []).map((s) => {
+    const vals = s.points.map((x) => x.value), lo = Math.min.apply(null, vals), hi = Math.max.apply(null, vals);
+    const xy = vals.map((v, i) => `${(i * 100 / (vals.length - 1)).toFixed(1)},${(hi === lo ? 10 : 18 - (v - lo) * 16 / (hi - lo)).toFixed(1)}`).join(" ");
+    const unit = s.unit ? " " + esc(s.unit) : "";
+    const rows = s.points.slice().reverse().map((x) => `<tr><td>${x.run ? "run " + x.run : "—"}</td><td>#${x.task}</td><td>${esc(x.at)}</td><td>${num(x.value)}${unit}</td>` +
+      `<td>${x.delta == null ? "" : (x.delta > 0 ? "+" : "") + num(x.delta)}</td></tr>`).join("");
+    return `<div class="trend"><b>${esc(s.name)}</b> <svg class="spark" viewBox="0 0 100 20" preserveAspectRatio="none"><polyline points="${xy}"/></svg>` +
+      `<table class="trend-t"><tr><th>run</th><th>task</th><th>time</th><th>value</th><th>delta</th></tr>${rows}</table></div>`;
+  }).join("");
+}
+
+function taskRow(t) {
+  const label = deferred(t) ? esc(t.starts) : waiting(t) ? esc(t.waiting || "waiting") : held(t) ? heldAs(t) : depWait(t) ? esc(depWait(t)) : t.review_since ? `review ${agoH(t.review_since)}` : t.status === "pushing" ? "approved, pushing" : t.outcome === "changes_needed" ? "changes needed" : esc(t.status);
+  const noteLabel = t.status === "blocked" ? "Blocked" : waiting(t) ? "Waiting" : held(t) ? "Held" : "Note";
+  return `<details class="row"><summary><span class="id">#${t.id}</span> <span class="st st-${t.outcome || t.status}">${label}</span>
+    <span class="title">${esc(t.title)}</span> <span class="meta">${esc(t.tier)} · ${money(t.spent_usd)}${t.budget_usd ? " / " + money(t.budget_usd) : ""} · ${agoH(t.updated)} ago${t.pr_url ? ` · ${isHttp(t.pr_url) ? link(t.pr_url, "PR") : "PR " + esc(t.pr_url)}` : ""}</span></summary>
+    ${t.wait ? `<p class="meta">${esc(t.wait.text)} (${esc(t.wait.age_text)})</p>` : ""}${t.blocking_step ? `<p class="meta">${esc(t.blocking_step)}</p>` : ""}${t.eta ? `<p class="meta">${esc(t.eta)}</p>` : ""}${topupWords(t.budget_topups) ? `<p class="meta">${esc(topupWords(t.budget_topups))}</p>` : ""}${(t.job_use || []).map((x) => `<p class="meta">${esc(x)}</p>`).join("")}${t.start_when ? `<p class="meta">start check: <code>${esc(t.start_when)}</code></p>` : ""}${t.gate ? `<p class="meta">${t.gate.warn ? "<b>warning:</b> " : ""}${esc(t.gate.text)}</p>` : ""}
+    ${t.blocked_reason ? `<p><b>${noteLabel}:</b> ${esc(t.blocked_reason)}</p>` : ""}${t.result ? `<p>${esc(t.result)}</p>` : ""}${trendHtml(t.trend)}
+    ${(t.pushed || []).map((x) => `<p class="meta">${x.status === "landed" ? "already on the branch" : "pushed"} ${esc((x.sha || "").slice(0, 7))}${x.version ? " as " + esc(x.version) : ""} (${esc(x.branch || "?")})</p>`).join("")}
+    <p class="meta">origin ${esc(t.origin)} · kind ${esc(t.kind)} · attempts ${t.attempts}${t.branch ? " · branch " + esc(t.branch) : ""}</p>
+    ${["queued", "running", "blocked", "pushing"].includes(t.status) ? `<button class="ghost" data-task-act="cancelled" data-task="${esc(t.id)}">Cancel</button>` : ""}
+    ${["blocked", "failed"].includes(t.outcome || t.status) ? `<button class="ghost" data-task-act="queued" data-task="${esc(t.id)}">Retry</button>` : ""}</details>`;
+}
+// One delegated listener for the task rows' buttons (no inline handlers): rows patched later keep working.
+document.addEventListener("click", async (e) => {
+  const b = e.target.closest("[data-task-act]");
+  if (!b) return;
+  const r = await api(`/api/task/${encodeURIComponent(b.dataset.task)}`, { status: b.dataset.taskAct }); if (r.error) alert(r.error); refresh();
+});
+
+function bars(el, rows, key, label, cap) {
+  if (!rows.length) { put(el, `<p class="muted">No data yet.</p>`); return; }
+  const days = [...new Set(rows.map((r) => r.d))].sort(), W = Math.max(360, days.length * 44), H = 170, P = 28;
+  const tot = days.map((d) => rows.filter((r) => r.d === d).reduce((a, r) => Math.max(key === "usd" ? a + (+r.usd || 0) : Math.max(a, +r[key] || 0), a), 0));
+  const max = Math.max(cap || 0, ...tot, 1), bw = (W - P * 2) / days.length * 0.7;
+  const y = (v) => H - P - (H - P * 2) * v / max;
+  let s = `<svg viewBox="0 0 ${W} ${H}" width="${W}" height="${H}" role="img" aria-label="${esc(label)}">`;
+  s += `<line x1="${P}" x2="${W - P}" y1="${H - P}" y2="${H - P}" stroke="currentColor" opacity=".2"/>`;
+  if (cap) s += `<line x1="${P}" x2="${W - P}" y1="${y(cap)}" y2="${y(cap)}" stroke="var(--red)" stroke-dasharray="4 3"/><text x="${W - P}" y="${y(cap) - 4}" text-anchor="end">limit ${key === "usd" ? money(cap) : cap + "%"}</text>`;
+  days.forEach((d, i) => { const x = P + i * (W - P * 2) / days.length; const v = tot[i];
+    s += `<rect x="${x}" y="${y(v)}" width="${bw}" height="${H - P - y(v)}" fill="var(--accent)" rx="2"><title>${d}: ${key === "usd" ? money(v) : v + "%"}</title></rect>`;
+    s += `<text x="${x + bw / 2}" y="${H - 10}" text-anchor="middle">${d.slice(5)}</text>`; });
+  put(el, s + `</svg>`);
+}
+
+// Browser notifications while this page is open in any tab. Browsers allow them only in a secure
+// context: https, or http on localhost/127.0.0.1 (the address `ttp web` prints, also through its tunnel).
+// on | ask (not allowed yet) | blocked (by the browser) | insecure (this address) | unsupported.
+const notifyState = (w) => w.isSecureContext === false ? "insecure" : !("Notification" in w) ? "unsupported"
+  : ({ granted: "on", denied: "blocked" })[w.Notification.permission] || "ask";
+const NOTIFY_TEXT = {
+  on: "on: new asks, problems and work ready for review pop up while this page is open in a tab.",
+  ask: "not allowed yet. Allow them to get a pop-up for new asks, problems and work ready for review.",
+  blocked: "blocked by this browser. To allow them again: click the icon left of the address bar, set Notifications to Allow, and reload.",
+  insecure: "unavailable on this address: browsers allow them only on https or localhost. Open the link `ttp web` prints (http://127.0.0.1:…).",
+  unsupported: "not supported by this browser.",
+};
+const NOTIFY_PILL = { ask: "Turn on notifications", blocked: "Notifications blocked", insecure: "Notifications unavailable", unsupported: "Notifications unavailable" };
+// "" once shown, else why not (Chrome on Android shows them only from a service worker). Each stays
+// until the user closes it, where the browser supports that (requireInteraction).
+// A preview of `s` in `n` chars: when cut, it says where the full text is.
+const preview = (s, n, where) => (s = String(s || "")).length <= n ? s : s.slice(0, n - where.length - 4) + "… (" + where + ")";
+function popup(title, body, tag) {
+  try { const n = new Notification(title, { body: preview(body, 240, "full text in the web chat"), tag, requireInteraction: true }); n.onclick = () => { window.focus(); n.close(); }; return ""; }
+  catch (e) { return String((e && e.message) || e); }
+}
+let slackState = null;
+function notifyCard() {
+  const s = notifyState(window), pill = $("#notify");
+  pill.hidden = s === "on"; text(pill, NOTIFY_PILL[s] || "");
+  put($("#notifystate"), `<b>Browser notifications:</b> ${codes(NOTIFY_TEXT[s])}`);
+  $("#notifyask").hidden = s !== "ask";
+  put($("#slackline"), slackState ? codes(slackState.line) + (slackState.since ? ` (${at(slackState.since)})` : "") : "");
+}
+const allowNotify = async () => {
+  // Called from a click: browsers ignore a permission request that no user gesture started.
+  await new Promise((done) => { const r = Notification.requestPermission(done); if (r && r.then) r.then(done, done); });
+  notifyCard();
+};
+$("#notifyask").onclick = allowNotify;
+$("#notify").onclick = () => {
+  if (notifyState(window) === "ask") return allowNotify();
+  document.querySelector('#tabs button[data-tab="overview"]').click(); $("#notifycard").scrollIntoView();
+};
+$("#notifytest").onclick = async () => {
+  const slack = !!slackState && !["not_configured", "no_token", "unreadable"].includes(slackState.state);
+  text($("#notifyresult"), "sending…");
+  const r = await api("/api/notify/test", slack ? { slack: true } : {}), s = notifyState(window), out = [];
+  if (s !== "on") out.push(`Browser: not sent, notifications are ${s === "ask" ? "not allowed yet" : s}.`);
+  else { const err = popup(r.title, r.body, "ttp-test");
+    out.push(err ? `Browser: could not show it: ${err}` : "Browser: sent. None appeared? Check the system's do-not-disturb or focus mode and its setting for this browser."); }
+  if (r.slack) out.push(`${r.slack.ok ? "Slack" : "Slack failed"}: ${r.slack.text}`);
+  put($("#notifyresult"), codes(out.join(" ")));
+};
+// What this tab has seen. Its first look notifies nothing (it is all on screen); after that each new
+// ask, problem and task ready for review notifies once, also while the tab is in the background.
+let seenKeys = JSON.parse(sessionStorage.getItem("ttp_seen") || "null"), unseen = 0;
+const ready = (t) => t.status === "review" || (t.pr_url && t.status === "done");
+function announce(st) {
+  const items = (st.attention || []).map((m) => ({ key: `m${m.id}`, title: m.kind === "ask" ? "needs you" : "problem", body: m.text, tag: `ttp-${m.id}` }))
+    .concat((st.tasks || []).filter(ready).map((t) => ({ key: `r${t.id}`, title: "ready for review", body: `#${t.id} ${t.title}`, tag: `ttp-review-${t.id}` })));
+  const fresh = seenKeys ? items.filter((m) => !seenKeys.includes(m.key)) : [];
+  seenKeys = items.map((m) => m.key); sessionStorage.setItem("ttp_seen", JSON.stringify(seenKeys));
+  if (!fresh.length) return;
+  if (notifyState(window) === "on") fresh.slice(-3).forEach((m) => popup(`${st.project.name}: ${m.title}`, m.body, m.tag));
+  if (document.hidden) unseen += fresh.length;
+}
+document.addEventListener("visibilitychange", () => { if (!document.hidden) unseen = 0; });
+
+// Blocked tasks that wait on the user (kind "user"), or on anything else (no kind).
+const stuck = (st, kind) => st.tasks.filter((t) => t.status === "blocked" && t.wait && (kind ? t.wait.kind === kind : t.wait.kind !== "user"));
+// What needs the user: open asks (problems and alerts wait on the project) plus blocked tasks that
+// wait on the user, plus queued tasks gated on an open ask, minus a gated task its open ask already
+// counts (an ask names it as #<id>, so the ask is counted once, not once per task).
+function needsYou(st) {
+  const ids = new Set();
+  for (const m of st.attention || []) if (m.kind === "ask")
+    for (const hit of String(m.text || "").matchAll(/#(\d+)/g)) ids.add(+hit[1]);
+  return (st.attention || []).length + stuck(st, "user").length +
+    (st.tasks || []).filter((t) => t.status === "queued" && t.gate && t.gate.ask && !ids.has(t.id)).length;
+}
+function board(st) {
+  const asks = st.attention.filter((m) => m.kind === "ask");
+  // An item is its text, cut to fit, then an optional HTML tail (an age).
+  const cols = [
+    // Only what needs the user: open asks and tasks that wait on them. Other stuck tasks are the project's.
+    ["you", "Waiting on you", stuck(st, "user").map((t) => [`#${t.id} ${t.title} — ${t.wait.text}`, ` (${t.wait.age_text})`])
+      .concat(asks.map((m) => [`${m.text}`, "", `ask ${m.id}, ${agoH(m.ts)} ago${m.auto ? `; ${esc(m.auto)}` : ""}: `]))],
+    ["stuck", "Stuck, the project is on it", stuck(st).map((t) => [`#${t.id} ${t.title} — ${t.wait.text}`, ` (${t.wait.age_text})`])],
+    ["review", "Ready for review", st.tasks.filter(ready).map((t) => [`#${t.id} ${t.title}`, t.review_since ? ` (in review ${agoH(t.review_since)})` : ""])],
+    ["work", "Working", st.tasks.filter((t) => t.status === "running").map((t) => [`#${t.id} ${t.title}`])],
+    ["queued", "Queued", st.tasks.filter((t) => t.status === "queued").map((t) => [`#${t.id} ${t.title}${deferred(t) ? ` (${t.starts})` : waiting(t) ? ` (${t.waiting || "waiting"}, next try ${at(t.not_before)})` : ""}`])],
+  ];
+  R.rows($("#board"), cols.map(([cls, name, items]) => ({ key: cls, html: `<div class="col ${cls}"><h3>${name}<span class="n">${items.length}</span></h3>` +
+    // What waits on the user shows in full and every item of it: never only an id to look up.
+    (items.slice(0, cls === "you" ? items.length : 6).map(([x, tail, head]) => `<div class="item">${head || ""}${esc(cls === "you" ? x : x.slice(0, 160))}${tail || ""}</div>`).join("") || `<div class="item muted">—</div>`) + `</div>` })));
+}
+
+let lastOk = 0;
+// `cmd` in server text becomes <code>cmd</code>; the rest is escaped.
+const codes = (t) => esc(t).replace(/`([^`]+)`/g, "<code>$1</code>");
+function banner(html) {
+  put($("#banner"), html);
+  $("#banner").hidden = !html;
+}
+
+// The push queue card: what waits, the live batch, and the recent batches with their deploy.
+function pushQueueHtml(q, now) {
+  const ent = (q.entries || []).map((e) => `<div class="row"><span class="id">#${e.task}</span><span class="st st-${esc(e.status)}">${esc(e.status)}</span>` +
+    `<span class="title">${esc(e.title || "")}</span><span class="meta">${esc(e.branch || "?")} ${esc(e.head)} · ${agoH(Math.round(now - e.age_s))} old${e.pushed_sha ? ` · ${esc(e.pushed_sha)}` : ""}</span></div>`).join("");
+  const b = (q.last || []).map((x) => `<div class="row"><span class="id">${esc(x.id)}</span><span class="st ${x.outcome === "pushed" ? "st-done" : ["pushed", "landed", "nothing"].includes(x.outcome) ? "" : "st-failed"}">${esc(x.outcome || "?")}</span>` +
+    `<span class="meta">${x.landing ? esc(x.landing) + " · " : x.pushed_sha ? esc(x.pushed_sha.slice(0, 7)) + (x.version ? " as " + esc(x.version) : "") + " · " : ""}${x.check_runs != null ? `checks ${x.check_runs} run${x.check_runs === 1 ? "" : "s"}${x.check_s != null ? ` in ${Math.round(x.check_s)} s` : ""} · ` : ""}` +
+    `deploy ${esc(x.after_push || (q.live && q.live.id === x.id ? "running" : "pending"))} · ${agoH(x.ended || x.started)} ago</span></div>`).join("");
+  return (ent ? `<h3>Entries</h3>${ent}` : `<p class="muted">Nothing waiting.</p>`) + (b ? `<h3>Recent batches</h3>${b}` : "");
+}
+
+function healthHtml(h) {
+  const c = h.coordinator, parts = [];
+  if (c.route_line) parts.push(esc(c.route_line));
+  parts.push(c.last_turn ? `last turn ${agoH(c.last_turn)} ago${c.last_status ? ` (${esc(c.last_status)})` : ""}` : "no turn yet");
+  if (c.failures) parts.push(`<span class="lv-red">${c.failures} failed in a row</span>`);
+  if (c.backoff_until) parts.push(`retry at ${at(c.backoff_until)}`);
+  if (c.idle_wake) parts.push(`next idle check ${at(c.idle_wake)}`);
+  else if (c.idle_held) parts.push(`idle check ${esc(c.idle_held)}`);
+  return `<div class="row"><span class="meta">${parts.join(" · ")}</span></div>` + h.providers_paused.map((p) =>
+    `<div class="row"><b>${esc(p.provider)}</b><span class="pill lv-red">paused until ${at(p.until)}</span><span>${esc(p.note)}</span><span class="meta">fix: ${esc(p.fix)}</span></div>`).join("") +
+    (h.breakers || []).map((b) => `<div class="row"><b>${esc(b.provider)}</b><span class="pill lv-red">logged out</span><span>${esc(b.line)}</span></div>`).join("") +
+    (h.schedules_broken ? `<div class="row"><span class="pill lv-red">${esc(h.schedules_broken)}</span></div>` : "") +
+    (h.self_review ? `<div class="row"><span class="${/overdue/.test(h.self_review) ? "pill lv-red" : "meta"}">${esc(h.self_review)}</span></div>` : "") +
+    (h.health ? `<div class="row"><span class="${/ [1-9]\d* failing/.test(h.health) ? "pill lv-red" : "meta"}">${esc(h.health)}</span></div>` : "") +
+    (h.drivers_stalled || []).map((line) => `<div class="row"><span class="pill lv-yellow">${esc(line)}</span></div>`).join("") +
+    (h.coverage ? `<div class="row"><span class="${/missing:/.test(h.coverage) ? "pill lv-yellow" : "meta"}">${esc(h.coverage)}</span></div>` : "") +
+    (h.obligations || []).map((line) => `<div class="row"><span class="${/OVERDUE/.test(line) ? "pill lv-yellow" : "meta"}">${esc(line)}</span></div>`).join("") +
+    (h.outages || []).map((line) => `<div class="row"><span class="pill ${/OVERDUE/.test(line) ? "lv-red" : "lv-yellow"}">${esc(line)}</span></div>`).join("") +
+    (h.upstream ? `<div class="row"><span class="meta">${esc(h.upstream)}</span></div>` : "") +
+    (h.resources_paused || []).map((r) =>
+    `<div class="row"><b>${esc(r.resource)}</b><span class="pill lv-orange">resource paused</span><span>${esc(r.reason || "")}</span><span class="meta">since ${at(r.since)} by ${esc(r.by || "user")}${r.end ? `; ${esc(r.end)}` : ""}: its tasks wait</span><button data-resume-resource="${esc(r.resource)}">Resume</button></div>`).join("");
+}
+
+let lastKey = "";
+// One delegated listener: rows patched later (held updates, R.flush) keep working.
+$("#chealth").addEventListener("click", async (e) => {
+  const b = e.target.closest("[data-resume-resource]");
+  if (!b) return;
+  await api("/api/pause", { resource: b.dataset.resumeResource, paused: false }); refresh();
+});
+
+async function refresh() {
+  let st;
+  try { st = await api(document.hidden ? "/api/state" : `/api/state?visible=1&seen=${lastMsg}`); } catch (e) {
+    if (e.message === "auth") return;
+    lastKey = "";
+    // The page keeps its last data; say so rather than let it look current.
+    // Only this computer can reopen a tunnel, so the page says how; the daemon's service restarts it by itself.
+    const help = localStorage.getItem("ttp_offline_help") || "If the project runs on another machine, the SSH tunnel from this computer is down: `ttp web <project> --tunnel` reopens it, and `--keep` keeps it up. If it runs on this computer, its daemon is down and its service restarts it within a few minutes.";
+    banner(`Cannot reach the project's daemon (${esc(e.message || e)}). What you see is from ${lastOk ? ago(lastOk / 1000) + " ago" : "earlier"} and may be out of date.<br>${codes(help)}`);
+    text($("#daemon"), "unreachable"); $("#daemon").className = "pill lv-red";
+    return;
+  }
+  lastOk = Date.now();
+  ZONE = (st.project && st.project.zone) || (st.health && st.health.zone) || "UTC";
+  const hb = st.heartbeat;
+  const stuck = hb && hb.age > st.heartbeat_stale_s;
+  // Nothing new (ticking ages aside): leave the page alone and only move the ages on. The minute
+  // in the key still re-renders once a minute for what the page derives from the clock.
+  const key = R.key(st, `${!!stuck}|${Math.floor(Date.now() / 60000)}`);
+  if (key === lastKey) { R.flush(); R.tick(); return; }
+  lastKey = key;
+  if (st.offline_help) localStorage.setItem("ttp_offline_help", st.offline_help);
+  // A daemon started before an upgrade serves this file without the health fields until it restarts.
+  const h = st.health || { spend: {}, coordinator: {}, providers_paused: [], asks: [], running: 0, why_idle: "" };
+  const cfg = st.project.config || {};
+  const disk = st.disk_low;
+  // The daemon's service restarts a stuck daemon by itself; a command is named only where none does.
+  const svc = st.service, fix = !svc ? `<code>ttp restart ${esc(st.project.name)}</code> restarts it.`
+    : svc.watchdog ? `Its watchdog restarts it after ${Math.round((st.watchdog_s || 600) / 60)} min without a tick.`
+    : `Its service predates the watchdog: <code>ttp restart ${esc(st.project.name)}</code> restarts it and adds one.`;
+  banner([stuck ? `The daemon has not completed a tick for ${Math.round(hb.age / 60)} min: nothing new starts. ${fix}` : "",
+          st.pause ? `This project is ${esc(st.pause.text)}. No new model runs start until it resumes.` : "",
+          disk ? `Only ${disk.free_gb} GB free under ${esc(disk.path)}: only questions and plans start until ${st.disk && st.disk.resume_gb ? st.disk.resume_gb + " GB are" : "space is"} free.` : "",
+          // Shown only while no ask is on screen: an ask in "Needs you now" already reached the user.
+          h.undelivered && !(st.attention || []).some((m) => m.kind === "ask") ? `${esc(h.undelivered.line)}.${h.undelivered.below_floor ? ` ${h.undelivered.below_floor} of the questions are below every chat's severity floor.` : ""}` : ""].filter(Boolean).join("<br>"));
+  text($("#pname"), st.project.name);
+  text($("#daemon"), st.paused ? "paused" : stuck ? "stuck" : (st.daemon && st.daemon.pid ? `running on ${st.daemon.host}` : "stopped"));
+  $("#daemon").className = "pill " + (stuck ? "lv-red" : st.paused ? "lv-orange" : "lv-green");
+  $("#daemon").title = st.pause ? st.pause.text : "";
+  text($("#spend"), h.spend.headline || `24h ${money(h.spend.spent_24h)}`);
+  $("#spend").title = h.spend.detail || "all providers";
+  const needs = needsYou(st);
+  $("#needs").hidden = !needs; text($("#needs"), `${needs} need${needs === 1 ? "s" : ""} you`);
+  $("#hostline").hidden = !h.host; text($("#hostline"), h.host || "");
+  $("#sleepline").hidden = !h.idle_sleep; text($("#sleepline"), h.idle_sleep || "");
+  $("#mcpline").hidden = !h.mcp_gap; text($("#mcpline"), h.mcp_gap || "");
+  $("#relline").hidden = !h.release; text($("#relline"), h.release || "");
+  const rt = (h.runtime || {}).restart_pending ? h.runtime.line : "";   // the header shows only what needs action
+  $("#runline").hidden = !rt; text($("#runline"), rt);
+  $("#localline").hidden = !h.local_only; text($("#localline"), h.local_only || "");
+  const dk = st.disk, kept = Object.keys(st.worktrees_kept || {});
+  $("#disk").hidden = !dk;
+  if (dk) {
+    text($("#disk"), `disk ${dk.free_gb} GB free${dk.low ? " · guard on" : ""}`);
+    $("#disk").className = "pill " + (dk.low ? "lv-red" : dk.free_gb < 2 * dk.threshold_gb ? "lv-orange" : "lv-green");
+    $("#disk").title = `${dk.free_gb} of ${dk.total_gb} GB free under ${dk.path}; the guard holds new tasks below ${dk.threshold_gb} GB` +
+      (kept.length ? `\nFinished tasks' worktrees kept: ${kept.map(t => `#${t} (${st.worktrees_kept[t]})`).join(", ")}` : "");
+  }
+  put($("#why"), h.why_idle ? `<b>Idle:</b> ${esc(h.why_idle)}` : `${h.running} run${h.running === 1 ? "" : "s"} working.` +
+    (h.held ? ` <b>Held:</b> ${esc(h.held)}` : ""));
+  text($("#selfwatch"), st.selfwatch || "");
+  text($("#top"), [h.spend.in_flight ? `~${money(h.spend.in_flight)} so far in running work` : "",
+    h.spend.top_7d ? `Top spender, 7 days: ${h.spend.top_7d.source} ${money(h.spend.top_7d.usd)}` : "",
+    h.spend.caps_line ? `Project caps: ${h.spend.caps_line}` : "",
+    h.spend.bases_line ? `Runs by cost basis, 7 days: ${h.spend.bases_line}` : "",
+    h.spend.route_line ? `routing: ${h.spend.route_line}` : ""].filter(Boolean).join(" · "));
+  put($("#chealth"), healthHtml(h));
+  $("#pqcard").hidden = !st.push_queue;
+  if (st.push_queue) { text($("#pqline"), st.push_queue.line || ""); put($("#pq"), pushQueueHtml(st.push_queue, st.now || Date.now() / 1000)); }
+  slackState = (st.notify && st.notify.slack) || null; notifyCard();
+  announce(st);
+  document.title = `${unseen ? "(" + unseen + ") " : ""}${st.project.name} · tt-project`;
+  board(st);
+  const muted = (s) => [{ key: "empty", html: `<p class="muted">${s}</p>` }];
+  const attn = (st.attention || []).map((m) => ({ key: `${m.kind}:${m.id}`, html: `<div class="attn"><span class="when">${agoH(m.ts)} ago · ${m.kind === "ask" ? "ask " + m.id + (m.auto ? "; " + esc(m.auto) : "") : "problem"}</span><div>${esc(m.text)}</div></div>` }));
+  R.rows($("#attention"), attn.length ? attn : muted("Nothing needs you right now."));
+  const feed = (st.feed || []).map((m) => ({ key: m.id != null ? `id:${m.id}` : `${m.kind}:${m.ts}:${m.text}`, html: `<div class="row"><span class="when">${agoH(m.ts)} ago</span>` +
+    `<span class="meta">${m.state === "cleared" ? "cleared" + (m.cleared_at ? " " + at(m.cleared_at) : "") : m.state === "status" ? "status, clears itself" : m.state === "acked" ? "acknowledged" + (m.acked_why ? ": " + esc(m.acked_why) : "") : esc(m.kind === "alert" ? "note" : m.kind)}</span>` +
+    `<span class="title">${esc(m.text)}</span></div>` }));
+  R.rows($("#feed"), feed.length ? feed : muted("Nothing yet."));
+  put($("#gates2"), gateHtml(st.gates));
+  const running = h.working || st.runs.filter((r) => r.status === "running").map((r) => ({ ...r, run: r.id }));
+  R.rows($("#running"), running.length ? running.map((r) => ({ key: r.run, html: `<div class="row"><span class="id">run ${r.run}</span><span class="title">${r.task ? `#${r.task} ${esc(r.title || "")}` : esc(r.role)}${r.batch ? ` <span class="meta">(batch ${esc(r.batch.id)}: +${r.batch.members.map((m) => `#${m}`).join(", ")})</span>` : ""}</span><span class="meta">${esc(r.provider)} ${esc(r.model || "")} ${esc(r.effort || "")}${r.wake ? ` · ${esc(r.wake)} wake` : ""}${r.floor ? ` · ${esc(r.floor)}` : ""} · ${agoH(r.started)}${r.cost_usd ? ` · ~${money(r.cost_usd)} so far` : ""}</span>${r.note ? `<div class="meta">${esc(r.note)}</div>` : ""}${r.doing ? `<div class="meta">${esc(r.doing)}${r.files_n ? ` · ${r.files_n} file(s) changed` : ""}</div>` : ""}${r.checks ? `<div class="meta">${esc(r.checks)}</div>` : ""}</div>` })) : muted("Idle."));
+  text($("#coord"), (st.coordinator && st.coordinator.summary) || "—");
+  const cache = st.budget && st.budget.coordinator_cache && st.budget.coordinator_cache["24h"];
+  text($("#coordcache"), (cache && cache.line) || "cache stats unavailable");   // the server's wording, as is
+  const done = st.tasks.filter((t) => ["done", "failed", "cancelled"].includes(t.status)).slice(0, 8);
+  const taskRows = (ts) => ts.map((t) => ({ key: t.id, html: taskRow(t) }));
+  R.rows($("#recent"), done.length ? taskRows(done) : muted("Nothing yet."));
+  R.rows($("#tasklist"), st.tasks.length ? taskRows(st.tasks) : muted("No tasks."));
+  R.rows($("#issuelist"), st.issues.length ? st.issues.map((i) => ({ key: i.id, html: `<div class="row"><span class="id">${esc(i.severity)}</span><span class="title">${esc(i.title)}</span><span class="meta">${esc(i.source)} · seen ${i.count}× · last ${agoH(i.last_seen)} ago${i.task ? " · task #" + i.task : ""}</span></div>` })) : muted("No open issues."));
+  put($("#schedlist"), `<table><tr><th>Name</th><th>Kind</th><th>Every</th><th>Last run</th><th>7-day cost</th><th>Daily budget</th><th>On</th></tr>` +
+    st.schedules.map((s) => `<tr><td><b>${esc(s.name)}</b><div class="meta">${esc(s.description)}</div></td><td>${esc(s.kind)}${s.payload && s.payload.precheck ? `<div class="meta">precheck: ${esc(s.payload.precheck)}</div>` : ""}</td><td>${Math.round(s.every_s / 60)} min${s.at_text ? " " + esc(s.at_text) : ""}</td>
+      <td>${agoH(s.last_run)} ago<div class="meta">${esc((s.last_status || "").startsWith("skipped: budget ") ? "waiting for budget" : s.last_status || "")}${s.skips_24h ? ` · ${s.skips_24h} skip(s) in 24 h` : ""}</div></td><td>${money(s.cost_7d)}</td>
+      <td><input type="number" min="0" step="0.5" value="${s.budget_usd_day == null ? "" : esc(s.budget_usd_day)}" style="width:6em" data-schedule="${esc(s.name)}" data-field="budget_usd_day"></td>
+      <td><input type="checkbox" ${s.enabled ? "checked" : ""} data-schedule="${esc(s.name)}" data-field="enabled"></td></tr>`).join("") + `</table>`);
+  put($("#accounts"), (st.accounts || []).map((a) => `<div class="row"><b>${esc(a.provider)}</b><span class="meta">${esc(a.account || "unknown")}</span><span class="meta">last used ${agoH(a.last)} ago</span></div>`).join("") || `<p class="muted">No runs yet.</p>`);
+  bars($("#spendchart"), st.budget.daily_spend, "usd", "daily spend", cfg.budget && cfg.budget.daily_usd);
+  bars($("#peakchart"), st.budget.window_peaks, "peak", "window peaks", cfg.budget ? 100 - cfg.budget.reserve_pct : 90);
+  put($("#sources"), `<table>${st.budget.top_sources_7d.map((r) => `<tr><td>${esc(r.source)}</td><td>${esc(r.provider)}</td><td>${money(r.usd)}</td><td class="meta">${r.n} runs</td></tr>`).join("")}</table>`);
+  if (document.activeElement !== $("#daily")) $("#daily").value = cfg.budget ? cfg.budget.daily_usd : "";
+  if (document.activeElement !== $("#weekly")) $("#weekly").value = cfg.budget ? cfg.budget.weekly_usd : "";
+  text($("#pause"), st.paused ? "Resume project" : "Pause project");
+  $("#pause").onclick = async () => {
+    const reason = st.paused ? "" : window.prompt("Why pause the project? (shown in status and the alert)", "");
+    if (reason === null) return;
+    await api("/api/pause", { paused: !st.paused, reason }); refresh();
+  };
+  R.tick();
+}
+const setSched = async (name, body) => { await api(`/api/schedule/${encodeURIComponent(name)}`, body); refresh(); };
+// One delegated listener for the schedule inputs: the name comes from data-schedule, never from inline script.
+$("#schedlist").addEventListener("change", (e) => {
+  const el = e.target.closest("[data-schedule]");
+  if (!el) return;
+  setSched(el.dataset.schedule, el.dataset.field === "enabled" ? { enabled: el.checked } : { budget_usd_day: el.value });
+});
+$("#savecaps").onclick = async () => {
+  await api("/api/config", { key: "budget.daily_usd", value: $("#daily").value });
+  await api("/api/config", { key: "budget.weekly_usd", value: $("#weekly").value }); refresh();
+};
+
+let lastMsg = 0;
+async function pollChat() {
+  let rows; try { rows = await api(`/api/messages?after=${lastMsg}`); } catch (e) { return; }
+  const log = $("#log"), atBottom = log.scrollHeight - log.scrollTop - log.clientHeight < 40;
+  rows.forEach((m) => { lastMsg = Math.max(lastMsg, m.id);
+    const d = document.createElement("div"); d.className = `msg ${m.direction} sev-${m.severity}`;
+    const where = m.chat === null ? (m.direction === "out" ? " · to everyone" : "")
+      : m.chat === "web" ? "" : ` · chat ${esc(m.chat_label || m.chat)}`;
+    d.innerHTML = `<div class="b">${esc(m.text)}</div><div class="meta">${agoH(m.ts)} ago${where}</div>`;
+    log.appendChild(d); });
+  R.tick();
+  if (rows.length && atBottom) log.scrollTop = log.scrollHeight;
+}
+$("#say").onsubmit = async (e) => { e.preventDefault(); const t = $("#msg").value.trim(); if (!t) return; $("#msg").value = ""; await api("/api/say", { text: t }); pollChat(); };
+
+refresh(); pollChat();
+// A hidden tab still looks once 30 s have passed since its last look (by the clock:
+// browsers slow timers in long-hidden tabs), so its notifications still come; it also looks when shown.
+let lastLook = Date.now();
+const look = () => { lastLook = Date.now(); return refresh(); };
+setInterval(() => { if (!document.hidden) { look(); pollChat(); if ($("#projects").classList.contains("on")) projects().catch(() => {}); } else if (Date.now() - lastLook >= 30000) look(); }, 4000);
+document.addEventListener("visibilitychange", () => { if (!document.hidden) look(); });

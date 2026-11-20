@@ -1,0 +1,1728 @@
+# SPDX-FileCopyrightText: © 2026 Tenstorrent USA, Inc.
+# SPDX-License-Identifier: Apache-2.0
+"""Local `ttp detach` jobs (cli.cmd_detach): start them, queue them for the daemon, tell their state.
+
+A job writes <name>.log, then <name>.rc with its exit code, in the run's folder. Its wrapper writes
+<name>.started the moment it runs and holds <name>.lock (locks.job_lock) while any of its processes
+lives, so a job gone without an .rc is told apart from one still running. An exit 0 whose log's last test
+summary reports failures (a test command piped into tail) is recorded as 1 (VERDICT_SH).
+
+A sandbox that runs each command in a PID namespace or a cgroup of its own can end every process the
+command started once it returns, a new session or not: the job would die before its first line. As
+for `ttp push --detach`, a launcher that finds itself boxed (push._boxed) queues the job under
+state/detach-queue, with <name>.queued next to its .rc, and the daemon starts it outside the sandbox
+(tend). So does a push check or `ttp checks` command (check_owner), sandboxed or not: the check's
+sandbox, or else its reaper by the token in the job's environment (checkreap), would end the job with
+the check. No task owns its job, so bound() ends it at CHECK_JOB_S or once the push or checks run that owns the
+check is gone. A job gone without an exit code gets <name>.lost holding why, so its probe and the next
+run read the reason, never a bare "gone".
+
+Each request carries an id, which <name>.queued names too. The queue folder's .lock serializes
+publishing a request (enqueue), settling one (_settle) and telling whether one is pending (pending):
+a newer request that arrives while the daemon starts an older one is never deleted with it, and a
+marker whose request is gone (a crash between the two writes) is cleared instead of hiding the result.
+
+A job gets a temp dir of its own (scratch), with TMPDIR, TMP and TEMP pointing at it: the run's own
+tmp dir, which a fenced run's environment names, goes when that run ends, while the job still runs
+(a compiler then loses its scratch partway through). The wrapper removes it when the job ends; tend
+sweeps those of jobs gone without doing so (killed, or the host restarted). The temp dir itself is a
+short one (shorttmp), so a socket bound beneath it stays within the AF_UNIX path limit; the job's
+record under the state names it in its `path` file. Without a usable short root the record is the
+temp dir.
+
+It also gets a work dir of its own, `$TTP_JOB_DIR` (WORK in its record, under the project's state for a
+job of a run or a check): a check's own scratch and temp dir go with the check, maybe before the daemon
+starts the job it queued, so the job keeps its files here. A queued job whose cwd went meanwhile starts
+there. Both go when it ends, as its temp dir does.
+
+A job started with `ttp detach --resumable` also gets <name>.resume.json: its argv, cwd and
+environment (secrets left out, as for a queued job) and how often the daemon relaunched it. When a
+host reboot cut it short, the daemon starts the same command again on the next boot (relaunch),
+model-free, while its task still waits on it, up to RELAUNCH_CAP times; past that the task wakes as
+before. Only a job that is safe to run again from the start opts in.
+
+Every signal tt-project sends a job (stop, jobstop) is logged by `signalled`: a line in the job's log and a
+row in state/job-signals.jsonl naming the code path and the sender. A job outlives its run while an open
+task waits on it; tt-project ends one only by SIGKILL of its group with <name>.lost, so an .rc of 143
+means its command alone got SIGTERM from elsewhere (a waiting `ttp lock` logs who: `received`). An
+owner's stop (jobstop.end) then also writes <name>.rc holding 137 (STOP_RC, record_stop), so a reader of
+the .rc alone sees an ended job; `stopped` tells it from an exit code the job wrote itself. A kill from
+outside tt-project cannot be seen as it happens: when the record closes (close), a job that died by a
+signal with no stop on record gets a row too (unseen_kill, reason "unseen", by "unknown").
+"""
+from __future__ import annotations
+
+import fcntl
+import json
+import os
+import re
+import shlex
+import shutil
+import signal
+import subprocess
+import sys
+import threading
+import time
+import uuid
+from contextlib import contextmanager, nullcontext
+from pathlib import Path
+
+from . import locks, machines, shorttmp
+from .project import FOLDER, Project, durable_append, durable_write, nice_level, renice, write_json
+
+QUEUE = "detach-queue"   # under the project's state: <run>-<name>.json per job a sandboxed command or a check queued
+SCRATCH = "detach-tmp"   # under the project's state: <run>-<name>/ is a job's temp dir while it runs
+WORK = "work"            # in a job's record: its durable work dir, $TTP_JOB_DIR
+QUEUED_S = 900           # a queued job the daemon has not started by then is recorded as lost
+BOUND = "detach-bound"   # under the project's state: <run>-<name>.json per running job a check queued (bound)
+CHECK_JOB_S = 6 * 3600   # a job a check queued ends this long after it was queued, if its owner lasts that long
+RELAUNCH_CAP = 3         # default relaunches of a resumable job after reboots (budget.max_job_relaunches)
+FAILED_RC = 4            # `ttp detach --check`: every job ended, but one with an exit code other than 0 or none
+CHECK_RE = re.compile(r"\bdetach\s+--check\b")
+
+
+def failed_check(probe: str, rc) -> bool:
+    """Whether a probe's exit says the detached jobs it checks ended and one failed (FAILED_RC), not
+    that the probe itself is broken: the daemon then runs the hand-off's on_pass_cmd or wakes the task
+    with the job's exit code, never as a passed probe."""
+    return rc == FAILED_RC and bool(CHECK_RE.search(probe or ""))
+def _top_ops(text: str) -> list[tuple[int, str]]:
+    """(index, operator) of each `||`, `&&`, `;`, `&`, newline and closing `)`/`}` of `text` outside
+    quotes, backslash escapes and nested parentheses or braces; a closer ends the list. The `&` of a
+    redirect or `|&` is not an operator."""
+    out, depth, i, q = [], 0, 0, ""
+    while i < len(text):
+        c = text[i]
+        if q:
+            if c == "\\" and q == '"':
+                i += 1
+            elif c == q:
+                q = ""
+        elif c == "\\":
+            i += 1
+        elif c in "'\"":
+            q = c
+        elif c in "({":
+            depth += 1
+        elif c in ")}":
+            if depth == 0:
+                out.append((i, c))
+                return out
+            depth -= 1
+        elif depth == 0 and text.startswith(("||", "&&"), i):
+            out.append((i, text[i:i + 2]))
+            i += 1
+        elif c == "&" and (text[i - 1:i] in (">", "<", "|") or text[i + 1:i + 2] == ">"):
+            pass   # a redirect (`2>&1`, `<&3`, `&>f`, `&>>f`) or bash's `|&` pipe, not a separator
+        elif depth == 0 and c in ";&\n":
+            out.append((i, c))
+        i += 1
+    return out
+
+
+def guard_or(probe: str) -> str:
+    """`probe` with the fallback of each top-level `<... detach --check ...> || <fallback>` rewritten so
+    the check's FAILED_RC (jobs ended, one failed) exits FAILED_RC instead of running the fallback:
+    written as `ttp detach --check x.rc || test "$(date +%s)" -ge <t>`, a failed job would sleep until
+    <t>. Other exits reach the fallback as before. Checks inside parentheses or braces stay as written;
+    a probe with no such `||` comes back unchanged."""
+    if not isinstance(probe, str) or not CHECK_RE.search(probe):
+        return probe
+    ops = _top_ops(probe)
+    stop = ops[-1][0] if ops and ops[-1][1] in ")}" else len(probe)
+    ops = [o for o in ops if o[1] not in ")}"]
+    cuts = [0] + [i + len(op) for i, op in ops]
+    ends = [i for i, _ in ops] + [stop]
+    parts, wrap = [], False
+    for n, (lo, hi) in enumerate(zip(cuts, ends)):
+        word = probe[lo:hi]
+        if wrap and word.strip() and not word.strip().startswith(f"{{ [ $? -eq {FAILED_RC} ]"):
+            word = f" {{ [ $? -eq {FAILED_RC} ] && exit {FAILED_RC}; {word.strip()}; }}" + (" " if n < len(ops) else "")
+        parts.append(word + (ops[n][1] if n < len(ops) else ""))
+        wrap = n < len(ops) and ops[n][1] == "||" and bool(CHECK_RE.search(probe[lo:hi]))
+    return "".join(parts) + probe[stop:]
+
+
+def _checked(probe: str, cwd=None) -> list[Path]:
+    """The local .rc paths a probe's `detach --check` names, relative to `cwd` (none for a --host one)."""
+    words = shlex.split(probe or "")
+    for i, w in enumerate(words):
+        if w == "--check":
+            out = []
+            for a in words[i + 1:]:
+                if a.startswith("-") or a in ("&&", "||", ";", "|"):
+                    break
+                out.append(Path(cwd or ".") / a)
+            return out
+    return []
+
+
+def last_progress(probe: str, cwd=None) -> float | None:
+    """When a detached job this probe's local `detach --check` names last showed progress while it still
+    runs or is queued: the newest mtime of its log, its .started and its .queued, else None (no such job,
+    or all ended). A wait on a job is stale only once this is old, never by the time since the wait
+    began (daemon._hold_waiting). A job on another host (--host) reads its mirror instead (_remote_progress)."""
+    if "--host" in (probe or ""):
+        return _remote_progress(probe, cwd)
+    best = None
+    try:
+        rcs = _checked(probe, cwd)
+    except ValueError:   # unbalanced quotes: no job to read, the wait counts as before
+        return None
+    for rc in rcs:
+        if rc.exists() or lost(rc).exists():
+            continue
+        e = _entry(rc)
+        for path in (Path(e["log"]) if e.get("log") else rc.with_suffix(".log"), started(rc), queued(rc)):
+            try:
+                t = path.stat().st_mtime
+            except OSError:
+                continue
+            best = t if best is None else max(best, t)
+    return best
+
+
+def _remote_progress(probe: str, cwd=None) -> float | None:
+    """last_progress for a `detach --check --host <alias> --mirror <dir> <path>...` probe: the newest time
+    a mirrored job not known to have ended last moved (its log grew, or it started: mirror_save's
+    "moved"; a mirror written before that key, its .remote.log's mtime). None without a mirror folder,
+    or when no named job has a live mirror: the wait counts as before."""
+    try:
+        words = shlex.split(probe or "")
+    except ValueError:
+        return None
+    host = mirror = None
+    paths: list[str] = []
+    for i, w in enumerate(words):
+        if w != "--check":
+            continue
+        rest = words[i + 1:]
+        while rest:
+            w = rest.pop(0)
+            key, eq, val = w.partition("=")
+            if key in ("--rows", "--after", "--host", "--mirror"):
+                if not eq:
+                    val = rest.pop(0) if rest else ""
+                host, mirror = (val, mirror) if key == "--host" else (host, val if key == "--mirror" else mirror)
+            elif w.startswith("-") or w in ("&&", "||", ";", "|"):
+                break
+            else:
+                paths.append(w)
+        break
+    if not host or not mirror:
+        return None
+    d = Path(cwd or ".") / mirror
+    best = None
+    for pre in paths:
+        name = mirror_name(pre)
+        m = mirror_read(d, name, host, pre)
+        if not m or m.get("end"):
+            continue
+        t = m.get("moved")
+        if not isinstance(t, (int, float)):
+            try:
+                t = (d / f"{name}.remote.log").stat().st_mtime
+            except OSError:
+                continue
+        best = t if best is None else max(best, float(t))
+    return best
+
+
+def failed_why(probe: str, rc, cwd=None) -> str:
+    """How a failed check reads: "job rc=N" (the first failed job's exit code, read from the rc files the
+    probe's `detach --check` names, relative to `cwd`), else "probe exit 4": 4 is the probe's, not the job's."""
+    try:
+        for path in _checked(probe, cwd):
+            st, why = state(path)
+            if st == "ended" and why != "0":
+                stop = stopped(path)
+                return f"job rc={why}" + (f", stopped on purpose: {stop}" if stop else "")
+    except (OSError, ValueError):
+        pass
+    return f"probe exit {rc}"
+
+
+# A failed step of a job whose driver keeps running: `ttp progress report failure` inside a `ttp detach`
+# job (progress.JOB_ENV) appends {"ts", "key", "reason"} to <name>.stepfail. The job still runs, so its
+# `detach --check` still exits 1 (every probe consumer reads it as "not yet"), and prints the failure; the
+# daemon, probing a waiting task's retry_when, takes the lines (take_step_failures: renamed to
+# <name>.stepfail.seen) and wakes the task once per batch of failures (Daemon._step_failed).
+STEP_FAILS_MAX = 20   # lines a wake quotes; the file keeps them all until taken
+
+
+def step_failed(rc: Path) -> Path:
+    return job_rc(rc).with_suffix(".stepfail")
+
+
+def note_step_failure(rc: Path, key: str, reason: str, now: float | None = None) -> None:
+    """Records one failed step of the running job `rc` (an OSError is the caller's)."""
+    line = json.dumps({"ts": round(time.time() if now is None else now, 3), "key": key, "reason": reason})
+    durable_append(step_failed(rc), line + "\n")
+
+
+def step_failures(rc: Path) -> list[dict]:
+    """The job's failed steps not yet taken, oldest first; [] when none or unreadable."""
+    try:
+        text = step_failed(rc).read_text()
+    except OSError:
+        return []
+    return [r for ln in text.splitlines() if (r := _json_line(ln))]
+
+
+def step_line(recs: list[dict]) -> str:
+    """'N failed step(s), last at <time>: <reason>' for a check's output and a wake."""
+    last = recs[-1]
+    when = time.strftime("%H:%M:%S %Z", time.localtime(float(last.get("ts") or 0)))
+    return f"{len(recs)} failed step{'s' if len(recs) != 1 else ''}, last at {when}: {last.get('reason') or '(no reason)'}"
+
+
+def take_step_failures(probe: str, cwd=None) -> list[tuple[Path, list[dict]]]:
+    """The failed steps of each still-running job a probe's local `detach --check` names, each job's file
+    renamed to <name>.stepfail.seen (appended to an earlier one) so the same failures wake its task once.
+    A job that ended is left out: its own exit code, not a step, is then the check's verdict."""
+    taken = []
+    try:
+        jobs = _checked(probe, cwd)
+    except ValueError:
+        return []
+    for rc in jobs:
+        f = step_failed(rc)
+        if not f.exists() or state(rc)[0] != "running":
+            continue
+        seen = f.with_name(f.name + ".seen")
+        try:
+            os.replace(f, tmp := f.with_name(f.name + f".{os.getpid()}"))
+            text = tmp.read_text()
+            durable_append(seen, text)
+            tmp.unlink()
+        except OSError:
+            continue
+        recs = [r for ln in text.splitlines() if (r := _json_line(ln))]
+        if recs:
+            taken.append((rc, recs))
+    return taken
+
+
+def _json_line(ln: str) -> dict | None:
+    try:
+        rec = json.loads(ln)
+    except ValueError:
+        return None
+    return rec if isinstance(rec, dict) else None
+
+
+# The first line of a failed job's log that names its failure, case-sensitive so ordinary words do not
+# match: a Python traceback, any word ending in Error (ValueError, Error:), the word error or ERROR, and
+# FAIL or FAILED (pytest, ctest). Lower-case "fail"/"failed" is left out: "0 failed" is a pass.
+ERROR_RE = re.compile(r"Traceback \(most recent call last\)|\b\w*Error\b|\berror\b|\bERROR\b|\bFAIL(?:ED)?\b")
+ERROR_SCAN_BYTES = 8 * 1024 * 1024   # first_error reads at most this much of a log's start
+LOG_EXCERPT_CHARS = 4000             # failed_logs' whole text, every job's together
+
+
+def first_error(log: Path) -> tuple[int, str] | None:
+    """The first line of `log` ERROR_RE matches, with its line number. Raises OSError."""
+    from .project import clean_line
+    seen = 0
+    with open(log, "rb") as f:
+        for n, raw in enumerate(f, 1):
+            line = raw.decode(errors="replace")
+            if ERROR_RE.search(line):
+                return n, clean_line(line.rstrip("\n"), 300)
+            seen += len(raw)
+            if seen >= ERROR_SCAN_BYTES:
+                return None
+    return None
+
+
+def failed_logs(probe: str, cwd=None, limit: int = LOG_EXCERPT_CHARS) -> str:
+    """For each job a probe's local `detach --check` names that failed or is gone: its <name>.log's last
+    20 lines and its first error line (first_error), all within `limit` chars, so a woken run need not
+    look for them; one short line for a log that is missing or unreadable. '' when none applies."""
+    from .project import file_tail
+    try:
+        jobs = [rc for rc in _checked(probe, cwd) if (st := state(rc))[0] == "lost"
+                or st[0] == "ended" and st[1] != "0"]
+    except (OSError, ValueError):
+        return ""
+    if not jobs:
+        return ""
+    each = max(limit // len(jobs), 400)
+    parts = []
+    for rc in jobs:
+        log = rc.with_suffix(".log")
+        try:
+            hit = first_error(log)
+            tail = file_tail(log, 20, max(each - 450, 200), 200)
+        except FileNotFoundError:
+            parts.append(f"{log.name}: no log at {log}")
+            continue
+        except OSError as e:
+            parts.append(f"{log.name}: its log could not be read ({type(e).__name__}: {e.strerror or e})"[:300])
+            continue
+        first = (f"first error line (line {hit[0]}): {hit[1]}" if hit
+                 else "no line matches Traceback, *Error, error, ERROR or FAIL")
+        parts.append(f"{log.name} ({log}), last lines:\n{tail or '(empty)'}\n{first}")
+    text = "\n".join(parts)
+    return text if len(text) <= limit else text[:limit - 1] + "…"
+
+
+# Environment a queued job does not take from the run that queued it: the run's sandbox markers, and
+# secrets, which stay off disk (the daemon's own environment supplies them).
+# Also a check's fds (its scratch guard, a push's run lock) and its reaper token (checkreap.MARKER):
+# meaningless where the daemon starts the job, and the token would have the check's reaper end it.
+_SKIP_ENV = ("TTP_PIDNS", "TTP_CGROUP", "TTP_CHECKS_TMP_FD", "TTP_PUSH_RUN_LOCK_FD", "TTP_CHECK_SANDBOX")
+_SECRET_ENV = re.compile(r"TOKEN|SECRET|PASSW|CREDENTIAL|API_?KEY|_KEY$|AUTH", re.I)
+# <name>.started (the wrapper's pid) and <name>.rc are written by rename, so a reader never sees one empty.
+# With TTP_ACTIVITY_LOG and TTP_ACTIVITY_ID set (unset before the job runs), the job's end is appended
+# to that project's activity log (activity.py).
+# A job's exit 0 is its verdict, but a test command piped into tail or head (`bash -c 'pytest ... | tail
+# -30'`) exits with the last command's 0 however its tests went, and an on_pass reading the .rc would act
+# on failed tests. So once the command exited 0, the wrapper reads the last test summary in the log's
+# last 200 lines (pytest's "N failed, M passed in Xs", unittest's "FAILED (failures=N)" or "OK"): one
+# that reports failures or errors makes the recorded exit 1, with a line in the log saying why. A failing
+# exit code is never changed, no pipeline is run differently (a `| head` that ends on SIGPIPE behaves as
+# before), a `ttp` command keeps its own verdict (`ttp checks` passes a head whose only failures also
+# fail on its base), and TTP_DETACH_RC_ONLY=1 in the job's environment keeps the exit code as it is.
+# Uses $o (the log), $c (the exit code) and $1 (the command's first word); no single quotes, so the
+# remote wrapper can embed it (cli._REMOTE_START).
+VERDICT_SH = (r'if [ "$c" = 0 ] && [ -z "${TTP_DETACH_RC_ONLY-}" ]; then case ${1##*/} in ttp) ;; *) '
+              r'v=$(tail -n 200 "$o" 2>/dev/null | grep -aE "[0-9]+ (passed|failed|errors?|skipped|deselected|'
+              r'xfailed|xpassed|warnings?)[, ].*in [0-9.]+s|^FAILED \((failures|errors)=|^OK$|^OK \(" | tail -n 1); '
+              r'case $v in *[0-9]" failed"*|*[0-9]" error"*|"FAILED ("*) echo "ttp detach: the command exited 0 '
+              r'but its last test summary reports failures ($v); recorded exit 1" >>"$o"; c=1 ;; esac ;; esac; fi; ')
+# Once the job's rc is written, the wrapper removes the job's temp and record dirs only when no other
+# process holds its job lock: a `setsid nohup` child that outlives the job inherited both the lock and
+# $TMPDIR, and removing the dir under it made its mktemp fail (a deploy continuation died so). The dash
+# shell cannot close a two-digit descriptor, so the wrapper execs this to drop its own copy of the lock,
+# test it and remove the dirs when free; a held lock leaves them to sweep, which drops them once it frees.
+_CLEAN_PY = ("import fcntl, os, shutil, sys\n"
+             "os.closerange(int(sys.argv[1]), int(sys.argv[1]) + 1)\n"
+             "try:\n    fd = os.open(sys.argv[2], os.O_RDONLY)\n    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)\n"
+             "except FileNotFoundError:\n    pass\n"
+             "except OSError:\n    sys.exit(0)\n"
+             "for d in sys.argv[3:]:\n    shutil.rmtree(d, ignore_errors=True)\n")
+WRAPPER = ('o="$1" r="$2" s="$3" t="$4" k="$5" py="$6" cl="$7" fd="$8" lk="$9"; shift 9; '
+           'a=${TTP_ACTIVITY_LOG-} i=${TTP_ACTIVITY_ID-}; '
+           'unset TTP_ACTIVITY_LOG TTP_ACTIVITY_ID; echo $$ >"$s.tmp"; mv "$s.tmp" "$s"; '
+           '"$@" >"$o" 2>&1 </dev/null; c=$?; ' + VERDICT_SH +
+           'echo $c >"$r.tmp"; mv "$r.tmp" "$r"; [ -z "$a" ] || '
+           'printf \'{"end": %s, "ev": "job_end", "id": "%s", "rc": %s}\\n\' "$(date +%s)" "$i" "$c" >>"$a" 2>/dev/null; '
+           'if [ -x "$py" ]; then exec "$py" -I -S -c "$cl" "$fd" "$lk" "$t" "$k" 2>/dev/null; fi; rm -rf "$t" "$k"')
+_TMP_VARS = ("TMPDIR", "TMP", "TEMP")
+
+
+def started(rc: Path) -> Path:
+    return Path(rc).with_suffix(".started")
+
+
+def queued(rc: Path) -> Path:
+    return Path(rc).with_suffix(".queued")
+
+
+def lost(rc: Path) -> Path:
+    return Path(rc).with_suffix(".lost")
+
+
+def resume_file(rc: Path) -> Path:
+    return Path(rc).with_suffix(".resume.json")
+
+
+def scratch(rc: Path) -> Path:
+    """The record of the job's own temp dir and work dir, under the project's state for a job of a run
+    or of a check (keyed by run or check report folder and job name, so tend can tell whose it is),
+    else next to its .rc."""
+    rc = Path(rc)
+    if rc.parent.parent.name == "runs":
+        return rc.parent.parent.parent / SCRATCH / f"{rc.parent.name}-{rc.stem}"
+    if rc.parent.parent.name == "check-reports":
+        return rc.parent.parent.parent / SCRATCH / f"check-{rc.parent.name}-{rc.stem}"
+    return rc.with_suffix(".tmp")
+
+
+def tmp_dir(record: Path) -> Path:
+    """The temp dir a job's record names, else the record itself."""
+    try:
+        named = (Path(record) / "path").read_text().strip()
+    except OSError:
+        return Path(record)
+    return Path(named) if shorttmp.owned(named) else Path(record)
+
+
+def _drop(record: Path) -> None:
+    shorttmp.remove(tmp_dir(record))
+    shutil.rmtree(record, ignore_errors=True)
+
+
+def start(rc: Path, log: Path, cmd: list, cwd: str, env: dict, lock, *, check: bool = False) -> int:
+    """Start the job's wrapper in a session of its own, holding `lock` (its job lock, which the
+    caller took and closes after), with a fresh temp dir of its own, whoever starts it (a worker, or the
+    daemon for a queued, relaunched or heal fix job). A `check`'s queued
+    job whose cwd went with its push starts in its work dir; any other job's gone cwd fails it. Returns its pid."""
+    record = scratch(rc)
+    if record.exists() and not record.is_symlink():   # left by an earlier start of it that never ran
+        _drop(record)
+    record.mkdir(mode=0o700, parents=True)
+    tmp = shorttmp.make() or record
+    if tmp != record:
+        try:
+            durable_write(record / "path", f"{tmp}\n")
+        except OSError:   # unrecorded, nothing would remove it: use the record itself
+            shorttmp.remove(tmp)
+            tmp = record
+    work = record / WORK
+    work.mkdir(mode=0o700)
+    env = {**env, **{var: str(tmp) for var in _TMP_VARS}, "TTP_JOB_DIR": str(work), "TTP_DETACHED": "1"}
+    if check and not os.path.isdir(cwd):   # a check's checkout, gone with its push before the job started
+        cmd = ["sh", "-c", 'echo "ttp detach: its directory $0 is gone: started in its work dir $PWD" >&2; exec "$@"',
+               cwd, *cmd]
+        cwd = str(work)
+    proc = subprocess.Popen(["/bin/sh", "-c", WRAPPER, "sh", str(log), str(rc), str(started(rc)), str(tmp),
+                             str(record), sys.executable or "", _CLEAN_PY, str(lock.fileno()),
+                             str(locks.job_lock(rc)), *cmd],
+                            cwd=cwd, env=env, stdin=subprocess.DEVNULL,
+                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True,
+                            pass_fds=(lock.fileno(),))
+    # Inherited on purpose, unlike a `ttp lock` command's locks: the job lock means "a process of this job
+    # lives", even one that left its group, and jobstop finds and ends those through it (jobstop._free).
+    # Every reader takes the .rc first, so a leftover never makes an ended job look running; the kernel
+    # frees the lock once the last of them ends, and lockreap leaves a lock labelled via "job" alone.
+    locks.label_pid(lock, proc.pid, via="job")
+    _children.append(proc)
+    return proc.pid
+
+
+# Wrappers this process started (start): a long-lived one, the daemon (tend, relaunch), reaps each that
+# ended on its next tick (reap_children), so none stays a zombie with the daemon as its parent.
+_children: list = []
+
+
+def reap_children() -> int:
+    """Reap the started wrappers that ended (non-blocking); how many."""
+    left = [c for c in _children if c.poll() is None]
+    n = len(_children) - len(left)
+    _children[:] = left
+    return n
+
+
+def enqueue(state: Path, rc: Path, log: Path, cmd: list, cwd: str, env: dict, *, checks: dict | None = None,
+            start_within: float | None = None, bound: dict | None = None) -> Path:
+    """Queue the job for the daemon to start, replacing a request of the same job not started yet;
+    returns the queue file. The request and its marker are published together, under the lock, the
+    marker first: a signal between the two writes (a caller with other threads is not masked) leaves at
+    most a marker without its request, which withdraw_unstarted and pending clear, never a request
+    no marker names. `start_within` (seconds) gives the request its own start deadline in place of
+    QUEUED_S: one its caller stopped waiting for, even if killed without withdrawing it, never starts late.
+    `bound` (check_bound) marks a job a check queued: the daemon starts it hiding the device nodes from a
+    CPU-only one and ends it at that bound (bound())."""
+    rc = Path(rc)
+    q = Path(state) / QUEUE / f"{rc.parent.name}-{rc.stem}.json"
+    keep = _kept_env(env)
+    rid = uuid.uuid4().hex
+    now = time.time()
+    with _locked(q.parent):
+        durable_write(queued(rc), f"{q}\n{rid}\n")
+        write_json(q, {"rc": str(rc), "log": str(log), "command": cmd, "cwd": cwd, "env": keep, "id": rid,
+                       "queued": now, **({"checks": checks} if checks is not None else {}),
+                       **({"start_by": now + start_within} if start_within is not None else {}),
+                       **({"bound": bound} if bound is not None else {})}, mode=0o600)
+    return q
+
+
+def check_owner(rd: Path, base: str | None) -> tuple[Path, str | None] | None:
+    """(the project's state, the marker of the push or `ttp checks` run that owns the check) when `rd` is
+    a check's report folder (checkdirs.reports) of project `base` (TTP_PROJECT), else None. The owner is
+    what the check allocation's owner.json names; None when it names none or cannot be read."""
+    from . import checkdirs
+    if not base or rd.parent.name != "check-reports":
+        return None
+    state = Project(base).state
+    if state.resolve() != rd.parent.parent:
+        return None
+    try:
+        marker = json.loads((state / checkdirs.FOLDER / rd.name / checkdirs.OWNER).read_text()).get("marker")
+    except (OSError, ValueError, AttributeError):
+        marker = None
+    return state, marker if isinstance(marker, str) and marker else None
+
+
+def check_bound(marker: str | None, now: float | None = None) -> dict:
+    """The bound of a job a check queues: CHECK_JOB_S from now, and the life of its owner's `marker`."""
+    return {"marker": marker, "until": (time.time() if now is None else now) + CHECK_JOB_S}
+
+
+def bound(p: Project, now: float | None = None) -> None:
+    """The daemon's pass over the running jobs checks queued (BOUND): no task waits on one, so jobstop
+    never ends it; this does, once its bound passed or the marker of its owner (the push or checks run
+    that ran the check) is gone, whichever comes first, with the reason in its .lost. A record of a job
+    that ended or is gone goes."""
+    now = time.time() if now is None else now
+    folder = p.state / BOUND
+    for f in sorted(folder.glob("*.json")) if folder.is_dir() else []:
+        try:
+            b = json.loads(f.read_text())
+            rc, marker, until = Path(b["rc"]), b.get("marker"), _num(b.get("until"))
+        except (OSError, ValueError, KeyError, TypeError, AttributeError):
+            f.unlink(missing_ok=True)
+            continue
+        if pending(rc):
+            continue   # not started yet
+        if not rc.exists() and not lost(rc).exists() and not locks.any_free([locks.job_lock(rc)]):
+            why = (f"its bound passed: a job a check queued runs at most {CHECK_JOB_S // 3600} h" if now > until
+                   else f"its owner {marker} (the push or checks run whose check queued it) is gone"
+                   if marker and not os.path.lexists(marker) else "")
+            if not why:
+                continue
+            pid = job_pid(rc)
+            if not pid:
+                continue   # not running its wrapper yet: the next tick
+            stop(rc, pid, why, reason="detach.bound", state=p.state)
+        elif not rc.exists():
+            state(rc)   # gone without an exit code: records why
+        f.unlink(missing_ok=True)
+
+
+def _kept_env(env: dict) -> dict:
+    """What a queued or resumable job keeps of `env`: no sandbox markers or secrets."""
+    return {k: v for k, v in env.items() if k not in _SKIP_ENV and not _SECRET_ENV.search(k)}
+
+
+def _job_env(saved) -> dict:
+    """The daemon's environment with a queued or resume record's `env` over it."""
+    own = {k: v for k, v in os.environ.items() if k not in _SKIP_ENV}   # a daemon started from a check, say
+    return machines.mask_devices({**own, **_kept_env(saved if isinstance(saved, dict) else {})})
+
+
+def save_resume(rc: Path, log: Path, cmd: list, cwd: str, env: dict, boot: str) -> None:
+    """Record what `relaunch` needs to start a resumable job again: written before the job starts."""
+    write_json(resume_file(rc), {"command": list(cmd), "cwd": cwd, "env": _kept_env(env), "log": str(log),
+                                 "boot": boot, "relaunches": 0}, mode=0o600)
+
+
+def read_resume(rc: Path) -> dict | None:
+    """The job's resume record, or None for a job that did not opt in (or a malformed record)."""
+    try:
+        m = json.loads(resume_file(rc).read_text())
+    except (OSError, ValueError):
+        return None
+    ok = isinstance(m, dict) and isinstance(m.get("command"), list) and m["command"] and \
+        isinstance(m.get("cwd"), str) and isinstance(m.get("env") or {}, dict)
+    return m if ok else None
+
+
+def mark_stopped(rc: Path, why: str) -> None:
+    """Record in a resumable job's resume record that it was stopped on purpose (jobstop.end), so no
+    reboot relaunches it. A job without one has nothing to mark."""
+    m = read_resume(rc)
+    if m is None or m.get("stopped"):
+        return
+    try:
+        write_json(resume_file(rc), {**m, "stopped": time.time(), "stopped_why": why}, mode=0o600)
+    except OSError:
+        pass
+
+
+def relaunch(rc: Path, boot: str, nice: int = 0) -> tuple[str, int]:
+    """Start a resumable job a reboot cut short again, with the command, cwd and environment it was
+    started with (secrets from the caller's own environment). Its old log is kept as <name>.log.<n>.
+    Returns ("", pid) once started, else (why not, 0)."""
+    rc = Path(rc)
+    m = read_resume(rc)
+    if m is None:
+        return "it has no resume record", 0
+    if m.get("stopped"):
+        return f"it was stopped ({m.get('stopped_why') or 'by request'})", 0
+    if rc.exists():
+        return "it already ended", 0
+    lock = locks.try_take([locks.job_lock(rc)], f"detached job {rc.stem}", " ".join(map(str, m["command"])))
+    if lock is None:
+        return "it is still running", 0
+    try:
+        # Counted on this boot already, by a daemon that died before starting it: counted once.
+        again = m.get("boot") == boot and bool(m.get("relaunches"))
+        n = int(m.get("relaunches") or 0) + (0 if again else 1)
+        log = Path(m.get("log") or rc.with_suffix(".log"))
+        if log.exists():
+            log.replace(log.with_name(f"{log.name}.{n}"))
+        lost(rc).unlink(missing_ok=True)
+        started(rc).unlink(missing_ok=True)
+        # Counted before it starts: a crash here never relaunches it past the cap.
+        if not again:
+            write_json(resume_file(rc), {**m, "boot": boot, "cut_boot": m.get("boot"), "relaunches": n,
+                                         "relaunched": time.time()}, mode=0o600)
+        pid = start(rc, log, [str(c) for c in m["command"]], m["cwd"],
+                    _job_env(m.get("env")), lock)
+        # Before the lock goes: a daemon that dies after this still finds the job to stop
+        # (running_pid; the wrapper's <name>.started covers the instant before).
+        _restamp(rc, pid, boot)
+    except (OSError, ValueError, TypeError) as e:
+        return f"it could not start: {e}", 0
+    finally:
+        lock.close()
+    renice(pid, nice)
+    return "", pid
+
+
+def relaunch_started(rc: Path) -> bool:
+    """Whether the job `relaunch` counted on this boot started (it clears <name>.started and <name>.rc
+    is absent before it starts): it runs, or its wrapper ran. False after a crash between counting
+    it and starting it."""
+    rc = Path(rc)
+    return rc.exists() or started(rc).exists() or not locks.any_free([locks.job_lock(rc)])
+
+
+SIGNALS = "job-signals.jsonl"   # under the project's state: one line per signal tt-project sent a job
+STATE_NAMES = ("state", "state.noindex")   # a project's state folder (state.noindex on macOS: noindex.py)
+
+
+def signals_file(rc: Path, state: Path | None = None) -> Path:
+    """The project's job-signal audit stream: under `state` when given, else the project state the .rc
+    sits in at any depth (state/runs/<run>/, a subfolder of one, state/heal-fix/<check>/), else the
+    state a run's job sits in (<runs>/<run>/<name>.rc), else next to the .rc."""
+    rc = Path(rc)
+    if state is not None:
+        return Path(state) / SIGNALS
+    real = Path(os.path.abspath(rc.expanduser())).parent.resolve()
+    for a in (real, *real.parents):
+        if a.name in STATE_NAMES and a.parent.name == FOLDER:
+            return a / SIGNALS
+    if rc.parent.parent.name == "runs":
+        return rc.parent.parent.parent / SIGNALS
+    return rc.parent / SIGNALS
+
+
+def _me() -> str:
+    """This process as a short command line (`ttp daemon`, `ttp detach`): which tt-project process sent it."""
+    argv = sys.argv or ["?"]
+    return " ".join([Path(argv[0]).name, *argv[1:2]])[:80]
+
+
+def signalled(rc: Path, sig: int, pid: int, reason: str, why: str = "", *, by: str = "",
+              group: bool = True, log: Path | None = None, state: Path | None = None,
+              task: int | None = None) -> dict:
+    """Record that tt-project sent `sig` to a detached job (its group led by `pid`, or that pid alone):
+    one line in the job's own log (`log`, else <name>.log) and one in the project's audit stream
+    (signals_file), naming the job, pid, signal, the code path (`reason`), why, the sender (component
+    and pid) and the time. Call it after a SIGSTOP or SIGKILL, so the job's own writes cannot land over
+    it. Best effort: a write that fails never stops the stop."""
+    rc = Path(rc)
+    try:
+        name = signal.Signals(sig).name
+    except ValueError:
+        name = str(sig)
+    now = time.time()
+    row = {"ts": now, "job": rc.stem, "rc": str(rc), "pid": pid, "group": group, "signal": name,
+           "reason": reason, "why": why, "by": by or "ttp", "by_pid": os.getpid(), "by_cmd": _me(), "task": task}
+    stamp = time.strftime("%Y-%m-%d %H:%M:%S %Z", time.localtime(now))
+    line = (f"[ttp {stamp}] {name} to {'group' if group else 'pid'} {pid} of job {rc.stem}"
+            + (f" (task #{task})" if task else "") + f" from {row['by']} pid {row['by_pid']} [{row['by_cmd']}] ({reason})"
+            + (f": {why}" if why else "") + "\n")
+    home = _markable(rc, quiet=True)   # never a stray log or stream beside an .rc outside state and runs
+    out = [(Path(log), line)] if log else [(home.with_suffix(".log"), line)] if home else []
+    if state is not None or home:
+        out.append((signals_file(home or rc, state), json.dumps(row) + "\n"))
+    for path, text in out:
+        try:
+            durable_append(path, text)
+        except OSError:
+            pass
+    return row
+
+
+SIGNAL_SCAN_BYTES = 4 * 1024 * 1024   # unseen_kill reads at most this much of the signal stream's end
+
+
+def _signal_rows_for(f: Path, rc: Path) -> bool:
+    """Whether the signal stream `f` (its last SIGNAL_SCAN_BYTES) has a row for the job at `rc`."""
+    try:
+        with open(f, "rb") as fh:
+            fh.seek(max(0, fh.seek(0, os.SEEK_END) - SIGNAL_SCAN_BYTES))
+            tail = fh.read()
+    except OSError:
+        return False
+    key = json.dumps(str(rc)).encode()
+    return any(key in line for line in tail.splitlines())
+
+
+def unseen_kill(rc: Path, entry: dict, code: str | None, why: str = "") -> dict | None:
+    """At reap (close): a job that ended by a signal no tt-project path recorded, a kill from outside
+    `ttp detach --stop` or jobstop. The kill itself cannot be seen, so one row in the signal stream says
+    the job died by signal N (its exit code 128+N, as its shell wrapper reports it; None for a job gone
+    with no exit code, killed with its wrapper) with no stop on record. None, and nothing written, for an
+    ordinary exit, a stop on record (stopped, or a row for this job already in the stream) or a reboot."""
+    rc = Path(rc)
+    if code is not None:
+        if not re.fullmatch(r"[0-9]+", code or "") or not 128 < int(code) < 128 + 65 or stopped(rc):
+            return None
+        num = int(code) - 128
+    elif why.startswith("it was killed after it started"):
+        num = None
+    else:
+        return None
+    home = _markable(rc, quiet=True)
+    if home is None:
+        return None
+    f = signals_file(home)
+    if _signal_rows_for(f, rc):
+        return None
+    try:
+        name = signal.Signals(num).name if num else "unknown"
+    except ValueError:
+        name = str(num)
+    row = {"ts": time.time(), "job": rc.stem, "rc": str(rc), "pid": entry.get("pid"), "group": True,
+           "signal": name, "reason": "unseen", "exit": None if code is None else int(code),
+           "why": (f"died by signal {num} ({name})" if num else "died with its wrapper, by an unknown signal")
+           + " with no ttp detach --stop or other tt-project stop on record: killed from outside tt-project",
+           "by": "unknown", "by_pid": None, "by_cmd": "", "seen": "at reap", "task": entry.get("task")}
+    try:
+        durable_append(f, json.dumps(row) + "\n")
+    except OSError:
+        return None
+    return row
+
+
+def sender(pid: int) -> str:
+    """The command line of process `pid` (best effort, cut to 200 chars), else ""."""
+    try:
+        raw = Path(f"/proc/{pid}/cmdline").read_bytes()
+    except OSError:
+        return ""
+    return raw.replace(b"\0", b" ").decode("utf-8", "replace").strip()[:200]
+
+
+def received(sig: int, pid: int, uid: int, reason: str, *, job: dict | None = None,
+             state: Path | None = None, extra: dict | None = None) -> str:
+    """Record a signal a tt-project process received from `pid` (sigtimedwait names it): one row in the
+    project's job-signal stream (under `state`, or that of the detached job `job` names, as
+    locks.job_fields gives it) with the sender's pid, uid and command line, and the fields of `extra`.
+    Returns the line to log."""
+    try:
+        name = signal.Signals(sig).name
+    except ValueError:
+        name = str(sig)
+    cmd = sender(pid) if pid > 0 else ""
+    job = job or {}
+    row = {"ts": time.time(), "received": True, "signal": name, "pid": os.getpid(), "reason": reason,
+           "from_pid": pid, "from_uid": uid, "from_cmd": cmd, "job": job.get("job"), "rc": job.get("job_rc"),
+           **(extra or {})}
+    if state is not None or (job.get("job_rc") and _markable(job["job_rc"], quiet=True)):
+        try:
+            durable_append(signals_file(Path(job.get("job_rc") or "."), state), json.dumps(row) + "\n")
+        except OSError:
+            pass
+    return (f"{name} received by pid {os.getpid()} ({reason}) from pid {pid} uid {uid}"
+            + (f" [{cmd}]" if cmd else " (sender gone or unreadable)"))
+
+
+def stop(rc: Path, pid: int, why: str, *, reason: str = "detach.stop", by: str = "",
+         task: int | None = None, state: Path | None = None) -> None:
+    """End a job `relaunch` just started (pid, its wrapper, leads a session and process group of its
+    own) before it writes an exit code, and record why in <name>.lost: its probe then reads it ended.
+    The why goes first: a reader that sees its lock go free before it would record a guess instead.
+    The SIGKILL is then logged (signalled) as sent from `reason`, the calling code path, in the
+    signal stream under `state` when given (signals_file)."""
+    _mark_lost(Path(rc), why)
+    try:
+        os.killpg(pid, signal.SIGKILL)
+    except OSError:
+        return   # already gone: nothing signalled
+    signalled(rc, signal.SIGKILL, pid, reason, why, by=by, task=task, state=state)
+
+
+def running_pid(rc: Path, this_boot) -> int:
+    """The pid of a job relaunched on this boot (its registry entry names a boot `this_boot` accepts,
+    else its resume record does and <name>.started names it) that still runs (holds its lock), else 0:
+    the one `stop` may end."""
+    rc = Path(rc)
+    if locks.any_free([locks.job_lock(rc)]):
+        return 0
+    j = _entry(rc)
+    pid = j.get("pid") if this_boot(j.get("boot")) else None
+    if not (isinstance(pid, int) and pid > 1) and this_boot((read_resume(rc) or {}).get("boot")):
+        # A daemon that died between starting it and restamping the registry: the wrapper's own pid.
+        try:
+            pid = int(started(rc).read_text().split()[0])
+        except (OSError, ValueError, IndexError):
+            pid = None
+    return job_pid(rc, pid) if isinstance(pid, int) and pid > 1 else 0
+
+
+def foreign_pidns() -> bool:
+    """This process runs in a PID namespace other than the one /proc shows (a namespace no TTP_PIDNS
+    marks, as `unshare --pid` without --mount-proc makes): a pid it would record (a child's, a wrapper's
+    $$) names another process, or none, on the host, and the namespace ends its processes with its
+    first. Linux only."""
+    try:
+        return int(os.readlink("/proc/self")) != os.getpid()
+    except (OSError, ValueError):
+        return False
+
+
+def job_pid(rc: Path, pid: int | None = None) -> int:
+    """The host pid of the job's wrapper (it leads the job's session and group): `pid`, else its registry
+    entry's, else the one <name>.started holds; 0 when none is known or that pid now names another process
+    (a recycled pid): one whose start time differs from the entry's pid_start, or, with none recorded, one
+    whose arguments do not name the job's .rc. A pid no process holds stays: the job's group may live on.
+    A job is started in the host's PID namespace (cmd_detach queues one from a sandbox to the daemon),
+    so its pid is the host's."""
+    rc = Path(rc)
+    j = _entry(rc)
+    if pid is None:
+        pid = j.get("pid")
+    if not (isinstance(pid, int) and pid > 1):
+        try:
+            pid = int(started(rc).read_text().split()[0])
+        except (OSError, ValueError, IndexError):
+            return 0
+    if pid <= 1:
+        return 0
+    born, now = j.get("pid_start") if j.get("pid") == pid else None, locks.start_time(pid)
+    if now is None:   # the wrapper is gone; its group may live on, and no pid is reused while it does
+        return pid
+    if born is not None:
+        return pid if now == str(born) else 0
+    if Path(f"/proc/{pid}/cmdline").exists():
+        try:
+            return pid if str(rc).encode() in Path(f"/proc/{pid}/cmdline").read_bytes() else 0
+        except OSError:
+            pass
+    return pid
+
+
+def _restamp(rc: Path, pid: int, boot: str, reopen: bool = True) -> None:
+    """Point the run's registry entry of the job at its new process and boot (state reads the boot);
+    a relaunched job's record is open again (`reopen`; a queued one's keeps what the worker ran)."""
+    try:
+        with registry(rc.parent) as jobs:
+            for j in jobs:
+                if isinstance(j, dict) and j.get("rc") == str(rc):
+                    j.update(pid=pid, pid_start=locks.start_time(pid), boot=boot)
+                    if not reopen:
+                        continue
+                    j.update(started=time.time(), queued=False, status="running")
+                    for k in ("exit", "ended", "why"):
+                        j.pop(k, None)
+    except OSError:
+        pass
+
+
+# A run's detached.json records each local job `ttp detach` started (cli.cmd_detach): its start fields
+# and status "running" (or "queued"), and once it is over status "ended" with its exit code (exit, None
+# when the .rc holds no number) and end time (the .rc's), or "died" (exit None) with why and when it was
+# found gone. The daemon closes them each tick (close_records), `ttp detach --reap` closes one at once;
+# both by state(), which reads liveness from the job's lock, never its pid, so a pid reused by another
+# process never keeps a record open and a driver still alive (any of its processes) is never closed.
+# Every write goes through registry(), one flock per run, so a close and a new job's entry never race.
+# Each entry also names its owner (project, task, run: owner()), so a later run of the task lists and
+# stops it (`ttp detach --list`, `--stop <name>`, its kill guard: jobstop.task_jobs, own_job_group).
+REGISTRY = "detached.json"
+CLOSED = ("ended", "died")
+CLOSE_DAYS = 14   # the runs whose records the daemon's sweep looks at
+CLOSE_EVERY_S = 60
+
+
+@contextmanager
+def registry(run_dir: Path):
+    """The run's detached.json entries as a list to change in place, written back (durably) if changed."""
+    reg = Path(run_dir) / REGISTRY
+    with open(reg.with_name(REGISTRY + ".flock"), "a") as f:   # never <name>.lock: a job's own lock
+        fcntl.flock(f, fcntl.LOCK_EX)
+        try:
+            jobs = json.loads(reg.read_text())
+        except (OSError, ValueError):
+            jobs = []
+        jobs = jobs if isinstance(jobs, list) else []
+        before = json.dumps(jobs)
+        yield jobs
+        if json.dumps(jobs) != before:
+            durable_write(reg, json.dumps(jobs, indent=1))
+
+
+def owner(env=None, state: Path | None = None) -> dict:
+    """Whose job a new registry entry is: the project folder, task id and run id of the run that starts
+    it (from its TTP_* environment), for listing and stopping it from a later run of the same task
+    (jobstop.task_jobs). Shown, never proof alone: a stop or kill also checks the db and the process."""
+    env = os.environ if env is None else env
+    out = {"project": env.get("TTP_PROJECT") or (str(state.parent) if state is not None else None),
+           "task": env.get("TTP_TASK") or env.get("TTP_TASK_ID"), "run": env.get("TTP_RUN_ID"),
+           "schedule": env.get("TTP_SCHEDULE")}   # schedjobs.ENV: a command schedule's run started it
+    return {k: int(v) if k in ("task", "run") and str(v).isdigit() else v for k, v in out.items() if v}
+
+
+def close(rc: Path, now: float | None = None) -> dict | None:
+    """Close the record of the job at this .rc once state() says it is over: "ended" once its .rc
+    exists, "died" once it is gone without one. The record (closed now or before: idempotent), or None
+    while the job runs or is queued, or when no record names it."""
+    rc = Path(rc)
+    e = _entry(rc)
+    if e and e.get("status") in CLOSED and e.get("unmasked") and _mask_log(rc):
+        with registry(rc.parent) as jobs:   # closed while a leftover process still held its lock: masked now
+            for j in jobs:
+                if isinstance(j, dict) and j.get("rc") == str(rc):
+                    j.pop("unmasked", None)
+                    e = j
+        return e
+    if not e or e.get("status") in CLOSED:
+        return e or None
+    st, why = state(rc)
+    if st not in ("ended", "lost"):
+        return None
+    masked = _mask_log(rc)
+    if st == "ended":
+        try:
+            end = rc.stat().st_mtime
+        except OSError:
+            end = time.time() if now is None else now
+        upd = {"status": "ended", "exit": int(why) if re.fullmatch(r"-?[0-9]+", why) else None, "ended": end}
+        if (stop := stopped(rc)) is not None:
+            upd.update(stopped=True, why=stop)
+    else:
+        try:
+            end = lost(rc).stat().st_mtime
+        except OSError:
+            end = time.time() if now is None else now
+        upd = {"status": "died", "exit": None, "ended": end, "why": why}
+    if not masked:   # close_records masks the log once the lock frees
+        upd["unmasked"] = True
+    out, closed = None, False
+    with registry(rc.parent) as jobs:
+        for j in jobs:
+            if isinstance(j, dict) and j.get("rc") == str(rc):
+                if j.get("status") not in CLOSED:
+                    j.update(upd)
+                    closed = True
+                out = j
+    if closed:   # once per job: a kill from outside tt-project leaves a row in the signal stream too
+        unseen_kill(rc, out, why if st == "ended" else None, "" if st == "ended" else why)
+    return out
+
+
+def _mask_log(rc: Path) -> bool:
+    """Mask the log of the job at `rc` once no process of it holds its job lock (scrub_run left it whole
+    while the job ran: live_job_logs); a big one is masked detached (scrub.log). False while one still does."""
+    if not locks.any_free([locks.job_lock(rc)]):
+        return False
+    from . import redact
+    left: list = []
+    redact.scrub_file(rc.with_suffix(".log"), redact.STEP_FILE_BYTES, left)
+    redact.scrub_later(left, rc.with_name("scrub.log"))
+    return True
+
+
+def close_records(p: Project, now: float | None = None) -> int:
+    """The daemon's sweep (tend, at most once a minute): close every open record of the runs of the last
+    CLOSE_DAYS days whose job is over. How many it closed."""
+    now = time.time() if now is None else now
+    mark = p.state / "detach-closed.at"
+    try:
+        if now - mark.stat().st_mtime < CLOSE_EVERY_S:
+            return 0
+    except OSError:
+        pass
+    mark.touch()
+    n = 0
+    for d in sorted(p.runs.glob("*/" + REGISTRY)) if p.runs.is_dir() else []:
+        try:
+            if now - d.stat().st_mtime > CLOSE_DAYS * 86400:
+                continue
+            jobs = json.loads(d.read_text())
+        except (OSError, ValueError):
+            continue
+        for j in jobs if isinstance(jobs, list) else []:
+            if isinstance(j, dict) and j.get("rc") and (j.get("status") not in CLOSED or j.get("unmasked")):
+                try:
+                    n += bool(close(Path(j["rc"]), now)) and j.get("status") not in CLOSED
+                except OSError:
+                    continue
+    return n
+
+
+_held = threading.local()
+
+
+@contextmanager
+def _locked(folder: Path):
+    """Hold the queue folder's lock (briefly: never while a job starts). Re-entrant within a thread,
+    so a nested take never deadlocks on the thread's own lock."""
+    key = str(folder)
+    held = _held.__dict__.setdefault("folders", set())
+    if key in held:
+        yield
+        return
+    folder.mkdir(parents=True, exist_ok=True)
+    with open(folder / ".lock", "a") as f:
+        fcntl.flock(f, fcntl.LOCK_EX)
+        held.add(key)
+        try:
+            yield
+        finally:
+            held.discard(key)
+
+
+def _marker(rc: Path) -> tuple[Path | None, str | None]:
+    """The queue file and request id <name>.queued names; (None, None) without one."""
+    try:
+        lines = queued(rc).read_text().split("\n")
+    except OSError:
+        return None, None
+    return (Path(lines[0].strip()) if lines[0].strip() else None), ((lines[1].strip() if len(lines) > 1 else "") or None)
+
+
+def _request_id(q: Path) -> str | None:
+    try:
+        m = json.loads(q.read_text())
+    except (OSError, ValueError):
+        return None
+    return m.get("id") if isinstance(m, dict) else None
+
+
+def pending(rc: Path) -> bool:
+    """Whether a queued request of this job waits for the daemon (or is being started). A marker
+    whose queue file is gone is an orphan: it is removed, so the job's own result answers again. The
+    daemon removes a request it consumed together with its marker (_settle), so an orphan of a job that
+    never started had its request taken out of the queue: it is recorded lost, else nothing would ever
+    answer for it."""
+    rc = Path(rc)
+    q, _ = _marker(rc)
+    if q is None:
+        return False
+    try:
+        with _locked(q.parent):
+            q, rid = _marker(rc)
+            if q is None:
+                return False
+            if q.exists():
+                return True
+            if not _began(rc, rid):
+                _mark_lost_first(rc, REMOVED)
+            queued(rc).unlink(missing_ok=True)
+            return False
+    except OSError:
+        return q.exists()
+
+
+REMOVED = "its queued request was taken out of the daemon's queue before it started"
+
+
+def _began(rc: Path, rid: str | None) -> bool:
+    """Whether the job of request `rid` started or ended: its exit code, its started marker or running
+    lock, or detached checks that recorded that request."""
+    if rc.exists() or started(rc).exists() or lost(rc).exists():
+        return True
+    if locks.job_lock(rc).exists() and not locks.any_free([locks.job_lock(rc)]):
+        return True
+    from .cli import CHECKS_RC, _read_checks_pid
+    return rc.name == CHECKS_RC and bool(rid) and _read_checks_pid(rc.parent).get("req") == rid
+
+
+def withdraw(rc: Path) -> None:
+    """Drop the job's pending request (a foreground launch replaces it)."""
+    q, _ = _marker(rc)
+    if q is None:
+        return
+    with _locked(q.parent):
+        q.unlink(missing_ok=True)
+        queued(rc).unlink(missing_ok=True)
+
+
+WITHDRAWN = "its caller withdrew its queued request before the daemon started it: it never ran"
+
+
+def withdraw_unstarted(rc: Path, why: str = WITHDRAWN) -> bool:
+    """Withdraw the job's queued request unless the daemon has claimed it: True when withdrawn (it never
+    runs, and <name>.lost says why), False when it started or is starting. Atomic with tend's claim: tend
+    takes the job lock, then checks the request is still queued under the queue lock (_still_queued);
+    here, under that lock, a held job lock means it is claimed."""
+    rc = Path(rc)
+    q, _ = _marker(rc)
+    with _locked(q.parent) if q is not None else nullcontext():
+        q, rid = _marker(rc)
+        if _began(rc, rid):
+            return False
+        if q is not None:
+            if q.exists() and _request_id(q) == rid:
+                q.unlink(missing_ok=True)
+            queued(rc).unlink(missing_ok=True)
+        _mark_lost_first(rc, why)
+        return True
+
+
+def _still_queued(q: Path, rid: str | None) -> bool:
+    """Whether request `rid` is still in the queue: tend's claim, made while it holds the job's lock."""
+    with _locked(q.parent):
+        return q.exists() and _request_id(q) == rid
+
+
+def _settle(q: Path, rc: Path, rid: str | None, lost_why: str = "") -> None:
+    """Remove the request the daemon consumed, and its marker, only while they still name it: a
+    newer request queued meanwhile stays for the next tick. `lost_why` records why it did not start,
+    again only for a request not replaced."""
+    with _locked(q.parent):
+        if q.exists() and _request_id(q) != rid:
+            return   # replaced: the newer request and its marker stay
+        if lost_why:
+            _mark_lost(rc, lost_why)
+        q.unlink(missing_ok=True)
+        if _marker(rc)[1] == rid:
+            queued(rc).unlink(missing_ok=True)
+
+
+def _markable(rc: Path, quiet: bool = False) -> Path | None:
+    """The absolute .rc path when a marker may go next to it: inside a project's state (its runs, the
+    daemon's own jobs), the calling run's folder ($TTP_RUN_DIR) or a run folder that records detached
+    jobs (detached.json). Else None, with a warning: a relative path a probe names resolves against
+    its cwd, and a stray <name>.lost would land in the caller's checkout."""
+    p = Path(os.path.abspath(Path(rc).expanduser()))
+    real = p.parent.resolve()
+    run = os.environ.get("TTP_RUN_DIR")
+    up = [real, *real.parents]
+    if (any(a.name in STATE_NAMES and a.parent.name == FOLDER for a in up) or (real / "detached.json").is_file()
+            or (run and Path(run).resolve() in up)):
+        return p
+    if not quiet:
+        print(f"ttp detach: not marking {p.with_suffix('.lost')}: outside the project state and run folders",
+              file=sys.stderr)
+    return None
+
+
+def _mark_lost(rc: Path, why: str) -> None:
+    rc = _markable(rc)
+    if rc is None:
+        return
+    try:
+        durable_write(lost(rc), why + "\n")
+    except OSError:
+        pass
+
+
+def _write_first(target: Path, text: str) -> str | None:
+    """Write `text` as `target` unless it exists: None once written, else what stands there (stripped).
+    Never half-written, never over another: a synced temp file hard-linked into place, else (no hard
+    links here) renamed into place while `target` is still absent."""
+    tmp = target.with_name(f".{target.name}.{os.getpid()}.{threading.get_ident()}.tmp")
+    try:
+        durable_write(tmp, text + "\n")
+        os.link(tmp, target)   # atomic create-if-absent
+        return None
+    except FileExistsError:
+        try:
+            return target.read_text().strip()
+        except OSError:
+            return ""
+    except OSError:
+        if target.exists():
+            return ""
+        try:
+            durable_write(target, text + "\n")
+        except OSError:
+            pass
+        return None
+    finally:
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+
+
+def _mark_lost_first(rc: Path, why: str) -> str:
+    """Record `why` in <name>.lost unless a reason is already there, and return the one that stands:
+    a guess made from the outside never replaces a verdict written meanwhile (stop, remote_verdict)."""
+    rc = _markable(rc)
+    if rc is None:
+        return why
+    return _write_first(lost(rc), why) or why
+
+
+# A stop on purpose (jobstop.end: `ttp detach --stop`, a spend cap, the daemon ending an ended task's
+# jobs) kills the job's wrapper, which so never writes an exit code. record_stop writes one for it, STOP_RC (a SIGKILL's
+# 128 + 9), so a reader that looks only at <name>.rc (a watcher, a shell probe) sees the job ended, not
+# dead; <name>.lost beside it says who stopped it and why. An .rc the job wrote itself always stands.
+STOP_RC = 128 + signal.SIGKILL
+
+
+def record_stop(rc: Path, why: str) -> bool:
+    """After a stop on purpose (jobstop.end): write <name>.rc holding STOP_RC unless the job wrote one itself (kept as it
+    is), with `why` in <name>.lost unless a reason is already there. True when this wrote the .rc."""
+    rc = _markable(rc, quiet=True)
+    if rc is None or rc.exists():
+        return False
+    _mark_lost_first(rc, why)
+    return _write_first(rc, str(STOP_RC)) is None
+
+
+def stopped(rc: Path) -> str | None:
+    """Why the job at this .rc was stopped on purpose (its .rc holds STOP_RC and <name>.lost says
+    why: record_stop), else None: an exit code the job wrote itself, or no .rc yet."""
+    rc = job_rc(rc)
+    try:
+        if rc.read_text().strip() != str(STOP_RC):
+            return None
+        return lost(rc).read_text().strip() or "stopped on purpose"
+    except OSError:
+        return None
+
+
+def tend(p: Project) -> None:
+    """The daemon's part, each tick: start the queued jobs, and record as lost those queued too long
+    ago or that cannot start. The .lost goes before the queue entry, so a probe never sees neither."""
+    # Completion normally removes scratch; SIGKILL, a launcher crash or a reboot cannot.
+    # The inherited lifetime lock protects live checks across daemon restarts and pid namespaces.
+    from . import checkdirs, checkreap
+    reap_children()
+    checkreap.sweep(p.state)   # first, so the scratch whose lock a leftover held can go below
+    checkdirs.recover(p.state, p.runs)
+    sweep(p.state)
+    close_records(p)
+    folder = p.state / QUEUE
+    for q in sorted(folder.glob("*.json")) if folder.is_dir() else []:
+        try:
+            m = json.loads(q.read_text())
+            rc, log = Path(m["rc"]), Path(m["log"])
+        except (OSError, ValueError, KeyError, TypeError):
+            q.unlink(missing_ok=True)
+            continue
+        rid, why = m.get("id"), ""
+        if "checks" in m:
+            from .cli import _read_checks_pid
+            # A restart after launch but before settlement must not expire checks already
+            # started, even when the daemon was down longer than QUEUED_S.
+            if rid and _read_checks_pid(rc.parent).get("req") == rid:
+                _settle(q, rc, rid)
+                continue
+        elif _superseded(rc, m):
+            _settle(q, rc, rid)
+            continue
+        if m.get("start_by") is not None and time.time() > _num(m["start_by"]):
+            why = ("the daemon did not start it by its start deadline; its caller had stopped waiting "
+                   "for it, so it never ran")
+        elif time.time() - float(m.get("queued") or 0) > QUEUED_S:
+            why = (f"the daemon did not start it within {QUEUED_S // 60} min of it being queued "
+                   f"(was the daemon down?)")
+        elif "checks" in m:
+            # Replacement checks must cancel their earlier host pid here, never in the tool's
+            # PID namespace. An earlier checks.rc is removed only after that process ends. The
+            # request stays queued while they start, so a crash here starts them again.
+            from argparse import Namespace
+            from .cli import _checks_start
+            try:
+                c = m["checks"]
+                lost(rc).unlink(missing_ok=True)
+                pid = _checks_start(Namespace(cmd=c["cmd"], fresh=c["fresh"], full=c.get("full", False),
+                                              purpose=c.get("purpose")), rc.parent, c["worktree"],
+                                    c["head"], _job_env(m.get("env")), rid or "",
+                                    c.get("need") if isinstance(c.get("need"), int) else None)
+                renice(pid, nice_level(p.config().get("runner"))[0])
+            except (OSError, ValueError, TypeError, KeyError) as e:
+                why = f"the daemon could not start the checks: {e}"
+        elif not (lost(rc).exists() or rc.exists()):
+            lock = locks.try_take([locks.job_lock(rc)], f"detached job {rc.stem}", " ".join(m["command"]))
+            if lock is not None:   # else it already runs
+                try:
+                    if _still_queued(q, rid):   # else withdrawn meanwhile (withdraw_unstarted): never start it
+                        cmd, env = list(m["command"]), _job_env(m.get("env"))
+                        if isinstance(m.get("bound"), dict):   # a check's: recorded first, so a crash leaves no unbounded job
+                            write_json(p.state / BOUND / q.name, {**m["bound"], "rc": str(rc)})
+                        pid = start(rc, log, cmd, m["cwd"], env, lock, check=isinstance(m.get("bound"), dict))
+                        renice(pid, nice_level(p.config().get("runner"))[0])
+                        from .runner import boot_id
+                        _restamp(rc, pid, boot_id(), reopen=False)   # its host pid and start time, never a namespace's
+                except (OSError, ValueError, TypeError) as e:   # its folder went, say: never retried each tick
+                    why = f"the daemon could not start it: {e}"
+                finally:
+                    lock.close()
+        _settle(q, rc, rid, why)
+    bound(p)
+
+
+def _num(v) -> float:
+    """A queue entry's time; a damaged one reads as long past, so its request never starts."""
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _superseded(rc: Path, m: dict) -> bool:
+    """Whether a queued job already runs, or the daemon relaunched it since it was queued (a
+    --resumable job queued before a reboot): its request is spent, never a lost job, however old."""
+    r = read_resume(rc)
+    if r is not None and float(r.get("relaunched") or 0) >= float(m.get("queued") or 0) > 0:
+        return True
+    return locks.job_lock(rc).exists() and not locks.any_free([locks.job_lock(rc)])
+
+
+def sweep(state: Path) -> None:
+    """Remove the temp dirs of jobs that ended or are gone: the wrapper removes its own when the job
+    ends, but not when it is killed, the host restarts or a child that outlived the job (a `setsid nohup`
+    continuation) still holds its lock and uses its $TMPDIR. A job or such a child holds the job lock, so
+    an ended job's dir stays until that frees."""
+    folder = Path(state) / SCRATCH
+    for d in sorted(folder.iterdir()) if folder.is_dir() else []:
+        m = re.fullmatch(r"(?:([0-9]+)|check-([0-9a-f]{32}))-([A-Za-z0-9._-]{1,64})", d.name)
+        if not m or d.is_symlink() or not d.is_dir():
+            continue
+        rc = Path(state) / ("runs" if m[1] else "check-reports") / (m[1] or m[2]) / f"{m[3]}.rc"
+        if lost(rc).exists() or locks.any_free([locks.job_lock(rc)]):
+            _drop(d)
+
+
+def job_rc(rc) -> Path:
+    """The .rc path of a job named by its bare path <dir>/<name> (a probe's `detach --check <dir>/<name>`),
+    as state(), recorded() and stopped() read it: with_suffix on the bare path would read <name>'s own
+    files under another name and mark an exited job lost. A .rc path or a series driver's dir is as given."""
+    rc = Path(rc)
+    return rc if rc.suffix == ".rc" or rc.is_dir() else rc.with_name(rc.name + ".rc")
+
+
+def resolve_check(arg: str, env=None) -> Path:
+    """What `ttp detach --check <arg>` reads. A path with a / is as given. A bare name (`build` or
+    `build.rc`) is that path when something records a job there, else the job of that name in this run
+    ($TTP_RUN_DIR), else the newest job of that name a run folder's detached.json records; failing all,
+    the name as given (which then reads as no job recorded)."""
+    if "/" in arg or recorded(Path(arg)):
+        return Path(arg)
+    env = os.environ if env is None else env
+    name = arg[:-3] if arg.endswith(".rc") else arg
+    roots = []
+    if run_dir := env.get("TTP_RUN_DIR"):
+        if recorded(here := Path(run_dir) / f"{name}.rc"):
+            return here
+        roots.append(Path(run_dir).parent)
+    if env.get("TTP_PROJECT"):
+        try:
+            roots.append(Project(Path(env["TTP_PROJECT"])).runs)
+        except Exception:   # not a project folder: only the run's own folder was there to read
+            pass
+    best, when = None, -1.0
+    for reg in {r for root in roots if root.is_dir() for r in root.glob("*/" + REGISTRY)}:
+        try:
+            jobs = json.loads(reg.read_text())
+        except (OSError, ValueError):
+            continue
+        for j in jobs if isinstance(jobs, list) else []:
+            if (isinstance(j, dict) and isinstance(j.get("rc"), str)
+                    and name in (j.get("name"), Path(j["rc"]).stem) and float(j.get("started") or 0) > when):
+                best, when = Path(j["rc"]), float(j.get("started") or 0)
+    return best or Path(arg)
+
+
+def _entry(rc: Path) -> dict:
+    try:
+        jobs = json.loads((rc.parent / "detached.json").read_text())
+    except (OSError, ValueError):
+        return {}
+    want = os.path.abspath(rc)   # an entry written with a relative or ./ path is the same job
+    return next((j for j in jobs if isinstance(j, dict) and isinstance(j.get("rc"), str)
+                 and os.path.abspath(j["rc"]) == want), {}) if isinstance(jobs, list) else {}
+
+
+def recorded(rc: Path) -> bool:
+    """Whether anything records a detached job at this .rc path: its exit code, its loss, its start,
+    its entry in detached.json, a queued request or its held lock. False for a path no `ttp detach`
+    wrote, which state() would call lost (and mark so)."""
+    rc = job_rc(rc)
+    return (rc.exists() or lost(rc).exists() or started(rc).exists() or bool(_entry(rc)) or pending(rc)
+            or not locks.any_free([locks.job_lock(rc)]))
+
+
+def series(rc: Path) -> tuple[str, str] | None:
+    """A series driver's own dir at this path less its .rc (<dir>/pid and or <dir>/lock, optional
+    <dir>/EXIT holding its exit code), as state() reads a job: ("ended", code, "?" when EXIT holds none)
+    once EXIT exists, ("running", "") while it lives, ("lost", why) once it is gone. A driver that holds
+    an flock on <dir>/lock for its life is judged by that lock, which the kernel frees when it exits:
+    its pid may be from a PID namespace of its own (one started inside a sandboxed check), where the
+    same number here is another process or none. Without a lock, by its pid. None for no such dir."""
+    rc = Path(rc).expanduser()
+    d = rc.with_suffix("") if rc.suffix == ".rc" else rc
+    if not d.is_dir():
+        return None
+
+    def ended() -> tuple[str, str] | None:
+        if not (d / "EXIT").exists():
+            return None
+        try:
+            code = "".join((d / "EXIT").read_text(errors="replace").split())[:16]
+        except OSError:
+            code = ""
+        return "ended", code if code.isdigit() else "?"
+    if out := ended():
+        return out
+    lock = d / "lock"
+    free = locks.free_state(lock) if lock.exists() else None
+    if free is False:
+        return "running", ""
+    if free is True:   # the driver writes EXIT before its lock goes free: look again
+        return ended() or ("lost", f"series driver lock {lock} is free with no EXIT; see {d / 'log'}")
+    try:
+        pid = int((d / "pid").read_text().strip())
+    except (OSError, ValueError):
+        return ("running", f"series driver lock {lock}: state unknown here") if lock.exists() else None
+    from .liveness import pid_state, DEAD, UNKNOWN, FOREIGN
+    if (st := pid_state(pid)) == DEAD:
+        return "lost", f"series driver pid {pid} is dead with no EXIT; see {d / 'log'}"
+    return "running", (f"series driver pid {pid}: {FOREIGN}" if st == UNKNOWN else "")
+
+
+def state(rc: Path) -> tuple[str, str]:
+    """("ended", exit code), ("running" or "queued", ""), or ("lost", why). The first look at a lost
+    job records why in <name>.lost."""
+    rc = job_rc(rc)
+    for _ in range(2):   # a job that ends between the looks wrote its .rc before its lock went free
+        if rc.exists():
+            return "ended", rc.read_text().strip() or "?"
+        if lost(rc).exists():
+            return "lost", lost(rc).read_text().strip() or "no reason recorded"
+        if pending(rc):
+            return "queued", ""
+        if not locks.any_free([locks.job_lock(rc)]):
+            return "running", ""
+    from .runner import boot_id, same_boot
+    boot = _entry(rc).get("boot")
+    known = bool(boot) and "unknown" not in (boot, boot_id())   # a boot id recorded at launch and readable now
+    if known and not same_boot(boot):
+        why = "the driver died with the host reboot: the host restarted while it ran (its boot id changed)"
+    elif not started(rc).exists():
+        why = ("it never started: it was killed with the command that ran `ttp detach` (a sandbox or tool "
+               "that ends the processes a command starts)")
+    elif known:
+        why = "it was killed after it started, before it wrote an exit code (same boot: it crashed or was killed)"
+    else:
+        why = ("it was killed after it started, before it wrote an exit code, or the host restarted: the boot "
+               "id could not be read, so which is unknown")
+    if rc.exists():   # it ended while the reasons were read: its own exit code wins over a guess
+        return "ended", rc.read_text().strip() or "?"
+    return "lost", _mark_lost_first(rc, why)
+
+
+# A local job that drives a job on another host itself (`ttp detach <name> --remote-host <alias>
+# [--remote-pid <pid or remote file holding it>] [--remote-marker <remote path>] -- <command...>`) records
+# that host's boot id at start in its detached.json entry ("remote"). The keeper of an exclusive run's
+# hold (hold.watch) asks the host now and then, read-only and bounded, whether the remote side still
+# lives: a changed boot id (the host reset) or a remote pid gone with no completion marker ends the
+# local job (stop) with that verdict in <name>.lost, so its hold goes before the job's own deadline.
+# A host it cannot reach proves nothing: the job and its hold stay. Run by POSIX sh over ssh, with the
+# pid (or the remote file holding it) as $1 and the marker as $2, either "" when not given.
+REMOTE_TIMEOUT_S = 30
+GONE_CONFIRM = 2   # probes in a row that read the remote pid dead with no marker before the job is ended
+_REMOTE_LIVE = r'''pid=$1 m=$2
+case $pid in "~/"*) pid=$HOME${pid#\~} ;; esac
+case $m in "~/"*) m=$HOME${m#\~} ;; esac
+%s
+echo "boot $b"
+if [ -n "$m" ] && [ -e "$m" ]; then echo "marker"; fi
+case $pid in
+  ""|*[!0-9]*) if [ -n "$pid" ] && [ -s "$pid" ]; then pid=$(tr -cd 0-9 <"$pid" | head -c 12); else pid=; fi ;;
+esac
+if [ -n "$pid" ] && [ "$pid" -gt 1 ]; then
+  if kill -0 "$pid" 2>/dev/null || ps -p "$pid" >/dev/null 2>&1; then echo "alive $pid"; else echo "dead $pid"; fi
+fi
+echo "end"
+'''
+
+
+def _remote_sh(host: str, pid: str = "", marker: str = "") -> dict | None:
+    """What the remote host says of a job's remote side: {"boot", "marker" (bool), "alive" / "dead"
+    (the pid)}; None when ssh fails, times out or the answer is cut short. On this machine itself
+    (netwait.own) it is asked here in HOME, with no ssh."""
+    from . import netwait
+    from .cli import REMOTE_BOOT_SH
+    words = ["sh", "-c", _REMOTE_LIVE % REMOTE_BOOT_SH, "sh", pid or "", marker or ""]
+    remote = "sh -c " + " ".join(shlex.quote(x) for x in words[2:])
+    local = netwait.own(host)
+    cmd = words if local else ["ssh", "-o", "BatchMode=yes", "-o",
+                               f"ConnectTimeout={REMOTE_TIMEOUT_S // 2}", host, remote]
+    try:   # here it runs in HOME, as ssh does, so a relative marker names the same file
+        r = subprocess.run(cmd, stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=REMOTE_TIMEOUT_S,
+                           cwd=os.path.expanduser("~") if local else None)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    lines = r.stdout.splitlines()
+    if r.returncode != 0 or "end" not in lines:
+        return None
+    out: dict = {"marker": "marker" in lines}
+    for ln in lines:
+        key, _, val = ln.partition(" ")
+        if key in ("boot", "alive", "dead"):
+            out[key] = val.strip()
+    return out
+
+
+def remote_start(host: str) -> str:
+    """The boot id of the host a local job drives, read as it starts; "" when the host does not answer."""
+    return (_remote_sh(host) or {}).get("boot") or ""
+
+
+def remote_verdict(rc: Path, memo: dict) -> str | None:
+    """Why a local job's remote side is dead (its host reset, or its remote pid is gone with no completion
+    marker on GONE_CONFIRM probes in a row), else None: alive, finished (its marker is there), no remote
+    contract, or the host did not answer. `memo` keeps what earlier probes of this job learned."""
+    c = _entry(Path(rc)).get("remote")
+    if not isinstance(c, dict) or not c.get("host"):
+        return None
+    host = str(c["host"])
+    seen = _remote_sh(host, str(c.get("pid") or ""), str(c.get("marker") or ""))
+    if seen is None:
+        return None   # unreachable is no proof of death: keep it until its deadline
+    if seen["marker"]:
+        memo.pop("dead", None)
+        return None
+    boot = c.get("boot") or memo.get("boot")
+    if not boot and seen.get("boot"):
+        memo["boot"] = seen["boot"]   # unreachable at start: the first answer names its boot
+    elif boot and seen.get("boot") and seen["boot"] != boot:
+        return f"remote reset: {host} restarted (its boot id changed) while the job ran"
+    if not seen.get("dead"):
+        memo.pop("dead", None)
+        return None
+    memo["dead"] = memo.get("dead", 0) + 1
+    if memo["dead"] < GONE_CONFIRM:
+        return None
+    mark = f" and its completion marker {c['marker']} is missing" if c.get("marker") else ""
+    return f"remote driver gone: pid {seen['dead']} on {host} is dead{mark}"
+
+
+def end_remote(rc: Path, why: str) -> None:
+    """End a local job whose remote side is dead: kill its wrapper's process group and record why."""
+    rc = Path(rc)
+    pid = job_pid(rc)
+    if pid > 1 and not locks.any_free([locks.job_lock(rc)]):
+        stop(rc, pid, why, reason="detach.end_remote", by="daemon")
+    else:
+        _mark_lost(rc, why)
+
+
+# A job started with `ttp detach --remote` keeps its .log and .rc on that host, so a host that stops
+# answering later (it reset, or its network went) would hide a result it already had. Its probe,
+# `ttp detach --check --host <alias> --mirror <run folder> <dir>/<name>`, copies what each answer says
+# into that folder: <name>.remote.log (the last MIRROR_TAIL_BYTES of its log, sent only when the log's
+# size changed), <name>.remote.json (host, remote path, log size, time, and the end once known) and, once
+# it ended, <name>.remote.rc with its exit code. When ssh then fails, the probe reads the mirrored end
+# (exit 0 or 4) instead of 255. An exclusive run's hold keeper refreshes the run's mirrors as it probes
+# (mirror_refresh). Run by POSIX sh over ssh before the check, with the job's path as $1 and the log
+# size already mirrored as $3.
+MIRROR_TAIL_BYTES = 64 * 1024
+_REMOTE_TAIL = r'''q=$1 z=$3
+case $q in "~"|"~/"*) q=$HOME${q#\~} ;; esac
+q=${q%%/}; q=${q%%.rc}
+l=$q.log; [ -f "$l" ] || l=$q/log
+if [ -f "$l" ]; then
+  s=$(wc -c <"$l" | tr -d " ")
+  if [ "$s" = "$z" ]; then echo "tail same $s"
+  elif command -v base64 >/dev/null 2>&1; then echo "tail $s"; tail -c %d "$l" | base64; echo "tail-end"
+  fi
+fi
+'''
+
+
+def mirror_name(pre: str) -> str:
+    """A remote job's name from its path, <dir>/<name> or <dir>/<name>.rc."""
+    return Path(pre[:-3] if pre.endswith(".rc") else pre.rstrip("/")).name
+
+
+def mirror_read(d, name: str, host: str, pre: str) -> dict | None:
+    """The mirror of this remote job in folder `d`, None when there is none or it is another job's."""
+    try:
+        m = json.loads((Path(d) / f"{name}.remote.json").read_text())
+    except (OSError, ValueError):
+        return None
+    return m if isinstance(m, dict) and m.get("host") == host and m.get("path") == pre else None
+
+
+def mirror_save(d, name: str, host: str, pre: str, *, tail: bytes | None = None, size=None,
+                end: dict | None = None, probe: dict | None = None) -> None:
+    """Record what a remote job's answer said in folder `d`: its log tail and size, and its end
+    ({"rc": code} or {"gone": why}), which is kept once known; `probe`: the job sweep's last liveness
+    answer (onhost.refresh_remote). "moved" is when it was first mirrored or its log size last changed."""
+    d = Path(d)
+    now = int(time.time())
+    m = mirror_read(d, name, host, pre) or {"host": host, "path": pre, "moved": now}
+    if tail is not None:
+        durable_write(d / f"{name}.remote.log", tail[-MIRROR_TAIL_BYTES:])
+    if size is not None:
+        if str(size) != m.get("size"):   # its log grew: the job's progress (last_progress)
+            m["moved"] = now
+        m["size"] = str(size)
+    if end and not m.get("end"):
+        m["end"] = end
+        if "rc" in end:
+            durable_write(d / f"{name}.remote.rc", f"{end['rc']}\n")
+    if probe is not None:
+        m["probe"] = probe
+    m["at"] = now
+    write_json(d / f"{name}.remote.json", m)
+
+
+def _split_tail(out: str) -> tuple[list[str], tuple | None]:
+    """The answer's lines less its tail block, and the tail: (size, bytes), (size, None) when the log
+    is unchanged, None when the answer has none."""
+    import base64
+    lines, tail, i = out.splitlines(), None, 0
+    rest: list[str] = []
+    while i < len(lines):
+        ln = lines[i]
+        if ln.startswith("tail same "):
+            tail = (ln.split()[-1], None)
+        elif ln.startswith("tail ") and "tail-end" in lines[i + 1:]:
+            j = lines.index("tail-end", i + 1)
+            try:
+                tail = (ln.split()[-1], base64.b64decode("".join(lines[i + 1:j])))
+            except ValueError:
+                tail = None
+            i = j
+        elif ln.strip():
+            rest.append(ln)
+        i += 1
+    return rest, tail
+
+
+def mirror_probe(host: str, pre: str, d=None, rows: str | None = None, timeout: float = 60):
+    """One ssh call for a remote job: the rows count (with `rows`), its log tail when mirroring into
+    folder `d`, and the check's verdict (cli._REMOTE_CHECK). (r, lines): r is None or exits 255 when
+    ssh failed; lines are its answer less the tail, which is mirrored into `d` already."""
+    from .cli import _REMOTE_CHECK, _REMOTE_ROWS, _ssh_sh
+    name = mirror_name(pre)
+    seen = (mirror_read(d, name, host, pre) or {}).get("size", "") if d else ""
+    # With a mirror the verdict is read before the tail and printed after it, so a job that ends between
+    # the two cannot leave a tail missing its last lines; the verdict stays the last line.
+    check = f'v=$(\n{_REMOTE_CHECK}\n)\n' if d else _REMOTE_CHECK
+    script = ((_REMOTE_ROWS if rows is not None else "") + check
+              + (_REMOTE_TAIL % MIRROR_TAIL_BYTES + 'printf "%s\\n" "$v"\n' if d else ""))
+    r = _ssh_sh(host, script, [pre, rows or "", seen] if d else [pre, rows] if rows is not None else [pre], timeout)
+    if r is None or r.returncode == 255:
+        return r, []
+    lines, tail = _split_tail(r.stdout)
+    if d and tail:
+        try:
+            mirror_save(d, name, host, pre, tail=tail[1], size=tail[0])
+        except OSError:
+            pass
+    return r, lines
+
+
+def mirror_end(answer: str) -> dict | None:
+    """The end a check's verdict line names, for the mirror: {"rc": code} or {"gone": word}, else None."""
+    word, _, rest = answer.partition(" ")
+    if word == "rc":
+        return {"rc": rest.strip() or "?"}
+    if word in ("gone", "boot", "series"):
+        return {"gone": answer.strip()}
+    return None
+
+
+def mirror_refresh(run_dir) -> None:
+    """Refresh the mirrors of a run's remote jobs not known to have ended (the hold keeper, now and then)."""
+    for meta in sorted(Path(run_dir).glob("*.remote.json")):
+        try:
+            m = json.loads(meta.read_text())
+        except (OSError, ValueError):
+            continue
+        if not isinstance(m, dict) or m.get("end") or not m.get("host") or not m.get("path"):
+            continue
+        r, lines = mirror_probe(str(m["host"]), str(m["path"]), run_dir)
+        if r is None or r.returncode or not lines:
+            continue
+        end = mirror_end(lines[-1])
+        if end:
+            try:
+                mirror_save(run_dir, mirror_name(str(m["path"])), str(m["host"]), str(m["path"]), end=end)
+            except OSError:
+                pass

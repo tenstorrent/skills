@@ -1,0 +1,147 @@
+# setup-box: agents on the box
+
+An agent that edits and builds on the box runs there, or drives the box over ssh from the project
+box. Either way the work happens in the box's own checkout (`ssh-workflow.md`).
+
+## Agent CLIs, logins and editor extensions
+
+The skill runs every step below itself, in the user's own account (`account.md`), never a shared
+admin login, and never as root. `box.py` is `<plugin-root>/skills/setup-box/scripts/box.py`.
+
+```
+box.py agents check <box-alias>                      # read-only: each gap and the command that fixes it
+box.py agents install <box-alias> --run              # Claude Code and Codex CLIs, PATH lines
+box.py agents install <box-alias> --cli none --extensions --run   # editor extensions only
+box.py agents login <box-alias> claude|codex         # a headless login; shows its link, code and end time
+box.py agents login <box-alias> claude|codex --status
+box.py agents login <box-alias> claude|codex --mcp glean     # sign the agent in to Glean
+box.py agents login <box-alias> claude|codex --wait <seconds>   # how long a new login's link works
+box.py agents editor-defaults --run                  # on the machine the editor runs on, only on the user's yes
+```
+
+| Agent | Install | Login (on the box; the user enters a code in their browser) | Check |
+|---|---|---|---|
+| Claude Code | `curl -fsSL https://claude.ai/install.sh \| bash` | `claude auth login` | `claude --version`, `claude auth status` |
+| Codex | `curl -fsSL https://chatgpt.com/codex/install.sh \| sh` | `codex login --device-auth` | `codex --version`, `codex login status` |
+| Cursor agent | per its official instructions | its own login | `cursor-agent --version` |
+
+- `install` is idempotent: a CLI whose `--version` works is left alone. It puts `~/.local/bin` on
+  PATH for a plain `ssh <box-alias> <command>` (the first line of `~/.bashrc`, before any early
+  return for non-interactive shells; `~/.zshenv` for zsh) and for login shells (`~/.bash_profile`
+  or `~/.profile`), each file backed up once to `<file>.ttp-bak`.
+- Editors over Remote-SSH (Cursor, VS Code): the editor's own login carries over only to its own
+  AI. The Claude Code (`anthropic.claude-code`) and Codex (`openai.chatgpt`) extensions run on the
+  box's editor server and log in with the box's `~/.claude` and `~/.codex`, the same logins as the
+  CLIs. `install --extensions` installs both on every server build there (`~/.cursor-server`,
+  `~/.vscode-server`) and checks them with `--list-extensions`. A server build appears on the
+  editor's first connect: connect once, then install.
+- An editor update brings a new server build without the extensions. `editor-defaults` adds both
+  to `remote.SSH.defaultExtensions` in Cursor's and VS Code's user settings, so every new build on
+  every box gets them. It edits the user's own machine: only on their yes (the setup question),
+  merged into the list with existing entries and comments kept, the file backed up first. When
+  the editor runs on another machine than the agent, it says so and changes nothing; the box check
+  then finds a new build without them and `install --extensions` fixes it.
+- `login` starts the CLI's headless login on the box, detached, and prints its sign-in link and
+  code. Tell the user both word for word; they open the link and enter the code. When Claude
+  Code's page then shows a code to paste back, the user gives it to the agent, which passes it on
+  with `login <box-alias> claude --code-stdin` (on stdin; single-use, it only completes that
+  pending login). Then `login ... --status`. The login and its tokens stay on the box: never copy
+  `~/.claude` or `~/.codex` between machines, never print or log a token, and never put an API
+  key in a prompt, task or file.
+- `check` reports each missing CLI, PATH gap, login and editor extension with the command that
+  fixes it; run that command yourself. A login is the one step that needs the user: its code.
+- A login or sign-in link lapses (`--wait <seconds>`; default 15 min for a CLI login, 60 min for
+  an MCP sign-in, at most 5 min for Claude Code's: it stops listening for the callback then), so
+  send it only while the user is likely there. In a tt-project run, first
+  `ttp hours --check --for 1800`: it reads their usual active hours from the times of their own
+  messages (none yet: now). A link that lapses within 10 min (Claude Code's) also needs
+  `--present 10`: the user wrote in the chat in the last 10 min. Exit 1: do not start it or send
+  it on a timer; hand off `waiting` with that command as `retry_when`. The output names when the link works until, in the user's home zone: pass that on.
+- gh: a distro's packaged gh can be too old for a newer `hosts.yml`; install it from GitHub's own
+  apt repository. Its login is the user's (`gh auth login`, a code in their browser).
+
+## Building and running: tt-buddy
+
+Link to the tt-buddy plugin's recipes and skills; do not copy them here.
+
+| Need | tt-buddy file |
+|---|---|
+| A new box: toolchain, drivers, firmware checks | `recipes/developer-setup.md` |
+| Where checkouts and build trees live | `recipes/workspace.md` |
+| Build tt-metal | `recipes/tt-metal/build.md` |
+| Environment variables for runs | `recipes/tt-metal/env.md` |
+| Run tests | `recipes/tt-metal/test.md` |
+| Device runs (jobs, queueing, logs) | the `tt-buddy:run` skill |
+| Device runs through tt-device-mcp | the `tt-buddy:run` skill's `skills/run/mcp.md` |
+
+- tt-buddy is a separate plugin, installed only by the user's choice. When it is missing, name it in
+  the hand-off as the plugin that holds these recipes; do not reconstruct them.
+- Device runs on a box with a device broker go through it (tt-device-mcp), never by opening the
+  device directly.
+
+## MCP endpoints
+
+- A site's MCP endpoints (device broker, other services) come from the site file
+  (`mcp` in `site.md`), never from a repo or this skill.
+- Glean: `install` adds an HTTP MCP server named `glean` to each CLI it sets up (Claude Code
+  `claude mcp add --scope user --transport http glean <url>`, Codex `[mcp_servers.glean]`), and to
+  the MCP config of each editor server on the box (Cursor `~/.cursor/mcp.json`, VS Code
+  `~/.vscode-server/data/User/mcp.json`; merged, with a `.ttp-bak` copy first). An existing `glean`
+  entry is always kept, even on another URL (the user may have added it by hand); `check` only
+  notes the other URL. The URL comes from `--glean-url`, the site file's `mcp.glean`, or a `glean`
+  server already in this machine's Claude Code, Codex or Cursor config, never from this skill.
+  With none, it skips Glean with one line saying so.
+- Sign-in: `login <box-alias> <cli> --mcp glean` runs the agent's own headless sign-in
+  (`claude mcp login glean --no-browser`, `codex mcp login glean --no-browser`) in a tmux session
+  on the box (`tmux -L ttp-login`), started over ssh, so outside any agent sandbox. It waits there
+  up to 60 min (`--wait`), Claude Code's 5 min at most: Claude Code stops its callback listener
+  after 5 min ('Authentication timeout'). The user opens the link inside that window; after it the
+  link is dead. Start a new one only while the user is there to open it at once. Before it hands
+  out the link it checks with `ss` that the sign-in's callback port listens on the box; if not, it
+  stops the sign-in and says so, and never hands out a dead link.
+  A pending sign-in whose port stopped listening is replaced on the next `login`.
+- Detached start, live link only: the sign-in's tmux server starts apart from the ssh session that
+  launches it (`systemd-run --user --scope` where the user's systemd manager lingers, else `setsid`),
+  and its pane is logged to an owner-only file on the box, so it outlives that session. Its link goes
+  out only after the callback port listens on the box (`ss -ltn`, polled up to 30 s) and a check from a
+  new ssh session, after the starting one ended, still finds it listening. Otherwise `login` stops it,
+  starts it once more, and if that fails too says why (the log's last lines) and hands out no link.
+  The sign-in then runs for its whole window and ends by itself.
+- One message to the user per link handed out; none for a start that never reached a live listener.
+  An expired one-time link is never re-issued on a timer while the user is away: start a new one
+  right after their next message, so they are there to open it.
+- Fixed callback port: every sign-in `login --mcp` starts asks for one localhost callback port,
+  28461 by default (`--callback-port <port>` overrides it): Claude Code through
+  `MCP_OAUTH_CALLBACK_PORT`, Codex through `-c mcp_oauth_callback_port=<port>`. A server added with
+  its own `claude mcp add --callback-port` keeps that port. When something already listens on the
+  port on the box, `login` starts nothing and says what holds it (a CLI fails on a taken port).
+  A CLI that ignores the setting picks a random port; `login` then says so and the forward it
+  prints is for that sign-in only.
+- The user completes it either way: (a) one standing forward for the fixed port from the machine
+  their browser runs on, `ssh -N -L 28461:127.0.0.1:28461 <their alias for the box>`, left open;
+  with it open the page completes by itself, for this and every later sign-in on that box. Its
+  local port (the first 28461) must be the port the link names, so a forward serves one box: each
+  box a user's machine keeps a standing forward to needs its own `--callback-port` and its own
+  standing forward for that port, whether or not sign-ins overlap in time (with a standing
+  forward to the first box open, a second box on the same local port cannot bind it, or the
+  callback reaches the wrong box). Where the agent runs on the machine the browser runs
+  on, it starts that forward itself in the background; otherwise it tells the user that one step once, not on every sign-in; or (b) the
+  user opens the link, copies the `localhost` address the browser ends on, and the agent passes it
+  on with `--code-stdin` (on stdin, never on a command line, never stored). `--status` says signed in,
+  pending, or that the link is dead. A Claude Code too old for `mcp login` gets one step instead:
+  update it, or the user runs `claude` on the box, types `/mcp`, picks `glean` and chooses
+  Authenticate. Editors sign in from their own MCP view.
+- Tokens and credential files stay where the agent wrote them: never copied, printed or moved
+  between boxes or users. Status and search output are filtered to one line each.
+- Reload: agents read MCP servers when a session starts. Sessions open before `glean` was added,
+  an editor's agent panel too, do not show it until restarted (`claude` or `codex` again, or
+  `Developer: Reload Window` in the editor). `install` says so once when it adds an entry.
+- Claude Code also lists the account's own connectors, such as `claude.ai Glean`, beside the
+  `glean` server. That connector is separate and needs its own sign-in (`/mcp` in Claude Code, or
+  the connector settings on claude.ai). A `Needs authentication` on it says nothing about `glean`.
+- Account connectors (Atlassian, Google and others) follow the claude.ai account, not the box:
+  `connectors.md`. `check` adds their findings for a logged-in Claude Code (`--no-connectors` skips).
+- `check` reports Glean per agent: missing, configured but signed out, or working, and each
+  editor's entry as configured or missing. `check --search` proves working: each signed-in CLI
+  runs one real non-interactive Glean search (`claude -p ... --allowedTools=mcp__glean`,
+  `codex exec`) and reports its result count, or the failure as a gap.

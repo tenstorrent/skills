@@ -1,0 +1,363 @@
+# SPDX-FileCopyrightText: © 2026 Tenstorrent USA, Inc.
+# SPDX-License-Identifier: Apache-2.0
+"""One model-free status table, `ttp status --hourly`, which the daemon records for the web app
+(Daemon.post_hourly_status) only when something important changed since the last post (important, changes:
+an order or promise closed or went overdue, a blocker or outage appeared or cleared, the spend gate changed
+level). Counts, times, loads or versions moving alone never post it; nor does a batch landing or a deploy by itself.
+The changes since the last post add up, so the next post names them all. The post folds the
+main chat's held hand-off lines (chatdigest.handoff), one per finished task. No model call builds or posts it.
+
+Rows, in order:
+1. Fork rate: of the worker and review runs started in the last hour and today (home zone), the share that
+   started from a copy of a saved session (ctxfork.forked: a fork, or a resume of an earlier run), per
+   provider, against review.fork_target (default 0.9); forks, resumes and disk-block starts counted apart
+   (a disk-block start is never a fork).
+2. The project host's load (1-minute load per core: now, last-hour mean and max, from SAMPLES) and each spill
+   host's use in 24 h (check runs placed there, passed there, run again on the project host after failing
+   there; from each run's checks record). Hosts are named only by their alias from the machines list.
+3. Test runs and CPU-hours per landed change in 24 h (trainstats). Tests are CPU work, so the row shows no
+   test dollars; it shows apart, labelled, the model spend of runs woken while their task waited on its own
+   checks (trainstats.checkwait: wakes, $ and wake reasons). Total spend stays in the spend reports
+   (`ttp status`, `ttp spend-today`), never in this row.
+4. Queue: open tasks, push queue entries and the oldest approval's age.
+5. Approved-to-landed median today (trainstats) and tasks created in 24 h.
+
+No ETA row: the table repeats no ETA, so none can go stale in it; ETAs stay in the coordinator's STATE (eta.py).
+
+Corrections at the source (mark_corrected): when a user correction is recorded (a memory entry starting
+'Correction (user msg #N)', whose key claim correction.remember keeps in CLAIMS_KEY), each table posted in
+KEEP_S whose row restates the corrected value (correction.contradicts) is marked corrected in STATE_FILE
+("corrected": {message id: {msg, entry, wrong, row}}), and the next table follows at once, rows recomputed, with
+one line per new mark naming the post, the wrong value and the correction.
+
+The load sampler (sample) appends one reading to SAMPLES at most every SAMPLE_S; the overseer's pass and the
+daemon both call it, so the history keeps growing while either one runs, and it never holds two readings
+closer than SAMPLE_S."""
+from __future__ import annotations
+
+import json
+import os
+import time
+from pathlib import Path
+
+from . import ctxfork, timefmt
+from .db import REPLIES_ONLY
+from .project import durable_append, durable_write
+
+SAMPLES = "host-load.jsonl"     # in the state folder: {"ts", "load1", "cores"} per line
+STATE_FILE = "hourly-status.json"
+SAMPLE_S = 240.0
+CHECK_S = 600.0    # an unchanged signature (important) is read again at most this often
+OUTAGE_S = 2 * 86400.0   # an uncleared high or critical alert raised this recently counts as an outage
+KEEP_S = 2 * 86400.0
+REF = "hourly_status"
+OPEN = ("queued", "running", "blocked", "waiting", "pushing")
+QUEUED = ("approved", "batched", "held")
+
+
+def sample(state: Path, now: float | None = None, load1: float | None = None, cores: int | None = None) -> bool:
+    """Append this host's 1-minute load and core count to SAMPLES unless the newest reading is under SAMPLE_S
+    old; drop readings older than KEEP_S once a day's worth piles up. True when a reading was written."""
+    now = time.time() if now is None else now
+    f = state / SAMPLES
+    rows = _samples(f)
+    if rows and now - rows[-1]["ts"] < SAMPLE_S:
+        return False
+    if load1 is None:
+        try:
+            load1 = os.getloadavg()[0]
+        except (OSError, AttributeError):
+            return False
+    row = {"ts": round(now, 1), "load1": round(float(load1), 2), "cores": int(cores or os.cpu_count() or 1)}
+    if rows and now - rows[0]["ts"] > KEEP_S + 86400:
+        kept = [r for r in rows if now - r["ts"] <= KEEP_S] + [row]
+        durable_write(f, "".join(json.dumps(r) + "\n" for r in kept))
+    else:
+        durable_append(f, json.dumps(row) + "\n")
+    return True
+
+
+def _samples(f: Path) -> list[dict]:
+    out = []
+    try:
+        text = f.read_text()
+    except OSError:
+        return out
+    for ln in text.splitlines():
+        try:
+            r = json.loads(ln)
+            out.append({"ts": float(r["ts"]), "load1": float(r["load1"]), "cores": max(int(r["cores"]), 1)})
+        except (ValueError, KeyError, TypeError):
+            continue   # a torn last line is skipped
+    return out
+
+
+def fork_share(db, since: float) -> dict[str, list[int]]:
+    """{provider: [forks of the coordinator's session, resumes of an earlier run, disk-block starts, runs]}
+    of worker and review runs started since `since`, from each run's own note (ctxfork.KEY); the first two
+    are the runs ctxfork.forked counts."""
+    out: dict[str, list[int]] = {}
+    for r in db.q("SELECT provider, note FROM runs WHERE role IN ('worker','reviewer') AND started>=?", (since,)):
+        try:
+            note = json.loads(r["note"] or "{}")
+        except ValueError:
+            note = {}
+        note = note if isinstance(note, dict) else {}
+        how = (note.get(ctxfork.KEY) or {}).get("how") if isinstance(note.get(ctxfork.KEY), dict) else None
+        n = out.setdefault(r["provider"] or "?", [0, 0, 0, 0])
+        if ctxfork.forked(note):
+            n[0 if how == "fork" else 1] += 1
+        n[2] += how == "disk"
+        n[3] += 1
+    return out
+
+
+def _forked(c: dict[str, list[int]]) -> tuple[int, int]:
+    return sum(v[0] + v[1] for v in c.values()), sum(v[3] for v in c.values())
+
+
+def _share(c: dict[str, list[int]]) -> str:
+    f, n = _forked(c)
+    if not n:
+        return "no runs"
+    split = "fork {}, resume {}, disk {}".format(*(sum(v[i] for v in c.values()) for i in range(3)))
+    each = ", ".join(f"{k} {v[0] + v[1]}/{v[3]}" for k, v in sorted(c.items())) if len(c) > 1 else next(iter(c))
+    return f"{f}/{n} ({100 * f / n:.0f}%: {split}; {each})"
+
+
+def spill_use(db, runs: Path, since: float) -> dict[str, list[int]]:
+    """{spill host alias: [placed, passed, run again here]} from the checks records written since `since` by
+    runs (worker and review runs; a run may have started up to a day before)."""
+    from .prguard import CHECKS_FILE
+    out: dict[str, list[int]] = {}
+    for r in db.q("SELECT id, dir FROM runs WHERE started>=? OR status='running'", (since - 86400,)):
+        try:
+            rec = json.loads((Path(r["dir"] or runs / str(r["id"])) / CHECKS_FILE).read_text())
+        except (OSError, ValueError):
+            continue
+        if not isinstance(rec, dict) or float(rec.get("ts") or 0) < since:
+            continue
+        if host := rec.get("spilled_to"):
+            n = out.setdefault(str(host), [0, 0, 0])
+            n[0] += 1
+            n[1] += bool(rec.get("passed"))
+        for e in str(rec.get("spill_off") or "").split(","):
+            if (host := e.rpartition(":")[0] if ":" in e else e) and e != "1":
+                n = out.setdefault(host, [0, 0, 0])
+                n[0] += 1
+                n[2] += not rec.get("spilled_to")   # the rerun ran here, not on another spill host
+    return out
+
+
+def rows(p, now: float | None = None) -> list[str]:
+    """The table's rows (module doc), without its header."""
+    from . import machines, trainstats
+    now = time.time() if now is None else now
+    db, cfg, tz = p.db, p.config(), timefmt.home(p)
+    target = float((cfg.get("review") or {}).get("fork_target", 0.9))
+    hour, today = fork_share(db, now - 3600), fork_share(db, _day_start(now, tz))
+    low = [w for w, c in (("last hour", hour), ("today", today))
+           if (fn := _forked(c))[1] and fn[0] / fn[1] < target]
+    out = [f"Fork rate: last hour {_share(hour)}; today {_share(today)}; target {target:.0%}"
+           + (f" (below target {' and '.join(low)})" if low else "")]
+    try:
+        me = (machines.here() or ("the project host",))[0]
+    except Exception:
+        me = "the project host"
+    s = [r for r in _samples(p.state / SAMPLES) if now - r["ts"] <= 3600]
+    per = [r["load1"] / r["cores"] for r in s]
+    load = (f"load {per[-1]:.2f}/core now, mean {sum(per) / len(per):.2f}, max {max(per):.2f} in the last hour "
+            f"({len(per)} samples)") if per else "load not sampled yet"
+    spill = spill_use(db, p.runs, now - 86400)
+    out.append(f"Project host {me}: {load}. Spill hosts in 24 h: "
+               + ("; ".join(f"{h} {v[0]} placed, {v[1]} passed, {v[2]} run again here"
+                            for h, v in sorted(spill.items())) if spill else "none used"))
+    days = trainstats.report(db, p.runs, tz, days=1, now=now, cfg=cfg)["days"]
+    landed = sum(d["landed"] for d in days)
+    runs_n = sum(d["checks_runs"] + d["train_check_runs"] for d in days)
+    cpu_h = sum(d["cpu_s"] + d["train_cpu_s"] for d in days) / 3600
+    wakes, wusd = sum(d["checkwait_wakes"] for d in days), sum(d["checkwait_usd"] for d in days)
+    by: dict = {}
+    for d in days:
+        for k, (n, u) in d["checkwait_by_reason"].items():
+            by[k] = (by.get(k, (0, 0.0))[0] + n, by.get(k, (0, 0.0))[1] + u)
+    out.append(f"Tests in 24 h (CPU work, no model spend): {runs_n} check runs, {cpu_h:.1f} CPU-h; {landed} landed"
+               + (f", so {runs_n / landed:.1f} runs and {cpu_h / landed:.2f} CPU-h per landed change" if landed else "")
+               + f". Model spend of runs woken while waiting on their checks: {wakes} wakes, ${wusd:.2f}"
+               + (f" (${wusd / landed:.2f} per landed change)" if landed and wakes else "")
+               + (f": {trainstats.checkwait_reasons(by)}" if by else ""))
+    open_n = db.one(f"SELECT COUNT(*) n FROM tasks WHERE status IN ({','.join('?' * len(OPEN))})", OPEN)["n"]
+    q = db.q(f"SELECT status, created FROM push_queue WHERE status IN ({','.join('?' * len(QUEUED))})", QUEUED)
+    oldest = min((float(r["created"]) for r in q if r["status"] == "approved"), default=None)
+    out.append(f"Queue: {open_n} open tasks, {len(q)} in the push queue"
+               + (f", oldest approval {_age(now - oldest)} old" if oldest is not None else ""))
+    med = next((d["landing_median_h"] for d in reversed(days) if d["landing_median_h"] is not None), None)
+    made = db.one("SELECT COUNT(*) n FROM tasks WHERE created>=?", (now - 86400,))["n"]
+    out.append(f"Landing: approved to landed median {'n/a' if med is None else f'{med:g} h'}; "
+               f"{made} tasks created in 24 h")
+    return out
+
+
+def _day_start(now: float, tz: str) -> float:
+    from datetime import datetime
+    d = datetime.fromtimestamp(now, timefmt.tzinfo(tz))
+    return d.replace(hour=0, minute=0, second=0, microsecond=0).timestamp()
+
+
+def _age(s: float) -> str:
+    return f"{s / 60:.0f} min" if s < 5400 else f"{s / 3600:.1f} h"
+
+
+def table(p, now: float | None = None) -> str:
+    now = time.time() if now is None else now
+    return "\n".join([f"Status at {timefmt.short(now, timefmt.home(p), now)}", *rows(p, now)])
+
+
+def important(p, now: float | None = None) -> dict:
+    """What a post may be due for, as sorted lists: open obligation keys, those closed with a receipt in
+    OUTAGE_S (one opened and closed between two posts still counts), those overdue (a promise or order
+    past its due, a milestone past its due without its receipt), blockers (blocked tasks and open asks to
+    the user), outages (uncleared high or critical alerts raised in OUTAGE_S) and each provider's spend gate
+    level. Counts, times and versions are not in it, so they never make a post due."""
+    from . import obligations, waits
+    now = time.time() if now is None else now
+    db = p.db
+    opened, late, closed = [], [], []
+    for o in obligations.items(db):
+        if not obligations._open(o):
+            if float((o.get("receipt") or {}).get("at") or 0) >= now - OUTAGE_S:
+                closed.append(o["id"])
+            continue
+        opened.append(o["id"])
+        due = (o.get("promise") or {}).get("due")
+        ms = [m for m in (o.get("milestones") or {}).values() if isinstance(m, dict)]
+        if (isinstance(due, (int, float)) and now >= due) or any(
+                not m.get("receipt") and isinstance(m.get("due"), (int, float)) and now >= m["due"] for m in ms):
+            late.append(o["id"])
+    blocked = [f"#{r['id']}" for r in db.q("SELECT id FROM tasks WHERE status='blocked' ORDER BY id")]
+    blocked += [f"ask {a['id']}" for a in waits.open_asks(db)]
+    outages = sorted({r["key"] for r in db.q(
+        "SELECT key FROM alerts WHERE cleared IS NULL AND LOWER(COALESCE(severity,'')) IN ('high','critical') "
+        "AND raised>=?", (now - OUTAGE_S,))})
+    gates = db.kv("gates") or {}
+    gate = sorted(f"{k}:{(v or {}).get('level')}" for k, v in gates.items() if isinstance(v, dict))
+    return {"open": opened, "closed": closed, "overdue": late, "blocked": blocked, "outages": outages, "gate": gate}
+
+
+def changes(old: dict, new: dict) -> list[str]:
+    """The important changes from `old` to `new` (important), in a few words each; [] for none."""
+    def gone(k):
+        return set(old.get(k) or ()) - set(new.get(k) or ())
+
+    def came(k):
+        return set(new.get(k) or ()) - set(old.get(k) or ())
+    got = []
+    if done := came("closed"):
+        got.append("an order closed" if len(done) == 1 else f"{len(done)} orders closed")
+    if late := came("overdue") & set(new.get("open") or ()):
+        got.append("an order went overdue" if len(late) == 1 else f"{len(late)} orders went overdue")
+    for k, what in (("blocked", "a blocker"), ("outages", "an outage")):
+        if came(k):
+            got.append(f"{what} appeared")
+        if gone(k):
+            got.append(f"{what} cleared")
+    if sorted(old.get("gate") or ()) != sorted(new.get("gate") or ()):
+        got.append("the spend gate changed level")
+    return got
+
+
+def main_chat(db) -> str | None:
+    """The chat the user wrote in last, else the one active last; never a reply-only chat (a one-off
+    `ttp say` caller's), which gets no status."""
+    r = (db.one("SELECT m.chat FROM messages m LEFT JOIN chats c ON c.id=m.chat WHERE m.direction='in' "
+                "AND m.chat IS NOT NULL AND c.min_severity IS NOT ? ORDER BY m.id DESC LIMIT 1", (REPLIES_ONLY,))
+         or db.one("SELECT id chat FROM chats WHERE min_severity IS NOT ? ORDER BY COALESCE(last_active, created) DESC "
+                   "LIMIT 1", (REPLIES_ONLY,)))
+    return r["chat"] if r else None
+
+
+def due(p, now: float | None = None) -> tuple[str, str] | None:
+    """(table, why) when a post is due (module doc), else None; records only the first pass's baseline and
+    the time of an unchanged check."""
+    now = time.time() if now is None else now
+    try:
+        st = json.loads((p.state / STATE_FILE).read_text())
+    except (OSError, ValueError):
+        st = {}
+    if not st or "sig" not in st:   # the first pass only sets the baseline: a table follows the first change
+        durable_write(p.state / STATE_FILE, json.dumps({**st, "at": st.get("at", now), "sig": important(p, now),
+                                                        "why": st.get("why", "baseline"),
+                                                        "corr_seen": st.get("corr_seen", now)}))
+        return None
+    fixed = mark_corrected(p, st, now)
+    if not fixed and 0 <= now - float(st.get("checked") or -1e18) < CHECK_S:
+        return None
+    why = ", ".join((["a correction"] if fixed else []) + changes(st.get("sig") or {}, important(p, now)))
+    if not why:
+        durable_write(p.state / STATE_FILE, json.dumps({**st, "checked": now}))
+        return None
+    notes = [f"Corrected: the status posted at {timefmt.short(m['ts'], timefmt.home(p), now)} said '{m['wrong']}' in "
+             f"its {m['row']} row; user msg #{m['msg']} corrected it, and the rows above are recomputed"
+             for m in st.get("new_marks") or ()]
+    return "\n".join([f"Status at {timefmt.short(now, timefmt.home(p), now)} ({why})", *rows(p, now), *notes]), why
+
+
+def mark_corrected(p, st: dict, now: float) -> bool:
+    """Mark each table posted in KEEP_S that a correction recorded since st['corr_seen'] contradicts (module doc);
+    True when a new mark was made. Writes STATE_FILE and keeps the new marks in st['new_marks'] for the next post."""
+    from .correction import CLAIMS_KEY, contradicts
+    seen = float(st.get("corr_seen") or st.get("at") or now)
+    new = [(n, c) for n, c in ((p.db.kv(CLAIMS_KEY, {}) or {}).items()) if float(c.get("ts") or 0) > seen]
+    if not new:
+        return bool(st.get("new_marks"))
+    marks, fresh = dict(st.get("corrected") or {}), list(st.get("new_marks") or ())
+    posts = p.db.q("SELECT id, ts, text FROM messages WHERE ref=? AND direction='out' AND ts>=? ORDER BY id",
+                   (REF, now - KEEP_S))
+    for name, c in new:
+        for m in posts:
+            if str(m["id"]) in marks:
+                continue
+            for line in str(m["text"]).split("\n")[1:]:
+                if line.startswith("Corrected:") or not (hit := contradicts(c, line)):
+                    continue
+                mark = {"msg": c.get("msg"), "entry": name, "wrong": hit, "row": line.partition(":")[0],
+                        "ts": float(m["ts"])}
+                marks[str(m["id"])] = mark
+                fresh.append(mark)
+                break
+    st.update({"corr_seen": max(float(c.get("ts") or 0) for _, c in new), "corrected": marks, "new_marks": fresh})
+    durable_write(p.state / STATE_FILE, json.dumps(st))
+    return bool(fresh)
+
+
+def corrected(p) -> dict:
+    """{posted message id: its correction mark} (mark_corrected)."""
+    try:
+        return dict(json.loads((p.state / STATE_FILE).read_text()).get("corrected") or {})
+    except (OSError, ValueError, AttributeError):
+        return {}
+
+
+def post(p, now: float | None = None) -> int | None:
+    """Record the table for the web app when due, the main chat's held hand-off lines folded in; the
+    message id, else None."""
+    now = time.time() if now is None else now
+    if not (p.config().get("notify") or {}).get("hourly_status", True):
+        return None
+    from . import alerts, chatdigest
+    chat = main_chat(p.db)
+    if not (got := due(p, now)):
+        return None
+    sig = important(p, now)
+    with p.db.tx():
+        text = "\n".join([got[0], *chatdigest.handoff_lines(chatdigest.take_handoffs(p.db, chat))])
+        mid = p.db.post("out", text, chat=None, channel=alerts.QUIET, kind="info", severity="low", ref=REF)
+    try:
+        st = json.loads((p.state / STATE_FILE).read_text())
+    except (OSError, ValueError):
+        st = {}
+    st.pop("new_marks", None)
+    st.pop("checked", None)
+    st.pop("rows", None)
+    durable_write(p.state / STATE_FILE, json.dumps({**st, "at": now, "sig": sig, "id": mid, "why": got[1]}))
+    return mid

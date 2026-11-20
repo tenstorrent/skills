@@ -47,7 +47,8 @@ automatically for matching tasks; you can also ask your agent to make them expli
 | `tt-model-bringup` | Eleven stages from HF decoder through TTNN/vLLM benchmarking, with chunked-prefill guidance, required prefix caching and batched prefill with resume and burst checks, prefill/TTFT optimization, trace warmup/reuse and allocation validation, targeted path/serving checks, and fixed standard accuracy subsets plus 4K-input vLLM benchmarks at concurrency 1 and 32. Includes a standalone TTI release skill. Requires `tt-autodebug`. |
 | `tt-debug-tools` | Drive the Tenstorrent debug tools and read their output: tt-triage, dprint, watcher, asserts, etc. See [`plugins/tt-debug-tools/README.md`](plugins/tt-debug-tools/README.md) |
 | `tt-buddy` | A coding agent with Tenstorrent operating principles: takes notes all the time, learns when needed, keeps the diff minimal. Device runs need [`tt-device-mcp`](https://github.com/tenstorrent/tt-device-mcp). See [`plugins/tt-buddy/README.md`](plugins/tt-buddy/README.md) |
-| `tt-serve-model` | Take a model from host discovery to a verified server on Tenstorrent hardware: discover the host (boards vs ASICs, `--tt-device` string, driver/firmware, hugepages, docker, device holders, reset verdict), retrieve the model (HF gating, tt-inference-server spec entry, image spec drift, GHCR tag/ancestry, tt-model-manager bundles, exact pull command), diagnose a launch (stage/hang/failure classification, mandatory docker flags, override safety, timing, displaced services) and verify the running server (health, correctness, mesh utilization, throughput/batching, reasoning-model checks). |
+| `tt-project` | Long-running, self-driving projects that run locally or on an always-on box: a coordinator daemon that plans and delegates to isolated workers, memory, budget guards that leave headroom for your own work, watchers, desktop notifications and a web app. Reconnect from any Claude Code, Codex or Cursor chat by name. One-line install and quick start: [`plugins/tt-project/README.md`](plugins/tt-project/README.md) |
+| `tt-serve-model` | Take a model from host discovery to a verified server on Tenstorrent hardware: discover the host (boards vs ASICs, `--tt-device` string, driver/firmware, hugepages, docker, device holders, reset verdict), retrieve the model (HF gating, tt-inference-server spec entry, image spec drift, GHCR tag/ancestry, tt-model-manager bundles, exact pull command), diagnose a launch (stage/hang/failure classification, mandatory docker flags, override safety, timing, displaced displaced services) and verify the running server (health, correctness, mesh utilization, throughput/batching, reasoning-model checks). |
 
 AutoDebug investigates in a fresh agent process and writes `AUTODEBUG.md`. AutoFix handles source
 changes and validation. For examples and expected outputs, see the
@@ -107,6 +108,7 @@ codex plugin add tt-review-skills@tenstorrent-skills
 codex plugin add tt-debug-tools@tenstorrent-skills
 codex plugin add tt-buddy@tenstorrent-skills
 # tt-buddy ships session hooks: trust them in Codex with /hooks, then t.
+codex plugin add tt-project@tenstorrent-skills
 codex plugin add tt-serve-model@tenstorrent-skills
 # Model bring-up also requires tt-autodebug:
 codex plugin add tt-model-bringup@tenstorrent-skills
@@ -130,6 +132,7 @@ Choose any optional plugins you want:
 /plugin install tt-review-skills@tenstorrent-skills
 /plugin install tt-debug-tools@tenstorrent-skills
 /plugin install tt-buddy@tenstorrent-skills
+/plugin install tt-project@tenstorrent-skills
 /plugin install tt-serve-model@tenstorrent-skills
 ```
 

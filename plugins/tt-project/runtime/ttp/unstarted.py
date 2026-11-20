@@ -1,0 +1,344 @@
+# SPDX-FileCopyrightText: © 2026 Tenstorrent USA, Inc.
+# SPDX-License-Identifier: Apache-2.0
+"""Known, ready work that was announced or is ready but has not started. Model-free, on the daemon tick
+(Daemon.check_unstarted). Observation only: dispatch never reads these events.
+
+announced(): each open promise (obligations.py's records, no second ledger) and each queued, blocked or
+waiting task announced in a reply (reply_chat set) that no open promise owns, and each `ready:` follow-up
+of a hand-off (_ready_followups: owned by the later task that takes it up, else 'none'). When ANNOUNCED_S after it
+was made (ANNOUNCED_P1_S when an owner has priority 1) no owner task has a run started since then, and
+no owner is held by a recorded external condition (external_hold) or by the push queue (an owner in status
+pushing with an open queue row: started while the queue is alive on it, pushq.holding), one keyed `announced_not_started`
+event names it, its owner ('none' when it has none), its age and what parks it (parked). The event is
+retired (handled, so it wakes no turn) once an owner starts, the promise closes or the task ends, or an
+owner becomes held externally: nothing is left for a turn to decide. One per promise or task, never
+raised again (accepted gap: a parked owner that is held, then parked again, is not raised twice).
+Promises and tasks older than MAX_AGE_S are left to promise_overdue and the wait checks, so a deploy
+does not raise an old backlog at once.
+
+ready_since() and READY_S/READY_P1_S size the ready-not-started check, which needs dispatch's own
+holds (Daemon._start_hold) and so lives in the daemon. It covers what check_slot_wait (urgent work and
+obligation owners held by full slots or any hold) and check_stall (no worker run at all for hours) do
+not: any queued task dispatch could start while a slot of its provider is free that still has not.
+A backlog is not such a stall: while more tasks are ready than their provider has free slots, or the
+spend gate stopped new work less than BACKLOG_S ago (the queue a red gate left), a late task with no
+recorded hold raises no alarm while the queue drains (a run of its provider started within the task's
+threshold and after the gate cleared; free slots with no such start still raise it); one BACKLOG_KIND record per episode (handled: it wakes nothing) gives the
+queue depth, when the gate cleared or that it still holds, the live runs and the free slots (backlog_words).
+
+open_followups() and followup_lines(): each follow-up a hand-off of any task kind proposed that a turn or
+gate has handled but no later task took up stays listed in the digest until one does or the coordinator
+drops it (`ttp task <project> drop-followup`, drop_followup: marked on its own followup_proposed event).
+
+parked_nudge() is the coordinator's advice for a deferral that names no external fact: it never
+refuses, it counts (NUDGE_KV)."""
+from __future__ import annotations
+
+import re
+import time
+
+from .db import dependency_ids, deferral, load_result
+
+ANNOUNCED_KIND = "announced_not_started"
+READY_KIND = "ready_not_started"
+ANNOUNCED_S = 600       # a promise or announced task with no started owner run after this is parked
+ANNOUNCED_P1_S = 300    # an owner of priority 1
+READY_S = 600           # a ready task with a free slot not started after this
+READY_P1_S = 120        # priority 1 or urgent
+READY_URGENT_S = 60     # a fresh `urgent:` line or an obligation owner: its slots full counts too
+BACKLOG_KIND = "ready_backlog"
+BACKLOG_S = 3600        # a spend gate that stopped new work this recently still explains the queue it left
+BACKLOG_KV = "ready_backlog"   # kv: {provider: {"stopped": bool, "why": str, "cleared": ts, "since": ts}}
+CLEARED_WAIT_S = 300    # a task the spend gate held until this recently waits for one dispatch pass first
+DEFER_S = 600           # task_update adding spec to a task deferred further than this gets the nudge
+MAX_AGE_S = 86400
+FOLLOWUPS_SHOWN = 8   # open follow-ups listed per digest
+READY_TITLE = re.compile(r"(?i)^\s*ready\s*:\s*")   # a hand-off follow-up whose inputs are ready now
+START_SLACK_S = 60      # a run started just before the reply that announced it counts
+NUDGE_KV = "parked_work_nudges"   # kv: {"n": total, "day": "YYYY-MM-DD", "today": n, "at": ts}
+LIVE = ("queued", "blocked", "waiting", "review")
+# A deferral's `why` naming an external fact: a time another party sets, data that must accumulate, a
+# person, a shared resource, or another task's landing.
+EXTERNAL = re.compile(
+    r"#\d+|\blands?\b|\blanded\b|\bmerge|\brelease|\bwindow|\bschedul|\bmaintenance|\bcut\b|\bdeadline|"
+    r"\baccumulat|\bcollect|\bsoak|\bovernight|\bdata\b|\bsamples?\b|\bmetrics?\b|\bmeasure|\bnightly|"
+    r"\buser\b|\breview(?:er)?\b|\bapprov|\banswer|\brepl(?:y|ies)|\back(?:s|ed)?\b|\bperson|\bowner\b|"
+    r"\bteam\b|\bdevice|\bbox\b|\bmachine|\bnode|\bbroker|\block\b|\bqueue|\bslot|\bcluster|\breserv|"
+    r"\bquota|\bpause|\blull|\bidle\b|\bbusy\b|\bci\b|\bbuild\b|\bupstream|\bprovider|\blimit|\bcredit",
+    re.I)
+TIME_ONLY = re.compile(r'^\s*(?:test|\[)\s+"?\$\(\s*date\s+\+%s\s*\)"?\s+-ge\s+\d+\s*\]?\s*$')
+
+
+def threshold(prio: int | None, p1: float, rest: float) -> float:
+    return p1 if prio is not None and int(prio) <= 1 else rest
+
+
+def _runs_since(db, ids: list[int], since: float) -> bool:
+    if not ids:
+        return False
+    q = ",".join("?" * len(ids))
+    return bool(db.one(f"SELECT 1 FROM runs WHERE task IN ({q}) AND started>=? LIMIT 1", (*ids, since - START_SLACK_S))
+                or db.one(f"SELECT 1 FROM tasks WHERE id IN ({q}) AND status='running' LIMIT 1", ids))
+
+
+def _asks_naming(db, tid: int) -> int | None:
+    pat = re.compile(rf"#{tid}\b")
+    for r in db.q("SELECT id, text FROM messages WHERE direction='out' AND kind='ask' AND handled=0"):
+        if pat.search(r["text"] or ""):
+            return int(r["id"])
+    return None
+
+
+def external_hold(db, task: dict, paused: dict) -> str | None:
+    """The recorded external condition holding `task`, in words, or None: a start_when probe not yet
+    passed, a dependency on a task still running, waiting or in review, a paused resource, an open ask
+    naming it, its own wait probe (not a timer alone) or a review in progress."""
+    st = task["status"]
+    if st not in LIVE:
+        return None
+    if ask := _asks_naming(db, task["id"]):
+        return f"open ask #{ask}"
+    if st == "review":
+        return "its review"
+    if st == "waiting":
+        probe = str(load_result(task["result"]).get("retry_when") or "")
+        return f"its wait probe ({probe[:120]})" if probe.strip() and not TIME_ONLY.match(probe) else None
+    if st != "queued":
+        return None
+    d = deferral(task)
+    if d.get("when"):
+        return f"its start_when probe ({(d.get('why') or d['when'])[:120]})"
+    from .coordinator import task_resources
+    if hit := sorted(task_resources(task) & set(paused)):
+        return f"paused resource {', '.join(hit)}"
+    deps = dependency_ids(task)
+    for row in db.q(f"SELECT id, status FROM tasks WHERE id IN ({','.join('?' * len(deps))})", deps) if deps else []:
+        if row["status"] in ("running", "waiting", "review"):
+            return f"dependency #{row['id']} ({row['status']})"
+    return None
+
+
+def parked(db, task: dict | None, now: float) -> str:
+    """What keeps a task that no external condition holds from starting, in words."""
+    if task is None:
+        return "no owner task"
+    st = task["status"]
+    if st == "queued" and float(task["not_before"] or 0) > now:
+        why = deferral(task).get("why")
+        return (f"start_after in {(float(task['not_before']) - now) / 60:.0f} min"
+                + (f" ({why[:80]})" if why else ", naming no external fact"))
+    if st == "queued":
+        deps = dependency_ids(task)
+        for row in db.q(f"SELECT id, status FROM tasks WHERE id IN ({','.join('?' * len(deps))})", deps) if deps else []:
+            if row["status"] != "done":
+                return f"dependency #{row['id']} ({row['status']}, not started)"
+        return f"dispatch: {task['blocked_reason'][:160]}" if task["blocked_reason"] else "nothing: ready, not picked"
+    if st == "waiting":
+        return f"a timer: it wakes in {max(float(task['not_before'] or now) - now, 0) / 60:.0f} min"
+    if st == "blocked":
+        return f"blocked: {(task['blocked_reason'] or 'no reason')[:160]}"
+    return f"{st} without starting"
+
+
+def _subjects(db, now: float) -> list[dict]:
+    """The open promises and announced tasks to check: {key, what, created, owners}. An order is no subject
+    (its owners still count as owned): obligations' order_late at its start_by is its one start-late
+    signal. Claims never come here (open_promises leaves them out)."""
+    from . import obligations
+    out, owned = [], set()
+    for o in obligations.open_promises(db):
+        ids = obligations._owner_ids(o)
+        owned |= set(ids)
+        if o["promise"].get("order") is not None:
+            continue   # an order's one start-late signal is its own order_late at start_by
+        if now - float(o["created"]) <= MAX_AGE_S:
+            out.append({"key": o["id"], "what": f"promise {o['id']} in chat {o['promise']['chat']} ({o['text'][:160]})",
+                        "created": float(o["created"]), "owners": ids})
+    for t in db.q("SELECT id, title, created FROM tasks WHERE reply_chat IS NOT NULL AND kind!='review' "
+                  f"AND status IN ({','.join('?' * len(LIVE))}) AND created>=?", (*LIVE, now - MAX_AGE_S)):
+        if t["id"] not in owned:
+            out.append({"key": f"t{t['id']}", "what": f"task #{t['id']} {t['title'][:100]} (announced in a reply)",
+                        "created": float(t["created"]), "owners": [t["id"]]})
+    return out + _ready_followups(db, now)
+
+
+def _ready_followups(db, now: float) -> list[dict]:
+    """Each `ready:` follow-up of a hand-off (a step the worker could not finish whose inputs are ready),
+    from when its run ended. Its owners are the later tasks titled as it (with or without the `ready:`
+    prefix) or whose spec quotes its title; none yet is owner 'none'."""
+    out = []
+    for src in db.q("SELECT t.id, t.result, MAX(r.ended) ended FROM tasks t JOIN runs r ON r.task=t.id "
+                    "WHERE t.result LIKE '%ready:%' AND r.ended>=? GROUP BY t.id", (now - MAX_AGE_S,)):
+        fups = load_result(src["result"]).get("followups")
+        titles = [str(f["title"]).strip() for f in fups if isinstance(f, dict)
+                  and READY_TITLE.match(str(f.get("title") or ""))] if isinstance(fups, list) else []
+        if not titles:
+            continue
+        later = db.q("SELECT id, title, spec FROM tasks WHERE id>?", (src["id"],))
+        for i, title in enumerate(titles):
+            out.append({"key": f"f{src['id']}.{i}", "what": f"follow-up {title[:160]!r} of #{src['id']}",
+                        "created": float(src["ended"]), "owners": _taken_by(later, title)})
+    return out
+
+
+def _taken_by(later, title: str) -> list[int]:
+    """The tasks of `later` titled as follow-up `title` (with or without a `ready:` prefix) or whose spec quotes it."""
+    step = READY_TITLE.sub("", title).strip().lower()
+    quotes = [title.lower()] + ([step] if len(step) >= 20 else [])   # a short step text matches by chance
+    return [t["id"] for t in later if (t["title"] or "").strip().lower() in (title.lower(), step)
+            or any(q in (t["spec"] or "").lower() for q in quotes)]
+
+
+def open_followups(db, now: float) -> list[dict]:
+    """Each follow-up a hand-off proposed (any task kind) in the last MAX_AGE_S whose followup_proposed event a
+    turn or gate has handled, that no later task took up (_taken_by) and the coordinator did not drop
+    (drop_followup): {id (the event), task, title}. A folded one, a `continue:` one (check_unqueued_continues)
+    and an `upstream:` one (filed by the daemon) are left out: each has its own owner. A follow-up not taken
+    up within 24 h leaves the digest list (no full-history scan per digest build)."""
+    out = []
+    for e in db.q("SELECT id, task, text FROM events WHERE kind='followup_proposed' AND status='handled' AND ts>=? "
+                  "AND task IS NOT NULL AND text NOT LIKE '%(folded into #%' "
+                  "AND COALESCE(data,'') NOT LIKE '%\"dropped\"%' ORDER BY id", (now - MAX_AGE_S,)):
+        fups = load_result((db.task(e["task"]) or {}).get("result")).get("followups")
+        title = next((str(f["title"]).strip() for f in fups if isinstance(f, dict) and f.get("title")
+                      and str(f["title"])[:200] in e["text"]), None) if isinstance(fups, list) else None
+        if not title or re.match(r"(?i)\s*(continue|upstream)\s*:", title):
+            continue
+        if not _taken_by(db.q("SELECT id, title, spec FROM tasks WHERE id>?", (e["task"],)), title):
+            out.append({"id": e["id"], "task": e["task"], "title": title})
+    return out
+
+
+def followup_lines(p, now: float) -> list[str]:
+    """The digest's open follow-ups (open_followups), at most FOLLOWUPS_SHOWN, under a header saying how to settle each."""
+    fups = open_followups(p.db, now)
+    if not fups:
+        return []
+    more = f" ({len(fups) - FOLLOWUPS_SHOWN} older not shown)" if len(fups) > FOLLOWUPS_SHOWN else ""
+    return ([f"## Open follow-ups{more}: handed off, no task took them up; add each (task_add with its title) or drop "
+             f"it: `ttp task {p.name} drop-followup <id> \"<why>\"`"]
+            + [f"- {f['id']}: {f['title'][:200]} (from #{f['task']})" for f in fups[-FOLLOWUPS_SHOWN:]])
+
+
+def drop_followup(db, event_id: int, why: str) -> str:
+    """Record the coordinator's drop of open follow-up `event_id` on its own event (no second store)."""
+    import json
+    if not why.strip():
+        raise ValueError("say why the follow-up is dropped")
+    e = db.one("SELECT id, task, data FROM events WHERE id=? AND kind='followup_proposed'", (event_id,))
+    if not e:
+        raise ValueError(f"no proposed follow-up {event_id}")
+    data = load_result(e["data"])
+    db.x("UPDATE events SET status='handled', data=? WHERE id=?",
+         (json.dumps({**data, "dropped": why.strip()[:300]}), event_id))
+    return f"follow-up {event_id} of #{e['task']} dropped"
+
+
+def announced(p, now: float | None = None, paused: dict | None = None) -> list[str]:
+    """Raise and retire the announced_not_started events (module doc). Returns the fingerprints raised."""
+    now = time.time() if now is None else now
+    db = p.db
+    paused = db.paused_resources() if paused is None else paused
+    from . import pushq
+    from .obligations import _retire
+    raised, live = [], set()
+    for s in _subjects(db, now):
+        fp = f"{ANNOUNCED_KIND}:{s['key']}"
+        live.add(fp)
+        tasks = {t["id"]: t for t in db.q(f"SELECT * FROM tasks WHERE id IN ({','.join('?' * len(s['owners']))})",
+                                          s["owners"])} if s["owners"] else {}
+        held = [h for t in tasks.values() if (h := external_hold(db, t, paused))]
+        # A pushing owner the push queue holds is the daemon's to deliver: started while the queue is
+        # alive on it, else held by it (a dead batch or stalled queue pages through its own events).
+        queue = {i: q for i, t in tasks.items() if t["status"] == "pushing" and (q := pushq.holding(db, i))}
+        held += [f"#{i} in a {w}, paged by the push queue's own events" for i, (live, w) in queue.items() if not live]
+        pushing = any(live for live, _ in queue.values())
+        done = any(t["status"] == "done" for t in tasks.values())   # its work ended: promise_overdue covers delivery
+        if done or pushing or _runs_since(db, s["owners"], s["created"]) or held:
+            _retire(db, now, "owner started" if not held else f"owner held: {held[0]}", fp)
+            continue
+        prio = min((t["priority"] for t in tasks.values()), default=None)
+        age = now - s["created"]
+        if age < threshold(prio, ANNOUNCED_P1_S, ANNOUNCED_S) or db.one("SELECT 1 FROM events WHERE fingerprint=?", (fp,)):
+            continue
+        owner = ", ".join(f"#{i}" for i in s["owners"]) or "none"
+        holds = "; ".join(f"#{i}: {parked(db, tasks.get(i), now)}" for i in s["owners"]) or parked(db, None, now)
+        text = (f"Announced, not started: {s['what']}, announced {age / 60:.0f} min ago. Owner: {owner}. No owner run "
+                f"has started and no external condition holds it; what parks it: {holds}. Known, ready work starts "
+                f"now: start it in its own task (task_add, no start_after; or task_update the owner's start_after "
+                f"to now), or close the promise if it is no longer owed.")
+        db.x("INSERT INTO events(ts,source,kind,fingerprint,severity,text,status,task) VALUES(?,?,?,?,?,?,?,?)",
+             (now, "daemon", ANNOUNCED_KIND, fp, "normal", text[:4000], "queued", s["owners"][0] if s["owners"] else None))
+        raised.append(fp)
+    for r in db.q("SELECT fingerprint FROM events WHERE kind=? AND status='queued'", (ANNOUNCED_KIND,)):
+        if r["fingerprint"] not in live:   # its promise closed or its task ended
+            _retire(db, now, "closed", r["fingerprint"])
+    return raised
+
+
+def backlog_words(prov: str, depth: int, free: int, live: str, rec: dict, limit: str, when) -> str:
+    """A ready backlog in words: queue depth, the spend gate (still stopping new work, or when it cleared
+    and why it held; `limit` its cut of the slots now, budget.gate_slots), the live runs and the free
+    slots. `when` formats a timestamp in the project's zone."""
+    why = f" ({rec['why'][:160]})" if rec.get("why") else ""
+    gate = (f"the spend gate still stops new work{why}" if rec.get("stopped") else
+            f"the spend gate cleared at {when(rec['cleared'])}, after it stopped new work{why}"
+            if rec.get("cleared") else "")
+    return (f"{depth} ready on {prov} (queue depth), {live} live, {free} free slot{'s' if free != 1 else ''}"
+            + "".join(f"; {x}" for x in (gate, limit) if x))
+
+
+def ready_since(db, task: dict) -> float:
+    """When a queued task became ready by its records: made, its last run ended, its start_after came, its
+    last dependency was done, or the push queue last moved its approved head (a review sent back to
+    the queue: its time in 'pushing' was no wait for a worker), whichever is latest."""
+    ended = db.one("SELECT MAX(ended) e FROM runs WHERE task=?", (task["id"],))
+    pushed = db.one("SELECT MAX(updated) u FROM push_queue WHERE task=?", (task["id"],))
+    at = max(float(task["created"] or 0), float((ended or {}).get("e") or 0), float(task["not_before"] or 0),
+             float((pushed or {}).get("u") or 0))
+    deps = dependency_ids(task)
+    if deps:
+        row = db.one(f"SELECT MAX(updated) u FROM tasks WHERE id IN ({','.join('?' * len(deps))})", deps)
+        at = max(at, float((row or {}).get("u") or 0))
+    return at
+
+
+RULE = ("work whose inputs are ready starts now in its own task without start_after; defer only for a named "
+        "external fact (a time another party sets, data that must accumulate, a person, a shared resource)")
+
+
+def parked_nudge(where: str, why: str | None, after: float | None, when: str | None) -> str | None:
+    """The advice for a time-only deferral (start_after) whose `why` names no external fact; None when
+    there is none, one is named (EXTERNAL), or a start_when probe is set: the daemon checks that
+    condition live, so it is the named fact."""
+    if not after or when or EXTERNAL.search(why or ""):
+        return None
+    return (f"{where} is deferred with no external fact named"
+            + (f" (why: {' '.join(str(why).split())[:80]!r})" if why else "") + f": {RULE}")
+
+
+def update_nudge(where: str, task: dict, now: float) -> str | None:
+    """The advice for spec added to a task whose start is still more than DEFER_S away (its start_after,
+    or the timer of its wait); None otherwise."""
+    at = float(task.get("not_before") or 0)
+    if task.get("status") not in ("queued", "waiting") or at - now <= DEFER_S:
+        return None
+    return f"{where} added work to a task that starts in {(at - now) / 60:.0f} min: {RULE}"
+
+
+def add_nudge(notes: list[str], where: str, nudge: str) -> None:
+    """Fold the nudge into this action's note for the same task, if one was written: one note per
+    action, so a flag already shown (a marker probe, a missing file) keeps its place."""
+    for i in range(len(notes) - 1, -1, -1):
+        if notes[i].startswith(where + " ") or notes[i].startswith(where + ";"):
+            notes[i] += "; " + nudge[len(where):].lstrip()
+            return
+    notes.append(nudge)
+
+
+def count_nudge(db, now: float | None = None) -> None:
+    now = time.time() if now is None else now
+    day = time.strftime("%Y-%m-%d", time.localtime(now))
+    cur = db.kv(NUDGE_KV) or {}
+    db.set_kv(NUDGE_KV, {"n": int(cur.get("n") or 0) + 1, "day": day,
+                         "today": (int(cur.get("today") or 0) if cur.get("day") == day else 0) + 1, "at": now})

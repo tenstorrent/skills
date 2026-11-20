@@ -17,7 +17,8 @@ concurrency:
 jobs:
   validate:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    # Over twice the measured wall time of `pytest tests/`: 8 min on 4 CPUs with CI=true.
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
@@ -27,6 +28,8 @@ jobs:
           python-version: "3.11"
       - name: Install test dependencies
         run: python -m pip install pytest==9.1.1 pyyaml==6.0.3
+      - name: Check each plugin's version files agree
+        run: python scripts/check_plugin_versions.py
       - name: Enforce plugin version bumps
         if: github.event_name == 'pull_request'
         run: python scripts/check_plugin_versions.py "${{ github.event.pull_request.base.sha }}"
@@ -36,6 +39,25 @@ jobs:
         run: python scripts/copilot_smoke.py --validate-only
       - name: Test catalogues and skills
         run: pytest tests/
+
+  # The tt-project runtime supports Python 3.9: run its required suite on that minimum too.
+  tt-project-python39:
+    runs-on: ubuntu-latest
+    # Twice the measured wall time: 23 min on 4 CPUs with CI=true (a loaded workstation).
+    timeout-minutes: 50
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: "3.9"
+      - name: Install test dependencies
+        run: python -m pip install pytest==8.4.2 pyyaml==6.0.3
+      - name: Test tt-project on Python 3.9
+        run: >-
+          python -m pytest -q tests/test_tt_project_plugin.py tests/test_tt_project_runtime.py
+          tests/test_plugin_catalogue.py
 
   macos-launcher:
     runs-on: macos-latest
@@ -47,3 +69,26 @@ jobs:
           python-version: "3.11"
       - name: Test launcher with macOS Bash (no model calls)
         run: python -m unittest discover -s tests -p test_autodebug_sandbox.py
+      - name: Install test dependencies
+        run: python -m pip install pytest==9.1.1 pyyaml==6.0.3
+      # tt-project's launchd agent, watchdog, service restart/rollback, kept tunnels, idle-sleep
+      # hold and macOS boot id: run on real macOS so launchd support is exercised there.
+      - name: Test tt-project launchd and service handling on macOS
+        run: >-
+          python -m pytest -q
+          tests/test_tt_project_runtime.py::test_a_macos_restart_uses_the_launchd_agent_and_falls_back_when_it_is_not_loaded
+          tests/test_tt_project_runtime.py::test_launchd_and_cron_run_the_watchdog_and_old_installs_get_it
+          tests/test_tt_project_runtime.py::test_a_cron_restart_waits_for_the_old_daemon_and_never_rolls_it_back
+          tests/test_tt_project_runtime.py::test_a_cron_fallback_is_named_by_new_doctor_and_setup
+          tests/test_tt_project_runtime.py::test_restart_rolls_back_when_the_new_daemon_dies_or_its_first_tick_fails
+          tests/test_tt_project_runtime.py::test_a_new_daemon_that_fails_under_the_manager_is_rolled_back_with_its_output
+          tests/test_tt_project_runtime.py::test_a_refused_restart_keeps_the_managers_output_and_a_live_old_daemon
+          tests/test_tt_project_runtime.py::test_an_unreachable_service_manager_with_no_live_daemon_is_not_taken_for_a_bad_runtime
+          tests/test_tt_project_runtime.py::test_kept_tunnel_service_files_and_adopt_replace_remove
+          tests/test_tt_project_runtime.py::test_web_keep_installs_a_kept_local_forward_and_adopts_an_existing_one
+          tests/test_tt_project_runtime.py::test_idle_sleep_held_on_ac_with_work_by_caffeinate_i_s_tied_to_the_daemon
+          tests/test_tt_project_runtime.py::test_idle_sleep_released_on_daemon_shutdown_and_shown_in_status
+          tests/test_tt_project_runtime.py::test_macos_boot_id_prefers_bootsessionuuid_and_still_knows_the_boottime_seconds
+          tests/test_tt_project_runtime.py::test_launchd_cron_and_no_service_are_not_checked_for_linger
+          tests/test_tt_project_runtime.py::test_macos_is_not_checked_for_linger
+          tests/test_tt_project_plugin.py::test_setup_box_migrate_check_lists_launchd_agents_running_a_workflow_clone

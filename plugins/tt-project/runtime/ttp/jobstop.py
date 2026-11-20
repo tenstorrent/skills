@@ -1,0 +1,1839 @@
+# SPDX-FileCopyrightText: © 2026 Tenstorrent USA, Inc.
+# SPDX-License-Identifier: Apache-2.0
+"""End the `ttp detach` jobs of a task that ended or handed off, and `ttp detach --stop <rc>`.
+
+A detached job outlives the run that started it, so a task cancelled, failed or out of attempts would
+leave its jobs running: their process group, the device-broker jobs they queued and their `ttp lock`
+slots. Each daemon tick (sweep) ends every still running job of such a task, unless an open task still
+waits on it (its retry_when, on_pass_cmd, on_pass or next_step names the job's .rc or `<run>/<name>`).
+It does the same, across all of the task's runs, for a task that handed off `done` (keeping a job its
+own hand-off names; HANDED_OFF). A task still alive (waiting, blocked, queued, running) keeps its jobs
+whatever its hand-off says: a blocked hand-off with live jobs is recorded as waiting on them
+(task_live_jobs).
+end() does it in this order:
+
+1. SIGSTOP the job's whole process group, so a loop in it cannot resubmit what is ended next.
+2. With the broker CLI (BROKER) on PATH: each `tt-device-mcp run` client process in the group names a
+   broker job by its owner (the client's `--owner`, else its Unix user) and its full command; a live
+   broker job (`status -j`) with that exact owner and command is ended once (`kill <id>`). Nothing
+   else is: another owner's or another command's job stays. No CLI, or a status call that fails or
+   does not parse, skips this step with a note.
+3. detach.stop: <name>.lost records why (task and state), then SIGKILL to the group; then <name>.rc
+   holding 137 (detach.record_stop) unless the job wrote its own, so a reader of the .rc alone sees it ended.
+4. The job's own lock and every lock slot whose label names the job's .rc (locks.job_fields) are
+   checked; a slot still held by a process of the stopped group is freed by ending that process.
+   The job's own lock file, once free, is removed (drop_lock), so no reader finds it naming a dead pid.
+5. One event names the task, job, group, broker jobs ended and locks freed.
+
+The same pass stops such a task's detached `ttp checks` (checks.pid in any of its runs, end_checks):
+SIGTERM to their group, so they end their check command and write checks.rc, then SIGKILL. And its
+detached `ttp push` (a marker under the project's pushes/ naming the task, end_push), which leads a
+session of its own outside every run: a queued one is recorded as failed before the daemon starts it,
+a running one gets SIGTERM to its group (it ends its check and writes a failed outcome), then SIGKILL.
+A push queue batch serves many tasks and is never stopped here. A task that handed off done has its
+detached checks stopped too (sweep_done_checks), so they stop holding a check slot of the host, unless
+its own hand-off names them or something still waits on their result (checks_consumer: an open task's
+wait, another checks run that joined them). The daemon's review prechecks (state/prechecks, no runs row)
+are stopped once no review still reads them (sweep_prechecks).
+
+`ttp detach --stop-pids <file>` stops the processes a task's own driver listed in a pid file (stop_pids),
+for a driver started some other way than `ttp detach` (setsid and a pid file, its own launcher), so the
+task need not rely on the driver's own stop path (a STOP file its loop may skip). See plan_pids.
+
+A job counts as running while its job lock is held, whatever its .rc or .lost say: a daemon that dies
+mid-stop finds it still running on its next tick and finishes the stop; a stopped one is skipped and
+logs nothing new.
+
+`ttp detach --stop <rc>` is the manual form: allowed for a job whose task has ended (cancelled, failed,
+exhausted or done), for the job's own task (TTP_TASK, with a TTP_RUN_ID the project records as a run of
+that task: one of its runs, this or an earlier one, started the job), or for an open priority-1 caller
+task whose resources include one the job's held slots hold. Anyone else is refused while the job's task
+is open. A stop by the owner records who stopped it, the run that started the job, the caller's run and
+why (`--why`, else a default) in <name>.lost and the stop event. A sandboxed caller, which cannot signal
+the job, queues the request (QUEUE) and the daemon carries it out on its next tick, checking it again.
+A stopped job is never relaunched at boot: its resume record is marked stopped (detach.mark_stopped).
+
+A detached job registers each process it re-spawns outside its own group as `<pid> <start ticks>` lines in
+`<rc>.requeue-pid` (requeued, end_requeued): `ttp detach --stop` (end) and `ttp detach --stop-pids`
+(stop_pids, through the TTP_DETACH_RC of each listed process) also stop those groups, each only while its
+start ticks still match.
+
+`ttp detach --stop <run>/checks.rc` (or `checks` from the run) stops a run's detached `ttp checks`,
+which have no detach record, by the same rule (stop_checks: may_stop, then end_checks); a group holding
+the caller, a running worker, another task's or another project's process is refused (checks_refused).
+"""
+from __future__ import annotations
+
+import fcntl
+import hashlib
+import json
+import os
+import pwd
+import re
+import shutil
+import signal
+import subprocess
+import time
+from pathlib import Path
+
+from . import detach, locks, procinfo, procowner
+from .db import load_result
+from .project import Project, durable_write, write_json
+from .util import read_dict
+
+ENDED = ("cancelled", "failed", "exhausted")   # task states whose jobs the daemon stops
+HANDED_OFF = ("done",)                          # hand-offs whose jobs the daemon stops unless the hand-off names them
+STOPPABLE = ENDED + ("done",)                   # task states whose jobs `ttp detach --stop` may stop
+OPEN_WAITER_SKIP = ("done", "failed", "cancelled", "exhausted")
+BROKER = "tt-device-mcp"
+BROKER_TIMEOUT_S = 30
+BROKER_LIVE = ("queued", "pending", "waiting", "running", "started")
+SWEEP_EVERY_S = 30
+SWEEP_DAYS = 14
+FREE_WAIT_S = 2.0
+CHECKS_TERM_S = 15.0   # detached checks end their check command on SIGTERM, which may take a few seconds
+PUSH_TERM_S = 15.0     # likewise a detached push: it ends its check and writes its outcome
+CANCEL_TERM_S = 5.0    # a cancelled task's checks: SIGKILL this long after SIGTERM (nobody reads their result)
+QUEUE = "jobstop-queue"
+EVENT = "detached_job_stopped"
+BY = "jobstop"   # the sender component detach.signalled names
+_PROC = Path("/proc/self/stat").exists()   # Linux; without it (macOS) procinfo reads sysctl and ps
+
+
+# Process groups ---------------------------------------------------------------------------------
+
+def _stat(pid: int) -> tuple[int, int] | None:
+    """(pgid, uid) of a live process (not a zombie), else None: /proc, else (macOS) ps."""
+    if not _PROC:
+        return procinfo.stat(pid)
+    try:
+        st = Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()
+        if st[0] == "Z":
+            return None
+        uid = Path(f"/proc/{pid}").stat().st_uid
+        return int(st[2]), uid
+    except (OSError, IndexError, ValueError):
+        return None
+
+
+def members(pgid: int) -> list[int]:
+    """The live processes of group pgid: /proc, else (macOS) one ps of every process; [] where neither tells."""
+    out = []
+    if not _PROC:
+        return sorted(pid for pid, (g, _) in procinfo.table().items() if g == pgid)
+    try:
+        names = os.listdir("/proc")
+    except OSError:
+        return out
+    for n in names:
+        if n.isdigit() and (s := _stat(int(n))) and s[0] == pgid:
+            out.append(int(n))
+    return out
+
+
+def _proc_table() -> dict[int, tuple[int, int, int | None]] | None:
+    """{pid: (ppid, pgid, sid)} of every live (not zombie) process from /proc; None without /proc."""
+    try:
+        names = os.listdir("/proc")
+    except OSError:
+        return None
+    procs = {}
+    for n in names:
+        try:
+            st = Path(f"/proc/{n}/stat").read_text().rsplit(")", 1)[1].split()
+            if n.isdigit() and st[0] != "Z":
+                procs[int(n)] = (int(st[1]), int(st[2]), int(st[3]))   # ppid, pgid, sid
+        except (OSError, IndexError, ValueError):
+            continue
+    return procs
+
+
+def _ps_table() -> dict[int, tuple[int, int, int | None]]:
+    """{pid: (ppid, pgid, None)} of every live (not zombie) process from one `ps` read, where /proc is
+    missing (macOS); {} when ps fails. ps gives no session id here, so only descendants are followed."""
+    try:
+        out = subprocess.run(["ps", "-axo", "pid=,ppid=,pgid=,stat="], capture_output=True, text=True,
+                             timeout=10, stdin=subprocess.DEVNULL).stdout
+    except (OSError, subprocess.SubprocessError):
+        return {}
+    procs = {}
+    for line in out.splitlines():
+        f = line.split()
+        if len(f) >= 4 and f[0].isdigit() and f[1].isdigit() and f[2].isdigit() and not f[3].startswith("Z"):
+            procs[int(f[0])] = (int(f[1]), int(f[2]), None)
+    return procs
+
+
+def strays(pgid: int, table=None) -> list[int]:
+    """The live processes of the job led by pgid outside its group: its session's other groups (a test
+    runner's helpers, such as pytest-xdist workers, that took a group of their own) and the descendants of
+    its members that left the group or session (setsid). From /proc, else one `ps` read (macOS), where the
+    descendants of the group's members are followed by ppid. `table`: a process table to read instead."""
+    procs = table() if table else _proc_table()
+    if procs is None:
+        procs = _ps_table()
+    ours = {pid for pid, (_, g, sid) in procs.items() if g == pgid or (sid is not None and sid == pgid)}
+    grew = True
+    while grew:
+        more = {pid for pid, (pp, _, _) in procs.items() if pp in ours and pid not in ours}
+        ours |= more
+        grew = bool(more)
+    return sorted(pid for pid in ours if procs[pid][1] != pgid and pid != os.getpid())
+
+
+def _argv(pid: int) -> list[str]:
+    if not _PROC:
+        return procinfo.argv(pid)   # macOS: sysctl KERN_PROCARGS2
+    try:
+        return [a.decode(errors="replace") for a in Path(f"/proc/{pid}/cmdline").read_bytes().split(b"\0")[:-1]]
+    except OSError:
+        return []
+
+
+def group_of(rc: Path) -> int:
+    """The process group of the job at this .rc: its wrapper's pid (it leads a session of its own), from
+    the run's registry, else its <name>.started; 0 when no such group lives. A live wrapper must carry
+    the .rc in its arguments, so a reused pid is never taken for it."""
+    rc = Path(rc)
+    pid = detach._entry(rc).get("pid")
+    if not (isinstance(pid, int) and pid > 1):
+        try:
+            pid = int(detach.started(rc).read_text().split()[0])
+        except (OSError, ValueError, IndexError):
+            return 0
+    if _stat(pid) is not None:
+        if str(rc) not in _argv(pid):
+            return 0
+        return pid
+    try:
+        os.killpg(pid, 0)   # the wrapper is gone; its group lives while any member does
+    except ProcessLookupError:
+        return 0
+    except PermissionError:
+        pass
+    return pid
+
+
+def running(rc: Path) -> bool:
+    """Whether any process of the job still lives: its job lock is held."""
+    return not locks.any_free([locks.job_lock(Path(rc))])
+
+
+def drop_lock(rc: Path) -> bool:
+    """Remove the job lock file of a job that is over (locks.job_ended: its .rc or .lost written), taken
+    first so a holder that still lives keeps it: no reader finds a stale label naming a dead pid. True
+    when removed."""
+    path = locks.job_lock(Path(rc))
+    try:
+        fd = os.open(path, os.O_WRONLY | os.O_APPEND)
+    except OSError:
+        return False
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        if not locks.job_ended(Path(rc)):
+            return False
+        path.unlink()
+        return True
+    except OSError:   # still held, or already gone
+        return False
+    finally:
+        os.close(fd)
+
+
+# Broker jobs ------------------------------------------------------------------------------------
+
+def _client(argv: list[str]) -> tuple[str, str, str] | None:
+    """(owner, full command, command after `--`) of a `tt-device-mcp run` client's argv, else None."""
+    for i, a in enumerate(argv[:-1]):
+        if os.path.basename(a) == BROKER and argv[i + 1] == "run":
+            rest, owner = argv[i + 2:], ""
+            j = 0
+            while j < len(rest) and rest[j] != "--" and rest[j].startswith("-"):
+                if rest[j] == "--owner" and j + 1 < len(rest):
+                    owner = rest[j + 1]
+                    j += 2
+                    continue
+                if rest[j].startswith("--owner="):
+                    owner = rest[j].split("=", 1)[1]
+                j += 1
+            cmd = rest[j + 1:] if j < len(rest) and rest[j] == "--" else rest[j:]
+            return owner, " ".join(rest), " ".join(cmd)
+    return None
+
+
+def _jobs_listed(out: str) -> list[dict] | None:
+    try:
+        data = json.loads(out)
+    except ValueError:
+        return None
+    jobs = data.get("jobs") if isinstance(data, dict) else data
+    return [j for j in jobs if isinstance(j, dict)] if isinstance(jobs, list) else None
+
+
+def end_broker_jobs(pids: list[int]) -> tuple[list[str], str]:
+    """End the live broker jobs whose owner and exact full command match a `tt-device-mcp run` client
+    among pids, once each. Returns (job ids ended, note: why the step was skipped or a kill failed)."""
+    clients = []
+    for pid in pids:
+        c = _client(_argv(pid))
+        if c is None:
+            continue
+        owner = c[0]
+        if not owner:
+            try:
+                owner = pwd.getpwuid(Path(f"/proc/{pid}").stat().st_uid).pw_name
+            except (OSError, KeyError):
+                continue
+        clients.append((owner, {c[1], c[2]} - {""}))
+    if not clients:
+        return [], ""
+    cli = shutil.which(BROKER)
+    if not cli:
+        return [], f"{BROKER} is not on PATH: its broker jobs were not ended"
+    try:
+        r = subprocess.run([cli, "status", "-j"], capture_output=True, text=True, timeout=BROKER_TIMEOUT_S,
+                           stdin=subprocess.DEVNULL)
+    except (OSError, subprocess.TimeoutExpired) as e:
+        return [], f"`{BROKER} status -j` failed ({e}): its broker jobs were not ended"
+    jobs = _jobs_listed(r.stdout) if r.returncode == 0 else None
+    if jobs is None:
+        return [], (f"`{BROKER} status -j` failed (exit {r.returncode}) or did not list jobs: its broker jobs "
+                    "were not ended")
+    ended, notes = [], []
+    for j in jobs:
+        jid = str(j.get("job_id") if j.get("job_id") is not None else j.get("id") or "")
+        if not jid or jid in ended or j.get("finished_at") or str(j.get("status") or "running") not in BROKER_LIVE:
+            continue
+        owner, cmd = str(j.get("owner") or ""), str(j.get("command") or "")
+        if not any(owner == o and cmd in cmds for o, cmds in clients):
+            continue
+        try:
+            k = subprocess.run([cli, "kill", jid], capture_output=True, text=True, timeout=BROKER_TIMEOUT_S,
+                               stdin=subprocess.DEVNULL)
+            if k.returncode == 0:
+                ended.append(jid)
+            else:
+                notes.append(f"`{BROKER} kill {jid}` exited {k.returncode}")
+        except (OSError, subprocess.TimeoutExpired) as e:
+            notes.append(f"`{BROKER} kill {jid}` failed ({e})")
+    return ended, "; ".join(notes)
+
+
+# Lock slots -------------------------------------------------------------------------------------
+
+def lock_dirs(p: Project) -> list[Path]:
+    """The project's lock folder and those of the shared resources it names."""
+    from . import shared
+    out = [p.state / "locks"]
+    try:
+        out += [shared.root() / r for r in sorted(shared.names(p.config()))]
+    except Exception:
+        pass
+    return out
+
+
+def job_slots(p: Project, rc: Path) -> list[Path]:
+    """The lock slots held right now whose label names this job's .rc (job_rc)."""
+    out = []
+    for d in lock_dirs(p):
+        try:
+            slots = sorted(d.glob("*.lock"))
+        except OSError:
+            continue
+        for s in slots:
+            try:
+                h = json.loads(s.read_text() or "{}")
+            except (OSError, ValueError):
+                continue
+            if isinstance(h, dict) and h.get("job_rc") == str(rc) and not locks.any_free([s]):
+                out.append(s)
+    return out
+
+
+def _resource(slot: Path) -> str:
+    return slot.name.rsplit(".", 2)[0]
+
+
+def _free(slots: list[Path], pgid: int, pids: set[int], note=None) -> tuple[list[str], list[str]]:
+    """Wait a moment for each slot to go free; one still held by a process of the stopped group is freed
+    by ending that process, and note(pid, slot) logs that kill. Returns (freed, still held) as slot names."""
+    deadline = time.monotonic() + FREE_WAIT_S
+    left = list(slots)
+    while left and time.monotonic() < deadline:
+        left = [s for s in left if not locks.any_free([s])]
+        if left:
+            time.sleep(0.05)
+    for s in left:
+        try:
+            pid = int(json.loads(s.read_text() or "{}").get("pid") or 0)
+        except (OSError, ValueError, TypeError):
+            pid = 0
+        st = _stat(pid) if pid > 1 else None
+        if st is not None and (pid in pids or st[0] == pgid):
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except OSError:
+                continue
+            if note:
+                note(pid, s)
+    deadline = time.monotonic() + FREE_WAIT_S
+    while left and time.monotonic() < deadline:
+        left = [s for s in left if not locks.any_free([s])]
+        if left:
+            time.sleep(0.05)
+    return [s.name for s in slots if s not in left], [s.name for s in left]
+
+
+# The stop ---------------------------------------------------------------------------------------
+
+REQUEUE = ".requeue-pid"   # <rc>.requeue-pid: extra process groups a detached job re-spawned (requeued)
+JOB_ENV = "TTP_DETACH_RC"  # progress.JOB_ENV: the .rc path `ttp detach` sets in its job's environment
+
+
+def requeued(p: Project, rc: Path) -> list[tuple[int, int]]:
+    """(pid, its process group) of each live process `<rc>.requeue-pid` lists: one `<pid> <start ticks>`
+    line per process a detached job re-spawned outside its own group, the ticks being field 22 of
+    /proc/<pid>/stat when it started. A line counts only while that pid's start ticks still match (a
+    reused pid never does); a missing file, a malformed line, an exited process, and a group holding
+    this process, one of its parents or a running worker (_guarded), or a process of another project, are
+    skipped without a word."""
+    from .runner import proc_start
+    try:
+        lines = Path(str(rc) + REQUEUE).read_text(errors="replace").splitlines()[:PIDS_MAX]
+    except OSError:
+        return []
+    out, guarded = [], None
+    for line in lines:
+        words = line.split()
+        if len(words) != 2 or not all(w.isdigit() for w in words) or int(words[0]) <= 1:
+            continue
+        pid = int(words[0])
+        if proc_start(pid) != str(int(words[1])) or (st := _stat(pid)) is None or st[0] <= 1:
+            continue
+        guarded = _guarded(p) if guarded is None else guarded
+        if (st[0] == os.getpgrp() or guarded & ({pid} | set(members(st[0])))
+                or procowner.foreign_env(p.base, procowner.environ(pid))):
+            continue
+        if (pid, st[0]) not in out:
+            out.append((pid, st[0]))
+    return out
+
+
+def end_requeued(p: Project, rc: Path, why: str, task: int | None = None, reason: str = "jobstop.end") -> list[int]:
+    """Stop the process groups `<rc>.requeue-pid` names (requeued): SIGSTOP to each, then SIGKILL, each
+    logged (detach.signalled). The groups signalled."""
+    targets = requeued(p, rc)
+    for sig in (signal.SIGSTOP, signal.SIGKILL):
+        for pid, pgid in targets:
+            try:
+                os.killpg(pgid, sig)
+            except OSError:
+                continue
+            detach.signalled(rc, sig, pgid, reason, f"{why}; its requeued process {pid}", by=BY,
+                             state=p.state, task=task)
+    return sorted({g for _, g in targets})
+
+
+def end(p: Project, rc: Path, why: str, task: int | None = None, reason: str = "jobstop.end",
+        fields: dict | None = None) -> dict | None:
+    """Stop the running job at this .rc (steps 1-5 above). Its summary, also logged as an event, or None
+    when it no longer runs (nothing done, nothing logged). Each signal sent is logged (detach.signalled)
+    in the job's log and the project's job-signal stream, naming `reason`, the calling code path. `fields`
+    (who stopped it and why) go into the summary and event as they are."""
+    rc = Path(rc)
+    if not running(rc):
+        return None
+    pgid = group_of(rc)
+    fp = f"job_stopped:{rc}:{pgid}"
+    if not pgid and p.db.one("SELECT id FROM events WHERE fingerprint=?", (fp,)):
+        return None   # its holder left the group: said once, nothing more to do
+    slots = [locks.job_lock(rc), *job_slots(p, rc)]
+    detach.mark_stopped(rc, why)   # first: a reboot right after the kill never relaunches it
+    pids: list[int] = []
+    if pgid:
+        try:
+            os.killpg(pgid, signal.SIGSTOP)
+            detach.signalled(rc, signal.SIGSTOP, pgid, reason, why, by=BY, state=p.state, task=task)
+        except OSError:
+            pass
+        pids = members(pgid)
+        for pid in strays(pgid):   # stopped too, before any can start another
+            try:
+                os.kill(pid, signal.SIGSTOP)
+            except OSError:
+                pass
+        stray = strays(pgid)
+        pids += stray
+    ids, note = end_broker_jobs(pids)
+    if pgid:
+        detach.stop(rc, pgid, why, reason=reason, by=BY, task=task, state=p.state)
+        for pid in stray:   # its helpers in other groups of its session, or that left it
+            try:
+                os.kill(pid, signal.SIGKILL)
+                detach.signalled(rc, signal.SIGKILL, pid, reason, f"{why}; a helper of the job outside its group",
+                                 by=BY, group=False, state=p.state, task=task)
+            except OSError:
+                pass
+    extra = end_requeued(p, rc, why, task, reason)
+    freed, held = _free(slots, pgid, set(pids), lambda pid, s: detach.signalled(
+        rc, signal.SIGKILL, pid, reason, f"{why}; it still held {s.name}", by=BY, group=False, state=p.state,
+        task=task))
+    if pgid or not held:   # its wrapper is gone, so no exit code comes: the stop's own (detach.record_stop)
+        detach.record_stop(rc, why)
+    if locks.job_lock(rc).name not in held:
+        drop_lock(rc)
+    mark_dead(rc, why, "SIGKILL" if pgid else None)
+    out = {"task": task, "job": rc.stem, "rc": str(rc), "pgid": pgid, "broker_jobs": ids, "freed": freed,
+           "held": held, "requeued": extra, "note": note if pgid else "no live process group found for it",
+           **(fields or {})}
+    text = (f"stopped detached job {rc.stem}" + (f" (task #{task})" if task else "") + f": {why}; "
+            + (f"SIGSTOP then SIGKILL to group {pgid} from {BY} pid {os.getpid()} ({reason})" if pgid else "group ?")
+            + f"; broker jobs ended: {', '.join(ids) or 'none'}; locks freed: {', '.join(freed) or 'none'}"
+            + (f"; still held: {', '.join(held)}" if held else "")
+            + (f"; requeued groups stopped: {', '.join(map(str, extra))}" if extra else "")
+            + (f"; {out['note']}" if out["note"] else ""))
+    out["text"] = text
+    if not p.db.one("SELECT id FROM events WHERE fingerprint=?", (fp,)):
+        p.db.x("INSERT INTO events(ts,source,kind,fingerprint,severity,text,data,status,task) VALUES(?,?,?,?,?,?,?,?,?)",
+               (time.time(), "daemon", EVENT, fp, "low", text, json.dumps(out), "handled", task))
+    return out
+
+
+def end_checks(p: Project, run_dir: Path, why: str, task: int | None = None, fields: dict | None = None) -> dict | None:
+    """Stop the run's detached `ttp checks` (checks.pid) while they still run: SIGTERM to their group,
+    which makes them end their check command and write checks.rc (143); SIGKILL after CHECKS_TERM_S,
+    as a newer `ttp checks --detach` does. One event per checks process. None when none ran. `fields`
+    (who stopped them and why) go into the summary and event as they are."""
+    from .cli import CHECKS_RC, _checks_alive, _read_checks_pid
+    info = _read_checks_pid(run_dir)
+    if not _checks_alive(info):
+        return None
+    pid = info["pid"]
+    sent = []
+    for sig, wait in ((signal.SIGTERM, CHECKS_TERM_S), (signal.SIGKILL, FREE_WAIT_S)):
+        try:
+            os.killpg(pid, sig)
+            sent.append(sig)
+        except OSError:
+            pass
+        deadline = time.monotonic() + wait
+        while _checks_alive(info) and time.monotonic() < deadline:
+            time.sleep(0.1)
+        if not _checks_alive(info):
+            break
+    rc = run_dir / CHECKS_RC
+    for sig in sent:   # logged once they ended: their own writes to checks.log come first
+        detach.signalled(rc, sig, pid, "jobstop.end_checks", why, by=BY, state=p.state, task=task)
+    text = (f"stopped the detached checks of run {run_dir.name} (task #{task}): {why}; "
+            f"{' then '.join(signal.Signals(x).name for x in sent) or 'no signal'} to group {pid} "
+            f"from {BY} pid {os.getpid()}; "
+            f"checks.rc {rc.read_text().strip() if rc.exists() else 'not written'}")
+    fp = f"checks_stopped:{run_dir}:{pid}:{info.get('started')}"
+    out = {"task": task, "job": "checks", "rc": str(rc), "pgid": pid, **(fields or {}), "text": text}
+    if not p.db.one("SELECT id FROM events WHERE fingerprint=?", (fp,)):
+        p.db.x("INSERT INTO events(ts,source,kind,fingerprint,severity,text,data,status,task) VALUES(?,?,?,?,?,?,?,?,?)",
+               (time.time(), "daemon", EVENT, fp, "low", text, json.dumps(out), "handled", task))
+    return out
+
+
+def checks_refused(p: Project, run_dir: Path, task: int | None) -> str | None:
+    """Why the run's live detached checks must not be signalled, or None: their group holds a process this
+    one guards (_guarded: itself, its ancestors, a running worker), or a member that carries another task's
+    TTP_TASK or another project's TTP_PROJECT."""
+    from .cli import _read_checks_pid
+    pid = _read_checks_pid(Path(run_dir)).get("pid")
+    if not isinstance(pid, int) or pid <= 1 or pid == os.getpgrp():
+        return f"checks.pid in {run_dir} names no process group that may be signalled"
+    group = members(pid) or [pid]
+    if _guarded(p) & set(group):
+        return f"their group {pid} holds this process, one of its parents or a running worker"
+    want = str(task) if task else None
+    for m in group:
+        env = _environ(m)
+        if procowner.foreign_env(p.base, env):
+            return f"process {m} in their group is another project's"
+        other = _env_task(m)
+        if want and other not in (None, "", want):
+            return f"process {m} in their group runs for task #{other}"
+    return None
+
+
+def _names_run(result: dict, run_dir: Path) -> bool:
+    """Whether this hand-off's waits (retry_when, on_pass_cmd, next_step, on_pass and each later wait in
+    `then`) name the run's folder itself, as `ttp checks --result <run dir>` does."""
+    parts = [result.get(k) for k in ("retry_when", "on_pass_cmd", "next_step")] + [json.dumps(result.get("on_pass") or "")]
+    later = result.get("then")
+    for w in later if isinstance(later, list) else []:
+        if isinstance(w, dict):
+            parts += [w.get("retry_when"), w.get("on_pass_cmd")]
+    text = " ".join(str(x or "") for x in parts)
+    name = re.escape(f"{Path(run_dir).parent.name}/{Path(run_dir).name}")
+    return re.search(rf"(?<![\w.-]){name}/?(?![\w./-])", text) is not None
+
+
+def checks_consumer(p: Project, run_dir: Path) -> str | None:
+    """What still waits on the result of the run's detached checks, or None: an open task whose hand-off
+    names them (`<run>/checks.rc`, `<run>/checks` or the run's folder, as `ttp checks --result` does), or
+    another `ttp checks` run that joined them (checkjoin: a review precheck, a reviewer's or a push's
+    checks of the same tree) and still follows them."""
+    return checks_waiter(p, run_dir) or checks_joiner(p.state, run_dir)
+
+
+def waiting_checks(run_dir: Path) -> dict | None:
+    """The checks.pid record of the run's detached checks while they still wait in the checks queue (their
+    own live checks-slot.wait: for a lane, a host slot or test slots), else None: none run, or they hold
+    a slot and run their commands."""
+    from .cli import CHECKS_SLOT_WAIT, _checks_alive, _read_checks_pid
+    try:
+        wait = json.loads((Path(run_dir) / CHECKS_SLOT_WAIT).read_text())
+    except (OSError, ValueError):
+        return None
+    info = _read_checks_pid(Path(run_dir))
+    if not isinstance(wait, dict) or wait.get("pid") != info.get("pid") or not _checks_alive(info):
+        return None
+    return info
+
+
+def ask_drop(run_dir: Path, info: dict, why: str) -> bool:
+    """Ask the run's waiting checks (`info`, waiting_checks) to leave the queue with `why`: a cancel request
+    (cli.CHECKS_SLOT_CANCEL) only that process honours, only while it waits; it records checks.dropped and
+    exits, so `ttp checks --result` says it was dropped and why. False when the same request stands.
+    Raises OSError when it cannot be written."""
+    from .cli import CHECKS_SLOT_CANCEL
+    req = {"pid": info["pid"], "started": info["started"], "why": why}
+    try:
+        if json.loads((Path(run_dir) / CHECKS_SLOT_CANCEL).read_text()) == req:
+            return False
+    except (OSError, ValueError):
+        pass
+    durable_write(Path(run_dir) / CHECKS_SLOT_CANCEL, json.dumps(req))
+    return True
+
+
+ADOPT_HOPS = 20   # checks_adopter follows a chain of continues this long at most
+
+
+def checks_adopter(p: Project, task: int, info: dict) -> str | None:
+    """What adopts an ended task's detached checks (checks.pid `info`), or None: an open task that continues
+    it, or continues a continue of it, whose branch still holds their head (a queued one without a branch
+    yet starts from the nearest branch up its chain). It will read their result, so they are not dropped."""
+    from .db import continues_id
+    head, tree = str(info.get("head") or ""), info.get("worktree")
+    repo = Path(tree) if tree and Path(tree).is_dir() else Path(p.root)
+    holds: dict[str, bool] = {}
+
+    def has(branch: str) -> bool:
+        if branch not in holds:
+            try:
+                holds[branch] = subprocess.run(["git", "-C", str(repo), "merge-base", "--is-ancestor", head, branch],
+                                               capture_output=True, timeout=20).returncode == 0
+            except (OSError, subprocess.SubprocessError):
+                holds[branch] = False
+        return holds[branch]
+    root = p.db.task(task)
+    level, seen = [(task, (root or {}).get("branch") or "")], {task}
+    for _ in range(ADOPT_HOPS):
+        nxt = []
+        for tid, branch in level:
+            for t in p.db.q("SELECT id, status, branch, labels FROM tasks WHERE labels LIKE ?", (f'%"continues:{tid}"%',)):
+                if t["id"] in seen or continues_id(t) != tid:
+                    continue
+                seen.add(t["id"])
+                own = t["branch"] or branch
+                if t["status"] not in OPEN_WAITER_SKIP and (not head or (own and has(own))):
+                    return f"open task #{t['id']} continues #{tid} on a branch that holds their head"
+                nxt.append((t["id"], own))
+        if not (level := nxt):
+            break
+    return None
+
+
+def mark_dead(rc: Path, why: str, sig: str | None = None, now: float | None = None) -> dict | None:
+    """Close the registry record of a job jobstop stopped (`sig` sent) or found gone (None), so
+    detached.json never shows it running: a stop keeps detach.close's "ended" (the stop's own .rc, stopped
+    on purpose) and adds when, the signal and why; a job gone without an .rc stays "died", its why marked
+    "gone: ...". None while it still runs or is queued (detach.close: it closes once its .rc or loss is on record)."""
+    rc = Path(rc)
+    if detach.close(rc, now) is None:
+        return None
+    out = None
+    with detach.registry(rc.parent) as jobs:
+        for j in jobs:
+            if isinstance(j, dict) and isinstance(j.get("rc"), str) and os.path.abspath(j["rc"]) == os.path.abspath(rc):
+                if sig and not j.get("killed_at"):
+                    j.update(killed_at=time.time() if now is None else now, signal=sig, why=f"stopped: {why}")
+                elif not sig and not j.get("killed_at") and j.get("status") == "died" and not str(j.get("why") or "").startswith("gone:"):
+                    j["why"] = f"gone: {j.get('why') or why}"
+                out = j
+    return out
+
+
+def heir(p: Project, task: int) -> dict | None:
+    """The newest open task (any status but OPEN_WAITER_SKIP) down the chain of tasks that continue this
+    one, ADOPT_HOPS deep at most, or None: it takes over the ended task's detached jobs."""
+    from .db import continues_id
+    level, seen, best = [task], {task}, None
+    for _ in range(ADOPT_HOPS):
+        nxt = []
+        for tid in level:
+            for t in p.db.q("SELECT id, status, labels FROM tasks WHERE labels LIKE ?", (f'%"continues:{tid}"%',)):
+                if t["id"] in seen or continues_id(t) != tid:
+                    continue
+                seen.add(t["id"])
+                nxt.append(t["id"])
+                if t["status"] not in OPEN_WAITER_SKIP and (best is None or t["id"] > best["id"]):
+                    best = t
+        if not (level := nxt):
+            break
+    return p.db.task(best["id"]) if best else None
+
+
+def ancestors(p: Project, task: int) -> list[int]:
+    """The tasks this one continues, nearest first (the continues chain upward, ADOPT_HOPS deep at most)."""
+    from .db import continues_id
+    out, t = [], p.db.task(int(task))
+    while t is not None and len(out) < ADOPT_HOPS and (up := continues_id(t)) is not None and up not in out + [task]:
+        out.append(up)
+        t = p.db.task(up)
+    return out
+
+
+def adopter(p: Project, rc: Path, started_by: int) -> dict | None:
+    """The task that took over the job at this .rc from task `started_by` (its registry entry names it,
+    and the db's continues chain leads from it back to `started_by`), else None."""
+    tid = detach._entry(Path(rc)).get("task")
+    if not isinstance(tid, int) or tid == started_by or started_by not in ancestors(p, tid):
+        return None
+    return p.db.task(tid)
+
+
+def adopt(p: Project, rc: Path, frm: int, to: int, now: float | None = None) -> dict | None:
+    """Re-own the running job at this .rc to task `to`, which continues ended task `frm`: its registry
+    entry names `to`, with whom it came from and when. Its summary, or None when `to` owns it already."""
+    now = time.time() if now is None else now
+    rc, prev = Path(rc), None
+    with detach.registry(rc.parent) as jobs:
+        for j in jobs:
+            if isinstance(j, dict) and isinstance(j.get("rc"), str) and os.path.abspath(j["rc"]) == os.path.abspath(rc) \
+                    and j.get("task") != to:
+                prev = j.get("task") or frm
+                j.update(task=to, adopted_from=prev, adopted_at=now)
+    if prev is None:
+        return None
+    return {"task": to, "job": rc.stem, "rc": str(rc), "adopted_from": prev,
+            "text": f"detached job {rc.stem} of task #{prev} kept running: open task #{to} continues #{frm} and owns it now"}
+
+
+def checks_waiter(p: Project, run_dir: Path) -> str | None:
+    """checks_consumer's database half: an open task whose hand-off names the run's detached checks."""
+    from .cli import CHECKS_RC
+    run_dir = Path(run_dir)
+    rc = run_dir / CHECKS_RC
+    marks = ",".join("?" * len(OPEN_WAITER_SKIP))
+    for t in p.db.q(f"SELECT id, result FROM tasks WHERE status NOT IN ({marks}) AND result LIKE ?",
+                    (*OPEN_WAITER_SKIP, f"%{run_dir.name}%")):
+        r = load_result(t["result"])
+        if names_job(r, rc) or _names_run(r, run_dir):
+            return f"open task #{t['id']} waits on them"
+    return None
+
+
+def checks_joiner(state: Path, run_dir: Path) -> str | None:
+    """checks_consumer's file and /proc half (no database): another live `ttp checks` run that joined them."""
+    from . import checkjoin
+    from .cli import _read_checks_pid
+    run_dir = Path(run_dir)
+    pid = _read_checks_pid(run_dir).get("pid")
+    recs = checkjoin.records(state, prune=False)
+    ids = {r.get("id") for r in recs if r.get("pid") == pid and str(r.get("run")) == run_dir.name}
+    for r in recs:
+        if r.get("follows") in ids and not r.get("outcome") and r.get("alive") is not False:
+            return f"checks run {r.get('id')} (task #{r.get('task') or '?'}) joined them"
+    return None
+
+
+def sweep_done_checks(p: Project, now: float | None = None) -> list[dict]:
+    """Stop the detached checks still running in any run of a task that handed off done (HANDED_OFF), so
+    they stop holding a check slot of the host, unless their result is still consumed: the task's own
+    hand-off names them, or an open task or another checks run waits on them (checks_consumer). The task
+    must have ended checks.done_holder_flag_s ago (checklane.done_flag_s, 300 s by default), so a review
+    precheck that starts as it ends has joined them first. Checks whose checks.rc is written are ending by
+    themselves; a group checks_refused names is never signalled."""
+    from .checklane import done_flag_s
+    from .cli import CHECKS_RC, _checks_alive, _read_checks_pid
+    now = time.time() if now is None else now
+    grace = done_flag_s(p.config())
+    marks = ",".join("?" * len(HANDED_OFF))
+    rows = p.db.q(f"SELECT r.dir, t.id, t.status, t.result, t.updated FROM runs r JOIN tasks t ON t.id=r.task "
+                  f"WHERE t.status IN ({marks}) AND r.dir IS NOT NULL AND COALESCE(r.started, 0)>? ORDER BY t.id",
+                  (*HANDED_OFF, now - SWEEP_DAYS * 86400))
+    out, seen = [], set()
+    for row in rows:
+        d = Path(row["dir"])
+        if row["dir"] in seen:
+            continue
+        seen.add(row["dir"])
+        if now - float(row["updated"] or 0) < grace:
+            continue
+        if (d / CHECKS_RC).exists() or not _checks_alive(_read_checks_pid(d)):
+            continue
+        own = load_result(row["result"])
+        if names_job(own, d / CHECKS_RC) or _names_run(own, d) or checks_consumer(p, d):
+            continue
+        if checks_refused(p, d, row["id"]):
+            continue
+        r = end_checks(p, d, f"task #{row['id']} handed off {row['status']} and nothing waits on its checks",
+                       row["id"])
+        if r:
+            out.append(r)
+    return out
+
+
+def sweep_prechecks(p: Project, now: float | None = None) -> list[dict]:
+    """Stop the daemon's review prechecks (state/prechecks/t<task>-<head>) still running once no review
+    labelled precheck:<name> still reads them (checklane.precheck_read): their review is past dispatch (in
+    the push queue, done, failed) or none was ever labelled, so they only hold a host checks slot. They
+    must have started checks.done_holder_flag_s ago (checklane.done_flag_s), so the review's label is
+    written first; checks whose checks.rc is written are ending by themselves; those another task's hand-off
+    or a joined checks run still waits on (checks_consumer) stay; a group checks_refused names is never
+    signalled."""
+    from .checklane import done_flag_s, precheck_read
+    from .cli import CHECKS_RC, _checks_alive, _read_checks_pid
+    now = time.time() if now is None else now
+    grace = done_flag_s(p.config())
+    try:
+        dirs = sorted(x for x in (p.state / "prechecks").iterdir() if x.is_dir())
+    except OSError:
+        return []
+    out = []
+    for d in dirs:
+        task = precheck_task(p, d)
+        if task is None or (d / CHECKS_RC).exists():
+            continue
+        info = _read_checks_pid(d)
+        if not _checks_alive(info):
+            continue
+        try:
+            since = float(info.get("ts") or (d / "checks.pid").stat().st_mtime)
+        except (OSError, TypeError, ValueError):
+            continue
+        if now - since < grace or precheck_read(p.db, d.name) or checks_consumer(p, d) \
+                or checks_refused(p, d, task):
+            continue
+        r = end_checks(p, d, f"no review of task #{task} reads its precheck {d.name} any more", task)
+        if r:
+            out.append(r)
+    return out
+
+
+def stop_checks(p: Project, run_dir: Path, caller: str | None, caller_run: str | None = None,
+                given: str | None = None) -> tuple[int, str, dict | None]:
+    """`ttp detach --stop <run>/checks.rc`: stop the run's detached checks (end_checks) when may_stop allows
+    it and checks_refused does not refuse it. (0, what, summary) once stopped or when they no longer run,
+    (3, why, None) when refused, (1, why, summary) when they still run after the stop."""
+    from .cli import CHECKS_RC, _checks_alive, _read_checks_pid
+    run_dir = Path(run_dir)
+    rc = run_dir / CHECKS_RC
+    if not _checks_alive(_read_checks_pid(run_dir)):
+        return 0, f"the checks of run {run_dir.name} no longer run; nothing to stop", None
+    ok, why = may_stop(p, rc, caller, caller_run)
+    if not ok:
+        return 3, why, None
+    t = task_of(p, rc)
+    if no := checks_refused(p, run_dir, t["id"] if t else None):
+        return 3, f"refused: {no}; nothing was signalled", None
+    text = stop_why(why, given)
+    r = end_checks(p, run_dir, text, t["id"] if t else None, fields=stop_fields(p, rc, caller, caller_run, text))
+    if r is None:
+        return 0, f"the checks of run {run_dir.name} no longer run; nothing to stop", None
+    if _checks_alive(_read_checks_pid(run_dir)):
+        return 1, r["text"] + "; they still run", r
+    if why.startswith(COORD_STOP):   # the waiting task wakes on checks.rc, reads why and reruns its checks
+        from .cli import _checks_drop
+        _checks_drop(run_dir, text)
+    return 0, r["text"], r
+
+
+def _env_task(pid: int) -> str | None:
+    """The task a process runs for (TTP_TASK, else TTP_TASK_ID; "" for none), None when unreadable."""
+    env = _environ(pid)
+    return None if env is None else env.get("TTP_TASK") or env.get("TTP_TASK_ID") or ""
+
+
+def cancelled_checks(p: Project, task: int) -> list[dict]:
+    """The live process groups of cancelled task `task`'s `ttp checks`, attached or detached: each holder of
+    one of the project's checks lanes labelled with the task (but a daemon review precheck its open review
+    reads, checklane.open_precheck: never a finished task's holder), each waiter queued for one with such a
+    ticket, and the detached checks (checks.pid) of each of the task's runs. A group counts only when its
+    named process carries TTP_TASK (or TTP_TASK_ID) `task` and is provably this project's (a lane holder or
+    waiter: procowner.owns, as task ids overlap across projects sharing the host's lanes; a detached checks:
+    its run's checks.pid with its start time), none of its members carries another task's or another
+    project's TTP_PROJECT, and it holds no process this one guards (_guarded: itself, its ancestors, every
+    running worker). Read only:
+    [{pgid, pid, lane (a lane file or None), rc (a detached checks.rc or None), since}]."""
+    from . import checkcap, checklane, testslots
+    from .cli import CHECKS_RC, _checks_alive, _read_checks_pid
+    node, want, cands = os.uname().nodename, str(task), []
+    for base in testslots.suite_bases(p.name):
+        for path in testslots._lanes_of(base):
+            for rec in locks.holder_records([path]):
+                if (str(rec.get("task") or "") == want and rec.get("alive") is True and not rec.get("shared")
+                        and rec.get("node") in (None, node) and isinstance(rec.get("pid"), int)
+                        and not checklane.open_precheck(p.db, want, rec.get("holder"))):
+                    cands.append({"pid": rec["pid"], "lane": path, "rc": None, "since": rec.get("since")})
+        for t in locks.queued(checkcap.slot_dir(), base):
+            m = re.match(r"[\d.]+-(\d+)", t.name)
+            if m and checklane._ticket_task(t) == want:
+                try:
+                    holder = t.read_text()
+                except OSError:
+                    continue
+                if not checklane.open_precheck(p.db, want, holder):
+                    cands.append({"pid": int(m.group(1)), "lane": None, "rc": None, "since": locks._arrival(t)})
+    for r in p.db.q("SELECT DISTINCT dir FROM runs WHERE task=? AND dir IS NOT NULL", (task,)):
+        info = _read_checks_pid(Path(r["dir"]))
+        if _checks_alive(info):
+            cands.append({"pid": info["pid"], "lane": None, "rc": Path(r["dir"]) / CHECKS_RC,
+                          "since": info.get("started")})
+    guarded, mine, out = _guarded(p), os.getpgrp(), []
+    for c in cands:
+        st = _stat(c["pid"])
+        if st is None or st[0] <= 1 or st[0] == mine or _env_task(c["pid"]) != want:
+            continue
+        if not (c["rc"] or procowner.owns(p.base, c["pid"])):
+            continue   # the same task id in another project's lane or ticket
+        group = members(st[0])
+        if guarded & set(group) or any(_env_task(m) not in (None, "", want) or procowner.foreign_env(p.base, _environ(m))
+                                       for m in group):
+            continue
+        out.append({**c, "pgid": st[0]})
+    return out
+
+
+def end_cancelled_checks(p: Project, task: int, why: str, grace: float = CANCEL_TERM_S) -> list[dict]:
+    """Stop cancelled task `task`'s checks (cancelled_checks) at once: SIGTERM to each of their process
+    groups, SIGKILL to those still alive after `grace`, then wait at most FREE_WAIT_S for their checks lanes
+    to go free (a lane is an OS file lock: it frees as its holder ends). A group already gone is no error.
+    One event per group; [] when none ran."""
+    targets = cancelled_checks(p, task)
+    groups = sorted({t["pgid"] for t in targets})
+    sent: dict[int, list[int]] = {}
+    for sig, wait in ((signal.SIGTERM, grace), (signal.SIGKILL, FREE_WAIT_S)):
+        live = [g for g in groups if members(g)]
+        for g in live:
+            try:
+                os.killpg(g, sig)
+                sent.setdefault(g, []).append(sig)
+            except OSError:   # ended meanwhile
+                pass
+        deadline = time.monotonic() + wait
+        while live and time.monotonic() < deadline:
+            live = [g for g in live if members(g)]
+            if live:
+                time.sleep(0.1)
+        if not live:
+            break
+    lanes = [t["lane"] for t in targets if t["lane"]]
+    deadline = time.monotonic() + FREE_WAIT_S
+    held = list(lanes)
+    while held and time.monotonic() < deadline:
+        held = [x for x in held if not locks.any_free([x])]
+        if held:
+            time.sleep(0.05)
+    out = []
+    for g in groups:
+        mine = [t for t in targets if t["pgid"] == g]
+        for t in mine:
+            for sig in sent.get(g, []) if t["rc"] else []:
+                detach.signalled(t["rc"], sig, g, "jobstop.end_cancelled_checks", why, by=BY, state=p.state, task=task)
+        freed = [t["lane"].name for t in mine if t["lane"] and t["lane"] not in held]
+        still = [t["lane"].name for t in mine if t["lane"] and t["lane"] in held]
+        text = (f"stopped the checks of cancelled task #{task}: {why}; "
+                f"{' then '.join(signal.Signals(x).name for x in sent.get(g, [])) or 'no signal (already ended)'} "
+                f"to group {g} from {BY} pid {os.getpid()}"
+                + (f"; freed checks lane {', '.join(freed)}" if freed else "")
+                + (f"; checks lane {', '.join(still)} still held" if still else ""))
+        fp = f"checks_cancel_stopped:{task}:{g}:{mine[0].get('since')}"
+        r = {"task": task, "job": "checks", "pgid": g, "freed": freed, "held": still, "text": text}
+        if not p.db.one("SELECT id FROM events WHERE fingerprint=?", (fp,)):
+            p.db.x("INSERT INTO events(ts,source,kind,fingerprint,severity,text,data,status,task) VALUES(?,?,?,?,?,?,?,?,?)",
+                   (time.time(), "daemon", EVENT, fp, "low", text, json.dumps(r), "handled", task))
+        out.append(r)
+    return out
+
+
+def lane_tasks(p: Project) -> set[int]:
+    """The tasks whose `ttp checks` hold or wait for one of the project's checks lanes now (their labels)."""
+    from . import checkcap, checklane, testslots
+    out = set()
+    for base in testslots.suite_bases(p.name):
+        out |= {str(r.get("task") or "") for r in locks.holder_records(testslots._lanes_of(base))}
+        out |= {checklane._ticket_task(t) for t in locks.queued(checkcap.slot_dir(), base)}
+    return {int(x) for x in out if x.isdigit()}
+
+
+def sweep_superseded_checks(p: Project, now: float | None = None) -> list[dict]:
+    """Stop the detached checks an open task's run started under a superseded check set: checks.pid
+    records the configured set's id (push.checks_set_id; of task_checks for a run that can take them,
+    `checks_task`) and that set has changed since, so their result would no longer qualify the head. Each is ended (end_checks) and dropped (cli._checks_drop
+    writes checks.rc 1 and why), so the task wakes and reruns its checks under the current set. Runs of
+    named commands or harness checks record no set and are left alone; a group checks_refused names is never
+    signalled."""
+    from .cli import CHECKS_RC, _checks_alive, _checks_drop, _read_checks_pid
+    from .push import checks_set_id
+    now = time.time() if now is None else now
+    try:
+        delivery = p.config().get("delivery") or {}
+        ids = {task: checks_set_id(delivery, task) for task in (False, True)}
+    except Exception:
+        return []
+    marks = ",".join("?" * len(ENDED + HANDED_OFF))
+    rows = p.db.q(f"SELECT r.dir, t.id FROM runs r JOIN tasks t ON t.id=r.task WHERE t.status NOT IN ({marks}) "
+                  "AND r.dir IS NOT NULL AND COALESCE(r.started, 0)>?", (*ENDED, *HANDED_OFF, now - SWEEP_DAYS * 86400))
+    out, seen = [], set()
+    for row in rows:
+        d = Path(row["dir"])
+        if row["dir"] in seen:
+            continue
+        seen.add(row["dir"])
+        info = _read_checks_pid(d)
+        old, current = info.get("checks_set"), ids[bool(info.get("checks_task"))]
+        if not old or old == current or (d / CHECKS_RC).exists() or not _checks_alive(info):
+            continue
+        if checks_refused(p, d, row["id"]):
+            continue
+        why = (f"they started under a superseded check set ({old}); "
+               f"delivery.{'task_checks' if info.get('checks_task') else 'push_checks'} is now {current}, "
+               "so rerun them under the current set")
+        r = end_checks(p, d, why, row["id"])
+        if r:
+            _checks_drop(d, why)
+            out.append(r)
+    return out
+
+
+def sweep_cancelled_checks(p: Project, after: float | None = None) -> list[dict]:
+    """end_cancelled_checks for each task cancelled (its row last updated) after `after`, and, with None, for
+    each cancelled task that holds or waits for a checks lane now (lane_tasks: the backstop of a cancel
+    missed, as across a daemon restart)."""
+    if after is None:
+        ids = sorted(lane_tasks(p))
+        marks = ",".join("?" * len(ids))
+        rows = p.db.q(f"SELECT id FROM tasks WHERE status='cancelled' AND id IN ({marks}) ORDER BY id", ids) if ids else []
+    else:
+        rows = p.db.q("SELECT id FROM tasks WHERE status='cancelled' AND updated>? ORDER BY id",
+                      (max(after, time.time() - SWEEP_DAYS * 86400),))
+    out = []
+    for row in rows:
+        out += end_cancelled_checks(p, row["id"], f"task #{row['id']} was cancelled")
+    return out
+
+
+def end_push(p: Project, marker: Path, why: str, task: int | None = None) -> dict | None:
+    """Stop the detached `ttp push` of this marker while it is queued or runs: a queued one is recorded
+    as failed under its run lock, so the daemon never starts it; a running one (its run lock held) gets
+    SIGTERM to its group, then SIGKILL after PUSH_TERM_S, and its marker then says why. A pid that no
+    longer carries the marker in its arguments is never signalled. One event per push; None when it
+    neither waits nor runs."""
+    from . import push
+    marker = Path(marker)
+    m = read_dict(marker)
+    if m.get("kind") == "batch" or m.get("status") not in ("queued", "running"):
+        return None
+    run_lock = push._run_lock(marker)
+    pid = m.get("pid")
+    sent: list[int] = []
+    if m.get("status") == "queued":
+        lock = locks.try_take([run_lock], f"detached push {m.get('id')}", "jobstop")
+        if lock is None:
+            return None   # the daemon is starting it right now: stopped on the next pass
+        with lock:
+            m = read_dict(marker)
+            if m.get("status") != "queued":
+                return None
+            m.update(status="failed", exit=None, ended=time.time(), reason=f"not started: {why}")
+            write_json(marker, m)
+        push._forget_lock(marker)
+        pid = 0
+    else:
+        if locks.any_free([run_lock]):
+            return None   # it ended: push._settle records the outcome
+        if not (isinstance(pid, int) and pid > 1) or str(marker) not in _argv(pid):
+            return None
+        for sig, wait in ((signal.SIGTERM, PUSH_TERM_S), (signal.SIGKILL, FREE_WAIT_S)):
+            try:
+                os.killpg(pid, sig)
+                sent.append(sig)
+            except OSError:
+                pass
+            deadline = time.monotonic() + wait
+            while not locks.any_free([run_lock]) and time.monotonic() < deadline:
+                time.sleep(0.1)
+            if locks.any_free([run_lock]):
+                break
+        for sig in sent:
+            detach.signalled(marker, sig, pid, "jobstop.end_push", why, by=BY, state=p.state, task=task)
+        m = push._settle(marker)
+        if m.get("status") == "failed":
+            m["reason"] = f"stopped: {why}" + (f" ({m['reason']})" if m.get("reason") else "")
+            write_json(marker, m)
+    text = (f"stopped the detached push {marker.stem}" + (f" (task #{task})" if task else "")
+            + f": {why}; " + (f"{' then '.join(signal.Signals(x).name for x in sent) or 'no signal'} to group {pid} "
+                                f"from {BY} pid {os.getpid()}; marker {m.get('status')}" if pid else "it was queued and never started"))
+    fp = f"push_stopped:{marker}:{pid}"
+    out = {"task": task, "job": "push", "rc": str(marker), "pgid": pid, "text": text}
+    if not p.db.one("SELECT id FROM events WHERE fingerprint=?", (fp,)):
+        p.db.x("INSERT INTO events(ts,source,kind,fingerprint,severity,text,data,status,task) VALUES(?,?,?,?,?,?,?,?,?)",
+               (time.time(), "daemon", EVENT, fp, "low", text, json.dumps(out), "handled", task))
+    return out
+
+
+def ended_pushes(p: Project) -> list[tuple[Path, int, str]]:
+    """(marker, task, state) of each queued or running detached push of a task in ENDED."""
+    from . import push
+    found = []
+    for marker in sorted((p.state / push.DETACHED).glob("*.json")):
+        m = read_dict(marker)
+        if m.get("kind") != "batch" and m.get("status") in ("queued", "running") and str(m.get("task") or "").isdigit():
+            found.append((marker, int(m["task"])))
+    out = []
+    for marker, task in found:
+        row = p.db.one("SELECT status FROM tasks WHERE id=?", (task,))
+        if row and row["status"] in ENDED:
+            out.append((marker, task, row["status"]))
+    return out
+
+
+def names_job(result: dict, rc: Path) -> bool:
+    """Whether this hand-off's retry_when, on_pass_cmd, on_pass or next_step names the job: its .rc, or
+    `<run>/<name>` as `ttp detach --check <dir>/<name>` writes it (a longer name such as <name>2 is not it).
+    A file of another kind (a push marker's .json) counts only by its full name."""
+    rc = Path(rc)
+    text = " ".join(str(result.get(k) or "") for k in ("retry_when", "on_pass_cmd", "next_step"))
+    text += " " + json.dumps(result.get("on_pass") or "")
+    names = [re.escape(f"{rc.parent.name}/{rc.name}") + r"(?![\w-])"]
+    if rc.suffix == ".rc":
+        names.append(re.escape(f"{rc.parent.name}/{rc.stem}") + r"(?![\w.-])")
+    return re.search(rf"(?<![\w.-])(?:{'|'.join(names)})", text) is not None
+
+
+MENTION_FIELDS = ("message", "summary", "followups")   # a done hand-off's prose that may mention a job it meant to keep
+KEPT_EVENT = "done_job_kept"
+
+
+def mentions_job(result: dict, rc: Path) -> str | None:
+    """The text around the first mention of this job's name (`<name>` or `<name>.rc`, a whole word) in a
+    hand-off's message, summary or followups, else None. names_job is what keeps a job; this only
+    catches one the worker meant to keep but named only in prose (it is kept, and the coordinator told)."""
+    rc = Path(rc)
+    if rc.suffix != ".rc" or not rc.stem:
+        return None
+    pat = re.compile(rf"(?<![\w.-]){re.escape(rc.stem)}(?![\w-])")
+    for k in MENTION_FIELDS:
+        v = result.get(k)
+        text = v if isinstance(v, str) else json.dumps(v) if v else ""
+        if m := pat.search(text):
+            return f"{k}: " + text[max(0, m.start() - 100):m.end() + 100].strip()
+    return None
+
+
+def waited_on(p: Project, rc: Path) -> int | None:
+    """An open task whose hand-off names this job (names_job), else None."""
+    rc = Path(rc)
+    marks = ",".join("?" * len(OPEN_WAITER_SKIP))
+    for t in p.db.q(f"SELECT id, result FROM tasks WHERE status NOT IN ({marks}) AND result LIKE ?",
+                    (*OPEN_WAITER_SKIP, f"%{rc.parent.name}/{rc.stem}%")):
+        if names_job(load_result(t["result"]), rc):
+            return t["id"]
+    return None
+
+
+def _live_jobs(run_dir: Path) -> list[Path]:
+    """The .rc of each job in this run's registry that is not closed and still runs."""
+    try:
+        jobs = json.loads((Path(run_dir) / detach.REGISTRY).read_text())
+    except (OSError, ValueError):
+        return []   # a run without detached jobs has no registry
+    return [Path(j["rc"]) for j in (jobs if isinstance(jobs, list) else [])
+            if isinstance(j, dict) and j.get("rc") and j.get("status") not in detach.CLOSED and running(Path(j["rc"]))]
+
+
+def task_live_jobs(p: Project, task: int, now: float | None = None) -> list[Path]:
+    """The .rc of each live job (_live_jobs) across this task's runs of the last SWEEP_DAYS."""
+    now = time.time() if now is None else now
+    out: list[Path] = []
+    for row in p.db.q("SELECT DISTINCT dir FROM runs WHERE task=? AND dir IS NOT NULL AND COALESCE(started, 0)>? "
+                      "ORDER BY id", (task, now - SWEEP_DAYS * 86400)):
+        out += [rc for rc in _live_jobs(Path(row["dir"])) if rc not in out]
+    out += [rc for _, j in task_jobs(p, task, now) if j.get("adopted_from") and str(j.get("task")) == str(task)
+            and j.get("status") not in detach.CLOSED and running(rc := Path(j["rc"])) and rc not in out]
+    return out
+
+
+PRECHECK_NAME = re.compile(r"t(\d+)-[0-9a-f]{7,40}")   # a review precheck's folder (Daemon._precheck)
+
+
+def precheck_task(p: Project, d: Path) -> int | None:
+    """The code task whose head the daemon's review precheck in folder `d` checks: state/prechecks/t<id>-<head>
+    (Daemon._precheck: no runs row), else None."""
+    d = Path(d)
+    m = PRECHECK_NAME.fullmatch(d.name)
+    if not m or os.path.realpath(d.parent) != os.path.realpath(p.state / "prechecks"):
+        return None
+    return int(m[1])
+
+
+def task_of(p: Project, rc: Path) -> dict | None:
+    """The task whose run started the job at this .rc; for a review precheck's checks (precheck_task), the
+    code task it checks."""
+    d = Path(rc).parent
+    t = p.db.one("SELECT t.* FROM runs r JOIN tasks t ON t.id=r.task WHERE r.dir IN (?,?) ORDER BY r.id DESC LIMIT 1",
+                 (str(d), str(d.resolve())))
+    if t is None and (tid := precheck_task(p, d)) is not None:
+        return p.db.one("SELECT * FROM tasks WHERE id=?", (tid,))
+    if t is not None and (a := adopter(p, rc, t["id"])) is not None:   # a task continuing it took it over
+        return a
+    return t
+
+
+def precheck_read(p: Project, run_dir: Path) -> str:
+    """Why daemon review precheck folder `run_dir` is still read (its code task is not ended, no review
+    names it yet, or one queued, running or waiting reads it: checklane.open_precheck), "" once it may be stopped."""
+    from . import checklane
+    d = Path(run_dir)
+    tid = precheck_task(p, d)
+    t = p.db.task(tid) if tid is not None else None
+    if t is None:
+        return f"{d.name} is no review precheck of a task of this project"
+    if t["status"] not in STOPPABLE:
+        return f"task #{tid} is {t['status']}: its precheck {d.name} may still be read"
+    if not p.db.one("SELECT id FROM tasks WHERE kind='review' AND labels LIKE ?",
+                    (f'%"{checklane.PRECHECK_LABEL}{d.name}"%',)):
+        return f"no review names precheck {d.name} yet"
+    if checklane.open_precheck(p.db, str(tid), f"run {d.name}"):
+        return f"a queued, running or waiting review still reads task #{tid}'s precheck {d.name}"
+    return ""
+
+
+def run_of(p: Project, rc: Path) -> int | None:
+    """The id of the run that started the job at this .rc."""
+    d = Path(rc).parent
+    r = p.db.one("SELECT id FROM runs WHERE dir IN (?,?) ORDER BY id DESC LIMIT 1", (str(d), str(d.resolve())))
+    return r["id"] if r else None
+
+
+def _end_ended_checks(p: Project, run_dir: Path, task: int, status: str) -> dict | None:
+    """sweep's step for one run of a task in ENDED: its detached checks stay while an open task reads their
+    result (checks_consumer) or adopts their head (checks_adopter); still waiting in the checks queue they
+    are asked to leave it (ask_drop: they exit cleanly and record why, never a signal mid-wait, which left
+    `ttp checks --result` with a bare exit code 143); running ones are stopped (end_checks)."""
+    from .cli import _checks_alive, _read_checks_pid
+    info = _read_checks_pid(run_dir)
+    if not _checks_alive(info) or checks_consumer(p, run_dir) or checks_adopter(p, task, info):
+        return None
+    if waiting_checks(run_dir) is not None:
+        try:
+            ask_drop(run_dir, info, f"task #{task} ended ({status})")
+        except OSError:
+            pass
+        return None
+    return end_checks(p, run_dir, f"task #{task} is {status}", task)
+
+
+def sweep(p: Project, now: float | None = None) -> list[dict]:
+    """The daemon's pass: stop each running job, detached checks and detached push of a task in ENDED that
+    no open task waits on, ask the hosts of such a task's `ttp detach --remote` jobs whether they still run
+    (onhost.refresh_remote, for its stop line), then carry out queued `ttp detach --stop` requests. The
+    summaries of the jobs it stopped."""
+    now = time.time() if now is None else now
+    out = []
+    marks = ",".join("?" * len(ENDED))
+    rows = p.db.q(f"SELECT r.dir, t.id, t.status FROM runs r JOIN tasks t ON t.id=r.task WHERE t.status IN ({marks}) "
+                  "AND r.dir IS NOT NULL AND COALESCE(r.started, 0)>?", (*ENDED, now - SWEEP_DAYS * 86400))
+    out += sweep_cancelled_checks(p)
+    out += sweep_superseded_checks(p, now)
+    seen = set()
+    for row in rows:
+        reg = Path(row["dir"]) / detach.REGISTRY
+        if row["dir"] in seen:
+            continue
+        seen.add(row["dir"])
+        if r := _end_ended_checks(p, Path(row["dir"]), row["id"], row["status"]):
+            out.append(r)
+        try:
+            jobs = json.loads(reg.read_text())
+        except (OSError, ValueError):
+            continue
+        for j in jobs if isinstance(jobs, list) else []:   # a run without detached jobs has no registry
+            if not (isinstance(j, dict) and j.get("rc")) or j.get("status") in detach.CLOSED:
+                continue
+            rc = Path(j["rc"])
+            if not running(rc):
+                mark_dead(rc, f"task #{row['id']} is {row['status']}", now=now)
+                continue
+            if waited_on(p, rc) is not None:
+                continue
+            if (h := heir(p, row["id"])) is not None:   # a task that continues it still needs the job
+                if r := adopt(p, rc, row["id"], h["id"], now):
+                    out.append(r)
+                continue
+            who, why = row["id"], f"task #{row['id']} is {row['status']}"
+            if (a := adopter(p, rc, row["id"])) is not None:
+                if a["status"] in HANDED_OFF and names_job(load_result(a["result"]), rc):
+                    continue
+                who, why = a["id"], f"task #{a['id']} (it took the job over from #{row['id']}) is {a['status']}"
+            if r := end(p, rc, why, who, "jobstop.sweep"):
+                out.append(r)
+    out += _sweep_handed_off(p, now)
+    out += sweep_done_checks(p, now)
+    out += sweep_prechecks(p, now)
+    for marker, task, state in ended_pushes(p):
+        if waited_on(p, marker) is None and (r := end_push(p, marker, f"task #{task} is {state}", task)):
+            out.append(r)
+    try:   # their `ttp detach --remote` jobs: each host's bounded answer, for the stop line (onhost.refresh_remote)
+        from . import onhost
+        onhost.refresh_remote(p, now)
+    except Exception as e:
+        out.append({"text": f"probing the remote jobs of ended tasks failed: {type(e).__name__}: {e}"})
+    out += serve_requests(p)
+    return out
+
+
+def _sweep_handed_off(p: Project, now: float) -> list[dict]:
+    """Stop the live jobs, across all its runs, of a task that handed off done: all but those its own
+    hand-off names or an open task waits on. A task in any other state keeps them all. A job its done
+    hand-off mentions only in its message, summary or followups (mentions_job) is kept too, and one
+    queued event per job tells the coordinator to wait on it or stop it: a hand-off never silently loses
+    a job it meant to keep."""
+    out = []
+    marks = ",".join("?" * len(HANDED_OFF))
+    rows = p.db.q(f"SELECT r.dir, t.id, t.status, t.result FROM runs r JOIN tasks t ON t.id=r.task "
+                  f"WHERE t.status IN ({marks}) AND r.dir IS NOT NULL AND COALESCE(r.started, 0)>? ORDER BY t.id",
+                  (*HANDED_OFF, now - SWEEP_DAYS * 86400))
+    tasks: dict[int, tuple[str, dict, list[Path]]] = {}
+    seen = set()
+    for row in rows:
+        if row["dir"] in seen:
+            continue
+        seen.add(row["dir"])
+        if live := _live_jobs(Path(row["dir"])):
+            tasks.setdefault(row["id"], (row["status"], load_result(row["result"]), []))[2].extend(live)
+    for tid, (status, result, jobs) in tasks.items():
+        kept = [rc for rc in jobs if names_job(result, rc)]
+        for rc in jobs:
+            if rc in kept or waited_on(p, rc) is not None:
+                continue
+            if said := mentions_job(result, rc):
+                _kept_mentioned(p, tid, rc, said)
+                continue
+            if r := end(p, rc, f"task #{tid} handed off {status}", tid, "jobstop.sweep_handed_off"):
+                out.append(r)
+    return out
+
+
+def _kept_mentioned(p: Project, tid: int, rc: Path, said: str) -> None:
+    """One queued event per job: task tid handed off done while this job ran, naming it only in prose."""
+    fp = f"{KEPT_EVENT}:{rc}"
+    if p.db.one("SELECT id FROM events WHERE fingerprint=?", (fp,)):
+        return
+    text = (f"task #{tid} handed off done while its detached job {rc.stem} still runs ({rc}). Its hand-off "
+            f"mentions the job but names it in no retry_when or next_step, so it was kept, not stopped: wait "
+            f"on it (a task whose retry_when names {rc.parent.name}/{rc.stem}) or stop it with "
+            f"`ttp detach --stop {rc} --why ...`. The hand-off's {said[:400]}")
+    data = {"task": tid, "rc": str(rc), "mention": said[:400]}
+    p.db.x("INSERT INTO events(ts,source,kind,fingerprint,severity,text,data,status,task) VALUES(?,?,?,?,?,?,?,?,?)",
+           (time.time(), f"task:{tid}", KEPT_EVENT, fp, "normal", text, json.dumps(data), "queued", tid))
+
+
+# `ttp detach --stop` ----------------------------------------------------------------------------
+
+def job_resources(p: Project, rc: Path) -> set[str]:
+    cfg = p.config()
+    return {locks.canonical(cfg, _resource(s)) for s in job_slots(p, rc)}
+
+
+def may_stop(p: Project, rc: Path, caller: str | None, caller_run: str | None = None) -> tuple[bool, str]:
+    """(allowed, why) for `ttp detach --stop` of the job at rc by caller task id (TTP_TASK, may be empty)
+    from its run (TTP_RUN_ID, may be empty)."""
+    from .coordinator import task_resources
+    t = task_of(p, rc)
+    if t is None and (coord := coord_job_stop(p, rc, caller_run)) is not None:
+        return True, coord
+    if t is None:
+        return False, f"no task of this project started the job at {rc}"
+    if t["status"] in STOPPABLE and (pre := precheck_task(p, Path(rc).parent)) is not None:
+        # A review precheck of an ended task stays while a review still reads it (checklane.open_precheck).
+        from . import checklane
+        name = Path(rc).parent.name
+        if checklane.open_precheck(p.db, str(pre), f"run {name}"):
+            return False, f"refused: a queued, running or waiting review still reads task #{pre}'s precheck {name}"
+    if t["status"] in STOPPABLE:
+        return True, f"task #{t['id']} is {t['status']}"
+    if (own := _own_stop(p, rc, t, caller, caller_run)) is not None:
+        return True, own
+    if (coord := coord_checks_stop(p, rc, t, caller_run)) is not None:
+        return True, coord
+    me = p.db.task(int(caller)) if caller and str(caller).isdigit() else None
+    if me is None or me["status"] in OPEN_WAITER_SKIP or int(me["priority"]) != 1:
+        return False, (f"refused: its task #{t['id']} is {t['status']}; only a job of an ended task, or one holding "
+                       "a resource of the calling open priority-1 task, may be stopped")
+    cfg = p.config()
+    mine = {locks.canonical(cfg, r) for r in task_resources(me)}
+    common = sorted(mine & job_resources(p, rc))
+    if not common:
+        return False, (f"refused: its task #{t['id']} is {t['status']} and the job holds none of task #{me['id']}'s "
+                       "resources")
+    return True, f"priority-1 task #{me['id']} needs {', '.join(common)}"
+
+
+def caller_task(p: Project, caller: str | None, caller_run: str | None) -> int | None:
+    """The calling task's id when its run id is one the project's db records for that task (an id alone,
+    set by hand, or a run of another task never counts), else None."""
+    if not (caller and str(caller).isdigit() and caller_run and str(caller_run).isdigit()):
+        return None
+    if not p.db.one("SELECT id FROM runs WHERE id=? AND task=?", (int(caller_run), int(caller))):
+        return None
+    return int(caller)
+
+
+def task_jobs(p: Project, task: int, now: float | None = None) -> list[tuple[int, dict]]:
+    """(run id, registry entry) of each `ttp detach` job the task's runs of the last SWEEP_DAYS recorded,
+    oldest run first. Only run folders the db records for the task and that lie in the project's runs
+    folder are read, so a registry copied elsewhere never counts."""
+    now = time.time() if now is None else now
+    out = []
+    runs = Path(os.path.realpath(p.runs))
+    for tid in [int(task), *ancestors(p, task)]:   # plus the jobs it took over from the tasks it continues
+        for row in p.db.q("SELECT id, dir FROM runs WHERE task=? AND dir IS NOT NULL AND COALESCE(started, 0)>? "
+                          "ORDER BY id", (tid, now - SWEEP_DAYS * 86400)):
+            d = Path(os.path.realpath(row["dir"]))
+            if d.parent != runs:
+                continue
+            try:
+                jobs = json.loads((d / detach.REGISTRY).read_text())
+            except (OSError, ValueError):
+                continue
+            out += [(row["id"], j) for j in (jobs if isinstance(jobs, list) else [])
+                    if isinstance(j, dict) and j.get("rc") and Path(os.path.realpath(j["rc"])).parent == d
+                    and (tid == int(task) or str(j.get("task")) == str(task))]
+    return out
+
+
+def task_job_named(p: Project, task: int, name: str) -> Path | None:
+    """The .rc of the task's job called `name` (task_jobs): the newest still running, else the newest."""
+    named = [Path(j["rc"]) for _, j in task_jobs(p, task) if j.get("name") == name]
+    return next((rc for rc in reversed(named) if running(rc)), named[-1] if named else None)
+
+
+def own_job_group(p: Project, pgid: int, caller: str | None, caller_run: str | None) -> Path | None:
+    """The .rc of the live `ttp detach` job whose process group is `pgid` when a run of the calling task
+    started it, else None: the kill guard's own-job rule (killguard), for a job an earlier run detached.
+    No file a worker can write is proof alone. The caller's run must be one the db records for its task
+    (caller_task); the job's run folder one the db records for that task (task_jobs); its registry entry
+    must name pid `pgid` with the start time the live process has now (a reused pid has another); the
+    process must lead its group; and its environment, set by `ttp detach` at start, must name this
+    project, that run folder and that job's .rc. A forged entry naming another task's process fails on
+    that environment; one naming a recycled pid fails on its start time."""
+    task = caller_task(p, caller, caller_run)
+    if task is None or pgid <= 1:
+        return None
+    st = _stat(pgid)
+    now = locks.start_time(pgid)
+    if st is None or st[0] != pgid or not now:
+        return None
+    env = procowner.environ(pgid) or {}
+    if not procowner.owns_env(p.base, env) or procowner.foreign_env(p.base, env):
+        return None
+    for _, j in task_jobs(p, task):
+        rc = Path(j["rc"])
+        if (str(j.get("pid")) != str(pgid) or str(j.get("pid_start") or "") != now
+                or (j.get("task") is not None and str(j.get("task")) != str(task))):
+            continue
+        if (env.get(JOB_ENV) and os.path.realpath(env[JOB_ENV]) == os.path.realpath(rc) and env.get("TTP_RUN_DIR")
+                and os.path.realpath(env["TTP_RUN_DIR"]) == os.path.realpath(rc.parent)):
+            return rc
+    return None
+
+
+def _own_stop(p: Project, rc: Path, t: dict, caller: str | None, caller_run: str | None) -> str | None:
+    """Why the job's own task may stop it, or None when the caller is not that task: TTP_TASK names the
+    job's task and TTP_RUN_ID a run the project records for that same task (an id alone, set by hand,
+    or a run of another task never counts)."""
+    if not (caller and str(caller).isdigit() and int(caller) == int(t["id"])):
+        return None
+    if not (caller_run and str(caller_run).isdigit()):
+        return None
+    if not p.db.one("SELECT id FROM runs WHERE id=? AND task=?", (int(caller_run), int(t["id"]))):
+        return None
+    started = run_of(p, rc)
+    when = "its current run" if started == int(caller_run) else "an earlier run"
+    return f"stopped by owning task #{t['id']} (run {caller_run}) from {when}, run {started if started else '?'}"
+
+
+COORD_STOP = "stopped by the coordinator"   # coord_checks_stop's reason: stop_checks then drops the checks
+
+
+def coord_checks_stop(p: Project, rc: Path, t: dict, caller_run: str | None) -> str | None:
+    """Why the coordinator may stop these checks, or None: rc is a run's detached `ttp checks` (checks.rc),
+    its task waits on them (status waiting), and TTP_RUN_ID names a coordinator run the project records
+    whose run folder holds a `ttp audit why` (coordfix.intent). The task is told and reruns its checks
+    (stop_checks drops them). Every other rule of may_stop and checks_refused still applies."""
+    from .cli import CHECKS_RC
+    from . import coordfix
+    if Path(rc).name != CHECKS_RC or t.get("status") != "waiting" or not (caller_run and str(caller_run).isdigit()):
+        return None
+    run = p.db.one("SELECT id, dir FROM runs WHERE id=? AND role='coordinator'", (int(caller_run),))
+    if not run or not run["dir"] or not (why := coordfix.intent(run["dir"])).get("why"):
+        return None
+    return (f"{COORD_STOP} (run {run['id']}) for waiting task #{t['id']}: {why['why'][:200]}; "
+            f"serves {why.get('serves') or '?'}")
+
+
+def coord_run(p: Project, run: str | int | None, live: bool = False) -> dict | None:
+    """The coordinator run of this project with this id ({id, dir}), else None; `live`: only one that
+    has not ended (the caller's own wake)."""
+    if not (run and str(run).isdigit()):
+        return None
+    return p.db.one("SELECT id, dir FROM runs WHERE id=? AND role='coordinator'"
+                    + (" AND ended IS NULL" if live else ""), (int(run),))
+
+
+def coord_job_stop(p: Project, rc: Path, caller_run: str | None) -> str | None:
+    """Why the coordinator may stop this job, or None: a coordinator run of this project detached it
+    (each wake of the persistent coordinator is a new run, so a job an earlier wake started has no task
+    of its own), and TTP_RUN_ID names a live coordinator run of the same project whose folder holds a
+    `ttp audit why` (coordfix.intent). A task run never qualifies, whatever TTP_RUN_ID it sets."""
+    from . import coordfix
+    d = Path(rc).parent
+    job = p.db.one("SELECT id FROM runs WHERE dir IN (?,?) AND role='coordinator' ORDER BY id DESC LIMIT 1", (str(d), str(d.resolve())))
+    run = coord_run(p, caller_run, live=True)
+    if not job or not run or not run["dir"] or not (why := coordfix.intent(run["dir"])).get("why"):
+        return None
+    when = "its current wake" if job["id"] == run["id"] else f"an earlier wake, run {job['id']}"
+    return (f"stopped by coordinator run {run['id']}, a job it detached in {when}: {why['why'][:200]}; "
+            f"serves {why.get('serves') or '?'}")
+
+
+def coord_jobs(p: Project, now: float | None = None) -> list[tuple[int, dict]]:
+    """(run id, registry entry) of each `ttp detach` job this project's coordinator runs of the last
+    SWEEP_DAYS recorded, oldest run first (task_jobs for the coordinator, whose runs have no task)."""
+    now = time.time() if now is None else now
+    out = []
+    runs = Path(os.path.realpath(p.runs))
+    for row in p.db.q("SELECT id, dir FROM runs WHERE role='coordinator' AND dir IS NOT NULL "
+                      "AND COALESCE(started, 0)>? ORDER BY id", (now - SWEEP_DAYS * 86400,)):
+        d = Path(os.path.realpath(row["dir"]))
+        if d.parent != runs:
+            continue
+        try:
+            jobs = json.loads((d / detach.REGISTRY).read_text())
+        except (OSError, ValueError):
+            continue
+        out += [(row["id"], j) for j in (jobs if isinstance(jobs, list) else [])
+                if isinstance(j, dict) and j.get("rc") and Path(os.path.realpath(j["rc"])).parent == d]
+    return out
+
+
+def stop_why(why: str, given: str | None) -> str:
+    """The reason a stop records: may_stop's, plus the caller's own `--why` when given."""
+    given = " ".join(str(given or "").split())[:300]
+    text = f"{why} via `ttp detach --stop`" if why.startswith("stopped by ") else f"stopped by `ttp detach --stop` ({why})"
+    return text + (f": {given}" if given else "")
+
+
+def stop_fields(p: Project, rc: Path, caller: str | None, caller_run: str | None, why: str) -> dict:
+    """Who stopped the job, the run that started it, the caller's run and why: kept in the stop event."""
+    return {"stopped_by": int(caller) if caller and str(caller).isdigit() else None,
+            "job_run": run_of(p, rc), "caller_run": int(caller_run) if caller_run and str(caller_run).isdigit()
+            else None, "why": why}
+
+
+def request(p: Project, rc: Path, caller: str | None, caller_run: str | None = None, why: str | None = None) -> Path:
+    """Queue a stop for the daemon (a sandboxed caller cannot signal the job)."""
+    q = p.state / QUEUE / f"{Path(rc).parent.name}-{Path(rc).stem}.json"
+    q.parent.mkdir(parents=True, exist_ok=True)
+    write_json(q, {"rc": str(rc), "caller": caller or "", "run": caller_run or "", "why": why or "",
+                   "at": time.time()})
+    return q
+
+
+def serve_requests(p: Project) -> list[dict]:
+    out = []
+    folder = p.state / QUEUE
+    for q in sorted(folder.glob("*.json")) if folder.is_dir() else []:
+        try:
+            m = json.loads(q.read_text())
+            if m.get("pidfile"):
+                out += _serve_pids(p, m)
+                q.unlink(missing_ok=True)
+                continue
+            if m.get("leftovers") is not None:   # `ttp leftover-procs --stop` from a sandboxed caller
+                from . import leftoverstop
+                out += leftoverstop.serve(p, m)
+                q.unlink(missing_ok=True)
+                continue
+            rc = Path(m["rc"])
+        except (OSError, ValueError, KeyError, TypeError, AttributeError):
+            q.unlink(missing_ok=True)
+            continue
+        caller, run = m.get("caller"), m.get("run")
+        from .cli import CHECKS_PID, CHECKS_RC
+        if rc.name == CHECKS_RC and (rc.parent / CHECKS_PID).is_file() and not detach._entry(rc):
+            _, _, r = stop_checks(p, rc.parent, caller, run, m.get("why"))
+            if r:
+                out.append(r)
+            q.unlink(missing_ok=True)
+            continue
+        ok, why = may_stop(p, rc, caller, run)
+        if ok:
+            t = task_of(p, rc)
+            text = stop_why(why, m.get("why"))
+            r = end(p, rc, text, t["id"] if t else None, "ttp detach --stop",
+                    fields=stop_fields(p, rc, caller, run, text))
+            if r:
+                out.append(r)
+        q.unlink(missing_ok=True)
+    return out
+
+
+# Pid files --------------------------------------------------------------------------------------
+# `ttp detach --stop-pids <file>`: a task stops the processes its own driver listed in a pid file, one pid
+# per line (the line's first word; `start=<token>`, the token runner.proc_start gives, pins it to that
+# process; other words and `#` lines are ignored). plan_pids allows it only when all of these hold:
+# - the file's resolved path (symlinks followed) lies under one of the calling task's own results dirs: a
+#   run dir of the task, or a folder named for it (t<id>, task<id> or task-<id>) inside the project root;
+# - each live pid in it runs as the caller's user, carries the task's own TTP_TASK and this project's
+#   TTP_PROJECT in its environment (so it was started from one of the task's runs), and is still the
+#   process the file recorded: its start= token matches, else it started no later than the file was
+#   last written (a later one reuses the pid);
+# - none is the caller, one of its ancestors or a running worker, and none holds a lock slot for another
+#   task or holder.
+# A pid that is gone is skipped; any other refusal refuses the whole file, so nothing is stopped in part.
+# stop_pids then sends SIGTERM, waits PIDS_TERM_S and sends SIGKILL to those still the same process.
+
+PIDS_TERM_S = 10.0
+PIDS_MAX = 256
+TASK_DIR_RE = re.compile(r"(?:t|task-?)(\d+)")
+
+
+def task_results(p: Project, task: int, f: Path) -> bool:
+    """Whether the resolved path f lies under one of the task's results dirs (see above)."""
+    for r in p.db.q("SELECT dir FROM runs WHERE task=? AND COALESCE(dir,'')!=''", (task,)):
+        if f.is_relative_to(Path(r["dir"]).resolve()):
+            return True
+    root = p.root.resolve()
+    if not f.is_relative_to(root):
+        return False
+    return any((m := TASK_DIR_RE.fullmatch(x)) and int(m[1]) == task for x in f.relative_to(root).parts[:-1])
+
+
+def read_pidfile(f: Path) -> list[tuple[int, str | None]]:
+    """(pid, start token or None) per line; ValueError for a line whose first word is not a pid."""
+    out = []
+    for line in f.read_text(errors="replace")[:65536].splitlines():
+        w = line.split()
+        if not w or w[0].startswith("#"):
+            continue
+        if not w[0].isdigit():
+            raise ValueError(f"line {line.strip()[:80]!r} does not start with a pid")
+        out.append((int(w[0]), next((x.split("=", 1)[1] for x in w[1:] if x.startswith("start=")), None)))
+    return out
+
+
+def _environ(pid: int) -> dict[str, str] | None:
+    if not _PROC:
+        return procinfo.environ(pid)   # macOS: sysctl KERN_PROCARGS2
+    try:
+        raw = Path(f"/proc/{pid}/environ").read_bytes()
+    except OSError:
+        return None
+    return dict(x.decode(errors="replace").split("=", 1) for x in raw.split(b"\0") if b"=" in x)
+
+
+def _started_at(pid: int) -> float | None:
+    """When pid started, in seconds since the epoch (Linux /proc), else None."""
+    from .runner import proc_start
+    try:
+        btime = next(float(x.split()[1]) for x in Path("/proc/stat").read_text().splitlines() if x.startswith("btime"))
+        return btime + int(proc_start(pid) or "") / os.sysconf("SC_CLK_TCK")
+    except (OSError, ValueError, StopIteration):
+        return None
+
+
+def _guarded(p: Project) -> set[int]:
+    """The caller and its ancestors, and every running worker: never a stop target."""
+    out, pid = set(), os.getpid()
+    while pid > 1 and pid not in out:
+        out.add(pid)
+        try:
+            pid = int(Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[1])
+        except (OSError, IndexError, ValueError):
+            break
+    out |= {int(r["pid"]) for r in p.db.q("SELECT pid FROM runs WHERE status='running' AND pid IS NOT NULL")}
+    return out
+
+
+def _foreign_slot(p: Project, pid: int, task: int) -> str | None:
+    """The name of a held lock slot whose holder process is pid and whose holder is not this task."""
+    from . import hold
+    node = os.uname().nodename
+    for d in lock_dirs(p):
+        try:
+            slots = sorted(d.glob("*.lock"))
+        except OSError:
+            continue
+        for s in slots:
+            try:
+                h = json.loads(s.read_text() or "{}")
+            except (OSError, ValueError):
+                continue
+            if (isinstance(h, dict) and h.get("pid") == pid and h.get("node") in (None, node)
+                    and hold.task_of(h.get("holder"), p.name) != task and not locks.any_free([s])):
+                return s.name
+    return None
+
+
+def pid_refusal(p: Project, task: int, pid: int, token: str | None, written: float, guarded: set[int]) -> str | None:
+    """Why pid (live) may not be stopped for this task, else None (see above)."""
+    from .runner import proc_start
+    if pid <= 1 or pid in guarded:
+        return "is the caller, one of its ancestors or a running worker"
+    try:
+        if Path(f"/proc/{pid}").stat().st_uid != os.getuid():
+            return "runs as another user"
+    except OSError:
+        return "its /proc/<pid> cannot be read, so it cannot be checked or stopped (Linux only)"
+    env = _environ(pid)
+    if env is None:
+        return "its /proc/<pid>/environ cannot be read, so it cannot be told to be this task's"
+    there = env.get("TTP_PROJECT") or ""
+    if not there or Path(there).resolve() != p.base.resolve():
+        return "was not started by this project" + (f" (TTP_PROJECT {there})" if there else "")
+    if (env.get("TTP_TASK") or env.get("TTP_TASK_ID") or "") != str(task):
+        return f"belongs to task #{env.get('TTP_TASK') or '?'}, not #{task}"
+    if token is not None:
+        if proc_start(pid) != token:
+            return f"is not the process the file recorded (start token {token}): the pid was reused"
+    else:
+        at = _started_at(pid)
+        if at is None or at > written + 1:
+            return "started after the pid file was last written: the pid was reused"
+    if slot := _foreign_slot(p, pid, task):
+        return f"holds lock slot {slot} for another holder"
+    return None
+
+
+def plan_pids(p: Project, pidfile: str | Path, caller: str | None,
+              procs: bool = True) -> tuple[list[tuple[int, str]], list[int], str | None]:
+    """(targets as (pid, start token), pids already gone, refusal or None) for a stop of the pid file by
+    task `caller`. procs=False checks only the caller and the file (a sandboxed caller cannot see them)."""
+    if not (caller and str(caller).isdigit() and p.db.task(int(caller))):
+        return [], [], "only a task of this project may stop processes from a pid file (TTP_TASK is not one)"
+    task = int(caller)
+    if procs and not (Path("/proc").is_dir() and Path("/proc/stat").is_file()):
+        return [], [], ("no /proc on this host: `ttp detach --stop-pids` is Linux-only, and a live pid "
+                        "cannot be verified or stopped without it")
+    f = Path(pidfile).expanduser()
+    try:
+        real = f.resolve(strict=True)
+        written = real.stat().st_mtime
+    except (OSError, RuntimeError):
+        return [], [], f"no pid file at {f}"
+    if not real.is_file():
+        return [], [], f"{real} is not a file"
+    if not task_results(p, task, real):
+        return [], [], (f"{real} is not under a results dir of task #{task} (one of its run dirs, or a folder "
+                        f"t{task}, task{task} or task-{task} inside the project root {p.root})")
+    try:
+        listed = read_pidfile(real)
+    except (OSError, ValueError) as e:
+        return [], [], f"{real}: {e}"
+    if len(listed) > PIDS_MAX:
+        return [], [], f"{real} lists {len(listed)} pids, over {PIDS_MAX}"
+    if not procs:
+        return [(pid, tok or "") for pid, tok in listed], [], None
+    from .runner import proc_start
+    guarded, targets, gone, bad = _guarded(p), [], [], []
+    for pid, tok in dict.fromkeys(listed):
+        st = _stat(pid) if pid > 0 else None
+        if st is None:
+            gone.append(pid)
+            continue
+        if why := pid_refusal(p, task, pid, tok, written, guarded):
+            bad.append(f"pid {pid} {why}")
+        elif (now := proc_start(pid)) is not None:
+            targets.append((pid, now))
+        else:
+            gone.append(pid)
+    if bad:
+        return [], gone, "refused, nothing stopped: " + "; ".join(bad)
+    return targets, gone, None
+
+
+def stop_pids(p: Project, pidfile: str | Path, task: int, targets: list[tuple[int, str]], gone: list[int],
+              why: str) -> dict:
+    """SIGTERM each target that is still the same process, SIGKILL those left after PIDS_TERM_S; one event."""
+    from .runner import proc_start
+
+    def same(pid, tok):
+        return _stat(pid) is not None and proc_start(pid) == tok
+
+    rcs = []   # the detached jobs (TTP_DETACH_RC) the targets ran in: their requeued groups stop with them
+    for pid, tok in targets:
+        rc = (procowner.environ(pid) or {}).get(JOB_ENV) if same(pid, tok) else None
+        if rc and Path(rc).is_absolute() and Path(rc) not in rcs:
+            rcs.append(Path(rc))
+    for sig, wait in ((signal.SIGTERM, PIDS_TERM_S), (signal.SIGKILL, FREE_WAIT_S)):
+        sent = []
+        for pid, tok in targets:
+            if same(pid, tok):
+                try:
+                    os.kill(pid, sig)
+                    sent.append((pid, tok))
+                except OSError:
+                    pass
+        deadline = time.monotonic() + wait
+        while any(same(*t) for t in sent) and time.monotonic() < deadline:
+            time.sleep(0.1)
+        if sig == signal.SIGTERM:
+            killed = [pid for pid, tok in targets if same(pid, tok)]
+    left = [pid for pid, tok in targets if same(pid, tok)]
+    extra = sorted({g for rc in rcs for g in end_requeued(p, rc, why, task, "jobstop.stop_pids")})
+    pids = [pid for pid, _ in targets]
+    text = (f"stopped the processes of pid file {pidfile} (task #{task}): {why}; "
+            f"SIGTERM to {', '.join(map(str, pids)) or 'none'}"
+            + (f"; SIGKILL after {PIDS_TERM_S:g}s to {', '.join(map(str, killed))}" if killed else "")
+            + (f"; already gone: {', '.join(map(str, gone))}" if gone else "")
+            + (f"; still running: {', '.join(map(str, left))}" if left else "")
+            + (f"; requeued groups stopped: {', '.join(map(str, extra))}" if extra else ""))
+    out = {"task": task, "job": Path(pidfile).name, "pidfile": str(pidfile), "pids": pids, "killed": killed,
+           "gone": gone, "left": left, "requeued": extra, "text": text}
+    if pids:
+        fp = "pids_stopped:" + hashlib.sha256(f"{pidfile}:{targets}".encode()).hexdigest()[:16]
+        p.db.x("INSERT INTO events(ts,source,kind,fingerprint,severity,text,data,status,task) VALUES(?,?,?,?,?,?,?,?,?)",
+               (time.time(), "daemon", EVENT, fp, "low", text, json.dumps(out), "handled", task))
+    return out
+
+
+def request_pids(p: Project, pidfile: Path, caller: str) -> Path:
+    """Queue a pid file stop for the daemon (a sandboxed caller cannot see or signal the processes)."""
+    key = hashlib.sha256(str(pidfile).encode()).hexdigest()[:12]
+    q = p.state / QUEUE / f"pids-{caller}-{key}.json"
+    q.parent.mkdir(parents=True, exist_ok=True)
+    write_json(q, {"pidfile": str(pidfile), "caller": caller, "at": time.time()})
+    return q
+
+
+def _serve_pids(p: Project, m: dict) -> list[dict]:
+    """The daemon's side of request_pids: check again, stop, and leave the outcome beside the pid file
+    (<file>.stopped) for the task to read."""
+    f, caller = Path(m["pidfile"]), str(m.get("caller") or "")
+    targets, gone, why = plan_pids(p, f, caller)
+    r = None if why else stop_pids(p, f, int(caller), targets, gone, "stopped by `ttp detach --stop-pids` (queued)")
+    try:   # only into the task's own results dir, never through a link out of it
+        out = f.resolve().with_name(f.name + ".stopped")
+        if caller.isdigit() and task_results(p, int(caller), out) and not out.is_symlink():
+            durable_write(out, f"{r['text'] if r else why}\n")
+    except (OSError, RuntimeError):
+        pass
+    return [r] if r and r["pids"] else []

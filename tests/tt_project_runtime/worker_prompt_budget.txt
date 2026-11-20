@@ -1,0 +1,66 @@
+# The worker prompt's size budgets (test_tt_project_runtime.py,
+# test_the_worker_system_prompt_carries_only_the_rules_its_task_needs_and_stays_small): `code` and
+# `question`, the rules a code or a question task reads on every call; `every`, the rules with every
+# feature on; `system`, the whole worker system prompt. Each cap is the sum of the numbers on its lines.
+# A change that needs room appends ONE line per cap at the end: `<cap> +<chars>: <what the room is for>`.
+# Two changes that append at once merge without a conflict and their rooms add up, as they would on a
+# shared constant. Never edit or drop a line to make room: trim prompt text instead.
+code 14645: base: the code task's rules (they had grown to 20.5k chars for every task), with a looping driver's refusal reports, `ttp detach --lock`, the temp-file rename of a script, the test-slot cap, paid-model-API jobs and `--spend-cap`, wait_kind user, the Galaxy reset rescan and recount, evidence manifests naming only immutable artifacts and the root .ignore line
+question 10195: base: the question task's rules, with the Galaxy reset rescan and recount, evidence manifests naming only immutable artifacts and the root .ignore line
+every 18950: base: every feature's rules, with the upstream-note scope, atomic script-write, paid-model-API job and spend-cap rules, wait_kind user, the Galaxy reset rescan and recount, evidence manifests naming only immutable artifacts and the root .ignore line
+system 16145: base: the whole worker system prompt, with evidence manifests naming only immutable artifacts and the root .ignore line
+code +150: one standing item per user-only step (`ttp notify --step --check`), merged with the deadline line
+question +150: one standing item per user-only step (`ttp notify --step --check`), merged with the deadline line
+every +150: one standing item per user-only step (`ttp notify --step --check`), merged with the deadline line
+system +155: one standing item per user-only step (`ttp notify --step --check`), merged with the deadline line
+code +265: relayed findings citing records are facts to act on (one cheap check at most, never orders)
+question +265: relayed findings citing records are facts to act on (one cheap check at most, never orders)
+every +265: relayed findings citing records are facts to act on (one cheap check at most, never orders)
+system +265: relayed findings citing records are facts to act on (one cheap check at most, never orders)
+code +55: an upstream fix is confirmed by its ack alone (the fixer's receipt), never by a separate note
+system +55: an upstream fix is confirmed by its ack alone (the fixer's receipt), never by a separate note
+question +55: an upstream fix is confirmed by its ack alone (the fixer's receipt), never by a separate note
+every +55: an upstream fix is confirmed by its ack alone (the fixer's receipt), never by a separate note
+code +20: a hand-written on_pass_cmd tests a checks pass with `ttp checks --result --passed`
+code +155: urgent work sets a retry or deadline wake at the expected finish from `ttp eta`, never a padded worst case
+system +155: urgent work sets a retry or deadline wake at the expected finish from `ttp eta`, never a padded worst case
+question +155: urgent work sets a retry or deadline wake at the expected finish from `ttp eta`, never a padded worst case
+every +155: urgent work sets a retry or deadline wake at the expected finish from `ttp eta`, never a padded worst case
+code +265: a waiting hand-off lists the later waits of a known sequence in `then`, passed model-free
+every +265: a waiting hand-off lists the later waits of a known sequence in `then`, passed model-free
+code +135: the `context_gaps` hand-off field names what the spec and its context block lacked
+code +44: a confirm or watch wait settles from its probe output by `probe_match`, model-free
+every +83: a confirm or watch wait settles from its probe output by `probe_match`, model-free
+code +45: the kill guard and Stop hook lines say on which providers the harness hook runs (no false claim without it)
+question +41: the kill guard and Stop hook lines say on which providers the harness hook runs (no false claim without it)
+every +45: the kill guard and Stop hook lines say on which providers the harness hook runs (no false claim without it)
+code +102: the Threads line: independent parts run in parallel subagents, their spend in the run's budget
+question +169: the Threads line: independent parts run in parallel subagents, their spend in the run's budget
+every +169: the Threads line: independent parts run in parallel subagents, their spend in the run's budget
+code +46: the no-search rule names the KNOWN PATHS block and `ttp paths` (no search of / or the home folder)
+question +46: the no-search rule names the KNOWN PATHS block and `ttp paths` (no search of / or the home folder)
+every +46: the no-search rule names the KNOWN PATHS block and `ttp paths` (no search of / or the home folder)
+code +115: a remote test (`ttp lock <box> --`, ssh) or a slow poll runs detached and the worker hands off waiting, freeing its slot
+question +115: a remote test (`ttp lock <box> --`, ssh) or a slow poll runs detached and the worker hands off waiting, freeing its slot
+every +115: a remote test (`ttp lock <box> --`, ssh) or a slow poll runs detached and the worker hands off waiting, freeing its slot
+system +115: a remote test (`ttp lock <box> --`, ssh) or a slow poll runs detached and the worker hands off waiting, freeing its slot
+every +130: a long queue for CPU-only work runs on another allowed host with room, rather than wait
+code +101: a failed try inside a route's grace is a retry, not a finding (command schedule grace_min)
+question +101: a failed try inside a route's grace is a retry, not a finding (command schedule grace_min)
+every +101: a failed try inside a route's grace is a retry, not a finding (command schedule grace_min)
+system +101: a failed try inside a route's grace is a retry, not a finding (command schedule grace_min)
+every +72: a running worker acks a mid-run update with a `ttp note "update: ..."` (#6313)
+every +217: a broker device job runs --preemptable within the 1500 s cap, ends cleanly on SIGTERM and resumes from a checkpoint
+every +110: a reply wait can skip replies already taken and wait past an acknowledgement or plan (ack-wait --after, --terminal)
+code +80: a reply wait can skip replies already taken and wait past an acknowledgement or plan (ack-wait --after, --terminal)
+every +92: device work names Galaxy parts as the setup-box hardware reference does
+code +80: a `done` hand-off stops each live detached job its `retry_when` or `next_step` does not name
+every +80: a `done` hand-off stops each live detached job its `retry_when` or `next_step` does not name
+every +170: the devq fence says to queue device jobs at task start, that a runner's prewarm builds off the device, and that a broker call over 1500 s is refused (#8778)
+system +170: the devq fence says to queue device jobs at task start, that a runner's prewarm builds off the device, and that a broker call over 1500 s is refused (#8778)
+code +170: the devq fence says to queue device jobs at task start, that a runner's prewarm builds off the device, and that a broker call over 1500 s is refused (#8778)
+question +170: the devq fence says to queue device jobs at task start, that a runner's prewarm builds off the device, and that a broker call over 1500 s is refused (#8778)
+every +265: the ETA format a worker posts and the devq fence's further lines on every-feature prompts (#8771, #8778)
+every +103: device profiling points to the optional tt-profiler skill, else tt-metal's docs
+every +45: a fix on an unlanded stack hands off done, never waiting on its own stack landing
+code +40: a fix on an unlanded stack hands off done, never waiting on its own stack landing (the line counts in the code prompt too)

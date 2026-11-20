@@ -1,0 +1,78 @@
+#!/bin/sh
+# SPDX-FileCopyrightText: © 2026 Tenstorrent USA, Inc.
+# SPDX-License-Identifier: Apache-2.0
+# git for tt-project runs: the real git further down PATH. Inside a run (TTP_TASK set), a call naming
+# `push` goes through ttp/gitguard.py first, which keeps a code task off the push branch while
+# delivery.code_tasks_may_push is off and scans what the push sends for leaks (ttp/outscan.py). So
+# does a call whose subcommand is no common builtin: gitguard resolves a git alias (`git -c alias.p=push
+# p`) and refuses send-pack. Aliases never shadow a builtin, so the listed ones go straight to git.
+# In a coordinator run (TTP_ROLE=coordinator, or full tools) every push goes there too and is
+# refused; a guard that fails to load refuses it as well. Every other call execs the real git at once.
+# The real git is the first git on PATH that is no tt-project git wrapper: another project's
+# harness bin/ further down PATH holds a copy, and taking it would make the two exec each other.
+# Only a script can be a wrapper: a candidate whose first line is no `#!` line (the real git, a
+# binary) is taken without the marker search, so a git call forks nothing but git itself.
+set -f
+real=
+ifs=$IFS
+IFS=:
+for d in $PATH; do
+    if [ -n "$d" ] && [ -x "$d/git" ] && ! [ "$d/git" -ef "$0" ]; then
+        first=
+        IFS= read -r first < "$d/git" 2>/dev/null
+        case $first in
+        '#!'*) ! grep -qsF '# tt-project git wrapper' "$d/git" || continue ;;
+        esac
+        real=$d/git
+        break
+    fi
+done
+IFS=$ifs
+if [ -z "$real" ]; then
+    echo "git: not found on PATH" >&2
+    exit 127
+fi
+coord=
+[ "${TTP_ROLE:-}" = coordinator ] || [ "${TTP_COORD_FULL_TOOLS:-}" = 1 ] && coord=1
+if [ -n "${TTP_TASK:-}" ] || [ -n "$coord" ]; then
+    sub=
+    skip=
+    for a in "$@"; do
+        if [ -n "$skip" ]; then
+            skip=
+            continue
+        fi
+        case $a in
+        -C|-c|--git-dir|--work-tree|--namespace|--super-prefix|--config-env) skip=1 ;;
+        -*) ;;
+        *) sub=$a; break ;;
+        esac
+    done
+    case $sub in
+    ''|add|am|annotate|apply|archive|bisect|blame|branch|bundle|cat-file|check-attr|check-ignore|\
+    check-mailmap|check-ref-format|checkout|checkout-index|cherry|cherry-pick|clean|clone|column|commit|\
+    commit-graph|commit-tree|config|count-objects|credential|describe|diff|diff-files|diff-index|diff-tree|\
+    fetch|for-each-ref|format-patch|fsck|gc|grep|hash-object|help|init|interpret-trailers|log|ls-files|\
+    ls-remote|ls-tree|merge|merge-base|merge-file|merge-tree|mktree|mv|name-rev|notes|pack-refs|patch-id|\
+    prune|pull|range-diff|read-tree|rebase|reflog|remote|repack|replace|reset|restore|rev-list|rev-parse|\
+    revert|rm|shortlog|show|show-branch|show-ref|sparse-checkout|stash|status|stripspace|submodule|switch|\
+    symbolic-ref|tag|update-index|update-ref|var|verify-commit|verify-tag|version|worktree|write-tree) ;;
+    *) sub=" push " ;;
+    esac
+    case " $* $sub " in
+    *" push "*)
+        [ -x "${TTP_PYTHON:-}" ] || TTP_PYTHON=python3
+        rt=${0%/*}/../runtime                                # a harness's bin/
+        [ -d "$rt/ttp" ] || rt=${0%/*}/../../runtime         # the plugin's template/bin/
+        # The guard never stops git by failing to load: the real git runs then.
+        "$TTP_PYTHON" -I -c 'import sys; sys.path.insert(0, sys.argv[1]); import ttp.gitguard' "$rt" 2>/dev/null &&
+            exec "$TTP_PYTHON" -I -c 'import sys; sys.path.insert(0, sys.argv[1]); from ttp.gitguard import main; sys.exit(main(sys.argv[2:]))' \
+                "$rt" "$real" "$@"
+        if [ -n "$coord" ]; then
+            echo "tt-project: a coordinator run pushes nothing (the push guard did not load)" >&2
+            exit 1
+        fi
+        ;;
+    esac
+fi
+exec "$real" "$@"

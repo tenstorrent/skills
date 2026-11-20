@@ -1,0 +1,5 @@
+---
+"tt-project": patch
+---
+
+`tt-project`: an ssh alias that resolves nowhere is caught when it is recorded and never read as a pause. `ttp machines add` and `ttp machines set` (a new alias, or a changed `--hostname`) ask `ssh -G <alias>`, which only reads the ssh config and never connects: an alias that no Host entry maps to a HostName, ProxyJump or ProxyCommand, and that does not resolve as a host name either, is refused with one line naming the fix (add a `Host` entry, or pass `--no-ssh-check` for a machine never reached by ssh); one naming this machine is always saved. An ssh error saying the name does not exist (`Could not resolve hostname <name>: Name or service not known`, or `No address associated with hostname`) is now a broken route the project fixes: a probe's 255 with it wakes its task as a broken probe instead of waiting as unreachable, and a heal check with it queues its self-fix task at once, past a paused resource or the outage window. "Temporary failure in name resolution" stays an outage. The tt-project-harness skill says to confirm a new ssh route with `ssh -G` before a gate or guard uses it.

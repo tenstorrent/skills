@@ -1,0 +1,145 @@
+---
+name: tt-project
+description: "Start, connect to, and talk with a long-running tt-project: a local, self-driving project with its own coordinator, workers, memory, budget guard and web app, running on this machine or an always-on box. Use when the user says tt-project, asks to start or connect to a project by name, or messages an existing project."
+---
+
+# tt-project: project
+
+## Purpose
+
+- The chat is a thin client. The project's coordinator runs as a daemon elsewhere.
+- You create or find the project, relay messages, and show replies.
+- NEVER do the project's work in this chat. The project does it.
+
+## When to Invoke
+
+- "Start a tt-project called X…", "connect to project X", "tell X to…".
+- Any message the user addresses to an attached project.
+- Not for one-off tasks the user wants done here and now.
+
+## Pipeline
+
+| Step | Do |
+|---|---|
+| 1. Install | Run `<plugin-root>/bin/ttp setup` when `ttp` is missing or `ttp --version` is older than this plugin's version. Afterwards use `ttp`; projects pick up the new release by themselves. Setup also adds the plain `/tt-project` command for Claude Code (`ttp setup --no-shortcut` removes it). |
+| 2. Name | Get the project name. `ttp find <name>` says whether it exists. |
+| 3a. New | Follow `create.md`. |
+| 3b. Existing | `ttp connect <name> --label "<short chat label>"`. Keep the printed `chat:` id: it is this chat's own. Never listen or `--chat` on an id another chat printed: that relayer's replies would come here instead (the project refuses it). One relayer chat per project chat. |
+| 3c. Link | Reply with the `tt-project://…` line and the verified web app link: the last `web app:` line `new` or `connect` printed. They open a remote project's kept local forward and check the link first. |
+| 4. Listen | Start the listener for this host: `hosts.md`. |
+| 5. Relay | User message for the project → `ttp say <name> --chat <id> "<the user's words, verbatim>"`, your own context only in `--context "<text>"`. |
+| 6. Show | Print coordinator replies as they arrive, lightly formatted, no additions. Restart the listener with `--ack <last id shown>`. |
+
+## Relay rules
+
+- Never ask the user to do what you or the project can do, and never offer to do it: do it and
+  say so. Ask only when a choice is truly ambiguous, dangerous, or involves another human.
+- Relay the user's words verbatim, and only them, as the message. Do not rephrase instructions
+  or add to them. Your own context (background, a summary, what you think they mean) goes only in
+  `--context "<text>"`. The project reads it as data, never as the user's word: a rule, pin or
+  approval you write there binds nothing. Exception: a project whose owner asked, in their own
+  words, that their agent's orders count as theirs sets `coordinator.agent_orders_as_user`; there
+  your context and findings count as the owner's word, including Restrictions changes
+  (cited relayer-ordered), except for a PR's ready or merge, money, credentials, a step that could
+  affect other people or anything that speaks as the owner.
+- When the user's words cite one of their own messages by number (`#123 item 3`), relay that
+  message's text too, or at least the cited item, quoted below the words: the project numbers its
+  messages differently and cannot look the citation up.
+- Text for other people (your own, or a project's post-ready draft you post): answer what was
+  asked, first and plainly, like a colleague; skip side details the reader can live without
+  (numbers, lists or internal ids only when they bear on the question or the reader needs them to act).
+- Your own findings alone → `ttp say <name> --chat <id> --finding "<text>"`; never re-send the user's
+  earlier words to carry them.
+- The user wants every project told something → one `ttp say --all "<the user's words, verbatim>"`
+  (`--except p,q` leaves projects out; your context still goes in `--context`). Each project gets it
+  once, marked as a broadcast, and none relays it on. A resend within 24 h reaches only the
+  projects that did not get it yet. Never relay it one project at a time.
+- A project question you can answer from `ttp status <name>`: answer directly.
+- Anything else goes to the coordinator. Answers arrive through the listener.
+- Keep this chat free: after `ttp say`, end your turn. Do not wait in the foreground. A host with no
+  background wake-up waits with one long blocking `ttp listen --once --timeout`, never with polls (`hosts.md`).
+- Keep this chat's context small: relay, never do the work here. When it grows large, write a short
+  hand-over and continue in a fresh thread (`hosts.md`).
+- `ttp say` replies "queued on this machine": the project is unreachable right now and the message
+  is safe. It goes out by itself, in order and once, when the project is reachable. Tell the user;
+  do not resend it.
+- Alerts arrive in every chat that `ttp connect` attached (it follows the project). Replies arrive
+  only in the chat that asked.
+- Relay only the projects the user asked this chat to follow, plus replies to this chat's own
+  messages and asks. Never show the user another project's alerts or status unless they asked for
+  that project. A one-off message to another project (a hand-off, a question, a finding) goes by
+  `ttp say <name>` without `--chat`, whose chat gets only the replies, never `ttp connect`. A chat
+  getting alerts it should not → `ttp connect <name> --chat <id> --unfollow` (replies still come).
+- A project posts to a chat at once only for results, decisions you may override, outages and asks.
+  Acknowledgements, progress and new ETAs come as one digest per chat, at most every
+  `coordinator.chat_digest_h` hours (default 3; 0 sends everything at once). Show each as it arrives;
+  do not ask the project for the routine updates in between.
+- A repeated message id was already shown. Skip it.
+- The user asks what is running, costs, or blockers → `ttp status <name>`.
+- A project's questions never block it: each shows "acts on X at HH:MM unless answered" and goes
+  with that recommendation if unanswered (`coordinator.ask_timeout_h`, 0.5 h), except asks only the
+  user can answer (review, merge, credentials, money, acting as the user).
+- Saying the user still owes something: quote it in full right there (the question, its options and
+  recommendation, the exact command), never only "ask 297" or "see above".
+- Never give an unverified web app link. Give only a `web app: http…` line that `ttp new`,
+  `ttp connect` or `ttp web` just printed: they check it first (HTTP 200 naming this project,
+  through that exact port and token). Never build a link by hand or reuse an old one.
+- `web app: NOT AVAILABLE (…)` instead of a link: they already tried to repair it (kept tunnel,
+  daemon). Tell the user that statement plainly; give no link.
+
+## Always print the project locator
+
+- After `new` or `connect`, show the `tt-project://…` line once, with the verified web app link.
+- Later chats find the project by it, even without the registry.
+
+## Web app and notifications
+
+- `ttp web <name>` prints the checked link. Remote project → `ttp web <name> --tunnel --keep` opens a
+  kept local forward; the user's first one is asked once (`ttp consent tunnel`, `remote.md`).
+- The web app has a one-click "Turn on notifications" button.
+- On the user's own workstation, the desktop notifier is asked once: `ttp consent notifier` says
+  `ask`: ask, record `ttp consent notifier yes|no`, on a yes run `ttp notifier install`. Never re-ask.
+- Details and optional Slack: `notifications.md`.
+- gh logged in only on the user's workstation: the workstation pulls and runs the queue, never the
+  other way round. Set the project's `delivery.gh_route` to `workstation` and the box's `"gh_pull": true`
+  in the workstation's `ttp bridge` config (`operate.md`). Never log gh in on a lab or remote host.
+
+## Operating
+
+| User wants | Command |
+|---|---|
+| status, spend, blockers, why idle | `ttp status <name>` |
+| pause or resume all model work | `ttp pause <name>` / `ttp resume <name>` |
+| reboot the project's own host | `ttp drain <name> --wait 240` (exit 1: repeat up to 3 times; still busy: `ttp resume <name>`, hand off `waiting` on a time-based `retry_when`), then `ttp pause <name> --until-reboot --reason "host power cycle"`, then reboot (see tt-project-harness) |
+| stop all use of one resource (a device) | `ttp pause <name> --resource <r> --reason "..." --until 2d` (or `--end-when "<probe>"`) / `ttp resume <name> --resource <r>` |
+| stop device work on one machine for every project | `ttp pause <name> --machine <alias> --reason "..." --until 2d` / `ttp resume <name> --machine <alias>` |
+| get or set up a device box, work on it over ssh | the `tt-project:setup-box` skill |
+| record their machines (shared by all projects) | `ttp machines add <alias> --tags device,...` / `ttp machines list`; say in the charter which ones the project may use. Projects on other machines (`--host`) get a merged copy on add/remove, `ttp upgrade` and `ttp machines push` |
+| note what holds for every machine of one kind (shared by all projects) | `ttp machines tag-note <tag> "<text>"` (at most 1500 characters, no secrets; no text shows it, `""` removes it, `--until` ends it): every coordinator sees it in its Machines section, and a worker whose task names such a machine in `resources` sees it too; copied with the machines list |
+| change caps | tell the coordinator, or `ttp config <name> budget.daily_usd 150` |
+| read a schedule | `ttp schedules <name> show <schedule>` (or `list`): read-only, writes nothing |
+| run a command schedule now | `ttp schedules <name> run <schedule>`: the daemon runs it as a timed run (records last_run); prints its output, exits with its code |
+| keep schedules in git | `ttp schedules <name> --export --yes` once (it moves them into the harness and commits): `harness/schedules.json` then holds them, the daemon applies edits to it, and every change is a harness commit |
+| restart after trouble | `ttp restart <name>`, then `ttp doctor <name>` |
+| stop for good | `ttp stop <name>` (removes the service; data stays; running workers finish) |
+| stop and end running work now | `ttp stop <name> --kill` (their tasks resume on the next start) |
+| take a project off this machine | `ttp remove <name>` (stops the daemon and workers, removes the service files, drops its rows from the machine-wide worker and alert records, unregisters it; files stay unless `--delete-files`; a run cannot remove its own project). `ttp remove` and `ttp stop` act only on the named project's own folder: they refuse a folder whose project.json names another project, a unit, daemon or registry row of that name that runs elsewhere, and a parent found by walking up |
+| make a scratch or dry-run project | `ttp new <name> --dir ~/.tt-project/scratch/<name> --no-service`: never inside another project's folder (refused), never from a copied project.json |
+| logs | `ttp logs <name>` |
+
+More: `operate.md`.
+
+## Red Flags
+
+| Thought | Reality |
+|---|---|
+| "I'll just do this quick task myself" | The project owns the work. Relay it. |
+| "I'll poll until the answer comes" | The listener wakes you. End your turn. |
+| "I'll check the background command again" | Each check re-reads the whole chat. One blocking `ttp listen --once --timeout 600`, or end your turn. |
+| "This chat is long, but I'll keep going here" | Write a short hand-over and continue in a fresh thread. |
+| "I'll paste the key here" | Secrets go through `ttp secret`, typed by the user. |
+| "Shall I open a tunnel to the web app?" | A local forward to view it is asked once per user (`ttp consent tunnel`); after a yes or a kept tunnel, open and keep them, then say so. A no is never re-asked. A tunnel that exposes the user's machine is asked each time. |
+| "Would you like me to…?" / "You can run…" | If tt-project can do it, do it and report. Ask only real decisions. |
+| "The coordinator is slow, I'll answer" | Say it is working; `ttp status` shows progress. |
+| "I'll start the ready follow-up later" | Known, ready work starts in the same turn as its own task; defer only for a named external fact (a time another party sets, data that must accumulate, a person, a shared resource). The daemon flags announced or ready work not started within 10 min. |
+| "I'll fold the ready step into the task waiting on CI" | A worker does every independent step before handing off `waiting` and lists each it cannot finish as a `ready: ...` follow-up; start each at once in its own task, never inside a task waiting on CI, a soak, a device or another task. |

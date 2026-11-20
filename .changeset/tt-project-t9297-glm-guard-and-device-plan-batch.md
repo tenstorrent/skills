@@ -1,0 +1,5 @@
+---
+"tt-project": patch
+---
+
+`tt-project`: fewer GLM runs go back to Opus on guard false stops and on device plans that fail their own checks, with no protection loosened. The write guard reads `sed -i` properly: its script (`-e`, `-f`, `-E`, `-i.bak`, any `s` delimiter, `--`) is never a target file, while its file operands, relative ones after a `cd` included, and a script's `w file` command still count. A GLM run may still write under the folder it started in after its shell `cd`s to a sibling folder; the daemon records that folder in the run's marker. A command run on another host that writes under `~` or `$HOME` is now refused like any other remote write outside the run's folder. The device planner is told to publish only with `ttp push`, never `git push`, and to make any remote scratch folder in its own step, named from the task id it is now given; the GLM run is told to use the plan's paths exactly. The glm_device wave verdict counts bounces only from runs after the project's latest re-arm and needs 10 of them before it can roll the project back; a harmful step GLM takes on its own still stops the route at once.

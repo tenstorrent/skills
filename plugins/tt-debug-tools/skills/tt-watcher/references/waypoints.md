@@ -75,3 +75,8 @@ hang.
    never acknowledges, and that is what the sanitizer catches when enabled.
 4. Resolve the exact code with the grep above before concluding. Two codes in the
    same family can sit in different functions.
+5. Usual deadlock causes, check these first: producer and consumer block on the
+   same circular buffer at once; `cb_reserve_back` / `cb_wait_front` called in
+   the wrong order across two buffers; a kernel exits before consuming every
+   tile it was sent; a `noc_semaphore_wait` writer overshot the value (strict
+   equality, see `tt-triage` `references/signals.md`).

@@ -1,0 +1,8 @@
+---
+"tt-project": patch
+---
+
+`tt-project`: three waits that used to need a model run are now settled by the daemon itself.
+- **Shared check failure that passes on the push-branch tip.** When a task's checks fail only on test ids that pass on the tip, the daemon rebases the task's worktree onto the tip and reruns its checks on the new head. It does this only when the worktree is clean and its head is on no remote ref. It never force-pushes or touches a remote branch. A dirty or published worktree, a tip missing from the repository, or a rebase that stops (it is aborted) wakes the task as before, and the wake says why it was not rebased.
+- **Missing program after `--`.** `ttp checks` now refuses, before anything is queued, a command after `--` whose first program `command -v` cannot find. The lookup uses the checks' own environment and directory, and runs on the check host when there is one. The refusal names the missing program. Launcher forms (`env`, `timeout`, `nice`, `nohup`, assignments) resolve to the program that really runs; `timeout -s/-k` and `env -u/-C` now skip their option values. Python and test runners are left to the existing runner precheck. Relative paths, and commands that may change `PATH`, are not checked. An unreachable check host refuses nothing.
+- **Hand-off waiting on its own push.** When a waiting hand-off waits on `ttp push --result` and the push marker says pushed (a single push, or a batch that pushed or landed), its `on_pass` is recorded model-free. With no `on_pass`, its own summary (a review's verdict, say) is recorded as `done`. A failed, refused or empty push, a `next_step`, an `on_pass_cmd` or an invalid `on_pass` still wakes the task as before.

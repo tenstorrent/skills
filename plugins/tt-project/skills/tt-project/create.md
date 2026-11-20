@@ -1,0 +1,102 @@
+# Creating a project
+
+Ask only what you cannot infer. One message, all questions at once.
+
+## 1. Name and brief
+
+- Name: letters, digits, `.`, `_`, `-`. Taken → connect to it and say so; ask for another name only
+  if the brief clearly describes different work.
+- Brief: inline text, a file path, a link — anything. Pass it on verbatim.
+- Save a long inline brief to a file first; pass it with `--describe-file`.
+
+## 2. Where the project lives (the folder)
+
+- Default: the git top level of the current directory.
+- Data goes in `<root>/tt-project/`, which ignores itself. Nothing is committed.
+- Unclear root (no repo, several repos, a non-code project) → ask the user.
+
+## 3. Which machine runs it
+
+| Situation | Default | Ask |
+|---|---|---|
+| This machine has TT devices (`/dev/tenstorrent` exists) | this machine | no |
+| Always-on Linux box, no devices, none needed | this machine | no |
+| Laptop (has a battery) | ask | "Which always-on machine should run it? A laptop works only while awake." |
+| Work needs devices the laptop lacks | ask | the box or reservation to use |
+
+- A laptop is allowed. Say it pauses while asleep and resumes on wake.
+- Remote machine → `--host <ssh-alias> --dir <root on that machine>`.
+- Device details or reservations named by the user go into the brief.
+
+## 3b. The user's machines (for device or remote work)
+
+The user's machines are listed once per user and shared by all their projects:
+`ttp machines list`. When the work needs devices or other machines:
+
+- record machines the user names that are not listed yet yourself:
+  `ttp machines add <alias> --tags device,... --note "..."` (their ssh alias; tags say what it
+  offers; no secrets in the note); a machine whose disk other services keep near full by design
+  gets its own disk guard threshold with `--min-free-gb N` (add `--hostname` if the alias is not
+  its short host name);
+- ask, in the same message as any other question, which of them this project may use (a
+  restriction only the user sets). Put that in the brief as a line starting
+  "Machines this project may use:", so the charter's Resources section records it; the daemon's
+  first start moves those aliases into config `machines.allowed` once, and later changes go there
+  with `ttp config machines.allowed '[...]'`.
+
+Shared clusters (Slurm, other people's machines): record in the "Machines this project may use:"
+line the clusters the user names and any nodes, partitions or limits they set for this project;
+add none of your own. The project gets nodes through the scheduler, never takes one allocated,
+drained or reserved for others, runs each test as one self-ending batch job and never holds a node
+idle (the worker prompt's "Shared clusters" rules).
+
+When one machine keeps failing, the coordinator moves the work to another allowed machine with
+the same tags and tells the user. With only one allowed machine it has to ask instead.
+
+## 4. Jev (optional)
+
+Check `ttp secret show`. No Jev entry → tell the user, in plain words:
+
+> Jev is an optional add-on: a cheap decision model the project uses to screen logs and alerts
+> before waking an LLM. It is off until you save a key; from then on it sends log and alert text
+> to an outside paid service. Without it everything still works, screening just costs more. To add
+> a key, run `ttp secret jev` in a terminal and paste it there (not in this chat).
+
+- OpenRouter users: `ttp secret jev --via openrouter`.
+- The key is saved once per user and shared by all their projects on that machine.
+- Saved keys stay on the machine they were typed on. A project on a shared or build box gets them
+  at run time from that box's store (`ttp secret store command --shared -- <fetch command>`, run
+  there by the user); a machine of the user's own may take a copy (`--copy-secrets` on `ttp new
+  --host`, or `ttp secret push --host <ssh-alias>`).
+- Jev turns on by itself once a key exists. No key: say so once, carry on.
+
+## 5. Create
+
+```bash
+ttp new <name> --relayer [--dir <root>] [--host <ssh-alias>] [--coordinator-effort <level>] --describe-file <brief.md>
+```
+
+- `--relayer`: you, the user's agent, create it, so it takes your orders as the user's
+  (`coordinator.agent_orders_as_user` on, recorded as the owner's). Leave it out only if the user
+  says their agent's words should not count as theirs.
+
+- The coordinator runs at xhigh effort by default (each provider takes its nearest level). Pass
+  `--coordinator-effort` only if the user asks for another; later,
+  `ttp config <name> coordinator.effort <level>` changes it from the next turn.
+- Remote host: the command ships the runtime over ssh and creates it there.
+- The daemon installs as a service: systemd user unit (+ linger) or launchd; cron fallback.
+- Print the `tt-project://…` line and the verified web app link from the output. For a remote
+  project the command already opened the kept local forward and checked the link through it.
+- Relay the defaults lines it prints (spending caps, the 90% plan line, free Codex resets, Jev, the
+  coordinator's model and effort) in plain words, once; the user changes any with
+  `ttp config <name> KEY VALUE`.
+- A `web app: NOT AVAILABLE (…)` line (exit 3) means the project was created but its web app did
+  not answer after repair. Say what it names as broken; give no link.
+
+## 6. Then
+
+- `ttp connect <name> --label "<chat label>"` and start the listener (`hosts.md`).
+- The coordinator restates goals and asks what it still needs. Relay its message.
+- On the user's own workstation, the notifier is asked once: if `ttp consent notifier` says `ask`, ask,
+  record `ttp consent notifier yes|no`, and on a yes run `ttp notifier install` and say so.
+- Reply with the verified web app link `connect` printed last (never an unverified one).

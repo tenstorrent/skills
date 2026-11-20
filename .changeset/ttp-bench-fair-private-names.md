@@ -1,0 +1,5 @@
+---
+"tt-project": patch
+---
+
+`tt-project`: the model bench's fair filter now drops a task whose held-out tests depend on a private name (leading underscore) that neither the task's spec states nor the base commit defines, whether the test imports it, calls it, patches it by string or reads it as an attribute; the existing checks stay. A model-suite folder pair that the tighter filter leaves with fewer than 12 fair tasks is rebuilt once it is a day old instead of after its week. Also: `ttp ack-wait --terminal` reads only the sender's own words (the `[facts at send time ...]` block is stripped first); a planned check and an under-use wake keep their own tier, and only the run that writes a conclusion is lifted to the conclusion floor; a cached wait-gate verdict is reused only for the same wake reason, so a planned check after an event wake is judged by its own plan; `waiting.check_plan` is a known config key with the wake planner's defaults, so `ttp config` accepts it; and a regression test covers a `continue:` hop whose only missing cell is unrunnable or tried and rejected, which queues no further hop.

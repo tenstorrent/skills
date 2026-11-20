@@ -111,6 +111,24 @@ data collected".
 roughly 1000 kernel runs the buffer needs draining sooner —
 `detail::ReadDeviceProfilerResults(device)` after the program of interest.
 
+**A long pipeline overflows the buffer and loses its tail.** When one capture
+holds more zones than the buffer keeps, the later stages come back partial or
+missing. Profile each stage in its own capture, or drain between stages as
+above, and merge the CSVs off the device. Post-process off the device too, so
+the device is held only for the capture.
+
+**A zone name must be a compile-time string literal.** `DeviceZoneScopedN`
+hashes its argument at compile time from a `const char (&)[N]`. A runtime choice
+such as `cond ? "a" : "b"` decays to `const char*` and breaks the profiler build.
+Without `TT_METAL_DEVICE_PROFILER` the macro expands to nothing, so the same code
+compiles and the break hides until the first capture. Put a literal zone inside
+each branch.
+
+**Compare medians of warm runs.** The first run carries JIT compile and
+program-cache setup and is several times slower. Drop warm-up runs and compare
+the median over several runs, never a single run or the mean (see the first-iter
+caveat in `references/op-report.md`).
+
 **`DeviceZoneScopedN` costs time.** Timings from heavily annotated code include
 the annotation overhead. Instrument selectively, and do not compare an annotated
 run against an unannotated one.

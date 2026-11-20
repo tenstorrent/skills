@@ -1,0 +1,160 @@
+# SPDX-FileCopyrightText: © 2026 Tenstorrent USA, Inc.
+# SPDX-License-Identifier: Apache-2.0
+"""A deterministic stand-in agent for tests and dry runs: no model, no network, no cost.
+
+Coordinator runs echo a scripted action list (TTP_FAKE_ACTIONS, JSON) or, by default, reply to
+every user message and queue one task per message. Worker runs write result.json and exit; with
+TTP_FAKE_SHELL set they first run it with sh in their working directory (it may write result.json).
+A compacting run of either role emits a compact_boundary with its summary (TTP_FAKE_COMPACT_AT set by
+compact_env, TTP_FAKE_CONTEXT the run's context size, TTP_FAKE_COMPACT_SUMMARY what it compacted into).
+With TTP_FAKE_SESSIONS set to a directory, each run saves a session transcript there, and
+`--resume <id>` continues one (or fails to start, like a real agent, when it is gone).
+"""
+from __future__ import annotations
+
+import json
+import os
+import sys
+from pathlib import Path
+
+from . import register
+from .base import Provider, RunUsage
+
+
+@register
+class Fake(Provider):
+    name = "fake"
+    coord_session = "agent"
+    resume_new_prompt = "reread"
+    efforts = ("minimal", "low", "medium", "high", "xhigh", "max")
+    subagent_model_env = "TTP_FAKE_SUBAGENT_MODEL"
+
+    def credential_files(self) -> list[str]:
+        return [f] if (f := os.environ.get("TTP_FAKE_CREDENTIALS")) else []
+
+    def login_check(self) -> bool | None:
+        # With TTP_FAKE_LOGIN set to a path, the agent is logged in while that file exists.
+        return Path(f).exists() if (f := os.environ.get("TTP_FAKE_LOGIN")) else None
+
+    def binary(self):
+        return sys.executable
+
+    def compact_env(self, tokens: int) -> dict[str, str]:
+        # With TTP_FAKE_AGENT_COMPACTS set, it has a compaction switch like Claude Code's: a context
+        # past `tokens` (TTP_FAKE_CONTEXT) compacts in place (a compact_boundary in its output).
+        return {"TTP_FAKE_COMPACT_AT": str(int(tokens))} if tokens and os.environ.get("TTP_FAKE_AGENT_COMPACTS") else {}
+
+    def build(self, *, role, model, effort, cwd, budget_usd, read_only, schema, restrictions,
+              disallowed_tools=(), denied_reads=(), web=True):
+        return [sys.executable, "-m", "ttp.providers.fake", role], {}
+
+    def resume_args(self, session_id: str) -> list[str]:
+        return ["--resume", session_id] if session_id else []
+
+    def session_saved(self, session_id: str, cwd: str, env: dict | None = None) -> bool:
+        d = os.environ.get("TTP_FAKE_SESSIONS")
+        return bool(d and session_id and (Path(d) / f"{session_id}.jsonl").is_file())
+
+    def session_paths(self, session_id: str, cwd: str, env: dict | None = None) -> list[Path]:
+        d = os.environ.get("TTP_FAKE_SESSIONS")
+        path = Path(d) / f"{session_id}.jsonl" if d and session_id else None
+        return [path] if path and path.is_file() else []
+
+    def fork_session(self, session_id: str, cwd: str, env: dict | None, new_id: str) -> str:
+        src = self.session_paths(session_id, cwd, env)
+        if not src:
+            return "no saved session"
+        (src[0].parent / f"{new_id}.jsonl").write_text(src[0].read_text())
+        return ""
+
+    def parse(self, output_path, stderr_path=None) -> RunUsage:
+        u = RunUsage(cost_usd=0.0)
+        try:
+            data = json.loads(Path(output_path).read_text() or "{}")
+        except (OSError, ValueError):
+            data = {}
+        u.final_text = json.dumps(data)
+        u.structured = data if isinstance(data, dict) else None
+        u.cost_usd = float(data.get("_cost", 0.0)) if isinstance(data, dict) else 0.0
+        u.output_tokens = int(data.get("_output_tokens", 0)) if isinstance(data, dict) else 0
+        u.session_id = str(data.get("_session") or "") if isinstance(data, dict) else ""
+        if isinstance(data, dict) and data.get("_error"):
+            u.error, u.extra["subtype"] = str(data["_error"]), str(data["_error"])
+        if isinstance(data, dict) and data.get("_model"):
+            u.extra["model"] = str(data["_model"])
+        return u
+
+
+def _main(role: str, args: list[str] | None = None) -> int:
+    import uuid
+    args = args or []
+    prompt = sys.stdin.read()
+    sessions = os.environ.get("TTP_FAKE_SESSIONS")
+    session = args[args.index("--resume") + 1] if "--resume" in args[:-1] else ""
+    if session and not (sessions and (Path(sessions) / f"{session}.jsonl").is_file()):
+        sys.stderr.write(f"No conversation found with session ID: {session}\n")
+        return 1
+    session = session or os.environ.get("TTP_FAKE_SESSION") or str(uuid.uuid4())
+    if sessions:
+        with open(Path(sessions) / f"{session}.jsonl", "a") as f:
+            f.write(json.dumps({"role": role, "prompt": prompt}) + "\n")
+    cost = float(os.environ.get("TTP_FAKE_COST", "0"))
+    cap = args[args.index("--max-budget-usd") + 1] if "--max-budget-usd" in args[:-1] else ""
+    if cap and cost > float(cap):   # like Claude Code: a session total over the cap ends the run, the session kept
+        sys.stdout.write(json.dumps({"_cost": cost, "_session": session, "_error": "error_max_budget_usd",
+                                     "_output_tokens": 1000}))
+        return 1
+    if role == "coordinator":
+        scripted = os.environ.get("TTP_FAKE_ACTIONS")
+        if scripted:
+            out = {"actions": json.loads(scripted)}
+        else:
+            actions = []
+            for line in prompt.splitlines():
+                if line.startswith("- [user message "):
+                    chat = line.split("chat=")[1].split("]")[0]
+                    text = line.split("] ", 1)[1]
+                    mid = int(line.split("#", 1)[1].split()[0])
+                    actions.append({"type": "reply", "chat": chat, "text": f"ack: {text}", "order": mid,
+                                    "no_order": "fake turn"})
+                    actions.append({"type": "task_add", "title": f"do: {text}"[:80], "spec": text, "tier": "light",
+                                    "reply_chat": chat})
+            out = {"actions": actions or [{"type": "noop"}]}
+        if os.environ.get("TTP_FAKE_SESSION_NOTE") and "## Session compaction" in prompt:
+            out["session_note"] = os.environ["TTP_FAKE_SESSION_NOTE"]   # a session's own summary
+        at, size = int(os.environ.get("TTP_FAKE_COMPACT_AT") or 0), int(os.environ.get("TTP_FAKE_CONTEXT") or 0)
+        if at and size >= at:
+            out.update({"subtype": "compact_boundary", "compact_metadata": {"trigger": "auto", "pre_tokens": size}})
+            out["summary"] = os.environ.get("TTP_FAKE_COMPACT_SUMMARY") or ""
+        if os.environ.get("TTP_FAKE_SUMMARY"):   # the turn's own summary (a session keeps the last ones)
+            out["summary"] = os.environ["TTP_FAKE_SUMMARY"]
+    else:
+        run_dir = Path(os.environ["TTP_RUN_DIR"])
+        if os.environ.get("TTP_FAKE_SHELL"):
+            import subprocess
+            subprocess.run(["sh", "-c", os.environ["TTP_FAKE_SHELL"]], stdin=subprocess.DEVNULL)
+        if os.environ.get("TTP_FAKE_RESULT") == "none":
+            pass   # ends without writing a hand-off
+        elif not (os.environ.get("TTP_FAKE_SHELL") and (run_dir / "result.json").exists()):
+            result = json.loads(os.environ.get("TTP_FAKE_RESULT") or "null") or {
+                "status": "done", "summary": f"fake {role} finished", "followups": []}
+            (run_dir / "result.json").write_text(json.dumps(result))
+        out = {"ok": True}
+        if os.environ.get("TTP_FAKE_SHELL"):
+            out["_shell"] = os.environ["TTP_FAKE_SHELL"]   # in the transcript, as a real agent's tool call is
+        # A compacting run of any role marks the boundary in its output like the coordinator does
+        # (a forked worker's session compacts in place too).
+        at, size = int(os.environ.get("TTP_FAKE_COMPACT_AT") or 0), int(os.environ.get("TTP_FAKE_CONTEXT") or 0)
+        if at and size >= at:
+            out.update({"subtype": "compact_boundary", "compact_metadata": {"trigger": "auto", "pre_tokens": size}})
+            out["summary"] = os.environ.get("TTP_FAKE_COMPACT_SUMMARY") or f"fake {role} summary"
+    out["_cost"] = cost
+    out["_session"] = session
+    if os.environ.get("TTP_FAKE_MODEL"):   # the model the session reports (claude: its init event)
+        out["_model"] = os.environ["TTP_FAKE_MODEL"]
+    sys.stdout.write(json.dumps(out))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(_main(sys.argv[1] if len(sys.argv) > 1 else "worker", sys.argv[2:]))

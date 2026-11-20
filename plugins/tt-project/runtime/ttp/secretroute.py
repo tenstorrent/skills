@@ -1,0 +1,198 @@
+# SPDX-FileCopyrightText: © 2026 Tenstorrent USA, Inc.
+# SPDX-License-Identifier: Apache-2.0
+"""`ttp secret env` from a worker that cannot read the secrets store (cli.cmd_secret_env).
+
+Such a worker cannot get its secrets itself. Instead it queues `ttp secret env ... -- <command>` as a
+detached job (detach.enqueue), which the daemon starts (detach.tend): that served copy reads the store,
+puts the secrets into the one command's environment and masks them in its output (every stored value,
+and each given value line by line), which goes to the job's log in the run folder. The worker streams
+that log and exits with the command's exit code. The value never reaches the worker: the request, the
+job's record and the log name only the secret, and the served copy records which secrets it gave, to
+which task and when (USES, under the project's state).
+"""
+from __future__ import annotations
+
+import json
+import os
+import signal
+import sys
+import time
+import uuid
+from contextlib import contextmanager
+from pathlib import Path
+
+from . import detach
+from .project import durable_append
+
+SERVED_ENV = "TTP_ROUTED_RUN"   # set in the served copy: it runs the command itself, never queues again
+# (a name detach._kept_env keeps: it drops every variable named like a secret)
+USES = "secret-uses.jsonl"         # under the project's state: {"at", "task", "run", "secrets"} per served command
+START_WAIT_S = 90                  # unstarted by then: the daemon is down or stuck; withdraw it, well inside a
+                                   # 10-min tool call, so a killed call never leaves it to run late or twice
+START_MARGIN_S = 30                # the request's own start deadline is START_WAIT_S plus this: past it the daemon
+                                   # never starts it, even when its caller was killed (SIGKILL) and withdrew nothing
+POLL_S = 0.2
+
+
+def _store_denied() -> bool:
+    from .project import secrets_path
+    p = secrets_path()
+    return p.exists() and not os.access(p, os.R_OK)
+
+
+def state_dir() -> Path | None:
+    """The project's state folder of this run (its run folder sits in state/runs), else None."""
+    rd = os.environ.get("TTP_RUN_DIR")
+    if not rd:
+        return None
+    rd_path = Path(rd).resolve()
+    return rd_path.parent.parent if rd_path.parent.name == "runs" else None
+
+
+def routed() -> bool:
+    """Whether `ttp secret env` here goes through the daemon: a run of a project that cannot read the
+    secrets store, and not the served copy itself."""
+    if os.environ.get(SERVED_ENV) or state_dir() is None:
+        return False
+    return _store_denied()
+
+
+def record_use(labels: list[str]) -> None:
+    """The served copy's record of the secrets it gave: their names, the task, the run and the time."""
+    state = state_dir()
+    if os.environ.get(SERVED_ENV) and state is not None and labels:
+        try:
+            durable_append(state / USES, json.dumps({"at": time.time(), "task": os.environ.get("TTP_TASK_ID"),
+                                                     "run": os.environ.get("TTP_RUN_ID"),
+                                                     "secrets": labels}) + "\n")
+        except OSError:
+            pass
+
+
+def job_command(alias: str | None, specs: list[str], argv: list[str]) -> list[str]:
+    """The served copy's command line. Its markers ride in the command itself, never only in the job's
+    environment: a dropped marker would make the served copy queue itself again."""
+    from .cli import RUNTIME
+    path = os.pathsep.join([str(RUNTIME), *filter(None, [os.environ.get("PYTHONPATH")])])
+    return ["env", f"{SERVED_ENV}=1", f"PYTHONPATH={path}", sys.executable, "-m", "ttp",
+            *_shown(alias, specs, argv)[1:]]
+
+
+def _shown(alias: str | None, specs: list[str], argv: list[str]) -> list[str]:
+    """The command as the worker gave it, for the run folder's job list: the launcher prefix (a PYTHONPATH
+    of any length) would push the secrets and the command past the list's 300-character cut."""
+    return ["ttp", "secret", "env", *([alias] if alias else []), *(f"--secret={s}" for s in specs), "--", *argv]
+
+
+class _Stopped(BaseException):   # as KeyboardInterrupt: no `except Exception` takes it
+    def __init__(self, sig: int):
+        self.sig = sig
+
+
+_SEEN: list[int] = []   # stops _raise_stopped took in this run: one whose exception was dropped still ends the wait
+
+
+def _raise_stopped(sig, frame):
+    _SEEN.append(sig)
+    raise _Stopped(sig)
+
+
+@contextmanager
+def _held_signals():
+    """SIGINT and SIGTERM wait until the block ends."""
+    held = {signal.SIGINT, signal.SIGTERM}
+    before = signal.pthread_sigmask(signal.SIG_BLOCK, held)
+    try:
+        yield
+    finally:
+        signal.pthread_sigmask(signal.SIG_SETMASK, before)
+
+
+def run(alias: str | None, specs: list[str], argv: list[str], out=None) -> int:
+    """Queue the command for the daemon, stream its masked output to `out` and return its exit code.
+    A request the daemon has not started within START_WAIT_S, or on SIGINT or SIGTERM, is withdrawn
+    (detach.withdraw_unstarted), so it never runs after this call ends; one it started keeps running."""
+    out = out or sys.stdout.buffer
+    state = state_dir()
+    rd = Path(os.environ["TTP_RUN_DIR"]).resolve()
+    name = f"secret-env-{uuid.uuid4().hex[:8]}"
+    rc, log = rd / f"{name}.rc", rd / f"{name}.log"
+    cmd = job_command(alias, specs, argv)
+    old_int = old_term = None
+    _SEEN.clear()
+    try:
+        old_term = signal.signal(signal.SIGTERM, _raise_stopped)
+        if signal.getsignal(signal.SIGINT) is signal.default_int_handler:   # a caller's own SIGINT handling stays
+            old_int = signal.signal(signal.SIGINT, _raise_stopped)
+    except ValueError:   # not the main thread: SIGTERM and SIGINT keep their handlers
+        pass
+    try:
+        with _held_signals():   # a stop mid-enqueue would leave a request without the marker that withdraws it
+            # its own start deadline: a caller killed without withdrawing it (SIGKILL) never sees a late start
+            detach.enqueue(state, rc, log, cmd, os.getcwd(), dict(os.environ), start_within=START_WAIT_S + START_MARGIN_S)
+            with detach.registry(rd) as jobs:
+                jobs.append({"name": name, "rc": str(rc), "log": str(log), "pid": None, **detach.owner(),
+                             "started": time.time(),
+                             "queued": True, "status": "queued",
+                             "command": " ".join(_shown(alias, specs, argv))[:300]})
+        print(f"ttp secret env: the sandbox cannot read the secrets store; the daemon runs the command "
+              f"(log {log})", file=sys.stderr)
+        return _wait(rc, log, out, time.time() + START_WAIT_S)
+    except (KeyboardInterrupt, _Stopped) as e:
+        sig = e.sig if isinstance(e, _Stopped) else signal.SIGINT
+        if old_term is not None:   # stopping already: a second SIGINT or SIGTERM never cuts the report
+            int_now = signal.signal(signal.SIGINT, signal.SIG_IGN)
+            old_int = int_now if old_int is None else old_int   # the caller's, put back below
+            signal.signal(signal.SIGTERM, signal.SIG_IGN)
+        with _held_signals():   # a second stop never cuts the withdrawal short
+            withdrawn = detach.withdraw_unstarted(rc, f"{detach.WITHDRAWN} (its caller got {signal.Signals(sig).name})")
+        if withdrawn:
+            print(f"ttp secret env: stopped by {signal.Signals(sig).name}; the command was withdrawn before "
+                  f"the daemon started it: nothing ran", file=sys.stderr)
+        else:
+            st, why = detach.state(rc)
+            print(f"ttp secret env: stopped by {signal.Signals(sig).name}; " + (
+                f"the command ran and ended with exit code {why}" if st == "ended" else
+                f"the command did not run: {why}" if st == "lost" else
+                f"the daemon had already started the command and it keeps running: its output goes to {log}, "
+                f"its exit code to {rc}"), file=sys.stderr)
+        return 128 + sig
+    finally:
+        if old_term is not None:
+            signal.signal(signal.SIGTERM, old_term)
+            if old_int is not None:
+                signal.signal(signal.SIGINT, old_int)
+
+
+def _wait(rc: Path, log: Path, out, deadline: float) -> int:
+    pos = 0
+    while True:
+        pos = _copy(log, pos, out)
+        st, why = detach.state(rc)
+        if _SEEN:   # a stop raised inside a finalizer (Python drops that exception): acted on here
+            raise _Stopped(_SEEN[0])
+        if st == "ended":
+            _copy(log, pos, out)
+            return int(why) if why.lstrip("-").isdigit() else 1
+        if st == "lost":
+            print(f"ttp secret env: the command did not run: {why}", file=sys.stderr)
+            return 1
+        if st == "queued" and time.time() > deadline and detach.withdraw_unstarted(
+                rc, f"the daemon did not start it within {START_WAIT_S} s: withdrawn, it never ran"):
+            print(f"ttp secret env: the daemon did not start the command within {START_WAIT_S} s; it was "
+                  f"withdrawn and nothing ran. Is the daemon running (`ttp status`)?", file=sys.stderr)
+            return 1
+        time.sleep(POLL_S)
+
+
+def _copy(log: Path, pos: int, out) -> int:
+    try:
+        with open(log, "rb") as f:
+            f.seek(pos)
+            data = f.read()
+    except OSError:
+        return pos
+    if data:
+        out.write(data)
+        out.flush()
+    return pos + len(data)

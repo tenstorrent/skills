@@ -1,0 +1,9 @@
+# Schedule budgets and skips
+
+- `budget_usd` (`budget_usd_day` in `schedules.json`) caps a schedule's spend over 24 h.
+- `budget_usd_run` (llm payload) caps one run. Unset, it is the tier's `budget.task_default_usd`, never the whole daily cap. A run never gets more than what is left of the day.
+- Every skipped trigger, whatever the reason (daily budget, debounce, precheck, gate, open run), is kept in the schedule's skip history with its time and reason: the last 50, kept across daemon restarts. `ttp schedules <name> show <schedule>` lists them; the schedule list and the web app count the last 24 h.
+- A skip for the schedule's own daily cap while the gate allows optional work raises one `daemon:schedule-budget` observation per schedule a day, closed once the schedule runs again. Expected skips (debounce, a precheck exit 0, a yellow, orange or red gate) are only logged.
+- `ttp schedules` (and `show`) gives an llm schedule's suggested daily cap: its runs a day x the median cost of its last 10 finished runs x 1.25, none under 3 runs. The daily review's audit lists the caps below it. Nothing changes a cap by itself.
+- Its spend past 80% of its own daily cap while the gate is green raises one `daemon:schedule-cap` observation (key `schedule-cap-80:<name>`) per budget day, closed when a new day starts.
+- `ttp schedules <name> run <schedule>` runs a command schedule now: the daemon runs it as a timed run (same runner, environment, timeout, heal and observations, and it records `last_run`). It prints the schedule's output, exits with its code and writes `exit <n>` to stderr. It refuses llm schedules and unknown names (exit 2) and exits 75 when no daemon takes the request within 120 s. A new or re-enabled command schedule that never ran runs at the next daemon pass.

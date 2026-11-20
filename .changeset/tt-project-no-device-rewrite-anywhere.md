@@ -1,0 +1,5 @@
+---
+"tt-project": patch
+---
+
+`tt-project`: the no-device test guard now rewrites a pytest or ctest run into `ttp clip -- ttp sandbox --` wherever it stands at the top level, instead of only when it is the command's last simple command. That covers runs after `cd x;` or `&&`, under assignments, `timeout N` and other wrappers, inside loops and subshells, and as the first member of a pipeline (`pytest -q 2>&1 | tail -5`). Redirections and the pipe tail are kept. Every test run in the command is wrapped, or none is. Before this, the guard logged no rewrites at all, because nearly every refused call piped pytest into `tail`. Replayed against the last day's refused worker commands, about 98% are now rewritten. A `bash -c`, `sh -c` or `xargs` form, a test fed by a pipe or a stdin redirect, and a test inside a function body are still refused. A `python3 -` heredoc script is refused only when its code calls `pytest.main` or runs pytest through `subprocess` or `os` outside string literals. Edit scripts that only write such text into test files pass.

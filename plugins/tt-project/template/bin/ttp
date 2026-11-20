@@ -1,0 +1,43 @@
+#!/bin/sh
+# Run as sh first: exec the interpreter the daemon named (TTP_PYTHON), so a project venv's
+# python3 early on a run's PATH cannot break ttp; otherwise python3 from PATH. Python reads the
+# next line as a string.
+''''[ -x "${TTP_PYTHON:-}" ] || TTP_PYTHON=python3; exec "$TTP_PYTHON" "$0" "$@" # '''
+# SPDX-FileCopyrightText: © 2026 Tenstorrent USA, Inc.
+# SPDX-License-Identifier: Apache-2.0
+"""Launcher for the ttp CLI next to this file's ../runtime (plugin checkout or a project's harness)."""
+import os
+import re
+import sys
+
+HERE = os.path.dirname(os.path.realpath(__file__))
+RUNTIME = os.path.join(os.path.dirname(HERE), "runtime")
+if sys.version_info < (3, 9):
+    sys.exit("ttp needs Python 3.9 or newer")
+# A project's harness copy (no template/ beside it) may be older than the installed ttp, and an upgrade
+# rewrites its files while it runs: setup and upgrade always run the installed stable copy.
+if (sys.argv[1:2] in (["setup"], ["upgrade"]) and os.path.isdir(RUNTIME)
+        and not os.path.isdir(os.path.join(os.path.dirname(HERE), "template"))):
+    home = os.environ.get("TTP_HOME") or os.path.join(os.path.expanduser("~"), ".tt-project")
+    installed = os.path.join(home, "lib", "current", "bin", "ttp")
+    if not os.path.isfile(installed):
+        sys.exit("ttp: %s is a project's harness copy and no ttp is installed at %s; run "
+                 "`<plugin-root>/bin/ttp %s` from the plugin instead" % (HERE, installed, sys.argv[1]))
+    if os.path.realpath(installed) != os.path.realpath(__file__):
+        os.execv(sys.executable, [sys.executable, installed] + sys.argv[1:])
+# Only this launcher's own runtime may run: inside a worker PYTHONPATH names the harness's runtime, and
+# `ttp setup` would silently reinstall that one.
+if not os.path.isfile(os.path.join(RUNTIME, "ttp", "__init__.py")):
+    sys.exit("ttp: no runtime at %s; run bin/ttp from the plugin root instead" % RUNTIME)
+sys.path.insert(0, RUNTIME)
+import ttp  # noqa: E402
+
+if os.path.dirname(os.path.dirname(os.path.realpath(ttp.__file__))) != os.path.realpath(RUNTIME):
+    with open(os.path.join(RUNTIME, "ttp", "__init__.py")) as f:
+        want = re.search(r'__version__ = "([^"]+)"', f.read())
+    sys.exit("ttp: loaded ttp %s from %s, not %s from %s; unset PYTHONPATH and retry"
+             % (getattr(ttp, "__version__", "?"), os.path.dirname(ttp.__file__),
+                want.group(1) if want else "?", RUNTIME))
+from ttp.cli import main  # noqa: E402
+
+main()

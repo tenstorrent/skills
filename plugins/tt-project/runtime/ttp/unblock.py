@@ -1,0 +1,959 @@
+# SPDX-FileCopyrightText: © 2026 Tenstorrent USA, Inc.
+# SPDX-License-Identifier: Apache-2.0
+"""Unblocking quality, for the daily review: how long stuck work stays stuck, how many asks the user
+handed back ("decide yourself"), and how the coordinator's effort was split.
+
+Stuck time: an episode starts when a task is handed off blocked, waiting or for review (a queued
+task behind a dead dependency is set blocked too) and ends when the task next moves forward: a run
+of it starts (a blocked or review task only; a waiting task's wakes keep waiting), it is done,
+failed, requeued or pushed, or its status left the stuck state (cancelled, re-pointed). Consecutive
+stuck hand-offs are one episode; its per-state intervals (blocked, then review, ...) are reported
+apart from the whole episode, so time in one state is not the episode's full age. Episodes and
+intervals are a start cohort (started in the window; an open one counts with its age so far). What
+is stuck now, whenever it started, is the inventory, reported on its own; a stuck task without the
+history to date it shows its age as unknown, never as zero.
+
+Waits are self or external (classify_wait). A self-wait is the task's own progress: its detached
+`ttp checks` or `ttp detach` jobs, the push queue, or a time window it planned itself. It neither
+starts a stuck episode nor counts toward the coordinator's 'repeated waits' trigger or a resource's
+waits, and it ends a waiting episode (the task moved on). The daily review lists self-waits apart.
+
+A wait whose retry_when only probes `ttp detach --check` jobs or `ttp lock --probe` resources is a wait
+on live work (live_wait). While the job runs (or the resource is not paused) such a wait is routine for
+the 'repeated waits' trigger, external or not, until the same jobs or locks were waited on more than
+coordinator.live_waits_max times in 24 h or, for jobs, their logs stopped growing since the last wait.
+
+Handed-back asks: a user message answers an ask when, after the ask was sent, it names it (`ask <id>`
+or `#<id>`), replies in its chat thread, or the coordinator resolved the ask in the turn that message
+started (record_resolve). A plain message that does none of these, in the ask's chat (any chat for a
+broadcast ask), not in another thread and not a reply to another outbound message (`re #<id>` in its
+text or relayer context, or a reply in that message's thread), answers the one ask then open when it is
+about it (about_ask): sent before it, no answer linked yet and not resolved before it. With several
+open, it answers the newest only when that is the only one sent since the user's previous message in
+that chat (a plain reply answers what was just asked) and, for a broadcast ask, the reply came where
+the ask is known to have been delivered (Slack, once posted there, or a relay chat that read past it at
+or above its severity floor) or is about it; otherwise it is
+linked to none. The answer's part about that ask is matched against
+HANDBACK, a short phrase list of answers that give the decision back to the project.
+"""
+from __future__ import annotations
+
+import os
+import re
+import shlex
+import time
+from pathlib import Path
+from typing import Any
+
+from . import anchors, chatgone, reviewcap
+from .db import CHAT_RANK, DB, SEVERITY_RANK, chat_floor
+from .util import loads_dict
+
+WINDOWS = (("24 h", 86400), ("7 d", 7 * 86400))
+STUCK = {"task_blocked": "blocked", "task_waiting": "waiting", "task_review": "review"}
+MOVED = frozenset({"task_done", "task_failed", "task_changes_needed", "task_queued", "task_requeued", "push_queued"})
+ENDED = frozenset({"done", "failed", "cancelled", "pushing"})   # a status that ends any episode
+ANSWER_MAX_AGE_S = 14 * 86400   # a mention of an ask id later than this is not its answer
+RESOLVED_KEY = "ask_resolved"   # kv: {ask id: {"ts": resolved at, "messages": the user messages of that turn}}
+RESOLVED_KEEP = 500
+# How an answer was linked to its ask, as the daily review names it.
+LINKED_BY = {"named": "named", "thread": "in its thread", "resolved": "resolved on it",
+             "only_open": "the only open ask", "newest": "the newest ask"}
+
+# What a waiting hand-off's `retry_when` probes, when it is the task's own work: by the `ttp` subcommand.
+SELF_PROBES = (("checks", re.compile(r"\bchecks\s+--result\b")),
+               ("detached jobs", re.compile(r"\bdetach\s+--check\b")),
+               ("push queue", re.compile(r"\bpush\s+--(result|free)\b")))
+EXTERNAL_PROBE = re.compile(r"\block\s+--probe\b")   # a shared resource: someone else holds it
+# The project's own checks lane (its `ttp checks` result, slot or lane), in a probe or a `waiting_for`:
+# a self-wait even when the hand-off says external. A probe that also waits on other work (a lock,
+# another task or project, an upstream fix, the network, another host) keeps the hand-off's word.
+OWN_CHECKS_PROBE = re.compile(r"\bchecks\s+(--(result|probe|slot-status)\b|status\b)|/checks\.rc\b")
+OWN_CHECKS_FOR = re.compile(r"\bttp\s+checks\b|\bchecks?\s+(slot|lane|holder|queue|run|result)s?\b", re.I)
+OTHER_WORK_PROBE = re.compile(r"\block\s+--probe\b|\blanded:|\b(ack-wait|upstream|curl|wget|ssh|nc|gh)\b|\w+://",
+                              re.I)
+# A time window the task planned itself (a measurement or soak period), in its `waiting_for`.
+PLANNED_WINDOW = re.compile(
+    r"\b(planned|scheduled|own|measurement|measuring|observation|observing|monitoring|soak|burn-in|bake|"
+    r"settling|cool-?down|data[- ]collection)\s+(time\s+)?(window|period|interval|run)\b"
+    r"|\b(window|period|delay)\s+(it|I|the task|this task|we)\s+(set|planned|chose)\b"
+    r"|\bstart_(after|when)\b", re.I)
+WAIT_KINDS = ("self", "external", "user")
+# A wait only the user's step ends (a sign-in, a confirmation): no worker can end it, so it is never a
+# self-wait and raises no probe stall (progress.probe_stalls); it counts as an external wait otherwise.
+USER_WAIT_KINDS = ("user", "user-action")
+LIVE_WAITS_MAX = 6   # coordinator.live_waits_max: waits on the same live jobs or locks in 24 h that stay routine
+_SHELL_OPS = frozenset({"&&", "||", ";", "|", "&"})
+# A cheap wake that found work and runs again at once: the same wait going on, never a new one.
+ESCALATED_WAKE = re.compile(r"\bwoke at \w+ and found work; runs again now\b")
+# Tokens that change from one wait to the next without the reason changing: the next-try time,
+# timestamps, times, shas and run ids, then any other number.
+REASON_NOISE = (re.compile(r";\s*next try\b.*$", re.I),
+                re.compile(r"\b\d{4}-\d{2}-\d{2}([T ]\d{1,2}:\d{2}(:\d{2})?(\.\d+)?)?(Z|[+-]\d{2}:?\d{2})?"),
+                re.compile(r"\b\d{1,2}:\d{2}(:\d{2})?\b"),
+                re.compile(r"\b(?=[0-9a-f]*\d)[0-9a-f]{7,64}\b", re.I),
+                re.compile(r"\d+"))
+
+# Answers that hand the decision back: the ask should not have been sent.
+HANDBACK = tuple(re.compile(p, re.I) for p in (
+    r"\bdecide (it |that |this )?(for )?yourself\b",
+    r"\bdecide (it |that |this )?on your own\b",
+    r"\byou (can |should |may )?decide\b",
+    r"\b(it'?s |that'?s )?your (call|choice|decision)\b",
+    r"\bup to you\b",
+    r"\b(just|simply) (do|fix|handle) it\b",
+    r"\buse your (own |best )?(judge?ment|discretion)\b",
+    r"\bwhatever you (think|prefer|decide)\b",
+    r"\b(do|go with) what(ever)? you think\b",
+    r"\bno need to ask\b",
+    r"\b(don'?t|do not|never|shouldn'?t|should not) (need to )?ask( me)?\b",
+    r"\b(stop|quit) asking\b",
+    r"\bwhy (are you |did you |do you )?ask(ing)?\b",
+    r"\b(don'?t|do not|never) (get|stay|be) (blocked|stuck)\b",
+    r"\bunblock (yourself|itself|efficiently)\b",
+    r"\b(you )?(don'?t|do not) need my (ok|okay|approval|answer|input|permission)\b",
+    r"\bhandle it yourself\b",
+    r"\bi trust (you|your)\b",
+))
+_MENTION = re.compile(r"(?:(?<![\w/])#|\bask\s+#?)(\d+)\b", re.I)   # "#12", "ask 12", "ask #12"
+_NOT_ASK = re.compile(r"\b(task|pr|issue|run|pull request)\s*$", re.I)
+# "re #12", "re: 12", "reply to message #12", "in reply to #12": names the message a reply is for.
+_REPLY_TO = re.compile(r"(?:(?<![^\W\d_]['\u2019])\bre\b|\breply(?:ing)? to\b)\s*:?\s*(?:(?:message|msg|post)\s+)?#?(\d+)(?![\w.])", re.I)
+
+
+def handback(text: str) -> str | None:
+    """The phrase in an answer that hands the decision back, or None."""
+    text = (text or "").replace("’", "'")
+    for rx in HANDBACK:
+        m = rx.search(text)
+        if m:
+            return m.group(0)
+    return None
+
+
+def classify_wait(result: dict | None) -> tuple[str, str]:
+    """(kind, why) of a waiting hand-off: kind 'self' when the task waits on its own progress (its
+    detached checks or jobs, the push queue, a time window or start_after/start_when it set), else
+    'external' (a busy resource or lock, another task, a human, a review), or 'user' when the hand-off
+    says only the user's step ends it (`user` or `user-action`; never a self-wait, counted as external).
+    The hand-off's own `wait_kind` wins, except that a wait on the project's own checks lane is always
+    'self'; an unknown wait counts as external, so a real one still raises effort."""
+    r = result if isinstance(result, dict) else {}
+    own = str(r.get("wait_kind") or "").strip().lower()
+    if own in USER_WAIT_KINDS:
+        return "user", "hand-off"
+    probe = str(r.get("retry_when") or "")
+    if own != "self" and not OTHER_WORK_PROBE.search(probe) and (
+            OWN_CHECKS_PROBE.search(probe) or OWN_CHECKS_FOR.search(str(r.get("waiting_for") or ""))):
+        return "self", "checks"
+    if own in WAIT_KINDS:
+        return own, "hand-off"
+    if EXTERNAL_PROBE.search(probe):
+        return "external", "lock"
+    for why, rx in SELF_PROBES:
+        if rx.search(probe):
+            return "self", why
+    if PLANNED_WINDOW.search(str(r.get("waiting_for") or "")):
+        return "self", "planned window"
+    return "external", "other"
+
+
+def wait_data(raw: Any) -> dict:
+    """A task_waiting event's `data`: {"wait": self|external, "why": ...}; {} for older events."""
+    d = loads_dict(raw)
+    return d if d.get("wait") in WAIT_KINDS else {}
+
+
+def is_self_wait(raw: Any) -> bool:
+    """Whether a task_waiting event's `data` marks it a self-wait (older events count as external)."""
+    return wait_data(raw).get("wait") == "self"
+
+
+def counted_wait(ev: Any, older: Any = (), live_max: int = LIVE_WAITS_MAX) -> bool:
+    """Whether a task_waiting event (a row with `data` and `text`) counts toward 'repeated waits':
+    not a cheap wake that found work, and not routine live work (live_routine, given the task's
+    `older` waits, newest first); else an external wait counts and a self-wait does not (older
+    events lack the data and count as external)."""
+    if ESCALATED_WAKE.search(ev["text"] or ""):
+        return False
+    routine = live_routine(ev, older, live_max)
+    if routine is not None:
+        return not routine
+    return not is_self_wait(ev["data"])
+
+
+def wait_probes(retry_when: Any) -> tuple[list[str], list[str]] | None:
+    """The rc paths of `ttp detach --check` and the resources of `ttp lock --probe` in a retry_when,
+    when every command in it is one of these two; None otherwise."""
+    try:
+        toks = shlex.split(str(retry_when or ""))
+    except ValueError:
+        return None
+    rcs: list[str] = []
+    res: list[str] = []
+    cmd: list[str] = []
+    for tok in toks + [";"]:
+        if tok not in _SHELL_OPS:
+            cmd.append(tok)
+            continue
+        at = next((i for i, t in enumerate(cmd[1:], 1) if os.path.basename(cmd[i - 1]) == "ttp"
+                   and t in ("detach", "lock")), None)   # `ttp`, a path to it or `python3 -m ttp`
+        args = [x for x in cmd[at:] if not (x == "--shared" and cmd[at] == "lock")] if at else []
+        if len(args) >= 3 and args[:2] == ["detach", "--check"] and not any(a.startswith("-") for a in args[2:]):
+            rcs += args[2:]
+        elif len(args) == 3 and args[:2] == ["lock", "--probe"]:
+            res.append(args[2])
+        elif cmd:
+            return None
+        cmd = []
+    return (rcs, res) if rcs or res else None
+
+
+def live_wait(p: Any, result: dict | None) -> dict | None:
+    """What a waiting hand-off's live work is, for the task_waiting event's `data.live`: {"key",
+    "alive", "log"}; None when its retry_when probes anything else (wait_probes). `key` names the
+    jobs and locks; `alive` is whether a job still runs or no resource is paused; `log` is the jobs'
+    log bytes now (None without jobs). Read here, at the hand-off: later the job may be gone."""
+    probes = wait_probes((result or {}).get("retry_when") if isinstance(result, dict) else None)
+    if not probes:
+        return None
+    from . import locks as lk
+    rcs, res = probes
+    cfg = p.config()
+    paths = [Path(r) if os.path.isabs(r) else Path(p.base) / r for r in rcs]
+    locked = sorted({lk.canonical(cfg, r) for r in res})
+    alive = True
+    if paths:
+        alive = not all(lk.job_ended(x) for x in paths)
+    if locked:
+        paused = {lk.canonical(cfg, k) for k in p.db.paused_resources()}
+        alive = alive and not paused & set(locked)
+    log = None
+    if paths:
+        log = 0
+        for x in paths:
+            try:
+                log += x.with_suffix(".log").stat().st_size
+            except OSError:
+                pass
+    key = " ".join([f"job:{x}" for x in sorted(map(str, paths))] + [f"lock:{r}" for r in locked])
+    return {"key": key[:500], "alive": alive, "log": log}
+
+
+def live_routine(ev: Any, older: Any = (), live_max: int = LIVE_WAITS_MAX) -> bool | None:
+    """For a wait on live work that was alive at its hand-off: True while it is routine, False once
+    the same work was waited on more than `live_max` times in the 24 h before it (`older`: the
+    task's earlier events, newest first; 0 makes none routine) or its jobs' log did not grow since
+    the previous wait on them. None for any other wait."""
+    live = loads_dict(ev["data"]).get("live")
+    if not isinstance(live, dict) or not live.get("alive") or not live.get("key"):
+        return None
+    if not live_max:
+        return False
+    same = [loads_dict(o["data"]).get("live") or {} for o in older
+            if o["kind"] == "task_waiting" and o["ts"] > ev["ts"] - 86400]
+    same = [o for o in same if isinstance(o, dict) and o.get("key") == live["key"]]
+    if len(same) + 1 > live_max:
+        return False
+    before, now = (same[0].get("log") if same else None), live.get("log")
+    return not (isinstance(before, int) and isinstance(now, int) and now <= before)
+
+
+def wait_reason(ev: Any) -> str:
+    """What a task_waiting event waits for, normalized so waits differing only in times, shas, run
+    ids or counts compare equal: its `data.for`, else its text after "#id title: "."""
+    raw = str(loads_dict(ev["data"]).get("for") or (ev["text"] or "").split(": ", 1)[-1])
+    return _denoise(re.sub(r"^waiting for\s+", "", raw.strip(), flags=re.I))
+
+
+def _denoise(raw: str, n: int = 200) -> str:
+    for rx in REASON_NOISE:
+        raw = rx.sub("0" if rx.pattern == r"\d+" else "", raw)
+    return " ".join(raw.lower().split())[:n]
+
+
+def wait_owner(result: dict, own: int | None = None) -> str:
+    """Who owns what a waiting hand-off waits on, for the task_waiting event's `data.owner`: its
+    `wait_owner` (a check gap's repair task), else the asks and tasks its `waiting_for` names
+    (refwaits.refs, never the task itself), as "task:12 ask:3"; "" when it names none."""
+    from . import refwaits
+    if str(result.get("wait_owner") or "").strip():
+        return " ".join(str(result["wait_owner"]).split())[:200]
+    return " ".join(f"{k}:{n}" for k, n in refwaits.refs(str(result.get("waiting_for") or ""), own))[:200]
+
+
+def wait_probe(raw: Any) -> str:
+    """A retry_when, for the task_waiting event's `data.probe` (as given, cut to 500 characters)."""
+    return str(raw).strip()[:500] if isinstance(raw, str) else ""
+
+
+def wait_marks(ev: Any) -> dict:
+    """What a task_waiting event's wait compares on (coordinator.wait_raises): its `reason`
+    (wait_reason), `probe` (its retry_when with times, shas, ids and counts as noise, as in reasons)
+    and `owner` (wait_owner); `probe` and `owner` are None for events recorded before they were."""
+    d = loads_dict(ev["data"])
+    probe = d.get("probe")
+    return {"reason": wait_reason(ev), "probe": _denoise(probe, 300) if isinstance(probe, str) else None,
+            "owner": d.get("owner") if isinstance(d.get("owner"), str) else None}
+
+
+def _ask_mentions(text: str, ask_ids: set[int]) -> list[re.Match]:
+    return [m for m in _MENTION.finditer(text or "") if int(m.group(1)) in ask_ids
+            and not _NOT_ASK.search(text[:m.start()])]
+
+
+def replies_to(*texts: str | None) -> set[int]:
+    """The message ids a user message (its text or a relayer's context) says it replies to."""
+    return {int(m.group(1)) for t in texts for m in _REPLY_TO.finditer(t or "")}
+
+
+def answer_part(text: str, ask_id: int, ask_ids: set[int]) -> str | None:
+    """The part of a message about ask `ask_id`: from its `ask id` or `#id` to the next ask id it
+    names, or None when it does not name it. A `#id` right after "task" or "PR" names something else."""
+    found = _ask_mentions(text, ask_ids)
+    for i, m in enumerate(found):
+        if int(m.group(1)) == ask_id:
+            end = next((n.start() for n in found[i + 1:] if int(n.group(1)) != ask_id), len(text))
+            return text[m.start():end]
+    return None
+
+
+_SUBJECT_STOP = frozenset("""
+    about above after again also anything before being could does doing done each from have here into just
+    like look made make more most much need needs next only other over please really right same should
+    since some still such sure than that their them then there these they thing this those through time
+    very want wants were what when where which while will with would your yours ask asks question
+    recommendation recommend approve decide decision answer reply task tasks project""".split())
+# A bare reply: an answer word or a hand-back phrase in a short message.
+# A lone option letter or digit counts only as the whole reply or before punctuation ('b', 'B.', '2)'),
+# never before more words: 'A typo in ...' or '2 more people ...' is not an answer.
+_BARE = re.compile(r"^\W*((yes|yeah|yep|yup|no|nope|ok|okay|sure|agreed?|approved?|go( ahead)?|do it|"
+                   r"proceed|fine|lgtm|ship it|option\s+([a-e1-9]|one|two|three|four|five))\b"
+                   r"|[a-e1-9](?=\s*([^\w\s]|$)))", re.I)
+BARE_MAX_WORDS = 8
+
+
+def _subject(text: str) -> set[str]:
+    return {w for w in re.findall(r"[a-z][a-z0-9_-]{3,}", (text or "").lower()) if w not in _SUBJECT_STOP}
+
+
+def about_ask(text: str, ask_id: int, ask_text: str | None) -> bool:
+    """Whether a reply can answer the one open ask without naming it: it mentions the ask's id or a
+    subject word of the ask, or it is a bare reply (yes/no/ok or a hand-back phrase in a few words).
+    Anything else is a message about something else, not that ask's answer."""
+    text = text or ""
+    if re.search(rf"(?:#|\b(?:re|ask|question)\s*#?){ask_id}(?![\w.])", text, re.I):   # not a bare count
+        return True
+    if len(text.split()) <= BARE_MAX_WORDS and (_BARE.search(text) or handback(text)):
+        return True
+    return bool(_subject(text) & _subject(ask_text))
+
+
+# A reply that gives an order: a sentence opening with an order verb (the rest of its sentence is the
+# object), or an instruction phrase. Bare 'please' is politeness, not an order.
+_INSTRUCTION = re.compile(
+    r"(?:^|[.!?;\n]\s*)(?:please\s+|also\s+|now\s+|first\s+|and\s+)?(?:fix|add|run|stop|start|use|make|check|"
+    r"set|remove|delete|keep|move|update|change|build|deploy|test|push|merge|open|close|restart|retry|rerun|"
+    r"switch|try|write|send|install|upgrade|investigate|look|find|create|enable|disable|drop|skip|turn|"
+    r"focus|prioriti[sz]e|clean|split|rename|document|replace|revert|pause|resume|cancel|finish|ship)\b"
+    r"|\b(?:from now on|make sure|going forward|you should|we need to|i want you to)\b", re.I)
+# A reply that refers back to the ask's subject or options ('it', 'that one', 'the first', 'instead',
+# 'the cheaper one'): it may be the answer, whatever verb it opens with.
+_REFERS = re.compile(
+    r"\b(?:it|its|that|this|these|those|them|either|neither|both|instead|same|former|latter|ones?|"
+    r"option\s+\w+|(?:the\s+)?(?:first|second|third|fourth|last|other|\d+(?:st|nd|rd|th))\s+(?:one|option|choice)"
+    r"|the\s+(?:first|second|third|fourth|last|other)|(?:cheap|fast|slow|small|big|larg|new|old|bett|saf|"
+    r"simpl|short|long|earli|lat|light|heavi|quick|easi)(?:er|est))\b", re.I)
+OWN_WORDS_SHORT = 2   # a short reply (<= BARE_MAX_WORDS) is an order only when its object brings this many new words
+NOT_ANSWER_HOLD_S = 3600   # an ask a new instruction came in place of an answer is not asked again this soon
+
+
+def off_topic(text: str, ask_text: str | None) -> bool:
+    """A reply that does not address the ask: no bare answer or hand-back, nothing referring back
+    (_REFERS), no content word shared with the ask (reask.words), and a new instruction (_INSTRUCTION)
+    whose object brings content words of its own (two in a short reply)."""
+    from . import reask
+    text = (text or "").strip()
+    if not text or handback(text) or (len(text.split()) <= BARE_MAX_WORDS and _BARE.search(text)):
+        return False
+    asked = reask.words(ask_text or "")
+    if _REFERS.search(text) or reask.words(text) & asked:
+        return False
+    need = OWN_WORDS_SHORT if len(text.split()) <= BARE_MAX_WORDS else 1
+    return any(len(reask.words(re.split(r"[.!?;\n]", text[m.end():], maxsplit=1)[0]) - asked) >= need
+               for m in _INSTRUCTION.finditer(text))
+
+
+def not_answers(db: DB, msgs: list[dict], question=lambda t: t) -> dict[int, int]:
+    """{user message id: ask id}: each of `msgs` that would answer an ask (a reply in its thread, else
+    the newest ask open when it came, in its chat or broadcast) but is a new instruction instead
+    (off_topic). The ask stays open. A message naming an ask or replying to a message is never one.
+    `question` strips the gate's notes from an ask's text."""
+    from .relay import split
+    resolved = db.kv(RESOLVED_KEY, {}) or {}
+    every = {r["id"] for r in db.q("SELECT id FROM messages WHERE direction='out' AND kind='ask'")}
+    out = {}
+    for m in msgs:
+        if m.get("direction", "in") != "in" or m.get("kind", "user") != "user":
+            continue
+        said = split(m.get("text") or "", m.get("context"))[0]
+        if not said or _ask_mentions(said, every) or replies_to(m.get("text"), m.get("context")):
+            continue
+        live = [a for a in db.q("SELECT id, ts, text, ext_id, handled FROM messages WHERE direction='out' "
+                                "AND kind='ask' AND id<? AND ts>=? AND (chat IS NULL OR chat IS ?) ORDER BY id DESC",
+                                (m["id"], float(m["ts"]) - ANSWER_MAX_AGE_S, m.get("chat")))
+                if not a["handled"] or float((resolved.get(str(a["id"])) or {}).get("ts") or 0) >= float(m["ts"])]
+        ask = next((a for a in live if a["ext_id"] and m.get("ref") == a["ext_id"]), live[0] if live else None)
+        if ask and off_topic(said, question(ask["text"] or "")):
+            out[int(m["id"])] = int(ask["id"])
+    return out
+
+
+def _pct(sorted_vals: list[float], q: float) -> float:
+    """Nearest-rank percentile of an ascending list."""
+    k = max(0, min(len(sorted_vals) - 1, -(-int(q * 100) * len(sorted_vals) // 100) - 1))
+    return sorted_vals[k]
+
+
+def _task_episodes(db: DB, task: dict, now: float) -> list[dict]:
+    """Every stuck episode of one task, oldest first: {task, title, kind, start, [end], open, s, segments}.
+    `segments` are its per-state intervals ({kind, start, [end], open, s}): a blocked task that goes
+    to review and then waits is one episode of three segments. `kind` is the episode's one state, or
+    "mixed" when it changed state."""
+    tid = task["id"]
+    kinds = tuple(STUCK) + tuple(MOVED)
+    # A self-wait is the task moving on: it ends a waiting episode and starts none.
+    marks = [(e["ts"], "self_wait" if e["kind"] == "task_waiting" and is_self_wait(e["data"]) else e["kind"])
+             for e in db.q(f"SELECT ts, kind, data FROM events WHERE task=? AND kind IN "
+                           f"({','.join('?' * len(kinds))})", (tid, *kinds))]
+    marks += [(r["started"], "run") for r in db.q(
+        "SELECT started FROM runs WHERE task=? AND role!='coordinator' AND started IS NOT NULL", (tid,))]
+    marks.sort()
+    out: list[dict] = []
+    ep: dict | None = None
+    for ts, kind in marks:
+        if kind in STUCK:
+            if ep is None:
+                ep = {"task": tid, "title": task["title"], "start": ts, "segments": []}
+            if not ep["segments"] or ep["segments"][-1]["kind"] != STUCK[kind]:
+                if ep["segments"]:
+                    ep["segments"][-1]["end"] = ts
+                ep["segments"].append({"kind": STUCK[kind], "start": ts})
+        elif ep and (kind in MOVED or (kind == "self_wait" and ep["segments"][-1]["kind"] == "waiting")
+                     or (kind == "run" and ep["segments"][-1]["kind"] != "waiting")):
+            ep["end"] = ts
+            out.append(ep)
+            ep = None
+    if ep:
+        status, upd = task["status"], float(task["updated"] or 0)
+        mode = ep["segments"][-1]["kind"]
+        left = status in ENDED or (mode != "waiting" and status not in ("blocked", "review"))
+        if left and upd >= ep["start"]:
+            ep["end"] = upd
+        out.append(ep)
+    for ep in out:
+        if "end" in ep:
+            ep["segments"][-1]["end"] = ep["end"]
+        for x in (ep, *ep["segments"]):
+            x["open"] = "end" not in x
+            x["s"] = max(0.0, (now if x["open"] else x["end"]) - x["start"])
+        states = {x["kind"] for x in ep["segments"]}
+        ep["kind"] = states.pop() if len(states) == 1 else "mixed"
+    return out
+
+
+def _stuck_since(db: DB, since: float, now: float) -> list[dict]:
+    """Every episode of each task with a stuck hand-off at or after `since` (each interval starts with one)."""
+    ids = [r["task"] for r in db.q(
+        f"SELECT DISTINCT task FROM events WHERE task IS NOT NULL AND ts>=? AND kind IN "
+        f"({','.join('?' * len(STUCK))})", (since, *STUCK))]
+    out: list[dict] = []
+    for tid in ids:
+        task = db.task(tid)
+        if task:
+            out += _task_episodes(db, task, now)
+    return out
+
+
+def episodes(db: DB, since: float, now: float | None = None) -> list[dict]:
+    """Stuck episodes that started at or after `since` (a start cohort; see _task_episodes). An open
+    one counts with its full age so far; what is stuck now, whenever it started, is inventory()."""
+    now = time.time() if now is None else now
+    return [ep for ep in _stuck_since(db, since, now) if ep["start"] >= since]
+
+
+def intervals(db: DB, since: float, now: float | None = None) -> list[dict]:
+    """Per-state intervals that started at or after `since`, whenever their episode started, each with
+    its task and title: time in one state, not the episode's whole age."""
+    now = time.time() if now is None else now
+    return [{**seg, "task": ep["task"], "title": ep["title"]}
+            for ep in _stuck_since(db, since, now) for seg in ep["segments"] if seg["start"] >= since]
+
+
+def inventory(db: DB, now: float | None = None) -> list[dict]:
+    """Tasks stuck now, whenever they got stuck: {task, title, kind (its status), state_s (time in
+    that state, None when unknown), stuck_s (the whole open episode, None when unknown)}. A waiting
+    task whose latest wait is its own work (a self-wait) is not stuck. Without stuck history (pruned,
+    or from a release that logged none) its ages are unknown, never zero."""
+    now = time.time() if now is None else now
+    out = []
+    for task in db.q("SELECT * FROM tasks WHERE status IN ('blocked','waiting','review') ORDER BY id"):
+        eps = _task_episodes(db, task, now)
+        ep = eps[-1] if eps and eps[-1]["open"] else None
+        if ep is None and task["status"] == "waiting":
+            last = db.one("SELECT data FROM events WHERE task=? AND kind='task_waiting' ORDER BY ts DESC, id DESC "
+                          "LIMIT 1", (task["id"],))
+            if last and is_self_wait(last["data"]):
+                continue
+        seg = ep["segments"][-1] if ep else None
+        out.append({"task": task["id"], "title": task["title"], "kind": task["status"],
+                    "state_s": seg["s"] if seg and seg["kind"] == task["status"] else None,
+                    "stuck_s": ep["s"] if ep else None})
+    return out
+
+
+def unanchored(db: DB, now: float | None = None) -> list[dict]:
+    """Blocked tasks with no anchor (anchors.py), oldest first: {task, title, age_s}, aged from when the
+    hold sweep first saw them blocked, else their last update."""
+    now = time.time() if now is None else now
+    since = db.kv(anchors.SINCE_KEY, {}) or {}
+    out = []
+    for t in db.q("SELECT * FROM tasks WHERE status='blocked' ORDER BY id"):
+        if anchors.anchor(t):
+            continue
+        at = since.get(str(t["id"]))
+        at = float(at) if isinstance(at, (int, float)) else float(t["updated"] or now)
+        out.append({"task": t["id"], "title": t["title"], "age_s": max(0.0, now - at)})
+    return sorted(out, key=lambda r: -r["age_s"])
+
+
+def unanchored_line(rows: list[dict]) -> str:
+    """How many holds wait on nothing, and each one's age (the 10 oldest)."""
+    if not rows:
+        return "none"
+    shown = ", ".join(f"#{r['task']} {_dur(r['age_s'])}" for r in rows[:10])
+    return f"{len(rows)}: {shown}" + (f" and {len(rows) - 10} more" if len(rows) > 10 else "")
+
+
+def self_waits(db: DB, since: float) -> list[dict]:
+    """Self-waits handed off since `since`: {task, why}."""
+    return [{"task": e["task"], "why": wait_data(e["data"]).get("why") or "other"}
+            for e in db.q("SELECT task, data FROM events WHERE kind='task_waiting' AND ts>=? AND task IS NOT NULL",
+                          (since,)) if is_self_wait(e["data"])]
+
+
+def self_waits_line(rows: list[dict]) -> str:
+    """How many self-waits, by how many tasks, and on what."""
+    if not rows:
+        return "none"
+    per: dict[str, int] = {}
+    for r in rows:
+        per[r["why"]] = per.get(r["why"], 0) + 1
+    return (f"{len(rows)} by {len({r['task'] for r in rows})} tasks (not counted as stuck): "
+            + ", ".join(f"{k} {n}" for k, n in sorted(per.items(), key=lambda kv: (-kv[1], kv[0]))))
+
+
+def _dur(s: float) -> str:
+    return f"{s / 60:.0f} min" if s < 3600 else f"{s / 3600:.1f} h" if s < 4 * 86400 else f"{s / 86400:.1f} d"
+
+
+def stuck_line(eps: list[dict]) -> str:
+    """count, still open, median, p90 and the longest of some episodes or intervals; for episodes, how
+    many changed state (kind "mixed")."""
+    if not eps:
+        return "none"
+    vals = sorted(e["s"] for e in eps)
+    top = max(eps, key=lambda e: e["s"])
+    opened = sum(e["open"] for e in eps)
+    mixed = sum(e.get("kind") == "mixed" for e in eps)
+    return (f"{len(eps)} ({opened} still open{f', {mixed} changed state' if mixed else ''}), median {_dur(_pct(vals, 0.5))}, p90 {_dur(_pct(vals, 0.9))}, "
+            f"longest #{top['task']} {top['title'][:70]} {_dur(top['s'])}{' (still open)' if top['open'] else ''}")
+
+
+def record_resolve(db: DB, ask_id: int, messages: list[int], landed: list[int] | None = None,
+                   auto: str | None = None, step: int | None = None) -> None:
+    """Remember that the coordinator resolved `ask_id` now, in a turn started for `messages` (the
+    user messages it answered; none for a turn of its own). asks() links those messages to it.
+    `landed`: the tasks whose landing closed it instead (close_landed). `auto`: the recommendation
+    it auto-resolved to, unanswered (coordinator.expire_asks). `step`: the task whose user step was
+    done (close_step_done)."""
+    rec = db.kv(RESOLVED_KEY, {}) or {}
+    rec[str(ask_id)] = {"ts": time.time(), "messages": [int(m) for m in messages]}
+    if landed:
+        rec[str(ask_id)]["landed"] = [int(t) for t in landed]
+    if step:
+        rec[str(ask_id)]["step"] = int(step)
+    if auto:
+        rec[str(ask_id)]["auto"] = str(auto)[:500]
+    db.set_kv(RESOLVED_KEY, dict(sorted(rec.items(), key=lambda kv: int(kv[0]))[-RESOLVED_KEEP:]))
+
+
+# `#<id>` in an ask's text names a task, unless it names an ask, a PR or an issue.
+_NAMED_TASK = re.compile(r"(\b(?:ask|asks|pr|prs|pull|issue|issues)\s*)?#(\d+)(?!\d)", re.I)
+
+
+# An ask's ref for a step only the user can take (user_only): a task it names landing never closes it.
+USER_ONLY_REFS = ("blocking:access", "blocking:funds")
+
+
+def user_only(ask: dict) -> bool:
+    """An ask for a step only the user can take: its ref is access or funds, or its text names a sign-in,
+    a device code or a credential (userstep.kind_of)."""
+    from . import userstep
+    return (ask.get("ref") or "") in USER_ONLY_REFS or userstep.kind_of({"text": ask.get("text")}) is not None
+
+
+def ask_tasks(db: DB, ask: dict) -> list[int]:
+    """The tasks an ask is for: those its text names as `#<id>` and those anchored on it (`waits:ask:<id>`)."""
+    from .waits import _held_ask
+    named = {int(m.group(2)) for m in _NAMED_TASK.finditer(str(ask.get("text") or "")) if not m.group(1)}
+    ids = {t["id"] for t in db.q(f"SELECT id FROM tasks WHERE id IN ({','.join('?' * len(named))})",
+                                 sorted(named))} if named else set()
+    ids |= {t["id"] for t in db.q("SELECT id, labels FROM tasks WHERE labels LIKE '%waits:ask:%'")
+            if _held_ask(t) == int(ask["id"])}
+    return sorted(ids)
+
+
+def close_landed(db: DB, landed, now: float | None = None) -> list[int]:
+    """Close each open ask whose work landed after it was sent: it is for at least one task (ask_tasks),
+    and every such task, or a task carrying its change on (landed.carriers: its review, review fixes,
+    re-reviews, continuations), is done and in `landed` (the done tasks whose every claimed push the
+    push audit confirmed on its remote, pushclaim.audit), with that landing after the ask (landed_at).
+    An ask for no task, for a task not confirmed landed, or for one that landed before it (named only
+    as context) stays open. So does an ask for a step only the user can take (user_only): a task it
+    names may be only context (the install a sign-in is for) and a task held on it is never done, so it
+    closes when that step is done (close_step_done) or the user answers it. Each is recorded resolved with its
+    tasks (record_resolve), which asks() and the daily audit report as "resolved: its work landed".
+    Returns the asks closed."""
+    from .landed import carriers
+    landed = {int(t) for t in landed or ()}
+    if not landed:
+        return []
+    when: dict[int, float | None] = {}
+
+    def landed_when(tid: int) -> float | None:
+        if tid not in when:
+            ids = [c for c in carriers(db, tid) if c in landed]
+            rows = db.q(f"SELECT id FROM tasks WHERE status='done' AND id IN ({','.join('?' * len(ids))})", ids) if ids else []
+            when[tid] = max((landed_at(db, r["id"]) for r in rows), default=None)
+        return when[tid]
+    closed = []
+    for a in db.q("SELECT id, ts, ref, text FROM messages WHERE direction='out' AND kind='ask' AND handled=0 ORDER BY id"):
+        if user_only(a):
+            continue
+        tasks = ask_tasks(db, a)
+        # A task whose work landed before the ask was sent is named only as context, not the work it was for.
+        if not tasks or any((landed_when(t) or 0) <= float(a["ts"]) for t in tasks):
+            continue
+        with db.tx():
+            if db.one("SELECT id FROM messages WHERE id=? AND kind='ask' AND handled=0", (a["id"],)):
+                db.x("UPDATE messages SET handled=1 WHERE id=?", (a["id"],))
+                record_resolve(db, a["id"], [], landed=tasks)
+                closed.append(a["id"])
+    return closed
+
+
+def close_step_done(db: DB, tid: int) -> list[int]:
+    """Task `tid`'s user step is done (userstep.probe_passed): close each open ask for a step only the
+    user can take (user_only) that is for `tid` (ask_tasks) or for a task `tid` carries on (landed.carriers:
+    a continuation waiting on the step). Recorded resolved with `tid` as the step done. Returns the asks."""
+    from .landed import carriers
+    closed = []
+    for a in db.q("SELECT id, ref, text FROM messages WHERE direction='out' AND kind='ask' AND handled=0 ORDER BY id"):
+        if not user_only(a):
+            continue
+        tasks = ask_tasks(db, a)
+        if tid in tasks or any(tid in carriers(db, t) for t in tasks):
+            with db.tx():
+                if db.one("SELECT id FROM messages WHERE id=? AND kind='ask' AND handled=0", (a["id"],)):
+                    db.x("UPDATE messages SET handled=1 WHERE id=?", (a["id"],))
+                    record_resolve(db, a["id"], [], step=tid)
+                    closed.append(a["id"])
+    return closed
+
+
+def landed_at(db: DB, tid: int) -> float:
+    """When task `tid`'s confirmed push landed: its push queue landing's last update, else (a push of
+    its own) when it finished (task_done event, else its last update)."""
+    r = db.one("SELECT MAX(updated) AS ts FROM push_queue WHERE task=? AND status IN ('pushed','landed')", (tid,))
+    if r and r["ts"]:
+        return float(r["ts"])
+    r = db.one("SELECT (SELECT MAX(ts) FROM events e WHERE e.task=t.id AND e.kind='task_done') AS done_at, "
+               "t.updated FROM tasks t WHERE t.id=?", (tid,))
+    return float((r["done_at"] or r["updated"] or 0) if r else 0)
+
+
+def inventory_line(rows: list[dict]) -> str:
+    """What is stuck now, per state: count and the oldest by time in that state; unknown ages apart."""
+    if not rows:
+        return "nothing stuck"
+    parts = []
+    for kind in STUCK.values():
+        of = [r for r in rows if r["kind"] == kind]
+        known = [r for r in of if r["state_s"] is not None]
+        if not of:
+            continue
+        part = f"{kind} {len(of)}"
+        if known:
+            top = max(known, key=lambda r: r["state_s"])
+            whole = f", stuck {_dur(top['stuck_s'])} in all" if top["stuck_s"] is not None and \
+                top["stuck_s"] - top["state_s"] >= 60 else ""
+            part += f", oldest #{top['task']} {top['title'][:70]} {_dur(top['state_s'])} in {kind}{whole}"
+        parts.append(part)
+    unknown = [r for r in rows if r["state_s"] is None]
+    line = "; ".join(parts)
+    if unknown:
+        line += "; time in state unknown: " + ", ".join(f"#{r['task']}" for r in unknown[:10])
+        line += f" and {len(unknown) - 10} more" if len(unknown) > 10 else ""
+    return line
+
+
+def asks(db: DB, since: float, now: float | None = None, chat_min: str | None = None) -> list[dict]:
+    """Asks sent since `since`: {id, blocking, answered, handback (the phrase or None), how (the
+    first rule that linked an answer: named, thread, resolved, only_open or newest; None), answer
+    (the earliest linked answer's text, cut to 200 chars), answered_at (its time), landed ({tasks, ts}
+    when close_landed closed it) and step ({task, ts} when close_step_done closed it)}. `chat_min` is the
+    project's notify.chat_min_severity, the floor under every relay chat's own."""
+    now = time.time() if now is None else now
+    # Older asks still count as open when a plain reply is matched, so it is not given to a newer one.
+    sent = db.q("SELECT id, ts, ref, ext_id, chat, text, severity, channel FROM messages WHERE direction='out' AND kind='ask' AND ts>=? "
+                "ORDER BY id", (since - ANSWER_MAX_AGE_S,))
+    if not any(a["ts"] >= since for a in sent):
+        return []
+    every = {r["id"] for r in db.q("SELECT id FROM messages WHERE direction='out' AND kind='ask'")}
+    replies = db.q("SELECT id, ts, text, context, ref, chat, ext_id FROM messages WHERE direction='in' "
+                   "AND kind='user' AND ts>? ORDER BY id", (sent[0]["ts"],))
+    named_out = sorted(set().union(*(replies_to(m["text"], m["context"]) for m in replies)) - every)
+    # Outbound messages other than asks that a reply names or threads under: they claim it, not an ask.
+    others = {r["id"] for r in db.q(f"SELECT id FROM messages WHERE direction='out' AND kind!='ask' AND id IN "
+                                    f"({','.join('?' * len(named_out))})", named_out)} if named_out else set()
+    other_threads = {r["ext_id"] for r in db.q("SELECT ext_id FROM messages WHERE direction='out' AND kind!='ask' "
+                                               "AND ext_id IS NOT NULL AND ts>=?", (sent[0]["ts"],))}
+    resolved = db.kv(RESOLVED_KEY, {}) or {}
+    # Relay chats: what each has read and its severity floor (a broadcast below it was skipped, not read).
+    # The web app's visible tab reads every message (web.web_seen).
+    # A say chat reads only broadcasts after it was made (chatgone.read_from): making it is no read.
+    readers = {r["id"]: (int(r["last_read"] or 0), 0 if r["id"] == "web" else
+                         CHAT_RANK.get(chat_floor(r["min_severity"], chat_min), 1), chatgone.read_from(db, r["id"]))
+               for r in db.q("SELECT id, last_read, min_severity FROM chats")}
+    rows = {a["id"]: {"id": a["id"], "blocking": (a["ref"] or "").split(":", 1)[1]
+                      if (a["ref"] or "").startswith("blocking:") else "unset",
+                      "answered": False, "handback": None, "how": None, "first": None, "answer": None} for a in sent}
+
+    def link(a: dict, m: dict, part: str, how: str) -> None:
+        row = rows[a["id"]]
+        if row["first"] is None or m["ts"] < row["first"]:
+            row["answer"] = " ".join(part.split())[:200]
+        row["answered"] = True
+        row["handback"] = row["handback"] or handback(part)
+        row["how"] = row["how"] or how
+        row["first"] = min(row["first"] or m["ts"], m["ts"])
+
+    def in_window(a: dict, m: dict) -> bool:
+        return a["ts"] < m["ts"] <= a["ts"] + ANSWER_MAX_AGE_S
+
+    def answered_before(a: dict, m: dict) -> bool:
+        return rows[a["id"]]["first"] is not None and rows[a["id"]]["first"] < m["ts"]
+
+    def delivered(a: dict, m: dict) -> bool:
+        """Whether the ask is known to have reached the reply's chat: its own chat, Slack for a
+        broadcast ask posted there (its ext_id), or a relay chat that read past a broadcast ask at or
+        above its floor; the web app once its visible tab showed it (web.web_seen)."""
+        if a["chat"] == m["chat"]:
+            return True
+        if a["chat"] is not None:
+            return False
+        if m["chat"] == "slack":
+            return bool(a["ext_id"])
+        seen, floor, start = readers.get(m["chat"], (0, 99, 0))
+        return start < a["id"] <= seen and SEVERITY_RANK.get(a["severity"], 1) >= floor and a["channel"] != "quiet"
+
+    def closed_before(a: dict, m: dict) -> bool:
+        return float((resolved.get(str(a["id"])) or {}).get("ts") or m["ts"]) < m["ts"]
+
+    claimed = set()   # replies about a particular ask, or in another thread: never a plain answer
+    for m in replies:
+        elsewhere = bool(m["ext_id"] and m["ref"] and m["ref"] != m["ext_id"])   # a reply in a thread
+        other = m["ref"] in other_threads \
+            or any(i in others and i < m["id"] for i in replies_to(m["text"], m["context"]))
+        if elsewhere or other or _ask_mentions(m["text"], every):
+            claimed.add(m["id"])
+        for a in sent:
+            if not in_window(a, m):
+                continue
+            part, how = answer_part(m["text"], a["id"], every), "named"
+            if part is None and a["ext_id"] and m["ref"] == a["ext_id"]:
+                part, how = m["text"], "thread"
+            if part is None and m["id"] in (resolved.get(str(a["id"])) or {}).get("messages", []):
+                part, how = m["text"], "resolved"
+            if part is not None:
+                claimed.add(m["id"])
+                link(a, m, part, how)
+    last_in: dict = {}   # chat -> ts of the user's previous message there
+    for m in replies:
+        prev, last_in[m["chat"]] = last_in.get(m["chat"]), m["ts"]
+        if m["id"] in claimed:
+            continue
+        open_ = [a for a in sent if in_window(a, m) and a["chat"] in (None, m["chat"])
+                 and not answered_before(a, m) and not closed_before(a, m)]
+        if len(open_) == 1 and about_ask(m["text"], open_[0]["id"], open_[0]["text"]):
+            link(open_[0], m, m["text"], "only_open")
+        elif open_ and prev is not None and sum(a["ts"] > prev for a in open_) == 1 and open_[-1]["ts"] > prev \
+                and (delivered(open_[-1], m) or about_ask(m["text"], open_[-1]["id"], open_[-1]["text"])) \
+                and not off_topic(m["text"], open_[-1]["text"]):
+            link(open_[-1], m, m["text"], "newest")
+    return [{**{k: v for k, v in rows[a["id"]].items() if k != "first"}, "answered_at": rows[a["id"]]["first"],
+             "landed": _landed(resolved, a["id"]), "step": _step(resolved, a["id"])} for a in sent if a["ts"] >= since]
+
+
+def _landed(resolved: dict, ask_id: int) -> dict | None:
+    """{"tasks", "ts"} when close_landed closed the ask, else None."""
+    r = resolved.get(str(ask_id))
+    return {"tasks": list(r["landed"]), "ts": float(r.get("ts") or 0)} if isinstance(r, dict) and r.get("landed") else None
+
+
+def _step(resolved: dict, ask_id: int) -> dict | None:
+    """{"task", "ts"} when close_step_done closed the ask (that task's user step was done), else None
+    (also for a record that does not decode)."""
+    r = resolved.get(str(ask_id))
+    try:
+        return {"task": int(r["step"]), "ts": float(r.get("ts") or 0)} if isinstance(r, dict) and r.get("step") else None
+    except (TypeError, ValueError):
+        return None
+
+
+def asks_line(rows: list[dict]) -> str:
+    if not rows:
+        return "no asks sent"
+    back = [r for r in rows if r["handback"]]
+    answered = sum(r["answered"] for r in rows)
+    hows = [r["how"] for r in rows if r.get("how")]
+    by = ", ".join(f"{hows.count(h)} {label}" for h, label in LINKED_BY.items() if h in hows)
+    by = f" ({by})" if by else ""
+    line = (f"{len(rows)} sent, {answered} with a linked answer{by}, {len(back)} handed back "
+            f"({100 * len(back) / len(rows):.0f}% of asks)")
+    if back:
+        line += ": " + ", ".join(f"ask {r['id']} ({r['blocking']}; \"{r['handback']}\")" for r in back)
+    return line
+
+
+def refused_line(db: DB, since: float, flagged: bool = False) -> str:
+    """Asks the gate refused since `since` (coordinator._count_refusal), by why: self-health
+    questions the project should have fixed itself, and unclassified or `neither` asks. With
+    `flagged`, asks it sent but flagged instead (status quo, reversible step)."""
+    from .coordinator import ASK_FLAGGED_KIND, ASK_REFUSED_KIND
+    verb = "flagged" if flagged else "refused"
+    by: dict[str, int] = {}
+    for r in db.q("SELECT text FROM events WHERE kind=? AND ts>=?",
+                  (ASK_FLAGGED_KIND if flagged else ASK_REFUSED_KIND, since)):
+        label = str(r["text"]).split(":", 1)[0]
+        by[label] = by.get(label, 0) + 1
+    if not by:
+        return f"none {verb}"
+    return f"{sum(by.values())} {verb} (" + ", ".join(
+        f"{label} {n}" for label, n in sorted(by.items(), key=lambda kv: (-kv[1], kv[0]))) + ")"
+
+
+def turns_line(db: DB, since: float) -> str:
+    """The coordinator's turns by effort, and its turns by trigger label. Notes without a `triggers`
+    list fall back to `trigger` or `unblock`."""
+    rows = db.q("SELECT effort, note FROM runs WHERE role='coordinator' AND started>=?", (since,))
+    if not rows:
+        return "no coordinator turns"
+    split: dict[str, int] = {}
+    why: dict[str, int] = {}
+    for r in rows:
+        split[r["effort"] or "default"] = split.get(r["effort"] or "default", 0) + 1
+        for t in _triggers(loads_dict(r["note"])):
+            why[t] = why.get(t, 0) + 1
+    line = f"{len(rows)} turns: " + ", ".join(f"{n} {k}" for k, n in sorted(split.items(), key=lambda kv: -kv[1]))
+    if why:
+        line += "; triggers: " + ", ".join(f"{k} {n}" for k, n in sorted(why.items(), key=lambda kv: -kv[1])[:5])
+    return line
+
+
+def _triggers(note: dict) -> list[str]:
+    """A turn's trigger labels: each entry's text before the first ':' or '(', cut to 40 chars."""
+    trigs = note.get("triggers")
+    if not isinstance(trigs, list):
+        trig = note.get("trigger") or note.get("unblock")
+        trigs = [trig] if trig else []
+    labels = (re.split(r"[:(]", str(t), maxsplit=1)[0].strip()[:40] for t in trigs if t)
+    return [lab for lab in labels if lab]
+
+
+def triggers_line(db: DB, since: float) -> str:
+    """Coordinator turns per trigger label, and the triggered vs routine share with their cost."""
+    rows = db.q("SELECT note, cost_usd FROM runs WHERE role='coordinator' AND started>=?", (since,))
+    if not rows:
+        return "no coordinator turns"
+    per: dict[str, int] = {}
+    raised = [0, 0.0]
+    routine = [0, 0.0]
+    for r in rows:
+        trigs = _triggers(loads_dict(r["note"]))
+        side = raised if trigs else routine
+        side[0] += 1
+        side[1] += float(r["cost_usd"] or 0)
+        for t in trigs:
+            per[t] = per.get(t, 0) + 1
+    n = len(rows)
+    line = (f"triggered {raised[0]} ({100 * raised[0] / n:.0f}%, ${raised[1]:.2f}), "
+            f"routine {routine[0]} ({100 * routine[0] / n:.0f}%, ${routine[1]:.2f})")
+    if per:
+        line += "; per trigger: " + ", ".join(f"{k} {v}" for k, v in sorted(per.items(), key=lambda kv: (-kv[1], kv[0])))
+    return line
+
+
+TRIGGER_DAYS = 3   # triggers_by_day's span: before and after a wake rule change compare over these days
+
+
+def triggers_by_day(db: DB, now: float, days: int = TRIGGER_DAYS) -> str:
+    """Coordinator turns per trigger label in each of the last `days` 24-h windows, newest first, and
+    the labels that rode along instead (the turn note's `carried`: coordinator.effort_triggers), so a
+    wake rule's effect reads as raised vs carried per day."""
+    out = []
+    for i in range(days):
+        rows = db.q("SELECT note FROM runs WHERE role='coordinator' AND started>=? AND started<?",
+                    (now - (i + 1) * 86400, now - i * 86400))
+        per: dict[str, int] = {}
+        rode: dict[str, int] = {}
+        for r in rows:
+            note = loads_dict(r["note"])
+            for t in _triggers(note):
+                per[t] = per.get(t, 0) + 1
+            carried = note.get("carried")
+            for t in carried if isinstance(carried, list) else []:
+                rode[str(t)] = rode.get(str(t), 0) + 1
+
+        def counts(d: dict) -> str:
+            return ", ".join(f"{k} {v}" for k, v in sorted(d.items(), key=lambda kv: (-kv[1], kv[0])))
+        out.append(f"{i * 24}-{(i + 1) * 24} h ago: {len(rows)} turns"
+                   + (f"; {counts(per)}" if per else "") + (f"; carried, not raised: {counts(rode)}" if rode else ""))
+    return " | ".join(out)
+
+
+def lines(db: DB, now: float | None = None, cfg: dict | None = None) -> list[str]:
+    """The daily review's 'Unblocking quality' lines (`cfg`: the project's, for the queue-wait threshold)."""
+    from . import queuewait
+    now = time.time() if now is None else now
+    out = [f"stuck now (inventory, whenever it started): {inventory_line(inventory(db, now))}",
+           f"holds with no anchor (no ask, resource, until or when), by age: {unanchored_line(unanchored(db, now))}"]
+    for label, span in WINDOWS:
+        eps = episodes(db, now - span, now)
+        segs = intervals(db, now - span, now)
+        for kind in STUCK.values():
+            out.append(f"time in {kind}, {label} (intervals started in window): "
+                       f"{stuck_line([x for x in segs if x['kind'] == kind])}")
+        out.append(f"stuck episodes, {label} (started in window, all stuck states, full age): {stuck_line(eps)}")
+        out.append(f"self-waits, {label}: {self_waits_line(self_waits(db, now - span))}")
+    for label, span in WINDOWS:
+        out.append(f"asks, {label}: {asks_line(asks(db, now - span, now))}")
+        out.append(f"asks refused by the gate, {label}: {refused_line(db, now - span)}")
+        out.append(f"asks sent but flagged by the gate, {label}: {refused_line(db, now - span, flagged=True)}")
+    out.append(f"coordinator, 24 h: {turns_line(db, now - 86400)}")
+    out.append(f"coordinator triggers, 24 h: {triggers_line(db, now - 86400)}")
+    out.append(f"coordinator triggers by day, {TRIGGER_DAYS} d: {triggers_by_day(db, now)}")
+    out.append(f"{reviewcap.TRIGGER}, 24 h: {reviewcap.daily_line(db, now - 86400)}")
+    out.append(queuewait.daily_line(db, cfg, now))
+    return out

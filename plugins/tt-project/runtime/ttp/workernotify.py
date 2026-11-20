@@ -1,0 +1,151 @@
+"""A worker's normal `ttp notify` from a run that ended blocked, waiting, failed or needs_review goes
+to the coordinator first, so it cannot duplicate or contradict what the coordinator then tells the user.
+It is queued as a ride-along `worker_notify` event (alerts.RIDE_ALONG: it joins the turn the run's
+hand-off starts, never one of its own) and kept in a kv list. The coordinator takes it up by an ask,
+reply or notify naming the task (#<id>), or drops it with a task_update whose text starts DROPPED
+(handled). Otherwise, once notify.hold_s has passed, post_due posts it unchanged and model-free. The
+list lives in kv and each post removes its entry in the same transaction, so a daemon restart during
+the hold neither loses nor doubles it. A hand-off that queues no coordinator turn of its own (a waiting
+one, a routine or quiet one: recorded 'handled') has its notifies posted at once (release_unqueued).
+
+Who may post: a worker or reviewer run on the light tier, or routed to the chat provider (route.TO,
+unless it is the project's core provider), never writes text the user's chat shows. The daemon marks
+such a run at start (ENV: why, from no_post) and `ttp notify` refuses its low and normal notifies,
+user steps included, telling it to hand the text off: the coordinator, a run at least at the standard
+tier, decides what the user reads. `--severity high` still goes to the coordinator, and the daemon's
+own model-free notices are unaffected. A refusal, not a relay through a standard run: the hand-off
+already reaches the coordinator, so a relay would add a paid run per notify for no new path.
+Known gaps: the mark is an environment value, so a run that unsets it, or writes the notify file
+itself, is not refused; this guards against a model's habit, not a hostile run."""
+from __future__ import annotations
+
+import hashlib
+import json
+import re
+import time
+
+from . import alerts
+
+KIND = "worker_notify"
+KV = "worker_notify_hold"   # kv: [{event, task, text, severity, due}] notifies held for the coordinator
+HELD_ENDS = ("blocked", "waiting", "failed", "needs_review")
+DROPPED = "notify dropped:"
+HOLD_S = 900
+_TASK_REF = re.compile(r"#(\d+)\b")
+ENV = "TTP_NO_USER_POST"   # set by the daemon on a run that must not post to the user's chat: why
+
+
+def no_post(cfg: dict, role: str, tier: str, provider: str) -> str:
+    """Why a run of `role` on `tier` and `provider` must not post to the user's chat, or "" if it may."""
+    from . import route
+    if role not in ("worker", "reviewer"):
+        return ""
+    if provider == route.TO and (cfg.get("core_provider") or "claude") != route.TO:
+        return f"routed to the {route.TO} provider"
+    if tier == "light":
+        return "on the light tier"
+    return ""
+
+
+def refusal(why: str) -> str:
+    return (f"ttp notify: this run is {why}, so it does not post to the user's chat. Put the text in your "
+            "hand-off (its summary, or `question` if you hand off blocked): the coordinator decides what the "
+            "user reads. `--severity high` still reaches the coordinator now")
+
+
+def hold_s(cfg: dict) -> float:
+    try:
+        return max(0.0, float((cfg.get("notify") or {}).get("hold_s", HOLD_S)))
+    except (TypeError, ValueError):
+        return float(HOLD_S)
+
+
+def _entries(db) -> list[dict]:
+    v = db.kv(KV, [])
+    return [e for e in v if isinstance(e, dict)] if isinstance(v, list) else []
+
+
+def _due(e: dict) -> float:
+    try:
+        return float(e.get("due") or 0)
+    except (TypeError, ValueError):
+        return 0.0   # a damaged entry is posted now, never left to stop every tick
+
+
+def hold(db, task: dict, text: str, run: str, end: str, hold_for: float, now: float | None = None) -> bool:
+    """Hold alert `text` of task `task`'s run `run` (ended `end`) for the coordinator. Call inside the
+    run end's transaction: a rollback drops both the event and the entry. False if already held."""
+    now = time.time() if now is None else now
+    fp = f"{KIND}:{run}:{hashlib.sha256(text.encode()).hexdigest()[:16]}"
+    with db.tx():
+        if db.one("SELECT id FROM events WHERE fingerprint=?", (fp,)):
+            return False
+        _hold(db, task, text, end, hold_for, now, fp)
+    return True
+
+
+def _hold(db, task: dict, text: str, end: str, hold_for: float, now: float, fp: str) -> None:
+    mins = max(1, round(hold_for / 60))
+    body = (f"Worker notify of #{task['id']} (its run ended {end}), held for you, not yet sent: {text}\n"
+            f"Posted to the user unchanged in {mins} min unless you ask, reply or notify naming #{task['id']} "
+            f"first, or drop it with task_update #{task['id']} text '{DROPPED} <why>'.")
+    eid = db.x("INSERT INTO events(ts,source,kind,fingerprint,severity,text,data,status,task) VALUES(?,?,?,?,?,?,?,?,?)",
+               (now, f"worker:{task['id']}", KIND, fp, "normal", body[:4000],
+                json.dumps({alerts.RIDE_ALONG: True, "task": task["id"], "text": text}), "queued", task["id"]))
+    db.set_kv(KV, _entries(db) + [{"event": eid, "task": task["id"], "text": text, "severity": "normal",
+                                    "due": now + hold_for}])
+
+
+def _close(db, keep: list[dict], gone: list[dict]) -> None:
+    db.set_kv(KV, keep)
+    for e in gone:
+        db.x("UPDATE events SET status='handled' WHERE id=? AND status='queued'", (e.get("event"),))
+
+
+def handled(db, tasks) -> int:
+    """The coordinator took up (or dropped) the held notifies of `tasks`: none of them is posted."""
+    tasks = {int(t) for t in tasks}
+    with db.tx():
+        entries = _entries(db)
+        gone = [e for e in entries if e.get("task") in tasks]
+        if gone:
+            _close(db, [e for e in entries if e not in gone], gone)
+    return len(gone)
+
+
+def named(text: str) -> set[int]:
+    return {int(m) for m in _TASK_REF.findall(str(text or ""))}
+
+
+def _post(db, entries: list[dict], due: list[dict], now: float) -> int:
+    for e in due:
+        text = str(e.get("text") or "")
+        if text and not db.one("SELECT id FROM messages WHERE direction='out' AND kind='alert' AND text=? "
+                               "AND ts>?", (text, now - 86400)):
+            db.post("out", text, chat=None, kind="alert", severity=e.get("severity") or "normal")
+    if due:
+        _close(db, [e for e in entries if e not in due], due)
+    return len(due)
+
+
+def post_due(db, now: float | None = None) -> int:
+    """Post each held notify whose hold ended, unchanged, and close its coordinator item."""
+    now = time.time() if now is None else now
+    with db.tx():
+        entries = _entries(db)
+        return _post(db, entries, [e for e in entries if _due(e) <= now], now)
+
+
+def release_unqueued(db, task_id: int, now: float | None = None) -> int:
+    """Post task `task_id`'s held notifies now when no queued event of the task starts a coordinator
+    turn: a waiting hand-off and a routine or quiet one are recorded 'handled', so the ride-along item
+    would reach the coordinator only by chance and the user 15 min late (a sign-in link or device
+    code may lapse by then). Run after the run end commits; a crash before it leaves post_due."""
+    now = time.time() if now is None else now
+    with db.tx():
+        evs = db.q("SELECT severity, data FROM events WHERE task=? AND status='queued' AND kind!=?",
+                   (task_id, KIND))
+        if any(not alerts.rides_along(dict(e)) for e in evs):
+            return 0
+        entries = _entries(db)
+        return _post(db, entries, [e for e in entries if e.get("task") == task_id], now)

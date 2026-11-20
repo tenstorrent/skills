@@ -1,0 +1,5 @@
+---
+"tt-project": patch
+---
+
+`tt-project`: in coordinator session mode, an injected instruction can no longer persist across wakes by passing itself off as a user order. A handover line labelled as the user's words (`user's word(s)`, the owner's too, `User (msg #N):`, `per the user`, `the user said "..."`) is kept only when its quotes are in the own words of the logged user message it cites (the check charter changes use); a failing or quote-less labelled line is dropped and logged as an `order_claim_dropped` event, both when the note is saved and when it seeds the next session. Paraphrases and quoted terms on unlabelled lines stay as data, and the seed header vouches for nothing it did not check. A `memory_add` with a labelled line that fails the same check is refused, and a coordinator run's `ttp memory` writes are refused in favour of `memory_add`. The wake after a compacted one leads with the open order ledger and the last chat exchanges verbatim, so the summary carries no order of its own.

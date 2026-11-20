@@ -1,0 +1,768 @@
+# SPDX-FileCopyrightText: © 2026 Tenstorrent USA, Inc.
+# SPDX-License-Identifier: Apache-2.0
+"""A model-free guard on the side effects of a run on the code arm's GLM side.
+
+A GLM-arm run (codearm.py) builds what its spec decided and hands the result back; it does not talk to a
+person or another project, write the project's records or touch anything outside its worktree. A prompt
+rule cannot hold that for a cheaper model, so the harness enforces it in code, with no model call, on
+every harness the arm runs:
+
+The guard is a short explicit denylist of the harmful kinds measured on real GLM runs;
+everything else runs, with Opus's plan and the post-run audit as the backstop (deviceplan.py):
+- writes or deletes outside the run's worktree, run folder and scratch folder (a redirect, tee, a writing
+  verb's target, a copy's destination; never inferred from interpreter code), any write an ssh call makes on
+  another host (REMOTE_WHY: a device plan's own step may), and the guard's own files, its identity variables
+  and the project's database and machine records (TAMPER, STATE_DB); protected and served paths are
+  pathguard's (guards.protected_paths), on every run;
+- srun, sbatch or salloc on held nodes and recorded undos of user-ordered changes: ruleguard's (slurm_nodes,
+  user_undo), on every run;
+- pushes and landing before review: a raw `git push`, `ttp land`, `ttp express`, `ttp push --land` (`ttp push`
+  keeps its own checks and review gates);
+- outward posts: `ttp notify`, `say`, `ask`, `upstream`, a note routed past the run's own log (NOTE_ROUTES),
+  a `gh` write, an HTTP post, mail and raw sockets (nc, telnet);
+- resets, power cycles and flashes outside the approved routes (deviceplan.power_refusal, and deviceplan.risky
+  outside a device plan, whose steps need an Opus step check);
+- machine-ledger writes: any `ttp machines` call but its reads;
+- service state changes: `systemctl` start, stop, restart, enable, disable or mask and `service <name>` start,
+  stop or restart anywhere in the command's text, heredoc bodies and ssh commands included (SERVICE_RE; a device
+  plan's own step may);
+- every connector tool, and a Write or Edit outside the run's folders (tool_refusal).
+A script file run by its path (`bash s.sh`, `bash < s.sh`, `ssh box bash < s.sh`) is opaque to the guard: its
+contents are not read, and neither is a `$(...)` in a heredoc body a program other than a shell reads. Opus's
+plan and the post-run audit are the backstop there. Protected names are read in the command's raw text, all but a
+quoted heredoc body (`<<'EOF'`) only written to a file; an unquoted body is checked like command text. A search for
+one (`grep project.db`, `git log -S glm_guard.json`) is refused, so is setting the guard flag
+(`TTP_CODE_ARM_GUARD=1`) like any other mention, and so is a `$TMPDIR` write after interpreter code that names
+TMPDIR (`os.environ["TMPDIR"]` reads as setting it).
+The hook (hook.pre_tool_use, Claude Code and any provider with hooks), `ttp` itself (cli.glm_gate) and the
+command layer of a harness without hooks (glmenv, for mini-swe-agent) ask it before each call.
+
+A refused command never runs. refused() records it in the run's glm_refusals.jsonl and decides it by RULES, the one
+table of refusal rules: a redirect (a database or record read, `ttp upstream`, a scratch file outside the run's
+folders) shows the run the reason and the allowed way, and the run goes on; a harmful attempt (a device, machine
+or service act, publishing or speaking, credentials, a write to a project's records or tree, a delete or overwrite
+outside the run's folders), the run's third refusal (route.glm_refusals.hand_back_after) or redirects switched off
+(route.glm_refusals.redirect false) end the run as a hand-back to Opus: hit() writes the run's glm_guard.json and
+a `needs_opus` result.json (reason `guard: <what>`), the runner stops the agent at its next look and the daemon
+requeues the task on Opus without spending an attempt (codearm.bounce_reason). deny_list() is the prompt's
+short list of the same rules, each with its allowed way. The guard applies to
+runs where active() holds: the daemon sets TTP_CODE_ARM_GUARD for a run whose arm is glm and writes MARK in
+its run folder, so a run that unsets the variable is still guarded. Other runs are not touched.
+
+Every run on the chat model, whatever route sent it there (run_env: the chat provider, a code arm's GLM run, a
+routine coordinator lane), also gets these rules; the daemon sets RUN_ENV and writes RUN_MARK:
+- the guard above, in the tool hook (hook._pre_tool_use), whatever route sent the run there;
+- human interaction stays on Opus: an outward post (outward: `ttp notify`, `say`, `ask`, `ttp note --to/--reply`,
+  a `gh` write, an HTTP post, mail, any connector tool) is refused and recorded as a draft (DRAFTS: channel,
+  target, text, why, command), and the run goes on; after the run the daemon hands the drafts to the
+  coordinator's Opus session, which reviews each and sends or drops it (daemon.relay_glm_drafts);
+- on a device task (its resources name a device or machine), the first failed gate command (a `check:` or
+  `gate:` line of the spec, `ttp checks`, `ttp lock`, a broker status or preflight) ends the run as a hand-back
+  to Opus with the command and its output (gate_stop); any other failed command does not."""
+from __future__ import annotations
+
+import json
+import os
+import re
+import time
+from pathlib import Path
+
+from . import glmassist
+from .coordtools import READ_COMMANDS
+
+ENV = "TTP_CODE_ARM_GUARD"
+MARK = "glm_guard.on"        # in the run folder: the daemon wrote it before launch
+HIT = "glm_guard.json"       # in the run folder: {"why", "ts"}; the runner stops the agent when it exists
+KEPT = "result.pre-guard.json"   # a hand-off the run wrote before the guard replaced it
+
+# The ttp commands the denylist refuses outright: those that post outward or land a head (a `ttp machines`
+# write is refused by read_only).
+OUT_TTP = frozenset({"notify", "say", "ask", "upstream"})
+LANDING = frozenset({"land", "express"})
+# `ttp note` flags that send a note on, or change a record beyond the run's own log: refused on the GLM arm.
+NOTE_ROUTES = ("--to", "--reply", "--urgent", "--severity", "--confirms")   # --status ID only reads
+GH_READS = frozenset({"view", "list", "diff", "status", "checks"})
+# read-only ttp queries, by word prefix: the coordinator's reads and the machine ledger's list
+READS = READ_COMMANDS + (("machines", "change", "list"), ("machines", "change", "show"), ("occupancy",))
+NET = frozenset({"nc", "ncat", "netcat", "telnet"})
+COPIERS = frozenset({"scp", "rsync", "sftp"})
+REMOTE_WHY = "it writes on another host"   # a device plan's own step may (deviceplan.refusal)
+# A service started, stopped or switched on a box can take its devices from others: only a step of Opus's device
+# plan may (deviceplan.refusal); a run with no plan never does. Read on the raw text, so a heredoc body or an ssh
+# command is covered without parsing either.
+SERVICE_WHY = "it changes a service's state"
+SERVICE_RE = re.compile(r"\bsystemctl(?:\s+--?[\w-]+(?:=\S+)?)*\s+(?:start|stop|restart|enable|disable|mask)\b"
+                        r"|\bservice\s+[\w@.-]+\s+(?:start|stop|restart)\b")
+HTTP = frozenset({"curl", "wget", "http", "https", "httpie"})
+HTTP_DATA = re.compile(r"(?:^|\s)(?:-X\s*(?:POST|PUT|PATCH|DELETE)|--request\s+(?:POST|PUT|PATCH|DELETE)|-d\b|--data\S*|"
+                       r"-F\b|--form\S*|-T\b|--upload-file|--post-\S+)", re.I)
+# A command that edits what identifies the run: the guard's own variable, or the run's identity. Only where a shell
+# reads an assignment (the start of a command, after a wrapper such as sudo or env, or a -c or eval script), so
+# `echo TTP_RUN_DIR=$TTP_RUN_DIR` is a read, while `TTP_RUN_DIR=x cmd`, `export`, `env`, `unset`, `read` and
+# `printf -v` of one are edits.
+_IDS = r"(?:TTP_CODE_ARM_GUARD|TTP_RUN_DIR|TTP_TASK|TTP_PROJECT|TTP_RUN_ID)"
+_AT = (r"(?:^|[;&|({}\n`!]|\$\(|\b(?:then|do|else|elif|if|while|until)\s|(?:-c|eval)\s+['\"]?)\s*"
+       r"(?:(?:sudo|exec|command|nohup|time|nice|xargs|builtin|doas)\s+(?:-\S+\s+)*)*")
+TAMPER = re.compile(
+    _AT + r"(?:(?:unset|export|declare|typeset|local|readonly|env|set|read|mapfile|readarray|for)\b[^;|&\n]*\b"
+    + _IDS + r"\b|printf\s+-v\s*" + _IDS + r"\b|(?:[A-Za-z_]\w*=\S*\s+)*" + _IDS + r"\+?=)"
+    r"|\benv\s+-i\b|\bglm_guard\.(?:on|json)\b", re.M)
+# A shell redirection (`2>&1`, `>out.log`, `<in`): its fd digit and target are no words of a ttp call.
+# the target stops at a quote: `ssh h "ls > f"` keeps its closing quote, so the remote command stays one word
+REDIRECT = re.compile(r"(?<![\w$])\d*(?:&>>?|>>?|<<?<?|>&|<&)\s*(?:&?\d+-?|[^\s;|&<>()'\"]+)?")
+STATE_DB = re.compile(r"\bproject\.db\b|\bmachine-workers\.json\b|\b\.tt-project/(?:locks|machines)\b")
+# Every run on the chat model (the code arm, a GLM work route, a routine coordinator lane, a bench run as a task):
+# human interaction stays on Opus, so its outward posts become drafts an Opus step reviews and sends.
+SCRATCH = "tmp"               # in the run folder: the run's own scratch folder, its TMPDIR (TMP, TEMP)
+SCRATCH_VARS = ("TMPDIR", "TMP", "TEMP")
+SCRATCH_LINE = ("Keep scratch files in $TMPDIR (a folder of your own in your run folder) or your worktree: write"
+                ' `> "$TMPDIR/body.md"`, never a literal `/tmp/...` path, and never create files in the project\'s'
+                " `state/` folder. The guard refuses writes anywhere else.")
+# What a code run's own checklist (template kind-code.md) leaves out of its check before it hands off done: the
+# review fails tests that pass without the change, and a large diff with no reason.
+HANDOFF_LINE = ("Before you hand off done, check your own diff as the independent review will. Revert your fix once and"
+                " see each new or changed test fail, then restore it; assert behaviour, not message wording; leave no"
+                " unused test setup. If the diff stays large, add a `why this size:` line to your summary. Every claim"
+                " in your summary cites the command or file that shows it.")
+_SCRATCH_REF = re.compile(r"\$(?:\{(TMPDIR|TMP|TEMP)\}|(TMPDIR|TMP|TEMP)(?!\w))")
+_SCRATCH_SET = re.compile(r"(?<![\w${])(?:TMPDIR|TMP|TEMP)(?!\w)")   # the command names one itself (sets it)
+RUN_ENV = "TTP_GLM_RUN"       # "1", or DEVICE for a run on a device task
+RUN_MARK = "glm_run.json"     # in the run folder: {"device", "gates", "plan", "cwd"}, read where the variable is gone
+DEVICE = "device"
+DRAFTS = "outbound.jsonl"     # in the run folder: one {channel, target, text, why, command, ts} per refused post
+GATE = "gate"
+OUTPUT_TAIL = 2000
+OUT_SUBS = frozenset({"notify", "say", "ask"})
+OUT_NOTE = ("--to", "--reply")
+MAIL = frozenset({"mail", "mailx", "sendmail", "mutt"})
+GATE_SUBS = frozenset({"checks", "lock"})
+BUSY = 75                     # `ttp lock` and the checks queue: busy, not failed
+BROKER = re.compile(r"(?i)\bbroker\b.*\b(?:status|preflight)\b|\bpreflight\b")
+GATE_LINE = re.compile(r"(?im)^\s*[-*]?\s*(?:check|gate)\s*:\s*`?([^`\n]+?)`?\s*$")
+WRITE_TOOLS = {"Write", "Edit", "MultiEdit", "NotebookEdit", "apply_patch", "ApplyPatch"}
+READ_TOOLS = {"Read", "Grep", "Glob", "LS", "TodoWrite", "Task", "WebSearch", "WebFetch"}
+
+
+def active(env=None) -> bool:
+    """Whether this process is a run on the GLM arm: the variable, or the marker in its run folder."""
+    e = os.environ if env is None else env
+    if e.get(ENV) == "1":
+        return True
+    rd = e.get("TTP_RUN_DIR") or ""
+    return bool(rd) and (Path(rd) / MARK).exists()
+
+
+def arm_env(note: dict | None) -> dict[str, str]:
+    """The run environment's flag for a run whose arm is glm (empty otherwise): `note` is the run note."""
+    from . import codearm
+    arm = (note or {}).get(codearm.KEY)
+    return {ENV: "1"} if isinstance(arm, dict) and arm.get("run") == "glm" else {}
+
+
+def scratch_env(run_dir, env=None) -> dict[str, str]:
+    """TMPDIR, TMP and TEMP for a run under the GLM guards: `env`'s own short temp dir (a fenced run's, from
+    shorttmp) when it has one, else the run folder's scratch folder, made here. The guard lets writes go there."""
+    tmp = (env or {}).get("TMPDIR") or ""
+    if not _own_tmp(tmp, str(run_dir)):
+        tmp = str(Path(run_dir) / SCRATCH)
+        Path(tmp).mkdir(exist_ok=True)
+    return {var: tmp for var in SCRATCH_VARS}
+
+
+def _own_tmp(tmp: str, run_dir: str) -> bool:
+    """Whether `tmp` is a run's own scratch folder: its run folder's, or a short temp dir shorttmp made."""
+    from . import shorttmp
+    return bool(tmp) and ((bool(run_dir) and os.path.normpath(tmp) == os.path.normpath(Path(run_dir) / SCRATCH))
+                          or shorttmp.owned(tmp))
+
+
+def mark(run_dir) -> None:
+    """The daemon's marker for a run on the arm (read by active() where the variable is gone)."""
+    from .project import durable_write
+    durable_write(Path(run_dir) / MARK, "1")
+
+
+def hit(run_dir, why: str, kind: str = "guard", detail: str = "") -> None:
+    """End the run as a hand-back to Opus: record the refusal and replace its hand-off with a `needs_opus`
+    one (a hand-off it already wrote is kept beside it). The runner stops the agent when HIT exists;
+    the daemon requeues the task on Opus. `kind`: "guard" for a refused side effect, GATE for a failed gate
+    command on a device run, whose output tail is `detail`. Never raises: a guard that cannot write still
+    refuses."""
+    if not run_dir:
+        return
+    d = Path(run_dir)
+    why = why.strip()[:280]
+    try:
+        from .project import durable_write
+        res = d / "result.json"
+        if res.exists() and not (d / KEPT).exists():
+            try:
+                durable_write(d / KEPT, res.read_bytes())
+            except OSError:
+                pass
+        durable_write(res, json.dumps({"status": "blocked", "needs_opus": f"{kind}: {why}",
+                                       "summary": f"needs Opus: {kind}: {why}",
+                                       **({"gate_output": detail[-OUTPUT_TAIL:]} if detail else {})}))
+        durable_write(d / HIT, json.dumps({"why": why, "kind": kind, "ts": time.time(),
+                                           **({"output": detail[-OUTPUT_TAIL:]} if detail else {})}))
+    except OSError:
+        pass
+
+
+def hit_reason(run_dir) -> str:
+    """The reason the guard ended the run in `run_dir`, '' when it did not."""
+    try:
+        got = json.loads((Path(run_dir) / HIT).read_text())
+    except (OSError, ValueError, TypeError):
+        return ""
+    return str(got.get("why") or "guard") if isinstance(got, dict) else "guard"
+
+
+# A refusal is a redirect or a hand-back (refused()). RULES is the one table of the guard's refusals: (rule, class,
+# the reason's pattern, what the prompt tells a run never to do, the allowed way). A redirect shows the run the reason
+# and the allowed way, and the run goes on. A harmful attempt (a device, machine or service act, publishing or
+# speaking, credentials, a write to a project's records or tree, a delete or overwrite outside the run's folders), or
+# the run's hand_back_after-th refusal (route.glm_refusals), ends the run as a hand-back to Opus (hit()). The first
+# match wins; a reason no rule names is harmful.
+HARMFUL, REDIRECTED = "harmful", "redirect"
+REFUSALS = "glm_refusals.jsonl"   # in the run folder: one {ts, rule, class, why, n, back} per refusal
+REFUSAL_KEY = "glm_refusals"      # route.glm_refusals: {"hand_back_after": 3, "redirect": true}
+HAND_BACK_AFTER = 3
+_OUTSIDE = "outside its worktree"
+_OWN_TREE = ("change only files in your worktree and `$TMPDIR`, and say in your hand-off "
+             "what else should change")
+RULES = (
+    ("db_read", REDIRECTED, r"database or machine records by hand",
+     "open the project's database or machine records (sqlite or any other tool)",
+     "read them with `ttp status`, `ttp task <project> show <id>` (or `list`), `ttp machines list` and the run "
+     "folders' `state/runs/<run>/result.json`"),
+    ("upstream", REDIRECTED, r"`ttp upstream`", "run `ttp upstream`",
+     "write the note as a hand-off follow-up titled `upstream: ...`"),
+    ("scratch", REDIRECTED, _OUTSIDE, "write to a literal `/tmp/...` path or create files outside your worktree",
+     'write scratch files under `"$TMPDIR"` (a folder of your own) or in your worktree'),
+    ("records", HARMFUL, None, "write in a project's `state/` folder, another task's worktree or another project, or "
+     "delete or overwrite a file outside your worktree and `$TMPDIR`", _OWN_TREE),
+    ("delete", HARMFUL, None, None, _OWN_TREE),
+    ("outward", HARMFUL, r"`ttp (?:notify|say|ask|note)\b", "post outward (`ttp notify`, `ttp say`, "
+     "`ask`, `ttp note --to`/`--reply`)", 'put what a person should read in your hand-off summary; a plain `ttp note "<text>"` '
+     "goes to your task's own log"),
+    ("publish", HARMFUL, r"lands a head|never `git push`", "run `git push`, `ttp land` or `ttp express`",
+     "commit on your branch and hand off done; the review publishes the head"),
+    ("post", HARMFUL, r"post to GitHub|send data to a service|reaches a person or another service|connector tool",
+     "post to GitHub (`gh` writes), send HTTP posts or mail, or call a connector tool",
+     "put the text in your hand-off summary; `gh pr view` and `gh pr diff` only read and run"),
+    ("machines", HARMFUL, r"machine ledger|`ttp remove`", "change the machine ledger (`ttp machines` writes) or "
+     "remove a project", "say in your hand-off what changed; read the ledger with `ttp machines list`"),
+    ("device", HARMFUL, r"^out of plan|power cycle|reset|flash|firmware|" + re.escape(SERVICE_WHY) + "|"
+     + re.escape(REMOTE_WHY), "reset, power-cycle, flash or reboot a device, start or stop a service, or write on "
+     "another host", "on a device task these run only as steps of Opus's device plan; otherwise hand off and say "
+     "what is needed"),
+    ("credentials", HARMFUL, r"secrets|credential|identity or the guard's own files|run a local program",
+     "read stored secrets, keys or credential files, or change the run's `TTP_*` variables",
+     "hand off and say which access the task needs"),
+    ("other", HARMFUL, r"", None, "hand off and say what the task needs"),
+)
+_DELETES = re.compile(r"\b(?:rm|rmdir|shred|unlink|truncate|chmod|chown|chgrp) target\b|\bmv source\b|\bdd of=|sed -i")
+_NEW_ONLY = re.compile(r"\b(?:mkdir|touch) target\b")
+_TMP = ("/tmp", "/var/tmp")
+
+
+def _local_rule(why: str) -> str:
+    """The rule of a refused local write (`it writes outside its worktree: <path> (<how>)`): a delete or overwrite,
+    a project's records or tree, else a new file or folder (scratch)."""
+    m = re.match(r"it writes outside its worktree: (.+?)(?: \(([^()]*)\))?$", why.strip())
+    path, how = (m.group(1), m.group(2) or "") if m else ("", "")
+    if _DELETES.search(how):
+        return "delete"
+    q = Path(path)
+    if ".tt-project" in q.parts or "/tt-project/state" in path or any(
+            (a / "tt-project" / "state").is_dir() for a in list(q.parents)[:-1]):
+        return "records"
+    if path in _TMP or path.startswith(tuple(t + "/" for t in _TMP)):
+        return "scratch"
+    return "delete" if path and os.path.lexists(path) and not _NEW_ONLY.search(how) else "scratch"
+
+
+def classify(why: str) -> tuple[str, str, str]:
+    """(rule, class, allowed way) of a refusal's reason, from RULES."""
+    by = {r[0]: r for r in RULES}
+    key = next(r[0] for r in RULES if r[2] is not None and re.search(r[2], why or ""))
+    if key == "scratch":
+        key = _local_rule(why)
+    return key, by[key][1], by[key][4]
+
+
+def refusal_settings(cfg: dict | None = None) -> dict:
+    """route.glm_refusals: `redirect` false (the off switch) hands the task back on the first refusal, as before
+    redirects; `hand_back_after` (default 3) is the refusal count in one run that hands it back."""
+    if cfg is None:
+        from . import deviceplan
+        cfg = deviceplan._cfg()
+    g = ((cfg or {}).get("route") or {}).get(REFUSAL_KEY)
+    g = g if isinstance(g, dict) else {}
+    try:
+        n = max(1, int(g.get("hand_back_after", HAND_BACK_AFTER)))
+    except (TypeError, ValueError):
+        n = HAND_BACK_AFTER
+    return {"redirect": g.get("redirect") is not False, "hand_back_after": n}
+
+
+def refusals(run_dir) -> list[dict]:
+    """The refusals a run recorded (REFUSALS), oldest first."""
+    return glmassist.rows(Path(run_dir) / REFUSALS) if run_dir else []
+
+
+def refused(run_dir, why: str, kind: str = "guard", cfg: dict | None = None) -> tuple[bool, str]:
+    """Record a refusal (REFUSALS) and decide it: (handed back, the text the run reads). A redirect's text is the
+    reason and the allowed way, and the run goes on; a harmful attempt, the run's hand_back_after-th refusal, or
+    redirects switched off end the run as a hand-back to Opus (hit()). The refused command never runs either way."""
+    why = (why or "").strip()
+    rule, cls, instead = classify(why)
+    s = refusal_settings(cfg)
+    n = len(refusals(run_dir)) + 1
+    back = cls == HARMFUL or not s["redirect"] or n >= s["hand_back_after"]
+    if run_dir:
+        try:
+            from .project import durable_append
+            durable_append(Path(run_dir) / REFUSALS, json.dumps(
+                {"ts": round(time.time(), 3), "rule": rule, "class": cls, "why": why[:280], "n": n, "back": back},
+                sort_keys=True) + "\n")
+        except OSError:
+            pass
+    if back:
+        hit(run_dir, why if cls == HARMFUL or n == 1 else f"refusal {n} in one run: {why}", kind)
+        return True, f"refused: {why}; the run ends and its task goes back to Opus"
+    left = s["hand_back_after"] - n
+    return False, (f"refused, not run: {why}.\nInstead: {instead}. Carry on with the task; "
+                   f"{left} more refusal{'s' if left > 1 else ''} in this run hand{'' if left > 1 else 's'} it "
+                   "back to Opus.")
+
+
+def deny_list() -> str:
+    """The prompt's short deny list, one line per rule with its allowed way, built from RULES so the two agree."""
+    return ("## What the guard refuses, and the allowed way\nA refused command does not run: you read why and the "
+            "allowed way, and carry on. A harmful attempt (marked) or a third refusal in one run hands the task "
+            "back to Opus.\n" + "\n".join(f"- Never {r[3]}: {r[4]}." + (" (harmful)" if r[1] == HARMFUL else "")
+                                          for r in RULES if r[3]))
+
+
+def note_route(flags) -> str:
+    """The first of `flags` (option words of a `ttp note` call, argparse prefixes included) that routes the
+    note past the run's own log, else ''."""
+    for w in flags:
+        opt = str(w).split("=", 1)[0]
+        if len(opt) > 2 and opt.startswith("--") and any(o.startswith(opt) for o in NOTE_ROUTES):
+            return next(o for o in NOTE_ROUTES if o.startswith(opt))
+    return ""
+
+
+def read_only(words: list[str], flags=()) -> bool:
+    """True for a read-only ttp call: its positional `words` (no `ttp`, no leading project name) start with an entry
+    of READS, or are the machines call that lists its records (the one that takes at most a machine name, no option but --json).
+    Any other call, an unknown subcommand too, is False."""
+    if words[:2] == ["machines", "outage"]:
+        return len(words) <= 3 and all(f == "--json" for f in flags)
+    return any(words[:len(r)] == list(r) for r in READS)
+
+
+def cli_refusal(cmd: str, action: str = "", flags=(), words=()) -> str | None:
+    """Why a GLM-arm run may not run `ttp <cmd> [<action>]` with option words `flags` (and the call's positional
+    `words` from the command on, where known), else None: the denylist's ttp kinds only."""
+    if cmd in OUT_TTP or cmd == "note" and note_route(flags):
+        what = f"`ttp {cmd}" + (f" {note_route(flags)}" if cmd == "note" else "") + "`"
+        return (f"{what} is not allowed to a run on the GLM arm: its notes go only to its own task log, "
+                f"and the coordinator decides what reaches a person, a chat or another project")
+    if cmd in LANDING or cmd == "push" and any(str(f).split("=", 1)[0] in ("--land", "--express") for f in flags):
+        return f"`ttp {cmd}` lands a head: a run on the GLM arm publishes only with `ttp push`, after review"
+    if cmd == "remove":
+        return "`ttp remove` deletes a project, outside the run's worktree and run folder: not for a run on the GLM arm"
+    if cmd == "machines" and not {"-h", "--help"} & set(flags) and not read_only(list(words) or [cmd, action], flags):
+        return ("a run on the GLM arm does not write the machine ledger (`ttp machines` writes): say in the "
+                "hand-off what it changed on a machine, and Opus records it")
+    return None
+
+
+def _ttp_args(seg: list[str], project: str) -> list[str] | None:
+    """The words after `ttp` in a command segment (an optional leading project name dropped), None for a
+    segment that is not a ttp call."""
+    if not seg:
+        return None
+    name = os.path.basename(seg[0])
+    args = seg[1:] if name == "ttp" else seg[seg.index("-m") + 2:] if "-m" in seg[:-1] and \
+        seg[seg.index("-m") + 1] in ("ttp", "ttp.cli") else None
+    if args is None:
+        return None
+    words = [w for w in args if not w.startswith("-")]
+    if len(words) > 1 and (project and words[0] == project or words[0] not in _ARG_TAKERS and cli_refusal(words[1])):
+        words = words[1:]   # `ttp <project> <command>`: the command after a project's name
+    return words
+
+
+# Commands a run uses whose next word is an argument, never a command (`ttp memory --search notify`)
+_ARG_TAKERS = frozenset({c[0] for c in READ_COMMANDS} | {"checks", "lock", "detach", "push", "landed", "task"}
+                        | {"memory", "obligation", "config", "slop", "clip", "sandbox", "advise", "audit", "note"})
+
+
+def _own_name(env) -> str:
+    """This run's project name (the first word of `ttp <project> <command>`), '' when it cannot be read."""
+    base = str(env.get("TTP_PROJECT") or "")
+    if not base:
+        return ""
+    try:
+        from .project import Project
+        return str(Project(base).name or "")
+    except Exception:
+        return os.path.basename(base)
+
+
+def _git_word(args: list[str]) -> str:
+    """The git subcommand of `args` (what follows `git`), its global options and their values skipped."""
+    i = 0
+    while i < len(args):
+        a = args[i]
+        if a in ("-C", "-c", "--git-dir", "--work-tree", "--namespace", "--exec-path") and "=" not in a:
+            i += 2
+        elif a.startswith("-"):
+            i += 1
+        else:
+            return a
+    return ""
+
+
+def _gh_posts(seg: list[str]) -> bool:
+    """Whether the `gh` call `seg` writes: anything but a read subcommand or a read-only `gh api`."""
+    from . import hook
+    args = [w for w in seg[1:] if not w.startswith("-")]
+    return not (args[1:2] and args[1] in GH_READS) and not (args[:1] == ["api"] and not hook._gh_write(seg)
+                                                         and not HTTP_DATA.search(" ".join(seg[1:])))
+
+
+def _scratch(run_dir: str, env) -> str:
+    """The run's scratch folder as the guard reads it: its TMPDIR when that is its own, else the run folder's."""
+    tmp = str(env.get("TMPDIR") or "")
+    return tmp if _own_tmp(tmp, run_dir) else (str(Path(run_dir) / SCRATCH) if run_dir else "")
+
+
+def _roots(cwd: str, run_dir: str, scratch: str = "", env=None) -> list[str]:
+    """The folders a GLM run may write in: its shell's cwd, run folder, scratch and the folder it started in (a
+    `cd` into a sibling folder moves the shell's cwd, never that start)."""
+    out = []
+    for x in (cwd, run_dir, scratch, ((glm_run(env) if env is not None else None) or {}).get("cwd", "")):
+        if x:
+            out += [os.path.normpath(x), os.path.realpath(x)]
+    return out
+
+
+def _remote_dest(seg: list[str]) -> str:
+    """The remote destination of a copy (`scp`/`rsync` last argument, `sftp` host), '' for a local one."""
+    args = [a for a in seg[1:] if not a.startswith("-")]
+    if os.path.basename(seg[0]) == "sftp":
+        return args[0] if args else ""
+    return args[-1] if len(args) > 1 and re.match(r"^[^/:]+:", args[-1]) else ""
+
+
+def writes_outside(cmd: str, cwd: str, run_dir: str = "", env=None, inline: bool = False) -> list[tuple[str, str]]:
+    """(path, why) for each file `cmd` writes or deletes outside the run's worktree, run folder and scratch folder
+    (a device and an fd aside). Writes read from interpreter code count only with `inline` (the post-run scan)."""
+    from . import sidefx
+    e = os.environ if env is None else env
+    roots = _roots(cwd, run_dir, _scratch(run_dir, e), e)
+    # $TMPDIR (TMP, TEMP) is read as its value in the run's environment, or as /tmp where the command sets it itself
+    told = bool(_SCRATCH_SET.search(cmd))
+    paths = _SCRATCH_REF.sub(lambda m: "/tmp" if told else str(e.get(m.group(1) or m.group(2)) or "/tmp"), cmd)
+    return [(p, why) for p, (cls, why) in sidefx.classify_paths(paths, os.path.expanduser("~"), cwd or os.getcwd(),
+                                                                 run_dir).items()
+            if cls == "write" and (inline or "inline code" not in why) and not p.startswith(sidefx.HARMLESS)
+            and not sidefx._inside(p, roots)]
+
+
+def remote_writes(cmd: str, cwd: str = "") -> list[tuple[str, str]]:
+    """(path, why) for each file a command run on another host writes there by an absolute or home path (a device,
+    an fd and a path relative to the run's folder there aside)."""
+    from . import sidefx
+    there, home = "/@remote-cwd", "/@remote-home"   # a relative path there is under the run's own folder on that host
+    return [("~" + p[len(home):] if p == home or p.startswith(home + "/") else p, why)
+            for p, (cls, why) in sidefx.classify_paths(cmd, home, there, "").items()
+            if cls == "write" and "inline code" not in why and not p.startswith((there,) + sidefx.HARMLESS)]
+
+
+def shell_refusal(cmd: str, cwd: str, run_dir: str = "", env=None, remote: bool = False, writes: bool = True,
+                  power: bool = True, services: bool = True) -> str | None:
+    """Why a shell command of a GLM-arm run is refused (before it runs), else None. The denylist: writes or
+    deletes outside the run's worktree and run folder (and on another host), pushes and landing, outward
+    posts, machine-ledger writes, service starts and stops (SERVICE_RE) and, with `power`, resets,
+    power cycles and flashes outside the approved routes; the hook adds protected paths, held Slurm nodes and
+    replayed undos (pathguard, ruleguard). Everything else runs. `remote`: the command an ssh call runs on another
+    host. `writes` and `services`: False skips those checks (a step of Opus's plan, deviceplan._static)."""
+    from . import credguard, hook, pathguard
+    e = os.environ if env is None else env
+    lines, bodies = hook._heredocs(cmd)
+    # a quoted heredoc body (`<<'EOF'`, no expansion) only written to a file (`cat > t.py <<'EOF' ... project.db ...`)
+    # is data that opens nothing; an unquoted one runs its `$(...)` and backticks, so it stays checked
+    named = "\n".join(lines + [ln for i, body, pos in bodies
+                               if not (hook.HEREDOC_RE.match(lines[i], pos)[2]
+                                       and hook._data_only(*hook._piece_at(lines[i], pos), "\n".join(lines)))
+                               for ln in body])
+    if TAMPER.search(named):
+        return "a command may not edit the run's identity or the guard's own files"
+    if STATE_DB.search(named):
+        return "a run on the GLM arm may not read or write the project's database or machine records by hand"
+    if services and (svc := SERVICE_RE.search(cmd)):
+        return f"{SERVICE_WHY}: {svc.group(0)[:120]}"
+    commands, _ = hook._split(cmd)   # heredoc bodies a program, not a shell, reads are its input
+    for sub in pathguard._substitutions(commands):   # "$(...)" runs a command too
+        if why := shell_refusal(sub, cwd, run_dir, e, remote, writes, power, services):
+            return why
+    segs = hook._all_segments(commands) + hook._segments(commands, strip=False)
+    project = _own_name(e)
+    # `ttp checks 2>&1`: the 2 is no word of the call; a backtick substitution runs a command of its own, like `$(...)`
+    plain, _ = hook._split(REDIRECT.sub(" ", commands).replace("`", ";"))   # heredoc bodies no shell reads: gone
+    for seg in hook._all_segments(plain) + hook._segments(plain, strip=False):
+        words = _ttp_args(seg, project)
+        if words and (why := cli_refusal(words[0], (words[1:2] or [""])[0], [w for w in seg if w.startswith("-")],
+                                         words)):
+            return why
+    for seg in segs:
+        if not seg:
+            continue
+        name = os.path.basename(seg[0])
+        if _ttp_args(seg, project) is not None:
+            continue   # read above, without its redirections
+        elif name == "git" and _git_word(seg[1:]) == "push":
+            return "a run on the GLM arm publishes only with `ttp push` (after its checks), never `git push`"
+        elif name == "gh" and _gh_posts(seg):
+            return "a run on the GLM arm does not post to GitHub (comments, reviews, PRs, issues)"
+        elif name in HTTP and HTTP_DATA.search(" ".join(seg[1:])) and not any(
+                w.split("=", 1)[0] in ("--unix-socket", "--abstract-unix-socket") for w in seg):
+            return "a run on the GLM arm does not send data to a service (an HTTP post)"   # a local socket's API: no
+        elif name in MAIL or name in NET:
+            return f"`{name}` reaches a person or another service: not for a run on the GLM arm"
+        elif name in ("ssh", "scp", "sftp") and credguard.ssh_runs_local(seg):
+            return f"`{name}` options that run a local program (ProxyCommand and the like) would get past this guard"
+        elif name in COPIERS and writes and (dest := _remote_dest(seg)):
+            return f"{REMOTE_WHY}: {dest} (a copy)"
+        elif name == "ssh":
+            from . import deviceplan
+            got = deviceplan.ssh_target(seg)
+            if got and got[1].strip() and (why := shell_refusal(got[1], cwd, run_dir, e, True, writes, power, services)):
+                return why
+    if power:
+        from . import deviceplan
+        s = deviceplan.settings(deviceplan._cfg())
+        if why := deviceplan.power_refusal(cmd, s["power_routes"]):
+            return why
+        if deviceplan.risky(cmd) and not any(deviceplan._matches(w[0], s["power_routes"]) for w in
+                                             (x[0] for x in deviceplan._words(cmd) if x)):
+            return ("a reset, power cycle, flash or firmware step runs only through the project's approved routes "
+                    "or as a checked step of an Opus device plan: " + cmd[:120])
+    if not writes:
+        return None
+    if remote:
+        got = remote_writes(cmd)
+        return f"{REMOTE_WHY}: {got[0][0]} ({got[0][1]})" if got else None
+    got = writes_outside(cmd, cwd, run_dir, e)
+    return f"it writes outside its worktree: {got[0][0]} ({got[0][1]})" if got else None
+
+
+def tool_refusal(payload: dict, env=None) -> str | None:
+    """Why a hook payload (the tool name, its input, the cwd) of a GLM-arm run is refused, else None: the
+    Bash command checks above, a file write outside the worktree and run folder, any connector tool."""
+    from . import sidefx
+    e = os.environ if env is None else env
+    tool = str(payload.get("tool_name") or "")
+    args = payload.get("tool_input") if isinstance(payload.get("tool_input"), dict) else {}
+    cwd, run_dir = str(payload.get("cwd") or os.getcwd()), str(e.get("TTP_RUN_DIR") or "")
+    if tool == "Bash":
+        return shell_refusal(str(args.get("command") or ""), cwd, run_dir, e)
+    if tool.startswith("mcp__"):
+        return "a connector tool reaches a person or a service outside the hand-off"
+    if tool in WRITE_TOOLS:
+        home, roots = os.path.expanduser("~"), _roots(cwd, run_dir, _scratch(run_dir, e), e)
+        paths = sidefx._arg_paths(args) + sidefx._patch_paths(json.dumps(args) if tool == "apply_patch" else
+                                                              str(args.get("input") or args.get("patch") or ""))
+        for p in paths:
+            full = sidefx._expand(p, home, cwd, run_dir)
+            if not sidefx._inside(full, roots):
+                return f"it writes outside its worktree: {full}"
+    return None
+
+
+def run_env(provider: str, note, device: bool = False) -> dict[str, str]:
+    """The flag for a run on the chat model, whatever route sent it there (empty for any other run): every
+    run on the chat provider or whose note routes it there (glm_work, a tier route, a model pick), a code
+    arm's GLM run and a coordinator lane or shadow turn. `device`: its task names a device or machine, so a
+    failed gate command stops it (gate_stop)."""
+    from . import coordroute, route
+    routed = note.get(route.KEY) if isinstance(note, dict) else None
+    on = (provider == route.TO or (isinstance(routed, dict) and routed.get("to") == route.TO)
+          or bool(arm_env(note)) or bool(coordroute.guard_env(note)))
+    return {RUN_ENV: DEVICE if device else "1"} if on else {}
+
+
+def device_task(task: dict | None, cfg: dict | None = None) -> bool:
+    """Whether `task` is device work: labelled `needs_device`, or a resource it names (its resource, exclusive
+    and read labels) is a device lock (`*-device`, or one of `cfg`'s device locks) or a machine the machine list
+    tags `device`. A CPU-only machine or any other resource is not; an unreadable machine list counts as device
+    work, so the stricter guard holds."""
+    from . import effort
+    from .coordinator import task_resources
+    from .util import task_labels
+    t = task or {}
+    if "needs_device" in task_labels(t):
+        return True
+    names = task_resources(t)
+    return bool(effort.device_resources(names, cfg, unreadable_is_device=True))
+
+
+def gate_lines(spec: str) -> list[str]:
+    """The commands of the `check:` and `gate:` lines of a task spec (or an arm's plan)."""
+    return [" ".join(m.split()) for m in GATE_LINE.findall(spec or "")][:20]
+
+
+def mark_run(run_dir, device: bool, gates=(), plan: bool = False, cwd: str = "") -> None:
+    """The daemon's marker for a run on the chat model (read by glm_run() where the variable is gone); `plan`: a
+    device run under an Opus plan (deviceplan.py); `cwd`: the folder it starts in, a root of its writes (_roots)."""
+    from .project import durable_write
+    durable_write(Path(run_dir) / RUN_MARK, json.dumps({"device": bool(device), "gates": list(gates),
+                                                       **({"plan": True} if plan else {}), **({"cwd": cwd} if cwd else {})}))
+
+
+def glm_run(env=None) -> dict | None:
+    """{"device", "gates", "plan", "cwd"} for a run on the chat model, None for any other run."""
+    e = os.environ if env is None else env
+    rd = str(e.get("TTP_RUN_DIR") or "")
+    try:
+        got = json.loads((Path(rd) / RUN_MARK).read_text()) if rd else None
+    except (OSError, ValueError):
+        got = None
+    if isinstance(got, dict):
+        gates = got.get("gates") if isinstance(got.get("gates"), list) else []
+        return {"device": bool(got.get("device")) or e.get(RUN_ENV) == DEVICE, "gates": [str(g) for g in gates],
+                "plan": got.get("plan") is True, "cwd": str(got.get("cwd") or "")}
+    if e.get(RUN_ENV) in ("1", DEVICE) or active(e):
+        return {"device": e.get(RUN_ENV) == DEVICE, "gates": [], "plan": False}
+    return None
+
+
+def _value(seg: list[str], *names: str) -> str:
+    """The value of the first of option `names` in `seg` (`--x v` or `--x=v`), '' when absent."""
+    for i, w in enumerate(seg):
+        for n in names:
+            if w == n and i + 1 < len(seg):
+                return seg[i + 1]
+            if w.startswith(n + "=") and n.startswith("--"):
+                return w.split("=", 1)[1]
+    return ""
+
+
+def _outward_seg(seg: list[str], project: str) -> dict | None:
+    name = os.path.basename(seg[0])
+    words = _ttp_args(seg, project)
+    if words is not None:
+        if words and words[0] in OUT_SUBS:
+            return {"channel": words[0], "target": _value(seg, "--chat") or "user", "text": " ".join(words[1:]),
+                    "why": f"`ttp {words[0]}` reaches a person"}
+        flags = [w for w in seg if w.startswith("--")]
+        if words and words[0] == "note" and (route := note_route(flags)) in OUT_NOTE:
+            target = _value(seg, route)
+            return {"channel": "note", "target": target, "text": " ".join(w for w in words[1:] if w != target),
+                    "why": f"`ttp note {route}` reaches another project or a person"}
+        return None
+    if name == "gh" and _gh_posts(seg):
+        return {"channel": "github", "target": " ".join(w for w in seg[1:4] if not w.startswith("-")),
+                "text": _value(seg, "--body", "-b", "--title", "-t"), "why": "a `gh` write posts to GitHub"}
+    if name in HTTP and HTTP_DATA.search(" ".join(seg[1:])):
+        url = next((w for w in seg[1:] if "://" in w), "")
+        return {"channel": "http", "target": url, "text": _value(seg, "-d", "--data", "--data-raw", "-F", "--form"),
+                "why": "an HTTP post sends data to a service"}
+    if name in MAIL:
+        return {"channel": "mail", "target": " ".join(w for w in seg[1:] if not w.startswith("-"))[:200], "text": "",
+                "why": "mail reaches a person"}
+    return None
+
+
+def outward_shell(cmd: str, env=None) -> dict | None:
+    """The draft of the first outward post in shell command `cmd` (a `ttp notify`, `say` or `ask`, a
+    `ttp note --to/--reply`, a `gh` write, an HTTP post, mail), None when it posts nothing."""
+    from . import hook
+    e = os.environ if env is None else env
+    project = _own_name(e)
+    plain, _ = hook._split(REDIRECT.sub(" ", cmd))
+    for seg in hook._all_segments(plain) + hook._segments(plain, strip=False):
+        if seg and (d := _outward_seg(seg, project)):
+            return {**d, "command": cmd[:OUTPUT_TAIL]}
+    return None
+
+
+def outward(payload: dict, env=None) -> dict | None:
+    """The draft of a hook payload's outward post (a Bash command as outward_shell, any connector tool), else None."""
+    tool = str(payload.get("tool_name") or "")
+    args = payload.get("tool_input") if isinstance(payload.get("tool_input"), dict) else {}
+    if tool == "Bash":
+        return outward_shell(str(args.get("command") or ""), env)
+    if tool.startswith("mcp__"):
+        target = next((str(args[k]) for k in ("channel", "channel_id", "to", "issueKey", "issue_key", "page_id",
+                                               "recipient", "user") if args.get(k)), "")
+        text = next((str(args[k]) for k in ("text", "body", "message", "content", "comment") if args.get(k)), "")
+        return {"channel": tool, "target": target, "text": text or json.dumps(args)[:OUTPUT_TAIL],
+                "why": "a connector tool reaches a person or a service"}
+    return None
+
+
+def outward_cli(cmd: str, text: str = "", to: str = "", reply: str = "", chat: str = "") -> dict | None:
+    """The draft of `ttp <cmd>` when it posts outward (the command layer of a run without hooks), else None."""
+    if cmd in OUT_SUBS:
+        return {"channel": cmd, "target": chat or "user", "text": text, "why": f"`ttp {cmd}` reaches a person"}
+    if cmd == "note" and (to or reply):
+        return {"channel": "note", "target": to or reply, "text": text,
+                "why": f"`ttp note {'--to' if to else '--reply'}` reaches another project or a person"}
+    return None
+
+
+def drafted(run_dir, d: dict) -> str:
+    """Record draft `d` in the run's DRAFTS (an identical one once) and return the refusal the model reads."""
+    if run_dir:
+        from .project import durable_append
+        f = Path(run_dir) / DRAFTS
+        key = (d.get("channel"), d.get("target"), d.get("text"))
+        try:
+            seen = any((x.get("channel"), x.get("target"), x.get("text")) == key
+                       for x in (json.loads(ln) for ln in f.read_text().splitlines() if ln.strip()))
+        except (OSError, ValueError):
+            seen = False
+        if not seen:
+            durable_append(f, json.dumps({**d, "ts": time.time()}) + "\n")
+    return (f"not sent: {d.get('why')}, and a run on the chat model hands outward posts off. It is recorded as a "
+            f"draft ({DRAFTS} in the run folder); after the run an Opus step reviews it and sends or drops it. "
+            f"Carry on with the task and do not retry the post")
+
+
+def drafts(run_dir) -> list[dict]:
+    """The drafts a run recorded."""
+    return glmassist.rows(Path(run_dir) / DRAFTS)
+
+
+def is_gate(cmd: str, gates=(), env=None) -> bool:
+    """Whether shell command `cmd` is a gate: a `check:`/`gate:` line of the spec, `ttp checks`, `ttp lock`,
+    or a broker status or preflight."""
+    from . import hook
+    norm = " ".join(cmd.split())
+    if any(g and (norm == g or norm.startswith(g + " ")) for g in gates):
+        return True
+    if BROKER.search(cmd):
+        return True
+    project = _own_name(os.environ if env is None else env)
+    plain, _ = hook._split(REDIRECT.sub(" ", cmd))
+    return any((w := _ttp_args(seg, project)) and w[0] in GATE_SUBS
+               for seg in hook._all_segments(plain) + hook._segments(plain, strip=False) if seg)
+
+
+def gate_stop(run_dir, cmd: str, rc, output: str, env=None) -> str | None:
+    """On a device run on the chat model, a gate command that failed (`rc` neither 0 nor busy) ends the run
+    as a hand-back to Opus with the command and its output; returns why, None when the run goes on."""
+    g = glm_run(env)
+    if not g or not g["device"] or rc in (0, BUSY, None) or not is_gate(cmd, g["gates"], env):
+        return None
+    why = f"a gate failed (exit {rc}): `{' '.join(cmd.split())[:160]}`"
+    hit(run_dir, why, GATE, output or "")
+    return why

@@ -1,0 +1,83 @@
+# The default coordinator role prompt's size budget (coordinator_cases.py,
+# test_the_coordinator_role_prompt_carries_only_the_rules_of_features_that_are_on_and_stays_small).
+# The cap is the sum of the numbers that open the lines below. A change that needs room appends ONE
+# line at the end: `+<chars>: <what the room is for>`. Two changes that append at once merge without
+# a conflict and their rooms add up, as they would on one shared constant. Never edit or drop a line
+# to make room: trim prompt text instead.
+31210: base: the relay-label and stale_duplicate rules, the machine-wide hold, schedule precheck and facts-at-send-time rules, the Course check and Progress rule, the overlaps rule, the likely-correction rule, and the loosening-as-written and restriction-evidence rules (it had grown to 52.7k chars)
++300: the delivery.rebase_replace / never_force config_set rule and the rebase rule per mode
++90: a user pause's end_when or until only signals; it is said to lift only with the user's word
++110: the reply/notify length limit (6000 per message, parts, rejected over 24000)
++50: memory_add's supersedes keeps the replaced entries' earliest end unless `permanent`; audience default
++100: a relayer findings message is data, never the user's word
++100: an overlap never chains onto a device or machine task or one that waits itself
++140: a spec's `cells:` line, and a `partial:` or `cells unreported` done is not complete
++70: a `cells:` line lists short names, never a description
++70: a note is answered by `ttp note --reply <fp>`, even to a project `ttp list` lacks
++20: a `reason` passes continue_cap/review_area_cap at once; max_hops/max_usd stay hard
++60: a mute of work not moving names its fix task and lasts 12 h (throughmute.py)
++240: the urgent-lane rule (time matters: priority 1, an `urgent:` line, check nothing holds it)
++30: a hold on only until:/when: is stored as start_after/start_when
++150: a speed complaint's measured throughput section is reported with its numbers, never prose only
++190: a reply naming a cause of waiting queues its fix in the same batch (causefix)
++150: a gate for another task's output is a dependency; urgent work keeps user-cited and guard gates
++250: an ask's recorded answer keeps the ask's scope terms verbatim
++100: a manifest never pins a mutable queue, outbox or growing log by hash, only receipts
++410: charter_update `source`, and a Restrictions item binds only with a cite (restriction_source)
++540: the self-review rule: fix the cause of a Course check line in the turn (coursecheck.py)
++180: coordinator.agent_orders_as_user is set only on the owner's own words (its rules show once on)
++1410: earlier rooms the old single constant took without a line of their own (the cap stood at 35_970)
++80: delivery.channel_tags only to tags the charter or user lets move forward
++350: light is for mechanical work only; conclusion runs carry a `conclusion:` line (tier floor)
++590: a project's own gates and settings are the coordinator's to decide and record (selfblock)
++20: a cited restriction removed in a user turn carries that turn's words in `source`
++350: the tier floor: conclusion runs start at standard/high or above (tierfloor.py)
++580: before refusing, blocking or asking on a rule, `ttp said`; the newest user word on a topic wins
++350: relayer findings labeled `citing records` are facts to act on, one cheap check at most, never rules
++170: a held worker_notify item and what settles it (workernotify.py)
++33: relayer context's agent-mode exception named in the relayed-messages and loosening rules
++294: plain replies: answer first, short, what the harness does rather than its internal names (plainreply.py)
++210: an urgent goal splits into independent tasks that start at once (no chain without a new file or symbol)
++70: asks and lulls never for inferred neighbours, serving tags or site rules
++473: approved work runs at once while a refused charter_update's paperwork catches up (yesask.py repair)
++190: a device or machine action reads as under way only once STATE shows it on the host; stops only once the jobs are gone
++70: wake_now only when the worker must act before its wait ends; priority 1 alone is no spec wake (#5955)
++140: user_msg marks a task as the user's newer order on a resource (userorder.py)
++480: a user order and reply/notify claims in the ledger; Must act now items are acted on in the same turn (mustact.py)
++230: the worker sandbox is the user's (config_set row): a harness-wide order binds every project, no opt-out
++180: Restrictions gate accepts ordered exceptions with no new risk class and the owner's cited record words; `"ask": N` closes the cited gate ask (#5959, #6066)
++60: a plan's tasks cite it to inherit its start gate; task_update sets one later (plangate)
++400: each user message gets an order or no_order; owner kind fit; reply `cites` of run results (turnrules.py)
++580: each spec is self-contained with a Context block of what the worker cannot see; plan first
++90: obligation order `supersedes`: older spec steps it replaces; running tasks told (userorder.fan_out)
++90: a `restart: <why>` line in a running task's spec reruns it from a safe point, work kept, max 3 per 6 h (#6301)
++239: posts to people other than the user end with the AI-authorship tag, replies to the user never (aitag.py)
++180: the Running workers digest section: what it shows, steer or restart a flagged run (#6311)
++60: task_add refuses a premise a check proved false for 14 days (#6452)
++860: the standing-rules cite rule: check the Standing rules index and cite a rule, safety rule or dependency on every hold (rulecite)
++360: a missed promise or order changes approach, never only its time; due moves past due need a plan change (replan.py, #6664)
++237: a qwait queue-wait must-act item: queue its fix or name the rule that holds it (#6665)
++225: the untrusted-text rule names the per-turn provenance delimiters around event and relayer text (spans.py)
++140: quote STATE's spend projection, never one that ignores the cap's reset
++120: task_update row: the spec's retire: and replace: lines (#7052)
++300: the `look` action row: the coordinator sets its own next check-in (looks.py)
++46: text the batch-1 merge (#6 integration) left over the cap on 3bc14129b (cause not traced; this change adds no stateless-role text); measured 44817 against 44771
++203: machine_change_overdue: the project's expired entries come batched; renew, close or undo them without the user's word; only a risky one left 24 h reaches the user
++120: task_update check_plan: a task's own planned checks of its waits (waketier.py)
++214: old orders line: record each order's reason, retire one whose reason is gone (oldorders.py)
++255: Short path rule (ttp express) and the session prompt's `ttp push --land` of a reviewed fix
++651: chat digest: post only results, decisions, outages and asks; routine updates wait for the chat's digest (chatdigest.py)
++630: a granted setting is applied by the coordinator with config_set, the user-only push permission and machine allowlist by the `ttp config` its reply names (review #7994); the daemon reads no charter wording (grants.py, plan #2119 P4 item 4)
++120: task_update untrusted_input false clears the label with a vouching text
++350: cut queue times with the charter's resources, weighed by urgency; a silent throttle gets fixed or named
++135: when the user asked for speed, apply a worker's slot proposal at once; no spend cap rises without the user's word (note 90a59829)
++10: the queue-time bullet's speed clause, measured after rebasing onto the tip (45632 against 45625)
++110: a running worker acks a mid-run update with a `ttp note "update: ..."`; unread after 5 min raises steer_unread (#6313)
++33: schedule_set's grace_min row (keyed lines at normal or above, could-not-run errors; e21249641, +47) and the larger-batches rewrite (7a8f0fb2a, +46) landed past the cap; measured 47648 against 47615 on e342ade66
++170: a hand-off carries a failure's whole contract with an owner for an unknown runtime fault; a sweep outcome names its owner
++365: the urgent-message and high-severity-note rules landed past the cap (0af95e16b, aa60cac21); measured 48183 against 47818 on a83cfcd17
++140: the ETA format a coordinator posts (basis, range, what would change it) and its over-estimate line (#8771)
++370: the urgent-message rules of 0af95e16b landed 365 chars past the cap; measured 48183 against 47818 on a83cfcd17 (added by #8789 so its smoke check passes)
++110: the `code_arm: user msg #<id>` line for a code task the user ordered onto GLM (#9044)
++185: another project's status or alerts reach the user only when they change this project's work or needs
++324: release-flag rule: flag-gated work waits on the flag itself (`ttp rollout on`), never a note or someone's word

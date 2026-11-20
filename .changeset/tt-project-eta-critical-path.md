@@ -1,0 +1,5 @@
+---
+"tt-project": patch
+---
+
+Expected finish from the critical path. A model-free estimate gives each open task's expected finish, and each open promise's through its owner tasks: dependency chain, queue wait, run, review and landing, using only measured medians from the last 14 days, with "no estimate yet" when nothing is measured. It shows beside urgent tasks and open promises in the coordinator's STATE (`Expected finish`), in `ttp status` and in the web task view; workers and the coordinator get `ttp eta <task|o1>` (`--json` adds `wake_at`). The coordinator and worker prompts say to quote these, never padded worst cases, and to put a deadline wake on urgent work at the expected finish. A new Course check line flags a promise or milestone on urgent work due more than `coordinator.course_check.long_promise_h` (default 2 h) after it was made; it clears once the promise is shortened, met, or justified with the `obligation` action's `justify` key, and never pages the user. Deploy time is not yet a leg of the estimate.

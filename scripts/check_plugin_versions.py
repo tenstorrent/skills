@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import json
 from pathlib import Path
+import re
 import subprocess
 
 
@@ -13,6 +14,13 @@ MANIFESTS = (
     Path(".codex-plugin/plugin.json"),
     Path(".claude-plugin/plugin.json"),
 )
+# Checked only when the plugin has one; it must match the Codex and Claude versions.
+OPTIONAL_MANIFEST = Path(".cursor-plugin/plugin.json")
+# Python packages whose __version__ must stay in step with the plugin manifests.
+VERSION_MODULES = {
+    "tt-project": Path("runtime/ttp/__init__.py"),
+}
+VERSION_LINE = re.compile(r"^__version__\s*=\s*[\"']([^\"']+)[\"']", re.MULTILINE)
 
 
 def git(repo: Path, *args: str, check: bool = True) -> subprocess.CompletedProcess[str]:
@@ -40,6 +48,52 @@ def current_version(repo: Path, plugin: str, manifest: Path) -> str:
     if not path.is_file():
         raise ValueError(f"{path.relative_to(repo)} is missing")
     return str(json.loads(path.read_text(encoding="utf-8"))["version"])
+
+
+def module_version(repo: Path, plugin: str, module: Path) -> str:
+    path = repo / "plugins" / plugin / module
+    if not path.is_file():
+        raise ValueError(f"{path.relative_to(repo)} is missing")
+    match = VERSION_LINE.search(path.read_text(encoding="utf-8"))
+    if match is None:
+        raise ValueError(f"{path.relative_to(repo)} has no __version__")
+    return match.group(1)
+
+
+def extra_version_errors(repo: Path, plugin: str, version: str) -> list[str]:
+    """Compare the Cursor manifest and any version module with the host manifests' version."""
+    extras: list[tuple[Path, str]] = []
+    try:
+        if (repo / "plugins" / plugin / OPTIONAL_MANIFEST).is_file():
+            extras.append((OPTIONAL_MANIFEST, current_version(repo, plugin, OPTIONAL_MANIFEST)))
+        module = VERSION_MODULES.get(plugin)
+        if module is not None:
+            extras.append((module, module_version(repo, plugin, module)))
+    except (KeyError, ValueError, json.JSONDecodeError) as exc:
+        return [f"{plugin}: {exc}"]
+    return [
+        f"{plugin}: {path.as_posix()} version {found} differs from the Codex and Claude "
+        f"version {version}"
+        for path, found in extras
+        if found != version
+    ]
+
+
+def check_consistency(repo: Path) -> list[str]:
+    """Every plugin's version files agree, whatever changed."""
+    errors: list[str] = []
+    for root in sorted(path for path in (repo / "plugins").iterdir() if path.is_dir()):
+        plugin = root.name
+        try:
+            current = [current_version(repo, plugin, path) for path in MANIFESTS]
+        except (KeyError, ValueError, json.JSONDecodeError) as exc:
+            errors.append(f"{plugin}: {exc}")
+            continue
+        if current[0] != current[1]:
+            errors.append(f"{plugin}: Codex and Claude versions differ: {current}")
+            continue
+        errors.extend(extra_version_errors(repo, plugin, current[0]))
+    return errors
 
 
 def base_version(repo: Path, base_ref: str, plugin: str, manifest: Path) -> str | None:
@@ -72,6 +126,10 @@ def check_versions(repo: Path, base_ref: str) -> list[str]:
         if current[0] != current[1]:
             errors.append(f"{plugin}: Codex and Claude versions differ: {current}")
             continue
+        extra_errors = extra_version_errors(repo, plugin, current[0])
+        if extra_errors:
+            errors.extend(extra_errors)
+            continue
 
         previous = [base_version(repo, base_ref, plugin, path) for path in MANIFESTS]
         if previous == [None, None]:
@@ -97,16 +155,26 @@ def check_versions(repo: Path, base_ref: str) -> list[str]:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("base_ref", help="base commit or ref to compare with HEAD")
+    parser.add_argument(
+        "base_ref",
+        nargs="?",
+        help="base commit or ref to compare with HEAD; without it, only check that every "
+        "plugin's version files agree",
+    )
     args = parser.parse_args()
 
     repo = Path.cwd()
-    errors = check_versions(repo, args.base_ref)
+    if args.base_ref is None:
+        errors = check_consistency(repo)
+        ok = "plugin versions agree"
+    else:
+        errors = check_versions(repo, args.base_ref)
+        ok = "changed plugin versions are valid"
     if errors:
         for error in errors:
             print(error)
         return 1
-    print("changed plugin versions are valid")
+    print(ok)
     return 0
 
 

@@ -127,3 +127,8 @@ assertion messages name `TT_METAL_WATCHER_DISABLE_NOC_SANITIZE`, which does not
 exist — setting it does nothing and the assertion still fires.
 
 **Over the fabric-kernel binary limit**, shed in order: `_DISABLE_SANITIZE_NOC`, `_NOINLINE`, `_DISABLE_ASSERT`.
+On a multi-chip config with active ethernet this shows as `Program size ... too
+large for kernel config buffer ... on ACTIVE_ETH` at fabric init, before your
+kernel runs; a longer interval does not help. When the bug is on a Tensix core,
+set `TT_METAL_WATCHER_DISABLE_ETH=1` first: it drops watcher from ethernet cores
+only and keeps full Tensix coverage.

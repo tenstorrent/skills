@@ -1,0 +1,658 @@
+# Power-cycle notice and interrupted upgrade tests of tests/test_tt_project_runtime.py, which runs this
+# file in its own namespace (see _include_cases there): helpers, fixtures and imports come from that file.
+# Only fake notice paths in the test folder are read (the env fixture points TTP_TEST_CYCLE_NOTICES there).
+from __future__ import annotations
+
+
+def _notice(env, monkeypatch, state="possible", reason="chip 3 dropped off the bus", **extra):
+    path = env["tmp"] / "power-cycle-pending.json"
+    monkeypatch.setenv("TTP_TEST_CYCLE_NOTICES", str(path))
+    if state is not None:
+        path.write_text(json.dumps({"state": state, "fault_class": "chip_drop", "chips": [3], "reason": reason,
+                                    "hold_since": time.time() - 30, "earliest_cycle_at": time.time() + 90,
+                                    "updated_at": time.time(), **extra}))
+    return path
+
+
+def _cn_exited_pid() -> int:
+    proc = subprocess.Popen(["true"])
+    proc.wait()
+    return proc.pid
+
+
+def _upgradable(env, monkeypatch):
+    """A project whose installed template adds a line to worker.md, and a stubbed daemon restart."""
+    from ttp import service
+    p = make(env)
+    restarts = []
+    monkeypatch.setattr(service, "restart", lambda q: restarts.append(1) or "restarted")
+    worker = (RUNTIME.parent / "template" / "prompts" / "worker.md").read_text()
+    _install_template(env, {"worker.md": worker + "\nupstream line\n"})
+    return p, restarts
+
+
+@pytest.mark.parametrize("state", ["possible", "requested"])
+def test_upgrade_and_setup_change_nothing_and_exit_75_while_a_power_cycle_notice_holds(env, monkeypatch, capsys,
+                                                                                      state):
+    from ttp import __version__, cli
+    p, restarts = _upgradable(env, monkeypatch)
+    _notice(env, monkeypatch, state)
+    head = _git_out(p.harness, "rev-parse", "HEAD")
+    with pytest.raises(SystemExit) as e:
+        cli.main(["upgrade", "demo"])
+    err = capsys.readouterr().err
+    assert e.value.code == 75 and f"state {state}" in err and "chip 3 dropped off the bus" in err, err
+    assert "earliest cycle at" in err and err.count("power cycle") == 1
+    assert _git_out(p.harness, "rev-parse", "HEAD") == head and not restarts
+    assert not _git_out(p.harness, "status", "--porcelain") and not (p.state / "upgrade.journal").exists()
+    with pytest.raises(SystemExit) as e:
+        cli.main(["setup", "--bin-dir", str(env["tmp"] / "bin")])
+    err = capsys.readouterr().err
+    assert e.value.code == 75 and f"state {state}" in err
+    assert not (env["home"] / "lib" / __version__).exists() and not (env["tmp"] / "bin" / "ttp").exists()
+
+
+def test_without_a_notice_the_upgrade_runs_and_the_override_proceeds_with_a_warning(env, monkeypatch, capsys):
+    from ttp import cli
+    p, restarts = _upgradable(env, monkeypatch)
+    path = _notice(env, monkeypatch, None)       # the path is configured, the file absent
+    cli.main(["upgrade", "demo"])
+    assert "upstream line" in (p.harness / "prompts" / "worker.md").read_text() and restarts == [1]
+    assert "power cycle" not in capsys.readouterr().err
+    worker = (p.harness / "prompts" / "worker.md").read_text()
+    _install_template(env, {"worker.md": worker + "second line\n"})
+    _notice(env, monkeypatch, "requested")
+    cli.main(["upgrade", "demo", "--ignore-cycle-notice"])
+    err = capsys.readouterr().err
+    assert "second line" in (p.harness / "prompts" / "worker.md").read_text() and restarts == [1, 1]
+    assert "state requested" in err and "warning" in err.lower(), err
+    path.unlink()
+    assert not (p.state / "upgrade.journal").exists()
+
+
+def test_a_malformed_notice_holds_only_while_fresh_and_a_stale_or_idle_one_never(env, monkeypatch):
+    from ttp import cyclenotice
+    path = _notice(env, monkeypatch, None)
+    now = time.time()
+    path.write_text("{not json")
+    h = cyclenotice.held([str(path)], now)
+    assert h and h["malformed"] and h["state"] == "unreadable"
+    assert cyclenotice.held([str(path)], now + cyclenotice.MALFORMED_FRESH_S + 1) is None
+    path.write_text(json.dumps({"state": "idle", "updated_at": now}))
+    assert cyclenotice.held([str(path)], now) is None, "only a hold state holds"
+    path.write_text(json.dumps({"state": "possible", "reason": "x", "updated_at": now}))
+    assert cyclenotice.held([str(path)], now)["state"] == "possible"
+    assert cyclenotice.held([str(path)], now + cyclenotice.VALID_FRESH_S + 1) is None, "a dead broker's leftover"
+    assert cyclenotice.held([str(env["tmp"] / "absent.json")], now) is None
+    assert cyclenotice.paths({"upgrade": {"cycle_notices": []}}) == [], "[] turns the hold off"
+    assert cyclenotice.paths({}) == [str(path)]
+    assert cyclenotice.default_paths() == [str(path)] and cyclenotice.NOTICE.startswith("/run/")
+
+
+def test_a_malformed_fresh_notice_holds_the_upgrade(env, monkeypatch, capsys):
+    from ttp import cli
+    p, restarts = _upgradable(env, monkeypatch)
+    _notice(env, monkeypatch, None).write_text("")
+    with pytest.raises(SystemExit) as e:
+        cli.main(["upgrade", "demo"])
+    assert e.value.code == 75 and "unreadable" in capsys.readouterr().err and not restarts
+
+
+def test_the_automatic_upgrade_waits_for_a_notice_without_spending_its_try(env, monkeypatch):
+    from ttp import release
+    p, restarts = _upgradable(env, monkeypatch)
+    _notice(env, monkeypatch, "possible")
+    why = release.hold_reason(p, release.drift(p) or {"key": "k"}) if hasattr(release, "drift") else ""
+    assert why and why.endswith(release.CYCLE_HELD) and "state possible" in why
+
+
+def test_an_ordinary_push_after_push_waits_for_the_notice_and_runs_once_it_is_gone(env, monkeypatch):
+    """The deploy is held, not failed: no alert, no try spent, and the daemon runs it once the file is gone."""
+    from ttp import batch, push, pushq
+    seen = env["tmp"] / "after_push.txt"
+    p, repo, origin, other = _push_setup(env, monkeypatch, ["true"])
+    p.set_config("delivery.after_push", [f"echo ran >> {seen}"])
+    _notice(env, monkeypatch, "requested")
+    _commit(repo, "mine.txt", "mine\n")
+    assert push.run(p, repo) == 0
+    (r,) = _receipts(p)
+    assert r["status"] == "held" and not seen.exists() and "state requested" in r["after_held"]["why"]
+    spawned, alerts = [], []
+    monkeypatch.setattr(pushq, "subprocess", types.SimpleNamespace(DEVNULL=subprocess.DEVNULL, Popen=lambda argv, **k: spawned.append(argv)))
+    assert pushq.tend_receipts(p, lambda *a, **k: alerts.append(a)) == [] and not spawned and not alerts
+    assert not p.db.one("SELECT id FROM events WHERE kind='after_push_failed'")
+    (env["tmp"] / "power-cycle-pending.json").unlink()
+    pushq.tend_receipts(p, lambda *a, **k: alerts.append(a))
+    (r,) = _receipts(p)
+    assert len(spawned) == 1 and r["status"] == "rerun" and not r.get("tries"), "a held deploy spends no try"
+    pushq.tend_receipts(p, lambda *a, **k: alerts.append(a))
+    assert len(spawned) == 1, "not started twice while its rerun starts"
+    assert batch.rerun_receipt(p, p.state / "after_push" / f"{r['id']}.json") == 0
+    (r,) = _receipts(p)
+    assert r["status"] == "finished" and r["after_push"]["status"] == "ok" and seen.read_text() == "ran\n", r["after_push"].get("tail")
+    assert pushq.tend_receipts(p, lambda *a, **k: alerts.append(a)) == [r["id"]] and not alerts
+    assert p.db.one("SELECT id FROM events WHERE kind='after_push_ok'")
+
+
+def test_an_after_push_a_reboot_cut_short_is_run_again_once_at_the_next_daemon_tick(env, monkeypatch):
+    from ttp import pushq
+    p = make(env)
+    p.set_config("delivery.after_push", ["true"])
+    folder = p.state / "after_push"
+    folder.mkdir(parents=True)
+    receipt = folder / "r1.json"
+    receipt.write_text(json.dumps({"v": 1, "id": "r1", "status": "running", "outcome": "pushed", "pushed_sha": "a" * 40,
+                                   "target": "origin/x", "pid": _cn_exited_pid(), "boot": "an-earlier-boot",
+                                   "started": time.time() - 60}))
+    spawned = []
+    monkeypatch.setattr(pushq, "subprocess", types.SimpleNamespace(DEVNULL=subprocess.DEVNULL, Popen=lambda argv, **k: spawned.append(argv)))
+    assert pushq.tend_receipts(p) == [] and len(spawned) == 1
+    m = json.loads(receipt.read_text())
+    assert m["status"] == "rerun" and m["tries"] == 1
+    assert p.db.one("SELECT id FROM events WHERE kind='after_push_resumed'")
+    # Its rerun never started: after RERUN_START_S it is reported as stopped, not run a third time.
+    reported = pushq.tend_receipts(p, now=time.time() + pushq.RERUN_START_S + 5)
+    assert reported == ["r1"] and len(spawned) == 1
+    assert json.loads(receipt.read_text())["after_push"]["status"] == "killed"
+
+
+class _Cut(BaseException):
+    """A kill or power cut at one step of the upgrade."""
+
+
+def _cut_at(monkeypatch, step, partial=None):
+    from ttp import upjournal
+    real = upjournal.step
+
+    def step_(p, name, **fields):
+        real(p, name, **fields)
+        if name == step:
+            if partial:
+                partial(p)
+            rec = json.loads(upjournal.path(p).read_text())
+            upjournal.path(p).write_text(json.dumps({**rec, "pid": _cn_exited_pid()}))
+            raise _Cut(name)
+    monkeypatch.setattr(upjournal, "step", step_)
+    return real
+
+
+def _half_merge(p):
+    """The merge wrote some of its files, then the power went."""
+    (p.harness / "prompts" / "worker.md").write_text("half")
+
+
+@pytest.mark.parametrize("step", ["committed", "merging", "merged", "restarting"])
+def test_an_upgrade_cut_short_at_any_step_is_finished_by_the_next_run_with_no_half_state(env, monkeypatch, step,
+                                                                                       capsys):
+    from ttp import cli, upjournal
+    p, restarts = _upgradable(env, monkeypatch)
+    head = _git_out(p.harness, "rev-parse", "HEAD")
+    real = _cut_at(monkeypatch, step, _half_merge if step == "merging" else None)
+    with pytest.raises(_Cut):
+        cli.main(["upgrade", "demo"])
+    assert upjournal.path(p).exists() and not restarts
+    moved = _git_out(p.harness, "rev-parse", "HEAD") != head
+    assert moved == (step in ("merged", "restarting"))
+    monkeypatch.setattr(upjournal, "step", real)
+    cli.main(["upgrade", "demo"])
+    out = capsys.readouterr().out
+    assert f"stopped at step {step}" in out, out
+    h = p.harness
+    assert "upstream line" in (h / "prompts" / "worker.md").read_text()
+    assert not _git_out(h, "status", "--porcelain")
+    assert subprocess.run(["git", "-C", str(h), "rev-parse", "-q", "--verify", "MERGE_HEAD"],
+                          capture_output=True).returncode != 0
+    assert not upjournal.path(p).exists() and restarts, "the stopped daemon was restarted"
+
+
+def test_an_upgrade_cut_mid_merge_rolls_back_to_main_and_a_merged_one_restarts_the_old_daemon(env, monkeypatch):
+    from ttp import cli, service, upjournal
+    p, restarts = _upgradable(env, monkeypatch)
+    head = _git_out(p.harness, "rev-parse", "HEAD")
+    real = _cut_at(monkeypatch, "merging", _half_merge)
+    with pytest.raises(_Cut):
+        cli.main(["upgrade", "demo"])
+    monkeypatch.setattr(upjournal, "step", real)
+    line = upjournal.recover(p, log=lambda m: None)
+    assert "rolled back" in line and _git_out(p.harness, "rev-parse", "HEAD") == head
+    assert not _git_out(p.harness, "status", "--porcelain") and not upjournal.path(p).exists()
+    assert upjournal.recover(p) == "", "once"
+    # Cut after main moved, while a daemon that started before it runs: it is asked to restart.
+    started = time.time() - 5
+    _cut_at(monkeypatch, "merged")
+    with pytest.raises(_Cut):
+        cli.main(["upgrade", "demo"])
+    line = upjournal.recover(p, daemon_started=started, log=lambda m: None)
+    assert "finished" in line and "restarts" in line and not restarts
+    req = json.loads((p.state / service.RESTART_REQUEST).read_text())
+    assert req["at"] >= started and service.take_restart_request.__name__
+
+
+def test_a_live_upgrade_journal_is_left_alone(env, monkeypatch):
+    from ttp import upjournal
+    p = make(env)
+    upjournal.begin(p, "upgrade")
+    upjournal.step(p, "merging", base="x", merged="y")
+    assert upjournal.recover(p) == "" and upjournal.path(p).exists(), "its run still goes"
+    upjournal.end(p)
+    assert not upjournal.path(p).exists()
+
+
+def test_an_automatic_upgrade_a_reboot_cut_short_is_retried_a_bounded_number_of_times(env, monkeypatch):
+    from ttp import release, upjournal
+    p = make(env)
+    for n in range(1, upjournal.MAX_INTERRUPTS + 1):
+        p.db.set_kv(release.KV_AUTO, {**(p.db.kv(release.KV_AUTO) or {}), "key": "k", "outcome": "running"})
+        upjournal.path(p).parent.mkdir(parents=True, exist_ok=True)
+        upjournal.path(p).write_text(json.dumps({"pid": _cn_exited_pid(), "boot": "old", "step": "committed",
+                                                 "auto": True}))
+        assert upjournal.recover(p, log=lambda m: None)
+        rec = p.db.kv(release.KV_AUTO)
+        assert rec["interrupted"] == n
+        assert rec["outcome"] == ("held" if n < upjournal.MAX_INTERRUPTS else "failed")
+
+
+def _plugin_copy(tmp):
+    import shutil
+    plugin = tmp / "plugin"
+    for part in ("runtime", "template", "bin"):
+        shutil.copytree(RUNTIME.parent / part, plugin / part, ignore=shutil.ignore_patterns("__pycache__"))
+    return plugin
+
+
+def test_a_setup_cut_short_is_finished_or_rolled_back_by_the_next_ttp_command(env, tmp_path, capsys):
+    import os as _os
+    from ttp import __version__, cli
+    from ttp.runner import boot_id
+    lib_dir = env["home"] / "lib"
+    lib = lib_dir / __version__
+    (lib / "runtime" / "ttp").mkdir(parents=True)
+    (lib / "runtime" / "ttp" / "cli.py").write_text("")          # the copy stopped half way
+    journal = lib_dir / cli.SETUP_JOURNAL
+    plugin = _plugin_copy(tmp_path)
+    journal.write_text(json.dumps({"pid": _cn_exited_pid(), "boot": boot_id(), "source": str(plugin), "lib": str(lib),
+                                   "commit": "abc123", "existed": False, "prev": ""}))
+    assert "finished" in cli._recover_setup()
+    assert (lib / "runtime" / "ttp" / "cli.py").read_text() == (plugin / "runtime" / "ttp" / "cli.py").read_text()
+    assert _os.readlink(lib_dir / "current") == str(lib) and not journal.exists()
+    assert (lib / "runtime" / "ttp" / "SOURCE_COMMIT").read_text().strip() == "abc123"
+    # The plugin folder it copied from is gone: back to the release lib/current pointed at before.
+    old = lib_dir / "0.0.1"
+    (old / "runtime").mkdir(parents=True)
+    import shutil
+    shutil.rmtree(lib)
+    (lib / "runtime").mkdir(parents=True)
+    journal.write_text(json.dumps({"pid": _cn_exited_pid(), "boot": "an-earlier-boot", "source": str(tmp_path / "gone"),
+                                   "lib": str(lib), "existed": False, "prev": str(old)}))
+    cli.main(["list"])
+    assert "rolled back" in capsys.readouterr().err
+    assert _os.readlink(lib_dir / "current") == str(old) and not lib.exists() and not journal.exists()
+
+
+def test_a_setup_cut_short_whose_plugin_folder_now_holds_another_version_is_rolled_back(env, tmp_path, capsys):
+    """The plugin was updated between the cut and the next command: copying it in would put that version
+    in a release folder named for the one setup started, so the recovery rolls back instead."""
+    import os as _os
+    import re as _re
+    from ttp import __version__, cli
+    from ttp.runner import boot_id
+    lib_dir = env["home"] / "lib"
+    lib = lib_dir / __version__
+    (lib / "runtime" / "ttp").mkdir(parents=True)
+    (lib / "runtime" / "ttp" / "cli.py").write_text("")          # the copy stopped half way
+    old = lib_dir / "0.0.1"
+    (old / "runtime").mkdir(parents=True)
+    plugin = _plugin_copy(tmp_path)
+    init = plugin / "runtime" / "ttp" / "__init__.py"
+    init.write_text(_re.sub(r'__version__ = "[^"]+"', '__version__ = "99.0.0"', init.read_text()))
+    journal = lib_dir / cli.SETUP_JOURNAL
+    journal.write_text(json.dumps({"pid": _cn_exited_pid(), "boot": boot_id(), "source": str(plugin), "lib": str(lib),
+                                   "commit": "abc123", "existed": False, "prev": str(old)}))
+    assert "rolled back to 0.0.1" in cli._recover_setup()
+    assert _os.readlink(lib_dir / "current") == str(old) and not lib.exists() and not journal.exists()
+
+def test_a_push_batch_after_push_waits_for_the_notice_and_the_daemon_resumes_it_once_it_is_gone(env, monkeypatch):
+    """The batch pushes but holds its deploy (marker after_held); ticks while the notice exists start nothing and
+    say so once; once it is gone one tick resumes it, the deploy runs once and no resume try is spent."""
+    from ttp import pushq
+    deploys = env["tmp"] / "deploys.log"
+    s = _pq_real(env, monkeypatch, after_push=[f"git rev-parse HEAD >> {deploys}"])
+    notice = _notice(env, monkeypatch, "requested")
+    _pq_hand_off(env, s)
+    bid = _pq_batch(s)
+    marker = s.p.state / "pushes" / f"{bid}.json"
+    m = json.loads(marker.read_text())
+    assert m["outcome"] == "pushed" and "state requested" in m["after_held"]["why"], m
+    assert not deploys.exists()
+    for _ in range(3):
+        _pq_tend(s)     # the first one reaps the batch process; none starts a resume while the notice holds
+        assert bid not in pushq._children and not deploys.exists(), "no resume while the notice holds"
+    held = s.p.db.q("SELECT text FROM events WHERE kind='after_push_held'")
+    assert len(held) == 1 and bid in held[0]["text"], held
+    notice.unlink()
+    _pq_tend(s)
+    assert bid in pushq._children, "one tick after the notice is gone resumes the batch"
+    child = pushq._children[bid]
+    child.wait(timeout=60)
+    assert child.returncode == 0, (s.p.state / "pushes" / f"{bid}.log").read_text()
+    _pq_tend(s)
+    m = json.loads(marker.read_text())
+    assert m["after_push"]["status"] == "ok" and len(deploys.read_text().split()) == 1, m.get("after_push")
+    assert s.p.db.one("SELECT after_tries FROM push_batches WHERE id=?", (bid,))["after_tries"] == 0
+    assert not s.p.db.one("SELECT id FROM events WHERE kind='after_push_failed'")
+
+
+def test_two_concurrent_setup_recoveries_copy_once_and_the_recoverer_records_itself(env, tmp_path):
+    """A journal from an earlier boot (no liveness check applies) found by two `ttp` commands at once: only
+    the setup lock's holder re-copies the release; the other skips. The holder writes its own pid and boot
+    into the journal first, and a third call after it finished finds nothing to do."""
+    import threading
+    from ttp import __version__, cli
+    from ttp.runner import boot_id
+    lib_dir = env["home"] / "lib"
+    lib = lib_dir / __version__
+    (lib / "runtime" / "ttp").mkdir(parents=True)
+    journal = lib_dir / cli.SETUP_JOURNAL
+    plugin = _plugin_copy(tmp_path)
+    journal.write_text(json.dumps({"pid": _cn_exited_pid(), "boot": "an-earlier-boot", "source": str(plugin),
+                                   "lib": str(lib), "commit": "abc123", "existed": False, "prev": ""}))
+    real, copies, inside, go = cli._install_parts, [], threading.Event(), threading.Event()
+    seen = {}
+
+    def install(src, dst):
+        copies.append(dst)
+        seen.update(json.loads(journal.read_text()))
+        inside.set()
+        assert go.wait(30)
+        real(src, dst)
+    out = []
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(cli, "_install_parts", install)
+        t = threading.Thread(target=lambda: out.append(cli._recover_setup()))
+        t.start()
+        assert inside.wait(30)
+        assert cli._recover_setup() == "", "the second caller skips while the first recovers"
+        go.set()
+        t.join(30)
+    assert len(copies) == 1 and "finished" in out[0]
+    assert seen["pid"] == os.getpid() and seen["boot"] == boot_id() and seen["lib"] == str(lib)
+    assert not journal.exists() and os.readlink(lib_dir / "current") == str(lib)
+    assert cli._recover_setup() == "" and len(copies) == 1
+
+
+def test_a_failed_setup_recovery_restores_the_journal_so_the_next_ttp_retries_it(env, tmp_path):
+    """The recoverer names itself in the journal, then its copy (or its rollback) raises: the journal gets back
+    the dead setup's pid and boot, so a later `ttp` (another process, while this one lives on as a daemon)
+    retries instead of skipping a live pid. Both the finish and the rollback path."""
+    import errno
+    import shutil
+    from ttp import __version__, cli, release
+    from ttp.runner import boot_id
+    lib_dir = env["home"] / "lib"
+    lib = lib_dir / __version__
+    journal = lib_dir / cli.SETUP_JOURNAL
+    plugin = _plugin_copy(tmp_path)
+    old = lib_dir / "0.0.1"
+    (old / "runtime").mkdir(parents=True)
+    dead = _cn_exited_pid()
+    for source, patch, done in ((plugin, "_install_parts", "finished"), (tmp_path / "gone", "point_current", "rolled back")):
+        shutil.rmtree(lib, ignore_errors=True)
+        (lib / "runtime" / "ttp").mkdir(parents=True)
+        body = json.dumps({"pid": dead, "boot": boot_id(), "source": str(source), "lib": str(lib),
+                           "commit": "abc123", "existed": False, "prev": str(old)})
+        journal.write_text(body)
+
+        def boom(*_a, **_k):
+            raise OSError(errno.ENOSPC, "No space left on device")
+        with pytest.MonkeyPatch.context() as mp:
+            mp.setattr(cli if patch == "_install_parts" else release, patch, boom)
+            with pytest.raises(OSError):
+                cli._recover_setup()
+        assert json.loads(journal.read_text()) == json.loads(body), "the dead setup's pid and boot are back"
+        assert done in cli._recover_setup() and not journal.exists()
+
+
+def test_setup_recovery_skips_while_another_process_holds_the_setup_lock(env, tmp_path):
+    """`ttp setup` (or another recovery) in another process holds the lock: a `ttp` command neither copies
+    nor rolls back, and the journal stays for the holder."""
+    import subprocess
+    import sys as _sys
+    from ttp import __version__, cli
+    lib_dir = env["home"] / "lib"
+    lib_dir.mkdir(parents=True, exist_ok=True)
+    journal = lib_dir / cli.SETUP_JOURNAL
+    body = json.dumps({"pid": _cn_exited_pid(), "boot": "an-earlier-boot", "source": str(tmp_path / "gone"),
+                       "lib": str(lib_dir / __version__), "existed": False, "prev": ""})
+    journal.write_text(body)
+    holder = subprocess.Popen([_sys.executable, "-c", "import fcntl, sys; f = open(sys.argv[1], 'a'); "
+                               "fcntl.flock(f, fcntl.LOCK_EX); print('held', flush=True); sys.stdin.read()",
+                               str(lib_dir / cli.SETUP_LOCK)], stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
+    try:
+        assert holder.stdout.readline().strip() == "held"
+        assert cli._recover_setup() == "" and journal.read_text() == body
+    finally:
+        holder.stdin.close()
+        holder.wait(30)
+    assert "rolled back" in cli._recover_setup() and not journal.exists()
+
+
+# A cycle a heal check's output announces (cyclenotice.probe_held): fixture probe text in the test db only.
+def _cycle_probe(p, out, name="broker", ago=30, **spec):
+    """A heal check `name` whose last run `ago` s back printed `out`."""
+    from ttp import heal
+    from ttp import schedule as sched
+    sched.upsert(p.db, name, "command", "5m", payload={"heal": spec if spec.get("preset") else {"check": "true", **spec}})
+    p.db.set_kv(heal.STATE_KEY + name, {"last_check": time.time() - ago, "last_rc": 1, "last_out": out})
+
+
+_ANNOUNCED = "chips: 31/32 up\nnext: power cycle of this host in 90 s (chip 7 lost)\n"
+
+
+def test_a_probe_announcing_a_power_cycle_holds_until_its_output_clears(env, monkeypatch):
+    from ttp import cyclenotice as cn
+    p = make(env)
+    _notice(env, monkeypatch, None)           # no notice file: only the probe announces
+    assert cn.project_held(p) is None
+    _cycle_probe(p, _ANNOUNCED)
+    h = cn.project_held(p)
+    assert h and h["path"] == "heal check broker" and "chip 7 lost" in h["reason"], h
+    assert "heal check broker" in cn.line(h, p) and "notice heal" not in cn.line(h, p)
+    _cycle_probe(p, "chips: 32/32 up\nnext: nothing scheduled\n")
+    assert cn.project_held(p) is None, "the next output that no longer announces it releases the hold"
+    _cycle_probe(p, _ANNOUNCED, ago=cn.PROBE_FRESH_S + 5)
+    assert cn.project_held(p) is None, "an old output says nothing about now"
+
+
+@pytest.mark.parametrize("out", [
+    '{"auto_power_cycle": true, "held": false}',            # a setting, not an announcement
+    "power_cycle_pending: false",
+    "last power cycle: 3 days ago",
+    "Power cycle completed",
+    "no power cycle scheduled in 90 s",
+    "power cycle pending: no",
+    "power cycle requested: none",
+    "next: power cycle disabled",
+    "power cycle pending: 0",
+    "auto power cycle: scheduled on chip loss",          # a setting: no time or countdown
+    "next: power cycle",                                 # no time or countdown either
+])
+def test_probe_text_that_names_no_pending_cycle_holds_nothing(env, monkeypatch, out):
+    from ttp import cyclenotice as cn
+    p = make(env)
+    _notice(env, monkeypatch, None)
+    _cycle_probe(p, out)
+    assert cn.project_held(p) is None, out
+
+
+def test_a_probe_line_that_stays_past_the_bound_releases_its_hold_and_is_told_once(env, monkeypatch):
+    from ttp import cyclenotice as cn
+    p = make(env)
+    _notice(env, monkeypatch, None)
+    _cycle_probe(p, _ANNOUNCED)
+    t0 = time.time()
+    assert cn.probe_held(p, now=t0), "a fresh announcement holds"
+    _cycle_probe(p, _ANNOUNCED, ago=-(cn.PROBE_MAX_HOLD_S - 90))   # rerun since: the same line again
+    assert cn.probe_held(p, now=t0 + cn.PROBE_MAX_HOLD_S - 60), "still within the bound"
+    _cycle_probe(p, _ANNOUNCED, ago=-cn.PROBE_MAX_HOLD_S)      # rerun since: the same line again
+    for _ in range(3):
+        assert cn.probe_held(p, now=t0 + cn.PROBE_MAX_HOLD_S + 60) is None, "past the bound the line is stuck"
+    ev = p.db.q("SELECT severity, text FROM events WHERE fingerprint LIKE 'cycle-probe-stuck:%'")
+    assert len(ev) == 1 and ev[0]["severity"] == "low" and "heal check broker" in ev[0]["text"] \
+        and "chip 7 lost" in ev[0]["text"], ev
+    # The output changes: a new announcement holds again, from its own start.
+    _cycle_probe(p, "next: power cycle of this host in 60 s (chip 3 lost)\n", ago=-cn.PROBE_MAX_HOLD_S)
+    assert cn.probe_held(p, now=t0 + cn.PROBE_MAX_HOLD_S + 90)
+
+
+def test_a_broker_check_on_another_box_holds_nothing_here(env, monkeypatch):
+    from ttp import cyclenotice as cn
+    from ttp import machines
+    p = make(env)
+    _notice(env, monkeypatch, None)
+    monkeypatch.setattr(machines, "load", lambda: {"box-a": {"hostname": "box-a.example"},
+                                                   "box-b": {"hostname": "box-b.example"}})
+    monkeypatch.setattr(machines, "here", lambda: ("box-a", {"hostname": "box-a.example"}))
+    _cycle_probe(p, _ANNOUNCED, preset="broker", resource="box-b-device",
+                status_command="example-broker status")
+    assert cn.project_held(p) is None, "a broker check of another box says nothing about this host"
+    _cycle_probe(p, _ANNOUNCED, preset="broker", resource="box-a-device",
+                status_command="example-broker status")
+    assert cn.project_held(p), "the same check on this host's box holds"
+
+
+def test_probe_patterns_and_checks_are_configurable_and_a_remote_check_holds_nothing_here(env, monkeypatch):
+    from ttp import cyclenotice as cn
+    p = make(env)
+    _notice(env, monkeypatch, None)
+    _cycle_probe(p, _ANNOUNCED, name="other-box", machine="some-other-box")
+    assert cn.project_held(p) is None, "a check watching another machine says nothing about this host"
+    p.set_config("upgrade.cycle_checks", ["other-box"])
+    assert cn.project_held(p), "a check named in upgrade.cycle_checks is read whatever it watches"
+    p.set_config("upgrade.cycle_checks", None)
+    _cycle_probe(p, "state: RECYCLE_SOON", name="local")
+    assert cn.project_held(p) is None
+    p.set_config("upgrade.cycle_patterns", ["recycle_soon", "(unbalanced"])   # a bad regex is skipped
+    assert cn.project_held(p)["reason"] == "state: RECYCLE_SOON"
+    p.set_config("upgrade.cycle_patterns", [])
+    _cycle_probe(p, _ANNOUNCED, name="local")
+    assert cn.project_held(p) is None, "[] turns the probe hold off"
+
+
+def test_while_a_probe_announces_a_cycle_no_push_batch_checks_or_detached_job_start(env, monkeypatch, capsys, tmp_path):
+    from ttp import cli, pushq
+    s = _pq(env, monkeypatch)
+    _notice(env, monkeypatch, None)
+    _pq_plan(s, release=str(env["tmp"] / "go"), sha="ab" * 20, version="1.2.3")
+    _pq_hand_off(env, s)
+    _cycle_probe(s.p, _ANNOUNCED)
+    said = []
+    assert pushq.schedule(s.p, log=said.append) is None and not s.p.db.q("SELECT id FROM push_batches")
+    assert pushq.schedule(s.p, log=said.append) is None
+    assert len(said) == 1 and "no new batch starts" in said[0] and "chip 7 lost" in said[0], said
+    monkeypatch.setenv("TTP_PROJECT", str(s.p.base))
+    monkeypatch.setenv("TTP_RUN_DIR", str(tmp_path))
+    repo = tmp_path / "work"   # checks are refused once their list is known: in a committed checkout
+    subprocess.run(["git", "init", "-q", str(repo)], check=True)
+    subprocess.run(["git", "-C", str(repo), "-c", "user.email=t@example.com", "-c", "user.name=t", "commit", "-q",
+                    "--allow-empty", "-m", "a"], check=True)
+    monkeypatch.chdir(repo)
+    for argv in (["detach", "job", "--", "true"], ["checks", "--", "true"]):
+        with pytest.raises(SystemExit) as e:
+            cli.main(argv)
+        err = capsys.readouterr().err
+        assert e.value.code == 75 and "power cycle of this host is pending" in err and "retry_when" in err, err
+        assert "ttp detach --resumable" in err and "ttp detach --remote" in err, "the ways around it are named"
+    assert not (tmp_path / "job.rc").exists() and not (tmp_path / "job.log").exists()
+    _cycle_probe(s.p, "next: nothing scheduled\n")
+    assert pushq.schedule(s.p, log=said.append), "the batch starts once the announcement clears"
+    assert s.p.db.kv(pushq.CYCLE_SAID_KEY) is None
+    (env["tmp"] / "go").write_text("")   # the stub batch waits for its release file: let it end before teardown
+    for child in list(pushq._children.values()):
+        child.wait(timeout=30)
+
+
+def test_a_resumable_detached_job_starts_while_a_cycle_is_announced_and_a_plain_one_still_waits(env, monkeypatch):
+    # Note 46355c6a511ad7ea: the daemon relaunches a --resumable job a reboot cut short, so an announced cycle of
+    # this host holds it not; a plain local job is still refused (75) and told both ways around it.
+    p = make(env)
+    _notice(env, monkeypatch)
+    run_dir = p.runs / "cycle-detach"
+    run_dir.mkdir(parents=True, exist_ok=True)
+    e = {"TTP_RUN_DIR": str(run_dir)}
+    r = _ttp_run(p, "detach", "plain", "--", "true", env=e, timeout=HANG_S)
+    assert r.returncode == 75 and "power cycle of this host is pending" in r.stderr, r.stderr
+    assert "ttp detach --resumable" in r.stderr and "ttp detach --remote" in r.stderr and "retry_when" in r.stderr
+    assert not (run_dir / "plain.rc").exists() and not (run_dir / "plain.log").exists()
+    for args in (["--resumable", "first"], ["second", "--resumable"]):   # the option before or after the name
+        name = args[0] if args[0] != "--resumable" else args[1]
+        r = _ttp_run(p, "detach", *args, "--", "true", env=e, timeout=HANG_S)
+        assert r.returncode == 0, r.stderr
+        assert "starting it anyway" in r.stderr and "relaunches it after the reboot" in r.stderr, r.stderr
+        assert r.stderr.count("power cycle of this host is pending") == 1
+        rc = run_dir / f"{name}.rc"
+        assert _wait_for_path(rc, HANG_S) and _job_lock_free(rc.resolve(), 30) and rc.read_text().strip() == "0"
+
+
+def _cycle_checks_repo(env, tmp_path, monkeypatch):
+    p, repo, run, git = _checks_repo(env, tmp_path, monkeypatch)
+    _notice(env, monkeypatch)
+    started = []
+    from ttp import cli
+    monkeypatch.setattr(cli, "_checks_detach", lambda *a, **k: started.append(a[3]))
+    return p, run, started
+
+
+def test_ttp_checks_while_a_cycle_is_announced_refuses_only_heavy_checks_that_would_run_here(env, tmp_path,
+                                                                                            monkeypatch, capsys):
+    from ttp import checkspill, cli
+    p, run, started = _cycle_checks_repo(env, tmp_path, monkeypatch)
+    with pytest.raises(SystemExit) as e:   # a heavy check here, nowhere else to go
+        cli.main(["checks", "--detach", "--", "true"])
+    err = capsys.readouterr().err
+    assert e.value.code == 75 and "power cycle of this host is pending" in err and not started, err
+    assert "ttp detach --resumable" in err and "ttp detach --remote" in err
+    p.set_config(f"delivery.{checkspill.KEY}", ["spillbox"])   # it may spill: it goes ahead and waits for one
+    cli.main(["checks", "--detach", "--", "true"])
+    err = capsys.readouterr().err
+    assert len(started) == 1 and "going ahead on a spill host" in err, err
+    monkeypatch.setenv(checkspill.OFF_ENV, "1")   # a rerun kept off every spill host runs here: refused
+    with pytest.raises(SystemExit) as e:
+        cli.main(["checks", "--detach", "--", "true"])
+    assert e.value.code == 75 and len(started) == 1
+    monkeypatch.delenv(checkspill.OFF_ENV)
+    p.set_config("delivery.push_checks", [{"run": "true", "spill": False}])
+    with pytest.raises(SystemExit) as e:   # "spill": false keeps a check here: refused
+        cli.main(["checks", "--detach"])
+    assert e.value.code == 75 and len(started) == 1 and "power cycle" in capsys.readouterr().err
+    p.set_config("delivery.push_checks", None)
+    p.set_config(f"delivery.{checkspill.KEY}", None)
+    capsys.readouterr()
+    cli.main(["checks", "--detach", "--", "git diff --check"])   # light checks only (seconds): they go ahead
+    err = capsys.readouterr().err
+    assert len(started) == 2 and "only light checks here" in err, err
+
+
+def test_a_run_that_may_spill_takes_no_slot_here_while_a_cycle_is_announced(env, tmp_path, monkeypatch):
+    # _checks_slot: with the notice, a run that may spill tries the spill hosts and waits for one, never taking
+    # a checks slot here; once the notice clears it queues here as before.
+    import io
+    from ttp import checkcap, checkspill, cli, push
+    p = make(env)
+    p.set_config(f"delivery.{checkspill.KEY}", ["spillbox"])
+    path = _notice(env, monkeypatch)
+    picks, takes = [], []
+    claim = types.SimpleNamespace(host="spillbox", close=lambda: None)
+    monkeypatch.setattr(checkspill, "pick", lambda *a, **k: picks.append(a[4] if len(a) > 4 else "")
+                        or (claim if len(picks) > 1 else None))
+    monkeypatch.setattr(checkspill, "after_s", lambda cfg: 0.0)
+    monkeypatch.setattr(cli, "_checks_slot_take", lambda *a, **k: takes.append(1) or checkcap.Slot())
+    cmds = push.check_list(["true"])
+    out = io.StringIO()
+    slot = cli._checks_slot(p, tmp_path, out, "a" * 40, detached=True, cmds=cmds, top=str(p.root), spill=True)
+    assert slot.spill is claim and not takes and len(picks) == 2, (picks, takes)
+    assert "waiting for a spill host, not running here" in out.getvalue(), out.getvalue()
+    path.unlink()
+    monkeypatch.setattr(checkspill, "first", lambda cfg: False)
+    slot = cli._checks_slot(p, tmp_path, io.StringIO(), "a" * 40, detached=True, cmds=cmds, top=str(p.root),
+                            spill=True)
+    assert takes == [1] and slot.spill is None, "no notice: it queues here as before"

@@ -1,0 +1,1489 @@
+# SPDX-FileCopyrightText: © 2026 Tenstorrent USA, Inc.
+# SPDX-License-Identifier: Apache-2.0
+"""Throughput review (`ttp throughput`): where this project's tasks waited, against which limit, and a
+bounded, reversible raise of the sizing limits that held work back. Model-free.
+
+measure() reads the task, run and push-queue records of a window (default 24 h) and sorts each wait
+into a lane, from the time the task could start (created, its start_after, its dependencies ended)
+to its first run, or to now for one still queued:
+- worker_slots: no resource, deferral, dependency or provider hold. Limit budget.max_parallel_workers,
+  or the provider gate's lower max_parallel (a spend gate: reported, never changed). A wait over its
+  threshold counts at the limit (all slots ran), idle (a slot was free), or raised (all slots then in
+  force ran, before a raise: throughput's own or one in the config-change log, configwho.LOG); the cap
+  in force is read per wait from both records, and a wait after the last logged change whose value is
+  no longer the cap (an edit outside both records, time unknown) counts as unknown, never idle. So does
+  the wait of a task with no record that it could start: one blocked now, or one with a resource label
+  dispatch recorded no hold for (no hold or eligibility history). An idle one at least half inside a dispatch stall (no worker run
+  started for STALL_GAP_S) also counts as stalled. A task's wait ends at its first run ever, not its first
+  run in the window: a re-run of an old task (a requeued review) is no creation-to-start wait.
+- dependency: a dependency was not done during the wait (DB.unmet_dependencies' rule). Reported, no
+  limit; a task's wait counts from the time its last dependency was done.
+- resource:<name> / device:<name>: a `resource:`/`exclusive:` label, counted only when dispatch
+  recorded a hold of kind busy, lock, reserved or pause naming it for the task in the wait (its
+  dispatch_hold events, Daemon._log_resource_wait); else the wait goes on to worker_slots (a first
+  wait) or retry_wait (a re-queue wait). Limit its slot count (a device lock is always 1). Reported only: a box's headroom is not measurable from here.
+- hold: such a wait at least half inside a pause of one of its resources (a deliberate hold: the
+  pauses in force, db.paused_resources, with shared ones and machine-wide fleet holds, and the ended
+  ones, the resource_resumed events coordinator._wake_pause_waiters writes). No limit; a shorter
+  overlap is taken off the resource lane's wait.
+- review_sweep: a code task's hand-off into review (its task_review or task_done event; else its last
+  run's end, when a model-free on_pass finished it later) to its review task being queued. Limits
+  review.sweep_after_s, judged only on the reviews the sweep queued (its review_swept events), and
+  review.unreviewed_per_pass (against the backlog of tasks in review now). A review the unreviewed
+  backstop queued (its review_unqueued event: the finish queued none, Daemon.sweep_unreviewed found it
+  later) is counted apart (backstop): no limit holds it, so plan() names it whatever the provider gate.
+  Both lanes start a re-review's wait (a fix's re-review, a push-conflict rebase review) no earlier than
+  the end of an earlier review of the same task: while that one was open the task was under review, and
+  its wait is counted on that review's own row.
+- review_stall: the same end to the review's first run, against coordinator.review_stall_s (the age at
+  which a waiting review is raised). Reported only: plan() never lowers it, since a sooner alarm starts
+  no review sooner. Its waits the checks did not hold (free) are reported apart, as information.
+  A review wait the checks held (slot-held) does not lower review.sweep_after_s and is not free: a
+  checks_slot_wait event for the code task inside it, or checkcap's waits log for the code task (its
+  own checks, or the precheck the daemon starts on its head as it queues the review) and, for the
+  stall, the review's precheck hold (Daemon._precheck_holds) covering half of it.
+- push_batch: a push-queue row's approval to its batch's start. Limit delivery.push_batch_s, judged
+  only on the rows the window alone held (no other batch ran while they waited). Rows that waited
+  through batches that did not end clean (an unreachable remote, a failing tip, a reboot: `failed_*`)
+  are held by those batches: with them half the lane or more, plan() reports the last one's message
+  as information (no throughput task), since no push setting moves them. Rows behind running batches
+  whose check runs (`check_run_s`, the last week's mean) take longer than checks.smoke_max_s are held
+  by the project's own push checks: reported the same way, with the smoke-split lever (gatetime).
+- landed_chain / deferral: `start_when` waits (a `landed:#<id>` chain or another probe); provider_gate:
+  a task held because its provider is logged out or paused. Reported with their cause, no limit.
+- Re-queue waits: each waiting hand-off (its task_waiting event) to the task's next run, and the current
+  wait of a task that has run (queued, blocked or waiting) from its last run's end to now, sorted by
+  its reason (the event's "for" or text; the task's blocked_reason for the current wait), its event's
+  data (a self-wait, `wait` self, or a wait on its own `ttp detach` job, a `job:` live key: own_job), or by the
+  checks slot's own records (a checks_slot_wait event in the wait, or checkcap's waits log covering
+  half of it): checks_slots (waiting for this project's other `ttp checks`; limit checks.slots per
+  repository or checks.test_project_max per project, whichever of the two held the wait: both are
+  project settings, reported, never raised; a wait is at the limit only when checkcap's waits log has it
+  queued, [queued, granted), while the project's recorded checks runs (checkwall) were at the cap in
+  force then: the most of them that ran at once for SUSTAIN_S in all while the queue stayed non-empty
+  (a shorter peak is an urgent run past the cap), at most checklane.project_cap; a record that stores
+  the cap in force at its grant ("cap", record_wait) is judged by that instead; no per-repository run
+  record exists; a wait whose last logged slot was granted before it ended, with no later queueing, is a
+  checks wait only up to that grant and the rest goes on by its reason as below (its own checks run, its
+  retry condition, a worker slot), unless that rest is under the lane's threshold;
+  `serialized` when they ran one at a time back to back, each start and the grant within SERIAL_S of a
+  run's end, a queue served one run at a time rather than the cap, and every wait behind a one-at-a-time
+  wrapper lock (checks.wrap_cmd, or an event naming such a lane: a script's own lock goes there); a checks
+  wait ends at its last slot grant; with checks.slots unset the lanes are host-sized (checklane.capacity), so
+  a wait its lanes held names the host's load as `holder`, never a checks.slots raise; a wait over threshold neither is
+  `held_by` the host when its waits-log time before the grant, or its events' lane holders all waiting
+  for a host-wide gate, show it: other projects' host test grants when another project's grant
+  (checkcap.grant_records) fell inside it, else the host's free-cores gate; with none at the limit and
+  none held by the project's own limits the lane names that `holder` instead of a checks setting, and
+  plan() reports it as information only: no raise, no task; a set test-worker budget,
+  checks.test_project_slots, that admits fewer full runs at once than both checks limits is the lane's
+  limit instead, reported, never raised, naming the setting that binds it (`budget_from`,
+  testslots.project_max_from: the account's, its environment variable, the host's per-project worker
+  ceiling or pool, or the project's own)), own_job (its own detached job or checks,
+  or a retry_when on its own driver: no limit), the resource rule above only with a dispatch hold recorded
+  in the wait, a deferral or provider hold, else retry_wait: its own retry condition until the daemon's
+  ready check saw it ready (the next run's runs.note ready_wait "since", readywait.take; for a task still
+  queued, its passed retry timer), and the rest a worker_slots wait judged like any other. With no ready
+  record the two are not told apart: the whole wait stays retry_wait, counted as capacity unknown and never
+  against worker slots.
+
+Each lane has a `kind` (wait_kind): blocked (dependency, deferral, landed_chain, provider_gate, hold,
+retry_wait: the task could not start), execution (own_job: its own detached job or checks ran) or eligible
+(queue time while it could start). Only an eligible lane is ever slow or judged against capacity: blocked and
+execution time are reported with their label, never read as idle capacity.
+
+A lane is slow when the 90th percentile of its waits is over the threshold: P1_WAIT_S for priority 1
+tasks, else the longer of WAIT_S and the median worker run (a wait shorter than one run is normal
+while every slot is busy). Each slow lane names its limiting setting and whether that limit was
+reached while work waited (`at_limit`) or capacity sat idle (`idle`; for the checks lane also
+`serialized`: runs went one at a time back to back, the queue's own fault, not the limit's).
+
+The report also shows the host-wide checks pool per project (host_shares: grants, running runs and wait
+time in the window), and how many of each project's waits ended while another project held more than its
+fair share of the cap (checkcap's fair share). Information only: nothing is raised for it.
+
+apply() changes only LEVERS, each a key config_set accepts (coordinator.USER_SETTABLE), and only for a
+slow lane whose limit was reached while work waited and whose resource has headroom: the provider
+gate allows new work and is not the binding cap, the provider is not paused, and the host's load leaves
+CPU free. A paused resource holds only its own resource:/device: lane and its tasks' waits (the hold
+lane), never another lane's raise; it is still never dispatched. The
+new value comes from load_size() over what was seen (work waiting at the limit, slots, hosts), never a
+fixed step. Spend caps, budgets, provider gates, locks, holds, pauses, restrictions and review-before-
+push are never touched (safe()). Each change is kept in KV with its reason and undo command
+(`ttp throughput --undo <id>`), which the daily review and `ttp status` show. A raise of
+budget.max_parallel_workers moves no spend limit: budget sizes them from spend_workers()."""
+from __future__ import annotations
+
+import json
+import os
+import re
+import time
+from pathlib import Path
+
+from . import gatetime, loadcaps, replacegap
+from .db import DB, START_PASSED, deferral
+from .timefmt import dur as _dur
+from .util import task_labels
+
+KV = "throughput_changes"   # kv: [{"id", "ts", "key", "old", "new", "why", "undo", "trigger", "undone"}], newest last
+LAST_KV = "throughput_last"  # kv: the last measured review: {"ts", "trigger", "lanes", "changes", "kept"}
+KEEP_S = 14 * 86400
+DAY = 86400
+P1_WAIT_S = 600       # a priority 1 task waiting minutes is slow
+WAIT_S = 1800         # any other task: tens of minutes, or one median run if runs are longer
+CPU_FREE = 0.75       # headroom: measured CPU demand under this share of the host's cores
+ROWS = 5000
+STALL_GAP_S = 1800   # no worker run started anywhere for this long: dispatch stalled, not a slot limit
+SERIAL_S = 10.0   # a checks grant this close to a run's end, one run at a time: a serialized queue
+SUSTAIN_S = 600.0   # how long in all a count of checks runs at once must hold to count as the cap then
+SLOT_ROUND_S = 0.001   # checkcap stores a slot record's times to the millisecond, run times are not
+# The settings apply() may change: each sizes how soon queued work starts and is accepted by config_set.
+# coordinator.review_stall_s stays only so `--undo` can restore an earlier change: plan() never proposes it.
+LEVERS = ("budget.max_parallel_workers", "review.sweep_after_s", "review.unreviewed_per_pass",
+          "coordinator.review_stall_s", "delivery.push_batch_s")
+# Keys never changed here, whatever LEVERS says.
+FORBIDDEN = re.compile(r"usd|spend|cap\b|_cap|gate|lock|hold|pause|restrict|review\.auto|before_push|reserve"
+                       r"|credit|provider|budget\.(?!max_parallel_workers$)", re.I)
+FLOORS = {"review.sweep_after_s": 300, "delivery.push_batch_s": 60}
+
+
+# What a lane's waits are (each lane's "kind"): time the task could not start (blocked: a dependency, a
+# deferral or landed chain, a provider hold, a pause, its own retry condition), time it ran its own detached job
+# or checks (execution), or queue time while it could start (eligible). Only eligible time is judged against
+# capacity: a blocked or execution lane is reported with its label, never slow, never a sign of idle capacity.
+BLOCKED_LANES = frozenset({"dependency", "deferral", "landed_chain", "provider_gate", "hold", "retry_wait"})
+EXECUTION_LANES = frozenset({"own_job"})
+
+
+def wait_kind(lane: str) -> str:
+    """"blocked", "execution" or "eligible" (BLOCKED_LANES, EXECUTION_LANES)."""
+    return "blocked" if lane in BLOCKED_LANES else "execution" if lane in EXECUTION_LANES else "eligible"
+
+
+def _ready_since(run: dict | None) -> float | None:
+    """When the task of `run` became ready to start, as the daemon's ready check recorded it on the run
+    (its note's "ready_wait" "since", readywait.take), or None where no such record exists."""
+    try:
+        rw = (json.loads((run or {}).get("note") or "{}") or {}).get("ready_wait")
+        return float(rw["since"]) if isinstance(rw, dict) and rw.get("since") is not None else None
+    except (ValueError, TypeError, KeyError, AttributeError):
+        return None
+
+
+def safe(key: str) -> bool:
+    return key in LEVERS and not FORBIDDEN.search(key)
+
+
+def spend_workers(db: DB, cur: int) -> int:
+    """The worker count spend limits are sized from (budget.evaluate): `cur`, or while `cur` is the
+    result of throughput raises of budget.max_parallel_workers, the value before the first of them."""
+    rec = [r for r in db.kv(KV) or [] if isinstance(r, dict) and r.get("key") == "budget.max_parallel_workers"
+           and not r.get("undone")]
+    v = cur
+    for r in reversed(rec):
+        if r.get("new") != v:
+            break
+        v = int(r.get("old") or v)
+    return min(cur, v)
+
+
+def load_size(current: int, waiting: int, units: int) -> int:
+    """The next value of a count limit, from load: `current` plus the work seen waiting at it, at most
+    doubling, never above `units` (the cores, hosts or slots the work spreads over) unless current
+    already is; never below current."""
+    current = max(1, int(current))
+    step = max(1, min(int(waiting), current))
+    return max(current, min(current + step, int(units)))
+
+
+def _batch_message(marker) -> str:
+    """A finished push batch's own message (its marker's `message`, as `ttp push` wrote it), cut short; ''."""
+    try:
+        m = json.loads(Path(str(marker)).read_text())
+    except (OSError, ValueError, TypeError):
+        return ""
+    return " ".join(str(m.get("message") or "").split())[:240] if isinstance(m, dict) else ""
+
+
+def _pct(xs: list[float], q: float) -> float:
+    s = sorted(xs)
+    return s[min(len(s) - 1, max(0, int(round(q * len(s) + 0.5)) - 1))] if s else 0.0
+
+
+def _deps(t: dict) -> list[int]:
+    try:
+        return [int(d) for d in json.loads(t.get("depends_on") or "[]") if str(d).isdigit()]
+    except (ValueError, TypeError):
+        return []
+
+
+def _reviewed(t: dict) -> int | None:
+    """The task a review task reviews: its parent, its `auto_review:<id>` label or its one dependency."""
+    if t.get("parent"):
+        return int(t["parent"])
+    for lb in task_labels(t):
+        if isinstance(lb, str) and lb.startswith("auto_review:") and lb[12:].isdigit():
+            return int(lb[12:])
+    deps = _deps(t)
+    return deps[0] if len(deps) == 1 else None
+
+
+def _peak(spans: list[tuple[float, float]], t0: float, t1: float) -> int:
+    """The most spans running at once at any point of [t0, t1]."""
+    pts = [t0] + [s for s, _ in spans if t0 < s <= t1]
+    return max((sum(1 for s, e in spans if s <= x < e) for x in pts), default=0)
+
+
+def _stalled(starts: list[float], t0: float, t1: float) -> float:
+    """The seconds of [t0, t1] inside a dispatch stall: a gap of at least STALL_GAP_S between two worker
+    run starts (sorted `starts`; the window's ends are not starts), clipped to [t0, t1]."""
+    import bisect
+    i, j = bisect.bisect_right(starts, t0), bisect.bisect_left(starts, t1)
+    pts = starts[max(0, i - 1):min(len(starts), j + 1)]
+    return sum(max(0.0, min(b, t1) - max(a, t0)) for a, b in zip(pts, pts[1:]) if b - a >= STALL_GAP_S)
+
+
+def _int(v) -> int | None:
+    return v if isinstance(v, int) and not isinstance(v, bool) else None
+
+
+def _limit_then(db: DB, key: str, cur: int, t0: float, t1: float,
+                hist: list | None = None) -> tuple[int | None, dict | None]:
+    """(the lowest value `key` had during [t0, t1], the change that raised it from there), from this
+    module's own change records (KV) and the config-change log's rows (`hist`, configwho.history: a
+    `ttp config` or chat edit): a wait before a raise is judged against the limit then in force.
+    (cur, None) when no recorded change touches the span; (None, None) when the span reaches past the
+    last recorded change and that change's value is not `cur`: the cap was changed outside both
+    records at a time not known, so the limit then is unknown."""
+    evs = []
+    for c in db.kv(KV) or []:
+        if isinstance(c, dict) and c.get("key") == key and _int(c.get("old")) is not None \
+                and _int(c.get("new")) is not None:
+            evs.append((float(c.get("ts") or 0), c["new"], c["old"], c))
+            if c.get("undone"):
+                evs.append((float(c["undone"]), c["old"], c["new"], None))
+    for r in hist or []:
+        if isinstance(r, dict) and r.get("key") == key and not r.get("refused") \
+                and _int(r.get("old")) is not None and _int(r.get("new")) is not None and r["old"] != r["new"]:
+            evs.append((float(r.get("ts") or 0), r["new"], r["old"], {"config": True, "ts": r.get("ts"),
+                        "old": r["old"], "new": r["new"], "by": r.get("by")}))
+    evs.sort(key=lambda e: e[0])
+    if evs and evs[-1][1] != cur and t1 > evs[-1][0]:
+        return None, None
+    # The value at t0: the last event's value at or before it, else the first event's prior value.
+    val = next((e[1] for e in reversed(evs) if e[0] <= t0), evs[0][2] if evs else cur)
+    low, by = val, None
+    for ts, new, old, c in evs:
+        if t0 < ts <= t1 and new < low:
+            low = new
+    if low < cur:
+        by = next((c for ts, new, old, c in evs if c and ts > t0 and old <= low < new), None)
+    return low, by
+
+
+def _wait_for(t: dict, e: dict) -> str:
+    """What a task_waiting event waits for, lower case: its data's "for", else its text without the
+    "#<id> <title>: " prefix (a title may name checks the task does not wait on)."""
+    try:
+        data = json.loads(e["data"] or "{}")
+    except (ValueError, TypeError):
+        data = {}
+    if isinstance(data, dict) and data.get("for"):
+        return str(data["for"]).lower()
+    text = e["text"] or ""
+    head = f"#{t['id']} {t.get('title') or ''}: "
+    return (text[len(head):] if text.startswith(head) else text).lower()
+
+
+# A retry_when that probes the task's own driver: `ttp detach --check`, a results/ marker or an .rc file.
+OWN_PROBE = re.compile(r"\bdetach\s+--check\b|(?:^|[\s/'\"=])results/|\.rc\b")
+# The kinds of dispatch hold (Daemon._resource_hold) that keep a ready task off a resource.
+HOLD_KINDS = ("busy", "lock", "reserved", "pause")
+
+
+def _self_wait(e: dict) -> bool:
+    """Whether a task_waiting event (Daemon's hand-off writer) is a wait on the task's own work: `wait`
+    self (unblock.classify_wait), its live work (unblock.live_wait) names one of its own jobs, or its
+    retry_when (`probe`) checks its own driver (OWN_PROBE)."""
+    from . import unblock
+    if unblock.is_self_wait(e["data"]):
+        return True
+    try:
+        data = json.loads(e["data"] or "{}")
+        live, probe = data.get("live"), data.get("probe")
+    except (ValueError, TypeError, AttributeError):
+        return False
+    return (isinstance(live, dict) and str(live.get("key") or "").startswith("job:")) \
+        or (isinstance(probe, str) and bool(OWN_PROBE.search(probe)))
+
+
+def _cfg(cfg: dict, dotted: str, default):
+    node = cfg
+    for k in dotted.split("."):
+        if not isinstance(node, dict) or k not in node:
+            return default
+        node = node[k]
+    return node
+
+
+def _covered(spans, w0: float, w1: float) -> float:
+    """Seconds of [w0, w1] that the union of `spans` ((start, end) pairs) covers."""
+    tot, edge = 0.0, w0
+    for a, b in sorted((max(float(a), w0), min(float(b), w1)) for a, b in spans):
+        if b > a and b > edge:
+            tot, edge = tot + b - max(a, edge), b
+    return tot
+
+
+def thresholds(spans: list[tuple[float, float]]) -> tuple[float, float]:
+    """(priority 1 threshold, other threshold) in seconds, the latter sized from the median run."""
+    durs = [e - s for s, e in spans if e > s]
+    return float(P1_WAIT_S), max(float(WAIT_S), _pct(durs, 0.5))
+
+
+CAP_KEY = "checks.test_project_max"
+SLOTS_KEY = "checks.slots"
+TASK_TITLE = "throughput: "   # slowcomplaint's follow-up tasks: `throughput: <lane>[, <lane>] waits over threshold; ...`
+
+
+def _settled(db: DB, ln: dict, now: float) -> str:
+    """Why the checks lane opens no follow-up, or '': the tried-work ledger holds, from the last DAY, a
+    rejected 'raise <its limit key>' or a done follow-up task that listed the lane, and no wait held at the
+    project's own limits (own_wait_last, ck_holder) started after it."""
+    key, name = ln.get("limit_key"), ln["lane"]
+    raise_rx = re.compile(rf"\braise\w*\s+(?:the\s+)?{re.escape(key)}(?![\w.])", re.I) if key else None
+    try:
+        from . import tried
+        ledger = tried.entries(db, now=now, days=1)
+    except Exception:   # an unreadable ledger holds nothing back
+        return ""
+    for e in ledger:   # newest first
+        title = e["title"] or ""
+        lanes = title[len(TASK_TITLE):].split(" waits over threshold", 1)[0].split(", ") \
+            if title.startswith(TASK_TITLE) else []
+        if not (now - DAY <= e["ts"] <= now and (e["outcome"] == "rejected" and raise_rx and raise_rx.search(title)
+                                               or e["status"] == "done" and name in lanes)):
+            continue
+        if float(ln.get("own_wait_last") or 0) > e["ts"]:
+            return ""   # a new wait at the project's own limits since: new evidence
+        return (f"ledger #{e['id']} ({e['outcome']}: {title[:80]}) settled it on {e['date']} and no wait "
+                "held at the project's own limits started since: not reopened")
+    return ""
+
+
+def slot_limit(text: str) -> str:
+    """The limit a checks_slot_wait event's text names, in checklane's own wording (its closing "This
+    wait was held by ..."): "the per-repository lane limit (checks.slots)" is SLOTS_KEY, "the project
+    cap (checks.test_project_max)" CAP_KEY, the host's gate (checklane.HOST_GATE: a wait below the
+    project cap) HOST_CORES and "nothing (about to start)" "" (no cap); the default is the project
+    cap, the limit every pre-#4316 event and every reason text was held under."""
+    from .checklane import HOST_GATE
+    held = text.rpartition("This wait was held by ")[2]
+    if held.startswith(HOST_GATE):   # first: the gate's own reason may name any limit
+        return HOST_CORES
+    if held.startswith("nothing (about to start)"):
+        return ""
+    if "per-repository lane limit" in held:
+        return SLOTS_KEY
+    return CAP_KEY
+
+
+# Who held a checks wait the project's own limits did not (ck_holder): the host's free-cores gate
+# (checkcap.cores_short, host slots sized by load), or other projects taking host slots meanwhile.
+HOST_CORES, OTHER_PROJECTS = "host_cores", "other_projects"
+HOLDERS = {HOST_CORES: "the host's free-cores gate (host load)", OTHER_PROJECTS: "other projects' host test grants"}
+HELD_NOTE = {
+    HOST_CORES: "held by the host's free-cores gate: a check starts only while the host's live free cores cover "
+                "one check's price and host-wide checks slots follow the host's load (checkcap), while the "
+                "project's own checks were under its cap (at_limit 0). Raising the per-project slots does not "
+                "help: it only queues more checks on a host that is already busy; find what loads the host",
+    OTHER_PROJECTS: "held by other projects' host test grants: other projects took host-wide checks slots while "
+                    "these waited (the host grants log, checkcap.grant_records) and the project's own checks were "
+                    "under its cap (at_limit 0). No per-project raise helps: the host's slots are shared"}
+
+
+def host_held(text: str) -> bool:
+    """Whether a checks_slot_wait event's text (checklane.wait_events) shows every lane holder it names
+    not running yet, itself waiting for a host-wide gate (a host-wide checks slot, host test slots:
+    testslots.lane_waits), or that names the host's gate as its limit (slot_limit): the host held the
+    wait, not the project's own lanes."""
+    m = re.search(r"\bbehind (.*?)\. Lanes:", text)
+    held = m.group(1).split("; ") if m else []
+    return slot_limit(text) == HOST_CORES or bool(held) and all("not running yet (waiting for " in h for h in held)
+
+
+def _config_hist(db: DB, since: float) -> list[dict]:
+    """The config-change log's rows from `since` (configwho.LOG, beside the project's database)."""
+    from . import configwho
+    try:
+        lines = (Path(db.path).parent / configwho.LOG).read_text().splitlines()
+    except (OSError, TypeError, AttributeError):
+        return []
+    out = []
+    for line in lines:
+        try:
+            r = json.loads(line)
+            if isinstance(r, dict) and float(r.get("ts") or 0) >= since:
+                out.append(r)
+        except (ValueError, TypeError):
+            continue
+    return out
+
+
+
+# A resource wait's first hold record (or ready check) this soon after the wait could start is the
+# dispatcher's first pass over it: the whole wait is the resource's, no retry_wait sliver before it.
+HOLD_GRACE_S = 60.0
+
+def measure(db: DB, cfg: dict, since_s: float = DAY, now: float | None = None, gates: dict | None = None,
+            hist: list | None = None) -> dict:
+    """The waits per lane over the last `since_s` seconds (module doc). `hist`: the config-change log's
+    rows (configwho.history); None reads them beside `db`."""
+    from . import locks, shared
+    now = time.time() if now is None else now
+    t0 = now - since_s
+    if hist is None:
+        hist = _config_hist(db, t0 - 7 * DAY)
+    runs = db.q("SELECT task, started, ended, status, note FROM runs WHERE role!='coordinator' AND started IS NOT NULL "
+                "AND (ended IS NULL OR ended>?) ORDER BY started DESC LIMIT ?", (t0 - DAY, ROWS))
+    spans = [(float(r["started"]), float(r["ended"] or now)) for r in runs]
+    starts = sorted(s for s, _ in spans)
+    first: dict[int, float] = {}
+    last_end: dict[int, list[float]] = {}
+    for r in runs:
+        if r["task"] is None:
+            continue
+        first[r["task"]] = min(first.get(r["task"], r["started"]), r["started"])
+        if r["ended"]:
+            last_end.setdefault(r["task"], []).append(float(r["ended"]))
+    p1_s, other_s = thresholds([sp for sp in spans if sp[0] >= t0])
+    devices = locks.device_locks(cfg)
+    all_gates = gates if gates is not None else (db.kv("gates") or {})
+    gate = all_gates.get(cfg.get("core_provider", "claude")) or {} if isinstance(all_gates, dict) else {}
+    workers = int(_cfg(cfg, "budget.max_parallel_workers", 6) or 6)
+    lanes: dict[str, dict] = {}
+
+    def lane(name: str, limit_key: str | None, limit) -> dict:
+        return lanes.setdefault(name, {"lane": name, "kind": wait_kind(name), "limit_key": limit_key, "limit": limit,
+                                       "waits": [], "p1": [], "at_limit": 0, "idle": 0, "unknown": 0,
+                                       "serialized": 0, "waiting_now": 0, "measured": True})
+
+    def add(ln: dict, w: float, prio: int, start: float, end: float, limit: int | None, queued: bool,
+            known: bool = True) -> None:
+        ln["waits"].append(w)
+        if prio <= 1:
+            ln["p1"].append(w)
+        ln["waiting_now"] += queued
+        if limit and w > (p1_s if prio <= 1 else other_s):
+            then, by = _limit_then(db, ln["limit_key"], limit, start, end, hist) if ln["limit_key"] else (limit, None)
+            peak = _peak(spans, start, end)
+            if then is None or (not known and peak < limit):
+                # The cap then in force, or whether the task could start at all, is not on record: no
+                # idle-capacity finding rests on it.
+                ln["unknown"] += 1
+            elif peak < limit and by and peak >= then:
+                # Every slot of a lower limit then in force was busy: a wait the raise since then is for,
+                # neither at the current limit nor idle capacity.
+                ln["raised"] = ln.get("raised", 0) + 1
+                ln["raised_by"] = {"id": by.get("id"), "old": by.get("old"), "new": by.get("new"), "ts": by.get("ts"),
+                                   **({"config": True} if by.get("config") else {})}
+            else:
+                ln["at_limit" if peak >= limit else "idle"] += 1
+                if peak < limit and _stalled(starts, start, end) * 2 >= end - start:
+                    # Free slots and no run started at all for most of it: dispatch stopped (a stopped
+                    # daemon, a stalled tick, a spend gate), whatever the slot count.
+                    ln["stalled"] = ln.get("stalled", 0) + 1
+
+    tasks = db.q("SELECT * FROM tasks WHERE created>? OR status IN ('queued','blocked','waiting') OR id IN "
+                 "(SELECT task FROM runs WHERE ended IS NULL OR ended>?) ORDER BY id DESC LIMIT ?", (t0, t0, ROWS))
+    # A task's first run ever, not its first in the runs read above: an old task re-run in the window (a
+    # requeued review, a re-review) started long ago, so its wait is not creation to that late run.
+    ids = [t["id"] for t in tasks]
+    for r in db.q("SELECT task, MIN(started) AS s FROM runs WHERE role!='coordinator' AND started IS NOT NULL "
+                  "AND task IN (SELECT value FROM json_each(?)) GROUP BY task", (json.dumps(ids),)) if ids else []:
+        if r["s"] is not None:
+            first[r["task"]] = min(first.get(r["task"], float(r["s"])), float(r["s"]))
+    by_task: dict[int, list] = {}
+    for r in sorted(runs, key=lambda r: r["started"]):
+        if r["task"] is not None:
+            by_task.setdefault(r["task"], []).append(r)
+    dep_ids = sorted({d for t in tasks for d in _deps(t)})
+    dep_rows = {r["id"]: r for r in db.q("SELECT id, status, kind, updated FROM tasks WHERE id IN "
+                                         "(SELECT value FROM json_each(?))", (json.dumps(dep_ids),))} if dep_ids else {}
+    try:
+        from . import checklane
+        lanes_n, cap_n = checklane.slots(cfg), checklane.project_cap(cfg)
+    except Exception:
+        lanes_n = cap_n = None
+
+    def done_at(t: dict, dep: int, start: float | None) -> float | None:
+        """When dependency `dep` of `t` was done (DB.unmet_dependencies' rule), or None while it is not."""
+        r = dep_rows.get(dep)
+        if r is None:
+            return 0.0
+        if r["status"] == "done" or (r["status"] == "review" and t["kind"] == "review"):
+            at = float(r["updated"] or 0)
+            return min(at, start) if start is not None else at
+        # Started anyway (approved past it): done by its last run before the start.
+        return None if start is None else max([e for e in last_end.get(dep, []) if e <= start], default=start)
+
+    def by_rule(t: dict, d: dict, why: str, w0: float, end: float, prio: int, queued: bool,
+                ready: float | None = None) -> bool:
+        """Add a wait held by a deferral, provider hold or resource label; False when none applies. A
+        resource's wait starts at the latest of its first hold dispatch in the wait, the last start_when
+        gate that passed in it and `ready` (the task's ready record): before that the gate held it (deferral)
+        or its own retry condition did (retry_wait), never the resource."""
+        res = sorted({lb.split(":", 1)[1] for lb in task_labels(t) if isinstance(lb, str) and ":" in lb
+                      and lb.split(":", 1)[0] in ("resource", "exclusive")})
+        when = str(d.get("when") or "")
+        if when:
+            ln = lane("landed_chain" if when.strip().startswith("landed:#") else "deferral", None, None)
+            add(ln, max(0.0, end - max(w0, float(d.get("since") or t["created"] or now))), prio, w0, end, None, queued)
+        elif queued and ("logged out" in why or "provider" in why):
+            add(lane("provider_gate", None, None), max(0.0, end - w0), prio, w0, end, None, queued)
+        elif res:
+            span = max(0.0, end - w0)
+            held = _covered([h for r in res for h in holds.get(r, ())], w0, end) if span else 0.0
+            if span and held * 2 >= span:
+                lane("hold", None, None)["note"] = "a deliberate pause or hold of its resource: no limit"
+                add(lanes["hold"], span, prio, w0, end, None, queued)
+                return True
+            # Only a hold dispatch recorded for this task in the wait (its dispatch_hold events) puts it
+            # in a resource's lane; a label alone is no evidence the resource held it.
+            named = {h for ts, h in res_held.get(t["id"], ()) if w0 <= ts <= end}
+            res = [r for r in res if r in named or locks.canonical(cfg, r) in named]
+            if not res:
+                return False
+            names = {*res, *(locks.canonical(cfg, r) for r in res)}
+            hold0 = min((ts for ts, h in res_held.get(t["id"], ()) if w0 <= ts <= end and h in names), default=w0)
+            gate = max((ts for ts, _ in passed.get(t["id"], ()) if w0 < ts <= end), default=None)
+            g0 = max(w0, gate or w0)
+            r0 = min(end, max(hold0, g0, ready if ready is not None else w0))
+            if r0 - g0 <= HOLD_GRACE_S:   # held from its first dispatch pass on: the resource's from the start
+                r0 = g0
+            if gate is not None:
+                add(lane("deferral", None, None), gate - w0, prio, w0, gate, None, False)
+            if r0 > g0:
+                add(_retry_lane(), r0 - g0, prio, g0, r0, None, False)
+            held = _covered([h for r in res for h in holds.get(r, ())], r0, end) if end > r0 else 0.0
+            for r in res:
+                lim = shared.own_slots(cfg, r)
+                ln = lane(("device:" if r in devices else "resource:") + r, None if r in devices else f"resources.{r}", lim)
+                ln["note"] = ("a device lock is one slot; its box's headroom is not measurable here" if r in devices
+                              else "a resource's slots size a shared machine; its headroom is not measurable here")
+                add(ln, max(0.0, end - r0 - held), prio, r0, end, None, queued)
+        else:
+            return False
+        return True
+
+    def _retry_lane() -> dict:
+        rl = lane("retry_wait", None, None)
+        rl["note"] = ("its own retry condition (blocked) until it was ready, then a worker slot (eligible); "
+                      "a wait with no ready record is not split and never counted against worker slots")
+        return rl
+
+    # Deliberate holds per resource: the pauses in force and the ended ones (module doc).
+    holds: dict[str, list[tuple[float, float]]] = {}
+    try:
+        for name, v in db.paused_resources().items():
+            holds.setdefault(name, []).append((float((v or {}).get("since") or now), now))
+    except Exception:   # an unreadable shared or fleet file leaves the ended pauses
+        pass
+    # When a start_when gate ended (db.record_start_passed): its deferral labels are gone by then.
+    passed: dict[int, list[tuple[float, dict]]] = {}
+    for e in db.q("SELECT ts, task, data FROM events WHERE kind=? AND task IS NOT NULL AND ts>?",
+                  (START_PASSED, t0 - DAY)):
+        try:
+            v = json.loads(e["data"] or "{}")
+        except (ValueError, TypeError):
+            v = {}
+        passed.setdefault(e["task"], []).append((float(e["ts"]), v if isinstance(v, dict) else {}))
+    res_held: dict[int, list[tuple[float, str]]] = {}
+    for e in db.q("SELECT ts, task, data FROM events WHERE kind='dispatch_hold' AND task IS NOT NULL AND ts>?",
+                  (t0 - DAY,)):
+        try:
+            v = json.loads(e["data"] or "{}")
+        except (ValueError, TypeError):
+            continue
+        if isinstance(v, dict) and v.get("kind") in HOLD_KINDS and v.get("resource"):
+            res_held.setdefault(e["task"], []).append((float(e["ts"]), str(v["resource"])))
+            res_held[e["task"]].append((float(e["ts"]), locks.canonical(cfg, str(v["resource"]))))
+    for e in db.q("SELECT ts, data FROM events WHERE kind='resource_resumed' AND ts>?", (t0 - DAY,)):
+        try:
+            v = json.loads(e["data"] or "{}")
+            holds.setdefault(str(v["resource"]), []).append((float(v.get("since") or e["ts"]), float(e["ts"])))
+        except (ValueError, TypeError, KeyError, AttributeError):
+            continue
+
+    # Re-queue waits read what the daemon writes: task_waiting events, each waiting task's last run, and
+    # the checks slot's own records for its slot waits: the checks_slot_wait events Daemon.check_checks_wait
+    # writes from checklane.wait_events while a task still waits, and checkcap's waits log (a row only at grant).
+    wait_ids = [t["id"] for t in tasks if t["status"] in ("queued", "blocked", "waiting")]
+    last_run = {r["task"]: r for r in db.q(
+        "SELECT task, MAX(ended) AS ended, SUM(ended IS NULL) AS live FROM runs WHERE role!='coordinator' "
+        "AND started IS NOT NULL AND task IN (SELECT value FROM json_each(?)) GROUP BY task",
+        (json.dumps(wait_ids),))} if wait_ids else {}
+    ev_waits: dict[int, list] = {}
+    for e in db.q("SELECT ts, task, text, data FROM events WHERE kind='task_waiting' AND task IS NOT NULL AND ts>? "
+                  "ORDER BY ts LIMIT ?", (t0 - DAY, ROWS)):
+        ev_waits.setdefault(e["task"], []).append(e)
+    slot_ev: dict[int, list[tuple[float, str]]] = {}
+    slot_host: dict[int, list[tuple[float, bool | None]]] = {}   # each event: did the host hold its lane holders
+    slot_serial: dict[int, list[float]] = {}   # events naming a one-at-a-time wrapper lock's lane
+    for e in db.q("SELECT ts, task, text FROM events WHERE kind='checks_slot_wait' AND task IS NOT NULL AND ts>?",
+                  (t0 - DAY,)):
+        key = slot_limit(e["text"] or "")
+        slot_ev.setdefault(e["task"], []).append((float(e["ts"]), key))
+        # an event about to start ("": no cap) names no holder: ck_holder skips it
+        slot_host.setdefault(e["task"], []).append((float(e["ts"]), host_held(e["text"] or "") if key else None))
+        if "one at a time" in (e["text"] or ""):
+            slot_serial.setdefault(e["task"], []).append(float(e["ts"]))
+    slot_log: dict[int, list[tuple[float, float]]] = {}
+    slot_cap: dict[tuple[int, float, float], int] = {}   # the cap in force a record stored at its grant
+    slot_lane: dict[tuple[int, float, float], float] = {}   # when the record's run got its repository's lane
+    slot_rec: dict[tuple[int, float, float], dict] = {}   # its lane_s, pool_s, cut_at and cut_by (record_wait)
+    # The time inside a record's [queued_at, granted_at) that was its own earlier run, no wait: a relaunch or
+    # spill rerun keeps its first arrival for its place in the queue, so its record starts at its wait_from
+    # (checkcap.wait_start); an older record without one, overlapping the same task's earlier grant (a reboot's
+    # relaunch), starts at that grant, or at the task's checks_relaunched event after it.
+    slot_ran: dict[int, list[tuple[float, float]]] = {}
+    relaunched: dict[int, list[float]] = {}
+    for e in db.q("SELECT ts, task FROM events WHERE kind='checks_relaunched' AND task IS NOT NULL AND ts>?",
+                  (t0 - DAY,)):
+        relaunched.setdefault(e["task"], []).append(float(e["ts"]))
+    own_names, others = {cfg.get("name")}, []   # other projects' host slot grants (times), from the host log
+    try:
+        from . import checkcap
+        recs = checkcap.wait_records(Path(db.path).parent, now, now - t0 + DAY)
+        grants: dict[int, list[float]] = {}
+        for r in recs:
+            if isinstance(r.get("task"), int):
+                grants.setdefault(r["task"], []).append(r["granted_at"])
+        for r in recs:
+            own_names.add(r.get("project"))
+            if isinstance(r.get("task"), int):
+                q0, g1 = r["queued_at"], r["granted_at"]
+                q = checkcap.wait_start(r)
+                if q == q0 and (prior := max((g for g in grants[r["task"]] if q0 < g < g1), default=None)):
+                    q = max([prior, *(x for x in relaunched.get(r["task"], ()) if prior < x < g1)])
+                if q > q0:
+                    run0 = max((g for g in grants[r["task"]] if q0 < g < q), default=q0)
+                    slot_ran.setdefault(r["task"], []).append((run0, q))
+                r = {**r, "queued_at": q}
+                slot_log.setdefault(r["task"], []).append((r["queued_at"], r["granted_at"]))
+                if isinstance(r.get("cap"), int) and not isinstance(r["cap"], bool) and r["cap"] >= 0:
+                    slot_cap[(r["task"], r["queued_at"], r["granted_at"])] = r["cap"]
+                if isinstance(r.get("lane_at"), (int, float)) and not isinstance(r["lane_at"], bool):
+                    slot_lane[(r["task"], r["queued_at"], r["granted_at"])] = float(r["lane_at"])
+                slot_rec[(r["task"], r["queued_at"], r["granted_at"])] = {
+                    k: float(r[k]) if k != "cut_by" else str(r[k]) for k in ("lane_s", "pool_s", "cut_at", "cut_by")
+                    if k in r and (k == "cut_by" or (isinstance(r[k], (int, float)) and not isinstance(r[k], bool)))}
+        others = [g["ts"] for g in checkcap.grant_records(now, now - t0 + DAY)
+                  if g.get("project") and g.get("project") not in own_names]
+    except Exception:
+        pass
+    try:
+        from . import checkwall
+        ck_runs = checkwall.run_spans(Path(db.path).parent, now, now - t0 + 2 * DAY)
+    except Exception:
+        ck_runs = []
+
+    def ck_peak(a: float, b: float) -> int:
+        """The most recorded checks runs (checkwall) running at once in [a, b)."""
+        pts = [a] + [x for x, _ in ck_runs if a < x < b]
+        return max(sum(1 for x0, x1 in ck_runs if x0 <= x < x1) for x in pts)
+
+    def ck_held(a: float, b: float) -> int:
+        """The most recorded checks runs that ran at once in [a, b) for SUSTAIN_S in all: a shorter peak
+        (an urgent run in a lane past the cap) is not the cap."""
+        cuts = sorted({a, b, *(x for r in ck_runs for x in r if a < x < b)})
+        held: dict[int, float] = {}
+        for x, y in zip(cuts, cuts[1:]):
+            n = sum(1 for x0, x1 in ck_runs if x0 <= x < x1)
+            for k in range(1, n + 1):
+                held[k] = held.get(k, 0.0) + y - x
+        return max((k for k, s in held.items() if s >= SUSTAIN_S), default=0)
+
+    # The checks queue's busy periods: the logged [queued, granted) spans of every task, merged.
+    busy: list[list[float]] = []
+    for q, g in sorted(x for v in slot_log.values() for x in v if x[1] > x[0]):
+        if busy and q <= busy[-1][1]:
+            busy[-1][1] = max(busy[-1][1], g)
+        else:
+            busy.append([q, g])
+
+    def cap_wait(task: int, w0: float, w1: float) -> str:
+        """How `task`'s checks slot wait in [w0, w1] was held (checkcap's waits log: [queued, granted)
+        with granted after queued; only the time before the grant counts, as the task's own run starts
+        at its grant): "at_limit" when the project's recorded checks runs (checkwall) reached the cap in
+        force then, the most of them that ran at once for SUSTAIN_S in all while the queue stayed non-empty
+        (one busy period; a shorter peak is an urgent run past the cap),
+        at most checklane.project_cap (a cap raised since then is not today's); a record that stored the
+        cap in force at its grant ("cap", 0: none) is judged by that, not the estimate; "serialized" when
+        they ran one at a time back to back, each start and the grant within
+        SERIAL_S of a run's end (a queue served one run at a time, not the cap), or when its runs go behind
+        a one-at-a-time wrapper lock (checks.wrap_cmd, or a checks_slot_wait event in the wait naming such a
+        lane: a script's own lock, declared there), which no cap raise frees; else "idle". No grant
+        record, or one granted at once: not at the limit."""
+        serial = bool(_cfg(cfg, "checks.wrap_cmd", None)) or any(w0 <= x <= w1 for x in slot_serial.get(task, ()))
+        for q, g in slot_log.get(task, ()):
+            a, b = max(q, w0), min(g, w1)
+            cap = slot_cap.get((task, q, g), cap_n)
+            if not cap or b <= a:
+                continue
+            if (task, q, g) not in slot_cap:
+                seen = max((ck_held(x0, x1) for x0, x1 in busy if x0 <= q and g <= x1), default=0)
+                cap = min(cap, seen) if seen >= 2 else cap
+            k = ck_peak(a, b)
+            if k >= cap and not serial:
+                return "at_limit"
+            ends = [e for _, e in ck_runs]
+            serial = serial or (k <= 1 and all(any(abs(x - e) <= SERIAL_S for e in ends)
+                                               for x in [g, *(x0 for x0, _ in ck_runs if a < x0 < b)]))
+        return "serialized" if serial else "idle"
+
+    def ck_holder(task: int, w0: float, w1: float, state: str) -> str:
+        """Who held `task`'s checks wait in [w0, w1] that cap_wait() judged `state`: "own" (at the project's
+        cap, its own queue served one run at a time, its own lane holders running per its checks_slot_wait
+        events, or known only from its reason text, the legacy default), else HOST_CORES or
+        OTHER_PROJECTS. A waits-log record's time before its run got the repository's lane ("lane_at") is
+        the project's own lanes (checks.slots); one with no lane_at is all own when the project's recorded
+        runs filled checks.slots in it; a record with "lane_s" (its own lane waits over every bound, which
+        give the lane back and take it again) is own only for lane_s less its "pool_s" (the host's test pool
+        refused it a lane: the host's), spread evenly over the record; a wait mostly held so is own. A rerun
+        of a preempted run ("cut_at", "cut_by") counts only from its old grant: the preempting project's,
+        OTHER_PROJECTS unless that is this project. A wait the host held (its waits-log
+        time from the lane to the grant, or events whose lane holders all waited for a host-wide gate) is
+        OTHER_PROJECTS when another project's host slot grant fell inside it (checkcap.grant_records), else
+        the host's free-cores gate."""
+        if state in ("at_limit", "serialized"):
+            return "own"
+        spans, own_s, host_s, cut_s = [], 0.0, 0.0, 0.0
+        for q, g in slot_log.get(task, ()):
+            rec = slot_rec.get((task, q, g), {})
+            if (cut := rec.get("cut_at")) is not None and q <= cut < g:   # before it: the preempted grant's
+                a, b = max(q, w0, cut), min(g, w1)
+                if b > a and rec.get("cut_by") == cfg.get("name"):
+                    own_s += b - a
+                elif b > a:
+                    cut_s += b - a
+                continue
+            a, b = max(q, w0), min(g, w1)
+            if b <= a:
+                continue
+            if (lane_s := rec.get("lane_s")) is not None:
+                mine = max(0.0, lane_s - rec.get("pool_s", 0.0)) * (b - a) / max(g - q, 1e-9)
+                own_s += min(mine, b - a)
+                host_s += b - a - min(mine, b - a)
+                if b - a > mine:
+                    spans.append((a, b))
+                continue
+            if (lane_at := slot_lane.get((task, q, g))) is not None:
+                h = min(max(lane_at, a), b)
+            else:
+                h = b if lanes_n and ck_peak(a, b) >= lanes_n else a
+            own_s += h - a
+            if b > h:
+                spans.append((h, b))
+                host_s += b - h
+        if own_s and own_s >= host_s + cut_s:
+            return "own"
+        if cut_s and cut_s >= host_s:
+            return OTHER_PROJECTS
+        evs = [h for ts, h in slot_host.get(task, ()) if w0 <= ts <= w1 and h is not None]
+        if evs and not all(evs):
+            return "own"
+        if not spans and not evs:
+            return "own"
+        return OTHER_PROJECTS if any(a <= g <= b for a, b in spans or [(w0, w1)] for g in others) else HOST_CORES
+
+    def slot_held(task: int, w0: float, w1: float, extra: list | tuple = ()) -> str | None:
+        """Which checks limit held `task` in [w0, w1] — "checks.slots" (its repository's lanes),
+        "checks.test_project_max" (the project's cap), HOST_CORES (the host's gate, below the cap) or ""
+        (no cap: about to start) — or None when the checks did not hold it:
+        a checks_slot_wait event in the wait (its text names the limit: slot_limit; older events named none:
+        the project cap, the limit those waits were held under), or its logged slot waits and
+        `extra` spans covering at least half of it (no limit recorded: the per-repository limit,
+        the default holder of a queue wait)."""
+        for ts, key in slot_ev.get(task, ()):
+            if w0 <= ts <= w1:
+                return key
+        return SLOTS_KEY if w1 > w0 and _covered([*slot_log.get(task, ()), *extra], w0, w1) * 2 >= w1 - w0 else None
+
+    def slot_granted(task: int, w0: float, w1: float) -> float | None:
+        """When `task`'s last logged checks slot in (w0, w1) was granted, when nothing queued it for a slot
+        again after (no later record or checks_slot_wait event): the rest of the wait was its checks run
+        and whatever came after (a retry condition, a worker slot), never a checks slot. None: no grant."""
+        recs = slot_log.get(task, ())
+        g = max((b for a, b in recs if w0 < b < w1 and a < w1), default=None)
+        if g is None or any(g < a < w1 for a, _ in recs) or any(g < ts <= w1 for ts, _ in slot_ev.get(task, ())):
+            return None
+        return g
+
+    def precheck_hold(t: dict) -> list[tuple[float, float]]:
+        """The span review `t` was held for the checks the daemon started on its code task's head: from
+        when they began running on a host to their end, at most precheck_hold_s (Daemon._precheck_holds)."""
+        from .cli import CHECKS_RC, CHECKS_RUNNING
+        from .daemon import PRECHECK_LABEL, PRECHECKS_DIR, precheck_hold_s
+        name = next((lb[len(PRECHECK_LABEL):] for lb in task_labels(t) if isinstance(lb, str)
+                     and lb.startswith(PRECHECK_LABEL)), "")
+        if not name or "/" in name:
+            return []
+        state = Path(db.path).parent
+        out = state / PRECHECKS_DIR / name
+        try:
+            ts = float(json.loads((out / CHECKS_RUNNING).read_text()).get("since") or 0)
+        except (OSError, ValueError, TypeError, AttributeError):
+            ts = 0.0
+        if not ts:
+            return []
+        try:
+            end = (out / CHECKS_RC).stat().st_mtime
+        except OSError:
+            end = now
+        return [(ts, min(end, ts + precheck_hold_s(state, now)))]
+
+    slot_tally: dict[str, float] = {SLOTS_KEY: 0.0, CAP_KEY: 0.0}
+    for t in tasks:
+        start = first.get(t["id"])
+        d = deferral(t)
+        gate_end, gd = None, d
+        if not d.get("when"):
+            # A start_when that passed before this wait's end: the wait up to its passing was the gate's.
+            lim = first.get(t["id"]) if first.get(t["id"]) is not None else now
+            got = [(ts, v) for ts, v in passed.get(t["id"], ()) if ts <= lim]
+            if got:
+                gate_end, v = max(got, key=lambda x: x[0])
+                gd = {**d, "when": str(v.get("when") or "start_when"), "since": v.get("since")}
+        prio = int(t["priority"] or 3)
+        why = (t.get("blocked_reason") or "").lower()
+        # Whether a slot alone kept it from starting is on record: not for a task blocked now, nor for one
+        # whose resource label dispatch recorded no hold for (by_rule fell through).
+        known = not (start is None and t["status"] == "blocked") and not any(
+            isinstance(lb, str) and lb.split(":", 1)[0] in ("resource", "exclusive") and ":" in lb for lb in task_labels(t))
+        if (start is not None or (t["status"] in ("queued", "blocked") and t["id"] not in last_run)) \
+                and not (start is not None and start < t0):
+            base = max(float(t["created"] or now), float(d.get("after") or 0), float(t.get("not_before") or 0))
+            dones = [done_at(t, dep, start) for dep in _deps(t)]
+            end, queued = (start if start is not None else now), start is None
+            if not d.get("when") and None in dones:
+                add(lane("dependency", None, None), max(0.0, end - base), prio, base, end, None, queued)
+            elif gate_end is not None:
+                ready = max([base, *[x for x in dones if x is not None]])
+                by_rule(t, gd, why, ready, min(gate_end, end), prio, False)
+                if end > max(gate_end, ready):   # from the gate's passing to its start: a slot wait
+                    w0 = max(gate_end, ready)
+                    add(lane("worker_slots", "budget.max_parallel_workers", workers), end - w0, prio, w0,
+                        end, workers, queued, known)
+            elif not by_rule(t, d, why, max([base, *[x for x in dones if x is not None]]), end, prio, queued):
+                ready = max([base, *[x for x in dones if x is not None]])
+                add(lane("worker_slots", "budget.max_parallel_workers", workers), max(0.0, end - ready), prio, ready,
+                    end, workers, queued, known)
+        # Re-queue waits: from each task_waiting event (a waiting hand-off) to the task's next run, and
+        # the current one from the last run's end to now while the task still waits.
+        trs = by_task.get(t["id"], [])
+        spans_w = []
+        evs = ev_waits.get(t["id"], [])
+        for k, e in enumerate(evs):
+            w0 = float(e["ts"])
+            nxt = next((float(r["started"]) for r in trs if float(r["started"]) > w0), None)
+            if nxt is None or (k + 1 < len(evs) and float(evs[k + 1]["ts"]) < nxt):
+                continue   # the current wait below, or a later hand-off before the same run
+            ran = next(r for r in trs if float(r["started"]) > w0)
+            spans_w.append((w0, nxt, _wait_for(t, e), False, _self_wait(e), _ready_since(ran)))
+        lr = last_run.get(t["id"])
+        if lr and not lr["live"] and lr["ended"] and t["status"] in ("queued", "blocked", "waiting"):
+            # Its hand-off is the last event after its last run started, when there is one. Still queued with
+            # its retry timer passed after the run (a probe that passed sets it to then): ready since that timer.
+            mine = bool(evs and trs and float(evs[-1]["ts"]) >= float(trs[-1]["started"]) and _self_wait(evs[-1]))
+            nb = float(t.get("not_before") or 0)
+            ready_now = nb if t["status"] == "queued" and float(lr["ended"]) < nb <= now else None
+            spans_w.append((float(lr["ended"]), now, why, True, mine, ready_now))
+        for s0, s1, reason, queued, selfw, ready in spans_w:
+            if s1 <= t0 or s1 < s0:
+                continue
+            key = slot_held(t["id"], s0, s1)
+            ck = "other full checks" in reason or "ttp checks: waiting" in reason or key is not None
+            cut = slot_granted(t["id"], s0, s1) if ck else None
+            if cut is not None and s1 - cut <= (p1_s if prio <= 1 else other_s):
+                cut = None   # a short tail (its checks run, then its next run) is not worth a wait of its own
+            segs = [(s0, s1, ck)] if cut is None else [(s0, cut, True), (cut, s1, False)]
+            for a, b in slot_ran.get(t["id"], ()):   # its own earlier run inside a slot wait: no wait
+                segs = [x for w0, w1, h in segs for x in
+                        ([(w0, w1, h)] if not h or b <= w0 or a >= w1 else
+                         [(w0, max(w0, a), h), (max(w0, a), min(w1, b), "ran"), (min(w1, b), w1, h)])
+                        if x[1] - x[0] > SLOT_ROUND_S]   # a sliver from the record's rounding is no wait
+            for w0, w1, held_ck in segs:
+                if w1 <= t0:
+                    continue
+                if held_ck == "ran":
+                    lane("own_job", None, None)["note"] = "the task's own detached job or checks ran: no limit"
+                    add(lanes["own_job"], w1 - w0, prio, w0, w1, None, queued)
+                elif held_ck:
+                    # Which of the two checks limits held it: a checks_slot_wait event or checkcap record
+                    # names the limit; a reason text alone means the legacy default, the project cap. A wait
+                    # the host's gate held (ck_holder counts it) or one about to start charges neither.
+                    key = CAP_KEY if key is None else key
+                    if key in slot_tally:
+                        slot_tally[key] += w1 - w0
+                    ln = lane("checks_slots", CAP_KEY, cap_n)
+                    add(ln, w1 - w0, prio, w0, w1, None, queued)
+                    if w1 - w0 > (p1_s if prio <= 1 else other_s):
+                        state = cap_wait(t["id"], w0, w1) if cap_n else "idle"
+                        ln[state] += bool(cap_n)
+                        held = ln.setdefault("held_by", {"own": 0, HOST_CORES: 0, OTHER_PROJECTS: 0})
+                        if key:
+                            who = ck_holder(t["id"], w0, w1, state)
+                            held[who] += 1
+                            if who == "own" and state != "serialized":   # held at the project's own limits
+                                ln["own_wait_last"] = max(ln.get("own_wait_last", 0.0), w0)
+                elif selfw or "detach" in reason or "ttp checks" in reason or "own job" in reason:
+                    lane("own_job", None, None)["note"] = "the task's own detached job or checks ran: no limit"
+                    add(lanes["own_job"], w1 - w0, prio, w0, w1, None, queued)
+                elif not by_rule(t, d if queued else {}, reason, w0, w1, prio, queued, ready):
+                    # Its own retry condition until the ready check saw it ready (the next run's ready_wait,
+                    # or the timer of a task still queued), then a slot: only that queue time is judged
+                    # against the worker slots. With no ready record the two are not told apart, and none of
+                    # it counts against capacity.
+                    rl = _retry_lane()
+                    cut = min(max(ready, w0), w1) if ready is not None else None
+                    if cut is None:
+                        rl["unknown"] += 1
+                    if (cut if cut is not None else w1) > w0:
+                        add(rl, (cut if cut is not None else w1) - w0, prio, w0, cut if cut is not None else w1, None,
+                            queued and cut is None)
+                    if cut is not None and w1 > cut:
+                        add(lane("worker_slots", "budget.max_parallel_workers", workers), w1 - cut, prio, cut, w1,
+                            workers, queued, known)
+    # Reviews: a code task's last run ending to its review queued (sweep) and started (stall). A wait the
+    # checks held is measured but judges neither limit (the swept and free lists plan() reads).
+    sweep_s = float(_cfg(cfg, "review.sweep_after_s", 1800) or 0)
+    per_pass = loadcaps.unreviewed_per_pass(cfg)   # as the daemon reads it: unset is the worker slots, not off
+    stall_s = float(_cfg(cfg, "coordinator.review_stall_s", 14400) or 0)
+    rs, rt = lane("review_sweep", "review.sweep_after_s", sweep_s), lane("review_stall", "coordinator.review_stall_s", stall_s)
+    queued_by = {kind: {int(m.group(1)) for e in db.q("SELECT text FROM events WHERE kind=? AND ts>?", (kind, t0))
+                        if (m := re.search(r"review #(\d+) queued", e["text"] or ""))}
+                 for kind in ("review_swept", "review_unqueued")}
+    swept, backstop = queued_by["review_swept"], queued_by["review_unqueued"]
+    rs["swept"], rs["backstop"], rs["slot_held"], rt["free"], rt["slot_held"] = [], [], 0, [], 0
+    # A code task's hand-off into review: the task_review/task_done event Daemon's finish writes, which
+    # a model-free on_pass may write long after its last run ended (its own checks ran in between).
+    handoff: dict[int, list[float]] = {}
+    for e in db.q("SELECT ts, task FROM events WHERE kind IN ('task_review','task_done') AND task IS NOT NULL "
+                  "AND ts>?", (t0 - DAY,)):
+        handoff.setdefault(e["task"], []).append(float(e["ts"]))
+    # Earlier reviews covering a target (a re-review, a push-conflict rebase review): while one was open,
+    # the target was under review, so a later review's waits start once it ended, not at the target's end.
+    covers: dict[int, list[tuple[float, float, str]]] = {}
+    for r in db.q("SELECT id, parent, labels, depends_on, status, created, updated FROM tasks WHERE kind='review' "
+                  "AND created>? LIMIT ?", (t0 - DAY, ROWS)):
+        for tg in {_reviewed(r), *_deps(r)} - {None}:
+            covers.setdefault(tg, []).append((float(r["created"] or 0), float(r["updated"] or 0), r["status"]))
+    for t in tasks:
+        target = _reviewed(t) if t["kind"] == "review" else None
+        if not target or float(t["created"] or 0) < t0:
+            continue
+        ends = [e for e in last_end.get(target, []) if e <= float(t["created"])]
+        if not ends:
+            continue
+        # The finish queues the review just before it writes the hand-off event (milliseconds apart).
+        done = min(max(ends + [h for h in handoff.get(target, ()) if h <= float(t["created"]) + 60]), float(t["created"]))
+        c = float(t["created"])
+        for c0, up, st in covers.get(target, ()):
+            if c0 < c:   # open at this one's creation: it covered the whole span
+                done = max(done, min(up if st in ("done", "failed", "cancelled") else c, c))
+        prio = int(t["priority"] or 3)
+        add(rs, float(t["created"]) - done, prio, done, float(t["created"]), None, False)
+        if slot_held(target, done, float(t["created"])):
+            rs["slot_held"] += 1
+        elif t["id"] in swept:
+            rs["swept"].append(float(t["created"]) - done)
+        elif t["id"] in backstop:
+            rs["backstop"].append(float(t["created"]) - done)
+        start = first.get(t["id"])
+        w1 = start if start is not None else now
+        add(rt, w1 - done, prio, done, w1, None, start is None)
+        if slot_held(target, done, w1, precheck_hold(t)):
+            rt["slot_held"] += 1
+        else:
+            rt["free"].append(w1 - done)
+    backlog = db.one("SELECT COUNT(*) n FROM tasks t WHERE t.status='review' AND t.kind!='review' AND NOT EXISTS "
+                     "(SELECT 1 FROM tasks r WHERE r.kind='review' AND (r.parent=t.id OR r.labels LIKE '%\"auto_review:'||t.id||'\"%') "
+                     "AND r.status IN "
+                     "('queued','running','waiting','blocked'))")["n"]
+    rs["backlog"], rs["per_pass"] = backlog, per_pass
+    # Push queue: approval to its batch's start.
+    push_s = float(_cfg(cfg, "delivery.push_batch_s", 300) or 0)
+    pb = lane("push_batch", "delivery.push_batch_s", push_s)
+    from .pushq import CLEAN_OUTCOMES
+    batches = db.q("SELECT id, marker, target, started, ended, outcome FROM push_batches WHERE ended IS NULL OR ended>?",
+                   (t0 - DAY,))
+    pb["window"], pb["failed"], bad = [], [], {}
+    for r in db.q("SELECT q.created c, q.batch b, b.started s FROM push_queue q LEFT JOIN push_batches b ON b.id=q.batch "
+                  "WHERE q.created>? LIMIT ?", (t0, ROWS)):
+        c, s1 = float(r["c"]), float(r["s"] or now)
+        add(pb, max(0.0, s1 - c), 3, c, s1, None, r["s"] is None)
+        # Held by the window alone: about the window long, with no other batch running meanwhile.
+        if s1 - c <= 1.25 * push_s + 60 and not any(b["id"] != r["b"] and float(b["started"]) < s1
+                                                    and float(b["ended"] or now) > c for b in batches):
+            pb["window"].append(s1 - c)
+        # Held by batches that did not end clean (an unreachable remote, a failing tip, a reboot): each
+        # sends its rows back, and the next one waits delivery.push_min_gap_s, so no window helps them.
+        hit = [b for b in batches if b["id"] != r["b"] and b["ended"] and b["outcome"]
+               and b["outcome"] not in CLEAN_OUTCOMES and float(b["started"]) < s1 and float(b["ended"]) > c]
+        if hit:
+            pb["failed"].append(s1 - c)
+            bad.update({b["id"]: b for b in hit})
+    # What one check run of a batch costs (the last week's finished batches): a push check suite over the
+    # smoke limit holds every queued row for a full run (and more when a batch re-checks a candidate).
+    cr = db.one("SELECT SUM(check_s) s, SUM(check_runs) n FROM push_batches WHERE started>? AND check_runs>0 "
+                "AND check_s>0", (now - 7 * DAY,))
+    if cr and cr["n"]:
+        pb["check_run_s"], pb["check_runs"] = round(float(cr["s"]) / int(cr["n"])), int(cr["n"])
+    if bad:
+        pb["failed_batches"] = len(bad)
+        pb["failed_outcomes"] = {o: sum(1 for b in bad.values() if b["outcome"] == o)
+                                 for o in sorted({b["outcome"] for b in bad.values()})}
+        last = max(bad.values(), key=lambda b: float(b["started"]))
+        pb["failed_last"] = {"id": last["id"], "outcome": last["outcome"], "target": last["target"],
+                             "message": _batch_message(last["marker"])}
+    # The lane's limit is whichever of the two checks limits held more of its wait time (its
+    # checks_slot_wait events name the holder; a logged wait with no event defaults to the
+    # per-repository lane limit; a wait known only from its reason text, the project cap).
+    # Both limits are read through checklane, never second-guessed here.
+    slot_key = max(slot_tally, key=slot_tally.get) if any(slot_tally.values()) else CAP_KEY
+    ck_lane = lane("checks_slots", slot_key, cap_n if slot_key == CAP_KEY else lanes_n)
+    if ck_lane["limit_key"] != slot_key:  # lane() keeps the first key it was created with
+        ck_lane["limit_key"], ck_lane["limit"] = slot_key, (cap_n if slot_key == CAP_KEY else lanes_n)
+    ck_lane["limits"] = {SLOTS_KEY: lanes_n, CAP_KEY: cap_n}
+    ck_lane.setdefault(
+        "note", "a wait was held by the per-repository lane limit (checks.slots) or the project cap "
+                "(checks.test_project_max), whichever held more of this lane's wait time; both are "
+                "project settings (config_set checks.slots / checks.test_project_max): raise the one "
+                "that held it, or find what else runs on its lanes; at_limit counts only waits queued for a "
+                "checks slot while the project's recorded checks runs were at the cap in force then; "
+                "serialized, waits behind runs that went one at a time back to back (the queue, not the cap)")
+    # Waits the host held, not the project's own limits (ck_holder): with none at the project's own limit,
+    # the lane names that holder instead of a checks setting, and plan() proposes no raise.
+    held = ck_lane.get("held_by") or {}
+    host = {k: held.get(k, 0) for k in HOLDERS if held.get(k)}
+    if host and not ck_lane["at_limit"] and not held.get("own"):
+        who = max(host, key=lambda k: (host[k], k == OTHER_PROJECTS))
+        ck_lane.update(holder=who, held_text=HOLDERS[who], limit_key=None, limit=None, note=HELD_NOTE[who] + "".join(
+            f"; {n} wait(s) {HELD_NOTE[k].split(':')[0]}" for k, n in host.items()))
+    elif host:
+        ck_lane["note"] += "".join(f"; {n} wait(s) {HELD_NOTE[k].split(':')[0]}, not by the project's limits"
+                                   for k, n in host.items())
+    # With checks.slots unset its lanes are what the host's load and memory fit (checklane.capacity): the
+    # host's load held such a wait, and raising checks.slots is no fix the lane names.
+    if ck_lane["limit_key"] == SLOTS_KEY and not ck_lane.get("holder") and ck_lane["waits"] \
+            and lanes_n is not None and checklane._explicit_slots(cfg) is None:
+        ck_lane.update(holder=HOST_CORES, held_text=HOLDERS[HOST_CORES], limit_key=None, limit=None,
+                       note=HELD_NOTE[HOST_CORES] + "; checks.slots is unset, so the host's load sized its lanes")
+    # A set test-worker budget (checks.test_project_slots: the project's, the account's or its environment
+    # variable) that admits fewer full runs at once than both checks limits holds the lane instead: each
+    # full run starts with at least checks.test_run_min workers (testslots.run_min), so raising
+    # checks.slots or checks.test_project_max changes nothing. Reported, never raised here.
+    if ck_lane["waits"] and not ck_lane.get("holder") and lanes_n and cap_n:
+        try:
+            from . import testslots
+            env, key = testslots.TESTS.setting(testslots.TESTS.budget)
+            s = testslots.sizes(cfg)
+            set_ = testslots._number(_cfg(cfg, f"checks.{key}", None)) or testslots._setting(env, key)
+            budget = testslots.project_max(cfg, s) if s and set_ else 0
+            fits = budget // testslots.run_min(cfg, s[1]) if budget else 0
+            src = testslots.project_max_from(cfg, s) if budget else ""
+        except Exception:
+            budget = fits = 0
+        if budget and fits < min(lanes_n, cap_n):
+            # Name the setting that binds (testslots.project_max_from): a raise of any other changes nothing.
+            mine = testslots._number(_cfg(cfg, f"checks.{key}", None))
+            fix = {
+                "account": (f", the account's setting{f': its own {mine} only lowers it' if mine else ''}",
+                            f"raise or unset the account's (ttp config --account checks.{key}; it holds every "
+                            "project on this host; unset, it follows the host's spare cores)"),
+                "env": (f", set by {env}", f"raise or unset {env} in the daemon's environment"),
+                "workers": (f", held by the host's per-project worker ceiling {budget}",
+                            "the per-project worker ceiling follows the host's load (checks.test_project_workers "
+                            f"only lowers it): raising checks.{key} changes nothing; cut the host's other load"),
+                "pool": (f", held by the host's test pool {s[0]}", f"raise checks.test_pool, not checks.{key}"),
+            }.get(src, ("", f"raise or unset checks.{key} (unset, it follows the host's spare cores)"))
+            ck_lane.update(limit_key=f"checks.{key}", limit=budget, budget_runs=max(1, fits), budget_from=src)
+            ck_lane["limits"][f"checks.{key}"] = budget
+            ck_lane["note"] = (
+                f"the project's test-worker budget (checks.{key} {budget}{fix[0]}) admits only {max(1, fits)} "
+                f"full run(s) at once (each starts with at least checks.test_run_min "
+                f"{testslots.run_min(cfg, s[1])} workers), fewer than checks.slots {lanes_n} and "
+                f"checks.test_project_max {cap_n}: it holds the lane, so raising those changes nothing; "
+                f"{fix[1]}; " + ck_lane["note"])
+    peak = _peak(spans, t0, now)
+    out = []
+    for ln in lanes.values():
+        w, p1 = ln.pop("waits"), ln.pop("p1")
+        for k in ("swept", "backstop", "window", "free", "failed"):
+            if k in ln:
+                v = ln.pop(k)
+                ln.update({f"{k}_count": len(v), f"{k}_p90_s": round(_pct(v, 0.9))})
+        ln.update(count=len(w), median_s=round(_pct(w, 0.5)), p90_s=round(_pct(w, 0.9)),
+                  p1_count=len(p1), p1_p90_s=round(_pct(p1, 0.9)))
+        ln["slow"] = bool(ln["measured"] and ln["kind"] == "eligible"
+                          and ((p1 and _pct(p1, 0.9) > p1_s) or (w and _pct(w, 0.9) > other_s)))
+        if ln["lane"] == "worker_slots":
+            ln["peak"] = peak
+            if gate and int(gate.get("max_parallel") or workers) < workers:
+                ln["gate_max"] = int(gate.get("max_parallel"))
+        out.append(ln)
+    out.sort(key=lambda x: (not x["slow"], -x["p90_s"]))
+    return {"ts": now, "since_s": since_s, "thresholds_s": {"p1": p1_s, "other": round(other_s)}, "lanes": out,
+            "gate": {k: gate.get(k) for k in ("level", "allow_new_work", "max_parallel")} if gate else {}}
+
+
+def cpu_free() -> tuple[bool, str]:
+    """(CPU free, why not): the host's measured CPU demand (checkcap.cpu_demand: busy cores from /proc/stat
+    or macOS's CPU ticks, the 1-minute load only where those cannot be read) under CPU_FREE of its cores,
+    and its memory not short (hostcpu.mem_short). The load average alone counts tasks waiting on I/O, so a
+    mostly idle host read high by it."""
+    from . import checkcap, hostcpu
+    if mem := hostcpu.mem_short():
+        return False, f"the host is {mem}"
+    d, cores = checkcap.cpu_demand(), checkcap.cores()
+    if d != d or d == float("inf"):
+        return True, ""
+    if d >= CPU_FREE * cores:
+        return False, f"host CPU demand {d:.1f} cores on {cores} cores leaves no CPU free"
+    return True, ""
+
+
+def headroom(db: DB, cfg: dict, report: dict) -> tuple[bool, str]:
+    """(may raise, why not): the provider gate allows new work and the provider is not paused. A paused
+    resource is no reason here: it holds only its own lanes (plan()) and its tasks' waits (the hold lane)."""
+    g = report.get("gate") or {}
+    if g and (g.get("level") == "red" or g.get("allow_new_work") is False):
+        return False, f"the provider gate is {g.get('level')} (spend or plan window): never raised here"
+    lim = db.kv(f"limited:{cfg.get('core_provider', 'claude')}") or {}
+    if isinstance(lim, dict) and float(lim.get("until") or 0) > time.time():
+        return False, "the provider is paused"
+    return True, ""
+
+
+def plan(db: DB, cfg: dict, report: dict) -> tuple[list[dict], list[dict]]:
+    """(changes [{key, old, new, why}], kept [{lane, key, why, info?}]) for the slow lanes; `info` marks a
+    kept lane reported as information only (no change is ever proposed from it: it opens no task), as is the
+    checks lane the tried-work ledger settled in the last day with no own wait since (_settled)."""
+    ok, why_not = headroom(db, cfg, report)
+    try:
+        paused = set(db.paused_resources())
+    except Exception:   # an unreadable shared or fleet file: no lane of a resource is raised anyway
+        paused = set()
+    changes, kept = [], []
+    th = report["thresholds_s"]
+    for ln in report["lanes"]:
+        if not ln["slow"]:
+            continue
+        key, cur, name = ln.get("limit_key"), ln.get("limit"), ln["lane"]
+        p90 = max(ln["p90_s"], ln["p1_p90_s"])
+        if name == "review_stall":
+            # Never lowered: a sooner alarm starts no review sooner, it only adds coordinator wakes.
+            n, fp90, held = ln.get("free_count", 0), ln.get("free_p90_s", 0), ln.get("slot_held", 0)
+            kept.append({"lane": name, "key": key, "info": True,
+                         "why": f"{n} review wait(s) not held by the checks (p90 {fp90}s), "
+                         f"{held} held by their precheck or a checks slot: information only, no {key} change is "
+                         "proposed from them (a lower stall alarm only adds coordinator wakes)"})
+            continue
+        if ln.get("holder"):
+            # Checks waits the host held, not the project's limits: information only, no raise, no task.
+            kept.append({"lane": name, "key": None, "info": True, "why": ln["note"]})
+            continue
+        if name == "checks_slots" and (why := _settled(db, ln, float(report.get("ts") or time.time()))):
+            kept.append({"lane": name, "key": key, "info": True, "why": why})
+            continue
+        if name.split(":", 1)[0] in ("resource", "device") and name.split(":", 1)[1] in paused:
+            kept.append({"lane": name, "key": key, "why": f"{name.split(':', 1)[1]} is paused: its lane is not raised"})
+            continue
+        if not key or not safe(key):
+            kept.append({"lane": name, "key": key, "why": ln.get("note") or (
+                f"{name} has no setting this may change: its cause is outside the project's sizing limits"
+                if not key else f"{key} is not a sizing limit this changes: needs a person or a task")})
+            if ln.get("serialized"):
+                kept[-1]["why"] += (f"; {ln['serialized']} wait(s) serialized: runs went one at a time back to "
+                                    "back, so the queue held them, not the cap")
+            continue
+        if not ok and name != "review_sweep":
+            kept.append({"lane": name, "key": key, "why": why_not})
+            continue
+        if name == "worker_slots":
+            if ln.get("gate_max"):
+                kept.append({"lane": name, "key": key, "why": f"the provider gate holds parallel work at "
+                             f"{ln['gate_max']} (spend or plan window), below {cur}: never raised here"})
+            elif not ln["at_limit"] and (ln.get("raised") or ln["idle"]):
+                # Idle waits outnumbering the ones a raise was for lead: they name the real cause.
+                rb, idle = ln.get("raised_by") or {}, ln["idle"]
+                who = f"throughput #{rb.get('id')}" if rb.get("id") is not None else "a config change"
+                raised = (f"{ln['raised']} wait(s) met all {rb.get('old')} slots before {who} "
+                          f"raised {key} to {rb.get('new')}; none met the {cur} now" if ln.get("raised") else "")
+                stalled = (f"; {ln['stalled']} of them while no run started for {STALL_GAP_S // 60}+ min (a "
+                           "stopped daemon, a stalled dispatch tick or a spend gate)" if ln.get("stalled") else "")
+                why = (f"slots sat idle while work waited ({idle} waits{stalled}): the cause is not the slot count"
+                       + (f"; {raised}" if raised else "") if idle > ln.get("raised", 0)
+                       else f"{raised}: the raise is in force, measure again once the window runs under it"
+                       + (f"; {idle} wait(s) found slots idle" if idle else ""))
+                kept.append({"lane": name, "key": key, "why": why})
+            elif not ln["at_limit"]:
+                # No wait over threshold met every slot (none, or each one's cap or eligibility unknown):
+                # nothing shows the slot count held work back.
+                kept.append({"lane": name, "key": key, "why": "no wait over threshold met every slot"
+                             + (f" ({ln['unknown']} with the cap then in force or the task's eligibility not on "
+                                "record)" if ln.get("unknown") else "") + ": the slot count is not shown to be the cause"})
+            elif not (cpu := cpu_free())[0]:
+                kept.append({"lane": name, "key": key, "why": cpu[1]})
+            else:
+                new = load_size(cur, max(ln["at_limit"], ln["waiting_now"]), max(cur, (os.cpu_count() or 2) // 2))
+                if new > cur:
+                    changes.append({"key": key, "old": cur, "new": new, "why": f"{ln['at_limit']} wait(s) over threshold "
+                                    f"while all {cur} slots ran (peak {ln.get('peak')}), p90 {p90}s"})
+                else:
+                    kept.append({"lane": name, "key": key, "why": f"already at the host's share of cores ({cur})"})
+        elif name == "review_sweep":
+            # Its diagnosis stands whatever the provider gate; only a change it proposes waits on the gate.
+            mine, per = [], ln.get("per_pass") or 0
+            if per and ln.get("backlog", 0) > per:
+                new = load_size(per, ln["backlog"] - per, ln["backlog"])
+                mine.append({"key": "review.unreviewed_per_pass", "old": per, "new": new,
+                             "why": f"{ln['backlog']} task(s) in review without one, {per} per pass; p90 {p90}s"})
+            n, sp90 = ln.get("swept_count", 0), ln.get("swept_p90_s", 0)
+            b, bp90 = ln.get("backstop_count", 0), ln.get("backstop_p90_s", 0)
+            why = ""
+            if cur and cur > FLOORS[key] and n and sp90 > cur:
+                mine.append({"key": key, "old": int(cur), "new": int(max(FLOORS[key], cur // 2)),
+                             "why": f"{n} review(s) the sweep queued, p90 {sp90}s after the work ended, "
+                                    f"sweep every {int(cur)}s"})
+            else:
+                held = ln.get("slot_held", 0)
+                why = (f"{ln['count'] - n - held - b} of {ln['count']} review(s) were queued at finish, not by the "
+                       f"sweep, and {held} held by the checks ({n} swept, p90 {sp90}s): {key} did not hold them"
+                       if cur and cur > FLOORS[key] else f"{key} is at its floor")
+                if b:
+                    why += (f"; {b} queued late by the unreviewed backstop (p90 {bp90}s): their finish queued no "
+                            "review (its git read timed out or the review cap was full) and sweep_unreviewed found "
+                            "them later: see the daemon log's 'no review queued' and 'tick step sweep_unreviewed "
+                            "stopped at its budget' lines")
+            if mine and not ok:
+                why = f"{why}; {why_not}" if why else why_not
+            else:
+                changes += mine
+            if why:
+                kept.append({"lane": name, "key": key, "why": why})
+        elif name == "push_batch":
+            n, wp90 = ln.get("window_count", 0), ln.get("window_p90_s", 0)
+            target = max(FLOORS[key], int(cur // 2))
+            nf, total = ln.get("failed_count", 0), ln.get("count", 0)
+            if cur and int(cur) > target and n and wp90 > th["other"]:
+                changes.append({"key": key, "old": int(cur), "new": target, "why": f"{n} row(s) held by the {int(cur)}s "
+                                f"window alone, p90 {wp90}s over threshold"})
+            elif nf and 2 * nf >= total:
+                # Batches that ended unclean held them: their own events and alarms own the cause, so the
+                # lane is reported, never handed to a throughput task (no setting here would move it).
+                from .pushq import DEFAULT_MIN_GAP_S
+                gap = int(float(_cfg(cfg, "delivery.push_min_gap_s", DEFAULT_MIN_GAP_S) or 0))
+                last = ln.get("failed_last") or {}
+                outs = ", ".join(f"{o} {k}" for o, k in (ln.get("failed_outcomes") or {}).items())
+                why = (f"{nf} of {total} row(s) waited through {ln.get('failed_batches', 0)} push batch(es) that did "
+                       f"not end clean ({outs}); each sent its rows back and the next waited delivery.push_min_gap_s "
+                       f"({gap}s): the failing batches held them, not {key}")
+                if last:
+                    why += f"; the last, {last.get('id')} on {last.get('target')}: {last.get('outcome')}"
+                    why += f" ({last['message']})" if last.get("message") else ""
+                    if re.search(r"cannot reach|could not resolve|connection (timed out|refused)|unable to access",
+                                 last.get("message") or "", re.I):
+                        why += (f"; its target's remote cannot be reached: point delivery.push_branch at a "
+                                f"reachable remote or restore the route to it")
+                kept.append({"lane": name, "key": key, "info": True, "holder": "failed_batches", "why": why})
+            else:
+                why = (f"{ln['count'] - n} of {ln['count']} row(s) waited behind a running batch or its checks; {n} "
+                       f"held by the {int(cur)}s window alone (p90 {wp90}s): a shorter window only means more "
+                       f"batches, each a full check run")
+                run_s, lim = ln.get("check_run_s") or 0, gatetime.max_s(cfg)
+                if lim and run_s > lim:
+                    # The project's own push checks hold the queue: they are its choice (gatetime flags
+                    # them), so the lane is reported with that lever, never handed to a throughput task.
+                    kept.append({"lane": name, "key": key, "info": True, "holder": "push_checks", "why": (
+                        f"{why}; each batch check run takes {run_s // 60} min ({ln.get('check_runs')} run(s) in "
+                        f"7 d), over the {int(lim) // 60} min smoke limit (checks.smoke_max_s): the push checks "
+                        f"hold the queue, not {key}: {gatetime.split_advice(short=True)}")})
+                else:
+                    kept.append({"lane": name, "key": key, "why": why})
+    return [c for c in changes if safe(c["key"])], kept
+
+
+def apply(p, cfg: dict, report: dict, trigger: str = "", now: float | None = None) -> tuple[list[dict], list[dict]]:
+    """Make plan()'s changes through Project.set_config and record each in KV; (changes, kept)."""
+    from .coordinator import settable
+    now = time.time() if now is None else now
+    changes, kept = plan(p.db, cfg, report)
+    # A worker raise in force stays: spend_workers() sizes spend limits from its old value.
+    rec = [r for r in (p.db.kv(KV) or []) if isinstance(r, dict) and (now - float(r.get("ts") or 0) < KEEP_S or (
+        r.get("key") == "budget.max_parallel_workers" and not r.get("undone")))]
+    nid = max([int(r.get("id") or 0) for r in (p.db.kv(KV) or []) if isinstance(r, dict)] + [0]) + 1
+    done = []
+    for c in changes:
+        try:
+            val = settable(c["key"])(c["new"])
+            p.set_config(c["key"], val, by={"by": "harness", "via": "throughput"})
+        except Exception as e:
+            kept.append({"lane": c["key"], "key": c["key"], "why": f"could not set: {e}"[:200]})
+            continue
+        c.update(id=nid, ts=now, new=val, trigger=trigger, undone=False, undo=f"ttp throughput --undo {nid}")
+        rec.append(c)
+        done.append(c)
+        nid += 1
+    p.db.set_kv(KV, rec)
+    return done, kept
+
+
+def undo(p, cid: int) -> str:
+    """Set change `cid`'s key back to its old value, unless something else changed it since."""
+    rec = p.db.kv(KV) or []
+    c = next((r for r in rec if isinstance(r, dict) and int(r.get("id") or 0) == cid), None)
+    if not c:
+        return f"no throughput change #{cid}"
+    if c.get("undone"):
+        return f"#{cid} was already undone"
+    if not safe(c["key"]):
+        return f"#{cid}: {c['key']} is not a throughput lever"
+    cur = _cfg(p.config(), c["key"], None)
+    if cur != c["new"]:
+        return f"#{cid}: {c['key']} is {cur!r} now, not {c['new']!r}: left as it is"
+    p.set_config(c["key"], c["old"], by={"by": "harness", "via": f"throughput undo #{cid}"})
+    c["undone"] = time.time()
+    p.db.set_kv(KV, rec)
+    return f"#{cid}: {c['key']} back to {c['old']!r}"
+
+
+def recent(db: DB, now: float | None = None, within: float = DAY) -> list[dict]:
+    now = time.time() if now is None else now
+    return [r for r in db.kv(KV) or [] if isinstance(r, dict) and now - float(r.get("ts") or 0) < within]
+
+
+def review(p, cfg: dict, since_s: float = DAY, do_apply: bool = False, trigger: str = "",
+           gates: dict | None = None, now: float | None = None) -> dict:
+    """measure(), then apply() when asked; kept as LAST_KV. Changes of the last day are listed too."""
+    now = time.time() if now is None else now
+    rep = measure(p.db, cfg, since_s, now, gates)
+    rep["host_checks"] = host_shares(since_s, now)
+    rep["replace_gap"] = replacegap.summary(p.db, since_s, now)
+    earlier = recent(p.db, now)
+    if do_apply:
+        rep["changes"], rep["kept"] = apply(p, cfg, rep, trigger, now)
+    else:
+        rep["would_change"], rep["kept"] = plan(p.db, cfg, rep)
+        rep["changes"] = []
+    rep["earlier_changes"] = earlier
+    rep["trigger"] = trigger
+    p.db.set_kv(LAST_KV, {k: rep[k] for k in ("ts", "trigger", "changes", "kept", "earlier_changes")}
+                | {"slow": [ln["lane"] for ln in rep["lanes"] if ln["slow"]]})
+    return rep
+
+
+def host_shares(since_s: float = DAY, now: float | None = None) -> dict:
+    """The host-wide checks pool per project over the window: {"cap", "share", "projects": {name: {"grants",
+    "running", "wait_s", "over_share_waits", "over_share_by"}}}. Grants and waits come from the host grants
+    log (checkcap.grant_records), running ones from the slots held now; over_share_waits counts the grants
+    whose wait ended while another project held more than its fair share of the cap (checkcap.over_share),
+    over_share_by names those projects. {} when it cannot be read or nothing ran."""
+    now = time.time() if now is None else now
+    try:
+        from . import checkcap, locks
+        cap, rows, run = checkcap.limit(), checkcap.grant_records(now, since_s), checkcap.running_by_project()
+        waiting = {locks.ticket_group(t) for t in locks.queued(checkcap.slot_dir(), checkcap.RESOURCE)}
+    except Exception:
+        return {}
+    projects: dict[str, dict] = {}
+    for name in run:
+        projects.setdefault(name, {"grants": 0, "running": 0, "wait_s": 0.0, "over_share_waits": 0,
+                                   "over_share_by": []})["running"] = run[name]
+    for r in rows:
+        x = projects.setdefault(str(r.get("project") or ""), {"grants": 0, "running": 0, "wait_s": 0.0,
+                                                              "over_share_waits": 0, "over_share_by": []})
+        x["grants"] += 1
+        x["wait_s"] += _grant_wait(r)
+        if by := [str(b) for b in r.get("over_share") or () if isinstance(b, str)]:
+            x["over_share_waits"] += 1
+            x["over_share_by"] = sorted(set(x["over_share_by"]) | set(by))
+    if not projects:
+        return {}
+    for x in projects.values():
+        x["wait_s"] = round(x["wait_s"])
+    k = len({locks.group_id(n) for n, c in run.items() if c} | waiting)
+    return {"cap": cap, "share": locks.share_of(cap, k) if cap else None, "projects": projects}
+
+
+def _grant_wait(r: dict) -> float:
+    """A host grant row's slot wait: its "waited_s" (checkcap.record_grant, from wait_start: a relaunch's or
+    spill rerun's earlier run is no wait), else, for a row logged without it, arrival to grant."""
+    w = r.get("waited_s")
+    if isinstance(w, (int, float)) and not isinstance(w, bool) and w >= 0:
+        return float(w)
+    return max(0.0, float(r["ts"]) - float(r["since"]))
+
+
+def text(rep: dict) -> str:
+    """The review as plain lines (`ttp throughput`, the coordinator's wake, the daily review)."""
+    th = rep["thresholds_s"]
+    out = [f"Throughput over the last {_dur(rep['since_s'])} (slow: p90 over {_dur(th['p1'])} for priority 1, "
+           f"{_dur(th['other'])} otherwise):"]
+    for ln in rep["lanes"]:
+        if not ln["count"] and not ln["measured"]:
+            out.append(f"- {ln['lane']}: limit {ln['limit_key']}={ln['limit']}; {ln.get('note', '')}")
+            continue
+        if not ln["count"]:
+            continue
+        extra = "".join(f", {k} {ln[k]}" for k in ("peak", "gate_max", "backlog", "stalled") if ln.get(k) is not None) \
+            + (f", {ln['raised']} at the limit before " + (f"raise #{ln['raised_by']['id']}"
+               if ln["raised_by"].get("id") is not None else "a config raise") if ln.get("raised") else "")
+        kind = {"blocked": " (blocked: could not start)", "execution": " (its own job ran)"}.get(ln.get("kind"), "")
+        if ln.get("kind") == "blocked" and ln.get("unknown"):
+            kind = f" (blocked; {ln['unknown']} with no ready record: capacity unknown)"
+        out.append(f"- {ln['lane']}{kind}{' SLOW' if ln['slow'] else ''}: {ln['count']} wait(s), median {_dur(ln['median_s'])}, "
+                   f"p90 {_dur(ln['p90_s'])}" + (f" (priority 1: {ln['p1_count']}, p90 {_dur(ln['p1_p90_s'])})"
+                                                 if ln["p1_count"] else "")
+                   + (f"; limit {ln['limit_key']}={ln['limit']}" if ln.get("limit_key")
+                      else f"; held by {ln['held_text']}, not a project limit" if ln.get("held_text") else "; no limit")
+                   + (f"; waits over threshold: {ln['at_limit']} at the limit, {ln['idle']} with capacity idle"
+                      + (f", {ln['unknown']} with capacity unknown" if ln.get("unknown") else "")
+                      if ln["at_limit"] or ln["idle"] or ln["lane"] == "worker_slots" else "")
+                   + (f", serialized {ln['serialized']}" if ln.get("serialized") else "")
+                   + (f", {ln['waiting_now']} waiting now" if ln["waiting_now"] else "") + extra)
+    if hc := rep.get("host_checks"):
+        cap = (f"cap {hc['cap']}, fair share {hc['share']} each now" if hc.get("cap") else "no cap")
+        out.append(f"Host checks pool ({cap}), per project:")
+        for name, x in sorted(hc["projects"].items(), key=lambda kv: -kv[1]["wait_s"]):
+            out.append(f"- {name or 'no project'}: {x['grants']} grant(s), {x['running']} running, waited "
+                       f"{_dur(x['wait_s'])}" + (f"; {x['over_share_waits']} wait(s) ended while "
+                                                 f"{', '.join(x['over_share_by'])} held over its fair share"
+                                                 if x["over_share_waits"] else ""))
+    if (rg := rep.get("replace_gap")) and rg.get("count"):
+        out.append(f"Lost runners: {rg['count']} in the window; a task waited median {_dur(rg['median_s'])}, p90 "
+                   f"{_dur(rg['p90_s'])} for its replacement run (target {_dur(rg['target_s'])}), "
+                   f"{rg['over_target']} over the target" + (f", {rg['open']} still without a next run" if rg["open"] else "")
+                   + (" SLOW" if rg["p90_s"] > rg["target_s"] else ""))
+    for c in rep.get("changes") or []:
+        out.append(f"Changed #{c['id']}: {c['key']} {c['old']} -> {c['new']} ({c['why']}); undo: {c['undo']}")
+    for c in rep.get("would_change") or []:
+        out.append(f"Would change: {c['key']} {c['old']} -> {c['new']} ({c['why']}); run with --apply")
+    for k in rep.get("kept") or []:
+        out.append(f"Not changed: {k['lane']} ({k['key'] or 'no setting'}): {k['why']}")
+    for c in rep.get("earlier_changes") or []:
+        out.append(f"Earlier (last 24 h) #{c.get('id')}: {c.get('key')} {c.get('old')} -> {c.get('new')}"
+                   + (" (undone)" if c.get("undone") else "") + f"; undo: {c.get('undo')}")
+    if not any(ln["slow"] for ln in rep["lanes"]):
+        out.append("No lane is slow.")
+    return "\n".join(out)
+
+
+def status_line(db: DB, now: float | None = None) -> str:
+    """One `ttp status` line for the throughput changes of the last day, or ''."""
+    rec = [r for r in recent(db, now) if not r.get("undone")]
+    if not rec:
+        return ""
+    return "throughput: " + "; ".join(f"#{r['id']} {r['key']} {r['old']}->{r['new']} (undo: {r['undo']})"
+                                      for r in rec[-4:])

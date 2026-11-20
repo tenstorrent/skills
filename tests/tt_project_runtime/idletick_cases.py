@@ -1,0 +1,797 @@
+from __future__ import annotations
+
+
+def _git_spy(monkeypatch):
+    """Count the git processes started through subprocess.run, by their verb."""
+    import collections
+    seen = collections.Counter()
+    real = subprocess.run
+
+    def run(args, *a, **k):
+        if isinstance(args, (list, tuple)) and args and args[0] == "git":
+            rest = [x for x in args[1:] if not str(x).startswith("-C")]
+            rest = rest[1:] if args[1:2] == ["-C"] else rest
+            seen[" ".join(map(str, rest[:2]))] += 1
+        return real(args, *a, **k)
+    monkeypatch.setattr(subprocess, "run", run)
+    return seen
+
+
+def _ancestry_line(tmp_path, n):
+    repo = tmp_path / "line"
+    repo.mkdir()
+    _git_out(repo, "init", "-q", "-b", "main")
+    return repo, [_commit_file_in(repo, f"c{i}.txt") for i in range(n)]
+
+
+def test_landed_ancestry_of_several_shas_against_one_tip_costs_one_git_call_then_none(env, tmp_path, monkeypatch):
+    from ttp import gitcache, landed
+    repo, shas = _ancestry_line(tmp_path, 5)
+    tip = shas[-1]
+    _git_out(repo, "checkout", "-q", "-b", "side", shas[1])
+    side = _commit_file_in(repo, "side.txt")
+    _git_out(repo, "checkout", "-q", "main")
+    for s in (*shas, side):
+        assert landed._commit(repo, s) == s
+    seen = _git_spy(monkeypatch)
+    assert gitcache.ancestors(repo, [*shas, side], tip) == {**{s: True for s in shas}, side: False}
+    assert sum(seen.values()) == 1 and seen["rev-list --max-count=100000"] == 1
+    seen.clear()
+    # The same shas again, as landed's own is-ancestor reads and whole on_branch answers: no git at all.
+    assert [landed._git(repo, "merge-base", "--is-ancestor", s, tip).returncode for s in (*shas, side)] == [0] * 5 + [1]
+    assert landed.on_branch(repo, shas[2], tip) and landed.on_branch(repo, shas[2], tip)
+    assert sum(seen.values()) == 0, seen
+    # The tip moves: a fresh answer, read with one rev-list from the old tip's set.
+    _git_out(repo, "merge", "-q", "--no-edit", "--no-ff", "side")
+    new = _git_out(repo, "rev-parse", "HEAD")
+    seen.clear()
+    assert gitcache.ancestors(repo, [side, new, shas[0]], new) == {side: True, new: True, shas[0]: True}
+    assert sum(seen.values()) == 1 and seen["rev-list --boundary"] == 1, seen
+    assert gitcache.ancestors(repo, [side], tip) == {side: False}   # the old tip's answer is unchanged
+
+
+def test_landed_ancestry_of_an_abbreviated_or_missing_commit_still_asks_git(env, tmp_path, monkeypatch):
+    from ttp import landed
+    repo, shas = _ancestry_line(tmp_path, 2)
+    seen = _git_spy(monkeypatch)
+    missing = "0" * 40
+    assert landed._git(repo, "merge-base", "--is-ancestor", missing, shas[1]).returncode not in (0, 1)
+    assert landed._git(repo, "merge-base", "--is-ancestor", shas[0][:10], shas[1]).returncode == 0
+    assert seen["merge-base --is-ancestor"] == 2
+
+
+def test_git_remote_reads_are_kept_until_the_repository_config_changes(env, tmp_path, monkeypatch):
+    from ttp import gitcache, push
+    monkeypatch.setattr(gitcache, "RACY_S", -1.0)
+    (tmp_path / "global").write_text("[gc]\n\tauto = 0\n")    # the tests' own global config includes others
+    monkeypatch.setenv("GIT_CONFIG_GLOBAL", str(tmp_path / "global"))
+    repo, _ = _ancestry_line(tmp_path, 1)
+    _git_out(repo, "remote", "add", "origin", str(tmp_path / "a.git"))
+    seen = _git_spy(monkeypatch)
+    for _ in range(3):
+        assert push._git(repo, "remote").stdout.split() == ["origin"]
+        assert push._git(repo, "remote", "get-url", "origin").stdout.strip() == str(tmp_path / "a.git")
+    assert seen["remote"] == 1 and seen["remote get-url"] == 1
+    _git_out(repo, "remote", "add", "other", str(tmp_path / "b.git"))
+    _git_out(repo, "remote", "set-url", "origin", str(tmp_path / "c.git"))
+    assert push._git(repo, "remote").stdout.split() == ["origin", "other"]
+    assert push._git(repo, "remote", "get-url", "origin").stdout.strip() == str(tmp_path / "c.git")
+    assert seen["remote"] == 2 and seen["remote get-url"] == 2
+    # A config that includes another file is never kept: the included file's changes would not show.
+    (repo / ".git" / "config").write_text((repo / ".git" / "config").read_text() + "[include]\n\tpath = extra\n")
+    push._git(repo, "remote")
+    push._git(repo, "remote")
+    assert seen["remote"] == 4
+
+
+def test_an_idle_daemon_tick_reads_unchanged_settings_files_once(env, monkeypatch):
+    import collections
+    from ttp import daemon as dmod, machines, project as projmod, statcache
+    monkeypatch.setattr(statcache, "RACY_S", -1.0)
+    p = make(env)
+    projmod.HOME_DIR.mkdir(parents=True, exist_ok=True)
+    projmod.write_json(projmod.account_settings_path(), {"budget": {"global_daily_usd": 50}})
+    projmod.write_json(machines.path(), {"machines": {"box": {"tags": ["device"]}}})
+    d = dmod.Daemon(p.base)
+    d.tick()
+    reads = collections.Counter()
+    real = pathlib.Path.read_text
+
+    def read_text(self, *a, **k):
+        reads[self.name] += 1
+        return real(self, *a, **k)
+    monkeypatch.setattr(pathlib.Path, "read_text", read_text)
+    for _ in range(3):
+        d._last_cfg = time.time()
+        d.tick()
+    assert not {n: reads[n] for n in ("project.json", "settings.json", "machines.json") if reads[n]}, reads
+    # A change is read at once, and a file that stops parsing reads as before: the default, no crash.
+    projmod.write_json(machines.path(), {"machines": {"box": {"tags": []}, "two": {"tags": []}}})
+    assert sorted(machines.load()) == ["box", "two"]
+    machines.path().write_text("{not json")
+    assert machines.load() == {}
+    projmod.account_settings_path().write_text("[1, 2")
+    assert projmod.load_account_settings() == {}
+
+
+def test_a_json_file_read_from_memory_is_a_private_copy(env, tmp_path, monkeypatch):
+    from ttp import statcache
+    monkeypatch.setattr(statcache, "RACY_S", -1.0)
+    f = tmp_path / "a.json"
+    f.write_text('{"a": {"b": [1]}}')
+    first = statcache.load_json(f)
+    first["a"]["b"].append(2)
+    assert statcache.load_json(f) == {"a": {"b": [1]}}
+
+
+def test_gitcache_git_takes_the_scope_cap_and_a_failed_system_config_lookup_is_not_kept(env, tmp_path, monkeypatch):
+    from ttp import gitcache, gitmemo
+    monkeypatch.delenv("GIT_CONFIG_SYSTEM", raising=False)
+    monkeypatch.delenv("GIT_CONFIG_NOSYSTEM", raising=False)
+    monkeypatch.setattr(gitcache, "_system", [])
+    repo, shas = _ancestry_line(tmp_path, 2)
+    real, timeouts, hang = subprocess.run, [], [True]
+
+    def run(args, *a, **k):
+        if isinstance(args, (list, tuple)) and args[:1] == ["git"]:
+            timeouts.append((args[-1], k.get("timeout")))
+            if hang[0] and "var" in args:
+                raise subprocess.TimeoutExpired(args, k.get("timeout"))
+        return real(args, *a, **k)
+    monkeypatch.setattr(subprocess, "run", run)
+    with gitmemo.bounded(0.5):
+        assert gitcache._system_config() is None          # a hung lookup is not kept as "no system config"
+        assert gitcache._config_stamp(gitcache._dirs(repo)) is None
+        gitcache.ancestors(repo, shas, shas[-1])
+    assert timeouts and all(t is not None and t <= 0.5 for _, t in timeouts), timeouts
+    assert gitcache._system == []
+    hang[0] = False
+    assert gitcache._system_config() and gitcache._system      # asked again, and kept once git answers
+
+
+def _it_picked(tmp_path):
+    """A repo whose main has a cherry-pick of side's commit, plus one more: on_branch(side, main) is
+    True only through git cherry. Returns (repo, side commit, main tip, an unpicked side commit)."""
+    repo, shas = _ancestry_line(tmp_path, 2)
+    _git_out(repo, "checkout", "-q", "-b", "side", shas[0])
+    side = _commit_file_in(repo, "s.txt", "s")
+    _git_out(repo, "checkout", "-q", "-b", "other", shas[0])
+    other = _commit_file_in(repo, "o.txt", "o")
+    _git_out(repo, "checkout", "-q", "main")
+    _git_out(repo, "cherry-pick", side)
+    tip = _commit_file_in(repo, "m.txt", "m")
+    return repo, side, tip, other
+
+
+def _it_failing(monkeypatch, landed, fails):
+    """landed._git with the calls `fails(args)` picks exiting 128, as a read error or signal would."""
+    real = landed._git
+
+    def fake(repo, *args, **k):
+        if fails(args):
+            return subprocess.CompletedProcess(["git", *args], 128, "", "fatal: read error")
+        return real(repo, *args, **k)
+    monkeypatch.setattr(landed, "_git", fake)
+    return real
+
+
+def test_on_branch_a_failed_git_cherry_answers_false_and_is_not_kept(env, tmp_path, monkeypatch):
+    from ttp import landed
+    repo, side, tip, other = _it_picked(tmp_path)
+    real = _it_failing(monkeypatch, landed, lambda a: a[0] == "cherry")
+    assert landed.on_branch(repo, other, tip) is False     # was True: an empty cherry read as "all on tip"
+    assert landed.on_branch(repo, side, tip) is False      # cannot tell
+    monkeypatch.setattr(landed, "_git", real)
+    assert landed.on_branch(repo, side, tip) is True       # asked again once git answers
+    assert landed.on_branch(repo, other, tip) is False
+
+
+def test_on_branch_a_failed_merge_base_or_log_is_asked_again_on_the_next_call(env, tmp_path, monkeypatch):
+    from ttp import gitcache, landed
+    repo, side, _, _ = _it_picked(tmp_path)
+    # A side commit on main only through a replay trailer: its answer needs every log read.
+    _git_out(repo, "checkout", "-q", "side")
+    rep = _commit_file_in(repo, "r.txt", "r")
+    _git_out(repo, "checkout", "-q", "main")
+    (repo / "r2.txt").write_text("other")
+    _git_out(repo, "add", "r2.txt")
+    _git_out(repo, "commit", "-q", "-m", f"replay\n\n{landed.REPLAYED}: {rep}")
+    tip = _git_out(repo, "rev-parse", "HEAD")
+    for sha, fails in ((side, lambda a: a[0] == "merge-base" and a[1] != "--is-ancestor"),
+                       (side, lambda a: a[:2] == ("merge-base", "--is-ancestor")),
+                       (side, lambda a: a[:2] == ("log", "-1")),
+                       (rep, lambda a: a[:2] == ("log", "--no-merges")),
+                       (rep, lambda a: a[:2] == ("log", "--format=%B"))):
+        gitcache.clear()                      # the last round's (good) answer is kept
+        real = _it_failing(monkeypatch, landed, fails)
+        assert landed.on_branch(repo, sha, tip) is False
+        monkeypatch.setattr(landed, "_git", real)
+        assert landed.on_branch(repo, sha, tip) is True
+
+
+def test_gitcache_keeps_nothing_where_history_can_change_under_the_same_ids(env, tmp_path, monkeypatch):
+    from ttp import gitcache, landed
+    repo, shas = _ancestry_line(tmp_path, 3)
+    _git_out(repo, "checkout", "-q", "-b", "side", shas[0])
+    side = _commit_file_in(repo, "side.txt")
+    _git_out(repo, "checkout", "-q", "main")
+    shallow = tmp_path / "shallow"
+    _git_out(tmp_path, "clone", "-q", "--depth", "1", f"file://{repo}", str(shallow))
+    grafts = tmp_path / "grafts"
+    _git_out(tmp_path, "clone", "-q", str(repo), str(grafts))
+    (grafts / ".git" / "info").mkdir(exist_ok=True)
+    (grafts / ".git" / "info" / "grafts").write_text(f"{shas[1]}\n")
+
+    def uncached(r, sha, tip):
+        assert gitcache.is_ancestor(r, sha, tip) is None
+        n = []
+        assert gitcache.fixed(r, "q", sha, tip, lambda: n.append(1) or True) is True
+        assert gitcache.fixed(r, "q", sha, tip, lambda: n.append(1) or True) is True
+        assert len(n) == 2
+        seen = _git_spy(monkeypatch)
+        for _ in range(2):
+            landed._git(r, "rev-parse", "--verify", "--quiet", f"{tip}^{{commit}}")
+            landed._git(r, "merge-base", "--is-ancestor", sha, tip)
+        assert seen["rev-parse --verify"] == 2 and seen["merge-base --is-ancestor"] == 2, seen
+    uncached(shallow, shas[-1], shas[-1])
+    uncached(grafts, shas[0], shas[-1])
+    # Answers kept before a replace ref appears are not served after it, loose or packed.
+    seen = []
+    assert gitcache.is_ancestor(repo, shas[0], shas[-1]) is True
+    assert gitcache.fixed(repo, "q", shas[0], shas[-1], lambda: seen.append(1) or True) is True
+    _git_out(repo, "replace", shas[1], side)
+    uncached(repo, shas[0], shas[-1])
+    _git_out(repo, "pack-refs", "--all")
+    assert not any((repo / ".git" / "refs" / "replace").iterdir())
+    assert "refs/replace/" in (repo / ".git" / "packed-refs").read_text()
+    uncached(repo, shas[0], shas[-1])
+
+
+def test_gitcache_a_negative_ancestry_answer_is_asked_again_once_the_packs_change(env, tmp_path, monkeypatch):
+    from ttp import gitcache, landed
+    repo, shas = _ancestry_line(tmp_path, 3)
+    _git_out(repo, "checkout", "-q", "-b", "side", shas[0])
+    side = _commit_file_in(repo, "side.txt")
+    _git_out(repo, "checkout", "-q", "main")
+    tip = shas[-1]
+    assert landed._commit(repo, side) == side
+    seen = _git_spy(monkeypatch)
+    n = []
+    for _ in range(2):
+        assert landed._git(repo, "merge-base", "--is-ancestor", side, tip).returncode == 1
+        assert gitcache.fixed(repo, "q", side, tip, lambda: n.append(1) or False) is False
+    assert seen["merge-base --is-ancestor"] == 0 and len(n) == 1, seen
+    _git_out(repo, "repack", "-q", "-a", "-d")
+    assert landed._git(repo, "merge-base", "--is-ancestor", side, tip).returncode == 1
+    assert gitcache.fixed(repo, "q", side, tip, lambda: n.append(1) or False) is False
+    assert seen["merge-base --is-ancestor"] == 1 and len(n) == 2, seen
+
+
+def test_gitcache_a_rewound_or_force_moved_tip_reads_its_ancestors_in_full(env, tmp_path, monkeypatch):
+    from ttp import gitcache, landed
+    repo, shas = _ancestry_line(tmp_path, 4)
+    _git_out(repo, "checkout", "-q", "--orphan", "lone")
+    lone = [_commit_file_in(repo, f"l{i}.txt") for i in range(2)]
+    every = [*shas, *lone]
+    for s in every:                           # a "no" is given only for a commit rev-parse found
+        assert landed._commit(repo, s) == s
+
+    def truth(sha, tip):
+        return subprocess.run(["git", "-C", str(repo), "merge-base", "--is-ancestor", sha, tip]).returncode == 0
+    assert gitcache.ancestors(repo, every, shas[-1]) == {s: truth(s, shas[-1]) for s in every}
+    for tip in (shas[1], lone[-1]):           # rewound to an ancestor, then moved to unrelated history
+        seen = _git_spy(monkeypatch)
+        assert gitcache.ancestors(repo, every, tip) == {s: truth(s, tip) for s in every}
+        assert seen["rev-list --boundary"] == 1 and seen["rev-list --max-count=100000"] == 1, seen
+
+
+def test_files_and_git_config_changed_within_the_racy_window_are_read_every_time(env, tmp_path, monkeypatch):
+    import types
+    from ttp import gitcache, push, statcache
+    assert statcache.RACY_S == gitcache.RACY_S == 2.0
+    f = tmp_path / "a.json"
+    f.write_text('{"a": 1}')
+    reads = []
+    real_read = pathlib.Path.read_text
+    monkeypatch.setattr(pathlib.Path, "read_text", lambda self, *a, **k: reads.append(self.name) or real_read(self, *a, **k))
+    for _ in range(3):
+        assert statcache.load_json(f) == {"a": 1}
+    assert reads.count("a.json") == 3
+    monkeypatch.setattr(pathlib.Path, "read_text", real_read)
+    (tmp_path / "global").write_text("[gc]\n\tauto = 0\n")
+    monkeypatch.setenv("GIT_CONFIG_GLOBAL", str(tmp_path / "global"))
+    repo, _ = _ancestry_line(tmp_path, 1)
+    _git_out(repo, "remote", "add", "origin", str(tmp_path / "a.git"))
+    seen = _git_spy(monkeypatch)
+    for _ in range(3):
+        assert push._git(repo, "remote").stdout.split() == ["origin"]
+        assert push._git(repo, "remote", "get-url", "origin").stdout.strip() == str(tmp_path / "a.git")
+    assert seen["remote"] == 3 and seen["remote get-url"] == 3, seen
+    # Once the window has passed, both are kept.
+    later = time.time() + 10
+    monkeypatch.setattr(gitcache, "time", types.SimpleNamespace(time_ns=lambda: int(later * 1e9)))
+    monkeypatch.setattr(statcache, "time", types.SimpleNamespace(time=lambda: later))
+    for _ in range(3):
+        push._git(repo, "remote")
+        statcache.load_json(f)
+    assert seen["remote"] == 4, seen
+    assert statcache._kept
+
+
+def test_gitcache_and_statcache_never_keep_more_than_their_bounds(env, tmp_path, monkeypatch):
+    from ttp import gitcache, landed, statcache
+    monkeypatch.setattr(gitcache, "MAX_TIPS", 2)
+    monkeypatch.setattr(gitcache, "MAX_ENTRIES", 3)
+    monkeypatch.setattr(statcache, "MAX_FILES", 2)
+    monkeypatch.setattr(statcache, "RACY_S", -1.0)
+    repo, shas = _ancestry_line(tmp_path, 6)
+    for tip in shas:
+        for s in shas:
+            landed._commit(repo, s)
+            gitcache.is_ancestor(repo, s, tip)
+            gitcache.fixed(repo, "q", s, tip, lambda: True)
+            assert len(gitcache._sets) <= 2 and len(gitcache._pairs) <= 3 and len(gitcache._answers) <= 3
+    for i in range(5):
+        (tmp_path / f"{i}.json").write_text(str(i))
+        assert statcache.load_json(tmp_path / f"{i}.json") == i
+        assert len(statcache._kept) <= 2
+
+
+def _billing_db(tmp_path):
+    from ttp.db import DB
+    d = DB(tmp_path / "b.db")
+    now = time.time()
+    d.conn.executemany("INSERT INTO runs(task,role,provider,account,started,ended,status,cost_usd,dir) VALUES(?,?,?,?,?,?,?,?,?)",
+                       [(1, "worker", "claude", "a" if i % 3 else "", now - 86400 * 20 + i * 1800, now - 86400 * 20 + i * 1800 + 600,
+                         "ok", 1.0, "") for i in range(900)])
+    d.conn.executemany("INSERT INTO snapshots(ts,provider,account,window) VALUES(?,?,?,?)",
+                       [(now - 86400 * 9 + i * 600, "claude", "a", "5h") for i in range(0, 1300) if not 400 < i < 700])
+    for i in range(300):
+        d.spend("claude", 0.5, "worker", account="a" if i % 2 else "", ts=now - 86400 * 8 + i * 2400)
+    return d, now
+
+
+def test_billing_memo_matches_the_uncached_reads_and_ends_when_its_tables_are_written(tmp_path):
+    """The ledger rows, plan readings and runs billed_by_account reads are reused (DB.billing_memo) only
+    while nothing wrote their tables: totals always equal the uncached path's."""
+    import sqlite3 as sq
+    from ttp import billing
+    d, now = _billing_db(tmp_path)
+
+    def both(since):
+        cached = billing.billed_by_account(d.conn, since, running_at=now, memo=d.billing_memo)
+        assert cached == billing.billed_by_account(d.conn, since, running_at=now)
+        return cached
+
+    for since in (now - 3600, now - 86400, now - 7 * 86400, now - 3 * 86400):
+        both(since)
+    assert len(d.billing_memo) == 5   # the ledger's rows, and per plan query its rows and their parsed form, sliced for every later window
+    before = both(now - 7 * 86400)
+    other = sq.connect(str(tmp_path / "b.db"))   # another connection's commit: table_writes
+    other.execute("DELETE FROM snapshots WHERE ts > ?", (now - 86400 * 5,))
+    other.commit()
+    other.close()
+    after = both(now - 7 * 86400)
+    assert after != before
+    # this connection's own write
+    d.conn.executemany("INSERT INTO snapshots(ts,provider,account,window) VALUES(?,?,?,?)",
+                       [(now - 86400 * 5 + i * 600, "claude", "a", "5h") for i in range(700)])
+    assert both(now - 7 * 86400) != after
+
+
+def test_plan_spans_parsed_once_per_memo_entry_match_the_uncached_path(tmp_path):
+    """plan_spans parses the memo's plan readings and runs once and slices them per window: spans equal
+    the uncached path's for every window and provider, mixed and missing providers too, until a write."""
+    from ttp import billing
+    d, now = _billing_db(tmp_path)
+    d.conn.executemany("INSERT INTO runs(task,role,provider,account,started,ended,status,cost_usd,dir) VALUES(?,?,?,?,?,?,?,?,?)",
+                       [(1, "worker", p, a, now - 86400 * 6 + i * 900, now - 86400 * 6 + i * 900 + 300, st, c, "")
+                        for i, (p, a, st, c) in enumerate([(None, "", "ok", 2.0), ("", "a", "ok", 1.0), ("codex", "b", "failed", 3.0),
+                                                           ("codex", "b", "ok", 0.0), ("claude", None, "ok", 1.0)] * 40)])
+    d.conn.executemany("INSERT INTO snapshots(ts,provider,account,window) VALUES(?,?,?,?)",
+                       [(now - 86400 * 6 + i * 3000, p, a, "5h") for i in range(120) for p, a in ((None, "a"), ("", None), ("codex", "b"))])
+    sinces = [now - 3600, now - 86400, now - 7 * 86400, now - 3 * 86400, now - 40 * 86400, now + 3600]
+    for provider in (None, "claude", "codex", ""):
+        for since in sinces:
+            assert billing.plan_spans(d.conn, since, provider, d.billing_memo) == billing.plan_spans(d.conn, since, provider)
+    parsed = {k: v for k, v in d.billing_memo.items() if k[0] == "parsed"}
+    assert len(parsed) == 8   # readings and runs per provider asked for, each parsed once
+    billing.plan_spans(d.conn, now - 86400, None, d.billing_memo)
+    assert all(d.billing_memo[k] is v for k, v in parsed.items())
+    d.conn.execute("DELETE FROM snapshots WHERE ts > ?", (now - 86400 * 2,))   # a write ends the reuse
+    for since in sinces:
+        assert billing.plan_spans(d.conn, since, None, d.billing_memo) == billing.plan_spans(d.conn, since, None)
+    assert d.billing_memo[("parsed",) + next(k for k in parsed if k[2] is None)[1:]] is not parsed[next(k for k in parsed if k[2] is None)]
+    d.conn.execute("INSERT INTO snapshots(ts,provider,account,window) VALUES(?,?,?,?)", ("soon", "claude", "a", "5h"))
+    with pytest.raises(ValueError):   # a text time fails both paths alike, as before the memo
+        billing.plan_spans(d.conn, now - 86400, "claude", d.billing_memo)
+    with pytest.raises(ValueError):
+        billing.plan_spans(d.conn, now - 86400, "claude")
+
+
+def test_idle_reads_use_their_indexes(tmp_path):
+    """The reads an idle tick makes on a long history use an index, never a scan of every row."""
+    from ttp.db import DB, OPEN_TASKS
+    d = DB(tmp_path / "i.db")
+
+    def plan(sql, args=()):
+        return " ".join(r[-1] for r in d.conn.execute("EXPLAIN QUERY PLAN " + sql, args).fetchall())
+
+    assert "tasks_open" in plan(f"SELECT * FROM tasks WHERE {OPEN_TASKS} ORDER BY id")
+    assert "SCAN" not in plan("SELECT MAX(updated) m FROM tasks WHERE status IN (?,?,?)", ("done", "failed", "cancelled"))
+    assert "SCAN" not in plan("SELECT MAX(ts) m FROM messages WHERE direction='in'")
+    assert "SCAN" not in plan("SELECT * FROM messages WHERE kind='ask' AND handled=0")
+    assert "runs_ended" in plan("SELECT provider FROM runs WHERE ended>=? ORDER BY ended", (0,))
+
+
+def test_unmet_dependencies_reads_only_the_tasks_depended_on(tmp_path):
+    """Done dependencies are met, open, failed and missing ones are not, the same as reading all tasks."""
+    from ttp.db import DB
+    d = DB(tmp_path / "u.db")
+    ids = {}
+    for name, status in (("done", "done"), ("open", "queued"), ("failed", "failed")):
+        ids[name] = d.add_task(title=name, spec="s", kind="work")
+        d.x("UPDATE tasks SET status=? WHERE id=?", (status, ids[name]))
+    t = d.add_task(title="t", spec="s", kind="work", depends_on=[ids["done"], ids["open"], ids["failed"], 9999, "x"])
+    got = d.unmet_dependencies([d.task(t), d.task(ids["done"])])
+    assert got == {t: [ids["open"], ids["failed"], 9999, None], ids["done"]: []}
+
+
+def test_billing_memo_is_dropped_when_the_transaction_that_wrote_rolls_back(tmp_path):
+    """Rows memoized after a transaction's own write must not outlive its rollback (neither
+    total_changes nor data_version moves on ROLLBACK)."""
+    from ttp import billing
+    d, now = _billing_db(tmp_path)
+    since = now - 86400
+    d.conn.execute("BEGIN")
+    d.conn.executemany("INSERT INTO snapshots(ts,provider,account,window) VALUES(?,?,?,?)",
+                       [(now - 80000 + i * 3000, p, "a", "5h") for i in range(25) for p in ("claude", "codex")])
+    billing.plan_spans(d.conn, since, None, d.billing_memo)
+    d._rolled_back()
+    assert not d.conn.in_transaction
+    assert billing.plan_spans(d.conn, since, None, d.billing_memo) == billing.plan_spans(d.conn, since, None)
+
+
+def _traced(conn):
+    """The statements `conn` runs from now on, as a list it appends to."""
+    seen: list[str] = []
+    conn.set_trace_callback(seen.append)
+    return seen
+
+
+_KEPT = ("ts, usd FROM ledger", "COALESCE(account,''), ts FROM snapshots", "FROM runs WHERE ended>=", "MAX(id) FROM runs")
+
+
+def _spend_reads(stmts):
+    """The statements of the spend reads kept across ticks (billing._ledger, plan_spans, budget._latest_run_accounts)."""
+    return [q for q in stmts if any(t in q for t in _KEPT)]
+
+
+def test_spend_reads_are_kept_across_writes_to_other_tables_and_refresh_when_their_own_change(tmp_path):
+    """Each kept spend read (ledger rows, plan readings, ended runs, the latest run accounts) is reused while
+    only other tables are written, and read again, equal to the uncached answer, once its own table is
+    written: by this connection, by another one, or by a running run that changes its account."""
+    import sqlite3 as sq
+    from ttp import billing, budget
+    d, now = _billing_db(tmp_path)
+
+    seen: list[str] = []
+
+    def both():
+        seen.clear()
+        d.conn.set_trace_callback(seen.append)
+        cached = {s: billing.billed_by_account(d.conn, s, running_at=now, memo=d.billing_memo) for s in (now - 86400, now - 7 * 86400)}
+        accounts = budget.current_accounts(d)
+        d.conn.set_trace_callback(None)
+        assert cached == {s: billing.billed_by_account(d.conn, s, running_at=now) for s in cached}
+        return cached, accounts
+
+    both()
+    d.set_kv("unrelated", {"x": 1})
+    d.conn.execute("INSERT INTO events(ts,source,kind,severity,text,status) VALUES(?,?,?,?,?,?)", (now, "d", "info", "low", "t", "new"))
+    d.conn.execute("INSERT INTO runs(task,role,provider,started,status,dir) VALUES(1,'worker','claude',?,'running','')", (now,))
+    first = both()
+    assert first[1] == {"claude": "a"}
+    assert _spend_reads(seen) == [q for q in seen if "MAX(id) FROM runs" in q], seen   # a run without an account started: only its query
+
+    other = sq.connect(str(tmp_path / "b.db"))
+    for table, write in (
+            ("FROM ledger", lambda c: c.execute("INSERT INTO ledger(ts,provider,account,source,usd) VALUES(?,?,?,?,?)",
+                                                (now - 60, "claude", "z", "x", 3.0))),
+            ("FROM snapshots", lambda c: c.execute("DELETE FROM snapshots WHERE rowid IN (SELECT rowid FROM snapshots ORDER BY ts DESC LIMIT 20)")),
+            ("FROM runs WHERE ended", lambda c: c.execute("UPDATE runs SET cost_usd=0 WHERE id IN (SELECT id FROM runs WHERE ended IS NOT NULL LIMIT 50)")),
+            ("MAX(id) FROM runs", lambda c: c.execute("UPDATE runs SET account='b' WHERE status='running'"))):
+        for conn in (d.conn, other):
+            before = both()
+            assert not _spend_reads(seen), seen
+            write(conn)
+            if conn is other:
+                other.commit()
+            after = both()
+            assert any(table in q for q in seen), (table, seen)
+            if table == "MAX(id) FROM runs":
+                assert after[1] == {"claude": "b"}
+            elif table == "FROM ledger":
+                assert after != before
+            if table == "MAX(id) FROM runs":
+                d.conn.execute("UPDATE runs SET account='' WHERE status='running'")
+                both()
+    other.close()
+
+
+def test_ledger_rows_read_inside_a_transaction_are_not_kept(tmp_path):
+    """Spend a transaction wrote is counted while it is open and gone once it rolls back."""
+    from ttp import billing
+    d, now = _billing_db(tmp_path)
+    total = lambda: sum(billing.billed_by_account(d.conn, now - 86400, memo=d.billing_memo).values())
+    base = total()
+    d.conn.execute("BEGIN")
+    d.conn.execute("INSERT INTO ledger(ts,provider,account,source,usd) VALUES(?,?,?,?,?)", (now - 60, "claude", "z", "x", 7.0))
+    assert total() == base + 7.0
+    d.conn.execute("ROLLBACK")
+    assert total() == base
+
+
+def test_a_dispatch_after_new_spend_sees_that_spend(env):
+    """The kept spend reads never hide new spend from the caps: spend another process books between two
+    ticks (a worker ending) stops the next dispatch that would pass the cap."""
+    import sqlite3 as sq
+    p = make(env)
+    from ttp.daemon import Daemon
+    p.db.x("UPDATE messages SET handled=1")
+    d = Daemon(p.base)
+    d.update_gates()
+    d.update_gates()
+    assert any(k[0] == "ledger" for k in d.p.db.billing_memo), "the idle tick keeps the ledger's rows"
+    other = sq.connect(str(p.db.path))
+    other.execute("INSERT INTO ledger(ts,provider,account,source,usd) VALUES(?,?,?,?,?)", (time.time() - 60, "fake", "", "task:0", 99.0))
+    other.commit()
+    other.close()
+    task = p.db.add_task("t", "s", kind="work", tier="light", origin="user", budget_usd=5.0)
+    d.update_gates()
+    try:
+        d.dispatch()
+        started = p.db.q("SELECT task FROM runs WHERE role!='coordinator'")
+    finally:
+        _stop_all(p)
+    assert not started and p.db.task(task)["status"] != "running", started
+    assert p.db.spent_since(time.time() - 3600, billed=True) == 99.0
+
+
+def test_an_idle_tick_reads_the_spend_tables_again_only_after_they_change(env):
+    """Once warm, idle ticks re-read no ledger, plan reading or run rows; new spend is read on the next tick."""
+    p = make(env)
+    from ttp.daemon import Daemon
+    p.db.x("UPDATE messages SET handled=1")
+    now = time.time()
+    for i in range(50):
+        p.db.spend("fake", 0.1, "task:0", ts=now - 3600 * i)
+    d = Daemon(p.base)
+    d.tick()
+    d.tick()
+    seen = _traced(d.p.db.conn)
+    for _ in range(3):
+        d.tick()
+    assert not _spend_reads(seen), _spend_reads(seen)
+    p.db.spend("fake", 0.1, "task:0")
+    d.tick()
+    assert any("FROM ledger" in q for q in _spend_reads(seen)), seen
+
+
+def _synthetic_history(p, tasks, runs):
+    """A project with a long history and nothing to do: ended tasks, runs, spend, plan readings, events,
+    messages, pushes, machine changes and obligations, as a busy project has after weeks."""
+    import json as _j
+    from ttp import machine_ledger as ml, project as projmod
+    now, db = time.time(), p.db
+    with db.tx():
+        for i in range(tasks):
+            db.conn.execute("INSERT INTO tasks(created,updated,title,spec,kind,status,priority,spent_usd,depends_on,labels,result) "
+                            "VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                            (now - 86400 * 30 + i * 600, now - 86400 * 30 + i * 600 + 300, f"task {i}", "spec " * 100,
+                             "code", "done", 3, 1.5, "[]", "[]", _j.dumps({"summary": "x" * 400})))
+        for i in range(runs):
+            t0 = now - 86400 * 30 + i * 200
+            db.conn.execute("INSERT INTO runs(task,role,provider,model,account,started,ended,status,cost_usd,dir) "
+                            "VALUES(?,?,?,?,?,?,?,?,?,?)",
+                            (1 + i % tasks, "worker" if i % 5 else "coordinator", "claude", "m", "acct",
+                             t0, t0 + 150, "done", 0.4, str(p.runs / str(100000 + i))))
+        for i in range(runs * 5 // 3):
+            ts = now - 86400 * 30 + i * 120
+            db.conn.execute("INSERT INTO ledger(ts,provider,account,source,usd) VALUES(?,?,?,?,?)", (ts, "claude", "acct", "run", 0.05))
+            db.conn.execute("INSERT INTO snapshots(ts,provider,account,window,utilization,resets_at) VALUES(?,?,?,?,?,?)",
+                            (ts, "claude", "acct", "five_hour", 0.3, now + 3600))
+        for i in range(runs * 5 // 2):
+            db.conn.execute("INSERT INTO events(ts,source,kind,severity,text,status) VALUES(?,?,?,?,?,?)",
+                            (now - 86400 * 30 + i * 80, "daemon", "info", "low", "event " * 10, "handled"))
+        for i in range(tasks):
+            db.conn.execute("INSERT INTO messages(ts,direction,text,handled) VALUES(?,?,?,1)",
+                            (now - 86400 * 30 + i * 500, "in" if i % 2 else "out", "hello " * 20))
+            db.conn.execute("INSERT INTO push_queue(task,branch,head,target,status,created,updated) VALUES(?,?,?,?,?,?,?)",
+                            (1 + i, f"b{i}", "0" * 40, "main", "pushed", now - 86400 * 20 + i * 600, now - 86400 * 20 + i * 600))
+    projmod.HOME_DIR.mkdir(parents=True, exist_ok=True)
+    projmod.write_json(ml._path(ml.LEDGER), {"next": 3001, "changes": [
+        {"id": i + 1, "alias": f"m{i % 30}", "what": "change " * 20, "undo": "none: x", "by": "x", "added": now - 86400,
+         "closed": now if i % 3 else None} for i in range(3000)]})
+    db.set_kv("obligations", {"items": {f"o{i}": {"text": "promise " * 30, "status": "open" if i % 4 == 0 else "met", "created": now}
+                                        for i in range(600)}})
+
+
+@pytest.mark.skipif(not os.environ.get("TTP_BENCH_IDLE_TICK"), reason="benchmark: set TTP_BENCH_IDLE_TICK=1 to run")
+def test_benchmark_idle_tick_cpu_with_and_without_the_kept_spend_reads(env, monkeypatch):
+    """Idle per-tick CPU on a project with weeks of history, with the spend reads kept across ticks and
+    with nothing kept (every tick reads them again, as before). Prints both; the target is 3x lower."""
+    from ttp import db as dbmod
+    from ttp.daemon import Daemon
+    p = make(env)
+    p.db.x("UPDATE messages SET handled=1")
+    _synthetic_history(p, int(os.environ.get("TTP_BENCH_TASKS", "4000")), int(os.environ.get("TTP_BENCH_RUNS", "12000")))
+    n = int(os.environ.get("TTP_BENCH_TICKS", "20"))
+
+    def cpu_per_tick():
+        d = Daemon(p.base)
+        for _ in range(3):
+            d.tick()
+        t0 = time.process_time()
+        for _ in range(n):
+            d.tick()
+        return (time.process_time() - t0) / n * 1000
+
+    after = cpu_per_tick()
+
+    class Forgets(dict):
+        def __setitem__(self, k, v):
+            pass
+    init = dbmod.DB.__init__
+
+    def forgetful(self, *a, **k):
+        init(self, *a, **k)
+        self.billing_memo = Forgets()
+    monkeypatch.setattr(dbmod.DB, "__init__", forgetful)
+    before = cpu_per_tick()
+    print(f"\nidle tick CPU: {before:.1f} ms with nothing kept, {after:.1f} ms with the spend reads kept ({before / after:.1f}x)")
+    assert after * 3 <= before
+
+
+def test_the_spawn_counter_counts_children_by_step_and_program_and_resets_when_read(env):
+    from ttp import stepclock
+    stepclock.spawns()
+    stepclock.install()
+    try:
+        stepclock.begin("probe_step", 30, 5)
+        try:
+            subprocess.run(["true"], check=True)
+            subprocess.run(["/usr/bin/env", "true"], check=True)
+        finally:
+            stepclock.end()
+        subprocess.run("true", shell=True, check=True)
+    finally:
+        stepclock.uninstall()
+    got = stepclock.spawns()
+    assert got[("probe_step", "true")] == 1 and got[("probe_step", "env")] == 1, got
+    assert got[(threading.current_thread().name, "true")] == 1, got
+    assert stepclock.spawns() == {}
+    stepclock._count_spawn(object())   # an argv Popen itself rejects never breaks the count
+    stepclock._count_spawn(pathlib.Path("/bin/true"))
+    assert stepclock.spawns() == {(threading.current_thread().name, "true"): 1}
+
+
+def test_the_daemon_logs_its_spawns_per_window_by_step_and_program(env, monkeypatch):
+    from ttp import daemon as dmod, gitmemo, stepclock
+    p = make(env)
+    d = dmod.Daemon(p.base)
+    # A test clock: with the host's monotonic time, (t0 + 600) - t0 can round to just under 600.
+    t0 = d._spawn_logged = 1000.0
+    assert d._log_spawns(t0 + 10) is None
+    monkeypatch.setattr(stepclock, "spawns", lambda: {("reap_runs", "ps"): 30, ("dispatch", "git"): 20,
+                                                      ("reap_runs", "git"): 10})
+    monkeypatch.setattr(gitmemo, "kept_hits", [7])
+    rec = d._log_spawns(t0 + 600)
+    assert rec["git_kept"] == 7 and gitmemo.kept_hits == [0], "git reads the tick memo answered, per window"
+    assert "git reads answered from memory: 7" in (p.logs / "daemon.log").read_text()
+    assert rec["per_min"] == 6.0 and rec["steps"] == {"reap_runs": 40, "dispatch": 20}
+    assert rec["programs"] == {"ps": 30, "git": 30}
+    assert p.db.kv(dmod.SPAWN_KV)["per_min"] == 6.0
+    assert "spawns: 6.0/min over 10 min; steps: reap_runs 40, dispatch 20" in (p.logs / "daemon.log").read_text()
+    assert d._log_spawns(t0 + 700) is None
+
+
+def test_one_ps_answers_a_snapshots_pid_questions_until_it_is_older_than_its_bound(env, monkeypatch):
+    from ttp import locks, project as projmod, runner
+    if projmod._PROC:
+        pytest.skip("with /proc nothing forks: no snapshot is taken")
+    calls = []
+    real = subprocess.run
+
+    def run(args, *a, **k):
+        if isinstance(args, list) and args[:1] == ["ps"]:
+            calls.append(args)
+        return real(args, *a, **k)
+    monkeypatch.setattr(subprocess, "run", run)
+    clock = [1000.0]
+    monkeypatch.setattr(projmod.time, "monotonic", lambda: clock[0])
+    me = os.getpid()
+    with projmod.ps_snapshot():
+        first = locks.start_time(me)
+        assert first and runner.proc_start(me) == first and not projmod.zombie(me)
+        assert len(calls) == 1 and "-A" in calls[0]
+        clock[0] += projmod.PS_SNAPSHOT_MAX_S / 2
+        assert locks.start_time(me) == first
+        assert len(calls) == 1
+        clock[0] += projmod.PS_SNAPSHOT_MAX_S   # older than its bound: the next question takes a fresh one
+        assert locks.start_time(me) == first
+        assert len(calls) == 2
+    # Outside a snapshot each question asks alone, as before.
+    assert locks.start_time(me) == first and len(calls) == 3 and "-p" in calls[2]
+
+
+def test_a_pid_started_after_the_snapshot_is_asked_alone_and_a_gone_one_is_none(env, monkeypatch):
+    from ttp import locks, project as projmod
+    if projmod._PROC:
+        pytest.skip("with /proc nothing forks: no snapshot is taken")
+    with projmod.ps_snapshot():
+        projmod.ps_rows()
+        child = subprocess.Popen(["sleep", "30"])
+        try:
+            assert locks.start_time(child.pid)   # not in the snapshot yet: its own `ps`
+        finally:
+            child.kill()
+            child.wait()
+        assert locks.start_time(child.pid) is None
+
+
+def _idle_daemon(env):
+    from ttp import daemon as dmod
+    p = make(env)
+    p.db.x("UPDATE messages SET handled=1")
+    return p, dmod, dmod.Daemon(p.base)
+
+
+def test_an_idle_daemon_waits_longer_between_ticks_and_a_busy_one_keeps_the_usual_pace(env, monkeypatch):
+    p, dmod, d = _idle_daemon(env)
+    monkeypatch.setattr(d, "_has_work", lambda: False)
+    waits = [d._between_ticks() for _ in range(6)]
+    assert waits == [6.0, 12.0, dmod.IDLE_TICK_MAX_S, dmod.IDLE_TICK_MAX_S, dmod.IDLE_TICK_MAX_S,
+                     dmod.IDLE_TICK_MAX_S], waits
+    monkeypatch.setattr(d, "_has_work", lambda: True)
+    assert d._between_ticks() == dmod.TICK_S
+    # The tick's own _has_work answer (IdleHold's) is used, never asked twice.
+    asked = []
+    monkeypatch.setattr(d, "_has_work", lambda: asked.append(1) or False)
+    d._work_seen()
+    assert d._between_ticks() == 6.0 and len(asked) == 1
+    monkeypatch.setattr(d, "_has_work", lambda: 1 / 0)   # unknown is busy
+    assert d._between_ticks() == dmod.TICK_S
+
+
+def test_an_idle_wait_ends_within_a_second_when_another_process_writes_the_db(env, monkeypatch):
+    import sqlite3 as sq
+    p, dmod, d = _idle_daemon(env)
+    monkeypatch.setattr(dmod, "IDLE_WATCH_S", 0.05)
+    d._wake = os.pipe()
+    try:
+        t0 = time.monotonic()
+        d._idle_nap(0.3)   # nothing written: the whole wait
+        assert 0.25 <= time.monotonic() - t0 < 2
+
+        def write():
+            time.sleep(0.2)
+            other = sq.connect(str(p.db.path))
+            other.execute("INSERT INTO kv(key, value, ts) VALUES('idle-wait-probe', '1', 0)")
+            other.commit()
+            other.close()
+        threading.Thread(target=write, daemon=True).start()
+        d._idle_s = dmod.IDLE_TICK_MAX_S
+        t0 = time.monotonic()
+        d._idle_nap(20)
+        assert time.monotonic() - t0 < 5, "a chat message or task change ends an idle wait"
+        assert d._idle_s == dmod.TICK_S
+        threading.Thread(target=lambda: (time.sleep(0.2), setattr(d, "stopping", True)), daemon=True).start()
+        t0 = time.monotonic()
+        d._idle_nap(20)
+        assert time.monotonic() - t0 < 5, "a stop ends it at once"
+    finally:
+        d.stopping = True
+        for fd in d._wake:
+            os.close(fd)
+        d._wake = None
