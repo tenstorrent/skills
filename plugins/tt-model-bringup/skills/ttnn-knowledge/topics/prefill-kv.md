@@ -49,3 +49,11 @@ when few rows are consumed; running the smallest prepared profile that fits the 
 - For hybrid attention, inspect per-layer page-table routing and cache specs instead of assuming one page table shape covers every layer.
 - Gemma-style shared-KV layers may skip K/V projection and cache update; tests must still prove the consumer layer reads the intended source cache.
 - DeepSeek-style MLA cache updates can have aliasing hazards between prompt/speculative lanes; inspect masks and lane routing when validating cache correctness.
+
+## Diagnosing paged-decode misses
+
+Record the first top-k miss index, absolute position, page or block id and the dynamic attention chunk boundary
+before blaming dtype drift. If misses cliff at a page, tile, power-of-two or chunk boundary, run an
+over-allocation control where the cache and page table cover the next rounded SDPA decode read window. If that
+control passes, the bug is in allocation or the attention window, even if BF16 happened to hide the shorter
+allocation.

@@ -39,3 +39,22 @@ matched the reference. Telling quantization from a kernel bug took a full-precis
 **Ties from softcapping.** A BF16 softcap on logits creates many exact maxima; a sampler that keeps a fixed
 number of candidates per shard and breaks ties by id then gives run-dependent picks when the logits themselves
 move slightly.
+
+## When an accuracy failure follows a precision change
+
+A failure that appears after a dtype, cache dtype, math fidelity or CCL payload change marks an error-budget
+boundary, not yet a root cause. Write down the whole active policy first (activation dtype, every weight group,
+fidelity per projection, cache dtype, CCL payload dtype, page and block size, cache layout, page-table policy,
+decode update op), then run controls that separate a real cache or kernel defect from a policy margin:
+
+- the same cache dtype with higher-precision weights, math and CCL payloads;
+- the same weights and math with only the cache dtype changed;
+- an exact page, block and cache-shape probe that imports the model's constants rather than hard-coding page
+  sizes, local KV heads, batch slots or mapper behaviour;
+- a mature implementation that uses the same low-precision cache path on a comparable repeated-decode workload,
+  when one exists.
+
+"BF16 fixes it" does not by itself show that a BFP8 cache is unstable, that `paged_update_cache` is defective, or
+that accumulated error is the cause; keep those as hypotheses until the controls isolate them. A reduced probe
+whose page size, batch width, local KV heads, update row shape, mesh mapper or page-table policy differ from the
+full model is smoke evidence, not causal proof.
