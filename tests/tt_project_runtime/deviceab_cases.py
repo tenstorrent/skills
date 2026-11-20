@@ -600,19 +600,19 @@ def test_device_ab_the_next_tick_lifts_a_stop_the_old_rule_charged_to_a_run_that
     assert "another task's recorded change on box-a" in got["lifted"] and not deviceab.stopped(p.db)
 
 
-def test_device_ab_a_re_arm_ignores_incidents_from_before_it_but_charges_a_run_started_earlier_for_one_after(env):
+def test_device_ab_a_re_arm_ignores_events_from_before_it_but_charges_a_run_started_earlier_for_a_later_one(env):
     from ttp import deviceab
     p = make(env)
     cfg = _dab_cfg(p)
     tid, rid = _dab_sonnet_run(p, cfg, ["resource:box-a-device", "needs_device"])
     old = _dab_event(p, "machine_condition", "box-a-device: chip hang, reset needed", ts=2650.0)
-    # Re-armed (a new setting, same window start) after that incident: it is not counted, nor is a recorded stop on it.
+    # A new setting with the same window start re-arms it: the earlier event and a stop recorded on it are dropped.
     re = _dab_cfg(p, max_tasks=135, start=1000)
     assert deviceab.tick(p.db, re, 2700.0)["stop"] is None
     p.db.set_kv(deviceab.STOP_KV, {"ts": 2710.0, "arm": "sonnet", "task": tid, "run": rid, "event": old,
                                    "text": "box-a-device: chip hang"})
     assert "before the A/B was re-armed" in deviceab.tick(p.db, re, 2750.0)["lifted"]
-    # The same run (started before the re-arm, its own reset in its log) is charged for an incident after it.
+    # The same run (started before the re-arm, its own reset in its log) is charged for a later event.
     new = _dab_event(p, "machine_condition", "box-a-device: chip hang, reset needed", ts=2800.0)
     got = deviceab.tick(p.db, re, 2850.0)["stop"]
     assert (got["run"], got["event"]) == (rid, new)

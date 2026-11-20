@@ -31,8 +31,8 @@ device_ab event): its open tasks run on the control arm, new tasks are excluded,
 the project's coordinator. A run that only read state (a question or report task, `read:` resources, or no
 state-changing command in its own log: changed_state) is never charged, nor is one for an incident inside another
 task's machine-change ledger entry on that machine (a planned reboot, deploy or power cycle: others_change). A
-re-armed start skips events from before the re-arm (at or before the stop it cleared); a run started earlier is still
-charged for an incident after it.
+re-armed start skips events from before the re-arm (at or before the stop it cleared); a run started earlier is
+still charged for a later event.
 
 Review: each finished A/B task gets one masked review task (Opus at high effort, REVIEW_LABEL) that scores
 answered-what-was-asked and conclusions-supported-by-logs, 0-4 each; the spec never names the arm or model.
@@ -164,8 +164,8 @@ def _kv(db, key: str) -> dict:
 def start(db, s: dict, now: float | None = None) -> dict:
     """The A/B's start {"ts", "sig"}: recorded the first time this setting is seen; a new setting (other
     projects, arms or seed) re-arms it: a new A/B that lifts an old stop; events from before the re-arm ("armed", never
-    before the stop it cleared, "after") stay spent and never stop the new one, while a run started earlier is still
-    charged for an incident after it."""
+    before the stop it cleared, "after") stay spent and never stop the new one; a run started earlier is still charged for a later
+    event."""
     got = _kv(db, START_KV)
     if got.get("sig") == s["sig"] and isinstance(got.get("ts"), (int, float)):
         return got
