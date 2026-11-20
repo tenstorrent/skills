@@ -17912,7 +17912,13 @@ def glm_gate(a, name: str | None = None) -> None:
     flags = [f"--{k}" for k in ("to", "reply", "confirms", "status") if getattr(a, k, None) is not None] + \
         (["--urgent"] if getattr(a, "urgent", False) else []) + \
         (["--severity"] if getattr(a, "severity", "normal") not in (None, "normal") else []) if cmd == "note" else []
-    why = glmguard.cli_refusal(cmd, action, flags)
+    words = [cmd, action] if cmd == "machines" else [cmd]
+    if cmd == "machines" and action == "change":
+        words.append(str(getattr(a, "change", "") or ""))
+    if cmd == "machines" and action == "outage":
+        words = [cmd, action] + [str(w) for w in (a.alias, a.why) if w]
+        flags += [f"--{k}" for k in ("owner", "expires", "by", "covers", "clear") if getattr(a, k, None)]
+    why = glmguard.cli_refusal(cmd, action, flags, words)
     if why:
         glmguard.hit(os.environ.get("TTP_RUN_DIR"), why)
         die(f"refused: {why}", 2)

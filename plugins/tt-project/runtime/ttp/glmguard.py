@@ -8,7 +8,8 @@ rule cannot hold that for a cheaper model, so the harness enforces it in code, w
 every harness the arm runs:
 
 - `ttp` (cli.glm_gate) runs only the commands in SUBS_ALLOWED: checks, push, reads of its own task, the
-  lock and detach it needs, and a plain `ttp note "<text>"`, which goes only to the run's own task log
+  lock and detach it needs, the read-only queries of READS (machine lists and status, occupancy;
+  a write form of any of them, or an unknown subcommand, is refused) and a plain `ttp note "<text>"`, which goes only to the run's own task log
   (progress.md); the coordinator decides what reaches a chat. Every route from a note to a person or
   another project (NOTE_ROUTES: --to, --reply and the flags that go with them), `say`, `ask`, `notify`,
   `upstream`, task, obligation, memory and config writes, and every other command are refused.
@@ -60,6 +61,8 @@ TASK_WRITES = frozenset({"add", "cancel", "requeue", "restart", "set-when", "sup
 # `ttp note` flags that send a note on, or change a record beyond the run's own log: refused on the GLM arm.
 NOTE_ROUTES = ("--to", "--reply", "--urgent", "--severity", "--confirms", "--status")
 GH_READS = frozenset({"view", "list", "diff", "status", "checks"})
+READS = (("machines", "list"), ("machines", "show"), ("machines", "status"), ("machines", "activity"),
+         ("machines", "change", "list"), ("status",), ("occupancy",))   # read-only ttp queries, by word prefix
 PLAN_BOOKKEEPING = (("machines", "change", "add"), ("machines", "change", "edit"), ("obligation", "progress"),
                     ("occupancy",))
 REACH = frozenset({"ssh", "scp", "sftp", "mail", "mailx", "sendmail", "mutt", "nc", "ncat", "telnet", "sqlite3"})
@@ -191,12 +194,24 @@ def note_route(flags) -> str:
     return ""
 
 
-def cli_refusal(cmd: str, action: str = "", flags=()) -> str | None:
-    """Why a GLM-arm run may not run `ttp <cmd> [<action>]` with option words `flags`, else None."""
+def read_only(words: list[str], flags=()) -> bool:
+    """True for a read-only ttp call: its positional `words` (no `ttp`, no leading project name) start with an entry
+    of READS, or are the machines call that lists its records (the one that takes at most a machine name, no option but --json).
+    Any other call, an unknown subcommand too, is False."""
+    if words[:2] == ["machines", "outage"]:
+        return len(words) <= 3 and all(f == "--json" for f in flags)
+    return any(words[:len(r)] == list(r) for r in READS)
+
+
+def cli_refusal(cmd: str, action: str = "", flags=(), words=()) -> str | None:
+    """Why a GLM-arm run may not run `ttp <cmd> [<action>]` with option words `flags` (and the call's positional
+    `words` from the command on, where known), else None."""
     if cmd == "note" and (route := note_route(flags)):
         return (f"`ttp note {route}` is not allowed to a run on the GLM arm: its notes go only to its own task log, "
                 f"and the coordinator decides what reaches a person, a chat or another project")
     if cmd in SUBS_ALLOWED and (cmd != "task" or action in TASK_ACTIONS):
+        return None
+    if words and read_only(list(words), flags):
         return None
     what = f"`ttp {cmd}" + (f" {action}" if cmd == "task" and action else "") + "`" if cmd else "a ttp call naming no command"
     return (f"{what} is not allowed to a run on the GLM arm (it changes records or reaches a person or another "
@@ -285,7 +300,8 @@ def shell_refusal(cmd: str, cwd: str, run_dir: str = "", env=None, remote: bool 
     commands, _ = hook._split(cmd)
     segs = hook._all_segments(commands) + hook._segments(commands, strip=False)
     project = _own_name(e)
-    plain, _ = hook._split(REDIRECT.sub(" ", cmd))   # `ttp checks 2>&1`: the 2 is no word of the call
+    # `ttp checks 2>&1`: the 2 is no word of the call; a backtick substitution runs a command of its own, like `$(...)`
+    plain, _ = hook._split(REDIRECT.sub(" ", cmd).replace("`", ";"))
     plan = bool((glm_run(e) or {}).get("plan"))   # a device run under an Opus plan (deviceplan.py)
     for seg in hook._all_segments(plain) + hook._segments(plain, strip=False):
         words = _ttp_args(seg, project)
@@ -294,7 +310,7 @@ def shell_refusal(cmd: str, cwd: str, run_dir: str = "", env=None, remote: bool 
             acts = [w for w in words[1:] if w in TASK_WRITES or w in TASK_ACTIONS]
             act = [next((w for w in acts if w in TASK_WRITES), acts[0] if acts else "")]
         if words and not (plan and plan_bookkeeping(words)) and (
-                why := cli_refusal(words[0], act[0] if act else "", [w for w in seg if w.startswith("--")])):
+                why := cli_refusal(words[0], act[0] if act else "", [w for w in seg if w.startswith("--")], words)):
             return why
     for seg in segs:
         if not seg:

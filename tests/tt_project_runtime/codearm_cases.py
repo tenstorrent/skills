@@ -358,6 +358,72 @@ def test_glm_guard_lets_a_glm_run_run_its_checks_in_every_form(argv, env, monkey
                                   {"TTP_PROJECT": str(p.base), **_GG_RUN_ENV}) is None
 
 
+_GG_READS = [
+    "ttp machines list", "ttp machines list --json", "ttp machines show x", "ttp machines status", "ttp machines activity",
+    "ttp machines change list", "ttp machines change list x --all --json", "ttp machines outage", "ttp machines outage x",
+    "ttp machines outage list", "ttp machines outage --json", "ttp status", "ttp status --json --verbose", "ttp occupancy",
+    "ttp occupancy --list", "ttp task proj show 5", "ttp proj machines change list", "ttp machines change list 2>&1 | tail -5"]
+_GG_WRITES = [
+    "ttp machines change add x 'what' --undo true", "ttp machines change edit 3 --what y", "ttp machines change close 3",
+    "ttp machines set x --tag a", "ttp machines add x", "ttp machines remove x", "ttp machines push", "ttp machines tag-note a 'text'",
+    "ttp machines outage x 'why' --expires 1d", "ttp machines outage x --clear", "ttp machines outage x why", "ttp machines outage --by p",
+    "ttp machines outage --owner o x", "ttp machines outage --cl x", "ttp machines frobnicate", "ttp machines", "ttp machines change",
+    "ttp machines change frobnicate", "ttp note --to p hi", "ttp notify hi", "ttp task add t s", "ttp task cancel 5",
+    "ttp task requeue 5", "ttp obligation progress o1 x"]
+
+
+@_pytest.mark.parametrize("cmd", _GG_READS)
+def test_glm_guard_allows_the_read_only_ttp_queries(cmd, tmp_path):
+    from ttp import glmguard
+    wt, rd = _gg_run(tmp_path)
+    assert glmguard.shell_refusal(cmd, str(wt), str(rd), {"TTP_PROJECT": str(tmp_path / "proj"), **_GG_RUN_ENV}) is None, cmd
+
+
+@_pytest.mark.parametrize("cmd", _GG_WRITES)
+def test_glm_guard_still_refuses_every_ttp_write_and_an_unknown_machines_subcommand(cmd, tmp_path):
+    from ttp import glmguard
+    wt, rd = _gg_run(tmp_path)
+    assert glmguard.shell_refusal(cmd, str(wt), str(rd), {"TTP_PROJECT": str(tmp_path / "proj"), **_GG_RUN_ENV}), cmd
+
+
+@_pytest.mark.parametrize("write", ["ttp machines change add x y", "ttp machines set x", "ttp note --to p hi", "ttp task add t s"])
+@_pytest.mark.parametrize("chain", ["ttp machines list; {w}", "ttp machines list && {w}", "ttp machines list | {w}",
+                                    "ttp machines list || {w}", "echo $({w})", "echo `{w}`", "ttp status & {w}",
+                                    "ttp machines change list\n{w}", "bash -c 'ttp machines list; {w}'"])
+def test_glm_guard_refuses_a_chain_with_a_write_after_a_read(chain, write, tmp_path):
+    from ttp import glmguard
+    wt, rd = _gg_run(tmp_path)
+    cmd = chain.replace("{w}", write).replace("\\n", "\n")
+    assert glmguard.shell_refusal(cmd, str(wt), str(rd), {"TTP_PROJECT": str(tmp_path / "proj"), **_GG_RUN_ENV}), cmd
+
+
+@_pytest.mark.parametrize("argv,refused", [
+    (["machines", "list"], False), (["machines", "status"], False), (["machines", "activity"], False),
+    (["machines", "change", "list"], False), (["machines", "outage"], False), (["machines", "outage", "x"], False),
+    (["machines", "outage", "x", "--json"], False), (["status"], False), (["occupancy"], False),
+    (["machines", "change", "add", "x", "w", "--undo", "true"], True), (["machines", "change", "close", "3"], True),
+    (["machines", "change", "edit", "3", "--what", "w"], True), (["machines", "set", "x"], True), (["machines", "add", "x"], True),
+    (["machines", "remove", "x"], True), (["machines", "outage", "x", "why", "--expires", "1d"], True),
+    (["machines", "outage", "x", "--clear"], True), (["machines", "outage", "x", "--by", "p"], True),
+    (["machines", "tag-note", "t", "text"], True)])
+def test_glm_guard_cli_gate_reads_a_machines_call_from_its_parsed_arguments(argv, refused, env, monkeypatch, tmp_path):
+    from ttp import cli, glmguard
+    p = make(env)
+    wt, rd = _gg_run(tmp_path)
+    monkeypatch.setenv("TTP_PROJECT", str(p.base))
+    monkeypatch.setenv("TTP_RUN_DIR", str(rd))
+    monkeypatch.setenv("TTP_CODE_ARM_GUARD", "1")
+    monkeypatch.setattr(cli, "_recover_setup", lambda: (_ for _ in ()).throw(_GatesPassed()))
+    try:
+        cli.main(argv)
+        passed = True
+    except _GatesPassed:
+        passed = True
+    except SystemExit as e:
+        passed = not (e.code == 2 and (rd / glmguard.HIT).exists())
+    assert passed is not refused, (argv, glmguard.hit_reason(rd))
+
+
 class _GatesPassed(BaseException):
     pass
 
