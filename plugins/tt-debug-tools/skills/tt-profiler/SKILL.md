@@ -54,7 +54,11 @@ Neither: skip to "Device profiler" below.
 ```bash
 TT_METAL_STREAMING_PROFILER=1 ./your_program          # capture, decode, no output yet
 TT_METAL_STREAMING_PROFILER=1 TT_METAL_STREAMING_PROFILER_TRACY=1 ./your_program  # Tracy GUI
+TT_METAL_STREAMING_PROFILER=1 TT_METAL_STREAMING_PROFILER_OPS_CSV=ops.csv pytest <test id>
 ```
+
+Build with `./build_metal.sh` (Tracy is on by default). For op names and a
+headless Tracy capture, see `references/op-report.md`.
 
 What it fixes compared with the device profiler:
 
@@ -98,6 +102,20 @@ DeviceRecordEvent("NAME");                 // an event; the name is compile-time
 Docs in the checkout: `tt_metal/tools/profiler/STREAMING_PROFILER.md` and
 `STREAMING_PROFILER_DETAILED.md`. As written there: Blackhole only, a
 Tracy-enabled build, and idle Ethernet cores for the sync.
+
+`STREAMING_PROFILER.md` is a GUI primer; the options (including
+`_SYNC_EVENTS` and `_SYNC_CHECK`) are in `STREAMING_PROFILER_DETAILED.md` section 1.
+
+Seen on a first run, tested on a 32-chip Blackhole Galaxy (as of 2026-11-19,
+check current behaviour):
+
+- The first run recompiles every kernel with `-DPROFILE_STREAMING`; time the second.
+- Read the CSVs only after the mesh closes; they are complete then.
+- Too few idle Ethernet cores for the sync is a `TT_FATAL` at bring-up.
+- `python -m tracy` sets `TT_METAL_DEVICE_PROFILER=1` by default, a `TT_FATAL`
+  beside the streaming switch; `--no-device` should avoid it (not tested).
+- The zone CSV is about 1,000 rows per op per chip: on a full model write only
+  the ops CSV.
 
 Known gaps as of 2026-11-19 (check their current status):
 

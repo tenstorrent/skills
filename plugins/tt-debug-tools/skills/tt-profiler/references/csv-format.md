@@ -1,5 +1,11 @@
 # Reading `profile_log_device.csv`
 
+The streaming profiler's CSVs differ (tt-metal main, as of 2026-11-19): the ops
+CSV has 19 columns, one row per op per chip, `DEVICE ID`, `GLOBAL CALL COUNT`,
+then durations in ns overall and per RISC; it joins to `ops_perf_results` on
+`GLOBAL CALL COUNT`. The zone CSV has the 15 columns below plus `logical_x`,
+`logical_y` (17).
+
 Two header lines, then one row per zone boundary. Parse the header row rather
 than assuming column positions: the doc page still documents a 12-column layout
 with a `zone phase` of `begin`/`end`, and the file has 15 columns and

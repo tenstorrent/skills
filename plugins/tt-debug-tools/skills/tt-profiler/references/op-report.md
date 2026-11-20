@@ -98,3 +98,17 @@ above — it names the op-level bound.
 | < 40 | ≥ 60 | compute-bound |
 | — | ≥ 70 | near peak |
 | mid | mid | inspect per-RISC |
+
+## Streaming profiler: op names
+
+The streaming CSVs carry no op names. To get them (tested as of 2026-11-19):
+
+```bash
+./build/tools/profiler/bin/tracy-capture -o run.tracy -f -p <port> &   # headless
+TTNN_OP_PROFILER=1 TRACY_PORT=<port> TT_METAL_STREAMING_PROFILER=1 \
+  TT_METAL_STREAMING_PROFILER_OPS_CSV=ops.csv pytest <test id>
+./build/tools/profiler/bin/tracy-csvexport -m -s ";" run.tracy
+```
+
+Read the `TT_DNN_DEVICE_OP` messages. Each one's last number is
+`(GLOBAL CALL COUNT << 10) + DEVICE ID`, which names its ops-CSV row.
