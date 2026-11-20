@@ -132,3 +132,13 @@ def test_hours_well_over_budget_are_advisory(tmp_path):
     data['hours_used'] = 40
     code, stderr = run(tmp_path, data)
     assert code == 1 and 'over the 24 h budget' in stderr
+
+
+def test_claude_brief_names_existing_skills_and_scripts():
+    brief = (PLUGIN / 'prompts/model_bringup_claude/brief.md').read_text()
+    for name in re.findall(r'`([a-z][a-z0-9-]+)`', brief):
+        if '-' in name and name not in ('stage-review',):
+            assert (PLUGIN / 'skills' / name / 'SKILL.md').is_file(), name
+    for script in re.findall(r'(check_[a-z_]+\.py)', brief):
+        assert (PLUGIN / 'scripts' / script).is_file(), script
+    assert '`open`' in brief and 'HF_MODEL' in brief
