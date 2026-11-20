@@ -2,7 +2,7 @@
 
 Subagents are authorized and recommended; $lean-model says how to run them.
 
-This goal brings HF_MODEL to a correct, fast TTNN full model on the target mesh under models/autoports/<model>. The approach is yours: plan, reuse the closest model in tt-metal, port modules in parallel, optimise where the profiler shows lost time. The outputs and tests below are fixed. Read bringup/agentic_evals/inputs.json for mode, batch_sizes and budget_hours. Do not begin vLLM work.
+This goal brings HF_MODEL to a correct, fast TTNN full model on the target mesh under models/autoports/<model>. The approach is yours: plan, reuse the closest model in tt-metal, port modules in parallel, optimise where the profiler shows lost time. The outputs and tests below are fixed. Read bringup/agentic_evals/inputs.json for mode, scope, batch_sizes and budget_hours. Do not begin vLLM work.
 
 Goal completion requirements:
 - SPEC.md and a roofline with per-batch targets exist before device work; targets are multiples of their floors.

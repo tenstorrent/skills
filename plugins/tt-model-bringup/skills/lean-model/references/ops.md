@@ -11,12 +11,16 @@ reaches the target:
 3. **A model-local fusion**: a `ttnn.generic_op` kernel under the model directory for a chain of small ops,
    intermediates round-tripping DRAM, or gaps inside a traced step. Gain = the chain's measured time minus the
    fused floor.
-4. **A change to a ttnn op**: when the op is the problem for every model, not only this one.
-5. **A new ttnn op**: when nothing in ttnn does the job at model shapes.
+4. **Editing a ttnn op's source** (its C++ or kernels) for speed, or **a new ttnn op**: only under `scope`
+   `open` (`model-bringup`). Under `release`, steps 1-3 are the whole ladder.
+
+Making an op work is a different question from making it fast: when an op is wrong or rejects the model's
+shapes, adapt the inputs to its contract or work around it inside the model under `release`, or fix the op with
+a test under `open`; keep a minimal repro either way.
 
 Skip ahead when the roofline and a microbenchmark of the existing op at model shapes show it cannot reach the
-target's order of magnitude: start the
-new op or fusion early, on a side branch, while the plain path keeps the model correct.
+target's order of magnitude: start the new op or fusion early, on a side branch, while the plain path keeps the
+model correct.
 
 ## Every new or changed path
 
@@ -25,11 +29,11 @@ new op or fusion early, on a side branch, while the plain path keeps the model c
 - A switch back to the plain path, kept until T2 has passed with the new one.
 - A row in `model.json` `ops`: name, kind (fusion, op change, new op), test, switch, measured gain.
 
-## Changing a shared ttnn op
+## Changing a ttnn op (scope `open`)
 
-Other models use it. Prefer adding an option to changing a default. Run the op's existing tests and find the
-other models that call it. Only one agent builds the C++ tree at a time; the coordinator schedules rebuilds.
-Write the change so it could go upstream as its own pull request.
+The model may keep its own version of the op; it does not go back to main. Run the op's existing tests where they
+still apply, and note in `model.json` `ops` that the model depends on a changed op. Only one agent builds the C++
+tree at a time; the coordinator schedules rebuilds.
 
 ## Check kernels against main
 
