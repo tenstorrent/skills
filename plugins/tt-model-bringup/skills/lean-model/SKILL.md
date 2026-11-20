@@ -36,8 +36,8 @@ here.
 - **Design for the target before the first kernel.** The parallel layout and how many cores each step uses
   decide speed far more than tuning; a wrong structure is not recovered by leaf work. Derive per-batch targets
   from a roofline (bytes and FLOPs per step against bandwidth and peak) and pick the layout that can reach them.
-  Start from the closest model in tt-metal and its fastest kernels where the architecture matches, and check
-  each borrowed piece against the reference rather than assuming it fits.
+  Similar models in tt-metal are worth reading while planning; anything reused from them is checked against the
+  reference rather than assumed to fit.
 - **Whole and thin before deep.** Get the whole model correct end to end early, at any speed. Then add what
   changes the design: batching with fixed slots, chunked prefill, long context, paged KV, request state. Optimise
   after those exist; work done before them is often redone.
@@ -47,9 +47,9 @@ here.
 - **The reference decides numerics.** Build the CPU captures and corpus early, in the background. Every
   precision or kernel change is judged on the reference tiers, not on a few prompts.
 - **Touch the end early.** Once the model is correct, drive it with a small request loop over the generator
-  (several users, mixed lengths, arrivals mid-decode) and a few eval questions. This is a smoke test, not the vLLM
-  adapter, which belongs to the serve goal. Hangs under real traffic, memory exhaustion and routing or state bugs show up there long
-  before unit tests catch them.
+  (several users, mixed lengths, arrivals mid-decode) and a few eval questions. This is a smoke test, not the
+  vLLM adapter, which belongs to the serve goal. Hangs under real traffic, memory exhaustion and routing or state
+  bugs show up there long before unit tests catch them.
 
 A workable order: plan (no device) → correct skeleton at B1 → design-shaping features → speed and precision →
 hardening. Overlap them wherever the work is independent.
@@ -88,8 +88,9 @@ CPU reference, the op inventory, one module or layer kind each, the integration 
 each. The coordinator's review is the bottleneck, so a handful of live agents is usually the useful limit.
 Landing: cherry-pick onto head, run T1, announce the new head; agents rebase.
 
-Experiment where a measurement can decide. A share of the budget, which you choose and record, can go to throwaway prototypes on side branches (another
-layout, a fused op, a different parallel scheme), run side by side and judged only by measurement. Land the
+Experiment where a measurement can decide. A share of the budget, which you choose and record, can go to
+throwaway prototypes on side branches (another layout, a fused op, a different parallel scheme), run side by side
+and judged only by measurement. Land the
 winner, drop the rest. Scope risky work as "measure and report before building", bugs as "root cause before fix".
 
 ## Modes (`inputs.json` `mode`)
@@ -100,7 +101,13 @@ ports first), `speedup` (an existing correct model: start at the perf loop, gate
 
 ## Devices and budget
 
-Every device job runs under a lock with a timeout; an unclean exit resets the board and checks it before the
-next job (`tt-device-usage`). `budget_hours` in `model.json` bounds the goal: use it to get closer to the targets, and when it ends, report
-as is. A missed target is reported with its reason; it is not a reason to stop before the budget is spent.
-Commit summaries, not raw output (`model-bringup`). One `stage-review`, at the end.
+Before the first device run, record in `model.json` whether bounded resets and multi-chip health checks are
+authorized on the run's machines; without it, the first unclean exit stops the goal until someone answers. Every
+device job runs under a lock with a timeout, and after an unclean exit the board is reset and checked before the
+next job (`tt-device-usage`).
+
+`budget_hours` in `model.json` bounds the goal: use it to get closer to the targets, and when it ends, report as
+is. A missed target is reported with its reason; it is not a reason to stop before the budget is spent.
+
+Commit summaries, not raw output, and when something took long to understand and is solved, add a few lines to
+`bringup/lessons.md` (`model-bringup`). One `stage-review`, at the end.
