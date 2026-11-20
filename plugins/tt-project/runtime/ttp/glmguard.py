@@ -37,9 +37,15 @@ TMPDIR (`os.environ["TMPDIR"]` reads as setting it).
 The hook (hook.pre_tool_use, Claude Code and any provider with hooks), `ttp` itself (cli.glm_gate) and the
 command layer of a harness without hooks (glmenv, for mini-swe-agent) ask it before each call.
 
-A refused attempt ends the run as a hand-back to Opus: hit() writes the run's glm_guard.json and a
-`needs_opus` result.json (reason `guard: <what>`), the runner stops the agent at its next look and the
-daemon requeues the task on Opus without spending an attempt (codearm.bounce_reason). The guard applies to
+A refused command never runs. refused() records it in the run's glm_refusals.jsonl and decides it by RULES, the one
+table of refusal rules: a redirect (a database or record read, `ttp upstream`, a scratch file outside the run's
+folders) shows the run the reason and the allowed way, and the run goes on; a harmful attempt (a device, machine
+or service act, publishing or speaking, credentials, a write to a project's records or tree, a delete or overwrite
+outside the run's folders), the run's third refusal (route.glm_refusals.hand_back_after) or redirects switched off
+(route.glm_refusals.redirect false) end the run as a hand-back to Opus: hit() writes the run's glm_guard.json and
+a `needs_opus` result.json (reason `guard: <what>`), the runner stops the agent at its next look and the daemon
+requeues the task on Opus without spending an attempt (codearm.bounce_reason). deny_list() is the prompt's
+short list of the same rules, each with its allowed way. The guard applies to
 runs where active() holds: the daemon sets TTP_CODE_ARM_GUARD for a run whose arm is glm and writes MARK in
 its run folder, so a run that unsets the variable is still guarded. Other runs are not touched.
 
@@ -109,7 +115,7 @@ SCRATCH = "tmp"               # in the run folder: the run's own scratch folder,
 SCRATCH_VARS = ("TMPDIR", "TMP", "TEMP")
 SCRATCH_LINE = ("Keep scratch files in $TMPDIR (a folder of your own in your run folder) or your worktree: write"
                 ' `> "$TMPDIR/body.md"`, never a literal `/tmp/...` path, and never create files in the project\'s'
-                " `state/` folder. The guard refuses writes anywhere else, and a refusal hands the task to Opus.")
+                " `state/` folder. The guard refuses writes anywhere else.")
 # What a code run's own checklist (template kind-code.md) leaves out of its check before it hands off done: the
 # review fails tests that pass without the change, and a large diff with no reason.
 HANDOFF_LINE = ("Before you hand off done, check your own diff as the independent review will. Revert your fix once and"
@@ -208,6 +214,146 @@ def hit_reason(run_dir) -> str:
     except (OSError, ValueError, TypeError):
         return ""
     return str(got.get("why") or "guard") if isinstance(got, dict) else "guard"
+
+
+# A refusal is a redirect or a hand-back (refused()). RULES is the one table of the guard's refusals: (rule, class,
+# the reason's pattern, what the prompt tells a run never to do, the allowed way). A redirect shows the run the reason
+# and the allowed way, and the run goes on. A harmful attempt (a device, machine or service act, publishing or
+# speaking, credentials, a write to a project's records or tree, a delete or overwrite outside the run's folders), or
+# the run's hand_back_after-th refusal (route.glm_refusals), ends the run as a hand-back to Opus (hit()). The first
+# match wins; a reason no rule names is harmful.
+HARMFUL, REDIRECTED = "harmful", "redirect"
+REFUSALS = "glm_refusals.jsonl"   # in the run folder: one {ts, rule, class, why, n, back} per refusal
+REFUSAL_KEY = "glm_refusals"      # route.glm_refusals: {"hand_back_after": 3, "redirect": true}
+HAND_BACK_AFTER = 3
+_OUTSIDE = "outside its worktree"
+RULES = (
+    ("db_read", REDIRECTED, r"database or machine records by hand",
+     "open the project's database or machine records (sqlite or any other tool)",
+     "read them with `ttp status`, `ttp task <project> show <id>` (or `list`), `ttp machines list` and the run "
+     "folders' `state/runs/<run>/result.json`"),
+    ("upstream", REDIRECTED, r"`ttp upstream`", "run `ttp upstream`",
+     "write the note as a hand-off follow-up titled `upstream: ...`"),
+    ("scratch", REDIRECTED, _OUTSIDE, "write to a literal `/tmp/...` path or create files outside your worktree",
+     'write scratch files under `"$TMPDIR"` (a folder of your own) or in your worktree'),
+    ("records", HARMFUL, None, "write in a project's `state/` folder, another task's worktree or another project, or "
+     "delete or overwrite a file outside your worktree and `$TMPDIR`",
+     "change only files in your worktree and `$TMPDIR`, and say in your hand-off what else should change"),
+    ("delete", HARMFUL, None, None, "change only files in your worktree and `$TMPDIR`, and say in your hand-off what "
+     "else should change"),
+    ("outward", HARMFUL, r"`ttp (?:notify|say|ask|note)\b", "run `ttp notify`, `ttp say`, `ttp ask` or "
+     "`ttp note --to`/`--reply`", 'put what a person should read in your hand-off summary; a plain `ttp note "<text>"` '
+     "goes to your task's own log"),
+    ("publish", HARMFUL, r"lands a head|never `git push`", "run `git push`, `ttp land` or `ttp express`",
+     "commit on your branch and hand off done; the review publishes the head"),
+    ("post", HARMFUL, r"post to GitHub|send data to a service|reaches a person or another service|connector tool",
+     "post to GitHub (`gh` writes), send HTTP posts or mail, or call a connector tool",
+     "put the text in your hand-off summary; `gh pr view` and `gh pr diff` only read and run"),
+    ("machines", HARMFUL, r"machine ledger|`ttp remove`", "change the machine ledger (`ttp machines` writes) or "
+     "remove a project", "say in your hand-off what changed; read the ledger with `ttp machines list`"),
+    ("device", HARMFUL, r"^out of plan|power cycle|reset|flash|firmware|" + re.escape(SERVICE_WHY) + "|"
+     + re.escape(REMOTE_WHY), "reset, power-cycle, flash or reboot a device, start or stop a service, or write on "
+     "another host", "on a device task these run only as steps of Opus's device plan; otherwise hand off and say "
+     "what is needed"),
+    ("credentials", HARMFUL, r"secrets|credential|identity or the guard's own files|run a local program",
+     "read stored secrets, keys or credential files, or change the run's `TTP_*` variables",
+     "hand off and say which access the task needs"),
+    ("other", HARMFUL, r"", None, "hand off and say what the task needs"),
+)
+_DELETES = re.compile(r"\b(?:rm|rmdir|shred|unlink|truncate|chmod|chown|chgrp) target\b|\bmv source\b|\bdd of=|sed -i")
+_NEW_ONLY = re.compile(r"\b(?:mkdir|touch) target\b")
+_TMP = ("/tmp", "/var/tmp")
+
+
+def _local_rule(why: str) -> str:
+    """The rule of a refused local write (`it writes outside its worktree: <path> (<how>)`): a delete or overwrite,
+    a project's records or tree, else a new file or folder (scratch)."""
+    m = re.match(r"it writes outside its worktree: (.+?)(?: \(([^()]*)\))?$", why.strip())
+    path, how = (m.group(1), m.group(2) or "") if m else ("", "")
+    if _DELETES.search(how):
+        return "delete"
+    q = Path(path)
+    if ".tt-project" in q.parts or "/tt-project/state" in path or any(
+            (a / "tt-project" / "state").is_dir() for a in list(q.parents)[:-1]):
+        return "records"
+    if path in _TMP or path.startswith(tuple(t + "/" for t in _TMP)):
+        return "scratch"
+    return "delete" if path and os.path.lexists(path) and not _NEW_ONLY.search(how) else "scratch"
+
+
+def classify(why: str) -> tuple[str, str, str]:
+    """(rule, class, allowed way) of a refusal's reason, from RULES."""
+    by = {r[0]: r for r in RULES}
+    key = next(r[0] for r in RULES if r[2] is not None and re.search(r[2], why or ""))
+    if key == "scratch":
+        key = _local_rule(why)
+    return key, by[key][1], by[key][4]
+
+
+def refusal_settings(cfg: dict | None = None) -> dict:
+    """route.glm_refusals: `redirect` false (the off switch) hands the task back on the first refusal, as before
+    redirects; `hand_back_after` (default 3) is the refusal count in one run that hands it back."""
+    if cfg is None:
+        from . import deviceplan
+        cfg = deviceplan._cfg()
+    g = ((cfg or {}).get("route") or {}).get(REFUSAL_KEY)
+    g = g if isinstance(g, dict) else {}
+    try:
+        n = max(1, int(g.get("hand_back_after", HAND_BACK_AFTER)))
+    except (TypeError, ValueError):
+        n = HAND_BACK_AFTER
+    return {"redirect": g.get("redirect") is not False, "hand_back_after": n}
+
+
+def refusals(run_dir) -> list[dict]:
+    """The refusals a run recorded (REFUSALS), oldest first."""
+    out = []
+    try:
+        lines = (Path(run_dir) / REFUSALS).read_text(errors="replace").splitlines() if run_dir else []
+    except OSError:
+        return out
+    for ln in lines:
+        try:
+            r = json.loads(ln)
+        except ValueError:
+            continue
+        if isinstance(r, dict):
+            out.append(r)
+    return out
+
+
+def refused(run_dir, why: str, kind: str = "guard", cfg: dict | None = None) -> tuple[bool, str]:
+    """Record a refusal (REFUSALS) and decide it: (handed back, the text the run reads). A redirect's text is the
+    reason and the allowed way, and the run goes on; a harmful attempt, the run's hand_back_after-th refusal, or
+    redirects switched off end the run as a hand-back to Opus (hit()). The refused command never runs either way."""
+    why = (why or "").strip()
+    rule, cls, instead = classify(why)
+    s = refusal_settings(cfg)
+    n = len(refusals(run_dir)) + 1
+    back = cls == HARMFUL or not s["redirect"] or n >= s["hand_back_after"]
+    if run_dir:
+        try:
+            from .project import durable_append
+            durable_append(Path(run_dir) / REFUSALS, json.dumps(
+                {"ts": round(time.time(), 3), "rule": rule, "class": cls, "why": why[:280], "n": n, "back": back},
+                sort_keys=True) + "\n")
+        except OSError:
+            pass
+    if back:
+        hit(run_dir, why if cls == HARMFUL or n == 1 else f"refusal {n} in one run: {why}", kind)
+        return True, f"refused: {why}; the run ends and its task goes back to Opus"
+    left = s["hand_back_after"] - n
+    return False, (f"refused, not run: {why}.\nInstead: {instead}. Carry on with the task; "
+                   f"{left} more refusal{'s' if left > 1 else ''} in this run hand{'' if left > 1 else 's'} it "
+                   "back to Opus.")
+
+
+def deny_list() -> str:
+    """The prompt's short deny list, one line per rule with its allowed way, built from RULES so the two agree."""
+    return ("## What the guard refuses, and the allowed way\nA refused command does not run: you read why and the "
+            "allowed way, and carry on. A harmful attempt (marked) or a third refusal in one run hands the task "
+            "back to Opus.\n" + "\n".join(f"- Never {r[3]}: {r[4]}." + (" (harmful)" if r[1] == HARMFUL else "")
+                                          for r in RULES if r[3]))
 
 
 def note_route(flags) -> str:

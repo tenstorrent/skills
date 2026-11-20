@@ -443,14 +443,15 @@ def refusal(cmd: str, cwd: str = "", env=None, cfg: dict | None = None) -> str |
 
 
 def hook_refusal(cmd: str, cwd: str = "", env=None) -> str | None:
-    """refusal() for the hook and the mini-swe-agent runner: a step out of plan or a raw power step ends the run as
-    a hand-back to Opus (glmguard.hit); a missing plan or step check only refuses, so the run takes it first."""
+    """refusal() for the hook and the mini-swe-agent runner, as the text the run reads: a missing plan or step
+    check only refuses, so the run takes it first; any other refusal goes to glmguard.refused, where a step out of
+    plan or a raw power step (harmful) ends the run as a hand-back to Opus and a redirect lets it go on."""
     e = os.environ if env is None else env
     why = refusal(cmd, cwd, e)
     if why and not why.endswith(" first"):
         from . import glmguard
         kind = "out_of_plan" if why.startswith("out of plan") else "power" if power_refusal(cmd, ()) else "guard"
-        glmguard.hit(e.get("TTP_RUN_DIR"), why, kind=kind)
+        return glmguard.refused(e.get("TTP_RUN_DIR"), why, kind=kind)[1]
     return why
 
 
@@ -495,8 +496,8 @@ def glm_lines() -> str:
             "words>\"`; it prints the plan. Reads run freely; every command that changes state must be one of its "
             "steps, as written (fill only its <placeholders>); a reset, power cycle, flash or firmware step needs "
             "`ttp advise --check-step N` to answer ok first. A check step that exits nonzero or prints an error has "
-            "failed: stop there, run no later step and hand the task back to Opus. Anything else outside the plan "
-            "also hands it back: never work around a refusal. Use the plan's paths and names exactly, even one that "
+            "failed: stop there, run no later step and hand the task back to Opus. A step outside the plan "
+            "also hands it back; any other refusal says the allowed way: take it and carry on. Use the plan's paths and names exactly, even one that "
             "looks like a typo.")
 
 

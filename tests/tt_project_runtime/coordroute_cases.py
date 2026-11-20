@@ -463,7 +463,7 @@ def test_coordroute_lane_rows_never_count_as_the_coordinators_own_turn(env):
 # The GLM-arm ask-Opus switches (glmassist.py) ----------------------------------------------------------------
 
 def test_glmassist_switches_are_off_by_default_and_told_to_the_run_only_when_on():
-    from ttp import codearm, glmassist
+    from ttp import codearm, glmassist, glmguard
     assert glmassist.for_run({}) is None and glmassist.prompt_lines(None) == ""
     s = glmassist.for_run({"route": {"glm_work": {"advisor": True}}})
     assert s["advisor"] and not s["plan_first"] and (s["max_calls"], s["max_minutes"]) == (3, 10.0)
@@ -472,7 +472,7 @@ def test_glmassist_switches_are_off_by_default_and_told_to_the_run_only_when_on(
     assert s["plan_first"] and not s["advisor"] and "ttp advise --plan" in glmassist.prompt_lines(s)
     s = glmassist.settings({"route": {"glm_work": {"advisor": {"on": True, "max_calls": 99, "max_minutes": -1}}}})
     assert (s["max_calls"], s["max_minutes"]) == (20, 0.0)
-    assert "advise" not in codearm._guard_lines(), "the arm's prompt names advise only when it is on"
+    assert "advise" not in codearm.contract() + glmguard.deny_list(), "the arm's prompt names advise only when it is on"
 
 
 def _ga_reply(answer="do X then Y", cost=0.25, seen=None):
