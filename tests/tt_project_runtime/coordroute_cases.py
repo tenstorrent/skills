@@ -265,6 +265,52 @@ def test_coordroute_shadow_mode_records_the_lane_beside_the_coordinator_and_appl
     assert rec["opus"]["status"] == "ok" and rec["glm"]["status"] == "ok" and rec["compare"]["agree"]
     assert p.db.task(tid)["priority"] == 4, "the coordinator's own turn applied it once"
     assert coordroute.report(p.db, p.state)["shadow"]["compared"] == 1
+    wk = coordroute.report(p.db, p.state)["wakes"]
+    assert (wk["routine"], wk["shadow_started"]) == (1, 1) and wk["judged"] >= 1, wk
+
+
+def test_coordroute_a_must_act_blocks_own_instructions_never_make_a_wake_the_coordinators(env):
+    """The block's fixed text says "re-order or start its work": only its items may tie a wake to an order."""
+    from ttp import coordroute, mustact, obligations
+    p = _cr_db(env)
+    tid = p.db.add_task("waits", "s", kind="work", tier="light")
+    now = time.time()
+    obligations._raise(p.db, now, "qw:1", mustact.QUEUE_KIND, "#%d waited 40 min on the checks queue" % tid, tid,
+                       {"must_act": {"key": f"qwait-{tid}-checks", "chat": "all", "tasks": [tid],
+                                     "kind": mustact.QUEUE_KIND}}, severity="normal")
+    qid = p.db.one("SELECT id FROM events WHERE fingerprint='qw:1'")["id"]
+    must = mustact.block(p.db, [qid])
+    assert "re-order" in must, "the fixture must carry the block's own instructions"
+    routine, why = coordroute.classify(p.db, _cr_cfg(), evs=[p.db.one("SELECT * FROM events WHERE id=?", (qid,))],
+                                       must=must)
+    assert routine and why == [], why
+    obligations._raise(p.db, now, "pr:1", obligations.PROMISE_KIND, "promise o7 overdue", tid,
+                       {"must_act": {"key": "o7", "chat": "c1", "tasks": [tid]}})
+    pid = p.db.one("SELECT id FROM events WHERE fingerprint='pr:1'")["id"]
+    why = coordroute.classify(p.db, _cr_cfg(), must=mustact.block(p.db, [qid, pid]))[1]
+    assert "must-act item tied to an order or promise" in why
+
+
+def test_coordroute_wakes_are_counted_by_reason_with_the_shadows_they_started(env, capsys):
+    from ttp import coordroute
+    p = _cr_db(env)
+    now = time.time()
+    coordroute.wake_seen(p.state, 1, False, ["effort trigger: user message, failed review", "event ask_answered"],
+                         now=now - 30)
+    coordroute.wake_seen(p.state, 2, False, ["urgent task #12"], now=now - 20)
+    coordroute.wake_seen(p.state, 3, False, ["urgent task #13"], now=now - 15)
+    coordroute.wake_seen(p.state, 4, True, [], "started", now=now - 10)
+    coordroute.wake_seen(p.state, 5, True, [], "busy", now=now - 5)
+    coordroute.wake_seen(p.state, 6, False, ["heartbeat"], now=now - 9 * 86400)
+    wk = coordroute.report(p.db, p.state, now=now)["wakes"]
+    assert (wk["judged"], wk["routine"], wk["shadow_started"], wk["shadow_busy"]) == (5, 2, 1, 1)
+    by = {r["reason"]: (r["wakes"], r["alone"]) for r in wk["why"]}
+    assert by["urgent task #"] == (2, 2) and by["trigger user message"] == (1, 0)
+    assert by["trigger failed review"] == (1, 0) and "heartbeat" not in by, by
+    assert wk["why"][0]["reason"] == "urgent task #", "the commonest reason first"
+    out = coordroute.text(coordroute.report(p.db, p.state, now=now))
+    assert "coordinator wakes judged: 5, routine 2 (shadow started 1, skipped while another ran 1)" in out
+    assert "urgent task # 2/2" in out
 
 
 def _cr_opus_fix(p, tid, run=900):

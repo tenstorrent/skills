@@ -12555,8 +12555,12 @@ class Daemon:
         db.set_kv("last_coordinator_turn", now)
         try:   # the lane's read-back and any escalation are the coordinator's own session's now
             coordroute.opus_started(db, rid, now)
+            shadow = None
             if routine and lane["mode"] == "shadow":
-                self._start_shadow(rid, prompt_parts=parts, whole=whole, budget=budget, c=c, lane=lane, why=routine_why)
+                shadow = "started" if self._start_shadow(rid, prompt_parts=parts, whole=whole, budget=budget, c=c,
+                                                         lane=lane, why=routine_why) else "busy"
+            if lane["mode"] != "off":   # counted by reason, so a low shadow count shows its cause
+                coordroute.wake_seen(self.p.state, rid, routine, routine_why, shadow, now)
         except Exception:   # bookkeeping: the coordinator's wake runs either way
             log(self.p, "routine lane record failed: " + traceback.format_exc().replace("\n", " | ")[:1500])
         if lead:
@@ -12604,11 +12608,12 @@ class Daemon:
             coordroute._save(db, st)
             return None
 
-    def _start_shadow(self, opus_run: int, *, prompt_parts: list, whole: list, budget, c: dict, lane: dict, why: list) -> None:
-        """Starts a shadow lane turn beside coordinator turn `opus_run`: its answer is compared, never applied."""
+    def _start_shadow(self, opus_run: int, *, prompt_parts: list, whole: list, budget, c: dict, lane: dict, why: list) -> bool:
+        """Starts a shadow lane turn beside coordinator turn `opus_run`: its answer is compared, never applied.
+        False when another shadow still runs."""
         if self.p.db.one("SELECT id FROM runs WHERE role='coordinator' AND status='running' AND NOT ("
                          + coordroute.NOT_SHADOW_SQL + ")"):
-            return   # one shadow at a time
+            return False   # one shadow at a time
         prompt, system, context = self._lane_prompt(prompt_parts, whole, lane)
         srid = self.start_run("coordinator", prompt, lane["provider"], c.get("tier", "light"), str(self.p.base),
                               read_only=True, schema=coordsession.schema(), system=system, context=context,
@@ -12617,6 +12622,7 @@ class Daemon:
                                     "route": {"model": lane["model"], "effort": lane["effort"]},
                                     "messages": [], "events": [], "default_chat": None})
         coordroute.shadow_started(self.p.state, opus_run, srid, why)
+        return True
 
     def _finish_lane(self, r: dict, usage, status: str, note: dict, lane: str, actions) -> bool:
         """A shadow turn's answer is recorded, never applied; a live lane turn that failed, escalated or

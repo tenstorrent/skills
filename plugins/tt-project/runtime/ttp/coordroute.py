@@ -37,6 +37,9 @@ KEY = "coord_routine"          # kv: {"last_opus", "turns": [...], "escalate", "
 LANE = "coord_lane"            # a run note's field: "routine" on a live lane turn
 SHADOW = "coord_shadow"        # a run note's field on a shadow turn: {"of": the coordinator run it shadows}
 SHADOW_DIR = "coord-shadow"    # under the project's state folder: one <coordinator run id>.json per pair
+WAKES_FILE = "coord-routine-wakes.jsonl"   # under the state folder: one line per coordinator wake the lane judged
+WAKES_KEPT = 3000              # lines kept once the file passes WAKES_TRIM_BYTES
+WAKES_TRIM_BYTES = 1_000_000
 FLAG = "glm_coord"             # rollout.FLAGS
 MODES = ("off", "shadow", "on")
 ESCALATE = "escalate:"         # a lane noop whose `why` starts with it hands the wake to the coordinator
@@ -179,7 +182,7 @@ def classify(db, cfg: dict, *, msgs=(), evs=(), triggers=(), due=None, rerun=Fal
     if hot:
         why.append("deadline hangs on an event")
     if triggers:
-        why.append("effort trigger: " + ", ".join(str(t) for t in triggers)[:120])
+        why.append("effort trigger: " + ", ".join(str(t) for t in triggers)[:400])
     if due not in ROUTINE_DUE:
         why.append(f"wake due {due}")
     if st.get("suspended"):
@@ -204,7 +207,7 @@ def classify(db, cfg: dict, *, msgs=(), evs=(), triggers=(), due=None, rerun=Fal
                 why.append("session compaction")
         except Exception:
             why.append("session state unreadable")
-    if must and _ORDERISH.search(must):
+    if must and _ORDERISH.search(_must_items(must)):
         why.append("must-act item tied to an order or promise")
     for name, text in parts or ():
         if name == "course_check" and "promise" in str(text).lower():
@@ -214,6 +217,15 @@ def classify(db, cfg: dict, *, msgs=(), evs=(), triggers=(), due=None, rerun=Fal
     for e in evs or ():
         why += _event_reasons(db, e)
     return (not why), list(dict.fromkeys(why))
+
+
+def _must_items(must: str) -> str:
+    """The item lines of a must-act block (mustact.block): its fixed instructions ("re-order or start its
+    work", "`obligation` with its key") name no order of their own. Text with no heading is all items."""
+    lines = str(must or "").splitlines()
+    if not any(ln.startswith("## ") for ln in lines):
+        return "\n".join(lines)
+    return "\n".join(ln for ln in lines if ln.startswith("- "))
 
 
 def _event_reasons(db, e) -> list[str]:
@@ -480,6 +492,50 @@ def _write(path: Path, rec: dict) -> None:
     durable_write(path, json.dumps(rec, indent=1))
 
 
+def _reason_classes(why) -> list[str]:
+    """classify()'s reasons as countable classes: ids dropped, each effort trigger label a class of its own."""
+    out = []
+    for w in why or ():
+        w = str(w)
+        if w.startswith("effort trigger: "):
+            out += [f"trigger {x.strip()}" for x in w[len("effort trigger: "):].split(",") if x.strip()]
+        else:
+            out.append(re.sub(r"#\d+", "#", w.split(":", 1)[0] if w.startswith("lane suspended") else w))
+    return list(dict.fromkeys(out))
+
+
+def wake_seen(state_dir, run_id, routine: bool, why, shadow: str | None = None, now: float | None = None) -> None:
+    """Records one coordinator wake the lane judged (its mode not off): routine or not, with classify()'s
+    reasons as classes, and for a routine wake in shadow mode whether its shadow started ("started") or
+    waited on another still running ("busy"). report() counts them, so why few wakes are shadowed shows."""
+    from .project import append_text
+    path = Path(state_dir) / WAKES_FILE
+    path.parent.mkdir(parents=True, exist_ok=True)
+    rec = {"ts": round(time.time() if now is None else now, 1), "run": run_id, "routine": bool(routine),
+           "why": _reason_classes(why), **({"shadow": shadow} if shadow else {})}
+    append_text(path, json.dumps(rec) + "\n")
+    if path.stat().st_size > WAKES_TRIM_BYTES:
+        _write_text(path, "\n".join(path.read_text(errors="replace").splitlines()[-WAKES_KEPT:]) + "\n")
+
+
+def _write_text(path: Path, text: str) -> None:
+    from .project import durable_write
+    durable_write(path, text)
+
+
+def _wakes(state_dir, since: float, until: float) -> list[dict]:
+    path = Path(state_dir) / WAKES_FILE
+    out = []
+    for line in path.read_text(errors="replace").splitlines() if path.is_file() else []:
+        try:
+            rec = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(rec, dict) and since <= float(rec.get("ts") or 0) <= until:
+            out.append(rec)
+    return out
+
+
 def shadow_started(state_dir, opus_run, shadow_run, why_routine, now: float | None = None) -> None:
     path = shadow_path(state_dir, opus_run)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -557,7 +613,26 @@ def report(db, state_dir, days: float = 7.0, now: float | None = None, since: fl
                                      "differ": [{"run": r.get("opus_run"), **{k: r["compare"][k] for k in
                                                                               ("opus_only", "glm_only")}}
                                                 for r in done if not r["compare"].get("agree")][-10:]},
-            "live": live}
+            "live": live, "wakes": wake_counts(_wakes(state_dir, since, until)),
+            "glm_usd_per_compared": round(cost["glm"] / n, 3) if n else None}
+
+
+def wake_counts(wakes: list[dict]) -> dict:
+    """The coordinator's wakes the lane judged: how many were routine and shadowed, and per reason class
+    how many it kept from the lane, and how many it alone kept (the wakes a fix of that class would free)."""
+    why: dict[str, int] = {}
+    alone: dict[str, int] = {}
+    for w in wakes:
+        classes = [str(c) for c in w.get("why") or []]
+        for c in classes:
+            why[c] = why.get(c, 0) + 1
+        if len(classes) == 1:
+            alone[classes[0]] = alone.get(classes[0], 0) + 1
+    ranked = sorted(why.items(), key=lambda kv: (-kv[1], kv[0]))
+    return {"judged": len(wakes), "routine": sum(1 for w in wakes if w.get("routine")),
+            "shadow_started": sum(1 for w in wakes if w.get("shadow") == "started"),
+            "shadow_busy": sum(1 for w in wakes if w.get("shadow") == "busy"),
+            "why": [{"reason": r, "wakes": k, "alone": alone.get(r, 0)} for r, k in ranked]}
 
 
 def text(rep: dict, project: str = "") -> str:
@@ -572,6 +647,15 @@ def text(rep: dict, project: str = "") -> str:
            f"lane ${sh['cost_usd']['glm']:.2f}",
            f"live: {lv['turns']} lane turns, {lv['actions']} actions applied, {lv['escalated']} escalated, "
            f"{lv['failed']} failed" + (f"; suspended: {lv['suspended'].get('why')}" if lv['suspended'] else "")]
+    if rep.get("glm_usd_per_compared") is not None:
+        out[1] += f", ${rep['glm_usd_per_compared']:.3f} per compared wake"
+    wk = rep.get("wakes") or {}
+    if wk.get("judged"):
+        out.append(f"coordinator wakes judged: {wk['judged']}, routine {wk['routine']} (shadow started "
+                   f"{wk['shadow_started']}, skipped while another ran {wk['shadow_busy']})")
+        if wk["why"]:
+            out.append("  kept from the lane by (wakes, alone): " + "; ".join(
+                f"{r['reason']} {r['wakes']}" + (f"/{r['alone']}" if r["alone"] else "") for r in wk["why"][:15]))
     for d in sh["differ"]:
         out.append(f"  run {d['run']}: coordinator only {', '.join(d['opus_only']) or '-'}; "
                    f"lane only {', '.join(d['glm_only']) or '-'}")
