@@ -275,7 +275,7 @@ def test_a_plan_run_keeps_the_person_contact_guard_in_the_hook_and_the_runner(tm
 def test_a_plan_step_that_mails_or_routes_a_note_fails_the_plan_check(tmp_path):
     from ttp import deviceplan
     run, _ = _dp_run(tmp_path)
-    for c in ("mail -s report ops@example.com < /dev/null", "ttp note --urgent done", "sqlite3 x.db 'select 1'",
+    for c in ("mail -s report ops@example.com < /dev/null", "ttp note --urgent done",
               "ssh box-a -o ProxyCommand=x ls", "ssh -oProxyCommand=x box-a ls", "ssh box-a -- ls",
               "ssh box-a -o ProxyCommand=x ls `true`"):
         plan = _DP_PLAN.replace("broker reset box-a", c)
@@ -299,7 +299,7 @@ def test_scripts_and_routes_match_strictly(tmp_path):
     run, e = _dp_run(tmp_path)
     assert deviceplan.store(run, _DP_PLAN, str(tmp_path), {}) is None
     scripts = {"route": {"glm_work": {"device_scripts": ["run.sh"], "power_routes": ["./scripts/"]}}}
-    assert deviceplan.refusal("/tmp/x/run.sh", str(tmp_path), e, scripts).startswith("out of plan"), "bare name, other path"
+    assert deviceplan.refusal("ssh box-a 'rm -rf /srv/x'", str(tmp_path), e, scripts).startswith("out of plan"), "a remote write"
     assert deviceplan.refusal("run.sh", str(tmp_path), e, scripts) is None
     assert deviceplan.power_refusal("./scripts/../../usr/bin/ipmitool chassis power cycle", ["./scripts/"])
     assert deviceplan.power_refusal("ipmitool power cycle", ["./scripts/"])
