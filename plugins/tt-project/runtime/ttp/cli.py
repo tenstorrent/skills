@@ -9436,13 +9436,13 @@ def cmd_land(a) -> None:
 
 
 def cmd_express(a) -> None:
-    """Land one small, urgent, reviewed head alone, ahead of the push queue (express.py): 0 started or
+    """Land one small, urgent, reviewed head alone, ahead of the push queue (pushq.py): 0 started or
     landed, 2 refused (each reason printed), 1 failed."""
-    from . import express
+    from . import pushq
     p = here()
     if not p:
         die("ttp express: no project here (run it in a project or with TTP_PROJECT set)")
-    sys.exit(express.main(p, a.ref, a.why, dry_run=a.dry_run, wait_s=a.wait))
+    sys.exit(pushq.express_main(p, a.ref, a.why, dry_run=a.dry_run, wait_s=a.wait))
 
 
 def cmd_model_bench(a) -> None:
