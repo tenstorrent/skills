@@ -11020,8 +11020,9 @@ def _detach_occupied(a, rhost: str | None) -> list[str]:
     locks = [r for v in (getattr(a, "lock", None) or []) for r in str(v).split(",") if r]
     step = getattr(a, "step", None) or "test"
     if step == "none":   # touches no box: no stream can hold it
-        if a.remote:
-            die("ttp detach: --step none cannot go with --remote: a job on another host touches that host")
+        if used := [f for f, v in (("--remote", a.remote), ("--remote-host", rhost), ("--lock", locks)) if v]:
+            die(f"ttp detach: --step none cannot go with {' or '.join(used)}: a job that uses another host "
+                "or box touches it")
         return []
     if a.remote:
         if why := occupancy.blocks_any([a.remote, *locks], step):
@@ -17114,7 +17115,7 @@ def main(argv: list[str] | None = None) -> None:
     s.add_argument("--step", choices=("deploy", "restart", "test", "bench", "warmup", "health", "reset", "none"),
                    default=None, help="what the job does on its box (default test): checked against `ttp occupancy` "
                    "before it starts; none: a job that adds no host load (a gh or API call, waiting on a remote "
-                   "service) never waits for a box; builds and test runs keep the default; not with --remote")
+                   "service) never waits for a box; builds and test runs keep the default; not with --remote, --remote-host or --lock")
     s.add_argument("--reap", metavar="NAME|RC",
                    help="close the record of a job that is over now, as the daemon does each minute: ended "
                    "with its exit code, or died when gone without one; refuses (exit 1) while it runs; idempotent")

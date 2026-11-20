@@ -752,15 +752,18 @@ def test_occupancy_detach_step_none_never_waits_and_the_default_still_does(env, 
     asked = []
     monkeypatch.setattr(occupancy, "blocks_any", lambda targets, step="test", now=None:
                         asked.append(step) or "box-a: a live realtime stream holds it")
-    assert cli._detach_occupied(argparse.Namespace(remote=None, lock=["box-a"], step="none"), None) == []
-    with pytest.raises(SystemExit):   # a job on another host touches that host
-        cli._detach_occupied(argparse.Namespace(remote="box-a", lock=[], step="none"), None)
+    assert cli._detach_occupied(argparse.Namespace(remote=None, lock=[], step="none"), None) == []
+    for remote, rhost, lock in (("box-a", None, []), (None, "box-a", []), (None, None, ["box-a"])):
+        with pytest.raises(SystemExit):   # a job that uses another host or box touches it
+            cli._detach_occupied(argparse.Namespace(remote=remote, lock=lock, step="none"), rhost)
+        assert "--step none cannot go with" in capsys.readouterr().err
     assert asked == []   # a job that touches no box asks no stream
     assert cli._detach_occupied(argparse.Namespace(remote=None, lock=["box-a"], step=None), None) == \
         [project.hostname(), "box-a"] and asked == ["test"]
     with pytest.raises(SystemExit):
         cli.main(["detach", "--help"])
-    assert "none: a job that adds no host load" in " ".join(capsys.readouterr().out.split())
+    out = "".join(capsys.readouterr().out.split())   # help wraps at spaces and hyphens
+    assert "none:ajobthataddsnohostload" in out and "notwith--remote,--remote-hostor--lock" in out
 
 
 def test_occupancy_harness_ab_cell_start_waits_for_the_box(monkeypatch, tmp_path):
