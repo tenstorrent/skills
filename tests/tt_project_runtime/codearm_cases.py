@@ -362,7 +362,8 @@ _GG_READS = [
     "ttp machines list", "ttp machines list --json", "ttp machines status", "ttp machines activity",
     "ttp machines change list", "ttp machines change list x --all --json", "ttp machines outage", "ttp machines outage x",
     "ttp machines outage list", "ttp machines outage --json", "ttp status", "ttp status --json --verbose", "ttp occupancy",
-    "ttp occupancy --list", "ttp stats", "ttp hostcheck", "ttp checks queue", "ttp task proj show 5", "ttp proj machines change list", "ttp machines change list 2>&1 | tail -5"]
+    "ttp occupancy --list", "ttp stats", "ttp hostcheck", "ttp checks queue", "ttp task proj show 5", "ttp proj machines change list", "ttp machines change list 2>&1 | tail -5",
+    "ttp ci --branch b", "ttp ci --repo o/r --sha abc123 --workflow w", "ttp ci --run 5 --no-hang"]   # the CI probe only reads
 _GG_WRITES = [
     "ttp machines change add x 'what' --undo true", "ttp machines change edit 3 --what y", "ttp machines change close 3",
     "ttp machines set x --tag a", "ttp machines add x", "ttp machines remove x", "ttp machines push", "ttp machines tag-note a 'text'",
@@ -754,6 +755,18 @@ def test_a_glm_runs_scratch_folder_is_in_its_run_folder_or_its_own_short_temp_di
     assert "tmp_env.update(glmguard.scratch_env(run_dir, tmp_env))" in src
     assert "if glmguard.run_env(run_prov, note):" in src and "glmguard.SCRATCH_LINE" in src
     assert "$TMPDIR" in glmguard.SCRATCH_LINE and "/tmp" in glmguard.SCRATCH_LINE
+    assert '"$TMPDIR/body.md"' in glmguard.SCRATCH_LINE and "state/" in glmguard.SCRATCH_LINE
+
+
+def test_glm_code_runs_get_the_self_check_before_hand_off():
+    # the review's top failures: size, test quality, a spec item left undone (a code run checks its own diff first)
+    import inspect
+    from ttp import daemon, glmguard
+    line = glmguard.HANDOFF_LINE
+    assert "ttp slop --diff" in line and "why this size:" in line
+    assert "fail without your change" in line and "self_check" in line and "tick every step" in line
+    src = inspect.getsource(daemon)
+    assert 'if task["kind"] in ("code", "harness"):' in src and "glmguard.HANDOFF_LINE" in src
 
 
 def test_glm_guard_hook_denies_a_refused_call_and_ends_the_run_as_a_bounce(monkeypatch, tmp_path):

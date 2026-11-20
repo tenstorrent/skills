@@ -13273,6 +13273,8 @@ class Daemon:
                 prompt += deviceplan.glm_lines() if note.get(deviceplan.KEY) else deviceplan.prompt_lines(is_device)
                 if glmguard.run_env(run_prov, note):   # its TMPDIR is a scratch folder of its own (start_run)
                     prompt += f"\n\n{glmguard.SCRATCH_LINE}\n"
+                    if task["kind"] in ("code", "harness"):
+                        prompt += f"\n{glmguard.HANDOFF_LINE}\n"
                 members = [] if note.get("wake") or note.get("resumes") or on_arm else \
                     self._batch_members(task, ready, batched | set(fate), live)
                 if members:

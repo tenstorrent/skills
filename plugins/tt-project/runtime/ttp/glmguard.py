@@ -107,8 +107,18 @@ STATE_DB = re.compile(r"\bproject\.db\b|\bmachine-workers\.json\b|\b\.tt-project
 # human interaction stays on Opus, so its outward posts become drafts an Opus step reviews and sends.
 SCRATCH = "tmp"               # in the run folder: the run's own scratch folder, its TMPDIR (TMP, TEMP)
 SCRATCH_VARS = ("TMPDIR", "TMP", "TEMP")
-SCRATCH_LINE = ("Keep scratch files in $TMPDIR (a folder of your own in your run folder) or your worktree, never in"
-                " /tmp: the guard refuses writes anywhere else.")
+SCRATCH_LINE = ("Keep scratch files in $TMPDIR (a folder of your own in your run folder) or your worktree: write"
+                ' `> "$TMPDIR/body.md"`, never a literal `/tmp/...` path, and never create files in the project\'s'
+                " `state/` folder. The guard refuses writes anywhere else, and a refusal hands the task to Opus.")
+# A code run's check of its own diff before it hands off done: the review fails size, test and spec-step gaps.
+HANDOFF_LINE = ("Before you hand off done, review your own diff as the independent review will, and fix what it would"
+                " flag. (1) Size: run `ttp slop --diff <base>..HEAD`; cut restated prose, a second copy of a rule or"
+                " helper, comments about the task and files the spec did not ask for; reuse what exists; if the diff"
+                " stays large, add a `why this size:` line to your summary. (2) Tests: each new or changed test must"
+                " fail without your change (run it once with the fix reverted, then restore it), assert behaviour"
+                " rather than message wording, and leave no unused setup. (3) Spec: tick every step and listed item;"
+                " an item left undone is a failed review, so finish it or say why not. Every claim in your summary"
+                " cites the command or file that shows it. Put the result in a `self_check` line of result.json.")
 _SCRATCH_REF = re.compile(r"\$(?:\{(TMPDIR|TMP|TEMP)\}|(TMPDIR|TMP|TEMP)(?!\w))")
 _SCRATCH_SET = re.compile(r"(?<![\w${])(?:TMPDIR|TMP|TEMP)(?!\w)")   # the command names one itself (sets it)
 RUN_ENV = "TTP_GLM_RUN"       # "1", or DEVICE for a run on a device task
