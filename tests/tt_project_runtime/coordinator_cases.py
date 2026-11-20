@@ -1636,8 +1636,8 @@ def test_a_snapshot_from_before_recent_memory_was_cached_shows_it_all_in_the_dig
 
 @pytest.mark.parametrize("provider", ["claude", "codex"])
 def test_user_corrections_are_read_from_the_cached_prompt_and_new_ones_show_in_the_digest(env, monkeypatch, provider):
-    # Claude Code's cache reads only the system prompt, never a shared start of the user prompt (measured,
-    # ): the corrections (6 changes in 1,000 turns) were rewritten with every digest.
+    # Claude Code's cache reads only the system prompt, never a shared start of the user prompt (measured):
+    # the corrections (6 changes in 1,000 turns) were rewritten with every digest.
     from ttp import coordinator as coord
     from ttp.project import CORRECTIONS_HEADER
     p, turn = _coordinator_turns(env, monkeypatch, provider, step=60)

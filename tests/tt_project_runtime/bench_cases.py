@@ -2281,7 +2281,7 @@ def test_bench_grade_runs_the_held_out_tests_in_parallel_where_xdist_is_availabl
 
 
 def test_model_suite_refresh_widens_the_draw_until_enough_tasks_are_fair_and_stops_at_its_widest(tmp_path, monkeypatch):
-    """item 1: the daily prep draws past landed tasks until at least PREP_LIMIT are fair
+    """The daily prep draws past landed tasks until at least PREP_LIMIT are fair
     (unfair ones are dropped, never counted); the lookback doubles from 14 days and stops at WIDEN_MAX_S."""
     import hashlib
     from ttp import bench, modelsuite

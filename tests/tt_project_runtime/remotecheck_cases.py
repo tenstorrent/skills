@@ -5003,7 +5003,7 @@ def test_on_a_workstation_a_heavy_run_waits_for_a_busy_spill_host_and_never_runs
 
 def test_a_workstations_wait_for_a_busy_spill_host_says_so_and_holds_no_checks_slot(env, tmp_path, monkeypatch,
                                                                                      capsys):
-    """Owner's (checks waited an hour as "queued for a host-wide checks slot ... 0 running, 0 queued"):
+    """Checks once waited an hour as "queued for a host-wide checks slot ... 0 running, 0 queued". Now
     a workstation's wait for a busy spill host holds no checks slot here, so its `--result` probe says it waits
     for the spill host and the queue report files it under busy spill hosts, never offering a raise of the
     host-wide checks cap."""

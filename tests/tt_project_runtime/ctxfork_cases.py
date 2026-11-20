@@ -1187,7 +1187,7 @@ def _codex_rollout_with_instructions(home, sid, cwd="/coord"):
 
 
 def test_codex_own_instructions_replace_the_sessions_harness_text_everywhere(monkeypatch, tmp_path):
-    """Task #198: `codex exec resume` keeps the rollout's developer messages and takes no new
+    """`codex exec resume` keeps the rollout's developer messages and takes no new
     developer_instructions, so a worker forked from a coordinator without tools ran under "This session has
     no tools". The run's own text replaces the harness's blocks (top level and inside compactions); Codex's
     own <...> blocks, user messages and the source session stay; Claude takes each launch's system prompt."""
@@ -1297,7 +1297,7 @@ def test_codex_worker_runs_start_with_their_own_instructions_and_the_coordinator
     assert got["how"] == "fork" and argv[argv.index("resume") + 1] == got["session"], (got, argv)
     assert "no tools" not in text and "WORKER RULES" in text and "<multi_agent_role>" in text
     assert "This session has no tools" in coord_src.read_text()   # the coordinator's session is untouched
-    # Task #299: the prompt overrides the coordinator's rules the copy may still hold and
+    # The prompt overrides the coordinator's rules the copy may still hold and
     # carries the worker's own, once, as a shaped Claude fork's does (forks without it wrote no result).
     lead, rest = start.prompt.split("TASK PROMPT", 1)[0], start.prompt.split("TASK PROMPT", 1)[1]
     assert lead.startswith(ctxfork.FORK_HEAD) and "are the coordinator's and do not apply" in lead

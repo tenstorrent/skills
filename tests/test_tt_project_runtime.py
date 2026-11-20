@@ -25200,7 +25200,7 @@ def test_codex_gets_its_system_text_and_compact_window_as_config_overrides(env, 
     assert prompt == "PROMPT-MARKER", "the system text still leads the prompt"
     assert argv[-3:] == ["resume", THREAD, "-"], "options after the resume subcommand"
     # The coordinator's system text goes the same way; its session compacts in place at its own limit
-    #, not at a tier's window.
+    # (coordsession.limit), not at a tier's window.
     argv, prompt = start("coordinator", system=system, read_only=True)
     assert overrides(argv)["developer_instructions"] == system and _unmoded(prompt) == "PROMPT-MARKER"
     assert overrides(argv)["model_auto_compact_token_limit"] >= 100000 and argv[-1] == "-"
@@ -38419,7 +38419,7 @@ def test_host_slept_alert_says_why_keep_awake_did_not_stop_the_sleep(env, state,
 
 
 def test_idle_sleep_off_by_default_and_explicit_on_or_auto_still_holds(env):
-    """Tt-project never keeps a Mac awake unless the user sets the key; an explicit
+    """tt-project never keeps a Mac awake unless the user sets the key; an explicit
     value set before an upgrade keeps working."""
     from ttp import awake, project as pj
     assert awake.mode({}) == awake.mode(pj.DEFAULT_CONFIG) == "off"
