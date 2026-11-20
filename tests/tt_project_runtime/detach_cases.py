@@ -2517,11 +2517,13 @@ def test_the_wrapper_writes_its_started_file_by_rename_so_no_reader_sees_it_empt
         pid = detach.start(rc, rc.with_suffix(".log"), ["true"], str(tmp_path), dict(os.environ), lock)
     finally:
         lock.close()
-    assert _wait_for_path(rc) and rc.read_text().strip() == "0"
+    # The wrapper removes its scratch dir (job.tmp) only after the .rc is in place: wait for it to exit.
+    next(c for c in detach._children if c.pid == pid).wait(timeout=20)
+    detach.reap_children()
+    assert rc.read_text().strip() == "0"
     assert detach.started(rc).read_text().split() == [str(pid)]
     assert view.read_text() == "stale\n", "the wrapper truncated .started in place"
     assert not [f.name for f in rc.parent.iterdir() if f.name.endswith(".tmp")], "a temp file was left"
-    detach.reap_children()
 
 
 def test_detach_check_host_on_the_own_machine_reads_it_here_with_no_ssh(env, tmp_path, monkeypatch):
