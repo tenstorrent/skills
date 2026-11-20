@@ -45,30 +45,6 @@ Load the references when you reach them, not up front: [ops and kernels](referen
 A workable order: plan (no device) → correct skeleton at B1 → design-shaping features → speed and precision →
 hardening. Overlap them wherever the work is independent.
 
-## What tends to go wrong
-
-- **Speed never gets its turn.** Correctness, serving and fixes absorb the budget and the model ends far from its
-  floor. Keep at least one agent on the top perf item from the skeleton on, and report measured against floor
-  at every milestone.
-- **Checks too coarse to see the bug.** A PCC of 0.99999 can hide a difference that flips a discrete choice
-  (routing, top-k, sampling) many layers later. Batched against alone compares logits bit for bit where the ops allow; any op that is not batch-invariant
-  is named with its largest difference and shown not to change greedy tokens or routing over long runs. Teacher-forced
-  checks use enough positions to resolve the difference that matters (64 positions cannot resolve 0.2 points).
-- **Late discoveries.** Programs compiled after warmup, host work per step, on-chip memory collisions between
-  modules, and prompt lengths nobody tried (very short, odd, at chunk edges) surface only under real traffic.
-  Test them on purpose: program-cache count after warmup, host time per step, every prefill size in warmup.
-- **The coordinator as bottleneck.** More agents than it can review means unreviewed merges or idle agents.
-  Batch landings behind T1; keep briefs short and exact; let agents report in one line and a notes file.
-- **Breaking the machine.** Parallel agents on one board interfere: killed jobs, overlapping meshes, resets.
-  Follow `tt-device-usage` from the first device run; it is cheaper than a lost host.
-- **Blaming the model for the machine.** Different firmware gives different results; compare machines before
-  debugging numerics.
-- **Silent scope cuts.** When the budget forces a cut (an eval, a feature, a precision study), the report says
-  what was not done and why.
-
-The staged pipeline's strengths are worth keeping here too: fixed, checkable outputs; one independent review
-by a fresh agent; summaries a reviewer can audit; tokens and hours recorded per goal so runs can be compared.
-
 ## Tests
 
 | Tier | When | What |
@@ -80,13 +56,32 @@ by a fresh agent; summaries a reviewer can audit; tokens and hours recorded per 
 Keep T1 near ten minutes so it runs often. Every device run has a timeout. Never loosen a check or delete one
 to pass; a numerics change moves the baseline only after T2.
 
+What the tiers must contain, because these bugs pass weaker checks:
+- **Batched equals alone:** run the largest batch with mixed prompts and compare each user with the same prompt run
+  alone over at least 1,000 generated tokens: identical greedy tokens, and logits bitwise where the ops allow. A
+  PCC near 1 is not enough: a difference of 1e-5 can flip a routing or top-k choice many layers later. Name any op
+  that is not batch-invariant with its largest difference.
+- **Enough positions:** a teacher-forced comparison needs enough positions to resolve the difference it decides
+  on; to tell top-1 apart by 0.5 points, use several thousand positions, not a few dozen.
+- **Warmup covers every shape:** prefill lengths 1, 2, an odd length, chunk size − 1, chunk size and chunk size + 1,
+  and the longest context, at every batch. After warmup, the program-cache count does not change across a
+  mixed-length request loop; a change means something compiles per request.
+- **Host time per step** is measured beside device time in every perf result. Host work that grows with batch,
+  context or table size shows up only there.
+- **Model memory map:** keep one map of persistent on-chip and DRAM allocations per module; T2 runs every module
+  together at the largest batch and longest context, where allocations of different modules collide.
+
 ## Working in parallel
 
 One coordinator plans, briefs, lands and reports, and never blocks on a wait. A subagent gets one deliverable,
 the files it owns, the ones it must not touch, its device slot, its tests and how to report. Good units: the
 CPU reference, the op inventory, one module or layer kind each, the integration skeleton, later one perf hotspot
-each. The coordinator's review is the bottleneck, so a handful of live agents is usually the useful limit.
-Landing: cherry-pick onto head, run T1, announce the new head; agents rebase.
+each. Run only as many live agents as the coordinator can review: a report should be reviewed and landed or
+answered within about an hour, or the next agent waits. Landing: batch reports, cherry-pick onto head, run T1
+once, announce the new head; agents rebase.
+
+From the first correct skeleton on, one agent always owns the top item of the perf ranking, and every milestone
+report gives measured and floor per batch. Speed work is never parked until the end.
 
 Experiment where a measurement can decide. At most about a fifth of the budget goes to throwaway prototypes on side branches (another
 layout, a fused op, a different parallel scheme), run side by side and judged only by measurement. Land the
@@ -101,6 +96,8 @@ ports first), `speedup` (an existing correct model: start at the perf loop, gate
 ## Devices and budget
 
 Every device job runs under a lock with a timeout; an unclean exit resets the board and checks it before the
-next job (`tt-device-usage`). `budget_hours` in `model.json` bounds the goal: use it to get closer to the targets, and when it ends, report
+next job (`tt-device-usage`). Set this up before the first device run, not after the first incident. When two
+machines disagree on a numeric result, compare firmware and driver versions and rerun on the other machine before
+debugging the model. `budget_hours` in `model.json` bounds the goal: use it to get closer to the targets, and when it ends, report
 as is. A missed target is reported with its reason; it is not a reason to stop before the budget is spent.
 Commit summaries, not raw output (`model-bringup`). One `stage-review`, at the end.
