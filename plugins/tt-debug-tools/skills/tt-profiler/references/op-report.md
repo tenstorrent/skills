@@ -113,8 +113,8 @@ wait "$capture_pid" || exit 1   # run.tracy is complete only once it exits
 ./build/tools/profiler/bin/tracy-csvexport -m -s ";" run.tracy
 ```
 
-On a full model run, give teardown about 10 minutes before reading `ops.csv`,
-and check the log for `missed N bytes of frames` (a partial CSV): see the
+On a full model run, profile the steady part, let teardown finish before
+reading `ops.csv`, and check that every op is on every chip: see the
 streaming-profiler findings in `SKILL.md`.
 
 Read the `TT_DNN_DEVICE_OP` messages. Each one's last number is

@@ -111,18 +111,26 @@ Tracy-enabled build, and idle Ethernet cores for the sync.
 Seen on device runs, tested on a 32-chip Blackhole Galaxy (as of 2026-11-20,
 check current behaviour):
 
+- **On a full model, profile the steady part of the run and check that every op
+  is on every chip before trusting per-op numbers.** The ops CSV can miss
+  frames with no sign in its rows; the only sign is
+  `[streaming profiler] consumer "ops-csv" missed N bytes of frames` in the log.
+  On a full model run (about 37k ops on each of 32 chips) it missed 28 of the
+  63 GB captured, all on the first clip: 46% of that clip's ops were missing on
+  some or all chips. The steady clip after it was complete on all 32 chips
+  (12,576 ops); a 10-op run dropped nothing. So profile only the steady part, or
+  run it last; check the log for the warning; and check that every
+  `GLOBAL CALL COUNT` in your span appears on every chip before you sum. Whether
+  the loss always falls early in a run is not tested.
 - The first run recompiles every kernel with `-DPROFILE_STREAMING`; time the second.
-- Read the CSVs only after the mesh closes; they are written then, in one go.
-  On a full model run (about 37k ops on each of 32 chips) the ops CSV stayed
-  0 bytes until teardown ended, 474 s after the test passed. A job ended early
-  leaves it empty: seen twice, with a hang watchdog stopping the job about
-  5 min after PASSED. Give the job about 10 min for teardown, let the process
-  exit by itself, then read the CSV.
-- `[streaming profiler] consumer "ops-csv" missed N bytes of frames` in the log
-  means the ops CSV is partial. On that full run it missed about 28 GB of the
-  63 GB captured, and each chip's CSV held about 75% of its ops; a 10-op run
-  dropped nothing. Check the log for it; when every op must be counted,
-  profile a shorter span (not tested).
+- The CSVs are written in one go when the mesh closes, and teardown is a slow
+  drain, not a deadlock: 474 s for 63 GB of frames, about 13 s per 1,000 ops on
+  32 chips, with the ops CSV at 0 bytes until it ended. A job runner's hang
+  timeout must allow for it: two jobs stopped about 5 min after PASSED lost all
+  output. Let the process exit by itself, then read the CSV.
+- Ops-CSV durations are spans that include waits on other chips, and
+  `EXECUTION` 1 rows add to their op (`references/csv-format.md`). Summed per-op
+  time still matched a device-bound stage's wall time within 0.5%.
 - The steady step time was the same with the profiler on and off (2.25 s).
 - Too few idle Ethernet cores for the sync is a `TT_FATAL` at bring-up.
 - `python -m tracy` sets `TT_METAL_DEVICE_PROFILER=1` by default, a `TT_FATAL`
