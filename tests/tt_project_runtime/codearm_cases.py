@@ -1306,3 +1306,24 @@ def test_a_project_the_glm_work_route_covers_has_no_policy_file_stay_or_refusal_
     covered["route"]["glm_work"]["harness"] = "codex"
     assert codearm.settings(covered) is None   # an unguarded harness still turns it off
 
+
+
+def test_a_covered_follow_up_of_a_claude_arm_change_is_decided_afresh_except_in_the_holdout(env):
+    from ttp import chaincap, codearm
+    p = make(env)
+    covered, plain = _ua_cfgs()
+    covered["route"]["glm_work"]["holdout"] = 0
+    def follow(root, cfg):
+        fix = p.db.add_task("Fix review #9: tidy", "", kind="code", tier="standard", priority=3, budget_usd=1.0)
+        p.db.x("UPDATE tasks SET labels=? WHERE id=?", (json.dumps([f"{chaincap.FOLLOWS}{root['id']}"]), fix))
+        return codearm.choose(p.db, cfg, p.db.task(fix), "standard", policy=_PF_LIST)
+    kept = _ca_task(p)   # its parent stayed on Claude for a rule since removed
+    p.db.set_kv(f"{codearm.ARM_KV}{kept['id']}", {"arm": "claude", "why": "conclusion", "seed": "s", "ts": 1.0})
+    assert follow(kept, covered)["run"] == "glm"
+    held = _ca_task(p)   # the Claude holdout keeps its whole lineage there
+    p.db.set_kv(f"{codearm.ARM_KV}{held['id']}", {"arm": "claude", "why": "holdout: seeded coin", "seed": "s", "ts": 1.0})
+    got = follow(held, covered)
+    assert got["arm"] == "claude" and "lineage" in got["why"]
+    again = _ca_task(p)   # outside the work route a lineage always keeps its parent's arm
+    p.db.set_kv(f"{codearm.ARM_KV}{again['id']}", {"arm": "claude", "why": "conclusion", "seed": "s", "ts": 1.0})
+    assert follow(again, plain)["arm"] == "claude"

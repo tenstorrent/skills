@@ -239,3 +239,38 @@ def test_glm_share_names_reviews_that_ran_on_glm_only_when_there_are_any(env):
     s = glmshare.report(p, now - 2 * 86400, now)
     newest = datetime.datetime.fromtimestamp(now - 10 * 3600).strftime("%Y-%m-%d")
     assert f"reviews on GLM: 2, newest {newest} (run class rebase)" in glmshare.text(s)
+
+
+def test_glm_share_held_groups_claude_runs_by_the_rule_that_kept_them_and_marks_the_users_own(env, capsys):
+    from ttp import glmshare
+    p = make(env)
+    now = 1_000_000_000.0 + 30 * 86400
+    t = now - 5 * 3600
+    cl = {"provider": "claude", "model": "opus"}
+    def code(why, hours, **kw):
+        tid = _gs_task(p)
+        _gs_run(p, tid, t, hours, note={"code_arm": {"arm": "claude", "why": why}}, **cl, **kw)
+        return tid
+    code("policy: harness/policy_files.txt", 2)
+    code("lineage of #5", 1)
+    code("conclusion floor", 0.5)
+    code("person: post to slack", 1)
+    code("design: optimization", 0.25)
+    code("holdout: seeded coin", 0.25)
+    tid = _gs_task(p, kind="work")
+    _gs_run(p, tid, t, 0.5, note={"route": {"to": "claude", "fallback": "rerun"}}, **cl)
+    _gs_run(p, _gs_task(p, kind="review"), t, 1, **cl)
+    _gs_run(p, _gs_task(p, kind="plan"), t, 0.5, **cl)
+    _gs_run(p, None, t, 1, role="coordinator", **cl)
+    _gs_run(p, _gs_task(p), t, 4)   # on GLM: never counted as held
+    got = glmshare.held(p, now - 86400, now)
+    assert list(got)[0] == "policy files" and got["policy files"]["hours"] == 2.0
+    by = {k: (v["runs"], v["hours"], v["user_rule"]) for k, v in got.items()}
+    assert by["lineage misses"] == (1, 1.0, False) and by["conclusion floor"] == (1, 0.5, False)
+    assert by["rerun after a fallback"] == (1, 0.5, False) and by["policy files"][2] is False
+    assert by["person"] == (1, 1.0, True) and by["design or optimization"][2] is True and by["holdout"][2] is True
+    assert by["review"] == (1, 1.0, True) and by["plan"] == (1, 0.5, True) and by["coordinator turn"] == (1, 1.0, True)
+    assert got["policy files"]["tasks"] == 1 and got["policy files"]["hour_pct"] == round(100 * 2.0 / 12.0, 1)
+    s = glmshare.report(p, now - 86400, now)
+    assert s["held"] == got
+    assert "held off GLM by rule" in glmshare.text(s) and "policy files" in glmshare.text(s)

@@ -2766,6 +2766,27 @@ def test_a_lineage_with_two_routed_misses_stays_on_core_and_one_miss_still_route
     assert route.misses(p.db, chain(p.db, fix)) == [f"task {other} sent back by review"]
 
 
+def test_infrastructure_fallbacks_are_not_lineage_misses_when_the_caller_skips_them(env):
+    from ttp import glmwork, route
+    from ttp.chaincap import chain
+    p = make(env)
+    _route_config(p)
+    root = p.db.add_task("build", "s", kind="code", tier="light", priority=3, budget_usd=8.0, labels=[])
+    _routed_run(p, root, fallback="timeout")
+    _routed_run(p, root, fallback="timeout")
+    p.db.update_task(root, status="done")
+    hop = p.db.add_task("continue: build", "s", kind="code", tier="light", priority=3, budget_usd=8.0,
+                        labels=[f"continues:{root}"])
+    assert len(route.misses(p.db, chain(p.db, hop))) == 2      # the default still counts them
+    assert route.escalation(p.db, p.db.task(hop)).get("escalated") == "lineage"
+    assert route.misses(p.db, chain(p.db, hop), glmwork.INFRA_CAUSES) == []
+    assert route.escalation(p.db, p.db.task(hop), skip=glmwork.INFRA_CAUSES) == {}
+    _routed_run(p, root, handoff="failed")                      # a finished attempt that failed still counts
+    _routed_run(p, root, handoff="failed")
+    assert len(route.misses(p.db, chain(p.db, hop), glmwork.INFRA_CAUSES)) == 2
+    assert route.escalation(p.db, p.db.task(hop), skip=glmwork.INFRA_CAUSES).get("escalated") == "lineage"
+
+
 def test_escalated_starts_are_counted_apart_in_status_and_stats_runs(env, monkeypatch):
     from ttp import route
     p = make(env)

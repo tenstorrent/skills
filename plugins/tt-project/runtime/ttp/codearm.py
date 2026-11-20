@@ -299,7 +299,8 @@ def choose(db, cfg: dict, task: dict | None, tier: str, picked: dict | None = No
            policy: list | None = None) -> dict | None:
     """This run's arm: {"arm" (recorded, stable), "run" ("glm", "sonnet", "opus" or "claude": what this run
     takes), "why"}, or None when the arm is off or the task is not code. The first call for a task records its
-    arm (unless `peek`); a follow-up takes its lineage's recorded arm."""
+    arm (unless `peek`); a follow-up takes its lineage's recorded arm (on a covered project a Claude-arm lineage
+    other than the holdout's is decided afresh)."""
     s = settings(cfg, policy)
     if not s or not task or task.get("kind") != "code" or not task.get("id"):
         return None
@@ -312,7 +313,10 @@ def choose(db, cfg: dict, task: dict | None, tier: str, picked: dict | None = No
         mid, ignored = user_arm(db, task)
         if mid and not stays(db, cfg, task, tier, picked, policy):   # the user's order: no coin, no lineage
             got = {"arm": "glm", "why": f"user msg #{mid}", "seed": s["seed"], "ts": time.time()}
-        elif len(ch) > 1:
+        elif len(ch) > 1 and not (s.get("glm_work") and parent and parent["arm"] == "claude" and not str(
+                (recorded(db, ch[0]["id"]) or {}).get("why") or "").startswith("holdout")):
+            # a covered project's follow-up of a Claude-arm change is decided afresh (its own stays, then the coin):
+            # only the Claude holdout keeps a whole lineage on Claude
             got = {"arm": parent["arm"] if parent else "claude", "why": f"lineage of #{ch[0]['id']}"
                    + ("" if parent else " (no arm)"), "seed": s["seed"], "ts": time.time()}
         elif s.get("glm_work"):   # covered: a kept task stays on Claude; else the work route's holdout coin

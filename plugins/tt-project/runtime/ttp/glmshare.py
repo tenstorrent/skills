@@ -9,6 +9,13 @@ model-hours (wall time, started to ended or the window's end) and as runs. A run
 chat provider (route.TO) with a model whose name has "glm" in any case: the runs row names the provider a
 fallback ran on, and a mid-run swap counts its stand-in (modelrank.ran).
 
+Held off GLM (held): the runs of eligible kinds (code, work, question, harness) that ran on Claude in the
+window, plus coordinator, plan and review runs, grouped by the rule that kept them there (KEEPERS: the user's
+own rule, or a removable one), as model-hours and runs, with the share of the window's hours. A code run's
+reason is its recorded code arm stay, any other run's the route entry's fallback (a lineage's misses, a
+rerun) or the keep-core check run again on its task (glmwork.keeps_core), so a run that predates a rule is
+named by today's rules; a run none of them explains is "unrecorded".
+
 Quality per arm: each worker task (not a review) whose first worker run started in the window is in one arm
 (arm_of): its glm_work arm (kv glm_work_arm:<id>: glm, or holdout = claude), else its code arm (kv
 code_arm:<id>: glm, else claude), else glm when its first worker run was on GLM, else claude. Per arm: tasks,
@@ -241,6 +248,81 @@ def _requeued(db, since: float) -> set[int]:
             if " from done" in str(r["text"] or "") or " from failed" in str(r["text"] or "")}
 
 
+# What keeps eligible work on Claude: the user's own rule (True: deep thinking, optimization or design, a run that
+# talks to a person, a review or plan, the Claude holdout, outside text, an explicit pin or a bounce back for Opus)
+# or a rule that is not (False).
+ELIGIBLE = ("code", "work", "question", "harness")
+KEEPERS = {"coordinator turn": True, "review": True, "plan": True, "deep": True, "needs_opus bounce": True,
+           "design or optimization": True, "person": True, "holdout": True, "untrusted": True, "pin": True,
+           "bounced": True, "device": True, "policy files": False, "lineage misses": False, "rerun after a fallback": False,
+           "conclusion floor": False, "verdict wording": False, "retry": False, "urgent": False, "kind off the list": False,
+           "unrecorded": False}
+_WHY = (("policy", "policy files"), ("lineage", "lineage misses"), ("needs opus", "needs_opus bounce"),
+        ("needs_opus", "needs_opus bounce"), ("person", "person"), ("untrusted", "untrusted"),
+        ("conclusion", "conclusion floor"), ("design", "design or optimization"), ("optim", "design or optimization"),
+        ("verdict", "verdict wording"), ("deep", "deep"), ("retry", "retry"), ("urgent", "urgent"), ("pin", "pin"),
+        ("device", "device"), ("bounced", "bounced"), ("holdout", "holdout"))
+
+
+def keeper(p, cfg: dict, run: dict, task: dict | None, dev: dict) -> str:
+    """The rule that kept a Claude run off GLM (KEEPERS' names, else the raw reason)."""
+    if run.get("role") == "coordinator":
+        return "coordinator turn"
+    if not task:
+        return "unrecorded"
+    kind = str(task.get("kind") or "")
+    if kind in ("plan", "review"):
+        return kind
+    if kind not in ELIGIBLE:
+        return "kind off the list"
+    if role_of(run, task, cfg, dev) == "device":
+        return "device"
+    note = _note(run.get("note"))
+    arm = note.get("code_arm") if isinstance(note.get("code_arm"), dict) else {}
+    ent = note.get(route.KEY) if isinstance(note.get(route.KEY), dict) else {}
+    why = str(arm.get("why") or "").lower()
+    if not why and ent.get("fallback"):
+        why = {"escalated": str(ent.get("escalated") or "escalated"), "rerun": "rerun after a fallback"}.get(
+            str(ent["fallback"]), "")
+    if not why and (p.db.kv(f"{ARM_KV}{task['id']}") or {}).get("arm") == "holdout":
+        why = "holdout"
+    if not why and "conclusion_floor" in note:
+        why = "conclusion"
+    if not why:
+        from . import glmwork
+        try:
+            why = glmwork.keeps_core(p.db, cfg, task, str((note.get("pick") or {}).get("tier") or task.get("tier") or "standard"),
+                                     None, {"by": "retry"} if (note.get("pick") or {}).get("by") == "retry" else None).lower()
+        except Exception:   # in doubt, unnamed
+            why = ""
+    if why.startswith("rerun"):
+        return "rerun after a fallback"
+    return next((name for key, name in _WHY if key in why), why.split(":")[0][:40] or "unrecorded")
+
+
+def held(p, since: float, now: float) -> dict:
+    """The window's Claude runs of eligible kinds, coordinator, plan and review runs by keeping rule (the module doc)."""
+    cfg, db = p.config(), p.db
+    rows = db.q("SELECT id, task, role, provider, model, started, ended, note FROM runs WHERE started>=? AND started<?",
+                (since, now))
+    tasks, dev, groups = _tasks(db, (r["task"] for r in rows)), {}, {}
+    total = 0.0
+    for r in rows:
+        h = max(0.0, min(float(r["ended"] or now), now) - float(r["started"] or now)) / 3600
+        total += h
+        if on_glm(r["provider"], r["model"], r["note"]):
+            continue
+        name = keeper(p, cfg, r, tasks.get(r["task"]), dev)
+        g = groups.setdefault(name, {"runs": 0, "hours": 0.0, "tasks": set(), "user_rule": KEEPERS.get(name, False)})
+        g["runs"] += 1
+        g["hours"] += h
+        if r["task"]:
+            g["tasks"].add(r["task"])
+    out = {k: {"runs": v["runs"], "hours": round(v["hours"], 3), "tasks": len(v["tasks"]), "user_rule": v["user_rule"],
+               "hour_pct": round(100.0 * v["hours"] / total, 1) if total else None} for k, v in groups.items()}
+    return dict(sorted(out.items(), key=lambda kv: -kv[1]["hours"]))
+
+
 def report(p, since: float, now: float) -> dict:
     """The project's GLM share by role and quality per arm over [since, now) (the module doc)."""
     days, db, cfg = max(0.0, now - since) / 86400, p.db, p.config()
@@ -277,7 +359,7 @@ def report(p, since: float, now: float) -> dict:
     from . import correction
     corr = [c for c in (db.kv(correction.KEY, []) or []) if isinstance(c, dict) and since <= float(c.get("ts") or 0) < now]
     return {"project": p.name, "since": since, "until": now, "days": days, "total": total, "roles": roles,
-            "arms": arms, "claude_usd_per_day": round(float(usd or 0) / days, 2) if days > 0 else None,
+            "arms": arms, "held": held(p, since, now), "claude_usd_per_day": round(float(usd or 0) / days, 2) if days > 0 else None,
             "corrections": {"n": len(corr), "per_arm": None,
                             "note": "a correction names no task, so it is counted per project; kept 7 days"},
             "bad_output": bad_output(p, rows),
@@ -382,6 +464,10 @@ def text(s: dict) -> str:
     parts = [f"{k} {pct(v['hour_pct'])} of {v['hours']:.1f}h" for k, v in s["roles"].items() if v["runs"]]
     if parts:
         lines.append("  GLM share of hours by role: " + "; ".join(parts))
+    if s.get("held"):
+        lines.append("  held off GLM by rule (model-h, runs; * = the user's own rule):")
+        lines += [f"    {k}{'*' if v['user_rule'] else ''}: {v['hours']:.2f} h ({pct(v['hour_pct'])} of the window), {v['runs']} runs"
+                  for k, v in s["held"].items()]
     for a, q in s["arms"].items():
         lines.append(f"  {a}: {q['tasks']} tasks, {q['done']} done ({q['done_per_day'] or 0:g}/day), {q['failed']} failed, "
                      f"{q['reopened']} reopened, first review passed {pct(q['first_pass_pct'])} of {q['reviewed']}, "

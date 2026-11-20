@@ -594,15 +594,17 @@ def _handed_failed(run: dict) -> bool:
         return False
 
 
-def misses(db, ch: list[dict]) -> list[str]:
+def misses(db, ch: list[dict], skip: tuple = ()) -> list[str]:
     """The routed misses of lineage `ch` (chaincap.chain): runs on the routed-to provider that fell back on
     their own (RUN_CAUSES) or handed off `failed`, routed changes a review sent back (the next hop is a
-    review fix) and checks fixes of a routed change (an escalated start's `sent_back`, once per change)."""
+    review fix) and checks fixes of a routed change (an escalated start's `sent_back`, once per change). `skip`:
+    fallback causes that are not misses (the GLM work route's infrastructure ends, glmwork.INFRA_CAUSES)."""
     from .chaincap import is_review_fix
     runs, out, seen = _lineage_runs(db, [int(t["id"]) for t in ch]), [], set()
     for r in runs:
         if r["on"] and r["e"].get("fallback") in RUN_CAUSES:
-            out.append(f"run {r['id']} fell back")
+            if r["e"]["fallback"] not in skip:
+                out.append(f"run {r['id']} fell back")
         elif r["on"] and _handed_failed(r):
             out.append(f"run {r['id']} failed")
         elif r["e"].get("sent_back") == "checks" and (r["task"], r["e"].get("after")) not in seen:
@@ -613,13 +615,14 @@ def misses(db, ch: list[dict]) -> list[str]:
     return out
 
 
-def escalation(db, task: dict, urgency: bool = True) -> dict:
+def escalation(db, task: dict, urgency: bool = True, skip: tuple = ()) -> dict:
     """Why a routable start of `task` stays on the core provider ({"escalated": kind, "cause"}, with
     `sent_back` and `after` for a checks fix), or {} to route: an urgent task (urgent.is_urgent) or a
     user-ordered one (added by the user or answering a chat) must land in minutes; a review fix
     (chaincap.is_review_fix) of a lineage or a checks-fix wake (CHECKS_WOKE) of a task that ran on the
     routed-to provider gets its fix there; a lineage with LINEAGE_MISSES routed misses (misses) stays
-    there for its remaining runs. `urgency` False (a cheap run class) skips the urgent case alone."""
+    there for its remaining runs (`skip`: causes that do not count, misses). `urgency` False (a cheap run class) skips
+    the urgent case alone."""
     from . import urgent
     from .chaincap import chain, is_review_fix
     from .db import load_result
@@ -637,7 +640,7 @@ def escalation(db, task: dict, urgency: bool = True) -> dict:
         own = bool(last) and last["provider"] == (of(last["note"]) or {}).get("to")
         return {"escalated": "checks fix", "cause": "fixes failed checks of a change written on the routed provider",
                 **({"sent_back": "checks", "after": int(last["id"])} if own else {})}
-    if len(got := misses(db, ch)) >= LINEAGE_MISSES:
+    if len(got := misses(db, ch, skip)) >= LINEAGE_MISSES:
         return {"escalated": "lineage", "cause": f"lineage has {len(got)} routed misses: {', '.join(got[:3])}"[:160]}
     return {}
 
