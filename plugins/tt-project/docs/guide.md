@@ -991,7 +991,7 @@ coordinator with that evidence.
   from `waiting_since` in the hand-off, from the line's time in `ttp progress report ... --expected-wait-s
   <n> --eta-basis "<how measured>"`): the finish is that long after, with the same rules; one already
   past gives no finish.
-- ETA numbers from history (eta.py, etahist.py, `ttp eta`): the likely time is the p50 of this project's
+- ETA numbers from history (eta.py, `ttp eta`): the likely time is the p50 of this project's
   last 14 days, the conservative time the p90, both by task kind and size, for run time, queue wait,
   review, landing and push batches. Size is the spec length (short under 1500 characters, medium under
   4000, long above): a task's run samples are those of its kind and size once there are 5, else its kind

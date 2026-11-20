@@ -3,13 +3,13 @@
 from __future__ import annotations
 
 
-def _pick_on(p):
+def _effort_pick_on(p):
     cfg = p.config()
     cfg["effort_ab"] = {"jev_pick": True}
     return cfg
 
 
-def _code_task(p, **kw):
+def _effort_task(p, **kw):
     """A new code task queued at standard."""
     return p.db.add_task("Port the parser", "Make it faster.", kind="code", tier="standard",
                          origin="coordinator", provider="claude", budget_usd=8.0, **kw)
@@ -21,10 +21,10 @@ def test_jev_effort_pick_takes_the_lineage_root_and_skips_pinned_or_other_tasks(
     p = make(env)
     assert DEFAULT_CONFIG["effort_ab"] == {"jev_pick": False}
     assert coord.settable("effort_ab.jev_pick")("true") is True
-    med = _code_task(p)
+    med = _effort_task(p)
     # Off by default: no pick, the tier's effort.
     assert effortab.assign(p.db, p.config(), p.db.task(med), "standard", "claude", _EffortJev(0.2)) is None
-    cfg = _pick_on(p)
+    cfg = _effort_pick_on(p)
 
     def pick(t, tier="standard", c=cfg):
         got = effortab.assign(p.db, c, p.db.task(t), tier, "claude", _EffortJev(0.2))
@@ -42,7 +42,7 @@ def test_jev_effort_pick_takes_the_lineage_root_and_skips_pinned_or_other_tasks(
         assert pick(t)["root"] == med
     # Never picked: a task with its own effort pin (or a fix of a pinned root), one queued at deep or
     # light, a review, a work task.
-    pinned = _code_task(p, effort="high")
+    pinned = _effort_task(p, effort="high")
     pfix = p.db.add_task("Fix review #901: x", "f", kind="code", tier="standard", origin="daemon",
                          labels=[f"continues:{pinned}"])
     deep = p.db.add_task("Redesign", "s", kind="code", tier="deep", origin="coordinator")
@@ -67,7 +67,7 @@ def test_effort_pick_goes_in_the_run_note_and_the_run_starts_at_its_effort(env, 
     monkeypatch.setattr(d, "_workdir_for", lambda t: (str(p.base), None))
     started = []
     monkeypatch.setattr(d, "start_run", lambda *a, **k: started.append((a, k)) or 0)
-    med = _code_task(p)
+    med = _effort_task(p)
     d.dispatch()
     (args, kw), = [(a, k) for a, k in started if k["task"]["id"] == med]
     # Jev off: the tier's effort, noted.
