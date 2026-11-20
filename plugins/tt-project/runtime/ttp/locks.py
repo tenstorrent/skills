@@ -38,6 +38,7 @@ counts, so a crashed daemon or supervisor never wedges the resource.
 """
 from __future__ import annotations
 
+import contextlib
 import fcntl
 import hashlib
 import json
@@ -84,6 +85,7 @@ def try_take(paths: list[Path], holder: str, what: str = "", key: str = "", extr
              **(extra or {}), **run_ids(), **taker()}
     for path in paths:
         path.parent.mkdir(parents=True, exist_ok=True)
+        _make_probe_gate(path)
         f = open(path, "a+")
         try:
             fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -765,13 +767,15 @@ def free_state(path: Path) -> bool | None:
     if fd is None:
         return None
     try:
-        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        with probe_gate(path):
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            finally:
+                os.close(fd)
     except BlockingIOError:
         return False
     except OSError:
         return None if flags == os.O_RDONLY else False
-    finally:
-        os.close(fd)
     return True
 
 
@@ -889,8 +893,38 @@ def read_label(path: Path) -> dict:
     return {}
 
 
-PROBE_TRIES = 4      # slot_taken's probes of a slot whose label names no live holder
-PROBE_GAP_S = 0.015  # between them: another reader's own probe holds a free slot for microseconds
+PROBE_GATE = ".probe.gate"   # in a lock file's folder: the momentary probes of its lock files take it
+
+
+def _make_probe_gate(path: Path) -> None:
+    """Makes the probe gate of lock file `path`'s folder: its takers do (try_take, clear_stale), as a
+    probe writes nothing."""
+    with contextlib.suppress(OSError):
+        (path.parent / PROBE_GATE).touch()
+
+
+@contextlib.contextmanager
+def probe_gate(path: Path):
+    """Held around a momentary probe of lock file `path` (a non-blocking flock, let go before the gate
+    is): probes of one folder's lock files take turns, so a lock seen taken under the gate is a real holder's,
+    never another reader's probe. Waits for the gate (held for microseconds by a probe, never across
+    a wait). Opened for writing where it can be (an NFS exclusive lock needs it), never made: a folder
+    without one probes ungated."""
+    fd = None
+    for flags in (os.O_WRONLY | os.O_APPEND, os.O_RDONLY):
+        try:
+            fd = os.open(path.parent / PROBE_GATE, flags)
+            break
+        except OSError:
+            continue
+    try:
+        if fd is not None:
+            with contextlib.suppress(OSError):
+                fcntl.flock(fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        if fd is not None:
+            os.close(fd)
 
 
 def holder_live(h: dict) -> bool:
@@ -922,7 +956,7 @@ def holder_live(h: dict) -> bool:
 
 def _probe_taken(path: Path) -> bool | None:
     try:
-        with open(path) as f:
+        with probe_gate(path), open(path) as f:
             try:
                 fcntl.flock(f, fcntl.LOCK_SH | fcntl.LOCK_NB)
                 return False
@@ -935,27 +969,17 @@ def _probe_taken(path: Path) -> bool | None:
 def slot_taken(path: Path) -> tuple[bool | None, dict | None]:
     """(taken, label) for slot file `path`: taken when its lock is held right now (None when it cannot be
     opened), with the label read once (None while not read; {} when it does not parse). A slot keeps its
-    last label after release and every daemon on the host probes the same files, so a failed probe on a
-    slot whose label names no live holder (holder_live) is retried PROBE_TRIES times: one free in any of
-    them is free, so another reader's momentary probe never makes a stale label a holder. A lock that
-    stays taken is held (a dead taker's lock kept by a process it left counts)."""
-    h = None
-    for i in range(PROBE_TRIES):
-        got = _probe_taken(path)
-        if not got:
-            return got, h
-        if h is None:
-            try:
-                h = read_label(path)
-            except ValueError:
-                h = {}
-            except OSError:
-                return None, None
-            if holder_live(h):
-                return True, h
-        if i < PROBE_TRIES - 1:
-            time.sleep(PROBE_GAP_S)
-    return True, h
+    last label after release, and every daemon on the host probes the same files under probe_gate, so a
+    lock seen taken is a real holder's: a dead taker's lock kept by a process it left counts."""
+    got = _probe_taken(path)
+    if not got:
+        return got, None
+    try:
+        return True, read_label(path)
+    except ValueError:
+        return True, {}
+    except OSError:
+        return None, None
 
 
 def _slot_labels(paths: list[Path]) -> list[str]:
@@ -981,7 +1005,8 @@ def clear_stale(paths: list[Path]) -> list[dict]:
             f = open(path, "a+")
         except OSError:
             continue
-        with f:
+        _make_probe_gate(path)
+        with probe_gate(path), f:
             try:
                 fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
             except OSError:
@@ -1069,14 +1094,7 @@ def held(locks_dir: Path, where=None) -> list[str]:
     except OSError:
         return out
     for path in slots:
-        try:
-            with open(path) as f:
-                try:
-                    fcntl.flock(f, fcntl.LOCK_SH | fcntl.LOCK_NB)
-                    continue
-                except OSError:
-                    pass
-        except OSError:
+        if not _probe_taken(path):
             continue
         out += [f"{path.name.rsplit('.', 2)[0]}: {h}" for h in holders([path], where)]
     try:

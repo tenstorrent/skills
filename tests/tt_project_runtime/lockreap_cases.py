@@ -1170,10 +1170,12 @@ def _taken_by_a_dead_process(path, holder="task #9 (run 90)"):
 
 
 def _probe_storm(path, stop):
-    """Another reader on the host probing `path` again and again: an exclusive flock held for an instant."""
+    """Another reader on the host probing `path` again and again, as every reader probes a slot (under
+    locks.probe_gate): an exclusive flock held for an instant."""
     import fcntl
+    from ttp import locks
     while not stop.is_set():
-        with open(path) as f:
+        with locks.probe_gate(path), open(path) as f:
             try:
                 fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
                 time.sleep(0.0005)
@@ -1205,6 +1207,77 @@ def test_free_lock_dead_pid_not_holder(env, monkeypatch, tmp_path):
         stop.set()
         storm.join(10)
     assert "task #9" not in checkcap.line()
+
+
+def test_a_readers_probe_never_makes_a_dead_takers_slot_held_however_long_it_lasts(env, monkeypatch, tmp_path):
+    """A reader preempted mid-probe holds a free slot's lock far longer than an instant (a loaded host).
+    Every other reader waited out such a probe by retrying a few times, 15 ms apart, then named the dead
+    taker as the holder; now each waits on the probe gate, never on time."""
+    import fcntl
+    import threading
+    from ttp import checkcap, locks, lockreap
+    sd = tmp_path / "check-slots"
+    monkeypatch.setattr(checkcap, "slot_dir", lambda: sd)
+    monkeypatch.setenv("TTP_CHECKS_HOST_MAX", "2")
+    path = checkcap.all_paths()[0]
+    path.parent.mkdir(parents=True, exist_ok=True)
+    _taken_by_a_dead_process(path)
+    judges = {"slot_taken": lambda: locks.slot_taken(path)[0], "_held": lambda: lockreap._held(path),
+              "free_state": lambda: locks.free_state(path), "state": lambda: checkcap.state()["held"]}
+    seen = {}
+    for name, judge in judges.items():
+        holding, done = threading.Event(), threading.Event()
+
+        def probe():
+            with locks.probe_gate(path), open(path) as f:
+                fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                holding.set()
+                done.wait(0.3)    # the judge, blocked on the gate, cannot end it: it ends by itself
+        t = threading.Thread(target=probe)
+        t.start()
+        assert holding.wait(30)
+        try:
+            seen[name] = judge()
+        finally:
+            done.set()
+            t.join(30)
+    assert seen == {"slot_taken": False, "_held": "free", "free_state": True, "state": []}, seen
+
+
+def test_each_probe_lets_go_of_the_slot_inside_the_probe_gate(env, monkeypatch, tmp_path):
+    """A probe that let go of the gate before its own lock on the slot let another reader find the free
+    slot taken by it, the race the gate is there to stop: each probe goes through its gate once and lets
+    go of the slot inside it."""
+    import contextlib
+    import fcntl
+    from ttp import devq, locks, lockreap
+    path = tmp_path / "res.0.lock"
+    path.write_text("{}")
+    assert locks.free_state(path) and not (tmp_path / locks.PROBE_GATE).exists(), "a probe writes nothing"
+    locks.try_take([path], "task #1").close()   # a taker makes the gate
+    devq._dirs(tmp_path)   # and devq's
+    seen = []
+
+    def checked(gate):
+        @contextlib.contextmanager
+        def gated(p):
+            with gate(p):
+                yield
+                with open(p) as f:   # still in the gate: the probe's lock must be gone
+                    try:
+                        fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                        seen.append("let go")
+                    except OSError:
+                        seen.append("kept")
+        return gated
+    monkeypatch.setattr(locks, "probe_gate", checked(locks.probe_gate))
+    monkeypatch.setattr(devq, "_probe_gate", checked(devq._probe_gate))
+    for name, probe in (("free_state", locks.free_state), ("slot_taken", locks.slot_taken),
+                        ("_held", lockreap._held), ("clear_stale", lambda p: locks.clear_stale([p])),
+                        ("held", lambda p: locks.held(p.parent)), ("devq._free", devq._free)):
+        seen.clear()
+        probe(path)
+        assert seen == ["let go"], (name, seen)
 
 
 def test_live_holder_shown(env, monkeypatch, tmp_path):

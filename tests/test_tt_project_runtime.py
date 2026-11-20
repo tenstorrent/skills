@@ -37457,6 +37457,42 @@ def _devq_state(d, job):
         return {}
 
 
+def test_devq_a_starting_runner_takes_its_lock_past_a_probe_of_it(env, devq_dir, monkeypatch):
+    """start polls runner.lock while the runner it started comes up: a poll that held the lock as the
+    runner tried to take it (for longer than an instant on a loaded host) made the runner find it taken
+    and exit, and start said "runner did not start". The take now waits out a probe, never a holder."""
+    import fcntl
+    import threading
+    from ttp import devq
+    devq._dirs(devq_dir)
+    devq._write(devq_dir / "config.json", json.dumps(devq.settings({"idle_exit_s": 0})))
+    lock = devq_dir / "runner.lock"
+    lock.touch()
+    holding, done = threading.Event(), threading.Event()
+
+    def probe():   # a probe exactly as _free takes it, held until the runner's take waits on it
+        with devq._probe_gate(lock), open(lock) as f:
+            fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            holding.set()
+            done.wait(0.3)
+    t = threading.Thread(target=probe)
+    t.start()
+    assert holding.wait(30)
+    runner, took = devq.Runner(devq_dir), []
+    monkeypatch.setattr(runner, "next_job", lambda: took.append(devq.runner_alive(devq_dir)) or "")
+    monkeypatch.setattr(devq.signal, "signal", lambda *a: None)
+    try:
+        assert runner.loop() == 0 and took and took[0], "the runner took its lock and ran its loop"
+    finally:
+        done.set()
+        t.join(30)
+        (devq_dir / "runner.pid").unlink(missing_ok=True)   # this test's own pid: the fixture must not kill it
+    # A runner up for real is still a holder no probe waits out: a second one exits at once.
+    with open(lock, "a") as held:
+        fcntl.flock(held, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        assert not devq._free(lock) and devq.Runner(devq_dir).loop() == 0
+
+
 def test_devq_runner_records_an_attempt_before_the_job_starts_so_a_successor_can_adopt_it(devq_dir, tmp_path):
     """A runner killed between starting a job and saving its pid left nothing to adopt: the successor
     started the attempt again, found its lock held, and failed the job without its exit code."""

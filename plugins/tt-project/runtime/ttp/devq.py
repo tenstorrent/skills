@@ -986,24 +986,59 @@ def _rm(path: Path) -> None:
         pass
 
 
+GATE = ".probe.gate"   # made by _dirs: each try of a lock file in its folder holds it (_probe_gate)
+
+
 def _dirs(d: Path) -> None:
     for sub in ("queue", "running", "done", "logs", "configs"):
         (d / sub).mkdir(parents=True, exist_ok=True)
+    with contextlib.suppress(OSError):
+        (d / GATE).touch()
+
+
+@contextlib.contextmanager
+def _probe_gate(lock: Path):
+    """Held around each non-blocking try of a lock file in its folder (_free's probe, which lets go inside
+    it, and a runner's take): they take turns, so a starting runner never finds runner.lock taken by
+    start's poll of it. Opened read-only (a probe writes nothing); a folder without one is ungated."""
+    try:
+        fd = os.open(lock.parent / GATE, os.O_RDONLY)
+    except OSError:
+        fd = None
+    try:
+        if fd is not None:
+            with contextlib.suppress(OSError):
+                fcntl.flock(fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        if fd is not None:
+            os.close(fd)
+
+
+def _take_lock(lock) -> bool:
+    """Take an open lock file's lock if nobody holds it, under _probe_gate."""
+    with _probe_gate(Path(lock.name)):
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return True
+        except OSError:
+            return False
 
 
 def _free(lock: Path) -> bool:
     """Whether nobody holds this lock file (a missing one is free). Opens it read-only: no writes."""
-    try:
-        f = open(lock)
-    except OSError:
-        return True
-    try:
-        fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        return True
-    except OSError:
-        return False
-    finally:
-        f.close()
+    with _probe_gate(lock):
+        try:
+            f = open(lock)
+        except OSError:
+            return True
+        try:
+            fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return True
+        except OSError:
+            return False
+        finally:
+            f.close()
 
 
 def _queued(d: Path, job: str) -> list:
@@ -1795,9 +1830,7 @@ class Runner:
     def loop(self) -> int:
         _dirs(self.d)
         lock = open(self.d / "runner.lock", "a")
-        try:
-            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except OSError:
+        if not _take_lock(lock):
             return 0
         for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
             signal.signal(sig, self.stop)
@@ -1828,9 +1861,7 @@ class Runner:
                     self.log(f"idle {self.cfg['idle_exit_s']:.0f} s, exiting")
                     return 0
                 lock = open(self.d / "runner.lock", "a")
-                try:
-                    fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                except OSError:
+                if not _take_lock(lock):
                     self.log(f"idle {self.cfg['idle_exit_s']:.0f} s, exiting: another runner took the queue")
                     return 0
                 _write(self.d / "runner.pid", f"{os.getpid()}\n")
