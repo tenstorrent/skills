@@ -47,6 +47,9 @@ or replace acceptance criteria with a review plugin's criteria.
    hardware. Resolve model directory as `models/autoports/<lowercase HF ID with non-alphanumeric
    characters replaced by underscores>`. Do not acquire hardware just because a plugin was installed.
    Record any serving-plugin interface change that the operator authorizes for this run.
+   Before the first device run, record in the run's brief whether bounded resets and multi-chip health
+   checks are authorized on the run's machines (`tt-device-usage`). Without that answer, the first unclean
+   exit stops an unattended run until someone replies.
 5. Keep the checkout, `CODEX_HOME`, runner logs and artifacts on persistent storage. Runtime model
    changes belong in the target checkout; workflow fixes belong in this plugin. Changes to the
    TT vLLM plugin or vLLM follow [plugin changes](../vllm-integration/references/plugin-changes.md).
