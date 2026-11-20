@@ -596,11 +596,15 @@ def test_glm_guard_turns_notify_into_a_draft_and_sends_nothing(env, monkeypatch,
     assert not (rd / glmguard.HIT).exists() and not (rd / "notify.jsonl").exists()
 
 
-def test_the_glm_prompt_lists_the_denylist_and_says_where_notes_go():
-    """cells: prompt_denylist, glm_prompt_note_rule: the prompt names what the guard refuses, and nothing it allows."""
-    from ttp import codearm, glmguard
-    text = codearm.contract()
-    assert "everything runs except" in text and "goes only to your task's own log" in text
+def test_the_glm_prompt_deny_list_is_the_rule_table_with_each_allowed_way():
+    """cells: prompt_denylist, glm_prompt_note_rule: the deny list is built from the guard's rule table, every rule has
+    an allowed way, and the list names what the guard refuses and nothing it allows."""
+    from ttp import glmguard
+    text = glmguard.deny_list()
+    assert all(r[4] for r in glmguard.RULES), "every rule has an allowed way"
+    assert [ln for ln in text.splitlines() if ln.startswith("- ")] == [
+        f"- Never {r[3]}: {r[4]}." + (" (harmful)" if r[1] == glmguard.HARMFUL else "") for r in glmguard.RULES if r[3]]
+    assert 8 <= text.count("\n- ") <= 10 and "goes to your task's own log" in text
     for name in ("ask", "notify", "say", "upstream", "land", "express"):
         assert f"`ttp {name}`" in text and glmguard.cli_refusal(name), name
     assert "`ttp note --to`" in text and glmguard.cli_refusal("note", "", ["--to"])
@@ -818,11 +822,12 @@ def test_a_glm_code_or_harness_run_gets_the_hand_off_line_and_every_glm_run_the_
         prov, _tier, _note = _route_dispatch(p, d, monkeypatch, prompts, title=f"glm {kind}", kind=kind)
         assert prov == "chat", kind
         got[kind] = prompts[-1]
-    assert all(glmguard.SCRATCH_LINE in pr for pr in got.values())
+    assert all(glmguard.SCRATCH_LINE in pr and glmguard.deny_list() in pr for pr in got.values())
     assert [k for k, pr in got.items() if glmguard.HANDOFF_LINE in pr] == ["code", "harness"]
     prompts = []
     prov, _tier, _note = _route_dispatch(p, d, monkeypatch, prompts, title="core code", kind="code", provider="claude")
     assert prov != "chat" and glmguard.SCRATCH_LINE not in prompts[-1] and glmguard.HANDOFF_LINE not in prompts[-1]
+    assert glmguard.deny_list() not in prompts[-1]
 
 
 def test_glm_guard_hook_denies_a_refused_call_and_ends_the_run_as_a_bounce(monkeypatch, tmp_path):
@@ -840,6 +845,43 @@ def test_glm_guard_hook_denies_a_refused_call_and_ends_the_run_as_a_bounce(monke
     (rd / "glm_guard.json").unlink(), (rd / "result.json").unlink()
     hook.pre_tool_use({"tool_name": "Bash", "tool_input": {"command": "ttp task add x"}, "cwd": str(wt)})
     assert not (rd / "result.json").exists()   # not a GLM-arm run: the guard does not apply
+
+
+def test_glm_guard_redirects_a_refusal_with_its_allowed_way_and_hands_back_on_the_third(monkeypatch, tmp_path):
+    """cells: guard_redirect, guard_third_hands_back: a redirect shows the reason and the allowed way and the run
+    goes on; the third refusal in one run hands it back."""
+    from ttp import glmguard, hook
+    wt, rd = _gg_run(tmp_path)
+    monkeypatch.setenv("TTP_RUN_DIR", str(rd))
+    monkeypatch.setenv("TTP_PROJECT", str(tmp_path / "proj"))
+    monkeypatch.setenv("TTP_CODE_ARM_GUARD", "1")
+
+    def pre(c):
+        out = hook.pre_tool_use({"tool_name": "Bash", "tool_input": {"command": c}, "cwd": str(wt)})[0]
+        assert out["hookSpecificOutput"]["permissionDecision"] == "deny", c
+        return out["hookSpecificOutput"]["permissionDecisionReason"]
+    why = pre("sqlite3 state/" + "project" + ".db 'select 1'")
+    assert "`ttp task <project> show <id>`" in why and "goes back to Opus" not in why
+    assert "$TMPDIR" in pre("echo x > /tmp/notes.md")
+    assert not glmguard.hit_reason(rd) and not (rd / "result.json").exists(), "the run goes on"
+    assert "goes back to Opus" in pre("ttp upstream 'fix the parser'")
+    assert glmguard.hit_reason(rd).startswith("refusal 3 in one run")
+    assert [(r["rule"], r["back"]) for r in glmguard.refusals(rd)] == [
+        ("db_read", False), ("scratch", False), ("upstream", True)]
+
+
+def test_glm_guard_hands_back_a_harmful_attempt_at_once_and_off_restores_the_first_refusal(monkeypatch, tmp_path):
+    """cells: guard_harmful_hands_back, guard_redirect_off"""
+    from ttp import glmguard
+    _wt, rd = _gg_run(tmp_path)
+    back, text = glmguard.refused(rd, "`ttp upstream` is not allowed", cfg={})
+    assert not back and "`upstream: ...`" in text and not glmguard.hit_reason(rd)
+    back, text = glmguard.refused(rd, "a run on the GLM arm never `git push`", cfg={})
+    assert back and "goes back to Opus" in text and glmguard.hit_reason(rd).endswith("never `git push`")
+    off = tmp_path / "off"
+    off.mkdir()
+    assert glmguard.refused(off, "`ttp upstream` is not allowed", cfg={"route": {"glm_refusals": {"redirect": False}}})[0]
+    assert glmguard.hit_reason(off)
 
 
 def test_glm_guard_hit_is_read_as_a_bounce_by_push_and_the_runner_watches_for_it(tmp_path):
@@ -898,6 +940,8 @@ def test_the_guarded_environment_ends_a_run_on_a_refused_command_and_runs_the_re
     got = env.execute({"command": "ttp note --to other hi"}, str(wt))
     assert got["returncode"] == 2 and got["output"].startswith("not sent: ") and ran == ["ls"]
     assert (rd / glmguard.DRAFTS).exists() and not (rd / "result.json").exists()
+    got = env.execute({"command": "echo x > /tmp/notes.md"}, str(wt))   # a redirect: the run goes on
+    assert got["returncode"] == 2 and "$TMPDIR" in got["output"] and not (rd / "result.json").exists()
     with pytest.raises(glmenv.Submitted) as ei:
         env.execute({"command": "git push origin HEAD"}, str(wt))
     assert ran == ["ls"]   # the refused command never ran
@@ -1382,7 +1426,15 @@ def test_glm_share_counts_the_guards_fires_per_day(env, tmp_path):
     glmguard.drafted(rd, {"channel": "notify", "target": "user", "text": "a"})
     glmguard.drafted(rd, {"channel": "notify", "target": "user", "text": "b"})
     glmguard.hit(rd, "`ttp checks` failed", glmguard.GATE, "out")
-    assert glmshare.guard_fires(rd) == {"outward_drafts": 2, "gate_stops": 1, "guard_bounces": 0}
+    assert glmshare.guard_fires(rd) == {"outward_drafts": 2, "gate_stops": 1, "guard_bounces": 0,
+                                        "guard_redirects": 0}
+    r2 = tmp_path / "r2"
+    r2.mkdir()
+    glmguard.refused(r2, "`ttp upstream` is not allowed", cfg={})
+    assert glmshare.guard_fires(r2)["guard_redirects"] == 1 and not glmshare.guard_fires(r2)["guard_bounces"], \
+        "a redirect is counted apart: it is no bounce for the rollout judges"
+    glmguard.refused(r2, "a run on the GLM arm never `git push`", cfg={})
+    assert glmshare.guard_fires(r2)["guard_bounces"] == 1 and glmshare.guard_fires(r2)["guard_redirects"] == 1
     p = make(env)
     row = {"id": 1, "task": 1, "role": "worker", "provider": "chat", "model": "glm", "started": 1.7e9,
            "ended": 1.7e9, "note": None, "dir": str(rd)}

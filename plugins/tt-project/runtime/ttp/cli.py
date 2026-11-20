@@ -17817,8 +17817,9 @@ def blind_gate(a) -> None:
 def glm_gate(a, name: str | None = None) -> None:
     """A run on the chat model records an outward post (`ttp notify`, `say`, `ask`, `note --to/--reply`) as a
     draft and exits 2 (glmguard.drafted). A run on the code arm's GLM side runs only the commands the guard
-    allows; a refused one ends the run as a hand-back to Opus (glmguard.hit), and exits 2. `name`: the command's name (main reads it from
-    argv, since a.cmd is the commands after -- for `checks` and others)."""
+    allows; a refused one exits 2 with glmguard.refused's text: a redirect (the reason and the allowed way; the run
+    goes on) or a hand-back to Opus. `name`: the command's name (main reads it from argv, since a.cmd is the
+    commands after -- for `checks` and others)."""
     from . import glmguard
     if glmguard.glm_run() is None:
         return
@@ -17841,8 +17842,7 @@ def glm_gate(a, name: str | None = None) -> None:
         flags += [f"--{k}" for k in ("owner", "expires", "by", "covers", "clear") if getattr(a, k, None)]
     why = glmguard.cli_refusal(cmd, action, flags, words)
     if why:
-        glmguard.hit(os.environ.get("TTP_RUN_DIR"), why)
-        die(f"refused: {why}", 2)
+        die(glmguard.refused(os.environ.get("TTP_RUN_DIR"), why)[1], 2)
 
 
 def dry_run_stub(a, name: str | None = None) -> None:
