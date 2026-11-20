@@ -10004,9 +10004,14 @@ class Daemon:
         spent = sched.spent_today(db, s["name"]) if s["budget_usd_day"] is not None else 0.0
         if s["budget_usd_day"] is not None and spent >= float(s["budget_usd_day"]) - 0.005:
             return f"{held}: daily budget used"
-        if db.one("SELECT id FROM tasks WHERE origin='schedule' AND labels=? AND status NOT IN "
-                  "('done','failed','cancelled')", (json.dumps([s["name"]]),)):
-            return f"{held}: previous run still open"
+        open_ = db.one("SELECT id, created FROM tasks WHERE origin='schedule' AND labels=? AND status NOT IN "
+                       "('done','failed','cancelled') ORDER BY id DESC LIMIT 1", (json.dumps([s["name"]]),))
+        if open_:
+            age, hold = time.time() - float(open_["created"] or 0), sched.open_run_hold_s(s)
+            if age < hold:
+                return f"{held}: previous run still open"
+            log(self.p, f"schedule {s['name']}: run #{open_['id']} still open {age / 3600:.1f} h, past its "
+                        f"{hold / 3600:.1f} h hold; it no longer holds the next run")
         duplicate, evidence, owed = sched.debounce_gate(db, s["name"], payload)
         if duplicate and not force:
             return duplicate

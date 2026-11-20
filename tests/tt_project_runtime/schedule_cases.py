@@ -1579,3 +1579,26 @@ def test_a_completed_window_is_not_run_again_and_a_failed_one_is_retried_and_the
     p.db.set_kv(sched.WINDOW_KEY + "nightly", {"start": start - 86400, "task": third["id"]})
     assert llm() == "queued"
     assert len(_window_tasks(p)) == 4
+
+
+@pytest.mark.parametrize("age_h, held", [(0.5, True), (2.0, False)])
+def test_an_open_run_holds_its_schedule_only_for_one_period(env, age_h, held):
+    """A run stuck open (waiting, never closed) held its llm schedule forever; now it holds the next
+    trigger for the schedule's own period only, then the trigger admits and the release is logged."""
+    from ttp.daemon import Daemon
+    p = make(env)
+    d = Daemon(p.base)
+    d.gates = {}
+    _filler(p, skip_if_idle=False)   # every 1 h
+    tid = p.db.add_task("[filler] open", "x", origin="schedule")
+    p.db.x("UPDATE tasks SET labels=?, status='waiting', created=? WHERE id=?",
+           (json.dumps(["filler"]), time.time() - age_h * 3600, tid))
+    d.run_schedules()
+    status = p.db.one("SELECT last_status FROM schedules WHERE name='filler'")["last_status"]
+    n = p.db.one("SELECT COUNT(*) n FROM tasks WHERE origin='schedule' AND labels=?", (json.dumps(["filler"]),))["n"]
+    log = (p.logs / "daemon.log").read_text() if (p.logs / "daemon.log").exists() else ""
+    if held:
+        assert status == "skipped: previous run still open" and n == 1, status
+    else:
+        assert status == "queued" and n == 2, status
+        assert f"run #{tid} still open 2.0 h, past its 1.0 h hold" in log, log

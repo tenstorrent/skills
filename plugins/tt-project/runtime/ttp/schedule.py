@@ -669,6 +669,16 @@ def debounce_gate(db: DB, name: str, payload: dict,
     return f"skipped: last run done {(now - ended) / 3600:.1f} h ago on unchanged evidence", digests, ""
 
 
+HOLD_CAP_S = 6 * 3600   # how long an open run of a schedule with no period holds its next trigger
+
+
+def open_run_hold_s(row: dict) -> float:
+    """How long an open run of llm schedule `row` holds its next trigger: its own period, else HOLD_CAP_S.
+    A run still open past it (stuck waiting, never closed) stops holding, so no run holds a schedule
+    forever. [note 9dee0c949313c77b]"""
+    return float(row.get("every_s") or 0) or HOLD_CAP_S
+
+
 WINDOW_KEY = "schedule_window:"   # kv per schedule: {"start", "task"}: the run admitted for its latest window
 
 
