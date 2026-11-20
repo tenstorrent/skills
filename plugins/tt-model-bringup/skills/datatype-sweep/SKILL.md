@@ -10,31 +10,34 @@ Before using this workflow, follow the dependency and environment setup in
 Resolve its package root from this installed skill's location; do not assume
 this plugin is copied into the target tt-metal checkout.
 
-
 ## Mission Context
 
-This skill starts from a working optimized TTNN full model and chooses the fastest practical precision configuration that still meets a stated full-model accuracy bar. It is normally used after optimized full model and before vLLM so the serving adapter inherits a settled weight, activation, CCL, KV-cache dtype, and compute-fidelity policy.
+Start from a working optimized TTNN full model and choose the fastest precision configuration that still meets a
+stated full-model accuracy bar. It normally runs after optimized full model and before vLLM, so serving inherits a
+settled weight, activation, CCL, KV-cache dtype and compute-fidelity policy. How dtypes, fidelities and their
+failure modes behave: [matmul and precision](../ttnn-knowledge/topics/matmul-precision.md) and
+[numerics](../ttnn-knowledge/topics/numerics.md).
 
-The selected precision artifact must be complete enough for later stages to consume mechanically. Include weight dtype groups, layer exceptions, compute fidelities, activation/residual dtype, CCL communication dtype, KV-cache dtype, logits/sampling dtype assumptions, and any loader/runtime flags needed to construct that exact policy. A selected config that only says "BFP8 weights" is incomplete.
+- **Complete policy.** The selected artifact lets later stages construct the policy mechanically: weight dtype
+  groups, layer exceptions, compute fidelities, activation/residual dtype, CCL dtype, KV-cache dtype,
+  logits/sampling dtype assumptions, and any loader or runtime flags. "BFP8 weights" alone is incomplete.
+- **Consumed policy.** The runtime construction path consumes every selected dtype and fidelity field. Prove it
+  with a model summary, a config propagation check or profiler/perf-report rows from the measured candidate. A field
+  in `selected_precision_config.json` that the code ignores or hard-codes differently leaves the sweep incomplete.
+- **Source of truth.** Full-model top-1/top-5 decides. Decoder-layer PCC and component timing only order candidates
+  and debug surprises. Candidates also run the [`reference-accuracy`](../reference-accuracy/SKILL.md) quick tier and
+  the selected config its full tier; the selection becomes that skill's new baseline.
+- **Capability and context contract.** KV-cache dtype can change the largest feasible context: recompute
+  `models/autoports/<model>/doc/context_contract.json` for the selected config. A candidate that passes only by
+  lowering context or another advertised capability fails, unless a hard physical device limit prevents the
+  advertised value and evidence shows the smaller value is the largest feasible for that candidate.
+- **Non-aligned prompts.** A candidate that changes KV-cache dtype, cache layout, trace buffers or prefill chunking
+  reruns the non-aligned prompt/prefill check before selection. An aligned-only faster candidate fails.
 
-Recorded policy is not enough. The runtime construction path must actually consume every selected dtype and compute-fidelity field. Prove this with a model summary, config propagation check, or profiler/perf-report rows from the measured candidate. If a field appears in `selected_precision_config.json` but the code path ignores it or hard-codes a different value, the sweep is incomplete.
-
-The expensive source of truth is full-model top-1/top-5 accuracy. Decoder-layer PCC and component timing are useful only for ordering candidates and debugging surprises.
-
-Datatype selection must preserve the capability and context contract. KV-cache dtype can change the largest feasible context, so recompute `models/autoports/<model>/doc/context_contract.json` for the selected config. If a candidate only passes by lowering context or another advertised capability, it fails unless a hard physical device limit prevents the advertised capability from fitting or running and evidence proves that the smaller value is the largest feasible one for that candidate.
-
-Datatype selection must also preserve valid non-aligned prompt lengths. If a candidate changes KV-cache dtype, cache layout, trace buffers, or prefill chunking, rerun the non-aligned prompt/prefill check before selecting it. A faster candidate that only accepts aligned prompt lengths fails the capability contract.
-
-If the user does not provide an accuracy bar, use:
-
-- top-1 >= 90%;
-- top-5 >= 98%.
-
-Keep top-100 at the existing readiness expectation unless the user or model-specific evidence explicitly changes it.
+Default accuracy bar when the user gives none: top-1 >= 90%, top-5 >= 98%. Top-100 keeps the existing readiness
+expectation unless the user or model-specific evidence changes it.
 
 ## Preferred Outputs
-
-Produce:
 
 ```text
 models/autoports/<model>/doc/datatype_sweep/README.md
@@ -46,176 +49,215 @@ models/autoports/<model>/doc/datatype_sweep/top1_perf_pareto.png
 models/autoports/<model>/doc/datatype_sweep/top5_perf_pareto.png
 ```
 
-The README should lead with the selected config, top-1, top-5, top-100, TTFT, trace-verified teacher-forcing decode t/s/u, post-selection token-out decode t/s/u when available, and the exact acceptance thresholds. Label each performance number with its measurement regime and workload shape.
+The README leads with the selected config, top-1, top-5, top-100, TTFT, trace-verified teacher-forcing decode
+t/s/u, post-selection token-out decode t/s/u when available, and the exact acceptance thresholds. Label each
+performance number with its measurement regime and workload shape.
 
 ## Baseline
 
-Start from the completed optimized full model. Run and record the current baseline:
+From the completed optimized full model, record:
 
-- readiness reference provenance, preferably AIME24 with chat template and `--gen-len 100`;
+- readiness reference provenance, preferably AIME24 with chat template and `--gen-len 100`; regenerate a reference
+  with fewer than 100 generated tokens unless a concrete model or memory limit prevents it;
 - `run_prefill_check` and `run_teacher_forcing` top-1/top-5/top-100;
-- prefill TTFT and trace-verified teacher-forcing decode t/s/u from the readiness runner, generator metrics, or the model's benchmark harness;
-- the active dtype policy for weights, norms, residual stream, CCL activations, KV cache, logits, sampling, and MoE routing;
-- a teacher-forced natural-text reference beside the readiness reference: real next tokens from long non-repeating text (the readiness book `models/tt_transformers/tests/tale-of-two-cities.txt.bz2`, several hundred positions), scored per position against HF. The readiness reference is an HF-greedy continuation with large margins; a BFP4 MLP policy scored 0.92 to 0.97 top-1 there and 0.82 to 0.85 on 1468 natural-text positions, and the readiness reference alone would have selected it;
-- the baseline measured at least twice, serially, so the run-to-run spread is known before any candidate is ranked.
+- prefill TTFT and trace-verified teacher-forcing decode t/s/u (readiness runner, generator metrics or the model's
+  benchmark harness);
+- the active dtype policy for weights, norms, residual stream, CCL activations, KV cache, logits, sampling and MoE
+  routing;
+- a teacher-forced natural-text reference beside the readiness reference: real next tokens from long
+  non-repeating text (the readiness book `models/tt_transformers/tests/tale-of-two-cities.txt.bz2`, several hundred
+  positions), scored per position against HF. The readiness reference alone can select a policy that natural text
+  rejects ([numerics](../ttnn-knowledge/topics/numerics.md#choosing-a-precision-policy));
+- the baseline measured at least twice, serially, so the run-to-run spread is known before ranking.
 
-If an existing reference has fewer than 100 generated tokens, regenerate the main readiness reference with 100 generated tokens unless a concrete model or memory limit prevents it.
-
-Teacher-forcing decode performance is valid only when the measured path uses traced decode. Eager/untraced teacher-forcing results may be used for temporary correctness debugging, but they are not acceptable sweep evidence and must not be used to rank candidates, draw Pareto charts, or select the fastest passing config. If traced teacher forcing fails, fix tracing before continuing the sweep.
+Teacher-forcing decode performance counts only on traced decode. Eager or untraced results may help correctness
+debugging but never rank candidates, enter the Pareto charts or select a config. If traced teacher forcing fails,
+fix tracing (`$autofix` if needed) before continuing.
 
 ## Default Search
 
-Use this coarse search first. It usually finds most of the available win with a small number of full-model runs.
+The coarse search finds most of the win in few full-model runs:
 
 1. Evaluate the closest canonical performance and accuracy policies, if any.
-2. Try BFP8 KV cache as a yes/no switch. Any candidate that changes the KV-cache dtype must also pass the short-prefix case (about 32 cached tokens) and the same-input per-user comparison at the largest batch in `batch_sizes` at the full-model bar; a long-prompt layer PCC pass does not cover them (a BFP8 cache passed 1024-token layer PCC and failed 0.995 per user on a short prefix).
-3. Try BFP8 CCL or residual-transfer activations as a yes/no switch.
-4. Try BFP4 for eligible MLP/expert matmul groups, excluding the first and last layer by default unless the canonical policy says otherwise.
-5. If full-model accuracy fails, restore the highest-risk groups first until top-1 and top-5 pass.
-6. Once a passing inner-layer config is found, optionally try extending the surviving choices to the first and last layer. Keep that only if full-model accuracy still passes.
+2. BFP8 KV cache as a yes/no switch. A candidate that changes the KV-cache dtype also passes the short-prefix case
+   (about 32 cached tokens) and the same-input per-user comparison at the largest batch in `batch_sizes`, at the
+   full-model bar; a long-prompt layer PCC pass does not cover them
+   ([matmul and precision](../ttnn-knowledge/topics/matmul-precision.md#precision-and-fidelity)).
+3. BFP8 CCL or residual-transfer activations as a yes/no switch.
+4. BFP4 for eligible MLP/expert matmul groups, excluding the first and last layer unless the canonical policy says
+   otherwise.
+5. If full-model accuracy fails, restore the highest-risk groups first until top-1 and top-5 pass. Default restore
+   order, a heuristic to adapt to the architecture, profiler evidence and observed failures: FF2/down (and expert
+   down); QKV/attention input; WO; FF1+FF3/gate+up (and expert gate+up). For MLA, shared experts, unusual norm
+   placement, gated attention or fused projections, map groups to the nearest semantic operation and record the
+   mapping. Back a failed BFP4 trial out to BFP8 first unless BFP8 is known to fail for that group.
+6. Once an inner-layer config passes, optionally extend the surviving choices to the first and last layer; keep
+   that only if full-model accuracy still passes.
 
-Restore-order example for dense MLP or MoE-style blocks:
-
-1. FF2 / down projections / expert down projections.
-2. QKV / attention input projections.
-3. WO / attention output projection.
-4. FF1+FF3 / gate+up projections / expert gate+up projections.
-
-This order is a heuristic, not a law, with the typically most-sensitive parts of the model being tried first. Adjust it for the model architecture, profiler evidence, and observed failures. For MLA, shared experts, unusual norm placement, gated attention, or fused projections, map the groups to the nearest semantic operation and record the mapping.
-
-When backing out a failed BFP4 trial, restore to BFP8 first unless BFP8 itself is known to be the failing precision for that tensor group.
-
-For every material matmul group tested with BFP4 weights, include a LoFi compute-fidelity candidate for that same group. BFP4 with HiFi2 is allowed as a comparison or fallback, but it is not enough by itself. If a BFP4+LoFi candidate cannot be run, record the exact TTNN/runtime blocker and keep the stage open until the blocker is fixed or `$autofix` fails, unless BFP4 is already rejected for that group.
-
-Sweep compute fidelity even when dtype is unchanged. For dominant decode projection groups, include BFP8+LoFi and BFP8+HiFi2 candidates when both are legal. Do not assume HiFi2 is fastest for BFP8, and do not assume LoFi is safe without full-model top-1/top-5 evidence. Record dtype and fidelity together in each candidate id so later stages can construct the exact policy.
-
-Note sometimes different datatypes require small semantic changes to the code. KV cache is a common example of this - `paged_fill_cache` requires tensors that are the same datatype as the cache but `paged_update_cache` requires update tensors in BF16/FLOAT32 even when the destination cache is e.g. BFP8. So when changing datatypes first run a quick one-decoder smoketest to check it works correctly and get that right before using it or rejecting it in a full model pareto sweep.
+Fidelity is swept with dtype ([Compute Fidelity](#compute-fidelity)). A dtype change can need a small code change
+(the KV fill and update ops have different dtype contracts:
+[prefill and KV](../ttnn-knowledge/topics/prefill-kv.md#paged-kv-basics)); run a one-decoder smoke test of each new
+dtype before using or rejecting it in the full-model sweep.
 
 ## MoE Policy
 
-Geometry tuned for one precision rarely fits another; a candidate that fails on L1 is not yet rejected on accuracy ([memory](../ttnn-knowledge/topics/memory.md)). Expert layers differ in how much low precision they tolerate ([MoE](../ttnn-knowledge/topics/moe.md)).
-
-Treat expert matmuls like MLP matmuls:
-
-- expert gate/up projections follow the FF1+FF3 policy;
-- expert down projections follow the FF2 policy;
-- shared experts follow dense MLP policy unless evidence says otherwise;
-- routed sparse expert matmuls should be swept with the active-expert path, not dense all-expert debug paths.
-
-Router and weighting numerics are expected to be more sensitive. Do not include router logits, top-k selection, routing scores, gate weighting, or expert reduction weighting in the coarse BFP4 sweep, perhaps in BFP8 but with somewhat low priority as they are not typically expected to be a performance bottleneck.
-
-For MoE sweeps, record route/top-k distribution or active expert count when model architecture allows this to vary, since the performance impact depends on how many experts actually run.
+Expert matmuls follow MLP policy: gate/up as FF1+FF3, down as FF2, shared experts as dense MLP unless evidence says
+otherwise. Sweep routed experts on the active-expert path, not a dense all-expert debug path. Router logits, top-k
+selection, routing scores, gate weighting and expert reduction weighting stay out of the coarse BFP4 sweep; BFP8 for
+them is a low-priority trial. Record the route/top-k distribution or active expert count when it can vary. Why, and
+how L1 geometry interacts with precision: [MoE](../ttnn-knowledge/topics/moe.md),
+[memory](../ttnn-knowledge/topics/memory.md); a candidate that fails on L1 is not yet rejected on accuracy.
 
 ## Full-Model Evaluation
 
-Every kept candidate must be validated with full-model accuracy. For each evaluated config record:
+Every kept candidate is validated with full-model accuracy. Per config record:
 
 - config id and precision config path;
 - weight dtype groups and layer ranges;
-- activation, residual, CCL, logits/sampling, and KV-cache dtype choices;
-- top-1, top-5, top-100, token count, and reference path;
-- TTFT, trace-verified decode t/s/u, and the evidence that the teacher-forcing decode path was traced;
-- compute fidelities used by each material matmul group and evidence that the measured runtime used them;
-- direct comparisons for material same-dtype fidelity choices, especially BFP8+LoFi versus BFP8+HiFi2 on decode-bound projection groups;
-- whether this config passed the user-specified accuracy bar on every reference it ran on; the bar applies per reference, and a candidate that ran on fewer references than the baseline is not comparable until it has;
-- the binomial margin of each top-1 score: a 100-token reference at 0.95 carries about plus or minus 0.03, so a one-token difference between candidates is noise, not a ranking; use the natural-text reference or more tokens to separate close candidates;
-- exact command, branch/commit, hardware, mesh, and environment notes.
+- activation, residual, CCL, logits/sampling and KV-cache dtypes;
+- top-1, top-5, top-100, token count and reference path;
+- TTFT, trace-verified decode t/s/u, and evidence that the teacher-forcing decode path was traced;
+- compute fidelity per material matmul group and evidence the measured runtime used it;
+- direct comparisons for material same-dtype fidelity choices, especially BFP8+LoFi against BFP8+HiFi2 on
+  decode-bound projections;
+- whether the config passed the accuracy bar on every reference it ran on (the bar applies per reference; a
+  candidate run on fewer references than the baseline is not comparable until it has);
+- the binomial margin of each top-1 score; a one-token difference is noise, not a ranking; separate close
+  candidates with the natural-text reference or more tokens
+  ([numerics](../ttnn-knowledge/topics/numerics.md#choosing-a-precision-policy));
+- exact command, branch/commit, hardware, mesh and environment notes.
 
-Use `$qualitative-check` for prompt-based evaluation evidence: prompt-format metadata, rendered prompt artifacts or token ids, HF controls, and classification of raw-completion or chat-template behavior.
+Use `$qualitative-check` for prompt-based evidence: prompt-format metadata, rendered prompts or token ids, HF
+controls, and classification of raw-completion or chat-template behaviour.
 
-Always use trace-verified teacher-forcing decode t/s/u to rank datatype candidates - a non-traced path is not useful. If fully-traced decode is not working, use the $autofix skill until it is.
+Rank candidates only on trace-verified teacher-forcing decode t/s/u.
 
-A precision change can fail the resumed-prefill gate of `prefill-features.md` without a resume bug: the resumed and fresh TT paths agree with each other while both drift from HF at hard positions. Rerun `run_prefill_resume_check` on the selected policy, and classify any failure with a per-position comparison against HF (the margin probe) before treating it as a cache or position defect.
+Rerun `run_prefill_resume_check` (the resumed-prefill gate of
+[prefill features](../vllm-integration/references/prefill-features.md)) on the selected policy. A precision change
+can fail it with a correct cache; classify a failure with a per-position comparison against HF (the margin probe)
+before treating it as a cache or position defect.
 
-Teacher-forcing is the selection metric, not necessarily the serving headline. After selecting the winning config, run the same warmed token-out no-readback benchmark used by optimized full model, using the selected config through the normal construction path. Record this separately as post-selection token-out performance. If the model cannot run that benchmark, state why instead of presenting teacher-forcing performance as token-out performance.
+Teacher forcing is the selection metric, not the serving headline. After selection, run the warmed token-out
+no-readback benchmark of optimized full model on the selected config through the normal construction path, and
+record it separately as post-selection token-out performance. If it cannot run, say why; never present
+teacher-forcing numbers as token-out numbers.
 
-If layer-level decode evidence, reduced token-out evidence, or a prior optimized full-model token-out artifact points to a different fastest passing policy than teacher-forcing does, resolve the conflict before selecting. Run the same token-out benchmark for the baseline and the top conflicting candidate through the normal construction path. If token-out cannot run because the generator or trace-feedback path fails, treat that as a bug to fix or a recorded blocker; do not silently use teacher-forcing throughput as the serving-policy answer.
+If layer-level decode, reduced token-out or an earlier optimized-full-model token-out artifact points to a different
+fastest passing policy than teacher forcing, resolve it before selecting: run the same token-out benchmark for the
+baseline and the top conflicting candidate through the normal construction path. A token-out path that fails
+(generator or trace feedback) is a bug to fix or a recorded blocker, not a reason to use teacher-forcing throughput
+as the serving answer.
 
 ## Anomalies
 
-A degenerate reply (stray or repeated tokens, collapse into a few characters, a token loop) is a precision
-or stack defect until shown otherwise, not a model answer. Goal 12 runs steps 1–5 on each anomaly, on each
-failed task whose reference check says `implementation` (agentic-serving, Failure analysis; its CPU comparison
-replaces step 3's HF run), and on a phase below its band, inside the phase's time. A phase below its band with no degenerate reply has nothing
-to reproduce in step 2; its attempt is a precision check on its failed tasks: for each, the decisive call
-(GPQA: the answer; SWE: the call whose action first went wrong), teacher-forced at served and at full
-precision (top-1 agreement over the reply, probability of the chosen and of the correct continuation). Full
-precision that agrees with served rules precision out: record it with `changed` saying so; one entry for
-the phase covers its failed tasks. A disagreement goes on to step 4.
+A degenerate reply (stray or repeated tokens, collapse into a few characters, a token loop) is a precision or stack
+defect until shown otherwise, not a model answer. Goal 12 runs steps 1–5 on each anomaly, on each failed task whose
+reference check says `implementation` (agentic-serving, Failure analysis; its CPU comparison replaces step 3's HF
+run), and on a phase below its band, inside the phase's time. A phase below its band with no degenerate reply has
+nothing to reproduce in step 2; its attempt is a precision check on its failed tasks: for each, the decisive call
+(GPQA: the answer; SWE: the call whose action first went wrong), teacher-forced at served and at full precision
+(top-1 agreement over the reply, probability of the chosen and of the correct continuation). Full precision that
+agrees with served rules precision out: record it with `changed` saying so; one entry for the phase covers its
+failed tasks. A disagreement goes on to step 4.
 
 **Where precision comes from.** The served precision is the config this stage selected:
-`selected_precision_config.json` (this skill's Preferred Outputs; the model's default construction path or
-the build kwargs that load it). Its fields, this sweep's `sweep_results.json` and the model's precision
-plumbing (what `build_generator` accepts) list the options. A change is a new config file passed by
-`--build-kwargs-file` to the runners, or to the server with a restart (about 15–30 min for a large model;
-budget each one). Record the file in the run's `config.precision`.
+`selected_precision_config.json` (Preferred Outputs; the model's default construction path or the build kwargs
+that load it). Its fields, this sweep's `sweep_results.json` and the model's precision plumbing (what
+`build_generator` accepts) list the options. A change is a new config file passed by `--build-kwargs-file` to the
+runners, or to the server with a restart; restarts of a large model are slow, so time the first and budget each one
+([serving and evals](../ttnn-knowledge/topics/serving-evals.md#eval-infrastructure)). Record the file in the run's
+`config.precision`.
 
-1. **Detect.** On eval replies, agentic-serving's `scripts/reply_digest.py` reads every reply from the
-   server's response log and flags a degenerate tail (zlib ratio or distinct characters of the last 4,096
-   characters); a flag is an anomaly. A failed or capped task it does not flag goes to a triage sub-agent, and
-   the coordinator decides (agentic-serving, Failure analysis). `runtime/readiness_check/check_degenerate_output.py`
-   catches doubled tokens and collapse in runner outputs.
-2. **Reproduce.** From the failed trajectory take the model call that degenerated: its rendered input plus
-   the reply up to the first stray token. Save it as a prompt file under `doc/agentic_evals/anomalies/` with
-   the seed and sampling settings. Stop the eval server and run it on the model runner, not the eval
-   harness, at batch 1: `python -m readiness_check.run_autoregressive --prompt-file <file>
-   --build-kwargs-file <config>` (free-running, with the HF continuation beside it), or a reference from
-   `readiness_check.generate --prompt-source file` scored by `run_teacher_forcing`. Measure the anomaly rate
-   over N short continuations, or the top-1 agreement and the probability of the correct next token at the
-   failure point. It must run in minutes; shorten the prefix while it still fails.
-3. **Full precision on TT:** BF16 weights, HiFi4, BF16 activations, BF16 head. It only has to fit for this
-   batch-1 test. If it still fails, run the prompt on the HF/GPU reference: if that passes, bisect the stack
-   bug by op PCC; if it fails too, report model behaviour.
+1. **Detect.** On eval replies, agentic-serving's `scripts/reply_digest.py` reads every reply from the server's
+   response log and flags a degenerate tail (zlib ratio or distinct characters of the last 4,096 characters); a
+   flag is an anomaly. A failed or capped task it does not flag goes to a triage sub-agent, and the coordinator
+   decides (agentic-serving, Failure analysis). `runtime/readiness_check/check_degenerate_output.py` catches doubled
+   tokens and collapse in runner outputs.
+2. **Reproduce.** From the failed trajectory take the model call that degenerated: its rendered input plus the reply
+   up to the first stray token. Save it as a prompt file under `doc/agentic_evals/anomalies/` with the seed and
+   sampling settings. Between waves, when no list run or rerun wave is using it, stop the eval server and run the
+   prompt on the model runner, not the eval harness, at batch 1: `python -m readiness_check.run_autoregressive
+   --prompt-file <file> --build-kwargs-file <config>` (free-running, with the HF continuation beside it), or a
+   reference from `readiness_check.generate --prompt-source file` scored by `run_teacher_forcing`. Measure the
+   anomaly rate over N short continuations, or the top-1 agreement and the probability of the correct next token at
+   the failure point. It must run in minutes; shorten the prefix while it still fails.
+3. **Full precision on TT:** `reference-accuracy`'s `full` configuration (BF16 weights, activations, KV cache and
+   head, HiFi4). It only has to fit for this batch-1 test. If it still fails, run the prompt on the HF/GPU
+   reference: if that passes, bisect the stack bug by op PCC; if it fails too, report model behaviour.
 4. **Bisect to the fastest passing config** when full precision passes: by group (head, MLP gate/up, down,
-   attention, activations), then by layer range, measuring decode t/s/u at each step. Choose the fastest
-   config that passes; the next faster ones tried fail. A speed loss for accuracy is accepted.
-5. **Re-measure and rerun.** Restart the server on the chosen config, re-measure only the stage-11 rows the
-   eval uses at its batch (into `serving_rates.json`, labelled with the config), then rerun the eval list.
+   attention, activations), then by layer range, measuring decode t/s/u at each step. Choose the fastest config
+   that passes; the next faster ones tried fail. A speed loss for accuracy is accepted.
+5. **Re-measure and rerun.** Restart the server on the chosen config, re-measure only the stage-11 rows the eval
+   uses at its batch (into `serving_rates.json`, labelled with the config), then rerun the eval list.
 
-Goal 12 records each attempt in `results.json` `anomalies`: `phase`, `tasks`, `test` (command), `prompt`
-(file), `seed`, `served` (`precision`, `result`), `full_precision` (`result`, `pass`), the HF/GPU result
-when step 3 needed it, `changed` (what changed, or why nothing), `hours`; a precision fix adds
-`configs_tried` (`config`, `pass`, measured `decode_tok_s_user`), `chosen` and `remeasured_rows`.
+Goal 12 records each attempt in `results.json` `anomalies`: `phase`, `tasks`, `test` (command), `prompt` (file),
+`seed`, `served` (`precision`, `result`), `full_precision` (`result`, `pass`), the HF/GPU result when step 3 needed
+it, `changed` (what changed, or why nothing), `hours`; a precision fix adds `configs_tried` (`config`, `pass`,
+measured `decode_tok_s_user`), `chosen` and `remeasured_rows`.
 
 ## Plots
 
-Use matplotlib/pyplot to generate two elegant, delightful Pareto charts:
+Two matplotlib/pyplot Pareto charts, shown prominently in the README:
 
-- `top1_perf_pareto.png`: x-axis top-1 accuracy, y-axis performance.
+- `top1_perf_pareto.png`: x-axis top-1 accuracy, y-axis performance;
 - `top5_perf_pareto.png`: x-axis top-5 accuracy, y-axis performance.
 
-Use trace-verified teacher-forcing decode t/s/u as the default performance metric. If only traced latency is available, convert to a higher-is-better performance metric or clearly label the axis. Do not plot eager/untraced decode performance as a Pareto candidate.
-
-Plot every evaluated full-model config as a point. Fit or draw the non-dominated Pareto frontier through the evaluated points. Mark the selected config in red. Draw a vertical dotted line whose x-intercept is the minimum allowed accuracy level for that chart. Label or annotate enough points that the selected tradeoff and rejected candidates are clear without reading the raw JSON. Show these prominently in the README.md.
+Performance is trace-verified teacher-forcing decode t/s/u; if only traced latency exists, convert it to
+higher-is-better or label the axis. Never plot eager or untraced decode. Plot every evaluated full-model config,
+draw the non-dominated frontier, mark the selected config in red, and draw a vertical dotted line at the minimum
+allowed accuracy. Annotate enough points that the selected tradeoff and the rejected candidates read without the
+raw JSON.
 
 ## Compute Fidelity
 
-Compute fidelity is part of the selected precision policy, not only documentation.
+Fidelity is part of the selected policy, swept in the same candidate matrix as dtypes once the promising dtype
+groups are known, guided by `tt-perf-report` from decoder or reduced full-model runs and by full-model accuracy.
+Typical pairings (BFP4 with LoFi, BFP8 with HiFi2 or LoFi, HiFi4 or FP32 accumulation for sensitive BF16 ops):
+[matmul and precision](../ttnn-knowledge/topics/matmul-precision.md#precision-and-fidelity).
 
-For reduced-precision matmuls, sweep legal compute fidelities in the same candidate matrix as datatypes once the promising dtype groups are known. Use the `tt-perf-report` output from individual decoder or reduced full-model runs and full-model accuracy to guide this decision. BFP4 weights are expected to use LoFi unless measured evidence says otherwise. BFP8 weights should compare HiFi2 and LoFi for dominant decode projection groups instead of assuming one fidelity is best. HiFi4 is usually reserved for accuracy-sensitive operations with BF16 weights. FP32 destination accumulation is also an option.
+- For every material matmul group tested with BFP4 weights, include a BFP4+LoFi candidate. BFP4+HiFi2 is a
+  comparison or fallback, not a substitute. If BFP4+LoFi cannot run, record the exact TTNN/runtime blocker and keep
+  the stage open until it is fixed or `$autofix` fails, unless BFP4 is already rejected for that group.
+- Compare BFP4+LoFi against BFP4+HiFi2 where both are legal and the group is a meaningful decode cost: required for
+  every selected BFP4 group, optional for rejected ones; the sweep table says which groups ran it.
+- Sweep fidelity even when dtype is unchanged: for dominant decode projection groups include BFP8+LoFi and
+  BFP8+HiFi2 when both are legal. Neither is assumed fastest or safe without full-model evidence.
+- Record dtype and fidelity together in each candidate id.
+- Record where a per-group fidelity field is not honored by the measured kernel (for example prefill matmuls whose
+  fidelity is fixed by the weight dtype), so the table never claims a fidelity the op did not use.
+- Keep a short table per material matmul group: weight dtype, fidelity, traced decode speed, accuracy, kept or
+  rejected, reason.
+- Prove the model code constructs the requested fidelity policy without hard-coded overrides.
 
-Before selecting a config:
-
-- prove the model code can construct the requested fidelity policy without hard-coded overrides;
-- include at least one BFP4+LoFi candidate for every selected or seriously considered BFP4 matmul group;
-- compare BFP4+LoFi against BFP4+HiFi2 when both are legal and the group is a meaningful decode cost; the comparison is required for every selected BFP4 group and optional for rejected ones, and the sweep table says which groups ran it;
-- record where a per-group fidelity field is not honored by the measured kernel (prefill matmuls whose fidelity is fixed by the weight dtype, for example) so the table does not claim a fidelity the op never used;
-- record a short table for each material matmul group: weight dtype, compute fidelity, traced decode speed, accuracy result, kept/rejected decision, and reason.
-
-Pass a candidate's precision config to the readiness runners through `--build-kwargs` or `--build-kwargs-file` (a JSON object forwarded to `build_generator`), not through environment variables or an edited default file. If the runtime does not currently expose fidelity as a policy field, add that plumbing before ranking candidates. Do not satisfy this requirement by writing `compute_fidelities` into JSON that the measured model ignores.
+Pass a candidate's precision config to the readiness runners with `--build-kwargs` or `--build-kwargs-file` (a JSON
+object forwarded to `build_generator`), not environment variables or an edited default file. If the runtime does
+not expose fidelity as a policy field, add that plumbing before ranking. Writing `compute_fidelities` into JSON the
+measured model ignores does not satisfy this.
 
 ## Final Selection
 
-Select the fastest config that satisfies the acceptance bar on every reference, also checking agent-shaped long prefixes and the memory ledger as [`agentic-serving`](../agentic-serving/SKILL.md) describes, and free-running replies by the Anomalies guard. Higher precision chosen for those reasons is a valid selection. Measurement noise is the spread between the repeated serial baseline runs recorded in the baseline section; a candidate counts as a gain only when it beats the baseline by more than that spread, and two configs inside it are a tie, where the simpler and safer one wins.
+Select the fastest config that meets the bar on every reference, also checking agent-shaped long prefixes
+(`reference-accuracy`'s `agentic` and `long` slices) and the memory ledger
+([`agentic-serving`](../agentic-serving/SKILL.md)), and free-running replies by the Anomalies guard. Higher
+precision chosen for those reasons is a valid selection. Noise is the spread between the repeated serial baseline
+runs: a candidate is a gain only when it beats the baseline by more than that spread; two configs inside it are a
+tie, and the simpler, safer one wins.
 
 Before finishing:
 
-- make the selected config the model's default construction path, or write a required config artifact that `build_generator`, full-model, and vLLM paths actually consume by default;
-- keep a simple config change or override to return to the safe baseline setting;
-- run a post-selection token-out no-readback performance check with the selected config and record the workload shape, trace status, TTFT, decode t/s/u, and runtime counters;
-- rerun the resumed-prefill check on the selected config at the default thresholds and keep its record beside the sweep evidence;
-- use `$qualitative-check` to rerun the shared qualitative prompt suite on the selected config, with HF controls. If visible text quality selects or rejects a dtype/fidelity candidate, the verdict must come from this prompt-correct suite;
-- add a short propagation check proving `build_generator` and the vLLM adapter load the same selected weight/activation/CCL/KV/fidelity policy used by the winning sweep result.
-- update the context contract for the selected KV-cache dtype and prove later construction paths use a matching max context.
+- make the selected config the model's default construction path, or a required config artifact that
+  `build_generator`, full-model and vLLM paths consume by default;
+- keep a simple config change or override that returns to the safe baseline;
+- run the post-selection token-out no-readback check and record workload shape, trace status, TTFT, decode t/s/u
+  and runtime counters;
+- rerun the resumed-prefill check on the selected config at the default thresholds and keep its record beside the
+  sweep evidence;
+- run the `reference-accuracy` full tier on the selected config;
+- rerun the shared qualitative prompt suite with `$qualitative-check` and HF controls; if visible text quality
+  selects or rejects a candidate, the verdict comes from this prompt-correct suite;
+- add a propagation check proving `build_generator` and the vLLM adapter load the same weight, activation, CCL, KV
+  and fidelity policy as the winning sweep result;
+- update the context contract for the selected KV-cache dtype and prove later construction paths use a matching
+  max context.
 
-If no lower-precision config passes, keep the baseline and leave evidence that the sweep actually tested the likely wins.
+If no lower-precision config passes, keep the baseline and leave evidence that the sweep tested the likely wins.

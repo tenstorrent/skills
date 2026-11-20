@@ -42,6 +42,15 @@ scores as a sparsity tensor, `ttnn.sparse_matmul` for the gate/up/down active-ex
 `ttnn.sum` or the model's reduce over experts, and only then any TP or EP collective. Galaxy-only fused MoE paths
 need evidence that the target hardware and ops support them.
 
+## Precision
+
+Router logits, top-k selection, routing scores, gate weighting and expert reduction weighting are more sensitive
+than expert matmuls: a small error flips which experts run ([numerics](numerics.md)). They are rarely a performance
+bottleneck, so they are the last place to lower precision. Expert gate/up behave like dense FF1+FF3 and expert down
+like FF2. The performance effect of a precision change depends on how many experts actually run, so a sweep records
+the route or top-k distribution (or active expert count) beside each candidate. Expert layers differ in how much
+low precision they tolerate; L1 geometry tuned for one precision rarely fits another ([memory](memory.md)).
+
 ## Experts on a mesh
 
 Placement options: tensor-parallel experts (each active expert split over the devices), expert-parallel placement

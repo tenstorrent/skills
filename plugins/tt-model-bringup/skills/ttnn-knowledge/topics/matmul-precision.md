@@ -90,7 +90,8 @@ non-zero entries.
   (attention weights, MLP/expert weights, KV cache, activations/residuals, CCL payloads, norms, logits, layer
   exceptions) so a regression has one owner.
 - MLP gate/up (FF1/FF3) often tolerates BFP4; down (FF2) is more sensitive. Router logits, top-k and routing
-  weights are more sensitive still (see [datatype-sweep](../../datatype-sweep/SKILL.md)).
+  weights are more sensitive still ([moe](moe.md#precision)); the sweep procedure is
+  [datatype-sweep](../../datatype-sweep/SKILL.md).
 - Fidelity is a separate knob from dtype. BFP8 with HiFi2 is a safe start, not the answer: BFP8 with LoFi can be
   materially faster and still pass model-level accuracy. BFP4 is normally paired with LoFi. LoFi truncates
   operands, and PCC can miss the resulting gain error; add a gain check ([numerics](numerics.md)).

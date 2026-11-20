@@ -127,7 +127,7 @@
       "destination": "skills/datatype-sweep/SKILL.md",
       "blob": "457749253d5a2a220e7545c02f4e433cc984af12",
       "source_sha256": "25b874a7b6cf277e4e11d28c06c84056790b4ff61064defb24216ec1844d5764",
-      "packaged_sha256": "6ad4fc94cbf368bfa46d8c057b5a6ab4e2a0bdc8cea58fbf9fd14adfa17ac23f"
+      "packaged_sha256": "3c0868fd4aa417c2a167c8922e93691d597a19f383aa940db9fcae59b3ac8ebc"
     },
     {
       "source": ".agents/skills/datatype-sweep/agents/openai.yaml",
@@ -274,7 +274,7 @@
       "destination": "skills/vllm-integration/SKILL.md",
       "blob": "05d9e19f7cfbb596d209c504cc49e063b9361da1",
       "source_sha256": "a23a516ab0e8afc3a5dd6ddd72a42781997fb454872139e70605ecbd234e114c",
-      "packaged_sha256": "00b4f8205d191c60571a2676d23c3f2463aef99f5f7bc8d7c621a3f3073b3a19"
+      "packaged_sha256": "047d88eba11c50bc56291144fab966001d335b0fedb9c7ed178087ab74096d08"
     },
     {
       "source": ".agents/skills/vllm-integration/agents/openai.yaml",

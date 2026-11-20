@@ -38,6 +38,24 @@ Lengths at chunk edges and very long single prompts are where bugs cluster.
 **Long prompts stall concurrent decode** when intermediate chunks run padded to the largest canonical size even
 when few rows are consumed; running the smallest prepared profile that fits the consumed rows cut the stall.
 
+## Prefix caching and batched prefill in earlier bringups
+
+Background for the contract and gates in
+[prefill features](../../vllm-integration/references/prefill-features.md); models unnamed in the source notes.
+
+- **Gains.** A 16K shared prefix cut TTFT from 24.8 s to 179 ms on one chip; a 32-request burst of short prompts
+  cut TTFT from 6.3 s to 3.8 s on another model. Batched prefill at 32 x 128 gained about 2.5x to 3x on
+  device-bound MoE prefill against about 7x on host-bound dense models.
+- **Failures.** One shipped model returned garbage for any repeated prefix over about 130 tokens: a wrong resume
+  path. Kernel selection by row count cost one model its resume-check minimum PCC (`pcc_min` 0.876) with a correct cache.
+- **Random tokens do not test resume.** On a 30-layer MoE model a per-layer continuation PCC of 0.999 still gave
+  top-1 agreement near 0.3 on random token ids (near-flat next-token distributions, so argmax flips under ordinary
+  BF16 drift), while natural text gave PCC 1.000 and top-1 1.000 at every start.
+- **Recompiles after warmup.** On one model every unseen prompt length compiled 8 to 50 programs and cost a 1 to
+  8 s decode-trace recapture.
+- **Slot remap.** After a multi-row admission the plugin's slot remap cost one model 1.05 s per burst and dominated
+  TTFT, while generator-level calibration showed the full batched-prefill win.
+
 ## Paged KV basics
 
 - Use paged prefill and paged decode as the final path. Non-paged cache is not worth spending time on.

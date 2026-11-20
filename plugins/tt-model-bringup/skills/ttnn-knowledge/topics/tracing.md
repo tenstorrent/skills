@@ -18,6 +18,10 @@ active, and closing the mesh then hangs. Wrap capture in try/finally and release
 **Late kernels are hard to see.** Some program variants (for example certain flash-decoding prefill paths) compile
 only for shapes the warmup skipped; the allocation tracker found them, a single short test did not.
 
+**Warm on the served cache.** Paged-attention program keys include the KV-cache tensor shape. A generator that
+warmed on its own (or a test-sized) pool and then captured over the vLLM-allocated cache compiled inside the first
+capture; warmup and capture over the served cache allocation avoided it.
+
 ## How capture works
 
 Capture records a static command sequence on a device or mesh; replay reuses it without per-op host dispatch.

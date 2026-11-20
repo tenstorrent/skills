@@ -11,7 +11,26 @@ The pipeline stage finishes within `benchmark_budget_hours` from `bringup/agenti
 
 ## Measure performance
 
-Measure every supported batch size — `batch_sizes` from `bringup/agentic_evals/inputs.json`, default 1, 8, 16, 32, minus any stage 10 could not validate (the same set goes in `run_config.json` as `concurrencies`) — at input lengths **4096, `typical_context_tokens`, `working_set_tokens`, at least 28K and the longest context the evals reach** (their prompt plus output cap, at most the served max context; skip a batch the pool cannot hold at that length and list it in `missing_rows`), each with **128 output tokens**. Above batch 1, measure each length a second time at request concurrency 1 on the same server (`concurrency: 1` in the row): agent traffic keeps a large-batch server mostly part-full, and goal 12 interpolates between the two. Write a predicted rate for each row before measuring it, from stage 10's measurements or the roofline accounting, as a range narrow enough that a miss means something (about ±25%, per batch, not one range for every batch). The runner measures the 4096-token profiles with roofline accounting; measure the longer rows with the same client and the same server configuration per batch. The run config's `concurrencies` is that list: request concurrency is set equal to the batch under test so the device batch is actually filled, which is the only way the profile measures that batch rather than a padded one. Set `--max-num-seqs` to the same value. Use the configuration optimized-vLLM validated for that batch; batch 1 stays the single-user regression row. Each profile must use its corresponding decode trace and cache configuration. Keep model, precision, hardware and full context capacity unchanged. Warm each server configuration, then measure repeated requests. Record the prefix-caching setting, use distinct prompts, send the sampling settings stage 12's harness sends (temperature, top-k/top-p, seed: they can move sampling between device and host) and ignore EOS for performance. Verify actual token counts.
+The grid:
+
+- **Batches:** every batch in `batch_sizes` from `bringup/agentic_evals/inputs.json` (default 1, 8, 16, 32) that
+  stage 10 validated; the same set goes in `run_config.json` as `concurrencies`. Each runs on the configuration
+  optimized-vLLM validated for it, with its own decode trace and cache configuration, `--max-num-seqs` equal to the
+  batch, and request concurrency equal to the batch, so the device batch is actually filled rather than padded.
+  Batch 1 stays the single-user regression row.
+- **Lengths:** inputs of **4096, `typical_context_tokens`, `working_set_tokens`, at least 28K and the longest context
+  the evals reach** (their prompt plus output cap, at most the served max context), each with **128 output
+  tokens**. A batch the pool cannot hold at a length is skipped and listed in `missing_rows`.
+- **Concurrency 1:** above batch 1, measure each length again at request concurrency 1 on the same server
+  (`concurrency: 1` in the row): agent traffic keeps a large-batch server mostly part-full, and goal 12
+  interpolates between the two.
+- **Predictions:** before measuring a row, write its predicted rate from stage 10's measurements or the roofline
+  accounting, as a range narrow enough that a miss means something (about ±25%, per batch, not one range for all).
+- **Method:** the runner measures the 4096-token profiles with roofline accounting; measure the longer rows with
+  the same client and server configuration per batch. Keep model, precision, hardware and full context capacity
+  unchanged. Warm each server configuration, then measure repeated requests with distinct prompts, ignoring EOS.
+  Send the sampling settings stage 12's harness sends (temperature, top-k/top-p, seed: they can move sampling
+  between device and host). Record the prefix-caching setting and verify actual token counts.
 
 Prepare full-phase accounting before starting the timed run. Use or implement the model's collector and configure the required `roofline_command` from the run contract. Enable lightweight host timing at the actual prefill/decode completion boundaries and derive work from the model's executed shapes, precision and parallelism. Do not enable the live device profiler or add synchronization that changes the serving path. The runner checks the collector on each running server and collects its evidence before switching profiles.
 
@@ -31,11 +50,15 @@ each in `serving_rates.json` `release_rows`.
 
 ## Serving rates for goal 12
 
-Write `doc/benchmark/serving_rates.json`:
-the server config, `validated_batches`, `rows` (per batch and `input_tokens`: `prefill_tok_s`,
-`decode_tok_s_user`, `ttft_s`, `step_ms`, `predicted`, and a `cause` for a row below its predicted
-range), `release_rows` with `route: "eval"`, and `release_source`. Goal 12 reads these rates and
-does not re-measure them; `check_agentic_serving.py --stage benchmark` gates the file.
+Write `doc/benchmark/serving_rates.json`: the server config, `validated_batches`, the `workload` lengths the grid
+used (`typical_context_tokens`, `working_set_tokens`), `rows` (each with `batch`, `concurrency`, `input_tokens`,
+`prefill_tok_s`, `decode_tok_s_user`, `ttft_s`, `step_ms`, `predicted` written before measuring, and a `cause` for a
+row below its predicted range), `release_rows` with `route: "eval"`,
+`release_source`, and `missing_rows` (`batch`, `input_tokens`, `reason`) for every row the budget left unmeasured;
+the stage still completes. Goal 12 replays its runs on these rates, interpolating between measured lengths and
+concurrencies and extrapolating past the longest length: a row at the top of the range removes the largest error,
+and the concurrency-1 rows keep a part-full server from being priced as a full batch. Goal 12 does not re-measure
+them, except the rows it uses after a precision fix. `check_agentic_serving.py --stage benchmark` gates the file.
 
 ## Anomaly check for goal 12
 
@@ -56,18 +79,13 @@ reported, and no accuracy verdict.
 
 ## Diagnose slow benchmarks and evals
 
-Before a long run, use a small representative subset to estimate wall time from measured TTFT,
-TPOT/tokens-per-user, input/output lengths, concurrency and sample count. For high input length,
-output length, batch or concurrency cases, passing is not sufficient: compare host-observed TTFT
-and token cadence with device prefill/decode intervals and check whether an unexamined optimization
-could materially shorten the run.
-
-If device time explains the wall time, return to the relevant prefill, decode, sampling or
-multi-device optimization. If it does not, measure queue wait, request scheduling, trace
-compilation/selection, synchronization, HTTP/client overhead, serialization, retries, timeouts and
-eval-framework or task-environment setup. Fix the dominant overhead and repeat the small probe
-before committing the stage budget to the full workload. Keep first-use and warmed measurements
-separate, and do not shorten valid inputs or outputs to make the run finish.
+Before a long run, estimate its wall time from a small representative subset (measured TTFT, TPOT, input and output
+lengths, concurrency, sample count). For high input length, output length, batch or concurrency, passing is not
+enough: compare host-observed TTFT and token cadence with device prefill and decode intervals, and check whether an
+unexamined optimization could materially shorten the run. How to split device time from serving and harness
+overhead: [serving and evals](../ttnn-knowledge/topics/serving-evals.md#slow-benchmark-and-eval-runs). Fix the
+dominant overhead and repeat the probe before committing the stage budget. Keep first-use and warmed measurements
+separate, and never shorten valid inputs or outputs to make a run finish.
 
 ## Deliver the report
 

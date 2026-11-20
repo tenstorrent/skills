@@ -40,6 +40,25 @@ matched the reference. Telling quantization from a kernel bug took a full-precis
 number of candidates per shard and breaks ties by id then gives run-dependent picks when the logits themselves
 move slightly.
 
+## Choosing a precision policy
+
+- **The readiness reference is lenient.** It is an HF-greedy continuation, so most positions have large margins and
+  a precision loss rarely flips them. In one bringup a BFP4 MLP policy scored 0.92 to 0.97 top-1 on it and 0.82 to
+  0.85 over 1468 natural-text positions (real next tokens of the readiness book, scored per position against HF);
+  the readiness reference alone would have selected it.
+- **Top-1 has a binomial margin.** Over n tokens at rate p the standard error is sqrt(p(1-p)/n): about 0.022 at
+  p = 0.95 and n = 100, a 95% interval of about +/-0.04. A one-token difference between candidates is noise; more
+  tokens or the natural-text reference separate them.
+- **Run-to-run spread** sets what counts as a speed gain: measure the baseline at least twice, serially, before
+  ranking candidates.
+- **Resumed prefill after a precision change.** The resumed and fresh TT paths can agree with each other while
+  both drift from HF at hard positions, so a TT-versus-TT resume check fails with a correct cache. A per-position
+  comparison against HF (margin probe) separates this from a cache or position bug
+  ([prefill features](../../vllm-integration/references/prefill-features.md#generator-level-resume-check)).
+- **Restore order.** The sweep's default order for backing out BFP4 (FF2/down, then QKV, WO, FF1+FF3/gate+up)
+  puts the groups usually most sensitive first; it is a heuristic, not a measured ranking for any one model. Router
+  and routing weights are more sensitive than expert matmuls ([moe](moe.md#precision)).
+
 ## When an accuracy failure follows a precision change
 
 A failure that appears after a dtype, cache dtype, math fidelity or CCL payload change marks an error-budget

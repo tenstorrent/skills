@@ -31,3 +31,9 @@ not by compute; decode-style DRAM-sharded pipelines are decode-only (one tile ro
 of the time; the same code on newer firmware (19.17) showed none. Heavier NoC and DRAM traffic raised the rate,
 so a faster kernel looked like a bug. Running the identical reproducer on a second machine with different
 firmware early would have saved most of a day.
+
+**Full-phase roofline.** Prefill FLOP and decode DRAM roofline percentages are only meaningful over complete
+elapsed phases measured at the host boundary (dispatch, communication, sampling, readback and gaps), with work
+counted for the same requests and chips; a matmul-only duration overstates them. The method and the collector
+schema the benchmark stage uses:
+[run contract](../../benchmark-model/references/run-contract.md#full-phase-roofline-accounting).

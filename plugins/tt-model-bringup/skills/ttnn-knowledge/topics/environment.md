@@ -16,3 +16,8 @@
   layout differed from its docstring.
 - **Environment flags read as booleans:** a flag set to `0` was read as unset by a truthiness check.
 - **Network storage limits:** a shared NFS mount ran out of inodes with terabytes free.
+- **Truncated tensor-cache entries.** A cache entry truncated by a process killed mid-write stalled every later
+  loader on the host (one thread at full CPU, no I/O, no log line) and looked like a hang. A separate tensor-cache
+  directory per experiment series avoided it.
+- **Host-only tests opened chips.** A parametrized device fixture in an unrelated test module opened every chip on
+  the host, including chips another job held; setting `TT_VISIBLE_DEVICES` on host-only test sweeps too avoided it.
