@@ -475,3 +475,56 @@ def test_a_failed_review_whose_branch_read_a_slice_cut_defers_its_fix_to_a_later
     nofix = p.db.q("SELECT * FROM events WHERE kind='review_nofix' AND task=?", (rev2["id"],))
     assert len(nofix) == 1 and "was not read" in nofix[0]["text"]
     assert p.db.kv(KV_FIX_RETRY) == {}, "the bounded review is dropped once its event is raised"
+
+
+def test_a_deferred_fix_replays_the_inputs_its_finish_passed(env, monkeypatch):
+    """The retry of a cut fix read replays the finish's own _fix_failed_review call: a split review
+    waiting as 'pushing' with approved members gets its fix from the stored follow-ups (a marker
+    refusal's single fix, reuse_fix kept), never re-derived from the result, so a reviewer proposal
+    the finish left out never becomes a fix and the review is never dropped for not being 'failed'."""
+    from ttp import gitmemo, gitreplay
+    from ttp.daemon import Daemon, KV_FIX_RETRY
+    p = make(env)
+    p.set_config("budget.max_tasks_per_24h", 1000)
+    _with_origin(env, clone=False)
+    _, _, _, (rev,) = _finish_code(env, p, "a change", {"app.py": 20})
+    proposal = {"title": "rename helpers", "spec": "a reviewer proposal, not a fix"}
+    marker = {"title": "resolve the conflict markers", "spec": "remove the conflict markers in app.py"}
+    p.db.update_task(rev["id"], status="pushing", result=json.dumps(
+        {"status": "changes_needed", "summary": "markers", "followups": [proposal, marker]}))
+    d = Daemon(p.base)
+    gitreplay.clear()
+    with gitmemo.bounded(gitmemo.TX_GIT_S, gitmemo.TX_GIT_S), gitmemo.attempt(), \
+            gitmemo.strict(0.0, abortable=False):
+        assert d._fix_failed_review(p.db.task(rev["id"]), [marker], "markers",
+                                    reuse_fix=True, approved=True) is None
+    assert d._fix_cut and p.db.kv(KV_FIX_RETRY)[str(rev["id"])]["args"]["reuse_fix"] is True
+    calls = []
+    real = Daemon._fix_failed_review
+
+    def spy(self, review, fups, summary, reuse_fix=False, approved=False):
+        calls.append((review["id"], fups, summary, reuse_fix, approved))
+        return real(self, review, fups, summary, reuse_fix=reuse_fix, approved=approved)
+
+    monkeypatch.setattr(Daemon, "_fix_failed_review", spy)
+    d.retry_deferred_fixes()
+    assert calls == [(rev["id"], [marker], "markers", True, True)]
+    fix = p.db.one("SELECT * FROM tasks WHERE kind='code' AND title LIKE ?", (f"Fix review #{rev['id']}:%",))
+    assert fix and "conflict markers" in fix["spec"] and "reviewer proposal" not in fix["spec"]
+    assert p.db.kv(KV_FIX_RETRY) == {} and not p.db.q("SELECT * FROM events WHERE kind='review_nofix'")
+
+
+def test_a_failed_reviews_finish_says_its_fix_was_deferred(env, monkeypatch):
+    """A finish whose fix read was cut says so in the failure event (the fix comes on a later tick,
+    up to FIX_RETRY_MAX cut reads), instead of saying nothing about the fix."""
+    from ttp.daemon import Daemon, FIX_RETRY_MAX
+
+    def cut(self, review, fups, summary, reuse_fix=False, approved=False):
+        self._nofix, self._fix_cut = "", "its branch was not read (git time budget)"
+
+    monkeypatch.setattr(Daemon, "_fix_failed_review", cut)
+    p = make(env)
+    _, _, _, (rev,) = _finish_code(env, p, "a change", {"app.py": 20})
+    ev = _fail_review(env, p, rev["id"], followups=[{"title": "bug", "spec": "fix it"}])
+    assert "Fix deferred: its branch was not read (git time budget)" in ev["text"]
+    assert f"after {FIX_RETRY_MAX} cut reads" in ev["text"] and "No automatic fix" not in ev["text"]

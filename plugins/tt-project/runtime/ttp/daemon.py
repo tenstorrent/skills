@@ -829,7 +829,7 @@ UNREVIEWED_BACKLOG_EVERY_S = 100   # after a cut pass that queued a review (a ba
 KV_UNREVIEWED_COUNTED = "unreviewed_counted"   # kv: the runtime version whose first sweep logged its count
 KV_REVIEW_UNREAD = "review_unread"   # kv: task ids whose review a timed-out git read left unqueued (retry_unread_reviews)
 KV_REVIEW_RETRY = "review_read_retry"   # kv: {task id: first failure} of code tasks whose review's diff read failed
-KV_FIX_RETRY = "fix_read_retry"   # kv: {review id: [tries, why]} of failed reviews whose fix a cut branch read deferred
+KV_FIX_RETRY = "fix_read_retry"   # kv: {review id: {tries, why, args}} of failed reviews whose fix a cut branch read deferred
 FIX_RETRY_MAX = 3                  # tries the deferred fix queueing gets before review_nofix is raised
 REVIEW_RETRY_KEEP_S = 7 * 86400   # a read retry the sweep has not settled by then is dropped (logged)
 PUSH_REFS_EVERY_S = 600   # how often the push queue's pins (refs/ttp/push/<id>) of settled rows are pruned
@@ -8766,6 +8766,7 @@ class Daemon:
         # A split review's approved members go to the push queue while the failed members' fix is queued
         # for their part only (the review waits as 'pushing'; what waits on it keeps waiting on it).
         failed_fix = new == "failed" or bool(member_vs and approval)
+        self._fix_cut = ""
         fix = self._fix_failed_review(dict(task, **upd), fixes, summary, reuse_fix=bool(marker_fix),
                                       approved=bool(member_vs and approval)) \
             if failed_fix and task["kind"] == "review" and fixes and (len(fups) <= MAX_FOLLOWUPS or marker_fix) \
@@ -8786,6 +8787,9 @@ class Daemon:
             nofix = ""
         elif nofix:
             text += f"\nNo automatic fix: {nofix} ({deadwait.NOFIX_EVENT} raised)."
+        if self._fix_cut:
+            text += (f"\nFix deferred: {self._fix_cut}; a later tick queues it (after {FIX_RETRY_MAX} cut "
+                     f"reads, {deadwait.NOFIX_EVENT} is raised).")
         folded = {id(f) for f in fixes} if fix else set()
         revert_note = getattr(self, "_revert_note", "") if failed_fix else ""
         if revert_note:
@@ -19858,45 +19862,33 @@ class Daemon:
         return queued
 
     def retry_deferred_fixes(self) -> None:
-        """Queue the fix and re-review of each failed review whose finish cut the branch read on a
-        git time budget (KV_FIX_RETRY): the reads now run under no finish round's slice. Bounded by
-        FIX_RETRY_MAX: a review whose read keeps being cut raises its review_nofix event, and so
-        does one whose fix cannot be queued for a real reason; anything else ends the retry."""
+        """Replay the _fix_failed_review call of each failed review whose finish a git time budget cut
+        (KV_FIX_RETRY), with the inputs that finish passed it, under no finish round's slice. Bounded by
+        FIX_RETRY_MAX: a read that keeps being cut raises the review_nofix event, as does a fix that
+        cannot be queued for a real reason. A review rerun or cancelled since is dropped."""
         db = self.p.db
-        pending = db.kv(KV_FIX_RETRY) or {}
-        for rid in sorted(pending):
+        for rid in sorted(db.kv(KV_FIX_RETRY) or {}):
             if stepclock.over():
                 break
+            entry = (db.kv(KV_FIX_RETRY) or {}).get(rid)
             review = db.task(int(rid)) if str(rid).isdigit() else None
-            self._fix_cut = ""
-            fix = None
-            if review and review["kind"] == "review" and review["status"] == "failed":
-                res = load_result(review.get("result")) or {}
-                fups = [f for f in (res.get("followups") or []) if isinstance(f, dict)]
-                fixes = [f for f in fups if not upstream.is_note(f) and not f.get("start_after")
-                         and not f.get("start_when")]
-                if not fixes:   # as at its finish: a review with no fix to queue goes to the coordinator
-                    deadwait.raise_nofix(db, review, "it proposed no fix follow-ups", "")
-                    pending.pop(rid)
-                    continue
-                fix = self._fix_failed_review(review, fixes, str(res.get("summary") or ""))
-                if fix:
-                    pending.pop(rid)
-                    log(self.p, f"review {rid}: fix and re-review queued after its branch read was cut")
-                    continue
-                if self._fix_cut:   # cut again: the deferred read itself counts the try
-                    entry = (db.kv(KV_FIX_RETRY) or {}).get(rid) or pending.get(rid) or []
-                    pending[rid] = entry
-                    tries = entry[0] if isinstance(entry, list) and entry \
-                        and str(entry[0]).lstrip("-").isdigit() else 0
-                    if tries >= FIX_RETRY_MAX:
-                        deadwait.raise_nofix(db, review, self._fix_cut, "")
-                        pending.pop(rid)
-                    continue
-                if self._nofix:
-                    deadwait.raise_nofix(db, review, self._nofix, "")
-            pending.pop(rid)
-        db.set_kv(KV_FIX_RETRY, pending)
+            args = entry.get("args") if isinstance(entry, dict) else None
+            self._fix_cut = self._nofix = ""
+            fix = self._fix_failed_review(review, **args) \
+                if isinstance(args, dict) and review and review["status"] in ("failed", "pushing", "done") else None
+            pending = db.kv(KV_FIX_RETRY) or {}
+            again = pending.get(rid)
+            if fix:
+                log(self.p, f"review {rid}: fix and re-review queued after its branch read was cut")
+            elif self._fix_cut and isinstance(again, dict) and again.get("tries", 0) < FIX_RETRY_MAX:
+                continue   # cut again: the deferral re-recorded it with one more try
+            elif self._fix_cut or self._nofix:
+                deadwait.raise_nofix(db, review, self._fix_cut or self._nofix, "")
+            else:
+                log(self.p, f"review {rid}: deferred fix dropped (review "
+                            f"{review['status'] if review else 'gone'}, or nothing left to fix)")
+            pending.pop(rid, None)
+            db.set_kv(KV_FIX_RETRY, pending)
 
     def _review_pending(self, tid: int) -> None:
         """Mark task `tid`'s review pending (KV_REVIEW_UNREAD): retry_unread_reviews queues it on a later tick."""
@@ -21618,9 +21610,10 @@ class Daemon:
                 why = f"its branch was not read ({coord.clip(str(e), 200)})"
                 pending = db.kv(KV_FIX_RETRY) or {}
                 prior = pending.get(str(review["id"]))
-                tries = (int(prior[0]) if isinstance(prior, list) and prior
-                         and str(prior[0]).lstrip("-").isdigit() else 0) + 1
-                pending[str(review["id"])] = [tries, why]
+                tries = prior.get("tries", 0) if isinstance(prior, dict) else 0
+                pending[str(review["id"])] = {"tries": (tries if isinstance(tries, int) else 0) + 1, "why": why,
+                                              "args": {"fups": fups, "summary": summary,
+                                                       "reuse_fix": reuse_fix, "approved": approved}}
                 db.set_kv(KV_FIX_RETRY, pending)
                 self._fix_cut = why
                 log(self.p, f"review {review['id']}: fix deferred, its branch read was cut by a git time budget")

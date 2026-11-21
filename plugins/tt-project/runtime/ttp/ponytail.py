@@ -23,29 +23,7 @@ LABEL = "ponytail_lane:"     # ponytail_lane:<added lines at queue time, empty w
 FILE = "ponytail.json"       # {"verdict": "pass"|"fail", "head": <sha>, "findings": [{"severity", "text"}], "thread": bool}
 ENV = "TTP_PONYTAIL_LANE"    # 1: this run's hand-off needs FILE (hook.handoff_problem)
 FAILED = "the ponytail lane failed it"   # lane_problem's prefix for a valid fail verdict
-WHY = re.compile(r"(?im)(?:^|[.;][ \t])[ \t>*-]*why this size:[ \t]*\S")
-
-
-def has_reason(text: str) -> bool:
-    """Whether `text` carries a size reason: `why this size:` starting a line (bullet and quote
-    markers allowed) or a clause ("; " or ". "), never inside backticks or quotes, so a quote of
-    the rule itself is not a reason."""
-    return bool(WHY.search(_quoted_out(str(text or ""))))
-
-
-def _quoted_out(text: str) -> str:
-    """`text` with backtick- and double-quoted spans blanked, so a quoted phrase does not read as
-    a reason; a span that never closes blanks nothing."""
-    out, i = [], 0
-    while i < len(text):
-        ch = text[i]
-        if ch in '`"' and (j := text.find(ch, i + 1)) > 0:
-            out.append(" " * (j - i + 1))
-            i = j + 1
-        else:
-            out.append(ch)
-            i += 1
-    return "".join(out)
+WHY = re.compile(r"(?im)^[ \t>*-]*why this size:[ \t]*\S")
 
 
 def _review(cfg: dict) -> dict:
@@ -160,10 +138,10 @@ def size_problem(cfg: dict, added: int | None, text: str, run_dir, head: str = "
     if not cap or added is None or added <= cap:
         return ""
     key = "review.ponytail_pr_lines" if pr else "review.ponytail_land_lines"
-    if not has_reason(text):
-        return (f"it adds {added} lines, over {key} ({cap}): its spec or hand-off needs the reason "
-                f"starting `why this size:` on its own line or a clause (after '; ' or '. '), never "
-                f"quoted, and a passed ponytail lane (skill tt-ponytail-review, verdict in "
+    if not WHY.search(text or ""):
+        return (f"it adds {added} lines, over {key} ({cap}): its spec or hand-off needs the reason on its own "
+                f"line, starting with `why this size:` and followed by the reason (the phrase mid-line is not "
+                f"read), and a passed ponytail lane (skill tt-ponytail-review, verdict in "
                 f"$TTP_RUN_DIR/{FILE}); else make it smaller")
     if why := lane_problem(run_dir, head):
         return f"it adds {added} lines, over {key} ({cap}), and {why}"
