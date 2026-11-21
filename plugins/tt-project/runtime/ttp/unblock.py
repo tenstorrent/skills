@@ -46,6 +46,7 @@ from pathlib import Path
 from typing import Any
 
 from . import anchors, chatgone, reviewcap
+from .coordroute import OWN_SQL   # a lane or shadow turn is no coordinator wake
 from .db import CHAT_RANK, DB, SEVERITY_RANK, chat_floor
 from .util import loads_dict
 
@@ -884,7 +885,8 @@ def _triggers(note: dict) -> list[str]:
 
 def triggers_line(db: DB, since: float) -> str:
     """Coordinator turns per trigger label, and the triggered vs routine share with their cost."""
-    rows = db.q("SELECT note, cost_usd FROM runs WHERE role='coordinator' AND started>=?", (since,))
+    rows = db.q("SELECT note, cost_usd FROM runs WHERE role='coordinator' AND started>=? AND " + OWN_SQL,
+                (since,))
     if not rows:
         return "no coordinator turns"
     per: dict[str, int] = {}

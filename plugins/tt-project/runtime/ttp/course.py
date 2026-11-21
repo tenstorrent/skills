@@ -37,6 +37,7 @@ import statistics
 import time
 from typing import Any
 
+from .coordroute import OWN_SQL   # a lane or shadow turn is no coordinator wake
 from .db import DB, TERMINAL_TASK_STATES, deferral
 
 KEY = "course_check"
@@ -180,7 +181,7 @@ def idle_turns(db: DB, at: float) -> dict | None:
         return None
     streak, wakes = [], {}
     for r in db.q("SELECT started, cost_usd, note FROM runs WHERE role='coordinator' AND status='ok' "
-                  "ORDER BY started DESC LIMIT 200"):
+                  "AND " + OWN_SQL + " ORDER BY started DESC LIMIT 200"):
         note = _note(r["note"])
         if "decided" not in note or note["decided"]:
             break

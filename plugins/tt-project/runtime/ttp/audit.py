@@ -54,6 +54,7 @@ import time
 from typing import Any
 
 from . import budget, chaincap, checkprestage, coordfix, coordmodel, correction, ends, gatejudge, gatetime, landed, obligations, outscan, plainreply, planuse, quietgate, relay, replan, reviewstats, routinedefault, route, rulecite, schedule, sharedchecks, stalegate, suitecost, sweepskip, timefmt, turngate, unblock, upstream, wakesettle
+from .coordroute import OWN_SQL   # a lane or shadow turn is no coordinator wake
 from .db import DB, continues_id, load_result
 from .project import Project
 from .util import loads_dict
@@ -181,7 +182,8 @@ def coordinator_turns(db: DB, since: float) -> dict:
     with costs. A turn decided nothing when its note says `decided` 0 (turns before that was logged
     are not counted); an idle or starve wake was due to the
     idle timer or the idle-slot (starve) timer with no message or event in its batch."""
-    rows = db.q("SELECT note, cost_usd FROM runs WHERE role='coordinator' AND status='ok' AND started>=?", (since,))
+    rows = db.q("SELECT note, cost_usd FROM runs WHERE role='coordinator' AND status='ok' AND started>=? "
+                "AND " + OWN_SQL, (since,))
     out = {"n": len(rows), "usd": 0.0, "noop": 0, "noop_usd": 0.0, "idle": 0, "idle_usd": 0.0,
            "starve": 0, "starve_usd": 0.0, "logged": 0}
     for r in rows:

@@ -22,6 +22,7 @@ import json
 import time
 from typing import Any
 
+from .coordroute import OWN_SQL   # a lane or shadow turn is no coordinator wake
 
 STATUS_KEY = "cost_levers_status"   # kv: {"at", "lines"}, the status lines cached
 STATUS_TTL_S = 1800.0
@@ -68,7 +69,8 @@ def wake_tools_report(p, since: float, until: float | None = None) -> dict:
     from . import coordstats
     until = time.time() if until is None else until
     rows = p.db.q("SELECT id, dir, provider, cost_usd FROM runs WHERE role='coordinator' AND started>=? "
-                  "AND started<? AND status!='running' ORDER BY started DESC LIMIT ?", (since, until, SAMPLE))
+                  "AND started<? AND status!='running' AND " + OWN_SQL + " ORDER BY started DESC LIMIT ?",
+                  (since, until, SAMPLE))
     n = heavy = top = 0
     usd = heavy_usd = 0.0
     for r in rows:

@@ -494,6 +494,42 @@ def test_coordinator_turn_readers_skip_a_newer_lane_or_shadow_turn(env, caller):
     assert got == {"wakemode.latest": "resume", "wakemode.today_counts": today, "ctxfork.coord_model": "opus",
                    "ctxfork.coord_shape": own}.get(caller, 1.0), got
 
+
+@pytest.mark.parametrize("caller", ["course.idle_turns", "audit.coordinator_turns", "unblock.triggers_line",
+                                    "costlevers.wake_tools_report"])
+def test_coordinator_turn_reports_skip_a_newer_lane_or_shadow_turn(env, caller):
+    """The turn reports count the coordinator's own wakes only: a newer shadow or lane turn changes
+    none of their counts and does not break the idle streak."""
+    from ttp import audit, coordroute, costlevers, course, unblock
+    p = make(env)
+    now = time.time()
+    note = {"decided": 0, "wake_due": "idle", "triggers": ["task_blocked: #12"]}
+
+    def turn(ago, note):
+        rid = p.db.x("INSERT INTO runs(role,provider,started,ended,status,cost_usd,note) "
+                     "VALUES('coordinator','claude',?,?,'ok',1.0,?)", (now - ago, now - ago + 30, json.dumps(note)))
+        d = p.runs / str(rid)
+        d.mkdir(parents=True, exist_ok=True)
+        (d / "output.jsonl").write_text("\n".join(json.dumps({"message": {"content": [
+            {"type": "tool_use", "id": f"c{i}", "name": "Bash", "input": {}}]}}) for i in range(9)) + "\n")
+        return rid
+
+    own = [turn(240, note), turn(200, note)]
+    turn(120, {coordroute.SHADOW: {"of": own[0]}})   # a shadow of the newest own turn
+    turn(60, {coordroute.LANE: "routine"})           # a live lane turn, newest of all
+    since = now - 3600
+    got = {"course.idle_turns": lambda: course.idle_turns(p.db, 2),
+           "audit.coordinator_turns": lambda: audit.coordinator_turns(p.db, since),
+           "unblock.triggers_line": lambda: unblock.triggers_line(p.db, since),
+           "costlevers.wake_tools_report": lambda: costlevers.wake_tools_report(p, since, now + 10)}[caller]()
+    want = {"course.idle_turns": {"n": 2, "usd": 2.0, "hours": pytest.approx(40 / 3600), "wakes": {"idle": 2}},
+            "audit.coordinator_turns": {"n": 2, "usd": 2.0, "noop": 2, "noop_usd": 2.0, "idle": 2,
+                                        "idle_usd": 2.0, "starve": 0, "starve_usd": 0.0, "logged": 2},
+            "unblock.triggers_line": "triggered 2 (100%, $2.00), routine 0 (0%, $0.00); "
+                                     "per trigger: task_blocked 2",
+            "costlevers.wake_tools_report": {"wakes": 2, "heavy": 2, "usd": 2.0, "heavy_usd": 2.0, "max": 9}}
+    assert got == want[caller], (caller, got)
+
 # The GLM-arm ask-Opus switches (glmassist.py) ----------------------------------------------------------------
 
 def test_glmassist_switches_are_off_by_default_and_told_to_the_run_only_when_on():
