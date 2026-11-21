@@ -19875,6 +19875,10 @@ class Daemon:
                 fups = [f for f in (res.get("followups") or []) if isinstance(f, dict)]
                 fixes = [f for f in fups if not upstream.is_note(f) and not f.get("start_after")
                          and not f.get("start_when")]
+                if not fixes:   # as at its finish: a review with no fix to queue goes to the coordinator
+                    deadwait.raise_nofix(db, review, "it proposed no fix follow-ups", "")
+                    pending.pop(rid)
+                    continue
                 fix = self._fix_failed_review(review, fixes, str(res.get("summary") or ""))
                 if fix:
                     pending.pop(rid)
