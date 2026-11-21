@@ -233,7 +233,6 @@ CLEARED_TEXT = {
     "tick-step": "Daemon tick step {arg} runs again.",
     "pause-gone": "Machine change #{arg} is closed, or the resource pause its undo resumes is back.",
     "account-mismatch": "{arg}'s current account has plan readings of its own again, is known to be billed by use, or the old readings aged out.",
-    "relay-behind": "The upstream has every commit the push relay has again.",
 }
 # Conditions only the user can clear, alerted below high: tracked and shown in the top section like a
 # high alert; their clearing is a low feed line, not a new notification (netwait.py).
@@ -472,9 +471,6 @@ def holds(db: DB, key: str, since: float, now: float) -> bool:
         return (bool(((db.kv("push_queue") or {}).get("no_batch") or {}).get("alerted"))
                 and bool(db.one("SELECT id FROM push_queue WHERE status='approved' LIMIT 1"))
                 and not db.one("SELECT id FROM push_batches WHERE after_finalized IS NULL LIMIT 1"))
-    if key == "relay-behind":   # relaylag.apply: until the upstream has every relay commit (lag 0)
-        from . import relaylag
-        return relaylag.holds(db)
     if key == "push_not_landing":   # pushq.check_landing: until a batch lands
         if not db.one("SELECT id FROM push_queue WHERE status IN ('approved','batched') LIMIT 1"):
             return False   # every waiting approval was withdrawn or cancelled
@@ -502,7 +498,7 @@ def _checkable(key: str) -> bool:
                                          "push_rejected", "after_push_failed", "push_queue_dying", "push_not_landing", "push_no_batch", "push_tip_failing", "push_target_unreachable", "push_script_torn", "push_setup_fault",
                                          "push_scope", "heal",
                                          "heal-hold", "machine", "machine-change", "network", "deploy", "deploy-behind", "deploy-pending", "redeploy", "daemon-hang", "paused", "fleethold",
-                                         "coord-budget", "account-mismatch", "linger-off", "tick-step", "pause-gone", "notifier", "chat-silent", "user-step", "gh-auth", "ssh-agent", "bridge-agent", "relay-behind")
+                                         "coord-budget", "account-mismatch", "linger-off", "tick-step", "pause-gone", "notifier", "chat-silent", "user-step", "gh-auth", "ssh-agent", "bridge-agent")
 
 
 def _since(ep: dict) -> float:

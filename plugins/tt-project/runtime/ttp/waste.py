@@ -6,10 +6,7 @@ its own runs. Each run that ended in the window counts once, in the first bucket
   stand_in       runs started after the project moved (kv `project_moved_at` or `waste.moved_at`, epoch):
                  the old copy kept working beside the new one
   superseded     work on tasks later cancelled, superseded (task_superseded) or abandoned
-  failed_task    work on tasks that failed with no verdict (a broken run, no hand-off)
-  rejected       failed reviews that returned a verdict (changes_needed, superseded, or a failed hand-off with
-                 review_failure or followups): rework of the change they reviewed, listed by that change,
-                 not a broken run
+  failed_task    work on tasks that failed
   duplicate      a task whose title an earlier task of the last 7 days already had (schedules aside)
   rereview       a review of a head an earlier review already checked (same review_head label and
                  same hand-off body: review_payload label; a review without one is unknown, not waste)
@@ -30,15 +27,14 @@ from __future__ import annotations
 
 import re
 
-from . import budget, chainprio
-from .db import CHANGES_NEEDED, load_result
+from . import budget
 from .reviewreuse import FORCED_LABEL, HEAD_LABEL, PAYLOAD_LABEL
 from .util import task_labels
 
-BUCKETS = ("stand_in", "superseded", "failed_task", "rejected", "duplicate", "rereview", "review_rounds", "crashed",
+BUCKETS = ("stand_in", "superseded", "failed_task", "duplicate", "rereview", "review_rounds", "crashed",
            "over_runs", "costly_wake")
 LABELS = {"stand_in": "stand-in after a move", "superseded": "cancelled or superseded work",
-          "failed_task": "failed tasks", "rejected": "rejected changes", "duplicate": "duplicate tasks", "rereview": "re-reviews of a same head",
+          "failed_task": "failed tasks", "duplicate": "duplicate tasks", "rereview": "re-reviews of a same head",
           "review_rounds": "review rounds past the limit", "crashed": "crashed or timed-out runs",
           "over_runs": "runs past the per-task limit", "costly_wake": "coordinator wakes over the limit"}
 DEFAULTS = {"target_share": 0.10, "wake_usd": 1.0, "max_runs": 4, "review_rounds": 2, "fix_task": True}
@@ -73,24 +69,12 @@ def _moved_at(db, cfg: dict) -> float:
     return 0.0
 
 
-def _verdict(task: dict) -> bool:
-    """A failed review that returned a verdict on the change: its spend is rework of that change. Read from
-    the hand-off reviewsup keeps as it was, so a superseded crashed run stays a failed task."""
-    result = load_result(task["result"])
-    return result.get("status") == CHANGES_NEEDED or (
-        result.get("status") == "failed" and bool(result.get("review_failure") or result.get("followups")))
-
-
-def _task_sets(db, cfg: dict) -> dict:
+def _task_sets(db, cfg: dict) -> dict[str, set[int]]:
     tasks = {t["id"]: t for t in db.q("SELECT id, created, title, kind, status, origin, labels FROM tasks")}
     gone = {r["task"] for r in db.q("SELECT task FROM task_superseded UNION SELECT task FROM task_abandoned")}
-    rejected = {r["id"]: (chainprio.covered(r) or [r["id"]])[0]           # the review -> the change it reviewed
-                for r in db.q("SELECT id, kind, status, result, labels FROM tasks WHERE status='failed' AND kind='review'")
-                if _verdict(r)}
     out: dict[str, set[int]] = {
         "superseded": {i for i, t in tasks.items() if t["status"] == "cancelled"} | gone,
-        "failed_task": {i for i, t in tasks.items() if t["status"] == "failed"} - set(rejected), "rejected": set(rejected),
-        "rejected_of": rejected,
+        "failed_task": {i for i, t in tasks.items() if t["status"] == "failed"},
         "done": {i for i, t in tasks.items() if t["status"] == "done"},
         "duplicate": set(), "rereview": set(), "review_rounds": set(), "retained": set()}
     kept = {r["task"] for r in db.q("SELECT task FROM task_superseded UNION "
@@ -162,8 +146,6 @@ def report(db, since: float, now: float, cfg: dict | None = None) -> dict:
             got = "superseded"
         elif task in sets["failed_task"]:
             got = "failed_task"
-        elif task in sets["rejected"]:
-            got = "rejected"
         elif task in sets["duplicate"]:
             got = "duplicate"
         elif task in sets["rereview"]:
@@ -179,8 +161,7 @@ def report(db, since: float, now: float, cfg: dict | None = None) -> dict:
             b["usd"] += usd
             b["runs"] += 1
             if task is not None:
-                named = sets["rejected_of"][task] if got == "rejected" else task
-                b["tasks"][named] = b["tasks"].get(named, 0.0) + usd
+                b["tasks"][task] = b["tasks"].get(task, 0.0) + usd
             if got == "superseded" and task in sets["retained"]:
                 b["retained_usd"] += usd
                 b["retained_tasks"][task] = b["retained_tasks"].get(task, 0.0) + usd

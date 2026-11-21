@@ -2212,9 +2212,6 @@ def cmd_status(a) -> None:
         from . import branchcap
         if ln := branchcap.status_line(p.db, p.config()):
             print(ln)
-        from . import relaylag
-        if ln := relaylag.line(p.db):   # the daemon's last upstream read: no network here
-            print(ln)
         if ln := gatetime.waits_line(p.db, p.state):
             print(ln)
         from . import costlevers
@@ -2568,40 +2565,29 @@ def cmd_slop(a) -> None:
     if a.subsystem:
         cfg["subsystems"] = [*a.subsystem, *(cfg.get("subsystems") or [])]
     cache = str(p.state / "slop-cache.json")
-    # deslop.repos: a project root that is a plain folder scans the repositories it names, each in turn
-    roots = ([] if a.repo else slop.repos(p.root, cfg)) or [slop.repo(p.root, given=a.repo)]
-    if len(roots) > 1 and (a.diff or a.next):
-        die(f"slop: deslop.repos names {len(roots)} repositories: pick one with --repo")
-    reps = {}
-    for root in roots:
-        if len(roots) > 1 and not a.json:
-            print(f"== {root}")
-        try:
-            if a.diff:
-                base, sep, head = a.diff.partition("..")
-                if not sep or not base or not head:
-                    die("--diff: give base..head (two commits or branches)")
-                d = slop.delta(root, base, head, cfg, cache)
-                if a.json:
-                    print(json.dumps(d, indent=1))
-                    return
-                print("\n".join(slop.delta_lines(d, show=20) or ["the change adds none of what the scan counts"]))
+    try:
+        root = slop.repo(p.root, given=a.repo)
+        if a.diff:
+            base, sep, head = a.diff.partition("..")
+            if not sep or not base or not head:
+                die("--diff: give base..head (two commits or branches)")
+            d = slop.delta(root, base, head, cfg, cache)
+            if a.json:
+                print(json.dumps(d, indent=1))
                 return
-            if a.next:
-                pick = slop.pass_target(slop.scan_files(root, a.ref, cfg, a.paths or None, cache), cfg)
-                print(json.dumps({"subsystem": pick[0], "excess": pick[1]} if pick else {"subsystem": None}))
-                return
-            rep = slop.scan(root, a.ref, cfg, a.paths or None, cache)
-        except RuntimeError as e:
-            die(f"slop: {e}")
-        except slop.Deadline:
-            die("slop: the scan did not finish in its time budget; the cache keeps its progress, "
-                "so rerunning the same command finishes more of it")
-        reps[str(root)] = rep
-        if not a.json:
-            print(slop.text(rep, cfg))
-    if a.json:
-        print(slop.dump(rep) if len(reps) == 1 else json.dumps(reps, indent=1))
+            print("\n".join(slop.delta_lines(d, show=20) or ["the change adds none of what the scan counts"]))
+            return
+        if a.next:
+            pick = slop.pass_target(slop.scan_files(root, a.ref, cfg, a.paths or None, cache), cfg)
+            print(json.dumps({"subsystem": pick[0], "excess": pick[1]} if pick else {"subsystem": None}))
+            return
+        rep = slop.scan(root, a.ref, cfg, a.paths or None, cache)
+    except RuntimeError as e:
+        die(f"slop: {e}")
+    except slop.Deadline:
+        die("slop: the scan did not finish in its time budget; the cache keeps its progress, "
+            "so rerunning the same command finishes more of it")
+    print(slop.dump(rep) if a.json else slop.text(rep, cfg))
 
 
 def cmd_course(a) -> None:
@@ -2778,16 +2764,12 @@ def cmd_push_audit(a) -> None:
     if not p:
         die("no tt-project project here; name one: `ttp push-audit <name>`")
     got = pushclaim.audit(p, days=a.days)
-    from . import relaylag
-    relay = relaylag.line(p.db, ok_too=True)   # confirmed on a relay is not yet upstream
     if a.json:
-        print(json.dumps({**got, "relay": relay} if relay else got, indent=1))
+        print(json.dumps(got, indent=1))
         return
     for g in got["gaps"]:
         print(f"#{g['task']} {g['state']}: {g['why']}")
     print(pushclaim.summary_line({**got, "gaps": []}))
-    if relay:
-        print(relay)
 
 
 def cmd_spend_today(a) -> None:
@@ -12759,11 +12741,6 @@ def cmd_move(a) -> None:
     print(f"{p.name} move {way} {rec['host']} ({rec['name']}): {state}" + (f"; last: {rec['note']}" if rec.get("note") else ""))
 
 
-PUSH_PAUSE = re.compile(r"^push(:|$)")   # the push resource, or one push target's lock (push.lock_name)
-PUSH_PAUSE_WARNING = ("warning: a push pause that ends by the clock can lift in the middle of the operation it "
-                      "guards; end it with --end-when <probe> (a read-only check that exits 0 once that is done)")
-
-
 def cmd_pause(a) -> None:
     p = need(a.name, sys.argv[1:])
     if (a.resource or getattr(a, "machine", None)) and getattr(a, "until_reboot", False):
@@ -12806,8 +12783,6 @@ def cmd_pause(a) -> None:
         if a.cmd == "pause":
             _cite_hold(p, {"type": "resource_pause", "resource": a.resource, "paused": True,
                            "reason": getattr(a, "reason", None)})
-            if PUSH_PAUSE.match(a.resource) and not a.end_when:
-                print(PUSH_PAUSE_WARNING, file=sys.stderr)
         return
     boot = None
     if a.cmd == "pause" and getattr(a, "until_reboot", False):
@@ -16567,9 +16542,8 @@ def ttp_parser():
     s.add_argument("--diff", metavar="BASE..HEAD", help="the numbers a change adds, new duplicates and incident-style comments")
     s.add_argument("--subsystem", nargs="+", metavar="PATH", help="count these directories or files as subsystems "
                                                                   "of their own (a de-slop pass's target)")
-    s.add_argument("--repo", metavar="PATH", help="the git repository to read (default: deslop.repos when set, else "
-                                                  "the one holding the current directory, such as a worktree, else "
-                                                  "the project root)")
+    s.add_argument("--repo", metavar="PATH", help="the git repository to read (default: the one holding the current "
+                                                  "directory, such as a worktree, else the project root)")
     s.add_argument("--next", action="store_true", help="print the subsystem or part a de-slop pass would refactor (JSON)")
     s.add_argument("--json", action="store_true", help="print JSON")
     s.set_defaults(fn=cmd_slop)

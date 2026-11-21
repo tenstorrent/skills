@@ -2754,14 +2754,11 @@ def diff_lines(p: Project | None, refs: list[str], base: str = "", root: Path | 
 def own_base(p: Project, task: dict, ref: str) -> tuple[str, str]:
     """(base, its name) a task's change on `ref` is measured from by size (the split check): of the
     task's fork point (the commit its worktree started from), the configured base (resolve_base), the
-    push branch, the remote's default branch (a pull request's usual target) and the push branch's
-    retired tips (landed.retired_tips: their commits landed before a history rewrite), the one leaving the
+    push branch and the remote's default branch (a pull request's usual target), the one leaving the
     fewest commits on `ref` (`git rev-list --count base..ref`); ties keep that order. A branch the worker
-    made from another base than the project's (a draft PR's branch from the default branch), or from the
-    push branch's history before a rewrite, is then measured by its own commits, not by the gap between
-    the two bases. Accepted gap: a PR's target is
+    made from another base than the project's (a draft PR's branch from the default branch) is then
+    measured by its own commits, not by the gap between the two bases. Accepted gap: a PR's target is
     not read from the forge (no network here): the remote's default branch stands for it."""
-    from .landed import retired_tips
     d = p.config().get("delivery") or {}
     push = str(d.get("push_branch") or "").strip()
     try:
@@ -2769,8 +2766,7 @@ def own_base(p: Project, task: dict, ref: str) -> tuple[str, str]:
     except RuntimeError:
         configured = ""
     default = _git(p.root, "symbolic-ref", "--quiet", "--short", "refs/remotes/origin/HEAD", check=False)
-    cands = [f"{FORK_POINT_REF}{task['id']}", configured, *((f"origin/{push}", push) if push else ()), default,
-             *retired_tips(p)]
+    cands = [f"{FORK_POINT_REF}{task['id']}", configured, *((f"origin/{push}", push) if push else ()), default]
     found = _resolve(p, [*cands, ref])
     if not found.get(ref):
         return configured, configured
@@ -2782,8 +2778,7 @@ def own_base(p: Project, task: dict, ref: str) -> tuple[str, str]:
         seen.add(sha)
         n = _git(p.root, "rev-list", "--count", f"{sha}..{found[ref]}", check=False)
         if n.isdigit() and (best is None or int(n) < best[0]):
-            name = (f"the commit its worktree started from, {sha[:12]}" if cand.startswith(FORK_POINT_REF) else
-                    f"a retired push-branch tip, {sha[:12]}" if cand == sha else cand)
+            name = f"the commit its worktree started from, {sha[:12]}" if cand.startswith(FORK_POINT_REF) else cand
             best = (int(n), cand, name)
     return (best[1], best[2]) if best else (configured, configured)
 

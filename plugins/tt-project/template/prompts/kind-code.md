@@ -34,13 +34,6 @@
   GH_CONFIG_DIR at a fresh `mktemp -d`); exit codes: an unexpected one, an interrupted run; no
   unbounded wait or I/O in a db transaction. Hand off
   a `self_check` line (also in `on_pass`): what you ticked and tried.
-- Before the hand-off, run the review's ponytail lane on your own final diff: one fresh-context
-  subagent pinned to model `opus`, given only your spec and `git diff <base>..HEAD`, that applies skill
-  `tt-ponytail-review`. Fix every `block` finding (most often a helper or rule that an existing
-  function already decides: reuse or refactor it), commit, and say in `self_check` what it found.
-- Size: if your diff adds more than 400 lines (`git diff --numstat <base>..HEAD`, review.ponytail_land_lines),
-  make it smaller or put the reason on its own line of the hand-off `summary`, starting
-  `why this size:`. The review fails the change without that line.
 - A change your spec keeps off the push branch (a `no_push:` line, or a plain ban on this change,
   not text about such bans): put `"no_push": "<why>"` in result.json, so its review is review only.
 - A change published in another repo (no diff here): hand off `"published": {"repo":

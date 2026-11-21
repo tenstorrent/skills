@@ -81,4 +81,3 @@
 +110: the `code_arm: user msg #<id>` line for a code task the user ordered onto GLM (#9044)
 +185: another project's status or alerts reach the user only when they change this project's work or needs
 +324: release-flag rule: flag-gated work waits on the flag itself (`ttp rollout on`), never a note or someone's word
-+85: task_update `budget_usd` (raise only) and the `--end-when` rule for a pause guarding a multi-step operation

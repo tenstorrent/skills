@@ -19,7 +19,7 @@ import json
 import time
 from datetime import datetime
 
-from . import coordroute, timefmt
+from . import timefmt
 from .db import DB
 
 STRONGEST = "deep"        # the tier whose model a coordinator runs on by default
@@ -49,10 +49,9 @@ def migrate(raw: dict) -> tuple[str, str]:
 
 
 def last_turn(db: DB) -> dict | None:
-    """The latest coordinator turn's provider, model, effort, start and the model its session reported:
-    its own session's turn, never a routine lane or shadow turn on the chat model (coordroute.OWN_SQL)."""
-    r = db.one("SELECT provider, model, effort, started, note FROM runs WHERE role='coordinator' AND "
-               + coordroute.OWN_SQL + " ORDER BY COALESCE(started, 0) DESC, id DESC LIMIT 1")
+    """The latest coordinator turn's provider, model, effort, start and the model its session reported."""
+    r = db.one("SELECT provider, model, effort, started, note FROM runs WHERE role='coordinator' "
+               "ORDER BY COALESCE(started, 0) DESC, id DESC LIMIT 1")
     if not r:
         return None
     try:

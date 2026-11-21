@@ -941,9 +941,6 @@ coordinator with that evidence.
   delta and a rule that fails a change re-implementing a rule an existing function decides, adding an incident-diary
   comment or docstring, or adding a test that only replays one incident; the code-worker prompt says the same, and
   the daily review quotes the scan numbers. Scan flags are findings for the reviewer to judge, not verdicts.
-  `deslop.repos` (a list of repository paths, relative to the project root or absolute) names the repositories
-  `ttp slop` and the periodic pass scan, for a project root that is a plain folder; unset, the scan reads the
-  repository holding the current directory, else the project root.
   The periodic pass (deslop.py) is the llm schedule `deslop`, on only while `deslop.enabled` is true (default off;
   the daemon checks the flag hourly and adds or removes the schedule, every `deslop.every`, default 1d). Each pass
   scans the base branch, records the numbers against the targets (kv `deslop`: baseline, newest scan, past passes),
@@ -4121,14 +4118,6 @@ the pick order, so it takes the first starts. A resumed resource ramps only its 
   `ttp push`) and never fails or undoes the main push. Mirrors run right after the push and
   before `delivery.after_push`, which still runs as before. The push branch itself and invalid
   names are refused, and setting it needs the user's word.
-- `delivery.push_upstream` (off by default) is for a push remote that is a relay a forwarder sends on
-  to the real upstream: that upstream's URL, readable anonymously (https, git, file or a path) or a
-  git remote's name, or `{"url", "branch"}` when its branch has another name. The daemon reads the
-  upstream tip every 5 min with an anonymous `git ls-remote` and counts the relay commits it lacks.
-  `ttp status`, the daily review and `ttp push audit` show `relay ahead of upstream by N commits for
-  H h` (or `lag unknown` when the upstream cannot be read, never 0), landing replies and post_land
-  events add `on relay, not yet upstream`, and one high alert opens once the lag has lasted
-  `relay.gone_after_s` and clears when the upstream has every relay commit.
 - `delivery.auto_merge_repos` (`owner/repo` names, none by default) lists the repositories whose
   pull requests the project may merge itself. The coordinator sets it only in the turn that carries
   the user's own message saying so, and only adds repos; each change is logged as a `config_grant`

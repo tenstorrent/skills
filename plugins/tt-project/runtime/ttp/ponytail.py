@@ -76,26 +76,6 @@ def added_lines(repo, base: str, head: str, exclude: list[str] = ()) -> int | No
                                               if n and not any(matches([f], g) for g in exclude))
 
 
-def own_size(p, task: dict, branch: str, head: str, exclude: list[str] = ()) -> tuple[int | None, bool]:
-    """(lines `head` of code task `task`'s branch `branch` adds since its own base (worktree.own_base, which
-    measures a branch made from the push branch's history before a rewrite by its own commits), whether
-    it has a change of its own: False when it adds no commit since that base, or its change already is on
-    the push branch, as it stands or before a rewrite (landed.on_push: an ancestor, or each commit's
-    equivalent) or as a squash (landed.equivalent))."""
-    from . import landed, worktree
-    base = worktree.own_base(p, task, branch)[0]
-    added = added_lines(p.root, base, head, exclude)
-    if worktree._git(p.root, "rev-list", "--count", f"{base}..{head}", check=False) == "0":
-        return added, False
-    try:
-        tip = landed._commit(p.root, landed._push_ref(p, p.root))
-    except ValueError:
-        return added, True
-    bump = (p.config().get("delivery") or {}).get("version_bump")
-    on = bool(tip) and bool(landed.on_push(p, p.root, [head], tip) or landed.equivalent(p, branch, bump))
-    return added, not on
-
-
 def read(run_dir) -> dict | None:
     try:
         v = json.loads((Path(run_dir) / FILE).read_text())

@@ -68,9 +68,6 @@ def _git(repo, *args) -> subprocess.CompletedProcess:
 
 
 def _event(db, text: str, kind: str = "observation", queued: bool = True) -> None:
-    from . import relaylag
-    if kind == EVENT and (relay := relaylag.landing_words(db)):
-        text = f"{text} ({relay})"
     db.x("INSERT INTO events(ts,source,kind,fingerprint,severity,text,status) VALUES(?,?,?,?,?,?,?)",
          (time.time(), "daemon", kind, None, "normal", text[:6000], "queued" if queued else "handled"))
 

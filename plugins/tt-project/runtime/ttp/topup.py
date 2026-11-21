@@ -2,10 +2,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """Budget top-ups: an urgent or user-ordered task never waits on its per-task budget.
 
-A task qualifies (eligible) when it is urgent (urgent.is_urgent: priority 1, a spec `urgent:` line),
-was created for a user's order (origin 'user', or it answers a chat: reply_chat), owns an open
-obligation (obligations.owned_open), or is a review hop (chainprio.is_hop: `Review #`, `Fix review #`,
-`Re-review #`) of a task that qualifies. When dispatch finds
+A task qualifies (eligible) when it is urgent (urgent.is_urgent: priority 1, a spec `urgent:` line) or
+was created for a user's order (origin 'user', or it answers a chat: reply_chat). When dispatch finds
 such a task with its budget spent, the daemon raises its budget by its tier's default
 (budget.task_default_usd) and starts it in the same tick, with no coordinator turn
 (Daemon._dispatch). A run of one stopped by its budget mid-run goes back to the queue, not to failed,
@@ -20,11 +18,7 @@ for any task. Runaway guard (runaway): when a run stopped by its budget follows 
 followed a run stopped by its budget, with no hand-off and the branch head unchanged since that
 top-up, the task ends failed with that evidence: it is never topped up forever nor held on budget.
 Every other task keeps the plain budget hold (task_budget_exhausted). `budget.urgent_topup` false
-turns this off (default on).
-
-Any other task's budget is raised by the coordinator: a task_update `budget_usd` above its current
-budget, on a blocked or queued (waiting) task (raise_refusal), recorded as one RAISE_KIND event
-(record_raise); a task blocked on its spent budget is queued again by it. The dollar caps stay."""
+turns this off (default on)."""
 from __future__ import annotations
 
 import json
@@ -42,49 +36,11 @@ def enabled(cfg: dict) -> bool:
     return (cfg.get("budget") or {}).get(SETTING, True) is not False
 
 
-def eligible(task: dict | None, db=None, _seen: frozenset = frozenset()) -> bool:
-    """Urgent, or created for a user's order (origin 'user', or it answers a chat); with `db`, also an
-    owner of an open obligation, or a review hop of a task that is eligible."""
+def eligible(task: dict | None) -> bool:
+    """Urgent, or created for a user's order (origin 'user', or it answers a chat)."""
     if not task:
         return False
-    if urgent.is_urgent(task) or task.get("origin") == "user" or bool(task.get("reply_chat")):
-        return True
-    if db is None or task["id"] in _seen:
-        return False
-    from . import chainprio, obligations
-    if obligations.owned_open(db, task["id"]):
-        return True
-    return chainprio.is_hop(task) and any(eligible(db.task(i), db, _seen | {task["id"]})
-                                          for i in chainprio.covered(task))
-
-
-RAISE_KIND = "task_budget_raise"
-RAISE_STATES = ("blocked", "queued")   # no task has status waiting (coordinator.NO_WAITING_STATUS)
-HOLD_REASON = "task budget exhausted"   # a task blocked on its spent budget (Daemon._dispatch)
-
-
-def raise_refusal(task: dict, usd) -> str:
-    """Why a task_update `budget_usd` of `usd` is refused on `task`, or "" when it may raise it."""
-    if task["status"] not in RAISE_STATES:
-        return f"its budget is raised only while it is blocked or queued (waiting), not {task['status']}"
-    try:
-        usd = float(usd)
-    except (TypeError, ValueError):
-        return "`budget_usd` must be a number"
-    before = float(task.get("budget_usd") or 0)
-    if usd <= before:
-        return f"`budget_usd` only raises a budget: ${usd:.2f} is not above its ${before:.2f}"
-    return ""
-
-
-def record_raise(db, task: dict, after: float) -> None:
-    """One handled RAISE_KIND event for a budget raised from task's budget_usd to `after`."""
-    before = float(task.get("budget_usd") or 0)
-    text = (f"#{task['id']} {task['title'][:100]}: budget raised from ${before:.2f} to ${after:.2f} by the coordinator; "
-            f"the dollar caps still apply")
-    db.x("INSERT INTO events(ts,source,kind,severity,text,data,status,task) VALUES(?,?,?,?,?,?,?,?)",
-         (time.time(), "coordinator", RAISE_KIND, "low", text,
-          json.dumps({"before": before, "after": after}), "handled", task["id"]))
+    return urgent.is_urgent(task) or task.get("origin") == "user" or bool(task.get("reply_chat"))
 
 
 def spent(task: dict) -> bool:

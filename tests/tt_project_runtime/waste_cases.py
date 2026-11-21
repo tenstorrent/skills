@@ -245,26 +245,3 @@ def test_the_self_efficiency_audit_survives_a_push_ref_error(env, monkeypatch):
     gatejudge.quarantine(p.state, ["tests/x.py::test_gone"], {"why": "flaky"}, _time.time())
     out = audit.lines(p.db, p=p)                                     # the push-ref error costs only its line
     assert out and not any(gatejudge.NOT_FOUND in line for line in out)
-
-
-def test_failed_reviews_with_a_verdict_are_rejected_changes_and_a_broken_run_a_failed_task(env):
-    from ttp import waste
-    p = make(env)
-    now = 1_000_000.0
-    code = _waste_task(p, "a change")
-    sup = _waste_task(p, "Review sup", kind="review", status="failed", labels=[f"auto_review:{code}"])
-    p.db.update_task(sup, result=json.dumps({"status": "changes_needed", "summary": "two findings",
-                                             "review_superseded": {"by_review": 9, "how": "passed"}}))
-    fail = _waste_task(p, "Review fail", kind="review", status="failed")
-    p.db.update_task(fail, result=json.dumps({"status": "failed", "summary": "a bug", "review_failure": "substantive",
-                                              "followups": [{"title": "Fix the bug", "spec": "s"}]}))
-    broken = _waste_task(p, "Review broken", kind="review", status="failed")
-    p.db.update_task(broken, result=json.dumps({"status": "no_handoff", "summary": "ended without a hand-off",
-                                                "review_superseded": {"by_review": 9, "how": "passed"}}))
-    bare = _waste_task(p, "crashed work", status="failed")
-    for t, cost in ((code, 1.0), (sup, 2.0), (fail, 3.0), (broken, 4.0), (bare, 5.0)):
-        _waste_run(p, t, cost, now)
-    b = waste.report(p.db, now - 3600, now + 1)["buckets"]
-    assert (b["rejected"]["usd"], sorted(b["rejected"]["tasks"])) == (5.0, sorted([code, fail]))  # by the change
-    assert (b["failed_task"]["usd"], sorted(b["failed_task"]["tasks"])) == (9.0, sorted([broken, bare]))
-    assert "rejected changes: $5.00" in "\n".join(waste.lines(waste.report(p.db, now - 3600, now + 1)))
