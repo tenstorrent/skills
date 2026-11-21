@@ -6,7 +6,8 @@ the web app see what a run is doing while it runs.
 
 Per run: its last `ttp note` and `checks:` lines (progress.md); its last tool call and how long it
 has been pending, and the failed calls among its last 20 (the provider's `activity`, read from a
-stored byte offset of output.jsonl; a provider without one leaves these empty); the files its
+stored byte offset of output.jsonl; a chat run's steps come from its own
+mini-swe-agent record, glmharness.step_record); the files its
 worktree changed (git: workers often edit through shell heredocs that no tool call names), cached by
 HEAD and the index mtime for at most GIT_TTL_S; spend against the task budget and the share of its
 wall limit used; its attempt; and whether it read the last update written to its steer.md.
@@ -269,7 +270,9 @@ def _steer(run_dir: Path, provider: str, unhooked: bool = False) -> dict | None:
     """The last update written to steer.md and whether the run read it: up to steer.offset when the
     update hook runs (the provider's steer_hook, or this run's HOOKED_FILE: Codex and Cursor workers
     may run it). A run without it read the update once `ttp note` or `ttp steer` moved steer.offset to
-    the end; short of that it may read steer.md itself, so its read state is unknown (None)."""
+    the end; short of that it may read steer.md itself, so its read state is unknown (None). A
+    mini-swe-agent run is always without one (`unhooked`): the chat provider's steer_hook class flag
+    is a Claude Code run's, not its."""
     from .hook import OFFSET_FILE, STEER_FILE, hooked as run_hooked
     f = run_dir / STEER_FILE
     try:
