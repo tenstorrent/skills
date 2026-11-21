@@ -221,6 +221,39 @@ def _tip(repo: Path, onto: str, fetch: bool) -> tuple[str, str]:
     return (tip, onto) if tip else ("", f"cannot read {onto}")
 
 
+RETIRED = "retired-push-tips.json"   # state: tips the push branch was replaced from, landed commits still on
+
+
+def retired_tips(p) -> list[str]:
+    """The push-branch tips the branch no longer holds: replaced non-fast-forward (a squash, a lease
+    rebase: push retires the tip it replaced), or recorded by `ttp retire-tip`. A commit on one is
+    landed: the branch carried it before the rewrite, though no ref points at it now."""
+    return [x for x in (read_dict(p.state / RETIRED).get("tips") or []) if isinstance(x, str) and x]
+
+
+def retire_tip(p, sha: str) -> None:
+    """Record `sha` as a tip the push branch was replaced from (RETIRED): its commits keep counting
+    as landed. Idempotent; "" or an unknown sha is not written."""
+    from .project import durable_write
+    sha = _commit(p.root, sha)
+    tips = retired_tips(p)
+    if not sha or sha in tips:
+        return
+    durable_write(p.state / RETIRED, json.dumps({"tips": [*tips, sha]}, indent=1) + "\n")
+
+
+def on_push(p, repo: Path, shas: list[str], tip: str) -> str:
+    """The tip holding one of `shas`: the push branch's current `tip` or one of its retired tips
+    (retired_tips), each by on_branch (an ancestor of it, or the change's equivalent); "" when none
+    holds them. The one place the "is this commit on the push branch" rule lives."""
+    for s in shas:
+        full = _commit(repo, s)
+        for t in (tip, *retired_tips(p)):
+            if full and t and on_branch(repo, full, t):
+                return t
+    return ""
+
+
 def _push_ref(p, repo: Path) -> str:
     """The push branch to look on: <remote>/<branch>, or the local refs/heads/<branch> when the repo
     has no such remote (a remote-less repo pushes nowhere, so its branch is the local one)."""
@@ -1020,6 +1053,8 @@ def check(p, repo: Path, sha: str | None = None, tid: int | None = None, onto: s
             continue
         if any(_commit(repo, s) and on_branch(repo, s, tip) for s in shas):
             return 0, f"{what} is on {ref}"
+    if p is not None and onto == _push_ref(p, repo) and (found := on_push(p, repo, shas, "")):
+        return 0, f"{what} is on {onto}, at its retired tip {found[:10]}"
     return NOT_YET, f"{what} is not on {onto} yet"
 
 

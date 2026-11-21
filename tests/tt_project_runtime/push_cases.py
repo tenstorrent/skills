@@ -22756,3 +22756,63 @@ def test_task_labels_and_read_dict_take_any_shape(tmp_path):
         f.write_text(text)
         assert read_dict(f) == want == read_dict(str(f)) == loads_dict(text)
     assert loads_dict(None) == {}
+
+
+def test_a_commit_only_on_a_retired_tip_of_the_push_branch_still_counts_as_landed(env, monkeypatch, capsys):
+    """A push branch rewritten with none of its history kept (a squash switch) retires the tip it
+    replaced (`ttp retire-tip` records it, as the harness does for its own lease replace): a commit
+    only that tip held is still landed — `ttp landed` says so, the push audit raises no gap for a
+    task claiming it and the unreviewed sweep queues no review for a task whose head is under it —
+    while a commit on neither the rewritten branch nor a retired tip stays unlanded and is flagged."""
+    from ttp import cli, landed, pushclaim
+    from ttp import daemon as dmod, worktree
+    p, repo, origin, other = _push_setup(env, monkeypatch, ["true"])
+    _commit(repo, "mine.txt", "mine\n")
+    mine = _git_out(repo, "rev-parse", "HEAD")
+    _git_out(repo, "push", "-q", "origin", "HEAD:proj")
+    # the branch is rewritten from a fresh root: nothing of the tip it had survives on it
+    _git_out(other, "checkout", "-q", "--orphan", "switch")
+    _git_out(other, "commit", "-q", "--allow-empty", "-m", "tt-project: squashed history")
+    _git_out(other, "push", "-q", "-f", "origin", "HEAD:proj")
+    _git_out(repo, "fetch", "-q", "origin")
+    now = time.time()
+    t_audit, branch_audit, _ = _unreviewed(env, p, "pushed before the rewrite")
+    p.db.x("INSERT INTO push_queue(task, branch, head, target, status, created, updated, pushed_sha, landed_sha) "
+           "VALUES(?, ?, ?, 'origin/proj', 'landed', ?, ?, ?, ?)", (t_audit, branch_audit, mine, now, now, mine, mine))
+    t_sweep, _, _ = _unreviewed(env, p, "its head is the pre-rewrite commit")
+    wtpath, _ = worktree.ensure(p, p.db.task(t_sweep))
+    _git_out(wtpath, "reset", "-q", "--hard", mine + "~1")   # under the retired tip, not the queued head
+    t_lone, _, lone = _unreviewed(env, p, "never landed")
+    p.db.update_task(t_lone, result=json.dumps({"status": "done", "summary": "done",
+                                                "pushed": [{"sha": lone, "branch": "proj"}]}))
+    p.db.x("UPDATE tasks SET updated=? WHERE id=?", (time.time() - 600, t_lone))   # update_task touched it
+    assert landed.check(p, repo, mine)[0] == landed.NOT_YET, "nothing holds the pre-rewrite commit yet"
+    cli.main(["retire-tip", mine])
+    assert f"{mine[:10]} recorded as a retired push-branch tip" in capsys.readouterr().out
+    assert landed.retired_tips(p) == [mine]
+    assert landed.check(p, repo, mine)[0] == 0
+    assert landed.check(p, repo, lone)[0] == landed.NOT_YET, "a commit on neither tip stays unlanded"
+    assert [g["task"] for g in pushclaim.audit(p)["gaps"]] == [t_lone], "the retired-tip claim raises no gap"
+    assert dmod.Daemon(p.base).sweep_unreviewed(force=True) == [t_lone], "no review for a head under a retired tip"
+
+
+def test_a_lease_replace_retires_the_push_branch_tip_it_replaced_but_never_an_own_branch_tip(env, monkeypatch):
+    """The harness's own non-fast-forward replace of the push branch (a lease push of a rewritten
+    head) records the tip it replaced as retired, so its commits stay landed; the same replace of a
+    task's own branch records nothing, since that branch's commits never landed."""
+    from ttp import landed, push
+    p, repo, origin, other = _push_setup(env, monkeypatch, ["true"])
+    for branch in ("own", "proj"):
+        _git_out(repo, "checkout", "-q", "-B", branch, "origin/proj")
+        _commit(repo, f"{branch}.txt", "old\n")
+        old = _git_out(repo, "rev-parse", "HEAD")
+        _git_out(repo, "push", "-q", "-f", "origin", f"HEAD:{branch}")
+        _git_out(repo, "reset", "-q", "--hard", "HEAD~1")
+        _commit(repo, f"{branch}.txt", "rewritten\n")
+        new = _git_out(repo, "rev-parse", "HEAD")
+        assert push._own_push_head(repo, "origin", branch, new, old, True, lambda m: None, p) == 0
+        assert landed.retired_tips(p) == ([old] if branch == "proj" else []), branch
+    _commit(repo, "ff.txt", "ff\n")
+    assert push._own_push_head(repo, "origin", "proj", _git_out(repo, "rev-parse", "HEAD"), new, True,
+                               lambda m: None, p) == 0
+    assert landed.retired_tips(p) == [old], "a fast-forward retires nothing"

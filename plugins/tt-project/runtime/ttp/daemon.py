@@ -20108,7 +20108,7 @@ class Daemon:
                 return f"review #{r['id']} covers it"
         if db.one("SELECT 1 FROM push_queue WHERE head=? AND status!='cancelled'", (tip,)):
             return "its head is in the push queue"
-        if ref and landed.on_branch(self.p.root, tip, ref):
+        if ref and landed.on_push(self.p, self.p.root, [tip], ref):
             return "its head is on the push branch"
         changes = worktree.diff_lines(self.p, [t["branch"]])
         if not changes:

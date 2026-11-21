@@ -10072,6 +10072,19 @@ def cmd_landed(a) -> None:
     sys.exit(landed.run(p, a))
 
 
+def cmd_retire_tip(a) -> None:
+    """`ttp retire-tip <sha>`: record a tip the push branch was replaced from non-fast-forward (a
+    squash, a rewritten history), so commits it held still count as landed (`ttp landed`, the push
+    audit, the unreviewed sweep). The harness records one itself when its own lease push replaces
+    the branch; this is for a replace done outside it."""
+    from . import landed
+    p = here()
+    if not p:
+        die("ttp retire-tip: no project here (run it in a project or with TTP_PROJECT set)")
+    landed.retire_tip(p, a.sha)
+    print(f"ttp retire-tip: {a.sha[:10]} recorded as a retired push-branch tip of {p.name}")
+
+
 def cmd_quarantine(a) -> None:
     """`ttp quarantine list`: the tests the gate quarantined as flaky and the lifts of the last day.
     `ttp quarantine lift <test id> --why <text>`: drop one, logged as the daemon's lifts are (gatejudge).
@@ -15955,7 +15968,7 @@ COMMAND_GROUPS = (
                                          "deployed", "goal", "hours")),
     ("admin", ("setup", "upgrade", "start", "stop", "restart", "remove", "adopt", "prune", "secret", "consent",
                "notifier", "schedules", "heal", "upstream", "check-plan", "stats", "audit",
-               "push-audit", "ttr", "selfchange", "chat-load", "spend-today", "throughput", "model-trip", "echoes", "course",
+               "push-audit", "retire-tip", "ttr", "selfchange", "chat-load", "spend-today", "throughput", "model-trip", "echoes", "course",
                "uninstall", "bench", "model-bench", "model", "waste", "slop", "bridge", "gh-queue", "move", "landings")),
 )
 
@@ -16953,6 +16966,11 @@ def ttp_parser():
     s.add_argument("--task", type=int, help="the task whose landing to look for")
     s.add_argument("--onto", help="the branch to look on (default: delivery.push_branch)")
     s.set_defaults(fn=cmd_landed)
+
+    s = sub.add_parser("retire-tip", help="record a push-branch tip the branch was replaced from "
+                                          "(a squash, a rewrite): its commits keep counting as landed")
+    s.add_argument("sha", help="the tip commit the branch no longer holds")
+    s.set_defaults(fn=cmd_retire_tip)
 
     s = sub.add_parser("quarantine", help="list the tests the tests gate quarantined as flaky (and the last day's "
                                           "lifts), or lift one by hand with --why (logged)")

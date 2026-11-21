@@ -580,9 +580,8 @@ def _on_push_branch(p, task: int, repo: Path, shas: list, tips: dict | None = No
     if task:
         shas = list(shas) + [r["sha"] for r in p.db.q("SELECT sha FROM task_superseded WHERE task=?", (task,))]
     for s in shas:
-        full = _commit(repo, s)
-        if tip and full and landed.on_branch(repo, full, tip):
-            return f"{s[:12]} is on the push branch"
+        if found := landed.on_push(p, repo, [s], tip):
+            return f"{s[:12]} is on the push branch" + ("" if found == tip else f" at its retired tip {found[:10]}")
     return ""
 
 

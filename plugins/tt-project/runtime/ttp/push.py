@@ -4275,7 +4275,7 @@ def publish(repo: Path, remote: str, branch: str, checks: list[str],
             say(f"HEAD moved off {head[:10]} during the checks; not pushing")
             return REFUSED
         return _move_local(repo, branch, head, say) if local else _own_push_head(repo, remote, branch, head, read,
-                                                                                 lease, say)
+                                                                                 lease, say, p)
     finally:
         if lock is not None:
             lock.close()
@@ -4406,7 +4406,7 @@ def _own_checks(repo: Path, remote: str, branch: str, head: str, base: str | Non
 
 
 def _own_push_head(repo: Path, remote: str, branch: str, head: str, read: str, lease: bool,
-                   say: Callable[[str], None]) -> int:
+                   say: Callable[[str], None], p=None) -> int:
     """Push the checked `head` to remote/branch: under a lease on `read`, the tip read before the checks,
     when `lease`; else a plain push the remote takes only as a fast-forward."""
     if lease:
@@ -4414,6 +4414,10 @@ def _own_push_head(repo: Path, remote: str, branch: str, head: str, read: str, l
         if _git(repo, "push", f"--force-with-lease=refs/heads/{branch}:{read}", remote,
                 f"{head}:refs/heads/{branch}", quiet=False).returncode == 0:
             say(f"pushed {head[:10]} to {remote}/{branch}, replacing {read[:10]} (a rebase, under a lease)")
+            if (p is not None and target(p, repo) == (remote, branch)
+                    and _git(repo, "merge-base", "--is-ancestor", read, head).returncode != 0):
+                from . import landed
+                landed.retire_tip(p, read)   # the push branch replaced non-fast-forward: its commits stay landed
             return 0
         say(f"push to {remote}/{branch} was rejected: it no longer has {read[:10]}, the tip the lease was "
             f"taken on (someone pushed to it since); not overwritten")
