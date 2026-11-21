@@ -479,6 +479,58 @@ def test_progress_the_resource_key_ignores_ready_but_unstarted_tasks(env):
     assert got and got[0]["keys"] == ["resource:box-a"]
 
 
+def _prog_counts(p, tid, probe, cur, counts, start, step=180, line="progress: {}/50"):
+    """Feed one not-yet answer per count; return the stall keys the check raised after each."""
+    from ttp import progress
+    raised = []
+    for i, c in enumerate(counts):
+        progress.note_probe(p.db, tid, probe, 1, line.format(c), start + i * step)
+        raised.append([k for e in progress.check(p.db, {}, p.state, start + i * step, current_probe=cur)
+                       for k in e["keys"]])
+    return raised
+
+
+def test_progress_probe_rising_count_is_progress_not_a_stall(env):
+    from ttp import progress
+    p = make(env)
+    probe = "ttp wakes --compared"
+    tid = _prog_waiting(p, "Report at 50", probe)
+    now = time.time()
+    cur = lambda t: probe if t["id"] == tid else None
+    got = _prog_counts(p, tid, probe, cur, range(1, 25), now - 6000)   # 24 answers over 1.2 h, count always rising
+    assert not any(got) and progress.load(p.db)["probes"][str(tid)]["n"] == 1
+    assert progress.load(p.db)["probes"][str(tid)]["first"] == now - 6000 + 23 * 180
+
+
+def test_progress_probe_flat_or_falling_count_stalls_as_usual(env):
+    p = make(env)
+    probe = "ttp wakes --compared"
+    now = time.time()
+    for counts in ([5] * 24, [9] + [8, 7, 6, 5] * 6):
+        tid = _prog_waiting(p, f"Report at 50 {counts[1]}", probe + f" {counts[1]}")
+        pr = probe + f" {counts[1]}"
+        cur = lambda t, tid=tid, pr=pr: pr if t["id"] == tid else None
+        got = _prog_counts(p, tid, pr, cur, counts, now - 6000)
+        assert [f"probe:#{tid}"] in got
+
+
+def test_progress_probe_without_the_line_is_unchanged_and_a_raised_stall_clears_on_a_rise(env):
+    from ttp import progress
+    p = make(env)
+    probe = "ttp wakes --compared"
+    tid = _prog_waiting(p, "Report at 50", probe)
+    now = time.time()
+    cur = lambda t: probe if t["id"] == tid else None
+    got = _prog_counts(p, tid, probe, cur, range(24), now - 6000, line="waiting {}")   # rising digits, no progress line
+    assert [f"probe:#{tid}"] in got
+    assert f"stall:probe:#{tid}" in progress.load(p.db)["raised"]
+    progress.note_probe(p.db, tid, probe, 1, "progress: 3/50", now + 1)   # first line seen: the count is only stored
+    assert f"stall:probe:#{tid}" in progress.load(p.db)["raised"]
+    progress.note_probe(p.db, tid, probe, 1, "progress: 4/50", now + 2)   # a rise: progress
+    st = progress.load(p.db)
+    assert f"stall:probe:#{tid}" not in st["raised"] and st["probes"][str(tid)]["n"] == 1
+
+
 def test_progress_probe_stall_wakes_once_then_only_at_rewake_and_clears(env):
     """A probe stall's count grows with time alone, so it never escalates: one wake, then one per rewake_h."""
     from ttp import progress

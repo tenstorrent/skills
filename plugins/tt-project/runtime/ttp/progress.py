@@ -369,9 +369,14 @@ def _after(t: dict | None) -> float | None:
     return deferral(t).get("after") if t else None
 
 
+_PROGRESS_RE = re.compile(r"^progress:\s*(\d+)\s*/\s*\d+\s*$", re.I)
+
+
 def note_probe(db: DB, tid: int, probe: str, rc: Any, reason: str, now: float | None = None) -> None:
     """A probe (retry_when or start_when) said not yet: count it for its task. A count made under
-    another start_after starts over: only the answers since it last changed count."""
+    another start_after starts over: only the answers since it last changed count. A last output line
+    `progress: <n>/<target>` whose n beats the highest so far is progress: the count starts over and a
+    stall raised on the probe clears."""
     now = time.time() if now is None else now
     st = load(db)
     rec = st["probes"].get(str(tid))
@@ -379,13 +384,23 @@ def note_probe(db: DB, tid: int, probe: str, rc: Any, reason: str, now: float | 
     if rec and rec.get("probe") == probe and rec.get("after") == after and now <= float(rec["last"]):
         return   # this verdict is counted already
     norm = f"{rc}:{_norm(_clip(reason))}"   # `same` counts identical answers in a row (absentwait)
-    if rec and rec.get("probe") == probe and rec.get("after") == after:
+    got = _PROGRESS_RE.match(_clip(reason))
+    done = int(got.group(1)) if got else None
+    if rec and rec.get("probe") == probe and rec.get("after") == after and done is not None \
+            and done > int(rec.get("done") if rec.get("done") is not None else done):
+        rec.update(n=1, first=now, last=now, rc=rc, reason=_clip(reason), same=1, norm=norm, done=done)
+        _unraise(st, f"stall:probe:#{tid}", now)
+    elif rec and rec.get("probe") == probe and rec.get("after") == after:
         same = int(rec.get("same") or 1) + 1 if rec.get("norm") == norm else 1
         rec.update(n=int(rec["n"]) + 1, last=now, rc=rc, reason=_clip(reason) or rec.get("reason"), same=same,
                    norm=norm)
+        if done is not None:
+            rec["done"] = max(done, int(rec.get("done") or 0))
     else:
         st["probes"][str(tid)] = {"probe": probe, "n": 1, "first": now, "last": now, "rc": rc,
                                   "reason": _clip(reason), "after": after, "same": 1, "norm": norm}
+        if done is not None:
+            st["probes"][str(tid)]["done"] = done
     _save(db, st)
 
 

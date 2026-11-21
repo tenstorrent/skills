@@ -184,6 +184,7 @@ read the one for the lever you change.
   check's applicability is declared; a related change that lacks its test still fails.
 - Wait on an upstream fix with a probe (`ttp deployed`, a version check) as `retry_when`, never
   `blocked`. A hand-off is done only once the consumer acknowledged it and recovered.
+- A `start_when` or `retry_when` that waits for a count (N runs done) ends its output with one line `progress: <n>/<target>`; a higher n than before counts as progress, so the stall check does not page for it.
 - A task asleep on its `retry_when`: a spec update sleeps with it and applies when its wait ends
   (the probe passes or another wake), at the task's own tier, priority 1 too. An update that adds
   an `urgent:` line (once per wait) or a `task_update` with `wake_now: true` wakes once at once,
