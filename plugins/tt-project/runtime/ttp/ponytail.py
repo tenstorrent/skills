@@ -77,32 +77,23 @@ def added_lines(repo, base: str, head: str, exclude: list[str] = ()) -> int | No
 
 
 def own_size(p, task: dict, branch: str, head: str, exclude: list[str] = ()) -> tuple[int | None, bool]:
-    """(lines `head` of code task `task` adds, whether it has a commit of its own). Its own commits are those
-    the push branch lacks, by commit or by patch (rev-list --cherry-pick), and that neither the configured
-    base nor a retired push tip (landed.retired_tips) holds. Its size is the smaller of the
-    measure from its own base (worktree.own_base) and from the parent of its oldest own commit: after a
-    history rewrite left that base off the push branch, only its own commits count."""
+    """(lines `head` of code task `task`'s branch `branch` adds since its own base (worktree.own_base, which
+    measures a branch made from the push branch's history before a rewrite by its own commits), whether
+    it has a change of its own: False when it adds no commit since that base, or its change already is on
+    the push branch, as it stands or before a rewrite (landed.on_push: an ancestor, or each commit's
+    equivalent) or as a squash (landed.equivalent))."""
     from . import landed, worktree
-    added = added_lines(p.root, worktree.own_base(p, task, branch)[0], head, exclude)
+    base = worktree.own_base(p, task, branch)[0]
+    added = added_lines(p.root, base, head, exclude)
+    if worktree._git(p.root, "rev-list", "--count", f"{base}..{head}", check=False) == "0":
+        return added, False
     try:
-        tip = landed._push_ref(p, p.root)
+        tip = landed._commit(p.root, landed._push_ref(p, p.root))
     except ValueError:
         return added, True
-    try:
-        configured = worktree.resolve_base(p)
-    except RuntimeError:
-        configured = ""
-    found = worktree._resolve(p, [tip, configured, *landed.retired_tips(p)])
-    if not found.get(tip):
-        return added, True
-    def commits(*args: str) -> list[str]:
-        return worktree._git(p.root, "rev-list", "--no-merges", *args).split()
-    off = set(commits(head, "--not", *found.values()))
-    own = [c for c in commits("--reverse", "--right-only", "--cherry-pick", f"{found[tip]}...{head}") if c in off]
-    if not own:
-        return added, False
-    mine = added_lines(p.root, f"{own[0]}^", head, exclude)
-    return min((n for n in (added, mine) if n is not None), default=None), True
+    bump = (p.config().get("delivery") or {}).get("version_bump")
+    on = bool(tip) and bool(landed.on_push(p, p.root, [head], tip) or landed.equivalent(p, branch, bump))
+    return added, not on
 
 
 def read(run_dir) -> dict | None:

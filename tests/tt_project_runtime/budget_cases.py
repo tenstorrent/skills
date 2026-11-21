@@ -5508,7 +5508,7 @@ def test_a_run_started_on_the_daemon_s_first_tick_records_a_daemon_gap_not_a_dis
 
 
 def test_task_update_raises_a_task_budget_only_upward_and_only_before_it_runs(env):
-    """task_update `budget_usd` raises the budget of a blocked, waiting or queued task (a budget hold is
+    """task_update `budget_usd` raises the budget of a blocked or queued task (a budget hold is
     queued again), recorded as one handled event; a lower budget or a running or ended task is refused."""
     from ttp import coordinator as coord, topup
     p = make(env)

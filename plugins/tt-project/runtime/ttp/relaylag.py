@@ -12,8 +12,8 @@ The daemon (Daemon.check_relay_lag) asks the upstream for its branch tip at most
 one anonymous `git ls-remote` in a thread (no credential helper, no prompt, never ssh), and compares
 it with the relay's tip as the local tracking ref has it (refs/remotes/<remote>/<branch>; a push
 moves it). The lag is the number of commits on the relay tip not in the upstream tip (git rev-list);
-an upstream tip the local repository does not have is `diverged` (lag unknown), and an upstream that
-cannot be read is `unknown`, never 0. Since when: the time the oldest relay tip still not upstream was
+an upstream tip the local repository does not have, or an upstream that cannot be read, is `unknown`,
+never 0. Since when: the time the oldest relay tip still not upstream was
 first seen (relay tips are remembered while the lag lasts). The answer is kept in kv KV, so status,
 the daily review, `ttp push audit`, the landing replies and post_land events read it without network.
 
@@ -23,31 +23,19 @@ from __future__ import annotations
 
 import os
 import re
-import subprocess
 import threading
 import time
 
-from . import gitmemo
+from . import ghanon, landed
 
 KV = "relay_lag"           # kv: the last answer (see measure)
 KEY = "relay-behind"       # alert key
 EVERY_S = 300.0            # between upstream reads
 LS_TIMEOUT_S = 20.0
 TIPS_MAX = 200             # relay tips remembered while the lag lasts
-GONE_AFTER_S = 86400.0     # relay.gone_after_s default
-OK, AHEAD, DIVERGED, UNKNOWN = "ok", "ahead", "diverged", "unknown"
+OK, AHEAD, UNKNOWN = "ok", "ahead", "unknown"
 _ANON = re.compile(r"^(https?|git|file)://", re.I)
-_SHA = re.compile(r"^[0-9a-f]{40}$")
 _jobs: dict[str, dict] = {}   # project root -> {"thread", "answer", "started"}
-
-
-def _git(repo, *args: str, timeout: float = 30) -> subprocess.CompletedProcess:
-    env = {**os.environ, "GIT_TERMINAL_PROMPT": "0", "GIT_ASKPASS": "true", "SSH_ASKPASS": "true"}
-    try:
-        return gitmemo.run(["git", "-C", str(repo), *args], text=True, capture_output=True, timeout=timeout,
-                           stdin=subprocess.DEVNULL, env=env)
-    except (OSError, subprocess.SubprocessError) as e:
-        return subprocess.CompletedProcess(args, 124, "", f"{type(e).__name__}: {e}")
 
 
 def upstream(p, cfg: dict) -> dict | None:
@@ -70,7 +58,7 @@ def upstream(p, cfg: dict) -> dict | None:
 def _anon_url(p, url: str) -> tuple[str, str]:
     """(url to read, "") or ("", why not): a remote's name is read as its URL; ssh is never used."""
     if not (_ANON.match(url) or url.startswith("/")):
-        r = _git(p.root, "remote", "get-url", url, timeout=10)
+        r = landed._git(p.root, "remote", "get-url", url, timeout=10)
         if r.returncode == 0 and r.stdout.strip():
             url = r.stdout.strip()
     if _ANON.match(url) or (url.startswith("/") and os.path.exists(url)):
@@ -79,26 +67,12 @@ def _anon_url(p, url: str) -> tuple[str, str]:
 
 
 def ls_remote(p, url: str, branch: str) -> tuple[str | None, str]:
-    """(the upstream branch's tip, "") or (None, why): one anonymous `git ls-remote`."""
+    """(the upstream branch's tip, "") or (None, why): one anonymous `git ls-remote` (ghanon.ls_remote)."""
     url, why = _anon_url(p, url)
     if not url:
         return None, why
-    r = _git(p.root, "-c", "credential.helper=", "-c", "core.askPass=true", "ls-remote", url,
-             f"refs/heads/{branch}", timeout=LS_TIMEOUT_S)
-    if r.returncode != 0:
-        last = (r.stderr or "").strip().splitlines()
-        return None, f"upstream could not be read: {last[-1][:200] if last else f'git exit {r.returncode}'}"
-    sha = (r.stdout.split() or [""])[0]
-    return (sha, "") if _SHA.match(sha) else (None, f"upstream has no branch {branch}")
-
-
-def _commit(p, rev: str) -> str:
-    r = _git(p.root, "rev-parse", "-q", "--verify", f"{rev}^{{commit}}", timeout=10)
-    return r.stdout.strip() if r.returncode == 0 else ""
-
-
-def _contained(p, sha: str, up: str) -> bool:
-    return sha == up or _git(p.root, "merge-base", "--is-ancestor", sha, up, timeout=10).returncode == 0
+    sha, why = ghanon.ls_remote(url, f"refs/heads/{branch}", LS_TIMEOUT_S)
+    return (sha, "") if sha else (None, f"upstream could not be read: {why}")
 
 
 def measure(p, up: dict, answer: tuple[str | None, str], prev: dict | None, now: float) -> dict:
@@ -108,7 +82,7 @@ def measure(p, up: dict, answer: tuple[str | None, str], prev: dict | None, now:
     target = f"{up['remote']}/{up['relay_branch']}"
     rec = {"at": now, "target": target, "url": up["url"], "branch": up["branch"], "lag": None, "since": None,
            "upstream": answer[0] or "", "why": answer[1], "tips": []}
-    relay = _commit(p, f"refs/remotes/{target}")
+    relay = landed._commit(p.root, f"refs/remotes/{target}")
     rec["relay"] = relay
     if not relay:
         return {**rec, "state": UNKNOWN, "why": f"no local tracking ref of {target}"}
@@ -121,11 +95,11 @@ def measure(p, up: dict, answer: tuple[str | None, str], prev: dict | None, now:
     tips = [t for t in (prev.get("tips") or []) if isinstance(t, list) and len(t) == 2]
     if not tips or tips[-1][0] != relay:
         tips.append([relay, now])
-    if not _commit(p, upsha):
-        tips = tips[-TIPS_MAX:]
-        return {**rec, "state": DIVERGED, "since": min(t[1] for t in tips), "tips": tips,
+    if not landed._commit(p.root, upsha):
+        # Diverged, or newer than the relay: unknown, like an unread upstream.
+        return {**rec, "state": UNKNOWN, "since": prev.get("since"), "tips": prev.get("tips") or [],
                 "why": f"upstream tip {upsha[:10]} is not in the local repository (diverged, or newer than the relay)"}
-    r = _git(p.root, "rev-list", "--count", f"{upsha}..{relay}", timeout=30)
+    r = landed._git(p.root, "rev-list", "--count", f"{upsha}..{relay}", timeout=30)
     if r.returncode != 0 or not r.stdout.strip().isdigit():
         return {**rec, "state": UNKNOWN, "why": "git rev-list failed", "since": prev.get("since"),
                 "tips": prev.get("tips") or []}
@@ -133,7 +107,7 @@ def measure(p, up: dict, answer: tuple[str | None, str], prev: dict | None, now:
     if n == 0:
         return {**rec, "state": OK, "lag": 0}
     # The oldest remembered relay tip not upstream yet: when its commits were first seen on the relay.
-    while len(tips) > 1 and _contained(p, tips[0][0], upsha):
+    while len(tips) > 1 and landed.on_branch(p.root, tips[0][0], upsha):
         tips.pop(0)
     tips = tips[-TIPS_MAX:]
     return {**rec, "state": AHEAD, "lag": n, "since": tips[0][1], "tips": tips}
@@ -155,8 +129,8 @@ def _hours(s: float) -> str:
 
 
 def line(db, now: float | None = None, ok_too: bool = False) -> str:
-    """'relay ahead of upstream by N commits for H h', a diverged or unknown line, or "" (no record; lag 0
-    unless `ok_too`)."""
+    """'relay ahead of upstream by N commits for H h', an unknown line, or "" (no record; lag 0 unless
+    `ok_too`)."""
     rec = state(db)
     if not rec:
         return ""
@@ -170,8 +144,6 @@ def line(db, now: float | None = None, ok_too: bool = False) -> str:
     if rec["state"] == AHEAD:
         n = int(rec["lag"])
         return f"relay {t} ahead of upstream by {n} commit{'s' if n != 1 else ''}{dur}{age}"
-    if rec["state"] == DIVERGED:
-        return f"relay {t} and upstream diverged{dur}: lag unknown, {rec.get('why')}{age}"
     return f"relay {t} vs upstream: lag unknown ({rec.get('why') or 'not read'}){age}"
 
 
@@ -180,21 +152,21 @@ def landing_words(db) -> str:
     rec = state(db)
     if not rec or rec["state"] == OK:
         return ""
-    return "on relay, not yet upstream" if rec["state"] in (AHEAD, DIVERGED) else "on relay, upstream unknown"
+    return "on relay, not yet upstream" if rec["state"] == AHEAD else "on relay, upstream unknown"
 
 
 def apply(p, cfg: dict, up: dict, answer: tuple[str | None, str], alert, now: float | None = None) -> dict:
     """Store the answer's lag record and raise or clear the alert."""
-    from . import alerts
+    from . import alerts, chatgone
     now = time.time() if now is None else now
     db = p.db
     rec = measure(p, up, answer, state(db), now)
     db.set_kv(KV, rec)
-    after = float((cfg.get("relay") or {}).get("gone_after_s", GONE_AFTER_S) or 0)
+    after = float((cfg.get("relay") or {}).get("gone_after_s", chatgone.GONE_AFTER_S) or 0)
     if rec["state"] == OK:
         alerts.close_key(db, KEY, "the upstream has every relay commit",
                          text="Cleared: " + alerts.CLEARED_TEXT[KEY])
-    elif rec["state"] in (AHEAD, DIVERGED) and after > 0 and rec.get("since") and now - rec["since"] >= after:
+    elif rec["state"] == AHEAD and after > 0 and rec.get("since") and now - rec["since"] >= after:
         alert(KEY, f"{line(db, now)}: pushes land on the relay only; its forwarder may be down (landed work "
                    f"is not upstream yet)", severity="high")
     return rec

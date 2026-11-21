@@ -59,14 +59,14 @@ def eligible(task: dict | None, db=None, _seen: frozenset = frozenset()) -> bool
 
 
 RAISE_KIND = "task_budget_raise"
-RAISE_STATES = ("blocked", "queued", "waiting")
+RAISE_STATES = ("blocked", "queued")   # no task has status waiting (coordinator.NO_WAITING_STATUS)
 HOLD_REASON = "task budget exhausted"   # a task blocked on its spent budget (Daemon._dispatch)
 
 
 def raise_refusal(task: dict, usd) -> str:
     """Why a task_update `budget_usd` of `usd` is refused on `task`, or "" when it may raise it."""
     if task["status"] not in RAISE_STATES:
-        return f"its budget is raised only while it is blocked, waiting or queued, not {task['status']}"
+        return f"its budget is raised only while it is blocked or queued (waiting), not {task['status']}"
     try:
         usd = float(usd)
     except (TypeError, ValueError):
@@ -77,13 +77,13 @@ def raise_refusal(task: dict, usd) -> str:
     return ""
 
 
-def record_raise(db, task: dict, after: float, by: str = "coordinator", now: float | None = None) -> None:
+def record_raise(db, task: dict, after: float) -> None:
     """One handled RAISE_KIND event for a budget raised from task's budget_usd to `after`."""
     before = float(task.get("budget_usd") or 0)
-    text = (f"#{task['id']} {task['title'][:100]}: budget raised from ${before:.2f} to ${after:.2f} by the {by}; "
+    text = (f"#{task['id']} {task['title'][:100]}: budget raised from ${before:.2f} to ${after:.2f} by the coordinator; "
             f"the dollar caps still apply")
     db.x("INSERT INTO events(ts,source,kind,severity,text,data,status,task) VALUES(?,?,?,?,?,?,?,?)",
-         (time.time() if now is None else now, by, RAISE_KIND, "low", text,
+         (time.time(), "coordinator", RAISE_KIND, "low", text,
           json.dumps({"before": before, "after": after}), "handled", task["id"]))
 
 

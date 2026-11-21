@@ -153,24 +153,33 @@ def get(path: str, ttl: float, home: Path | None = None, cap: int = CAP, key: st
 
 
 def head_sha(repo: str, ref: str, timeout: float = TIMEOUT_S) -> str | None:
-    """The sha `ref` names in the public `repo` (owner/name), by `git ls-remote`: no API call, no
-    credential helper, no prompt, and an empty HOME with no global or system git config, so no netrc,
-    extra header or URL rewrite adds a login either. None when it cannot say."""
+    """The sha `ref` names in the public `repo` (owner/name), by ls_remote: no API call. None when it
+    cannot say."""
     base = os.environ.get("TTP_GH_ANON_GIT") or "https://github.com"
+    return ls_remote(f"{base}/{repo}", ref, timeout)[0]
+
+
+def ls_remote(url: str, ref: str, timeout: float = TIMEOUT_S) -> tuple[str | None, str]:
+    """(the sha `ref` names at `url`, "") or (None, why), by one `git ls-remote`: no credential helper,
+    no prompt, and an empty HOME with no global or system git config, so no netrc, extra header or URL
+    rewrite adds a login either."""
     try:
         with tempfile.TemporaryDirectory(prefix="ttp-gh-anon-") as empty:
             env = {**os.environ, "HOME": empty, "XDG_CONFIG_HOME": empty, "GIT_CONFIG_NOSYSTEM": "1",
                    "GIT_CONFIG_GLOBAL": os.devnull, "GIT_TERMINAL_PROMPT": "0", "GIT_ASKPASS": "true",
                    "SSH_ASKPASS": "true"}
-            r = subprocess.run(["git", "-c", "credential.helper=", "ls-remote", f"{base}/{repo}", ref],
+            r = subprocess.run(["git", "-c", "credential.helper=", "ls-remote", url, ref],
                                capture_output=True, text=True, timeout=timeout, env=env, stdin=subprocess.DEVNULL)
-    except (OSError, subprocess.SubprocessError):
-        return None
-    for line in r.stdout.splitlines() if r.returncode == 0 else []:
+    except (OSError, subprocess.SubprocessError) as e:
+        return None, f"{type(e).__name__}: {e}"
+    if r.returncode != 0:
+        last = (r.stderr or "").strip().splitlines()
+        return None, last[-1][:200] if last else f"git exit {r.returncode}"
+    for line in r.stdout.splitlines():
         sha, _, name = line.partition("\t")
         if name == ref and len(sha) == 40:
-            return sha
-    return None
+            return sha, ""
+    return None, f"no {ref} there"
 
 
 def _who(u: dict | None) -> dict:
