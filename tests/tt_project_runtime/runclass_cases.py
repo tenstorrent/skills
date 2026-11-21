@@ -380,7 +380,7 @@ def test_tt_unavailable_counts_only_cheap_runs_whose_route_failed_on_the_endpoin
     assert s["cheap"] == {"status_report": 3}
     assert runclass.tt_unavailable(s) == [] and s["last_error"] == {}
     for fault in ("down", "auth", "busy_wait_expired"):
-        assert runclass.endpoint_fault(fault)
+        assert runclass.chat_route_failed(fault)
     run({"to": "claude", "fallback": "down"})
     s = runclass.by_class(p.db, {}, now - 3600, now)
     assert runclass.tt_unavailable(s) == ["status_report"]

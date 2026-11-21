@@ -524,7 +524,7 @@ def by_class(db, cfg: dict, since: float, until: float | None = None) -> dict:
 
     eligible: dict = {}
     cheap: dict = {}   # runs per class on a cheap core model (CHEAP_KEY)
-    cheap_down: dict = {}   # those whose route failed on the endpoint (endpoint_fault)
+    cheap_down: dict = {}   # those whose route failed on the endpoint (chat_route_failed)
     last_error: dict = {}
     from .route import KEY as ROUTE_KEY
 
@@ -543,8 +543,8 @@ def by_class(db, cfg: dict, since: float, until: float | None = None) -> dict:
         fell = str(rn.get("fallback") or "") if isinstance(rn, dict) else ""
         if (cn := cheap_run(note, str(r["provider"] or ""))) and not cn.get(CODE_KEY):
             cheap[cls] = cheap.get(cls, 0) + 1
-            cheap_down[cls] = cheap_down.get(cls, 0) + int(endpoint_fault(fell))
-        if endpoint_fault(fell):
+            cheap_down[cls] = cheap_down.get(cls, 0) + int(chat_route_failed(fell))
+        if chat_route_failed(fell):
             last_error[cls] = f"route fallback: {fell}"
     for r in db.q("SELECT use, decision, cost_usd FROM jev_calls WHERE ts>=? AND ts<?", (since, until)):
         use = str(r["use"] or "")
@@ -1131,7 +1131,7 @@ def quiet_classes(s: dict, n: int = ALARM_MIN) -> list[dict]:
     return out
 
 
-def endpoint_fault(fallback: str) -> bool:
+def chat_route_failed(fallback: str) -> bool:
     """A run note's route fallback that says the chat endpoint failed it (a fault, a cool-down, full slots,
     the auth gate), not a keep-core rule (an escalation or a rerun after an earlier fallback)."""
     from .route import ESCALATED
