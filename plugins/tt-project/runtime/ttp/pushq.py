@@ -787,12 +787,12 @@ def _batch_reach(db, batch: str | None, b: dict | None = None, m: dict | None = 
     return r if isinstance(r, dict) else None
 
 
-def _landing(row: dict, target: str, reach: dict | None, db=None) -> str:
+def _landing(row: dict, target: str, reach: dict | None, db) -> str:
     """A pushed or landed row in words: the exact branch and short sha, and whether it is on the
-    branch it is meant to reach (push.reach_words), so "pushed" never reads as landed there. With `db`,
-    also whether a push relay's upstream has it yet (relaylag.landing_words)."""
+    branch it is meant to reach (push.reach_words), so "pushed" never reads as landed there, and
+    whether a push relay's upstream has it yet (relaylag.landing_words)."""
     from . import relaylag
-    relay = relaylag.landing_words(db) if db is not None else ""
+    relay = relaylag.landing_words(db)
     relay = f", {relay}" if relay else ""
     if row["status"] == "pushed":
         return push.landing(row["pushed_sha"], target, reach, row["version"]) + relay

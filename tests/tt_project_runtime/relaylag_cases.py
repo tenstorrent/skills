@@ -74,11 +74,15 @@ def test_relay_lag_is_unknown_never_zero_when_the_upstream_cannot_be_read(env):
     assert rec["state"] == "unknown" and rec["lag"] is None
     assert "lag unknown (upstream could not be read: timed out)" in relaylag.line(p.db)
     assert relaylag.landing_words(p.db) == "on relay, upstream unknown"
-    # An upstream tip this repository does not have: diverged, lag unknown.
+    # An upstream tip this repository does not have (diverged, or newer): unknown too.
     rec = relaylag.apply(p, p.config(), up, ("f" * 40, ""), lambda *a, **k: None)
-    assert rec["state"] == "diverged" and rec["lag"] is None and "diverged" in relaylag.line(p.db)
+    assert rec["state"] == "unknown" and rec["lag"] is None
+    assert "lag unknown (upstream tip ffffffffff is not in the local repository" in relaylag.line(p.db)
     # ssh is never used for the anonymous read.
     assert relaylag.ls_remote(p, "git@example.invalid:o/r.git", "ttp-land")[0] is None
+    # A local path is read with no global or system git config (ghanon.ls_remote).
+    cur = _git_out(p.root, "rev-parse", "--abbrev-ref", "HEAD").strip()
+    assert relaylag.ls_remote(p, str(p.root), cur) == (_git_out(p.root, "rev-parse", "HEAD").strip(), "")
 
 
 def test_relay_lag_alert_opens_past_gone_after_s_and_clears_at_zero(env, monkeypatch):
@@ -94,6 +98,7 @@ def test_relay_lag_alert_opens_past_gone_after_s_and_clears_at_zero(env, monkeyp
     assert not p.db.q("SELECT id FROM messages WHERE ref=?", (relaylag.KEY,)), "not yet past gone_after_s"
     relaylag.apply(p, p.config(), up, (base, ""), d.alert, now=now)
     relaylag.apply(p, p.config(), up, (None, "unreachable"), d.alert, now=now + 1)   # unknown keeps it
+    relaylag.apply(p, p.config(), up, ("f" * 40, ""), d.alert, now=now + 2)        # so does a tip not here
     (m,) = p.db.q("SELECT * FROM messages WHERE ref=?", (relaylag.KEY,))
     assert m["severity"] == "high" and "ahead of upstream by 1 commit for 1.5 h" in m["text"]
     assert relaylag.holds(p.db) and not alerts.sweep(p.db)
