@@ -73,7 +73,8 @@ STR_RE = re.compile(r"'((?:[^'\\\n]|\\.)*)'|\"((?:[^\"\\\n]|\\.)*)\"|`([^`]*)`")
 # Commands in an argv list that write the paths they name (login tools write their store: read as argv)
 ARGV_WRITERS = WRITE_ALL | DEST_LAST | set(OUTPUT_OPTS) | {"dd", "sed", "perl"}
 STORE_TOOLS = {"gh", "docker", "aws", "kubectl", "git", "ssh-keygen"}
-HOME_REF_RE = re.compile(r"~|\bHOME\b|home\(\)|expanduser|homedir|getpwuid|Dir\.home|\$ENV\{|os\.homedir")
+# A spaced `=~` or `!~` is a regex match operator (bash, perl), not a home reference; `T=~` still is
+HOME_REF_RE = re.compile(r"(?<!\s[=!])~|~(?!\s)|\bHOME\b|home\(\)|expanduser|homedir|getpwuid|Dir\.home|\$ENV\{|os\.homedir")
 # Python code is parsed: a write call checks only its target, so a script that reads a protected path
 # and writes elsewhere passes (_py_refusal)
 PY_WRITER_RE = re.compile(

@@ -667,3 +667,33 @@ def test_pathguard_a_variable_named_like_a_protected_folder_is_not_a_path(cred_h
                               "p = '~/records/a'", "p = '$HOME/records/a'", "p = os.path.join(home, 'records/a')"]):
         (bin_ / f"tool{i}.py").write_text(PG_BARE + hold + "\nopen(p, 'w')\n")
         assert pathguard_why(_pg_bash(f"python3 bin/tool{i}.py --check", cred_home.work), cfg), hold
+
+
+def test_pathguard_a_protected_folder_covers_whole_components_only(cred_home):
+    w, b = cred_home.work, cred_home.work / "b"
+    (b / "in").mkdir(parents=True)
+    (w / "bc").mkdir()
+    (w / "via").symlink_to(b)
+    cfg = {"guards": {"protected_paths": [str(b)]}}
+    for cmd, cwd in ((f"echo x > {w}/b-x", w), (f"echo x > {w}/bc/a", w), ("echo x > ./b-x/a", w),
+                     ("echo x > ../b-x", b), ("ssh box 'echo x > ./b/a'", w), ("ssh box 'cd b && touch a'", w)):
+        assert pathguard_why(_pg_bash(cmd, cwd), cfg) is None, cmd
+    for cmd, cwd in ((f"echo x > {b}/a", w), ("echo x > b/a", w), ("echo x > ./a", b / "in"), ("touch ../a", b / "in"),
+                     (f"echo x > {w}/bc/../b/a", w), ("echo x > via/a", w), ("echo x > $UNSET/a", b)):
+        assert pathguard_why(_pg_bash(cmd, cwd), cfg), cmd
+
+
+def test_pathguard_a_regex_match_operator_is_no_home_reference(cred_home):
+    """`=~` in a script is bash's match operator, not `~`: with a `../<name>` path elsewhere it named a
+    protected ~/<name> and refused a script handing its own output file to a writer."""
+    w = cred_home.work
+    cfg = {"guards": {"protected_paths": ["~/tray"]}}
+    (w / "w.py").write_text("import sys\nopen(sys.argv[1], 'w').write('x')\n")
+    body = ('#!/bin/bash\nM=/tmp/m\n[[ $1 =~ ^ok ]] && git -C "$M/../tray" log -1\n'
+            'python3 w.py "./tray-out-$$.txt"\n')
+    (w / "run.sh").write_text(body)
+    assert pathguard_why(_pg_bash("bash run.sh", w), cfg) is None
+    (w / "home.sh").write_text(body.replace('"$M/../tray"', '"$HOME/tray"') + 'python3 w.py "$HOME/tray/a"\n')
+    assert pathguard_why(_pg_bash("bash home.sh", w), cfg)
+    (w / "set.sh").write_text(body + 'T=~\npython3 w.py "$T/tray/a"\n')
+    assert pathguard_why(_pg_bash("bash set.sh", w), cfg)
