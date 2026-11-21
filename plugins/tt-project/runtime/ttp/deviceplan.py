@@ -213,25 +213,30 @@ def _words(cmd: str, depth: int = 0):
 
 
 # A device's own files: reading one reads the chip, which can bring the host down on a chip off the bus, so in a
-# device run it is a step of Opus's plan. Listing them reads nothing (LISTERS); a commit message only names them.
+# device run it is a step of Opus's plan. Listing them reads nothing (LISTERS) unless the listing feeds another
+# command (FEEDS: a pipe, `$( )`, `<( )`); a commit message only names them.
+FEEDS = re.compile(r"(?<!\|)\||[$<>]\(")
 DEVICE_PATH = re.compile(r"/sys/class/tenstorrent\b|/dev/tenstorrent")
 LISTERS = frozenset({"ls", "dir", "vdir", "tree", "stat", "test", "[", "readlink", "realpath", "echo", "printf"})
 
 
 def device_read(cmd: str) -> bool:
-    """Whether `cmd` reads a device file (DEVICE_PATH) here or on another host: any use but a listing, a commit
-    message or text it prints; one that cannot be read counts."""
+    """Whether `cmd` reads a device file (DEVICE_PATH) here or on another host: any use but a lone listing, a
+    commit message or text it prints; one that cannot be read, or whose listing feeds a command, counts."""
     if not DEVICE_PATH.search(cmd):
         return False
     if re.search(r"<\s*['\"]?(?:" + DEVICE_PATH.pattern + ")", cmd):   # `< /sys/...`: _segs drops the redirect
         return True
     from . import hook
+    fed = bool(FEEDS.search(hook._split(cmd)[0]))
     named = 0   # the mentions a listing, a commit message or printed text holds
     for x in _words(cmd):
         if x is None:
             return True
         n = sum(len(DEVICE_PATH.findall(a)) for a in x[0])
         if n and os.path.basename(x[0][0]) not in LISTERS and x[0][:2] != ["git", "commit"]:
+            return True
+        if n and fed and x[0][:2] != ["git", "commit"]:   # a listing whose output a reader may take
             return True
         named += n
     # a mention the parser did not show as a word (`d=/dev/tenstorrent/0; xxd $d`) counts as a read

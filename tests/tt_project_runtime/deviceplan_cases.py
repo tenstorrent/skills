@@ -803,7 +803,10 @@ _DP_SYS_LOOP = ('ls /sys/class/tenstorrent/ | head -40; echo ---; for d in /sys/
 _DP_DEVICE_READS = [_DP_SYS_LOOP, "cat /sys/class/tenstorrent/tenstorrent0/tt_heartbeat",
                     "head -c4 < /sys/class/tenstorrent/tenstorrent0/chip_id", "cd /sys/class/tenstorrent && cat x/chip_id",
                     "d=/dev/tenstorrent/0; xxd $d", "ssh box-a 'cat /sys/class/tenstorrent/tenstorrent0/chip_id'",
-                    "python3 -c 'open(\"/dev/tenstorrent/0\").read()'", "echo `cat /sys/class/tenstorrent/x/chip_id`"]
+                    "python3 -c 'open(\"/dev/tenstorrent/0\").read()'", "echo `cat /sys/class/tenstorrent/x/chip_id`",
+                    "ls -d /sys/class/tenstorrent/*/chip_id | xargs cat", "cat $(ls -d /sys/class/tenstorrent/*/chip_id)",
+                    "echo /dev/tenstorrent/0 | xargs xxd", "ls /dev/tenstorrent/ |& xargs xxd",
+                    "cat <(ls /sys/class/tenstorrent/*/chip_id)"]
 
 
 @pytest.mark.parametrize("cmd", _DP_DEVICE_READS)
@@ -817,7 +820,8 @@ def test_a_direct_device_read_with_no_plan_is_out_of_plan_and_hands_back(cmd, tm
 
 
 @pytest.mark.parametrize("cmd", ["ls /sys/class/tenstorrent/", "ls -l /dev/tenstorrent/",
-                                 "git commit -m 'read /sys/class/tenstorrent attributes'"])
+                                 "git commit -m 'read /sys/class/tenstorrent attributes'",
+                                 "ls /sys/class/tenstorrent && echo ok", "echo 'a | b /dev/tenstorrent/0'"])
 def test_listing_or_naming_device_files_is_no_device_read(cmd, tmp_path):
     from ttp import deviceplan
     run, e = _dp_run(tmp_path)
