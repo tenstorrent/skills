@@ -26,7 +26,7 @@ FAILED = "the ponytail lane failed it"   # lane_problem's prefix for a valid fai
 WHY = re.compile(r"(?im)(?:^|[.;][ \t])[ \t>*-]*why this size:[ \t]*\S")
 
 
-def reason(text: str) -> bool:
+def has_reason(text: str) -> bool:
     """Whether `text` carries a size reason: `why this size:` starting a line (bullet and quote
     markers allowed) or a clause ("; " or ". "), never inside backticks or quotes, so a quote of
     the rule itself is not a reason."""
@@ -160,7 +160,7 @@ def size_problem(cfg: dict, added: int | None, text: str, run_dir, head: str = "
     if not cap or added is None or added <= cap:
         return ""
     key = "review.ponytail_pr_lines" if pr else "review.ponytail_land_lines"
-    if not reason(text):
+    if not has_reason(text):
         return (f"it adds {added} lines, over {key} ({cap}): its spec or hand-off needs the reason "
                 f"starting `why this size:` on its own line or a clause (after '; ' or '. '), never "
                 f"quoted, and a passed ponytail lane (skill tt-ponytail-review, verdict in "
