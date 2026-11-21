@@ -37,11 +37,11 @@ def _rw_repo(tmp_path) -> pathlib.Path:
     return wt
 
 
-def _rw_run(p, provider, run_dir, cwd=None, role="worker", budget=4.0, cost=1.0):
+def _rw_run(p, provider, run_dir, cwd=None, role="worker", budget=4.0, cost=1.0, spec=None):
     t = p.db.add_task("watched work", "s", kind="code")
     p.db.x("UPDATE tasks SET budget_usd=?, attempts=2 WHERE id=?", (budget, t))
     run_dir.mkdir(parents=True, exist_ok=True)
-    (run_dir / "run.json").write_text(json.dumps({"cwd": str(cwd or ""), "timeout_s": 3600}))
+    (run_dir / "run.json").write_text(json.dumps({"cwd": str(cwd or ""), "timeout_s": 3600, **(spec or {})}))
     rid = p.db.x("INSERT INTO runs(task,role,provider,started,status,dir,cost_usd) VALUES(?,?,?,?,?,?,?)",
                  (t, role, provider, time.time() - 600, "running", str(run_dir), cost))
     return t, rid
@@ -380,3 +380,63 @@ def test_runs_live_command_and_web_view_read_the_record(env, tmp_path, capsys):
     assert "no running worker" in capsys.readouterr().out
     w = next(w for w in health(p, p.db)["working"] if w["run"] == rid)
     assert w["doing"].startswith("Bash: make all") and w["note"].endswith("compiling") and "dir" not in w
+
+
+def _rw_mini_call(mid, cmd, ts, prompt=1000, cached=900, completion=100):
+    return {"role": "assistant", "content": None, "tool_calls": [
+        {"id": mid, "type": "function", "function": {"name": "bash", "arguments": json.dumps({"command": cmd})}}],
+        "extra": {"response": {"created": int(ts), "usage": {
+            "prompt_tokens": prompt, "completion_tokens": completion,
+            "prompt_tokens_details": {"cached_tokens": cached}}}}}
+
+
+def _rw_mini_result(mid, rc, ts):
+    return {"role": "tool", "tool_call_id": mid, "content": json.dumps({"returncode": rc, "output": "x"}),
+            "extra": {"returncode": rc, "timestamp": ts}}
+
+
+def _rw_mini_traj(messages):
+    return json.dumps({"info": {"model_stats": {"instance_cost": 0.0, "api_calls": len(messages) // 2}},
+                       "messages": messages, "trajectory_format": "mini-swe-agent-1.1"})
+
+
+def test_runwatch_fills_a_chat_runs_entry_from_its_own_step_record(env, tmp_path):
+    """A mini-swe-agent (chat-provider) run's entry comes from its trajectory, its own step record:
+    its steps are tool calls (so drift's quiet, loop and repeat_fail work on it as on a Claude run),
+    its spend so far is that record's usage at its price row, and with no hook its steer state is
+    unknown until the run's own step that hands the update over marks it read."""
+    from ttp import runwatch
+    p = make(env)
+    run_dir = p.runs / "rw-mini"
+    spec = {"harness": {"kind": "mini-swe-agent", "version": "2.4.6"}, "model": "glm-x",
+            "prices": {"default": [0.6, 0.1, 2.5]}}
+    _, rid = _rw_run(p, "chat", run_dir, spec=spec)
+    now = time.time()
+    (run_dir / "trajectory.json").write_text(_rw_mini_traj([
+        _rw_mini_call("a", "cd /w && pytest -q tests/a.py", now - 400), _rw_mini_result("a", 1, now - 390),
+        _rw_mini_call("b", "cat > f.py <<'EOF'", now - 300), _rw_mini_result("b", 0, now - 290)]))
+    (run_dir / "output.jsonl").write_text("Building agent config from specs: ...\n")   # plain text, no events
+    (run_dir / "steer.md").write_text("\n## Update Thu 10:06 PST\nnew order\n")
+    e = runwatch.tick(p, now)["runs"][str(rid)]
+    assert [c["id"] for c in e["recent"]] == ["a", "b"] and e["traj_n"] == 4
+    assert e["last_tool"] == {"id": "b", "tool": "bash", "input_head": "cat > f.py <<'EOF'",
+                              "since": int(now - 300), "done": True, "is_error": False, "ended": now - 290}
+    assert e["fail_streak"] == {"pytest -q tests/a.py": 1} and e["failed_last_20"] == 1
+    assert e["active_at"] == now - 290, "the latest step's own time, not the run's start"
+    assert e["spend"]["run_usd"] == pytest.approx((200 * 0.6 + 1800 * 0.1 + 200 * 2.5) / 1e6)
+    assert e["steer"]["read"] is None, "a mini run has no hook: the update may be read by a step, or not"
+    assert "last bash" in runwatch.doing(e)
+    # The run's own `ttp note` step hands the update over (cli.print_update): the offset reaches the end.
+    (run_dir / "steer.offset").write_text(str((run_dir / "steer.md").stat().st_size))
+    assert runwatch.tick(p, now + 30)["runs"][str(rid)]["steer"]["read"] is True
+    # A newer update past the offset is unknown again; only the new steps are folded next tick.
+    (run_dir / "steer.md").write_text("\n## Update Thu 10:20 PST\nanother order\n")
+    (run_dir / "trajectory.json").write_text(_rw_mini_traj([
+        _rw_mini_call("a", "cd /w && pytest -q tests/a.py", now - 400), _rw_mini_result("a", 1, now - 390),
+        _rw_mini_call("b", "cat > f.py <<'EOF'", now - 300), _rw_mini_result("b", 0, now - 290),
+        _rw_mini_call("c", "ttp note 'done'", now + 5), _rw_mini_result("c", 0, now + 6)]))
+    e2 = runwatch.tick(p, now + 60)["runs"][str(rid)]
+
+    assert e2["traj_n"] == 6 and [c["id"] for c in e2["recent"]] == ["a", "b", "c"]
+    assert e2["steer"]["read"] is None and e2["steer"]["last"].startswith("Update")
+    assert e2["active_at"] == now + 6 and e2["spend"]["run_usd"] == pytest.approx(e["spend"]["run_usd"] * 1.5)

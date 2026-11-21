@@ -129,6 +129,67 @@ def context_per_call(usage: dict) -> int:
     return round((int(usage.get("input_tokens") or 0) + int(usage.get("cache_read_input_tokens") or 0)) / calls)
 
 
+def record(run_dir, seen: int = 0) -> tuple[list[dict], int, dict]:
+    """A running mini-swe-agent run's step record: (its new steps past message `seen` as provider
+    activity events (providers.base.Provider.activity's shape), the cursor to read from next, its
+    usage so far). The trajectory is saved after every step, so a step is an assistant message's
+    tool calls (a `call` each, its id, input hash and shell command) and the tool message that
+    answers one (a `result`, failed when its returncode is not 0). ([], seen, {}) while the run has
+    no readable trajectory."""
+    try:
+        msgs = json.loads((Path(run_dir) / "trajectory.json").read_text()).get("messages") or []
+    except (OSError, ValueError, AttributeError):
+        return [], seen, {}
+    if not isinstance(msgs, list):
+        return [], seen, {}
+    if len(msgs) < seen:   # a replaced record (a restarted run): read it afresh
+        seen = 0
+    from .chatbridge import tool_input, usage_of
+    from .providers.base import CMD_MAX, head80, input_hash
+    events, usage = [], {"calls": 0, "input_tokens": 0, "output_tokens": 0, "cache_read_input_tokens": 0}
+    for i, m in enumerate(msgs):
+        if not isinstance(m, dict):
+            continue
+        extra = m.get("extra") or {}
+        if isinstance((resp := extra.get("response") or {}), dict) and isinstance(resp.get("usage"), dict):
+            usage["calls"] += 1
+            for k, v in usage_of(resp["usage"]).items():
+                usage[k] = usage.get(k, 0) + int(v)
+        if i < seen or m.get("role") == "exit":
+            continue
+        if m.get("role") == "tool":
+            rc = extra.get("returncode")
+            if rc is None:
+                try:
+                    rc = json.loads(str(m.get("content") or "{}")).get("returncode", 0)
+                except ValueError:
+                    rc = 0
+            events.append({"kind": "result", "id": str(m.get("tool_call_id") or ""), "tool": "",
+                           "input_head": "", "is_error": bool(rc), "ts": extra.get("timestamp")})
+            continue
+        for call in m.get("tool_calls") or []:
+            fn = call.get("function") or {}
+            args = tool_input(fn.get("arguments"))
+            cmd = args.get("command") if isinstance(args.get("command"), str) else ""
+            name = str(fn.get("name") or "")
+            events.append({"kind": "call", "id": str(call.get("id") or ""), "tool": name,
+                           "input_head": head80(cmd or args), "is_error": None,
+                           "ts": (extra.get("response") or {}).get("created"),
+                           "hash": input_hash(name, args), "command": cmd[:CMD_MAX]})
+    return events, len(msgs), usage
+
+
+def record_cost(spec: dict, usage: dict) -> float | None:
+    """A running mini run's spend so far, priced exactly as its exit books it (harness_spend at the
+    chat provider's price row): None when its record holds no usage yet, so nothing is guessed."""
+    if not usage or not usage.get("calls"):
+        return None
+    from . import benchrun
+    from .providers import get_provider
+    prov = get_provider(spec.get("provider") or "chat").use(spec.get("model") or "", spec.get("prices"))
+    return float(benchrun.harness_spend(prov, usage)["cost_usd"])
+
+
 def result_line(stats: dict | None, prov) -> str:
     """A Claude-stream `result` line carrying the bridge's usage, which the provider's parser reads as the run's
     tokens (a mini-swe-agent run streams none): '' when the bridge counted no call."""

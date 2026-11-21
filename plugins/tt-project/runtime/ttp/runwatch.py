@@ -20,7 +20,7 @@ import subprocess
 import time
 from pathlib import Path
 
-from . import gitmemo, runner
+from . import gitmemo, glmharness, runner
 from .project import Project, write_json
 from .providers import get_provider
 
@@ -84,7 +84,11 @@ def _entry(p: Project, r: dict, old: dict, now: float, base: list[str]) -> dict:
         spec = {}
     spec = spec if isinstance(spec, dict) else {}
     e["note"], e["checks"] = _progress(run_dir / "progress.md")
-    e.update(_tools(r["provider"], run_dir / "output.jsonl", old, now))
+    steps, usage = None, None
+    if spec.get("harness"):   # a chat run's steps are its mini-swe-agent trajectory, not its plain-text stream
+        events, cursor, usage = glmharness.record(run_dir, int(old.get("traj_n") or 0))
+        steps = (events, cursor)
+    e.update(_tools(r["provider"], run_dir / "output.jsonl", old, now, steps))
     # its last sign of life (a tool call or result, a note), for drift.py's quiet check
     e["active_at"] = max(started, float(e.pop("tool_at", None) or old.get("active_at") or 0),
                          min(_mtime(run_dir / "progress.md") / 1e9, now))
@@ -93,13 +97,16 @@ def _entry(p: Project, r: dict, old: dict, now: float, base: list[str]) -> dict:
             e[k] = old[k]
     e.update(_files(p, str(spec.get("cwd") or ""), old, now, base))
     cost, budget = float(r["cost_usd"] or 0), r["budget_usd"]
+    if spec.get("harness"):   # a chat run books its spend only at exit: its record's usage prices it now
+        cost = glmharness.record_cost(spec, usage) if usage else None
+        cost = float(r["cost_usd"] or 0) if cost is None else cost
     task_usd = float(r["spent_usd"] or 0) + cost
     e["spend"] = {"run_usd": round(cost, 4), "task_usd": round(task_usd, 4), "budget_usd": budget,
                   "share": round(task_usd / budget, 3) if budget else None}
     limit = spec.get("timeout_s")
     e["wall"] = {"elapsed_s": round(now - started), "limit_s": limit,
                  "share": round((now - started) / float(limit), 3) if limit else None}
-    e["steer"] = _steer(run_dir, r["provider"])
+    e["steer"] = _steer(run_dir, r["provider"], unhooked=bool(spec.get("harness")))
     e["ended"] = ended(run_dir, r["provider"], now)
     return e
 
@@ -143,19 +150,26 @@ def _progress(f: Path) -> tuple[str, str]:
     return note[:200], checks[:200]
 
 
-def _tools(provider: str, out: Path, old: dict, now: float) -> dict:
+def _tools(provider: str, out: Path, old: dict, now: float, steps: tuple | None = None) -> dict:
+    """`steps`: a chat (mini-swe-agent) run's own step record, already read as (events, cursor); the
+    stream is then not parsed, and the cursor is its message count, kept as "traj_n"."""
     offset, recent, last = int(old.get("offset") or 0), list(old.get("recent") or []), old.get("last_tool")
     fails, streak, tool_at = dict(old.get("fails") or {}), dict(old.get("fail_streak") or {}), None
-    try:
-        size = out.stat().st_size
-    except OSError:
-        size = 0
-    if size < offset:   # the stream was replaced (a restarted run): read it afresh
-        offset, recent, last, fails, streak = 0, [], None, {}, {}
-    try:
-        events, offset = get_provider(provider).activity(out, offset)
-    except Exception:
-        events = []
+    if steps is None:
+        try:
+            size = out.stat().st_size
+        except OSError:
+            size = 0
+        if size < offset:   # the stream was replaced (a restarted run): read it afresh
+            offset, recent, last, fails, streak = 0, [], None, {}, {}
+        try:
+            events, offset = get_provider(provider).activity(out, offset)
+        except Exception:
+            events = []
+        feed = {"offset": offset}
+    else:
+        events, offset = steps
+        feed = {"traj_n": offset}
     for ev in events:
         ts = tool_at = ev.get("ts") or now
         known = next((c for c in reversed(recent) if ev["id"] and c["id"] == ev["id"]), None)
@@ -180,7 +194,7 @@ def _tools(provider: str, out: Path, old: dict, now: float) -> dict:
         fails = dict(sorted(fails.items(), key=lambda kv: -kv[1])[:MAX_FAILS])
     if len(streak) > MAX_FAILS:
         streak = dict(sorted(streak.items(), key=lambda kv: -kv[1])[:MAX_FAILS])
-    return {"offset": offset, "recent": recent, "last_tool": last, "fails": fails, "fail_streak": streak,
+    return {**feed, "recent": recent, "last_tool": last, "fails": fails, "fail_streak": streak,
             "tool_at": tool_at,
             "pending_s": round(now - last["since"]) if last and not last["done"] else None,
             "failed_last_20": sum(1 for c in recent[-20:] if c.get("error"))}
@@ -251,7 +265,7 @@ def _files(p: Project, cwd: str, old: dict, now: float, base: list[str]) -> dict
             "git": {"key": [head, index], "ts": now, "head": head, "committed": committed}}
 
 
-def _steer(run_dir: Path, provider: str) -> dict | None:
+def _steer(run_dir: Path, provider: str, unhooked: bool = False) -> dict | None:
     """The last update written to steer.md and whether the run read it: up to steer.offset when the
     update hook runs (the provider's steer_hook, or this run's HOOKED_FILE: Codex and Cursor workers
     may run it). A run without it read the update once `ttp note` or `ttp steer` moved steer.offset to
@@ -269,7 +283,7 @@ def _steer(run_dir: Path, provider: str) -> dict | None:
     lines = _tail_lines(f)
     at = max((i for i, ln in enumerate(lines) if ln.startswith("## Update")), default=None)
     try:
-        hooked = run_hooked(run_dir) or bool(getattr(get_provider(provider), "steer_hook", False))
+        hooked = (not unhooked) and (run_hooked(run_dir) or bool(getattr(get_provider(provider), "steer_hook", False)))
     except Exception:
         hooked = False
     return {"last": lines[at][3:] if at is not None else "",

@@ -357,3 +357,41 @@ def test_stream_ended_reads_each_providers_final_event_and_nothing_else(tmp_path
     assert codex.stream_ended(out)
     assert not get_provider("claude").stream_ended(tmp_path / "missing.jsonl")
     assert not get_provider("fake").stream_ended(out), "a provider naming no final event never ends early"
+
+
+def test_drift_reads_a_chat_runs_own_step_record_for_quiet_and_repeat_fail(env, tmp_path):
+    """A chat-provider (mini-swe-agent) run is judged by its trajectory: one that stepped within
+    quiet_s is not quiet, one whose last step is older than quiet_s is, and a command failing three
+    times in its record raises repeat_fail exactly as a Claude run's stream does."""
+    from ttp import runwatch
+    p = make(env)
+    now = time.time()
+
+    def entry(name, msgs):
+        run_dir = p.runs / f"drift-mini-{name}"
+        spec = {"harness": {"kind": "mini-swe-agent", "version": "2.4.6"}, "model": "glm-x",
+                "prices": {"default": [0.6, 0.1, 2.5]}}
+        _, rid = _rw_run(p, "chat", run_dir, spec=spec)
+        p.db.x("UPDATE runs SET started=? WHERE id=?", (now - 3000, rid))   # older than every step
+        (run_dir / "trajectory.json").write_text(_rw_mini_traj(msgs))
+        return runwatch.tick(p, now)["runs"][str(rid)]
+
+    # A run whose last step is fresh: not quiet.
+    fresh = now - 60
+    e = entry("active", [_rw_mini_call("a", "ttp note 'wip'", fresh), _rw_mini_result("a", 0, fresh)])
+    assert "quiet" not in _dr_flags(e, now)
+    # The same run left to age past quiet_s with no new step: quiet.
+    assert "quiet" in _dr_flags(e, now + 1000)
+    # A run whose last step is already older than quiet_s: quiet at once, from its own record.
+    stale = now - 1000
+    e = entry("stalled", [_rw_mini_call("a", "pytest -q tests/a.py", stale), _rw_mini_result("a", 1, stale)])
+    assert "quiet" in _dr_flags(e, now)
+    # A command failing three times in the record: repeat_fail, with the run's own spend so far.
+    fails = []
+    for i in range(3):
+        fails += [_rw_mini_call(f"f{i}", f"cd /w && pytest -q tests/a.py", stale - 10),
+                  _rw_mini_result(f"f{i}", 1, stale - 5)]
+    e = entry("failing", fails)
+    flags = _dr_flags(e, now)
+    assert "repeat_fail" in flags and flags["repeat_fail"].startswith("`pytest -q tests/a.py` failed 3")
+    assert e["spend"]["run_usd"] > 0, "the run's own record prices its spend while it runs"
