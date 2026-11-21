@@ -440,3 +440,27 @@ def test_runwatch_fills_a_chat_runs_entry_from_its_own_step_record(env, tmp_path
     assert e2["traj_n"] == 6 and [c["id"] for c in e2["recent"]] == ["a", "b", "c"]
     assert e2["steer"]["read"] is None and e2["steer"]["last"].startswith("Update")
     assert e2["active_at"] == now + 6 and e2["spend"]["run_usd"] == pytest.approx(e["spend"]["run_usd"] * 1.5)
+
+
+def test_a_replaced_chat_record_is_read_afresh_and_drops_the_old_fail_state(env, tmp_path):
+    """A restarted chat (mini-swe-agent) run replaces its trajectory with a shorter one: the entry
+    reads the new record afresh and drops the old one's ladder state, so a command the old record
+    failed is not counted again into the new run's fails."""
+    from ttp import runwatch
+    p = make(env)
+    run_dir = p.runs / "rw-mini-restart"
+    spec = {"harness": {"kind": "mini-swe-agent", "version": "2.4.6"}, "model": "glm-x",
+            "prices": {"default": [0.6, 0.1, 2.5]}}
+    _, rid = _rw_run(p, "chat", run_dir, spec=spec)
+    now = time.time()
+    (run_dir / "trajectory.json").write_text(_rw_mini_traj([
+        _rw_mini_call("a", "cd /w && pytest -q tests/a.py", now - 400), _rw_mini_result("a", 1, now - 390),
+        _rw_mini_call("b", "cd /w && pytest -q tests/a.py", now - 300), _rw_mini_result("b", 1, now - 290)]))
+    e = runwatch.tick(p, now)["runs"][str(rid)]
+    assert e["traj_n"] == 4 and e["fails"] == {"pytest -q tests/a.py": 2}
+    # The run restarts: the new record is shorter than the cursor the old one left behind.
+    (run_dir / "trajectory.json").write_text(_rw_mini_traj([
+        _rw_mini_call("c", "cat > f.py <<'EOF'", now - 100), _rw_mini_result("c", 0, now - 90)]))
+    e2 = runwatch.tick(p, now + 30)["runs"][str(rid)]
+    assert e2["traj_n"] == 2 and [c["id"] for c in e2["recent"]] == ["c"]
+    assert e2["fails"] == {} and e2["fail_streak"] == {}, "the replaced record's failures are not counted twice"

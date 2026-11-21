@@ -113,11 +113,19 @@ def apply(spec: dict, run_dir: Path, cfg: dict, runtime_dir: str, budget_usd=Non
     return ""
 
 
+def usage_cost(prov, usage: dict) -> float | None:
+    """A usage priced exactly as the run's exit books it (benchrun.harness_spend at the provider's price
+    row): None when no call was counted, so nothing is guessed."""
+    from . import benchrun
+    usage = usage or {}
+    if not usage.get("calls"):
+        return None
+    return float(benchrun.harness_spend(prov, usage)["cost_usd"])
+
+
 def cost_so_far(bridge, prov) -> float | None:
     """The run's spend so far, from the bridge's token counts (cached prompt tokens at the cache-read rate)."""
-    from . import benchrun
-    usage = (bridge.stats() or {}).get("usage") or {}
-    return float(benchrun.harness_spend(prov, usage)["cost_usd"]) if usage.get("calls") else None
+    return usage_cost(prov, (bridge.stats() or {}).get("usage") or {})
 
 
 def context_per_call(usage: dict) -> int:
@@ -158,14 +166,9 @@ def step_record(run_dir, seen: int = 0) -> tuple[list[dict], int, dict]:
         if i < seen or m.get("role") == "exit":
             continue
         if m.get("role") == "tool":
-            rc = extra.get("returncode")
-            if rc is None:
-                try:
-                    rc = json.loads(str(m.get("content") or "{}")).get("returncode", 0)
-                except ValueError:
-                    rc = 0
             events.append({"kind": "result", "id": str(m.get("tool_call_id") or ""), "tool": "",
-                           "input_head": "", "is_error": bool(rc), "ts": extra.get("timestamp")})
+                           "input_head": "", "is_error": bool(extra.get("returncode")),
+                           "ts": extra.get("timestamp")})
             continue
         for call in m.get("tool_calls") or []:
             fn = call.get("function") or {}
@@ -177,17 +180,6 @@ def step_record(run_dir, seen: int = 0) -> tuple[list[dict], int, dict]:
                            "ts": (extra.get("response") or {}).get("created"),
                            "hash": input_hash(name, args), "command": cmd[:CMD_MAX]})
     return events, len(msgs), usage
-
-
-def record_spend(spec: dict, usage: dict) -> float | None:
-    """A running mini run's spend so far, priced exactly as its exit books it (harness_spend at the
-    chat provider's price row): None when its record holds no usage yet, so nothing is guessed."""
-    if not usage or not usage.get("calls"):
-        return None
-    from . import benchrun
-    from .providers import get_provider
-    prov = get_provider(spec.get("provider") or "chat").use(spec.get("model") or "", spec.get("prices"))
-    return float(benchrun.harness_spend(prov, usage)["cost_usd"])
 
 
 def result_line(stats: dict | None, prov) -> str:

@@ -99,8 +99,9 @@ def _entry(p: Project, r: dict, old: dict, now: float, base: list[str]) -> dict:
     e.update(_files(p, str(spec.get("cwd") or ""), old, now, base))
     cost, budget = float(r["cost_usd"] or 0), r["budget_usd"]
     if spec.get("harness"):   # a chat run books its spend only at exit: its record's usage prices it now
-        cost = glmharness.record_spend(spec, usage) if usage else None
-        cost = float(r["cost_usd"] or 0) if cost is None else cost
+        prov = get_provider(spec.get("provider") or "chat").use(spec.get("model") or "", spec.get("prices"))
+        got = glmharness.usage_cost(prov, usage)
+        cost = float(r["cost_usd"] or 0) if got is None else got
     task_usd = float(r["spent_usd"] or 0) + cost
     e["spend"] = {"run_usd": round(cost, 4), "task_usd": round(task_usd, 4), "budget_usd": budget,
                   "share": round(task_usd / budget, 3) if budget else None}
@@ -170,6 +171,8 @@ def _tools(provider: str, out: Path, old: dict, now: float, steps: tuple | None 
         feed = {"offset": offset}
     else:
         events, offset = steps
+        if offset < int(old.get("traj_n") or 0):   # the record was replaced (a restarted run): read it afresh
+            recent, last, fails, streak = [], None, {}, {}
         feed = {"traj_n": offset}
     for ev in events:
         ts = tool_at = ev.get("ts") or now
