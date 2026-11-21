@@ -2057,7 +2057,7 @@ def status_text(p: Project, verbose: bool = False) -> str:
     if pq := pushq.status_line(p, now):
         lines.append(pq)
     from . import push
-    lines.extend(push.status_lines(p))
+    lines.extend(push.push_status_lines(p))
     from . import integrate
     lines.extend(integrate.status_lines(db, cfg, quiet=True))
     if rows:
@@ -3570,7 +3570,7 @@ def _cmd_push(a, push) -> None:
     if a.own_branch:   # read by push.own_target, also in the detached process (inherited, or QUEUE_ENV)
         a.own = True
         os.environ[push.OWN_BRANCH_ENV] = "1"
-    if a.land:   # read by push._resolve, also in the detached process (inherited, or QUEUE_ENV)
+    if a.land:   # read by push._resolve_target, also in the detached process (inherited, or QUEUE_ENV)
         if a.own:
             die("ttp push: --land lands on delivery.push_branch; --own publishes the own branch: pick one")
         os.environ[push.LAND_ENV] = "1"
@@ -5720,7 +5720,7 @@ def _verified_scope(p: Project | None, top: Path, head: str, todo: list, say,
         return m, []
     passed = {str(c) for c in m.get("commands") or []}
     mine = [c for c in todo if getattr(c, "if_changed", ()) and str(c) in passed
-            and not any(push.matches(files, g) for g in c.if_changed)]
+            and not any(push.path_matches(files, g) for g in c.if_changed)]
     for c in mine:
         say(f"Verified: {c} ({m['line']}: nothing under {', '.join(c.if_changed)} changed since)")
     if not mine:

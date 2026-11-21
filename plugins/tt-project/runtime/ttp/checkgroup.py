@@ -3,7 +3,7 @@
 """Run a check in its process group and end that group if the process that started it dies first.
 
 push starts a local check in a session of its own (its own process group) and kills what is left of the
-group once the check ends (push._end_group). That cannot happen when the push itself is killed outright
+group once the check ends (push._end_check_group). That cannot happen when the push itself is killed outright
 (SIGKILL, or a `kill -- -<pgid>` of the push's group): the check's group is not the push's. This script
 leads the check's group, starts the command in it and, should the push (`parent`) go away while the
 command runs, kills the whole group, so no check outlives its push. On Linux the kernel tells it at once

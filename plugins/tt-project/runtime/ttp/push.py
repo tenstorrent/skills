@@ -82,7 +82,7 @@ POOL_STATUS_SUFFIX = ".pool"     # beside a detached push's marker: its check's 
 QUEUED = 1075                    # once()'s answer for a check still queued at its outer bound: never a process's code
 POOL_STARVED = 1124              # _timed_wait's answer for a check ended at its pool-wait bound: never a process's code
 POOL_BUSY = 1175                 # _timed_wait's answer for a check still waiting for a pool slot at its limit: never a process's code
-GATE_LINES = 20000                # a failed check's last output lines the tests gate reads its failing ids from (_gate)
+GATE_LINES = 20000                # a failed check's last output lines the tests gate reads its failing ids from (_tests_gate)
 QUEUED_RETRY_S = 1800            # a push whose check stayed queued is tried again after this
 TIMINGS = "push_checks.json"   # under the project's state: how long the last full check run took
 BUMP_TRAILER = "Ttp-Version-Bump"   # marks the bump commit ttp push made, so a rerun replaces it
@@ -179,7 +179,7 @@ CHECK_KEYS = {"run", "if_exists", "if_changed", "purpose", "host", "env", "sandb
 PURPOSES = ("candidate", "harness")   # `ttp checks --purpose`; candidate is the default and publication evidence
 
 
-def _entries(v: Any) -> list:
+def _check_entries(v: Any) -> list:
     """Check entries from a config value: a list, a JSON-encoded list, or one command per line."""
     if isinstance(v, str):
         text = v.strip()
@@ -210,7 +210,7 @@ def _check(c: Any) -> Check | None:
         out.env = tuple(sorted((c.get("env") or {}).items()))
         out.cwd = "" if c.get("cwd") in (None, "clean") else c["cwd"]
         out.silent_s = c.get("silent_s")
-        out.ignore_paths = _globs(c.get("ignore_paths"))
+        out.ignore_paths = _entry_globs(c.get("ignore_paths"))
         out.pytest = c.get("pytest")
         out.spill = c.get("spill")
         out.spill_wrap_cmd = str(c.get("spill_wrap_cmd") or "").strip()
@@ -294,7 +294,7 @@ def wrap_problem(wrap: tuple[str, ...], cwd: str | Path, env: dict | None = None
 SPILL_WRAP_KEY = "checks.spill_wrap_cmd"
 
 
-def _words(v: Any, key: str) -> tuple[str, ...]:
+def _argv_words(v: Any, key: str) -> tuple[str, ...]:
     if v is None or v == "":
         return ()
     if not isinstance(v, str):
@@ -310,9 +310,9 @@ def spill_wrap_of(c: Any, cfg: dict | None) -> tuple[str, ...]:
     `checks.spill_wrap_cmd`; () for none. A relative path is the project's own, in the copy of the commit
     there (remotecheck). ValueError when it does not parse: the check then never spills."""
     if own := getattr(c, "spill_wrap_cmd", ""):
-        return _words(own, f"{str(c)!r}: spill_wrap_cmd")
+        return _argv_words(own, f"{str(c)!r}: spill_wrap_cmd")
     checks = (cfg or {}).get("checks")
-    return _words(checks.get("spill_wrap_cmd") if isinstance(checks, dict) else None, SPILL_WRAP_KEY)
+    return _argv_words(checks.get("spill_wrap_cmd") if isinstance(checks, dict) else None, SPILL_WRAP_KEY)
 
 
 def spill_to(checks: list, host: str, cfg: dict | None) -> list:
@@ -510,26 +510,26 @@ def _if_exists(c: dict) -> str:
 
 def _if_changed(c: dict) -> tuple[str, ...]:
     """The check's `if_changed` globs (one string or a list), normalized as `_if_exists`."""
-    return _globs(c.get("if_changed"))
+    return _entry_globs(c.get("if_changed"))
 
 
-def _globs(v: Any) -> tuple[str, ...]:
+def _entry_globs(v: Any) -> tuple[str, ...]:
     """Repo-relative globs from one string or a list, normalized as `_if_exists`."""
     globs = [v] if isinstance(v, str) else v if isinstance(v, list) else []
     return tuple(posixpath.normpath(g.strip()) for g in globs if isinstance(g, str) and g.strip())
 
 
 def scalar_problem(v: Any) -> str:
-    """Why a list setting's value is a scalar (true, 5) that `_entries` reads as no entries, or ""."""
+    """Why a list setting's value is a scalar (true, 5) that `_check_entries` reads as no entries, or ""."""
     return f"{v!r}: not a list" if v and not isinstance(v, (str, list, tuple, dict)) else ""
 
 
 def check_list(v: Any) -> list[Check]:
-    """Check commands from a config value (`_entries`), as `Check`s."""
-    return [c for c in map(_check, _entries(v)) if c]
+    """Check commands from a config value (`_check_entries`), as `Check`s."""
+    return [c for c in map(_check, _check_entries(v)) if c]
 
 
-def matches(files: list[str], pattern: str) -> bool:
+def path_matches(files: list[str], pattern: str) -> bool:
     """Whether a repo path or glob matches one of `files` (repo-relative); a directory by its files."""
     import fnmatch
     return any(f == pattern or f.startswith(pattern + "/") or fnmatch.fnmatchcase(f, pattern) for f in files)
@@ -573,7 +573,7 @@ def _changed_reason(repo: Path, head: str, check: Check, base: str) -> str | Non
         raise ScopeError(check, f"cannot tell what {head[:10]} changes since {base[:10]} "
                                 f"({_tail(diff.stderr) or f'git diff exit {diff.returncode}'})")
     files = [f for f in diff.stdout.splitlines() if f]
-    if any(matches(files, g) for g in globs):
+    if any(path_matches(files, g) for g in globs):
         return None
     if not files and _adds_nothing(repo, base, head):
         # An empty self-diff (the tip checked against itself, or a head already in base) proves nothing
@@ -597,7 +597,7 @@ def _exists_reason(repo: Path, head: str, check: Check) -> str | None:
     ls = _git(repo, "ls-tree", "-r", "--name-only", head)
     if ls.returncode != 0:
         return None   # cannot tell: run it
-    if matches(ls.stdout.splitlines(), check.if_exists):
+    if path_matches(ls.stdout.splitlines(), check.if_exists):
         return None
     return f"{check.if_exists} does not exist at {head[:10]}"
 
@@ -1310,13 +1310,13 @@ def check_pythonpath(env) -> str:
 def exclude_list(v: Any) -> list[str]:
     """`delivery.push_exclude_paths` as repo-relative globs (a list, a JSON list or one per line);
     empty, the default, turns the guard off."""
-    return [posixpath.normpath(str(g).strip()) for g in _entries(v) if not isinstance(g, dict)]
+    return [posixpath.normpath(str(g).strip()) for g in _check_entries(v) if not isinstance(g, dict)]
 
 
 def fast_forward_list(v: Any) -> list[str]:
     """`delivery.fast_forward_also` as branch names (a list, a JSON list or one per line); empty, the
     default, turns it off."""
-    return list(dict.fromkeys(str(b).strip() for b in _entries(v) if not isinstance(b, dict) and str(b).strip()))
+    return list(dict.fromkeys(str(b).strip() for b in _check_entries(v) if not isinstance(b, dict) and str(b).strip()))
 
 
 def fast_forward_problem(branch: str, push_branch: str) -> str:
@@ -1383,7 +1383,7 @@ def mirror_list(v: Any) -> list[dict]:
     strings); empty, the default, turns it off. Anything else comes back with an empty remote, so
     mirror_problem names it."""
     out: list[dict] = []
-    for x in _entries(v):
+    for x in _check_entries(v):
         if isinstance(x, dict):
             m = {"remote": str(x.get("remote") or "").strip(), "branch": str(x.get("branch") or "").strip()}
         else:
@@ -1519,7 +1519,7 @@ def excluded(repo: Path, tip: str, head: str, globs: list[str]) -> list[str]:
         return []
     log = _git(repo, "-c", "core.quotePath=false", "log", "--no-merges", "--right-only", "--cherry-pick",
                "--no-renames", "--diff-filter=AMT", "--name-only", "--format=", f"{tip}...{head}")
-    return [f for f in dict.fromkeys(log.stdout.splitlines()) if f and any(matches([f], g) for g in globs)]
+    return [f for f in dict.fromkeys(log.stdout.splitlines()) if f and any(path_matches([f], g) for g in globs)]
 
 
 def excluded_refusal(files: list[str], upstream: str) -> str:
@@ -1696,7 +1696,7 @@ def _form_problem(c: dict) -> str | None:
         return f"{c!r}: spill must be true or false (leave it out for the default: a check with host local stays here)"
     if "spill_wrap_cmd" in c:
         try:
-            if not _words(c["spill_wrap_cmd"], "spill_wrap_cmd"):
+            if not _argv_words(c["spill_wrap_cmd"], "spill_wrap_cmd"):
                 return f"{c!r}: spill_wrap_cmd must be a non-empty command"
         except ValueError as e:
             return f"{c!r}: {e}"
@@ -1729,7 +1729,7 @@ def _entry_problem(c: Any) -> str | None:
 def check_problems(v: Any) -> list[str]:
     if why := scalar_problem(v):
         return [why]
-    return [p for p in map(_entry_problem, _entries(v)) if p]
+    return [p for p in map(_entry_problem, _check_entries(v)) if p]
 
 
 def check_sig(check: Check) -> str:
@@ -1774,7 +1774,7 @@ def applicability_problems(v: Any, repo: Path | None = None, head: str = "HEAD")
         if re.search(r"/(?:tmp|var/tmp|private/tmp)/[^\s'\"]+", check):
             reasons.append("uses an absolute temp path")
         if not check.if_exists and files and files.returncode == 0:
-            missing = [p for p in path_args(check) if not matches(files.stdout.splitlines(), p)]
+            missing = [p for p in path_args(check) if not path_matches(files.stdout.splitlines(), p)]
             if missing:
                 reasons.append("missing target at the tip: " + ", ".join(missing))
         if reasons:
@@ -1794,7 +1794,7 @@ def target_missing(repo: Path, head: str, check: Check, rc: int, output: str, ba
     files = _git(repo, "ls-tree", "-r", "--name-only", head)
     if files.returncode:
         return None
-    targets = [p for p in path_args(check) if not matches(files.stdout.splitlines(), p)]
+    targets = [p for p in path_args(check) if not path_matches(files.stdout.splitlines(), p)]
     if not targets:
         return None
     diff = _git(repo, "diff", "--name-only", "--no-renames", f"{base}...{head}") if base else None
@@ -1805,10 +1805,10 @@ def target_missing(repo: Path, head: str, check: Check, rc: int, output: str, ba
         if not scopes:
             components = {p.split("/")[0] for p in targets}
             scopes = tuple(components) if all("/" in p for p in targets) and not components & {"tests", "test"} else ()
-        unrelated = not any(matches(changed, g) for g in scopes) if scopes else not any(
+        unrelated = not any(path_matches(changed, g) for g in scopes) if scopes else not any(
             not is_doc(p) for p in changed)
         # Deleting or changing the test itself always belongs to the check.
-        unrelated = unrelated and not any(matches(changed, p) for p in targets)
+        unrelated = unrelated and not any(path_matches(changed, p) for p in targets)
     return {"kind": "target_missing", "sig": check_sig(check), "check": check.config(),
             "targets": targets, "head": head, "base": base, "worktree": str(repo),
             "rc": rc, "output": output[-8000:], "unrelated": unrelated}
@@ -2016,13 +2016,13 @@ def unmatched_paths(repo: Path, remote: str, branch: str, checks: list[str]) -> 
     files = ls.stdout.splitlines()
     out = []
     for cmd in checks:
-        if getattr(cmd, "if_exists", "") and not matches(files, cmd.if_exists):
+        if getattr(cmd, "if_exists", "") and not path_matches(files, cmd.if_exists):
             continue  # not applicable there: it is skipped, not failed
         gone: list[str] = []
         for a in path_args(cmd):
             if any(a.startswith(g + "/") for g in gone):
                 continue  # under a missing `cd` dir, already reported
-            if not matches(files, a):
+            if not path_matches(files, a):
                 gone.append(a)
                 out.append(f"{cmd!r}: {a!r}")
     return ref, out
@@ -2995,13 +2995,13 @@ def own_pr_branch(p: Project, cfg: dict, branch: str) -> bool:
 
 def resolve(p: Project, repo: Path, own: bool = False) -> tuple[str, str, bool]:
     """(remote, branch, own) for `ttp push`, each publish as with --own passed through own_gate."""
-    remote, branch, own = _resolve(p, repo, own)
+    remote, branch, own = _resolve_target(p, repo, own)
     if own:
         own_gate(p, repo, remote, branch)
     return remote, branch, own
 
 
-def _resolve(p: Project, repo: Path, own: bool = False) -> tuple[str, str, bool]:
+def _resolve_target(p: Project, repo: Path, own: bool = False) -> tuple[str, str, bool]:
     """(remote, branch, own) for `ttp push`. `--own` is own_target. Otherwise the target is
     `delivery.push_branch`, but inside a run a worktree on another task's ttp/t<id>-... branch is
     refused (it would land that task's work: _may_land), a notes branch (is_notes_branch) is published
@@ -3262,7 +3262,7 @@ def foreign_base(p: Project, repo: Path, remote: str, push_to: str, branch: str)
     return base, carried
 
 
-def behind(repo: Path, remote: str, branch: str) -> str:
+def non_ff_reason(repo: Path, remote: str, branch: str) -> str:
     """Why pushing HEAD to remote/branch would not be a fast-forward, or "" when the branch is new
     there or its tip is an ancestor of HEAD. Fails closed when the remote cannot be read. Read where
     the push goes (push_side)."""
@@ -3364,7 +3364,7 @@ def kept_off(task: dict, changes: dict | None, d: dict, p: Project | None = None
     false, or `no_push: false`) on the nearest task ends the walk: it may reach the branch. Prose in the spec or hand-off summary
     is never read as a ban. Its review is then review only: no `ttp push` and no push-queue approval."""
     globs = exclude_list(d.get("push_exclude_paths"))
-    if changes and globs and all(any(matches([f], g) for g in globs) for f in changes):
+    if changes and globs and all(any(path_matches([f], g) for g in globs) for f in changes):
         return "every file it changes is one delivery.push_exclude_paths keeps off the push branch"
     seen: set = set()
     first = task
@@ -4297,7 +4297,7 @@ def _own_refusal(repo: Path, remote: str, branch: str, checks: list[str], say: C
         return REFUSED, False, "", ""
     local = remote == LOCAL and remote_less(repo)
     why = local_refusal(repo, branch) if local else \
-        refusal(repo, remote, branch) or (behind(repo, remote, branch) if ff_only else "")
+        refusal(repo, remote, branch) or (non_ff_reason(repo, remote, branch) if ff_only else "")
     if why:
         say(why)
         return REFUSED, local, "", ""
@@ -4793,7 +4793,7 @@ def _round_checks(repo: Path, remote: str, branch: str, run: list, head: str, ti
     return None, started, env, excused
 
 
-def _kill_tree(pid: int) -> None:
+def _kill_process_tree(pid: int) -> None:
     """SIGKILL process `pid` and every descendant /proc shows (Linux; elsewhere only `pid`)."""
     kids: dict[int, list[int]] = {}
     for d in Path("/proc").glob("[0-9]*"):
@@ -4817,7 +4817,7 @@ def _kill_tree(pid: int) -> None:
 CHECK_GROUP = (sys.executable, "-I", str(Path(__file__).with_name("checkgroup.py")))
 
 
-def _end_group(pgid: int) -> None:
+def _end_check_group(pgid: int) -> None:
     """SIGKILL what is left of an ended check's process group `pgid` (its pid, started in a session of its
     own): a background process it left behind ends with it, as no namespace reaps it."""
     try:
@@ -4828,7 +4828,7 @@ def _end_group(pgid: int) -> None:
 
 def _copy_out(stream, collect: workerloss.Collector, keep: deque | None = None) -> None:
     """A check's output into this process's output (the push log), each line also to `collect` (and its
-    last lines to `keep`, for the tests gate: _gate)."""
+    last lines to `keep`, for the tests gate: _tests_gate)."""
     try:
         for raw in iter(stream.readline, b""):
             line = raw.decode(errors="replace")
@@ -4846,7 +4846,7 @@ def _copy_out(stream, collect: workerloss.Collector, keep: deque | None = None) 
 
 def _kill_check(proc: subprocess.Popen) -> None:
     """End check `proc` and every process under it, and reap it (_timed_wait)."""
-    _kill_tree(proc.pid)
+    _kill_process_tree(proc.pid)
     proc.wait()
 
 
@@ -4982,7 +4982,7 @@ def _run_one(cmd: Any, repo: Path, env: dict, say: Callable[[str], None], seen: 
     lock, a test pool or a tests gate's rerun gave it no slot, so it judged nothing), when its check host
     could not run it (an environment fault, recorded as runner_wait records a missing runner) or its
     test workers were lost again on its one rerun, each exiting cleanly (workerloss): the host too.
-    A pass or failure fills `seen` with the check's own exit code and its last output lines (the tests gate: _gate)."""
+    A pass or failure fills `seen` with the check's own exit code and its last output lines (the tests gate: _tests_gate)."""
     if remote_host(cmd):
         say(f"running {cmd}{where(cmd)}")
     collect = workerloss.Collector()
@@ -5061,7 +5061,7 @@ def _check_once(cmd: Any, repo: Path, env: dict, say: Callable[[str], None], col
     try:
         argv = testslots.low_priority(check_argv(cmd, repo, env))
         guard = hoststate.Guard(env, tokens=[repo], argv=argv)   # the real crontab and units, compared after a local check
-        # own session: its group is ended once it ends (_end_group), or by checkgroup if this push dies first
+        # own session: its group is ended once it ends (_end_check_group), or by checkgroup if this push dies first
         proc = subprocess.Popen([*CHECK_GROUP, str(os.getpid()), "--", *argv], cwd=repo,
                                 env={**{k: v for k, v in env.items() if k != landmark.ENV}, checkwait.ENV: str(waits),
                                      **({landmark.ENV: str(mark.path)} if mark else {}),
@@ -5078,7 +5078,7 @@ def _check_once(cmd: Any, repo: Path, env: dict, say: Callable[[str], None], col
     reader.start()
     try:
         rc = _timed_wait(proc, waits, cmd, say, collect)
-        _end_group(proc.pid)   # what it left running ends first: nothing writes after the compare
+        _end_check_group(proc.pid)   # what it left running ends first: nothing writes after the compare
         changed, said = guard.end()
         for line in said:
             say(line)
@@ -5086,11 +5086,11 @@ def _check_once(cmd: Any, repo: Path, env: dict, say: Callable[[str], None], col
     except BaseException:   # stopped (run_detached's SIGTERM): the check ends with it, as run() did
         proc.kill()
         proc.wait()
-        _end_group(proc.pid)   # the command under checkgroup too, before the compare
+        _end_check_group(proc.pid)   # the command under checkgroup too, before the compare
         guard.stopped(say)   # a change made before the stop: restored and reported, not the next baseline
         raise
     finally:
-        _end_group(proc.pid)
+        _end_check_group(proc.pid)
         reader.join(timeout=10)   # a child that left the group may keep the pipe open; do not wait on it
         shutil.rmtree(waits, ignore_errors=True)
         if mark:
@@ -5131,7 +5131,7 @@ def _host_verdict(cmd: Any, rc: int, repo: Path, text: str, say: Callable[[str],
 
 
 def _gated(cmd: Any) -> bool:
-    """Whether the tests gate (_gate) may judge check `cmd`: a local check that runs
+    """Whether the tests gate (_tests_gate) may judge check `cmd`: a local check that runs
     pytest once (pushpass.resumable), or a script whose pytest runs are not known (no `"pytest"` key, no pytest
     in its words): its output tells, and its reruns select by the select plugin in PYTEST_ADDOPTS."""
     if remote_host(cmd):
@@ -5141,7 +5141,7 @@ def _gated(cmd: Any) -> bool:
                                        and not any(w in cmd for w in pushpass._OWN_ENV))
 
 
-def _gate(cmd: Any, repo: Path, env: dict, say: Callable[[str], None], head: str, target: str, seen: dict,
+def _tests_gate(cmd: Any, repo: Path, env: dict, say: Callable[[str], None], head: str, target: str, seen: dict,
           p: Project | None = None) -> int:
     """The base-vs-head tests gate for a push check that failed (`seen`: _run_one's exit code and output), as
     the push queue's batch and `ttp checks` judge one (gatejudge.judge): its failing pytest ids
@@ -5220,18 +5220,18 @@ def _gate(cmd: Any, repo: Path, env: dict, say: Callable[[str], None], head: str
 
 def _gate_here(cmd: Any, repo: Path, env: dict, say: Callable[[str], None], head: str, target: str, seen: dict,
                p: Project | None, here: Callable[[], Any]) -> int:
-    """_gate for a push check that failed; one spill_slot sent to a spill host is judged as its local
+    """_tests_gate for a push check that failed; one spill_slot sent to a spill host is judged as its local
     original (`was`, as the push batch's Batch._judged does), its reruns here in the slot `here()` takes."""
     was = getattr(cmd, "was", None)
     if was is None or not getattr(cmd, "spilled", False):
-        return _gate(cmd, repo, env, say, head, target, seen, p)
+        return _tests_gate(cmd, repo, env, say, head, target, seen, p)
     try:
         slot = here()
     except checkcap.Unavailable as e:
         say(f"{e}; not pushing")
         return CHECKS_FAILED
     with slot:
-        return _gate(was, repo, {**env, **slot.env()}, say, head, target, seen, p)
+        return _tests_gate(was, repo, {**env, **slot.env()}, say, head, target, seen, p)
 
 
 def _hard(rx: str, test_id: str) -> bool:
@@ -6618,7 +6618,7 @@ def stop_batch(p: Project, marker: Path, why: str) -> int:
     return 0
 
 
-def status_lines(p: Project) -> list[str]:
+def push_status_lines(p: Project) -> list[str]:
     """`ttp status`: a line per running or queued detached push that has retried, naming its attempt
     and the causes, so the coordinator and the user see a push that tries again by itself."""
     out = []

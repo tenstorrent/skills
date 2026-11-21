@@ -28,10 +28,10 @@ SHOWN = 5   # delta paths named in the record line before "and N more"
 
 def covers(check: Any, path: str, exclude: list[str] | tuple[str, ...] = ()) -> bool:
     """Whether a pass of `check` may depend on repo path `path`."""
-    if any(push.matches([path], g) for g in (*exclude, *getattr(check, "ignore_paths", ()))):
+    if any(push.path_matches([path], g) for g in (*exclude, *getattr(check, "ignore_paths", ()))):
         return False
     scope = getattr(check, "if_changed", ())
-    return not scope or any(push.matches([path], g) for g in scope)
+    return not scope or any(push.path_matches([path], g) for g in scope)
 
 
 def _names(repo: Path, a: str, b: str) -> list[str] | None:

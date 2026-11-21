@@ -637,7 +637,7 @@ def pre_cmd_of(v: Any) -> tuple[str, ...]:
     """A `checks.spill_pre_cmd` value as argv words; () when unset or empty. ValueError when it is not a
     string or does not parse."""
     from . import push
-    return push._words(v, f"checks.{PRE_KEY}")
+    return push._argv_words(v, f"checks.{PRE_KEY}")
 
 
 def pre_check(p, cfg: dict | None, alias: str) -> str:

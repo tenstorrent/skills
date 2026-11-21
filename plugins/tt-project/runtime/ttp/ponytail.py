@@ -6,7 +6,7 @@ A daemon-queued review of a code change (LABEL) also runs a separate ponytail re
 fresh context: is this the smallest change that solves the task, and should any of it exist? Its verdict
 goes, unedited, to FILE in the run dir. A labelled review hands off `done` only with a valid FILE
 (hook.handoff_problem), passes only when it says pass and has no blocking finding (lane_problem; a `note`
-finding never fails it), and its own `ttp push` lands only then (push._resolve). A change over a size threshold (added lines, git numstat, binaries and
+finding never fails it), and its own `ttp push` lands only then (push._resolve_target). A change over a size threshold (added lines, git numstat, binaries and
 delivery.push_exclude_paths left out) also needs a reason, a WHY line or the code task's splitgate no_split
 hand-off (reason_text): review.ponytail_land_lines before landing (the push queue's approval measures each
 approved head again, Daemon._ponytail_approval), review.ponytail_pr_lines (stricter: repos reached only by
