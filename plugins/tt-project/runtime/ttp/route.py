@@ -126,6 +126,13 @@ OWN_CAUSE_WORDS = ("timed out", "stalled", "exited without", "result.json", "exi
 # escalated: an urgent, user-ordered or fix start, or a lineage's, kept on the core provider (escalation).
 ESCALATED = "escalated"
 REASONS = ("none", *FAULTS, *RUN_CAUSES, "busy", "busy_wait_expired", "rerun", ESCALATED)
+
+
+def routed_fell(fallback: str) -> bool:
+    """True when a route note's fallback is a fallback: any REASONS value but none, rerun (the task fell back
+    before) and escalated (kept on core before it ran). It covers endpoint faults, cool-downs, full slots and the
+    auth gate, and also run causes and needs_opus."""
+    return fallback not in ("", "none", "rerun", ESCALATED)
 CHECKS_WOKE = "its checks failed"   # how the daemon's wake text after a task's failed checks starts
 LINEAGE_MISSES = 2          # routed misses (misses) that keep a lineage on the core provider
 WAIT_S = 90.0               # providers.chat.route_wait_s: how long a routed start waits for a slot
@@ -732,7 +739,7 @@ def phrase(db, now: float | None = None) -> str:
     if not rows:
         return ""
     on = [r for r in rows if r["provider"] == r["to"]]
-    fell = [r for r in rows if r["fallback"] not in ("none", "rerun", ESCALATED)]
+    fell = [r for r in rows if routed_fell(r["fallback"])]
     reruns = sum(1 for r in rows if r["fallback"] == "rerun")   # the same task starting again, not a new fallback
     escalated = sum(1 for r in rows if r["fallback"] == ESCALATED)   # kept on core before it ran (escalation)
     to = ", ".join(sorted({str(r["to"]) for r in rows}))
