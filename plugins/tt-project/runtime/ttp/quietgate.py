@@ -28,6 +28,7 @@ import time
 
 from . import userpause
 from .coordinator import task_resources
+from .coordroute import OWN_SQL   # a lane or shadow turn is no coordinator turn's price
 from .db import TERMINAL_TASK_STATES as CLOSED, deferral
 
 QUIET = "quiet: all held"
@@ -134,7 +135,7 @@ def quiet(db, cfg: dict, evs: list[dict], msgs: list, triggers, due: str | None,
 def _turn_usd(db) -> float:
     """What a routine turn costs: the mean of the last ten coordinator turns."""
     rows = db.q("SELECT cost_usd FROM runs WHERE role='coordinator' AND status!='running' "
-                "AND cost_usd IS NOT NULL ORDER BY id DESC LIMIT 10")
+                "AND cost_usd IS NOT NULL AND " + OWN_SQL + " ORDER BY id DESC LIMIT 10")
     return round(sum(float(r["cost_usd"] or 0) for r in rows) / len(rows), 4) if rows else 0.0
 
 

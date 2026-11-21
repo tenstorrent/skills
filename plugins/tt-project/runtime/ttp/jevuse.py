@@ -32,6 +32,7 @@ import json
 import time
 from typing import Any
 
+from .coordroute import OWN_SQL   # a lane or shadow turn is no coordinator wake's price
 from .db import DB
 
 OFF_KEY = "jev_uses_off"           # kv: {use: {"at", "why"}}: uses the review switched off
@@ -123,7 +124,7 @@ def mean_turn_cost(db: DB, cfg: dict, now: float | None = None, effort: str | No
     price of a wake avoided. WAKE_COST_FALLBACK_USD while no such turn was measured."""
     now = time.time() if now is None else now
     sql = ("SELECT AVG(cost_usd) c FROM runs WHERE role='coordinator' AND status!='running' "
-           "AND cost_usd>0 AND started>=?")
+           "AND cost_usd>0 AND started>=? AND " + OWN_SQL)
     args: tuple = (now - window_s(cfg),)
     if effort is not None:
         sql, args = sql + " AND COALESCE(effort,'')=?", args + (effort,)

@@ -70,6 +70,7 @@ import time
 import uuid
 
 from . import coordsession
+from .coordroute import OWN_SQL   # the coordinator's own session, never a lane or shadow turn
 from .util import as_float
 
 KEY = "coord_context"
@@ -579,7 +580,7 @@ _FAMILIES = ("opus", "sonnet", "haiku", "fable")
 def coord_model(p) -> str:
     """The --model of the coordinator's latest launch ("" when unknown)."""
     try:
-        r = p.db.one("SELECT id, dir FROM runs WHERE role='coordinator' ORDER BY id DESC LIMIT 1")
+        r = p.db.one("SELECT id, dir FROM runs WHERE role='coordinator' AND " + OWN_SQL + " ORDER BY id DESC LIMIT 1")
         if not r:
             return ""
         from pathlib import Path
@@ -678,7 +679,7 @@ def coord_shape(p) -> dict | None:
     and its system prompt text. None when it has none to share (no run, or its system prompt went
     into the prompt, too long for a file argument)."""
     try:
-        r = p.db.one("SELECT id, dir FROM runs WHERE role='coordinator' ORDER BY id DESC LIMIT 1")
+        r = p.db.one("SELECT id, dir FROM runs WHERE role='coordinator' AND " + OWN_SQL + " ORDER BY id DESC LIMIT 1")
         if not r:
             return None
         from pathlib import Path

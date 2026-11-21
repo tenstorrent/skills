@@ -24,6 +24,7 @@ import re
 import time
 
 from . import coordstats, timefmt
+from .coordroute import OWN_SQL   # a lane or shadow turn is no coordinator wake
 
 UNVERIFIED = "(unverified)"
 HEAD = "Coordinator wake mode (from ttp stats --coord-session's record, not the setting):"
@@ -70,7 +71,8 @@ def today_counts(db, tz: str, now: float | None = None) -> dict:
     now = time.time() if now is None else now
     start, end = coordstats._day_bounds(timefmt.today(now, tz), tz)
     out = {"resume": 0, "new": 0, "off": 0}
-    for r in db.q("SELECT note FROM runs WHERE role='coordinator' AND started>=? AND started<?", (start, end)):
+    for r in db.q("SELECT note FROM runs WHERE role='coordinator' AND started>=? AND started<? AND " + OWN_SQL,
+                  (start, end)):
         s = _turn(r["note"]).get("session")
         mode = s.get("mode") if isinstance(s, dict) else None
         out[mode if mode in MODES else "off"] += 1
@@ -79,7 +81,7 @@ def today_counts(db, tz: str, now: float | None = None) -> dict:
 
 def latest(db) -> tuple[str, str] | None:
     """(mode, reason) of the latest coordinator wake, or None when there is none."""
-    r = db.one("SELECT note, status FROM runs WHERE role='coordinator' ORDER BY id DESC LIMIT 1")
+    r = db.one("SELECT note, status FROM runs WHERE role='coordinator' AND " + OWN_SQL + " ORDER BY id DESC LIMIT 1")
     return of_note(r["note"], r["status"] or "ok") if r else None
 
 

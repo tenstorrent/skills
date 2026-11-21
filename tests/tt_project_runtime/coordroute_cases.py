@@ -460,6 +460,40 @@ def test_coordroute_lane_rows_never_count_as_the_coordinators_own_turn(env):
     assert [coordroute.lane_of_row(r) for r in p.db.q("SELECT note FROM runs ORDER BY id")] == ["", "routine", "shadow"]
 
 
+
+@pytest.mark.parametrize("caller", ["wakemode.latest", "wakemode.today_counts", "ctxfork.coord_model",
+                                    "ctxfork.coord_shape", "jevuse.mean_turn_cost", "quietgate._turn_usd",
+                                    "wakesettle.median_usd"])
+def test_coordinator_turn_readers_skip_a_newer_lane_or_shadow_turn(env, caller):
+    from ttp import coordroute, ctxfork, jevuse, quietgate, timefmt, wakemode, wakesettle
+    p = make(env)
+    now = time.time()
+    system = p.state / "coord-system.txt"
+    system.write_text("the coordinator's system prompt")
+
+    def turn(model, usd, note, ago):
+        rid = p.db.x("INSERT INTO runs(role,provider,model,started,ended,status,cost_usd,note) "
+                     "VALUES('coordinator','claude',?,?,?,'ok',?,?)", (model, now - ago, now - ago + 30, usd, json.dumps(note)))
+        d = p.runs / str(rid)
+        d.mkdir(parents=True, exist_ok=True)
+        argv = ["claude", "--model", model, "--json-schema", "{}", "--append-system-prompt-file", str(system)]
+        (d / "run.json").write_text(json.dumps({"argv": argv}))
+        return rid
+    own = turn("opus", 1.0, {"turn": {"session": {"mode": "resume"}}}, 120)
+    turn("glm-x", 0.02, {coordroute.SHADOW: {"of": own}}, 60)
+    turn("glm-x", 0.02, {coordroute.LANE: "routine"}, 30)
+    got = {"wakemode.latest": lambda: wakemode.latest(p.db)[0],
+           "wakemode.today_counts": lambda: wakemode.today_counts(p.db, timefmt.home(p), now=now),
+           "ctxfork.coord_model": lambda: ctxfork.coord_model(p),
+           "ctxfork.coord_shape": lambda: ctxfork.coord_shape(p)["run"],
+           "jevuse.mean_turn_cost": lambda: jevuse.mean_turn_cost(p.db, p.config(), now=now),
+           "quietgate._turn_usd": lambda: quietgate._turn_usd(p.db),
+           "wakesettle.median_usd": lambda: wakesettle.median_usd(p.db, now)}[caller]()
+    today = {"resume": 1, "new": 0, "off": 0} if timefmt.today(now - 120, timefmt.home(p)) == timefmt.today(now, timefmt.home(p)) \
+        else {"resume": 0, "new": 0, "off": 0}
+    assert got == {"wakemode.latest": "resume", "wakemode.today_counts": today, "ctxfork.coord_model": "opus",
+                   "ctxfork.coord_shape": own}.get(caller, 1.0), got
+
 # The GLM-arm ask-Opus switches (glmassist.py) ----------------------------------------------------------------
 
 def test_glmassist_switches_are_off_by_default_and_told_to_the_run_only_when_on():

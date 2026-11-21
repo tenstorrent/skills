@@ -37,6 +37,7 @@ import re
 import statistics
 import time
 
+from .coordroute import OWN_SQL   # a lane or shadow turn is no coordinator wake's price
 from .eventhold import SEVERITIES
 
 
@@ -108,7 +109,8 @@ def median_usd(db, now: float) -> float:
     if now - float(seen.get("at") or 0) < MEDIAN_TTL_S and seen.get("usd") is not None:
         return float(seen["usd"])
     costs = [float(r["cost_usd"] or 0) for r in db.q(
-        "SELECT cost_usd FROM runs WHERE role='coordinator' AND started>? AND cost_usd>0", (now - MEDIAN_WINDOW_S,))]
+        "SELECT cost_usd FROM runs WHERE role='coordinator' AND started>? AND cost_usd>0 AND " + OWN_SQL,
+        (now - MEDIAN_WINDOW_S,))]
     usd = round(statistics.median(costs), 4) if costs else DEFAULT_USD
     db.set_kv(MEDIAN_KEY, {"at": now, "usd": usd})
     return usd
