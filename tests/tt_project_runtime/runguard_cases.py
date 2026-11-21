@@ -9,6 +9,8 @@ PROXY_PORT = "40295"
 @pytest.fixture
 def run_env(tmp_path, monkeypatch):
     """A worker run's environment as the runner sets it (token, proxy port), in a scratch home."""
+    for k in [k for k in os.environ if k.endswith("_BASE_URL")]:   # a base url of the run this
+        monkeypatch.delenv(k, raising=False)                       # suite runs in is not the run's
     for k in ("HOME", "XDG_CONFIG_HOME", "GH_CONFIG_DIR"):
         monkeypatch.setenv(k, str(tmp_path / "home"))
     monkeypatch.setenv("TTP_RUN_DIR", str(tmp_path / "run"))
