@@ -35,7 +35,7 @@ def digest(text: str) -> str:
     return hashlib.sha256(str(text).encode("utf-8", "replace")).hexdigest()[:16]
 
 
-def chat_run(run: dict | None, cfg: dict | None = None) -> bool:
+def chat_run(run: dict | None) -> bool:
     """Whether `run` ran on the chat provider (the one GLM runs use)."""
     return str((run or {}).get("provider") or "") == "chat"
 
