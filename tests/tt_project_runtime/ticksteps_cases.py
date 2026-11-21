@@ -953,6 +953,7 @@ FINISH_ROUND_MEMORY = {
     "_cycles": "a cache of host-cycle records read from files, not from the rolled-back rows",
     "_nofix": "scratch: _fix_failed_review sets it before each use",
     "_revert_note": "scratch: as _nofix, _fix_failed_review clears it before each use",
+    "_fix_cut": "scratch: as _nofix, a git time budget cutting the fix's branch read sets it",
     "_net_holds": "a hold a run that reached its API proved over: kept ended; its kv row, if rolled back, "
                   "is rewritten on the next hold change and dropped after NET_HOLD_MAX_S on a restart",
     "_wait_what_errs": "a log-once set: a retried round may drop that one line, never repeat it",
