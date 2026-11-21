@@ -4793,7 +4793,7 @@ def _round_checks(repo: Path, remote: str, branch: str, run: list, head: str, ti
     return None, started, env, excused
 
 
-def _kill_process_tree(pid: int) -> None:
+def _kill_tree(pid: int) -> None:
     """SIGKILL process `pid` and every descendant /proc shows (Linux; elsewhere only `pid`)."""
     kids: dict[int, list[int]] = {}
     for d in Path("/proc").glob("[0-9]*"):
@@ -4846,7 +4846,7 @@ def _copy_out(stream, collect: workerloss.Collector, keep: deque | None = None) 
 
 def _kill_check(proc: subprocess.Popen) -> None:
     """End check `proc` and every process under it, and reap it (_timed_wait)."""
-    _kill_process_tree(proc.pid)
+    _kill_tree(proc.pid)
     proc.wait()
 
 
