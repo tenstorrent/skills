@@ -311,6 +311,30 @@ def test_config_breakage_blames_a_spill_host_list_only_for_runs_on_hosts_it_adde
     assert "undo" not in _config_events(p, "config_breakage")[0]["text"].split("The user set")[0].split("since")[-1]
 
 
+def test_config_breakage_blames_the_newest_of_two_changes_sharing_a_millisecond(env, monkeypatch):
+    """The change rows keep their timestamps rounded to milliseconds, so two changes of one key can
+    share one: the watch must then blame the newest change (the last row: the user\'s set right after a
+    reset), never the older one, whose undo lines would leak into the event\'s wording."""
+    from ttp import configwho
+    p = make(env)
+    _config_clear_run_env(monkeypatch)
+    clock = {"t": time.time()}
+    monkeypatch.setattr(configwho, "time", types.SimpleNamespace(time=lambda: clock["t"]))
+    p.set_config("checks.spill_beside_device", ["spill-a"])
+    change, put = _breakage_setup(p, "checks.spill_beside_device", ["spill-a", "new-1", "new-2"],
+                                  configwho.by("user", via="config"))
+    put((60, False, "spill-a", "3", {}), (90, False, "spill-b", "4", {}), (120, False, "", "5", {}))
+    assert configwho.watch(p, now=change + 300) == [], "no failing run used a host the change added"
+    clock["t"] = round(clock["t"], 3) + 0.001   # the reset and the set share this millisecond
+    p.set_config("checks.spill_beside_device", ["spill-a"])
+    change, put = _breakage_setup(p, "checks.spill_beside_device", ["spill-a", "new-1", "new-2"],
+                                  configwho.by("user", via="config"))
+    put((-700, True, "new-1", "6", {}), (-650, True, "new-2", "6", {}),
+        (60, False, "new-1", "3", {}), (90, False, "new-2", "4", {}), (120, False, "new-1", "5", {}))
+    assert configwho.watch(p, now=change + 300) == [f"config_breakage:checks.spill_beside_device:{change}"]
+    assert "The user set this value" in _config_events(p, "config_breakage")[0]["text"]
+
+
 def test_config_breakage_skips_failures_known_on_the_base_flaky_or_proven_new(env, monkeypatch):
     """Failed runs whose failing ids also failed on a base on the same host (the push-branch tip the gate
     reran), are quarantined as flaky, or that the gate proved new against the base at the same config,

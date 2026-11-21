@@ -507,7 +507,8 @@ def watch(p, now: float | None = None) -> list[str]:
     if not changes:
         return []
     runs = _runs(p)
-    for c in sorted(changes, key=lambda r: -float(r["ts"])):
+    # timestamps are rounded to milliseconds, so changes can tie; the newest is the last log row
+    for c in sorted(reversed(changes), key=lambda r: -float(r["ts"])):
         ts = float(c["ts"])
         after = [r for r in runs if ts < r["ts"] <= now and _used(c, r)
                  and (r["passed"] or not _known_failures(p, r, now))]
