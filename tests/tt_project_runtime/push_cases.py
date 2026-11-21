@@ -22943,3 +22943,38 @@ def test_a_lease_replace_retires_the_push_branch_tip_it_replaced_but_never_an_ow
     assert push._own_push_head(repo, "origin", "proj", _git_out(repo, "rev-parse", "HEAD"),
                                _git_out(repo, "rev-parse", "origin/proj"), True, lambda m: None, p) == 0
     assert landed.retired_tips(p) == [old]
+
+
+def test_an_untrusted_fix_of_an_external_change_commits_its_head_and_publishes_nothing(env):
+    """A failed review of an untrusted_input code task's external change: its fix task is told to commit in
+    its own clone and name the new local head, with no publish step."""
+    p = make(env)
+    _, _, _, (rev,) = _finish_code(env, p, "widget fix", {}, result=_ext_handoff("cd" * 20),
+                                   labels=["untrusted_input"])
+    _fail_review(env, p, rev["id"], [{"title": "add the missing test", "spec": "test_y must fail"}])
+    (fix,) = p.db.q("SELECT * FROM tasks WHERE kind='code' AND origin='daemon'")
+    assert "untrusted_input" in fix["labels"]
+    assert "publish the fix" not in fix["spec"] and "fast-forward" not in fix["spec"], fix["spec"]
+    assert "commit the fix there and publish nothing" in fix["spec"] and "new local head" in fix["spec"]
+
+
+def test_a_push_refused_before_any_remote_write_is_not_a_claim(env):
+    """A detached push that ended refused or rejected wrote nothing to the remote: its hand-off claims no
+    push. A push that failed its checks, or one that pushed, still is a claim."""
+    from ttp import push, pushclaim
+    p = make(env)
+    tid = p.db.add_task("t", "s", kind="code", origin="coordinator")
+    folder = p.state / push.DETACHED
+    folder.mkdir(parents=True, exist_ok=True)
+
+    def marker(name, **m):
+        (folder / f"t{tid}-{name}.json").write_text(json.dumps({"run": 7, "target": "origin/main", **m}))
+
+    marker("a", status="failed", exit=push.REJECTED)
+    marker("b", status="failed", exit=push.REFUSED)
+    assert pushclaim.marker_claims(p, tid, 7) == []
+    assert pushclaim.claims(p, p.db.task(tid), {"status": "done", "summary": "committed"}, {"id": 7}) == []
+    marker("c", status="failed", exit=push.CHECKS_FAILED)
+    assert [c["marker"] for c in pushclaim.marker_claims(p, tid, 7)] == [f"t{tid}-c.json"]
+    marker("d", status="pushed", exit=0, sha="ab" * 20)
+    assert [c["marker"] for c in pushclaim.marker_claims(p, tid, 7)] == [f"t{tid}-d.json"]

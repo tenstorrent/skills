@@ -410,3 +410,32 @@ def test_ttp_slop_diff_prints_a_small_diff_of_a_large_tree_and_a_clear_message_w
     with pytest.raises(SystemExit) as done:
         cli.main(["slop", "--diff", f"{base}..{head}"])
     assert done.value.code == 2 and "time budget" in capsys.readouterr().err
+
+
+def test_ttp_slop_and_the_deslop_pass_scan_the_repos_a_plain_folder_project_names(env, monkeypatch, tmp_path, capsys):
+    """A project root that is a plain folder: `deslop.repos` names the git repositories `ttp slop` and the
+    deslop pass scan (relative to the root or absolute); unset, the root itself is read and git refuses."""
+    import shutil
+    import pytest
+    from ttp import cli, deslop, project
+    p, dm, s = _deslop_project(env, monkeypatch)
+    shutil.rmtree(p.root / ".git")
+    code = p.root / "code"
+    code.mkdir()
+    _git_out(code, "init", "-q")
+    (p.root / "pkg").rename(code / "pkg")
+    _git_out(code, "add", ".")
+    _git_out(code, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "base")
+    monkeypatch.chdir(tmp_path)   # no repository here either
+    with pytest.raises(SystemExit):
+        cli.main(["slop", p.name])
+    assert "not a git repository" in capsys.readouterr().err
+    p.set_config("deslop.repos", ["code"])
+    assert "deslop.repos" not in " ".join(project.config_problems(p.raw_config()))
+    cli.main(["slop", p.name])
+    assert "pkg" in capsys.readouterr().out
+    dm.cfg["deslop"] = {"enabled": True, "repos": [str(code)]}   # absolute works too
+    assert dm._schedule_llm(s, dict(deslop.PAYLOAD)) == "queued", "scanned the named repository"
+    (t,) = _deslop_tasks(p)
+    assert f"--repo {code.resolve()}" in t["spec"]
+    assert p.db.kv(deslop.KEY)["passes"][-1]["repo"] == str(code.resolve())

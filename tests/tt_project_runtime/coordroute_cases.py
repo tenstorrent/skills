@@ -598,3 +598,25 @@ def test_coordroute_resume_leaves_no_old_escalation_to_suspend_the_lane_again_at
     for i in range(coordroute.SUSPEND_MIN):
         st = coordroute.record_turn(p.db, 200 + i, {}, [], [], [], "needs a judgement call")
     assert "escalated" in st["suspended"]["why"], "new escalations suspend it again"
+
+
+def test_coordinator_model_and_status_read_the_own_turn_not_a_newer_lane_or_shadow_turn(env):
+    from ttp import coordmodel, coordroute, coordstats, timefmt, web
+    p = make(env)
+    p.set_config("core_provider", "claude")
+    now = time.time()
+
+    def turn(provider, model, effort, status, note, ago):
+        return p.db.x("INSERT INTO runs(role,provider,model,effort,started,ended,status,cost_usd,note) "
+                      "VALUES('coordinator',?,?,?,?,?,?,0.1,?)",
+                      (provider, model, effort, now - ago, now - ago + 30, status, json.dumps(note)))
+    turn("claude", "opus", "xhigh", "ok", {"turn": {"session": {"mode": "resume"}}}, 120)
+    turn("chat", "glm-x", "", "error", {coordroute.SHADOW: {"of": 1}}, 60)
+    turn("chat", "glm-x", "", "error", {coordroute.LANE: "routine"}, 30)
+    line = coordmodel.line(p.config(), p.db, p)
+    assert "last turn" in line and "MISMATCH" not in line, line
+    assert web.health(p, p.db, now=now)["coordinator"]["last_status"] == "ok"
+    days = coordstats.report(p.db, p.runs, timefmt.home(p), 1, now=now)["by_day"]
+    assert all(not d["mode_off"] for d in days), days
+    turn("claude", "sonnet", "high", "ok", {}, 10)   # the coordinator's own turn ran otherwise
+    assert "MISMATCH: it ran with model sonnet, effort high" in coordmodel.line(p.config(), p.db, p)

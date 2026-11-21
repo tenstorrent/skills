@@ -3278,6 +3278,13 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                     # No task status 'waiting' exists (db.waiting_handoff): written, nothing would dispatch,
                     # probe or wake the task again.
                     raise ValueError(f"#{task['id']} rejected: {NO_WAITING_STATUS}")
+                raised_usd = None
+                if a.get("budget_usd") is not None:   # raise only (topup.raise_refusal); the dollar caps stay
+                    if refused := topup.raise_refusal(task, a["budget_usd"]):
+                        raise ValueError(f"#{task['id']} rejected: {refused}")
+                    raised_usd = upd["budget_usd"] = round(float(a["budget_usd"]), 2)
+                    if task["status"] == "blocked" and task["blocked_reason"] == topup.HOLD_REASON:
+                        upd.update(status="queued", blocked_reason=None)
                 if a.get("status") in ("queued", "blocked", "cancelled", "done"):
                     if task["status"] == "running" and a["status"] != "cancelled":
                         raise InfoRejection(f"task #{task['id']} is running: send `spec` alone to steer it mid-run, "
@@ -3508,6 +3515,8 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                     if waits or anchors.without(labels) != labels:
                         upd["labels"] = anchors.without(labels) + ([waits] if waits else [])
                 db.update_task(task["id"], **upd)
+                if raised_usd is not None:
+                    topup.record_raise(db, task, raised_usd)
                 if cleared:   # the audit trail of who vouched for the task's source
                     db.x("INSERT INTO events(ts,source,kind,severity,text,data,status,task) VALUES(?,?,?,?,?,?,?,?)",
                          (time.time(), "coordinator", untrusted.CLEARED_KIND, "low",

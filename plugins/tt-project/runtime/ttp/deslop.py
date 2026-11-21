@@ -11,8 +11,12 @@ while the last one is open (the schedule's own one-open-run rule). The task's sp
 change no behaviour, keep the tests green, respect holds, change freezes and settled areas, and never run
 device or machine work; its review compares the before and after numbers the spec carries.
 
+With `deslop.repos` set (a project root that is a plain folder) each named repository's working tree is
+scanned instead and the worst pick of them all wins; its spec and pass name the repository, and its rows
+in last_scan are keyed `<repo>:<subsystem>`.
+
 State, kv `deslop`: {"baseline": the first scan's rows, "last_scan": the newest, "passes": [{at,
-subsystem, task, ref, before, excess}] newest last}.
+subsystem, task, ref, before, excess, repo}] newest last}.
 """
 from __future__ import annotations
 
@@ -102,10 +106,12 @@ def _settled_files(p) -> set[str]:
     return {f for r in settled.live(p) for f in r.get("files") or []}
 
 
-def spec(p, c: dict, sub: str, row: dict, ref: str | None) -> str:
+def spec(p, c: dict, sub: str, row: dict, ref: str | None, repo: str = "") -> str:
     frozen = _settled_files(p)
+    at = f" --repo {repo}" if repo else ""
     lines = [
-        f"Goal: one de-slop refactor of the subsystem `{sub}`, chosen by the model-free scan (`ttp slop {p.name}`) "
+        f"Goal: one de-slop refactor of the subsystem `{sub}`" + (f" of the repository {repo}" if repo else "")
+        + f", chosen by the model-free scan (`ttp slop {p.name}{at}`) "
         "as the one furthest over its code-quality targets and not refactored lately. No behaviour change.",
         f"Numbers now (scan of {ref or 'the working tree'}): {_numbers(row, c)}.",
         f"Acceptance: cut each over-target number above by at least {c['step_share']:.0%}, or to its target. Merge "
@@ -120,7 +126,7 @@ def spec(p, c: dict, sub: str, row: dict, ref: str | None) -> str:
         + "; if the subsystem is frozen, do nothing and say so in the hand-off. Never run device or machine work. "
         "Leave generated copies and vendored code alone. Run only the affected tests while iterating, then the "
         "project's checks once.",
-        f"Hand-off: the before and after numbers of `{sub}` (run `ttp slop {p.name} --ref <head> --subsystem {sub}` "
+        f"Hand-off: the before and after numbers of `{sub}` (run `ttp slop {p.name}{at} --ref <head> --subsystem {sub}` "
         "and read its row) and the commits. Its review checks those numbers and fails a change whose numbers did not improve "
         "or that changed behaviour.",
     ]
@@ -136,21 +142,28 @@ def plan(p, cfg: dict, now: float | None = None) -> dict | str:
         return OFF_SKIP
     if projpause.current(db):
         return "skipped: the project is paused"
-    ref = _base(p)
-    infos = slop.scan_files(p.root, ref, c, None, str(p.state / "slop-cache.json"))
-    rows = _rows(slop.aggregate(infos, c), c["thresholds"])
+    # deslop.repos: each named repository's working tree, the worst pick of them all; else the root's base
+    targets = [(str(r), None) for r in slop.repos(p.root, c)] or [("", _base(p))]
     state = db.kv(KEY, {}) or {}
-    state["last_scan"] = {"at": now, "ref": ref, "subsystems": rows}
+    state["last_scan"], best = {"at": now, "ref": targets[0][1], "subsystems": {}}, None
+    for repo, ref in targets:
+        infos = slop.scan_files(repo or p.root, ref, c, None, str(p.state / "slop-cache.json"))
+        rows = _rows(slop.aggregate(infos, c), c["thresholds"])
+        state["last_scan"]["subsystems"].update({f"{repo}:{n}" if repo else n: v for n, v in rows.items()})
+        recent = {x.get("subsystem") for x in state.get("passes") or [] if (x.get("repo") or "") == repo
+                  and now - float(x.get("at") or 0) < c["gap_days"] * 86400}
+        pick = slop.pass_target(infos, c, recent | _settled_files(p))
+        if pick and (best is None or pick[1] > best[1][1]):
+            best = (repo, pick, ref)
     state.setdefault("baseline", state["last_scan"])
-    recent = {x.get("subsystem") for x in state.get("passes") or [] if now - float(x.get("at") or 0) < c["gap_days"] * 86400}
-    pick = slop.pass_target(infos, c, recent | _settled_files(p))
     db.set_kv(KEY, state)
-    if not pick:
+    if not best:
         return "skipped: every subsystem is under its targets or was refactored lately"
-    sub, excess, numbers = pick
+    repo, (sub, excess, numbers), ref = best
     row = _pass_row(numbers, c["thresholds"])
-    return {"title": f"[{SCHEDULE}] refactor {sub}: {excess} over targets, no behaviour change", "spec": spec(p, c, sub, row, ref),
-            "subsystem": sub, "ref": ref, "row": row, "excess": excess}
+    return {"title": f"[{SCHEDULE}] refactor {sub}: {excess} over targets, no behaviour change",
+            "spec": spec(p, c, sub, row, ref, repo), "subsystem": sub, "ref": ref, "row": row, "excess": excess,
+            "repo": repo}
 
 
 def record(db, picked: dict, task: int, now: float | None = None) -> None:
@@ -158,5 +171,5 @@ def record(db, picked: dict, task: int, now: float | None = None) -> None:
     state = db.kv(KEY, {}) or {}
     state["passes"] = (state.get("passes") or [])[-(KEEP_PASSES - 1):] + [
         {"at": time.time() if now is None else now, "subsystem": picked["subsystem"], "task": task,
-         "ref": picked["ref"], "before": picked["row"], "excess": picked["excess"]}]
+         "ref": picked["ref"], "before": picked["row"], "excess": picked["excess"], "repo": picked.get("repo") or ""}]
     db.set_kv(KEY, state)

@@ -8136,7 +8136,7 @@ class Daemon:
             new = {"done": "done", "blocked": "blocked", "failed": "failed", "needs_review": "review"}[rstatus]
         elif status in FREE_ENDS or reboot_lost:
             new = "queued"   # not an attempt: the account refused or the host went down, the task did not fail
-        elif turnsize.over_budget(status, usage) and topup.eligible(task) and topup.enabled(self.cfg):
+        elif turnsize.over_budget(status, usage) and topup.eligible(task, db) and topup.enabled(self.cfg):
             # An urgent or user-ordered task stopped by its budget (the runner's check, or the agent's
             # own cap: a failed run with error_max_budget_usd) is topped up and continued at the next
             # dispatch (topup.py), not failed, unless it repeats the run before its last top-up.
@@ -12980,7 +12980,7 @@ class Daemon:
                 db.update_task(task["id"], budget_usd=task["budget_usd"])
             # An urgent or user-ordered task never waits on its spent budget: raised here, model-free
             # (topup.py); the dollar caps in _start_hold still hold it.
-            if topup.spent(task) and topup.eligible(task) and topup.enabled(self.cfg):
+            if topup.spent(task) and topup.eligible(task, db) and topup.enabled(self.cfg):
                 task = topup.top_up(db, self.cfg, task, head=self._branch_head(task), now=now)
             # Before _start_hold: a review whose pre-review checks failed needs no reviewer, nor its gates.
             if task["kind"] == "review" and self._precheck_failed(task):
@@ -13499,7 +13499,7 @@ class Daemon:
         if not topup.enabled(self.cfg):
             return
         for t in self.p.db.q("SELECT * FROM tasks WHERE status='blocked' AND blocked_reason='task budget exhausted'"):
-            if topup.eligible(t):
+            if topup.eligible(t, self.p.db):
                 self.p.db.update_task(t["id"], status="queued", blocked_reason=None)
                 log(self.p, f"task {t['id']}: released from its budget hold for a top-up")
 
@@ -20362,13 +20362,23 @@ class Daemon:
             lines.append(note)
         lane = None   # the ponytail lane's label, for a code change (sa50: _code_change is the predicate)
         if ponytail.on(cfg) and self._code_change(task):
-            added = None
+            added, own = None, True
             if not ext and not published and branch and full:
                 try:
-                    added = ponytail.added_lines(self.p.root, worktree.own_base(self.p, task, branch)[0], full,
-                                                 push.exclude_list(d.get("push_exclude_paths")))
+                    added, own = ponytail.own_size(self.p, task, branch, full,
+                                                   push.exclude_list(d.get("push_exclude_paths")))
                 except Exception as e:
                     log(self.p, f"task {task['id']}: its added lines were not read: {e}")
+            # Refused here, model-free, what its review would only fail: nothing of its own to review, or
+            # over the size limit with no `why this size:` line (the lane's verdict is the review's to give).
+            text = ponytail.reason_text({}, {"summary": summary}, [task])
+            if not own:
+                log(self.p, f"task {task['id']}: no review queued, head {head} has no commit of its own "
+                            f"off the push branch (or each of its patches is already there)")
+                return None
+            if not ponytail.WHY.search(text) and (why := ponytail.size_problem(cfg, added, text, None)):
+                self._size_refused(task, full, why)
+                return None
             lines.append(ponytail.spec_line(cfg, added))
             lane = ponytail.label(added)
         fups = load_result(task.get("result")).get("followups")
@@ -21282,6 +21292,19 @@ class Daemon:
             log(self.p, f"continue hop after #{task['id']}: " + traceback.format_exc().replace("\n", " | ")[:1000])
             return ""
 
+    def _size_refused(self, task: dict, full: str, why: str) -> None:
+        """No review for code task `task`'s head `full`, refused by the size rule (`why`) before a review
+        ran: the task goes back to its worker once per head (chaincap.requeue) to add its reason line or
+        make the change smaller; when it cannot (not done, re-queues off), the coordinator decides."""
+        mark = f"review refused before it ran, head {full[:12]}"
+        task = self.p.db.task(task["id"]) or task
+        if mark not in str(task.get("spec") or "") and self._requeue_continue(task, {"title": mark, "spec": (
+                f"No review was queued: {why}. Add that line to your hand-off, or make the change smaller, "
+                f"then hand off again.")}, mark, int(task.get("attempts") or 0)):
+            log(self.p, f"task {task['id']}: no review queued, sent back to its worker: {why}")
+        else:
+            log(self.p, f"task {task['id']}: no review queued: {why}")
+
     def _requeue_continue(self, task: dict, fup: dict, why: str, attempts: int) -> bool:
         """chaincap.requeue for a done code task _continue_ready passed; False when it cannot be done (a new
         hop is then queued as before)."""
@@ -21709,8 +21732,8 @@ class Daemon:
     def _fix_external_review(self, review: dict, first: dict, code: dict, ch: dict, fups: list[dict],
                              summary: str) -> tuple[int, int, list[int]]:
         """_fix_failed_review for a review of code task `code`'s change published in another repository
-        (`ch`, extchange): one fix task that publishes onto the same branch there and names its new head
-        in its hand-off's `published`, and a review-only re-review that waits on it and takes over the
+        (`ch`, extchange): one fix task that publishes onto the same branch there (an untrusted_input one
+        only commits in its clone) and names its new head in its hand-off's `published`, and a review-only re-review that waits on it and takes over the
         failed review's dependents. Neither touches the project's own git."""
         cfg, db = self.cfg, self.p.db
         base_title = re.sub(r"^(?:Fix review #\d+: )+", "", code["title"])
@@ -21744,11 +21767,15 @@ class Daemon:
                 f"Fix the blocking findings of review #{review['id']} ({review['title']}) on code task "
                 f"#{code['id']} ({code['title']}).",
                 f"Its change lives in an external repository: {where}, head {ch['head']}. Work in your own "
-                f"clone of it on top of that head, then publish the fix to the same branch {ch['branch']} of "
-                f"{ch['repo'] or 'that repository'} (a fast-forward, never a force-push), and name the new head in "
-                f"your hand-off: " + (f'"{extchange.FIELD}": {{"repo": "{ch["repo"]}", "branch": "{ch["branch"]}", '
-                                      f'"head": "<new head sha>"}}. ' if ch["repo"] else
-                                      f'"branch": "{ch["branch"]}", "head": "<new head sha>" (top level). ') +
+                f"clone of it on top of that head, then " + (
+                    f"commit the fix there and publish nothing: this task reads untrusted input, so it pushes to "
+                    f"no remote. Name the clone's path in your summary and its new local head in your hand-off: "
+                    if untrusted.labelled(code) else
+                    f"publish the fix to the same branch {ch['branch']} of {ch['repo'] or 'that repository'} (a "
+                    f"fast-forward, never a force-push), and name the new head in your hand-off: ") +
+                (f'"{extchange.FIELD}": {{"repo": "{ch["repo"]}", "branch": "{ch["branch"]}", '
+                 f'"head": "<new head sha>"}}. ' if ch["repo"] else
+                 f'"branch": "{ch["branch"]}", "head": "<new head sha>" (top level). ') +
                 f"Push nothing to this project's push branch, and open no pull request. Re-review #{rid} "
                 f"checks each finding once this task is done.",
                 f"Findings to fix:\n{found}",

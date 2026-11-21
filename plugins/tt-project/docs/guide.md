@@ -941,6 +941,9 @@ coordinator with that evidence.
   delta and a rule that fails a change re-implementing a rule an existing function decides, adding an incident-diary
   comment or docstring, or adding a test that only replays one incident; the code-worker prompt says the same, and
   the daily review quotes the scan numbers. Scan flags are findings for the reviewer to judge, not verdicts.
+  `deslop.repos` (a list of repository paths, relative to the project root or absolute) names the repositories
+  `ttp slop` and the periodic pass scan, for a project root that is a plain folder; unset, the scan reads the
+  repository holding the current directory, else the project root.
   The periodic pass (deslop.py) is the llm schedule `deslop`, on only while `deslop.enabled` is true (default off;
   the daemon checks the flag hourly and adds or removes the schedule, every `deslop.every`, default 1d). Each pass
   scans the base branch, records the numbers against the targets (kv `deslop`: baseline, newest scan, past passes),

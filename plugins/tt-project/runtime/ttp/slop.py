@@ -49,6 +49,7 @@ DEFAULTS = {
                    "noise_share": 0.1},
     "exclude": [],               # path globs left out of the scan
     "budget_s": 20,              # a delta's scan budget: past it the numbers stand, the duplicate check narrows
+    "repos": [],                 # git repos to scan, relative to the project root or absolute; [] = the project root
 }
 CONTAINERS = {"plugins", "packages", "apps", "libs", "services", "modules", "src", "crates"}
 SKIP_DIRS = {"node_modules", "vendor", "third_party", "build", "dist", "target", "__pycache__", "venv", ".venv",
@@ -385,6 +386,12 @@ def repo(project_root, cwd=None, given: str | None = None) -> Path:
     if top and Path(top).resolve() not in (root, *root.parents):
         return Path(top).resolve()
     return Path(project_root)
+
+
+def repos(project_root, cfg: dict | None) -> list[Path]:
+    """deslop.repos: the repositories a project-wide scan reads (a project root that is a plain folder holding
+    them); [] when unset (the project root itself)."""
+    return [(Path(project_root) / str(r)).resolve() for r in (cfg or {}).get("repos") or []]
 
 
 def _excluded(path: str, globs: list[str]) -> bool:

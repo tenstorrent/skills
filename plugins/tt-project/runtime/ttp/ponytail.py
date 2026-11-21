@@ -76,6 +76,35 @@ def added_lines(repo, base: str, head: str, exclude: list[str] = ()) -> int | No
                                               if n and not any(matches([f], g) for g in exclude))
 
 
+def own_size(p, task: dict, branch: str, head: str, exclude: list[str] = ()) -> tuple[int | None, bool]:
+    """(lines `head` of code task `task` adds, whether it has a commit of its own). Its own commits are those
+    the push branch lacks, by commit or by patch (rev-list --cherry-pick), and that neither the configured
+    base nor a retired push tip (landed.retired_tips) holds. Its size is the smaller of the
+    measure from its own base (worktree.own_base) and from the parent of its oldest own commit: after a
+    history rewrite left that base off the push branch, only its own commits count."""
+    from . import landed, worktree
+    added = added_lines(p.root, worktree.own_base(p, task, branch)[0], head, exclude)
+    try:
+        tip = landed._push_ref(p, p.root)
+    except ValueError:
+        return added, True
+    try:
+        configured = worktree.resolve_base(p)
+    except RuntimeError:
+        configured = ""
+    found = worktree._resolve(p, [tip, configured, *landed.retired_tips(p)])
+    if not found.get(tip):
+        return added, True
+    def commits(*args: str) -> list[str]:
+        return worktree._git(p.root, "rev-list", "--no-merges", *args).split()
+    off = set(commits(head, "--not", *found.values()))
+    own = [c for c in commits("--reverse", "--right-only", "--cherry-pick", f"{found[tip]}...{head}") if c in off]
+    if not own:
+        return added, False
+    mine = added_lines(p.root, f"{own[0]}^", head, exclude)
+    return min((n for n in (added, mine) if n is not None), default=None), True
+
+
 def read(run_dir) -> dict | None:
     try:
         v = json.loads((Path(run_dir) / FILE).read_text())
