@@ -1984,10 +1984,13 @@ def test_glmenv_never_reads_a_redirects_file_descriptor_as_a_sed_target(tmp_path
     for cmd in (f"cd {wt} && sed -i 's/a/b/' mod.py 2>/dev/null; cd ..", "sed -i s/a/b/ mod.py 2>&1", "sed -i s/a/b/ mod.py 1>/dev/null"):
         assert glmenv.refusal(cmd, str(wt), str(rd), env) is None, cmd
     assert "sed -i target" in (glmenv.refusal("sed -i s/a/b/ /etc/x 2>/dev/null", str(wt), str(rd), env) or "")
-    from ttp import sidefx   # the digit is no operand, wherever the command runs
-    paths = sidefx.classify_paths("sed -i s/a/b/ mod.py 2>/dev/null", "/h", "/w", "/r")
-    assert not any(p.endswith("/2") for p in paths), paths
-    assert any(p.endswith("/2") for p in sidefx.classify_paths("cd /etc && rm -f 2 >/dev/null", "/h", "/w", "/r")), "a spaced 2"
+
+
+def test_sidefx_keeps_a_digit_operand_beside_a_redirect_of_the_same_digit():
+    from ttp import sidefx   # a word that is only digits stays an operand: no fd guess may drop a real target
+    got = sidefx.classify_paths("cd /etc && rm -f 2 >/dev/null 2>&1", "/h", "/w", "/r")
+    assert [(p, why) for p, (_, why) in got.items() if p.startswith("/etc/")] == [("/etc/2", "rm target")], got
+    assert "/etc/3" in sidefx.classify_paths("cd /etc && touch 3 >/dev/null; ls 3>/dev/null", "/h", "/w", "/r")
 
 
 def test_glmguard_gives_no_run_root_to_the_harness_owned_folders_a_spec_names(tmp_path, monkeypatch):
