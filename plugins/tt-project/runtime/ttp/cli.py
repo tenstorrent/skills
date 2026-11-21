@@ -2212,6 +2212,9 @@ def cmd_status(a) -> None:
         from . import branchcap
         if ln := branchcap.status_line(p.db, p.config()):
             print(ln)
+        from . import relaylag
+        if ln := relaylag.line(p.db):   # the daemon's last upstream read: no network here
+            print(ln)
         if ln := gatetime.waits_line(p.db, p.state):
             print(ln)
         from . import costlevers
@@ -2775,12 +2778,16 @@ def cmd_push_audit(a) -> None:
     if not p:
         die("no tt-project project here; name one: `ttp push-audit <name>`")
     got = pushclaim.audit(p, days=a.days)
+    from . import relaylag
+    relay = relaylag.line(p.db, ok_too=True)   # confirmed on a relay is not yet upstream
     if a.json:
-        print(json.dumps(got, indent=1))
+        print(json.dumps({**got, "relay": relay} if relay else got, indent=1))
         return
     for g in got["gaps"]:
         print(f"#{g['task']} {g['state']}: {g['why']}")
     print(pushclaim.summary_line({**got, "gaps": []}))
+    if relay:
+        print(relay)
 
 
 def cmd_spend_today(a) -> None:
@@ -12752,6 +12759,11 @@ def cmd_move(a) -> None:
     print(f"{p.name} move {way} {rec['host']} ({rec['name']}): {state}" + (f"; last: {rec['note']}" if rec.get("note") else ""))
 
 
+PUSH_PAUSE = re.compile(r"^push(:|$)")   # the push resource, or one push target's lock (push.lock_name)
+PUSH_PAUSE_WARNING = ("warning: a push pause that ends by the clock can lift in the middle of the operation it "
+                      "guards; end it with --end-when <probe> (a read-only check that exits 0 once that is done)")
+
+
 def cmd_pause(a) -> None:
     p = need(a.name, sys.argv[1:])
     if (a.resource or getattr(a, "machine", None)) and getattr(a, "until_reboot", False):
@@ -12794,6 +12806,8 @@ def cmd_pause(a) -> None:
         if a.cmd == "pause":
             _cite_hold(p, {"type": "resource_pause", "resource": a.resource, "paused": True,
                            "reason": getattr(a, "reason", None)})
+            if PUSH_PAUSE.match(a.resource) and not a.end_when:
+                print(PUSH_PAUSE_WARNING, file=sys.stderr)
         return
     boot = None
     if a.cmd == "pause" and getattr(a, "until_reboot", False):

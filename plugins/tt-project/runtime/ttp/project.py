@@ -821,12 +821,14 @@ EXTRA_KEYS = {
     # public_scan_paths: repo globs a public repository publishes; every push refuses a commit adding a line
     # there that names a local-state term (machine, project, user, remote host, chat id) nothing else in the
     # repository names, or a `msg #<digits>` or `task #<digits>` reference (outscan.public_problem; unset, the default: off).
+    # push_upstream: the real upstream a relay push remote forwards to (a URL readable anonymously, a
+    # remote's name, or {url, branch}); the daemon shows how far it is behind the relay (relaylag; off: unset).
     # push_retries: how often a detached push retries a cause it clears itself, a non-fast-forward
     # (--own) or a reboot that cut it short (push.retries_of; default 2, 0: never).
     "delivery": {"base_ref", "push_branch", "landed_probe", "push_checks", "post_land_checks", "push_checks_by_repo", "push_exclude_paths", "public_scan_paths", "push_rounds", "push_wait_s",
                  "push_checks_timeout_s", "push_pool_wait_s", "push_retries",
                  "version_bump", "push_queue", "push_batch_s", "push_batch_max", "push_min_gap_s", "push_age_s", "push_landing_alert_h", "push_script_torn_escalate_after",
-                 "push_setup_fault_escalate_after", "after_push",
+                 "push_setup_fault_escalate_after", "after_push", "push_upstream",
                  "push_solo_paths", "push_cap_tests", "push_entry_checks", "push_rerun_s", "push_hard_tests", "mechanical_merge_paths",
                  "after_push_timeout_s", "backup_remote", "fast_forward_also", "mirror_remotes",
                  "allow_protected_push_branch", "own_push", "own_push_remote", "own_push_reserved_lane", "deploy_restart_wait_s", "after_push_retry_s", "after_push_defer_alert_h", "plugin_version_guard",
