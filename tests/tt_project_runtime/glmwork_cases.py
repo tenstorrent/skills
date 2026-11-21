@@ -358,4 +358,4 @@ def test_a_run_that_started_on_the_glm_work_route_is_not_policy_bounced_after_a_
     fin = inspect.getsource(daemon.Daemon.finish_run)
     gate = fin[fin.index("bounce = self._policy_bounce(r)") - 400:fin.index("bounce = self._policy_bounce(r)")]
     # the run's own note names the route it took; the config at its end (the route rolled back mid-run) does not
-    assert 'routed.get(glmwork.KEY) != "glm"' in gate and "not glmwork.settings(self.cfg)" in gate
+    assert 'routed.get(glmwork.KEY) != "glm"' in gate and "glmwork.settings" not in gate

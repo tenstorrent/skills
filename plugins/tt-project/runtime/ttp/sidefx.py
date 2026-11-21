@@ -573,8 +573,9 @@ def classify_paths(cmd: str, home: str, cwd: str, run_dir: str, depth: int = 0) 
         name = toks[i].rsplit("/", 1)[-1]
         args, j = [], i + 1
         while j < len(toks) and not punct[j]:
-            if not (toks[j].isdigit() and j + 1 < len(toks) and punct[j + 1] and toks[j + 1][0] in "<>"):
-                args.append(toks[j])   # not the `2` of a `2>file` redirect: a file descriptor, no operand
+            if not (toks[j].isdigit() and j + 1 < len(toks) and punct[j + 1] and toks[j + 1][0] in "<>"
+                    and re.search(rf"(?<![\w$.-]){toks[j]}[<>]", cmd)):
+                args.append(toks[j])   # not the `2` of a `2>file` redirect (it touches the `>`): a file descriptor
             j += 1
         put(toks[i], "executed", "run as a command")
         if name == "cd":

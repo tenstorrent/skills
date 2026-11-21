@@ -116,7 +116,7 @@ REDIRECT = re.compile(r"(?<![\w$])\d*(?:&>>?|>>?|<<?<?|>&|<&)\s*(?:&?\d+-?|[^\s;
 # A program name, a variable's name or a `sleep` time the guard cannot read: a command word that is an expansion
 # (`$S 2`, `$(printf sleep)`, a backtick), `eval` of one, an indirect `${!n}` or `${${S}EC}`, `sleep $I`. Matched on
 # the command-word view only (shell_refusal), so a quoted string or a quoted heredoc body naming one is text.
-_CMD_AT = r"(?:[;&|]|(?<!\$\()\(|\b(?:do|then|else)\s)\s*"   # not the `((` of `$(($(...)+1))`
+_CMD_AT = r"(?:[;&|(]|\b(?:do|then|else)\s)\s*"
 HIDDEN = re.compile(rf"""(?m)(?:^\s*|{_CMD_AT})(?:["']?\\?\$(?:\{{\w+\}}|[A-Za-z_]\w*)["']?(?=[\s;&|)]|$)|\\?\$\()"""
                     rf"""|(?:^\s*|{_CMD_AT})["']?(?:[\w-]+\\?\$[{{A-Za-z_]|\\?\$\{{\w+\}}[\w-])"""
                     rf"""|{_CMD_AT}`|(?:^\s*|{_CMD_AT})eval\s+["'$\\]|\$\{{(?:\\?\$|!\w+\}})|(?<![\w.-])sleep\s+["']?\\?\$""")
@@ -569,40 +569,37 @@ OPENER_RE = re.compile(
     r"\b(?:open|fopen|read|readline|readlines|readFile\w*|read_text|read_bytes|load|loads|slurp)\s*\("
     r"|\b(?:open|subprocess|child_process|Popen|popen|system|exec|execv\w*|execl\w*|eval|spawn\w*|check_output|check_call"
     r"|qx|File|IO|Pathname|glob|shutil|copy\w*|rename|move|replace|link|symlink|tarfile|zipfile|requests|urlopen|urllib\w*"
-    r"|socket|http\w*|curl|wget)\b|`")
-
-
-# A command that may run a file as shell: a body it was written to could be shell, whatever OPENER_RE finds in it
-SHELL_RUN_RE = re.compile(r"(?:^|[\s;&|(=])(?:[a-z]*sh|source|chmod|exec|xargs|env|\.)(?:\s|$)|\./|\bssh\b|\bsudo\b")
+    r"|socket|http\w*|curl|wget|getline|\w*(?:Stream|Sync))\b|`")
 
 
 def code_text(cmd: str, interp: bool = False) -> str:
     """`cmd` without the heredoc bodies that are only data: a quoted body (`<<'EOF'`, no expansion) only written to a
     file (`cat > t.py <<'EOF' ... project.db ...`) opens nothing; an unquoted one runs its `$(...)` and backticks,
     and one a shell or interpreter reads runs, so they stay. `interp`: a quoted body that a script interpreter reads
-    (python, node, perl), or that is written to a file in a command with no shell to run it, also goes when it has
-    no call that opens a file (OPENER_RE): a test string naming a key."""
+    (python, node, perl) also goes when it has no call that opens a file (OPENER_RE): a test string naming a key."""
     from . import hook, pathguard
     lines, bodies = hook._heredocs(cmd)
-    outer = "\n".join(lines)
 
     def data(i: int, pos: int, body: list[str]) -> bool:
         if hook._data_body(lines, i, pos):
             return True
         if not (interp and hook.HEREDOC_RE.match(lines[i], pos)[2]) or OPENER_RE.search("\n".join(body)):
             return False
-        return bool(pathguard.INTERPRETER_RE.match(hook._first_word(hook._piece_at(lines[i], pos)[0]))) \
-            or not SHELL_RUN_RE.search(outer)
+        return bool(pathguard.INTERPRETER_RE.match(hook._first_word(hook._piece_at(lines[i], pos)[0])))
     return "\n".join(lines + [ln for i, body, pos in bodies if not data(i, pos, body) for ln in body])
+
+
+_ARITH = re.compile(r"\$\(\((?=(?:[^()]|\([^()]*\))*\)\))")   # `$((` that closes with `))`: arithmetic, no command
 
 
 _SED_SCRIPT = re.compile(r"""(\bsed\b(?:\s+(?:-[-\w=.]+|--\w[\w-]*=\S+))*\s+(?:-e\s+)?)'([^']*)'""")
 
 
-def _sed_text(view: str) -> str:
-    """`view` with the single-quoted script of each `sed` blanked: sed reads `s|a|"$s" b|` as text (a pattern or
-    a replacement naming an expansion runs nothing), unless a flag `e` makes it run the result."""
-    return _SED_SCRIPT.sub(lambda m: m[0] if re.search(r"[|/#,!]\w*e\w*\s*$|\be\b", m[2]) else f"{m[1]}''", view)
+def _inert(view: str) -> str:
+    """`view` read as bash does: `$((1+2))` is arithmetic, so its `(` starts no command, and the single-quoted script
+    of each `sed` is text (`s|a|"$s" b|` names an expansion, runs nothing) unless an `e` flag or command runs it."""
+    view = _ARITH.sub("$[", view)
+    return _SED_SCRIPT.sub(lambda m: m[0] if re.search(r"[|/#,!]\w*e\w*\s*$|(?<![A-Za-z])e\b", m[2]) else f"{m[1]}''", view)
 
 
 def shell_refusal(cmd: str, cwd: str, run_dir: str = "", env=None, remote: bool = False, writes: bool = True,
@@ -633,7 +630,7 @@ def shell_refusal(cmd: str, cwd: str, run_dir: str = "", env=None, remote: bool 
         return "a run on the GLM arm may not read or write the project's database or machine records by hand"
     if services and (svc := SERVICE_RE.search(view)):
         return f"{SERVICE_WHY}: {svc.group(0)[:120]}"
-    if writes and (m := HIDDEN.search(_sed_text(view))):
+    if writes and (m := HIDDEN.search(_inert(view))):
         return f"{HIDDEN_WHY}: {m.group(0).strip()[:80]}"
     commands, _ = hook._split(cmd)   # heredoc bodies a program, not a shell, reads are its input
     for sub in pathguard._substitutions(commands):   # "$(...)" runs a command too
