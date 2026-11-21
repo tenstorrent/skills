@@ -117,7 +117,6 @@ def usage_cost(prov, usage: dict) -> float | None:
     """A usage priced exactly as the run's exit books it (benchrun.harness_spend at the provider's price
     row): None when no call was counted, so nothing is guessed."""
     from . import benchrun
-    usage = usage or {}
     if not usage.get("calls"):
         return None
     return float(benchrun.harness_spend(prov, usage)["cost_usd"])
