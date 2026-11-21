@@ -17820,7 +17820,7 @@ class Daemon:
         text = unread_update(run_dir)[0]
         if not text or drift.notes_only(text):
             return None   # a stretch the harness itself wrote (drift notes) carries no instruction
-        if not steer_hooked(run_dir, r["provider"]):
+        if not steer_hooked(run_dir, r.get("provider")):   # a row without a provider falls back to the run's marker
             try:
                 if (run_dir / STEER_FILE).stat().st_mtime <= (run_dir / RESULT_FILE).stat().st_mtime:
                     return None
