@@ -62,6 +62,11 @@ def text(result) -> str:
     return str(result.get("summary") or "").strip()
 
 
+def digest(text) -> str:
+    """The hash a write-up's stamp carries for the message it covers."""
+    return hashlib.sha256(str(text).encode("utf-8", "replace")).hexdigest()[:16]
+
+
 def guard(result) -> str:
     """Why the chat must not get this hand-off's text ("" when it may): the run was on the chat provider and
     the text carries no valid opus-writeup stamp (the stamp names the step and the hash of the message it covers)."""
@@ -70,7 +75,7 @@ def guard(result) -> str:
     by = result.get(BY)
     msg = result.get(FIELD)
     if isinstance(by, dict) and by.get("step") == WRITEUP and isinstance(msg, str) and msg.strip() \
-            and by.get("sha") == hashlib.sha256(msg.encode("utf-8", "replace")).hexdigest()[:16]:
+            and by.get("sha") == digest(msg):
         return ""
     return "its run was on the chat provider and no Opus write-up of its message was made"
 

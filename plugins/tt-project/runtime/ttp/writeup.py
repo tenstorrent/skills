@@ -10,16 +10,13 @@ whatever path posts it (the reply block, the push queue's landed reply, a held r
 leaves the result unstamped: the task goes to review with `Not posted to the chat`, and nothing is posted."""
 from __future__ import annotations
 
-import hashlib
 import json
 import time
 from pathlib import Path
 
 from . import replymsg
 
-STEP = replymsg.WRITEUP
 LOG = "writeup.json"        # in the run folder: the call's row (model, minutes, dollars, error)
-CHAT_RUN = replymsg.CHAT_RUN   # the stored result's flag: this hand-off came from a run on the chat provider
 SPEC_LINES = 12             # the task's spec shown to the writer: its first lines only
 FIELD_CAP = 3000            # one hand-off field shown to the writer, cut here
 MAX_USD = 1.0
@@ -29,10 +26,6 @@ SYSTEM = ("You write the message a person reads in a chat, from the hand-off of 
           "you. State the answer or outcome first, in plain words, short; add only the details the reader needs "
           "to act. Say only what the hand-off and its evidence show; if something is unclear or unproven, say "
           "so. No AI-authorship tag. Reply with the message text only.")
-
-
-def digest(text: str) -> str:
-    return hashlib.sha256(str(text).encode("utf-8", "replace")).hexdigest()[:16]
 
 
 def chat_run(run: dict | None) -> bool:
@@ -54,7 +47,7 @@ def _clip(v, n: int = FIELD_CAP) -> str:
 def prompt(task: dict, result: dict, status: str, need: str, run_dir) -> str:
     """The writer's input: the task, the hand-off fields (all data) and where the evidence is."""
     spec = "\n".join(str(task.get("spec") or "").splitlines()[:SPEC_LINES])
-    fields = {k: result[k] for k in ("status", "summary", "message", "findings", "question", "artifacts")
+    fields = {k: result[k] for k in ("summary", "message", "findings", "question", "artifacts")
               if result.get(k) not in (None, "", [], {})}
     fields["status"] = status
     if need:
@@ -78,11 +71,11 @@ def _cost(db, usd: float, usage: dict, model: str, task_id) -> None:
 def write(p, cfg: dict, task: dict, result: dict, run: dict, status: str, need: str, run_dir, *,
           held: str = "", runner=None, binary: str | None = None, now=time.time) -> dict:
     """The write-up: sets `message` and the `message_by` stamp in `result` (a chat-provider run's hand-off) and
-    flags it CHAT_RUN. Returns the call's row ({"ok", "cost_usd", ...}); on a refusal or failure `ok` is false
+    flags it replymsg.CHAT_RUN. Returns the call's row ({"ok", "cost_usd", ...}); on a refusal or failure `ok` is false
     and the result stays unstamped (replymsg.guard then refuses to post it). Any worker-supplied stamp is dropped."""
     from . import claimcheck, glmassist
     result.pop(replymsg.BY, None)
-    result[CHAT_RUN] = True
+    result[replymsg.CHAT_RUN] = True
     s = glmassist.settings(cfg)
     model = s["model"]
     row = {"task": task.get("id"), "run": run.get("id"), "model": model, "ok": False}
@@ -105,8 +98,8 @@ def write(p, cfg: dict, task: dict, result: dict, run: dict, status: str, need: 
         checked, _, marked = claimcheck.check(
             p, got, own={"task": task.get("id"), "run": run.get("id")}) if p is not None else (got, [], 0)
         result[replymsg.FIELD] = checked.strip()
-        result[replymsg.BY] = {"step": STEP, "model": model, "run": run.get("id"),
-                               "sha": digest(result[replymsg.FIELD]), "unverified": marked,
+        result[replymsg.BY] = {"step": replymsg.WRITEUP, "model": model, "run": run.get("id"),
+                               "sha": replymsg.digest(result[replymsg.FIELD]), "unverified": marked,
                                "cost_usd": round(usd, 4)}
         row.update(ok=True, unverified=marked)
     except Exception as e:   # nothing is posted: the task goes to review with the line

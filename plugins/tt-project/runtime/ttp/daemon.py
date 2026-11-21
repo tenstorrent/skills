@@ -1421,6 +1421,7 @@ class Daemon:
         self._wake_directs: dict[int, dict] = {}   # task id -> its wake's direct decision (_wake_direct), until a run starts
         self._route_waits: dict[int, float] = {}   # task id -> since when it waits for a routed slot (route.wait_s)
         self._stall_probes: dict[str, list] = {}   # probe (or a caller's key) -> its re-check: [Pending, started, answer or None]
+        self._writeups: dict[int, dict] = {}   # task -> the Opus write-up made before its finish transaction (_prewrite)
         self._git_memo: dict[int, dict] = {}   # task -> git facts its hand-off is judged by, read before the tx (_prefetch_git)
         self._git_attempts: dict[int, gitmemo.Attempt] = {}   # task -> its finish's gitreplay attempt, from the warm-up
         self._slop_blocks: dict[int, tuple[str, str]] = {}   # task -> (head, its review's de-slop block), read before the tx
@@ -6706,6 +6707,8 @@ class Daemon:
         left_head = ""
         if r["role"] == "worker" and r["task"] and (t_row := db.task(r["task"])):
             left_head = self._branch_head(dict(t_row))
+        if r["role"] == "worker" and status == "ok":
+            self._prewrite(r, run_dir)
         # The run's end, its spend and what it did to its task commit together: a daemon stopped
         # half way leaves the run "running", and the next tick processes it again from disk.
         for rnd in self._finish_rounds(r["task"] or 0):
@@ -6764,6 +6767,7 @@ class Daemon:
                                         orderly=note.get("shutdown") == "orderly",
                                         slept=bool(note.get("lost_to_sleep") or note.get("lost_to_network")),
                                         held=held, root_wake=root_wake)
+        self._writeups.pop(r["task"], None)
         try:
             self._note_no_call(r, no_call, called, usage, prov)
         except Exception:   # a guard only: the run's end stands
@@ -7719,19 +7723,35 @@ class Daemon:
         finally:
             gitreplay.end(att.id)
 
-    def _writeup(self, r: dict, task: dict, result: dict, new: str, run_dir: Path) -> None:
-        """A reply_chat task's chat-provider run: flag its hand-off and, with the write-up on (writeup.py), have
-        Opus write the chat message from it. On a refusal or failure the hand-off stays unstamped, so
-        replymsg.guard keeps its text out of the chat."""
-        need = str(result.get("question") or result.get("blocked_reason") or "") if new == "blocked" else ""
-        if new not in ("done", "failed", "blocked") or not writeup.active(self.cfg):   # a later landing posts nothing of GLM's
-            result.pop(replymsg.BY, None)
-            result[replymsg.CHAT_RUN] = True
+    def _prewrite(self, r: dict, run_dir: Path) -> None:
+        """Before the finish transaction (a Claude call that long never holds the write lock, and a replayed
+        round does not repeat it): a reply_chat task's chat-provider run has Opus write the chat message from its
+        result.json (writeup.py); the stamped text waits in `_writeups` for `_writeup`."""
+        self._writeups.pop(r.get("task"), None)
+        task = self.p.db.task(r["task"]) if r.get("task") else None
+        if not (task and task["reply_chat"] and writeup.chat_run(r) and writeup.active(self.cfg)):
             return
+        result = _read_result(run_dir / RESULT_FILE)
+        status = result.get("status") if isinstance(result, dict) else None
+        if status not in ("done", "failed", "blocked"):
+            return
+        need = str(result.get("question") or result.get("blocked_reason") or "") if status == "blocked" else ""
         held = "auth" if self._logged_out("claude") else "down" if self.net_held("claude") else ""
-        row = writeup.write(self.p, self.cfg, task, result, r, new, need, run_dir, held=held)
+        row = writeup.write(self.p, self.cfg, task, result, r, status, need, run_dir, held=held)
+        self._writeups[task["id"]] = {"run": r.get("id"), "status": status,
+                                      "fields": {k: result[k] for k in (replymsg.FIELD, replymsg.BY) if k in result}}
         log(self.p, f"task {task['id']}: Opus write-up of run {r.get('id')}: "
                     f"{'ok' if row.get('ok') else 'failed: ' + str(row.get('error'))} (${row.get('cost_usd', 0):.2f})")
+
+    def _writeup(self, r: dict, task: dict, result: dict, new: str) -> None:
+        """A reply_chat task's chat-provider run: flag its hand-off, drop any stamp the run wrote itself and take
+        the one `_prewrite` made for this run and outcome. Without one the hand-off stays unstamped, so
+        replymsg.guard keeps its text out of the chat."""
+        result.pop(replymsg.BY, None)
+        result[replymsg.CHAT_RUN] = True
+        got = self._writeups.get(task["id"])
+        if got and got["run"] == r.get("id") and got["status"] == new and writeup.active(self.cfg):
+            result.update(got["fields"])
 
     def _finish_worker(self, r: dict, usage, status: str, run_dir: Path, ended: str | None = None,
                        rebooted: bool = False, slept: bool = False, handoff: dict | None = None,
@@ -8527,7 +8547,7 @@ class Daemon:
         # A done reply that delivers nothing (replymsg.undelivered) is not posted: the task goes to
         # review saying so, so the coordinator sees that the chat got nothing.
         if task["reply_chat"] and isinstance(result, dict) and writeup.chat_run(r):
-            self._writeup(r, task, result, new, run_dir)   # GLM's words never post: Opus's write-up or nothing
+            self._writeup(r, task, result, new)   # GLM's words never post: Opus's write-up or nothing
         undelivered = replymsg.undelivered(result) if task["reply_chat"] and new == "done" else ""
         if undelivered:
             new, reason = "review", f"nothing was posted to the chat: {undelivered}"
@@ -13820,7 +13840,7 @@ class Daemon:
                    peek: bool = False) -> dict | None:
         """A covered project's route (glmwork.py) for a run that is not a code arm's: the work model at its
         effort, or None (core) for a run the keep-core checks hold or the task's Claude holdout. The floor keeps
-        the run's tier and effort; only a verdict or a person-facing run stays on core for it (keeps_core)."""
+        the run's tier and effort; only the runs keeps_core names stay on core for it."""
         s = glmwork.settings(self.cfg, device=True)
         try:
             why = glmwork.keeps_core(self.p.db, self.cfg, task, tier, cls, picked)

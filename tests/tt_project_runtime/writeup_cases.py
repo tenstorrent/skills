@@ -27,8 +27,10 @@ def _wu_finish(env, p, result, *, provider="chat", kind="work", chat="c1", statu
     run_dir.mkdir()
     (run_dir / "result.json").write_text(json.dumps(result))
     d = Daemon(p.base)
+    run = {"task": tid, "id": 777, "provider": provider}
+    d._prewrite(run, run_dir)   # the daemon does this before its finish rounds
     with d.p.db.tx():
-        d._finish_worker({"task": tid, "id": 777, "provider": provider}, Usage(cost_usd=1.0), status, run_dir)
+        d._finish_worker(run, Usage(cost_usd=1.0), status, run_dir)
     replies = [m["text"] for m in p.db.q("SELECT text FROM messages WHERE kind='reply' AND chat=?", (chat,))]
     return p.db.task(tid), replies, run_dir
 
@@ -160,3 +162,40 @@ def test_a_glm_run_handing_off_for_review_is_flagged_so_a_later_landing_posts_no
     assert got.get(replymsg.CHAT_RUN) and replymsg.BY not in got and replymsg.guard(got) and not replies
     assert not seen.exists(), "no write-up for a hand-off that is not final"
     assert "GLM-" not in pushq._done_text(got, got.get("summary") or "", "pushed")
+
+
+def test_the_writeup_runs_outside_the_finish_transaction_and_a_replayed_round_does_not_repeat_it(env, monkeypatch):
+    from ttp.daemon import Daemon
+    from ttp.providers.base import RunUsage as Usage
+    p = make(env)
+    _wu_on(p)
+    _wu_bin(env, monkeypatch)
+    tid = p.db.add_task("answer the question", "Goal: answer.", kind="work", tier="standard", origin="coordinator")
+    p.db.update_task(tid, status="running", reply_chat="c1")
+    run_dir = env["tmp"] / "run-wu-tx"
+    run_dir.mkdir()
+    (run_dir / "result.json").write_text(json.dumps(dict(_WU_GLM)))
+    d = Daemon(p.base)
+    run = {"task": tid, "id": 778, "provider": "chat", "role": "worker"}
+    seen = []
+    from ttp import glmassist
+    real = glmassist._opus_call
+
+    def spy(*a, **k):
+        seen.append(p.db.conn.in_transaction)
+        return real(*a, **k)
+
+    monkeypatch.setattr(glmassist, "_opus_call", spy)
+    d._prewrite(run, run_dir)
+    for round_ in range(2):   # the first round is rolled back (a git miss) and replayed
+        try:
+            with d.p.db.tx():
+                d._finish_worker(run, Usage(cost_usd=1.0), "ok", run_dir)
+                if not round_:
+                    raise RuntimeError("rolled back")
+        except RuntimeError:
+            pass
+    replies = [m["text"] for m in p.db.q("SELECT text FROM messages WHERE kind='reply' AND chat='c1'")]
+    assert replies == ["Opus wrote this: it works."]
+    assert seen == [False], "one Opus call, with no write transaction open"
+    assert p.db.task(tid)["status"] == "done"
