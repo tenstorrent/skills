@@ -2232,7 +2232,7 @@ def own_target(p: Project, repo: Path) -> tuple[str, str]:
     too. Both only as a fast-forward (publish, ff_only: own_ff_only). A task labelled
     `pr_branch:<branch>` on its own ttp/t<id>-... branch (the PR's branch was held by another
     worktree) publishes its head onto that branch instead, and so does a review covering that task,
-    from that task's branch or from the pr_branch itself checked out (_reviewed finds the task); a
+    from that task's branch or from the pr_branch itself checked out (_reviewed_tasks finds the task); a
     review whose own spec has one `pr_branch:` line publishes the covered task's branch onto it.
     Never a detached HEAD, main/master, the
     push branch or the branch work starts from; publish also refuses the remote's default branch.
@@ -2271,7 +2271,7 @@ def own_target(p: Project, repo: Path) -> tuple[str, str]:
         onto = _review_onto(p, task, m.group(1), branch)
         carried = bool(onto)
     if not carried and not notes and task and rebase_replace(p.config()) != "lease" and any(
-            r and worktree.rebased_branch(r) == branch for r in [_task_row(p, task)] + _reviewed(p, task)):
+            r and worktree.rebased_branch(r) == branch for r in [_task_row(p, task)] + _reviewed_tasks(p, task)):
         raise ValueError(f"{branch} is the branch this task rebases: a rebase cannot fast-forward it, and "
                          f"under delivery.rebase_replace new_branch (the default) --own never replaces it; "
                          f"publish the rebase from the task's own new branch")
@@ -2306,7 +2306,7 @@ def _review_onto(p: Project, task: str, owner: str, branch: str) -> str:
     """The branch review task `task`, on task #`owner`'s ttp/t<id>-... `branch`, publishes onto (own_target):
     the pr_branch of the code task it covers, else the one branch its own spec's `pr_branch:` line names;
     "" when none."""
-    reviewed = _reviewed(p, task)
+    reviewed = _reviewed_tasks(p, task)
     onto = next((b for t in reviewed
                  if (b := pr_branch_of(p, t)) and (str(t["id"]) == owner or b == branch)), "")
     # Or, from the reviewed task's own branch, onto the one branch a `pr_branch:` line of the
@@ -2666,7 +2666,7 @@ def foreign_pr_branch(p: Project, task: str, branch: str, where: str) -> str:
     t = _task_row(p, task)
     if not t:
         return ""
-    owners = [foreign_owner(p, r, branch) for r in [t] + _reviewed(p, task)]
+    owners = [foreign_owner(p, r, branch) for r in [t] + _reviewed_tasks(p, task)]
     if not owners or None in owners:
         return ""
     own = own_name(t)
@@ -3089,7 +3089,7 @@ def ponytail_landing(p: Project, task: str, upstream: str, d: dict, repo: Path) 
         return ""
     run_dir, head = os.environ.get("TTP_RUN_DIR"), _git(repo, "rev-parse", "HEAD").stdout.strip()
     cfg = p.config()
-    reviewed = _reviewed(p, str(row["id"]))
+    reviewed = _reviewed_tasks(p, str(row["id"]))
     lane = ponytail.labelled(row) is not None or any(t.get("kind") in ("code", "work") for t in reviewed)
     if lane and ponytail.on(cfg) and (why := ponytail.lane_problem(run_dir, head)):
         return f"ttp push: refused, {why}. Landing needs the ponytail lane's pass on HEAD as well as yours"
@@ -3440,7 +3440,7 @@ def own_rebase(p: Project, branch: str) -> dict | None:
     task = os.environ.get("TTP_TASK")
     if not task or os.environ.get(OWN_BRANCH_ENV):
         return None
-    for r in [_task_row(p, task)] + _reviewed(p, task):
+    for r in [_task_row(p, task)] + _reviewed_tasks(p, task):
         if r and (found := delivery_source(p, r))[2] and found[1] == branch:
             return found[0]
     return None
@@ -3513,7 +3513,7 @@ def labelled_elsewhere(p: Project, task: dict | None, d: dict) -> str:
 REVIEW_TITLE = re.compile(r"\s*Review #(\d+)\b")   # a review's title names the task it covers
 
 
-def _reviewed(p: Project, task: str | None) -> list[dict]:
+def _reviewed_tasks(p: Project, task: str | None) -> list[dict]:
     """The code tasks review `task` covers (its dependencies, auto_review: label and the `Review #<id>`
     its title starts with), or []."""
     t = _task_row(p, task)
@@ -3530,7 +3530,7 @@ def pr_branch_guard(p: Project, branch: str, task: str | None, d: dict) -> str:
     task whose work it is (the ttp/t<id>-... branch's owner, else the running task or a code task the
     running review covers whose pr_branch is `branch`) delivers onto another branch (pr_elsewhere)."""
     m = OWN_BRANCH.fullmatch(branch)
-    rows = [_task_row(p, m.group(1))] if m else [_task_row(p, task)] + _reviewed(p, task)
+    rows = [_task_row(p, m.group(1))] if m else [_task_row(p, task)] + _reviewed_tasks(p, task)
     for t in rows:
         onto = pr_elsewhere(p, t, d)
         if onto and (m or onto == branch):

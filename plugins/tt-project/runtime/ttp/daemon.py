@@ -7916,7 +7916,7 @@ class Daemon:
             rstatus, result = "failed", dict(result, status=CHANGES_NEEDED)
         elif rstatus == "done" and task["kind"] == "review" and own and (
                 lane := ponytail.gate(self.cfg, task, run_dir, result,
-                                      push._reviewed(self.p, str(task["id"])) if ponytail.labelled(task) is not None
+                                      push._reviewed_tasks(self.p, str(task["id"])) if ponytail.labelled(task) is not None
                                       else []))[0]:
             # The ponytail lane failed it, or the change is over the size limit with no reason: its fixes
             # follow as for any failed review. No verdict at all is a form failure: nothing to fix.
@@ -20681,7 +20681,7 @@ class Daemon:
                     else worktree.reviewed_head(self.p, task)
                 if not head or not heads and reviewreuse.uncovered(self.p, task, head):
                     return
-                for t in push._reviewed(self.p, str(task["id"])):
+                for t in push._reviewed_tasks(self.p, str(task["id"])):
                     verified.record(self.p.db, t["id"], "review", head, review=task["id"])
                 extra["verified_through"] = head
             elif m := verified.own(self.p.db, task["id"], "checks"):
@@ -21442,7 +21442,7 @@ class Daemon:
         own base, its reason (ponytail.reason_text). A refused unlabelled review is labelled, so its rerun
         runs the lane and its hand-off needs the verdict."""
         cfg = self.cfg
-        codes = [t for t in push._reviewed(self.p, str(task["id"])) if self._code_change(t)]
+        codes = [t for t in push._reviewed_tasks(self.p, str(task["id"])) if self._code_change(t)]
         if not codes or not (ponytail.on(cfg) or ponytail.limit(cfg)):
             return ""
         exclude = push.exclude_list((cfg.get("delivery") or {}).get("push_exclude_paths"))

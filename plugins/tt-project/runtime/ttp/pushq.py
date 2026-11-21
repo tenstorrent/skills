@@ -1184,7 +1184,7 @@ def _pr_branch_notes(p: Project, task: dict, d: dict, tgt: tuple[str, str] | Non
     arm handed back or one delivering onto a pr_branch the push remote has, else (None, notes on the
     pr_branch labels ignored because the remote has no such branch)."""
     notes = []
-    for t in push._reviewed(p, str(task["id"])):
+    for t in push._reviewed_tasks(p, str(task["id"])):
         if why := codearm.task_handed_back(p, t["id"]):   # a code arm run that asked for Opus pushes nothing
             return {"invalid": f"#{t['id']}'s latest run handed the task back to Opus (needs_opus: {why}): "
                                f"its head is not approved for the push queue"}, []
@@ -1348,7 +1348,7 @@ def prefetch(p: Project, task: dict, cfg: dict | None = None) -> None:
             return
         if not push.allow_protected(d):
             _default_branch(p, tgt[0], None, True)
-        tasks = push._reviewed(p, str(task["id"]))
+        tasks = push._reviewed_tasks(p, str(task["id"]))
     for t in tasks:
         if onto := push.pr_elsewhere(p, t, d):
             _absent(p, tgt[0], onto, True)
@@ -3311,7 +3311,7 @@ def tend_scope_holds(p: Project, cfg: dict | None = None, now: float | None = No
 def resolves_of(p: Project, review_id: int) -> list[tuple[str, dict]]:
     """The upstream note fingerprints (upstream.fingerprint) the change review `review_id` approved
     fixes, each with the task that names it: the `resolves` lists in the hand-offs of the review, of
-    the code tasks it covers (push._reviewed), of the tasks whose commits it accepted (`inherited` in
+    the code tasks it covers (push._reviewed_tasks), of the tasks whose commits it accepted (`inherited` in
     its push entries) and of the tasks they continue, plus the open known notes their specs name as
     `[note <fp>]`. A note several hand-offs list goes to the earliest done code task that lists it:
     the one the note was given to, not a later task that only continued or unblocked it."""
@@ -3322,7 +3322,7 @@ def resolves_of(p: Project, review_id: int) -> list[tuple[str, dict]]:
     inherited = [p.db.task(int(str(i).lstrip("#"))) for e in (entries if isinstance(entries, list) else [])
                  if isinstance(e, dict) and isinstance(e.get("inherited"), list)
                  for i in e["inherited"] if str(i).lstrip("#").isdigit()]
-    for t in push._reviewed(p, str(review_id)) + [t for t in inherited if t]:
+    for t in push._reviewed_tasks(p, str(review_id)) + [t for t in inherited if t]:
         while t and t["id"] not in seen:
             seen.add(t["id"])
             tasks.append(t)
