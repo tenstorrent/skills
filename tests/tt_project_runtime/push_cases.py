@@ -22798,6 +22798,21 @@ def test_a_commit_only_on_a_retired_tip_of_the_push_branch_still_counts_as_lande
     assert landed.check(p, repo, lone, onto="origin/proj")[0] == landed.NOT_YET
 
 
+
+def test_retire_tip_refuses_a_sha_that_resolves_to_no_commit(env, monkeypatch, capsys):
+    """`ttp retire-tip` on a sha that is no commit records nothing and exits non-zero saying so,
+    never printing that a tip was recorded: a silent skip would let the pre-squash heads it should
+    cover go back to being flagged unlanded."""
+    from ttp import cli, landed
+    p, *_ = _push_setup(env, monkeypatch, ["true"])
+    bogus = "0" * 40
+    with pytest.raises(SystemExit) as e:
+        cli.main(["retire-tip", bogus])
+    assert e.value.code != 0
+    assert landed.retired_tips(p) == [], "nothing recorded for a sha that resolves to no commit"
+    assert bogus[:10] in capsys.readouterr().err
+
+
 def test_a_lease_replace_retires_the_push_branch_tip_it_replaced_but_never_an_own_branch_tip(env, monkeypatch):
     """The harness's own non-fast-forward replace of the push branch (a lease push of a rewritten
     head) records the tip it replaced as retired, so its commits stay landed; the same replace of a

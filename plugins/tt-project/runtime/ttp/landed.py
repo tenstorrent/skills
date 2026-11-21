@@ -231,21 +231,25 @@ def retired_tips(p) -> list[str]:
     return [x for x in (read_dict(p.state / RETIRED).get("tips") or []) if isinstance(x, str) and x]
 
 
-def retire_tip(p, sha: str) -> None:
+def retire_tip(p, sha: str) -> str:
     """Record `sha` as a tip the push branch was replaced from (RETIRED): its commits keep counting
-    as landed. Idempotent; "" or an unknown sha is not written."""
+    as landed. Idempotent; "" or an unknown sha is not written. Returns the resolved sha, or ""
+    when `sha` is no commit in the project repo (nothing was written)."""
     from .project import durable_write
-    sha = _commit(p.root, sha)
+    full = _commit(p.root, sha)
+    if not full:
+        return ""
     tips = retired_tips(p)
-    if not sha or sha in tips:
-        return
-    durable_write(p.state / RETIRED, json.dumps({"tips": [*tips, sha]}, indent=1) + "\n")
+    if full not in tips:
+        durable_write(p.state / RETIRED, json.dumps({"tips": [*tips, full]}, indent=1) + "\n")
+    return full
 
 
 def on_push(p, repo: Path, shas: list[str], tip: str) -> str:
     """The tip holding one of `shas`: the push branch's current `tip` or one of its retired tips
     (retired_tips), each by on_branch (an ancestor of it, or the change's equivalent); "" when none
-    holds them. The one place the "is this commit on the push branch" rule lives."""
+    holds them. Where the retired-tip half of the "is this commit on the push branch" rule lives;
+    landed.check keeps its own loop over the current tip, to name the ref each fetch variant read."""
     for s in shas:
         full = _commit(repo, s)
         for t in (tip, *retired_tips(p)):

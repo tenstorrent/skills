@@ -19,8 +19,10 @@ with a threshold under `coordinator.course_check` in project.json (0 turns one o
   tasks first, then the costliest finished ones, in id order; one count line names the rest and
   `ttp course <project>`, which lists them all.
 - over_estimate: a running worker run, at least `over_min_min` (15) minutes old, past `over_estimate`
-  (0.5, i.e. 50%) over the median of its kind and tier's ended runs (needs `over_min_samples` (3)
-  of them). The coordinator re-estimates it: steer, split or restart it, and update promises.
+  (0.5, i.e. 50%) over the median of its ended runs (eta._Est.run_samples: the kind-and-size
+  bucket's when it has enough of them, else the kind and tier's, else the kind's; needs
+  `over_min_samples` (3) of them). The coordinator re-estimates it: steer, split or restart it,
+  and update promises.
 - idle_turns: the last `idle_turns` (6) or more coordinator turns in a row decided nothing, with
   their cost and what woke them.
 
@@ -137,10 +139,11 @@ def spend(db: DB, ratio: float, floor: float, samples: float, now: float) -> lis
 
 
 def over_estimate(db: DB, over: float, samples: int, floor_min: float, now: float) -> list[dict]:
-    """The running worker runs that have gone `over` (0.5: 50%) past the median of the ended runs of their
-    kind and tier (eta._Est.run_samples; their kind alone when none of that tier; a long job's is its
-    per-cell time times its cells, eta.long_job), at least `floor_min` minutes in, when `samples` or more
-    ended runs measure the median: {"id", "title", "kind", "min", "median_min", "n"}."""
+    """The running worker runs that have gone `over` (0.5: 50%) past the median of their ended runs
+    (eta._Est.run_samples: the kind-and-size bucket when it holds enough samples, else kind and
+    tier, else kind alone; a long job's is its per-cell time times its cells, eta.long_job), at
+    least `floor_min` minutes in, when `samples` or more ended runs measure the median:
+    {"id", "title", "kind", "min", "median_min", "n"}."""
     if over <= 0:
         return []
     rows = db.q("SELECT t.id, t.title, t.kind, t.tier, t.spec, r.started FROM runs r JOIN tasks t ON t.id=r.task "

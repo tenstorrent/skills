@@ -10081,8 +10081,10 @@ def cmd_retire_tip(a) -> None:
     p = here()
     if not p:
         die("ttp retire-tip: no project here (run it in a project or with TTP_PROJECT set)")
-    landed.retire_tip(p, a.sha)
-    print(f"ttp retire-tip: {a.sha[:10]} recorded as a retired push-branch tip of {p.name}")
+    recorded = landed.retire_tip(p, a.sha)
+    if not recorded:
+        die(f"retire-tip: {a.sha[:10]} is no commit in {p.root}; no tip recorded")
+    print(f"ttp retire-tip: {recorded[:10]} recorded as a retired push-branch tip of {p.name}")
 
 
 def cmd_quarantine(a) -> None:
