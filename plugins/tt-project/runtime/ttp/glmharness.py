@@ -129,7 +129,7 @@ def context_per_call(usage: dict) -> int:
     return round((int(usage.get("input_tokens") or 0) + int(usage.get("cache_read_input_tokens") or 0)) / calls)
 
 
-def record(run_dir, seen: int = 0) -> tuple[list[dict], int, dict]:
+def step_record(run_dir, seen: int = 0) -> tuple[list[dict], int, dict]:
     """A running mini-swe-agent run's step record: (its new steps past message `seen` as provider
     activity events (providers.base.Provider.activity's shape), the cursor to read from next, its
     usage so far). The trajectory is saved after every step, so a step is an assistant message's
@@ -179,7 +179,7 @@ def record(run_dir, seen: int = 0) -> tuple[list[dict], int, dict]:
     return events, len(msgs), usage
 
 
-def record_cost(spec: dict, usage: dict) -> float | None:
+def record_spend(spec: dict, usage: dict) -> float | None:
     """A running mini run's spend so far, priced exactly as its exit books it (harness_spend at the
     chat provider's price row): None when its record holds no usage yet, so nothing is guessed."""
     if not usage or not usage.get("calls"):

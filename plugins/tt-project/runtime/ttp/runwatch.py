@@ -86,7 +86,7 @@ def _entry(p: Project, r: dict, old: dict, now: float, base: list[str]) -> dict:
     e["note"], e["checks"] = _progress(run_dir / "progress.md")
     steps, usage = None, None
     if spec.get("harness"):   # a chat run's steps are its mini-swe-agent trajectory, not its plain-text stream
-        events, cursor, usage = glmharness.record(run_dir, int(old.get("traj_n") or 0))
+        events, cursor, usage = glmharness.step_record(run_dir, int(old.get("traj_n") or 0))
         steps = (events, cursor)
     e.update(_tools(r["provider"], run_dir / "output.jsonl", old, now, steps))
     # its last sign of life (a tool call or result, a note), for drift.py's quiet check
@@ -98,7 +98,7 @@ def _entry(p: Project, r: dict, old: dict, now: float, base: list[str]) -> dict:
     e.update(_files(p, str(spec.get("cwd") or ""), old, now, base))
     cost, budget = float(r["cost_usd"] or 0), r["budget_usd"]
     if spec.get("harness"):   # a chat run books its spend only at exit: its record's usage prices it now
-        cost = glmharness.record_cost(spec, usage) if usage else None
+        cost = glmharness.record_spend(spec, usage) if usage else None
         cost = float(r["cost_usd"] or 0) if cost is None else cost
     task_usd = float(r["spent_usd"] or 0) + cost
     e["spend"] = {"run_usd": round(cost, 4), "task_usd": round(task_usd, 4), "budget_usd": budget,
