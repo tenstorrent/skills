@@ -147,3 +147,16 @@ def test_a_code_tasks_done_reply_from_a_glm_run_waits_for_its_landing_as_the_opu
     assert pushq.post_held(p.db, [task["id"]], "shipped") == [task["id"]]
     posted = [m["text"] for m in p.db.q("SELECT text FROM messages WHERE kind='reply' AND chat='c7'")]
     assert len(posted) == n + 1 and posted[-1].startswith("Landed text from Opus") and "GLM-" not in posted[-1]
+
+
+def test_a_glm_run_handing_off_for_review_is_flagged_so_a_later_landing_posts_none_of_its_text(env, monkeypatch):
+    from ttp import pushq, replymsg
+    from ttp.db import load_result
+    p = make(env)
+    _wu_on(p)
+    seen = _wu_bin(env, monkeypatch)
+    task, replies, _ = _wu_finish(env, p, {**_WU_GLM, "status": "needs_review"}, kind="code", chat="c8")
+    got = load_result(task["result"])
+    assert got.get(replymsg.CHAT_RUN) and replymsg.BY not in got and replymsg.guard(got) and not replies
+    assert not seen.exists(), "no write-up for a hand-off that is not final"
+    assert "GLM-" not in pushq._done_text(got, got.get("summary") or "", "pushed")

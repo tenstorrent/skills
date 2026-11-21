@@ -7724,7 +7724,7 @@ class Daemon:
         Opus write the chat message from it. On a refusal or failure the hand-off stays unstamped, so
         replymsg.guard keeps its text out of the chat."""
         need = str(result.get("question") or result.get("blocked_reason") or "") if new == "blocked" else ""
-        if not writeup.active(self.cfg):
+        if new not in ("done", "failed", "blocked") or not writeup.active(self.cfg):   # a later landing posts nothing of GLM's
             result.pop(replymsg.BY, None)
             result[replymsg.CHAT_RUN] = True
             return
@@ -8526,8 +8526,7 @@ class Daemon:
         shown = rstatus or status
         # A done reply that delivers nothing (replymsg.undelivered) is not posted: the task goes to
         # review saying so, so the coordinator sees that the chat got nothing.
-        if task["reply_chat"] and new in ("done", "failed", "blocked") and isinstance(result, dict) \
-                and writeup.chat_run(r):
+        if task["reply_chat"] and isinstance(result, dict) and writeup.chat_run(r):
             self._writeup(r, task, result, new, run_dir)   # GLM's words never post: Opus's write-up or nothing
         undelivered = replymsg.undelivered(result) if task["reply_chat"] and new == "done" else ""
         if undelivered:
