@@ -214,8 +214,9 @@ def _words(cmd: str, depth: int = 0):
 
 # A device's own files: reading one reads the chip, which can bring the host down on a chip off the bus, so in a
 # device run it is a step of Opus's plan. Listing them reads nothing (LISTERS) unless the listing feeds another
-# command (FEEDS: a pipe, `$( )`, `<( )`); a commit message only names them.
-FEEDS = re.compile(r"(?<!\|)\||[$<>]\(")
+# command (_fed); a commit message only names them.
+# a pipe (never `||`), a process substitution or the output written to a file a later command can read
+FEEDS = re.compile(r"(?<!\|)\|(?!\|)|[<>]\(|(?<![2-9>])>>?(?![&(>])\s*(?!/dev/null\b)[^\s>&]")
 DEVICE_PATH = re.compile(r"/sys/class/tenstorrent\b|/dev/tenstorrent")
 LISTERS = frozenset({"ls", "dir", "vdir", "tree", "stat", "test", "[", "readlink", "realpath", "echo", "printf"})
 
@@ -228,7 +229,7 @@ def device_read(cmd: str) -> bool:
     if re.search(r"<\s*['\"]?(?:" + DEVICE_PATH.pattern + ")", cmd):   # `< /sys/...`: _segs drops the redirect
         return True
     from . import hook
-    fed = bool(FEEDS.search(hook._split(cmd)[0]))
+    fed = _fed(hook._split(cmd)[0])
     named = 0   # the mentions a listing, a commit message or printed text holds
     for x in _words(cmd):
         if x is None:
@@ -241,6 +242,22 @@ def device_read(cmd: str) -> bool:
         named += n
     # a mention the parser did not show as a word (`d=/dev/tenstorrent/0; xxd $d`) counts as a read
     return len(DEVICE_PATH.findall(hook._split(cmd)[0])) > named
+
+
+def _fed(text: str) -> bool:
+    """Whether a command of `text` that names a device file feeds another: it pipes on or writes a file (FEEDS,
+    quoted too, as in `ssh host 'ls ... | xargs cat'`) or a `$( )` or backquote naming the device sits in it (one in
+    single quotes too), or a compound naming it pipes on (`{ ls ...; } | xargs cat`). `ls ... || true`, a pipe in another
+    command and `echo "$(date) ..."` feed nothing."""
+    from . import hook, pathguard
+    for s, e, sep in hook._pieces(text):
+        piece, pipes = text[s:e], sep in ("|", "|&")
+        if DEVICE_PATH.search(piece) and (pipes or FEEDS.search(piece) or any(
+                DEVICE_PATH.search(b) for b in pathguard._substitutions(piece.replace("'", "")))):
+            return True
+        if pipes and re.match(r"\s*(?:\}|(?:done|fi|esac)\b)", piece) and DEVICE_PATH.search(text[:e]):
+            return True
+    return False
 
 
 def _matches(prog: str, entries) -> bool:

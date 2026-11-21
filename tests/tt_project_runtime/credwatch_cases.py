@@ -682,11 +682,24 @@ def test_credwatch_hook_words_split_as_shlex_does_with_long_runs_shortened():
     alphabet = ["a", "b", " ", "\t", "\n", "#", "'", '"', "\\", "(", ")", ";", "&", "|", "<", ">", "-", "/",
                 hook.RUN_MARK, "x" * hook.LONG_RUN, "y" * (hook.LONG_RUN + 37)]
     cases = ["echo " + "x" * 3000 + " | cat", "'" + "q" * 900 + "' \"" + "w" * 900 + "\"", "a\\" + "z" * 600,
-             "#" + "c" * 700 + "\nls", "x" * 600 + "#" + "x" * 600, "'" + "u" * 500, hook.RUN_MARK + "0" + hook.RUN_MARK]
+             "#" + "c" * 700 + "\nls", "git commit -m \"" + "fix it \\\" now " * 200 + "\" && ls",
+             "echo '" + "a b\n" * 300 + "' # " + "c d " * 300, "x=\"" + "w " * 400 + "\\",
+             "x" * 600 + "#" + "x" * 600, "'" + "u" * 500, hook.RUN_MARK + "0" + hook.RUN_MARK]
     cases += ["".join(rng.choice(alphabet) for _ in range(rng.randint(0, 20))) for _ in range(3000)]
     for cmd in cases:
         for punctuation, commenters in ((";&|()", "#"), (";&|()<>", "#"), (";&|()<>", "")):
             assert words(cmd, punctuation, commenters) == plain(cmd, punctuation, commenters), (cmd[:80], punctuation)
+
+
+
+def test_hook_first_argv_of_a_long_quoted_text_with_spaces_is_fast():
+    """A commit message or heredoc of many short quoted words splits in linear time (shlex alone is quadratic)."""
+    import time
+    from ttp import hook
+    msg = "fix the guard; it reads a quoted word \\\" here\n" * 16000
+    t = time.monotonic()
+    assert hook._first_argv(f'git commit -m "{msg}" && ls') == ("git", "commit", "-m", msg.replace("\\\"", '"'))
+    assert time.monotonic() - t < 2, time.monotonic() - t
 
 
 def test_credwatch_a_bridge_reconnect_remaking_its_links_and_up_markers_raises_nothing_and_a_key_change_still_does(

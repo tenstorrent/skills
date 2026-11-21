@@ -806,7 +806,12 @@ _DP_DEVICE_READS = [_DP_SYS_LOOP, "cat /sys/class/tenstorrent/tenstorrent0/tt_he
                     "python3 -c 'open(\"/dev/tenstorrent/0\").read()'", "echo `cat /sys/class/tenstorrent/x/chip_id`",
                     "ls -d /sys/class/tenstorrent/*/chip_id | xargs cat", "cat $(ls -d /sys/class/tenstorrent/*/chip_id)",
                     "echo /dev/tenstorrent/0 | xargs xxd", "ls /dev/tenstorrent/ |& xargs xxd",
-                    "cat <(ls /sys/class/tenstorrent/*/chip_id)"]
+                    "cat <(ls /sys/class/tenstorrent/*/chip_id)", "ls /dev/tenstorrent/ | wc -l",
+                    "{ ls /sys/class/tenstorrent; } | xargs cat",
+                    "for d in /sys/class/tenstorrent/*; do echo $d/chip_id; done | xargs cat",
+                    "while read d; do cat $d; done < <(ls -d /sys/class/tenstorrent/*/chip_id)",
+                    "bash -c 'ls /sys/class/tenstorrent/*/chip_id | xargs cat'",
+                    "ls -d /sys/class/tenstorrent/*/chip_id > f; xargs cat < f", "ls /dev/tenstorrent >> f && xxd $(cat f)"]
 
 
 @pytest.mark.parametrize("cmd", _DP_DEVICE_READS)
@@ -821,7 +826,11 @@ def test_a_direct_device_read_with_no_plan_is_out_of_plan_and_hands_back(cmd, tm
 
 @pytest.mark.parametrize("cmd", ["ls /sys/class/tenstorrent/", "ls -l /dev/tenstorrent/",
                                  "git commit -m 'read /sys/class/tenstorrent attributes'",
-                                 "ls /sys/class/tenstorrent && echo ok", "echo 'a | b /dev/tenstorrent/0'"])
+                                 "ls /sys/class/tenstorrent && echo ok", "echo 'a | b /dev/tenstorrent/0'",
+                                 "ls /sys/class/tenstorrent/ 2>/dev/null || true", "ls /dev/tenstorrent; ps aux | grep x",
+                                 'echo "$(date) /dev/tenstorrent"', "ls /dev/tenstorrent && echo ok || echo no",
+                                 "{ ls /sys/class/tenstorrent; } || true",
+                                 "ls /dev/tenstorrent >/dev/null 2>&1 && echo ok", "ls /dev/tenstorrent 2>err >&2"])
 def test_listing_or_naming_device_files_is_no_device_read(cmd, tmp_path):
     from ttp import deviceplan
     run, e = _dp_run(tmp_path)

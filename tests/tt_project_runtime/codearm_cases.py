@@ -767,7 +767,7 @@ def test_glm_guard_keeps_the_folder_a_run_started_in_as_a_write_root_after_its_s
         return glmguard.tool_refusal({"tool_name": "Edit", "tool_input": {"file_path": path}, "cwd": str(tmp_path / "sib")}, env_)
     assert edit(str(wt / "src" / "m.py")) is None
     assert "outside its worktree" in edit(str(tmp_path / "other" / "m.py"))
-    assert "plan=plan, cwd=str(cwd))" in inspect.getsource(daemon)
+    assert "plan=plan, cwd=str(cwd)," in inspect.getsource(daemon)
 
 
 @_pytest.mark.parametrize("cmd", [
@@ -1850,3 +1850,103 @@ def test_glm_guard_lets_python_code_in_a_quoted_heredoc_name_the_run_variables(m
     # the run folder stays writable: a note or a scratch file there is no record of the guard's
     for ok in (f'echo "step 1 done" >> "{rd}/notes.md"', f"cat > {rd}/scratch.txt <<'EOF'\nx\nEOF"):
         assert glmguard.shell_refusal(ok, str(wt), str(rd)) is None, ok
+
+
+@pytest.mark.parametrize("cmd, ok", [
+    ("TTP_PROJECT={p} python3 bin/ttp paths 2>&1 | tail -3", True), ('TTP_PROJECT="{p}" ttp paths', True),
+    ("cd x && TTP_PROJECT='{p}' ttp paths", True), ("TTP_PROJECT={p}x ttp paths", False),
+    ("TTP_PROJECT= ttp paths", False), ("TTP_PROJECT={p} TTP_TASK=1 ttp paths", False),
+    ("TTP_PROJECT={p}$X ttp paths", False), ("TTP_RUN_DIR={p} ttp paths", False)])
+def test_glm_guard_lets_a_command_restate_an_identity_it_already_has_and_refuses_any_other_value(cmd, ok, tmp_path):
+    from ttp import glmguard
+    wt, rd = _gg_run(tmp_path)
+    p = str(tmp_path / "proj")
+    why = glmguard.shell_refusal(cmd.format(p=p), str(wt), str(rd), {"TTP_PROJECT": p, **_GG_RUN_ENV})
+    assert (why is None) == ok, why
+    assert ok or glmguard.classify(why)[1] == glmguard.HARMFUL
+
+
+def test_glm_guard_lets_a_run_write_in_the_work_folders_its_spec_names_and_no_project_folder(tmp_path, monkeypatch):
+    from ttp import glmenv, glmguard
+    home = tmp_path / "home"
+    tp = home / ".tt-project"
+    bench, proj, scratch = tp / "model-bench" / "set", home / "a" / "b" / "proj", tp / "scratch" / "sp"
+    harness = [tp / "lib" / "0.2.1" / "runtime" / "ttp", tp / "locks" / "a", tp / "checks-env" / "a",
+               tp / "model-bench" / "harness" / "a"]
+    for d in (bench, proj / "tt-project" / "state", proj / "tt-project" / "harness", scratch / "tt-project" / "state",
+              home / "w" / "bench" / "set", home / "p" / "tt-project" / "x", home / "z" / "tt-project" / "state",
+              home / "z" / "y" / "x", *harness):
+        d.mkdir(parents=True)
+    monkeypatch.setenv("HOME", str(home))
+    base = tmp_path / "base"
+    spec = ("Extend ~/.tt-project/model-bench/set/run.py; not ~/w/bench/set/run.py, ~/a/b/proj (it holds a "
+            "project), ~/.tt-project/scratch/sp (a scratch project) or ~/.tt-project/locks/a.")
+    assert glmguard.spec_dirs(spec, base) == [str(bench)]
+    assert glmguard.spec_dirs(spec, bench.parent / "base") == [str(bench)]   # it holds this project's base
+    for no_root in ("~/a/b/proj", "~/.tt-project/scratch/sp", "~/w/bench/set", "~/p/tt-project/x", "~/z/y/x",
+                    "~/.tt-project/lib/0.2.1/runtime/ttp", "~/.tt-project/locks/a", "~/.tt-project/checks-env/a",
+                    "~/.tt-project/model-bench/harness/a", "~/w/none/at/all"):
+        assert glmguard.spec_dirs(f"Work in {no_root}", base) == [], no_root
+    wt, rd = proj / "tt-project" / "worktrees" / "t1", proj / "tt-project" / "state" / "runs" / "1"
+    wt.mkdir(parents=True), rd.mkdir(parents=True)
+    glmguard.mark_run(rd, False, cwd=str(wt), dirs=[str(bench), str(proj)])   # a root that holds a project, as a wider guard grants
+    e = {"TTP_PROJECT": str(tmp_path / "proj"), "TTP_RUN_DIR": str(rd), **_GG_RUN_ENV}
+    assert glmguard.shell_refusal(f"cd {bench} && cp run.py run.py.bak", str(wt), str(rd), e) is None
+    assert glmguard.tool_refusal({"tool_name": "Write", "tool_input": {"file_path": f"{bench}/run.py"},
+                                  "cwd": str(wt)}, e) is None
+    for d in (home / "w" / "bench" / "set", tp / "locks" / "a", scratch):
+        assert glmguard.shell_refusal(f"cp {wt}/a {d}/a", str(wt), str(rd), e), d
+    for path in (f"{proj}/tt-project/state/x.json", f"{proj}/tt-project/harness/CHARTER.md",
+                 f"{scratch}/tt-project/state/x.json"):
+        for cmd in (f"echo x > {path}", f"echo x >> {path}"):
+            why = glmguard.shell_refusal(cmd, str(wt), str(rd), e)
+            assert why and glmguard.classify(why)[:2] == ("records", glmguard.HARMFUL), cmd   # a project's records
+            assert glmenv.refusal(cmd, str(wt), str(rd), e) == why, cmd                      # the arm's own layer asks the same
+        assert glmguard.tool_refusal({"tool_name": "Write", "tool_input": {"file_path": path}, "cwd": str(wt)}, e), path
+    state = proj / "tt-project" / "state"   # a `cd` into a project's records never makes them the run's own
+    assert glmguard.shell_refusal(f"cd {state} && echo x > x.json", str(wt), str(rd), e)
+    assert glmguard.shell_refusal("echo x > x.json", str(state), str(rd), e)
+    assert glmguard.tool_refusal({"tool_name": "Write", "tool_input": {"file_path": f"{state}/x.json"},
+                                  "cwd": str(state)}, e)
+    # the run's own worktree and run folder stay writable, though both sit in a project's tt-project folder
+    for ok in (f"echo x > {wt}/a.py", f"echo x > {rd}/notes.md", "cat > " + str(rd) + "/scratch.txt <<'EOF'\nx\nEOF"):
+        assert glmguard.shell_refusal(ok, str(wt), str(rd), e) is None, ok
+    assert glmguard.tool_refusal({"tool_name": "Write", "tool_input": {"file_path": f"{rd}/notes/b.md"},
+                                  "cwd": str(wt)}, e) is None
+    assert glmguard.glm_run(e)["dirs"] == [str(bench), str(proj)]
+
+
+def test_glm_guard_spec_folder_too_big_to_check_for_a_project_folder_gets_no_root(tmp_path, monkeypatch):
+    from ttp import glmguard
+    home = tmp_path / "home"
+    d = home / ".tt-project" / "model-bench" / "set"
+    d.mkdir(parents=True)
+    (d / "run.py").write_text("x = 1")
+    for i in range(4):
+        (d / f"d{i}").mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    spec = "Extend ~/.tt-project/model-bench/set/run.py"
+    monkeypatch.setattr(glmguard, "WALK_CAP", 2)
+    assert glmguard.spec_dirs(spec, tmp_path / "base") == []            # a walk that caps out holds back
+    monkeypatch.setattr(glmguard, "WALK_CAP", 20000)
+    assert glmguard.spec_dirs(spec, tmp_path / "base") == [str(d)]      # read in full: the root is granted
+
+
+_GG_KEY = "~/." + "ssh/" + "id_example"
+
+
+@pytest.mark.parametrize("cmd, why", [
+    (f"cat > \"$TTP_RUN_DIR/t.py\" <<'EOF'\nCASE = \" ; cp /tmp/k {_GG_KEY} # \"\nEOF", "text"),
+    (f"python3 - <<\"EOF\"\nprint(len('cp /tmp/k {_GG_KEY}'))\nEOF", "read"),
+    (f"python3 - <<'EOF'\nopen('{_GG_KEY}').read()\nEOF", "read"),
+    (f"tee r.sh <<'EOF'\ncat {_GG_KEY}\nEOF\nsh r.sh", "read"),
+    (f"cat > t.py <<EOF\nCASE = 'cp /tmp/k {_GG_KEY}'\nEOF", "read"), (f"cat {_GG_KEY}", "read"),
+    (f"cat > t.py <<'EOF'\nx = 1\nEOF\ncat {_GG_KEY}", "read"), (f"bash <<'EOF'\ncat {_GG_KEY}\nEOF", "read"),
+    (f"ssh box-a <<'EOF'\ncat {_GG_KEY}\nEOF", "read")])
+def test_glmenv_redirects_a_key_named_only_in_a_quoted_heredoc_and_hands_back_a_read(cmd, why, tmp_path):
+    from ttp import glmenv, glmguard
+    wt, rd = _gg_run(tmp_path)
+    got = glmenv.refusal(cmd, str(wt), str(rd), {"TTP_RUN_DIR": str(rd), **_GG_RUN_ENV})
+    assert got == (glmguard.SECRET_TEXT_WHY if why == "text" else glmguard.SECRET_WHY), got
+    assert glmguard.classify(got)[:2] == (("secret_text", glmguard.REDIRECTED) if why == "text"
+                                      else ("credentials", glmguard.HARMFUL))

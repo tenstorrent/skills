@@ -312,18 +312,50 @@ def _words(cmd: str, punctuation: str, commenters: str = "#") -> list[str]:
     import shlex
     runs: dict[str, str] = {}
     if RUN_MARK not in cmd:
+        mark = lambda run: runs.setdefault(run, f"{RUN_MARK}{len(runs)}{RUN_MARK}")
         plain = "[^" + re.escape(" \t\r\n'\"\\" + punctuation + commenters) + "]"
-        cmd = re.sub(f"(?<!{plain}){plain}{{{LONG_RUN},}}",
-                     lambda m: runs.setdefault(m[0], f"{RUN_MARK}{len(runs)}{RUN_MARK}"), cmd)
+        cmd = re.sub(f"(?<!{plain}){plain}{{{LONG_RUN},}}", lambda m: mark(m[0]), cmd)
+        cmd = _mark_quoted(cmd, commenters, mark)
     lex = shlex.shlex(cmd, posix=True, punctuation_chars=punctuation)
     lex.whitespace_split = True
     lex.commenters = commenters
     words = list(lex)
-    if runs:
-        back = {mark: run for run, mark in runs.items()}
-        words = [re.sub(f"{RUN_MARK}\\d+{RUN_MARK}", lambda m: back[m[0]], w) if RUN_MARK in w else w
-                 for w in words]
+    back = {m: run for run, m in runs.items()}
+    for i, w in enumerate(words):
+        while runs and RUN_MARK in w:   # a quote's mark may hold a mark of its own
+            w = re.sub(f"{RUN_MARK}\\d+{RUN_MARK}", lambda m: back[m[0]], w)
+        words[i] = w
     return words
+
+
+def _mark_quoted(cmd: str, commenters: str, mark) -> str:
+    """`cmd` with the text of each quote of LONG_RUN or more characters read as mark(text as shlex reads it, a
+    backslash dropped only before `"` or a backslash inside double quotes): shlex grows a word one character at a time."""
+    out, i, n = [], 0, len(cmd)
+    outside = re.compile("[" + re.escape("'\"\\" + commenters) + "]")
+    while m := outside.search(cmd, i):
+        c, j = m[0], m.start() + 1
+        if c == "\\":
+            j += 1
+        elif c in commenters:
+            j = n if (k := cmd.find("\n", j)) < 0 else k
+        else:
+            inside = re.compile("'" if c == "'" else '["\\\\]')
+            while (q := inside.search(cmd, j)) and q[0] == "\\":
+                j = q.start() + 2
+            if not q:
+                break   # an unclosed quote: shlex raises on it
+            j = q.end()
+            body = cmd[m.end():q.start()]
+            if len(body) >= LONG_RUN:
+                body = mark(body if c == "'" else re.sub(r'\\([\\"])', r"\1", body))
+            out.append(cmd[i:m.end()] + body + c)
+            i = j
+            continue
+        out.append(cmd[i:j])
+        i = j
+    out.append(cmd[i:])
+    return "".join(out)
 
 
 def ssh_targets(cmd: str) -> list[str]:

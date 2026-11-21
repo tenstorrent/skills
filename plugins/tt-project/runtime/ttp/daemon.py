@@ -4256,8 +4256,9 @@ class Daemon:
                 glmguard.mark(run_dir)
             if glm_env:   # a run on the chat model: outward posts become drafts, a device run stops at a failed gate
                 plan = bool((note or {}).get(deviceplan.KEY))
-                glmguard.mark_run(run_dir, glm_env[glmguard.RUN_ENV] == glmguard.DEVICE or plan,
-                                  glmguard.gate_lines(str((task or {}).get("spec") or "")), plan=plan, cwd=str(cwd))
+                task_spec = str((task or {}).get("spec") or "")
+                glmguard.mark_run(run_dir, glm_env[glmguard.RUN_ENV] == glmguard.DEVICE or plan, glmguard.gate_lines(task_spec),
+                                  plan=plan, cwd=str(cwd), dirs=glmguard.spec_dirs(task_spec, self.p.base))
             if task and role in ctxfork.ROLES:   # restated after each compaction (rolerestore.py)
                 rolerestore.write(run_dir, role, task, self.p.name)
             if stdin is not None:   # what the agent reads; prompt.md stays the readable digest

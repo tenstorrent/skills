@@ -10,7 +10,8 @@ call:
 
 - the side-effect rules of glmguard.shell_refusal (a `ttp` command outside the allowed set, a raw `git push`,
   a GitHub write, an HTTP post, ssh or mail, a state or database write, a write outside the worktree);
-- a read of the stored secrets (hook.secret_read, credguard.bash_refusal), as the Claude Code hook does.
+- a read of the stored secrets (hook.secret_read, credguard.bash_refusal), as the Claude Code hook does; a key
+  named only in a quoted heredoc's text (a script's test string) is a redirect, not a hand-back.
 
 An outward post (glmguard.outward_shell) is not run but recorded as a draft for an Opus step, and the run goes on;
 on a device task a failed gate command ends the run as a hand-back to Opus with its output (glmguard.gate_stop).
@@ -63,10 +64,14 @@ def refusal(command: str, cwd: str = "", run_dir: str = "", env=None) -> str | N
         return why
     try:
         from . import credguard, hook
+        def secret(cmd: str) -> bool:
+            commands = hook._split(cmd)[0]
+            segs = hook._all_segments(commands) + hook._segments(commands, strip=False)
+            return bool(hook.secret_read(cmd, segs, cwd) or credguard.bash_refusal(cmd, segs, cwd=cwd))
+        if secret(command):
+            # named only in a quoted heredoc a file gets (a script's test string): still never run, but a redirect
+            return glmguard.SECRET_TEXT_WHY if not secret(glmguard.code_text(command)) else glmguard.SECRET_WHY
         commands, _ = hook._split(command)
-        segs = hook._all_segments(commands) + hook._segments(commands, strip=False)
-        if hook.secret_read(command, segs, cwd) or credguard.bash_refusal(command, segs, cwd=cwd):
-            return "a run on the GLM arm may not read stored secrets or credential files"
         from . import aitag, ruleguard
         if why := ruleguard.bash_refusal(command, hook._all_segments(commands), aitag.project_config(), cwd, e):
             return why

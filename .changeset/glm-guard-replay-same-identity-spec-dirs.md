@@ -1,0 +1,5 @@
+---
+"tt-project": patch
+---
+
+`tt-project`: fewer false GLM hand-backs. A command that sets a run identity variable to the value it already has (`TTP_PROJECT=<this run's project> ttp ...`) passes; any other value still hands back. A GLM run may write in the existing work folders its task spec names as its work, and those are only the `model-bench` and `scratch` work folders of `.tt-project` (never the bench harness folder), never one in, or holding at any depth, a project's tt-project folder. A key or credential file named only in a quoted heredoc that is just written to a file (a test string in a script) is still refused, but as a redirect the run can fix instead of a hand-back; a read of one from the shell, an unquoted heredoc, a heredoc a shell or interpreter reads, or a script the command then runs still hands back. On a GLM device task, `||` no longer counts as a pipe and text that only names a device path is no read, so `ls <device folder> || true` passes; a listing piped, substituted, written to a file or fed from a loop or `{ }` group into another command still hands back. The hook splits long quoted text in linear time.
