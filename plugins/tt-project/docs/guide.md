@@ -4121,6 +4121,14 @@ the pick order, so it takes the first starts. A resumed resource ramps only its 
   `ttp push`) and never fails or undoes the main push. Mirrors run right after the push and
   before `delivery.after_push`, which still runs as before. The push branch itself and invalid
   names are refused, and setting it needs the user's word.
+- `delivery.push_upstream` (off by default) is for a push remote that is a relay a forwarder sends on
+  to the real upstream: that upstream's URL, readable anonymously (https, git, file or a path) or a
+  git remote's name, or `{"url", "branch"}` when its branch has another name. The daemon reads the
+  upstream tip every 5 min with an anonymous `git ls-remote` and counts the relay commits it lacks.
+  `ttp status`, the daily review and `ttp push audit` show `relay ahead of upstream by N commits for
+  H h` (or `lag unknown` when the upstream cannot be read, never 0), landing replies and post_land
+  events add `on relay, not yet upstream`, and one high alert opens once the lag has lasted
+  `relay.gone_after_s` and clears when the upstream has every relay commit.
 - `delivery.auto_merge_repos` (`owner/repo` names, none by default) lists the repositories whose
   pull requests the project may merge itself. The coordinator sets it only in the turn that carries
   the user's own message saying so, and only adds repos; each change is logged as a `config_grant`

@@ -2392,7 +2392,7 @@ class Daemon:
                      self.sweep_alerts, self.check_release, self.sync_shared_pauses, self.check_pause_ends, self.check_move, self.track_outages,
                      self.check_integrity, self.heal_harness_git,
                      self.sync_schedules, self.lint_charter, self.lint_worker_prompt, self.tend_holds, self.record_ttr, self.alert_long_pause, self.reclassify_alerts,
-                     self.check_linger, self.check_notifier, self.check_overseer, self.check_gh_auth, self.check_reach, self.check_spill_health, self.watch_occupancy, self.check_chats,
+                     self.check_linger, self.check_notifier, self.check_overseer, self.check_gh_auth, self.check_reach, self.check_spill_health, self.watch_occupancy, self.check_chats, self.check_relay_lag,
                      self.probe_mcp):
             self._run_step(step)
         self._idle.update(self.cfg, self._work_seen)
@@ -5209,6 +5209,11 @@ class Daemon:
             self._spill_health = threading.Thread(target=spillhealth.probe, args=(t,), daemon=True, name="spill-health")
             self._spill_health.start()
         spillhealth.apply(self.p, self.cfg)
+
+    def check_relay_lag(self) -> None:
+        """How far the real upstream is behind a push relay (relaylag; off without delivery.push_upstream)."""
+        from . import relaylag
+        relaylag.tick(self.p, self.cfg, self.alert)
 
     def check_chats(self) -> None:
         """One low status line per relay chat that stopped reading with no listener running (chatgone)."""
@@ -10210,7 +10215,8 @@ class Daemon:
                 log(self.p, f"github purview line failed: {type(e).__name__}: {e}")
         if s["name"] == "daily-review":
             try:
-                line = pushq.target_line(db, timefmt.home(self.p))
+                from . import relaylag
+                line = "; ".join(x for x in (pushq.target_line(db, timefmt.home(self.p)), relaylag.line(db, ok_too=True)) if x)
                 if line:
                     spec += f"\n\nDelivery: {line}."
             except Exception as e:   # nor must a missing or broken push marker

@@ -787,12 +787,16 @@ def _batch_reach(db, batch: str | None, b: dict | None = None, m: dict | None = 
     return r if isinstance(r, dict) else None
 
 
-def _landing(row: dict, target: str, reach: dict | None) -> str:
+def _landing(row: dict, target: str, reach: dict | None, db=None) -> str:
     """A pushed or landed row in words: the exact branch and short sha, and whether it is on the
-    branch it is meant to reach (push.reach_words), so "pushed" never reads as landed there."""
+    branch it is meant to reach (push.reach_words), so "pushed" never reads as landed there. With `db`,
+    also whether a push relay's upstream has it yet (relaylag.landing_words)."""
+    from . import relaylag
+    relay = relaylag.landing_words(db) if db is not None else ""
+    relay = f", {relay}" if relay else ""
     if row["status"] == "pushed":
-        return push.landing(row["pushed_sha"], target, reach, row["version"])
-    return f"already on {target} at {_short(row['pushed_sha'])}" + push.reach_words(reach)
+        return push.landing(row["pushed_sha"], target, reach, row["version"]) + relay
+    return f"already on {target} at {_short(row['pushed_sha'])}" + push.reach_words(reach) + relay
 
 
 def target_line(db, tz: str | None = None) -> str | None:
@@ -2852,7 +2856,7 @@ def _settle_landed(p: Project, task: dict, b: dict, m: dict, prev: dict, summary
     last = max(done, key=lambda x: x["id"])
     new = [x for x in current if x["status"] == "pushed"]
     tail = _landing({**last, "status": "pushed" if new else "landed"}, last["target"] or target,
-                    _batch_reach(db, last["batch"], b, m))
+                    _batch_reach(db, last["batch"], b, m), db)
     ff = [str(x) for x in m.get("fast_forward") or []] if new else []
     if ff:   # delivery.fast_forward_also and mirror_remotes, as read back from the remotes
         tail += "; " + "; ".join(f"warning: {x}" if x in push.ff_warnings([x]) else x for x in ff)
@@ -3038,7 +3042,7 @@ def settle_reviewed(db, now: float | None = None, only: set[int] | None = None) 
         if not shipped:
             continue
         last = max(shipped, key=lambda x: x["id"])
-        tail = f"shipped by review #{latest['id']}: " + _landing(last, last["target"], _batch_reach(db, last["batch"]))
+        tail = f"shipped by review #{latest['id']}: " + _landing(last, last["target"], _batch_reach(db, last["batch"]), db)
         prev = load_result(t["result"])
         summary = str(prev.get("summary") or "")
         result = {**prev, "status": "done", "summary": f"{summary.rstrip()} ({tail})".strip()[:1500],
