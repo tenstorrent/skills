@@ -7468,13 +7468,15 @@ class Daemon:
             from .providers.base import RunUsage
             usage = RunUsage(cost_usd=float(pv.get("cost") or 0.0), estimated=bool(pv.get("estimated")))
             self._prefetch_lint(tid, handoff, run_dir)
+            frun = dict(run) if run else {"id": pv.get("run"), "task": tid, "note": "{}"}
+            self._prewrite(frun, run_dir, handoff)
             for rnd in self._finish_rounds(tid):
                 with rnd:
                     t = db.task(tid)
                     if t and t["status"] == "pushing" and pushclaim.KEY in load_result(t["result"]):
-                        self._finish_worker(dict(run) if run else {"id": pv.get("run"), "task": tid, "note": "{}"},
-                                            usage, "ok", run_dir, pv.get("ended"), handoff=handoff,
+                        self._finish_worker(frun, usage, "ok", run_dir, pv.get("ended"), handoff=handoff,
                                             push_verified=state == pushclaim.CONFIRMED)
+            self._writeups.pop(tid, None)
 
     def audit_pushes(self) -> None:
         """Hourly, model-free: done tasks of the last days whose claimed pushes are not on the remote
@@ -7723,34 +7725,35 @@ class Daemon:
         finally:
             gitreplay.end(att.id)
 
-    def _prewrite(self, r: dict, run_dir: Path) -> None:
+    def _prewrite(self, r: dict, run_dir: Path, result: dict | None = None) -> None:
         """Before the finish transaction (a Claude call that long never holds the write lock, and a replayed
         round does not repeat it): a reply_chat task's chat-provider run has Opus write the chat message from its
-        result.json (writeup.py); the stamped text waits in `_writeups` for `_writeup`."""
-        self._writeups.pop(r.get("task"), None)
+        hand-off (result.json, or the `result` standing in for it); the stamped text waits in `_writeups`."""
         task = self.p.db.task(r["task"]) if r.get("task") else None
         if not (task and task["reply_chat"] and writeup.chat_run(r) and writeup.active(self.cfg)):
             return
-        result = _read_result(run_dir / RESULT_FILE)
+        if result is None:
+            result = _read_result(run_dir / RESULT_FILE)
         status = result.get("status") if isinstance(result, dict) else None
         if status not in ("done", "failed", "blocked"):
             return
         need = str(result.get("question") or result.get("blocked_reason") or "") if status == "blocked" else ""
         held = "auth" if self._logged_out("claude") else "down" if self.net_held("claude") else ""
         row = writeup.write(self.p, self.cfg, task, result, r, status, need, run_dir, held=held)
-        self._writeups[task["id"]] = {"run": r.get("id"), "status": status,
-                                      "fields": {k: result[k] for k in (replymsg.FIELD, replymsg.BY) if k in result}}
+        if row.get("ok"):
+            self._writeups[task["id"]] = {"run": r.get("id"), "status": status, "fields": {
+                k: result[k] for k in (replymsg.FIELD, replymsg.BY) if k in result}}
         log(self.p, f"task {task['id']}: Opus write-up of run {r.get('id')}: "
                     f"{'ok' if row.get('ok') else 'failed: ' + str(row.get('error'))} (${row.get('cost_usd', 0):.2f})")
 
     def _writeup(self, r: dict, task: dict, result: dict, new: str) -> None:
         """A reply_chat task's chat-provider run: flag its hand-off, drop any stamp the run wrote itself and take
-        the one `_prewrite` made for this run and outcome. Without one the hand-off stays unstamped, so
-        replymsg.guard keeps its text out of the chat."""
+        the one `_prewrite` made for this run and outcome (a done one still stands as `pushing`). Without one the
+        hand-off stays unstamped, so replymsg.guard keeps its text out of the chat."""
         result.pop(replymsg.BY, None)
         result[replymsg.CHAT_RUN] = True
         got = self._writeups.get(task["id"])
-        if got and got["run"] == r.get("id") and got["status"] == new and writeup.active(self.cfg):
+        if got and got["run"] == r.get("id") and new in (got["status"], "pushing" if got["status"] == "done" else ""):
             result.update(got["fields"])
 
     def _finish_worker(self, r: dict, usage, status: str, run_dir: Path, ended: str | None = None,

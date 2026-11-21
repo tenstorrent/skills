@@ -199,3 +199,18 @@ def test_the_writeup_runs_outside_the_finish_transaction_and_a_replayed_round_do
     assert replies == ["Opus wrote this: it works."]
     assert seen == [False], "one Opus call, with no write transaction open"
     assert p.db.task(tid)["status"] == "done"
+
+
+def test_a_writeup_stamp_is_taken_only_for_its_own_run_and_outcome(env, monkeypatch):
+    from ttp import replymsg
+    from ttp.daemon import Daemon
+    d = Daemon(make(env).base)
+    task = {"id": 5}
+    stamp = {replymsg.FIELD: "Opus wrote this.", replymsg.BY: {"step": replymsg.WRITEUP, "sha": replymsg.digest("Opus wrote this.")}}
+    d._writeups[5] = {"run": 7, "status": "done", "fields": stamp}
+    for run, new, taken in ((7, "done", True), (7, "pushing", True), (7, "failed", False), (8, "done", False)):
+        result = {replymsg.FIELD: "GLM's own words", replymsg.BY: {"step": replymsg.WRITEUP, "sha": "forged"}}
+        d._writeup({"id": run}, task, result, new)
+        assert result[replymsg.CHAT_RUN] is True
+        assert (result.get(replymsg.BY) == stamp[replymsg.BY]) is taken
+        assert (result[replymsg.FIELD] == "Opus wrote this.") is taken
