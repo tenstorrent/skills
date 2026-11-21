@@ -6,13 +6,11 @@ normal alert per entry, keyed `pause-gone:<entry id>`; it clears once the entry 
 back. KEY keeps the entries alerted on (alerts.holds reads it), so a repeat check never alerts again."""
 from __future__ import annotations
 
-import json
 import os
 import shlex
 from typing import Any, Callable
 
 from . import alerts, ends, machine_ledger
-from .db import PAUSE_REMOVED_KIND
 
 KEY = "pause_gone"   # kv: {entry id: resource} of the open ledger entries alerted on
 KIND = "pause-gone"  # alert key prefix (alerts.STATUS_CONDITIONS)
@@ -52,17 +50,12 @@ def resumed_resource(undo: Any, project: str) -> str | None:
 
 
 def _removed_line(db, res: str, where) -> str:
-    """Who removed pause `res` last, from its PAUSE_REMOVED_KIND event, or ""."""
-    for row in db.q("SELECT ts, data FROM events WHERE kind=? ORDER BY id DESC LIMIT 50", (PAUSE_REMOVED_KIND,)):
-        try:
-            d = json.loads(row["data"] or "{}")
-        except ValueError:
-            continue
-        if isinstance(d, dict) and d.get("resource") in (res, "*"):
-            break
-    else:
+    """Who removed pause `res` last, from its pause-removal event (db.last_pause_removal), or ""."""
+    gone = db.last_pause_removal((res,))
+    if gone is None:
         return " (no event records who removed it)"
-    return (f" (removed {ends.shown(float(row['ts']), where)} by {d.get('by') or 'unknown'} via "
+    ts, d = gone
+    return (f" (removed {ends.shown(ts, where)} by {d.get('by') or 'unknown'} via "
             f"{d.get('via') or 'unknown'}: {d.get('reason') or 'no reason given'})")
 
 

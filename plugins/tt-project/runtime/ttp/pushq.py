@@ -59,8 +59,6 @@ from .db import (
     dependency_ids,
     dump_result,
     load_result,
-    PAUSE_REMOVED_KIND,
-    PAUSE_REPLACED_KIND,
     pin_of,
     review_subject,
     reviewed_ids,
@@ -3822,7 +3820,6 @@ def tend(p: Project, cfg: dict | None = None, alert: Callable = lambda *a, **k: 
         queue_off(p, cfg)
     changed = finalize(p, cfg, alert)
     check_landing(p, cfg, alert)
-    check_no_batch(p, cfg, alert)
     tend_scope_holds(p, cfg)
     return changed
 
@@ -3889,28 +3886,15 @@ def no_batch_holds(p: Project, cfg: dict | None = None, now: float | None = None
     return out or ["no hold found"]
 
 
-def _push_pause_end(db, names: tuple[str, ...], since: float) -> float:
-    """When a pause of the push resource last ended on or after `since` (its removal or replacement
-    event), else 0: a wait a pause held back does not count against the approvals (check_no_batch)."""
-    for row in db.q("SELECT ts, data FROM events WHERE kind IN (?, ?) AND ts>=? ORDER BY id DESC",
-                    (PAUSE_REMOVED_KIND, PAUSE_REPLACED_KIND, since)):
-        try:
-            d = json.loads(row["data"] or "{}")
-        except ValueError:
-            continue
-        if isinstance(d, dict) and d.get("resource") in names:
-            return float(row["ts"])
-    return 0.0
-
-
 def check_no_batch(p: Project, cfg: dict | None = None, alert: Callable = lambda *a, **k: None,
                    now: float | None = None) -> bool:
     """Raise NO_BATCH_ALERT once per stall: approvals have waited NO_BATCH_S, since the later of
-    their approval, the last batch that freed the queue and the end of a pause of the push resource,
-    and no batch runs. A pause that still holds keeps it quiet (the pause shows in status), and a
-    batch due now starts later in this same tick, so a stall alerts only once a check has seen it
-    before. It names what holds the batch (no_batch_holds) and queues one event for the coordinator;
-    alerts.holds clears it once a batch starts or no approval waits. Returns whether it alerted now."""
+    their approval, the last batch that freed the queue and the end of a pause of the push resource
+    (db.last_pause_removal), and no batch runs. The daemon runs this right after its start step
+    (Daemon.start_pushes), so a batch due this very tick has started and what remains is a real
+    stall; a pause that still holds keeps it quiet (the pause shows in status). It names what holds
+    the batch (no_batch_holds) and queues one event for the coordinator; alerts.holds clears it
+    once a batch starts or no approval waits. Returns whether it alerted now."""
     now = time.time() if now is None else now
     db = p.db
     st = _state(db)
@@ -3932,12 +3916,9 @@ def check_no_batch(p: Project, cfg: dict | None = None, alert: Callable = lambda
     last = db.one("SELECT MAX(COALESCE(after_finalized, finalized, ended, started)) AS t FROM push_batches")
     since = max(float(oldest["t"]), float(last["t"] or 0) if last else 0.0)
     if now - since >= NO_BATCH_S:   # a pause that held the queue back is no wait on the queue
-        since = max(since, _push_pause_end(db, names, float(oldest["t"])))
+        gone = db.last_pause_removal(names, float(oldest["t"]))
+        since = max(since, gone[0] if gone else 0.0)
     if now - since < NO_BATCH_S:
-        return False
-    if not stall.get("seen"):
-        st["no_batch"] = {"seen": now, "since": since}   # a batch starts later in this very tick
-        db.set_kv(KV, st)
         return False
     holds = no_batch_holds(p, cfg, now)
     n = db.one("SELECT COUNT(*) AS n FROM push_queue WHERE status='approved'")["n"]

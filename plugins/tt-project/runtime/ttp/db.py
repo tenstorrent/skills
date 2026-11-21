@@ -995,6 +995,23 @@ END""")
             cause = cause or self._pause_cause()
             self.pause_event(PAUSE_REPLACED_KIND if name in now else PAUSE_REMOVED_KIND, name, was[name], cause)
 
+    def last_pause_removal(self, names, since: float = 0.0) -> tuple[float, dict] | None:
+        """The last pause-removal event whose resource is one of `names` or '*' (what the kv
+        quarantine writes when the stored pauses were unreadable), at or after `since`: its ts and
+        data, else None. A pause the kv still holds has no end (its replacement event is not one);
+        a caller that reads the live pauses covers it. A shared or fleet pause leaves no removal
+        event in this database: its end passes coordinator.sync_shared_pauses, which records a
+        resource_resumed event."""
+        for row in self.q("SELECT ts, data FROM events WHERE kind=? AND ts>=? ORDER BY id DESC",
+                          (PAUSE_REMOVED_KIND, since)):
+            try:
+                d = json.loads(row["data"] or "{}")
+            except ValueError:
+                continue
+            if isinstance(d, dict) and d.get("resource") in (*names, "*"):
+                return float(row["ts"]), d
+        return None
+
     def set_paused(self, on: bool, boot: str | None = None, by: str = "unknown", reason: str = "",
                    via: str = "", end: str = "", user_msg: int | None = None) -> None:
         """Pause or resume the whole project, recording who (`by`: user, coordinator, daemon, a run or

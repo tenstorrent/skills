@@ -3389,8 +3389,11 @@ class Daemon:
                 log(self.p, "push queue: closing shipped code tasks failed\n" + traceback.format_exc())
 
     def start_pushes(self) -> None:
-        """Start a push batch when one is due (pushq.schedule): local checks only, no model."""
+        """Start a push batch when one is due (pushq.schedule): local checks only, no model. The
+        no-batch alarm checks right after it, so the batch this very tick starts is never read as a
+        stall; a tick that skips this step for a held cycle runs no check either (no stall)."""
         pushq.schedule(self.p, self.cfg, log=lambda m: log(self.p, m))
+        pushq.check_no_batch(self.p, self.cfg, self.alert)
 
     def _check_sleep(self) -> None:
         """Notice that the host slept: the wall clock jumped ahead of the monotonic one, which stands
