@@ -4414,9 +4414,8 @@ def _own_push_head(repo: Path, remote: str, branch: str, head: str, read: str, l
         if _git(repo, "push", f"--force-with-lease=refs/heads/{branch}:{read}", remote,
                 f"{head}:refs/heads/{branch}", quiet=False).returncode == 0:
             say(f"pushed {head[:10]} to {remote}/{branch}, replacing {read[:10]} (a rebase, under a lease)")
-            if (p is not None and target(p, repo) == (remote, branch)
+            if (p is not None and landed._has_push_branch(p) and target(p, repo) == (remote, branch)
                     and _git(repo, "merge-base", "--is-ancestor", read, head).returncode != 0):
-                from . import landed
                 landed.retire_tip(p, read)   # the push branch replaced non-fast-forward: its commits stay landed
             return 0
         say(f"push to {remote}/{branch} was rejected: it no longer has {read[:10]}, the tip the lease was "

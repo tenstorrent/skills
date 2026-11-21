@@ -22794,6 +22794,8 @@ def test_a_commit_only_on_a_retired_tip_of_the_push_branch_still_counts_as_lande
     assert landed.check(p, repo, lone)[0] == landed.NOT_YET, "a commit on neither tip stays unlanded"
     assert [g["task"] for g in pushclaim.audit(p)["gaps"]] == [t_lone], "the retired-tip claim raises no gap"
     assert dmod.Daemon(p.base).sweep_unreviewed(force=True) == [t_lone], "no review for a head under a retired tip"
+    p.set_config("delivery.push_branch", "")   # no push branch: a check on a named ref still answers
+    assert landed.check(p, repo, lone, onto="origin/proj")[0] == landed.NOT_YET
 
 
 def test_a_lease_replace_retires_the_push_branch_tip_it_replaced_but_never_an_own_branch_tip(env, monkeypatch):
@@ -22816,3 +22818,9 @@ def test_a_lease_replace_retires_the_push_branch_tip_it_replaced_but_never_an_ow
     assert push._own_push_head(repo, "origin", "proj", _git_out(repo, "rev-parse", "HEAD"), new, True,
                                lambda m: None, p) == 0
     assert landed.retired_tips(p) == [old], "a fast-forward retires nothing"
+    p.set_config("delivery.push_branch", "")   # no push branch: an own lease push still goes, retiring nothing
+    _git_out(repo, "reset", "-q", "--hard", "HEAD~1")
+    _commit(repo, "proj.txt", "again\n")
+    assert push._own_push_head(repo, "origin", "proj", _git_out(repo, "rev-parse", "HEAD"),
+                               _git_out(repo, "rev-parse", "origin/proj"), True, lambda m: None, p) == 0
+    assert landed.retired_tips(p) == [old]

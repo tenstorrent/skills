@@ -1053,7 +1053,7 @@ def check(p, repo: Path, sha: str | None = None, tid: int | None = None, onto: s
             continue
         if any(_commit(repo, s) and on_branch(repo, s, tip) for s in shas):
             return 0, f"{what} is on {ref}"
-    if p is not None and onto == _push_ref(p, repo) and (found := on_push(p, repo, shas, "")):
+    if p is not None and _has_push_branch(p) and onto == _push_ref(p, repo) and (found := on_push(p, repo, shas, "")):
         return 0, f"{what} is on {onto}, at its retired tip {found[:10]}"
     return NOT_YET, f"{what} is not on {onto} yet"
 
