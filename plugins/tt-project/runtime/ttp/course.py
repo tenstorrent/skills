@@ -19,7 +19,7 @@ with a threshold under `coordinator.course_check` in project.json (0 turns one o
   tasks first, then the costliest finished ones, in id order; one count line names the rest and
   `ttp course <project>`, which lists them all.
 - over_estimate: a running worker run, at least `over_min_min` (15) minutes old, past `over_estimate`
-  (0.5, i.e. 50%) over the median of its kind and tier's done runs (needs `over_min_samples` (3)
+  (0.5, i.e. 50%) over the median of its kind and tier's ended runs (needs `over_min_samples` (3)
   of them). The coordinator re-estimates it: steer, split or restart it, and update promises.
 - idle_turns: the last `idle_turns` (6) or more coordinator turns in a row decided nothing, with
   their cost and what woke them.
@@ -137,26 +137,29 @@ def spend(db: DB, ratio: float, floor: float, samples: float, now: float) -> lis
 
 
 def over_estimate(db: DB, over: float, samples: int, floor_min: float, now: float) -> list[dict]:
-    """The running worker runs that have gone `over` (0.5: 50%) past the median of the done runs of their
-    kind and tier (eta.history; their kind alone when none of that tier), at least `floor_min` minutes in,
-    when `samples` or more done runs measure the median: {"id", "title", "kind", "min", "median_min", "n"}."""
+    """The running worker runs that have gone `over` (0.5: 50%) past the median of the ended runs of their
+    kind and tier (eta._Est.run_samples; their kind alone when none of that tier; a long job's is its
+    per-cell time times its cells, eta.long_job), at least `floor_min` minutes in, when `samples` or more
+    ended runs measure the median: {"id", "title", "kind", "min", "median_min", "n"}."""
     if over <= 0:
         return []
-    rows = db.q("SELECT t.id, t.title, t.kind, t.tier, r.started FROM runs r JOIN tasks t ON t.id=r.task "
+    rows = db.q("SELECT t.id, t.title, t.kind, t.tier, t.spec, r.started FROM runs r JOIN tasks t ON t.id=r.task "
                 "WHERE r.status='running' AND r.role!='coordinator' AND r.started IS NOT NULL ORDER BY t.id")
     if not rows:
         return []
     from . import eta
-    h = eta.history(db, now)
+    est = eta._Est(db, now, load=None)   # one history read for every run; no host-load read
     out = []
     for r in rows:
-        runs = h["run"].get((r["kind"], r["tier"])) or h["kind"].get(r["kind"]) or []
-        if len(runs) < samples:
-            continue
-        med, spent = eta._med(runs), now - float(r["started"])
-        if med and spent >= floor_min * 60 and spent > med * (1 + over):
+        if (cell := est.cell_run(r)) is not None:   # cells at the measured per-cell time, never the kind's median
+            med, n = cell
+        else:
+            runs = est.run_samples(r)
+            med, n = eta._med(runs), len(runs)
+        spent = now - float(r["started"])
+        if n >= samples and med and spent >= floor_min * 60 and spent > med * (1 + over):
             out.append({"id": r["id"], "title": r["title"], "kind": r["kind"], "min": spent / 60,
-                        "median_min": med / 60, "n": len(runs)})
+                        "median_min": med / 60, "n": n})
     return out
 
 
@@ -231,7 +234,7 @@ def digest_lines(db: DB, cfg: dict | None, now: float | None = None,
         slow = []
     for t in slow:
         lines.append(f"- over its estimate: #{t['id']} '{_title(t)}' has run {t['min']:.0f} min, {t['min'] / t['median_min']:.1f}x "
-                     f"the median {t['median_min']:.0f} min of {t['n']} done {t['kind']} runs | re-estimate it: read its "
+                     f"the median {t['median_min']:.0f} min of {t['n']} ended {t['kind']} runs | re-estimate it: read its "
                      "progress, steer or split it, or restart it, and update any promise that waits on it")
         ident.append(f"over_estimate:{t['id']}")
     if i := idle_turns(db, s["idle_turns"]):

@@ -423,13 +423,23 @@ class _Est:
     def _held_none(self, tid: int, clears: str) -> dict:
         return self._none(tid, f"#{tid} is held by the spend cap until {clears}")
 
-    def _run(self, t: dict) -> list[float]:
+    def run_samples(self, t: dict) -> list[float]:
         """The run samples of a task: its kind and size when there are MIN_SIZE of them, else its
         kind and tier, else its kind."""
         by_size = (self.h.get("size") or {}).get((t["kind"], size_of(t.get("spec") or "")))
         if by_size and len(by_size) >= MIN_SIZE:
             return by_size
         return self.h["run"].get((t["kind"], t["tier"])) or self.h["kind"].get(t["kind"]) or []
+
+    def cell_run(self, t: dict) -> tuple[float | None, int] | None:
+        """A long job's run estimate (long_job): its cells at the measured per-cell time (None when
+        unmeasured or it lists no cells) and how many per-cell samples measure it; None for any
+        other task, whose estimate is run_samples."""
+        if (lj := long_job(t)) is None:
+            return None
+        per = self.h["cell"].get(t["kind"]) or []
+        m = self._m(per)
+        return (m * len(lj) if m is not None and lj else None), len(per)
 
     def _left(self, xs: list[float], elapsed: float) -> tuple[float, bool]:
         """Median time left of the samples longer than `elapsed`; past all of them: 0, overrunning."""
@@ -606,18 +616,17 @@ class _Est:
                     and merge_gate(when) is None and (tg := time_gate(when)) is None:
                 why = deferral(t).get("why")
                 return self._gated(tid, f"#{tid} starts when " + (why or f"`{when.strip()[:120]}` passes"), path)
-            runs = self._run(t)
+            runs = self.run_samples(t)
             lx = self._loadx() if not (long_job(t) is not None) else 1.0   # a long job runs on its own host
             if lx > 1.0:
                 notes.append(f"host load x{lx:.2f}")
             ow = outside_wait(t, now, self.reports, Path(self.db.path).parent) if st != "running" else None
             lj = long_job(t) if not ow else None
             if lj is not None:   # a bench or other long job: its cells at the measured per-cell time, never the kind's median
-                per = self._m(self.h["cell"].get(t["kind"]) or [])
-                if per is None or not lj:
+                if (cell := self.cell_run(t)[0]) is None:
                     return {**self._none(tid, f"no estimate yet: a long job with no per-cell time measured by "
                                               f"an earlier {t['kind']} run"), "path": path}
-                runs = [per * len(lj)]
+                runs = [cell]
             if st != "running" and (pr := merge_gate(gate_probe(t))) is not None and not (ow and ow["at"]):
                 return self._after(tid, f"PR #{pr} merges or closes", "a merge gate has no measured finish", path)
             if ow and ow["at"] is None:

@@ -15,9 +15,10 @@ def _over_running(tid=7, kind="code", tier="standard", started=0.0):
     return {"id": tid, "title": f"task {tid}", "kind": kind, "tier": tier, "started": started}
 
 
-def _hist(monkeypatch, run=None, kind=None):
+def _hist(monkeypatch, run=None, kind=None, cell=None):
     from ttp import eta
-    monkeypatch.setattr(eta, "history", lambda db, now=None: {"run": run or {}, "kind": kind or {}})
+    monkeypatch.setattr(eta, "history", lambda db, now=None: {"run": run or {}, "kind": kind or {},
+                                                               "cell": cell or {}})
 
 
 def test_over_estimate_names_a_run_past_the_median_of_its_kind_and_tier(monkeypatch):
@@ -49,3 +50,16 @@ def test_over_estimate_falls_back_to_the_kind_and_skips_unmeasured_kinds(monkeyp
     _hist(monkeypatch)
     assert course.over_estimate(_FakeDB(rows), 0.5, 3, 15, 2000.0) == []
     assert course.over_estimate(_FakeDB([]), 0.5, 3, 15, 2000.0) == []
+
+
+def test_over_estimate_measures_a_long_job_by_its_cells_not_the_runs_median(monkeypatch):
+    """A long job's estimate is its per-cell time x its cells (eta.long_job): a bench run still under
+    that is not flagged even when the kind's median run time is far shorter; one past it is."""
+    from ttp import course
+    row = _over_running(kind="bench", tier="standard", started=0.0)
+    row["spec"] = "cells: one, two, three, four"
+    _hist(monkeypatch, run={("bench", "standard"): [60.0, 60.0, 60.0]}, cell={"bench": [300.0, 300.0, 330.0]})
+    # per-cell median 300 s x 4 cells = 1200 s: 1500 s in is inside it (and past the 15 min floor)
+    assert course.over_estimate(_FakeDB([row]), 0.5, 3, 15, 1500.0) == []
+    got = course.over_estimate(_FakeDB([row]), 0.5, 3, 15, 2000.0)   # past the 1200 s estimate
+    assert [g["id"] for g in got] == [7] and round(got[0]["median_min"]) == 20 and got[0]["n"] == 3, got
