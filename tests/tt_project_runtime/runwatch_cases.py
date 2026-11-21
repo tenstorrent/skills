@@ -249,8 +249,8 @@ def _drift_note_setup(env, tmp_path, update):
     run_dir.mkdir()
     (run_dir / "result.json").write_text(json.dumps({"status": "done", "summary": "landed"}))
     (run_dir / "steer.md").write_text(update)
-    d._finish_worker({"task": tid, "note": json.dumps({"spec_sha": started})}, Usage(cost_usd=1.0),
-                     "ok", run_dir)
+    d._finish_worker({"task": tid, "provider": "claude", "note": json.dumps({"spec_sha": started})},
+                     Usage(cost_usd=1.0), "ok", run_dir)
     return p, tid
 
 
