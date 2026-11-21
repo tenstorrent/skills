@@ -190,12 +190,19 @@ def _markers(p, tid: int) -> list[tuple[Path, dict]]:
     return out
 
 
+def _refused_before_write(m: dict) -> bool:
+    """A push that ended refused (push.REFUSED) or rejected (push.REJECTED): no remote write happened."""
+    from . import push
+    return m.get("status") == "failed" and m.get("exit") in (push.REFUSED, push.REJECTED)
+
+
 def marker_claims(p, tid: int, run_id) -> list[dict]:
     """The detached pushes a run started (and any of the task's still queued or running): each is a
-    claim, checked once it wrote its outcome (_check_marker)."""
+    claim, checked once it wrote its outcome (_check_marker). A push refused before any remote write
+    claims nothing (_refused_before_write)."""
     out = []
     for marker, m in _markers(p, tid):
-        mine = run_id is not None and str(m.get("run")) == str(run_id)
+        mine = run_id is not None and str(m.get("run")) == str(run_id) and not _refused_before_write(m)
         if mine or m.get("status") in ("queued", "running"):
             out.append({"marker": marker.name, "source": f"its detached push {marker.stem}", "strict": True})
     pushed = {c["marker"] for c in out if _read_marker(p, c["marker"]).get("status") == "pushed"}

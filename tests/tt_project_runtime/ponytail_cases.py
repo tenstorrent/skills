@@ -74,12 +74,18 @@ def test_a_change_over_the_landing_size_needs_a_reason_and_the_lanes_pass(env, m
     p = make(env)
     p.set_config("review.ponytail_land_lines", 30)
     passed = {"verdict": "pass", "head": "", "findings": []}
-    _, _, _, (rev,) = _finish_code(env, p, "big", {"big.py": 45})
+    _, _, _, (rev,) = _finish_code(env, p, "big", {"big.py": 45},
+                                   result={"status": "done", "summary": "why this size: one table"})
     assert "it adds 45 lines, over review.ponytail_land_lines (30)" in rev["spec"]
     t = _lane_review(env, p, rev["id"], passed)
-    assert t["status"] == "failed" and "why this size" in t["result"]
+    assert t["status"] == "done", t["result"]
+    p.set_config("review.ponytail_land_lines", 60)   # under the limit when queued, over it once handed off
     _, _, _, (rev,) = _finish_code(env, p, "big2", {"big2.py": 45})
-    t = _lane_review(env, p, rev["id"], passed, summary="why this size: one generated table\nlooks right")
+    _, _, _, (rev3,) = _finish_code(env, p, "big3", {"big3.py": 45})
+    p.set_config("review.ponytail_land_lines", 30)
+    t = _lane_review(env, p, rev["id"], passed)
+    assert t["status"] == "failed" and "why this size" in t["result"]
+    t = _lane_review(env, p, rev3["id"], passed, summary="why this size: one generated table\nlooks right")
     assert t["status"] == "done", t["result"]
     p.set_config("review.ponytail_lane", False)
     _, _, _, (rev,) = _finish_code(env, p, "off", {"off.py": 45})
@@ -246,8 +252,8 @@ def _size_failed_review(env, p, monkeypatch, files, verdict):
     head as the daemon does: (code task id, review id, head, check key)."""
     from ttp import reviewreuse
     monkeypatch.delenv("TTP_TEST_PONYTAIL")
+    tid, branch, _, (rev,) = _finish_code(env, p, "big", files)   # the limit is set once it is queued
     p.set_config("review.ponytail_land_lines", 30)
-    tid, branch, _, (rev,) = _finish_code(env, p, "big", files)
     head, key = _git_out(p.root, "rev-parse", branch).strip(), reviewreuse.check_key(p.config())
     t = _lane_review(env, p, rev["id"], dict({"head": head, "findings": []}, **verdict))
     assert t["status"] == "failed"
@@ -352,3 +358,74 @@ def test_the_lane_text_names_the_skill_file_to_read():
     m = re.search(r"read skill `tt-ponytail-review` at `([^`]+)` and apply it", line)
     assert m, line
     assert m.group(1).endswith("tt-ponytail-review/SKILL.md") and Path(m.group(1)).is_file(), line
+
+
+def test_an_oversized_change_without_a_reason_goes_back_to_its_worker_with_no_review(env, monkeypatch):
+    """Over review.ponytail_land_lines with no `why this size:` line in the code task's spec or hand-off,
+    no review is queued (it could only fail): the task is re-queued to its worker with the reason, once
+    per head. With the line, the review is queued as before."""
+    from ttp.daemon import Daemon
+    monkeypatch.delenv("TTP_TEST_PONYTAIL")
+    p = make(env)
+    p.set_config("review.ponytail_land_lines", 30)
+    tid, branch, _, reviews = _finish_code(env, p, "big", {"big.py": 45})
+    assert reviews == [] and not p.db.q("SELECT id FROM tasks WHERE kind='review'")
+    t = p.db.task(tid)
+    assert t["status"] == "queued", t["status"]
+    assert "review refused before it ran, head " in t["spec"] and "it adds 45 lines" in t["spec"]
+    p.db.update_task(tid, status="done")   # the same head handed off again: not sent back twice
+    assert Daemon(p.base)._auto_review(p.db.task(tid), "again") is None
+    assert p.db.task(tid)["status"] == "done" and not p.db.q("SELECT id FROM tasks WHERE kind='review'")
+    _, _, _, (rev,) = _finish_code(env, p, "big2", {"big2.py": 45},
+                                   result={"status": "done", "summary": "done\nwhy this size: one table"})
+    assert "it adds 45 lines" in rev["spec"]
+
+
+def test_a_head_whose_patch_is_already_on_the_push_branch_gets_no_review(env, monkeypatch):
+    """A head with no commit of its own off the push branch (each patch already there, under other
+    commits) is refused before a review runs."""
+    from ttp import ponytail
+    monkeypatch.delenv("TTP_TEST_PONYTAIL")
+    p = make(env)
+    p.set_config("delivery.push_branch", "work")
+
+    def land_first(tid, head):   # the same patch lands on the push branch as another commit
+        _git_out(p.root, "branch", "-f", "work", f"{head}~1")
+        wt = env["tmp"] / "land"
+        _git_out(p.root, "worktree", "add", "-q", str(wt), "work")
+        _git_out(wt, "-c", "user.name=o", "-c", "user.email=o@o", "cherry-pick", head)
+        _git_out(p.root, "worktree", "remove", "--force", str(wt))
+
+    tid, branch, _, reviews = _finish_code(env, p, "dup", {"dup.py": 5}, before=land_first)
+    head = _git_out(p.root, "rev-parse", branch).strip()
+    assert _git_out(p.root, "rev-parse", "work").strip() != head
+    assert ponytail.own_size(p, p.db.task(tid), branch, head)[1] is False
+    assert reviews == [] and not p.db.q("SELECT id FROM tasks WHERE kind='review'")
+    _, _, _, (rev,) = _finish_code(env, p, "new", {"new.py": 5})   # a change of its own is reviewed
+
+
+def test_a_change_after_a_history_rewrite_is_measured_by_its_own_commits(env, monkeypatch):
+    """After the push branch was rewritten (its old tip retired), a task branched from the old history is
+    measured by its own commits only, not by the whole old history its base no longer shares."""
+    from ttp import landed, ponytail, worktree
+    monkeypatch.delenv("TTP_TEST_PONYTAIL")
+    p = make(env)
+    p.set_config("delivery.push_branch", "work")
+    p.set_config("review.ponytail_land_lines", 30)
+
+    def rewrite(tid, head):   # the old history (60 lines) is rewritten on `work`
+        old = f"{head}~1"
+        _git_out(p.root, "update-ref", "-d", f"{worktree.FORK_POINT_REF}{tid}")   # an old task: none recorded
+        tree = _git_out(p.root, "rev-parse", f"{old}^{{tree}}").strip()
+        new = _git_out(p.root, "-c", "user.name=o", "-c", "user.email=o@o", "commit-tree", tree, "-p", f"{old}~1",
+                       "-m", "squash")
+        _git_out(p.root, "update-ref", "refs/heads/work", new.strip())
+        landed.retire_tip(p, _git_out(p.root, "rev-parse", old).strip())
+
+    def old_history(path):
+        (path / "old.py").write_text("".join(f"old {i}\n" for i in range(60)))
+        _git_out(path, "add", "old.py")
+        _git_out(path, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "old history")
+
+    tid, branch, _, (rev,) = _finish_code(env, p, "small", {"small.py": 5}, edit=old_history, before=rewrite)
+    assert ponytail.labelled(rev) == "5", rev["labels"]

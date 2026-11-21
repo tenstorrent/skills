@@ -170,7 +170,8 @@ def report(db, runs_dir, tz: str, days: float = 7, now: float | None = None) -> 
     first = next((r["started"] for r in noted if session_of(r).get("mode") in ("resume", "new")), None)
     since = now - days * 86400
     prev, by_day, off = {}, {}, {}
-    for r in db.q("SELECT started, note FROM runs WHERE role='coordinator' AND started>=?", (since,)):
+    from .coordroute import OWN_SQL   # a routine lane or shadow turn is stateless by design, not a session off
+    for r in db.q("SELECT started, note FROM runs WHERE role='coordinator' AND started>=? AND " + OWN_SQL, (since,)):
         if not session_of(r):   # an older stateless turn (or an agent that cannot resume), recorded or not
             why = str(_part(r, "turn").get("session_off") or "off, not recorded")
             day = off.setdefault(timefmt.today(r["started"], tz), {})

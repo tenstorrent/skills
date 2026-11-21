@@ -329,8 +329,9 @@ def health(p: Project, db: DB, alive: bool = True, now: float | None = None) -> 
     gates = db.kv("gates", {})
     last_turn = float(db.kv("last_coordinator_turn", 0))
     backoff = float(db.kv("coordinator_backoff_until", 0))
-    last_run = db.one("SELECT status, ended FROM runs WHERE role='coordinator' AND status!='running' "
-                      "ORDER BY id DESC LIMIT 1")
+    from .coordroute import OWN_SQL   # the coordinator's own turn, not a routine lane or shadow turn
+    last_run = db.one("SELECT status, ended FROM runs WHERE role='coordinator' AND status!='running' AND "
+                      + OWN_SQL + " ORDER BY id DESC LIMIT 1")
     paused_providers = []
     for r in db.q("SELECT key, value FROM kv WHERE key LIKE 'limited:%'"):
         v = json.loads(r["value"] or "{}")
