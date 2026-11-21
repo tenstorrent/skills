@@ -60,7 +60,8 @@ def refusal(command: str, cwd: str = "", run_dir: str = "", env=None) -> str | N
     e = os.environ if env is None else env
     cwd = cwd or os.getcwd()
     run_dir = run_dir or str(e.get("TTP_RUN_DIR") or "")
-    if why := glmguard.shell_refusal(command, cwd, run_dir, e):
+    why = glmguard.shell_refusal(command, cwd, run_dir, e)
+    if why and glmguard.classify(why)[1] == glmguard.HARMFUL:
         return why
     try:
         from . import credguard, hook
@@ -68,16 +69,19 @@ def refusal(command: str, cwd: str = "", run_dir: str = "", env=None) -> str | N
             commands = hook._split(cmd)[0]
             segs = hook._all_segments(commands) + hook._segments(commands, strip=False)
             return bool(hook.secret_read(cmd, segs, cwd) or credguard.bash_refusal(cmd, segs, cwd=cwd))
-        if secret(command):
+        if secret(command):   # before a redirect (`cp <key> /tmp/k`: the scratch write is the lesser fault)
             # named only in a quoted heredoc a file gets (a script's test string): still never run, but a redirect
-            return glmguard.SECRET_TEXT_WHY if not secret(glmguard.code_text(command)) else glmguard.SECRET_WHY
+            return glmguard.SECRET_TEXT_WHY if not secret(glmguard.code_text(command, interp=True)) \
+                else glmguard.SECRET_WHY
+        if why:
+            return why
         commands, _ = hook._split(command)
         from . import aitag, ruleguard
         if why := ruleguard.bash_refusal(command, hook._all_segments(commands), aitag.project_config(), cwd, e):
             return why
     except Exception:
-        return None   # a checker that cannot run never refuses on its own; the rules above already held
-    return None
+        return why   # a checker that cannot run never refuses on its own; the rules above already held
+    return why
 
 
 def digest(output: str, returncode, save_dir, limit: int = DIGEST_BYTES) -> str:

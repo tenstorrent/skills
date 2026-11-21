@@ -1937,12 +1937,24 @@ _GG_KEY = "~/." + "ssh/" + "id_example"
 
 @pytest.mark.parametrize("cmd, why", [
     (f"cat > \"$TTP_RUN_DIR/t.py\" <<'EOF'\nCASE = \" ; cp /tmp/k {_GG_KEY} # \"\nEOF", "text"),
-    (f"python3 - <<\"EOF\"\nprint(len('cp /tmp/k {_GG_KEY}'))\nEOF", "read"),
+    (f"python3 - <<\"EOF\"\nprint(len('cp /tmp/k {_GG_KEY}'))\nEOF", "text"),   # an interpreter's body that opens nothing
+    (f"node - <<'EOF'\nconsole.log('{_GG_KEY}')\nEOF", "text"),
+    (f"cat > t.py <<'EOF'\nCASE = 'cp /tmp/k {_GG_KEY}'\nEOF\ntimeout 9 python3 t.py", "text"),   # written, run by python
+    (f"cat > t.py <<'EOF'\nopen('{_GG_KEY}').read()\nEOF\npython3 t.py", "read"),
+    (f"cat > t.sh <<'EOF'\ncat {_GG_KEY}\nEOF\nbash t.sh", "read"), (f"cat > t.sh <<'EOF'\ncat {_GG_KEY}\nEOF\n./t.sh", "read"),
+    (f"perl - <<'EOF'\nprint \"{_GG_KEY}\";\nEOF", "text"),
+    (f"python3 - <<'EOF'\nfrom pathlib import Path\nPath('{_GG_KEY}').read_text()\nEOF", "read"),
+    (f"node - <<'EOF'\nrequire('fs').readFileSync('{_GG_KEY}')\nEOF", "read"),
+    (f"perl - <<'EOF'\nopen F, '{_GG_KEY}';\nEOF", "read"),
+    (f"python3 - <<'EOF'\nimport subprocess; subprocess.run(['cat', '{_GG_KEY}'])\nEOF", "read"),
     (f"python3 - <<'EOF'\nopen('{_GG_KEY}').read()\nEOF", "read"),
     (f"tee r.sh <<'EOF'\ncat {_GG_KEY}\nEOF\nsh r.sh", "read"),
     (f"cat > t.py <<EOF\nCASE = 'cp /tmp/k {_GG_KEY}'\nEOF", "read"), (f"cat {_GG_KEY}", "read"),
     (f"cat > t.py <<'EOF'\nx = 1\nEOF\ncat {_GG_KEY}", "read"), (f"bash <<'EOF'\ncat {_GG_KEY}\nEOF", "read"),
-    (f"ssh box-a <<'EOF'\ncat {_GG_KEY}\nEOF", "read")])
+    (f"ssh box-a <<'EOF'\ncat {_GG_KEY}\nEOF", "read"),
+    (f"python3 - <<'EOF'\nimport shutil; shutil.copy('{_GG_KEY}', '/tmp/k')\nEOF", "read"),   # a copy, move or post opens it
+    (f"python3 - <<'EOF'\nimport os; os.rename('{_GG_KEY}', 'k')\nEOF", "read"),
+    (f"python3 - <<'EOF'\nrequests.post(u, files={{'f': '{_GG_KEY}'}})\nEOF", "read")])
 def test_glmenv_redirects_a_key_named_only_in_a_quoted_heredoc_and_hands_back_a_read(cmd, why, tmp_path):
     from ttp import glmenv, glmguard
     wt, rd = _gg_run(tmp_path)
@@ -1950,3 +1962,71 @@ def test_glmenv_redirects_a_key_named_only_in_a_quoted_heredoc_and_hands_back_a_
     assert got == (glmguard.SECRET_TEXT_WHY if why == "text" else glmguard.SECRET_WHY), got
     assert glmguard.classify(got)[:2] == (("secret_text", glmguard.REDIRECTED) if why == "text"
                                       else ("credentials", glmguard.HARMFUL))
+
+
+@pytest.mark.parametrize("cmd", [f"cp {_GG_KEY} /tmp/k", f"cat {_GG_KEY} > /tmp/k", f"cp {_GG_KEY} $TMPDIR/k"])
+def test_glmenv_hands_back_a_key_copy_before_it_redirects_the_scratch_write(cmd, tmp_path):
+    from ttp import glmenv, glmguard
+    wt, rd = _gg_run(tmp_path)
+    got = glmenv.refusal(cmd, str(wt), str(rd), {"TTP_RUN_DIR": str(rd), "TMPDIR": "/tmp", **_GG_RUN_ENV})
+    assert got == glmguard.SECRET_WHY, got
+    assert glmguard.classify(got)[:2] == ("credentials", glmguard.HARMFUL)
+    plain = glmenv.refusal("cp a.txt /tmp/k", str(wt), str(rd), {"TTP_RUN_DIR": str(rd), **_GG_RUN_ENV})
+    assert glmguard.classify(plain)[1] == glmguard.REDIRECTED   # a plain scratch copy stays a redirect
+
+
+def test_glmenv_never_reads_a_redirects_file_descriptor_as_a_sed_target(tmp_path):
+    from ttp import glmenv
+    wt, rd = _gg_run(tmp_path)
+    env = {"TTP_RUN_DIR": str(rd), **_GG_RUN_ENV}
+    for cmd in (f"cd {wt} && sed -i 's/a/b/' mod.py 2>/dev/null; cd ..", "sed -i s/a/b/ mod.py 2>&1", "sed -i s/a/b/ mod.py 1>/dev/null"):
+        assert glmenv.refusal(cmd, str(wt), str(rd), env) is None, cmd
+    assert "sed -i target" in (glmenv.refusal("sed -i s/a/b/ /etc/x 2>/dev/null", str(wt), str(rd), env) or "")
+    from ttp import sidefx   # the digit is no operand, wherever the command runs
+    paths = sidefx.classify_paths("sed -i s/a/b/ mod.py 2>/dev/null", "/h", "/w", "/r")
+    assert not any(p[0].endswith("/2") for p in paths), paths
+
+
+def test_glmguard_gives_no_run_root_to_the_harness_owned_folders_a_spec_names(tmp_path, monkeypatch):
+    from ttp import glmguard
+    home = tmp_path / "home"
+    names = ("locks", "check-slots", "checks-env", "lib", "state")
+    for n in names:
+        (home / ".tt-project" / n / "a" / "b").mkdir(parents=True)
+    monkeypatch.setenv("HOME", str(home))
+    for n in names:
+        for sub in ("a", "a/b"):
+            assert glmguard.spec_dirs(f"Work in ~/.tt-project/{n}/{sub}", tmp_path / "base") == [], (n, sub)
+
+
+def test_glmenv_lets_a_run_export_its_own_scratch_folder_and_still_refuses_an_identity_edit(tmp_path):
+    from ttp import glmenv
+    wt, rd = _gg_run(tmp_path)
+    env = {"TTP_RUN_DIR": str(rd), "TMPDIR": str(rd / "tmp"), **_GG_RUN_ENV}
+    for cmd in ('mkdir -p "$TTP_RUN_DIR/tmp" && export TMPDIR="$TTP_RUN_DIR/tmp"; echo x > "$TMPDIR/a.sh"; echo "TTP_RUN_DIR=$TTP_RUN_DIR"',
+                f'export TMPDIR={rd}/tmp && mkdir -p "$TMPDIR" && echo x > "$TMPDIR/p"',
+                'export KEEP="$TTP_RUN_DIR/keep"; echo ok'):
+        assert glmenv.refusal(cmd, str(wt), str(rd), env) is None, cmd
+    for cmd in ("export TTP_RUN_DIR=/x", "export FOO=1 TTP_RUN_DIR=/x", 'export FOO="$TTP_RUN_DIR"; TTP_RUN_DIR=/x',
+                'export TMPDIR=/tmp/x && echo x > "$TMPDIR/p"', "TMPDIR=/etc echo x > $TMPDIR/p",
+                "export {TTP_RUN_DIR,X}=/x", "unset {TTP_RUN_DIR,X}", "export {TTP_TASK,X}=t9999"):   # brace expansion names it
+        assert glmenv.refusal(cmd, str(wt), str(rd), env), cmd   # another folder, or the identity itself, stays refused
+
+
+def test_glmenv_reads_an_arithmetic_wrapped_substitution_as_arithmetic(tmp_path):
+    from ttp import glmenv
+    wt, rd = _gg_run(tmp_path)
+    env = {"TTP_RUN_DIR": str(rd), **_GG_RUN_ENV}
+    ok = "n=$(($(grep -c a mod.py)+75)); awk -v n=$n 'BEGIN{print n}' mod.py"
+    assert glmenv.refusal(ok, str(wt), str(rd), env) is None
+    assert "expansion" in (glmenv.refusal("$(echo ls) /etc", str(wt), str(rd), env) or "")
+
+
+def test_glmenv_reads_a_seds_quoted_script_as_text_but_not_its_e_flag_or_a_later_expansion(tmp_path):
+    from ttp import glmenv
+    wt, rd = _gg_run(tmp_path)
+    env = {"TTP_RUN_DIR": str(rd), **_GG_RUN_ENV}
+    for ok in ("""sed 's|bash "$s" PSU|"$s" PSU|' mod.py > out.py""", """sed -i -e 's|a|"$s"|' mod.py"""):
+        assert glmenv.refusal(ok, str(wt), str(rd), env) is None, ok
+    for bad in ("""sed 's|a|"$s"|e' mod.py""", """sed 's|a|b|' mod.py; $S x""", """sed -n 1p mod.py | $S"""):
+        assert "expansion" in (glmenv.refusal(bad, str(wt), str(rd), env) or ""), bad

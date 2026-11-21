@@ -104,8 +104,8 @@ HTTP_DATA = re.compile(r"(?:^|\s)(?:-X\s*(?:POST|PUT|PATCH|DELETE)|--request\s+(
 _IDS = r"(?:TTP_CODE_ARM_GUARD|TTP_RUN_DIR|TTP_TASK|TTP_PROJECT|TTP_RUN_ID)"
 _AT = (r"(?:^|[;&|({}\n`!]|\$\(|\b(?:then|do|else|elif|if|while|until)\s|(?:-c|eval)\s+['\"]?)\s*"
        r"(?:(?:sudo|exec|command|nohup|time|nice|xargs|builtin|doas)\s+(?:-\S+\s+)*)*")
-TAMPER = re.compile(
-    _AT + r"(?:(?:unset|export|declare|typeset|local|readonly|env|set|read|mapfile|readarray|for)\b[^;|&\n]*\b"
+TAMPER = re.compile(   # an id after `$` or `${` is a value read (`export TMPDIR="$TTP_RUN_DIR/tmp"`), not a name set
+    _AT + r"(?:(?:unset|export|declare|typeset|local|readonly|env|set|read|mapfile|readarray|for)\b[^;|&\n]*(?<!\w)(?<!\$)(?<!\$\{)"
     + _IDS + r"\b|printf\s+-v\s*" + _IDS + r"\b|(?:[A-Za-z_]\w*=\S*\s+)*" + _IDS + r"\+?=)"
     r"|\benv\s+-i\b|\bglm_guard\.(?:on|json)\b", re.M)
 SAME_ID = re.compile(r"\b(TTP_RUN_DIR|TTP_TASK|TTP_PROJECT|TTP_RUN_ID)=(['\"]?)([^\s'\"`$~\\;&|<>()]*)\2(?=[\s;&|)]|$)",
@@ -116,7 +116,7 @@ REDIRECT = re.compile(r"(?<![\w$])\d*(?:&>>?|>>?|<<?<?|>&|<&)\s*(?:&?\d+-?|[^\s;
 # A program name, a variable's name or a `sleep` time the guard cannot read: a command word that is an expansion
 # (`$S 2`, `$(printf sleep)`, a backtick), `eval` of one, an indirect `${!n}` or `${${S}EC}`, `sleep $I`. Matched on
 # the command-word view only (shell_refusal), so a quoted string or a quoted heredoc body naming one is text.
-_CMD_AT = r"(?:[;&|(]|\b(?:do|then|else)\s)\s*"
+_CMD_AT = r"(?:[;&|]|(?<!\$\()\(|\b(?:do|then|else)\s)\s*"   # not the `((` of `$(($(...)+1))`
 HIDDEN = re.compile(rf"""(?m)(?:^\s*|{_CMD_AT})(?:["']?\\?\$(?:\{{\w+\}}|[A-Za-z_]\w*)["']?(?=[\s;&|)]|$)|\\?\$\()"""
                     rf"""|(?:^\s*|{_CMD_AT})["']?(?:[\w-]+\\?\$[{{A-Za-z_]|\\?\$\{{\w+\}}[\w-])"""
                     rf"""|{_CMD_AT}`|(?:^\s*|{_CMD_AT})eval\s+["'$\\]|\$\{{(?:\\?\$|!\w+\}})|(?<![\w.-])sleep\s+["']?\\?\$""")
@@ -137,6 +137,18 @@ HANDOFF_LINE = ("Before you hand off done, check your own diff as the independen
                 " in your summary cites the command or file that shows it.")
 _SCRATCH_REF = re.compile(r"\$(?:\{(TMPDIR|TMP|TEMP)\}|(TMPDIR|TMP|TEMP)(?!\w))")
 _SCRATCH_SET = re.compile(r"(?<![\w${])(?:TMPDIR|TMP|TEMP)(?!\w)")   # the command names one itself (sets it)
+_SCRATCH_OWN = re.compile(r"(?<![\w${])(?:TMPDIR|TMP|TEMP)=([\"']?)([^\s;&|\"'`()]+)\1(?=[\s;&|]|$)")   # `TMPDIR=<value>`
+
+
+def _sets_own_scratch(cmd: str, run_dir: str) -> bool:
+    """Whether every naming of TMPDIR (TMP, TEMP) in `cmd` is `TMPDIR=<the run's own scratch folder>` (the folder
+    itself or `$TTP_RUN_DIR/tmp`): that sets nothing but what the run already has, so `$TMPDIR` stays its value."""
+    named = [m for m in _SCRATCH_SET.finditer(cmd)]
+    own = [m for m in _SCRATCH_OWN.finditer(cmd)
+           if _own_tmp(m.group(2).replace("${TTP_RUN_DIR}", run_dir).replace("$TTP_RUN_DIR", run_dir), run_dir)]
+    return bool(named) and len(own) == len(named)
+
+
 RUN_ENV = "TTP_GLM_RUN"       # "1", or DEVICE for a run on a device task
 RUN_MARK = "glm_run.json"     # in the run folder: {"device", "gates", "plan", "cwd", "dirs"}, read where the variable is gone
 DEVICE = "device"
@@ -534,7 +546,8 @@ def writes_outside(cmd: str, cwd: str, run_dir: str = "", env=None, inline: bool
     roots, own = _roots(cwd, run_dir, _scratch(run_dir, e), e), _own_roots(cwd, run_dir, e)
     # $TMPDIR (TMP, TEMP) is read as its value in the run's environment, or as /tmp where the command sets it itself
     told = bool(_SCRATCH_SET.search(cmd))
-    paths = _SCRATCH_REF.sub(lambda m: "/tmp" if told else str(e.get(m.group(1) or m.group(2)) or "/tmp"), cmd)
+    own_tmp = _scratch(run_dir, e) if told and _sets_own_scratch(cmd, run_dir) else ""   # `TMPDIR=<its own folder>`
+    paths = _SCRATCH_REF.sub(lambda m: own_tmp or ("/tmp" if told else str(e.get(m.group(1) or m.group(2)) or "/tmp")), cmd)
     return [(p, why) for p, (cls, why) in sidefx.classify_paths(paths, home, cwd or os.getcwd(),
                                                                  run_dir).items()
             if cls == "write" and (inline or "inline code" not in why) and not p.startswith(sidefx.HARMLESS)
@@ -551,13 +564,45 @@ def remote_writes(cmd: str, cwd: str = "") -> list[tuple[str, str]]:
             if cls == "write" and "inline code" not in why and not p.startswith((there,) + sidefx.HARMLESS)]
 
 
-def code_text(cmd: str) -> str:
+# Code that can open a file by a name it holds: a quoted interpreter-fed body without one only names a key
+OPENER_RE = re.compile(
+    r"\b(?:open|fopen|read|readline|readlines|readFile\w*|read_text|read_bytes|load|loads|slurp)\s*\("
+    r"|\b(?:open|subprocess|child_process|Popen|popen|system|exec|execv\w*|execl\w*|eval|spawn\w*|check_output|check_call"
+    r"|qx|File|IO|Pathname|glob|shutil|copy\w*|rename|move|replace|link|symlink|tarfile|zipfile|requests|urlopen|urllib\w*"
+    r"|socket|http\w*|curl|wget)\b|`")
+
+
+# A command that may run a file as shell: a body it was written to could be shell, whatever OPENER_RE finds in it
+SHELL_RUN_RE = re.compile(r"(?:^|[\s;&|(=])(?:[a-z]*sh|source|chmod|exec|xargs|env|\.)(?:\s|$)|\./|\bssh\b|\bsudo\b")
+
+
+def code_text(cmd: str, interp: bool = False) -> str:
     """`cmd` without the heredoc bodies that are only data: a quoted body (`<<'EOF'`, no expansion) only written to a
     file (`cat > t.py <<'EOF' ... project.db ...`) opens nothing; an unquoted one runs its `$(...)` and backticks,
-    and one a shell or interpreter reads runs, so they stay."""
-    from . import hook
+    and one a shell or interpreter reads runs, so they stay. `interp`: a quoted body that a script interpreter reads
+    (python, node, perl), or that is written to a file in a command with no shell to run it, also goes when it has
+    no call that opens a file (OPENER_RE): a test string naming a key."""
+    from . import hook, pathguard
     lines, bodies = hook._heredocs(cmd)
-    return "\n".join(lines + [ln for i, body, pos in bodies if not hook._data_body(lines, i, pos) for ln in body])
+    outer = "\n".join(lines)
+
+    def data(i: int, pos: int, body: list[str]) -> bool:
+        if hook._data_body(lines, i, pos):
+            return True
+        if not (interp and hook.HEREDOC_RE.match(lines[i], pos)[2]) or OPENER_RE.search("\n".join(body)):
+            return False
+        return bool(pathguard.INTERPRETER_RE.match(hook._first_word(hook._piece_at(lines[i], pos)[0]))) \
+            or not SHELL_RUN_RE.search(outer)
+    return "\n".join(lines + [ln for i, body, pos in bodies if not data(i, pos, body) for ln in body])
+
+
+_SED_SCRIPT = re.compile(r"""(\bsed\b(?:\s+(?:-[-\w=.]+|--\w[\w-]*=\S+))*\s+(?:-e\s+)?)'([^']*)'""")
+
+
+def _sed_text(view: str) -> str:
+    """`view` with the single-quoted script of each `sed` blanked: sed reads `s|a|"$s" b|` as text (a pattern or
+    a replacement naming an expansion runs nothing), unless a flag `e` makes it run the result."""
+    return _SED_SCRIPT.sub(lambda m: m[0] if re.search(r"[|/#,!]\w*e\w*\s*$|\be\b", m[2]) else f"{m[1]}''", view)
 
 
 def shell_refusal(cmd: str, cwd: str, run_dir: str = "", env=None, remote: bool = False, writes: bool = True,
@@ -588,7 +633,7 @@ def shell_refusal(cmd: str, cwd: str, run_dir: str = "", env=None, remote: bool 
         return "a run on the GLM arm may not read or write the project's database or machine records by hand"
     if services and (svc := SERVICE_RE.search(view)):
         return f"{SERVICE_WHY}: {svc.group(0)[:120]}"
-    if writes and (m := HIDDEN.search(view)):
+    if writes and (m := HIDDEN.search(_sed_text(view))):
         return f"{HIDDEN_WHY}: {m.group(0).strip()[:80]}"
     commands, _ = hook._split(cmd)   # heredoc bodies a program, not a shell, reads are its input
     for sub in pathguard._substitutions(commands):   # "$(...)" runs a command too

@@ -350,3 +350,12 @@ def test_glm_work_a_timeout_or_crash_fallback_does_not_pin_the_next_run_to_core_
                (t["id"], note))
         assert route.fell_back_before(p.db, t["id"]) is not None, cause
         assert (route.fell_back_before(p.db, t["id"], glmwork.INFRA_CAUSES) is None) is skipped, cause
+
+
+def test_a_run_that_started_on_the_glm_work_route_is_not_policy_bounced_after_a_rollback_took_the_route():
+    import inspect
+    from ttp import daemon
+    fin = inspect.getsource(daemon.Daemon.finish_run)
+    gate = fin[fin.index("bounce = self._policy_bounce(r)") - 400:fin.index("bounce = self._policy_bounce(r)")]
+    # the run's own note names the route it took; the config at its end (the route rolled back mid-run) does not
+    assert 'routed.get(glmwork.KEY) != "glm"' in gate and "not glmwork.settings(self.cfg)" in gate

@@ -6454,7 +6454,9 @@ class Daemon:
                     if glmwork.bounce_on(self.cfg) else "")   # the bridge's loop guard stopped it (chatbridge)
         if not bounce and on_route and routed and routed.get(codearm.KEY) == "glm" and r["task"] \
                 and r["role"] != "coordinator" and refused != "instructions_missing" \
-                and not glmwork.settings(self.cfg):   # a covered project's GLM runs write policy files too: review checks them
+                and routed.get(glmwork.KEY) != "glm" and not glmwork.settings(self.cfg):
+            # a covered project's GLM runs write policy files too (review checks them), also one that started on the
+            # route before a rollback took it away: the run's own note says which route it took
             bounce = self._policy_bounce(r)   # a run on the arm that changed a policy file hands nothing off
         handed_off = r["role"] != "coordinator" and refused != "instructions_missing" and not bounce and \
             (_read_result(run_dir / RESULT_FILE) or {}).get("status") in HANDOFF_STATES

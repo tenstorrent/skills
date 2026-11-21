@@ -576,10 +576,27 @@ def _rate_txt(v) -> str:
 
 
 def _says(s: dict) -> str:
+    """One signal for a why line: GLM's value, the baseline's and the margin it is held to; a signal past a margin
+    names that margin, a passing one says so plainly (never "worse by -20.6")."""
     if s["signal"] == "user corrections":
         return f"user corrections {s['glm']} in {CORR_DAYS} days (holds above {_rate_txt(s['advance'])})"
-    tail = "" if s["verdict"] == "unmeasured" else f", worse by {_rate_txt(s['worse_by'])}"
-    return f"{s['signal']} GLM {_rate_txt(s['glm'])} vs Claude {_rate_txt(s['base'])}{tail} ({s['verdict']})"
+    head = f"{s['signal']} GLM {_rate_txt(s['glm'])} vs Claude {_rate_txt(s['base'])}"
+    by, v = s["worse_by"], s["verdict"]
+    if by is None:
+        return f"{head} (too few outcomes to compare yet)"
+    unit = "%" if s["signal"] == "tasks done per day" else ""
+    if v in ("worse", "hold"):
+        kind, margin = ("rollback", s.get("rollback")) if v == "worse" else ("advance", s["advance"])
+        return f"{head}, worse by {_rate_txt(by)}{unit}, past the {kind} margin of {_rate_txt(margin)}{unit}"
+    if not by:
+        return f"{head}, level, within the margins"
+    return f"{head}, {'better' if by < 0 else 'worse'} by {_rate_txt(abs(by))}{unit}, within the margins"
+
+
+def _failing_first(sig: list[dict]) -> list[dict]:
+    """The signals past a margin first (rollback, then advance), the rest in gate order."""
+    rank = {"worse": 0, "hold": 1}
+    return sorted(sig, key=lambda s: rank.get(s["verdict"], 2))
 
 
 def judge(p, cfg: dict, now: float) -> dict:
@@ -619,10 +636,8 @@ def judge(p, cfg: dict, now: float) -> dict:
     sig = signals(g, b, before, after, corr, st)
     n = g["decided"]
     frm = datetime.datetime.fromtimestamp(lo, datetime.timezone.utc)
-    nums = (f"GLM {n} tasks with an outcome, first review pass {_rate_txt(g['first_pass_pct'])}%; Claude baseline "
-            f"{b['decided']} with an outcome since {frm:%Y-%m-%d %H:%M} UTC, first review pass "
-            f"{_rate_txt(b['first_pass_pct'])}%; "
-            + "; ".join(_says(s) for s in sig))
+    nums = (f"GLM {n} tasks with an outcome; Claude baseline {b['decided']} with an outcome since "
+            f"{frm:%Y-%m-%d %H:%M} UTC; " + "; ".join(_says(s) for s in _failing_first(sig)))
     out = lambda state, why: {"state": state, "why": f"{why}; {nums}", "n": n, "signals": sig,   # noqa: E731
                               "glm_pct": g["first_pass_pct"], "base_pct": b["first_pass_pct"],
                               "base_window": [round(lo, 3), round(now, 3)]}

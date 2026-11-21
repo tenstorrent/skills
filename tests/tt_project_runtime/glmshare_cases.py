@@ -112,7 +112,8 @@ def test_glm_share_judge_waits_for_enough_glm_tasks_then_compares_with_the_proje
     _gs_decided(p, t0 + 7200, 1, arm="glm")
     v = glmshare.judge(p, cfg, now)
     assert (v["state"], v["n"]) == ("ok", 3), v
-    assert "GLM 3 tasks with an outcome, first review pass 100%; Claude baseline 6 with an outcome" in v["why"]
+    assert "GLM 3 tasks with an outcome; Claude baseline 6 with an outcome" in v["why"]
+    assert "first review pass rate GLM 100 vs Claude 83.3 (too few outcomes to compare yet)" in v["why"]
     # Any device incident on a GLM run (on a device it changed): worse.
     p.db.update_task(g1, labels=["resource:box-a-device"])
     p.db.x("INSERT INTO events(ts,source,kind,text,task) VALUES(?,?,?,?,?)",
@@ -123,7 +124,8 @@ def test_glm_share_judge_waits_for_enough_glm_tasks_then_compares_with_the_proje
     for _ in range(3):
         _gs_decided(p, t0 + 9000, 0, arm="glm")
     v = glmshare.judge(p, cfg, now)
-    assert (v["state"], v["n"]) == ("worse", 5) and "first review pass rate GLM 40 vs Claude 83.3" in v["why"]
+    assert (v["state"], v["n"]) == ("worse", 5)
+    assert "first review pass rate GLM 40 vs Claude 83.3, worse by 43.3, past the rollback margin of 15" in v["why"]
     # Inside a wider rollback margin but past the advance margin: the wave holds.
     v = glmshare.judge(p, {"route": {"glm_work": {"min_tasks": 3, "min_base": 5, "rollback_pts": 50}}}, now)
     assert v["state"] == "wait" and "holding the wave: first review pass rate" in v["why"]
@@ -167,6 +169,21 @@ def test_glm_share_judge_each_new_signal_past_its_advance_margin_holds_the_wave(
     v = glmshare.judge(p, _GS_CFG, now)
     assert (v["state"], _gs_verdict(v, signal)) == ("wait", "hold"), v
     assert f"holding the wave: {signal}" in v["why"]
+
+
+def test_glm_share_rollback_reason_leads_with_the_failing_metric_and_its_numbers(env):
+    from ttp import glmshare, route
+    p = make(env)
+    now = 1_000_000_000.0 + 60 * 86400
+    t0, glm = _gs_waved(p, now)
+    for tid in glm[:2]:   # 2 of 4 GLM tasks bounced to Opus: 50 points vs 0, past the 25-point rollback margin
+        _gs_run(p, tid, t0 + 7200, 1, note={route.KEY: {"to": route.TO, "fallback": route.BOUNCE}})
+    v = glmshare.judge(p, _GS_CFG, now)
+    assert v["state"] == "worse", v
+    assert v["why"].startswith("worse than the Claude baseline past the rollback margin: bounce rate; ")
+    nums = v["why"].split("; ", 1)[1]
+    assert "bounce rate GLM 50 vs Claude 0, worse by 50, past the rollback margin of 25" in nums.split("; ", 3)[2]
+    assert "worse by -" not in v["why"]   # a passing signal is never printed as a negative "worse by"
 
 
 def test_glm_share_judge_rolls_back_a_clearly_worse_glm_arm(env):
