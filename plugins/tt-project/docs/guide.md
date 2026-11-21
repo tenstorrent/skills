@@ -1346,9 +1346,13 @@ with the arm's share at `1 - holdout`, its policy-file bounce and switch-back gu
 These stay on the core provider, checked before any route returns: coordinator turns, plan and review tasks and
 verdict runs, the deep tier, a provider or model pin, outside text (`untrusted_input`), a tier-up retry, a run a
 chat model bounced (needs Opus or deep), a run that answers a chat or posts to a person (`reply_chat`, or a spec
-naming a post, reply or comment to a person, a channel, an issue or a PR), optimization or design work (a spec
-naming optimize, redesign, architecture, design a/the/how, or propose a plan, design or approach, plus the model
-pick's hard and the code arm's judgment patterns), and device work. Urgent work stays only with `keep_urgent`.
+naming a post, reply or comment to a person, a channel, an issue or a PR), a question or work task titled as a
+review of another task (`review of #N`, `second reviewer`), optimization or design work (the title or the spec's own
+goal naming optimize, redesign, architecture, design a/the/how, propose a plan, design or approach, hard debugging,
+a deadlock or race condition, or the code arm's judgment patterns), and device work (device resources, or the title
+or goal naming a device action or a job through a device broker). The goal is the spec above its first `Context:` or
+`Restrictions:` line (all of it without one), so quoted words and restated rules keep nothing; metric words (perf,
+latency, throughput, root cause, bisect) alone keep nothing. Urgent work stays only with `keep_urgent`.
 A seeded coin per task keeps the holdout on core for the quality baseline: `holdout` while the project's wave is
 judged, `holdout_held` once the hourly wave gate says its quality holds (back to `holdout` if it turns worse);
 each task's arm is recorded once (`glm_work_arm:<task>`) and follow-ups keep their lineage's arm. A start the

@@ -45,10 +45,27 @@ PERSON = re.compile(
     r"\b(?:to|on|in|at)\s+(?:the\s+|a\s+|an\s+)?(?:slack|jira|github|gh|e-?mail|user|requester|reviewer|author|person|"
     r"people|channel|thread|pr|pull\s+request|issue|chat)\b"
     r"|(?i:\b(?:run|use|call|via)\s+`?(?:gh\s+(?:pr|issue)\s+(?:comment|review)|ttp\s+(?:notify|urgent-reply))\b)")
-# Optimization or design work (Opus keeps it): besides modelpick.HARD and codearm.JUDGMENT.
+# Optimization, design or hard-debug work (Opus keeps it), besides codearm.JUDGMENT, read in the task's own goal
+# (goal_spec). Metric and debug words (latency, throughput, root cause, bisect) are no design: they mostly name fixes,
+# deflakes and measurements.
 DESIGN = re.compile(
-    r"(?i)\boptimi[sz](?:e|es|ed|ing|ation|ations)\b|\bre-?design\w*|\bdesign\s+(?:a|an|the|how|which)\b"
-    r"|\barchitect\w*|\bpropose\b[^\n.]{0,40}\b(?:plan|design|approach)\b")
+    r"(?i)\boptimi[sz](?:e|es|ed|er|ers|ing|ation|ations)\b|\bre-?design\w*|\bdesign\s+(?:a|an|the|how|which)\b"
+    r"|\barchitect\w*|\bpropose\b[^\n.]{0,40}\b(?:plan|design|approach)\b|\bhard[- ]debug\w*|\bdeadlock"
+    r"|\brace\s+condition")
+# A question or work task that reviews another task (Opus reviews), not a fix of one.
+REVIEW_TITLE = re.compile(r"(?i)\breview\s+of\s+#\d+|\bsecond\s+reviewer\b")
+# A job the goal runs through a box's device broker (tierfloor.DEVICE_SPEC names resets, soaks and device tests).
+BROKER_JOB = re.compile(r"(?i)\bthrough\s+(?:its|the|a|each|every|[\w.-]+'s)\s+(?:[\w-]+\s+){0,2}broker\b")
+# Where a spec's own goal ends: its first `Context:` or `Restrictions:` line (`Restrictions (binding):` too).
+GOAL_END = re.compile(r"(?im)^[ \t#>*-]*(?:context|restrictions)\b(?:\s*\([^)\n]*\))?\**\s*:")
+
+
+def goal_spec(spec) -> str:
+    """The spec above its first Context or Restrictions line (the whole spec without one): quoted user words,
+    findings and restated rules below it name no design or device work of the task's own."""
+    spec = str(spec or "")
+    m = GOAL_END.search(spec)
+    return spec[:m.start()] if m else spec
 
 
 def _raw(cfg: dict) -> dict:
@@ -253,9 +270,10 @@ def keeps_core(db, cfg: dict, task: dict, tier: str, cls: str | None = None, pic
     (untrusted_input), a tier-up retry after a finished attempt (infra_failed: a crash, timeout or endpoint error
     retries on GLM), a GLM bounce (needs Opus or deep), a run that talks to a person (`reply_chat` with
     person_writeup off, or an instruction to post, comment or notify with the outward-drafts redirect off: with
-    them on, Opus writes the words and GLM does the work), optimization or design work, device work (with glm_device on it runs on GLM under an Opus
-    plan, deviceplan.py), urgent (only with keep_urgent), a kind off the
-    list."""
+    them on, Opus writes the words and GLM does the work), a task titled as a review of another, optimization or
+    design work, device work (a job through a device broker too; with
+    glm_device on it runs on GLM under an Opus plan, deviceplan.py; both read only the title and goal_spec besides
+    its resources), urgent (only with keep_urgent), a kind off the list."""
     from . import codearm, deviceplan, effort, modelpick, untrusted, urgent
     kind = str(task.get("kind") or "")
     text = f"{task.get('title') or ''}\n{task.get('spec') or ''}"
@@ -279,9 +297,13 @@ def keeps_core(db, cfg: dict, task: dict, tier: str, cls: str | None = None, pic
         return "person"
     if PERSON.search(text) and not drafts_on(cfg):
         return "person"
-    if DESIGN.search(text) or modelpick.HARD.search(text) or codearm.JUDGMENT.search(text):
+    if kind in ("question", "work") and REVIEW_TITLE.search(str(task.get("title") or "")):
+        return "review"
+    own = {**task, "spec": goal_spec(task.get("spec"))}
+    goal = f"{task.get('title') or ''}\n{own['spec']}"
+    if DESIGN.search(goal) or codearm.JUDGMENT.search(goal):
         return "design"
-    if deviceplan.device(task, cfg) and not deviceplan.on(cfg):
+    if (deviceplan.device(own, cfg) or BROKER_JOB.search(goal)) and not deviceplan.on(cfg):
         return "device"   # with glm_device on, a device task runs on GLM under an Opus plan (deviceplan.py)
     s = settings(cfg) or {}
     if s.get("keep_urgent") and urgent.is_urgent(task):

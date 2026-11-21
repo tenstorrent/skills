@@ -118,6 +118,41 @@ def test_glm_work_keeps_every_protected_run_on_core(env):
                               "standard") == "urgent"
 
 
+def test_glm_work_design_and_device_keepers_read_only_the_tasks_own_goal(env):
+    """Design and device words in a Context or Restrictions block keep nothing; the goal's design words, a
+    judgment phrase, a review of another task, device resources and a device or broker goal still keep the run on core.
+    Metric and debug words are no design (plan #9448: they mostly name fixes, deflakes and measurements)."""
+    from ttp import glmwork
+    p = make(env)
+    cfg = _gw_cfg()
+    kc = lambda spec, title=None, kind="work", **kw: glmwork.keeps_core(
+        p.db, cfg, p.db.task(p.db.add_task(title or f"{kind} task", spec, kind=kind, tier="standard", priority=3,
+                                           budget_usd=1.0, **kw)), "standard")
+    quoted = "\nContext:\n- In the user's words: 'everything but deep thinking, optimization, and human interaction'"
+    assert kc("Fix the flaky test." + quoted, kind="code") == ""
+    for goal in ("Optimize the review sweep.", "Design the release ring.", "Write up the architecture of X."):
+        assert kc(goal + quoted) == "design", goal
+    assert kc("Tidy the helper.", title="Optimize the review sweep") == "design"   # the title is goal text
+    for goal in ("Measure latency of the push queue.", "Find the root cause of the flaky test.",
+                 "Take an optimistic lock on the row.", "Bisect the throughput drop and fix perf."):
+        assert kc(goal) == "", goal
+    assert kc("Weigh the trade-offs of both caches.") == "design"   # codearm.JUDGMENT in the goal
+    assert kc("Tidy it.\nReturn: the diff.\nNotes: optimize the review sweep later.") == "design"   # no Context: whole
+    assert kc("Read the runs and say if it holds.", title="Device A/B review of #12 (second reviewer)",
+              kind="question") == "review"
+    assert kc("Apply the findings.", title="Fix review #12: tidy the helper", kind="code") == ""
+    rules = "Fix the flaky push test.\n\nRestrictions (binding):\n- No reset, reboot or power cycle of any box."
+    assert kc(rules) == "" and kc(rules.replace("Restrictions (binding):", "context:")) == ""
+    assert kc("Fix the flaky push test.", labels=["resource:box-a-device"]) == "device"
+    assert kc("Power cycle the box, then rerun the test." + quoted) == "device"
+    broker = "Land the stack.\n2. Run one smoke on the exact sha on box-a through its device broker."
+    assert kc(broker) == "device" and kc(broker.replace("2.", "Context:\n- device work only")) == ""
+    assert kc("Fix the broker queue sort.", kind="code") == ""
+    assert kc("Land it, then one smoke on the head through box-a's tt-device broker.") == "device"
+    assert kc("Add preemptable broker jobs to the runner; test it with tt-device-mcp.", kind="code") == ""
+    assert kc("Apply it.", title="Fix review of #12: x", kind="code") == ""
+
+
 def test_glm_work_bounce_keeps_the_task_on_core(env, monkeypatch):
     from ttp import codearm, glmwork
     p = make(env)
