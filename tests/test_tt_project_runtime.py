@@ -2424,7 +2424,7 @@ def test_the_audit_grades_asks_answers_rejections_and_waste(env):
     assert "failed worker runs: 1, $0.70" in out, "a run lost to a reboot is not a failure"
     assert "worker runs lost (not failures): 1, $0.40: 1 to reboot $0.40" in out
     assert f"tasks run again after a failed attempt: 1: #{task} flaky build (attempt 2, done, $1.50)" in out
-    assert "coordinator turns: 2, $0.30; 1 decided nothing ($0.05); 1 idle wakes ($0.05), 0 starve wakes ($0.00)" in out
+    assert "coordinator turns: 2, $0.30 of own wakes; 1 decided nothing ($0.05); 1 idle wakes ($0.05), 0 starve wakes ($0.00)" in out
     assert "finished tasks: 1 (1 done), workers $1.50 ($1.50 each), coordinator $0.30" in out
     assert old not in rows
 

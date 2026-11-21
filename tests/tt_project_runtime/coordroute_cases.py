@@ -523,12 +523,29 @@ def test_coordinator_turn_reports_skip_a_newer_lane_or_shadow_turn(env, caller):
            "unblock.triggers_line": lambda: unblock.triggers_line(p.db, since),
            "costlevers.wake_tools_report": lambda: costlevers.wake_tools_report(p, since, now + 10)}[caller]()
     want = {"course.idle_turns": {"n": 2, "usd": 2.0, "hours": pytest.approx(40 / 3600), "wakes": {"idle": 2}},
-            "audit.coordinator_turns": {"n": 2, "usd": 2.0, "noop": 2, "noop_usd": 2.0, "idle": 2,
-                                        "idle_usd": 2.0, "starve": 0, "starve_usd": 0.0, "logged": 2},
+            "audit.coordinator_turns": {"n": 2, "usd": 2.0, "all_usd": 4.0, "noop": 2, "noop_usd": 2.0,
+                                        "idle": 2, "idle_usd": 2.0, "starve": 0, "starve_usd": 0.0, "logged": 2},
             "unblock.triggers_line": "triggered 2 (100%, $2.00), routine 0 (0%, $0.00); "
                                      "per trigger: task_blocked 2",
             "costlevers.wake_tools_report": {"wakes": 2, "heavy": 2, "usd": 2.0, "heavy_usd": 2.0, "max": 9}}
     assert got == want[caller], (caller, got)
+
+
+def test_the_audit_spreads_all_coordinator_spend_over_finished_tasks(env):
+    """The finished-tasks line spreads the window's whole coordinator spend, lane and shadow turns
+    included, over the finished tasks, while the turns line counts the coordinator's own wakes."""
+    from ttp import audit, coordroute
+    p = make(env)
+    now = time.time()
+    run = "INSERT INTO runs(role,started,status,cost_usd,note) VALUES('coordinator',?,'ok',1.0,?)"
+    p.db.x(run, (now - 200, json.dumps({"decided": 0})))          # the coordinator's own turn
+    p.db.x(run, (now - 100, json.dumps({coordroute.LANE: "routine"})))
+    t = p.db.add_task("t", "s", kind="code", tier="standard", origin="user")
+    p.db.update_task(t, status="done", spent_usd=2.0)
+    out = "\n".join(audit.lines(p.db, now))
+    assert "coordinator turns: 1, $1.00 of own wakes" in out, out
+    assert "coordinator $2.00 in the window ($2.00 per finished task)" in out, out
+
 
 # The GLM-arm ask-Opus switches (glmassist.py) ----------------------------------------------------------------
 

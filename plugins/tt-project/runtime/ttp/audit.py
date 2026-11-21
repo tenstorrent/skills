@@ -181,11 +181,14 @@ def coordinator_turns(db: DB, since: float) -> dict:
     """Coordinator turns since `since`: all, those that decided nothing, idle wakes and starve wakes,
     with costs. A turn decided nothing when its note says `decided` 0 (turns before that was logged
     are not counted); an idle or starve wake was due to the
-    idle timer or the idle-slot (starve) timer with no message or event in its batch."""
-    rows = db.q("SELECT note, cost_usd FROM runs WHERE role='coordinator' AND status='ok' AND started>=? "
-                "AND " + OWN_SQL, (since,))
-    out = {"n": len(rows), "usd": 0.0, "noop": 0, "noop_usd": 0.0, "idle": 0, "idle_usd": 0.0,
-           "starve": 0, "starve_usd": 0.0, "logged": 0}
+    idle timer or the idle-slot (starve) timer with no message or event in its batch. `all_usd` is
+    the window's whole coordinator spend, lane and shadow turns included; the counts and `usd`
+    cover the coordinator's own turns only."""
+    where = "role='coordinator' AND status='ok' AND started>=?"   # one row set, so the total covers it whole
+    rows = db.q("SELECT note, cost_usd FROM runs WHERE " + where + " AND " + OWN_SQL, (since,))
+    total = db.q("SELECT COALESCE(SUM(cost_usd), 0) AS usd FROM runs WHERE " + where, (since,))
+    out = {"n": len(rows), "usd": 0.0, "all_usd": float(total[0]["usd"] or 0), "noop": 0, "noop_usd": 0.0,
+           "idle": 0, "idle_usd": 0.0, "starve": 0, "starve_usd": 0.0, "logged": 0}
     for r in rows:
         note, usd = loads_dict(r["note"]), float(r["cost_usd"] or 0)
         out["usd"] += usd
@@ -559,7 +562,7 @@ def lines(db: DB, now: float | None = None, window_s: float = WINDOW_S, blocked_
         noop = (f"{turns['noop']} decided nothing (${turns['noop_usd']:.2f})" if turns["logged"] else
                 "turns that decided nothing: not logged")
         part = f" of {turns['logged']} logged" if turns["logged"] and turns["logged"] < turns["n"] else ""
-        out.append(f"coordinator turns: {turns['n']}, ${turns['usd']:.2f}; {noop}{part}; "
+        out.append(f"coordinator turns: {turns['n']}, ${turns['usd']:.2f} of own wakes; {noop}{part}; "
                    f"{turns['idle']} idle wakes (${turns['idle_usd']:.2f}), "
                    f"{turns['starve']} starve wakes (${turns['starve_usd']:.2f})")
     if turns["n"]:   # what the next turn runs with against the last one, and $ per day (a model change's cost)
@@ -594,8 +597,8 @@ def lines(db: DB, now: float | None = None, window_s: float = WINDOW_S, blocked_
     if done:
         work = sum(float(t["spent_usd"] or 0) for t in done)
         out.append(f"finished tasks: {len(done)} ({sum(t['status'] == 'done' for t in done)} done), workers ${work:.2f} "
-                   f"(${work / len(done):.2f} each), coordinator ${turns['usd']:.2f} in the window "
-                   f"(${turns['usd'] / len(done):.2f} per finished task)"
+                   f"(${work / len(done):.2f} each), coordinator ${turns['all_usd']:.2f} in the window "
+                   f"(${turns['all_usd'] / len(done):.2f} per finished task)"
                    + (f"; {sum(unpriced.values())} runs unpriced" if sum(unpriced.values()) else "") + "; most costly: " + ", ".join(
                        f"#{t['id']} {_short(t['title'], 50)} {t['status']} ${float(t['spent_usd'] or 0):.2f}"
                        for t in done[:3]))
