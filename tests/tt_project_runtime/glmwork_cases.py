@@ -100,8 +100,13 @@ def test_glm_work_keeps_every_protected_run_on_core(env):
     assert kc(_gw_task(p, model="opus")) == "pin"
     assert kc(_gw_task(p, labels=["untrusted_input"])) == "untrusted"
     assert kc(_gw_task(p), picked={"by": "retry"}) == "retry"
-    assert kc(_gw_task(p, reply_chat="chat-1")) == "person"
-    assert kc(_gw_task(p, "Post a comment on the GitHub issue saying it is fixed.")) == "person"
+    assert kc(_gw_task(p, reply_chat="chat-1")) == ""   # Opus writes the post (writeup.py), GLM does the work
+    assert kc(_gw_task(p, "Post a comment on the GitHub issue saying it is fixed.")) == ""   # a draft the coordinator relays
+    assert kc(_gw_task(p, "Tidy it.\nconclusion: the tidy-up is done")) == ""   # that hand-off reaches only the coordinator
+    off = _gw_cfg(person_writeup=False)
+    assert glmwork.keeps_core(p.db, off, _gw_task(p, reply_chat="chat-1"), "standard") == "person"
+    noredirect = {**cfg, "route": {**cfg["route"], "glm_refusals": {"redirect": False}}}
+    assert glmwork.keeps_core(p.db, noredirect, _gw_task(p, "Notify the user in chat."), "standard") == "person"
     assert kc(_gw_task(p, "Optimize the scheduler's queue scan.")) == "design"
     assert kc(_gw_task(p, "Redesign the push queue.")) == "design"
     assert kc(_gw_task(p, "Propose a plan for the new cache layer.")) == "design"
@@ -158,7 +163,8 @@ def test_glm_work_routes_work_question_harness_runs_to_the_chat_model_and_keeps_
         assert d._route(t, "deep", None, 1.0, cls="hard") is None, kind
     for kind in ("plan", "review"):
         assert d._route(_gw_task(p, kind=kind), "standard", None, 1.0, cls="routine") is None, kind
-    assert d._route(_gw_task(p, reply_chat="chat-1"), "standard", None, 1.0) is None
+    got = d._route(_gw_task(p, reply_chat="chat-1"), "standard", None, 1.0)
+    assert got and got["to"] == "chat" and got[glmwork.KEY] == "glm"   # GLM does the work; Opus writes the post
     held = _gw_daemon(p, _gw_cfg(holdout=1.0))
     assert held._route(_gw_task(p), "standard", None, 1.0, cls="routine") is None   # the Claude holdout
 
@@ -175,7 +181,11 @@ def test_glm_work_takes_code_tasks_through_the_guarded_code_arm(env):
     got = _gw_daemon(p, cfg)._route(t, "standard", None, 1.0, cls="routine")
     assert got and got["to"] == "chat" and got[codearm.KEY] == "glm" and got[glmwork.KEY] == "glm"
     person = _gw_task(p, "Fix it, then post a comment on the GitHub issue.", kind="code")
-    assert codearm.choose(p.db, cfg, person, "standard")["run"] == "claude"
+    assert codearm.choose(p.db, cfg, person, "standard")["run"] == "glm", "the post is a draft the coordinator relays"
+    conclusion = _gw_task(p, "Fix it.\nconclusion: the fix is in", kind="code")
+    assert codearm.choose(p.db, cfg, conclusion, "standard")["run"] == "glm", "a conclusion line alone keeps nothing"
+    noredirect = {**cfg, "route": {**cfg["route"], "glm_refusals": {"redirect": False}}}
+    assert codearm.choose(p.db, noredirect, person, "standard")["run"] == "claude", "redirect off: the post stays on Opus"
 
 
 def test_glm_device_routes_device_work_by_its_need_whatever_its_kind(env):
@@ -240,7 +250,8 @@ def test_a_class_route_runs_every_keep_core_check_first(env, monkeypatch):
         None if core_only else {"to": name, "model": model})
     route = lambda t, tier="standard": d._route(t, tier, None, 1.0, cls="routine")   # noqa: E731
     assert route(_gw_task(p)) == {"to": "chat", "model": _GW_MODEL}
-    assert route(_gw_task(p, spec="tidy the helper and add a test\nconclusion: the helper is tidy")) is None
+    assert route(_gw_task(p, spec="tidy the helper and add a test\nconclusion: the helper is tidy")) is None   # no GLM work route here: the floor keeps it
+    assert route(_gw_task(p, spec="tidy the helper", reply_chat="chat-1")) is None   # no GLM work route here: the floor keeps it
     assert route(_gw_task(p), tier="deep") is None
     assert route(_gw_task(p, spec="reset the device and rerun the hang on the board")) is None
     assert route(_gw_task(p, kind="question")) is None
@@ -332,11 +343,16 @@ def test_glm_work_only_an_instruction_to_a_person_keeps_a_run_on_core(env):
                  "The code posts a message to slack on failure; fix its retry.",
                  "Refactor ttp notify output.", "Add a test for the Jira client's reply parsing."):
         assert kc(spec) == "", spec
-    for spec in ("Then post a summary to the Slack channel.", "Please reply to the user with the numbers.",
-                 "Run gh pr comment with the summary.", "Notify the user in chat when it lands.",
-                 "Daily report. Read-only. The coordinator posts your result in chat; do not post to any chat "
-                 "yourself.\nReturn: a one-line verdict first, then a small table.\n\nconclusion: the report text."):
-        assert kc(spec) == "person", spec
+    posts = ("Then post a summary to the Slack channel.", "Please reply to the user with the numbers.",
+             "Run gh pr comment with the summary.", "Notify the user in chat when it lands.")
+    report = ("Daily report. Read-only. The coordinator posts your result in chat; do not post to any chat "
+              "yourself.\nReturn: a one-line verdict first, then a small table.\n\nconclusion: the report text.")
+    for spec in (*posts, report):   # with the outward-drafts redirect on (default), GLM works and the post is a draft
+        assert kc(spec) == "", spec
+    noredirect = {**cfg, "route": {**cfg["route"], "glm_refusals": {"redirect": False}}}
+    assert glmwork.keeps_core(p.db, noredirect, _gw_task(p, report), "standard") == ""   # a conclusion line alone keeps nothing
+    for spec in posts:
+        assert glmwork.keeps_core(p.db, noredirect, _gw_task(p, spec), "standard") == "person", spec
 
 
 def test_glm_work_a_timeout_or_crash_fallback_does_not_pin_the_next_run_to_core_but_a_bounce_does(env):

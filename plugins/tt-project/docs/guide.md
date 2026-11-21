@@ -1328,6 +1328,17 @@ GLM work route (`glmwork.py`, off by default). `route.glm_work` (a project and a
 project's model-hours to one chat model: `{"on": true, "model": "<chat model>", "effort": "max", "holdout": 0.1,
 "holdout_held": 0.05, "kinds": ["code", "work", "question", "harness"], "fallback": {"provider": "claude", "model":
 "sonnet", "effort": "high"}}` (the values shown are the defaults; `model` falls back to `route.code_sonnet.glm.model`).
+Person-facing tasks (`route.glm_work.person_writeup`, default on where `route.glm_work` is on). A task that answers a
+chat (`reply_chat`), holds a `conclusion:` line or tells the worker to post no longer stays on Opus whole: GLM does the
+work and Opus writes every word a person reads. For a `reply_chat` task whose run was on the chat provider the daemon
+never posts GLM's `message` or `summary`. It makes one small Opus call (no tools, no session) that reads the hand-off as
+data and writes the chat message; claimcheck marks the claims the records do not show, and the result carries
+`message_by` = `{step: opus-writeup, model, run, sha}`. A post guard refuses chat-provider text without that stamp on every
+path (the reply block, the push queue's landed reply, a held reply). A failed write-up or a held core provider posts
+nothing: the task goes to review with `Not posted to the chat`. A code task's done reply still waits for its landing.
+With `person_writeup: false` a `reply_chat` task stays on core; an instruction to post stays on core only while
+`route.glm_refusals.redirect` is off (with it on, the post is a draft the coordinator relays). `ttp stats --glm-share` reports the
+kept runs as `person:reply_chat`, `person:instruction` and `person:conclusion`.
 The `glm_work` release flag sets `on` per project (Waves and auto below); a project's own `on` wins. On a covered
 project every run of a kind on the list goes to the model at its effort, worker wakes and conclusion runs included
 (the conclusion floor keeps the run's tier and effort, not its provider), and code tasks take the code arm above

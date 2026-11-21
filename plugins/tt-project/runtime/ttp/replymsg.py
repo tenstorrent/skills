@@ -8,15 +8,24 @@ of its own, delivers nothing: `undelivered` names why, and the daemon sends the 
 of posting it, so the coordinator sees that the user got nothing. The check runs on every reply_chat worker's done hand-off, a
 code task's too (it then waits in review for the coordinator); a landed reply from the push queue posts
 the `message` the worker's hand-off already passed it with.
+
+A hand-off from a run on the chat provider (GLM) is data: its text posts only as the Opus write-up
+(writeup.py), which stamps it; `guard` refuses any other, on every path that posts it.
 """
 from __future__ import annotations
 
+import hashlib
 import re
 
 FIELD = "message"
 # A code task's done reply held until its review passes and the push queue ships it (pushq.post_held):
 # the chat never hears "shipped" while the review and landing are still ahead.
 HELD = "reply_held"
+# A hand-off from a run on the chat provider (GLM) posts only as the Opus write-up (writeup.py): `BY` is that
+# step's stamp, `CHAT_RUN` marks the hand-off as such a run's.
+BY = "message_by"
+CHAT_RUN = "chat_run"
+WRITEUP = "opus-writeup"
 
 # Phrases of a run describing its own delivery, not delivering. Narrow on purpose: each names the
 # reply itself as an object ("them as the message", "the steps to the user", "is above"), never a
@@ -53,9 +62,24 @@ def text(result) -> str:
     return str(result.get("summary") or "").strip()
 
 
+def guard(result) -> str:
+    """Why the chat must not get this hand-off's text ("" when it may): the run was on the chat provider and
+    the text carries no valid opus-writeup stamp (the stamp names the step and the hash of the message it covers)."""
+    if not isinstance(result, dict) or not result.get(CHAT_RUN):
+        return ""
+    by = result.get(BY)
+    msg = result.get(FIELD)
+    if isinstance(by, dict) and by.get("step") == WRITEUP and isinstance(msg, str) and msg.strip() \
+            and by.get("sha") == hashlib.sha256(msg.encode("utf-8", "replace")).hexdigest()[:16]:
+        return ""
+    return "its run was on the chat provider and no Opus write-up of its message was made"
+
+
 def undelivered(result) -> str:
-    """Why a done reply delivers nothing ("" when it delivers): no text, or a short text that only
-    describes the run."""
+    """Why a done reply delivers nothing ("" when it delivers): no text, a short text that only
+    describes the run, or text a chat-provider run wrote that Opus did not write up (guard)."""
+    if why := guard(result):
+        return why
     t = text(result)
     if not t:
         return "the hand-off has no message or summary"

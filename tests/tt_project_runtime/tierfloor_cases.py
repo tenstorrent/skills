@@ -575,3 +575,22 @@ def test_the_bench_and_device_second_reviewers_cap_a_configured_max_at_high(env)
         got = deviceab.second_reviewer({"route": {"device_ab_shadow": {"second_reviewer": sr}}})
         assert (got["effort"], got["provider"]) == (want, "chat"), effort
         assert benchdaily.second_reviewer({"bench": {"second_reviewer": sr}})["effort"] == want, effort
+
+
+def test_a_conclusion_only_task_goes_to_glm_with_the_floors_tier_and_effort_and_stays_on_core_without_the_glm_route(env, monkeypatch):
+    from ttp import tierfloor
+    p, d, _ = _floor_daemon(env, monkeypatch)
+    glm = {"on": True, "model": "glm-x"}
+    chat = {"tiers": {"light": {"route": True, "model": "glm-x"}, "standard": {"route": True, "model": "glm-x"}}}
+    d.cfg = dict(d.cfg, core_provider="claude", providers={**d.cfg["providers"], "chat": chat},
+                 route={**(d.cfg.get("route") or {}), "glm_work": glm})
+    task = p.db.task(p.db.add_task("Tidy", "Tidy the helper.\nconclusion: the helper is tidy", tier="standard",
+                                   origin="coordinator"))
+    assert tierfloor.target(p.db, d.cfg, task), "the conclusion line still lifts the tier and effort"
+    assert d._floor_keeps_core(task, "standard", None) == "", "the GLM work route takes it"
+    reply = p.db.task(p.db.add_task("Answer", "Answer it.", tier="standard", origin="coordinator", reply_chat="c1"))
+    assert d._floor_keeps_core(reply, "standard", None) == "", "Opus writes the post; GLM does the work"
+    dev = p.db.task(p.db.add_task("Soak", "Start the soak on the box.", tier="standard", origin="coordinator"))
+    assert d._floor_keeps_core(dev, "standard", None) == "chat:glm-x", "a device run still stays on core"
+    d.cfg = dict(d.cfg, route={**d.cfg["route"], "glm_work": {"on": False, "model": "glm-x"}})
+    assert d._floor_keeps_core(task, "standard", None) == "chat:glm-x", "without the GLM route the floor keeps it"

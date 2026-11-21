@@ -404,3 +404,24 @@ def test_glm_share_judge_reaches_back_only_as_far_as_the_minimum_reviewed_claude
     # Fewer than the minimum in all: the whole lookback, never further.
     v = glmshare.judge(p, {"route": {"glm_work": dict(_GS_SAME["route"]["glm_work"], min_window=40)}}, now)
     assert v["base_window"][0] == t0 - glmshare.BASE_DAYS * 86400 and "Claude baseline 25 with an outcome" in v["why"]
+
+
+def test_glm_share_held_splits_person_by_how_the_task_reaches_a_person_and_reads_old_rows(env):
+    from ttp import glmshare
+    p = make(env)
+    now = 1_000_000_000.0 + 30 * 86400
+    t = now - 5 * 3600
+    cl = {"provider": "claude", "model": "opus"}
+
+    def task(spec, **kw):
+        tid = p.db.add_task("t person", spec, kind="work", tier="standard", origin="coordinator", priority=3, **kw)
+        p.db.x("UPDATE tasks SET status='done' WHERE id=?", (tid,))
+        return tid
+    _gs_run(p, task("Answer it.", reply_chat="c1"), t, 1, **cl)
+    _gs_run(p, task("Fix it, then post a summary to the Slack channel."), t, 0.5, **cl)
+    _gs_run(p, task("Tidy it.\nconclusion: the tidy-up is done"), t, 0.25, **cl)
+    _gs_run(p, task("Do it."), t, 2, note={"code_arm": {"arm": "claude", "why": "person: post to slack"}}, **cl)   # an old row
+    got = glmshare.held(p, now - 86400, now)
+    by = {k: (v["runs"], v["hours"], v["user_rule"]) for k, v in got.items()}
+    assert by["person:reply_chat"] == (1, 1.0, True) and by["person:instruction"] == (1, 0.5, True)
+    assert by["person:conclusion"] == (1, 0.25, True) and by["person"] == (1, 2.0, True)

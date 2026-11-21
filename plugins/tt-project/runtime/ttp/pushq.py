@@ -768,7 +768,10 @@ def post_held(db, ids, tail: str) -> list[int]:
 
 
 def _done_text(prev: dict, summary: str, tail: str) -> str:
-    """A landed task's reply: its hand-off's `message` (replymsg) with how it landed, else its summary."""
+    """A landed task's reply: its hand-off's `message` (replymsg) with how it landed, else its summary. A
+    chat-provider run's text with no Opus write-up (replymsg.guard) never posts: the coordinator has the hand-off."""
+    if replymsg.guard(prev):
+        return f"The change landed ({tail}); its hand-off is with the coordinator."
     msg = prev.get(replymsg.FIELD)
     return f"{msg.strip()} ({tail})" if isinstance(msg, str) and msg.strip() else summary
 

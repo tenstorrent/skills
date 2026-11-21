@@ -95,6 +95,18 @@ def settings(cfg: dict, device: bool = False) -> dict | None:
             "fallback": {k: str(fb.get(k) or v) for k, v in FALLBACK.items()}}
 
 
+def person_writeup(cfg: dict) -> bool:
+    """Whether a GLM run of a task that answers a chat leaves the words to Opus (`route.glm_work.person_writeup`,
+    default on; false keeps such a task whole on core). It acts only where route.glm_work is on."""
+    return _raw(cfg).get("person_writeup") is not False
+
+
+def drafts_on(cfg: dict) -> bool:
+    """Whether a GLM run's outward post becomes a draft for the Opus coordinator (glmguard `redirect`)."""
+    from . import glmguard
+    return glmguard.refusal_settings(cfg)["redirect"]
+
+
 def bounce_on(cfg: dict) -> bool:
     """Whether a GLM run's hand-off asking for Opus or deep thinking sends its task back (`route.glm_work.bounce`,
     default on; false keeps the old way: such a hand-off stands as the run's end, and only later runs keep core)."""
@@ -239,8 +251,9 @@ def keeps_core(db, cfg: dict, task: dict, tier: str, cls: str | None = None, pic
     """Why a run of `task` stays on the core provider on a covered project ('' when GLM may take it). Model-free,
     in order: coordinator, plan and review runs, deep, a provider or model pin, outside text
     (untrusted_input), a tier-up retry after a finished attempt (infra_failed: a crash, timeout or endpoint error
-    retries on GLM), a GLM bounce (needs Opus or deep), a run that talks to a person (`reply_chat`, a
-    `conclusion:` line the user reads or an instruction to post, comment or notify), optimization or design work, device work (with glm_device on it runs on GLM under an Opus
+    retries on GLM), a GLM bounce (needs Opus or deep), a run that talks to a person (`reply_chat` with
+    person_writeup off, or an instruction to post, comment or notify with the outward-drafts redirect off: with
+    them on, Opus writes the words and GLM does the work), optimization or design work, device work (with glm_device on it runs on GLM under an Opus
     plan, deviceplan.py), urgent (only with keep_urgent), a kind off the
     list."""
     from . import codearm, deviceplan, effort, modelpick, untrusted, urgent
@@ -259,7 +272,12 @@ def keeps_core(db, cfg: dict, task: dict, tier: str, cls: str | None = None, pic
         return "retry"   # GLM finished and the work failed: Opus; a crash, timeout or endpoint error retries on GLM
     if task.get("id") and codearm.bounced(db, task["id"]):
         return "bounced"
-    if task.get("reply_chat") or PERSON.search(text) or codearm.CONCLUSION.search(text):   # a conclusion goes to the user
+    # A `conclusion:` line alone keeps nothing: that hand-off reaches only the Opus coordinator. A chat reply
+    # stays on core only with person_writeup off (else Opus writes the post, writeup.py); an instruction to post
+    # only with the outward-drafts redirect off (else the post is a draft the Opus coordinator relays, glmguard.py).
+    if task.get("reply_chat") and not person_writeup(cfg):
+        return "person"
+    if PERSON.search(text) and not drafts_on(cfg):
         return "person"
     if DESIGN.search(text) or modelpick.HARD.search(text) or codearm.JUDGMENT.search(text):
         return "design"

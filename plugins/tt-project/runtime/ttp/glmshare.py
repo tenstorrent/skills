@@ -261,7 +261,8 @@ def _requeued(db, since: float) -> set[int]:
 # talks to a person, a review or plan, the Claude holdout, outside text, an explicit pin or a bounce back for Opus)
 # or a rule that is not (False).
 KEEPERS = {"coordinator turn": True, "review": True, "plan": True, "deep": True, "needs_opus bounce": True,
-           "design or optimization": True, "person": True, "holdout": True, "untrusted": True, "pin": True,
+           "design or optimization": True, "person": True, "person:reply_chat": True, "person:instruction": True,
+           "person:conclusion": True, "holdout": True, "untrusted": True, "pin": True,
            "bounced": True, "device": True, "policy files": False, "lineage misses": False, "rerun after a fallback": False,
            "conclusion floor": False, "verdict wording": False, "retry": False, "urgent": False, "kind off the list": False,
            "unrecorded": False}
@@ -272,8 +273,20 @@ _WHY = (("policy", "policy files"), ("lineage", "lineage misses"), ("needs opus"
         ("device", "device"), ("bounced", "bounced"), ("holdout", "holdout"))
 
 
+def _person(task: dict) -> str:
+    """Which way a task reaches a person (the `person:` keeper names; old rows keep the bare "person"): a chat
+    reply, an instruction to post or notify, else only a `conclusion:` line (which keeps nothing now)."""
+    from . import codearm, glmwork
+    if task.get("reply_chat"):
+        return "person:reply_chat"
+    if glmwork.PERSON.search(f"{task.get('title') or ''}\n{task.get('spec') or ''}"):
+        return "person:instruction"
+    return "person:conclusion" if codearm.CONCLUSION.search(str(task.get("spec") or "")) else ""
+
+
 def keeper(p, cfg: dict, run: dict, task: dict | None, dev: dict) -> str:
-    """The rule that kept a Claude run off GLM (KEEPERS' names, else the raw reason)."""
+    """The rule that kept a Claude run off GLM (KEEPERS' names, else the raw reason). A run that stayed on
+    Claude for reaching a person is split by how (`_person`), also where today's rules would send it to GLM."""
     from . import glmwork
     if run.get("role") == "coordinator":
         return "coordinator turn"
@@ -305,6 +318,8 @@ def keeper(p, cfg: dict, run: dict, task: dict | None, dev: dict) -> str:
             why = ""
     if why.startswith("rerun"):
         return "rerun after a fallback"
+    if (not why or why.startswith("person")) and (how := _person(task)):
+        return how
     return next((name for key, name in _WHY if key in why), why.split(":")[0][:40] or "unrecorded")
 
 

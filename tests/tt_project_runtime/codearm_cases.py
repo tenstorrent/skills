@@ -2037,3 +2037,24 @@ def test_glmenv_reads_a_seds_quoted_script_as_text_but_not_its_e_flag_or_a_later
         assert glmenv.refusal(ok, str(wt), str(rd), env) is None, ok
     for bad in ("""sed 's|a|"$s"|e' mod.py""", """sed '1e sleep $T' mod.py""", """sed '3,5e sleep $T' mod.py""", """sed 's|a|b|' mod.py; $S x""", """sed -n 1p mod.py | $S"""):
         assert "expansion" in (glmenv.refusal(bad, str(wt), str(rd), env) or ""), bad
+
+
+def test_a_covered_glm_code_arm_takes_a_conclusion_only_task_and_keeps_the_rest(env):
+    from ttp import codearm, policyfiles
+    p = make(env)
+    (p.harness / policyfiles.FILE).write_text("src/policy_module.py\n")
+    cfg = {"providers": {"chat": {"endpoint": "placeholder", "base_url": "https://chat.example.invalid/v1"}},
+           "route": {"glm_work": {"on": True, "model": "glm-x", "holdout": 0}}}
+
+    def run(spec, **kw):
+        t = p.db.task(p.db.add_task("code task", spec, kind="code", tier="standard", origin="coordinator", **kw))
+        return codearm.choose(p.db, cfg, t, "standard")["run"]
+    assert run("Fix it.\nconclusion: the fix is in") == "glm"
+    assert run("Fix it.", reply_chat="c1") == "glm"
+    assert run("Fix it, then post a summary to the Slack channel.") == "glm"
+    assert run("Redesign the push queue.") == "claude"
+    assert run("Run the soak on the box.") == "claude"
+    off = {**cfg, "route": {"glm_work": {**cfg["route"]["glm_work"], "person_writeup": False}}}
+    t = p.db.task(p.db.add_task("code task", "Fix it.", kind="code", tier="standard", origin="coordinator",
+                                reply_chat="c1"))
+    assert codearm.choose(p.db, off, t, "standard")["run"] == "claude", "person_writeup off keeps a reply task on core"

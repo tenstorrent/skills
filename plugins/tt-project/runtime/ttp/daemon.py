@@ -139,7 +139,7 @@ from . import costlevers, wakesettle
 from . import convgate
 from . import readywait, unstarted
 from . import boundedchild
-from . import replymsg
+from . import replymsg, writeup
 from . import msgparts
 from . import awake
 from . import selfreview
@@ -7719,6 +7719,20 @@ class Daemon:
         finally:
             gitreplay.end(att.id)
 
+    def _writeup(self, r: dict, task: dict, result: dict, new: str, run_dir: Path) -> None:
+        """A reply_chat task's chat-provider run: flag its hand-off and, with the write-up on (writeup.py), have
+        Opus write the chat message from it. On a refusal or failure the hand-off stays unstamped, so
+        replymsg.guard keeps its text out of the chat."""
+        need = str(result.get("question") or result.get("blocked_reason") or "") if new == "blocked" else ""
+        if not writeup.active(self.cfg):
+            result.pop(replymsg.BY, None)
+            result[replymsg.CHAT_RUN] = True
+            return
+        held = "auth" if self._logged_out("claude") else "down" if self.net_held("claude") else ""
+        row = writeup.write(self.p, self.cfg, task, result, r, new, need, run_dir, held=held)
+        log(self.p, f"task {task['id']}: Opus write-up of run {r.get('id')}: "
+                    f"{'ok' if row.get('ok') else 'failed: ' + str(row.get('error'))} (${row.get('cost_usd', 0):.2f})")
+
     def _finish_worker(self, r: dict, usage, status: str, run_dir: Path, ended: str | None = None,
                        rebooted: bool = False, slept: bool = False, handoff: dict | None = None,
                        orderly: bool = False, refused: str = "", push_verified: bool = False,
@@ -8512,6 +8526,9 @@ class Daemon:
         shown = rstatus or status
         # A done reply that delivers nothing (replymsg.undelivered) is not posted: the task goes to
         # review saying so, so the coordinator sees that the chat got nothing.
+        if task["reply_chat"] and new in ("done", "failed", "blocked") and isinstance(result, dict) \
+                and writeup.chat_run(r):
+            self._writeup(r, task, result, new, run_dir)   # GLM's words never post: Opus's write-up or nothing
         undelivered = replymsg.undelivered(result) if task["reply_chat"] and new == "done" else ""
         if undelivered:
             new, reason = "review", f"nothing was posted to the chat: {undelivered}"
@@ -8624,10 +8641,16 @@ class Daemon:
                 log(self.p, f"review {task['id']}: earlier reviews not marked superseded: {e}")
         reply_text = None   # a code change's done reply, posted or held once its review is known
         if task["reply_chat"] and new in ("done", "failed", "blocked"):
-            text = db.for_user(replymsg.text(result) if new == "done" else f"(task #{task['id']} {outcome}) {summary}")
-            need = db.for_user(upd.get("blocked_reason")) if new == "blocked" else None
-            if need and need not in summary:
-                text += f"\nNeeds from you: {need}"
+            if isinstance(result, dict) and result.get(replymsg.CHAT_RUN):   # a chat-provider run: Opus's write-up only
+                text = db.for_user(replymsg.text(result)) if not replymsg.guard(result) else ""
+                text = f"(task #{task['id']} {outcome}) " + (text or "Its hand-off is with the coordinator.") \
+                    if new != "done" else text
+            else:
+                text = db.for_user(replymsg.text(result) if new == "done"
+                                   else f"(task #{task['id']} {outcome}) {summary}")
+                need = db.for_user(upd.get("blocked_reason")) if new == "blocked" else None
+                if need and need not in summary:
+                    text += f"\nNeeds from you: {need}"
             # The chat's status pace (chatdigest.handoff): at once only when owed or the user must act.
             # A code change's done reply waits for the review decision below (_hold_reply).
             from . import chatdigest
@@ -13701,6 +13724,8 @@ class Daemon:
         if not to or not route.eligible(task, picked):
             return ""
         try:
+            if glmwork.settings(self.cfg) and not glmwork.keeps_core(self.p.db, self.cfg, task, tier, None, picked):
+                return ""   # the GLM work route takes it (floor tier and effort still lift); Opus writes what a person reads
             return f"{to['to']}:{to['model']}" if tierfloor.target(self.p.db, self.cfg, task) else ""
         except Exception as e:   # the floor must never hold a task back
             log(self.p, f"task {task['id']}: tier floor not applied: {e}")
