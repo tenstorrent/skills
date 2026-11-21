@@ -1977,7 +1977,7 @@ def test_glmenv_hands_back_a_key_copy_before_it_redirects_the_scratch_write(cmd,
     assert glmguard.classify(plain)[1] == glmguard.REDIRECTED   # a plain scratch copy stays a redirect
 
 
-def test_glmenv_never_reads_a_redirects_file_descriptor_as_a_sed_target(tmp_path):
+def test_glmenv_keeps_a_sed_edit_with_an_fd_redirect_inside_the_worktree(tmp_path):
     from ttp import glmenv
     wt, rd = _gg_run(tmp_path)
     env = {"TTP_RUN_DIR": str(rd), **_GG_RUN_ENV}
