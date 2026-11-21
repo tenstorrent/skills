@@ -288,17 +288,6 @@ def _in_turn(run, mid: int) -> bool:
         return False
 
 
-def _hooked(run, run_dir: Path) -> bool:
-    """Whether this turn's update hook hands steer.md over after its tool calls (the provider's, or the
-    run's own marker: Codex and Cursor turns may run it)."""
-    from .hook import hooked
-    from .providers import get_provider
-    try:
-        return hooked(run_dir) or bool(getattr(get_provider(run["provider"]), "steer_hook", False))
-    except Exception:
-        return hooked(run_dir)
-
-
 def reach(p, rec: dict, c: dict, now: float) -> str | None:
     """Get the urgent message to the coordinator now. Returns where it stands, kept in the record:
     "next" (no turn runs: the next one starts past the holds), "in_turn" (the running turn already has it
@@ -315,7 +304,8 @@ def reach(p, rec: dict, c: dict, now: float) -> str | None:
     run_dir = Path(run["dir"])
     if (run_dir / "STOP").exists():
         return "next"   # already ending: the next turn reads it
-    if _hooked(run, run_dir):
+    from .hook import steer_hooked
+    if steer_hooked(run_dir, run["provider"]):
         if rec.get("reached") != "steer":
             m = db.one("SELECT text, context FROM messages WHERE id=?", (rec["mid"],))
             from .coordinator import _append_update

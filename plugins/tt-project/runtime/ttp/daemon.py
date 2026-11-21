@@ -17807,11 +17807,12 @@ class Daemon:
         """{"started": spec digest the run started on, "text": its unread updates} when the task's spec
         changed after the run started and the steer.md update carrying the change was not read before
         the run ended; else None. A stretch of the harness's own drift notes carries no instruction, so
-        it is not a missed update. A worker with the update hook (provider steer_hook, or the run's
-        HOOKED_FILE: Codex and Cursor workers may run it) has read up to its steer.offset; one without gets it from `ttp note` or `ttp steer` (which advance
+        it is not a missed update. A worker with the update hook (hook.steer_hooked: the provider's
+        steer_hook class flag or the run's HOOKED_FILE; a mini-swe-agent run has none) has read up to
+        its steer.offset; one without gets it from `ttp note` or `ttp steer` (which advance
         that offset too) or reads steer.md itself, so only an update newer than its
         result.json is surely unread. A model-free on_pass is checked in _probe_passed instead."""
-        from .hook import STEER_FILE, hooked as run_hooked, unread_update
+        from .hook import STEER_FILE, steer_hooked, unread_update
         from .prompts import spec_digest
         started = load_result(r.get("note")).get("spec_sha")
         if not isinstance(started, str) or started == spec_digest(task):
@@ -17819,11 +17820,7 @@ class Daemon:
         text = unread_update(run_dir)[0]
         if not text or drift.notes_only(text):
             return None   # a stretch the harness itself wrote (drift notes) carries no instruction
-        try:
-            hooked = run_hooked(run_dir) or bool(getattr(get_provider(r["provider"]), "steer_hook", False))
-        except Exception:
-            hooked = True
-        if not hooked:
+        if not steer_hooked(run_dir, r["provider"]):
             try:
                 if (run_dir / STEER_FILE).stat().st_mtime <= (run_dir / RESULT_FILE).stat().st_mtime:
                     return None

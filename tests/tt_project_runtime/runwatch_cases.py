@@ -182,7 +182,8 @@ def test_runwatch_steer_read_state_is_per_run_not_per_provider_class(env, tmp_pa
 def test_missed_update_counts_a_codex_or_cursor_run_whose_hook_ran_as_hooked(env, tmp_path):
     """_missed_update: a hooked run's unread update is missed even if result.json came later; an
     unhooked run's is missed only when steer.md changed after its result.json. Codex and Cursor go by
-    the run's hook marker, Claude by its provider."""
+    the run's hook marker, Claude by its provider; a chat (mini-swe-agent) run has none even though
+    its class inherits Claude's steer_hook flag."""
     import os
     from ttp import hook
     from ttp.daemon import Daemon
@@ -215,6 +216,14 @@ def test_missed_update_counts_a_codex_or_cursor_run_whose_hook_ran_as_hooked(env
         assert d._missed_update(h, task, h_dir) is None, f"a hooked {prov} run's read update counted as missed"
     cl_dir, cl = run("cl", "claude", False)
     assert d._missed_update(cl, task, cl_dir)["text"].endswith("new order"), "Claude changed"
+    # A chat (mini-swe-agent) run: unhooked despite the steer_hook flag Chat inherits from Claude.
+    m_dir, m = run("chat-mini", "chat", False)
+    (m_dir / "run.json").write_text(json.dumps({"harness": {"kind": "mini-swe-agent", "version": "2.4.6"}}))
+    assert d._missed_update(m, task, m_dir) is None, \
+        "a mini-swe-agent run may have read steer.md itself: not missed while result.json is newer"
+    later = (m_dir / "result.json").stat().st_mtime + 60
+    os.utime(m_dir / "steer.md", (later, later))   # an update after the hand-off is surely unread
+    assert d._missed_update(m, task, m_dir)["text"].endswith("new order")
 
 
 def _drift_note_setup(env, tmp_path, update):

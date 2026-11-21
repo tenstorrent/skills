@@ -114,6 +114,26 @@ def mark_hooked(run_dir: Path) -> None:
         (run_dir / HOOKED_FILE).touch()
 
 
+def steer_hooked(run_dir: Path, provider: str, spec: dict | None = None) -> bool:
+    """Whether this run's update hook hands steer.md over: the run's own marker (HOOKED_FILE; Codex
+    and Cursor workers may run the hook) or its provider's steer_hook class flag — never a run with
+    a harness (a chat provider's mini-swe-agent run): it inherits the class flag from Claude Code
+    runs, but its agent has no hook, so `ttp note` or `ttp steer` carries its updates."""
+    if spec is None:
+        try:
+            spec = json.loads((run_dir / "run.json").read_text())
+        except (OSError, ValueError):
+            spec = {}
+        spec = spec if isinstance(spec, dict) else {}
+    if spec.get("harness"):
+        return False
+    try:
+        from .providers import get_provider
+        return hooked(run_dir) or bool(getattr(get_provider(provider), "steer_hook", False))
+    except Exception:
+        return hooked(run_dir)
+
+
 def unread_update(run_dir: Path) -> tuple[str, int]:
     """The part of steer.md this run has not seen yet, and the offset that marks it seen. The caller
     marks it only once the text is handed over (a repeat is harmless, a loss is not)."""

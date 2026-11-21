@@ -324,6 +324,25 @@ def test_reach_an_unhooked_provider_turn_is_cut_after_cut_after_s_and_a_marker_m
     assert msgurgent.reach(p, rec, c, now + 5) == "steer" and f"URGENT message #{mid}" in (marked / "steer.md").read_text()
 
 
+def test_reach_a_chat_mini_swe_agent_turn_has_no_hook_so_it_is_cut_not_steered(env):
+    """A chat provider turn whose run.json names a harness (mini-swe-agent) has no update hook even
+    though the chat class inherits Claude Code's steer_hook flag: the urgent message is never
+    written to its steer.md; the turn is cut once it is old enough, like any unhooked provider's."""
+    from ttp import msgurgent
+    p = _urgent_project(env)
+    now = time.time()
+    mid = _urg_inbound(p, "urgent: the live stream is down", ts=now)
+    msgurgent.tick(p, p.config(), now=now + 1)
+    c = msgurgent.config(p.config())
+    run = _urg_turn(p, env["tmp"], provider="chat", started=now - 5)
+    (run / "run.json").write_text(json.dumps({"harness": {"kind": "mini-swe-agent", "version": "2.4.6"}}))
+    rec = _urg_rec(p, mid, now)
+    assert msgurgent.reach(p, rec, c, now) is None, "a young turn without a hook is retried, not steered"
+    assert not (run / "steer.md").exists(), "the chat class's inherited steer_hook must not steer a mini run"
+    assert msgurgent.reach(p, rec, c, now + c["cut_after_s"] + 1) == "cut"
+    assert "preempt" in (run / "STOP").read_text() and not (run / "steer.md").exists()
+
+
 def test_reach_with_no_turn_running_or_the_message_in_the_turn_cuts_nothing(env):
     from ttp import msgurgent
     p = _urgent_project(env)

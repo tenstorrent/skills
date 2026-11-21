@@ -108,7 +108,7 @@ def _entry(p: Project, r: dict, old: dict, now: float, base: list[str]) -> dict:
     limit = spec.get("timeout_s")
     e["wall"] = {"elapsed_s": round(now - started), "limit_s": limit,
                  "share": round((now - started) / float(limit), 3) if limit else None}
-    e["steer"] = _steer(run_dir, r["provider"], unhooked=bool(spec.get("harness")))
+    e["steer"] = _steer(run_dir, r["provider"], spec)
     e["ended"] = ended(run_dir, r["provider"], now)
     return e
 
@@ -269,14 +269,12 @@ def _files(p: Project, cwd: str, old: dict, now: float, base: list[str]) -> dict
             "git": {"key": [head, index], "ts": now, "head": head, "committed": committed}}
 
 
-def _steer(run_dir: Path, provider: str, unhooked: bool = False) -> dict | None:
+def _steer(run_dir: Path, provider: str, spec: dict | None = None) -> dict | None:
     """The last update written to steer.md and whether the run read it: up to steer.offset when the
-    update hook runs (the provider's steer_hook, or this run's HOOKED_FILE: Codex and Cursor workers
-    may run it). A run without it read the update once `ttp note` or `ttp steer` moved steer.offset to
-    the end; short of that it may read steer.md itself, so its read state is unknown (None). A
-    mini-swe-agent run is always without one (`unhooked`): the chat provider's steer_hook class flag
-    is a Claude Code run's, not its."""
-    from .hook import OFFSET_FILE, STEER_FILE, hooked as run_hooked
+    run has an update hook (hook.steer_hooked decides which runs do). A run without one read the
+    update once `ttp note` or `ttp steer` moved steer.offset to the end; short of that it may read
+    steer.md itself, so its read state is unknown (None)."""
+    from .hook import OFFSET_FILE, STEER_FILE, steer_hooked
     f = run_dir / STEER_FILE
     try:
         size = f.stat().st_size
@@ -288,10 +286,7 @@ def _steer(run_dir: Path, provider: str, unhooked: bool = False) -> dict | None:
         seen = 0
     lines = _tail_lines(f)
     at = max((i for i, ln in enumerate(lines) if ln.startswith("## Update")), default=None)
-    try:
-        hooked = (not unhooked) and (run_hooked(run_dir) or bool(getattr(get_provider(provider), "steer_hook", False)))
-    except Exception:
-        hooked = False
+    hooked = steer_hooked(run_dir, provider, spec)
     return {"last": lines[at][3:] if at is not None else "",
             "text": " ".join(lines[at + 1:at + 3])[:160] if at is not None else "",
             "size": size, "offset": seen, "read": (seen >= size) if hooked else (seen >= size or None)}
