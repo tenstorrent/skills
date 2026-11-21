@@ -19881,8 +19881,11 @@ class Daemon:
                     log(self.p, f"review {rid}: fix and re-review queued after its branch read was cut")
                     continue
                 if self._fix_cut:   # cut again: the deferred read itself counts the try
-                    pending[rid] = (db.kv(KV_FIX_RETRY) or {}).get(rid, pending.get(rid))
-                    if int((pending.get(rid) or ["0"])[0] or 0) >= FIX_RETRY_MAX:
+                    entry = (db.kv(KV_FIX_RETRY) or {}).get(rid) or pending.get(rid) or []
+                    pending[rid] = entry
+                    tries = entry[0] if isinstance(entry, list) and entry \
+                        and str(entry[0]).lstrip("-").isdigit() else 0
+                    if tries >= FIX_RETRY_MAX:
                         deadwait.raise_nofix(db, review, self._fix_cut, "")
                         pending.pop(rid)
                     continue
@@ -21610,7 +21613,9 @@ class Daemon:
                 # abandoned; past FIX_RETRY_MAX tries the review_nofix event is raised there.
                 why = f"its branch was not read ({coord.clip(str(e), 200)})"
                 pending = db.kv(KV_FIX_RETRY) or {}
-                tries = int((pending.get(str(review["id"])) or ["0", ""])[0] or 0) + 1
+                prior = pending.get(str(review["id"]))
+                tries = (int(prior[0]) if isinstance(prior, list) and prior
+                         and str(prior[0]).lstrip("-").isdigit() else 0) + 1
                 pending[str(review["id"])] = [tries, why]
                 db.set_kv(KV_FIX_RETRY, pending)
                 self._fix_cut = why
