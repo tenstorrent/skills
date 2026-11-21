@@ -38,6 +38,7 @@ from . import (   # one name per line: two changes adding names merge without a 
     prhead,
     push,
     pushclaim,
+    relaylag,
     release,
     replymsg,
     reviewcap,
@@ -791,7 +792,6 @@ def _landing(row: dict, target: str, reach: dict | None, db) -> str:
     """A pushed or landed row in words: the exact branch and short sha, and whether it is on the
     branch it is meant to reach (push.reach_words), so "pushed" never reads as landed there, and
     whether a push relay's upstream has it yet (relaylag.landing_words)."""
-    from . import relaylag
     relay = relaylag.landing_words(db)
     relay = f", {relay}" if relay else ""
     if row["status"] == "pushed":
