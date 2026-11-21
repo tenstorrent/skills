@@ -53,7 +53,7 @@ DESIGN = re.compile(
     r"|\barchitect\w*|\bpropose\b[^\n.]{0,40}\b(?:plan|design|approach)\b|\bhard[- ]debug\w*|\bdeadlock"
     r"|\brace\s+condition")
 # A question or work task that reviews another task (Opus reviews), not a fix of one.
-REVIEW_TITLE = re.compile(r"(?i)\breview\s+of\s+#\d+|\bsecond\s+reviewer\b")
+REVIEW_TITLE = re.compile(r"(?i)^(?!\s*fix\b).*?(?:\breview\s+(?:of\s+)?#\d+|\bsecond\s+reviewer\b)")
 # A job the goal runs through a box's device broker (tierfloor.DEVICE_SPEC names resets, soaks and device tests).
 BROKER_JOB = re.compile(r"(?i)\bthrough\s+(?:its|the|a|each|every|[\w.-]+'s)\s+(?:[\w-]+\s+){0,2}broker\b")
 # Where a spec's own goal ends: its first `Context:` or `Restrictions:` line (`Restrictions (binding):` too).

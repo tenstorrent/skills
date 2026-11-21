@@ -1347,7 +1347,8 @@ These stay on the core provider, checked before any route returns: coordinator t
 verdict runs, the deep tier, a provider or model pin, outside text (`untrusted_input`), a tier-up retry, a run a
 chat model bounced (needs Opus or deep), a run that answers a chat or posts to a person (`reply_chat`, or a spec
 naming a post, reply or comment to a person, a channel, an issue or a PR), a question or work task titled as a
-review of another task (`review of #N`, `second reviewer`), optimization or design work (the title or the spec's own
+review of another task (`Review #N`, `review of #N`, `second reviewer`; a title starting `Fix` is a fix, not a
+review), optimization or design work (the title or the spec's own
 goal naming optimize, redesign, architecture, design a/the/how, propose a plan, design or approach, hard debugging,
 a deadlock or race condition, or the code arm's judgment patterns), and device work (device resources, or the title
 or goal naming a device action or a job through a device broker). The goal is the spec above its first `Context:` or

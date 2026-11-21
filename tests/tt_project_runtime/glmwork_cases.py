@@ -121,7 +121,7 @@ def test_glm_work_keeps_every_protected_run_on_core(env):
 def test_glm_work_design_and_device_keepers_read_only_the_tasks_own_goal(env):
     """Design and device words in a Context or Restrictions block keep nothing; the goal's design words, a
     judgment phrase, a review of another task, device resources and a device or broker goal still keep the run on core.
-    Metric and debug words are no design (plan #9448: they mostly name fixes, deflakes and measurements)."""
+    Metric and debug words are no design (they mostly name fixes, deflakes and measurements)."""
     from ttp import glmwork
     p = make(env)
     cfg = _gw_cfg()
@@ -150,7 +150,10 @@ def test_glm_work_design_and_device_keepers_read_only_the_tasks_own_goal(env):
     assert kc("Fix the broker queue sort.", kind="code") == ""
     assert kc("Land it, then one smoke on the head through box-a's tt-device broker.") == "device"
     assert kc("Add preemptable broker jobs to the runner; test it with tt-device-mcp.", kind="code") == ""
-    assert kc("Apply it.", title="Fix review of #12: x", kind="code") == ""
+    for title in ("Fix review of #12: x", "Fix review #12: x", "Fix re-review #12: x"):
+        assert kc("Apply it.", title=title) == "", title
+    for title in ("Review #12: x", "Re-review #12: x"):
+        assert kc("Apply it.", title=title) == "review", title
 
 
 def test_glm_work_bounce_keeps_the_task_on_core(env, monkeypatch):
