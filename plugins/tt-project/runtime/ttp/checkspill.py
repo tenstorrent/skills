@@ -2357,14 +2357,15 @@ def strike_settle(p, cfg: dict | None, head: str, passed_on: str = "", now: floa
 
 def quarantined(p, alias: str, now: float | None = None) -> str:
     """Why `alias` is quarantined for project `p`'s checks ("" when it is not). A quarantine past its end
-    ends here as lift ends one (its event, its strikes reset), ledger entry or not."""
+    ends here as lift ends one (its event, its strikes reset), ledger entry or not; a health one ends only on a
+    passing health check (spillhealth.apply)."""
     from . import timefmt
     now = time.time() if now is None else now
     try:
         off = _strikes(p.db)["hosts"].get(alias, {}).get("off")
         if not off:
             return ""
-        if float(off.get("until") or 0) <= now:
+        if float(off.get("until") or 0) <= now and off.get("kind") != "health":
             lift(p, alias, now)
             return ""
     except Exception:
@@ -2377,8 +2378,8 @@ def quarantined(p, alias: str, now: float | None = None) -> str:
 
 
 def lift(p, alias: str, now: float | None = None, severity: str = "normal") -> bool:
-    """`ttp checks --spill-back <alias>`: end `alias`'s quarantine (one event at `severity`, its ledger entry
-    closed) and its strikes. True when it was quarantined. Safe to run twice."""
+    """`ttp checks --spill-back <alias>`: end `alias`'s quarantine (one event at `severity`, none when it is "";
+    its ledger entry closed) and its strikes. True when it was quarantined. Safe to run twice."""
     now = time.time() if now is None else now
     with p.db.tx():
         doc = _strikes(p.db)
@@ -2389,7 +2390,7 @@ def lift(p, alias: str, now: float | None = None, severity: str = "normal") -> b
         off = off if isinstance(off, dict) else None
         h["n"] = 0
         p.db.set_kv(STRIKES_KV, doc)
-        if off:
+        if off and severity:
             _event(p.db, now, f"spill-back:{alias}:{now:.0f}", severity,
                    f"Spill host {alias} is back in {p.name}'s spill pool (its quarantine ended).")
     if off and off.get("change"):

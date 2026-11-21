@@ -5299,48 +5299,96 @@ def test_every_spill_host_failing_its_health_check_is_one_config_event_and_takes
     assert len(ev) == 1 and "No module named 'pytest'" in ev[0], ev
 
 
-def test_a_spill_host_dropping_with_the_workstation_tunnel_goes_out_and_back_at_low_and_other_faults_stay_normal(
+def test_tunnel_down_spill_hosts_stay_out_quietly_with_one_bridge_event_and_a_real_failure_keeps_its_own(
         env, tmp_path, monkeypatch):
-    """cells: spill_tunnel_flap. One spill host reached through a forwarded loopback route failing to connect is
-    a tunnel flap the harness heals itself: its out and back events are low and name the ssh alias, never the
-    loopback address. An auth failure on a host keeps both at normal."""
+    """cells: spill_tunnel_flap. Three spill hosts reached through a forwarded loopback route failing to connect,
+    over several probe rounds while another host fails and then passes: one low tunnel event for the outage, no
+    per-host out or back event for them, and they stay out of pick until they pass, then one low event that the
+    tunnel is back. The other host's auth failure keeps its own normal out and back events."""
     from ttp import checkspill, machines, netwait, spillhealth
-    hosts = ["spill-a", "spill-b", "spill-c"]
+    hosts = ["spill-a", "spill-b", "spill-c", "spill-d"]
     p = _health_setup(env, tmp_path, monkeypatch, hosts)
     for h in hosts:
         machines.add(h)
-    monkeypatch.setattr(netwait, "_ssh_config", lambda h: {"hostname": "127.0.0.1" if h == "spill-a" else h + ".example"})
-    res = {"spill-a": {"state": "fail", "why": "ssh failed: Connection to 127.0.0.1 port 2224 timed out"},
-           "spill-b": {"state": "fail", "why": "ssh failed: Permission denied (publickey)."}}
+    monkeypatch.setattr(netwait, "_ssh_config", lambda h: {"hostname": "spill-d.example" if h == "spill-d" else "127.0.0.1"})
+    res = {h: {"state": "fail", "why": "ssh failed: Connection to 127.0.0.1 port 2224 timed out"} for h in hosts[:3]}
+    res["spill-d"] = {"state": "fail", "why": "ssh failed: Permission denied (publickey)."}
     monkeypatch.setattr(spillhealth, "check", lambda h, w: res.get(h, {"state": "ok", "why": ""}))
     cfg, now = p.config(), time.time()
 
     def round_(t):
         spillhealth.probe(spillhealth.targets(cfg), t)
-        return spillhealth.apply(p, cfg, t)
+        spillhealth.apply(p, cfg, t)   # the daemon applies the same results again a minute later
+        return spillhealth.apply(p, cfg, t + 60)
 
-    def events(kind):
-        return {r["fingerprint"].split(":")[1]: (r["severity"], r["text"]) for r in p.db.q(
-            "SELECT fingerprint, severity, text FROM events WHERE fingerprint LIKE ?", (kind + ":%",))}
+    def events():
+        return sorted((r["fingerprint"].rsplit(":", 1)[0] if r["fingerprint"].count(":") > 1 else r["fingerprint"],
+                       r["severity"], r["text"]) for r in p.db.q(
+            "SELECT fingerprint, severity, text FROM events WHERE fingerprint LIKE 'spill-%'"))
 
-    assert sorted(round_(now)) == ["spill-a", "spill-b"]
-    out = events("spill-health")
-    assert out["spill-a"][0] == "low" and "spill-a" in out["spill-a"][1] and "tunnel" in out["spill-a"][1]
-    assert "127.0.0.1" not in out["spill-a"][1] and "port" not in out["spill-a"][1], out["spill-a"][1]
-    assert out["spill-b"][0] == "normal" and "Permission denied" in out["spill-b"][1] and "tunnel" not in out["spill-b"][1]
+    t = now
+    assert round_(t) == []
+    ev = events()
+    assert [e[:2] for e in ev] == [("spill-health-bridge:low", "low"), ("spill-health:spill-d", "normal")], ev
+    assert "spill-a, spill-b, spill-c" in ev[0][2] and "127.0.0.1" not in ev[0][2] and "port" not in ev[0][2]
+    assert "Permission denied" in ev[1][2] and "tunnel" not in ev[1][2]
+    assert all(checkspill.quarantined(p, h) for h in hosts)
+    res.pop("spill-d")
+    for k in range(4):   # spill-d passes (back at normal); the tunnel hosts keep failing: nothing new for them
+        t += spillhealth.EVERY_S + 1
+        round_(t)
+        assert all(checkspill.quarantined(p, h) for h in hosts[:3]) and not checkspill.quarantined(p, "spill-d")
+    assert [e[:2] for e in events()] == [("spill-back:spill-d", "normal"), ("spill-health-bridge:low", "low"),
+                                         ("spill-health:spill-d", "normal")], events()
     res.clear()
-    assert sorted(round_(now + spillhealth.EVERY_S + 1)) == ["spill-a", "spill-b"]
-    back = events("spill-back")
-    assert back["spill-a"][0] == "low" and back["spill-b"][0] == "normal"
-    assert not any(checkspill.quarantined(p, h) for h in hosts)
+    t += spillhealth.EVERY_S + 1
+    spillhealth.probe(spillhealth.targets(cfg), t)
+    assert spillhealth.apply(p, cfg, t) == hosts[:3] and round_(t) == []
+    assert not any(checkspill.quarantined(p, h) for h in hosts) and not p.db.kv(spillhealth.BRIDGE_KV)
+    back = [e for e in events() if e[0] == "spill-health-bridge:back"]
+    assert len(back) == 1 and back[0][1] == "low" and "tunnel is back" in back[0][2], events()
+    assert len(events()) == 4, "no per-host back event for the tunnel hosts"
+
+
+def test_a_health_quarantine_whose_time_ends_while_the_probe_still_fails_stays_out_until_a_pass(
+        env, tmp_path, monkeypatch):
+    """cells: spill_health_stays. A health quarantine whose time has run out while its host still fails its probe
+    stays out of pick with no event; a passing probe lifts it with one event."""
+    from ttp import checkspill, machines, spillhealth
+    hosts = ["spill-a", "spill-b", "spill-c"]
+    p = _health_setup(env, tmp_path, monkeypatch, hosts)
+    for h in hosts:
+        machines.add(h)
+    res = {"spill-a": {"state": "fail", "why": "no python3"}}
+    monkeypatch.setattr(spillhealth, "check", lambda h, w: res.get(h, {"state": "ok", "why": ""}))
+    cfg, now = p.config(), time.time()
+    spillhealth.probe(spillhealth.targets(cfg), now)
+    assert spillhealth.apply(p, cfg, now) == ["spill-a"]
+    doc = checkspill._strikes(p.db)
+    doc["hosts"]["spill-a"]["off"]["until"] = now - 1
+    p.db.set_kv(checkspill.STRIKES_KV, doc)
+
+    def backs():
+        return p.db.q("SELECT severity FROM events WHERE fingerprint LIKE 'spill-back:%'")
+
+    assert checkspill.quarantined(p, "spill-a", now + 60) and not backs()
+    t = now + spillhealth.EVERY_S + 1
+    spillhealth.probe(spillhealth.targets(cfg), t)
+    assert spillhealth.apply(p, cfg, t) == [] and checkspill.quarantined(p, "spill-a", t) and not backs()
+    res.clear()
+    t += spillhealth.EVERY_S + 1
+    spillhealth.probe(spillhealth.targets(cfg), t)
+    assert spillhealth.apply(p, cfg, t) == ["spill-a"] and not checkspill.quarantined(p, "spill-a", t)
+    assert [r["severity"] for r in backs()] == ["normal"]
 
 
 def test_every_spill_host_failing_to_connect_through_the_tunnel_is_one_low_bridge_event_not_a_config_fault(
         env, tmp_path, monkeypatch):
     """cells: spill_bridge_down. Every spill host reached through a forwarded loopback route failing to connect is
-    the workstation tunnel being down: one low event naming ssh aliases (no loopback address), none taken out; a
-    changed host set raises nothing new; still down after BRIDGE_NORMAL_S, one normal event; a host answering ends
-    the outage. An auth or env failure on every host stays the one high config fault."""
+    the workstation tunnel being down: one low event naming ssh aliases (no loopback address), and they go out
+    quietly; a changed host set raises nothing new; still down after BRIDGE_NORMAL_S, one normal event; the hosts
+    answering end the outage with one low event. An auth or env failure on every host stays the one high config
+    fault, none taken out."""
     from ttp import checkspill, machines, netwait, spillhealth
     hosts = ["spill-a", "spill-b", "spill-c"]
     p = _health_setup(env, tmp_path, monkeypatch, hosts)
@@ -5362,8 +5410,8 @@ def test_every_spill_host_failing_to_connect_through_the_tunnel_is_one_low_bridg
     def events():
         return [(r["severity"], r["text"]) for r in p.db.q("SELECT severity, text FROM events WHERE fingerprint LIKE 'spill-health%'")]
 
-    assert round_(now) == []
-    assert not any(checkspill.quarantined(p, h) for h in hosts)
+    assert round_(now) == hosts
+    assert all(checkspill.quarantined(p, h) for h in hosts)
     (sev, text), = events()
     assert sev == "low" and "workstation tunnel is down" in text and "reconnects by itself" in text, text
     assert "spill-a, spill-b, spill-c" in text and "127.0.0.1" not in text and "port" not in text
@@ -5378,10 +5426,12 @@ def test_every_spill_host_failing_to_connect_through_the_tunnel_is_one_low_bridg
         assert round_(t) == []
     assert [s for s, _ in events()] == ["low", "normal"], events()
     assert "127.0.0.1" not in events()[1][1]
-    # the hosts answer: the outage is over (no host was out, none comes back)
+    # the hosts answer: the outage is over, one low event and they are back
     res.clear()
     t += spillhealth.EVERY_S + 1
-    assert round_(t) == [] and not p.db.kv(spillhealth.BRIDGE_KV)
+    assert round_(t) == hosts and not p.db.kv(spillhealth.BRIDGE_KV)
+    assert events()[-1][0] == "low" and "tunnel is back" in events()[-1][1] and len(events()) == 3
+    assert not any(checkspill.quarantined(p, h) for h in hosts)
     # a route that is not loopback, or an auth failure through the tunnel: the high config fault, once
     p.db.x("DELETE FROM events")
     res.update({h: {"state": "fail", "why": "ssh failed: Permission denied (publickey)."} for h in hosts})
@@ -5404,9 +5454,10 @@ def test_every_spill_host_failing_to_connect_through_the_tunnel_is_one_low_bridg
 def test_tunnel_down_spill_hosts_beside_one_other_failure_are_the_bridge_event_and_the_other_goes_out_alone(
         env, tmp_path, monkeypatch):
     """cells: spill_bridge_mixed. Every spill host failing at once, most of them failing to connect through the
-    forwarded loopback route and one failing once on its own: the tunnel event names the tunnel hosts, no config
-    fault is raised, and the other host goes out alone and comes back on its next pass. Real failures on at least
-    CONFIG_FAULT_HOSTS hosts beside the tunnel ones are still the config fault."""
+    forwarded loopback route and one failing once on its own: the tunnel event names the tunnel hosts, which go out
+    quietly, no config fault is raised, and the other host goes out with its own event and comes back on its next
+    pass. Real failures on at least CONFIG_FAULT_HOSTS hosts beside the tunnel ones are still the config fault,
+    which takes none of them out."""
     from ttp import checkspill, machines, netwait, spillhealth
     hosts = ["spill-a", "spill-b", "spill-c", "spill-d"]
     p = _health_setup(env, tmp_path, monkeypatch, hosts)
@@ -5426,13 +5477,13 @@ def test_tunnel_down_spill_hosts_beside_one_other_failure_are_the_bridge_event_a
         return {r["fingerprint"].split(":")[0]: (r["severity"], r["text"]) for r in p.db.q(
             "SELECT fingerprint, severity, text FROM events WHERE fingerprint LIKE 'spill-health%'")}
 
-    assert round_(now) == ["spill-d"]
+    assert round_(now) == hosts
     ev = events()
     assert "spill-health-config" not in ev, ev
     sev, text = ev["spill-health-bridge"]
     assert sev == "low" and "spill-a, spill-b, spill-c" in text and "spill-d" not in text
     assert ev["spill-health"][0] == "normal" and "spill-d" in ev["spill-health"][1]
-    assert checkspill.quarantined(p, "spill-d") and not any(checkspill.quarantined(p, h) for h in hosts[:3])
+    assert all(checkspill.quarantined(p, h) for h in hosts)
     res.pop("spill-d")
     t = now + spillhealth.EVERY_S + 1
     assert "spill-d" in round_(t) and not checkspill.quarantined(p, "spill-d")
@@ -5442,7 +5493,7 @@ def test_tunnel_down_spill_hosts_beside_one_other_failure_are_the_bridge_event_a
     round_(t + spillhealth.EVERY_S + 1)
     sev, text = events()["spill-health-config"]
     assert sev == "high" and "spill-c, spill-d" in text and "spill-a" not in text
-    assert not any(checkspill.quarantined(p, h) for h in hosts)
+    assert not checkspill.quarantined(p, "spill-d"), "the config fault takes none out"
 
 
 def test_the_daemon_probes_spill_host_health_in_a_thread_and_acts_on_it(env, tmp_path, monkeypatch):
@@ -5653,8 +5704,8 @@ def test_a_host_that_cannot_make_the_checks_env_is_down_for_every_project_until_
 
 
 def test_spill_host_observations_honour_an_observation_mute(env, tmp_path, monkeypatch):
-    """A low spill-health line under a checks mute on 'Spill host' below normal is stored muted and counted
-    there; a normal one stays queued; with no mute nothing changes."""
+    """A low spill-health line (the tunnel's) under a checks mute on 'Spill host' below normal is stored muted
+    and counted there; a normal one stays queued; with no mute nothing changes."""
     from ttp import checkspill, screen, spillhealth
     p = _health_setup(env, tmp_path, monkeypatch, ["check-host-a", "check-host-b", "down"])
     cfg, now = p.config(), time.time()
@@ -5665,7 +5716,7 @@ def test_spill_host_observations_honour_an_observation_mute(env, tmp_path, monke
     monkeypatch.setattr(spillhealth, "tunnel", lambda h, why: True)   # a tunnel flap: low
     spillhealth.probe(spillhealth.targets(cfg), now)
     assert spillhealth.apply(p, cfg, now) == ["down"]
-    row = p.db.q("SELECT status, severity FROM events WHERE text LIKE 'Spill host down failed%' ORDER BY id DESC")[0]
+    row = p.db.q("SELECT status, severity FROM events WHERE fingerprint LIKE 'spill-health-bridge:%'")[0]
     assert (row["status"], row["severity"]) == ("muted", "low")
     checkspill._event(p.db, now, "spill-health:normal", "normal", "Spill host down failed its health check (boom)")
     assert status("spill-health:normal") == "queued"

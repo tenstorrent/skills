@@ -12,14 +12,14 @@ cannot run without a copy of its commit, so the import then runs without it.
 Results are shared by every project on this machine (checkspill.claim_dir, one file per host and wrapper),
 so a host other projects share is probed once per EVERY_S, by whichever daemon gets its lock first (probe,
 in a thread). Each project's daemon then applies them (apply, its own step): a failing host gets
-checkspill's quarantine (kind "health", renewed on each failing result) and one event when it goes out; a
-passing one is lifted (checkspill.lift) when the health check put it out, never from a strikes quarantine.
-When every probed host fails at once (at least checkspill.CONFIG_FAULT_HOSTS), those that reach their host
-through a forwarded loopback route (its ssh HostName is 127.0.0.0/8, ::1 or localhost) and failed to connect
-are the workstation tunnel being down, not a fault here: none is taken out, and one low event per outage
-(normal once it lasts BRIDGE_NORMAL_S) names their ssh aliases only. The other failures are a config fault
-(one high event, none taken out) when at least CONFIG_FAULT_HOSTS of them fail; fewer are each handled as a
-host of their own. Each event has one fingerprint, whichever hosts are in the set."""
+checkspill's quarantine (kind "health", renewed on each failing result) and one event when it goes out; only
+a passing result lifts it (checkspill.lift), never its time, and never a strikes quarantine. Hosts that reach
+their host through a forwarded loopback route (its ssh HostName is 127.0.0.0/8, ::1 or localhost) and failed
+to connect are the workstation tunnel being down, not a fault there: they go out quietly, with one low event
+per outage (normal once it lasts BRIDGE_NORMAL_S) naming their ssh aliases only, and come back quietly, with
+one low event once none of them fails. When every probed host fails at once, the other failures are a config
+fault (one high event, none taken out) when at least CONFIG_FAULT_HOSTS of them fail; fewer are each handled
+as a host of their own. Each event has one fingerprint, whichever hosts are in the set."""
 from __future__ import annotations
 
 import fcntl
@@ -157,38 +157,38 @@ def apply(p, cfg: dict | None, now: float | None = None) -> list[str]:
     res = {h: r for h, r in res.items() if r["state"] != "busy"}
     failing = {h: r for h, r in res.items() if r["state"] == "fail"}
     changed: list[str] = []
+    tun: set[str] = set()
     if not whole:
         hosts = checkspill._strikes(p.db)["hosts"]
         failing = {h: r for h, r in failing.items() if ((hosts.get(h) or {}).get("off") or {}).get("kind") == KIND}
-    elif len(failing) >= checkspill.CONFIG_FAULT_HOSTS and len(failing) == len(res):
+    else:
         tun = {h for h, r in failing.items() if tunnel(h, r.get("why", ""))}   # ssh -G here, outside the tx
-        failing = {h: r for h, r in failing.items() if h not in tun}
-        if tun:   # the workstation tunnel is down: none of its hosts is taken out
-            names = ", ".join(sorted(tun))
-            with p.db.tx():
-                since = float((p.db.kv(BRIDGE_KV) or {}).get("since") or now)
+        with p.db.tx():
+            was = p.db.kv(BRIDGE_KV) or {}
+            if tun:   # the workstation tunnel is down: its hosts go out quietly, one event per outage
+                since = float(was.get("since") or now)
                 p.db.set_kv(BRIDGE_KV, {"since": since})
                 long = now - since >= BRIDGE_NORMAL_S
                 fp = "spill-health-bridge:" + ("normal" if long else "low")
                 if not _told(p.db, fp, now):
                     checkspill._event(p.db, now, fp, "normal" if long else "low",
                                       f"The workstation tunnel is down{f' for {(now - since) / 60:.0f} min' if long else ''}: "
-                                      f"every spill host it reaches failed to connect ({names}). It reconnects by "
-                                      f"itself; none was taken out and checks run here meanwhile.")
-        else:
-            with p.db.tx():
+                                      f"the spill hosts it reaches failed to connect ({', '.join(sorted(tun))}). It "
+                                      f"reconnects by itself; they stay out of {p.name}'s spill pool until they answer.")
+            elif was:
                 p.db.set_kv(BRIDGE_KV, {})
-        if len(failing) >= checkspill.CONFIG_FAULT_HOSTS:   # fewer: each is handled as its own host below
-            names = ", ".join(sorted(failing))
+                checkspill._event(p.db, now, "spill-health-bridge:back", "low",
+                                  f"The workstation tunnel is back: its spill hosts answer again and are back in "
+                                  f"{p.name}'s spill pool.")
+        rest = {h: r for h, r in failing.items() if h not in tun}
+        if len(rest) >= checkspill.CONFIG_FAULT_HOSTS and len(failing) == len(res):   # fewer: each its own host
             with p.db.tx():
                 if not _told(p.db, "spill-health-config", now):
-                    why = _LOOP.sub("its forwarded route", next(iter(failing.values()))["why"])
+                    why = _LOOP.sub("its forwarded route", next(iter(rest.values()))["why"])
                     checkspill._event(p.db, now, "spill-health-config", "high",
-                                      f"Every spill host failed its health check at once ({names}): "
+                                      f"Every spill host failed its health check at once ({', '.join(sorted(rest))}): "
                                       f"a config fault, so none was taken out. {why}")
-            failing = {}
-    elif p.db.kv(BRIDGE_KV):
-        p.db.set_kv(BRIDGE_KV, {})   # a host answered: that outage is over
+            failing = {h: r for h, r in failing.items() if h in tun}
     for host, r in res.items():
         with p.db.tx():
             doc = checkspill._strikes(p.db)
@@ -197,20 +197,21 @@ def apply(p, cfg: dict | None, now: float | None = None) -> list[str]:
             if host in failing:
                 if off and off.get("kind") != KIND and float(off.get("until") or 0) > now:
                     continue   # a strikes quarantine already holds it
-                flap = tunnel(host, r["why"])   # ssh -G inside the tx: no network, at most a second
+                was_off = bool(off and off.get("kind") == KIND)
+                tunneled = host in tun if whole else bool(was_off and off.get("tunnel"))
                 h["off"] = {"n": 0, "kind": KIND, "why": r["why"], "until": now + checkspill.QUARANTINE_MAX_S,
-                            **({"tunnel": True} if flap else {}),
+                            **({"tunnel": True} if tunneled else {}),
                             **({"change": off["change"]} if off and off.get("change") else {})}
                 p.db.set_kv(checkspill.STRIKES_KV, doc)
-                if not (off and off.get("kind") == KIND):
-                    checkspill._event(p.db, now, f"spill-health:{host}:{now:.0f}", "low" if flap else "normal",
+                if not (was_off or tunneled):
+                    checkspill._event(p.db, now, f"spill-health:{host}:{now:.0f}", "normal",
                                       f"Spill host {host} failed its health check "
                                       f"({_LOOP.sub('its forwarded route', r['why'])}): out of "
-                                      f"{p.name}'s spill pool until it passes again"
-                                      + (" (the workstation tunnel dropped; it reconnects by itself)." if flap else "."))
+                                      f"{p.name}'s spill pool until it passes again.")
+                if not was_off:
                     changed.append(host)
                 continue
-        if off and off.get("kind") == KIND and checkspill.lift(p, host, now,
-                                                               severity="low" if off.get("tunnel") else "normal"):
+        if r["state"] == "ok" and off and off.get("kind") == KIND and checkspill.lift(
+                p, host, now, severity="" if off.get("tunnel") else "normal"):
             changed.append(host)
     return changed
