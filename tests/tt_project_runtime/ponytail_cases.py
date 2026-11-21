@@ -376,6 +376,10 @@ def test_an_oversized_change_without_a_reason_goes_back_to_its_worker_with_no_re
     p.db.update_task(tid, status="done")   # the same head handed off again: not sent back twice
     assert Daemon(p.base)._auto_review(p.db.task(tid), "again") is None
     assert p.db.task(tid)["status"] == "done" and not p.db.q("SELECT id FROM tasks WHERE kind='review'")
+    # Not sent back again: the coordinator is told once for that head, never silently left done.
+    assert Daemon(p.base)._auto_review(p.db.task(tid), "again") is None
+    (ev,) = p.db.q("SELECT text, status FROM events WHERE kind='review_unqueued' AND task=?", (tid,))
+    assert ev["status"] == "queued" and "it adds 45 lines" in ev["text"]
     _, _, _, (rev,) = _finish_code(env, p, "big2", {"big2.py": 45},
                                    result={"status": "done", "summary": "done\nwhy this size: one table"})
     assert "it adds 45 lines" in rev["spec"]

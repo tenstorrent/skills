@@ -31,7 +31,7 @@ from __future__ import annotations
 import re
 
 from . import budget, chainprio
-from .db import CHANGES_NEEDED, SUPERSEDED, load_result, task_outcome
+from .db import CHANGES_NEEDED, load_result
 from .reviewreuse import FORCED_LABEL, HEAD_LABEL, PAYLOAD_LABEL
 from .util import task_labels
 
@@ -74,11 +74,11 @@ def _moved_at(db, cfg: dict) -> float:
 
 
 def _verdict(task: dict) -> bool:
-    """A failed review that returned a verdict on the change: its spend is rework of that change."""
-    if task_outcome(task) in (CHANGES_NEEDED, SUPERSEDED):
-        return True
+    """A failed review that returned a verdict on the change: its spend is rework of that change. Read from
+    the hand-off reviewsup keeps as it was, so a superseded crashed run stays a failed task."""
     result = load_result(task["result"])
-    return result.get("status") == "failed" and bool(result.get("review_failure") or result.get("followups"))
+    return result.get("status") == CHANGES_NEEDED or (
+        result.get("status") == "failed" and bool(result.get("review_failure") or result.get("followups")))
 
 
 def _task_sets(db, cfg: dict) -> dict:

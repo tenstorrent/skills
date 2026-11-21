@@ -259,7 +259,8 @@ def test_failed_reviews_with_a_verdict_are_rejected_changes_and_a_broken_run_a_f
     p.db.update_task(fail, result=json.dumps({"status": "failed", "summary": "a bug", "review_failure": "substantive",
                                               "followups": [{"title": "Fix the bug", "spec": "s"}]}))
     broken = _waste_task(p, "Review broken", kind="review", status="failed")
-    p.db.update_task(broken, result=json.dumps({"status": "no_handoff", "summary": "ended without a hand-off"}))
+    p.db.update_task(broken, result=json.dumps({"status": "no_handoff", "summary": "ended without a hand-off",
+                                                "review_superseded": {"by_review": 9, "how": "passed"}}))
     bare = _waste_task(p, "crashed work", status="failed")
     for t, cost in ((code, 1.0), (sup, 2.0), (fail, 3.0), (broken, 4.0), (bare, 5.0)):
         _waste_run(p, t, cost, now)

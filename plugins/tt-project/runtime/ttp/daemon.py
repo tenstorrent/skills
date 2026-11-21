@@ -21301,15 +21301,25 @@ class Daemon:
     def _size_refused(self, task: dict, full: str, why: str) -> None:
         """No review for code task `task`'s head `full`, refused by the size rule (`why`) before a review
         ran: the task goes back to its worker once per head (chaincap.requeue) to add its reason line or
-        make the change smaller; when it cannot (not done, re-queues off), the coordinator decides."""
+        make the change smaller; when it cannot (not done, re-queues off, the head came back unchanged),
+        one review_unqueued event per head tells the coordinator, which decides."""
+        db = self.p.db
         mark = f"review refused before it ran, head {full[:12]}"
-        task = self.p.db.task(task["id"]) or task
+        task = db.task(task["id"]) or task
         if mark not in str(task.get("spec") or "") and self._requeue_continue(task, {"title": mark, "spec": (
                 f"No review was queued: {why}. Add that line to your hand-off, or make the change smaller, "
                 f"then hand off again.")}, mark, int(task.get("attempts") or 0)):
             log(self.p, f"task {task['id']}: no review queued, sent back to its worker: {why}")
-        else:
-            log(self.p, f"task {task['id']}: no review queued: {why}")
+            return
+        log(self.p, f"task {task['id']}: no review queued: {why}")
+        fp = f"{REVIEW_UNQUEUED}:{task['id']}:{full}"
+        if not db.one("SELECT id FROM events WHERE fingerprint=?", (fp,)):
+            db.x("INSERT INTO events(ts,source,kind,fingerprint,severity,text,status,task) VALUES(?,?,?,?,?,?,?,?)",
+                 (time.time(), "daemon", REVIEW_UNQUEUED, fp, "normal",
+                  f"#{task['id']} {task['title'][:120]}: no review was queued for head {full[:12]} and it could not "
+                  f"go back to its worker: {why}. Nothing reviews or lands it until you act. Options: continue it "
+                  f"to add the reason line or make it smaller, queue its review yourself, or cancel it.",
+                  "queued", task["id"]))
 
     def _requeue_continue(self, task: dict, fup: dict, why: str, attempts: int) -> bool:
         """chaincap.requeue for a done code task _continue_ready passed; False when it cannot be done (a new
