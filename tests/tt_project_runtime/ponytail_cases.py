@@ -341,3 +341,14 @@ def test_the_lane_fails_on_a_block_finding_or_one_with_no_severity_and_passes_wi
     (fix,) = p.db.q("SELECT * FROM tasks WHERE kind='code' AND origin='daemon'")
     assert "helper.py should not exist" in fix["spec"] and "unused import" not in fix["spec"]
     assert json.loads(t["result"])["ponytail_notes"] == ["one unused import"]
+
+
+def test_the_lane_text_names_the_skill_file_to_read():
+    """The lane step names the ponytail review skill's own file, resolved where this release keeps
+    its skills, and says to read it there: a reviewer with no plugin cache finds the skill without
+    searching the disk for it."""
+    from ttp import ponytail
+    line = ponytail.spec_line({}, None)
+    m = re.search(r"read skill `tt-ponytail-review` at `([^`]+)` and apply it", line)
+    assert m, line
+    assert m.group(1).endswith("tt-ponytail-review/SKILL.md") and Path(m.group(1)).is_file(), line

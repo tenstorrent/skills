@@ -128,14 +128,24 @@ def size_problem(cfg: dict, added: int | None, text: str, run_dir, head: str = "
     return ""
 
 
+def skill_file() -> str:
+    """The ponytail review skill's own file, resolved at run time where this release keeps its
+    skills (cli.skill_dirs: the plugin's copy first, then the installed one)."""
+    from .cli import skill_dirs
+    for d in skill_dirs():
+        if (d / "tt-ponytail-review" / "SKILL.md").is_file():
+            return str(d / "tt-ponytail-review" / "SKILL.md")
+    return "skills/tt-ponytail-review/SKILL.md"
+
+
 def spec_line(cfg: dict, added: int | None) -> str:
     """The review spec's lane step; with `added` over the landing limit, the size rule too."""
     model = _review(cfg).get("ponytail_model") or "opus"
     line = (f"Ponytail lane (review.ponytail_lane): beside correctness, run a separate ponytail review. Start one "
             f"fresh-context subagent pinned to model `{model}`, given only the change's spec and its diff, and "
-            f"have it apply skill `tt-ponytail-review`. It fails the change on any `block` finding (code that should "
-            f"not exist, a copied or vendored tree unless the spec has a line `vendored: <user msg>`); a `note` "
-            f"(a small leftover that can wait) does not. Write its "
+            f"have it read skill `tt-ponytail-review` at `{skill_file()}` and apply it. It fails the change on any "
+            f"`block` finding (code that should not exist, a copied or vendored tree unless the spec has a line "
+            f"`vendored: <user msg>`); a `note` (a small leftover that can wait) does not. Write its "
             f"verdict unedited to `$TTP_RUN_DIR/{FILE}` as {{\"verdict\": \"pass\" or \"fail\", \"head\": "
             f"\"<full sha reviewed>\", \"findings\": [{{\"severity\": \"block\" or \"note\", \"text\": "
             f"\"...\"}}], \"thread\": true}} before any `ttp push` or push list; "
