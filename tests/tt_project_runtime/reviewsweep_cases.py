@@ -429,3 +429,49 @@ def test_a_worker_renaming_its_branch_in_its_worktree_still_gets_a_pushable_revi
     (rev,) = _daemon_reviews(p, tid)
     assert extchange.NO_PUSH_LINE not in rev["spec"] and extchange.REVIEW_ONLY not in rev["spec"]
     assert head[:7] in rev["spec"] or f"ttp/t{tid}-renamed-by-worker" in rev["spec"]
+
+
+def test_a_failed_review_whose_branch_read_a_slice_cut_defers_its_fix_to_a_later_round(env):
+    """A finish round's live-git slice cutting the failed review's branch read defers the fix
+    (KV_FIX_RETRY) instead of raising review_nofix: no fix is queued, no event; the next round, with
+    no slice over the read, queues the fix and re-review. A read that keeps being cut raises the
+    event only at FIX_RETRY_MAX tries."""
+    from ttp import gitmemo, gitreplay
+    from ttp.daemon import Daemon, FIX_RETRY_MAX, KV_FIX_RETRY
+    p = make(env)
+    p.set_config("budget.max_tasks_per_24h", 1000)
+    _with_origin(env, clone=False)
+    cid, _, _, (rev,) = _finish_code(env, p, "a change", {"app.py": 20})
+    p.db.update_task(rev["id"], status="failed", result=json.dumps(
+        {"status": "changes_needed", "summary": "bug", "followups": [{"title": "bug", "spec": "fix it"}]}))
+    d = Daemon(p.base)
+    fups = [{"title": "bug", "spec": "fix it"}]
+
+    def cut_read(body):
+        gitreplay.clear()
+        with gitmemo.bounded(gitmemo.TX_GIT_S, gitmemo.TX_GIT_S), gitmemo.attempt(), \
+                gitmemo.strict(0.0, abortable=False):
+            body()
+
+    def first_cut():
+        assert d._fix_failed_review(p.db.task(rev["id"]), fups, "bug") is None
+
+    cut_read(first_cut)
+    assert d._nofix == "" and d._fix_cut, "the cut read is a deferral, not a nofix"
+    assert p.db.kv(KV_FIX_RETRY) and not p.db.q("SELECT * FROM events WHERE kind='review_nofix'")
+    assert not p.db.q("SELECT id FROM tasks WHERE title LIKE ?", (f"Fix review #{rev['id']}:%",))
+    # the next round: the read runs under no slice, so the fix and its re-review are queued
+    d.retry_deferred_fixes()
+    fix = p.db.one("SELECT * FROM tasks WHERE kind='code' AND title LIKE ?", (f"Fix review #{rev['id']}:%",))
+    assert fix and p.db.kv(KV_FIX_RETRY) == {} and not p.db.q("SELECT * FROM events WHERE kind='review_nofix'")
+    assert any(t["title"].startswith(f"Re-review #{rev['id']}:") for t in p.db.q("SELECT title FROM tasks"))
+    # a read cut every round raises the event only at the bound, never before
+    cid2, _, _, (rev2,) = _finish_code(env, p, "another change", {"app.py": 20})
+    p.db.update_task(rev2["id"], status="failed", result=json.dumps(
+        {"status": "changes_needed", "summary": "bug", "followups": [{"title": "bug", "spec": "fix it"}]}))
+    cut_read(lambda: d._fix_failed_review(p.db.task(rev2["id"]), fups, "bug"))
+    for _ in range(FIX_RETRY_MAX + 1):
+        cut_read(d.retry_deferred_fixes)
+    nofix = p.db.q("SELECT * FROM events WHERE kind='review_nofix' AND task=?", (rev2["id"],))
+    assert len(nofix) == 1 and "was not read" in nofix[0]["text"]
+    assert p.db.kv(KV_FIX_RETRY) == {}, "the bounded review is dropped once its event is raised"

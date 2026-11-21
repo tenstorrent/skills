@@ -108,7 +108,7 @@ def test_ponytail_size_and_verdict_rules(env, tmp_path, monkeypatch):
     run.mkdir()
     assert ponytail.size_problem(cfg, 20, "", run) == ""
     why = ponytail.size_problem(cfg, 30, "", run)
-    assert "on its own line, starting with `why this size:` and followed by the reason" in why, why
+    assert "starting `why this size:`" in why, why
     assert ponytail.size_problem(cfg, 30, "Noted, why this size: one parser.", run) == why   # mid-line: not read
     assert "ponytail_pr_lines (10)" in ponytail.size_problem(cfg, 15, "", run, pr=True)
     assert "recorded no verdict" in ponytail.size_problem(cfg, 30, "- why this size: a table", run, head)
@@ -288,7 +288,7 @@ def test_a_size_only_failed_verdict_does_not_stand_once_the_code_task_hands_off_
 def test_the_size_gate_reads_a_reason_from_a_reviewed_code_task_hand_off_summary(env, tmp_path, monkeypatch):
     """A size reason may sit in a reviewed code task's hand-off summary, not only its spec: the review's
     own spec and hand-off carry none, the lane passed, and only the code task's summary has the WHY
-    line, at a line start (a mid-line mention is none)."""
+    line, at a line or a clause start (a mention mid-line is none)."""
     from ttp import ponytail
     monkeypatch.delenv("TTP_TEST_PONYTAIL")
     cfg = {"review": {"ponytail_land_lines": 30}}
@@ -303,8 +303,33 @@ def test_the_size_gate_reads_a_reason_from_a_reviewed_code_task_hand_off_summary
     assert ponytail.gate(cfg, task, run, {"summary": "correct"},
                          [code_task("all landed.\nwhy this size: one schema change")]) == ("", [])
     why = ponytail.gate(cfg, task, run, {"summary": "correct"},
-                        [code_task("all landed; why this size: only mid-line")])
+                        [code_task("all landed, why this size: only mid-line")])
     assert why[0] and "why this size" in why[0], "a mid-line mention is no size reason"
+
+
+def test_a_size_reason_counts_at_a_line_or_clause_start_never_quoted(env, tmp_path, monkeypatch):
+    """A hand-off written as one paragraph still carries its size reason: the phrase counts at the
+    start of a line or of a clause ('; ' or '. '), never inside backticks or quotes, so a quote of
+    the rule itself is not a reason."""
+    from ttp import ponytail
+    monkeypatch.delenv("TTP_TEST_PONYTAIL")
+    cfg = {"review": {"ponytail_land_lines": 30}}
+    run = tmp_path / "lane-run"
+    run.mkdir()
+    head = "b" * 40
+    (run / ponytail.FILE).write_text(json.dumps({"verdict": "pass", "head": head, "findings": []}))
+    passing = ["why this size: one generated table\nlooks right",           # a line start
+               "all landed.\nwhy this size: one schema change",             # a line start
+               "the six case tests pass; why this size: the diff is the spec-ordered range",
+               "it is one parser. why this size: the table is generated"]   # a clause start
+    failing = ["the rule says `why this size:` goes on its own line",        # backticks
+               'the rule says "why this size:" goes on its own line',        # quotes
+               "Noted, why this size: only mid-line",                        # no line or clause start
+               "no reason at all"]
+    for text in passing:
+        assert ponytail.size_problem(cfg, 45, text, run, head) == "", text
+    for text in failing:
+        assert ponytail.size_problem(cfg, 45, text, run, head), text
 
 
 def test_a_failed_verdict_with_another_finding_is_still_reused_on_an_unchanged_head(env, monkeypatch):

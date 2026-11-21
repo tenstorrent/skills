@@ -175,7 +175,7 @@ def _sized(db, review: dict) -> bool:
     code task `review` covers or of a fix continuing one (reviewcap.change_codes)."""
     from . import ponytail
     from .reviewcap import change_codes
-    return any(ponytail.WHY.search(ponytail.reason_text({}, {}, [t])) for t in change_codes(db, review))
+    return any(ponytail.reason(ponytail.reason_text({}, {}, [t])) for t in change_codes(db, review))
 
 
 def conflicted(res: dict) -> bool:
