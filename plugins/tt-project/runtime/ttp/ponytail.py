@@ -66,14 +66,14 @@ def label(added: int | None) -> str:
 def added_lines(repo, base: str, head: str, exclude: list[str] = ()) -> int | None:
     """Lines `head` adds since its merge base with `base` (worktree.diff_lines), binaries and `exclude`
     globs left out; None when git cannot tell or it changes nothing measurable."""
-    from .push import matches
+    from .push import path_matches
     from .worktree import diff_lines
     try:
         per_file = diff_lines(None, [head], base=base, root=Path(repo), added=True)
     except (RuntimeError, OSError, subprocess.SubprocessError):
         return None
     return None if per_file is None else sum(n for f, n in per_file.items()
-                                              if n and not any(matches([f], g) for g in exclude))
+                                              if n and not any(path_matches([f], g) for g in exclude))
 
 
 def own_size(p, task: dict, branch: str, head: str, exclude: list[str] = ()) -> tuple[int | None, bool]:

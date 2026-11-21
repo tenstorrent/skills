@@ -34,9 +34,9 @@ SHA_RE = re.compile(r"[0-9a-f]{40}([0-9a-f]{24})?")
 def tags_of(v: Any) -> list[str]:
     """delivery.channel_tags as tag names (a list, a JSON list or one per line); empty, the default,
     moves no tag. A `refs/tags/` prefix is dropped. ValueError for a name git would not take."""
-    from .push import _entries
+    from .push import _check_entries
     out = []
-    for t in _entries(v):
+    for t in _check_entries(v):
         name = str(t).strip().removeprefix("refs/tags/") if not isinstance(t, dict) else ""
         if not name or subprocess.run(["git", "check-ref-format", f"refs/tags/{name}"],
                                       capture_output=True, timeout=30).returncode:

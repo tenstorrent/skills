@@ -605,10 +605,10 @@ def _term_rx(terms) -> re.Pattern | None:
 
 def _used_elsewhere(repo, head: str, term: str, globs: list[str]) -> bool:
     """Whether `term` appears, whole, in `head`'s tree outside `globs`: another plugin names it already."""
-    from .push import matches
+    from .push import path_matches
     out = _git("grep", "-l", "-w", "-F", *([] if term.isalpha() else ["-i"]), "-e", term, head,
                cwd=str(repo)).stdout
-    return any(not any(matches([f], g) for g in globs)
+    return any(not any(path_matches([f], g) for g in globs)
                for f in (line.partition(":")[2] for line in out.splitlines()))
 
 
@@ -642,7 +642,7 @@ def public_problem(repo, base: str, head: str = "HEAD", delivery: dict | None = 
     that nothing else in the repository names, or cites a user's chat message or a task (PROVENANCE; in
     Python only in comments and docstrings).
     Model-free; raises ValueError when the commits cannot be read."""
-    from .push import exclude_list, matches
+    from .push import exclude_list, path_matches
     globs = exclude_list((delivery or {}).get(PUBLIC_KEY))
     if not globs:
         return None
@@ -664,7 +664,7 @@ def public_problem(repo, base: str, head: str = "HEAD", delivery: dict | None = 
             header = True
         elif header and line.startswith("+++ "):
             path, header = line[4:].strip().removeprefix("b/"), False
-            scoped = any(matches([path], g) for g in globs)
+            scoped = any(path_matches([path], g) for g in globs)
         elif line.startswith("@@"):
             header, at = False, int((re.findall(r"\+(\d+)", line.split("@@")[-2]) or ["0"])[-1])
         elif scoped and line.startswith("+"):
