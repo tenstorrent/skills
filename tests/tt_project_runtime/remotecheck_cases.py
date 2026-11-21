@@ -5394,11 +5394,55 @@ def test_every_spill_host_failing_to_connect_through_the_tunnel_is_one_low_bridg
     assert not any(checkspill.quarantined(p, h) for h in hosts)
     # connection timeouts on a host whose route is direct: not the tunnel
     p.db.x("DELETE FROM events")
-    loop["spill-a"] = "spill-a.example"
+    loop.update({h: h + ".example" for h in hosts})
     res.update({h: {"state": "fail", "why": "ssh failed: ssh: connect to host spill-a.example port 22: Connection timed out"} for h in hosts})
     assert round_(t + 2 * (spillhealth.EVERY_S + 1)) == []
     (sev, text), = events()
     assert sev == "high" and "workstation tunnel" not in text
+
+
+def test_tunnel_down_spill_hosts_beside_one_other_failure_are_the_bridge_event_and_the_other_goes_out_alone(
+        env, tmp_path, monkeypatch):
+    """cells: spill_bridge_mixed. Every spill host failing at once, most of them failing to connect through the
+    forwarded loopback route and one failing once on its own: the tunnel event names the tunnel hosts, no config
+    fault is raised, and the other host goes out alone and comes back on its next pass. Real failures on at least
+    CONFIG_FAULT_HOSTS hosts beside the tunnel ones are still the config fault."""
+    from ttp import checkspill, machines, netwait, spillhealth
+    hosts = ["spill-a", "spill-b", "spill-c", "spill-d"]
+    p = _health_setup(env, tmp_path, monkeypatch, hosts)
+    for h in hosts:
+        machines.add(h)
+    monkeypatch.setattr(netwait, "_ssh_config", lambda h: {"hostname": "spill-d.example" if h == "spill-d" else "127.0.0.1"})
+    res = {h: {"state": "fail", "why": "ssh failed: Connection to 127.0.0.1 port 2224 timed out"} for h in hosts[:3]}
+    res["spill-d"] = {"state": "fail", "why": "`import pytest` exited 2"}
+    monkeypatch.setattr(spillhealth, "check", lambda h, w: res.get(h, {"state": "ok", "why": ""}))
+    cfg, now = p.config(), time.time()
+
+    def round_(t):
+        spillhealth.probe(spillhealth.targets(cfg), t)
+        return spillhealth.apply(p, cfg, t)
+
+    def events():
+        return {r["fingerprint"].split(":")[0]: (r["severity"], r["text"]) for r in p.db.q(
+            "SELECT fingerprint, severity, text FROM events WHERE fingerprint LIKE 'spill-health%'")}
+
+    assert round_(now) == ["spill-d"]
+    ev = events()
+    assert "spill-health-config" not in ev, ev
+    sev, text = ev["spill-health-bridge"]
+    assert sev == "low" and "spill-a, spill-b, spill-c" in text and "spill-d" not in text
+    assert ev["spill-health"][0] == "normal" and "spill-d" in ev["spill-health"][1]
+    assert checkspill.quarantined(p, "spill-d") and not any(checkspill.quarantined(p, h) for h in hosts[:3])
+    res.pop("spill-d")
+    t = now + spillhealth.EVERY_S + 1
+    assert "spill-d" in round_(t) and not checkspill.quarantined(p, "spill-d")
+    # two real failures beside the tunnel ones: the config fault, none taken out
+    res.update({h: {"state": "fail", "why": "ssh failed: Permission denied (publickey)."} for h in ("spill-c", "spill-d")})
+    monkeypatch.setattr(netwait, "_ssh_config", lambda h: {"hostname": h + ".example" if h in ("spill-c", "spill-d") else "127.0.0.1"})
+    round_(t + spillhealth.EVERY_S + 1)
+    sev, text = events()["spill-health-config"]
+    assert sev == "high" and "spill-c, spill-d" in text and "spill-a" not in text
+    assert not any(checkspill.quarantined(p, h) for h in hosts)
 
 
 def test_the_daemon_probes_spill_host_health_in_a_thread_and_acts_on_it(env, tmp_path, monkeypatch):

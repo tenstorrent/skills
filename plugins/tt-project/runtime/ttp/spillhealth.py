@@ -14,11 +14,12 @@ so a host other projects share is probed once per EVERY_S, by whichever daemon g
 in a thread). Each project's daemon then applies them (apply, its own step): a failing host gets
 checkspill's quarantine (kind "health", renewed on each failing result) and one event when it goes out; a
 passing one is lifted (checkspill.lift) when the health check put it out, never from a strikes quarantine.
-Every probed host failing at once (at least checkspill.CONFIG_FAULT_HOSTS) takes no host out. When each of
-them reaches its host through a forwarded loopback route (its ssh HostName is 127.0.0.0/8, ::1 or
-localhost) and each failed to connect, that is the workstation tunnel being down, not a fault here: one
-low event per outage (normal once it lasts BRIDGE_NORMAL_S), naming ssh aliases only. Any other all-fail
-is a config fault: one high event. Each has one fingerprint, whichever hosts are in the set."""
+When every probed host fails at once (at least checkspill.CONFIG_FAULT_HOSTS), those that reach their host
+through a forwarded loopback route (its ssh HostName is 127.0.0.0/8, ::1 or localhost) and failed to connect
+are the workstation tunnel being down, not a fault here: none is taken out, and one low event per outage
+(normal once it lasts BRIDGE_NORMAL_S) names their ssh aliases only. The other failures are a config fault
+(one high event, none taken out) when at least CONFIG_FAULT_HOSTS of them fail; fewer are each handled as a
+host of their own. Each event has one fingerprint, whichever hosts are in the set."""
 from __future__ import annotations
 
 import fcntl
@@ -141,11 +142,6 @@ def tunnel(host: str, why: str) -> bool:
     return why.startswith("ssh failed") and bool(_CONNECT.search(why)) and _loopback(host, why)
 
 
-def bridge_down(failing: dict) -> bool:
-    """Every failing host failed to connect through a loopback route: the workstation tunnel is down."""
-    return bool(failing) and all(tunnel(h, r.get("why", "")) for h, r in failing.items())
-
-
 def _told(db, fp: str, now: float) -> bool:
     return bool(db.q("SELECT 1 FROM events WHERE fingerprint=? AND ts>?", (fp, now - DEDUPE_S)))
 
@@ -165,8 +161,10 @@ def apply(p, cfg: dict | None, now: float | None = None) -> list[str]:
         hosts = checkspill._strikes(p.db)["hosts"]
         failing = {h: r for h, r in failing.items() if ((hosts.get(h) or {}).get("off") or {}).get("kind") == KIND}
     elif len(failing) >= checkspill.CONFIG_FAULT_HOSTS and len(failing) == len(res):
-        names = ", ".join(sorted(failing))
-        if bridge_down(failing):   # ssh -G runs here, outside the transaction
+        tun = {h for h, r in failing.items() if tunnel(h, r.get("why", ""))}   # ssh -G here, outside the tx
+        failing = {h: r for h, r in failing.items() if h not in tun}
+        if tun:   # the workstation tunnel is down: none of its hosts is taken out
+            names = ", ".join(sorted(tun))
             with p.db.tx():
                 since = float((p.db.kv(BRIDGE_KV) or {}).get("since") or now)
                 p.db.set_kv(BRIDGE_KV, {"since": since})
@@ -180,12 +178,15 @@ def apply(p, cfg: dict | None, now: float | None = None) -> list[str]:
         else:
             with p.db.tx():
                 p.db.set_kv(BRIDGE_KV, {})
+        if len(failing) >= checkspill.CONFIG_FAULT_HOSTS:   # fewer: each is handled as its own host below
+            names = ", ".join(sorted(failing))
+            with p.db.tx():
                 if not _told(p.db, "spill-health-config", now):
                     why = _LOOP.sub("its forwarded route", next(iter(failing.values()))["why"])
                     checkspill._event(p.db, now, "spill-health-config", "high",
                                       f"Every spill host failed its health check at once ({names}): "
                                       f"a config fault, so none was taken out. {why}")
-        failing = {}
+            failing = {}
     elif p.db.kv(BRIDGE_KV):
         p.db.set_kv(BRIDGE_KV, {})   # a host answered: that outage is over
     for host, r in res.items():

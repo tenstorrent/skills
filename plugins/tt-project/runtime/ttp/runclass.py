@@ -80,8 +80,8 @@ Report: by_class counts runs per class per model per hour with their real cost (
 and the share of runs whose class routes to chat. Alarm: quiet_classes names a class meant for cheap
 models (routed to chat, or with a cheap core model) that had at least ALARM_MIN runs in the window and none
 on chat or a cheap core model, and a wake gate that decided ALARM_MIN times with no chat-provider decision.
-tt_unavailable names the classes that ran cheap on Claude with none on chat: the daemon tells it once per
-outage, never as a repeating alarm.
+tt_unavailable names the classes that ran cheap on Claude because their route failed on the chat endpoint,
+with none on chat: the daemon tells it once per outage, never as a repeating alarm.
 """
 from __future__ import annotations
 
@@ -112,6 +112,7 @@ QUALITY_WINDOW_S = 86400.0
 ALARM_MIN = 5
 ALARM_P = 0.05     # a quality alarm needs the bad-share difference significant at this level (worse_p)
 CHEAP_KEY = "core_cheap"
+KEPT_CORE = "kept on core"   # core_cheap's why when no route was asked (a keep-core rule, a code arm, no chat model)
 # Claude models for cheap classes on the core provider while no tt model serves them: decisions and
 # screening on Haiku, work that writes or judges code on Sonnet; all at low effort. Light runs keep the
 # light tier's own model.
@@ -313,9 +314,9 @@ def core_cheap(cfg: dict, task: dict | None, cls: str, tier: str, provider: str,
     m = cheap_models(cfg).get(cls)
     if not m:
         return None
-    why = "routine work" if cls == ROUTINE else str((routed or {}).get("fallback") or "") if routed else "no chat model"
+    why = "routine work" if cls == ROUTINE else str((routed or {}).get("fallback") or "")
     return {"provider": provider, "model": m["model"], "effort": code_effort(task, m["model"], m["effort"]),
-            "class": cls, "why": why or "no chat model"}
+            "class": cls, "why": why or KEPT_CORE}
 
 
 def code_effort(task: dict | None, model: str | None, effort: str | None) -> str:
@@ -523,6 +524,7 @@ def by_class(db, cfg: dict, since: float, until: float | None = None) -> dict:
 
     eligible: dict = {}
     cheap: dict = {}   # runs per class on a cheap core model (CHEAP_KEY)
+    cheap_down: dict = {}   # those whose route failed on the endpoint (endpoint_fault)
     last_error: dict = {}
     from .route import KEY as ROUTE_KEY
 
@@ -537,11 +539,12 @@ def by_class(db, cfg: dict, since: float, until: float | None = None) -> dict:
         task, note = tasks.get(r["task"]), _note(r)
         cls = classify(task, r, cfg)
         add(cls, f"{r['provider'] or '?'}:{r['model'] or '?'}", float(r["cost_usd"] or 0), routable(task, note))
-        if (cn := cheap_run(note, str(r["provider"] or ""))) and not cn.get(CODE_KEY):
-            cheap[cls] = cheap.get(cls, 0) + 1
         rn = note.get(ROUTE_KEY)
         fell = str(rn.get("fallback") or "") if isinstance(rn, dict) else ""
-        if fell and fell != "none":
+        if (cn := cheap_run(note, str(r["provider"] or ""))) and not cn.get(CODE_KEY):
+            cheap[cls] = cheap.get(cls, 0) + 1
+            cheap_down[cls] = cheap_down.get(cls, 0) + int(endpoint_fault(fell))
+        if endpoint_fault(fell):
             last_error[cls] = f"route fallback: {fell}"
     for r in db.q("SELECT use, decision, cost_usd FROM jev_calls WHERE ts>=? AND ts<?", (since, until)):
         use = str(r["use"] or "")
@@ -556,7 +559,7 @@ def by_class(db, cfg: dict, since: float, until: float | None = None) -> dict:
     chat = sum(m["runs"] for c, ms in rows.items() if rt.get(c) == "chat" for m in ms.values())
     meant = {c for c in CHAT if rt.get(c) == "chat" or c in cheap_models(cfg)}
     return {"since": since, "until": until, "hours": round(hours, 3), "routes": rt, "classes": rows,
-            "eligible": eligible, "cheap": cheap, "meant": sorted(meant), "last_error": last_error, "runs": total, "share": round(chat / total, 3) if total else 0.0}
+            "eligible": eligible, "cheap": cheap, "cheap_down": cheap_down, "meant": sorted(meant), "last_error": last_error, "runs": total, "share": round(chat / total, 3) if total else 0.0}
 
 
 def routine_quality(db, cfg: dict, since: float, until: float | None = None) -> dict:
@@ -1128,10 +1131,17 @@ def quiet_classes(s: dict, n: int = ALARM_MIN) -> list[dict]:
     return out
 
 
+def endpoint_fault(fallback: str) -> bool:
+    """A run note's route fallback that says the chat endpoint failed it (a fault, a cool-down, full slots,
+    the auth gate), not a keep-core rule (an escalation or a rerun after an earlier fallback)."""
+    from .route import ESCALATED
+    return fallback not in ("", "none", "rerun", ESCALATED)
+
+
 def tt_unavailable(s: dict) -> list[str]:
-    """Classes that ran on a cheap core model in `s` (by_class) with no run on the chat provider: no tt model
-    served them (none configured, its endpoint down or its key refused)."""
-    return sorted(c for c, k in (s.get("cheap") or {}).items()
+    """Classes whose cheap core runs in `s` (by_class) include one whose route failed on the endpoint, with no
+    run on the chat provider: no tt model could serve them. Runs a keep-core rule held raise nothing."""
+    return sorted(c for c, k in (s.get("cheap_down") or {}).items()
                   if k and not any(on_chat(m) for m in (s["classes"].get(c) or {})))
 
 
@@ -1140,7 +1150,7 @@ def tt_unavailable_text(s: dict, classes: list[str]) -> str:
     errs = sorted({e for c in classes if (e := (s.get("last_error") or {}).get(c))})
     return (f"tt models unavailable: run classes {', '.join(classes)} ran on cheap Claude models "
             f"({', '.join(models)}) at low effort, not on a tt model; they move back by themselves once a tt "
-            f"endpoint answers with a working key. Last fallback: {'; '.join(errs) or 'no chat model configured'}.")
+            f"endpoint answers with a working key. Last fallback: {'; '.join(errs)}.")
 
 
 def summary(s: dict) -> str:

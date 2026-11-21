@@ -271,7 +271,7 @@ def test_a_cheap_class_falls_back_to_a_cheap_claude_model_at_low_effort_and_back
     t = {"kind": "question", "tier": "standard", "title": "why"}
     # No tt model configured (or none reachable): a cheap class takes Haiku or Sonnet at low effort, not Opus.
     c = runclass.core_cheap({}, t, "status_report", "standard", "claude")
-    assert (c["model"], c["effort"], c["why"]) == ("sonnet", "low", "no chat model")
+    assert (c["model"], c["effort"], c["why"]) == ("sonnet", "low", runclass.KEPT_CORE)
     assert runclass.core_cheap({}, t, "screening", "standard", "claude")["model"] == "haiku"
     assert runclass.core_cheap({}, t, "wake_decision", "standard", "claude")["model"] == "haiku"
     # The tt endpoint failed its probe (key refused, cooling): the same cheap model, naming why.
@@ -327,13 +327,14 @@ def test_a_question_with_no_tt_model_dispatches_to_sonnet_low_and_to_the_tt_mode
 
 
 def test_cheap_core_runs_keep_the_alarm_quiet_and_tt_unavailable_is_told_once(env, monkeypatch):
-    from ttp import runclass
+    from ttp import route, runclass
     from ttp.daemon import Daemon
     p = make(env)
     now = time.time()
     t = p.db.add_task("why", "", kind="question", tier="standard", priority=3, budget_usd=1.0)
     cheap = json.dumps({runclass.CHEAP_KEY: {"provider": "claude", "model": "sonnet", "effort": "low",
-                                             "class": "status_report", "why": "no chat model"}})
+                                             "class": "status_report", "why": "busy_wait_expired"},
+                        route.KEY: {"to": "claude", "fallback": "busy_wait_expired"}})
     for i in range(6):
         p.db.x("INSERT INTO runs(task,role,provider,model,started,status,cost_usd,note) VALUES(?,?,?,?,?,?,?,?)",
                (t, "worker", "claude", "sonnet", now - 60 - i, "ok", 0.05, cheap))
@@ -354,6 +355,36 @@ def test_cheap_core_runs_keep_the_alarm_quiet_and_tt_unavailable_is_told_once(en
     d._run_class_checked = 0.0
     d.watch_run_classes()
     assert not p.db.kv("tt_unavailable_told", "") and len(told) == 1
+
+
+def test_tt_unavailable_counts_only_cheap_runs_whose_route_failed_on_the_endpoint(env):
+    """A chat-class run a keep-core rule held on Claude (a code arm, urgent or protected work, the floor: no
+    route asked, or an escalation or rerun) is no sign the tt model is down; a route fault or full slots are."""
+    from ttp import route, runclass
+    p = make(env)
+    now = time.time()
+    t = p.db.add_task("why", "", kind="question", tier="standard", priority=3, budget_usd=1.0)
+
+    def run(routed):
+        note = {runclass.CHEAP_KEY: {"provider": "claude", "model": "sonnet", "effort": "low", "class": "status_report",
+                                     "why": (routed or {}).get("fallback") or runclass.KEPT_CORE}}
+        if routed:
+            note[route.KEY] = routed
+        p.db.x("INSERT INTO runs(task,role,provider,model,started,status,cost_usd,note) VALUES(?,?,?,?,?,?,?,?)",
+               (t, "worker", "claude", "sonnet", now - 60, "ok", 0.05, json.dumps(note)))
+
+    run(None)
+    run({"to": "claude", "fallback": route.ESCALATED})
+    run({"to": "claude", "fallback": "rerun"})
+    s = runclass.by_class(p.db, {}, now - 3600, now)
+    assert s["cheap"] == {"status_report": 3}
+    assert runclass.tt_unavailable(s) == [] and s["last_error"] == {}
+    for fault in ("down", "auth", "busy_wait_expired"):
+        assert runclass.endpoint_fault(fault)
+    run({"to": "claude", "fallback": "down"})
+    s = runclass.by_class(p.db, {}, now - 3600, now)
+    assert runclass.tt_unavailable(s) == ["status_report"]
+    assert "route fallback: down" in runclass.tt_unavailable_text(s, ["status_report"])
 
 
 def test_a_cheap_class_run_starts_claude_on_its_cheap_model_at_its_effort_or_the_floors(env, monkeypatch):
