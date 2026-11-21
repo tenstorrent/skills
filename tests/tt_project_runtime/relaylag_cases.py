@@ -80,6 +80,9 @@ def test_relay_lag_is_unknown_never_zero_when_the_upstream_cannot_be_read(env):
     assert "lag unknown (upstream tip ffffffffff is not in the local repository" in relaylag.line(p.db)
     # ssh is never used for the anonymous read.
     assert relaylag.ls_remote(p, "git@example.invalid:o/r.git", "ttp-land")[0] is None
+    # Nor a URL carrying a user or token.
+    assert relaylag.ls_remote(p, "https://user:secret@example.invalid/o/r.git", "ttp-land") == (
+        None, "the upstream URL carries a user or credentials; give one readable anonymously")
     # A local path is read with no global or system git config (ghanon.ls_remote).
     cur = _git_out(p.root, "rev-parse", "--abbrev-ref", "HEAD").strip()
     assert relaylag.ls_remote(p, str(p.root), cur) == (_git_out(p.root, "rev-parse", "HEAD").strip(), "")

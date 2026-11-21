@@ -61,6 +61,8 @@ def _anon_url(p, url: str) -> tuple[str, str]:
         r = landed._git(p.root, "remote", "get-url", url, timeout=10)
         if r.returncode == 0 and r.stdout.strip():
             url = r.stdout.strip()
+    if re.match(r"[a-z+]+://[^/]*@", url, re.I):
+        return "", "the upstream URL carries a user or credentials; give one readable anonymously"
     if _ANON.match(url) or (url.startswith("/") and os.path.exists(url)):
         return url, ""
     return "", "the upstream URL is not one readable without credentials (https, git, file or a path)"
