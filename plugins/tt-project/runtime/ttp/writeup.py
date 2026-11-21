@@ -114,7 +114,8 @@ def write(p, cfg: dict, task: dict, result: dict, run: dict, status: str, need: 
     row.update(minutes=round(max(0.0, now() - t0) / 60, 3), cost_usd=round(usd, 4))
     try:
         _cost(getattr(p, "db", None), usd, usage, model, task.get("id"))
-        (Path(run_dir) / LOG).write_text(json.dumps(row, sort_keys=True) + "\n")
+        from .project import durable_write
+        durable_write(Path(run_dir) / LOG, json.dumps(row, sort_keys=True) + "\n")
     except Exception:   # the log and the ledger never undo the step
         pass
     return row
