@@ -5340,14 +5340,22 @@ def test_tunnel_down_spill_hosts_stay_out_quietly_with_one_bridge_event_and_a_re
         assert all(checkspill.quarantined(p, h) for h in hosts[:3]) and not checkspill.quarantined(p, "spill-d")
     assert [e[:2] for e in events()] == [("spill-back:spill-d", "normal"), ("spill-health-bridge:low", "low"),
                                          ("spill-health:spill-d", "normal")], events()
+    # the tunnel is back, but spill-a now fails on its own: its own event, and its own back event later
+    res = {"spill-a": {"state": "fail", "why": "no python3"}}
+    t += spillhealth.EVERY_S + 1
+    spillhealth.probe(spillhealth.targets(cfg), t)
+    assert spillhealth.apply(p, cfg, t) == hosts[1:3] and round_(t) == []
+    assert checkspill.quarantined(p, "spill-a") and not any(checkspill.quarantined(p, h) for h in hosts[1:])
+    assert not p.db.kv(spillhealth.BRIDGE_KV)
+    back = [e for e in events() if e[0] == "spill-health-bridge:back"]
+    assert len(back) == 1 and back[0][1] == "low" and "tunnel is back" in back[0][2], events()
+    assert [e[1] for e in events() if e[0] == "spill-health:spill-a"] == ["normal"], events()
     res.clear()
     t += spillhealth.EVERY_S + 1
     spillhealth.probe(spillhealth.targets(cfg), t)
-    assert spillhealth.apply(p, cfg, t) == hosts[:3] and round_(t) == []
-    assert not any(checkspill.quarantined(p, h) for h in hosts) and not p.db.kv(spillhealth.BRIDGE_KV)
-    back = [e for e in events() if e[0] == "spill-health-bridge:back"]
-    assert len(back) == 1 and back[0][1] == "low" and "tunnel is back" in back[0][2], events()
-    assert len(events()) == 4, "no per-host back event for the tunnel hosts"
+    assert spillhealth.apply(p, cfg, t) == ["spill-a"] and not checkspill.quarantined(p, "spill-a")
+    assert sorted(e[0] for e in events() if e[0].startswith("spill-back")) == ["spill-back:spill-a", "spill-back:spill-d"], \
+        "no per-host back event for the tunnel hosts"
 
 
 def test_a_health_quarantine_whose_time_ends_while_the_probe_still_fails_stays_out_until_a_pass(

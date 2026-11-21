@@ -138,7 +138,7 @@ def _loopback(host: str, why: str) -> bool:
 
 def tunnel(host: str, why: str) -> bool:
     """`host` failed to connect (a timeout, refusal or banner wait) through a loopback route: the workstation
-    tunnel dropped, which heals itself, so its events stay low."""
+    tunnel dropped, which heals itself, so it goes out quietly (the one tunnel event covers it)."""
     return why.startswith("ssh failed") and bool(_CONNECT.search(why)) and _loopback(host, why)
 
 
@@ -177,9 +177,10 @@ def apply(p, cfg: dict | None, now: float | None = None) -> list[str]:
                                       f"reconnects by itself; they stay out of {p.name}'s spill pool until they answer.")
             elif was:
                 p.db.set_kv(BRIDGE_KV, {})
-                checkspill._event(p.db, now, "spill-health-bridge:back", "low",
-                                  f"The workstation tunnel is back: its spill hosts answer again and are back in "
-                                  f"{p.name}'s spill pool.")
+                if not _told(p.db, "spill-health-bridge:back", now):   # a tunnel that keeps dropping: told once
+                    checkspill._event(p.db, now, "spill-health-bridge:back", "low",
+                                      f"The workstation tunnel is back: {p.name}'s spill hosts behind it can be "
+                                      f"reached again.")
         rest = {h: r for h, r in failing.items() if h not in tun}
         if len(rest) >= checkspill.CONFIG_FAULT_HOSTS and len(failing) == len(res):   # fewer: each its own host
             with p.db.tx():
@@ -198,12 +199,13 @@ def apply(p, cfg: dict | None, now: float | None = None) -> list[str]:
                 if off and off.get("kind") != KIND and float(off.get("until") or 0) > now:
                     continue   # a strikes quarantine already holds it
                 was_off = bool(off and off.get("kind") == KIND)
+                told = was_off and not off.get("tunnel")   # it went out with its own event: it comes back with one
                 tunneled = host in tun if whole else bool(was_off and off.get("tunnel"))
                 h["off"] = {"n": 0, "kind": KIND, "why": r["why"], "until": now + checkspill.QUARANTINE_MAX_S,
-                            **({"tunnel": True} if tunneled else {}),
+                            **({"tunnel": True} if tunneled and not told else {}),
                             **({"change": off["change"]} if off and off.get("change") else {})}
                 p.db.set_kv(checkspill.STRIKES_KV, doc)
-                if not (was_off or tunneled):
+                if not (told or tunneled):
                     checkspill._event(p.db, now, f"spill-health:{host}:{now:.0f}", "normal",
                                       f"Spill host {host} failed its health check "
                                       f"({_LOOP.sub('its forwarded route', r['why'])}): out of "
