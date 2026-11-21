@@ -70,12 +70,11 @@ def _cost(db, usd: float, usage: dict, model: str, task_id) -> None:
 
 def write(p, cfg: dict, task: dict, result: dict, run: dict, status: str, need: str, run_dir, *,
           held: str = "", runner=None, binary: str | None = None, now=time.time) -> dict:
-    """The write-up: sets `message` and the `message_by` stamp in `result` (a chat-provider run's hand-off) and
-    flags it replymsg.CHAT_RUN. Returns the call's row ({"ok", "cost_usd", ...}); on a refusal or failure `ok` is false
-    and the result stays unstamped (replymsg.guard then refuses to post it). Any worker-supplied stamp is dropped."""
+    """The write-up: sets `message` and the `message_by` stamp in `result` (a chat-provider run's hand-off).
+    Returns the call's row ({"ok", "cost_usd", ...}); on a refusal or failure `ok` is false and the result stays
+    unstamped (replymsg.guard then refuses to post it). Daemon._writeup flags the real result and drops any
+    worker-supplied stamp."""
     from . import claimcheck, glmassist
-    result.pop(replymsg.BY, None)
-    result[replymsg.CHAT_RUN] = True
     s = glmassist.settings(cfg)
     model = s["model"]
     row = {"task": task.get("id"), "run": run.get("id"), "model": model, "ok": False}

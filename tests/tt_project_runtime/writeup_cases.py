@@ -164,41 +164,80 @@ def test_a_glm_run_handing_off_for_review_is_flagged_so_a_later_landing_posts_no
     assert "GLM-" not in pushq._done_text(got, got.get("summary") or "", "pushed")
 
 
-def test_the_writeup_runs_outside_the_finish_transaction_and_a_replayed_round_does_not_repeat_it(env, monkeypatch):
-    from ttp.daemon import Daemon
-    from ttp.providers.base import RunUsage as Usage
-    p = make(env)
-    _wu_on(p)
-    _wu_bin(env, monkeypatch)
-    tid = p.db.add_task("answer the question", "Goal: answer.", kind="work", tier="standard", origin="coordinator")
-    p.db.update_task(tid, status="running", reply_chat="c1")
-    run_dir = env["tmp"] / "run-wu-tx"
-    run_dir.mkdir()
-    (run_dir / "result.json").write_text(json.dumps(dict(_WU_GLM)))
-    d = Daemon(p.base)
-    run = {"task": tid, "id": 778, "provider": "chat", "role": "worker"}
-    seen = []
+def _wu_run(env, p, result, *, chat="c1", spec="Goal: answer."):
+    """A finished chat-provider worker run with its hand-off on disk, as finish_run reads it."""
+    tid = p.db.add_task("answer the question", spec, kind="work", tier="standard", origin="coordinator")
+    p.db.update_task(tid, status="running", reply_chat=chat)
+    rid = p.db.x("INSERT INTO runs(task,role,provider,model,started,status) VALUES(?,'worker','chat','',?,'running')",
+                 (tid, time.time() - 60))
+    run_dir = p.runs / str(rid)
+    run_dir.mkdir(parents=True)
+    (run_dir / "run.json").write_text(json.dumps({"budget_usd": 8.0, "timeout_s": 3600}))
+    (run_dir / "output.jsonl").write_text("")
+    (run_dir / "result.json").write_text(json.dumps(result))
+    return tid, p.db.one("SELECT * FROM runs WHERE id=?", (rid,))
+
+
+def _wu_calls(monkeypatch, p):
+    """Spy on the Opus call: whether a write transaction was open at each one."""
     from ttp import glmassist
-    real = glmassist._opus_call
+    seen, real = [], glmassist._opus_call
 
     def spy(*a, **k):
         seen.append(p.db.conn.in_transaction)
         return real(*a, **k)
-
     monkeypatch.setattr(glmassist, "_opus_call", spy)
-    d._prewrite(run, run_dir)
-    for round_ in range(2):   # the first round is rolled back (a git miss) and replayed
-        try:
-            with d.p.db.tx():
-                d._finish_worker(run, Usage(cost_usd=1.0), "ok", run_dir)
-                if not round_:
-                    raise RuntimeError("rolled back")
-        except RuntimeError:
-            pass
-    replies = [m["text"] for m in p.db.q("SELECT text FROM messages WHERE kind='reply' AND chat='c1'")]
-    assert replies == ["Opus wrote this: it works."]
+    return seen
+
+
+def test_the_writeup_runs_outside_the_finish_transaction_and_a_replayed_round_does_not_repeat_it(env, monkeypatch):
+    from ttp import gitmemo
+    from ttp.daemon import Daemon
+    p = make(env)
+    _wu_on(p)
+    _wu_bin(env, monkeypatch)
+    tid, run = _wu_run(env, p, dict(_WU_GLM))
+    seen = _wu_calls(monkeypatch, p)
+    real, rounds = Daemon._finish_worker, []
+
+    def finish(self, *a, **k):
+        real(self, *a, **k)
+        rounds.append(1)
+        if len(rounds) == 1:   # the first round rolls back (a git miss) and is replayed
+            raise gitmemo.GitMiss(["git", "-C", str(p.base), "rev-parse", "HEAD"], {"capture_output": True},
+                                  None, True, "miss", True)
+    monkeypatch.setattr(Daemon, "_finish_worker", finish)
+    Daemon(p.base).finish_run(run, {"rc": 0, "started": time.time() - 60, "ended": time.time(), "stopped": None})
+    assert len(rounds) == 2, "the finish round was replayed once"
+    assert [m["text"] for m in p.db.q("SELECT text FROM messages WHERE kind='reply' AND chat='c1'")] == [
+        "Opus wrote this: it works."]
     assert seen == [False], "one Opus call, with no write transaction open"
     assert p.db.task(tid)["status"] == "done"
+
+
+def test_a_glm_reply_claiming_a_push_pays_for_one_opus_writeup_when_its_push_verifies(env, monkeypatch):
+    from ttp import pushclaim
+    from ttp.daemon import Daemon
+    from ttp.db import load_result
+    p = make(env)
+    _wu_on(p)
+    _wu_bin(env, monkeypatch)
+    tid, run = _wu_run(env, p, dict(_WU_GLM))
+    seen = _wu_calls(monkeypatch, p)
+    claim = {"sha": "a" * 40, "remote": "origin", "ref": "refs/heads/main"}
+    monkeypatch.setattr(pushclaim, "claims", lambda *a, **k: [claim])
+    d = Daemon(p.base)
+    d.finish_run(run, {"rc": 0, "started": time.time() - 60, "ended": time.time(), "stopped": None})
+    assert p.db.task(tid)["status"] == "pushing" and seen == [], "no write-up for a hand-off that is deferred"
+    monkeypatch.setattr(pushclaim, "check_all", lambda *a, **k: (pushclaim.CONFIRMED, "found", []))
+    monkeypatch.setattr(d, "_push_net", lambda *a, **k: {"since": time.time()})
+    monkeypatch.setattr(d, "_prefetch_lint", lambda *a, **k: None)
+    p.db.update_task(tid, result=json.dumps({**load_result(p.db.task(tid)["result"]), pushclaim.KEY: {
+        **load_result(p.db.task(tid)["result"])[pushclaim.KEY], "next": 0}}))
+    d.verify_pushes()
+    assert seen == [False] and p.db.task(tid)["status"] == "done"
+    assert [m["text"] for m in p.db.q("SELECT text FROM messages WHERE kind='reply' AND chat='c1'")] == [
+        "Opus wrote this: it works."]
 
 
 def test_a_writeup_stamp_is_taken_only_for_its_own_run_and_outcome(env, monkeypatch):
@@ -208,7 +247,7 @@ def test_a_writeup_stamp_is_taken_only_for_its_own_run_and_outcome(env, monkeypa
     task = {"id": 5}
     stamp = {replymsg.FIELD: "Opus wrote this.", replymsg.BY: {"step": replymsg.WRITEUP, "sha": replymsg.digest("Opus wrote this.")}}
     d._writeups[5] = {"run": 7, "status": "done", "fields": stamp}
-    for run, new, taken in ((7, "done", True), (7, "pushing", True), (7, "failed", False), (8, "done", False)):
+    for run, new, taken in ((7, "done", True), (7, "failed", False), (8, "done", False)):
         result = {replymsg.FIELD: "GLM's own words", replymsg.BY: {"step": replymsg.WRITEUP, "sha": "forged"}}
         d._writeup({"id": run}, task, result, new)
         assert result[replymsg.CHAT_RUN] is True

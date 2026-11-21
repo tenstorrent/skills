@@ -7363,15 +7363,18 @@ class Daemon:
         except OSError as e:
             log(self.p, f"could not file the queued notes of #{tid}: {e}")
 
+    def _claimed_pushes(self, r: dict, task: dict, result) -> list[dict]:
+        """The pushes a hand-off claims (pushclaim.claims); none when they cannot be read."""
+        try:
+            return pushclaim.claims(self.p, task, result if isinstance(result, dict) else {}, r)
+        except Exception as e:
+            log(self.p, f"task {task['id']}: reading its push claims failed: {type(e).__name__}: {e}")
+            return []
+
     def _defer_for_push(self, r: dict, task: dict, run_dir: Path, usage, ended, result, summary: str) -> bool:
         """A done hand-off that claims a push waits in `pushing` until verify_pushes finds the push on
         the remote; True when it does. Offline: it runs inside on_pass's finishing transaction."""
-        try:
-            cs = pushclaim.claims(self.p, task, result if isinstance(result, dict) else {}, r)
-        except Exception as e:
-            log(self.p, f"task {task['id']}: reading its push claims failed: {type(e).__name__}: {e}")
-            return False
-        if not cs:
+        if not (cs := self._claimed_pushes(r, task, result)):
             return False
         db, now = self.p.db, time.time()
         saved = dict(result) if isinstance(result, dict) else {}
@@ -7469,7 +7472,7 @@ class Daemon:
             usage = RunUsage(cost_usd=float(pv.get("cost") or 0.0), estimated=bool(pv.get("estimated")))
             self._prefetch_lint(tid, handoff, run_dir)
             frun = dict(run) if run else {"id": pv.get("run"), "task": tid, "note": "{}"}
-            self._prewrite(frun, run_dir, handoff)
+            self._prewrite(frun, run_dir, handoff, push_verified=True)
             for rnd in self._finish_rounds(tid):
                 with rnd:
                     t = db.task(tid)
@@ -7725,17 +7728,20 @@ class Daemon:
         finally:
             gitreplay.end(att.id)
 
-    def _prewrite(self, r: dict, run_dir: Path, result: dict | None = None) -> None:
+    def _prewrite(self, r: dict, run_dir: Path, result: dict | None = None, push_verified: bool = False) -> None:
         """Before the finish transaction (a Claude call that long never holds the write lock, and a replayed
         round does not repeat it): a reply_chat task's chat-provider run has Opus write the chat message from its
-        hand-off (result.json, or the `result` standing in for it); the stamped text waits in `_writeups`."""
+        hand-off (result.json, or the `result` standing in for it); the stamped text waits in `_writeups`. A done
+        hand-off whose claimed push is still to be verified waits: _defer_for_push defers it, and verify_pushes
+        writes it up once, with `push_verified`."""
         task = self.p.db.task(r["task"]) if r.get("task") else None
         if not (task and task["reply_chat"] and writeup.chat_run(r) and writeup.active(self.cfg)):
             return
         if result is None:
             result = _read_result(run_dir / RESULT_FILE)
         status = result.get("status") if isinstance(result, dict) else None
-        if status not in ("done", "failed", "blocked"):
+        if status not in ("done", "failed", "blocked") \
+                or (status == "done" and not push_verified and self._claimed_pushes(r, task, result)):
             return
         need = str(result.get("question") or result.get("blocked_reason") or "") if status == "blocked" else ""
         held = "auth" if self._logged_out("claude") else "down" if self.net_held("claude") else ""
@@ -7748,12 +7754,12 @@ class Daemon:
 
     def _writeup(self, r: dict, task: dict, result: dict, new: str) -> None:
         """A reply_chat task's chat-provider run: flag its hand-off, drop any stamp the run wrote itself and take
-        the one `_prewrite` made for this run and outcome (a done one still stands as `pushing`). Without one the
+        the one `_prewrite` made for this run and outcome. Without one the
         hand-off stays unstamped, so replymsg.guard keeps its text out of the chat."""
         result.pop(replymsg.BY, None)
         result[replymsg.CHAT_RUN] = True
         got = self._writeups.get(task["id"])
-        if got and got["run"] == r.get("id") and new in (got["status"], "pushing" if got["status"] == "done" else ""):
+        if got and got["run"] == r.get("id") and new == got["status"]:
             result.update(got["fields"])
 
     def _finish_worker(self, r: dict, usage, status: str, run_dir: Path, ended: str | None = None,
