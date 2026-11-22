@@ -160,8 +160,19 @@ def hist_end(db, ref: str, now: float, h: dict | None = None) -> float | None:
     """The finish the measured history gives a task ref (`t12`) at `now`: the median first-start wait, plus
     the median run time of its kind and tier (else of its kind) times the mean runs a done task of that
     kind and tier took (retries), plus for a code task the median review and the median landing (the push
-    queue's approval-to-push time, else a push batch's); None for a promise or without samples.
+    queue's approval-to-push time, else a push batch's); None without samples. A promise ref (`o3`): the
+    latest of its owner tasks' ends, a closed owner counting `now`; None with no owner that gives one.
     `h` is eta.history's result, read once per caller."""
+    if ref.startswith("o"):
+        from . import eta, obligations
+        o = obligations.get(db, ref)
+        h = eta.history(db, now) if h is None and o and o.get("owners") else h
+        ends = []
+        for tid in (o or {}).get("owners") or {}:
+            t = db.task(int(tid)) if str(tid).isdigit() else None
+            ends.append(now if t and t["status"] in obligations.CLOSED else hist_end(db, f"t{tid}", now, h))
+        ends = [e for e in ends if e is not None]
+        return max(ends) if ends else None
     if not (ref.startswith("t") and ref[1:].isdigit()):
         return None
     t = db.task(int(ref[1:]))
@@ -342,11 +353,14 @@ def settle(db, now: float) -> int:
 def pairs(rows: list[dict], since: float) -> list[dict]:
     """One entry per delivered ref whose first ETA is at or after `since`: its `kind`, `promised` and
     `raw` seconds from that ETA, `conservative` seconds, `actual` seconds, the `due` seconds for a promise,
-    and `early`: it was delivered before that ETA was written (actual 0, nothing was predicted)."""
+    `early`: it was delivered before that ETA was written (actual 0, nothing was predicted), and `quoted`:
+    the ETA is a backfilled promise's own due, not a computed one. A ref's first computed row wins over
+    its backfill row."""
     first: dict[str, dict] = {}
     done: dict[str, float] = {}
     for r in rows:
-        if "shown" in r and r["ref"] not in first and r["ts"] >= since:
+        if "shown" in r and r["ts"] >= since and (r["ref"] not in first or (
+                first[r["ref"]].get("src") == "backfill" and r.get("src") != "backfill")):
             first[r["ref"]] = r
         elif "delivered" in r:
             done[r["ref"]] = float(r["delivered"])
@@ -360,13 +374,16 @@ def pairs(rows: list[dict], since: float) -> list[dict]:
         out.append({"ref": ref, "kind": r.get("kind") or "", "promised": p, "raw": max(r["likely"] - r["ts"], 60.0),
                     "conservative": (r.get("conservative") or r["shown"]) - r["ts"],
                     "due": (r["due"] - r["ts"]) if r.get("due") else None, "actual": max(done[ref] - r["ts"], 0.0),
-                    "hist": max(r["hist"] - r["ts"], 0.0) if r.get("hist") else None, "early": done[ref] < r["ts"]})
+                    "hist": max(r["hist"] - r["ts"], 0.0) if r.get("hist") else None, "early": done[ref] < r["ts"],
+                    "quoted": r.get("src") == "backfill"})
     return out
 
 
 def calibration(db, now: float, c: dict | None = None, days: float = 7.0) -> dict:
     """{"count", "median_ratio" (actual / promised), "share_by_conservative" (delivered by the conservative
-    time, or by the due for a promise), "by_kind"} of the last `days` days' deliveries."""
+    time, or by the due for a promise), "by_kind", and apart: "median_ratio_computed"/"count_computed" of
+    computed ETAs, "median_ratio_quoted"/"count_quoted" of backfilled promises' own dues} of the last `days`
+    days' deliveries."""
     ps = pairs(read(db), now - days * 86400)
     if not ps:
         return {"count": 0, "days": days}
@@ -375,19 +392,27 @@ def calibration(db, now: float, c: dict | None = None, days: float = 7.0) -> dic
     kinds: dict[str, list[float]] = {}
     for p, r in zip(ps, ratios):
         kinds.setdefault(p["kind"], []).append(r)
+    split = {q: [r for p, r in zip(ps, ratios) if p.get("quoted") == q] for q in (False, True)}
     return {"count": len(ps), "days": days, "median_ratio": statistics.median(ratios),
+            "median_ratio_computed": statistics.median(split[False]) if split[False] else None,
+            "count_computed": len(split[False]),
+            "median_ratio_quoted": statistics.median(split[True]) if split[True] else None,
+            "count_quoted": len(split[True]),
             "share_by_conservative": sum(ok) / len(ok),
             "by_kind": {k: {"count": len(v), "median_ratio": statistics.median(v)} for k, v in sorted(kinds.items())}}
 
 
 def line(cal: dict) -> str:
     """The calibration line: `ETA calibration, 7 d: 31 delivered, median actual/promised 1.4, 58% by the
-    conservative time (target 80%, median 0.7-1.3)`."""
+    conservative time (target 80%, median 0.7-1.3); computed 1.30 (n=225), quoted dues 0.18 (n=297)`."""
     if not cal.get("count"):
         return f"ETA calibration, {cal.get('days', 7):g} d: no delivered ETA yet"
+    split = ", ".join(f"{name} {cal[f'median_ratio_{k}']:.2f} (n={cal[f'count_{k}']})"
+                      for k, name in (("computed", "computed"), ("quoted", "quoted dues"))
+                      if cal.get(f"median_ratio_{k}") is not None)
     return (f"ETA calibration, {cal['days']:g} d: {cal['count']} delivered, median actual/promised "
             f"{cal['median_ratio']:.2f}, {cal['share_by_conservative']:.0%} by the conservative time or due "
-            f"(target {TARGET_SHARE:.0%}, median {TARGET_RATIO[0]}-{TARGET_RATIO[1]})")
+            f"(target {TARGET_SHARE:.0%}, median {TARGET_RATIO[0]}-{TARGET_RATIO[1]})" + (f"; {split}" if split else ""))
 
 
 def _p90(xs: list[float]) -> float:
@@ -395,28 +420,48 @@ def _p90(xs: list[float]) -> float:
     return xs[min(len(xs) - 1, int(0.9 * len(xs)))]
 
 
-def shadow(db, since: float) -> dict:
-    """{"count", "current": {"median", "p90"}, "hist": {...}} of the delivered ETAs since `since` that carry a
-    shadow `hist`: each method's absolute error (seconds) against the actual finish. A pair delivered before
-    its ETA was written is left out."""
-    ps = [p for p in pairs(read(db), since) if p.get("hist") and not p["early"]]
-    if not ps:
-        return {"count": 0}
+PROMOTE_KINDS = ("code", "review", "work", "promise")
+PROMOTE_MIN = 10
+
+
+def _errors(ps: list[dict]) -> dict:
     cur = [abs(p["actual"] - p["promised"]) for p in ps]
     his = [abs(p["actual"] - p["hist"]) for p in ps]
     return {"count": len(ps), "current": {"median": statistics.median(cur), "p90": _p90(cur)},
             "hist": {"median": statistics.median(his), "p90": _p90(his)}}
 
 
+def shadow(db, since: float) -> dict:
+    """{"count", "current": {"median", "p90"}, "hist": {...}, "by_kind": {kind: the same}, "promotable"} of the
+    delivered ETAs since `since` that carry a shadow `hist`: each method's absolute error (seconds) against
+    the actual finish, a promise (`o3`) as kind `promise`. A pair delivered before its ETA was written is
+    left out. `promotable`: each of PROMOTE_KINDS with PROMOTE_MIN pairs or more (at least one) has a history
+    median and p90 no worse than the current one's."""
+    ps = [p for p in pairs(read(db), since) if p.get("hist") and not p["early"]]
+    if not ps:
+        return {"count": 0, "promotable": False}
+    kinds: dict[str, list[dict]] = {}
+    for p in ps:
+        kinds.setdefault("promise" if p["ref"].startswith("o") else p["kind"], []).append(p)
+    by_kind = {k: _errors(v) for k, v in sorted(kinds.items())}
+    judged = [by_kind[k] for k in PROMOTE_KINDS if k in by_kind and by_kind[k]["count"] >= PROMOTE_MIN]
+    ok = bool(judged) and all(e["hist"]["median"] <= e["current"]["median"] and e["hist"]["p90"] <= e["current"]["p90"]
+                              for e in judged)
+    return {**_errors(ps), "by_kind": by_kind, "promotable": ok}
+
+
 def shadow_line(sh: dict) -> str:
-    """`ETA shadow (eta_history, 7 d): 12 compared; abs error median/p90 current 14m/52m, history 9m/40m`."""
+    """`ETA shadow (eta_history, 7 d): 12 compared; abs error median/p90 current 14m/52m, history 9m/40m;
+    code 21m/138m vs 38m/98m (n=86); promotable: no`."""
     if not sh.get("count"):
         return "ETA shadow (eta_history, 7 d): no delivered ETA with a history estimate yet"
 
     def m(x: dict) -> str:
         return f"{x['median'] / 60:.0f}m/{x['p90'] / 60:.0f}m"
+    kinds = "".join(f"; {k} {m(e['current'])} vs {m(e['hist'])} (n={e['count']})"
+                    for k, e in (sh.get("by_kind") or {}).items())
     return (f"ETA shadow (eta_history, 7 d): {sh['count']} compared; abs error median/p90 current "
-            f"{m(sh['current'])}, history {m(sh['hist'])}")
+            f"{m(sh['current'])}, history {m(sh['hist'])}{kinds}; promotable: {'yes' if sh.get('promotable') else 'no'}")
 
 
 def _clamp(c: dict) -> tuple[float, float]:

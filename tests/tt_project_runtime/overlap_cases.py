@@ -481,6 +481,24 @@ def test_task_add_never_chains_on_a_shared_path_outside_the_repo(env):
     assert not deferral(t) and dependency_ids(t) == [], (deferral(t), t["depends_on"])
 
 
+def test_a_shared_run_result_path_outside_the_tracked_tree_neither_overlaps_nor_chains(env):
+    """Two code specs cite the same run's result file (outside the repo's tracked tree) and change
+    disjoint repo files: no overlap note, no 'waits for' line-up (overlapdep, on by default), no chain."""
+    from ttp import coordinator as coord, overlap
+    from ttp.db import deferral, dependency_ids
+    p = make(env)
+    _on_base(p, "runtime/ttp/relay.py", "runtime/ttp/sweep.py")
+    cite = " Findings: tt-project/state/runs/12/result.json and state/runs/12/result.json."
+    assert overlap.spec_paths("Fix runtime/ttp/relay.py." + cite, p.root) == ["runtime/ttp/relay.py"]
+    first = p.db.add_task("relay", "Fix runtime/ttp/relay.py." + cite, kind="code", status="running")
+    assert coord.apply(p, [{"type": "task_add", "title": "sweep", "kind": "code",
+                            "spec": "Tune runtime/ttp/sweep.py." + cite}]) == []
+    t = p.db.one("SELECT * FROM tasks WHERE title='sweep'")
+    assert not deferral(t) and dependency_ids(t) == [], (deferral(t), t["depends_on"])
+    assert not [x for x in _labels(p, t["id"]) if x.startswith("overlap:")]
+    assert not [n for n in p.db.kv(coord.NOTES_KEY) if f"#{first}" in n], p.db.kv(coord.NOTES_KEY)
+
+
 def test_settled_records_lapse_after_14_days_unless_given_an_expiry(env):
     """Settled areas count for overlap.settled_days (14) after they were settled: an older record,
     even one written with the old 30-day expiry, is ignored; one given an expiry of its own keeps it,

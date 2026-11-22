@@ -62,6 +62,7 @@ _WHOLE_END = r"(?![\w/*?\[\]{}-]|\.[\w*?\[{])"
 _CREATES = re.compile(r"\b(?:add(?:s|ed|ing)?|creat(?:e|es|ed|ing)|new|introduc(?:e|es|ed|ing)|writ(?:e|es|ing)|"
                       r"generat(?:e|es|ed|ing)|split(?:s|ting)?|mov(?:e|es|ed|ing)|renam(?:e|es|ed|ing))\b", re.I)
 _ls_cache: dict[str, tuple[float, list[str]]] = {}
+_RUN_RECORD = re.compile(r"(?:^|/)state/runs/")
 
 
 def _git(root: Path, *args: str) -> subprocess.CompletedProcess:
@@ -108,9 +109,10 @@ def _dirs(files: list[str]) -> set[str]:
 
 def spec_paths(text: str, root: Path) -> list[str]:
     """The repo paths `text` names: slash paths with a known source extension, or whose folder the
-    repo has. Bare file names (named in passing), the repo's folders and URLs are left out."""
+    repo has. Bare file names (named in passing), the repo's folders, URLs and run records
+    (`state/runs/12/result.json`, which no task changes) are left out."""
     text = re.sub(r"\b[a-z]+://\S+", " ", text or "")
-    known = [f for f in settled.files_in(text) if "/" in f]
+    known = [f for f in settled.files_in(text) if "/" in f and not _RUN_RECORD.search(f)]
     plain = [t for t in _PLAIN.findall(text) if t not in known and "." not in t.rsplit("/", 1)[-1]]
     if plain:
         dirs = _dirs(tracked(root))

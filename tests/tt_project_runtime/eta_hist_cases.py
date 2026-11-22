@@ -331,3 +331,56 @@ def test_eta_rows_written_model_free_between_wakes_for_covered_tasks_only(env, m
     p.set_config("eta.ledger", False)
     monkeypatch.setattr(etaledger, "shown", real)
     assert etaledger.write_rows(p.db, p, now) == 0
+
+
+def test_eta_history_shadow_gives_a_promise_its_latest_owners_end(env):
+    from ttp import etaledger, obligations
+    p = make(env)
+    now = time.time()
+    h = {"wait": [100.0], "run": {("code", "standard"): [600.0], ("work", "standard"): [600.0]}, "kind": {},
+         "tries": {}, "tries_kind": {}, "review": [300.0], "land": [900.0], "batch": []}
+    code = p.db.add_task("c", "s", kind="code", tier="standard")
+    work = p.db.add_task("w", "s", kind="work", tier="standard")
+    done = p.db.add_task("d", "s", kind="work", tier="standard")
+    oid = obligations.add(p, "owed", owners=[code, work, done])
+    only_done = obligations.add(p, "owed too", owners=[done])
+    p.db.x("UPDATE tasks SET status='done' WHERE id=?", (done,))
+    assert etaledger.hist_end(p.db, oid, now, h) == pytest.approx(now + 100 + 600 + 300 + 900)
+    assert etaledger.hist_end(p.db, only_done, now, h) == pytest.approx(now)   # a closed owner counts now
+    assert etaledger.hist_end(p.db, obligations.add(p, "no owner"), now, h) is None
+
+
+def test_eta_calibration_and_shadow_split_quoted_dues_from_computed_etas_and_judge_promotion(env):
+    from ttp import etaledger
+    p = make(env)
+    now = time.time()
+    rows = []
+    for i in range(10):     # ten code tasks: history closer than the current ETA
+        rows += [{"ts": now - 9000, "ref": f"t{i}", "kind": "code", "src": "state", "likely": now - 7000,
+                  "shown": now - 7000, "conservative": now - 6000, "hist": now - 7900},
+                 {"ts": now - 8900, "ref": f"t{i}", "delivered": now - 8000}]
+    # A promise backfilled with its own due, then computed: the computed row is its pair.
+    rows += [{"ts": now - 9000, "ref": "o1", "kind": "work", "src": "backfill", "likely": now - 8800,
+              "shown": now - 8800, "due": now - 8800},
+             {"ts": now - 8990, "ref": "o1", "kind": "work", "src": "state", "likely": now - 7990,
+              "shown": now - 7990, "hist": now - 7990},
+             {"ts": now - 9000, "ref": "o2", "kind": "work", "src": "backfill", "likely": now - 8800,
+              "shown": now - 8800, "due": now - 8800},
+             {"ts": now - 8900, "ref": "o1", "delivered": now - 7990},
+             {"ts": now - 8900, "ref": "o2", "delivered": now - 8000}]
+    etaledger._append(p.db, rows)
+    ps = {x["ref"]: x for x in etaledger.pairs(etaledger.read(p.db), now - 86400)}
+    assert not ps["o1"]["quoted"] and ps["o1"]["promised"] == pytest.approx(1000) and ps["o2"]["quoted"]
+    cal = etaledger.calibration(p.db, now)
+    assert (cal["count_computed"], cal["count_quoted"]) == (11, 1)
+    assert cal["median_ratio_quoted"] == pytest.approx(5.0)
+    assert "; computed 0.50 (n=11), quoted dues 5.00 (n=1)" in etaledger.line(cal)
+    sh = etaledger.shadow(p.db, now - 86400)
+    assert sh["by_kind"]["code"]["count"] == 10 and sh["by_kind"]["promise"]["count"] == 1
+    assert sh["promotable"]            # the promise has under ten pairs: not judged
+    assert "; code 17m/17m vs 2m/2m (n=10)" in etaledger.shadow_line(sh) and etaledger.shadow_line(sh).endswith(
+        "promotable: yes")
+    etaledger._append(p.db, [x for i in range(10, 20) for x in (
+        {"ts": now - 9000, "ref": f"t{i}", "kind": "code", "src": "state", "likely": now - 8000,
+         "shown": now - 8000, "hist": now - 3000}, {"ts": now - 8900, "ref": f"t{i}", "delivered": now - 8000})])
+    assert not etaledger.shadow(p.db, now - 86400)["promotable"]     # history now worse at the p90
