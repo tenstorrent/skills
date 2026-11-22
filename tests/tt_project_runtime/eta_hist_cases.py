@@ -350,6 +350,23 @@ def test_eta_history_shadow_gives_a_promise_its_latest_owners_end(env):
     assert etaledger.hist_end(p.db, obligations.add(p, "no owner"), now, h) is None
 
 
+def test_eta_history_shadow_reads_a_promise_owned_through_promise_tasks_and_skips_dead_owners(env):
+    from ttp import etaledger, obligations
+    p = make(env)
+    now = time.time()
+    h = {"wait": [100.0], "run": {("work", "standard"): [600.0]}, "kind": {}, "tries": {}, "tries_kind": {},
+         "review": [], "land": [], "batch": []}
+    live = p.db.add_task("l", "s", kind="work", tier="standard")
+    dead = p.db.add_task("x", "s", kind="work", tier="standard")
+    oid = obligations.add(p, "promised in a reply")
+    st = obligations._load(p.db)
+    st["items"][oid]["promise"] = {"chat": "c", "message": 1, "due": now + 3600, "timed": True, "tasks": [live, dead]}
+    p.db.set_kv(obligations.KV, st)
+    p.db.update_task(dead, status="cancelled")
+    assert not obligations.get(p.db, oid)["owners"]
+    assert etaledger.hist_end(p.db, oid, now, h) == pytest.approx(now + 100 + 600)   # the cancelled owner adds none
+
+
 def test_eta_calibration_and_shadow_split_quoted_dues_from_computed_etas_and_judge_promotion(env):
     from ttp import etaledger
     p = make(env)

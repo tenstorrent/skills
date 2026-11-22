@@ -161,15 +161,18 @@ def hist_end(db, ref: str, now: float, h: dict | None = None) -> float | None:
     the median run time of its kind and tier (else of its kind) times the mean runs a done task of that
     kind and tier took (retries), plus for a code task the median review and the median landing (the push
     queue's approval-to-push time, else a push batch's); None without samples. A promise ref (`o3`): the
-    latest of its owner tasks' ends, a closed owner counting `now`; None with no owner that gives one.
+    latest of its live owner tasks' ends (obligations.live_owner_ids, so owners kept only in the promise
+    count and a cancelled or superseded one does not), a finished owner counting `now`; None with no owner
+    that gives one.
     `h` is eta.history's result, read once per caller."""
     if ref.startswith("o"):
         from . import eta, obligations
         o = obligations.get(db, ref)
-        h = eta.history(db, now) if h is None and o and o.get("owners") else h
+        owners = obligations.live_owner_ids(db, o) if o else []
+        h = eta.history(db, now) if h is None and owners else h
         ends = []
-        for tid in (o or {}).get("owners") or {}:
-            t = db.task(int(tid)) if str(tid).isdigit() else None
+        for tid in owners:
+            t = db.task(tid)
             ends.append(now if t and t["status"] in obligations.CLOSED else hist_end(db, f"t{tid}", now, h))
         ends = [e for e in ends if e is not None]
         return max(ends) if ends else None
