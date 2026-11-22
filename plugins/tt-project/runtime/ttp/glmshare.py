@@ -63,6 +63,7 @@ from __future__ import annotations
 import bisect
 import datetime
 import json
+import re
 from pathlib import Path
 
 from . import glmassist, route, runclass
@@ -270,7 +271,7 @@ _WHY = (("policy", "policy files"), ("lineage", "lineage misses"), ("needs opus"
         ("needs_opus", "needs_opus bounce"), ("person", "person"), ("untrusted", "untrusted"),
         ("conclusion", "conclusion floor"), ("design", "design or optimization"), ("optim", "design or optimization"),
         ("verdict", "verdict wording"), ("deep", "deep"), ("retry", "retry"), ("urgent", "urgent"), ("pin", "pin"),
-        ("device", "device"), ("bounced", "bounced"), ("holdout", "holdout"))
+        ("device", "device"), ("bounced", "bounced"), ("holdout", "holdout"), ("user_ordered", "user-ordered"))
 
 
 def _person(task: dict) -> str:
@@ -306,6 +307,10 @@ def keeper(p, cfg: dict, run: dict, task: dict | None, dev: dict) -> str:
     if not why and ent.get("fallback"):
         why = {"escalated": str(ent.get("escalated") or "escalated"), "rerun": "rerun after a fallback"}.get(
             str(ent["fallback"]), "")
+    if not why:   # the rule the daemon recorded when no route took the run (route.core_why)
+        why = str(note.get(route.CORE_WHY) or "").lower()
+    if m := re.match(r"lineage of #(\d+)", why):   # an older follow-up: the rule that put its root on Claude
+        why = str((p.db.kv(f"{CODE_ARM_KV}{m.group(1)}") or {}).get("why") or why).lower()
     if not why and (p.db.kv(f"{ARM_KV}{task['id']}") or {}).get("arm") == "holdout":
         why = "holdout"
     if not why and "conclusion_floor" in note:

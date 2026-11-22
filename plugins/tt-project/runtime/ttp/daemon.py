@@ -13196,7 +13196,8 @@ class Daemon:
                 conflictfix.KEY: (review_pick or {}).get(conflictfix.KEY)}}, self.cfg)
             # A tier routed to another provider (route.py) runs there unless it is cooling down.
             arm = self._code_arm(task, tier, picked)   # recorded on the task before its first run
-            routed = self._route(task, tier, picked, now, cls=run_cls, arm=arm)
+            held = {}   # why a run that is not routed starts on core (route.CORE_WHY)
+            routed = self._route(task, tier, picked, now, cls=run_cls, arm=arm, held=held)
             lease = None
             if routed and routed["fallback"] == "none":
                 why = self._no_room(routed["to"], ctx)
@@ -13271,6 +13272,8 @@ class Daemon:
                                            **({"unpinned": unpinned} if unpinned else {})}
                 if routed:
                     note[route.KEY] = routed
+                elif held.get("why") and not arm:   # the arm's own why is in its entry (codearm.KEY)
+                    note[route.CORE_WHY] = held["why"]
                 if dp := self._model_pick(task, tier, peek=True):
                     note[modelpick.KEY] = {k: dp.get(k) for k in ("by", "pick", "p", "why", "tier") if k in dp}
                 if untrusted.labelled(task):   # it never routes (route.eligible): the model it skipped, if any
@@ -13792,6 +13795,14 @@ class Daemon:
             log(self.p, f"task {task['id']}: tier floor not applied: {e}")
             return None
 
+    def _core_why(self, task: dict, tier: str, picked: dict | None, to: dict | None) -> str:
+        """Why a run no route took starts on core (route.core_why), recorded in its note."""
+        try:
+            return route.core_why(self.p.db, self.cfg, task, tier, picked, to,
+                                  self._floor_keeps_core(task, tier, picked, to) if to else "")
+        except Exception as e:   # recording must never hold a task back
+            return f"unchecked: {type(e).__name__}"
+
     def _code_arm(self, task: dict, tier: str, picked: dict | None, peek: bool = False) -> dict | None:
         """The code route's arm for this run (codearm.choose), or None (off, not code, or not readable)."""
         try:
@@ -13803,13 +13814,15 @@ class Daemon:
             return None
 
     def _route(self, task: dict, tier: str, picked: dict | None, now: float, peek: bool = False,
-               cls: str | None = None, arm: dict | None = None) -> dict | None:
+               cls: str | None = None, arm: dict | None = None, held: dict | None = None) -> dict | None:
         """The run note's `route` entry for a worker run of a tier routed to another provider
         (route.py), or None: `fallback` is none when it starts there, else why it starts on the core
         provider (a cool-down after a fallback, or the auth gate holding the endpoint). With no tier,
         rule or pick route, its run class `cls` routes it (runclass.target): a review or floor run too.
         A code task on the code route's chat arm (`arm`, codearm.choose) is routed to the arm's model first; any
-        other run of a code task under the arm (Claude, Sonnet, a bounce) stays on core, whatever its tier."""
+        other run of a code task under the arm (Claude, Sonnet, a bounce) stays on core, whatever its tier.
+        On None, `held["why"]` names the rule that kept the run on core (route.CORE_WHY)."""
+        held = {} if held is None else held
         arm = arm if arm is not None else self._code_arm(task, tier, picked, peek=True)
         if arm and arm["run"] == "glm" and (s := codearm.settings(self.cfg)):
             e = self._route_entry(task, tier, s["provider"], s["model"], now, cls=cls, arm=True, glm=s["glm_work"])
@@ -13818,7 +13831,7 @@ class Daemon:
         if arm:   # the arm owns every run of its code task: the tier route never moves one (light wakes included)
             return None
         if glmwork.settings(self.cfg) or glmwork.device_only(self.cfg) and deviceplan.device(task, self.cfg):
-            return self._glm_route(task, tier, picked, now, cls, peek)   # the GLM work route decides every run (device_only: device runs)
+            return self._glm_route(task, tier, picked, now, cls, peek, held)   # the GLM work route decides every run (device_only: device runs)
         dp = self._model_pick(task, tier, peek=peek)
         if dp is not None:   # the model pick (modelpick.py) decides this tier's route
             got = modelpick.target(self.cfg, dp)
@@ -13832,10 +13845,12 @@ class Daemon:
         # Every keep-core check runs before any route returns, the class route included: no review, pin,
         # retry or outside text (eligible), no floor run, no protected class.
         if not to or not route.eligible(task, picked) or (dp is None and self._floor_keeps_core(task, tier, picked, to)):
+            held["why"] = self._core_why(task, tier, picked, to)
             return None
         name, model = to["to"], to["model"]
         why = route.protected(self.p.db, self.cfg, task, tier, urgency=not (klass and cls in runclass.ORDER_ONLY))
         if why:   # the guard: a protected class stays on core, whoever asked for the route
+            held["why"] = why
             if (got_e := self._route_entry(task, tier, name, model, now, to["rule"], cls, core_only=True)):
                 return got_e   # it starts on core anyway (escalated, or a rerun after a fallback): the note says why
             if not peek:
@@ -13848,19 +13863,23 @@ class Daemon:
         return self._route_entry(task, tier, name, model, now, to["rule"], cls)
 
     def _glm_route(self, task: dict, tier: str, picked: dict | None, now: float, cls: str | None,
-                   peek: bool = False) -> dict | None:
+                   peek: bool = False, held: dict | None = None) -> dict | None:
         """A covered project's route (glmwork.py) for a run that is not a code arm's: the work model at its
         effort, or None (core) for a run the keep-core checks hold or the task's Claude holdout. The floor keeps
-        the run's tier and effort; only the runs keeps_core names stay on core for it."""
+        the run's tier and effort; only the runs keeps_core names stay on core for it. On None, `held["why"]`
+        says which."""
+        held = {} if held is None else held
         s = glmwork.settings(self.cfg, device=True)
         try:
             why = glmwork.keeps_core(self.p.db, self.cfg, task, tier, cls, picked)
         except Exception as e:   # in doubt, core
             why = f"unchecked: {type(e).__name__}"
         if why or not s:
+            held["why"] = why or "glm_work off"
             return None
         a = glmwork.arm(self.p.db, self.cfg, task, peek=peek)
         if not a or a["arm"] != "glm":
+            held["why"] = f"holdout: {(a or {}).get('why') or 'no arm'}"
             return None
         e = self._route_entry(task, tier, s["provider"], s["model"], now, glmwork.KEY, cls, glm=True)
         return {**e, glmwork.KEY: "glm", **({"pick_effort": s["effort"]} if s["effort"] else {})} if e else None

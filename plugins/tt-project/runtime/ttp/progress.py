@@ -369,14 +369,28 @@ def _after(t: dict | None) -> float | None:
     return deferral(t).get("after") if t else None
 
 
-_PROGRESS_RE = re.compile(r"^progress:\s*(\d+)\s*/\s*\d+\s*$", re.I)
+_PROGRESS_RE = re.compile(r"(?:^|\s)progress:\s*(\d+(?:\.\d+)?)\s*(?:/\s*\d+|%)\s*$", re.I)
+ADV_KEEP = 9   # advance times kept per probe: the median gap between them sets its stall threshold
+
+
+def probe_threshold_s(rec: dict, probe_h: float) -> float:
+    """How long a probe may say not yet before it counts as a stall: `probe_h`, or, once its progress
+    counter has advanced, at least 3x the median time between advances (a slow, steady job is no stall)."""
+    adv = [float(x) for x in rec.get("adv") or []]
+    gaps = sorted(b - a for a, b in zip(adv, adv[1:]))
+    if not gaps:
+        return probe_h * 3600
+    mid = len(gaps) // 2
+    med = gaps[mid] if len(gaps) % 2 else (gaps[mid - 1] + gaps[mid]) / 2
+    return max(probe_h * 3600, 3 * med)
 
 
 def note_probe(db: DB, tid: int, probe: str, rc: Any, reason: str, now: float | None = None) -> None:
     """A probe (retry_when or start_when) said not yet: count it for its task. A count made under
     another start_after starts over: only the answers since it last changed count. A last output line
-    `progress: <n>/<target>` whose n beats the highest so far is progress: the count starts over and a
-    stall raised on the probe clears."""
+    `progress: <n>/<target>` (or `progress: <n>%`) whose n beats the highest so far is progress: the
+    count starts over, a stall raised on the probe clears and the advance's time is kept (`adv`, from the
+    first counter seen) for probe_threshold_s."""
     now = time.time() if now is None else now
     st = load(db)
     rec = st["probes"].get(str(tid))
@@ -384,23 +398,26 @@ def note_probe(db: DB, tid: int, probe: str, rc: Any, reason: str, now: float | 
     if rec and rec.get("probe") == probe and rec.get("after") == after and now <= float(rec["last"]):
         return   # this verdict is counted already
     norm = f"{rc}:{_norm(_clip(reason))}"   # `same` counts identical answers in a row (absentwait)
-    got = _PROGRESS_RE.match(_clip(reason))
-    done = int(got.group(1)) if got else None
+    got = _PROGRESS_RE.search(_clip(reason))
+    done = float(got.group(1)) if got else None
     if rec and rec.get("probe") == probe and rec.get("after") == after and done is not None \
-            and done > int(rec.get("done") if rec.get("done") is not None else done):
-        rec.update(n=1, first=now, last=now, rc=rc, reason=_clip(reason), same=1, norm=norm, done=done)
+            and done > float(rec.get("done") if rec.get("done") is not None else done):
+        adv = (rec.get("adv") or [rec["first"]])[-(ADV_KEEP - 1):] + [now]
+        rec.update(n=1, first=now, last=now, rc=rc, reason=_clip(reason), same=1, norm=norm, done=done, adv=adv)
         _unraise(st, f"stall:probe:#{tid}", now)
     elif rec and rec.get("probe") == probe and rec.get("after") == after:
         same = int(rec.get("same") or 1) + 1 if rec.get("norm") == norm else 1
         rec.update(n=int(rec["n"]) + 1, last=now, rc=rc, reason=_clip(reason) or rec.get("reason"), same=same,
                    norm=norm)
         if done is not None:
-            rec["done"] = max(done, int(rec.get("done") or 0))
+            if rec.get("done") is None:
+                rec["adv"] = [now]   # the first counter seen: its first advance is timed from here
+            rec["done"] = max(done, float(rec.get("done") or 0))
     else:
         st["probes"][str(tid)] = {"probe": probe, "n": 1, "first": now, "last": now, "rc": rc,
                                   "reason": _clip(reason), "after": after, "same": 1, "norm": norm}
         if done is not None:
-            st["probes"][str(tid)]["done"] = done
+            st["probes"][str(tid)].update(done=done, adv=[now])
     _save(db, st)
 
 
@@ -648,7 +665,7 @@ def probe_stalls(db: DB, s: dict, st: dict, now: float, current_probe: Callable[
             rec.update(first=opened, n=0)   # the user's marker appeared: the live gate is timed from then
         if not s["probe_n"] or OWN_WAIT_RE.search(rec["probe"]) or ackwait.is_probe(rec["probe"], cfg, harness) \
                 or int(rec["n"]) < s["probe_n"] \
-                or now - float(rec["first"]) < s["probe_h"] * 3600:
+                or now - float(rec["first"]) < probe_threshold_s(rec, s["probe_h"]):
             continue
         out.append({"kind": "stall", "key": f"probe:#{t['id']}", "task": t["id"],
                     "what": f"task #{t['id']} {_clip(t['title'], 60)}: its probe said not yet {rec['n']} times",

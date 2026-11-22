@@ -347,6 +347,19 @@ def test_glm_share_held_groups_claude_runs_by_the_rule_that_kept_them_and_marks_
     assert "held off GLM by rule" in glmshare.text(s) and "policy files" in glmshare.text(s)
 
 
+def test_glm_share_held_reads_the_core_reason_and_an_old_lineage_s_root(env):
+    from ttp import codearm, glmshare, route
+    p = make(env)
+    now = 1_000_000_000.0 + 30 * 86400
+    t, cl = now - 5 * 3600, {"provider": "claude", "model": "opus"}
+    _gs_run(p, _gs_task(p, kind="work"), t, 1, note={route.CORE_WHY: "untrusted"}, **cl)
+    root = _gs_task(p)
+    p.db.set_kv(f"{codearm.ARM_KV}{root}", {"arm": "claude", "why": "design: optimization"})
+    _gs_run(p, _gs_task(p), t, 2, note={"code_arm": {"arm": "claude", "why": f"lineage of #{root}"}}, **cl)
+    by = {k: v["hours"] for k, v in glmshare.held(p, now - 86400, now).items()}
+    assert by == {"untrusted": 1.0, "design or optimization": 2.0}, by
+
+
 def _gs_outcome(p, start, passed, reviewed_at, provider="chat", arm=None, ts=None):
     """A decided task whose first auto review was queued at `reviewed_at`."""
     tid = _gs_decided(p, start, passed, provider=provider, arm=arm, ts=ts)

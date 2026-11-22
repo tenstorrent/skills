@@ -105,6 +105,7 @@ from .util import task_labels
 
 TO = "chat"                 # the provider a tier can be routed to
 KEY = "route"               # the run note's entry
+CORE_WHY = "core_why"       # the run note's entry when no route took it: the rule that kept it on core
 ROUTES = "routes"           # providers.chat.routes: the ordered rule list (match)
 RULE_KEYS = ("kinds", "tiers", "labels_any", "labels_none", "model", "effort", "route_timeout_s")
 # Labels (or `<label>:...`) the rule list never routes, on top of each rule's labels_none (kept_core).
@@ -274,6 +275,21 @@ def timeout_s(cfg: dict, tier: str, rule: int | None = None) -> float | None:
     t = (((cfg.get("providers") or {}).get(TO) or {}).get("tiers") or {}).get(tier) or {}
     v = t.get("route_timeout_s") if isinstance(t, dict) else None
     return float(v) if isinstance(v, (int, float)) and not isinstance(v, bool) and v > 0 else None
+
+
+def core_why(db, cfg: dict, task: dict, tier: str, picked: dict | None, to: dict | None, floor: str = "") -> str:
+    """Why a worker run no route took starts on the core provider (the run note's CORE_WHY, which the share
+    report reads), model-free: for a route `to` the run may not take, the keep-core rule (glmwork.keeps_core's
+    names) or the conclusion floor (`floor`, the model it skipped); else a code task with no live arm, or no
+    route for its tier (the GLM work route off for the project)."""
+    from . import codearm, glmwork
+    if to and not eligible(task, picked):
+        return glmwork.keeps_core(db, cfg, task, tier, None, picked) or "not eligible"
+    if to and floor:
+        return f"conclusion floor: kept off {floor}"
+    if task.get("kind") == "code":
+        return "code arm not chosen" if codearm.settings(cfg) else "code arm off"   # the daemon logs why
+    return "no route" if glmwork.settings(cfg) else "glm_work off"
 
 
 def eligible(task: dict, picked: dict | None) -> bool:

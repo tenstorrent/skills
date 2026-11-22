@@ -74,7 +74,7 @@ def test_code_arm_is_recorded_once_and_follow_ups_keep_their_lineage_arm(env):
     fix = p.db.add_task("Fix review #9: tidy", "", kind="code", tier="standard", priority=3, budget_usd=1.0)
     p.db.x("UPDATE tasks SET labels=? WHERE id=?", (json.dumps([f"{chaincap.FOLLOWS}{t['id']}"]), fix))
     got = codearm.choose(p.db, _ca_cfg(glm_share=0.0001), p.db.task(fix), "standard")
-    assert got["arm"] == "glm" and "lineage" in got["why"]
+    assert got["arm"] == "glm" and got["why"] == f"coin at share 1 (follows #{t['id']})"   # the root's rule
     peek = _ca_task(p)
     assert codearm.choose(p.db, cfg, peek, "standard", peek=True)["arm"] == "glm"
     assert codearm.recorded(p.db, peek["id"]) is None
@@ -2058,3 +2058,47 @@ def test_a_covered_glm_code_arm_takes_a_conclusion_only_task_and_keeps_the_rest(
     t = p.db.task(p.db.add_task("code task", "Fix it.", kind="code", tier="standard", origin="coordinator",
                                 reply_chat="c1"))
     assert codearm.choose(p.db, off, t, "standard")["run"] == "claude", "person_writeup off keeps a reply task on core"
+
+
+def test_core_why_names_the_rule_that_kept_an_unrouted_run_on_core(env):
+    from ttp import route
+    p = make(env)
+    to = {"provider": "chat", "model": "example-org/work-model"}
+    work = {"kind": "work", "title": "t", "spec": "s"}
+    assert route.core_why(p.db, {}, {**work, "provider": "claude"}, "standard", None, to) == "pin"
+    assert route.core_why(p.db, {}, work, "standard", None, to, floor="example-org/work-model") \
+        == "conclusion floor: kept off example-org/work-model"
+    assert route.core_why(p.db, {}, work, "standard", None, None) == "glm_work off"
+    assert route.core_why(p.db, {}, {**work, "kind": "code"}, "standard", None, None) == "code arm off"
+    assert route.core_why(p.db, _ca_cfg(), {**work, "kind": "code"}, "standard", None, None) == "code arm not chosen"
+
+
+def test_a_follow_up_records_the_rule_that_put_its_root_on_its_arm(env):
+    from ttp import chaincap, codearm
+    p = make(env)
+    def follow(root):
+        fix = p.db.add_task("Fix review #9: tidy", "", kind="code", tier="standard", priority=3, budget_usd=1.0)
+        p.db.x("UPDATE tasks SET labels=? WHERE id=?", (json.dumps([f"{chaincap.FOLLOWS}{root}"]), fix))
+        return p.db.task(fix)
+    root = _ca_task(p)
+    p.db.set_kv(f"{codearm.ARM_KV}{root['id']}", {"arm": "claude", "why": "person: post to slack", "seed": "s", "ts": 1.0})
+    fix = follow(root["id"])
+    got = codearm.choose(p.db, _ca_cfg(), fix, "standard")
+    assert got["arm"] == "claude" and got["why"] == f"person: post to slack (follows #{root['id']})"
+    again = codearm.choose(p.db, _ca_cfg(), follow(fix["id"]), "standard")   # a follow-up of the follow-up: no nesting
+    assert again["why"] == f"person: post to slack (follows #{root['id']})"
+    bare = _ca_task(p)   # a root with no recorded arm keeps the old lineage reason
+    assert codearm.lineage_why(p.db, bare["id"], None) == f"lineage of #{bare['id']} (no arm)"
+    assert codearm.lineage_why(p.db, bare["id"], {"arm": "claude", "why": f"lineage of #{bare['id']}"}) \
+        == f"lineage of #{bare['id']}"
+
+
+def test_the_daemon_records_why_an_unrouted_run_stays_on_core(env):
+    from ttp.daemon import Daemon
+    p = make(env)
+    d = Daemon(p.base)
+    for kind, want in (("work", "glm_work off"), ("code", "code arm off")):
+        held = {}
+        tid = p.db.add_task("tidy", "s", kind=kind, tier="standard", priority=3, budget_usd=1.0)
+        assert d._route(p.db.task(tid), "standard", None, time.time(), held=held) is None
+        assert held == {"why": want}

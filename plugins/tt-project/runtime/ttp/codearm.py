@@ -296,6 +296,17 @@ def stays(db, cfg: dict, task: dict, tier: str, picked: dict | None = None, poli
     return ""
 
 
+def lineage_why(db, root: int, parent: dict | None) -> str:
+    """A follow-up's recorded why: the rule that put its lineage on its arm (the root's why, else its nearest
+    recorded parent's), "(follows #root)" after it, so the share report names that rule and never a lineage miss;
+    "lineage of #root" only when no task in it recorded a why."""
+    got = str((recorded(db, root) or parent or {}).get("why") or "")
+    got = re.sub(r"\s*\(follows #\d+\)$", "", got)
+    if not got or got.startswith("lineage of #"):
+        return f"lineage of #{root}" + ("" if parent else " (no arm)")
+    return f"{got} (follows #{root})"[:300]
+
+
 def choose(db, cfg: dict, task: dict | None, tier: str, picked: dict | None = None, peek: bool = False,
            policy: list | None = None) -> dict | None:
     """This run's arm: {"arm" (recorded, stable), "run" ("glm", "sonnet", "opus" or "claude": what this run
@@ -318,8 +329,8 @@ def choose(db, cfg: dict, task: dict | None, tier: str, picked: dict | None = No
                 (recorded(db, ch[0]["id"]) or {}).get("why") or "").startswith("holdout")):
             # a covered project's follow-up of a Claude-arm change is decided afresh (its own stays, then the coin):
             # only the Claude holdout keeps a whole lineage on Claude
-            got = {"arm": parent["arm"] if parent else "claude", "why": f"lineage of #{ch[0]['id']}"
-                   + ("" if parent else " (no arm)"), "seed": s["seed"], "ts": time.time()}
+            got = {"arm": parent["arm"] if parent else "claude", "why": lineage_why(db, ch[0]["id"], parent),
+                   "seed": s["seed"], "ts": time.time()}
         elif s.get("glm_work"):   # covered: a kept task stays on Claude; else the work route's holdout coin
             from . import glmwork
             why = stays(db, cfg, task, tier, picked, policy)

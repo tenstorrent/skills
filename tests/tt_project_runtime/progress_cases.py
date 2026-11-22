@@ -531,6 +531,50 @@ def test_progress_probe_without_the_line_is_unchanged_and_a_raised_stall_clears_
     assert f"stall:probe:#{tid}" not in st["raised"] and st["probes"][str(tid)]["n"] == 1
 
 
+def test_progress_probe_slow_steady_counter_waits_three_median_gaps(env):
+    """A counter that advances every 70 min restarts the clock at each advance and, once it has advanced,
+    raises only after 3x the median gap; flat past that, it raises one stall."""
+    from ttp import progress
+    p = make(env)
+    probe = "ttp wakes --compared"
+    tid = _prog_waiting(p, "Report at 50", probe)
+    cur = lambda t: probe if t["id"] == tid else None
+    t0, gap, step = time.time() - 30 * 3600, 70 * 60, 180
+    raised, t, count = [], t0, 40
+    for g in (50 * 60, gap, gap, gap):       # a first advance inside probe_h, then three 70 min apart
+        for i in range(g // step):
+            progress.note_probe(p.db, tid, probe, 1, f"waiting on runs\nprogress: {count}/50", t)
+            raised += [k for e in progress.check(p.db, {}, p.state, t, current_probe=cur) for k in e["keys"]]
+            t += step
+        count += 1
+    assert raised == []                      # 70 min flat after an advance passed the old 1 h rule each time
+    rec = progress.load(p.db)["probes"][str(tid)]
+    assert len(rec["adv"]) == 4 and progress.probe_threshold_s(rec, 1) == 3 * (gap // step * step)
+    flat = []
+    for i in range(int(3.5 * gap) // step):  # flat for 3.5 gaps: one stall once the threshold passes
+        progress.note_probe(p.db, tid, probe, 1, f"progress: {count}/50", t)
+        got = progress.check(p.db, {}, p.state, t, current_probe=cur)
+        flat += [(t - rec["adv"][-1], k) for e in got for k in e["keys"]]
+        t += step
+    assert len(flat) == 1 and flat[0][1] == f"probe:#{tid}" and flat[0][0] >= 3 * gap - 2 * step, flat
+
+
+def test_progress_probe_percentage_counts_and_threshold_without_advances_is_probe_h(env):
+    from ttp import progress
+    p = make(env)
+    probe = "ttp wakes --pct"
+    tid = _prog_waiting(p, "Soak", probe)
+    now = time.time()
+    progress.note_probe(p.db, tid, probe, 1, "progress: 10%", now)
+    progress.note_probe(p.db, tid, probe, 1, "progress: 12.5%", now + 600)
+    rec = progress.load(p.db)["probes"][str(tid)]
+    assert rec["done"] == 12.5 and rec["n"] == 1 and rec["adv"] == [now, now + 600]
+    assert progress.probe_threshold_s({"adv": [now]}, 1) == 3600 == progress.probe_threshold_s({}, 1)
+    assert progress.probe_threshold_s({"adv": [0, 100, 200, 7200]}, 1) == 3600   # median gap 100 s: probe_h wins
+    assert progress.probe_threshold_s({"adv": [0, 7200, 14400]}, 1) == 3 * 7200
+    assert progress._PROGRESS_RE.search("47 of 50 done") is None                 # no `progress:` label: not a counter
+
+
 def test_progress_probe_stall_wakes_once_then_only_at_rewake_and_clears(env):
     """A probe stall's count grows with time alone, so it never escalates: one wake, then one per rewake_h."""
     from ttp import progress
