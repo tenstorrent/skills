@@ -6571,9 +6571,9 @@ class Daemon:
                 if route.hold(db, routed["tier"], model, r["id"], time.time()):
                     log(self.p, f"route: {routed['to']} does not serve {model}; tier {routed['tier']} held (run {r['id']})")
                     if not modelrank.pick(db, self.cfg, self.p.state, model, time.time()):   # else its switch alerts
-                        self.alert(f"route-model-missing:{routed['tier']}|{model}",
+                        self.alert(f"route-model-missing:{routed['to']}|{model}",   # one per provider model
                                    route.missing_notice(self.cfg, routed["to"], routed["tier"], model),
-                                   severity="normal", every_s=0)
+                                   severity="normal", every_s=route.RETRY_QUIET_S)
             elif fell and not own and not bounce:   # an endpoint fault cools the endpoint; a run's own end only its task
                 route.cool(db, self.cfg, routed["to"], fell, r["id"], time.time())
         elif r["provider"] == modelrank.TO and isinstance(note.get(modelrank.KEY), dict) and r["model"] and \

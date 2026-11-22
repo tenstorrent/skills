@@ -118,6 +118,7 @@ MISSING = "route_model_missing:"   # kv per routed tier and model (MISSING + tie
 MODELS_FILE = "endpoint-models.json"   # under the project state dir: {provider: {"ids", "checked", "ok", "check"}}
 MODELS_EVERY_S = 60         # the daemon's model-free /models check runs this often per provider (models_every)
 RETRY_QUIET_S = 86400       # a re-hold of the same model this soon after its quiet retry sends no new notice
+MISSING_TASK_S = 3600        # a task refused its routed model stays on the core provider this long
 FAULTS = ("down", "error", "rate_limit", "auth", "malformed", "model_missing")
 BOUNCE = "needs_opus"   # a code arm run handed the task back to Opus (codearm.BOUNCE)
 RUN_CAUSES = ("timeout", "failed", "no_handoff")   # a routed run's own end without a hand-off (own_cause)
@@ -237,10 +238,25 @@ def run_model(cfg: dict, tier: str, entry) -> tuple[str, str] | None:
     return str(entry["model"]), str(r.get("effort") or (t.get("effort") if isinstance(t, dict) else "") or "")
 
 
+def _chosen(cfg: dict) -> list[tuple[str, str]]:
+    """(setting, model) of each chat model the GLM work route, the code arm and a model pick choose, at any tier."""
+    from . import codearm, glmwork, modelpick
+    glm, arm = glmwork.settings(cfg, device=True), codearm.settings(cfg)
+    own = isinstance(g := (cfg.get("route") or {}).get(glmwork.KEY), dict) and str(g.get("model") or "").strip()
+    at = "route.glm_work.model" if own else "route.code_sonnet.glm.model"   # glmwork.model's order
+    out = [(at, glm["model"])] if glm and glm["provider"] == TO else []
+    if arm and arm["provider"] == TO:   # on a project the GLM work route covers, the arm runs its model
+        out.append((at if arm["glm_work"] else "route.code_sonnet.glm.model", arm["model"]))
+    return out + [(f"providers.{TO}.dispatch.options.{k}.model", str(o["model"]))
+                  for k, o in modelpick.options(cfg).items() if modelpick.routed(cfg, k)]
+
+
 def models(cfg: dict, tier: str) -> set[str]:
-    """Every model a run at `tier` may be routed to: the tier's own and each rule's that can match it."""
+    """Every model a run at `tier` may be routed to: the tier's own, each rule's that can match it, and the
+    chat models the GLM work route, the code arm and a model pick choose."""
     own = _per_tier(cfg, tier)
-    return {*([own[1]] if own else []), *(r["model"] for _, r in rules(cfg) if not r["tiers"] or tier in r["tiers"])}
+    return {*([own[1]] if own else []), *(r["model"] for _, r in rules(cfg) if not r["tiers"] or tier in r["tiers"]),
+            *(m for _, m in _chosen(cfg))}
 
 
 def protected(db, cfg: dict, task: dict, tier: str, urgency: bool = True) -> str:
@@ -352,11 +368,13 @@ def holds(db) -> dict[str, dict]:
 
 def sources(cfg: dict, tier: str, model: str) -> list[str]:
     """The settings that route `tier`'s runs to `model` (its hold ends once none does): the tier's own
-    providers.chat.tiers.<tier>.model, then each providers.chat.routes[<i>].model; the tier's if none."""
+    providers.chat.tiers.<tier>.model, then each providers.chat.routes[<i>].model, then the GLM work route's,
+    the code arm's and the model pick's (_chosen); the tier's if none."""
     own = _per_tier(cfg, tier)
     out = [f"providers.{TO}.tiers.{tier}.model"] if own and own[1] == model else []
     out += [f"providers.{TO}.{ROUTES}[{i}].model" for i, r in rules(cfg)
             if r["model"] == model and (not r["tiers"] or tier in r["tiers"])]
+    out += [at for at, m in _chosen(cfg) if m == model and at not in out]
     return out or [f"providers.{TO}.tiers.{tier}.model"]
 
 
@@ -384,7 +402,7 @@ def release(db, cfg: dict, served: dict, now: float) -> list[tuple[str, str, str
         to = target(cfg, tier)
         rec = (served or {}).get(to[0] if to else TO) or {}
         fresh = rec.get("ok") and float(rec.get("checked") or 0) > float(h.get("since") or 0)
-        if not to or model not in models(cfg, tier):
+        if model not in models(cfg, tier):
             why = f"the configured model is now {to[1]}" if to else "the tier is no longer routed"
         elif h.get("retry"):
             if now - float(h.get("at") or 0) < RETRY_QUIET_S:
@@ -589,12 +607,15 @@ def own_cause(status: str) -> str:
 
 
 def fell_back_before(db, task_id: int, skip: tuple = ()) -> int | None:
-    """The task's routed run that fell back on its own (RUN_CAUSES), or None: its later runs start on
-    the core provider. `skip`: causes that do not count (the GLM work route's infrastructure ends, glmwork)."""
-    for r in db.q("SELECT id, provider, note FROM runs WHERE task=? AND role='worker' AND note LIKE ? "
+    """The task's routed run that fell back on its own (RUN_CAUSES), or was refused its model in the last
+    MISSING_TASK_S (a quiet retry of that model is for other tasks), or None: its later runs start on the
+    core provider. `skip`: causes that do not count (the GLM work route's infrastructure ends, glmwork)."""
+    for r in db.q("SELECT id, provider, started, note FROM runs WHERE task=? AND role='worker' AND note LIKE ? "
                   "ORDER BY id DESC", (task_id, f'%"{KEY}"%')):
         e = of(r["note"]) or {}
-        if e.get("fallback") in (*RUN_CAUSES, BOUNCE) and e.get("fallback") not in skip and r["provider"] == e.get("to"):
+        fell = e.get("fallback")
+        if (fell in (*RUN_CAUSES, BOUNCE) and fell not in skip or fell == "model_missing"
+                and time.time() - float(r["started"] or 0) < MISSING_TASK_S) and r["provider"] == e.get("to"):
             return int(r["id"])
     return None
 

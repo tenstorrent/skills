@@ -1640,7 +1640,7 @@ def test_a_routed_run_refused_its_model_by_claude_code_holds_the_tier_with_one_n
         assert run["status"] == "fallback" and route.of(run["note"])["fallback"] == "model_missing", (n, run["note"])
         p.db.update_task(tid, status="done")
     assert route.held(p.db, d.cfg, "light") == _RT_MODEL and route.cooling(p.db, "chat", time.time()) == ""
-    assert alerts == [("route-model-missing:light|" + _RT_MODEL, "normal")]
+    assert alerts == [("route-model-missing:chat|" + _RT_MODEL, "normal")]
     prov, _, note = _route_dispatch(p, d, monkeypatch, title="next")
     assert prov == d.cfg.get("core_provider", "claude") and note[route.KEY]["fallback"] == "model_missing"
     # Other run errors stay as they were: a bridge error cools, a clean bridge leaves no endpoint fault.
@@ -1686,9 +1686,9 @@ def test_missing_rule_models_hold_apart_and_name_their_rule(env, monkeypatch):
         refuse("standard", "rule-model-a", 0)
         refuse("standard", "rule-model-b", 1)
     refuse("light", _RT_MODEL, None)
-    assert [k for k, _ in alerts] == ["route-model-missing:standard|rule-model-a",
-                                      "route-model-missing:standard|rule-model-b",
-                                      "route-model-missing:light|" + _RT_MODEL], alerts
+    assert [k for k, _ in alerts] == ["route-model-missing:chat|rule-model-a",
+                                      "route-model-missing:chat|rule-model-b",
+                                      "route-model-missing:chat|" + _RT_MODEL], alerts
     assert sorted(route.holds(p.db)) == ["light|" + _RT_MODEL, "standard|rule-model-a", "standard|rule-model-b"]
     for m in ("rule-model-a", "rule-model-b"):
         assert route.held(p.db, d.cfg, "standard", m) == m
@@ -1784,7 +1784,74 @@ def test_a_refused_model_the_endpoint_still_lists_retries_hourly_with_one_notice
         assert route.held(p.db, d.cfg, "light") == ""   # one routed run tries it again
         refused_run(n)
         assert route.held(p.db, d.cfg, "light") == _RT_MODEL
-    assert alerts == [("route-model-missing:light|" + _RT_MODEL, "normal")], alerts
+    assert alerts == [("route-model-missing:chat|" + _RT_MODEL, "normal")], alerts
+
+
+def test_a_model_missing_hold_on_a_glm_work_model_outside_the_chat_tiers_holds(env, monkeypatch):
+    """A model routed only by route.glm_work (its tier not in providers.chat.tiers) was refused: the hold
+    ended on the next tick ('the tier is no longer routed'), the same task was routed to the same model
+    again and each refusal sent the user a new notice. The hold stays, the task falls back to core and
+    one notice goes out per provider model."""
+    from ttp import glmwork, route
+    from ttp.daemon import Daemon
+    gm = "example-org/glm-work-model"
+    p = make(env)
+    p.set_config("providers.chat", {"endpoint": "placeholder", "base_url": _RT_URL})
+    d = Daemon(p.base)
+    d.cfg = {**d.cfg, "route": {**(d.cfg.get("route") or {}), "glm_work": {"on": True, "model": gm}}}
+    monkeypatch.setattr(d, "observe", lambda *a, **k: None)
+    sent = lambda: [(r["ref"], r["text"]) for r in p.db.q(   # noqa: E731
+        "SELECT ref, text FROM messages WHERE kind='alert' AND ref LIKE 'route-model-missing:%'")]
+    refused = '[claude-code:unrecognized_model] {"model":"%s"}' % gm
+
+    def refused_run(tid, tier="standard"):
+        p.db.update_task(tid, status="running")
+        rid = p.db.x("INSERT INTO runs(task,role,provider,model,started,status,boot_id,note) "
+                     "VALUES(?,'worker','chat',?,?,'running',?,?)", (tid, gm, time.time() - 30, d.boot, json.dumps(
+                         {"route": {"tier": tier, "to": "chat", "model": gm, "rule": glmwork.KEY,
+                                    "fallback": "none"}})))
+        rd = p.runs / str(rid)
+        rd.mkdir(parents=True)
+        (rd / "output.jsonl").write_text(json.dumps({"type": "result", "subtype": "error_during_execution",
+                                                     "is_error": True, "total_cost_usd": 0.0, "usage": {},
+                                                     "result": refused, "session_id": "s-1"}) + "\n")
+        p.db.x("UPDATE runs SET dir=? WHERE id=?", (str(rd), rid))
+        d.finish_run(p.db.one("SELECT * FROM runs WHERE id=?", (rid,)),
+                     {"rc": 1, "started": time.time() - 30, "ended": time.time(), "bridge": {"last_fault": "error"}})
+        p.db.update_task(tid, status="queued")
+
+    tasks = [p.db.add_task(f"work{n}", "", kind="work", tier="standard", priority=3, budget_usd=8.0, labels=[])
+             for n in range(2)]
+    refused_run(tasks[0])
+    d.check_route_models()   # the next tick
+    assert route.held(p.db, d.cfg, "standard", gm) == gm, "the hold ended on the next tick"
+    again = d._route_entry(p.db.task(tasks[0]), "standard", "chat", gm, time.time(), glmwork.KEY, glm=True)
+    assert again["fallback"] != "none", again   # the refused task goes to core, not to the same model
+    other = d._route_entry(p.db.task(tasks[1]), "standard", "chat", gm, time.time(), glmwork.KEY, glm=True)
+    assert other["fallback"] == "model_missing", other
+    refused_run(tasks[1])   # a run already started on it is refused too
+    route.write_served(p.state, "chat", True, "HTTP 200", [gm], time.time())   # yet /models lists it
+    d.check_route_models()   # one routed run tries it again, never on a task it already failed
+    assert route.held(p.db, d.cfg, "standard", gm) == ""
+    for tid in tasks:
+        again = d._route_entry(p.db.task(tid), "standard", "chat", gm, time.time(), glmwork.KEY, glm=True)
+        assert again["fallback"] == "rerun", again
+    fresh = p.db.add_task("work2", "", kind="work", tier="standard", priority=3, budget_usd=8.0, labels=[])
+    assert d._route_entry(p.db.task(fresh), "standard", "chat", gm, time.time(), glmwork.KEY, glm=True)["fallback"] == "none"
+    refused_run(fresh)
+    assert route.held(p.db, d.cfg, "standard", gm) == gm
+    light = p.db.add_task("work3", "", kind="work", tier="light", priority=3, budget_usd=8.0, labels=[])
+    refused_run(light, "light")   # another tier the route sends to it
+    glm = d.cfg["route"]["glm_work"]
+    d.cfg["route"]["glm_work"] = {**glm, "on": False}
+    d.check_route_models()
+    assert route.holds(p.db) == {}, "the route no longer sends runs to it"
+    d.cfg["route"]["glm_work"] = glm
+    again = p.db.add_task("work4", "", kind="work", tier="standard", priority=3, budget_usd=8.0, labels=[])
+    refused_run(again)
+    got = sent()
+    assert [k for k, _ in got] == ["route-model-missing:chat|" + gm], "one notice per provider model"
+    assert "route.glm_work.model" in got[0][1] and "tiers.standard" not in got[0][1], got
 
 
 def test_a_model_missing_hold_ends_when_the_endpoint_lists_it_or_the_config_changes(env, monkeypatch, mock_chat):
