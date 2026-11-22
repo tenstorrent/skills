@@ -124,9 +124,10 @@ def holders(db, t: dict, unmet: list, now: float) -> list[tuple[int, str]]:
     user = plangate.user_holders(db, t) | (set(refs) if when and convgate.user_word(d.get("why")) else set())
     out = [(r, f"start_when landed:#{r}") for r in refs if r not in user]
     out += [(d, "depends_on") for d in unmet if isinstance(d, int) and d not in user]
-    # The label holds only while the daemon's dispatch holds it (its note): a hold it released, with no
-    # branch or worktree clash left, is no lane wait.
-    if (h := lineage_hold(t)) is not None and (t["blocked_reason"] or "").startswith(f"{BRANCH_HELD_NOTE}{h},"):
+    # The label holds only while the daemon's dispatch holds it (its note) and the holder is live: a hold
+    # it released, with no branch or worktree clash left, is no lane wait.
+    if ((h := lineage_hold(t)) is not None and (t["blocked_reason"] or "").startswith(f"{BRANCH_HELD_NOTE}{h},")
+            and (row := db.task(h)) and row["status"] in ("queued", "running", "waiting")):
         out.append((h, "waits_end"))
     # A failed, cancelled or missing holder is a dead wait, raised on its own (dead_dependency,
     # missing_task_ref, deferral_probe_broken).

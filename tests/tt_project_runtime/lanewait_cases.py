@@ -180,6 +180,19 @@ def test_a_lane_wait_past_the_threshold_raises_one_event_cleared_on_start(env, h
     assert not p.db.kv(lanewait.KEY, {})
 
 
+def test_a_stale_lineage_note_naming_a_finished_holder_raises_no_lane_wait(env):
+    """A dispatch path that skips the note clear (disk guard, review precheck) leaves the old
+    'held: waits for #h' note: a done holder is no lane wait."""
+    from ttp import lanewait
+    p = make(env)
+    holder = p.db.add_task("the holder", "s", kind="code", status="done")
+    dep = p.db.add_task("the waiter", "s", kind="code", status="queued", labels=[f"waits_end:{holder}"])
+    p.db.update_task(dep, blocked_reason=f"held: waits for #{holder}, which is using branch x")
+    p.db.x("UPDATE tasks SET created=? WHERE id=?", (time.time() - 3 * 3600, dep))
+    lanewait.check(p.db, {"waiting": {"lane_wait_event_s": 600}}, time.time())
+    assert not p.db.q("SELECT * FROM events WHERE kind='lane_wait'")
+
+
 def test_a_lane_wait_under_the_threshold_or_off_raises_nothing(env):
     from ttp import lanewait
     p = make(env)
