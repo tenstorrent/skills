@@ -3001,3 +3001,39 @@ def test_a_lineage_hold_lasts_only_while_a_real_branch_or_worktree_clash_remains
     b = p.db.add_task("redo b", "s", kind="code", tier="light", origin="user",
                       labels=[f"continues:{old}", f"{worktree.LINEAGE_HOLD}{a}"])
     assert d._branch_clash(p.db.task(b), {}) == (a, f"worktree {p.worktrees / f't{old}'}")
+
+
+def test_a_fix_task_on_an_ended_batch_s_branch_is_not_held_by_a_member_left_running(env):
+    # A batch run ended and its lead waits in review; its member stays 'running' (no worker) until the
+    # batch lands. A coordinator-added fix on the batch branch must start: held behind that member, it
+    # would deadlock (the batch lands only after the fix). While the lead's run is live, it still holds.
+    from ttp import batchrun, coordinator as coord, daemon as dm
+    p = make(env)
+    lead = p.db.add_task("lead", "s", kind="code", tier="light", origin="coordinator")
+    mem = p.db.add_task("member", "s", kind="code", tier="light", origin="coordinator")
+    batchrun.record(p.db, p.db.task(lead), [p.db.task(mem)], "ttp/t-batch", p.config())
+    p.db.update_task(lead, status="review", branch="ttp/t-batch")
+    p.db.update_task(mem, status="running", branch="ttp/t-batch")
+    assert coord.apply(p, [{"type": "task_add", "kind": "code", "title": "fix the batch", "priority": 1,
+                            "spec": "urgent: now\npr_branch: ttp/t-batch"}]) == []
+    fix = p.db.one("SELECT * FROM tasks WHERE title='fix the batch'")
+    d = dm.Daemon(p.base)
+    assert d._branch_clash(fix, d._live_claims()) is None
+    p.db.update_task(lead, status="running")
+    assert d._branch_clash(fix, d._live_claims()) is not None, "a live batch run still holds its branch"
+
+
+def test_a_branch_held_note_is_cleared_once_the_task_is_held_for_another_reason(env, monkeypatch):
+    # The branch clash ended but the disk guard now holds the task: its old 'waits for #N' note goes.
+    from ttp import daemon as dm
+    p = make(env)
+    _no_events(p)
+    p.db.x("UPDATE tasks SET status='done'")
+    tid = p.db.add_task("was held", "s", kind="code", tier="light", origin="user")
+    p.db.update_task(tid, blocked_reason=f"{dm.BRANCH_HELD_NOTE}1, which is using branch feat/x; it starts once #1 ends")
+    _stub_runner(monkeypatch)
+    d = dm.Daemon(p.base)
+    monkeypatch.setattr(d, "_disk_holds", lambda t: True)
+    d.dispatch()
+    got = p.db.task(tid)
+    assert got["status"] == "queued" and not (got["blocked_reason"] or "").startswith(dm.BRANCH_HELD_NOTE), got
