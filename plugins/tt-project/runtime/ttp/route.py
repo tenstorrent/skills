@@ -245,8 +245,8 @@ def _chosen(cfg: dict) -> list[tuple[str, str]]:
     own = isinstance(g := (cfg.get("route") or {}).get(glmwork.KEY), dict) and str(g.get("model") or "").strip()
     at = "route.glm_work.model" if own else "route.code_sonnet.glm.model"   # glmwork.model's order
     out = [(at, glm["model"])] if glm and glm["provider"] == TO else []
-    if arm and arm["provider"] == TO:   # on a project the GLM work route covers, the arm runs its model
-        out.append((at if arm["glm_work"] else "route.code_sonnet.glm.model", arm["model"]))
+    if arm and arm["provider"] == TO and not arm["glm_work"]:   # else the arm runs the GLM work route's model
+        out.append(("route.code_sonnet.glm.model", arm["model"]))
     return out + [(f"providers.{TO}.dispatch.options.{k}.model", str(o["model"]))
                   for k, o in modelpick.options(cfg).items() if modelpick.routed(cfg, k)]
 
@@ -614,8 +614,8 @@ def fell_back_before(db, task_id: int, skip: tuple = ()) -> int | None:
                   "ORDER BY id DESC", (task_id, f'%"{KEY}"%')):
         e = of(r["note"]) or {}
         fell = e.get("fallback")
-        if (fell in (*RUN_CAUSES, BOUNCE) and fell not in skip or fell == "model_missing"
-                and time.time() - float(r["started"] or 0) < MISSING_TASK_S) and r["provider"] == e.get("to"):
+        if ((fell in (*RUN_CAUSES, BOUNCE) and fell not in skip) or (fell == "model_missing"
+                and time.time() - float(r["started"] or 0) < MISSING_TASK_S)) and r["provider"] == e.get("to"):
             return int(r["id"])
     return None
 
