@@ -280,8 +280,8 @@ def timeout_s(cfg: dict, tier: str, rule: int | None = None) -> float | None:
 def core_why(db, cfg: dict, task: dict, tier: str, picked: dict | None, to: dict | None, floor: str = "") -> str:
     """Why a worker run no route took starts on the core provider (the run note's CORE_WHY, which the share
     report reads), model-free: for a route `to` the run may not take, the keep-core rule (glmwork.keeps_core's
-    names) or the conclusion floor (`floor`, the model it skipped); else a code task with no live arm, or no
-    route for its tier (the GLM work route off for the project)."""
+    names) or the conclusion floor (`floor`, the model it skipped); else a code task with no live arm, or the
+    GLM work route off for the project (with it on, _route takes the GLM route first)."""
     from . import codearm, glmwork
     if to and not eligible(task, picked):
         return glmwork.keeps_core(db, cfg, task, tier, None, picked) or "not eligible"
@@ -289,7 +289,7 @@ def core_why(db, cfg: dict, task: dict, tier: str, picked: dict | None, to: dict
         return f"conclusion floor: kept off {floor}"
     if task.get("kind") == "code":
         return "code arm not chosen" if codearm.settings(cfg) else "code arm off"   # the daemon logs why
-    return "no route" if glmwork.settings(cfg) else "glm_work off"
+    return "glm_work off"
 
 
 def eligible(task: dict, picked: dict | None) -> bool:

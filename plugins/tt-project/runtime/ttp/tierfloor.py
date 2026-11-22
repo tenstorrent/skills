@@ -58,6 +58,7 @@ NOTE_PREFIX = "[tier floor]"
 SOURCE = "conclusion_floor"   # tasks.tier_source
 KINDS = ("question", "plan")
 LINE = re.compile(r"(?im)^[ \t>*#\d.)-]*conclusion\s*:")
+CONCLUSION_LINE = "conclusion: line"   # reasons() for a spec's `conclusion:` line
 VERDICT = re.compile(r"(?i)\b(?:verdicts?|pass/fail|k/n(?:\s+table)?|cell\s+results?|results?\s+per\s+cell)\b")
 DEVICE_SPEC = re.compile(r"(?i)\b(?:glx_reset|tt-smi|power[- ]cycl\w*|soak(?:s|ed|ing)?|device\s+(?:jobs?|runs?|tests?)|"
                          r"reboot(?:s|ed|ing)?|reset(?:s|ting)?\s+(?:the\s+|a\s+|each\s+|every\s+)?"
@@ -135,7 +136,7 @@ def reasons(task: dict, cfg: dict | None = None) -> list[str]:
     if task.get("reply_chat"):
         out.append("answers a chat")
     if LINE.search(spec):
-        out.append("conclusion: line")
+        out.append(CONCLUSION_LINE)
     if task.get("kind") == "review":
         out.append("review verdict")
     elif VERDICT.search(spec) and not out:

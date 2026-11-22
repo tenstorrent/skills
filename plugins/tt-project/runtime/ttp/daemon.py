@@ -23558,12 +23558,24 @@ def _route_cause(end: str, exit_info: dict, usage, run_dir: Path) -> str:
     return (str(usage.error or "") or f"exit {exit_info.get('rc')}")[:200]
 
 
+FOLLOWUP_ALIASES = ("follow_ups", "follow-ups")   # spellings a hand-off may use for `followups`
+
+
 def _read_result(path: Path) -> dict | None:
+    """A run's JSON file as a dict, or None; a hand-off's `follow_ups` or `follow-ups` list is merged into
+    `followups` (no duplicates), so a fix written under another spelling is not lost."""
     try:
         data = json.loads(path.read_text())
-        return data if isinstance(data, dict) else None
     except (OSError, ValueError):
         return None
+    if not isinstance(data, dict):
+        return None
+    for key in FOLLOWUP_ALIASES:
+        extra = data.pop(key, None)
+        if isinstance(extra, list):
+            got = data["followups"] if isinstance(data.get("followups"), list) else []
+            data["followups"] = got + [f for f in extra if f not in got]
+    return data
 
 
 def _cred_changed(run_dir: Path) -> list:

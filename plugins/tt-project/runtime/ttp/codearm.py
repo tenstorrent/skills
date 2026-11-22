@@ -249,11 +249,12 @@ def user_arm(db, task: dict) -> tuple[int, str]:
 
 def stays(db, cfg: dict, task: dict, tier: str, picked: dict | None = None, policy: list | None = None) -> str:
     """Why `task` stays on Claude now ('' when the arm may take it): the Sonnet route's own stays
-    (runclass.code_route), a resource (not on device work the glm_device route takes), a protected class, a `conclusion:` line, the force line, a user order,
+    (runclass.code_route), a resource (not on device work the glm_device route takes), a protected class (a `conclusion:` line alone is
+    none), the force line, a user order,
     a policy-class spec (policyfiles.task_reason against the project's list `policy`, model-free), an unsupported
     harness. A task the user ordered onto the arm (user_arm) skips the user-order and policy-class checks. A project
     the GLM work route covers has no policy-class stay: GLM writes those files too and the review checks them."""
-    from . import deviceplan, glmwork, policyfiles, route, runclass, urgent
+    from . import deviceplan, glmwork, policyfiles, route, runclass, tierfloor, urgent
     ordered = user_arm(db, task)[0]
     if (task.get("kind") or "") != "code":
         return "not_code"
@@ -277,15 +278,14 @@ def stays(db, cfg: dict, task: dict, tier: str, picked: dict | None = None, poli
         return why
     if FORCE.search(str(task.get("spec") or "")):
         return "forced_claude"
-    if CONCLUSION.search(str(task.get("spec") or "")):
-        return "conclusion"
     if JUDGMENT.search(str(task.get("spec") or "")):
         return "judgment"
     if not ordered and (task.get("origin") == "user" or urgent.user_ordered(task)):
         return "user_ordered"
     try:
-        if why := route.protected(db, cfg, task, tier):
-            return why
+        if (why := route.protected(db, cfg, task, tier)) and not (
+                why == "conclusion" and tierfloor.reasons(task, cfg) == [tierfloor.CONCLUSION_LINE]):
+            return why   # a `conclusion:` line alone keeps nothing: the coordinator reads the hand-off, Opus reviews it
     except Exception:   # in doubt, Claude
         return "unchecked"
     if policy and not ordered and (why := policyfiles.task_reason(policy, task)):

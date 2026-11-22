@@ -47,15 +47,15 @@ def warn_after(cfg: dict) -> float:
 
 def reason(db, when: str, rc, out: str = "") -> str:
     """Why the gate is still false, in a few words: for `landed:#<id>` (or `ttp landed --task <id>`)
-    the producer's state, else the probe's last output line, else what its exit code means."""
+    the producer's state, else the probe's last output line (its last 120 characters), else what its exit code means."""
     refs = landed.task_refs(when)
     if refs and refs[0].isdigit() and (t := db.task(int(refs[0]))):
         if gone := landed.abandoned(db, t["id"]):
             return f"producer #{t['id']} abandoned ({gone[0][:80]})"
         return f"producer #{t['id']} {_STATES.get(t['status'], t['status'])}"
     last = next((ln.strip() for ln in reversed((out or "").splitlines()) if ln.strip()), "")
-    if last:
-        return last[:120]
+    if last:   # its tail: a progress counter ends the line (progress.note_probe)
+        return last if len(last) <= 120 else "…" + last[-119:]
     return {1: "not yet", 75: "busy", 255: "host unreachable"}.get(rc, rc if isinstance(rc, str) else f"exit {rc}")
 
 

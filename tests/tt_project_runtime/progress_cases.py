@@ -502,6 +502,55 @@ def test_progress_probe_rising_count_is_progress_not_a_stall(env):
     assert progress.load(p.db)["probes"][str(tid)]["first"] == now - 6000 + 23 * 180
 
 
+def test_progress_probe_counter_at_the_end_of_a_long_line_still_counts(env):
+    from ttp import progress, startgate
+    p = make(env)
+    probe = "ttp wakes --compared"
+    long = "runs still pending on the queue " * 10 + "progress: {}/50"   # over 300 characters
+    assert startgate.reason(p.db, probe, 1, "first line\n" + long.format(7)).endswith("progress: 7/50")
+    tid = _prog_waiting(p, "Report at 50", probe)
+    now = time.time()
+    cur = lambda t: probe if t["id"] == tid else None
+    got = _prog_counts(p, tid, probe, cur, range(1, 25), now - 6000, line=long)
+    assert not any(got) and progress.load(p.db)["probes"][str(tid)]["n"] == 1
+
+
+def test_progress_probe_no_turn_can_end_is_no_stall_unless_it_is_broken(env):
+    """A wait on a holds folder, a rollout flag or a PR's state says a plain not yet without a stall; the
+    same probe exiting 2 (broken) still raises one."""
+    from ttp import progress
+    p = make(env)
+    now = time.time()
+    for probe in ("test ! -e ~/.tt-project/holds/box-a", "ttp rollout on new-flag", "ttp rollout status x | grep -q on",
+                  "gh pr view 12 --json state -q .state | grep -q MERGED || exit 1"):
+        tid = _prog_waiting(p, f"Waits {probe}", probe)
+        cur = lambda t, tid=tid, probe=probe: probe if t["id"] == tid else None
+        assert not any(_prog_counts(p, tid, probe, cur, [5] * 24, now - 6000)), probe
+        for i in range(24):
+            progress.note_probe(p.db, tid, probe, 2, "syntax error", now + 1 + i * 180)
+        got = progress.check(p.db, {}, p.state, now + 24 * 180, current_probe=cur)
+        assert f"probe:#{tid}" in [k for e in got for k in e["keys"]], probe
+
+
+def test_progress_probe_on_a_machine_in_a_known_outage_waits_for_its_repair(env):
+    from ttp import machine_ledger as ml, machines, progress
+    p = make(env)
+    machines.add("box-a")
+    probe = "ssh box-a test -e /tmp/done || exit 1"
+    tid = _prog_waiting(p, "Waits on box-a", probe)
+    now = time.time()
+    cur = lambda t: probe if t["id"] == tid else None
+    ml.set_outage("box-a", "hardware repair", "user", "2d", now=now - 7000)
+    assert not any(_prog_counts(p, tid, probe, cur, [5] * 24, now - 6000))
+    assert progress.load(p.db)["probes"][str(tid)]["outage"] is True
+    ml.clear_outage("box-a")
+    t1 = now + 60
+    progress.note_probe(p.db, tid, probe, 1, "not yet", t1)
+    assert not progress.check(p.db, {}, p.state, t1, current_probe=cur)   # the clock starts again at the repair
+    rec = progress.load(p.db)["probes"][str(tid)]
+    assert "outage" not in rec and rec["first"] == t1 and rec["n"] == 0
+
+
 def test_progress_probe_flat_or_falling_count_stalls_as_usual(env):
     p = make(env)
     probe = "ttp wakes --compared"

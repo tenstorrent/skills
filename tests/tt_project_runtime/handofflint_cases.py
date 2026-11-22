@@ -170,3 +170,15 @@ def test_the_hand_off_lint_asks_the_remote_of_the_repository_the_task_worked_in(
     tid2, _ = task_in_second("ttp/t2-unpublished")
     (note,) = _code_hand_off(p, env, tid2, push_it("ttp/t2-unpublished"))
     assert "hand-off lint:" in note and "ttp/t2-unpublished" in note
+
+
+def test_the_result_reader_merges_follow_ups_spellings_into_followups(tmp_path):
+    from ttp import daemon as dmod
+    fix = {"title": "Fix review #2: stale test", "kind": "code", "pr_branch": "ttp/t1-x", "spec": "update the assertion"}
+    other = {"title": "upstream: a note", "kind": "work", "spec": "s"}
+    path = tmp_path / "result.json"
+    path.write_text(json.dumps({"status": "done", "summary": "s", "follow_ups": [fix], "follow-ups": [fix, other]}))
+    got = dmod._read_result(path)
+    assert got["followups"] == [fix, other] and "follow_ups" not in got and "follow-ups" not in got
+    path.write_text(json.dumps({"status": "done", "followups": [other], "follow_ups": [fix, other]}))
+    assert dmod._read_result(path)["followups"] == [other, fix]

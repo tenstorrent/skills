@@ -291,6 +291,11 @@ BAD_RUNS = ("failed", "timeout", "stalled")
 # a push, CI, another task landing, another project's reply, an upstream fix, a time.
 OWN_WAIT_RE = re.compile(r"detach --check|checks --result|push --result|\bttp ci\b|ack-wait|landed:|ttp landed|"
                          r"upstream --fixed|^\s*test \"\$\(date")
+# A wait no model turn ends while it says a plain not yet (NO_TURN_RCS): a holds folder the user clears, a
+# rollout flag, a PR's state. A user marker file is userpause.user_gated. A broken probe still reports.
+NO_TURN_RE = re.compile(r"(?:^|[\s/'\"])holds/|\bttp\s+rollout\s+(?:on|status)\b|"
+                        r"\bgh\s+pr\s+(?:view|checks|status)\b|\bgh\s+api\s+\S*/pulls/\d+")
+NO_TURN_RCS = (1, 75)
 # A wait only the user ends: the hand-off's wait_kind (unblock.USER_WAIT_KINDS), or a waiting_for or
 # blocked_reason naming the user on a task that owns an open obligation.
 NAMES_USER_RE = re.compile(r"\buser(?:'s|’s)?\b(?!-(?:facing|space|land|agent))", re.I)
@@ -395,7 +400,7 @@ def note_probe(db: DB, tid: int, probe: str, rc: Any, reason: str, now: float | 
     if rec and rec.get("probe") == probe and rec.get("after") == after and now <= float(rec["last"]):
         return   # this verdict is counted already
     norm = f"{rc}:{_norm(_clip(reason))}"   # `same` counts identical answers in a row (absentwait)
-    got = _PROGRESS_RE.search(_clip(reason))
+    got = _PROGRESS_RE.search(" ".join(str(reason or "").split()))   # unclipped: the counter ends the line
     done = float(got.group(1)) if got else None
     if rec and rec.get("probe") == probe and rec.get("after") == after and done is not None \
             and done > float(rec.get("done") if rec.get("done") is not None else done):
@@ -622,6 +627,15 @@ def user_hold(db: DB, cfg: dict | None, t: dict, res: dict, probe: str, root=Non
     return _user_wait(db, t, res) or userpause.user_gated(probe, cfg, root) or _user_paused(db, cfg, probe)
 
 
+def _outage_hosts(probe: str, outages: dict) -> list[str]:
+    """The machines `probe` names (its ssh target or `--host`, or a `ttp lock --probe` resource) that have
+    an open known outage in the machine ledger (a resource on it counts: `<alias>-...`) (`outages`: machine_ledger.outages)."""
+    from . import locks, netwait
+    names = {n for h in [*netwait.hosts(probe), *locks.probe_resources(probe)]
+             for n in (h, h.rsplit("@", 1)[-1], h.rsplit("@", 1)[-1].split(".")[0])}
+    return sorted(a for a in outages if any(n == a or n.startswith((a + "-", a + ":")) for n in names))
+
+
 def probe_stalls(db: DB, s: dict, st: dict, now: float, current_probe: Callable[[dict], str | None],
                  cfg: dict | None = None, gone: set | None = None, harness=None, root=None) -> list[dict]:
     """Probe stalls; adds to `gone` the raised keys whose count was dropped as no longer valid. `harness`:
@@ -629,6 +643,11 @@ def probe_stalls(db: DB, s: dict, st: dict, now: float, current_probe: Callable[
     `root`: the project root, where probes run (a relative user marker is read from there)."""
     out = []
     paused, trouble = db.paused_resources(), db.kv("resource_trouble") or {}
+    try:
+        from . import machine_ledger
+        outages = machine_ledger.outages(now)
+    except Exception:
+        outages = {}   # an unreadable ledger is no outage
     for k, rec in list(st["probes"].items()):
         t = db.task(int(k))
         if not t or t["status"] in TERMINAL_TASK_STATES or t["status"] == "running" or current_probe(t) != rec["probe"]:
@@ -656,8 +675,15 @@ def probe_stalls(db: DB, s: dict, st: dict, now: float, current_probe: Callable[
             if gone is not None:
                 gone.add(f"stall:probe:#{k}")
             continue
-        if rec.pop("held", None):
-            rec.update(first=now, n=0)   # the user's pause lifted: the clock starts again from the lift
+        if rec.get("rc") in NO_TURN_RCS and NO_TURN_RE.search(rec["probe"]):
+            continue   # a holds folder, a rollout flag or a PR's state: no turn ends it, so not yet is no stall
+        if _outage_hosts(rec["probe"], outages):
+            rec["outage"] = True   # a machine in a known outage: its repair ends it (the ledger owns the outage)
+            if gone is not None:
+                gone.add(f"stall:probe:#{k}")
+            continue
+        if any([rec.pop("held", None), rec.pop("outage", None)]):
+            rec.update(first=now, n=0)   # the user's pause or the outage ended: the clock starts again from then
         if (opened := userpause.gate_opened(rec["probe"], cfg, root, now)) and opened > float(rec["first"]):
             rec.update(first=opened, n=0)   # the user's marker appeared: the live gate is timed from then
         if not s["probe_n"] or OWN_WAIT_RE.search(rec["probe"]) or ackwait.is_probe(rec["probe"], cfg, harness) \

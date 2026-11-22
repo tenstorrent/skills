@@ -37,7 +37,7 @@ def test_code_arm_coin_is_seeded_and_follows_the_share():
     assert [codearm.coin(i, 0.5, "a") for i in range(40)] != [codearm.coin(i, 0.5, "b") for i in range(40)]
 
 
-def test_code_arm_keeps_resources_conclusions_forces_pins_devices_and_judgment_on_claude(env):
+def test_code_arm_keeps_resources_chat_conclusions_forces_pins_devices_and_judgment_on_claude(env):
     from ttp import codearm
     p = make(env)
     cfg = _ca_cfg()
@@ -45,7 +45,9 @@ def test_code_arm_keeps_resources_conclusions_forces_pins_devices_and_judgment_o
     t = _ca_task(p)
     p.db.x("UPDATE tasks SET labels=? WHERE id=?", (json.dumps(["resource:box1"]), t["id"]))
     assert codearm.stays(p.db, cfg, p.db.task(t["id"]), "standard") == "resources"
-    assert codearm.stays(p.db, cfg, _ca_task(p, "fix it\nconclusion: the verdict"), "standard") != ""
+    # A conclusion line alone keeps nothing (the coordinator reads the hand-off); one a chat reads stays.
+    assert codearm.stays(p.db, cfg, _ca_task(p, "fix it\nconclusion: the verdict"), "standard") == ""
+    assert codearm.stays(p.db, cfg, _ca_task(p, "fix it\nconclusion: the verdict", reply_chat="c1"), "standard") != ""
     assert codearm.stays(p.db, cfg, _ca_task(p, "fix it\ncode_arm: claude"), "standard") == "forced_claude"
     for spec in ("decide how to batch. There are no measurements that settle it. Weigh speed against reverts.",
                  "pick a lock design; the trade-off is latency", "choose between per-repo and per-area batches"):
@@ -1568,7 +1570,7 @@ def test_a_covered_follow_up_of_a_claude_arm_change_is_decided_afresh_except_in_
     held = _ca_task(p)   # the Claude holdout keeps its whole lineage there
     p.db.set_kv(f"{codearm.ARM_KV}{held['id']}", {"arm": "claude", "why": "holdout: seeded coin", "seed": "s", "ts": 1.0})
     got = follow(held, covered)
-    assert got["arm"] == "claude" and "lineage" in got["why"]
+    assert got["arm"] == "claude" and got["why"] == f"holdout: seeded coin (follows #{held['id']})"
     again = _ca_task(p)   # outside the work route a lineage always keeps its parent's arm
     p.db.set_kv(f"{codearm.ARM_KV}{again['id']}", {"arm": "claude", "why": "conclusion", "seed": "s", "ts": 1.0})
     assert follow(again, plain)["arm"] == "claude"
