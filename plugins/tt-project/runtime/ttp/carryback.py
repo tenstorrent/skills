@@ -18,7 +18,7 @@ After the one send-back the review hold (reviewhold) handles what is still carri
 from __future__ import annotations
 
 from . import reviewhold
-from .chaincap import follows_id, waits_landing
+from .chaincap import waits_landing
 from .db import continues_id, deferral, dependency_ids, review_subject
 from .worktree import carried_branch
 
@@ -35,8 +35,7 @@ def declared(task: dict, prev: dict, tid: int) -> bool:
 
 def reworks(db, task: dict, tid: int) -> bool:
     """Whether `task` re-works task `tid`'s own change: down its `continues:` chain it reaches `tid` or
-    a review of it, or it delivers onto `tid`'s branch (`pr_branch:`). A `follows:` hop to a done code
-    task counts as one: a follow-up carries on that task's head, and with it the change it re-worked."""
+    a review of it, or it delivers onto `tid`'s branch (`pr_branch:`)."""
     other = db.task(tid)
     if other and other.get("branch") and carried_branch(task) == other["branch"]:
         return True
@@ -46,10 +45,7 @@ def reworks(db, task: dict, tid: int) -> bool:
         if t["id"] == tid or (t.get("kind") == "review"
                               and tid in {review_subject(t), *(d for d in dependency_ids(t) if isinstance(d, int))}):
             return True
-        c = continues_id(t)
-        if c is None and (f := follows_id(t)) and (ft := db.task(f)) and ft["kind"] == "code" and ft["status"] == "done":
-            c = f
-        t = db.task(c) if c else None
+        t = db.task(c) if (c := continues_id(t)) else None
     return False
 
 

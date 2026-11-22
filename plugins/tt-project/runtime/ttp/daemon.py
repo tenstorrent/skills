@@ -13068,8 +13068,6 @@ class Daemon:
             if why == "held":
                 if task["id"] in ctx["branch"]:
                     self._note_branch_hold(task, ctx["branch"][task["id"]])
-                elif (task["blocked_reason"] or "").startswith(BRANCH_HELD_NOTE):   # held now for another reason
-                    db.update_task(task["id"], blocked_reason=None)
                 continue
             # A paused resource holds its tasks in the queue, attempts untouched, until it resumes.
             note = task["blocked_reason"] or ""
@@ -13552,17 +13550,13 @@ class Daemon:
         mine, why = worktree.claims(self.p, task), None
         rec = batchrun.members_of(db, task["id"])
         mates = {rec["lead"], *rec.get("members", [])} if rec else set()   # one batch run shares its branch
-        # A member whose lead's run ended (in review or pushing) stays 'running' with no worker until the
-        # batch lands: it holds no branch, else a fix on that branch waits for a batch that waits for it.
-        idle = lambda tid: bool((b := batchrun.members_of(db, tid)) and tid != b["lead"]
-                                and (lt := db.task(b["lead"])) and lt["status"] in ("review", "pushing"))
         for tid, theirs in sorted(live.items()):
-            if tid != task["id"] and tid not in mates and (what := worktree.clash(mine, theirs)) and not idle(tid):
+            if tid != task["id"] and tid not in mates and (what := worktree.clash(mine, theirs)):
                 why = (tid, what)
                 break
         if why is None and (hid := worktree.lineage_hold(task)) and (h := db.task(hid)) \
                 and h["status"] in ("queued", "running", "waiting") \
-                and (what := worktree.clash(mine, worktree.claims(self.p, h))) and not idle(hid):
+                and (what := worktree.clash(mine, worktree.claims(self.p, h))):
             why = (hid, what)
         return why
 

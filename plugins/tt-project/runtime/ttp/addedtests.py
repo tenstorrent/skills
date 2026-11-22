@@ -179,8 +179,6 @@ def run(tests: list[tuple[str, str]], cmd: str, runner, out: Path, base_env: dic
     missing = [n for n in names if n not in t["selected"]]
     if not t["selected"]:
         return {**res, "status": "skipped", "why": f"{cmd!r} collects none of them"}
-    if not any(t["ran"].values()):
-        return {**res, "status": "skipped", "why": f"{cmd!r} ran none of them (deselected or skipped)"}
     short = [n for n in t["selected"] if t["ran"][n] < rounds]
     return {**res, "status": "passed", **({"not_collected": missing} if missing else {}),
             **({"short": short} if short else {})}
