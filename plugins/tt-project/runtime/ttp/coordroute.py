@@ -78,6 +78,7 @@ PROMISE_SOON_S = 3600          # an open promise due within this long (or overdu
 IDLE_KINDS = frozenset({"stall", "steer_unread", "run_cap"})   # events an idle (noop or look only) answer cannot settle
 DECLINED_H = 12.0              # how far back the lane is shown its own proposals the coordinator did not take
 DECLINED_MAX = 12
+SHADOW_KEEP_DAYS = 14.0   # pair files kept (report() reads 7 days by default)
 _ORDERISH = re.compile(r"(?i)\b(?:order|promise|o\d+|user msg|urgent)\b")
 _PINS = ("provider", "model", "effort", "pin_required")
 
@@ -300,8 +301,7 @@ def _event_reasons(db, e, promises=()) -> list[str]:
                 out.append(f"urgent task #{tid}")
             if t["reply_chat"]:
                 out.append(f"task #{tid} answers a chat")
-            if kind == "task_done" and any(int(tid) in {int(x) for x in obligations._owner_ids(o)}
-                                           for o in promises or ()):
+            if kind == "task_done" and any(int(tid) in obligations._owner_ids(o) for o in promises or ()):
                 out.append(f"task #{tid} owns a promise")
     return out
 
@@ -432,13 +432,15 @@ def recent_actions(db, n: int = RECENT_ACTIONS, fmt=None) -> str:
     return "\n".join(out) if rows else ""
 
 
-def declined_proposals(state_dir, now: float | None = None, hours: float = DECLINED_H, n: int = DECLINED_MAX) -> str:
+def declined_proposals(state_dir, now: float | None = None, hours: float = DECLINED_H, n: int = DECLINED_MAX,
+                       fmt=None) -> str:
     """The lane's own recent shadow proposals the coordinator did not take on the same wake, so it does not
-    propose them again ("" when none)."""
+    propose them again ("" when none). Actions the lane may not take (out_of_lane) were refused, not declined."""
     folder = Path(state_dir) / SHADOW_DIR if state_dir else None
     if not folder or not folder.is_dir():
         return ""
     now = time.time() if now is None else now
+    fmt = fmt or (lambda t: time.strftime("%H:%M", time.localtime(t)))
     rows = []
     for path in sorted(folder.glob("*.json")):
         if path.stat().st_mtime < now - hours * 3600:  # written last at its compare, never before its ts
@@ -449,13 +451,13 @@ def declined_proposals(state_dir, now: float | None = None, hours: float = DECLI
             continue
         taken = _keys(rec.get("opus") or {})
         for a in (rec.get("glm") or {}).get("actions") or []:
-            if a.get("type") not in ("noop", "look") and (a["type"], a["target"]) not in taken:
+            if a.get("type") not in ("noop", "look") and not a.get("out_of_lane") and (a["type"], a["target"]) not in taken:
                 rows.append((ts, f"{a['type']} {a['target']}".strip()))
     seen, lines = set(), []
     for ts, text in sorted(rows, reverse=True):
         if text not in seen:
             seen.add(text)
-            lines.append(f"- {time.strftime('%H:%M', time.gmtime(ts))}Z {text}")
+            lines.append(f"- {fmt(ts)} {text}")
     if not lines:
         return ""
     return ("## Earlier lane proposals the coordinator did not take\nDeclined on their wakes: propose one again only "
@@ -472,7 +474,7 @@ def lane_digest(parts: list, whole: list, db, n: int = RECENT_ACTIONS, fmt=None,
     have = {k for k, _ in out}
     out += [(k, full[k]) for k in LANE_VIEWS if k in full and k not in have]
     acts = recent_actions(db, n, fmt)
-    declined = declined_proposals(state_dir, now)
+    declined = declined_proposals(state_dir, now, fmt=fmt)
     return out + ([("recent_actions", acts)] if acts else []) + ([("declined_proposals", declined)] if declined else [])
 
 
@@ -631,12 +633,23 @@ def _wakes(state_dir, since: float, until: float) -> list[dict]:
 def shadow_started(state_dir, opus_run, shadow_run, why_routine, now: float | None = None, needs=()) -> None:
     path = shadow_path(state_dir, opus_run)
     path.parent.mkdir(parents=True, exist_ok=True)
+    _prune(path.parent, time.time() if now is None else now)
     rec = read_dict(path)
     rec.update({"opus_run": int(opus_run), "shadow_run": shadow_run, "ts": time.time() if now is None else now,
                 "routine_why": why_routine})
     if needs:
         rec["needs"] = list(needs)
     _write(path, rec)
+
+
+def _prune(folder: Path, now: float) -> None:
+    """Drops pair files last written over SHADOW_KEEP_DAYS ago, so the folder stays bounded."""
+    for old in folder.glob("*.json"):
+        try:
+            if old.stat().st_mtime < now - SHADOW_KEEP_DAYS * 86400:
+                old.unlink()
+        except OSError:
+            pass
 
 
 def shadow_side(state_dir, opus_run, side: str, actions, status: str, cost: float = 0.0,

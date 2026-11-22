@@ -415,6 +415,37 @@ def test_selfwatch_leftovers_end_only_a_processes_of_an_ended_task_after_the_gra
     assert leaks.first == {}
 
 
+def test_selfwatch_another_projects_process_with_the_same_task_id_is_never_a_leftover_of_ours(tmp_path):
+    """Two projects share task ids. Another project's driver whose relative TTP_RUN_DIR would resolve inside
+    this project, and a child under it (even one with no project of its own), are that project's: never a
+    leftover of ours. A real leftover of ours with the same task id still is."""
+    from ttp import procowner, selfwatch
+    root = tmp_path / "proc"
+    base = tmp_path / "proj" / "tt-project"
+    other = tmp_path / "other" / "tt-project"
+    base.mkdir(parents=True)
+    rel = {"TTP_TASK": "6183", "TTP_RUN_ID": "5", "TTP_RUN_DIR": "tt-project/state/runs/5"}
+    procs = {100: (1, 100, 50, {"PATH": "/bin"}),
+             4000: (1, 4000, 10, {"TTP_PROJECT": str(other), **rel}),
+             4001: (4000, 4000, 10, {"TTP_PROJECT": str(other), **rel}),
+             4002: (4001, 4000, 10, {"TTP_TASK": "6183", "TTP_RUN_DIR": str(base / "state" / "runs" / "5")}),
+             4100: (1, 4100, 10, {"TTP_PROJECT": str(base), **rel})}
+    _sw_proc(root, 1, procs)
+    cwd = os.getcwd()
+    os.chdir(base.parent)   # where the relative run folder would land inside this project
+    try:
+        assert not procowner.owns_env(base, procs[4000][3])
+        assert not procowner.owns_env(base, {"TTP_TASK": "1", "TTP_RUN_DIR": "tt-project/state/runs/5"})
+        assert procowner.owns_env(base, {"TTP_RUN_DIR": str(base / "state" / "runs" / "5")})
+        w = selfwatch.Watch(base, proc=root, daemon_pid=100, cores=4)
+        w.step(selfwatch.settings(None), 0.0)
+    finally:
+        os.chdir(cwd)
+    assert sorted(selfwatch.leftovers(w.procs, 100)) == [4100]
+    waiting, due = selfwatch.Leaks(root).step(selfwatch.leftovers(w.procs, 100), w.procs, set(), set(), 0.0, 0.0)
+    assert [c["pid"] for c in waiting + due] == [4100]
+
+
 def test_the_daemon_ends_a_leftover_of_a_done_task_once_audits_it_and_spares_live_and_detached_ones(env, monkeypatch, tmp_path):
     import json as _json
     from ttp import leftoverstop, locks, selfaudit, selfwatch

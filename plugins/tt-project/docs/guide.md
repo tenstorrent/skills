@@ -1380,7 +1380,7 @@ must-act item tied to an order or promise, urgent or high-severity item, charter
 heartbeat or compaction wake, or any event kind it cannot place. `mode` is set only from the user's own terminal
 (`ttp config <project> coordinator.routine.mode shadow|on|off`); the `glm_coord` release flag may only turn shadow
 on. In `shadow` every wake stays the coordinator's own and a routine one also runs a lane turn on the chat model
-whose actions are only recorded (`state/coord-shadow/<run>.json`); `ttp stats <project> --coord-routine` compares
+whose actions are only recorded (`state/coord-shadow/<run>.json`, kept 14 days); `ttp stats <project> --coord-routine` compares
 the two (same actions, would escalate, refused, cost). In `on` a routine wake runs as a stateless lane turn under
 the GLM run guard: only `task_add`, `task_update`, `look`, `sweep`, `noop` and owner-only `obligation` apply (no
 pins, deep tier, cancels, wakes, replies, notifies, asks, charter, memory or config changes). Any other action, an

@@ -787,6 +787,41 @@ def test_coordroute_the_lane_sees_its_earlier_proposals_the_coordinator_did_not_
     assert "Earlier lane proposals" in coordroute.LANE_PROMPT
 
 
+def test_coordroute_declined_proposals_skip_refused_actions_and_show_the_digest_time_format(env):
+    """An action the lane may not take was refused, not declined, so it is not listed; times use the lane
+    digest's format (the home zone with its abbreviation), not UTC."""
+    from ttp import coordroute
+    p = make(env)
+    now = time.time()
+    coordroute.shadow_started(p.state, 80, 81, [], now=now - 600)
+    coordroute.shadow_side(p.state, 80, "opus", [], "ok", 1.0)
+    coordroute.shadow_side(p.state, 80, "glm", [{"type": "reply", "chat": "c1", "text": "hi"},
+                                                {"type": "task_add", "title": "Pinned one", "model": "x"},
+                                                {"type": "task_add", "title": "Plain one"}], "ok", 0.1)
+    text = coordroute.declined_proposals(p.state, now, fmt=lambda t: "09:30 PST")
+    assert "- 09:30 PST task_add plain one" in text and "pinned one" not in text and "reply" not in text, text
+    assert "Z " not in text
+    parts = coordroute.lane_digest([], [], p.db, 0, lambda t: "09:30 PST", state_dir=p.state, now=now)
+    assert parts[-1] == ("declined_proposals", text)
+
+
+def test_coordroute_old_shadow_pair_files_are_pruned_and_the_report_still_counts_recent_pairs(env):
+    """A new pair drops files last written over SHADOW_KEEP_DAYS ago; recent pairs stay and report() counts them."""
+    from ttp import coordroute
+    p = make(env)
+    now = time.time()
+    for run in (90, 91):
+        coordroute.shadow_started(p.state, run, run + 1, [], now=now - 3600)
+        coordroute.shadow_side(p.state, run, "opus", [], "ok", 1.0)
+        coordroute.shadow_side(p.state, run, "glm", [], "ok", 0.1)
+    old = coordroute.shadow_path(p.state, 90)
+    gone = now - (coordroute.SHADOW_KEEP_DAYS + 1) * 86400
+    os.utime(old, (gone, gone))
+    coordroute.shadow_started(p.state, 92, 93, [], now=now)
+    assert not old.exists() and coordroute.shadow_path(p.state, 91).exists()
+    assert coordroute.report(p.db, p.state, now=now)["shadow"]["pairs"] >= 1
+
+
 def test_coordroute_an_escalation_where_the_coordinator_acted_out_of_lane_is_counted_right(env):
     """compare() keeps strict agreement, and marks an escalation right when the coordinator's own answer
     needed an action outside the lane (a reply, a memory entry, a promise receipt)."""

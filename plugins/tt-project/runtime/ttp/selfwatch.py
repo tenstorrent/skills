@@ -141,6 +141,8 @@ class Watch:
             env = _environ(self.proc, pid)
             if pid == self.daemon_pid or (ppid in seen and seen[ppid][0] == "daemon" and not (env or {}).get("TTP_RUN_ID")):
                 self.env[(pid, start)] = ("daemon", "daemon", None)
+            elif procowner.foreign_env(self.base, env) or (ppid in seen and seen[ppid][1] == "foreign"):
+                self.env[(pid, start)] = (None, "foreign", None)   # another project's, and so is all under it
             elif procowner.owns_env(self.base, env):
                 self.env[(pid, start)] = ("own", env.get("TTP_RUN_ID") or "other",
                                           env.get("TTP_TASK_ID") or env.get("TTP_TASK"))
@@ -307,17 +309,18 @@ def _uptime(proc: Path) -> float | None:
 
 def leftovers(procs: dict[int, tuple], daemon_pid: int) -> dict[int, dict]:
     """pid -> {pid, start, task, run, ticks} of this project's processes that name a task (owner "own",
-    a numeric TTP_TASK), never the daemon or a process under it. Whether its task still has a live run is
+    a numeric TTP_TASK), never the daemon or a process under it, nor one under another project's process. Whether its task still has a live run is
     decided by the caller (Leaks.step)."""
     out: dict[int, dict] = {}
     for pid, (who, run, task, ppid, _pg, start, ticks, _rss) in procs.items():
         if who != "own" or not str(task or "").isdigit() or pid == daemon_pid:
             continue
-        up, hops = ppid, 0
+        up, hops, foreign = ppid, 0, False
         while up in procs and up != daemon_pid and hops < 64:
+            foreign = foreign or procs[up][1] == "foreign"
             up, hops = procs[up][3], hops + 1
-        if up == daemon_pid and daemon_pid in procs:
-            continue   # a child of the daemon (a push, a check): the daemon's own
+        if foreign or (up == daemon_pid and daemon_pid in procs):
+            continue   # under another project's process (its own), or a child of the daemon (a push, a check)
         out[pid] = {"pid": pid, "start": start, "task": str(task), "run": run, "ticks": ticks, "ppid": ppid}
     return out
 

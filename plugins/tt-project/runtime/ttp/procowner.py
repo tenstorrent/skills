@@ -7,8 +7,9 @@ environment: the full path of its project's harness folder (<project root>/tt-pr
 TTP_TASK, TTP_TASK_ID, TTP_RUN_ID and TTP_RUN_DIR. Task and run ids are numbered per project, so they
 overlap across projects that share a host, and every project's folder has the same name: neither
 proves whose a process is. Code that signals a process it chose by a task or run id, a lock label or
-a checks lane signals it only once `owns` holds: its TTP_PROJECT is this project's folder, or its
-TTP_RUN_DIR lies inside it. Linux only (/proc); elsewhere nothing is provably owned."""
+a checks lane signals it only once `owns` holds: its TTP_PROJECT is this project's folder, or it names
+no other project and its absolute TTP_RUN_DIR lies inside it (a relative one is relative to whichever
+project root the process started in, so it proves nothing). Linux only (/proc); elsewhere nothing is provably owned."""
 from __future__ import annotations
 
 import os
@@ -51,7 +52,7 @@ def owns_env(base, env: dict | None) -> bool:
     if base_of(env.get("TTP_PROJECT")) == mine:
         return True
     run = env.get("TTP_RUN_DIR")
-    if not run:
+    if not run or not os.path.isabs(run) or foreign_env(base, env):
         return False
     try:
         return Path(os.path.realpath(run)).is_relative_to(mine)
