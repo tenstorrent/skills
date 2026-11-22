@@ -1364,19 +1364,23 @@ def pre_tool_use(payload: dict, stage: str = "before") -> tuple[dict | None, Non
         return None, None
     CALL.update(id=str(payload.get("tool_use_id") or payload.get("call_id") or payload.get("id") or ""), stage=stage)
     _refusal.update(logged=False, kind="worker_role")
-    out, _ = _pre_tool_use(payload)
+    made: list[str] = []
+    out, _ = _pre_tool_use(payload, made)
     spec = (out or {}).get("hookSpecificOutput") or {}
-    if spec.get("permissionDecision") == "deny" and not _refusal["logged"]:
+    if spec.get("permissionDecision") not in ("deny", "ask"):
+        from . import glmguard
+        glmguard.keep_tmp(made)   # a GLM run's command about to run: its new temp dir entries are its own
+    elif spec.get("permissionDecision") == "deny" and not _refusal["logged"]:
         _log_refusal(_refusal_command(payload), kind=_refusal["kind"],
                      reason=str(spec.get("permissionDecisionReason") or ""))
     return out, None
 
 
-def _pre_tool_use(payload: dict) -> tuple[dict | None, None]:
+def _pre_tool_use(payload: dict, made: list[str] | None = None) -> tuple[dict | None, None]:
     from . import glmguard, pathguard, untrusted
     if glmguard.glm_run() is not None and (d := glmguard.outward(payload)):   # a draft for Opus, the run goes on
         return _deny(glmguard.drafted(os.environ.get("TTP_RUN_DIR"), d)), None
-    if glmguard.glm_run() is not None and (why := glmguard.tool_refusal(payload)):   # every route to the chat model
+    if glmguard.glm_run() is not None and (why := glmguard.tool_refusal(payload, made=made)):   # every route to the chat model
         # a redirect (the reason and the allowed way; the run goes on) or a hand-back to Opus (no model call)
         return _deny(glmguard.refused(os.environ.get("TTP_RUN_DIR"), why)), None
     if why := _device_plan(payload):

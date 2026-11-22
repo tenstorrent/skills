@@ -605,6 +605,11 @@ def test_sed_in_place_counts_only_its_file_operands_as_targets_never_its_script(
     assert writes("sed -i 's/a/b/w /etc/x' f.py") == {"/etc/x": "sed -i script with a w command"}
     assert writes("sed -i 's|a|b|w /etc/x' f.py") == {"/etc/x": "sed -i script with a w command"}   # any s delimiter
     assert writes("sed -i 's|a w|b|' f.py") == {}   # a w inside the pattern is no command
+    assert writes("sed -i '24s/0:41/0:81/' t.sh && sed -i '35s/.*/  echo C8 wrote its 3 rounds/' t.sh") == {}
+    assert writes("sed -i '1,5s/x/y/w /etc/o' f.py") == {"/etc/o": "sed -i script with a w command"}
+    assert writes(f"cd /srv && sed -i '/warn/d; 2,/wait/!d' {wt}/f.py") == {}   # an address regex is no w command
+    assert writes("sed -i '/x/w /etc/a' f.py") == {"/etc/a": "sed -i script with a w command"}
+    assert writes("sed -i '$w /etc/last' f.py; sed -i 'y/abc/wxy/' f.py") == {"/etc/last": "sed -i script with a w command"}
     assert sidefx.classify_paths("sed -i -f /tmp/s.sed f.py", "/home/u", wt, "")["/tmp/s.sed"][0] == "executed"
     assert writes("cd /srv/o && sed -i s/a/b/ rel.txt") == {"/srv/o/rel.txt": "sed -i target"}
     assert writes("sed 's/a/b/' /srv/c > /srv/d") == {"/srv/d": "redirect target"}   # no -i: reads /srv/c

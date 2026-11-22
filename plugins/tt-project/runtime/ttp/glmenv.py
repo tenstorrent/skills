@@ -55,12 +55,13 @@ FAILING = re.compile(
     r"|^E\s|^\s*[✗✘]|exit(?:ed)? (?:code|status) [1-9]|returned [1-9]")
 
 
-def refusal(command: str, cwd: str = "", run_dir: str = "", env=None) -> str | None:
-    """Why a command of a GLM-arm mini-swe-agent run is refused before it runs, else None."""
+def refusal(command: str, cwd: str = "", run_dir: str = "", env=None, made: list[str] | None = None) -> str | None:
+    """Why a command of a GLM-arm mini-swe-agent run is refused before it runs, else None (`made`: as
+    glmguard.shell_refusal; nothing is written here)."""
     e = os.environ if env is None else env
     cwd = cwd or os.getcwd()
     run_dir = run_dir or str(e.get("TTP_RUN_DIR") or "")
-    why = glmguard.shell_refusal(command, cwd, run_dir, e)
+    why = glmguard.shell_refusal(command, cwd, run_dir, e, made=made)
     if why and glmguard.classify(why)[1] == glmguard.HARMFUL:
         return why
     try:
@@ -127,12 +128,14 @@ class GuardedEnvironment(LocalEnvironment):
         here = cwd or getattr(getattr(self, "config", None), "cwd", "") or os.getcwd()
         if (text := deviceplan.hook_refusal(command, here)) and text.endswith(" first"):   # take the plan or check first
             return {"output": f"refused: {text}", "returncode": 2, "exception_info": ""}
-        if not text and (why := refusal(command, here, run_dir)):
+        made: list[str] = []
+        if not text and (why := refusal(command, here, run_dir, made=made)):
             text = glmguard.refused(run_dir, why)   # the command is never run
         if text and glmguard.hit_reason(run_dir):   # a hand-back to Opus ends the agent loop
             raise Submitted({"role": "exit", "content": text, "extra": {"exit_status": "GuardRefused", "submission": ""}})
         if text:   # a redirect: the reason and the allowed way, and the run goes on
             return {"output": text, "returncode": 2, "exception_info": ""}
+        glmguard.keep_tmp(made)   # about to run: its new temp dir entries are the run's own
         got = super().execute(action, cwd, timeout=timeout)
         if isinstance(got, dict):
             deviceplan.log_step(run_dir, command, got.get("returncode"), str(got.get("output") or ""))

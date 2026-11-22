@@ -496,8 +496,19 @@ def commands(cmd: str, depth: int = 0) -> list[str]:
     return out
 
 
-SED_WRITE_RE = re.compile(r"(?:^|[;{}\n/\d$])\s*[wW]"   # a `w` command, or an `s` flag after any delimiter
-                          r"|s([^\w\s\\])(?:\\.|(?!\1).)*\1(?:\\.|(?!\1).)*\1[gpiImMe\d]*[wW]")
+# an `s` or `y` command's pattern and replacement are text: `s/x/C8 wrote/` names no `w` command
+SED_BODY_RE = re.compile(r"(?<![A-Za-z_])([sy])([^\w\s\\])(?:\\.|(?!\2).)*\2(?:\\.|(?!\2).)*\2")
+# a command's address (`/warn/d`, `1,/x/!d`): its regex is text too, so it is cut down to a bare `/`
+_SED_ADDR = r"(?:/(?:\\.|[^/\n])*/I?|[\d$]+)"
+SED_ADDR_RE = re.compile(r"(^|[;{}\n])(\s*)" + _SED_ADDR + r"(?:\s*,\s*" + _SED_ADDR + ")?")
+# a `w` command (after an address), or an `s` command's `w` flag, and its file: the rest of the line
+SED_WRITE_RE = re.compile(r"(?:^|[;{}\n/\d$]|\x00[gpiImMe\d]*)\s*[wW]\s*([^\n]*)")
+
+
+def _sed_writes(script: str) -> list[str]:
+    """The files a sed script's `w` commands and `s///w` flags write."""
+    script = SED_ADDR_RE.sub(r"\1\2/", SED_BODY_RE.sub("\x00", script))
+    return [m.group(1).strip() for m in SED_WRITE_RE.finditer(script)]
 
 
 def _sed_operands(args: list[str]) -> tuple[bool, list[str], list[str], list[str]]:
@@ -634,9 +645,8 @@ def classify_paths(cmd: str, home: str, cwd: str, run_dir: str, depth: int = 0) 
                 put(a, "write", "sed -i target", True)
             for a in sfiles:
                 put(a, "executed", "sed -f script")
-            for a in scripts:   # a `w file` command may write: the script stays a target, as before
-                if SED_WRITE_RE.search(a):
-                    put(a, "write", "sed -i script with a w command")
+            for f in (f for a in scripts for f in _sed_writes(a)):   # a `w file` command writes that file
+                put(f, "write", "sed -i script with a w command", True)
         elif name in ("source", "."):
             for a in paths[:1]:
                 put(a, "executed", f"{name} runs it")
