@@ -445,7 +445,7 @@ def declined_proposals(state_dir, now: float | None = None, hours: float = DECLI
             continue
         rec = read_dict(path)
         ts = float(rec.get("ts") or 0)
-        if not (now - hours * 3600 <= ts < now) or not rec.get("compare"):
+        if not (now - hours * 3600 <= ts < now) or not rec.get("compare") or (rec.get("opus") or {}).get("status") != "ok":
             continue
         taken = _keys(rec.get("opus") or {})
         for a in (rec.get("glm") or {}).get("actions") or []:

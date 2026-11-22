@@ -778,6 +778,10 @@ def test_coordroute_the_lane_sees_its_earlier_proposals_the_coordinator_did_not_
     assert text.count("task_add review the sweep findings") == 1
     assert "#9" not in text and "old idea" not in text
     assert coordroute.declined_proposals(p.state, now - 7200) == ""
+    coordroute.shadow_started(p.state, 70, 71, [], now=now - 600)  # the coordinator's turn failed: nothing declined
+    coordroute.shadow_side(p.state, 70, "opus", [], "failed", 0.0)
+    coordroute.shadow_side(p.state, 70, "glm", [{"type": "task_add", "title": "Never looked at"}], "ok", 0.1)
+    assert "never looked at" not in coordroute.declined_proposals(p.state, now)
     parts = coordroute.lane_digest([("tasks", "## Open tasks\n- #9")], [], p.db, 0, state_dir=p.state, now=now)
     assert parts[-1] == ("declined_proposals", text)
     assert "Earlier lane proposals" in coordroute.LANE_PROMPT
