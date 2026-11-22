@@ -77,12 +77,18 @@ from .project import durable_append
 from .util import read_dict
 
 KV_CURSOR = "upstream_cursor"
+MINUTE_S = 60
+HOUR_S = 3600
+DAY_S = 86400
+PRIVATE = 0o600             # files here hold notes and peer state: only their owner reads them
 LOCAL_EVERY_S = 60          # how often an ingesting project looks at this machine's inbox
 REMOTE_EVERY_S = 3600       # and at the inboxes on the machines its remote projects run on
 READER_FRESH_S = 2 * 86400  # a reader not seen this long is gone: coordinators pass notes on again
 SEEN_KEPT = 5000            # fingerprints a project remembers
-TITLE_CHARS, SPEC_CHARS = 300, 4000
+TITLE_CHARS = 300
+SPEC_CHARS = 4000
 REMOTE_TIMEOUT_S = 60       # one machine's read
+GIT_LOG_TIMEOUT_S = 60      # one `git log` looking for the commit that bumped a version
 REMOTE_BUDGET_S = 120       # all remote reads in one tick; a machine is started only if its read fits
 SSH = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=15"]
 REMOTE = "~/.tt-project/upstream.jsonl"
@@ -100,6 +106,7 @@ FORWARD_BATCH = 200         # lines per send
 FORWARD_PROBE_S = 6 * 3600  # how often a target is asked whether a project reads its inbox
 PEER_LOOKUP_TIMEOUT_S = 20  # one target's answer to `ttp note --to` asking whether it runs a project
 RECEIVE_BYTES = 4 << 20     # the most `ttp upstream --receive` reads
+SEND_MARGIN_PARTS = 32      # a send stays this fraction (1/32) under RECEIVE_BYTES
 LOCAL_NET_FAILS = 3         # daemon sends in a row failing 'Network is unreachable' on macOS: a suspected Local Network block
 FALLBACK_AFTER_S = 1800     # a target the daemon has failed to reach this long is also sent to from runs and the CLI
 WARN_AFTER_S = 3600         # and `ttp status` and `ttp note --to` say it has been failing
@@ -172,7 +179,7 @@ def _lines(raw: bytes) -> tuple[list[dict], int]:
         if isinstance(n, dict) and n.get("fp"):
             i = at.get(n["fp"]) if n.get("escalation") else None
             if i is not None:
-                if _rank(n.get("severity")) > _rank(notes[i].get("severity")):
+                if _severity_rank(n.get("severity")) > _severity_rank(notes[i].get("severity")):
                     notes[i] = {**notes[i], "severity": n["severity"], "escalated": n.get("escalated") or n.get("ts")}
                 continue
             at.setdefault(n["fp"], len(notes))
@@ -186,7 +193,7 @@ def append(name: str, task: int | None, followups) -> int:
     if not notes:
         return 0
     project.HOME_DIR.mkdir(parents=True, exist_ok=True)
-    fd = os.open(path(), os.O_RDWR | os.O_CREAT | os.O_APPEND, 0o600)
+    fd = os.open(path(), os.O_RDWR | os.O_CREAT | os.O_APPEND, PRIVATE)
     with os.fdopen(fd, "rb+") as f:
         fcntl.flock(f, fcntl.LOCK_EX)   # several daemons of this user append to the same inbox
         f.seek(0)
@@ -329,14 +336,14 @@ def send(source: str, task: int | None, to: str, text: str, severity: str = "nor
     title = f"note to {to}"
     fp = note_id(to, text)
     project.HOME_DIR.mkdir(parents=True, exist_ok=True)
-    fd = os.open(path(), os.O_RDWR | os.O_CREAT | os.O_APPEND, 0o600)
+    fd = os.open(path(), os.O_RDWR | os.O_CREAT | os.O_APPEND, PRIVATE)
     with os.fdopen(fd, "rb+") as f:
         fcntl.flock(f, fcntl.LOCK_EX)
         f.seek(0)
         notes = _lines(f.read())[0]
         had = next((n for n in notes if n["fp"] == fp), None)
         if (had is not None and sender != "daemon" and severity in NOTE_SEVERITIES
-                and _rank(severity) > _rank(had.get("severity"))):
+                and _severity_rank(severity) > _severity_rank(had.get("severity"))):
             f.write(escalate(had, severity, now))
             f.flush()
             return "sent"
@@ -348,7 +355,7 @@ def send(source: str, task: int | None, to: str, text: str, severity: str = "nor
         high = sender != "daemon" and severity == "high"
         if sender != "daemon" and sum(1 for n in notes if n.get("to") and n.get("project") == source
                                       and n.get("from") != "daemon" and (n.get("lane") == "high") == high
-                                      and now - float(n.get("ts") or 0) < 3600) >= (
+                                      and now - float(n.get("ts") or 0) < HOUR_S) >= (
                                           HIGH_NOTES_PER_HOUR if high else NOTES_PER_HOUR):
             return "limited"
         f.write((json.dumps({"ts": now, "project": source, "host": project.hostname(), "task": task,
@@ -380,7 +387,7 @@ OUTBOX_STUCK_S = 3 * 3600            # a note waiting this long gets one coordin
 
 def _outbox_lock(state: Path):
     """The outbox's lock, on a file of its own: drain replaces the outbox, so a lock on it would not hold."""
-    fd = os.open(Path(state) / (OUTBOX_FILE + ".lock"), os.O_RDWR | os.O_CREAT, 0o600)
+    fd = os.open(Path(state) / (OUTBOX_FILE + ".lock"), os.O_RDWR | os.O_CREAT, PRIVATE)
     f = os.fdopen(fd, "rb+")
     fcntl.flock(f, fcntl.LOCK_EX)
     return f
@@ -417,7 +424,7 @@ def high_used(source: str, now: float | None = None) -> int:
     except FileNotFoundError:
         return 0
     return sum(1 for n in notes if n.get("lane") == "high" and n.get("project") == source
-               and now - float(n.get("ts") or 0) < 3600)
+               and now - float(n.get("ts") or 0) < HOUR_S)
 
 
 def _filing_order(waiting: list[dict]) -> list[dict]:
@@ -426,7 +433,7 @@ def _filing_order(waiting: list[dict]) -> list[dict]:
     return sorted(waiting, key=lambda n: str(n.get("severity")) != "high")
 
 
-def _place(waiting: list[dict], i: int) -> int:
+def _filing_place(waiting: list[dict], i: int) -> int:
     """The 1-based place of `waiting[i]` in the filing order (`_filing_order`)."""
     return _filing_order(waiting).index(waiting[i]) + 1
 
@@ -448,10 +455,10 @@ def send_or_queue(state: Path, source: str, task: int | None, to: str, text: str
         waiting = _outbox(state)
         for i, n in enumerate(waiting):
             if n["fp"] == fp:
-                if severity in NOTE_SEVERITIES and _rank(severity) > _rank(n.get("severity")):
+                if severity in NOTE_SEVERITIES and _severity_rank(severity) > _severity_rank(n.get("severity")):
                     n["severity"] = severity
-                    _rewrite(Path(state) / OUTBOX_FILE, waiting)
-                return "queued", _place(waiting, i)
+                    _rewrite_notes(Path(state) / OUTBOX_FILE, waiting)
+                return "queued", _filing_place(waiting, i)
         if not waiting or _filed(fp) or severity == "high":   # a high note does not wait behind the others
             got = send(source, task, to, text, severity, now, at=at, back=back, confirms=confirms, reply_to=reply_to)
             if got != "limited":
@@ -465,7 +472,7 @@ def send_or_queue(state: Path, source: str, task: int | None, to: str, text: str
             {"ts": now, "task": task, "to": to, "text": text, "fp": fp, **({"at": at} if at else {}),
              **({"back": back} if back and not at else {}), **({"confirms": _confirms(confirms)} if _confirms(confirms) else {}),
              **({"reply_to": reply_to} if reply_to else {}), "severity": severity if severity in NOTE_SEVERITIES else "normal"}, sort_keys=True) + "\n")
-        return "queued", _place(waiting + [{"severity": severity}], len(waiting))
+        return "queued", _filing_place(waiting + [{"severity": severity}], len(waiting))
 
 
 _NOTE_ID_RE = re.compile(r"(?<![0-9A-Za-z])[0-9a-f]{16}(?![0-9A-Za-z])")
@@ -477,7 +484,7 @@ def named_notes(text: str, confirms: str | None = None) -> frozenset[str]:
     return frozenset(_NOTE_ID_RE.findall(_REPLY_RE.sub("", str(text or ""), count=1))) | ({_confirms(confirms)} if _confirms(confirms) else set())
 
 
-def _rank(severity) -> int:
+def _severity_rank(severity) -> int:
     return NOTE_SEVERITIES.index(severity if severity in NOTE_SEVERITIES else "normal")
 
 
@@ -497,7 +504,7 @@ def _repeat(notes: list[dict], source: str, task: int | None, to: str, text: str
         if (n.get("project") != source or n.get("task") != task or n.get("to") != to or n.get("from") == "daemon"
                 or not 0 <= now - ts < REPEAT_S or named_notes(n.get("spec"), n.get("confirms")) != ids
                 or reply_of(n.get("spec")) != reply_of(text)
-                or _rank(n.get("severity")) < _rank(severity)):
+                or _severity_rank(n.get("severity")) < _severity_rank(severity)):
             continue
         recs = _records() if recs is None else recs
         if not any(r.get("kind") in ("resolve", "regression", "wontfix") and r.get("fp") in ids
@@ -549,7 +556,7 @@ def drain_outbox(state: Path, source: str, now: float | None = None) -> tuple[in
             if high in limited:
                 left.append(n)
             elif send(source, n.get("task"), n["to"], n["text"], str(n.get("severity") or "normal"), now,
-                      at=_at(n), back=_at(n, "back"), confirms=_confirms(n.get("confirms")),
+                      at=_queued_target(n), back=_queued_target(n, "back"), confirms=_confirms(n.get("confirms")),
                       reply_to=_confirms(n.get("reply_to"))) == "limited":
                 limited.add(high)
                 left.append(n)
@@ -561,14 +568,14 @@ def drain_outbox(state: Path, source: str, now: float | None = None) -> tuple[in
                 n["stuck"] = True
                 stuck.append(n)
         if waiting and (filed or stuck):
-            _rewrite(p, waiting)
+            _rewrite_notes(p, waiting)
         elif not waiting:
             p.unlink()
             project.fsync_dir(p.parent)
     return filed, stuck
 
 
-def _rewrite(p: Path, notes: list[dict]) -> None:
+def _rewrite_notes(p: Path, notes: list[dict]) -> None:
     project.durable_write(p, "".join(json.dumps(n, sort_keys=True) + "\n" for n in notes))
 
 
@@ -576,7 +583,7 @@ QUEUED_FILE = "notes-to.jsonl"   # in a run's directory: notes a sandboxed worke
 QUEUED_MAX = 50                  # queued notes one run may leave
 
 
-def _at(n: dict, key: str = "at") -> str | None:
+def _queued_target(n: dict, key: str = "at") -> str | None:
     """A queued note's `at` (or `back`, send): the forwarder only ever sends to one of its own targets,
     and a `back` note goes only to the machine that asks for it, so this only has to be a string."""
     at = n.get(key)
@@ -598,7 +605,7 @@ def queue(run_dir: Path, to: str, text: str, severity: str = "normal", at: str |
                        **({"back": back} if back and not at else {}),
                        **({"reply_to": reply_of(text)} if reply_of(text) else {}),
                        **({"confirms": _confirms(confirms)} if _confirms(confirms) else {})}, sort_keys=True) + "\n"
-    fd = os.open(Path(run_dir) / QUEUED_FILE, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+    fd = os.open(Path(run_dir) / QUEUED_FILE, os.O_WRONLY | os.O_CREAT | os.O_APPEND, PRIVATE)
     try:
         os.write(fd, line.encode())
         os.fsync(fd)
@@ -631,10 +638,10 @@ def send_queued(run_dir: Path, source: str, task: int | None, state: Path | None
         sev = str(n.get("severity") or "normal")
         try:
             if state is None:
-                got[send(source, task, to, text, sev, at=_at(n), back=_at(n, "back"),
+                got[send(source, task, to, text, sev, at=_queued_target(n), back=_queued_target(n, "back"),
                          confirms=_confirms(n.get("confirms")), reply_to=_confirms(n.get("reply_to")))] += 1
             else:
-                r = send_or_queue(state, source, task, to, text, sev, at=_at(n), back=_at(n, "back"),
+                r = send_or_queue(state, source, task, to, text, sev, at=_queued_target(n), back=_queued_target(n, "back"),
                                   confirms=_confirms(n.get("confirms")), reply_to=_confirms(n.get("reply_to")))[0]
                 got["limited" if r == "full" else r] += 1
         except (NoteTooLong, NotePlaceholder):
@@ -674,7 +681,7 @@ def remote_hosts() -> list[str]:
                    if isinstance(e, dict) and e.get("host") and e["host"] != here})
 
 
-def _mark(p: project.Project, now: float) -> dict:
+def _reader_mark(p: project.Project, now: float) -> dict:
     return {"project": p.name, "host": project.hostname(), "ts": now}
 
 
@@ -731,7 +738,7 @@ def ingest(p: project.Project, cfg: dict, now: float | None = None, force_remote
     raw, size = _read_local(int(offsets.get(LOCAL, 0)))
     sources.append((LOCAL, raw, size))
     project.HOME_DIR.mkdir(parents=True, exist_ok=True)
-    project.write_json(reader_path(), _mark(p, now))
+    project.write_json(reader_path(), _reader_mark(p, now))
     remote_due = float(cur.get("remote_due") or 0)
     pending: list = list(cur.get("remote_pending") or [])   # hosts of this round not yet read
     if force_remote or (not pending and now >= remote_due):
@@ -744,7 +751,7 @@ def ingest(p: project.Project, cfg: dict, now: float | None = None, force_remote
                 if tried and _clock() - start + REMOTE_TIMEOUT_S > REMOTE_BUDGET_S:
                     break             # out of time this tick: the rest are read first on the next
                 tried += 1
-                got = _read_remote(host, int(offsets.get(host, 0)), _mark(p, now))
+                got = _read_remote(host, int(offsets.get(host, 0)), _reader_mark(p, now))
                 if got is not None:
                     sources.append((host, *got))
             pending.pop(0)
@@ -971,7 +978,7 @@ def close_report(n: dict, name: str) -> tuple[dict, str] | None:
     page_id = reply_of(n.get("spec"))
     if not page_id or n.get("from") != "worker" or n.get("severity") not in ("low", "normal"):
         return None
-    page, _ = _find(page_id)
+    page, _ = _find_note(page_id)
     cid = _own_page(page, name)
     if cid is None or page.get("to") != n.get("project"):
         return None
@@ -1072,7 +1079,7 @@ def received(p: project.Project, fp: str) -> dict | None:
     r = (p.db.kv(KV_ROUTES) or {}).get(fp)
     if isinstance(r, dict):
         return r
-    n, _ = _find(fp)
+    n, _ = _find_note(fp)
     if not n or not n.get("project") or (n.get("to") and n["to"] != p.name) \
             or (not n.get("via") and n.get("project") == p.name):
         return None
@@ -1136,7 +1143,7 @@ def _replies_for(via: str, now: float | None = None) -> list[dict]:
         carried = dict(doc.get("carried") or {})
         if any(n["fp"] not in carried for n in out):
             carried.update({n["fp"]: now for n in out if n["fp"] not in carried})
-            project.write_json(back_path(), {**doc, "carried": dict(list(carried.items())[-CARRIED_KEPT:])}, mode=0o600)
+            project.write_json(back_path(), {**doc, "carried": dict(list(carried.items())[-CARRIED_KEPT:])}, mode=PRIVATE)
     return out
 
 
@@ -1265,7 +1272,7 @@ def _records() -> list[dict]:
 
 def _record(rec: dict) -> dict:
     project.HOME_DIR.mkdir(parents=True, exist_ok=True)
-    fd = os.open(resolved_path(), os.O_RDWR | os.O_CREAT | os.O_APPEND, 0o600)
+    fd = os.open(resolved_path(), os.O_RDWR | os.O_CREAT | os.O_APPEND, PRIVATE)
     with os.fdopen(fd, "rb+") as f:
         fcntl.flock(f, fcntl.LOCK_EX)
         torn = False
@@ -1324,7 +1331,7 @@ def version_commit(p: project.Project, repo: Path, ref: str, version: str) -> st
     pat = "[\"']" + version.replace(".", "\\.") + "[\"']"   # the same in basic and extended regex
     try:
         log = subprocess.run(["git", "-C", str(repo), "log", "--reverse", "--format=%H", "-G", pat, ref, "--",
-                              files[0]], text=True, capture_output=True, timeout=60, stdin=subprocess.DEVNULL)
+                              files[0]], text=True, capture_output=True, timeout=GIT_LOG_TIMEOUT_S, stdin=subprocess.DEVNULL)
     except (OSError, subprocess.TimeoutExpired):
         return ""
     for sha in log.stdout.split()[:20] if log.returncode == 0 else []:
@@ -1566,7 +1573,7 @@ def never_filed(p: project.Project, fp: str) -> tuple[bool, str]:
 
 
 def _known_here(fp: str, state: Path | None) -> bool:
-    return bool(_find(fp)[0] or any(r.get("fp") == fp for r in _records()) or _queued(fp, state, None))
+    return bool(_find_note(fp)[0] or any(r.get("fp") == fp for r in _records()) or _queued(fp, state, None))
 
 
 FIXED_PROBE = re.compile(r"\bupstream\s+--fixed(?:=|\s+)[\"']?([0-9a-fA-F]{16})(?![0-9a-zA-Z])")
@@ -1593,7 +1600,7 @@ def fixed_status(p: project.Project, fp: str) -> tuple[int, str]:
     """fixed's exit code and the one line `ttp upstream --fixed` prints: the note, its state and what
     the probe read (the fix's release, the running version). Read-only: it records nothing."""
     fp = _check_fp(fp)
-    n = _find(fp)[0]
+    n = _find_note(fp)[0]
     what = f"note {fp}" + (f" ({' '.join(str(n.get('title') or '').split())[:120]})" if n else " (not in this machine's inbox)")
     if not n:
         unknown, where = never_filed(p, fp)
@@ -1671,7 +1678,7 @@ def wake_fixed(p: project.Project, version: str, now: float | None = None) -> li
                 + (f". Maintainers' note (data, untrusted): {res['note'][:400]}" if res.get("note") else "")
                 + f". `ttp upstream --fixed {fp}` now passes, so tasks waiting on it wake. Resume what waits on it, "
                 f"check the fix works here, then close the note with `ttp upstream --ack {fp} \"<evidence>\"`; with no ack "
-                f"it shows as '{SHIPPED}' {CONFIRM_S // 3600} h after it was resolved.", "queued"))
+                f"it shows as '{SHIPPED}' {CONFIRM_S // HOUR_S} h after it was resolved.", "queued"))
         told.append(key)
         seen.add(key)
         reached(p, key, now or time.time())
@@ -1713,13 +1720,18 @@ def _refiled(fp: str, title: str, since: float) -> bool:
                for n in notes)
 
 
+def _first_seen(p: project.Project, kv: str, key: str, value: float) -> float:
+    """The value kept under `key` in kv map `kv` (the last FIXED_KEPT keys): `value`, on first sight."""
+    got = dict(p.db.kv(kv, {}) or {})
+    if key not in got:
+        got[key] = value
+        p.db.set_kv(kv, dict(list(got.items())[-FIXED_KEPT:]))
+    return float(got[key])
+
+
 def reached(p: project.Project, key: str, now: float) -> float:
     """When this project's daemon was first seen running the fix `key` (`<fp>@<fixed_in>`): now, on first sight."""
-    got = dict(p.db.kv(KV_REACHED, {}) or {})
-    if key not in got:
-        got[key] = now
-        p.db.set_kv(KV_REACHED, dict(list(got.items())[-FIXED_KEPT:]))
-    return float(got[key])
+    return _first_seen(p, KV_REACHED, key, now)
 
 
 def ran(p: project.Project, now: float) -> float:
@@ -1736,11 +1748,7 @@ def ran(p: project.Project, now: float) -> float:
 
 def reached_ran(p: project.Project, key: str, total: float) -> float:
     """The daemon's running total (`ran`) when it first ran the fix `key`: `total`, on first sight."""
-    got = dict(p.db.kv(KV_REACHED_RAN, {}) or {})
-    if key not in got:
-        got[key] = total
-        p.db.set_kv(KV_REACHED_RAN, dict(list(got.items())[-FIXED_KEPT:]))
-    return float(got[key])
+    return _first_seen(p, KV_REACHED_RAN, key, total)
 
 
 def regress(fp: str, note: str, name: str = "", now: float | None = None) -> dict:
@@ -1789,15 +1797,15 @@ def follow_up_unconfirmed(p: project.Project, version: str, cfg: dict | None = N
     now = now or time.time()
     total = ran(p, now)
     conf = (cfg or {}).get("upstream") or {}
-    remind_s = float(conf.get("remind_after_h", REMIND_AFTER_H)) * 3600
-    close_s = float(conf.get("unconfirmed_close_days", CLOSE_AFTER_DAYS)) * 86400
+    remind_s = float(conf.get("remind_after_h", REMIND_AFTER_H)) * HOUR_S
+    close_s = float(conf.get("unconfirmed_close_days", CLOSE_AFTER_DAYS)) * DAY_S
     if not version or not re.search(r"\d", version):
         return []
     recs = _records()
     mine = filed(p.name)
     reminded = list(p.db.kv(KV_REMINDED, []) or [])
     closed, changed = [], False
-    quiet_s = float(conf.get("quiet_confirm_days", QUIET_CONFIRM_DAYS)) * 86400
+    quiet_s = float(conf.get("quiet_confirm_days", QUIET_CONFIRM_DAYS)) * DAY_S
     quiet_due = quiet_s > 0 and now - float(p.db.kv(KV_QUIET_CHECKED, 0) or 0) >= QUIET_EVERY_S
     if quiet_due:
         p.db.set_kv(KV_QUIET_CHECKED, now)
@@ -1811,12 +1819,12 @@ def follow_up_unconfirmed(p: project.Project, version: str, cfg: dict | None = N
         if (quiet_due and up >= quiet_s and now - float(res["ts"]) >= CONFIRM_S and not regressed(fp, recs)
                 and not _refiled(fp, mine[fp].get("title", ""), float(res["ts"]))):
             _record({"kind": "ack", "fp": fp, "project": p.name, "ts": now, "closed_by": QUIET,
-                     "evidence": f"confirmed by quiet: ran {version} for {up / 86400:.0f} days, no regression or re-filed note"})
+                     "evidence": f"confirmed by quiet: ran {version} for {up / DAY_S:.0f} days, no regression or re-filed note"})
             closed.append(fp)
             continue
         if age >= close_s and not regressed(fp, recs):
             _record({"kind": "ack", "fp": fp, "project": p.name, "ts": now, "closed_by": SILENCE,
-                     "evidence": f"confirmed by silence: no ack and no regression note {close_s / 86400:g} days after the fix "
+                     "evidence": f"confirmed by silence: no ack and no regression note {close_s / DAY_S:g} days after the fix "
                                  f"in {res['fixed_in']} reached this project"})
             closed.append(fp)
             continue
@@ -1824,9 +1832,9 @@ def follow_up_unconfirmed(p: project.Project, version: str, cfg: dict | None = N
             p.db.x("INSERT INTO events(ts,source,kind,severity,text,status) VALUES(?,?,?,?,?,?)",
                    (now, "upstream", "observation", "normal",
                     f"upstream fix not confirmed yet: note {fp} ({mine[fp].get('title', '')[:120]}) is fixed in {res['fixed_in']}, "
-                    f"this project's daemon runs {version}, and nobody acked it for {age / 3600:.0f} h. Check the fix works "
+                    f"this project's daemon runs {version}, and nobody acked it for {age / HOUR_S:.0f} h. Check the fix works "
                     f"here and run `ttp upstream --ack {fp} \"<evidence>\"`, or `ttp upstream --regress {fp} \"<reason>\"` if it "
-                    f"did not hold; with no regression it closes by silence {close_s / 86400:g} days after the fix reached "
+                    f"did not hold; with no regression it closes by silence {close_s / DAY_S:g} days after the fix reached "
                     f"this project.", "queued"))
             reminded.append(key)
             changed = True
@@ -1888,15 +1896,15 @@ def close_unreachable(now: float | None = None) -> list[str]:
     """Close, as UNREACHABLE, the orphans older than ORPHAN_CLOSE_S. Returns their fingerprints."""
     got = orphans(now, ORPHAN_CLOSE_S)
     for fp in got:
-        ack(fp, UNREACHABLE, f"no filer project on this machine confirmed within {ORPHAN_CLOSE_S // 86400} days", now)
+        ack(fp, UNREACHABLE, f"no filer project on this machine confirmed within {ORPHAN_CLOSE_S // DAY_S} days", now)
     return got
 
 
 def orphans_line(now: float | None = None) -> str:
     """For the daily review: shipped notes nobody here can confirm, past ORPHAN_LIST_S."""
     got = orphans(now)
-    return (f"{len(got)} upstream fix{'' if len(got) == 1 else 'es'} {SHIPPED} for {ORPHAN_LIST_S // 86400}+ days "
-            f"with no filer on this machine (closed as '{UNREACHABLE}' after {ORPHAN_CLOSE_S // 86400} days unless a "
+    return (f"{len(got)} upstream fix{'' if len(got) == 1 else 'es'} {SHIPPED} for {ORPHAN_LIST_S // DAY_S}+ days "
+            f"with no filer on this machine (closed as '{UNREACHABLE}' after {ORPHAN_CLOSE_S // DAY_S} days unless a "
             f"regression is recorded): {', '.join(got[:5])}" + ("" if len(got) <= 5 else ", …")) if got else ""
 
 
@@ -1966,7 +1974,7 @@ def answer_target(fp: str, by: str) -> tuple[dict, str | None, str]:
     """For `--resolve`: note `fp`'s inbox record, the project on this machine to answer (None when
     there is none) and the line saying who sent it and, with no target, why no answer goes."""
     fp = _check_fp(fp)
-    n = _find(fp)[0]
+    n = _find_note(fp)[0]
     if not n:
         return {}, None, f"sender: unknown (note {fp} is not in this machine's inbox); no answer sent"
     who, host = n.get("project"), n.get("host")
@@ -2020,7 +2028,7 @@ def set_forward_to(aliases: list[str] | None) -> None:
     else:
         up["forward_to"] = aliases
     doc["upstream"] = up
-    project.write_json(settings_path(), doc, mode=0o600)
+    project.write_json(settings_path(), doc, mode=PRIVATE)
 
 
 def alias() -> str:
@@ -2111,7 +2119,7 @@ def _append_received(notes: list[dict], via: str) -> tuple[int, int]:
     fingerprints it has, except an escalation above the severity filed (`escalate`): (accepted, duplicates)."""
     accepted = duplicates = 0
     project.HOME_DIR.mkdir(parents=True, exist_ok=True)
-    fd = os.open(path(), os.O_RDWR | os.O_CREAT | os.O_APPEND, 0o600)
+    fd = os.open(path(), os.O_RDWR | os.O_CREAT | os.O_APPEND, PRIVATE)
     with os.fdopen(fd, "rb+") as f:
         fcntl.flock(f, fcntl.LOCK_EX)
         f.seek(0)
@@ -2119,7 +2127,7 @@ def _append_received(notes: list[dict], via: str) -> tuple[int, int]:
         out = b""
         for n in notes:
             old = have.get(n["fp"])
-            if old is not None and not (n.get("escalation") and _rank(n["severity"]) > _rank(old.get("severity"))):
+            if old is not None and not (n.get("escalation") and _severity_rank(n["severity"]) > _severity_rank(old.get("severity"))):
                 duplicates += 1
             else:
                 have[n["fp"]] = n if old is None else {**old, "severity": n["severity"]}
@@ -2342,10 +2350,12 @@ def find_peer(name: str, timeout: float = PEER_LOOKUP_TIMEOUT_S) -> tuple[str | 
 # forwarded: in the inbox of the machine that runs the project, not yet read there;
 # delivered: that project's daemon read it (an event for its coordinator).
 STATUS_TIMEOUT_S = 20   # the far machine's answer to `ttp upstream --note-state`
-DELIVERED, ON_ITS_WAY, UNKNOWN = 0, 1, 2
+DELIVERED = 0
+ON_ITS_WAY = 1
+UNKNOWN = 2
 
 
-def _find(fp: str) -> tuple[dict | None, int]:
+def _find_note(fp: str) -> tuple[dict | None, int]:
     """Note `fp` in this machine's inbox and the byte offset just past its line, or (None, 0)."""
     try:
         with open(path(), "rb") as f:
@@ -2391,7 +2401,7 @@ def note_state(fp: str) -> dict:
     note, whether its project here read it (`read`: None when it does not run here). Read-only: the
     sending machine asks it over ssh."""
     fp = _check_fp(fp)
-    n, _ = _find(fp)
+    n, _ = _find_note(fp)
     out = {"fp": fp, "inbox": n is not None}
     if n and n.get("to"):
         out.update(to=n["to"], read=read_by(n["to"], fp))
@@ -2423,7 +2433,7 @@ def note_status(fp: str, state: Path | None = None, run_dir: Path | None = None)
     """`_note_status`, plus which hourly allowance a filed note went through: a high-severity note is filed
     on its own (`HIGH_NOTES_PER_HOUR`), apart from the normal limit."""
     rc, line = _note_status(fp, state, run_dir)
-    n = _find(_check_fp(fp))[0]
+    n = _find_note(_check_fp(fp))[0]
     if n is not None and n.get("lane") == "high":
         line += f" (filed on the high-severity allowance of {HIGH_NOTES_PER_HOUR} an hour, apart from the normal limit)"
     return rc, line
@@ -2435,7 +2445,7 @@ def _note_status(fp: str, state: Path | None = None, run_dir: Path | None = None
     unknown. The machine that runs the project is asked over ssh once the forward cursor is past the
     note; no answer leaves it at forwarded. Read-only, so a waiting hand-off can use it as retry_when."""
     fp = _check_fp(fp)
-    n, end = _find(fp)
+    n, end = _find_note(fp)
     if n is None:
         if where := _queued(fp, state, run_dir):
             return ON_ITS_WAY, f"queued: note {fp} is not filed yet: it waits {where}"
@@ -2446,9 +2456,9 @@ def _note_status(fp: str, state: Path | None = None, run_dir: Path | None = None
     if n.get("back") and not n.get("via"):
         if (when := (read_dict(back_path()).get("carried") or {}).get(fp)) is not None:
             return DELIVERED, (f"sent back: {n['back']}'s daemon took note {fp} on its call here "
-                               f"{max(0.0, time.time() - float(when)) / 3600:.1f} h ago; that machine files it for {to}")
+                               f"{max(0.0, time.time() - float(when)) / HOUR_S:.1f} h ago; that machine files it for {to}")
         if time.time() - float(n.get("ts") or 0) >= REPLY_BACK_S:
-            return UNKNOWN, (f"not sent: {n['back']}'s daemon did not call here within {REPLY_BACK_S // 86400} days "
+            return UNKNOWN, (f"not sent: {n['back']}'s daemon did not call here within {REPLY_BACK_S // DAY_S} days "
                              f"to take note {fp}; send it again once there is a route (`ttp upstream --forward-to`)")
         return ON_ITS_WAY, (f"waiting: note {fp} is in this machine's inbox until {n['back']}'s daemon takes it on "
                             f"its next call here (this machine cannot reach {n['back']})")
@@ -2462,7 +2472,7 @@ def _note_status(fp: str, state: Path | None = None, run_dir: Path | None = None
         return ON_ITS_WAY, f"filed-local: note {fp} is in this machine's inbox; {to}'s daemon has not read it yet"
     st = (read_dict(forward_path()).get("targets") or {}).get(target) or {}
     if int(st.get("cursor") or 0) < end:
-        why = (f" (sends there failing for {_failing_since(st, time.time()) / 3600:.1f} h: {st.get('last_error')})"
+        why = (f" (sends there failing for {_failing_since(st, time.time()) / HOUR_S:.1f} h: {st.get('last_error')})"
                if st.get("fails") else "")
         return ON_ITS_WAY, f"filed-local: note {fp} is in this machine's inbox; the daemon has not sent it on to {target} yet{why}"
     out, err = ssh_pipe(target, f"upstream --note-state {fp}", b"", STATUS_TIMEOUT_S)
@@ -2529,7 +2539,7 @@ def forward(now: float | None = None, budget_s: float = FORWARD_BUDGET_S, contex
     failure record alone."""
     now = now or time.time()
     project.HOME_DIR.mkdir(parents=True, exist_ok=True)
-    lock = os.open(project.HOME_DIR / "upstream-forward.lock", os.O_RDWR | os.O_CREAT, 0o600)
+    lock = os.open(project.HOME_DIR / "upstream-forward.lock", os.O_RDWR | os.O_CREAT, PRIVATE)
     try:
         try:
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -2544,12 +2554,88 @@ def _darwin() -> bool:
     return sys.platform == "darwin"
 
 
-def _failed(st: dict, err: str, now: float) -> None:
+def _backoff_s(fails: int) -> float:
+    """The wait after `fails` failed sends in a row: FORWARD_BACKOFF_S's first, doubling up to its last."""
+    first, most = FORWARD_BACKOFF_S
+    return min(first * 2 ** (fails - 1), most)
+
+
+def _send_cap() -> int:
+    """The most bytes one send carries: a margin under what the receiver reads."""
+    return RECEIVE_BYTES - RECEIVE_BYTES // SEND_MARGIN_PARTS
+
+
+def _record_send(st: dict, target: str, ack: dict | None, err: str, now: float, daemon: bool) -> None:
+    """Record one send to `target` in its state `st`: a daemon's failure and back-off, a run's own back-off
+    (the daemon's failure record stays), or on success the ack's counts, resolutions and replies."""
+    if ack is None and daemon:
+        _forward_failed(st, err, now)
+        return
+    if ack is None:
+        fails = int(st.get("run_fails") or 0) + 1
+        st.update(run_fails=fails, run_next=now + _backoff_s(fails), run_error=err)
+        return
+    if daemon:
+        st.update(fails=0, next=0)
+        for k in ("fail_since", "unreachable", "suspect", "python"):
+            st.pop(k, None)
+    else:
+        st["run_ok"] = now
+    for k in ("run_fails", "run_next", "run_error"):
+        st.pop(k, None)
+    st.update(last_ok=now, probed=now, pulled=now,
+              reader=re.sub(r"[^A-Za-z0-9_.@+-]", "", str(ack.get("reader") or ""))[:80] or None,
+              accepted=int(st.get("accepted") or 0) + ack["accepted"],
+              rejected=int(st.get("rejected") or 0) + ack["rejected"],
+              closure=isinstance(ack.get("resolved"), list))
+    if st["closure"] and ack["resolved"]:
+        st["resolutions"] = int(st.get("resolutions") or 0) + _take_resolved(target, ack["resolved"])
+    if isinstance(ack.get("replies"), list) and ack["replies"]:
+        st["replies"] = int(st.get("replies") or 0) + _take_replies(target, ack["replies"])
+
+
+def _pick_batch(raw: bytes, offset: int, st: dict, target: str, here: str, projects: dict,
+                reads: bool, now: float) -> tuple[list[bytes], int, int, bool]:
+    """The inbox lines from byte `offset` (of `raw`) that go to `target` in one send: (the lines, the offset
+    the cursor moves to once they are sent, their bytes, whether any is addressed). A note too big to send
+    is skipped and counted in `st`."""
+    batch, end, pos, nbytes, addressed = [], offset, offset, 0, False
+    cap = _send_cap()
+    for ln in raw[:raw.rfind(b"\n") + 1].splitlines(keepends=True):
+        try:
+            n = json.loads(ln)
+        except ValueError:
+            n = None
+        # Only this machine's own notes: one received from elsewhere (`via`) is never sent on again.
+        # A peer-qualified note or a reply (`at`) goes where it names; a `back` reply waits to be asked for.
+        if isinstance(n, dict) and n.get("fp") and not n.get("via") and not n.get("back") and n.get("host") == here and (
+                (n.get("at") or projects.get(n["to"])) == target if n.get("to") else reads):
+            if len(ln) > cap:
+                # The receiver would refuse any stream holding it: skip it, or it stalls the queue.
+                # Counted once: a failed send leaves the cursor before it, so later passes see it again.
+                if pos < int(st.get("skipped_at", -1)):
+                    pos += len(ln)
+                    end = pos
+                    continue
+                st.update(skipped_at=pos + 1, skipped=int(st.get("skipped") or 0) + 1, error_at=now,
+                          last_error=f"skipped a note of {len(ln)} bytes (over the {cap} a send may carry)")
+                print(f"ttp upstream: {target}: {st['last_error']}", file=sys.stderr)
+            elif len(batch) == FORWARD_BATCH or nbytes + len(ln) > cap:
+                break
+            else:
+                batch.append(ln)
+                nbytes += len(ln)
+                addressed = addressed or bool(n.get("to"))
+        pos += len(ln)
+        end = pos
+    return batch, end, nbytes, addressed
+
+
+def _forward_failed(st: dict, err: str, now: float) -> None:
     """Record a failed daemon send in target state `st`: the count and back-off, when the failures
     began, and on macOS whether they look like a Local Network block on the daemon's python."""
     fails = int(st.get("fails") or 0) + 1
-    first, most = FORWARD_BACKOFF_S
-    st.update(fails=fails, next=now + min(first * 2 ** (fails - 1), most), last_error=err, error_at=now)
+    st.update(fails=fails, next=now + _backoff_s(fails), last_error=err, error_at=now)
     st.setdefault("fail_since", now)
     st["unreachable"] = int(st.get("unreachable") or 0) + 1 if UNREACHABLE_RE.search(err) else 0
     if _darwin() and st["unreachable"] >= LOCAL_NET_FAILS:
@@ -2575,7 +2661,7 @@ def _forward(now: float, budget_s: float, context: str = "daemon") -> int:
         # Rows of retired targets go at the next save: nothing tries them any more.
         for t in [t for t in targets_st if t not in current]:
             del targets_st[t]
-        project.write_json(forward_path(), {"targets": targets_st}, mode=0o600)
+        project.write_json(forward_path(), {"targets": targets_st}, mode=PRIVATE)
 
     def fits() -> bool:
         return not tries[0] or _clock() - start + FORWARD_TIMEOUT_S <= budget_s
@@ -2584,30 +2670,7 @@ def _forward(now: float, budget_s: float, context: str = "daemon") -> int:
         tries[0] += 1
         st["tried"] = now
         ack, err = _ssh_receive(target, lines, FORWARD_TIMEOUT_S)
-        if ack is None and daemon:
-            _failed(st, err, now)
-        elif ack is None:
-            fails = int(st.get("run_fails") or 0) + 1
-            first, most = FORWARD_BACKOFF_S
-            st.update(run_fails=fails, run_next=now + min(first * 2 ** (fails - 1), most), run_error=err)
-        else:
-            if daemon:
-                st.update(fails=0, next=0)
-                for k in ("fail_since", "unreachable", "suspect", "python"):
-                    st.pop(k, None)
-            else:
-                st["run_ok"] = now
-            for k in ("run_fails", "run_next", "run_error"):
-                st.pop(k, None)
-            st.update(last_ok=now, probed=now, pulled=now,
-                      reader=re.sub(r"[^A-Za-z0-9_.@+-]", "", str(ack.get("reader") or ""))[:80] or None,
-                      accepted=int(st.get("accepted") or 0) + ack["accepted"],
-                      rejected=int(st.get("rejected") or 0) + ack["rejected"],
-                      closure=isinstance(ack.get("resolved"), list))
-            if st["closure"] and ack["resolved"]:
-                st["resolutions"] = int(st.get("resolutions") or 0) + _take_resolved(target, ack["resolved"])
-            if isinstance(ack.get("replies"), list) and ack["replies"]:
-                st["replies"] = int(st.get("replies") or 0) + _take_replies(target, ack["replies"])
+        _record_send(st, target, ack, err, now, daemon)
         targets_st[target] = st
         save()
         return ack
@@ -2629,38 +2692,10 @@ def _forward(now: float, budget_s: float, context: str = "daemon") -> int:
         if size < offset:                 # the inbox was cut or replaced: send it again; the target dedupes
             offset, (raw, size) = 0, _read_local(0)
             st.pop("skipped_at", None)
-        batch, end, pos, nbytes, addressed = [], offset, offset, 0, False
-        cap = RECEIVE_BYTES - RECEIVE_BYTES // 32   # a margin under what the receiver reads
-        for ln in raw[:raw.rfind(b"\n") + 1].splitlines(keepends=True):
-            try:
-                n = json.loads(ln)
-            except ValueError:
-                n = None
-            # Only this machine's own notes: one received from elsewhere (`via`) is never sent on again.
-            # A peer-qualified note or a reply (`at`) goes where it names; a `back` reply waits to be asked for.
-            if isinstance(n, dict) and n.get("fp") and not n.get("via") and not n.get("back") and n.get("host") == here and (
-                    (n.get("at") or projects.get(n["to"])) == target if n.get("to") else reads):
-                if len(ln) > cap:
-                    # The receiver would refuse any stream holding it: skip it, or it stalls the queue.
-                    # Counted once: a failed send leaves the cursor before it, so later passes see it again.
-                    if pos < int(st.get("skipped_at", -1)):
-                        pos += len(ln)
-                        end = pos
-                        continue
-                    st.update(skipped_at=pos + 1, skipped=int(st.get("skipped") or 0) + 1, error_at=now,
-                              last_error=f"skipped a note of {len(ln)} bytes (over the {cap} a send may carry)")
-                    print(f"ttp upstream: {target}: {st['last_error']}", file=sys.stderr)
-                elif len(batch) == FORWARD_BATCH or nbytes + len(ln) > cap:
-                    break
-                else:
-                    batch.append(ln)
-                    nbytes += len(ln)
-                    addressed = addressed or bool(n.get("to"))
-            pos += len(ln)
-            end = pos
+        batch, end, nbytes, addressed = _pick_batch(raw, offset, st, target, here, projects, reads, now)
         # Acks of resolutions that came from the target go back with the notes (only to a target whose
         # answers carry resolutions), and a target holding open notes of ours is asked now and then.
-        acks, acks_end = (_acks_to_send(target, int(st.get("acks_cursor") or 0), cap - nbytes)
+        acks, acks_end = (_acks_to_send(target, int(st.get("acks_cursor") or 0), _send_cap() - nbytes)
                           if st.get("closure") else ([], int(st.get("acks_cursor") or 0)))
         every = PULL_EVERY_S if st.get("closure") is not False else FORWARD_PROBE_S
         pull = reads and bool(st.get("accepted")) and now - float(st.get("pulled") or 0) >= every and bool(
@@ -2701,7 +2736,7 @@ def forward_status(now: float | None = None) -> list[str]:
         return ["no machines to send upstream notes on to (no remote projects, and upstream.forward_to is not set)"]
 
     def ago(t) -> str:
-        return f"{(now - float(t)) / 3600:.1f} h ago" if t else "never"
+        return f"{(now - float(t)) / HOUR_S:.1f} h ago" if t else "never"
     out = []
     for t in names:
         st = targets_st.get(t) or {}
@@ -2716,13 +2751,13 @@ def forward_status(now: float | None = None) -> list[str]:
             # (the daemon keeps its own record until its next try succeeds, so the run fallback still works).
             line += (f"; recovered: a send went through {ago(st['last_ok'])}, after the daemon's {st['fails']} "
                      f"failed tries (last {ago(st.get('error_at'))}: {st.get('last_error')}); the daemon "
-                     f"retries in {max(0.0, (float(st.get('next') or 0) - now) / 60):.1f} min")
+                     f"retries in {max(0.0, (float(st.get('next') or 0) - now) / MINUTE_S):.1f} min")
             if fix := local_network_fix(st):
                 line += f"; {fix}"
         elif st.get("fails"):
             line += (f"; failing ({st['fails']}x since {ago(st.get('fail_since') or st.get('error_at'))}, "
                      f"last {ago(st.get('error_at'))}: {st.get('last_error')}), "
-                     f"next try in {max(0.0, (float(st.get('next') or 0) - now) / 60):.1f} min")
+                     f"next try in {max(0.0, (float(st.get('next') or 0) - now) / MINUTE_S):.1f} min")
             if fix := local_network_fix(st):
                 line += f"; {fix}"
         if st.get("run_ok"):
@@ -2772,9 +2807,9 @@ def forward_line(now: float | None = None) -> str:
     for t, st in bad.items():
         why = ("suspected macOS Local Network block on the daemon (`ttp doctor <project>` has the fix)"
                if st.get("suspect") == LOCAL_NETWORK else f"last: {str(st.get('last_error') or '')[:120]}")
-        line = f"sending upstream notes on to {t} has failed for {_failing_since(st, now) / 3600:.1f} h ({st['fails']}x; {why})"
+        line = f"sending upstream notes on to {t} has failed for {_failing_since(st, now) / HOUR_S:.1f} h ({st['fails']}x; {why})"
         if st.get("run_ok"):
-            line += f"; last sent from a run or the CLI {(now - float(st['run_ok'])) / 3600:.1f} h ago"
+            line += f"; last sent from a run or the CLI {(now - float(st['run_ok'])) / HOUR_S:.1f} h ago"
         out.append(line)
     return "; ".join(out)
 
