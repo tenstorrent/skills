@@ -12586,17 +12586,18 @@ class Daemon:
             parts += seen_looks
             lead_part = [("lead", leadmode.digest(db, lead))] if lead else []
             parts += lead_part
-            lane, routine, routine_why = coordroute.settings(self.cfg), False, []
+            lane, routine, routine_why, needs = coordroute.settings(self.cfg), False, [], []
             if lane["mode"] != "off":   # a routine wake may go to the routine lane (coordroute.py)
                 try:
                     routine, routine_why = coordroute.classify(
                         db, self.cfg, msgs=msgs, evs=evs, triggers=triggers, due=due, rerun=rerun,
                         urgent=urgent_msgs, lead=lead, sweep_event=sweep_event, hot=hot, must=must, parts=parts, now=now)
+                    needs = coordroute.idle_needs(evs, must)   # what an idle lane answer cannot settle
                 except Exception as e:   # what it cannot place goes to the coordinator's own session
                     routine, routine_why = False, [f"classifier failed: {type(e).__name__}"]
                     log(self.p, "routine lane classifier failed: " + traceback.format_exc().replace("\n", " | ")[:1500])
             if routine and lane["mode"] == "on" and self._start_lane(prompt_parts=parts, whole=whole, evs=evs, budget=budget, c=c,
-                                                                     lane=lane, fire=fire, why=routine_why):
+                                                                     lane=lane, fire=fire, why=routine_why, needs=needs):
                 db.set_kv("last_coordinator_turn", now)
                 looks.settle(db, [x["id"] for x in fire], "woken", None, now)
                 quietgate.started(db)
@@ -12645,7 +12646,7 @@ class Daemon:
             shadow = None
             if routine and lane["mode"] == "shadow":
                 shadow = "started" if self._start_shadow(rid, prompt_parts=parts, whole=whole, budget=budget, c=c,
-                                                         lane=lane, why=routine_why) else "busy"
+                                                         lane=lane, why=routine_why, needs=needs) else "busy"
             if lane["mode"] != "off":   # counted by reason, so a low shadow count shows its cause
                 coordroute.wake_seen(self.p.state, rid, routine, routine_why, shadow, now)
         except Exception:   # bookkeeping: the coordinator's wake runs either way
@@ -12667,12 +12668,12 @@ class Daemon:
         hand-offs and results and pending asks whole, and the last coordinator actions with their outcomes."""
         head, context = coord.prompt_parts(self.p)
         parts = coordroute.lane_digest(prompt_parts, whole, self.p.db, lane.get("recent_actions", coordroute.RECENT_ACTIONS),
-                                       lambda t: timefmt.short(t, self.p))
+                                       lambda t: timefmt.short(t, self.p), state_dir=self.p.state)
         prompt = "\n".join(text for _, text in parts)
         return prompt, head + "\n\n" + coordroute.LANE_PROMPT, context
 
     def _start_lane(self, *, prompt_parts: list, whole: list, evs: list, budget, c: dict, lane: dict, fire: list,
-                    why: list) -> int | None:
+                    why: list, needs: list = ()) -> int | None:
         """Starts a live routine lane turn (coordroute.py) on the lane's provider and model; None when it could
         not start, so the coordinator's own session takes the wake."""
         db = self.p.db
@@ -12684,7 +12685,7 @@ class Daemon:
                                  note={coordroute.LANE: "routine", "route": {"model": lane["model"], "effort": lane["effort"]},
                                        "messages": [], "events": [e["id"] for e in evs],
                                        "event_kinds": [e["kind"] for e in evs], "budget_usd": budget,
-                                       "default_chat": None, "triggers": [], "routine_why": why,
+                                       "default_chat": None, "triggers": [], "routine_why": why, "needs": list(needs),
                                        **({"looks": [x["id"] for x in fire]} if fire else {})})
             log(self.p, f"run {rid}: routine lane turn on {lane['provider']} ({lane['model']})")
             return rid
@@ -12695,7 +12696,8 @@ class Daemon:
             coordroute._save(db, st)
             return None
 
-    def _start_shadow(self, opus_run: int, *, prompt_parts: list, whole: list, budget, c: dict, lane: dict, why: list) -> bool:
+    def _start_shadow(self, opus_run: int, *, prompt_parts: list, whole: list, budget, c: dict, lane: dict, why: list,
+                      needs: list = ()) -> bool:
         """Starts a shadow lane turn beside coordinator turn `opus_run`: its answer is compared, never applied.
         False when another shadow still runs."""
         if self.p.db.one("SELECT id FROM runs WHERE role='coordinator' AND status='running' AND NOT ("
@@ -12708,7 +12710,7 @@ class Daemon:
                               note={coordroute.SHADOW: {"of": opus_run},
                                     "route": {"model": lane["model"], "effort": lane["effort"]},
                                     "messages": [], "events": [], "default_chat": None})
-        coordroute.shadow_started(self.p.state, opus_run, srid, why)
+        coordroute.shadow_started(self.p.state, opus_run, srid, why, needs=needs)
         return True
 
     def _finish_lane(self, r: dict, usage, status: str, note: dict, lane: str, actions) -> bool:
@@ -12731,7 +12733,7 @@ class Daemon:
             coordroute.record_turn(db, r["id"], note, actions, [], [], "", failed=failed)
             log(self.p, f"routine lane turn {r['id']} failed ({failed[:200]}): the coordinator's own session takes it")
             return True
-        ok, refused, esc = coordroute.filter_actions(actions)
+        ok, refused, esc = coordroute.filter_actions(actions, note.get("needs") or ())
         if refused or esc:
             coordroute.record_turn(db, r["id"], note, actions, [], refused, esc, summary=summary)
             log(self.p, f"routine lane turn {r['id']} escalated: {(esc or '; '.join(w for _, w in refused))[:200]}")

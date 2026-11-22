@@ -707,3 +707,93 @@ def test_coordinator_model_and_status_read_the_own_turn_not_a_newer_lane_or_shad
     assert all(not d["mode_off"] for d in days), days
     turn("claude", "sonnet", "high", "ok", {}, 10)   # the coordinator's own turn ran otherwise
     assert "MISMATCH: it ran with model sonnet, effort high" in coordmodel.line(p.config(), p.db, p)
+
+
+def test_coordroute_a_due_promise_its_owners_end_and_a_due_look_to_tell_a_chat_are_the_coordinators(env):
+    """Model-free escalate triggers: an open promise due within the hour or overdue, a task_done of a task
+    owning one (its receipt is out of lane), and a due look tied to an order or a chat. A look skipped
+    unchanged, or one about routine checks, stays routine."""
+    from ttp import coordroute, obligations as ob
+    p = _cr_db(env)
+    cfg = _cr_cfg()
+    now = time.time()
+    owner = p.db.add_task("ship it", "s", kind="work", tier="standard")
+    mid = p.db.x("INSERT INTO messages(ts,direction,kind,text,handled) VALUES(?,?,?,?,?)",
+                 (now, "out", "reply", "I'll post the result here.", 1))
+    ob.record_promises(p, [(mid, "c1", "I'll post the result here.")], {owner: "c1"}, now=now)
+    o = ob.open_promises(p.db)[0]
+    due = o["promise"]["due"]
+    ev = {"kind": "task_done", "severity": "normal", "task": owner}
+    routine, why = coordroute.classify(p.db, cfg, evs=[ev], now=due - 4 * 3600)
+    assert not routine and f"task #{owner} owns a promise" in why and not any("due" in w for w in why), why
+    assert coordroute.classify(p.db, cfg, now=due - 4 * 3600) == (True, [])
+    assert f"promise {o['id']} due soon" in coordroute.classify(p.db, cfg, now=due - 600)[1]
+    assert f"promise {o['id']} overdue" in coordroute.classify(p.db, cfg, now=due + 60)[1]
+    looks = lambda line: [("looks", "## Looks you set (due now)\n" + line + "\nSet your next look with a `look` action.")]
+    for line in ("- 10:31 (coordinator): send the answer to chat c1 once the deploy is live",
+                 "- 10:31 (coordinator): o12 (due 14:15): check the task landed",
+                 "- 10:31 (coordinator, read early with this turn): reply to the user's question"):
+        routine, why = coordroute.classify(p.db, cfg, parts=looks(line), now=due - 4 * 3600)
+        assert not routine and "due look tied to an order, a promise or a chat" in why, (line, why)
+    for line in ("- 10:31 (coordinator): check #12's checks finished and requeue its review",
+                 "- 10:31 skipped, its tasks, asks and push tip unchanged: tell chat c1 the result"):
+        assert coordroute.classify(p.db, cfg, parts=looks(line), now=due - 4 * 3600) == (True, []), line
+
+
+def test_coordroute_an_idle_answer_on_a_wake_that_needs_an_action_escalates(env):
+    """A must-act item or a stall-class event needs an action: only noops and looks is an escalation, in the
+    live lane (the note's needs) and in the shadow record; a routine wake without one may stay idle."""
+    from ttp import coordroute
+    ev = lambda kind: {"kind": kind, "severity": "normal", "task": None}
+    assert coordroute.idle_needs([ev("task_done")], "") == []
+    needs = coordroute.idle_needs([ev("stall"), ev("task_done"), ev("run_cap")], "## Must act now\n- #5 waits")
+    assert needs == ["must-act item", "run_cap event", "stall event"]
+    idle = [{"type": "noop", "why": "nothing to do"}, {"type": "look", "at": "30m", "text": "x"}]
+    assert coordroute.filter_actions(idle) == ([0, 1], [], "")
+    ok, refused, esc = coordroute.filter_actions(idle, needs)
+    assert esc == "idle answer on must-act item, run_cap event, stall event" and not refused
+    assert coordroute.filter_actions([{"type": "task_update", "id": 5, "status": "queued"}], needs)[2] == ""
+    p = make(env)
+    coordroute.shadow_started(p.state, 30, 31, [], needs=["stall event"])
+    coordroute.shadow_side(p.state, 30, "opus", [{"type": "task_update", "id": 5, "status": "queued"}], "ok", 1.0)
+    rec = coordroute.shadow_side(p.state, 30, "glm", idle, "ok", 0.1)
+    assert rec["glm"]["escalated"] == "idle answer on stall event" and not rec["compare"]["agree"]
+
+
+def test_coordroute_the_lane_sees_its_earlier_proposals_the_coordinator_did_not_take(env):
+    """The lane has no session: its shadow proposals the coordinator did not take on the same wake are shown
+    once each (newest first, within the window), so it does not propose them again; taken ones are not."""
+    from ttp import coordroute
+    p = make(env)
+    now = time.time()
+    for run, ago, glm in ((40, 3600, [{"type": "task_add", "title": "Review the sweep findings"},
+                                      {"type": "task_update", "id": 9, "priority": 2}]),
+                          (50, 1800, [{"type": "task_add", "title": "Review the sweep findings"}]),
+                          (60, 20 * 3600, [{"type": "task_add", "title": "Old idea"}])):
+        coordroute.shadow_started(p.state, run, run + 1, [], now=now - ago)
+        coordroute.shadow_side(p.state, run, "opus", [{"type": "task_update", "id": 9, "priority": 2}], "ok", 1.0)
+        coordroute.shadow_side(p.state, run, "glm", glm, "ok", 0.1)
+    text = coordroute.declined_proposals(p.state, now)
+    assert text.startswith("## Earlier lane proposals the coordinator did not take")
+    assert text.count("task_add review the sweep findings") == 1
+    assert "#9" not in text and "old idea" not in text
+    assert coordroute.declined_proposals(p.state, now - 7200) == ""
+    parts = coordroute.lane_digest([("tasks", "## Open tasks\n- #9")], [], p.db, 0, state_dir=p.state, now=now)
+    assert parts[-1] == ("declined_proposals", text)
+    assert "Earlier lane proposals" in coordroute.LANE_PROMPT
+
+
+def test_coordroute_an_escalation_where_the_coordinator_acted_out_of_lane_is_counted_right(env):
+    """compare() keeps strict agreement, and marks an escalation right when the coordinator's own answer
+    needed an action outside the lane (a reply, a memory entry, a promise receipt)."""
+    from ttp import coordroute
+    p = make(env)
+    esc = [{"type": "noop", "why": "escalate: a promise is due"}]
+    for run, opus, right in ((70, [{"type": "reply", "chat": "c1", "text": "done"}], True),
+                             (80, [{"type": "obligation", "key": "o3", "evidence": "landed"}], True),
+                             (90, [{"type": "task_update", "id": 4, "priority": 1}], False)):
+        coordroute.shadow_started(p.state, run, run + 1, [])
+        coordroute.shadow_side(p.state, run, "opus", opus, "ok", 1.0)
+        rec = coordroute.shadow_side(p.state, run, "glm", esc, "ok", 0.1)
+        assert not rec["compare"]["agree"] and rec["compare"]["escalated_right"] is right, run
+    assert coordroute.report(p.db, p.state)["shadow"]["escalated_right"] == round(2 / 3, 3)

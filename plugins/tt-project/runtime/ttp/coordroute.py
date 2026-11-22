@@ -71,6 +71,12 @@ ROUTINE_KINDS = frozenset({
     "resource_pause_removed", "checks_flaky_test", "queue_wait", "ready_not_started", "dispatch_held",
     "checks_slot_wait"})
 ROUTINE_DUE = (None, "", "look", "idle")
+# A due look naming a chat, a reply or a person to tell: the coordinator's own session answers people.
+_TO_PERSON = re.compile(r"(?i)\b(?:chat|reply|replies|tell|answer|notify)\b")
+PROMISE_SOON_S = 3600          # an open promise due within this long (or overdue) is the coordinator's own wake
+IDLE_KINDS = frozenset({"stall", "steer_unread", "run_cap"})   # events an idle (noop or look only) answer cannot settle
+DECLINED_H = 12.0              # how far back the lane is shown its own proposals the coordinator did not take
+DECLINED_MAX = 12
 _ORDERISH = re.compile(r"(?i)\b(?:order|promise|o\d+|user msg|urgent)\b")
 _PINS = ("provider", "model", "effort", "pin_required")
 
@@ -84,6 +90,15 @@ deep tier, set pr_branch, cancel a task or wake one now. If the wake needs any o
 return one action `{"type": "noop", "why": "escalate: <what needs the coordinator and why>"}` and nothing
 else: the coordinator's own session then takes this wake with your note. Give every action a `why`.
 Decide from the digest below; run no commands (the run guard ends a turn that tries).
+A promise or order that is due, or a chat waiting for an answer, is the coordinator's: escalate it, never draft
+the answer. Before you answer with only noop or look, check this list; if one holds, act on it with a lane
+action, else escalate: a Must act now item; a finished task whose result needs a follow-up or closes a promise;
+a stalled, failed or waiting task with no owner of its next step; an alert that asks for a fix.
+A hand-off's follow-ups are suggestions: queue one only if the goal needs it and nothing in Recent coordinator
+actions, Open tasks or Earlier lane proposals covers it; a proposal listed there as not taken stays declined
+unless something new calls for it. Prefer a task_update of an open task to a new task on its subject. Bookkeeping
+the coordinator does in its own turn (recording a why, memory upkeep, closing machine-ledger entries) is never a
+task.
 """
 
 
@@ -212,11 +227,52 @@ def classify(db, cfg: dict, *, msgs=(), evs=(), triggers=(), due=None, rerun=Fal
     for name, text in parts or ():
         if name == "course_check" and "promise" in str(text).lower():
             why.append("promise course line")
+        if name == "looks" and look_reason(text):
+            why.append(look_reason(text))
         if name in ("speed_complaint", "Speed complaint"):
             why.append("speed complaint")
+    promises = _open_promises(db)
+    why += promise_reasons(promises, now)
     for e in evs or ():
-        why += _event_reasons(db, e)
+        why += _event_reasons(db, e, promises)
     return (not why), list(dict.fromkeys(why))
+
+
+def _open_promises(db) -> list[dict]:
+    from . import obligations
+    try:
+        return obligations.open_promises(db)
+    except Exception:
+        return []
+
+
+def promise_reasons(promises, now: float) -> list[str]:
+    """An open promise or order due within PROMISE_SOON_S, or overdue: its deliverable or an honest update goes
+    to a person, which only the coordinator's own session does."""
+    out = []
+    for o in promises or ():
+        due = float((o.get("promise") or {}).get("due") or 0)
+        if due and due <= now + PROMISE_SOON_S:
+            out.append(f"promise {o.get('id')} {'overdue' if due <= now else 'due soon'}")
+    return out
+
+
+def look_reason(text: str) -> str:
+    """A reason when a due look (looks.digest; skipped ones aside) is tied to an order or promise or asks
+    to tell a chat or a person, else ""."""
+    items = "\n".join(ln for ln in str(text or "").splitlines()
+                      if ln.startswith("- ") and " skipped, its tasks" not in ln)
+    if _ORDERISH.search(items) or _TO_PERSON.search(items):
+        return "due look tied to an order, a promise or a chat"
+    return ""
+
+
+def idle_needs(evs=(), must: str = "") -> list[str]:
+    """What an idle answer (only noop or look) cannot settle on this wake: a must-act item or a stall-class
+    event. filter_actions() turns such an answer into an escalation."""
+    out = ["must-act item"] if _must_items(must).strip() else []
+    out += sorted({f"{e['kind']} event" for e in evs or () if str(e["kind"] or "") in IDLE_KINDS})
+    return out
 
 
 def _must_items(must: str) -> str:
@@ -228,7 +284,7 @@ def _must_items(must: str) -> str:
     return "\n".join(ln for ln in lines if ln.startswith("- "))
 
 
-def _event_reasons(db, e) -> list[str]:
+def _event_reasons(db, e, promises=()) -> list[str]:
     kind, sev = str(e["kind"] or ""), str(e["severity"] or "")
     out = []
     if kind not in ROUTINE_KINDS:
@@ -249,11 +305,22 @@ def _event_reasons(db, e) -> list[str]:
                 out.append(f"urgent task #{tid}")
             if t["reply_chat"]:
                 out.append(f"task #{tid} answers a chat")
+            if kind == "task_done" and any(int(tid) in _owners(o) for o in promises or ()):
+                out.append(f"task #{tid} owns a promise")
     return out
 
 
-def filter_actions(actions) -> tuple[list[int], list[tuple[int, str]], str]:
-    """(allowed indexes, refused [(index, why)], escalation why or "") for a lane turn's actions."""
+def _owners(o: dict) -> set[int]:
+    from . import obligations
+    try:
+        return {int(x) for x in obligations._owner_ids(o)}
+    except Exception:
+        return set()
+
+
+def filter_actions(actions, needs=()) -> tuple[list[int], list[tuple[int, str]], str]:
+    """(allowed indexes, refused [(index, why)], escalation why or "") for a lane turn's actions. With `needs`
+    (idle_needs), an answer of only noops and looks is an escalation: the wake needs an action the lane did not take."""
     ok, refused, esc = [], [], ""
     for i, a in enumerate(actions if isinstance(actions, list) else []):
         why = _refusal(a)
@@ -265,6 +332,8 @@ def filter_actions(actions) -> tuple[list[int], list[tuple[int, str]], str]:
             ok.append(i)
     if not isinstance(actions, list):
         refused.append((-1, "no action list"))
+    elif needs and not esc and not refused and all(actions[i].get("type") in ("noop", "look") for i in ok):
+        esc = "idle answer on " + ", ".join(needs)
     return ok, refused, esc
 
 
@@ -306,7 +375,10 @@ def _brief(a) -> dict:
     if not isinstance(a, dict):
         return {"type": "?", "target": "", "why": ""}
     why = a.get("why") or a.get("text") or a.get("title") or ""
-    return {"type": str(a.get("type") or ""), "target": _target(a), "why": str(why)[:200]}
+    out = {"type": str(a.get("type") or ""), "target": _target(a), "why": str(why)[:200]}
+    if _refusal(a) not in ("", "escalate"):
+        out["out_of_lane"] = True
+    return out
 
 
 def _lane_turns(st: dict) -> list:
@@ -372,7 +444,36 @@ def recent_actions(db, n: int = RECENT_ACTIONS, fmt=None) -> str:
     return "\n".join(out) if rows else ""
 
 
-def lane_digest(parts: list, whole: list, db, n: int = RECENT_ACTIONS, fmt=None) -> list:
+def declined_proposals(state_dir, now: float | None = None, hours: float = DECLINED_H, n: int = DECLINED_MAX) -> str:
+    """The lane's own recent shadow proposals the coordinator did not take on the same wake, so it does not
+    propose them again ("" when none)."""
+    folder = Path(state_dir) / SHADOW_DIR if state_dir else None
+    if not folder or not folder.is_dir():
+        return ""
+    now = time.time() if now is None else now
+    rows = []
+    for path in sorted(folder.glob("*.json")):
+        rec = read_dict(path)
+        ts = float(rec.get("ts") or 0)
+        if not (now - hours * 3600 <= ts < now) or not rec.get("compare"):
+            continue
+        taken = _keys(rec.get("opus") or {})
+        for a in (rec.get("glm") or {}).get("actions") or []:
+            if a.get("type") not in ("noop", "look") and (a["type"], a["target"]) not in taken:
+                rows.append((ts, f"{a['type']} {a['target']}".strip()))
+    seen, lines = set(), []
+    for ts, text in sorted(rows, reverse=True):
+        if text not in seen:
+            seen.add(text)
+            lines.append(f"- {time.strftime('%H:%M', time.gmtime(ts))}Z {text}")
+    if not lines:
+        return ""
+    return ("## Earlier lane proposals the coordinator did not take\nDeclined on their wakes: propose one again only "
+            "if something new calls for it.\n" + "\n".join(lines[:n]))
+
+
+def lane_digest(parts: list, whole: list, db, n: int = RECENT_ACTIONS, fmt=None, state_dir=None,
+                now: float | None = None) -> list:
     """The digest parts for a lane or shadow turn: the coordinator's parts without the lane's read-back, the
     LANE_VIEWS sections whole, and the recent actions. The same section builders as the coordinator's digest
     (coordinator.digest_parts): nothing here is a second copy."""
@@ -381,7 +482,8 @@ def lane_digest(parts: list, whole: list, db, n: int = RECENT_ACTIONS, fmt=None)
     have = {k for k, _ in out}
     out += [(k, full[k]) for k in LANE_VIEWS if k in full and k not in have]
     acts = recent_actions(db, n, fmt)
-    return out + ([("recent_actions", acts)] if acts else [])
+    declined = declined_proposals(state_dir, now)
+    return out + ([("recent_actions", acts)] if acts else []) + ([("declined_proposals", declined)] if declined else [])
 
 
 def record_turn(db, run_id, note: dict, actions, applied, refused, esc: str, failed: str = "",
@@ -536,12 +638,14 @@ def _wakes(state_dir, since: float, until: float) -> list[dict]:
     return out
 
 
-def shadow_started(state_dir, opus_run, shadow_run, why_routine, now: float | None = None) -> None:
+def shadow_started(state_dir, opus_run, shadow_run, why_routine, now: float | None = None, needs=()) -> None:
     path = shadow_path(state_dir, opus_run)
     path.parent.mkdir(parents=True, exist_ok=True)
     rec = read_dict(path)
     rec.update({"opus_run": int(opus_run), "shadow_run": shadow_run, "ts": time.time() if now is None else now,
                 "routine_why": why_routine})
+    if needs:
+        rec["needs"] = list(needs)
     _write(path, rec)
 
 
@@ -555,7 +659,7 @@ def shadow_side(state_dir, opus_run, side: str, actions, status: str, cost: floa
     side_rec = {"status": status, "cost_usd": round(float(cost or 0), 4), "duration_s": round(float(duration_s or 0), 1),
                 "actions": [_brief(a) for a in acts]}
     if side == "glm":
-        ok, refused, esc = filter_actions(acts) if isinstance(actions, list) else ([], [], "")
+        ok, refused, esc = filter_actions(acts, rec.get("needs") or ()) if isinstance(actions, list) else ([], [], "")
         side_rec.update({"refused": [w for _, w in refused], "escalated": esc})
     rec[side] = side_rec
     if "opus" in rec and "glm" in rec:
@@ -569,10 +673,14 @@ def _keys(side: dict) -> set:
 
 
 def compare(opus: dict, glm: dict) -> dict:
-    """The pair's agreement on what each would have changed (noops and looks aside)."""
+    """The pair's agreement on what each would have changed (noops and looks aside). `escalated_right`: the
+    lane escalated a wake where the coordinator took an action outside the lane (a reply, a notify, memory,
+    a receipt), which is the lane doing its job, not a miss."""
     a, b = _keys(opus), _keys(glm)
     both = a & b
+    out_of_lane = any(x.get("out_of_lane") or x.get("type") not in ALLOWED for x in opus.get("actions") or [])
     return {"agree": a == b and glm.get("status") == "ok" and not glm.get("refused") and not glm.get("escalated"),
+            "escalated_right": bool(glm.get("escalated")) and out_of_lane,
             "both": len(both), "opus_only": sorted(f"{t} {x}".strip() for t, x in a - b),
             "glm_only": sorted(f"{t} {x}".strip() for t, x in b - a),
             "escalated": bool(glm.get("escalated")), "refused": len(glm.get("refused") or []),
@@ -606,7 +714,8 @@ def report(db, state_dir, days: float = 7.0, now: float | None = None, since: fl
             "actions": sum(len(t.get("actions") or []) for t in turns),
             "suspended": st.get("suspended") or None}
     return {"days": days, "shadow": {"pairs": len(pairs), "compared": n, "agree": rate("agree"),
-                                     "escalated": rate("escalated"), "glm_failed": round(1 - (rate("glm_ok") or 0), 3)
+                                     "escalated": rate("escalated"), "escalated_right": rate("escalated_right"),
+                                     "glm_failed": round(1 - (rate("glm_ok") or 0), 3)
                                      if n else None,
                                      "with_refused": round(sum(1 for c in cmp if c.get("refused")) / n, 3) if n else None,
                                      "cost_usd": cost,
