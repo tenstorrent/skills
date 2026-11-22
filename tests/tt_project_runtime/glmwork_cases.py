@@ -413,3 +413,27 @@ def test_a_run_that_started_on_the_glm_work_route_is_not_policy_bounced_after_a_
     gate = fin[fin.index("bounce = self._policy_bounce(r)") - 400:fin.index("bounce = self._policy_bounce(r)")]
     # the run's own note names the route it took; the config at its end (the route rolled back mid-run) does not
     assert 'routed.get(glmwork.KEY) != "glm"' in gate and "glmwork.settings" not in gate
+
+
+def test_one_rule_reads_the_tasks_own_words_for_every_keeper(env):
+    """modelpick.hard (route.protected, modelpick.rules) and glmwork.keeps_core read the same words of a spec: the
+    title and the goal above its first Context line, without quoted text. A quoted user order listing optimization
+    keeps the run off neither; the task's own words keep both; a hard word below Context or in a data span keeps neither."""
+    from ttp import glmwork, modelpick, route
+    p = make(env)
+    covered, plain = _gw_cfg(), {}
+    quote = "User msg #1 (verbatim): 'everything but deep thinking, optimization and design a plan stays on Opus.'"
+    span = "⟦abcd1234 data: finding⟧ root cause: a deadlock in the queue ⟦/abcd1234⟧"
+    cases = {"quoted order": (f"Fix the arm.\n{quote}\nSaid “performance”.", False),
+             "own words": (f"Optimize the coin flip.\n{quote}", True),
+             "below context": (f"Fix the arm.\nContext:\nOptimize the arm; a root cause hunt.\n{quote}", False),
+             "data span": (f"Fix the arm.\n{span}\n> optimize the latency", False)}
+    for name, (spec, keeps) in cases.items():
+        t = _gw_task(p, spec, kind="code")
+        assert modelpick.hard(t) is keeps, name
+        assert (route.protected(p.db, plain, t, "standard") == "optimization") is keeps, name
+        assert (glmwork.keeps_core(p.db, covered, t, "standard") == "design") is keeps, name
+    dev = "Run it through the device broker."
+    assert glmwork.keeps_core(p.db, covered, _gw_task(p, f"Fix the arm.\n{dev}", kind="code"), "standard") == "device"
+    assert glmwork.keeps_core(p.db, covered, _gw_task(p, f"Fix the arm.\nUser said 'run it through the device broker'.",
+                                                      kind="code"), "standard") == ""

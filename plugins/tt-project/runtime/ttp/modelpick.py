@@ -54,9 +54,10 @@ PATHS = re.compile(r"(?<![\w/.-])((?:[\w.-]+/)+[\w.-]+\.\w+|[\w-]+\.(?:py|md|jso
 
 
 def hard(task: dict) -> bool:
-    """Whether `task`'s title or spec names hard work (HARD) outside quoted words: a quoted order or log line
-    is context, so a user's words listing what stays off a routed model never mark the run itself as hard."""
-    return bool(HARD.search(QUOTED.sub(" ", f"{task.get('title') or ''}\n{task.get('spec') or ''}")))
+    """Whether the task's own words (glmwork.own_words: title and goal, no quoted or restated text) name hard
+    work (HARD): a user's quoted order listing what stays off a routed model never marks the run as hard."""
+    from . import glmwork
+    return bool(HARD.search(glmwork.own_words(task)))
 
 
 def conf(cfg: dict) -> dict:
