@@ -632,7 +632,7 @@ def _passes(where: Path, tests: list[tuple[str, str]], rounds: int, cmd: str, ti
     out = where.parent / f"{where.name}.jsonl"
     log = where.parent / f"{where.name}.out"
     env = addedtests.env(tests, out, {**os.environ, "PWD": str(where)}, rounds)
-    env[addedtests.ENV] = json.dumps({**json.loads(env[addedtests.ENV]), "spread": False})
+    env[addedtests.ENV] = json.dumps({**json.loads(env[addedtests.ENV]), "spread": False, "keep_filters": True})
     argv = _held_cmd(cmd, [f"{p}::{n}" for p, n in tests])[0]
     timed_out = False
     with open(log, "wb") as sink:
