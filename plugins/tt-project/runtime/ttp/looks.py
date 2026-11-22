@@ -28,6 +28,8 @@ from typing import Iterator
 
 from . import probespawn
 
+SKIPPED = " skipped, its tasks"  # a quiet look's digest line; the routine lane reads past it
+
 KEY = "coord_looks"
 DONE_KEY = "coord_looks_done"
 MAX = 10                  # pending looks kept; a new one past this drops the latest-due
@@ -183,7 +185,7 @@ def digest(looks: list[dict], tz_fmt=None, now: float | None = None, quiet: list
     fmt = (lambda t: tz_fmt(t)) if tz_fmt else (lambda t: str(int(t)))
     early = lambda x: f", read early with this turn" if now is not None and x["at"] > now else ""
     rows = [f"- {fmt(x['at'])} ({x['by']}{early(x)}): {x['text']}" for x in looks]
-    rows += [f"- {fmt(x['at'])} skipped, its tasks, asks and push tip unchanged: {x['text']}" for x in quiet or []]
+    rows += [f"- {fmt(x['at'])}{SKIPPED}, asks and push tip unchanged: {x['text']}" for x in quiet or []]
     return "## Looks you set (due now)\n" + "\n".join(rows) + \
         "\nSet your next look with a `look` action, or none to fall back to the idle wake."
 

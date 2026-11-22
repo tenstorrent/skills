@@ -31,6 +31,7 @@ import re
 import time
 from pathlib import Path
 
+from . import looks
 from .util import num_in, read_dict
 
 KEY = "coord_routine"          # kv: {"last_opus", "turns": [...], "escalate", "suspended", "shadows": [run ids]}
@@ -227,23 +228,16 @@ def classify(db, cfg: dict, *, msgs=(), evs=(), triggers=(), due=None, rerun=Fal
     for name, text in parts or ():
         if name == "course_check" and "promise" in str(text).lower():
             why.append("promise course line")
-        if name == "looks" and look_reason(text):
-            why.append(look_reason(text))
+        if name == "looks" and (r := look_reason(text)):
+            why.append(r)
         if name in ("speed_complaint", "Speed complaint"):
             why.append("speed complaint")
-    promises = _open_promises(db)
+    from . import obligations
+    promises = obligations.open_promises(db)
     why += promise_reasons(promises, now)
     for e in evs or ():
         why += _event_reasons(db, e, promises)
     return (not why), list(dict.fromkeys(why))
-
-
-def _open_promises(db) -> list[dict]:
-    from . import obligations
-    try:
-        return obligations.open_promises(db)
-    except Exception:
-        return []
 
 
 def promise_reasons(promises, now: float) -> list[str]:
@@ -251,7 +245,7 @@ def promise_reasons(promises, now: float) -> list[str]:
     to a person, which only the coordinator's own session does."""
     out = []
     for o in promises or ():
-        due = float((o.get("promise") or {}).get("due") or 0)
+        due = float(o["promise"]["due"] or 0)
         if due and due <= now + PROMISE_SOON_S:
             out.append(f"promise {o.get('id')} {'overdue' if due <= now else 'due soon'}")
     return out
@@ -261,7 +255,7 @@ def look_reason(text: str) -> str:
     """A reason when a due look (looks.digest; skipped ones aside) is tied to an order or promise or asks
     to tell a chat or a person, else ""."""
     items = "\n".join(ln for ln in str(text or "").splitlines()
-                      if ln.startswith("- ") and " skipped, its tasks" not in ln)
+                      if ln.startswith("- ") and looks.SKIPPED not in ln)
     if _ORDERISH.search(items) or _TO_PERSON.search(items):
         return "due look tied to an order, a promise or a chat"
     return ""
@@ -285,6 +279,7 @@ def _must_items(must: str) -> str:
 
 
 def _event_reasons(db, e, promises=()) -> list[str]:
+    from . import obligations
     kind, sev = str(e["kind"] or ""), str(e["severity"] or "")
     out = []
     if kind not in ROUTINE_KINDS:
@@ -305,17 +300,10 @@ def _event_reasons(db, e, promises=()) -> list[str]:
                 out.append(f"urgent task #{tid}")
             if t["reply_chat"]:
                 out.append(f"task #{tid} answers a chat")
-            if kind == "task_done" and any(int(tid) in _owners(o) for o in promises or ()):
+            if kind == "task_done" and any(int(tid) in {int(x) for x in obligations._owner_ids(o)}
+                                           for o in promises or ()):
                 out.append(f"task #{tid} owns a promise")
     return out
-
-
-def _owners(o: dict) -> set[int]:
-    from . import obligations
-    try:
-        return {int(x) for x in obligations._owner_ids(o)}
-    except Exception:
-        return set()
 
 
 def filter_actions(actions, needs=()) -> tuple[list[int], list[tuple[int, str]], str]:
@@ -453,6 +441,8 @@ def declined_proposals(state_dir, now: float | None = None, hours: float = DECLI
     now = time.time() if now is None else now
     rows = []
     for path in sorted(folder.glob("*.json")):
+        if path.stat().st_mtime < now - hours * 3600:  # written last at its compare, never before its ts
+            continue
         rec = read_dict(path)
         ts = float(rec.get("ts") or 0)
         if not (now - hours * 3600 <= ts < now) or not rec.get("compare"):
@@ -678,6 +668,7 @@ def compare(opus: dict, glm: dict) -> dict:
     a receipt), which is the lane doing its job, not a miss."""
     a, b = _keys(opus), _keys(glm)
     both = a & b
+    # the type test also counts records written before _brief marked out_of_lane
     out_of_lane = any(x.get("out_of_lane") or x.get("type") not in ALLOWED for x in opus.get("actions") or [])
     return {"agree": a == b and glm.get("status") == "ok" and not glm.get("refused") and not glm.get("escalated"),
             "escalated_right": bool(glm.get("escalated")) and out_of_lane,
