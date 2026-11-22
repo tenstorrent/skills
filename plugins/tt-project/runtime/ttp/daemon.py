@@ -23573,8 +23573,10 @@ def _read_result(path: Path) -> dict | None:
     for key in FOLLOWUP_ALIASES:
         extra = data.pop(key, None)
         if isinstance(extra, list):
-            got = data["followups"] if isinstance(data.get("followups"), list) else []
-            data["followups"] = got + [f for f in extra if f not in got]
+            got = data["followups"] = data["followups"] if isinstance(data.get("followups"), list) else []
+            for f in extra:
+                if f not in got:
+                    got.append(f)
     return data
 
 

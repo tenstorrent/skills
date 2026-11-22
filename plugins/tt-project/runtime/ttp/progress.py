@@ -294,7 +294,7 @@ OWN_WAIT_RE = re.compile(r"detach --check|checks --result|push --result|\bttp ci
 # A wait no model turn ends while it says a plain not yet (NO_TURN_RCS): a holds folder the user clears, a
 # rollout flag, a PR's state. A user marker file is userpause.user_gated. A broken probe still reports.
 NO_TURN_RE = re.compile(r"(?:^|[\s/'\"])holds/|\bttp\s+rollout\s+(?:on|status)\b|"
-                        r"\bgh\s+pr\s+(?:view|checks|status)\b|\bgh\s+api\s+\S*/pulls/\d+")
+                        r"\bgh\s+pr\s+(?:view|status)\b|\bgh\s+api\s+\S*/pulls/\d+")
 NO_TURN_RCS = (1, 75)
 # A wait only the user ends: the hand-off's wait_kind (unblock.USER_WAIT_KINDS), or a waiting_for or
 # blocked_reason naming the user on a task that owns an open obligation.
@@ -631,9 +631,9 @@ def _outage_hosts(probe: str, outages: dict) -> list[str]:
     """The machines `probe` names (its ssh target or `--host`, or a `ttp lock --probe` resource) that have
     an open known outage in the machine ledger (a resource on it counts: `<alias>-...`) (`outages`: machine_ledger.outages)."""
     from . import locks, netwait
-    names = {n for h in [*netwait.hosts(probe), *locks.probe_resources(probe)]
-             for n in (h, h.rsplit("@", 1)[-1], h.rsplit("@", 1)[-1].split(".")[0])}
-    return sorted(a for a in outages if any(n == a or n.startswith((a + "-", a + ":")) for n in names))
+    hosts = {n for h in netwait.hosts(probe) for n in (h, h.rsplit("@", 1)[-1], h.rsplit("@", 1)[-1].split(".")[0])}
+    res = locks.probe_resources(probe)
+    return sorted(a for a in outages if a in hosts or any(r == a or r.startswith((a + "-", a + ":")) for r in res))
 
 
 def probe_stalls(db: DB, s: dict, st: dict, now: float, current_probe: Callable[[dict], str | None],
