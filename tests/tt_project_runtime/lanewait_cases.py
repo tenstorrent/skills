@@ -163,6 +163,10 @@ def test_a_lane_wait_past_the_threshold_raises_one_event_cleared_on_start(env, h
     dep = p.db.add_task("the waiter", "s", kind="code", status="queued", labels=labels,
                         depends_on=[holder] if how == "depends_on" else None)
     p.db.x("UPDATE tasks SET created=? WHERE id=?", (t0, dep))
+    if how == "waits_end":   # the daemon's dispatch holds it (a released label with no clash is no wait)
+        lanewait.check(p.db, {"waiting": {"lane_wait_event_s": 600}}, time.time())
+        assert not p.db.q("SELECT * FROM events WHERE kind='lane_wait'")
+        p.db.update_task(dep, blocked_reason=f"held: waits for #{holder}, which is using branch x")
     cfg = {"waiting": {"lane_wait_event_s": 600}}
     for _ in range(3):
         lanewait.check(p.db, cfg, time.time())

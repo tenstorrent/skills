@@ -112,6 +112,7 @@ def holders(db, t: dict, unmet: list, now: float) -> list[tuple[int, str]]:
     """(holder id, how) of each other task queued task `t` waits on; [] when it waits on something
     else too that is not a task (a start_when naming none, a start_after ahead)."""
     from .premise import pending
+    from .daemon import BRANCH_HELD_NOTE
     from .worktree import lineage_hold
     d = deferral(t)
     when = d.get("when")
@@ -123,7 +124,9 @@ def holders(db, t: dict, unmet: list, now: float) -> list[tuple[int, str]]:
     user = plangate.user_holders(db, t) | (set(refs) if when and convgate.user_word(d.get("why")) else set())
     out = [(r, f"start_when landed:#{r}") for r in refs if r not in user]
     out += [(d, "depends_on") for d in unmet if isinstance(d, int) and d not in user]
-    if (h := lineage_hold(t)) is not None and (row := db.task(h)) and row["status"] in ("queued", "running", "waiting"):
+    # The label holds only while the daemon's dispatch holds it (its note): a hold it released, with no
+    # branch or worktree clash left, is no lane wait.
+    if (h := lineage_hold(t)) is not None and (t["blocked_reason"] or "").startswith(f"{BRANCH_HELD_NOTE}{h},"):
         out.append((h, "waits_end"))
     # A failed, cancelled or missing holder is a dead wait, raised on its own (dead_dependency,
     # missing_task_ref, deferral_probe_broken).
