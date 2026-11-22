@@ -334,8 +334,10 @@ def test_a_task_superseded_by_an_unlanded_commit_posts_nothing_and_its_heir_carr
     p.db.update_task(heir, reply_chat="c2")
     superseded(ref="origin/ttp/heir")
     assert p.db.task(heir)["reply_chat"] == "c2" and _c1_replies(p) == said
-    superseded()
-    assert [r for r in _c1_replies(p) if f"its work is in {relanded[:10]}" in r], _c1_replies(p)
+    for kw in ({}, {"ref": "origin/proj"}):   # no heir: a landing
+        before = len(_c1_replies(p))
+        superseded(**kw)
+        assert [r for r in _c1_replies(p)[before:] if f"its work is in {relanded[:10]}" in r], (kw, _c1_replies(p))
     p.db.x("DELETE FROM task_superseded WHERE task=?", (tid,))
     p.db.update_task(tid, result=json.dumps({"status": "done", replymsg.HELD: "Done."}))
     landed.record_superseded(p, tid, relanded)

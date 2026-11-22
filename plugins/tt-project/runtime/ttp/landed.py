@@ -578,8 +578,9 @@ def record_superseded(p, tid: int, sha: str, ref: str | None = None, repo: str |
     A code task in 'review', or one of another kind (not a review) with a branch on record, is accepted
     on the same checks (its work landed), a harness task in 'review' or done (with no `ref` or `repo`)
     when `sha` is merged into the harness checkout's HEAD and its worktree branch has nothing unmerged
-    (_record_harness); one left in 'review' is then closed as done. Its chat hears only a landing checked
-    on the push branch (no `ref` or `repo`); otherwise _hand_over gives its reply to the task named."""
+    (_record_harness); one left in 'review' is then closed as done. When `ref` names the branch of
+    an open task (_heir), that task carries the work: this one's chat hears nothing from it and _hand_over gives
+    the reply to that task; any other record posts the landing reply."""
     task = p.db.task(tid)
     if not task:
         raise ValueError(f"no task #{tid}")
@@ -592,9 +593,10 @@ def record_superseded(p, tid: int, sha: str, ref: str | None = None, repo: str |
         words = _record_harness(p, task, sha)
     else:
         words = _record_work(p, task, sha, ref, repo)
-    landed = not ref and not repo   # `sha` was checked on the push branch (or merged into the harness)
-    if not landed and (status == "review" or replymsg.HELD in load_result(task.get("result"))):
-        words += _hand_over(p, task, ref)   # its chat has not heard, and its work may not have landed
+    heir = _heir(p, tid, ref) if ref else None
+    landed = not heir   # else an open task carries the work and the reply: this one posts nothing
+    if heir and (status == "review" or replymsg.HELD in load_result(task.get("result"))):
+        words += _hand_over(p, task, heir)
     if status == "review":
         full = p.db.one("SELECT sha FROM task_superseded WHERE task=? ORDER BY ts DESC LIMIT 1", (tid,))["sha"]
         words += _close_review(p, task, full, landed)
@@ -624,11 +626,25 @@ def _record_harness(p, task: dict, sha: str) -> str:
     return f"task #{tid}: recorded as superseded by {full[:10]} (merged into the harness)"
 
 
-def _hand_over(p, task: dict, ref: str | None) -> str:
-    """Superseded `task`, whose chat has not heard its result, posts nothing (its record is not on the push
-    branch): its held reply (replymsg.HELD) is dropped, and the open task whose branch is `ref` (the record
-    names it) takes its reply chat, when it has none, and the obligations and promises it owns. The words
-    to add."""
+def _heir(p, tid: int, ref: str | None) -> dict | None:
+    """The open, non-review task whose branch `ref` names (a local branch, or one behind a remote's name:
+    only a remote prefix is stripped), when the record names one: the task that carries superseded `tid`'s work."""
+    from . import obligations
+    name = str(ref or "").removeprefix("refs/heads/")
+    if name.startswith("refs/remotes/"):
+        name = name.removeprefix("refs/remotes/").split("/", 1)[-1]
+    elif "/" in name and name.split("/", 1)[0] in _git(p.root, "remote").stdout.split():
+        name = name.split("/", 1)[1]
+    return next((t for t in p.db.q(
+        "SELECT id, branch, reply_chat FROM tasks WHERE id<>? AND kind<>'review' AND branch<>'' "
+        f"AND status NOT IN ({','.join('?' * len(obligations.CLOSED))}) ORDER BY id DESC",
+        (tid, *obligations.CLOSED)) if name and t["branch"] == name), None)
+
+
+def _hand_over(p, task: dict, heir: dict) -> str:
+    """Superseded `task` was re-landed by open task `heir`, not yet on the push branch, so its chat hears
+    nothing from it: its held reply (replymsg.HELD) is dropped, and `heir` takes its reply chat, when it has
+    none, and the obligations and promises it owns. The words to add."""
     from . import obligations
     from .db import dump_result
     tid = task["id"]
@@ -637,14 +653,6 @@ def _hand_over(p, task: dict, ref: str | None) -> str:
         prev = load_result(row.get("result"))
         if prev.pop(replymsg.HELD, None) is not None:
             p.db.update_task(tid, result=dump_result(prev))
-        name = str(ref or "").removeprefix("refs/heads/").removeprefix("refs/remotes/")
-        names = {name, name.split("/", 1)[-1]} - {""}   # a remote's branch names the task's own
-        heir = next((t for t in p.db.q(
-            "SELECT id, branch, reply_chat FROM tasks WHERE id<>? AND kind<>'review' AND branch<>'' "
-            f"AND status NOT IN ({','.join('?' * len(obligations.CLOSED))}) ORDER BY id DESC",
-            (tid, *obligations.CLOSED)) if t["branch"] in names), None)
-        if not heir:
-            return "; it posts nothing to its chat (no open task has that branch)" if row.get("reply_chat") else ""
         if row.get("reply_chat") and not heir["reply_chat"]:
             p.db.update_task(heir["id"], reply_chat=row["reply_chat"])
         moved = obligations.hand_over(p, tid, heir["id"], f"#{heir['id']} carries superseded #{tid}'s work on")
