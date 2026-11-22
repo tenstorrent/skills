@@ -22156,6 +22156,26 @@ def test_a_code_hand_off_passes_when_it_declares_the_landing_or_the_carried_comm
     assert t["status"] == "done" and carryback.KEY not in json.loads(t["result"]), dict(t)
 
 
+def test_a_follow_up_of_a_done_fix_re_works_the_change_its_chain_fixed(env):
+    # C follows done fix B; B continues A2, which continues A (A's review failed, B fixed it). C carries A's
+    # commits through B's head: it re-works A's change and is not sent back for them. A follows: hop to a
+    # task that is not a done code task, or a chain that never reaches A, still sends it back.
+    from ttp import carryback
+    p = make(env)
+    a = p.db.add_task("A", "s", kind="code", origin="user")
+    a2 = p.db.add_task("A2", "s", kind="code", origin="daemon", labels=[f"continues:{a}"])
+    b = p.db.add_task("B", "s", kind="code", origin="daemon", labels=[f"continues:{a2}"])
+    c = p.db.add_task("C", "s", kind="code", origin="coordinator", labels=[f"follows:{b}"])
+    for t in (a, a2, b):
+        p.db.update_task(t, status="done")
+    assert carryback.reworks(p.db, p.db.task(c), a)
+    assert carryback.pending(p.db, p.db.task(c), {a: ["abc1234 A's change"]}, {}) == {}
+    other = p.db.add_task("other", "s", kind="code", origin="user")
+    assert carryback.pending(p.db, p.db.task(c), {other: ["def5678 other"]}, {}) == {other: ["def5678 other"]}
+    p.db.update_task(b, status="failed")
+    assert not carryback.reworks(p.db, p.db.task(c), a)
+
+
 def test_land_needs_a_passed_review_of_exactly_head_where_delivery_wants_review(env, monkeypatch, capsys):
     # Replays the upstream note: on a project whose delivery wants a review before each push, a worker's
     # `ttp push --land --detach` ran only the checks and landed. `--land` overrides the landing step and
