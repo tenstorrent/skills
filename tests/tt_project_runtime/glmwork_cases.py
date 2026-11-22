@@ -435,5 +435,18 @@ def test_one_rule_reads_the_tasks_own_words_for_every_keeper(env):
         assert (glmwork.keeps_core(p.db, covered, t, "standard") == "design") is keeps, name
     dev = "Run it through the device broker."
     assert glmwork.keeps_core(p.db, covered, _gw_task(p, f"Fix the arm.\n{dev}", kind="code"), "standard") == "device"
-    assert glmwork.keeps_core(p.db, covered, _gw_task(p, f"Fix the arm.\nUser said 'run it through the device broker'.",
-                                                      kind="code"), "standard") == ""
+
+
+def test_the_device_keeper_reads_quoted_commands_as_the_tasks_own(env):
+    """The design and hard-work keepers drop quoted words (someone else's order), but a quoted device command is
+    the task's own instruction: with glm_device off it keeps the run on core. A device word only inside a data
+    span or a `>` line keeps nothing."""
+    from ttp import glmwork
+    p = make(env)
+    covered = _gw_cfg()
+    keeps = lambda spec: glmwork.keeps_core(p.db, covered, _gw_task(p, spec, kind="code"), "standard")
+    assert keeps('Fix the reset path.\nVerify with "tt-smi -r 0" and check the board comes back.') == "device"
+    assert keeps("Fix the reset path.\nVerify with 'tt-smi -r 0' and check the board comes back.") == "device"
+    assert keeps("Fix the arm.\nUser said 'run it through the device broker'.") == "device"
+    assert keeps("Fix the arm.\n⟦abcd1234 data: log⟧ ran tt-smi -r 0 through the device broker ⟦/abcd1234⟧") == ""
+    assert keeps("Fix the arm.\n> ran tt-smi -r 0 through the device broker") == ""

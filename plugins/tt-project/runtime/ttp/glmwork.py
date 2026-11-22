@@ -68,12 +68,14 @@ def goal_spec(spec) -> str:
     return spec[:m.start()] if m else spec
 
 
-def own_spec(spec) -> str:
-    """goal_spec without quoted text (modelpick.QUOTED words, untrusted data spans and `>` lines): the one rule
-    for which words of a spec are the task's own, read by keeps_core and modelpick.hard (so route.protected
-    and modelpick.rules)."""
-    from . import modelpick, untrusted
-    return modelpick.QUOTED.sub(" ", untrusted.unquoted(goal_spec(spec)))
+def own_spec(spec, words: bool = False) -> str:
+    """goal_spec without quoted text (untrusted.QUOTED words, data spans and `>` lines): the one rule for which
+    words of a spec are the task's own, read by keeps_core and modelpick.hard (so route.protected and
+    modelpick.rules). `words` keeps quoted words (only data spans and `>` lines go): the device keeper's
+    input, since a quoted command ("tt-smi -r 0") is the task's own instruction."""
+    from . import untrusted
+    text = untrusted.unquoted(goal_spec(spec))
+    return text if words else untrusted.QUOTED.sub(" ", text)
 
 
 def own_words(task: dict) -> str:
@@ -285,8 +287,9 @@ def keeps_core(db, cfg: dict, task: dict, tier: str, cls: str | None = None, pic
     person_writeup off, or an instruction to post, comment or notify with the outward-drafts redirect off: with
     them on, Opus writes the words and GLM does the work), a task titled as a review of another, optimization or
     design work, device work (a job through a device broker too; with
-    glm_device on it runs on GLM under an Opus plan, deviceplan.py; both read only the title and own_spec besides
-    its resources), urgent (only with keep_urgent), a kind off the list."""
+    glm_device on it runs on GLM under an Opus plan, deviceplan.py), urgent (only with keep_urgent), a kind off
+    the list. The design and judgment keepers read the title and own_spec; the device keepers the title and
+    own_spec with quoted words kept (a quoted command is the task's own), besides its resources."""
     from . import codearm, deviceplan, effort, modelpick, untrusted, urgent
     kind = str(task.get("kind") or "")
     text = f"{task.get('title') or ''}\n{task.get('spec') or ''}"
@@ -312,11 +315,12 @@ def keeps_core(db, cfg: dict, task: dict, tier: str, cls: str | None = None, pic
         return "person"
     if kind in ("question", "work") and REVIEW_TITLE.search(str(task.get("title") or "")):
         return "review"
-    own = {**task, "spec": own_spec(task.get("spec"))}
-    goal = f"{task.get('title') or ''}\n{own['spec']}"
+    goal = own_words(task)
     if DESIGN.search(goal) or codearm.JUDGMENT.search(goal):
         return "design"
-    if (deviceplan.device(own, cfg) or BROKER_JOB.search(goal)) and not deviceplan.on(cfg):
+    own = {**task, "spec": own_spec(task.get("spec"), words=True)}
+    if (deviceplan.device(own, cfg) or BROKER_JOB.search(f"{task.get('title') or ''}\n{own['spec']}")) \
+            and not deviceplan.on(cfg):
         return "device"   # with glm_device on, a device task runs on GLM under an Opus plan (deviceplan.py)
     s = settings(cfg) or {}
     if s.get("keep_urgent") and urgent.is_urgent(task):

@@ -117,6 +117,9 @@ def test_charter_gate_power_limit_exception_ignores_items_that_only_name_the_hos
     assert "Exception (a)" not in stored[0]     # it narrows the ban itself, not the older exception quoting it
     assert coord._ban_part("- Whenever box-b is too full, CPU checks may run on box-a, but never device work.") \
         .strip() == "never device work"
+    # an apostrophe inside a word (user's) stays inside the quote it sits in: no ban word leaks out of it
+    assert coord._ban_part("- Exception to 'Never reboot the user's box or never touch its power': box-a may run "
+                           "CPU checks, never device work.").strip() == "never device work"
     p.charter_path.write_text(_BOX_A_ITEMS + "- Never change the power limit of box-a. (user msg #1)\n")
     mids, src = _turn_said(p, "change the power limit of box-a from 170 to 160 W")
     err = coord.apply(p, [{**act, "source": src}], turn=2, user_turn=True, messages=mids)

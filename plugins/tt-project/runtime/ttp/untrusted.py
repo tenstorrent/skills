@@ -188,6 +188,8 @@ def push_branch(raw: bool = False) -> str:
 # A span of quoted text (spans.wrap) with its contents, or an unclosed one to the end; and a `>` quote line.
 _SPAN = re.compile(r"⟦([0-9a-f]{8}) data: [^⟧]*⟧.*?(?:⟦/\1⟧|\Z)", re.S)
 _QUOTE_LINE = re.compile(r"^[ \t]*>.*$", re.M)
+# Quoted words on one line: '...' (an apostrophe inside a word, as in user's, stays inside), "...", “...”, ‘...’.
+QUOTED = re.compile(r"""(?<!\w)'(?:[^'\n]|'(?=\w))*'(?!\w)|"[^"\n]*"|“[^”\n]*”|‘[^’\n]*’""")
 
 
 def unquoted(spec: str) -> str:

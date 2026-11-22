@@ -49,12 +49,11 @@ SUCCESS_DAYS = 14
 AVOID_DAYS = 7
 HARD = re.compile(r"(?i)\b(optimi[sz]\w*|performance|perf|throughput|latency|architect\w*|"
                   r"hard[- ]debug\w*|deadlock|race condition|root[- ]cause|bisect\w*)\b")
-QUOTED = re.compile(r"""(?<!\w)'(?:[^'\n]|'(?=\w))*'(?!\w)|"[^"\n]*"|“[^”\n]*”|‘[^’\n]*’""")
 PATHS = re.compile(r"(?<![\w/.-])((?:[\w.-]+/)+[\w.-]+\.\w+|[\w-]+\.(?:py|md|json|sh|ya?ml|toml|cpp|h|c|rs|js|ts))\b")
 
 
 def hard(task: dict) -> bool:
-    """Whether the task's own words (glmwork.own_words: title and goal, no quoted or restated text) name hard
+    """Whether the task's own words (glmwork.own_words: title and goal, no quoted text) name hard
     work (HARD): a user's quoted order listing what stays off a routed model never marks the run as hard."""
     from . import glmwork
     return bool(HARD.search(glmwork.own_words(task)))

@@ -6946,7 +6946,7 @@ def _ban_part(item: str) -> str:
     bare = restriction_source.bare(item)
     if not _may_lift(bare):
         return item
-    unquoted = re.sub(r"'[^']*'|\"[^\"]*\"|\u2018[^\u2019]*\u2019|\u201c[^\u201d]*\u201d", " ", bare)
+    unquoted = untrusted.QUOTED.sub(" ", bare)
     bans = [c for c in re.split(r"[,;:.]\s|\bbut\b|[;:.]$", unquoted) if _BAN_RE.search(c)]
     return " ".join(bans) or item
 
