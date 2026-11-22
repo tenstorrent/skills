@@ -2010,14 +2010,16 @@ def status_text(p: Project, verbose: bool = False) -> str:
         est = eta._Est(db, now, core=eta.core_of(p), delivery=eta.delivery_of(p))
     except Exception:
         est = None
+    later = {t["id"] for t in h["deferred"]}
     for t in hot[:8]:   # the urgent lane: each waiting urgent task, with how long it has waited and its ETA
         try:
             fin = f", {eta.field(e, p, now)}" if est and ((e := est.task(t["id"]))["end"] or e.get("after") or e.get("gated")) else ""
         except Exception:
             fin = ""
         # A future not_before (start_after, the tests gate) is when it can start at all: say so, never
-        # only that it is queued.
-        nb = f", deferred until {at(t['not_before'], now, tz)}" if float(t.get("not_before") or 0) > now else ""
+        # only that it is queued (a deferred row below says when and why: starts_text).
+        nb = f", deferred until {at(t['not_before'], now, tz)}" \
+            if float(t.get("not_before") or 0) > now and t["id"] not in later else ""
         if own := handoff_wait(t, now):   # its own wait's age (its waiting row names what), no bare ETA
             nb, fin = f", {own}", fin if "no estimate" not in fin else ""
         row(t, f"{t['status']} ({urgent.mark(db, t, now)}{nb}{fin})", f"urgent: {urgent.shown_why(db, t, now)}"
@@ -9389,8 +9391,9 @@ def cmd_lock(a) -> None:
                 try:
                     return proc.wait()
                 finally:
-                    if fg:
+                    if fg:   # a note already under way finishes (steer and progress) before this exits
                         fg.cancel()
+                        fg.join()
                     if keeper:
                         keeper.kill()
                         keeper.wait()
@@ -11451,7 +11454,7 @@ def list_tasks(p, a) -> tuple[list[dict], int, int | None]:
     """The rows `ttp task list` shows, newest first, how many matched and the cap applied (None: none).
     --status filters on the shown status (changes_needed included) before any cap, and with no --limit
     returns every match; with no filter only the newest TASK_LIST_LIMIT are shown unless --all."""
-    cols = "SELECT id,status,kind,result,tier,title,labels FROM tasks"
+    cols = "SELECT id,status,kind,result,tier,title,labels,not_before,blocked_reason,depends_on FROM tasks"
     want = {s.strip() for s in (a.status or "").split(",") if s.strip()}
     limit = None if a.all else a.limit if a.limit is not None else None if want else TASK_LIST_LIMIT
     if want:
@@ -11502,12 +11505,16 @@ def cmd_task(a) -> None:
             print(f"showing newest {limit} of {total} tasks; use --all, --limit N or --status", file=sys.stderr)
         from . import blindreview
         title = blindreview.scrub if blindreview.caller_blind() else str   # a blind review sees no model names
+        from .coordinator import starts_text   # a queued task held to a later start says when and why
+        starts = {t["id"]: starts_text(t, plain=True, where=p, db=p.db) for t in rows if t["status"] == "queued"}
         if a.json:
             print(json.dumps([{"id": t["id"], "status": task_outcome(t), "kind": t["kind"], "tier": t["tier"],
-                               "title": title(t["title"]), **task_timing(t)} for t in rows], indent=2))
+                               "title": title(t["title"]), **task_timing(t),
+                               **({"starts": starts[t["id"]]} if starts.get(t["id"]) else {})} for t in rows], indent=2))
             return
         for t in rows:
-            print(f"#{t['id']}\t{task_outcome(t)}\t{t['tier']}\t{title(t['title'])}")
+            print(f"#{t['id']}\t{task_outcome(t)}\t{t['tier']}\t{title(t['title'])}"
+                  + (f"\t{starts[t['id']]}" if starts.get(t["id"]) else ""))
     elif a.action == "show":
         if not a.title.strip().isdigit():
             die(f"show needs a task id, not {a.title!r}")

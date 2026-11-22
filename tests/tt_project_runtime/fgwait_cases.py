@@ -86,8 +86,7 @@ def test_a_long_foreground_ttp_lock_in_a_worker_run_steers_it_to_detach_once(env
     steer.unlink()
     r = _ttp_run(p, "lock", "rig-a", "--", "true", env={**run_env, "TTP_FG_WAIT_S": "30"})
     assert r.returncode == 0, r.stderr
-    time.sleep(0.5)
-    assert not steer.exists()
+    assert not steer.exists(), "ttp lock joins its timer before it exits: nothing writes later"
 
 
 def test_the_suggested_detach_hands_off_waiting_and_its_check_resumes_the_task_once_the_job_ends(env, tmp_path):

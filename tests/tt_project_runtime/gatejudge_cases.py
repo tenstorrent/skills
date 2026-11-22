@@ -475,6 +475,30 @@ def test_tests_quarantined_on_one_day_share_one_deflake_task_per_module(env):
     assert not p.db.q("SELECT id FROM events WHERE status='queued'")
 
 
+def test_a_deflake_task_held_to_the_next_day_says_when_it_starts_and_why_in_every_view(env, capsys):
+    """A queued task whose not_before is ahead says 'starts <home-zone time> (daemon: <why>)' in status,
+    `ttp task list`, the digest and the web task view, whatever set it; the deflake one's why is its batch."""
+    from ttp import cli, gatejudge
+    from ttp import coordinator as coord
+    from ttp.web import state_payload
+    p = make(env)
+    (tid,) = gatejudge.deflake(p.db, ["tests/test_m.py::test_a"], {"head": "f" * 40, "check": "pytest"}, time.time(), p)
+    t = p.db.task(tid)
+    assert t["not_before"] > time.time() and t["status"] == "queued"
+    said = coord.starts_text(t, plain=True, where=p, db=p.db)
+    assert said.startswith("starts ") and said.endswith(" (daemon: next-day flake batch)"), said
+    assert f"deferred, {said}: " in cli.status_text(p)
+    assert _ttp_task(p, "list") in (0, None)
+    assert f"#{tid}\t" in (out := capsys.readouterr().out) and said in out, out
+    assert f"| queued ({coord.starts_text(t, where=p, db=p.db)}) |" in coord.digest(p, {}, [], [])
+    assert {x["id"]: x["starts"] for x in state_payload(p, p.db)["tasks"]}[tid] == said
+    # A plain not_before with no why still says the daemon holds it; a retry stays `waiting, next try`.
+    p.db.update_task(tid, labels="[]")
+    assert coord.starts_text(p.db.task(tid), plain=True, where=p, db=p.db).endswith(" (daemon)")
+    p.db.update_task(tid, blocked_reason="next try 12:00")
+    assert coord.starts_text(p.db.task(tid), plain=True, where=p, db=p.db) == ""
+
+
 def test_a_quarantined_test_with_no_fix_owner_is_filed_once_by_the_daemons_sweep(env):
     """An entry quarantined by a path that filed no deflake task (or before it did) gets one from the sweep,
     exactly once across ticks; one an open deflake task lists is never filed again."""

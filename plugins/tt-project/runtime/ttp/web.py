@@ -341,12 +341,13 @@ def health(p: Project, db: DB, alive: bool = True, now: float | None = None) -> 
                                      "fix": fix_for(r["key"].split(":", 1)[1], note)})
     paused_resources = [{"resource": k, **v, "end": pauseends.describe(v, tz, pauseends.passed_at(db, k, v), now)}
                         for k, v in sorted(db.paused_resources().items())]
-    # A deferred task waits to start (start_after / start_when): a plan, not a problem or a retry.
+    # A deferred task waits to start (start_after / start_when, or a daemon's not_before such as a deflake
+    # batch): a plan, not a problem or a retry (starts_text says '' for a retry, which stays in `waiting`).
     start_gates, warn_s = db.kv(startgate.KEY, {}) or {}, startgate.warn_after(cfg)
     deferred = [{"id": t["id"], "title": t["title"], "starts": coord.starts_text(t, now, plain=True, where=tz, db=db),
                  "gate": startgate.view(db, t, now, warn_s, start_gates)}   # its last result, age, stale warning
-                for t in db.q("SELECT * FROM tasks WHERE status='queued' AND labels LIKE '%\"start_%' "
-                              "ORDER BY COALESCE(not_before, 0), id")]
+                for t in db.q("SELECT * FROM tasks WHERE status='queued' AND (labels LIKE '%\"start_%' "
+                              "OR not_before>?) ORDER BY COALESCE(not_before, 0), id", (now,))]
     deferred = [t for t in deferred if t["starts"]]
     later = {t["id"] for t in deferred}
     waiting = [t for t in db.q("SELECT id, title, not_before, blocked_reason, result FROM tasks WHERE status='queued' "

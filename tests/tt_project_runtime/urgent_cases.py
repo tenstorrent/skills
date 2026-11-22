@@ -257,10 +257,10 @@ def test_status_and_the_web_payload_mark_an_urgent_task_with_its_wait(env):
     assert all("spec" not in t for t in rows.values()), "the payload never carries the spec"
 
 
-def test_status_says_deferred_until_for_a_queued_task_whose_not_before_is_ahead(env):
-    """A queued task whose not_before is ahead (the tests gate's deferral, no retry recorded) reads 'deferred
-    until <time>' in status, in its urgent row too, never a bare 'queued' or 'next try' (cell status_not_before);
-    one waiting out a retry still reads 'next try'."""
+def test_status_says_when_a_queued_task_whose_not_before_is_ahead_starts(env):
+    """A queued task whose not_before is ahead (the tests gate's deferral, no retry recorded) reads 'deferred,
+    starts <time> (daemon)' in status, once in its urgent row too, never a bare 'queued' or 'next try' (cell
+    status_not_before); one waiting out a retry still reads 'next try'."""
     from ttp import cli
     p = make(env)
     hot = p.db.add_task("hot fix", "Fix it.\nurgent: the user is waiting", kind="code", origin="coordinator")
@@ -272,8 +272,9 @@ def test_status_says_deferred_until_for_a_queued_task_whose_not_before_is_ahead(
     p.db.x("UPDATE tasks SET blocked_reason='its device is busy' WHERE id=?", (retry,))
     out = cli.status_text(p)
     hot_line = next(x for x in out.splitlines() if f"#{hot} " in x)
-    assert ", deferred until " in hot_line and "next try" not in hot_line, out
-    assert f"#{calm} deferred until " in out, out
+    assert hot_line.count("starts ") == 1 and "(daemon)" in hot_line and "next try" not in hot_line, out
+    assert "deferred until" not in hot_line, "said once, by its deferred row"
+    assert f"#{calm} deferred, starts " in out, out
     assert f"#{retry} waiting, next try " in out, out
 
 

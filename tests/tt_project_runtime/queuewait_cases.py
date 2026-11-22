@@ -133,6 +133,27 @@ def test_queue_wait_covers_worker_slots_and_polled_checks(env):
     assert len(queuewait.scan(p, cfg, now, full)) == 2
 
 
+def test_a_deflake_task_waits_in_the_workers_queue_only_from_its_not_before(env):
+    """The time a deferred task is held (a deflake task's next-day not_before) is no queue wait: no item
+    before it, and once it passes the wait counts from not_before, not from when the task was made."""
+    from ttp import gatejudge, queuewait
+    p = make(env)
+    now = time.time()
+    busy = p.db.add_task("busy", "s", kind="code")
+    p.db.update_task(busy, status="running")
+    p.db.x("INSERT INTO runs(task,role,started,status) VALUES(?,?,?,'running')", (busy, "worker", now - 3600))
+    (tid,) = gatejudge.deflake(p.db, ["tests/test_m.py::test_a"], {"head": "f" * 40, "check": "pytest"}, now, p)
+    p.db.x("UPDATE tasks SET created=? WHERE id=?", (now - 3 * 3600, tid))
+    assert p.db.task(tid)["not_before"] > now
+    cfg = {**QW_CFG, "budget": {"max_parallel_workers": 1}}
+    assert tid not in {w["task"] for w in queuewait.collect(p, cfg, now, None)}
+    assert queuewait.scan(p, cfg, now, None) == []
+    nb = now - 45 * 60   # its day began 45 minutes ago
+    p.db.update_task(tid, not_before=nb)
+    got = [w for w in queuewait.collect(p, cfg, now, None) if w["task"] == tid]
+    assert [(w["queue"], w["since"]) for w in got] == [("workers", nb)], got
+
+
 def _qw_slot_wait(p, rc=False, slot=True, pid=None):
     """A run dir whose detached checks wait for a host-wide slot: checks.pid naming a live process (this
     one, or `pid`), checks-slot.wait, and checks.rc only when `rc` (its checks finished)."""

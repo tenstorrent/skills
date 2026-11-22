@@ -2567,6 +2567,8 @@ def defer_labels(after: float | None, when: str | None, why: str | None = None) 
 
 def starts_text(task: dict, now: float | None = None, plain: bool = False, where=None, db=None) -> str:
     """'starts <time>' / 'starts when: <probe>' for a task that waits to start; '' otherwise.
+    A queued task the daemon holds with a bare future not_before (no start_after, retry or hand-off wait,
+    e.g. a deflake batch) reads 'starts <time> (daemon: <its start_why>)'.
     `plain` (what the user sees): 'starts when <why>', or 'when a check passes', never the probe.
     Times are in the home zone `where` (a Project, zone name or ZoneInfo); UTC without one.
     With `db`, a probe on a task that does not exist reads as broken (BROKEN_START), never as a plan,
@@ -2580,7 +2582,11 @@ def starts_text(task: dict, now: float | None = None, plain: bool = False, where
             "" if plain else f" (start_when: {clip(d['when'], 160)})")
     after = d.get("after") if (d.get("after") or 0) > now and (task.get("not_before") or 0) > now else None
     if not after and not d.get("when"):
-        return held
+        nb = float(task.get("not_before") or 0)
+        if nb <= now or task.get("status") != "queued" or task.get("blocked_reason") or waiting_handoff(task):
+            return held
+        text = f"starts {_clock(nb, where)} (daemon" + (f": {clip(d['why'], 160)})" if d.get("why") else ")")
+        return f"{held}; {text}" if held else text
     if not d.get("when"):
         when = ""
     elif plain:

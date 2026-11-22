@@ -80,6 +80,7 @@ BUSY_FIRST_S = 30.0  # the first backoff; each next one doubles
 EVENT = "checks_flaky_test"   # the feed line (handled: no coordinator turn) naming the deflake task
 DEFLAKE_KEY = "deflake_tasks"  # kv {task id: {day, module, ids, ts}}: the deflake task of a module's tests of a day
 DEFLAKE_KEEP_S = 30 * 86400.0  # records kept this long, past any quarantine's life
+DEFLAKE_WHY = "next-day flake batch"  # its start_why: why its not_before holds it (coordinator.starts_text)
 LIFTS_FILE = "test_quarantine_lifts.jsonl"   # in the project's state: one line per lift
 LIFT_EVERY_S = 600.0   # the daemon's sweep for fixed or gone entries
 LIFT_SHOW_S = 86400.0  # status shows the lifts of the last day
@@ -435,7 +436,8 @@ def deflake(db, ids: list[str], evidence: dict, now: float, where, budget_usd: f
                 db.update_task(int(key), title=title, spec="\n".join([spec, *kept]))
             else:
                 key = str(db.add_task(title, spec, kind="code", tier="standard", priority=2, origin="daemon",
-                                      budget_usd=budget_usd, not_before=_next_day(now, where)))
+                                      budget_usd=budget_usd, not_before=_next_day(now, where),
+                                      labels=[f"start_why:{DEFLAKE_WHY}"]))
                 db.update_task(int(key), spec=f"{spec}\n{premise_line(key)}")   # its id is known only now
             recs[key] = {"day": day, "module": module, "ids": all_ids, "ts": now}
             out.add(int(key))
