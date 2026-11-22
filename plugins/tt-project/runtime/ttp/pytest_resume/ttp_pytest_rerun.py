@@ -5,7 +5,7 @@
 
 TTP_PYTEST_RERUN is a JSON object: "root", the directory the check runs in; "tests", a list of
 [path, qualname] (the path relative to "root", the qualname `test_x` or `TestY.test_x`); and
-"rounds". Only a pytest started in "root" acts on it (and drops the check's -m and -k filters), so
+"rounds". Only a pytest started in "root" acts on it (and drops the check's -m and -k filters unless they exclude), so
 one a test starts elsewhere (it inherits the environment) runs as it would without this plugin. This
 run keeps only the tests defined there (by the file their code is in, so a case file another module
 loads counts as itself), each case once per round, runs them round by round and starts each round at
@@ -64,9 +64,12 @@ def _write(line: dict) -> None:
 @pytest.hookimpl(tryfirst=True)
 def pytest_configure(config):
     # The check's own -m / -k filters chose its main run; the rerun runs the tests named here (a smoke
-    # check's `-m` would deselect every added test that is not a smoke test).
+    # check's `-m` would deselect every added test that is not a smoke test). An excluding filter
+    # ("not slow") stays: the tests it leaves out cannot run here.
     if _want(config)[0]:
-        config.option.markexpr, config.option.keyword = "", ""
+        for opt in ("markexpr", "keyword"):
+            if "not" not in str(getattr(config.option, opt, "") or "").split():
+                setattr(config.option, opt, "")
 
 
 @pytest.fixture

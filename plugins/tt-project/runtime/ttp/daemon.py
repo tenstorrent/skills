@@ -13554,15 +13554,15 @@ class Daemon:
         mates = {rec["lead"], *rec.get("members", [])} if rec else set()   # one batch run shares its branch
         # A member whose lead's run ended (in review or pushing) stays 'running' with no worker until the
         # batch lands: it holds no branch, else a fix on that branch waits for a batch that waits for it.
-        idle = {m for b in batchrun.live(db) if (lt := db.task(b["lead"])) and lt["status"] in ("review", "pushing")
-                for m in b.get("members", [])}
+        idle = lambda tid: bool((b := batchrun.members_of(db, tid)) and tid != b["lead"]
+                                and (lt := db.task(b["lead"])) and lt["status"] in ("review", "pushing"))
         for tid, theirs in sorted(live.items()):
-            if tid != task["id"] and tid not in mates | idle and (what := worktree.clash(mine, theirs)):
+            if tid != task["id"] and tid not in mates and (what := worktree.clash(mine, theirs)) and not idle(tid):
                 why = (tid, what)
                 break
-        if why is None and (hid := worktree.lineage_hold(task)) and hid not in idle and (h := db.task(hid)) \
+        if why is None and (hid := worktree.lineage_hold(task)) and (h := db.task(hid)) \
                 and h["status"] in ("queued", "running", "waiting") \
-                and (what := worktree.clash(mine, worktree.claims(self.p, h))):
+                and (what := worktree.clash(mine, worktree.claims(self.p, h))) and not idle(hid):
             why = (hid, what)
         return why
 

@@ -58,13 +58,15 @@ def test_ttp_checks_passes_a_stable_added_test_after_its_reruns_and_reruns_only_
     assert {r["id"] for r in rows if "id" in r} == {f"tests/test_mod.py::test_new[ttp-rerun-{k}]" for k in range(1, 6)}
 
 
+@pytest.mark.parametrize("flt", ["-k test_old", "-m smoke"])
 def test_ttp_checks_reruns_an_added_test_its_check_s_filter_leaves_out_and_never_calls_zero_runs_a_pass(
-        env, tmp_path, monkeypatch, capsys):
+        env, tmp_path, monkeypatch, capsys, flt):
     # A smoke check (`-m`/`-k`) runs only some tests; the rerun still runs the added one, 5 times. A rerun
     # whose selected tests ran no round says so: skipped, not passed.
     from ttp import addedtests, cli
-    run, runs = _added_repo(env, tmp_path, monkeypatch, "\n\ndef test_new():\n    _bump()\n")
-    cli.main(["checks", "--", _ADDED_CHECK + " -k test_old"])
+    body = "\n\nimport pytest\ntest_old = pytest.mark.smoke(test_old)\n\n\ndef test_new():\n    _bump()\n"
+    run, runs = _added_repo(env, tmp_path, monkeypatch, body)
+    cli.main(["checks", "--", f"{_ADDED_CHECK} -W ignore::pytest.PytestUnknownMarkWarning {flt}"])
     out = capsys.readouterr().out
     assert runs() == 5 and "reran 1 added test(s) 5 times each: all passed" in out, out
     out_file = tmp_path / "rerun.jsonl"
