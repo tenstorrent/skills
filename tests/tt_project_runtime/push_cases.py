@@ -301,6 +301,47 @@ def test_superseded_closes_a_question_task_in_review_whose_branch_work_landed(en
     t = p.db.task(tid)
     assert t["status"] == "done" and json.loads(t["result"])["superseded_by"] == relanded
 
+def test_a_task_superseded_by_an_unlanded_commit_posts_nothing_and_its_heir_carries_the_reply(env, monkeypatch):
+    """A code task in review with a reply chat was re-landed by a later task, recorded with `--ref` naming
+    that task's branch, and posted its raw hand-off to the chat as if done though nothing had landed: it
+    posts nothing, its held reply is dropped, and the later task takes its reply chat (only when it has
+    none) and the promise it owns. A record on the push branch with no task named still says where it
+    landed."""
+    from ttp import landed, replymsg
+    from ttp import obligations as ob
+    p, repo, other, tid, path, branch, head = _landed_setup(env, monkeypatch)
+    relanded = _git_out(repo, "rev-parse", "origin/proj")
+    _git_out(other, "push", "-q", "origin", "HEAD:refs/heads/ttp/heir")
+    _git_out(repo, "fetch", "-q", "origin")
+    heir = p.db.add_task("re-land the feature", "s", kind="code", origin="coordinator")
+    p.db.update_task(heir, status="running", branch="ttp/heir")
+    mid = p.db.x("INSERT INTO messages(ts,direction,kind,chat,text,handled) VALUES(?,?,?,?,?,?)",
+                 (time.time(), "out", "reply", "c1", "I'll post the result here.", 1))
+    ob.record_promises(p, [(mid, "c1", "I'll post the result here.")], {tid: "c1"})
+    oid, said = ob.open_promises(p.db)[0]["id"], _c1_replies(p)
+
+    def superseded(**kw):
+        p.db.x("DELETE FROM task_superseded WHERE task=?", (tid,))
+        p.db.update_task(tid, status="review", reply_chat="c1", result=json.dumps(
+            {"status": "done", "summary": f"branch {branch} at {head[:10]}: 40 passed", replymsg.HELD: "Done."}))
+        return landed.record_superseded(p, tid, relanded, **kw)
+    out = superseded(ref="origin/ttp/heir")
+    assert _c1_replies(p) == said, "the superseded task's hand-off went to the chat"
+    assert f"#{heir} carries its reply and {oid}" in out and "it was in review and is now done" in out
+    assert p.db.task(tid)["status"] == "done" and replymsg.HELD not in json.loads(p.db.task(tid)["result"])
+    assert p.db.task(heir)["reply_chat"] == "c1"
+    assert ob.get(p.db, oid)["promise"]["tasks"] == [heir]
+    p.db.update_task(heir, reply_chat="c2")
+    superseded(ref="origin/ttp/heir")
+    assert p.db.task(heir)["reply_chat"] == "c2" and _c1_replies(p) == said
+    superseded()
+    assert [r for r in _c1_replies(p) if f"its work is in {relanded[:10]}" in r], _c1_replies(p)
+    p.db.x("DELETE FROM task_superseded WHERE task=?", (tid,))
+    p.db.update_task(tid, result=json.dumps({"status": "done", replymsg.HELD: "Done."}))
+    landed.record_superseded(p, tid, relanded)
+    assert json.loads(p.db.task(tid)["result"])[replymsg.HELD] == "Done.", "a landing keeps its held reply"
+
+
 def _run_in(p, tid, cwd):
     """A finished run of task `tid` whose run.json records `cwd` as its working directory."""
     rid = p.db.x("INSERT INTO runs(task, role, status, started, ended) VALUES(?,?,?,?,?)",

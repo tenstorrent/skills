@@ -1578,6 +1578,28 @@ def adopt(p, tasks: dict[int, str | None], now: float | None = None) -> list[str
     return notes
 
 
+def hand_over(p, old: int, new: int, why: str, now: float | None = None) -> list[str]:
+    """Move the open obligations and promises task `old` owns to open task `new` (one whose work carries
+    `old`'s on): `new` is attached, and in a promise's tasks it takes `old`'s place, so the promise is kept
+    by `new`'s reply, not by `old` closing. The keys moved."""
+    now = time.time() if now is None else now
+    moved = []
+    with p.db.tx():
+        st = _load(p.db)
+        for o in st["items"].values():
+            if not _open(o) or old not in _owner_ids(o):
+                continue
+            if str(old) in o["owners"]:
+                _attach(p, o, [new], now)
+            if pr := o.get("promise"):
+                pr["tasks"] = sorted((set(pr.get("tasks") or []) - {old}) | {new})
+            o.setdefault("history", []).append({"at": now, "event": "attached", "task": new, "why": why})
+            moved.append(o["id"])
+        if moved:
+            p.db.set_kv(KV, st)
+    return moved
+
+
 def _auto_attach(p, o: dict, tid: int, mid: int, now: float) -> None:
     """Attach the task a promise's reply named (_named_owner) as a manual attach does, and keep it in the
     promise's history."""

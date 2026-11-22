@@ -27,7 +27,7 @@ import subprocess
 import time
 from pathlib import Path
 
-from . import gitcache, gitmemo, repoid
+from . import gitcache, gitmemo, replymsg, repoid
 from .db import TERMINAL_TASK_STATES, dependency_ids, load_result, review_subject
 from .util import read_dict
 
@@ -578,7 +578,8 @@ def record_superseded(p, tid: int, sha: str, ref: str | None = None, repo: str |
     A code task in 'review', or one of another kind (not a review) with a branch on record, is accepted
     on the same checks (its work landed), a harness task in 'review' or done (with no `ref` or `repo`)
     when `sha` is merged into the harness checkout's HEAD and its worktree branch has nothing unmerged
-    (_record_harness); one left in 'review' is then closed as done."""
+    (_record_harness); one left in 'review' is then closed as done. Its chat hears only a landing checked
+    on the push branch (no `ref` or `repo`); otherwise _hand_over gives its reply to the task named."""
     task = p.db.task(tid)
     if not task:
         raise ValueError(f"no task #{tid}")
@@ -591,9 +592,12 @@ def record_superseded(p, tid: int, sha: str, ref: str | None = None, repo: str |
         words = _record_harness(p, task, sha)
     else:
         words = _record_work(p, task, sha, ref, repo)
+    landed = not ref and not repo   # `sha` was checked on the push branch (or merged into the harness)
+    if not landed and (status == "review" or replymsg.HELD in load_result(task.get("result"))):
+        words += _hand_over(p, task, ref)   # its chat has not heard, and its work may not have landed
     if status == "review":
         full = p.db.one("SELECT sha FROM task_superseded WHERE task=? ORDER BY ts DESC LIMIT 1", (tid,))["sha"]
-        words += _close_review(p, task, full)
+        words += _close_review(p, task, full, landed)
     if abandoned(p.db, tid):   # its work landed after all
         p.db.x("DELETE FROM task_abandoned WHERE task=?", (tid,))
         words += "; its abandon record is cleared"
@@ -620,9 +624,36 @@ def _record_harness(p, task: dict, sha: str) -> str:
     return f"task #{tid}: recorded as superseded by {full[:10]} (merged into the harness)"
 
 
-def _close_review(p, task: dict, sha: str) -> str:
+def _hand_over(p, task: dict, ref: str | None) -> str:
+    """Superseded `task`, whose chat has not heard its result, posts nothing (its record is not on the push
+    branch): its held reply (replymsg.HELD) is dropped, and the open task whose branch is `ref` (the record
+    names it) takes its reply chat, when it has none, and the obligations and promises it owns. The words
+    to add."""
+    from . import obligations
+    from .db import dump_result
+    tid = task["id"]
+    with p.db.tx():
+        row = p.db.task(tid) or task
+        prev = load_result(row.get("result"))
+        if prev.pop(replymsg.HELD, None) is not None:
+            p.db.update_task(tid, result=dump_result(prev))
+        name = str(ref or "").removeprefix("refs/heads/").removeprefix("refs/remotes/")
+        names = {name, name.split("/", 1)[-1]} - {""}   # a remote's branch names the task's own
+        heir = next((t for t in p.db.q(
+            "SELECT id, branch, reply_chat FROM tasks WHERE id<>? AND kind<>'review' AND branch<>'' "
+            f"AND status NOT IN ({','.join('?' * len(obligations.CLOSED))}) ORDER BY id DESC",
+            (tid, *obligations.CLOSED)) if t["branch"] in names), None)
+        if not heir:
+            return "; it posts nothing to its chat (no open task has that branch)" if row.get("reply_chat") else ""
+        if row.get("reply_chat") and not heir["reply_chat"]:
+            p.db.update_task(heir["id"], reply_chat=row["reply_chat"])
+        moved = obligations.hand_over(p, tid, heir["id"], f"#{heir['id']} carries superseded #{tid}'s work on")
+    return f"; #{heir['id']} carries its reply" + (f" and {', '.join(moved)}" if moved else "")
+
+
+def _close_review(p, task: dict, sha: str, landed: bool = True) -> str:
     """Close `task`, left in 'review', as done now that `sha` carries its work, with the chat reply
-    (pushq._reply) when this closed it: the words to add."""
+    (pushq._reply) when this closed it and `sha` `landed`: the words to add."""
     from . import pushq
     from .db import dump_result, load_result
     now, line = time.time(), f"its work is in {sha[:10]}, recorded with `ttp task superseded`"
@@ -637,7 +668,8 @@ def _close_review(p, task: dict, sha: str) -> str:
         p.db.conn.execute("INSERT INTO events(ts,source,kind,severity,text,status,task) VALUES(?,?,?,?,?,?,?)",
                           (now, f"task:{task['id']}", "task_superseded", "normal",
                            f"#{task['id']} {task['title']}: {line}; closed as done.", "handled", task["id"]))
-        pushq._reply(p.db, task, "done", pushq._done_text(prev, result["summary"], line))
+        if landed:
+            pushq._reply(p.db, task, "done", pushq._done_text(prev, result["summary"], line))
     return "; it was in review and is now done"
 
 
