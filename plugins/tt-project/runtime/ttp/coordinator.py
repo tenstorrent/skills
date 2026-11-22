@@ -2565,6 +2565,9 @@ def defer_labels(after: float | None, when: str | None, why: str | None = None) 
         + ([f"start_why:{why}"] if when and why else []) + [f"deferred_since:{time.time():.0f}"]
 
 
+STARTS_CLIP = 160   # chars of a start probe or its why that a starts line shows
+
+
 def starts_text(task: dict, now: float | None = None, plain: bool = False, where=None, db=None) -> str:
     """'starts <time>' / 'starts when: <probe>' for a task that waits to start; '' otherwise.
     A queued task the daemon holds with a bare future not_before (no start_after, retry or hand-off wait,
@@ -2579,22 +2582,22 @@ def starts_text(task: dict, now: float | None = None, plain: bool = False, where
     missing = landed.missing_task_refs(db, d.get("when")) if db is not None and d.get("when") else []
     if missing:
         return f"{BROKEN_START}: waits on {landed.missing_words(missing)}, which does not exist" + (
-            "" if plain else f" (start_when: {clip(d['when'], 160)})")
+            "" if plain else f" (start_when: {clip(d['when'], STARTS_CLIP)})")
     after = d.get("after") if (d.get("after") or 0) > now and (task.get("not_before") or 0) > now else None
     if not after and not d.get("when"):
         nb = float(task.get("not_before") or 0)
         if nb <= now or task.get("status") != "queued" or task.get("blocked_reason") or waiting_handoff(task):
             return held
-        text = f"starts {_clock(nb, where)} (daemon" + (f": {clip(d['why'], 160)})" if d.get("why") else ")")
+        text = f"starts {_clock(nb, where)} (daemon" + (f": {clip(d['why'], STARTS_CLIP)})" if d.get("why") else ")")
         return f"{held}; {text}" if held else text
     if not d.get("when"):
         when = ""
     elif plain:
         on = re.fullmatch(r"landed:#([0-9]+)", d["when"].strip())
-        when = (f"when {clip(d['why'], 160)}" if d.get("why") else f"when #{on[1]} lands" if on
+        when = (f"when {clip(d['why'], STARTS_CLIP)}" if d.get("why") else f"when #{on[1]} lands" if on
                 else "when a check passes")
     else:
-        when = f"when: {clip(d['when'], 160)}" + (f" ({clip(d['why'], 160)})" if d.get("why") else "")
+        when = f"when: {clip(d['when'], STARTS_CLIP)}" + (f" ({clip(d['why'], STARTS_CLIP)})" if d.get("why") else "")
     text = "starts " + (f"{_clock(after, where)}" + (f", then {when}" if when else "") if after else when)
     return f"{held}; {text}" if held else text
 
