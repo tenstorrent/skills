@@ -13542,7 +13542,7 @@ class Daemon:
         """(holder id, what it uses) while a running task, or one started earlier this tick (`live`:
         _live_claims plus dispatch's starts), works on a branch or worktree `task` would use
         (worktree.claims), or while the task task_add chained it after (worktree.lineage_hold) is
-        queued, running or waiting; else None. Two workers on one branch or in one worktree lose each
+        queued, running or waiting and still shares a branch or worktree with it; else None. Two workers on one branch or in one worktree lose each
         other's work; the running one is never touched. Once it ends, the held task starts in a worktree
         of its own (worktree.ensure) from that branch's head. Changes nothing (_start_hold runs it)."""
         db = self.p.db
@@ -13554,8 +13554,9 @@ class Daemon:
                 why = (tid, what)
                 break
         if why is None and (hid := worktree.lineage_hold(task)) and (h := db.task(hid)) \
-                and h["status"] in ("queued", "running", "waiting"):
-            why = (hid, worktree.clash(mine, worktree.claims(self.p, h)) or "its lineage")
+                and h["status"] in ("queued", "running", "waiting") \
+                and (what := worktree.clash(mine, worktree.claims(self.p, h))):
+            why = (hid, what)
         return why
 
     def _note_branch_hold(self, task: dict, why: tuple[int, str]) -> None:

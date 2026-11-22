@@ -2973,3 +2973,31 @@ def test_a_queued_template_merge_task_waits_while_a_release_hold_stands(env, mon
     finally:
         drain(d)
         assert reap_tmp_processes(tmp_path) == [], "a stand-in run outlived the test"
+
+
+def test_a_lineage_hold_lasts_only_while_a_real_branch_or_worktree_clash_remains(env):
+    # task_add chained an urgent task after an open one on its branch (waits_end label); once the two no
+    # longer share a branch or worktree (here its pr_branch moved), dispatch starts it at once. A task
+    # still on the holder's branch, or in its worktree, stays held.
+    from ttp import coordinator as coord, daemon as dm, worktree
+    p = make(env)
+    holder = p.db.add_task("on x", "s", kind="code", tier="light", origin="user", labels=["pr_branch:feat/x"])
+    assert coord.apply(p, [{"type": "task_add", "kind": "code", "title": "urgent on x", "priority": 1,
+                            "spec": "urgent: now\npr_branch: feat/x"}]) == []
+    new = p.db.one("SELECT * FROM tasks WHERE title='urgent on x'")
+    assert worktree.lineage_hold(new) == holder, new["labels"]
+    d = dm.Daemon(p.base)
+    assert d._branch_clash(new, {}) == (holder, "branch feat/x")
+    assert coord.apply(p, [{"type": "task_update", "id": new["id"], "pr_branch": "feat/y"}]) == []
+    moved = p.db.task(new["id"])
+    assert worktree.lineage_hold(moved) == holder, "the label stays; only the hold ends"
+    assert d._branch_clash(moved, {}) is None, "held behind a task it no longer shares anything with"
+    ctx = {"now": time.time(), "paused": {}, "busy": {}, "committed": None, "logged_out": {}}
+    assert d._start_hold(moved, "claude", ctx) is None and moved["id"] not in ctx.get("branch", {})
+    # A shared worktree (two continuations of one task that ran) still holds.
+    old = p.db.add_task("failed work", "s", kind="code", tier="light", origin="user")
+    p.db.update_task(old, status="failed", attempts=1)
+    a = p.db.add_task("redo a", "s", kind="code", tier="light", origin="user", labels=[f"continues:{old}"])
+    b = p.db.add_task("redo b", "s", kind="code", tier="light", origin="user",
+                      labels=[f"continues:{old}", f"{worktree.LINEAGE_HOLD}{a}"])
+    assert d._branch_clash(p.db.task(b), {}) == (a, f"worktree {p.worktrees / f't{old}'}")

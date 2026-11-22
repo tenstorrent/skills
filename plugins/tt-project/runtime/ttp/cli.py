@@ -2010,7 +2010,8 @@ def status_text(p: Project, verbose: bool = False) -> str:
         est = eta._Est(db, now, core=eta.core_of(p), delivery=eta.delivery_of(p))
     except Exception:
         est = None
-    later = {t["id"] for t in h["deferred"]}
+    shown = h["deferred"][:5]
+    later = {t["id"] for t in shown}   # the urgent rows whose deferred row is printed below
     for t in hot[:8]:   # the urgent lane: each waiting urgent task, with how long it has waited and its ETA
         try:
             fin = f", {eta.field(e, p, now)}" if est and ((e := est.task(t["id"]))["end"] or e.get("after") or e.get("gated")) else ""
@@ -2031,7 +2032,7 @@ def status_text(p: Project, verbose: bool = False) -> str:
         # No retry recorded (no blocked reason): a deferral to its not_before, not a next try.
         row(t, f"{'waiting, next try' if why else 'deferred until'} {at(t['not_before'], now, tz)}", why,
             [f"    job {j['name']}: {j['line']}" for j in (db.kv("job_use", {}) or {}).values() if j.get("task") == t["id"]])
-    for t in h["deferred"][:5]:
+    for t in shown:
         broken = t["starts"].startswith(BROKEN_START + ":")
         row(t, t["starts"] if broken else "deferred, " + t["starts"], t["gate"]["text"] if t.get("gate") else "")
     for t in h.get("dep_held", [])[:5]:

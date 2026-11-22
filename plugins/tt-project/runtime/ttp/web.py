@@ -781,6 +781,9 @@ def state_payload(p: Project, db: DB) -> dict:
         t.pop("spec", None)
         t["waiting"] = coord.handoff_wait(t, now) or None   # 'waiting 2h13m': its own wait's age
         t["outcome"] = task_outcome(t)   # changes_needed for a review that asked for changes
+        # Plain words for the board; the probe itself stays in start_when, the task's detail; read
+        # before its result is cut to a summary, so starts_text sees the raw hand-off.
+        t["starts"] = coord.starts_text(t, now, plain=True, where=tz, db=db) if t["status"] == "queued" else ""
         result = load_result(t["result"])
         t["result"] = str(result.get("summary") or "")[:600]
         if t["status"] == "queued":   # a wait on locks names their holders now (lockprobe.live_note)
@@ -788,8 +791,6 @@ def state_payload(p: Project, db: DB) -> dict:
         pushed = result.get("pushed")
         t["pushed"] = [{k: x.get(k) for k in ("branch", "sha", "version", "status")} for x in pushed
                        if isinstance(x, dict)] or None if isinstance(pushed, list) else None   # what the push queue pushed for a review
-        # Plain words for the board; the probe itself stays in start_when, the task's detail.
-        t["starts"] = coord.starts_text(t, now, plain=True, where=tz, db=db) if t["status"] == "queued" else ""
         t["gate"] = startgate.view(db, t, now, warn_s, start_gates) if t["status"] == "queued" else None
         t["wait"] = waits.wait_kind(t, asks, now, tz, paused, entered.get(t["id"])) if t["status"] == "blocked" else None
         d = deferral(t)

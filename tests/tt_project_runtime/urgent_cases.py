@@ -278,6 +278,22 @@ def test_status_says_when_a_queued_task_whose_not_before_is_ahead_starts(env):
     assert f"#{retry} waiting, next try " in out, out
 
 
+def test_status_urgent_row_says_deferred_until_when_its_deferred_row_is_past_the_fifth(env):
+    """Only five deferred rows print: an urgent task deferred past them keeps 'deferred until' in its urgent
+    row, so its start time is never dropped from status."""
+    from ttp import cli
+    p = make(env)
+    now = time.time()
+    for i in range(5):
+        calm = p.db.add_task(f"calm {i}", "s", kind="code", origin="coordinator", priority=3)
+        p.db.x("UPDATE tasks SET not_before=? WHERE id=?", (now + 3600, calm))
+    hot = p.db.add_task("hot fix", "Fix it.\nurgent: the user is waiting", kind="code", origin="coordinator")
+    p.db.x("UPDATE tasks SET not_before=? WHERE id=?", (now + 3 * 3600, hot))
+    out = cli.status_text(p)
+    hot_line = next(x for x in out.splitlines() if f"#{hot} " in x)
+    assert "deferred until" in hot_line, out
+
+
 def test_status_digest_and_web_name_an_urgent_hand_off_wait_and_its_age_not_deferred_until(env):
     """An urgent task asleep on its own hand-off wait reads 'waiting <age>' and what it waits on in status,
     the digest's Open tasks line and the web payload, never only 'deferred until' or 'ETA: no estimate'."""
