@@ -273,7 +273,7 @@ def protected(db, cfg: dict, task: dict, tier: str, urgency: bool = True) -> str
         return "urgent"
     if modelpick.UNTRUSTED in task_labels(task):
         return "untrusted"
-    if modelpick.HARD.search(f"{task.get('title') or ''}\n{task.get('spec') or ''}"):
+    if modelpick.hard(task):
         return "optimization"
     try:
         if tierfloor.target(db, cfg, task):

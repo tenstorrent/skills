@@ -49,7 +49,14 @@ SUCCESS_DAYS = 14
 AVOID_DAYS = 7
 HARD = re.compile(r"(?i)\b(optimi[sz]\w*|performance|perf|throughput|latency|architect\w*|"
                   r"hard[- ]debug\w*|deadlock|race condition|root[- ]cause|bisect\w*)\b")
+QUOTED = re.compile(r"""(?<!\w)'(?:[^'\n]|'(?=\w))*'(?!\w)|"[^"\n]*"|“[^”\n]*”|‘[^’\n]*’""")
 PATHS = re.compile(r"(?<![\w/.-])((?:[\w.-]+/)+[\w.-]+\.\w+|[\w-]+\.(?:py|md|json|sh|ya?ml|toml|cpp|h|c|rs|js|ts))\b")
+
+
+def hard(task: dict) -> bool:
+    """Whether `task`'s title or spec names hard work (HARD) outside quoted words: a quoted order or log line
+    is context, so a user's words listing what stays off a routed model never mark the run itself as hard."""
+    return bool(HARD.search(QUOTED.sub(" ", f"{task.get('title') or ''}\n{task.get('spec') or ''}")))
 
 
 def conf(cfg: dict) -> dict:
@@ -170,7 +177,7 @@ def rules(db: DB, cfg: dict, task: dict, tier: str) -> str | None:
         return "urgent"
     if UNTRUSTED in task_labels(task):
         return "untrusted"
-    if HARD.search(f"{task.get('title') or ''}\n{task.get('spec') or ''}"):
+    if hard(task):
         return "hard"
     try:
         if tierfloor.reasons(task, cfg):

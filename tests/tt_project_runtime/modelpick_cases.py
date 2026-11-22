@@ -472,6 +472,22 @@ def test_model_trip_a_worse_head_to_head_keeps_the_sample_window(env):
     assert [t["stratum"] for t in modeltrip.check(p, p.config(), now=now)] == ["code/standard/*"]
 
 
+def test_route_guard_reads_hard_work_outside_quoted_words(env):
+    """A spec quoting the user's routing order ('everything but ... optimization ... on GLM') is no optimization
+    run: quoted words are context. The task's own words still keep it on core."""
+    from ttp import modelpick, route
+    p = make(env)
+    _mp_config(p)
+    quote = "User msg #1 (verbatim): 'get it close, that's the key. everything but deep thinking, optimization, " \
+            "and human interaction should be on GLM if possible.'"
+    add = lambda title, spec: p.db.task(p.db.add_task(title, spec, kind="code", tier="standard"))
+    quoted = add("Route code runs to the arm", f"Goal: fix the arm.\n{quote}\nSaid \u201cperformance\u201d and \"latency\".")
+    assert not modelpick.hard(quoted) and route.protected(p.db, p.config(), quoted, "standard") == ""
+    own = add("Route code runs to the arm", f"Optimize the coin flip.\n{quote}")
+    assert modelpick.hard(own) and route.protected(p.db, p.config(), own, "standard") == "optimization"
+    assert modelpick.hard({"title": "Fix the user's 'tidy' deadlock", "spec": ""})   # an apostrophe opens no quote
+
+
 def test_route_guard_keeps_protected_classes_on_core_whatever_asks(env, monkeypatch):
     from ttp import route
     from ttp.daemon import Daemon
