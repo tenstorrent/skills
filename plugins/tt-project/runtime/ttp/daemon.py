@@ -13795,11 +13795,10 @@ class Daemon:
             log(self.p, f"task {task['id']}: tier floor not applied: {e}")
             return None
 
-    def _core_why(self, task: dict, tier: str, picked: dict | None, to: dict | None) -> str:
+    def _core_why(self, task: dict, tier: str, picked: dict | None, to: dict | None, floor: str = "") -> str:
         """Why a run no route took starts on core (route.core_why), recorded in its note."""
         try:
-            return route.core_why(self.p.db, self.cfg, task, tier, picked, to,
-                                  self._floor_keeps_core(task, tier, picked, to) if to else "")
+            return route.core_why(self.p.db, self.cfg, task, tier, picked, to, floor)
         except Exception as e:   # recording must never hold a task back
             return f"unchecked: {type(e).__name__}"
 
@@ -13844,8 +13843,9 @@ class Daemon:
             klass = bool(to)
         # Every keep-core check runs before any route returns, the class route included: no review, pin,
         # retry or outside text (eligible), no floor run, no protected class.
-        if not to or not route.eligible(task, picked) or (dp is None and self._floor_keeps_core(task, tier, picked, to)):
-            held["why"] = self._core_why(task, tier, picked, to)
+        floor = self._floor_keeps_core(task, tier, picked, to) if to and dp is None and route.eligible(task, picked) else ""
+        if not to or not route.eligible(task, picked) or floor:
+            held["why"] = self._core_why(task, tier, picked, to, floor)
             return None
         name, model = to["to"], to["model"]
         why = route.protected(self.p.db, self.cfg, task, tier, urgency=not (klass and cls in runclass.ORDER_ONLY))

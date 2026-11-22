@@ -84,6 +84,7 @@ import fcntl
 import json
 import os
 import re
+import statistics
 import time
 from pathlib import Path
 from typing import Any, Callable
@@ -377,12 +378,8 @@ def probe_threshold_s(rec: dict, probe_h: float) -> float:
     """How long a probe may say not yet before it counts as a stall: `probe_h`, or, once its progress
     counter has advanced, at least 3x the median time between advances (a slow, steady job is no stall)."""
     adv = [float(x) for x in rec.get("adv") or []]
-    gaps = sorted(b - a for a, b in zip(adv, adv[1:]))
-    if not gaps:
-        return probe_h * 3600
-    mid = len(gaps) // 2
-    med = gaps[mid] if len(gaps) % 2 else (gaps[mid - 1] + gaps[mid]) / 2
-    return max(probe_h * 3600, 3 * med)
+    gaps = [b - a for a, b in zip(adv, adv[1:])]
+    return max(probe_h * 3600, 3 * statistics.median(gaps)) if gaps else probe_h * 3600
 
 
 def note_probe(db: DB, tid: int, probe: str, rc: Any, reason: str, now: float | None = None) -> None:

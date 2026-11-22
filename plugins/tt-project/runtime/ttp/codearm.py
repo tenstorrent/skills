@@ -297,10 +297,10 @@ def stays(db, cfg: dict, task: dict, tier: str, picked: dict | None = None, poli
 
 
 def lineage_why(db, root: int, parent: dict | None) -> str:
-    """A follow-up's recorded why: the rule that put its lineage on its arm (the root's why, else its nearest
-    recorded parent's), "(follows #root)" after it, so the share report names that rule and never a lineage miss;
+    """A follow-up's recorded why: the rule that put its lineage on its arm (its nearest recorded
+    parent's why, else the root's), "(follows #root)" after it, so the share report names that rule and never a lineage miss;
     "lineage of #root" only when no task in it recorded a why."""
-    got = str((recorded(db, root) or parent or {}).get("why") or "")
+    got = str((parent or {}).get("why") or (recorded(db, root) or {}).get("why") or "")
     got = re.sub(r"\s*\(follows #\d+\)$", "", got)
     if not got or got.startswith("lineage of #"):
         return f"lineage of #{root}" + ("" if parent else " (no arm)")
