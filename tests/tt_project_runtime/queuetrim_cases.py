@@ -195,6 +195,29 @@ def test_queuetrim_pauses_hold_work_without_ageing_it(env):
     assert db.task(held)["status"] == "queued"
 
 
+def test_queuetrim_deferred_task_ages_from_its_not_before_time(env):
+    from ttp import queuetrim
+    p = make(env)
+    db = p.db
+    now = time.time()
+    # Queued 73 h ago to start 46 min ago: 46 min of queue age, not 73 h, under a 48 h expiry.
+    waited = _qt_aged(p, "starts later", 73, labels=[f"start_after:{now - 46 * 60:.0f}"])
+    assert queuetrim.candidates(db, p.config(), now) == []
+    # A fresh expire_h after its not-before time: expired.
+    assert [t["id"] for t, _ in queuetrim.candidates(db, p.config(), now + 48 * 3600)] == [waited]
+
+
+def test_queuetrim_host_sleep_is_no_queue_age(env):
+    from ttp import queuetrim
+    p = make(env)
+    db = p.db
+    now = time.time()
+    slept = _qt_aged(p, "queued on a laptop", 50)
+    db.set_kv("host_sleeps", [[now - 40 * 3600, now - 5 * 3600]])   # 35 h of the 50 asleep
+    assert queuetrim.candidates(db, p.config(), now) == []
+    assert [t["id"] for t, _ in queuetrim.candidates(db, p.config(), now + 34 * 3600)] == [slept]
+
+
 def test_queuetrim_requeued_task_ages_from_its_requeue_not_its_creation(env):
     from ttp import queuetrim
     p = make(env)
