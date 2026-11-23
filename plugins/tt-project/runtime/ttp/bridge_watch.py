@@ -23,7 +23,7 @@ import sys
 import time
 from pathlib import Path
 
-from .project import durable_write
+from .project import durable_append, durable_write
 
 LABEL = "com.tt-project.bridge-watch"
 INTERVAL_S = 30
@@ -94,14 +94,17 @@ def release(cfg: dict, t: dict, ports: list[int]) -> bool:
     return bridge_relay.clean(ssh, f"{cid}/{prefix}", ports)
 
 
+def _unit(t: dict) -> str:
+    return t["service"] if t["service"].endswith(".service") else t["service"] + ".service"
+
+
 def loaded(t: dict, platform: str) -> bool:
     """The service is meant to run: loaded in launchd, or active or restarting in systemd (`ttp bridge stop`, or a
     hand-made service someone stopped, is left stopped)."""
-    from . import bridge
+    from . import bridge, service
     if platform == "darwin":
-        return bridge._run(["launchctl", "print", f"gui/{os.getuid()}/{t['service']}"]).returncode == 0
-    unit = t["service"] if t["service"].endswith(".service") else t["service"] + ".service"
-    r = bridge._run(["systemctl", "--user", "is-active", "--", unit])
+        return service.launchd_loaded(t["service"], lambda *a: bridge._run(list(a)))
+    r = bridge._run(["systemctl", "--user", "is-active", "--", _unit(t)])
     return r.stdout.strip() in ("active", "activating", "reloading")
 
 
@@ -112,8 +115,7 @@ def restart(t: dict, platform: str) -> str:
     if platform == "darwin":
         r = bridge._run(["launchctl", "kickstart", "-k", f"gui/{os.getuid()}/{t['service']}"])
     else:
-        unit = t["service"] if t["service"].endswith(".service") else t["service"] + ".service"
-        r = bridge._run(["systemctl", "--user", "restart", "--", unit])
+        r = bridge._run(["systemctl", "--user", "restart", "--", _unit(t)])
     return "restarted" if r.returncode == 0 else f"restart refused: {(r.stderr or r.stdout).strip()[:160]}"
 
 
@@ -153,8 +155,7 @@ def run_pass(cfg: dict, platform: str | None = None, now: float | None = None) -
                     rec = {"service": t["service"], "box": box, "failed_at": f["at"], "event": f["event"],
                            "healed_at": now, "seconds": round(now - f["at"]), "restarts": f["restarts"]}
                     _home().mkdir(parents=True, exist_ok=True)
-                    with open(_home() / HEAL_LOG, "a") as fh:
-                        fh.write(json.dumps(rec) + "\n")
+                    durable_append(_home() / HEAL_LOG, json.dumps(rec) + "\n")
                     out.append(f"{t['service']}: answers again after {rec['seconds']}s")
                     del fails[t["service"]]
                 continue
