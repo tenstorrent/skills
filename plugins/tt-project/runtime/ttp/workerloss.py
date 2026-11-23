@@ -16,7 +16,7 @@ import time
 from collections import deque
 from pathlib import Path
 
-from . import setupfault
+from . import setupfault, sharedchecks
 
 RERUNS = 1
 MARKER = "worker_loss.json"   # in a run's directory: its checks stopped at a lost test worker
@@ -25,8 +25,6 @@ MARKER = "worker_loss.json"   # in a run's directory: its checks stopped at a lo
 _ENDED = re.compile(r"^_+ (.+?) _+\nthe test worker process (\d+) ended \(wait status (-?\d+|None)\) before this "
                     r"test finished$", re.M)
 _LEFT = re.compile(r"^_+ (.+?) _+\nno test worker was left to run this test$", re.M)
-_SUMMARY = re.compile(r"^(?:=+ )?((?:\d+ \w+, )*\d+ (?:failed|passed|errors?)\b.*?) in [0-9.]+s", re.M)
-_COUNT = re.compile(r"(\d+) (failed|errors?)\b")
 _MESSAGE = re.compile(r"(?:the test worker process \d+ ended \(wait status (?:-?\d+|None)\) before this test finished"
                       r"|no test worker was left to run this test)$")
 KEPT = 20000   # a Collector keeps at most this many lost tests' sections
@@ -78,11 +76,8 @@ def lost(output: str) -> dict | None:
     if not ended and not left:
         return None
     workers = {pid: (None if status == "None" else int(status)) for pid, status in ended.values()}
-    summary = _SUMMARY.findall(output)
-    other = None
-    if summary:
-        failed = sum(int(n) for n, _ in _COUNT.findall(summary[-1]))
-        other = max(0, failed - len(ended) - left)
+    summary = sharedchecks.summary(output)
+    other = None if summary is None else max(0, sharedchecks.failed(summary[1]) - len(ended) - left)
     return {"workers": workers, "tests": len(ended) + left, "other": other}
 
 

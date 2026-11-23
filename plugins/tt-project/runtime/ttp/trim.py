@@ -10,14 +10,19 @@ from __future__ import annotations
 
 import re
 
+from . import sharedchecks
+
 MAX_LINES = 40          # an excerpt of ordinary output: this many lines, head and tail
 MAX_LINE_CHARS = 300    # each line is cut to this many characters
 MAX_FAILURE_LINES = 60  # failures-only output: at most this many lines
 
 # pytest (-q, -v, -ra) and unittest: the lines that say what failed and why
 _FAILED_RE = re.compile(r"^(?:FAILED|ERROR)\s+\S|^(?:FAIL|ERROR):\s+\S|^E\s{2,}\S|^\S+\.py:\d+: \w*(?:Error|Exception)\b")
-_TOTALS_RE = re.compile(r"^=*\s*(?:\d+ (?:failed|passed|errors?|skipped|xfailed|xpassed|deselected|warnings?)"
-                        r"[\d\w ,]*)+ in [\d.]+\s*s|^(?:Ran \d+ tests? in |FAILED \(|OK\b)")
+_TOTALS_RE = re.compile(r"^(?:Ran \d+ tests? in |FAILED \(|OK\b)")   # unittest's; pytest's is sharedchecks.summary
+
+
+def _totals(line: str) -> bool:
+    return bool(_TOTALS_RE.search(line) or sharedchecks.summary(line))
 
 
 def _cut(line: str) -> str:
@@ -26,14 +31,14 @@ def _cut(line: str) -> str:
 
 def is_test_output(text: str) -> bool:
     """Whether `text` ends like a pytest or unittest run."""
-    return any(_TOTALS_RE.search(ln.strip()) for ln in text.splitlines()[-15:])
+    return any(_totals(ln.strip()) for ln in text.splitlines()[-15:])
 
 
 def failures(text: str, limit: int = MAX_FAILURE_LINES) -> str:
     """The failing tests, their error lines and the totals line of a test run; "" when it shows none."""
     lines = text.splitlines()
     picked = [ln for ln in lines if _FAILED_RE.search(ln)]
-    totals = [ln for ln in lines[-15:] if _TOTALS_RE.search(ln.strip())]
+    totals = [ln for ln in lines[-15:] if _totals(ln.strip())]
     if not picked:
         return ""
     # Each failing test is listed twice by pytest (its section and the short summary): keep one.

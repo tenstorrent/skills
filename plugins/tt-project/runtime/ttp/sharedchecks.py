@@ -64,8 +64,11 @@ KEEP_S = 7 * 86400     # failure rows kept this long
 FAILING_KEY, COMPLETE_KEY = "failing_tests", "failing_tests_complete"
 
 _ID = re.compile(r"^(?:FAILED|ERROR) (\S+::[^\s\[]*(?:\[.*?\])?)(?=\s|$)", re.M)
-# pytest's last summary line: bare under -q, wrapped in '=' at the default verbosity.
-_SUMMARY = re.compile(r"^(?:=+ )?(\d+ [a-z]+(?:, \d+ [a-z]+)* in [\d.]+s\b[^=\n]*?)(?: =+)?\s*$", re.M)
+# pytest's last summary line: bare under -q, wrapped in '=' at the default verbosity. A plugin's count
+# label may take several words ('158 subtests passed').
+_LABEL = r"\d+ [a-z]+(?: [a-z]+)*"
+_SUMMARY = re.compile(rf"^(?:=+ )?(({_LABEL}(?:, {_LABEL})*) in [\d.]+s\b[^=\n]*?)(?: =+)?\s*$", re.M)
+_COUNT = re.compile(r"(\d+) ([a-z]+(?: [a-z]+)*)")
 
 
 def settings(cfg: dict) -> dict:
@@ -79,27 +82,38 @@ def settings(cfg: dict) -> dict:
 
 def failing_ids(output: str) -> tuple[list[str], bool]:
     """The failing pytest ids in a check's output, and whether they are all of them: pytest's last
-    summary line (bare or in '=' bars) counts as many failed and errors as there are FAILED/ERROR
-    lines. Any other
+    summary line (bare or in '=' bars) counts as many failures and errors (a plugin's 'subtests failed'
+    too) as there are FAILED/ERROR lines. Any other
     runner's output gives ([], False)."""
     lines = _ID.findall(output or "")
     ids = sorted(set(lines))
-    summaries = _SUMMARY.findall(output or "")
-    if not ids or not summaries:
+    s = summary(output)
+    if not ids or not s:
         return ids, False
-    last = summaries[-1]
-    n = sum(int(m.group(1)) for m in re.finditer(r"\b(\d+) (?:failed|errors?)\b", last))
-    return ids, n == len(lines)
+    return ids, failed(s[1]) == len(lines)
+
+
+def summary(output: str) -> tuple[str, dict[str, int]] | None:
+    """pytest's last summary line in `output` and its counts by label ('failed', 'errors', 'subtests
+    passed'), None when it has none."""
+    m = None
+    for m in _SUMMARY.finditer(output or ""):
+        pass
+    return (m.group(1), {label: int(n) for n, label in _COUNT.findall(m.group(2))}) if m else None
+
+
+def failed(counts: dict[str, int]) -> int:
+    """The failures and errors a summary's counts hold, a plugin's ('subtests failed') too; xfailed is none."""
+    return sum(n for label, n in counts.items() if label.split()[-1] in ("failed", "error", "errors"))
 
 
 def ran_clean(output: str) -> str:
     """pytest's last summary line when it ran to its end with tests passed and none failed or in error, so a
     non-zero exit came after the tests (a session hook such as a conftest guard), else ''."""
-    s = _SUMMARY.findall(output or "")
-    if not s or stopped_early(output) or re.search(r"\b\d+ (?:failed|errors?)\b", s[-1]) \
-            or not re.search(r"\b\d+ passed\b", s[-1]):
+    s = summary(output)
+    if not s or stopped_early(output) or failed(s[1]) or not s[1].get("passed"):
         return ""
-    return s[-1]
+    return s[0]
 
 
 def after_tests(output: str, n: int = 6) -> list[str]:

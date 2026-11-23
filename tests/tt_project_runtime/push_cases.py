@@ -17475,14 +17475,14 @@ def test_a_push_batch_rerun_selects_each_failing_test_by_its_full_node_id(tmp_pa
         return b._run_ids("h" * 40, cmd + extra, ids, "head", clean, {})
     same, gone = "tests/test_a.py::test_same", "tests/test_a.py::test_gone"
     rc, tail = rerun([same])
-    assert rc == 1 and gatejudge._ran(tail) == (0, 1), tail      # test_b.py::test_same is not run
+    assert rc == 1 and _passed_failed(tail) == (0, 1), tail      # test_b.py::test_same is not run
     rc, tail = rerun(["tests/test_a.py::test_p[one two]"])
-    assert rc == 1 and gatejudge._ran(tail) == (0, 1), tail      # the other two cases are not run
+    assert rc == 1 and _passed_failed(tail) == (0, 1), tail      # the other two cases are not run
     rc, tail = rerun(["tests/test_a.py::test_p[a[b]]"])
-    assert rc == 0 and gatejudge._ran(tail) == (1, 0), tail
+    assert rc == 0 and _passed_failed(tail) == (1, 0), tail
     assert "not_collected" not in b.checks
     rc, tail = rerun([gone, same])
-    assert rc == 1 and gatejudge._ran(tail) == (0, 1), tail
+    assert rc == 1 and _passed_failed(tail) == (0, 1), tail
     assert gatejudge.not_collected(tail) == [gone] and b.checks["not_collected"] == [gone], tail
     assert gatejudge.failed_of(rc, tail, [gone, same], "head") is None, "a missing id proves nothing"
     pytest.importorskip("xdist")

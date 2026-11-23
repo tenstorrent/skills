@@ -85,19 +85,8 @@ LIFTS_FILE = "test_quarantine_lifts.jsonl"   # in the project's state: one line 
 LIFT_EVERY_S = 600.0   # the daemon's sweep for fixed or gone entries
 LIFT_SHOW_S = 86400.0  # status shows the lifts of the last day
 FIX_TRIES = 5          # candidate fix tasks checked per entry and sweep, newest first
-_COUNT = re.compile(r"\b(\d+) (passed|failed|errors?)\b")   # the counts in pytest's summary line
 _AT = re.compile(r"^(\S+):(\d+): (\w[\w.]*)\s*$", re.M)   # a traceback's `path:line: Error` location line
 MARK_MAX = 300      # the characters of a failure mark's line or message kept
-
-
-def _ran(output: str) -> tuple[int, int] | None:
-    """(passed, failed or errored) in the last line of `output` that carries pytest's counts."""
-    for line in reversed(output.splitlines()):
-        got = _COUNT.findall(line)
-        if got:
-            return (sum(int(n) for n, k in got if k == "passed"),
-                    sum(int(n) for n, k in got if k != "passed"))
-    return None
 
 
 def settings(cfg: dict) -> dict:
@@ -154,8 +143,8 @@ def failed_of(rc: int | None, output: str, ids: list[str], at: str = "base") -> 
     reports fewer run (passed on exit 0, passed plus failed or errored on exit 1) than it reran (a
     name selection that missed one), proves nothing."""
     if at == "head" and rc in (0, 1):
-        ran = _ran(output)
-        if ran is None or ran[0] + (ran[1] if rc == 1 else 0) < len(set(ids)):
+        s = sharedchecks.summary(output)
+        if s is None or s[1].get("passed", 0) + (sharedchecks.failed(s[1]) if rc == 1 else 0) < len(set(ids)):
             return None
     if rc == 0 or (rc == NO_TESTS and at == "base"):
         return set()

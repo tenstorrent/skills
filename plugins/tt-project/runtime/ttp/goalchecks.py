@@ -32,6 +32,8 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
+from . import sharedchecks
+
 UNKNOWN = 75
 FAIL_SEVERITY = "normal"
 # A summary's test count: (pattern, how its groups give the count).
@@ -39,7 +41,7 @@ _COUNTS = (
     (re.compile(r"\bRan (\d+) tests?\b"), lambda m: int(m.group(1))),                    # unittest
     (re.compile(r"\btests? passed, \d+ tests? failed out of (\d+)"), lambda m: int(m.group(1))),  # ctest
 )
-_PYTEST = re.compile(r"\b(\d+) (passed|failed|errors?|xfailed|xpassed)\b")
+_RAN = ("passed", "failed", "error", "errors", "xfailed", "xpassed")   # pytest's labels of tests that ran
 
 
 def observation(check: str, key: str, ok: bool | None, text: str, **fields) -> dict:
@@ -67,9 +69,9 @@ def test_count(output: str, regex: str | None = None) -> int | None:
         last = found[-1]
         return int(last[0] if isinstance(last, tuple) else last)
     for line in reversed(output.splitlines()):
-        hits = _PYTEST.findall(line)
-        if hits and ("=" in line or " in " in line):
-            return sum(int(n) for n, _ in hits)
+        pytest = sharedchecks.summary(line)
+        if pytest:
+            return sum(n for label, n in pytest[1].items() if label in _RAN)
         if re.search(r"\bno tests ran\b", line):
             return 0
         for pattern, count in _COUNTS:

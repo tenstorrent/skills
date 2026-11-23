@@ -7,6 +7,13 @@ from __future__ import annotations
 _FAIL = "python3 -m pytest -p no:cacheprovider tests/"
 
 
+def _passed_failed(output: str) -> tuple[int, int]:
+    # The passed and failed counts of pytest's summary line in `output` (push_cases uses it too).
+    from ttp import sharedchecks
+    counts = sharedchecks.summary(output)[1]
+    return counts.get("passed", 0), sharedchecks.failed(counts)
+
+
 def _fake_run(head: dict, base: dict, calls: list):
     # run(at, ids): exit 1 with a FAILED line per id the dict marks failing at `at`, else exit 0.
     def run(at, ids):
@@ -219,11 +226,11 @@ def test_gate_rerun_selects_each_failing_id_by_its_full_node_id(tmp_path):
     # A failing id that runs again fails alone; its passing namesake in test_b.py is deselected.
     z = "tests/test_a.py::test_z"
     rc, out = run("head", [z])
-    assert rc == 1 and gatejudge._ran(out) == (0, 1), out
+    assert rc == 1 and _passed_failed(out) == (0, 1), out
     assert gatejudge.judge([z], run, tmp_path / "s3", "", "host-a", 1000.0)["new"] == [z]
     # Ids as pytest prints them from a subdirectory (relative to the current directory) still select.
     rc, out = run("head", ["test_b.py::test_x"], cwd=proj / "tests")
-    assert rc == 0 and gatejudge._ran(out) == (1, 0), out
+    assert rc == 0 and _passed_failed(out) == (1, 0), out
 
 
 def test_the_select_plugin_matches_a_cwd_relative_id_without_config_cwd_relative_nodeid(tmp_path, monkeypatch):
@@ -279,7 +286,7 @@ def test_gate_rerun_selection_stays_in_its_own_pytest_run(tmp_path):
         r = subprocess.run([sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider", f"--rootdir={proj}",
                             *extra, "tests"], cwd=str(proj), env=env, capture_output=True, text=True, timeout=180)
         out = r.stdout + r.stderr
-        assert r.returncode == 0 and gatejudge._ran(out) == (1, 0), (extra, out)
+        assert r.returncode == 0 and _passed_failed(out) == (1, 0), (extra, out)
         assert "-n" in extra or "1 deselected" in out, (extra, out)
 
 
