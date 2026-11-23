@@ -53,15 +53,19 @@
   restart (`launchctl kickstart -k` / `systemctl --user restart`, after `reset-failed` for a unit
   whose start limit was hit), paced 0, 60, 120, 300 s apart. A forward whose target does not
   answer from this computer is left alone (logged once; nothing ended or restarted). An
-  unreachable box restarts nothing and is checked again within 30-60 s, at once after a wake or a
-  network change. A stopped service is left alone. Hand-made ssh forward services join with a
+  unreachable box restarts nothing and is checked again within 30-60 s, at once after a network
+  change. A stopped service is left alone. Hand-made ssh forward services join with a
   `"watch"` list in the local bridge config, never shipped with entries:
   `"watch": [{"label": "<launchd label or systemd unit>", "box": "<ssh alias>", "port": <box port>}]`,
   optionally with `"target": "<host>:<port>"` (what the forward reaches) and `"interface": "<name>"`
   (the one this computer reaches that target through): a forward whose target does not answer is
   then left alone the same way. An entry with no target whose port still connects without
-  answering after one restart is not restarted again until its check changes or this computer
-  wakes or changes network (logged once).
+  answering after one restart is not restarted again until its check changes or the network
+  changes on macOS (logged once).
+  Known limits: the watch does not detect a wake (a sleep longer than the 60 s backoff ends it, so
+  the first pass after waking checks every box); an entry with no target is healed best effort;
+  boxes are checked one after another within a pass; a listener whose owner `ss` hides is never
+  freed.
   The checks of a target open and close a TCP connection to it each pass, which a strict
   fail2ban on the target's sshd may count.
   Each heal is one JSON line in `~/.tt-project/bridge-heal.log`; `ttp bridge status` shows the

@@ -7,16 +7,18 @@ box, in one login, whether each forwarded port answers end to end (a connection 
 bytes of the host's ssh banner). A port that does not answer gets the box cleanup (bridge_relay.CLEANUP:
 it ends only this account's sshd session holding exactly that port, SIGTERM then SIGKILL) and its service
 is restarted at once, skipping the random start delay. A box that cannot be reached (this computer is
-offline, or the box is down) restarts nothing: it is asked again within BACKOFF_S, or at once on a wake or
-a network change. A port whose forward's own destination does not answer from here (its host is off) is not
-a stale forward: nothing is ended or restarted for it, and it is logged once. A service that keeps failing is restarted at most once per RESTART_GAP_S step.
+offline, or the box is down) restarts nothing: it is asked again within BACKOFF_S, or at once on a network
+change. No pass measures the time since the last one: a sleep longer than BACKOFF_S ends every backoff,
+so the first pass after waking checks every box. A port whose forward's own destination does not answer
+from here (its host is off) is not a stale forward: nothing is ended or restarted for it, and it is logged
+once. A service that keeps failing is restarted at most once per RESTART_GAP_S step.
 
 Besides the sessions `ttp bridge` installs, the config's "watch" list names ssh forward services made by
 hand: {"label": the launchd label or systemd unit, "box": its ssh alias, "port": the box port it forwards},
 optionally with "target" (the host:port it forwards to) and "interface" (the one this computer reaches it
 through), so a forward whose target is off is left alone the same way. One with no target that still connects
-but sends nothing after a restart is not restarted again until its check result changes or this computer wakes
-or changes network (which can leave the forward stale again).
+but sends nothing after a restart is not restarted again until its check result changes or the network
+changes (macOS; a change can leave the forward stale again): best effort.
 Each heal (from the first failed check to the first answer again) is one JSON line in HEAL_LOG; `ttp bridge
 status` shows the last few."""
 from __future__ import annotations
@@ -38,7 +40,6 @@ NET_PATHS = {"darwin": ["/Library/Preferences/SystemConfiguration"]}   # launchd
 BACKOFF_S = (30, 60)                  # the next check of a box that could not be reached: never over a minute
 RESTART_GAP_S = (0, 60, 120, 300)   # the least time between restarts of one service that keeps failing
 #                                     (a restarted session needs some seconds to log in and forward its ports)
-WAKE_GAP_S = 3 * INTERVAL_S          # a longer gap since the last pass: this computer slept
 STATE, HEAL_LOG = "bridge-watch.json", "bridge-heal.log"   # in the bridge home (~/.tt-project)
 
 
@@ -158,11 +159,10 @@ def run_pass(cfg: dict, platform: str | None = None, now: float | None = None) -
     platform, now = platform or sys.platform, time.time() if now is None else now
     st, out = _load(), []
     boxes, fails, off = st.setdefault("boxes", {}), st.setdefault("fail", {}), st.setdefault("unreachable", {})
-    last, net = st.get("last", 0), _net_stamp(platform)
-    event = ("network change" if net and st.get("net") and net > st["net"]
-             else "wake" if last and now - last > WAKE_GAP_S else "")
-    st.update(last=now, net=net)
-    if event:   # a wake or network change can leave any forward stale again
+    net = _net_stamp(platform)
+    event = "network change" if net and st.get("net") and net > st["net"] else ""
+    st["net"] = net
+    if event:   # a network change can leave any forward stale again
         for f in fails.values():
             f.pop("down", None)
     ts = targets(cfg, platform)

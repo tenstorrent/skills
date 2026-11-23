@@ -2502,9 +2502,10 @@ def test_bridge_watch_frees_the_stale_port_restarts_and_heals_within_60s(tmp_pat
     out = bridge_watch.run_pass(cfg, "darwin", t0 + bridge_watch.INTERVAL_S)   # the next default pass
     assert out == [f"{svc}: answers again after 30s"]
     rec = json.loads((tmp_path / "ttp" / "bridge-heal.log").read_text())
-    assert rec["event"] == "wake" and rec["restarts"] == 1 and rec["seconds"] <= 60
+    assert rec["event"] == "" and rec["restarts"] == 1 and rec["seconds"] <= 60
     lines = bridge_watch.heal_lines("darwin")
-    assert lines[0].startswith("self-heal watch: not installed") and "after a wake, answering again 30s later" in lines[1]
+    assert lines[0].startswith("self-heal watch: not installed") and " after a " not in lines[1]
+    assert "answering again 30s later" in lines[1]
     # a session `ttp bridge stop` stopped is left stopped
     cfg, seen = _watch_env(tmp_path / "b", monkeypatch, "darwin", ["down 2301\nttp-watch-done\n"], loaded=False)
     assert bridge_watch.run_pass(cfg, "darwin", t0) == [] and seen["release"] == []
@@ -2630,7 +2631,7 @@ def test_bridge_watch_heals_a_listed_hand_made_service(tmp_path, monkeypatch):
 
 
 def test_bridge_watch_hand_made_service_without_a_target_is_restarted_once_while_it_stays_silent(tmp_path, monkeypatch):
-    # cells: no-target-one-heal, logged-once, heals-again-on-change, heals-again-after-wake
+    # cells: no-target-one-heal, logged-once, heals-again-on-change, held-across-sleep
     from ttp import bridge_watch
     watch = [{"label": "my-forward", "box": "box-2", "port": 2400}]
     down, none = "down 2400\nttp-watch-done\n", "none 2400\nttp-watch-done\n"
@@ -2647,9 +2648,40 @@ def test_bridge_watch_hand_made_service_without_a_target_is_restarted_once_while
     bridge_watch.run_pass(cfg, "linux", t0 + 330)
     bridge_watch.run_pass(cfg, "linux", t0 + 400)
     assert len(seen["release"]) == 3
-    bridge_watch.run_pass(cfg, "linux", t0 + 700)   # a wake can leave the forward stale again: one more restart
-    assert len(seen["release"]) == 4
-    assert sum(c == "systemctl --user restart -- my-forward.service" for c in seen["run"]) == 4
+    bridge_watch.run_pass(cfg, "linux", t0 + 700)   # a gap like a sleep changes nothing: still held
+    assert len(seen["release"]) == 3
+    assert sum(c == "systemctl --user restart -- my-forward.service" for c in seen["run"]) == 3
+
+
+def test_bridge_watch_takes_no_decision_from_the_time_between_passes(tmp_path, monkeypatch):
+    # cells: slow-pass-keeps-backoff, slow-pass-keeps-hold, sleep-heals-first-pass, network-change-lifts-hold, caps
+    import os
+    from ttp import bridge_watch
+    cfg, seen = _watch_env(tmp_path, monkeypatch, "darwin", [None, None, None])
+    t0 = 1_000_000.0
+    bridge_watch.run_pass(cfg, "darwin", t0)
+    bridge_watch.run_pass(cfg, "darwin", t0 + 31)   # second miss: next check 60s later
+    assert len(seen["box"]) == 2
+    # a 50s pass, then the next one 30-60s after its end: more than 90s between starts, still backing off
+    assert bridge_watch.run_pass(cfg, "darwin", t0 + 31 + 50) == [] and len(seen["box"]) == 2
+    bridge_watch.run_pass(cfg, "darwin", t0 + 31 + 50 + 600)   # the first pass after a sleep asks the box
+    assert len(seen["box"]) == 3
+    # a hand-made forward with no target stays held across the same gaps; a network change lifts it once
+    down = "down 2400\nttp-watch-done\n"
+    cfg, seen = _watch_env(tmp_path / "b", monkeypatch, "darwin", [down] * 6,
+                           watch=[{"label": "my-forward", "box": "box-2", "port": 2400}], agents=False)
+    bridge_watch.run_pass(cfg, "darwin", t0)
+    for t in (t0 + 60, t0 + 150, t0 + 245):   # slow passes and long gaps
+        bridge_watch.run_pass(cfg, "darwin", t)
+    assert len(seen["release"]) == 1
+    (tmp_path / "b" / "netconf").write_text("x")
+    os.utime(tmp_path / "b" / "netconf", (t0 + 300, t0 + 300))
+    bridge_watch.run_pass(cfg, "darwin", t0 + 300)   # the first stamp only records the network state
+    assert len(seen["release"]) == 1
+    os.utime(tmp_path / "b" / "netconf", (t0 + 330, t0 + 330))
+    out = bridge_watch.run_pass(cfg, "darwin", t0 + 330)
+    assert len(seen["release"]) == 2 and out[0].endswith("restarted")
+    assert max(bridge_watch.BACKOFF_S) <= 60 and not hasattr(bridge_watch, "WAKE_GAP_S")
 
 
 def test_bridge_watch_hand_made_service_with_a_target_heals_only_when_the_target_answers(tmp_path, monkeypatch):
