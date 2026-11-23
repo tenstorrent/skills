@@ -85,7 +85,8 @@ def screen(db: DB, cfg: dict, source: str, text: str, hint: str | None = None, j
     line with "whole": true) keeps the line as one condition: its text is never split at '; '. `key` (a watcher JSON line's
     "key" field) is the issue's identity instead of its text: the text may change without a new issue, and a lower valid
     `hint` lowers the open issue (ignored at info), so a watcher fixed to report info stops its reminders; a hint
-    back up to no more than it was lowered from within `screen.reraise_window_h` restores it quietly (a flap).
+    back up to no more than it was lowered from within `screen.reraise_window_h` restores it quietly (a flap;
+    with the window off, every flap back up wakes).
     A keyed issue a run that reported nothing closed, raised again under the same key within
     `screen.reraise_window_h` of that close at the same or a lower severity, only counts: it stays
     closed and wakes nobody (a watcher re-sending a known line each wake). A higher severity reopens and wakes.

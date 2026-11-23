@@ -89,6 +89,8 @@ def test_watchgrace_step_forget_and_status():
     assert wg.step(st, "k", 700, 600, "high") == (wg.RAISE, "high")   # its own rating, at least normal
     assert wg.step(st, "k", 800, 600, "high") == (wg.REPEAT, "high")
     assert wg.step(st, "k", 900, 600, "critical") == (wg.RAISE, "critical")   # a real escalation
+    assert wg.step(st, "k", 950, 600, "normal") == (wg.REPEAT, "normal")   # rated lower: its issue follows down
+    assert wg.step(st, "k", 960, 600, "low") == (wg.REPEAT, "normal")   # never under normal
     assert wg.status(st, 600, "other") == ["other: ok"]
     assert wg.forget(st, set()) == {} and wg.forget(st, {"k"}) == st
 
