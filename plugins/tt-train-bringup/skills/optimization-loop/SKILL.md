@@ -262,6 +262,9 @@ Measurement rules, all in one place:
   timing run. Check before the run and record what was running; a run taken beside a CPU reference
   is a diagnostic, not a result row, however clean its telemetry looks.
 - No forbidden fidelity, batch or run type, in any run, including clock experiments.
+- Variable-length inputs (a DiT's packed sequences): step time depends on which sequences a step
+  draws, so time A and B on the same fixed list of sequences, with the same host-drawn timesteps
+  and noise.
 
 Tracy never runs on the full model, and no full-step time is ever projected from a profile. The
 full-model number is the MFU run without the profiler; Tracy ranks items and diffs a change. It

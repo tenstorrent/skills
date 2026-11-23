@@ -170,6 +170,26 @@ loss log, fewer than N steps, or a NaN is a failed gate, never an empty file to 
 Never shrink hidden size, head counts, sequence length or weight shapes to make evidence easier to
 collect; small shapes are for debugging only.
 
+## Diffusion transformers
+
+A DiT trained with flow matching adds three rules:
+
+- The loss. The model predicts a velocity on x_t, a mix of the clean latent and the noise at time
+  t. Take the target's sign (x0 - noise or its negative) and the time convention (which end of t is
+  noise) from the reference's own training code, never from memory. The MSE covers the generated
+  modality's rows only; conditioning rows and padding are inputs. The batch loss is the mean of the
+  per-sequence MSEs.
+- Random numbers come from the host. Data order, caption dropout, timesteps and noise are drawn on
+  the host CPU in a fixed order and uploaded as inputs; no device or torch RNG runs in the step, and
+  a checkpoint carries the generator state. The device and a GPU golden then compare sequence by
+  sequence, and a resumed run draws what an uninterrupted one would.
+- Precision near the noise end. There the sinusoidal timestep features and the per-row AdaLN
+  modulation they drive (a small scale added to 1) lose bits in bf16: a forward can match within a
+  fraction of a percent at mid t and be several percent off near the noise end. The PCC harness
+  sweeps t explicitly into the last few percent before the noise end and compares the timestep
+  embedding, the AdaLN tables, the first and last block and the loss at each t; random draws rarely
+  land there.
+
 ## Baseline measurement
 
 Before leaving this phase, take the first measurement so the loop has a baseline: a cooled MFU run

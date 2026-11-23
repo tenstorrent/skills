@@ -163,6 +163,16 @@ from this the recompute policy (none, per block, per sub-module), whether the
 optimiser state can be fp32, and whether the full model fits on one chip at the target sequence
 length at all. Recompute multiplies every forward cost in the loop, so it must be fixed here.
 
+### Diffusion transformers
+
+A diffusion transformer (DiT) trained with flow matching is planned as above, with two differences:
+
+- A sample is a packed sequence whose length varies, and attention over it is bidirectional: the
+  plan's sequence length is the worst-case packed length, and attention FLOPs have no causal halving.
+- Timesteps are per row (a conditioning modality is often at t = 0), so the timestep embedding and
+  the AdaLN modulation it drives are per row group. List them in the inventory with their dtype:
+  small in FLOPs, large in numerics risk near the noise end (see composite-bringup).
+
 ## 5. Hardware ceiling
 
 Characterise the authorised chips on day 1, before any model code, with the plugin's scripts
