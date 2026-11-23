@@ -88,14 +88,15 @@ def test_failing_ids_reads_a_summary_whose_count_labels_have_several_words():
 
 
 def test_trim_and_goal_checks_read_a_summary_whose_count_labels_have_several_words():
-    # Both read pytest's summary through sharedchecks.pytest_summary: test output is told apart and its tests counted.
+    # trim reads pytest's summary through sharedchecks.pytest_summary; goalchecks counts the tests anywhere
+    # in a line (a log prefix) with its own pattern, which skips a plugin's labels.
     from ttp import goalchecks, trim
     line = "=" * 8 + " 1 failed, 173 passed, 2 skipped, 1 xfailed, 158 subtests passed in 12.90s (0:00:12) " + "=" * 8
     log = "\n".join(["compiling"] * 30 + ["FAILED tests/test_a.py::test_one - AssertionError: boom", line])
     assert trim.is_test_output(log) and trim.failures(log).splitlines()[-1] == line
     assert goalchecks.test_count(log) == 175, "subtests are no tests; skipped ones did not run"
     assert not trim.is_test_output("compiling\nttp-suite: wall 3.2s cpu 9.1s in 3.21s\n")
-    assert trim.is_test_output("Ran 9 tests in 0.1s\n\nOK\n") and goalchecks.test_count("== 2 skipped in 0.1s ==") == 0
+    assert trim.is_test_output("Ran 9 tests in 0.1s\n\nOK\n") and goalchecks.test_count("web-1  | " + line) == 175
 
 
 def test_failing_ids_reads_real_pytest_q_output(tmp_path):
