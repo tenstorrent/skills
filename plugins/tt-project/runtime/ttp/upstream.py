@@ -1345,8 +1345,8 @@ def check_fixed_in(p: project.Project | None, fp: str, fixed_in: str, tid: int |
     task (`tid`, else fixing_task) its landed commits must be in the first commit on the push branch
     whose manifests carry that version, read locally and then after one fetch. A commit on a retired tip
     (landed.on_push: landed before a history rewrite) is in version V when V's first commit on the retired
-    tip carries it, or when V was cut after the rewrite (its first commit is not on the retired tip) at or
-    after the retired tip's own version (the rewrite carried it on). With no fixing task, no project, push branch or version_bump, it is not checked: ok, saying so.
+    tip carries it, or, when V is not on the retired tip, when V is later than the retired tip's own
+    version (cut after the rewrite, which carried it on). With no fixing task, no project, push branch or version_bump, it is not checked: ok, saying so.
     Reads git only, writes nothing."""
     from . import landed, push
     v = str(fixed_in or "").strip().lstrip("v")
@@ -1375,13 +1375,12 @@ def check_fixed_in(p: project.Project | None, fp: str, fixed_in: str, tid: int |
         if vsha and any(landed._commit(p.root, s) and landed.on_branch(p.root, s, vsha) for s in shas):
             return True, f"version {v} checked: #{tid} ({shas[-1][:10]}) is in {vsha[:10]}"
     if (old := landed.on_push(p, p.root, shas, tip)) and old != tip:
-        at = push.pushed_version(p, p.root, old) or ""
-        if vsha and at and at_least(v, at) and not landed.on_branch(p.root, vsha, old):
+        if osha := version_commit(p, p.root, old, v):
+            if any(landed.on_branch(p.root, s, osha) for s in shas):
+                return True, f"version {v} checked: #{tid} ({shas[-1][:10]}) is in {osha[:10]} on the retired tip {old[:10]}"
+        elif vsha and (at := push.pushed_version(p, p.root, old) or "") and not at_least(at, v):
             return True, (f"version {v} checked: #{tid} ({shas[-1][:10]}) is on the retired tip {old[:10]} "
                           f"({at}), which {vsha[:10]} carries on")
-        osha = version_commit(p, p.root, old, v)
-        if osha and any(landed.on_branch(p.root, s, osha) for s in shas):
-            return True, f"version {v} checked: #{tid} ({shas[-1][:10]}) is in {osha[:10]} on the retired tip {old[:10]}"
     where = f"its first commit {vsha[:10]}" if vsha else f"no commit on {ref} carries it yet"
     return False, (f"#{tid} fixes note {_check_fp(fp)} but its landed commit {shas[-1][:10]} ({src}) is not in "
                    f"version {v} ({where}). Give the version that first carries it")

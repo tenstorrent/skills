@@ -880,7 +880,7 @@ def test_upstream_resolve_accepts_a_retired_tip_fix_at_a_version_after_the_squas
     """A fix whose landed commit is on a retired tip (the push branch was squashed since) resolves at a
     version cut after the squash, and at a version the squash folded whose first commit on the retired tip
     carries it; a version without it stays refused and records nothing, the retired tip's own version too
-    when its first commit (kept by the squash) predates the fix."""
+    when its first commit predates the fix, whether the squash kept or dropped that commit."""
     from ttp import cli, landed, upstream
     p = make(env)
     repo = p.root
@@ -934,6 +934,10 @@ def test_upstream_resolve_accepts_a_retired_tip_fix_at_a_version_after_the_squas
     late = commit("a late fix", path="late.txt")
     commit("more work", path="more.txt")
     old2 = squash(bump, "0.1.2")
+    _git_out(repo, "checkout", "-qb", "proj3", base)              # the squash drops the bump to 0.1.1
+    commit("p 0.1.1", "0.1.1")
+    fix3 = commit("a fix after 0.1.1", path="fix3.txt")
+    squash(base, "0.1.2")
     _git_out(repo, "checkout", "-q", start)
 
     fp, resolve = fixed_by(fix, "proj")
@@ -949,6 +953,9 @@ def test_upstream_resolve_accepts_a_retired_tip_fix_at_a_version_after_the_squas
     assert rc == 2 and "is not in version 0.1.1" in out and upstream.resolution(fp) is None
     rc, out = resolve("0.1.2")
     assert rc == 0 and f"is on the retired tip {old2[:10]} (0.1.1), which " in out
+    fp, resolve = fixed_by(fix3, "proj3")
+    rc, out = resolve("0.1.1")                                      # first on the new history at the squash
+    assert rc == 2 and "is not in version 0.1.1" in out and upstream.resolution(fp) is None
 
 
 # The text of a reply that went out with its template slot unfilled (a shared text for several replies).
