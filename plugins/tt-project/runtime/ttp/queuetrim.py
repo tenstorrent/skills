@@ -22,8 +22,8 @@ chat and better priority instead (merged; two different reply chats are never me
 adds it, and a hop of a continue chain (task_add `continues`) is never refused: it carries unfinished work.
 An urgent or user-ordered request is merged into a queued task but never refused.
 
-A project pause stops expiry and its time is no age, nor is recorded host sleep; a deferred task ages from its
-not-before time; a task naming a paused resource never expires."""
+A project pause stops expiry and its time is no age, nor is recorded host sleep (the daemon keeps a week of
+it); a deferred task ages from its not-before time; a task naming a paused resource never expires."""
 from __future__ import annotations
 
 import re
@@ -96,7 +96,7 @@ def candidates(db: DB, cfg: dict, now: float | None = None) -> list[tuple[dict, 
         owners = set(obligations.owner_due(db))
     except Exception:   # unreadable obligations keep every task, never expire an owner
         return []
-    from . import projpause
+    from . import projpause, schedule
     from .coordinator import task_resources
     if projpause.current(db, now):
         return []   # nothing runs while the project is paused: its queue is not stale
@@ -124,7 +124,7 @@ def candidates(db: DB, cfg: dict, now: float | None = None) -> list[tuple[dict, 
         if any(states.get(dep) not in TERMINAL for dep in dependency_ids(t) if dep in states):
             continue
         created = max(float(t["created"] or now), requeued, float(d.get("after") or 0))   # or its not-before time
-        age = now - created - sum(max(0.0, e - max(b, created)) for b, e in pauses)
+        age = now - created - schedule.idle_s(pauses, created, now)
         if age >= age_s:
             out.append((t, f"queued {age / 3600:.0f} h without starting (queue.expire_h {age_s / 3600:g})"))
     return out

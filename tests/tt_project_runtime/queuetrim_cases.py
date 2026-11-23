@@ -216,6 +216,13 @@ def test_queuetrim_host_sleep_is_no_queue_age(env):
     db.set_kv("host_sleeps", [[now - 40 * 3600, now - 5 * 3600]])   # 35 h of the 50 asleep
     assert queuetrim.candidates(db, p.config(), now) == []
     assert [t["id"] for t, _ in queuetrim.candidates(db, p.config(), now + 34 * 3600)] == [slept]
+    # A sleep inside a project pause counts once: 20 h paused, 13 h of it asleep, 50 h of age left of 70.
+    db.x("UPDATE tasks SET created=? WHERE id=?", (now - 70 * 3600, slept))
+    db.set_kv("host_sleeps", [[now - 40 * 3600, now - 27 * 3600]])
+    db.x("INSERT INTO events(ts,source,kind,severity,text,status,data) VALUES(?,?,?,?,?,?,?)",
+         (now - 25 * 3600, "harness", "project_pause", "low", "resumed", "handled",
+          json.dumps({"action": "resume", "paused": {"since": now - 45 * 3600}})))
+    assert [t["id"] for t, _ in queuetrim.candidates(db, p.config(), now)] == [slept]
 
 
 def test_queuetrim_requeued_task_ages_from_its_requeue_not_its_creation(env):

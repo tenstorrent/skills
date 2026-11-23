@@ -204,6 +204,16 @@ def refresh_feed(spec: str, feed: str, now: float, created: float, where: str | 
 GAP_MIN_S = 3600   # a schedule starting this late, and at least one whole period late, missed runs
 
 
+def idle_s(windows: list | None, start: float, now: float) -> float:
+    """Seconds from `start` to `now` inside the [start, end] windows (host sleeps, project pauses),
+    overlapping ones counted once."""
+    off, end = 0.0, start
+    for a, b in sorted((max(float(a), start), min(float(b), now)) for a, b in windows or []):
+        if b > max(a, end):
+            off, end = off + b - max(a, end), b
+    return off
+
+
 def missed(row: dict, now: float, sleeps: list | None = None) -> int:
     """How many whole periods a due schedule's run starts late: 0 when it is less than a period or
     GAP_MIN_S late, or never ran. Time the host slept or the project was paused (`sleeps`, [start,
@@ -212,11 +222,7 @@ def missed(row: dict, now: float, sleeps: list | None = None) -> int:
     nxt, every = row.get("next_run"), int(row.get("every_s") or 0)
     if nxt is None or every <= 0 or not row.get("last_run"):
         return 0
-    off, end = 0.0, float(nxt)
-    for a, b in sorted((max(float(a), float(nxt)), min(float(b), now)) for a, b in sleeps or []):
-        if b > max(a, end):
-            off, end = off + b - max(a, end), b
-    late = now - float(nxt) - off
+    late = now - float(nxt) - idle_s(sleeps, float(nxt), now)
     return int(late // every) if late >= max(every, GAP_MIN_S) else 0
 
 
