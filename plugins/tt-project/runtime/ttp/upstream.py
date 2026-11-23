@@ -1344,9 +1344,9 @@ def check_fixed_in(p: project.Project | None, fp: str, fixed_in: str, tid: int |
     """Whether recording note `fp` as fixed in `fixed_in` is true: (ok, one line). With a known fixing
     task (`tid`, else fixing_task) its landed commits must be in the first commit on the push branch
     whose manifests carry that version, read locally and then after one fetch. A commit on a retired tip
-    (landed.on_push: landed before a history rewrite) is in a version that first commit on the retired tip
-    carries it, or a version on the push branch at or after the retired tip's own (the rewrite carried it
-    on). With no fixing task, no project, push branch or version_bump, it is not checked: ok, saying so.
+    (landed.on_push: landed before a history rewrite) is in version V when V's first commit on the retired
+    tip carries it, or when V was cut after the rewrite (its first commit is not on the retired tip) at or
+    after the retired tip's own version (the rewrite carried it on). With no fixing task, no project, push branch or version_bump, it is not checked: ok, saying so.
     Reads git only, writes nothing."""
     from . import landed, push
     v = str(fixed_in or "").strip().lstrip("v")
@@ -1376,7 +1376,7 @@ def check_fixed_in(p: project.Project | None, fp: str, fixed_in: str, tid: int |
             return True, f"version {v} checked: #{tid} ({shas[-1][:10]}) is in {vsha[:10]}"
     if (old := landed.on_push(p, p.root, shas, tip)) and old != tip:
         at = push.pushed_version(p, p.root, old) or ""
-        if vsha and at and at_least(v, at):
+        if vsha and at and at_least(v, at) and not landed.on_branch(p.root, vsha, old):
             return True, (f"version {v} checked: #{tid} ({shas[-1][:10]}) is on the retired tip {old[:10]} "
                           f"({at}), which {vsha[:10]} carries on")
         osha = version_commit(p, p.root, old, v)

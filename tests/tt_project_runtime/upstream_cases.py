@@ -876,11 +876,11 @@ def test_upstream_resolve_fixed_in_refuses_a_version_without_the_fixing_tasks_la
     assert rc == 0 and "version 0.1.3 not checked: delivery.version_bump is not set" in out
 
 
-
 def test_upstream_resolve_accepts_a_retired_tip_fix_at_a_version_after_the_squash(env, monkeypatch, capsys):
     """A fix whose landed commit is on a retired tip (the push branch was squashed since) resolves at a
-    version whose first commit is at or after the squash, and at a pre-squash version that carries it on
-    the retired tip; a pre-squash version without it stays refused and records nothing."""
+    version cut after the squash, and at a version the squash folded whose first commit on the retired tip
+    carries it; a version without it stays refused and records nothing, the retired tip's own version too
+    when its first commit (kept by the squash) predates the fix."""
     from ttp import cli, landed, upstream
     p = make(env)
     repo = p.root
@@ -889,6 +889,7 @@ def test_upstream_resolve_accepts_a_retired_tip_fix_at_a_version_after_the_squas
         _git_out(repo, "remote", "remove", r)
     man = repo / "plugins/p/.claude-plugin/plugin.json"
     man.parent.mkdir(parents=True)
+    p.set_config("delivery.version_bump", {"files": ["plugins/p/.claude-plugin/plugin.json"]})
 
     def commit(msg, version=None, path=None):
         if version:
@@ -899,37 +900,56 @@ def test_upstream_resolve_accepts_a_retired_tip_fix_at_a_version_after_the_squas
         _git_out(repo, "commit", "-qm", msg)
         return _git_out(repo, "rev-parse", "HEAD")
 
+    def squash(onto, then):                                       # one commit holding the old tip's tree
+        old = _git_out(repo, "rev-parse", "HEAD")
+        _git_out(repo, "reset", "-q", "--soft", onto)
+        _git_out(repo, "commit", "-qm", "squash")
+        commit(f"p {then}", then)
+        assert landed.retire_tip(p, old) == old
+        return old
+
+    def fixed_by(fix, branch):
+        p.set_config("delivery.push_branch", branch)
+        fp = upstream.fingerprint(f"upstream: squashed fix on {branch}", "s")
+        tid = p.db.add_task("fix the note", "s", kind="code")
+        p.db.update_task(tid, status="done", result=json.dumps({"status": "done", "resolves": [fp]}))
+        p.db.x("INSERT INTO push_queue(task,branch,head,target,status,created,updated,landed_sha) "
+               "VALUES(?,'b',?,?,'landed',?,?,?)", (tid, fix, branch, time.time(), time.time(), fix))
+
+        def resolve(v):
+            rc = _upstream_cli(cli, "--resolve", fp, "--fixed-in", v, "--task", str(tid))
+            out = capsys.readouterr()
+            return rc, out.out + out.err
+        return fp, resolve
+
     start = _git_out(repo, "rev-parse", "--abbrev-ref", "HEAD")
     base = commit("p 0.1.0", "0.1.0")
-    _git_out(repo, "checkout", "-qb", "proj")
+    _git_out(repo, "checkout", "-qb", "proj")                     # the squash folds versions 0.1.1 and 0.1.2
     fix = commit("the fix", path="fix.txt")
     commit("p 0.1.1", "0.1.1")
-    old = commit("p 0.1.2", "0.1.2")
-    _git_out(repo, "reset", "-q", "--soft", base)                 # the squash: one commit, the old tip's tree
-    _git_out(repo, "commit", "-qm", "squash")
-    commit("p 0.1.3", "0.1.3")
+    commit("p 0.1.2", "0.1.2")
+    old = squash(base, "0.1.3")
+    _git_out(repo, "checkout", "-qb", "proj2", base)              # the squash keeps the bump to 0.1.1
+    bump = commit("p 0.1.1", "0.1.1")
+    late = commit("a late fix", path="late.txt")
+    commit("more work", path="more.txt")
+    old2 = squash(bump, "0.1.2")
     _git_out(repo, "checkout", "-q", start)
-    assert landed.retire_tip(p, old) == old
-    p.set_config("delivery.push_branch", "proj")
-    p.set_config("delivery.version_bump", {"files": ["plugins/p/.claude-plugin/plugin.json"]})
-    fp = upstream.fingerprint("upstream: squashed fix", "s")
-    tid = p.db.add_task("fix the note", "s", kind="code")
-    p.db.update_task(tid, status="done", result=json.dumps({"status": "done", "resolves": [fp]}))
-    p.db.x("INSERT INTO push_queue(task,branch,head,target,status,created,updated,landed_sha) "
-           "VALUES(?,'b',?,'proj','landed',?,?,?)", (tid, fix, time.time(), time.time(), fix))
 
-    def resolve(v):
-        rc = _upstream_cli(cli, "--resolve", fp, "--fixed-in", v, "--task", str(tid))
-        out = capsys.readouterr()
-        return rc, out.out + out.err
-
+    fp, resolve = fixed_by(fix, "proj")
     rc, out = resolve("0.1.0")                                      # before the fix
     assert rc == 2 and "is not in version 0.1.0" in out and upstream.resolution(fp) is None
-    rc, out = resolve("0.1.1")                                      # carries it on the retired tip
-    assert rc == 0 and f"is in " in out and f"on the retired tip {old[:10]}" in out
-    rc, out = resolve("0.1.3")                                      # after the squash
+    rc, out = resolve("0.1.1")                                      # folded; carries it on the retired tip
+    assert rc == 0 and "is in " in out and f"on the retired tip {old[:10]}" in out
+    rc, out = resolve("0.1.3")                                      # cut after the squash
     assert rc == 0 and f"is on the retired tip {old[:10]} (0.1.2), which " in out
     assert upstream.resolution(fp)["fixed_in"] == "0.1.3"
+    fp, resolve = fixed_by(late, "proj2")
+    rc, out = resolve("0.1.1")                                      # the retired tip's own version, cut before it
+    assert rc == 2 and "is not in version 0.1.1" in out and upstream.resolution(fp) is None
+    rc, out = resolve("0.1.2")
+    assert rc == 0 and f"is on the retired tip {old2[:10]} (0.1.1), which " in out
+
 
 # The text of a reply that went out with its template slot unfilled (a shared text for several replies).
 _SLOT_REPLY = ("[note %s] Correction on the ack: the config key has existed since the 0.2.685 batch (commit "
