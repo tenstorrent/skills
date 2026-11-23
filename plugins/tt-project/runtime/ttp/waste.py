@@ -15,9 +15,10 @@ its own runs. Each run that ended in the window counts once, in the first bucket
                  same hand-off body: review_payload label; a review without one is unknown, not waste)
   review_rounds  reviews past the `waste.review_rounds`th round of one change's chain
   crashed        crashed, stalled or timed-out runs (budget.wasted) on tasks that later finished
-  over_runs      a task's runs past its `waste.max_runs`th that brought no new result. One that did (the run
-                 stop's progress test, runcap.progress, and not its previous run's hand-off again) is a
-                 continuation: listed apart with its rank and the limit, and not avoidable
+  over_runs      a task's runs past its `waste.max_runs`th that brought no new result. One that did (a done or
+                 waiting hand-off that is not its previous run's again, or a commit inside it: the run stop's
+                 runcap.committed) is a continuation: listed apart with its rank and the limit, not avoidable.
+                 A repeated hand-off, a self-wait's poll too, is no new result
   costly_wake    the part of a coordinator wake over `waste.wake_usd`, unless the host slept SLEPT_COLD_S since
                  the wake before (no prompt cache outlives that: its cold rewrite is the sleep's)
 
@@ -144,18 +145,17 @@ def _slept_cold(db, r, sleeps: list) -> bool:
     return sum(max(0.0, min(b, start) - max(a, since)) for a, b in sleeps) >= SLEPT_COLD_S
 
 
-def _said(h: dict) -> tuple:
+def _result_key(h: dict) -> tuple:
     return h.get("status"), " ".join(str(h.get("summary") or "").split())
 
 
-def _continued(db, p, r: dict, prev: dict | None) -> bool:
-    """Run `r`, past the per-task limit, brought a new result: progress by the run stop's own test (a commit,
-    or a done or waiting hand-off that is not its previous run's again). Unknown evidence is no result."""
-    task = db.one("SELECT * FROM tasks WHERE id=?", (r["task"],)) or {}
-    if not runcap.progress(p, task, r):
-        return False
+def _new_result(db, p, r: dict, prev: dict | None) -> bool:
+    """Run `r`, past the per-task limit, brought a new result: a done or waiting hand-off that is not its
+    previous run's again, or a commit inside it (runcap.committed). Unknown evidence is no result."""
     h = runcap.handoff(r)
-    return h.get("status") not in runcap.PROGRESS or _said(h) != _said(runcap.handoff(prev) if prev else {})
+    if h.get("status") in runcap.PROGRESS and _result_key(h) != _result_key(runcap.handoff(prev) if prev else {}):
+        return True
+    return runcap.committed(p, db.one("SELECT * FROM tasks WHERE id=?", (r["task"],)) or {}, r) is True
 
 
 def report(db, since: float, now: float, cfg: dict | None = None, p=None) -> dict:
@@ -212,7 +212,7 @@ def report(db, since: float, now: float, cfg: dict | None = None, p=None) -> dic
         elif task in sets["done"] and budget.wasted(r):
             got = "crashed"
         elif max_runs and rank.get(r["id"], 0) > max_runs and cost > 0:
-            if _continued(db, p, r, prev.get(r["id"])):
+            if _new_result(db, p, r, prev.get(r["id"])):
                 continued["usd"] += cost
                 continued["runs"].append({"run": r["id"], "task": task, "rank": rank[r["id"]]})
             else:

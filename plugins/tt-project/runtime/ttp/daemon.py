@@ -10343,8 +10343,8 @@ class Daemon:
             return out + f"\nA fix task for {waste.LABELS[bucket]} is still open."
         b = rep["buckets"][bucket]
         flagged = set(b["run_ids"])
-        for t in db.q("SELECT id, spec FROM tasks WHERE labels LIKE ? AND created >= ?",
-                      (f'%"{label}"%', now - waste.DUP_WINDOW_S)):
+        for t in db.q("SELECT id, spec FROM tasks WHERE labels LIKE ? AND created >= ? "
+                      "AND status NOT IN ('failed','cancelled')", (f'%"{label}"%', now - waste.DUP_WINDOW_S)):
             m = re.search(r"^Flagged runs: ([\d, ]+)$", t["spec"] or "", re.M)
             if m and flagged <= {int(x) for x in re.findall(r"\d+", m.group(1))}:
                 return out + f"\nFix task #{t['id']} already covers these {waste.LABELS[bucket]}."
