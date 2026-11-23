@@ -398,7 +398,7 @@ def test_a_code_workers_own_lane_names_the_model_of_the_provider_it_runs_on(env)
     tid = p.db.add_task("fix", "a spec", kind="code", tier="standard", priority=3, budget_usd=8.0, labels=[])
     claude = " ".join(prompts.worker_task(p, p.db.task(tid), str(p.root), None).split())
     codex = " ".join(prompts.worker_task(p, p.db.task(tid), str(p.root), None, provider="codex").split())
-    assert "subagent pinned to model `opus` (if the tool refuses it, the strongest model the tool offers)" in claude
+    assert "subagent pinned to model `opus` (refused: the tool's strongest)" in claude
     assert "subagent on the strongest model your subagent tool offers" in codex and "`opus`" not in codex
     assert "{ponytail_pin}" not in claude + codex
 
