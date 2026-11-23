@@ -1348,7 +1348,7 @@ def check_fixed_in(p: project.Project | None, fp: str, fixed_in: str, tid: int |
     tip carries it, or, when V is not on the retired tip, when V is later than the retired tip's own
     version (cut after the rewrite, which carried it on). With no fixing task, no project, push branch or version_bump, it is not checked: ok, saying so.
     Reads git only, writes nothing."""
-    from . import landed, push
+    from . import landed, push, release
     v = str(fixed_in or "").strip().lstrip("v")
     if p is None:
         return True, f"version {v} not checked: no project here"
@@ -1378,7 +1378,7 @@ def check_fixed_in(p: project.Project | None, fp: str, fixed_in: str, tid: int |
         if osha := version_commit(p, p.root, old, v):
             if any(landed.on_branch(p.root, s, osha) for s in shas):
                 return True, f"version {v} checked: #{tid} ({shas[-1][:10]}) is in {osha[:10]} on the retired tip {old[:10]}"
-        elif vsha and (at := push.pushed_version(p, p.root, old) or "") and not at_least(at, v):
+        elif vsha and (at := push.pushed_version(p, p.root, old) or "") and release.is_newer(v, at):
             return True, (f"version {v} checked: #{tid} ({shas[-1][:10]}) is on the retired tip {old[:10]} "
                           f"({at}), which {vsha[:10]} carries on")
     where = f"its first commit {vsha[:10]}" if vsha else f"no commit on {ref} carries it yet"
