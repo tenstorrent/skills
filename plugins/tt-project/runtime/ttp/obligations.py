@@ -2218,8 +2218,8 @@ def order_starts(db, since: float, until: float, now: float | None = None) -> tu
             continue   # out of the window, or too new to say
         start = pr.get("started")
         start = float(start) if start is not None else first_run(db, _owner_ids(o), at)
-        if start is None and (pr.get("deferred") or _held_by_design(db, _owner_ids(o), at)):
-            continue   # its owners wait by design (a deferral past the start limit), or were all dropped
+        if pr.get("deferred") or (start is None and _held_by_design(db, _owner_ids(o), at)):
+            continue   # its owners waited by design (a deferral past the start limit, also once they ran), or were all dropped
         n += 1
         late += (start if start is not None else now) - at > ORDER_START_S
     return n, late

@@ -4445,7 +4445,10 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
             notes.append(f"restriction tools not checked: {type(e).__name__}: {str(e)[:200]}")
     for oid, msg, steps in fan_orders:   # an order recorded here gets this batch's tasks naming it as owners
         if oid is None:
-            notes += _batch_owners(p, msg, list(new_tasks.values()), batch_obls)
+            try:
+                notes += _batch_owners(p, msg, list(new_tasks.values()), batch_obls)
+            except Exception as e:   # a failed attach never stops the batch's other post-steps
+                notes.append(f"order owners for user msg #{msg} not attached: {type(e).__name__}: {str(e)[:200]}")
     for oid, msg, steps in fan_orders:   # once its owners are attached: every running task it affects is told
         try:
             notes.append(_fan_order(p, oid, msg, steps))

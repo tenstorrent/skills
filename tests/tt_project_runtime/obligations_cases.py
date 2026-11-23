@@ -1252,6 +1252,10 @@ def test_an_order_whose_owners_are_all_deferred_or_dropped_is_no_late_start(env,
     assert ob.order_starts(p.db, now - 1, now + 1, now + 2 * 3600) == (0, 0)
     p.db.update_task(tid, labels="[]", not_before=None)   # the deferral passed: its labels are gone
     assert ob.order_starts(p.db, now - 1, now + 1, now + 2 * 3600) == (0, 0)
+    p.db.x("INSERT INTO runs(task, role, started, ended, status) VALUES(?, 'worker', ?, ?, 'ok')",
+           (tid, now + 3 * 3600, now + 3 * 3600 + 600))
+    check(now + 3 * 3600 + 700)                          # the deferred owner ran past the limit, as planned
+    assert ob.order_starts(p.db, now - 1, now + 1, now + 4 * 3600) == (0, 0)
     m2 = p.db.post("in", "build the other thing", chat="c1")
     p.db.x("UPDATE messages SET ts=? WHERE id=?", (now, m2))
     t2 = p.db.add_task("other", "s", kind="work", tier="light", origin="user")
