@@ -24,7 +24,7 @@ from .db import DB
 
 STRONGEST = "deep"        # the tier whose model a coordinator runs on by default
 DAYS = 7                  # days of coordinator spend the daily review lists
-_ANY_MODEL = ("", "auto", "default")   # model settings that let the provider pick: no name to compare
+ANY_MODEL = ("", "auto", "default")   # model settings that let the provider pick: no name to compare
 
 
 def migrate(raw: dict) -> tuple[str, str]:
@@ -71,7 +71,7 @@ def mismatch(want: dict, got: dict) -> list[str]:
         out.append(f"provider {got['provider'] or '-'}")
     if want["model"] and got["model"] != want["model"]:
         out.append(f"model {got['model'] or 'default'}")
-    elif want["model"].lower() not in _ANY_MODEL and got["model_used"] \
+    elif want["model"].lower() not in ANY_MODEL and got["model_used"] \
             and want["model"].lower() not in got["model_used"].lower():
         out.append(f"model {got['model_used']} (the session's)")
     if got["effort"] != want["effort"]:

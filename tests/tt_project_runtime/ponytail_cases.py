@@ -385,6 +385,11 @@ def test_the_lane_pins_a_model_the_reviews_provider_can_start_and_falls_back_on_
     named["providers"]["codex"]["tiers"]["deep"]["model"] = "codex-big"
     named["providers"]["codex"]["tiers"]["light"]["model"] = "codex-deep"
     assert ponytail.lane_model(named) == "codex-deep"
+    named["providers"]["codex"]["tiers"]["deep"]["model"] = "default"
+    named["review"]["ponytail_model"] = "opus"
+    assert ponytail.lane_model(named) == ""
+    named["providers"]["chat"] = {"tiers": {"deep": {"model": "endpoint-model"}}}
+    assert ponytail.lane_model(named, "chat") == "opus"
     for line in (ponytail.spec_line(cfg, None), ponytail.spec_line(codex, None)):
         assert "if the tool refuses that model, start it on the strongest model the tool offers" in line, line
         assert '"model": "<the model it ran on>"' in line and "only with no subagent tool at all" in line, line

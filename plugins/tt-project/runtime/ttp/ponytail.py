@@ -161,17 +161,18 @@ def skill_file() -> str:
 
 def lane_model(cfg: dict, provider: str | None = None) -> str:
     """The model the lane's subagent is pinned to on `provider` (None: the core provider), or "" for the
-    strongest one its subagent tool offers: review.ponytail_model (default opus) on Claude, where that
-    provider's tiers name it or where it has none configured, else that provider's deep-tier model unless
-    it is the account default ("") or chosen at run time ("auto")."""
+    strongest one its subagent tool offers: review.ponytail_model (default opus) on Claude Code (claude,
+    chat), where that provider's tiers name it or where it has none configured, else that provider's
+    strongest-tier model unless that lets the provider pick (coordmodel.ANY_MODEL)."""
+    from .coordmodel import ANY_MODEL, STRONGEST
     want = _review(cfg).get("ponytail_model") or "opus"
     prov = provider or cfg.get("core_provider") or "claude"
     tiers = (((cfg.get("providers") or {}).get(prov) or {}).get("tiers") or {})
     named = [str((t or {}).get("model") or "") for t in tiers.values() if isinstance(t, dict)]
-    if prov == "claude" or not tiers or want in named:
+    if prov in ("claude", "chat") or not tiers or want in named:
         return want
-    deep = str((tiers.get("deep") or {}).get("model") or "")
-    return "" if deep in ("", "auto") else deep
+    top = str((tiers.get(STRONGEST) or {}).get("model") or "")
+    return "" if top.lower() in ANY_MODEL else top
 
 
 def pinned(cfg: dict, provider: str | None = None) -> str:
