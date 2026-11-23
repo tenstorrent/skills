@@ -386,10 +386,16 @@ def calibration(db, now: float, c: dict | None = None, days: float = 7.0) -> dic
     """{"count", "median_ratio" (actual / promised), "share_by_conservative" (delivered by the conservative
     time, or by the due for a promise), "by_kind", and apart: "median_ratio_computed"/"count_computed" of
     computed ETAs, "median_ratio_quoted"/"count_quoted" of backfilled promises' own dues} of the last `days`
-    days' deliveries."""
+    days' deliveries. A backfilled promise or order whose due nobody named (the default due) is no ETA anyone
+    quoted: it is left out of both and of the headline, its "median_ratio_default"/"count_default" apart."""
+    from . import obligations
     ps = pairs(read(db), now - days * 86400)
+    untimed = {o["id"] for o in obligations.items(db) if (o.get("promise") or {}).get("timed") is False}
+    dflt = [p["actual"] / p["promised"] for p in ps if p.get("quoted") and p["ref"] in untimed]
+    ps = [p for p in ps if not (p.get("quoted") and p["ref"] in untimed)]
+    apart = {"median_ratio_default": statistics.median(dflt) if dflt else None, "count_default": len(dflt)}
     if not ps:
-        return {"count": 0, "days": days}
+        return {"count": 0, "days": days, **apart}
     ratios = [p["actual"] / p["promised"] for p in ps]
     ok = [p["actual"] <= (p["due"] if p["due"] else p["conservative"]) for p in ps]
     kinds: dict[str, list[float]] = {}
@@ -400,22 +406,26 @@ def calibration(db, now: float, c: dict | None = None, days: float = 7.0) -> dic
             "median_ratio_computed": statistics.median(split[False]) if split[False] else None,
             "count_computed": len(split[False]),
             "median_ratio_quoted": statistics.median(split[True]) if split[True] else None,
-            "count_quoted": len(split[True]),
+            "count_quoted": len(split[True]), **apart,
             "share_by_conservative": sum(ok) / len(ok),
             "by_kind": {k: {"count": len(v), "median_ratio": statistics.median(v)} for k, v in sorted(kinds.items())}}
 
 
 def line(cal: dict) -> str:
     """The calibration line: `ETA calibration, 7 d: 31 delivered, median actual/promised 1.4, 58% by the
-    conservative time (target 80%, median 0.7-1.3); computed 1.30 (n=225), quoted dues 0.18 (n=297)`."""
+    conservative time (target 80%, median 0.7-1.3); computed 1.30 (n=225), quoted dues 0.18 (n=297)`, and
+    the default dues (named by nobody) on a line of their own."""
+    dflt = (f"\nETA default dues (no time named; not in the ratio above): {cal['median_ratio_default']:.2f} "
+            f"(n={cal['count_default']})") if cal.get("count_default") else ""
     if not cal.get("count"):
-        return f"ETA calibration, {cal.get('days', 7):g} d: no delivered ETA yet"
+        return f"ETA calibration, {cal.get('days', 7):g} d: no delivered ETA yet" + dflt
     split = ", ".join(f"{name} {cal[f'median_ratio_{k}']:.2f} (n={cal[f'count_{k}']})"
                       for k, name in (("computed", "computed"), ("quoted", "quoted dues"))
                       if cal.get(f"median_ratio_{k}") is not None)
     return (f"ETA calibration, {cal['days']:g} d: {cal['count']} delivered, median actual/promised "
             f"{cal['median_ratio']:.2f}, {cal['share_by_conservative']:.0%} by the conservative time or due "
-            f"(target {TARGET_SHARE:.0%}, median {TARGET_RATIO[0]}-{TARGET_RATIO[1]})" + (f"; {split}" if split else ""))
+            f"(target {TARGET_SHARE:.0%}, median {TARGET_RATIO[0]}-{TARGET_RATIO[1]})" + (f"; {split}" if split else "")
+            + dflt)
 
 
 def _p90(xs: list[float]) -> float:

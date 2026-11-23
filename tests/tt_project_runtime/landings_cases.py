@@ -139,6 +139,26 @@ def test_eta_ledger_backfills_promises_from_obligation_records_once(env):
     assert pr and pr[0]["actual"] == pytest.approx(3200) and pr[0]["promised"] == pytest.approx(3600)
 
 
+def test_eta_calibration_keeps_default_dues_out_of_the_quoted_ratio_and_the_headline_on_a_line_of_their_own(env):
+    # A due nobody named (the default due of an untimed order) is no quoted ETA: it is counted apart.
+    from ttp import etaledger, obligations
+    p = make(env)
+    now = time.time()
+    p.db.set_kv(obligations.KV, {"next": 3, "runs": {}, "items": {
+        "o1": {"id": "o1", "text": "named due", "created": now - 7200, "owners": {},
+               "promise": {"due": now - 3600, "set_at": now - 7200, "timed": True}, "receipt": {"at": now - 4000}},
+        "o2": {"id": "o2", "text": "default due", "created": now - 7200, "owners": {},
+               "promise": {"due": now - 3600, "set_at": now - 7200, "timed": False}, "receipt": {"at": now - 7000}}}})
+    assert etaledger.backfill(p.db, now) == 4
+    cal = etaledger.calibration(p.db, now, {})
+    assert cal["count"] == 1 and cal["count_quoted"] == 1
+    assert cal["median_ratio"] == pytest.approx(3200 / 3600) == cal["median_ratio_quoted"]
+    assert cal["count_default"] == 1 and cal["median_ratio_default"] == pytest.approx(200 / 3600)
+    ln = etaledger.line(cal).splitlines()
+    assert "quoted dues 0.89 (n=1)" in ln[0] and "0.06" not in ln[0]
+    assert ln[1] == "ETA default dues (no time named; not in the ratio above): 0.06 (n=1)"
+
+
 def test_eta_factor_is_bounded_needs_samples_and_has_an_off_switch(env):
     from ttp import eta, etaledger
     p = make(env)
