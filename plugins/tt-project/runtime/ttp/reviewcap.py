@@ -340,4 +340,3 @@ def daily_line(db: DB, since: float) -> str:
         f"#{k} ({len(d.get('reviews') or [])} failed reviews"
         + (f": {len(d.get('own') or [])} own, {len(d.get('pooled') or [])} pooled" if "own" in d else "")
         + (f", {', '.join(d.get('files') or [])}" if d.get("files") else "") + ")" for k, d in seen.items())
-

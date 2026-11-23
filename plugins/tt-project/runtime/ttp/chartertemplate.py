@@ -176,4 +176,3 @@ def landed(db, a: dict) -> int | None:
         return db.post("out", f"Cleared: the charter Restrictions item from your message #{rec['msg']} is now in "
                               f"the charter: \"{rec['item']}\".", chat=rec["chat"], kind="resolved",
                        severity="low", ref=f"charter-refused:{key}")
-

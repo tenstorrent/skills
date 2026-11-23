@@ -329,4 +329,3 @@ def event_row(key: str, e: dict, now: float) -> tuple:
     """The events row for a raised condition."""
     kind = EVENTS[key.split(":", 1)[0]]
     return (now, "daemon", kind, key, "normal", e["text"], "queued", e.get("task"))
-

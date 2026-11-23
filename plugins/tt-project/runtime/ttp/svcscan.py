@@ -209,7 +209,7 @@ def write_shims(folder: Path) -> list:
 
 
 # Kills by name or pattern (`ttp killscan`): Find pattern kills in a script before a worker runs it.
-# 
+#
 # `pkill -f <name>` matches every process of the user whose command line contains <name>, and that
 # includes the worker's own tool shell when its command mentions the name. A script or test stub that
 # kills by pattern can so end the worker that runs it, or other workers and projects. A separate

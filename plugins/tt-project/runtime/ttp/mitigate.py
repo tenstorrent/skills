@@ -226,4 +226,3 @@ def due_text(rec: dict, now: float, where) -> str:
 def status_lines(db, now: float, where) -> list[str]:
     rows = [f"  #{t['id']} {t['status']}, {due_text(rec, now, where)}: {t['title']}" for t, rec in open_ones(db)]
     return ["live impact, interim mitigations:", *rows] if rows else []
-

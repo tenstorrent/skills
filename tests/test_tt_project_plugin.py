@@ -974,6 +974,19 @@ def test_shipped_inventory_without_git(tmp_path):
     assert not [r for r in rels if "__pycache__" in r or r.endswith(".pyc")]
 
 
+def test_shipped_text_has_no_trailing_whitespace_or_blank_lines_at_end():
+    """`git diff --check` from a clean base stays quiet on the plugin (captured logs aside)."""
+    hits = []
+    for rel, text in shipped_text_files():
+        if rel.endswith(".log"):
+            continue
+        hits += [f"{rel}:{n}: trailing whitespace" for n, line in enumerate(text.split("\n"), 1)
+                 if line != line.rstrip()]
+        if text.endswith("\n") and not text.splitlines()[-1].strip():
+            hits.append(f"{rel}: blank line at end of file")
+    assert not hits, hits
+
+
 def test_root_relative_harness_bin_pattern():
     for line in ("run tt-project/harness/bin/ttp note x", "`harness/bin/ttp lock`",
                  'cmd = "tt-project/harness/bin/ttp"', "./harness/bin/gh", "x=harness/bin"):

@@ -281,5 +281,3 @@ def session_ended(state, now: float) -> dict:
     if isinstance(st.get(SESSION), dict):
         st[SESSION] = {**st[SESSION], "end": now}
     return st
-
-

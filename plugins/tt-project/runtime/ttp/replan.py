@@ -231,4 +231,3 @@ def audit_line(db, since: float, now: float | None = None) -> str:
     return (f"missed promises, {(now - since) / 3600:g} h: {r['missed']} missed, {r['twice']} missed twice or more, "
             f"{r['bare_moves']} due moves without a plan change (target 0)"
             + (f", median lateness {r['median_late_h']:.1f} h" if r["median_late_h"] is not None else ""))
-

@@ -1,11 +1,11 @@
 # tt-project
 
-Manages long-running, self-driving projects, sort of like Cursor and Claude projects, but they run locally, not in the cloud. 
-Start a new project, give it a name and a description of what it should manage and how it should behave, and a custom harness will be generated to manage your project. Not only for coding! It can handle finance, legal, data center, any project. 
+Manages long-running, self-driving projects, sort of like Cursor and Claude projects, but they run locally, not in the cloud.
+Start a new project, give it a name and a description of what it should manage and how it should behave, and a custom harness will be generated to manage your project. Not only for coding! It can handle finance, legal, data center, any project.
 
-Example 1: 
+Example 1:
 
-``` 
+```
 new tt-project named vidgen to manage all of my video-model related work in the Metal repo. The project should run
 on box-a, and can use box-a, box-b and the Slurm cluster box-c for device work. Research and implement
 optimizations. Integrate relevant optimizations from other DIT models, and explore novel optimization ideas.
@@ -15,7 +15,7 @@ Any PR you open must stay in draft form until I review and move it out of draft.
 issues and address them automatically.
 ```
 
-Example 2: 
+Example 2:
 
 ```
 new tt-project named Expenses to check expense reports. Running on this Mac.
@@ -51,7 +51,7 @@ Features:
 - Will stay within dollar budgets on usage billed plans and daily/weekly budgets on prepaid plans.
 - Budgets are set per project and global totals of all projects.
 - It throttles, stops and restarts work as token availability changes.
-- Switching between plans is also fine. 
+- Switching between plans is also fine.
 - If you want a project to go faster, just tell it to increase its budget.
 
 ## Install
@@ -64,11 +64,11 @@ curl -fsSL https://raw.githubusercontent.com/tenstorrent/skills/HEAD/plugins/tt-
 This installs from the default branch; for another branch or tag, put it in place of `HEAD` and pass `TT_PROJECT_REF=<ref>`.
 Or just tell your agent "install tt-project from https://github.com/tenstorrent/skills".
 
-Then reload your agent session. 
+Then reload your agent session.
 
-Rerun the above to update to the latest version of tt-project. 
+Rerun the above to update to the latest version of tt-project.
 
-If you're starting to work on a remote box you haven't worked on before (not project specific), you can say in the chat "/tt-project setup box box-a" and it will ask you a few questions and set up what you like: claude, claude plugin for cursor, tt-device-mcp, and other options. You can also tell it to set up things that are not part of the skill. 
+If you're starting to work on a remote box you haven't worked on before (not project specific), you can say in the chat "/tt-project setup box box-a" and it will ask you a few questions and set up what you like: claude, claude plugin for cursor, tt-device-mcp, and other options. You can also tell it to set up things that are not part of the skill.
 
 ## Learn more
 
