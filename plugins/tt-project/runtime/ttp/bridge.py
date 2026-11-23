@@ -6,7 +6,7 @@ the box's own key, made on the box by `--make-key`, and a short-lived certificat
 
 This computer (the user's workstation) keeps one ssh session per box and agent as a user service
 (launchd agent on macOS, systemd user unit on Linux; restarted on every drop, after sleep and at
-login). Each session forwards exactly one of this computer's agents and links the box's end of it
+login, each restart after a random 0-60 s wait so a wake does not log them all in at once). Each session forwards exactly one of this computer's agents and links the box's end of it
 to a stable path, `<socket_dir>/<agent>.sock` (default `~/.ssh/tt-agent`), and stays up only while
 that agent socket exists. Hosts the box cannot reach by itself are reverse-forwarded from this
 computer to a loopback port on the box (`-R 127.0.0.1:<port>:<host>:22`, ssh ports only), so the
@@ -306,13 +306,16 @@ RELAY = HOME_DIR / "bridge_relay.py"
 def service_argv(cfg: dict, box: str, agent: str, ssh: str | None = None, platform: str | None = None) -> list[str]:
     """What the service runs: the session inside the relay wrapper (a copy of bridge_relay.py, installed
     by setup), which tags it, recovers from a stale session holding its ports, relays the hosts
-    reached through one interface and, on macOS unless `keep_awake` is off, holds the sleep assertion."""
+    reached through one interface and, on macOS unless `keep_awake` is off, holds the sleep assertion; each
+    restart first waits the random start delay (tunnel.spread()) so a wake does not log every session in at once."""
     argv = ssh_argv(cfg, box, agent, ssh)
     bound = [h for h in cfg["boxes"][box]["agents"][agent]["forward"] if h["interface"] and not h["adopt"]]
     py = "/usr/bin/python3" if os.path.exists("/usr/bin/python3") else sys.executable
     awake = ["--keep-awake"] if cfg.get("keep_awake", True) and (platform or sys.platform) == "darwin" else []
-    return [py, str(RELAY), "--tag", f"{box}/{agent}", "--link", link(cfg, agent), *awake, str(relay_dir(box, agent)),
-            *[f"{h['name']}={h['target']}%{h['interface']}" for h in bound], "--", *argv]
+    from .tunnel import spread
+    return spread([py, str(RELAY), "--tag", f"{box}/{agent}", "--link", link(cfg, agent), *awake,
+                   str(relay_dir(box, agent)), *[f"{h['name']}={h['target']}%{h['interface']}" for h in bound], "--",
+                   *argv], start_marker(box, agent))
 
 
 def install_relay() -> bool:
@@ -414,6 +417,10 @@ def service_file(box: str, agent: str, platform: str | None = None) -> Path:
     return hoststate.unit_dir() / f"{label(box, agent)}.service"
 
 
+def start_marker(box: str, agent: str) -> Path:
+    return HOME_DIR / f"bridge-{box}-{agent}.start"
+
+
 def launchd_plist(box: str, agent: str, argv: list[str]) -> dict:
     log = str(HOME_DIR / f"bridge-{box}-{agent}.log")
     return {"Label": label(box, agent), "ProgramArguments": argv, "RunAtLoad": True, "KeepAlive": True,
@@ -442,20 +449,24 @@ def _box(box: str, script: str, timeout: int = 40, inp: str | None = None) -> su
 
 
 def start(box: str, agent: str, argv: list[str], platform: str | None = None) -> str:
+    from .tunnel import ready   # this start skips the random start delay; later restarts wait it
     platform = platform or sys.platform
     f = service_file(box, agent, platform)
     f.parent.mkdir(parents=True, exist_ok=True)
     HOME_DIR.mkdir(parents=True, exist_ok=True)
     if platform == "darwin":
         durable_write(f, plistlib.dumps(launchd_plist(box, agent, argv)))
+        ready(argv)
         from .service import _reload   # bootout, then bootstrap retried past launchd's error 5 right after it
         r = _reload(label(box, agent), f, lambda *a: _run(list(a)))
         return ("launchd agent started" if r.returncode == 0
                 else f"launchd refused it: {(r.stderr or r.stdout).strip()[:200]}")
     durable_write(f, systemd_unit(box, agent, argv))
     _run(["systemctl", "--user", "daemon-reload"])
+    ready(argv)
     r = _run(["systemctl", "--user", "enable", "--now", "--", f"{label(box, agent)}.service"])
     if r.returncode == 0:
+        ready(argv)   # enable --now may have started (and so used up) the first one
         _run(["systemctl", "--user", "restart", "--", f"{label(box, agent)}.service"])
     return "systemd user unit started" if r.returncode == 0 else f"systemd refused it: {r.stderr.strip()[:200]}"
 
@@ -472,6 +483,7 @@ def stop(box: str, agent: str, platform: str | None = None, remove: bool = False
         _run(["systemctl", "--user", "disable" if remove else "stop", "--now", "--", f"{label(box, agent)}.service"])
     if remove:
         f.unlink()
+        start_marker(box, agent).unlink(missing_ok=True)
     return "stopped and removed" if remove else "stopped"
 
 
@@ -529,7 +541,7 @@ def setup(cfg: dict, boxes: list[str], platform: str | None = None) -> list[str]
         out.append(f"{box}: {write_block(cfg, box)}")
         for an in cfg["boxes"][box]["agents"]:
             argv = service_argv(cfg, box, an, platform=platform)
-            if argv[1:2] == [str(RELAY)]:
+            if str(RELAY) in argv:
                 install_relay()
             out.append(f"{box} {an}: {start(box, an, argv, platform)}")
         if cfg["boxes"][box].get("gh_pull"):   # its delivery.gh_route "workstation" calls (ghqueue)

@@ -218,7 +218,7 @@ def test_bridge_service_runs_the_session_and_restarts_it(tmp_path, monkeypatch):
 
 
 def test_bridge_interface_hosts_go_through_the_relay_socket(tmp_path, monkeypatch):
-    from ttp import bridge
+    from ttp import bridge, tunnel
     monkeypatch.setattr(bridge, "HOME_DIR", tmp_path)
     monkeypatch.setattr(bridge, "RELAY", tmp_path / "bridge_relay.py")
     cfg = _bridge_cfg()
@@ -227,14 +227,92 @@ def test_bridge_interface_hosts_go_through_the_relay_socket(tmp_path, monkeypatc
     sock = tmp_path / "bridge-relay" / "box-1.auto" / "build-a.sock"
     assert argv[argv.index("-R") + 1] == f"127.0.0.1:2301:{sock}"
     svc = bridge.service_argv(cfg, "box-1", "auto", ssh="ssh")
-    assert svc[1:8] == [str(tmp_path / "bridge_relay.py"), "--tag", "box-1/auto", "--link", bridge.link(cfg, "auto"),
+    assert svc[:4] == ["/bin/sh", "-c", tunnel.SPREAD_SH, str(tmp_path / "bridge-box-1-auto.start")]   # the start delay
+    assert svc[5:12] == [str(tmp_path / "bridge_relay.py"), "--tag", "box-1/auto", "--link", bridge.link(cfg, "auto"),
                         str(sock.parent), "build-a=build-a.example.com%vpn0"]
     assert svc[svc.index("--") + 1:] == argv
     plain = bridge.service_argv(_bridge_cfg(), "box-1", "auto", ssh="ssh")   # no interface host: still wrapped
-    assert plain[1:7] == [str(tmp_path / "bridge_relay.py"), "--tag", "box-1/auto", "--link", bridge.link(cfg, "auto"),
-                          str(sock.parent)]
-    assert plain[7] == "--" and plain[8] == "/bin/sh"
+    assert plain[5:11] == [str(tmp_path / "bridge_relay.py"), "--tag", "box-1/auto", "--link", bridge.link(cfg, "auto"),
+                           str(sock.parent)]
+    assert plain[11] == "--" and plain[12] == "/bin/sh"
 
+
+
+def test_kept_ssh_services_wait_a_random_start_delay_but_not_on_the_start_that_installs_them(tmp_path, monkeypatch):
+    # cells: spread-wait, spread-first-start, spread-bound, spread-env-agent, spread-own-connection
+    import plistlib
+    from ttp import bridge, hoststate, tunnel
+    monkeypatch.delenv("TTP_TEST_NO_BRIDGE_REFRESH", raising=False)
+    for mod in (bridge, tunnel):
+        monkeypatch.setattr(mod, "HOME_DIR", tmp_path)
+    monkeypatch.setattr(bridge, "RELAY", tmp_path / "bridge_relay.py")
+    monkeypatch.setattr(hoststate, "unit_dir", lambda: tmp_path / "units")
+    fake = tmp_path / "bin"
+    fake.mkdir()
+    (fake / "sleep").write_text('#!/bin/sh\nprintf "slept %s\\n" "$1"\n')
+    (fake / "ssh").write_text(f'#!/bin/sh\nprintf "%s\\0" "${bridge.ENV_AGENT}" "$@"\n')
+    for f in fake.iterdir():
+        f.chmod(0o755)
+    path = {"PATH": f"{fake}:{os.environ['PATH']}"}
+    # The plist and the unit both carry the wait; the unit's escaping reads back as the same argv.
+    cfg = _bridge_cfg()
+    svc = bridge.service_argv(cfg, "box-1", "auto", platform="linux")
+    marker = bridge.start_marker("box-1", "auto")
+    assert svc[:4] == ["/bin/sh", "-c", tunnel.SPREAD_SH, str(marker)] and "/dev/urandom" in tunnel.SPREAD_SH
+    assert bridge.launchd_plist("box-1", "auto", svc)["ProgramArguments"] == svc
+    (tmp_path / "units").mkdir()
+    bridge.service_file("box-1", "auto", "linux").write_text(bridge.systemd_unit("box-1", "auto", svc))
+    assert bridge.installed_argv("box-1", "auto", "linux") == svc
+    # Its ssh keeps its own connection, and the session after the relay's "--" is the same argv as before.
+    assert svc[svc.index("--") + 1:] == bridge.ssh_argv(cfg, "box-1", "auto")
+    assert "ControlMaster=no" in svc and "ControlPath=none" in svc
+    # A restart without the marker sleeps 0..RECONNECT_SPREAD_S s, then execs the command.
+    runs = [subprocess.run(tunnel.spread(["echo", "ran"], marker), env=path, capture_output=True, text=True,
+                           timeout=30).stdout.split("\n") for _ in range(40)]
+    waits = [int(r[0].split()[1]) for r in runs]
+    assert all(r[0].startswith("slept ") and r[1] == "ran" for r in runs), runs[:2]
+    assert all(0 <= w <= tunnel.RECONNECT_SPREAD_S for w in waits) and len(set(waits)) > 1, waits
+    # The start an install or restart means skips it once, using up the marker.
+    tunnel.ready(svc)
+    assert marker.is_file()
+    r = subprocess.run(tunnel.spread(["echo", "ran"], marker), env=path, capture_output=True, text=True, timeout=30)
+    assert r.stdout == "ran\n" and not marker.exists()
+    # The env-agent form inside it still execs ssh with the same argv (the agent under its own name).
+    ssh = bridge.ssh_argv(cfg, "box-1", "auto", ssh=str(fake / "ssh"))
+    assert ssh[:2] == ["/bin/sh", "-c"]
+    marker.touch()
+    r = subprocess.run(tunnel.spread(ssh, marker), env={**path, "SSH_AUTH_SOCK": "/agents/env.sock"},
+                       capture_output=True, text=True, timeout=30)
+    assert r.stdout.split("\0")[:-1] == ["/agents/env.sock", *ssh[5:]], r
+    # bridge start (Linux): the marker is there for enable --now and again for the restart after it.
+    seen = []
+    monkeypatch.setattr(bridge, "_run", lambda argv, *a, **k: seen.append((argv[2], marker.is_file()))
+                        or subprocess.CompletedProcess(argv, 0, "", ""))
+    assert not marker.exists()
+    bridge.start("box-1", "auto", svc, "linux")
+    assert ("enable", True) in seen and ("restart", True) in seen, seen
+    # A kept tunnel: installed with the wait, its first start (and a restart) prompt, its ssh on its own connection.
+    calls = []
+    monkeypatch.setattr(tunnel, "_run", lambda *argv: calls.append((argv, tunnel.marker("demo").is_file()))
+                        or subprocess.CompletedProcess(argv, 0, "", ""))
+    assert tunnel.keep("demo", "box", 18700, lambda port: port, "linux")[0] == 18800
+    have = tunnel.installed("demo", "linux")
+    assert have["spread"] and have["own"] and have["host"] == "box" and have["local"] == 18800
+    assert any(a[2:4] == ("enable", "--now") and m for a, m in calls), calls
+    tunnel.marker("demo").unlink()
+    calls.clear()
+    assert tunnel.restart("demo", "linux") == "restarted" and calls[-1][1]
+    # An older kept tunnel without the wait is re-installed by setup/upgrade on its port; a current one is left.
+    old = tunnel.ssh_argv("box", 18900, 18750)
+    tunnel.service_file("older", "linux").write_text(tunnel.systemd_unit("older", old))
+    assert tunnel.refresh("linux") == ["tunnel older: start delay added; replaced the kept tunnel "
+                                       f"(systemd user unit, {tunnel.service_file('older', 'linux')})"]
+    assert tunnel.installed("older", "linux")["spread"] and tunnel.installed("older", "linux")["local"] == 18900
+    assert tunnel.refresh("linux") == []
+    plist = tunnel.launchd_plist("older", tunnel.spread(old, tunnel.marker("older")))
+    assert plistlib.loads(plistlib.dumps(plist))["ProgramArguments"][-1] == "box"   # the host stays argv's last word
+    tunnel.unkeep("older", "linux")
+    assert not tunnel.marker("older").exists()
 
 def test_bridge_relay_carries_one_connection_and_exits_with_its_session(monkeypatch, request):
     import shutil
@@ -1277,7 +1355,7 @@ def test_bridge_refresh_reinstalls_a_service_whose_command_changed(tmp_path, mon
     assert bridge.refresh("darwin", conf) == ["bridge box-1 auto: service command changed; restarted"]
     assert started == [new] and bridge.RELAY.is_file()
     f.write_bytes(plistlib.dumps(bridge.launchd_plist("box-1", "auto", new)))
-    assert bridge.launchd_plist("box-1", "auto", new)["ProgramArguments"][2:4] == ["--tag", "box-1/auto"]
+    assert bridge.launchd_plist("box-1", "auto", new)["ProgramArguments"][6:8] == ["--tag", "box-1/auto"]
     assert bridge.refresh("darwin", conf) == [] and len(started) == 1   # unchanged: left running
     nowake = [a for a in new if a != "--keep-awake"]   # a relay command from before the keep-awake flag
     f.write_bytes(plistlib.dumps(bridge.launchd_plist("box-1", "auto", nowake)))

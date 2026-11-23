@@ -4570,6 +4570,10 @@ Workers can read Slack links you paste, using your Slack connector if you have o
     No sudo, no other account's process, no sshd config change. `ttp bridge doctor` names a port held by a
     stale session. `ttp setup` and the upgrade re-install bridge services whose command changed, so
     nothing needs running by hand on the workstation.
+  - Bridge sessions and kept tunnels wait a random 0-60 s before ssh on each restart by launchd or
+    systemd, so many reconnecting after a wake do not trip the host's sshd `MaxStartups`; the start
+    that installs or restarts one does not wait. `ttp setup` and the upgrade add the wait to
+    installed ones.
   - A dead agent behind a live-looking link recovers too. Every 30 s the session asks its forwarded
     agent and the link's agent for their keys (`ssh-add -l`; exit 2 or a failed exchange is dead).
     A link whose agent is dead while the session's answers is relinked at once; the session's own

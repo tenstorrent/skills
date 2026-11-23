@@ -24214,8 +24214,8 @@ def test_budget_line_shows_both_windows_their_resets_and_the_mean_of_window_peak
 @needs_sockets
 def test_web_keep_installs_a_kept_local_forward_and_adopts_an_existing_one(env, tmp_path, monkeypatch, capsys):
     """`ttp web <name> --tunnel --keep` opens the local forward to a remote project's web app as a
-    user service without asking. A com.tt-project.tunnel.<name> service set up by hand is adopted
-    when it already forwards to the project, and otherwise replaced on its own local port."""
+    user service without asking. A com.tt-project.tunnel.<name> service is adopted when it already
+    forwards to the project with the start delay, and otherwise replaced on its own local port."""
     import plistlib
     from ttp import cli, tunnel, weblink
     monkeypatch.setenv("HOME", str(tmp_path / "userhome"))
@@ -24228,15 +24228,21 @@ def test_web_keep_installs_a_kept_local_forward_and_adopts_an_existing_one(env, 
         a, 0, "web app: http://127.0.0.1:18700/#token=abc123\n", ""))
     plist = tmp_path / "userhome" / "Library" / "LaunchAgents" / "com.tt-project.tunnel.demo.plist"
     plist.parent.mkdir(parents=True)
-    # Set up by hand earlier, through a shell, forwarding to the right port on its own connection: adopted as is.
+    # Set up by hand earlier, through a shell, forwarding to the right port on its own connection but restarting
+    # without the start delay: replaced on its port; once it has the delay, adopted as is.
     hand = {"Label": "com.tt-project.tunnel.demo", "KeepAlive": True, "ProgramArguments":
             ["/bin/sh", "-c", "exec ssh -N -o ControlMaster=no -o ControlPath=none -L 18999:localhost:18700 box"]}
     plist.write_bytes(plistlib.dumps(hand))
     cli.main(["web", "demo", "--tunnel", "--keep"])
     out = capsys.readouterr().out
+    assert "replaced the kept tunnel" in out and "http://127.0.0.1:18999/#token=abc123" in out, out
+    spread = plistlib.loads(plist.read_bytes())
+    assert spread["ProgramArguments"][:3] == ["/bin/sh", "-c", tunnel.SPREAD_SH]
+    cli.main(["web", "demo", "--tunnel", "--keep"])
+    out = capsys.readouterr().out
     assert "adopted the kept tunnel already installed" in out and "localhost:18999" in out, out
     assert "http://127.0.0.1:18999/#token=abc123" in out
-    assert plistlib.loads(plist.read_bytes()) == hand
+    assert plistlib.loads(plist.read_bytes()) == spread
     # Forwarding to an old port: replaced, keeping the local port so the link stays the same.
     hand["ProgramArguments"][-1] = "exec ssh -N -o ControlMaster=no -o ControlPath=none -L 18999:127.0.0.1:18650 box"
     plist.write_bytes(plistlib.dumps(hand))

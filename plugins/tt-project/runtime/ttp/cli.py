@@ -13839,7 +13839,8 @@ def _setup_refresh(a, cur: Path) -> int:
         print(ln)
     from . import bridge
     bridge_out, bridge_rc = bridge.refresh_checked()   # installed bridge sessions run the current wrapper from now on
-    for ln in bridge_out:
+    from . import tunnel
+    for ln in [*bridge_out, *tunnel.refresh()]:   # and kept tunnels the current command
         print(ln)
     print("defaults for new projects:")
     for ln in new_project_defaults_lines():
@@ -14358,7 +14359,8 @@ def cmd_upgrade(a) -> None:
         print(ln)
     from . import bridge
     bridge_out, bridge_rc = bridge.refresh_checked()   # and its bridge sessions
-    for ln in bridge_out:
+    from . import tunnel
+    for ln in [*bridge_out, *tunnel.refresh()]:   # and kept tunnels
         print(ln)
     from . import codexmarket
     for ln in codexmarket.once():   # and Codex's copy of tt-project, once per release
