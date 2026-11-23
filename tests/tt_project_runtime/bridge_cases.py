@@ -2435,6 +2435,7 @@ def _watch_env(tmp_path, monkeypatch, platform, answers, loaded=True, watch=None
 
     monkeypatch.setattr(bridge, "_box", box)
     monkeypatch.setattr(bridge, "_run", run)
+    monkeypatch.setattr(bridge_watch, "dest_answers", lambda d: True)
     monkeypatch.setattr(bridge_watch, "release",
                         lambda cfg, t, ports: seen["release"].append((t["service"], t["agent"], ports)) or True)
     return cfg, seen
@@ -2460,6 +2461,11 @@ def test_bridge_watch_offline_restarts_nothing_and_backs_off(tmp_path, monkeypat
     bridge_watch.run_pass(cfg, "darwin", t0 + 63)
     assert len(seen["box"]) == 3 and seen["release"] == []
     assert not any("kickstart" in c or "restart" in c for c in seen["run"])
+    assert max(bridge_watch.BACKOFF_S) <= 60   # a long outage is still checked within a minute of the network's return
+    cfg, seen = _watch_env(tmp_path / "c", monkeypatch, "linux", [None] * 6)
+    for i in range(6):
+        bridge_watch.run_pass(cfg, "linux", t0 + 61 * i)   # every pass lands just after the allowed wait
+    assert len(seen["box"]) == 6
 
 
 def test_bridge_watch_frees_the_stale_port_restarts_and_heals_within_60s(tmp_path, monkeypatch):
@@ -2487,6 +2493,38 @@ def test_bridge_watch_frees_the_stale_port_restarts_and_heals_within_60s(tmp_pat
     cfg, seen = _watch_env(tmp_path / "b", monkeypatch, "darwin", ["down 2301\nttp-watch-done\n"], loaded=False)
     assert bridge_watch.run_pass(cfg, "darwin", t0) == [] and seen["release"] == []
     assert not any("kickstart" in c for c in seen["run"])
+
+
+def test_bridge_watch_leaves_a_session_alone_when_a_forwards_destination_is_down(tmp_path, monkeypatch):
+    # cells: target-down-no-restart, target-up-heals
+    from ttp import bridge_watch
+    down = "down 2301\nttp-watch-done\n"
+    cfg, seen = _watch_env(tmp_path, monkeypatch, "darwin", [down, down])
+    answered = []
+    monkeypatch.setattr(bridge_watch, "dest_answers", lambda d: answered.append(d) or False)
+    t0 = 1_000_000.0
+    out = bridge_watch.run_pass(cfg, "darwin", t0)
+    assert answered == ["build-a.example.com:22"] and seen["release"] == []
+    assert not any("kickstart" in c for c in seen["run"])
+    assert len(out) == 1 and "destination does not answer" in out[0]
+    assert bridge_watch.run_pass(cfg, "darwin", t0 + 300) == [] and seen["release"] == []   # logged once
+    cfg, seen = _watch_env(tmp_path / "b", monkeypatch, "darwin", [down])
+    monkeypatch.setattr(bridge_watch, "dest_answers", lambda d: True)
+    out = bridge_watch.run_pass(cfg, "darwin", t0)
+    assert len(seen["release"]) == 1 and any("kickstart" in c for c in seen["run"]) and out[0].endswith("restarted")
+
+
+def test_bridge_watch_dest_answers_a_listening_socket_and_not_a_closed_one(tmp_path):
+    # cells: dest-answers
+    import socket
+    from ttp import bridge_watch
+    srv = socket.socket()
+    srv.bind(("127.0.0.1", 0))
+    srv.listen(1)
+    port = srv.getsockname()[1]
+    assert bridge_watch.dest_answers(f"127.0.0.1:{port}")
+    srv.close()
+    assert not bridge_watch.dest_answers(f"127.0.0.1:{port}") and not bridge_watch.dest_answers(str(tmp_path / "no.sock"))
 
 
 def test_bridge_watch_heals_a_listed_hand_made_service(tmp_path, monkeypatch):

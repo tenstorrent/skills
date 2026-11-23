@@ -7,8 +7,9 @@ box, in one login, whether each forwarded port answers end to end (a connection 
 bytes of the host's ssh banner). A port that does not answer gets the box cleanup (bridge_relay.CLEANUP:
 it ends only this account's sshd session holding exactly that port, SIGTERM then SIGKILL) and its service
 is restarted at once, skipping the random start delay. A box that cannot be reached (this computer is
-offline, or the box is down) restarts nothing: it is asked again after a growing pause, or at once on a
-wake or a network change. A service that keeps failing is restarted at most once per RESTART_GAP_S step.
+offline, or the box is down) restarts nothing: it is asked again within BACKOFF_S, or at once on a wake or
+a network change. A port whose forward's own destination does not answer from here (its host is off) is not
+a stale forward: nothing is ended or restarted for it, and it is logged once. A service that keeps failing is restarted at most once per RESTART_GAP_S step.
 
 Besides the sessions `ttp bridge` installs, the config's "watch" list names ssh forward services made by
 hand: {"label": the launchd label or systemd unit, "box": its ssh alias, "port": the box port it forwards}.
@@ -19,6 +20,7 @@ from __future__ import annotations
 import json
 import os
 import shlex
+import socket
 import sys
 import time
 from pathlib import Path
@@ -28,7 +30,7 @@ from .project import durable_append, durable_write
 LABEL = "com.tt-project.bridge-watch"
 INTERVAL_S = 30
 NET_PATHS = {"darwin": ["/Library/Preferences/SystemConfiguration"]}   # launchd runs the pass when it changes
-BACKOFF_S = (30, 60, 120, 300)        # the next check of a box that could not be reached
+BACKOFF_S = (30, 60)                  # the next check of a box that could not be reached: never over a minute
 RESTART_GAP_S = (0, 60, 120, 300)   # the least time between restarts of one service that keeps failing
 #                                     (a restarted session needs some seconds to log in and forward its ports)
 WAKE_GAP_S = 3 * INTERVAL_S          # a longer gap since the last pass: this computer slept
@@ -55,9 +57,12 @@ def targets(cfg: dict, platform: str | None = None) -> list[dict]:
     out = []
     for box, b in cfg["boxes"].items():
         for an, a in b["agents"].items():
-            ports = [h["port"] for h in a["forward"] if not h["adopt"]]
-            if ports and bridge.service_file(box, an, platform).is_file():
-                out.append({"service": bridge.label(box, an), "box": box, "ports": ports, "agent": an})
+            fw = [h for h in a["forward"] if not h["adopt"]]
+            if fw and bridge.service_file(box, an, platform).is_file():
+                dests = {h["port"]: str(bridge.relay_dir(box, an) / f"{h['name']}.sock") if h["interface"]
+                         else f"{h['target']}:22" for h in fw}
+                out.append({"service": bridge.label(box, an), "box": box, "ports": list(dests), "agent": an,
+                            "dests": dests})
     out += [{"service": w["label"], "box": w["box"], "ports": [w["port"]], "agent": ""} for w in cfg.get("watch", [])]
     return out
 
@@ -78,6 +83,22 @@ def _net_stamp(platform: str) -> float:
         except OSError:
             pass
     return m
+
+
+def dest_answers(dest: str) -> bool:
+    """A forward's destination (host:22, or a relay socket path) accepts a connection from this computer."""
+    try:
+        if dest.startswith("/"):
+            s = socket.socket(socket.AF_UNIX)
+            s.settimeout(5)
+            s.connect(dest)
+        else:
+            host, _, port = dest.rpartition(":")
+            s = socket.create_connection((host, int(port)), timeout=5)
+        s.close()
+        return True
+    except (OSError, ValueError):
+        return False
 
 
 def release(cfg: dict, t: dict, ports: list[int]) -> bool:
@@ -111,7 +132,9 @@ def loaded(t: dict, platform: str) -> bool:
 def restart(t: dict, platform: str) -> str:
     from . import bridge
     if t["agent"]:
-        bridge.bridge_marker(t["box"], t["agent"]).touch()   # skip the random start delay
+        m = bridge.bridge_marker(t["box"], t["agent"])   # skip the random start delay
+        m.parent.mkdir(parents=True, exist_ok=True)
+        m.touch()
     if platform == "darwin":
         r = bridge._run(["launchctl", "kickstart", "-k", f"gui/{os.getuid()}/{t['service']}"])
     else:
@@ -124,7 +147,7 @@ def run_pass(cfg: dict, platform: str | None = None, now: float | None = None) -
     from . import bridge
     platform, now = platform or sys.platform, time.time() if now is None else now
     st, out = _load(), []
-    boxes, fails = st.setdefault("boxes", {}), st.setdefault("fail", {})
+    boxes, fails, off = st.setdefault("boxes", {}), st.setdefault("fail", {}), st.setdefault("unreachable", {})
     last, net = st.get("last", 0), _net_stamp(platform)
     event = ("network change" if net and st.get("net") and net > st["net"]
              else "wake" if last and now - last > WAKE_GAP_S else "")
@@ -149,8 +172,19 @@ def run_pass(cfg: dict, platform: str | None = None, now: float | None = None) -
         boxes.pop(box, None)
         down = {int(ln.split()[1]) for ln in r.stdout.splitlines() if ln.startswith("down ")}
         for t in mine:
-            bad, f = [p for p in t["ports"] if p in down], fails.get(t["service"])
+            dead, f = [p for p in t["ports"] if p in down], fails.get(t["service"])
+            bad = [p for p in dead if dest_answers(t.get("dests", {}).get(p, ""))] if t.get("dests") else dead
+            gone = [p for p in dead if p not in bad]   # the forward is up; its destination does not answer
+            if gone and off.get(t["service"]) != gone:
+                out.append(f"{t['service']}: port {', '.join(map(str, gone))} on {box}: its destination does not "
+                           "answer from here; nothing restarted")
+            if gone:
+                off[t["service"]] = gone
+            else:
+                off.pop(t["service"], None)
             if not bad:
+                if gone:
+                    continue
                 if f:
                     rec = {"service": t["service"], "box": box, "failed_at": f["at"], "event": f["event"],
                            "healed_at": now, "seconds": round(now - f["at"]), "restarts": f["restarts"]}
@@ -170,7 +204,9 @@ def run_pass(cfg: dict, platform: str | None = None, now: float | None = None) -
             f.update(restarts=f["restarts"] + 1, last=now)
             out.append(f"{t['service']}: port {', '.join(map(str, bad))} on {box} did not answer"
                        f"{'' if freed else ' (still held after the cleanup)'}; {said}")
-    st["fail"] = {k: v for k, v in fails.items() if k in {t["service"] for t in ts}}
+    names = {t["service"] for t in ts}
+    st["fail"] = {k: v for k, v in fails.items() if k in names}
+    st["unreachable"] = {k: v for k, v in off.items() if k in names}
     _home().mkdir(parents=True, exist_ok=True)
     durable_write(_home() / STATE, json.dumps(st))
     return out
