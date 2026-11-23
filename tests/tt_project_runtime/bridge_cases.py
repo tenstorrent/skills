@@ -2461,7 +2461,7 @@ def test_bridge_watch_offline_restarts_nothing_and_backs_off(tmp_path, monkeypat
     bridge_watch.run_pass(cfg, "darwin", t0 + 63)
     assert len(seen["box"]) == 3 and seen["release"] == []
     assert not any("kickstart" in c or "restart" in c for c in seen["run"])
-    assert max(bridge_watch.BACKOFF_S) <= 60   # a long outage is still checked within a minute of the network's return
+    assert max(bridge_watch.BACKOFF_S) <= 60   # the pause never passes a minute
     cfg, seen = _watch_env(tmp_path / "c", monkeypatch, "linux", [None] * 6)
     for i in range(6):
         bridge_watch.run_pass(cfg, "linux", t0 + 61 * i)   # every pass lands just after the allowed wait
