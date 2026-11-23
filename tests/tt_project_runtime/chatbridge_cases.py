@@ -1787,6 +1787,94 @@ def test_a_refused_model_the_endpoint_still_lists_retries_hourly_with_one_notice
     assert alerts == [("route-model-missing:chat|" + _RT_MODEL, "normal")], alerts
 
 
+def test_a_model_missing_notice_is_sent_once_until_a_check_lists_the_model_again(env, monkeypatch, mock_chat):
+    """A missing model raised one notice per refused run while the endpoint was unreachable (a hold that
+    ended without proof re-held as new). One notice per model until a /models check that left it out
+    is followed by one that lists it; unreachable or empty checks prove nothing; the clear is said once."""
+    from ttp import endpoint, project, route
+    from ttp.daemon import Daemon
+    monkeypatch.setattr(project, "HOME_DIR", env["tmp"] / "models-home")
+    up = mock_chat()
+    up.models = None   # unreachable from the start
+    endpoint.save("placeholder", up.url, _CB_KEY, True, "HTTP 200")
+    p = make(env)
+    p.set_config("providers.chat", {"endpoint": "placeholder", "base_url": up.url,
+                                    "tiers": {"light": {"model": _RT_MODEL, "route": True}}})
+    d = Daemon(p.base)
+    monkeypatch.setattr(d, "observe", lambda *a, **k: None)
+    alerts = []
+    monkeypatch.setattr(d, "alert", lambda key, text, severity="high", **k: alerts.append((key, severity)))
+    monkeypatch.delenv("TTP_TEST_NO_MODELS_PROBE", raising=False)
+    refused = '[claude-code:unrecognized_model] {"model":"%s"}' % _RT_MODEL
+
+    def refused_run(n):
+        tid = p.db.add_task(f"build{n}", "", kind="work", tier="light", priority=3, budget_usd=8.0, labels=[])
+        p.db.update_task(tid, status="running")
+        rid = p.db.x("INSERT INTO runs(task,role,provider,model,started,status,boot_id,note) "
+                     "VALUES(?,'worker','chat',?,?,'running',?,?)", (tid, _RT_MODEL, time.time() - 30, d.boot,
+                     json.dumps({"route": {"tier": "light", "to": "chat", "model": _RT_MODEL, "fallback": "none"}})))
+        rd = p.runs / str(rid)
+        rd.mkdir(parents=True)
+        (rd / "output.jsonl").write_text(json.dumps({"type": "result", "subtype": "error_during_execution",
+                                                     "is_error": True, "total_cost_usd": 0.0, "usage": {},
+                                                     "result": refused, "session_id": "s-1"}) + "\n")
+        p.db.x("UPDATE runs SET dir=? WHERE id=?", (str(rd), rid))
+        d.finish_run(p.db.one("SELECT * FROM runs WHERE id=?", (rid,)),
+                     {"rc": 1, "started": time.time() - 30, "ended": time.time(), "bridge": {"last_fault": "error"}})
+        p.db.update_task(tid, status="done")
+
+    def check():
+        rec = route.read_served(p.state).get("chat")
+        if rec:   # the last check was a while ago
+            (p.state / route.MODELS_FILE).write_text(json.dumps({"chat": {**rec, "checked": time.time() - route.MODELS_EVERY_S}}))
+            _age_shared(p, route.MODELS_EVERY_S)
+        d._models_tried = 0.0
+        d.check_route_models()
+        if d._models_probe:
+            d._models_probe.join(10)
+        time.sleep(0.01)
+        d.check_route_models()
+
+    check()   # an unreachable check alone: no notice, no hold
+    assert not route.read_served(p.state).get("chat", {}).get("ok")
+    assert alerts == [] and route.holds(p.db) == {}
+    refused_run(0)
+    for n in range(1, 6):   # unreachable checks, refused runs, a hold ended by a config round trip
+        check()
+        assert not route.read_served(p.state)["chat"]["ok"]
+        if n == 3:
+            p.set_config("providers.chat.tiers.light.model", "example-org/model-b")
+            d._load_config()
+            d.check_route_models()
+            assert route.holds(p.db) == {}
+            p.set_config("providers.chat.tiers.light.model", _RT_MODEL)
+            d._load_config()
+        refused_run(n)
+        assert route.held(p.db, d.cfg, "light") == _RT_MODEL
+    up.models = []   # an empty list proves nothing either
+    check()
+    assert route.held(p.db, d.cfg, "light") == _RT_MODEL
+    up.models = ["example-org/model-b"]   # a good check leaves it out, then one lists it
+    check()
+    assert route.held(p.db, d.cfg, "light") == _RT_MODEL
+    up.models = ["example-org/model-b", _RT_MODEL]
+    check()
+    assert route.held(p.db, d.cfg, "light") == "" and route.holds(p.db) == {}
+    check()
+    assert alerts == [("route-model-missing:chat|" + _RT_MODEL, "normal"),
+                      ("route-model-served:chat|" + _RT_MODEL, "low")], alerts
+
+
+def test_a_routed_run_the_model_answers_clears_its_hold_and_notice(env):
+    from ttp import route
+    p = make(env)
+    t0 = time.time()
+    assert route.hold(p.db, "light", "m", 1, t0) and not route.hold(p.db, "standard", "m", 2, t0)
+    assert not route.served_ok(p.db, "other") and route.holds(p.db)
+    assert route.served_ok(p.db, "m") and route.holds(p.db) == {} and not route.served_ok(p.db, "m")
+    assert route.hold(p.db, "light", "m", 3, t0 + 1)   # a new condition: a new notice
+
+
 def test_a_model_missing_hold_on_a_glm_work_model_outside_the_chat_tiers_holds(env, monkeypatch):
     """A model routed only by route.glm_work (its tier not in providers.chat.tiers) was refused: the hold
     ended on the next tick ('the tier is no longer routed'), the same task was routed to the same model

@@ -179,6 +179,12 @@ REVIEW_PUSH_SECTIONS = ("## Pushing a reviewed change", "## Approving into the p
 OWN_SECTION = "## Publishing onto its own PR branch"   # kind-review.md's `ttp push --own` section
 
 
+def _ponytail_skill() -> str:
+    """The ponytail review skill's file, as review specs name it (ponytail.spec_line)."""
+    from .ponytail import skill_file
+    return skill_file()
+
+
 def _sections(text: str, cfg: dict) -> str:
     """A kind prompt without the push section that does not apply: the plain push's or the queue's,
     the `ttp push --own` advice while own pushes are off (delivery.own_push), its upstream note
@@ -983,7 +989,7 @@ def worker_task(p: Project, task: dict, cwd: str, branch: str | None, wake: dict
     parts = [
         restart_block(p, prev),
         streamguard.prompt_block(prev),
-        _sections(_raw(p, f"kind-{kind}.md"), cfg),
+        _sections(_raw(p, f"kind-{kind}.md"), cfg).replace("{ponytail_skill}", _ponytail_skill()),
         worker_memory_block(p),
         worker_rules(p, task),
         f"# YOUR TASK #{task['id']}: {task['title']}\n"

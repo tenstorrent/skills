@@ -35,9 +35,10 @@
   unbounded wait or I/O in a db transaction. Hand off
   a `self_check` line (also in `on_pass`): what you ticked and tried.
 - Before the hand-off, run the review's ponytail lane on your own final diff: one fresh-context
-  subagent pinned to model `opus`, given only your spec and `git diff <base>..HEAD`, that applies skill
-  `tt-ponytail-review`. Fix every `block` finding (most often a helper or rule that an existing
-  function already decides: reuse or refactor it), commit, and say in `self_check` what it found.
+  subagent pinned to model `opus`, given only your spec and `git diff <base>..HEAD`, that reads skill
+  `tt-ponytail-review` at `{ponytail_skill}` and applies it, searching the repository (`git grep`) for
+  an existing function that already decides each rule or helper the diff adds. Fix every `block` finding
+  (most often such a helper or rule: reuse or refactor it), commit, and say in `self_check` what it found.
 - Size: if your diff adds more than 400 lines (`git diff --numstat <base>..HEAD`, review.ponytail_land_lines),
   make it smaller or put the reason on its own line of the hand-off `summary`, starting
   `why this size:`. The review fails the change without that line.

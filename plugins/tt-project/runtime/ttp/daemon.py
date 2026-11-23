@@ -4823,6 +4823,9 @@ class Daemon:
         now = time.time()
         for tier, model, why in route.release(self.p.db, self.cfg, route.read_served(self.p.state), now):
             log(self.p, f"route: tier {tier} routes again ({model}: {why})")
+        for model in route.served_again(self.p.db, route.read_served(self.p.state), now):
+            self.alert(f"route-model-served:{route.TO}|{model}", route.served_notice(route.TO, model),
+                       severity="low", every_s=0)
         if os.environ.get("TTP_TEST_NO_MODELS_PROBE") or (self._models_probe and self._models_probe.is_alive()):
             return
         if now - self._models_tried < served.CHECK_S or not (alias := route.chat_alias(self.cfg)):
@@ -6573,7 +6576,11 @@ class Daemon:
                     if not modelrank.pick(db, self.cfg, self.p.state, model, time.time()):   # else its switch alerts
                         self.alert(f"route-model-missing:{routed['to']}|{model}",   # one per provider model
                                    route.missing_notice(self.cfg, routed["to"], routed["tier"], model),
-                                   severity="normal", every_s=route.RETRY_QUIET_S)
+                                   severity="normal", every_s=0)   # route.hold says when
+            elif on_route and not fell and (status == "ok" or _has_tokens(usage)) and \
+                    route.served_ok(db, model := r["model"] or routed["model"]):   # it serves the model again
+                self.alert(f"route-model-served:{routed['to']}|{model}", route.served_notice(routed["to"], model),
+                           severity="low", every_s=0)
             elif fell and not own and not bounce:   # an endpoint fault cools the endpoint; a run's own end only its task
                 route.cool(db, self.cfg, routed["to"], fell, r["id"], time.time())
         elif r["provider"] == modelrank.TO and isinstance(note.get(modelrank.KEY), dict) and r["model"] and \

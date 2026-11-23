@@ -117,7 +117,9 @@ MISSING = "route_model_missing:"   # kv per routed tier and model (MISSING + tie
                                    # before holds were per model): {"model", "since", "run"} while it is not served
 MODELS_FILE = "endpoint-models.json"   # under the project state dir: {provider: {"ids", "checked", "ok", "check"}}
 MODELS_EVERY_S = 60         # the daemon's model-free /models check runs this often per provider (models_every)
-RETRY_QUIET_S = 86400       # a re-hold of the same model this soon after its quiet retry sends no new notice
+NOTICE = "route_model_notice:"   # kv per model the user was told is not served ({"at", "gone"}): no new notice
+                                 # until a /models check lists it again after one left it out, or a routed run on it succeeds
+RETRY_QUIET_S = 86400       # a model the endpoint lists but refused is tried again by one routed run, at most this often
 MISSING_TASK_S = 3600        # a task refused its routed model stays on the core provider this long
 FAULTS = ("down", "error", "rate_limit", "auth", "malformed", "model_missing")
 BOUNCE = "needs_opus"   # a code arm run handed the task back to Opus (codearm.BOUNCE)
@@ -345,18 +347,53 @@ def held(db, cfg: dict, tier: str, model: str | None = None) -> str:
 
 def hold(db, tier: str, model: str, run_id: int | None, now: float) -> bool:
     """Hold the tier's route to `model`: its endpoint does not serve it (other models the tier routes to
-    hold apart). True when the hold is new (the user is told); a re-hold of the same model within
-    RETRY_QUIET_S of its quiet retry (release) is not. A per-tier record of `model` moves to its key."""
+    hold apart). True only when the user is to be told: once per model until its notice clears
+    (served_again, served_ok), whatever ends or renews the hold meanwhile. A per-tier record of `model`
+    moves to its key."""
     key, old = f"{MISSING}{tier}|{model}", db.kv(MISSING + tier) or {}
     h = db.kv(key) or (old if old.get("model") == model else {})
     if old.get("model") == model:
         db.set_kv(key, h)
         db.x("DELETE FROM kv WHERE key=?", (MISSING + tier,))
+    told = db.kv(NOTICE + model)
     if h.get("model") == model and not h.get("retry"):
+        if not told:   # a hold from before notices were kept: its user was told
+            db.set_kv(NOTICE + model, {"at": now})
         return False
-    quiet = h.get("model") == model and now - float(h.get("at") or 0) < RETRY_QUIET_S
     db.set_kv(key, {"model": model, "since": now, "run": run_id})
-    return not quiet
+    if told:
+        return False
+    db.set_kv(NOTICE + model, {"at": now})
+    return True
+
+
+def served_again(db, served: dict, now: float) -> list[str]:
+    """Each model whose not-served notice clears: a /models check (`served`, read_served) after the notice
+    left it out and a later one lists it again. A failed or empty check proves nothing either way."""
+    rec, out = (served or {}).get(TO) or {}, []
+    checked = float(rec.get("checked") or 0)
+    for r in db.q("SELECT key FROM kv WHERE substr(key, 1, ?) = ?", (len(NOTICE), NOTICE)):
+        n, model = db.kv(r["key"]) or {}, r["key"][len(NOTICE):]
+        if not (rec.get("ok") and rec.get("ids") and checked > float(n.get("at") or 0)):
+            continue
+        if model not in rec["ids"]:
+            if not n.get("gone"):
+                db.set_kv(r["key"], {**n, "gone": checked})
+        elif n.get("gone") and checked > float(n["gone"]):
+            db.x("DELETE FROM kv WHERE key=?", (r["key"],))
+            out.append(model)
+    return out
+
+
+def served_ok(db, model: str) -> bool:
+    """A routed run on `model` was answered: every hold on it ends and its notice clears. True when a
+    notice was open (the user hears it cleared)."""
+    for suffix, h in holds(db).items():
+        if h.get("model") == model:
+            db.x("DELETE FROM kv WHERE key=?", (MISSING + suffix,))
+    told = db.kv(NOTICE + model) is not None
+    db.x("DELETE FROM kv WHERE key=?", (NOTICE + model,))
+    return told
 
 
 def holds(db) -> dict[str, dict]:
@@ -390,18 +427,23 @@ def missing_notice(cfg: dict, to: str, tier: str, model: str) -> str:
             f"{change}. Served models: `ttp status`.")
 
 
+def served_notice(to: str, model: str) -> str:
+    """The one line saying a not-served notice cleared (served_again, served_ok)."""
+    return f"The {to} provider serves model {model} again; work routed to it runs there again."
+
+
 def release(db, cfg: dict, served: dict, now: float) -> list[tuple[str, str, str]]:
     """End each hold whose tier's configured model changed (or is no longer routed), or once a /models
     check (`served`, read_served) after the hold began left the model out and a later one lists it
     again: [(tier, model, why)]. A check after the hold that still lists the refused model contradicts
-    nothing it proves: the tier tries one routed run again (a quiet retry record) without a new notice
-    for RETRY_QUIET_S, so a model the endpoint lists but refuses costs one run an hour and one notice."""
+    nothing it proves: the tier tries one routed run again (a quiet retry record) at most every
+    RETRY_QUIET_S, with no new notice (hold). A failed or empty check proves nothing either way."""
     out = []
     for suffix, h in holds(db).items():
         tier, key, model = suffix.partition("|")[0], MISSING + suffix, str(h.get("model") or "")
         to = target(cfg, tier)
         rec = (served or {}).get(to[0] if to else TO) or {}
-        fresh = rec.get("ok") and float(rec.get("checked") or 0) > float(h.get("since") or 0)
+        fresh = rec.get("ok") and rec.get("ids") and float(rec.get("checked") or 0) > float(h.get("since") or 0)
         if model not in models(cfg, tier):
             why = f"the configured model is now {to[1]}" if to else "the tier is no longer routed"
         elif h.get("retry"):

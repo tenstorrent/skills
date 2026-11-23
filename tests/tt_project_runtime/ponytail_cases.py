@@ -364,6 +364,21 @@ def test_the_lane_text_names_the_skill_file_to_read():
     assert m.group(1).endswith("tt-ponytail-review/SKILL.md") and Path(m.group(1)).is_file(), line
 
 
+def test_a_code_tasks_own_ponytail_lane_names_the_skill_file_and_a_repository_search(env):
+    """A code worker's own lane step names the ponytail review skill's file, as a review's does, and
+    has the subagent search the repository for an existing function that already decides each rule
+    the diff adds: the lane missed such helpers when it named the skill alone."""
+    from ttp import ponytail, prompts
+    p = make(env)
+    tid = p.db.add_task("fix", "a spec", kind="code", tier="standard", priority=3, budget_usd=8.0, labels=[])
+    text = prompts.worker_task(p, p.db.task(tid), str(p.root), None)
+    m = re.search(r"reads skill\s+`tt-ponytail-review` at `([^`]+)`", text)
+    assert m and m.group(1) == ponytail.skill_file() and Path(m.group(1)).is_file(), text
+    assert "{ponytail_skill}" not in text
+    assert re.search(r"searching the repository \(`git grep`\) for\s+an existing function that already "
+                     r"decides each rule", text), text
+
+
 def test_an_oversized_change_without_a_reason_goes_back_to_its_worker_with_no_review(env, monkeypatch):
     """Over review.ponytail_land_lines with no `why this size:` line in the code task's spec or hand-off,
     no review is queued (it could only fail): the task is re-queued to its worker with the reason, once
