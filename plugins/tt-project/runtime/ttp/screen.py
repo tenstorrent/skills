@@ -187,11 +187,18 @@ def _issue(db: DB, fp: str, source: str, title: str, retitle: str | None, hint: 
                  ("open" if sev != "info" else "ignored", sev, now, _reopens(row, now), json.dumps(history), row["id"]))
             v = Verdict(SEVERITY_RANK.get(sev, 1) >= floor, sev, "regressed after fix", fp, row["id"], "dedupe")
             return _jev_missed(db, row, v)
-        if watch_key and 0 <= seen_at < rank:
+        history = json.loads(row.get("history") or "[]") if watch_key else []
+        since = next((i for i in range(len(history), 0, -1) if history[i - 1].get("action") == "reopened"), 0)
+        ceiling = max((SEVERITY_RANK.get(h.get("from") or "", -1) for h in history[since:]
+                       if h.get("action") == "lowered"), default=-1)
+        if watch_key and (0 <= seen_at < rank or rank < seen_at <= ceiling):
             # The watcher now rates a keyed condition lower (fixed to report info): the row follows it down.
-            history = json.loads(row.get("history") or "[]")
-            history.append({"ts": now, "action": "lowered", "by": "the watcher", "why": f"{row['severity']} to {hint}"})
-            row = {**row, "severity": hint, "status": "ignored" if hint == "info" else row["status"]}
+            # Back up to no more than it was before: restored quietly, so a flapping watcher reminds only
+            # by the rewake rule below.
+            history.append({"ts": now, "action": "lowered" if seen_at < rank else "restored", "by": "the watcher",
+                            "why": f"{row['severity']} to {hint}", "from": row["severity"]})
+            row = {**row, "severity": hint,
+                   "status": "ignored" if hint == "info" else "open" if seen_at > rank else row["status"]}
             db.x("UPDATE issues SET severity=?, status=?, history=? WHERE id=?",
                  (hint, row["status"], json.dumps(history), row["id"]))
             rank = seen_at

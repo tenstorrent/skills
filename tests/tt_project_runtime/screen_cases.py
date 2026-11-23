@@ -65,3 +65,19 @@ def test_an_unkeyed_issue_and_a_fixed_rows_reopen_ignore_the_lowering(env, monke
     row = p.db.one("SELECT severity, status, history FROM issues WHERE id=?", (first.issue_id,))
     assert (row["severity"], row["status"]) == ("info", "ignored")
     assert [h["action"] for h in json.loads(row["history"])] == ["reopened"]
+
+
+def test_a_keyed_issue_flapping_between_info_and_normal_reminds_only_by_the_rewake_rule(env, monkeypatch):
+    see, p, _scr = _hint_rig(env, monkeypatch)
+    assert see(0, "normal").wake
+    assert not see(1, "info").wake
+    # Back at no more than it was before it was lowered: restored quietly, not a new "now normal" wake.
+    assert not see(2, "normal").wake and not see(3, "info").wake and not see(4, "normal").wake
+    row = p.db.one("SELECT severity, status, history FROM issues")
+    assert (row["severity"], row["status"]) == ("normal", "open")
+    assert [h["action"] for h in json.loads(row["history"])] == ["lowered", "restored", "lowered", "restored"]
+    v = see(7, "normal")
+    assert v.wake and "after its last wake" in v.reason
+    # Above anything it was lowered from: the raise wakes as before.
+    v = see(8, "high")
+    assert v.wake and v.reason == "now high"
