@@ -268,3 +268,23 @@ def test_failed_reviews_with_a_verdict_are_rejected_changes_and_a_broken_run_a_f
     assert (b["rejected"]["usd"], sorted(b["rejected"]["tasks"])) == (5.0, sorted([code, fail]))  # by the change
     assert (b["failed_task"]["usd"], sorted(b["failed_task"]["tasks"])) == (9.0, sorted([broken, bare]))
     assert "rejected changes: $5.00" in "\n".join(waste.lines(waste.report(p.db, now - 3600, now + 1)))
+
+
+def test_waste_ledger_counts_no_costly_wake_after_a_long_host_sleep_and_queues_no_fix_for_one_small_one(env):
+    from ttp import waste
+    p = make(env)
+    now = 1_000_000.0
+    _waste_run(p, None, 0.5, now, role="coordinator", started=now - 3 * 86400)
+    p.db.set_kv("host_sleeps", [[now - 3 * 86400 + 100, now - 900]])   # days asleep: no cache outlives it
+    _waste_run(p, None, 3.0, now, role="coordinator", started=now - 600)
+    _waste_run(p, None, 2.5, now, role="coordinator", started=now - 300)   # awake since: over the limit
+    rep = waste.report(p.db, now - 86400, now, p.config())
+    assert (round(rep["buckets"]["costly_wake"]["usd"], 2), rep["buckets"]["costly_wake"]["runs"]) == (1.5, 1)
+    # One wake under $0.50 over the limit is no fix task's worth, though it tops an over-target share.
+    later = now + 10 * 86400   # a later day, awake throughout
+    _waste_run(p, None, 1.3, later, role="coordinator")
+    _waste_run(p, _waste_task(p, "fine work"), 1.0, later)
+    rep = waste.report(p.db, later - 86400, later, p.config())
+    assert waste.over(rep) and waste.fix_bucket(rep) == "" and "most in coordinator wakes" in waste.line("demo", rep)
+    _waste_run(p, None, 1.3, later, role="coordinator")
+    assert waste.fix_bucket(waste.report(p.db, later - 86400, later, p.config())) == "costly_wake"

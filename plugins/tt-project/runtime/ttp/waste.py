@@ -16,7 +16,8 @@ its own runs. Each run that ended in the window counts once, in the first bucket
   review_rounds  reviews past the `waste.review_rounds`th round of one change's chain
   crashed        crashed, stalled or timed-out runs (budget.wasted) on tasks that later finished
   over_runs      a task's runs past its `waste.max_runs`th
-  costly_wake    the part of a coordinator wake over `waste.wake_usd`
+  costly_wake    the part of a coordinator wake over `waste.wake_usd`, unless the host slept SLEPT_COLD_S since
+                 the wake before (no prompt cache outlives that: its cold rewrite is the sleep's)
 
 The total is every run's booking in the window; the share is avoidable less retained, over total.
 
@@ -43,6 +44,8 @@ LABELS = {"stand_in": "stand-in after a move", "superseded": "cancelled or super
           "over_runs": "runs past the per-task limit", "costly_wake": "coordinator wakes over the limit"}
 DEFAULTS = {"target_share": 0.10, "wake_usd": 1.0, "max_runs": 4, "review_rounds": 2, "fix_task": True}
 DUP_WINDOW_S = 7 * 86400
+SLEPT_COLD_S = 3600      # the longest prompt cache life (1h)
+WAKE_FIX_MIN_USD = 0.5   # one costly wake less over the limit than this queues no fix task
 
 
 def settings(cfg: dict | None) -> dict:
@@ -129,6 +132,16 @@ def _task_sets(db, cfg: dict) -> dict:
     return out
 
 
+def _slept_cold(db, r, sleeps: list) -> bool:
+    """The host slept at least SLEPT_COLD_S between coordinator wake `r` and the one before it."""
+    if not sleeps:
+        return False
+    prev = db.one("SELECT MAX(ended) AS e FROM runs WHERE (task IS NULL OR role='coordinator') AND id != ? "
+                  "AND ended <= ?", (r["id"], r["started"]))
+    start, since = float(r["started"] or 0), float((prev and prev["e"]) or 0)
+    return sum(max(0.0, min(b, start) - max(a, since)) for a, b in sleeps) >= SLEPT_COLD_S
+
+
 def report(db, since: float, now: float, cfg: dict | None = None) -> dict:
     """{total, avoidable, retained, share, buckets: {name: {usd, runs, tasks, retained_usd, retained_tasks}}}
     for runs that ended in [since, now)."""
@@ -147,6 +160,7 @@ def report(db, since: float, now: float, cfg: dict | None = None) -> dict:
                       "ORDER BY started, id", part):
             count[r["task"]] = rank[r["id"]] = count.get(r["task"], 0) + 1
     wake = float(cfg.get("wake_usd") or 0)
+    sleeps = db.kv("host_sleeps", []) or [] if wake else []   # the daemon's record of this host's sleeps
     buckets = {b: {"usd": 0.0, "runs": 0, "tasks": {}, "retained_usd": 0.0, "retained_tasks": {}} for b in BUCKETS}
     total = 0.0
     for r in runs:
@@ -156,7 +170,7 @@ def report(db, since: float, now: float, cfg: dict | None = None) -> dict:
         if moved and float(r["started"] or 0) >= moved:
             got = "stand_in"
         elif task is None or r["role"] == "coordinator":
-            if wake and cost > wake:
+            if wake and cost > wake and not _slept_cold(db, r, sleeps):
                 got, usd = "costly_wake", cost - wake
         elif task in sets["superseded"]:
             got = "superseded"
@@ -227,9 +241,13 @@ def line(project: str, rep: dict) -> str:
 
 
 def fix_bucket(rep: dict, any_share: bool = False) -> str:
-    """The largest bucket, when the avoidable share is over target (or always, with any_share)."""
+    """The largest bucket, when the avoidable share is over target (or always, with any_share). Without
+    any_share (the fix task's pick), one costly wake under WAKE_FIX_MIN_USD over the limit picks none."""
     if not (any_share or over(rep)):
         return ""
     net = {n: rep["buckets"][n]["usd"] - rep["buckets"][n].get("retained_usd", 0.0) for n in BUCKETS}
     best = max(BUCKETS, key=lambda n: net[n])
+    if not any_share and best == "costly_wake" and rep["buckets"][best]["runs"] == 1 \
+            and net[best] < WAKE_FIX_MIN_USD:
+        return ""
     return best if net[best] > 0 else ""
