@@ -12606,7 +12606,7 @@ def test_the_daemon_records_its_start_and_first_tick_failures(env, monkeypatch):
     monkeypatch.setattr(d, "_nap", lambda s: None)
     monkeypatch.setattr(d, "_idle_nap", lambda s: None)
     assert d.run() == 0
-    marker = dm.start_marker(p)
+    marker = dm.bridge_marker(p)
     assert marker["pid"] == os.getpid() and marker["tick_errors"] == 2
     assert dm.heartbeat(p) is None
 
@@ -24604,7 +24604,7 @@ def test_a_long_tick_tells_both_watchdogs_it_still_moves(env, monkeypatch):
     # Before its first completed tick the heartbeat is not written (`ttp restart` reads it as that
     # tick); the start marker carries the progress, which `ttp.watchdog` counts.
     assert not hb.exists()
-    assert dm.start_marker(p)["progress"] >= time.time() - 5
+    assert dm.bridge_marker(p)["progress"] >= time.time() - 5
     assert watchdog.last_tick(p, os.getpid()) >= time.time() - 5
     # Once it has ticked, a long tick keeps the heartbeat fresh.
     d._beat()
@@ -43162,7 +43162,7 @@ def test_identity_receipt_is_captured_once_and_survives_file_rewrites(env, tmp_p
     d._beat()
     hb = heartbeat(p)
     assert hb["receipt"]["version"] == "9.9.1" and hb["receipt"]["commit"] == "0123456789abcdef0123"
-    assert hb["receipt"] == d.identity == start_marker(p)["receipt"]
+    assert hb["receipt"] == d.identity == bridge_marker(p)["receipt"]
     # mixed or missing provenance is unverified, never assumed
     mixed = types.SimpleNamespace(__name__="ttp_fake", __file__=mod.__file__, __version__="9.9.1")
     assert identity.capture(mod=mixed)["provenance"] == "unverified"   # files say 9.9.2

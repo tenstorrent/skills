@@ -257,7 +257,7 @@ def test_kept_ssh_services_wait_a_random_start_delay_but_not_on_the_start_that_i
     # The plist and the unit both carry the wait; the unit's escaping reads back as the same argv.
     cfg = _bridge_cfg()
     svc = bridge.service_argv(cfg, "box-1", "auto", platform="linux")
-    marker = bridge.start_marker("box-1", "auto")
+    marker = bridge.bridge_marker("box-1", "auto")
     assert svc[:4] == ["/bin/sh", "-c", tunnel.SPREAD_SH, str(marker)] and "/dev/urandom" in tunnel.SPREAD_SH
     assert bridge.launchd_plist("box-1", "auto", svc)["ProgramArguments"] == svc
     (tmp_path / "units").mkdir()
@@ -273,7 +273,7 @@ def test_kept_ssh_services_wait_a_random_start_delay_but_not_on_the_start_that_i
     assert all(r[0].startswith("slept ") and r[1] == "ran" for r in runs), runs[:2]
     assert all(0 <= w <= tunnel.RECONNECT_SPREAD_S for w in waits) and len(set(waits)) > 1, waits
     # The start an install or restart means skips it once, using up the marker.
-    tunnel.ready(svc)
+    tunnel.skip_next_wait(svc)
     assert marker.is_file()
     r = subprocess.run(tunnel.spread(["echo", "ran"], marker), env=path, capture_output=True, text=True, timeout=30)
     assert r.stdout == "ran\n" and not marker.exists()
@@ -284,35 +284,35 @@ def test_kept_ssh_services_wait_a_random_start_delay_but_not_on_the_start_that_i
     r = subprocess.run(tunnel.spread(ssh, marker), env={**path, "SSH_AUTH_SOCK": "/agents/env.sock"},
                        capture_output=True, text=True, timeout=30)
     assert r.stdout.split("\0")[:-1] == ["/agents/env.sock", *ssh[5:]], r
-    # bridge start (Linux): the marker is there for enable --now and again for the restart after it.
+    # bridge start (Linux): enabled, then one restart (which also starts a stopped unit) with the marker there.
     seen = []
     monkeypatch.setattr(bridge, "_run", lambda argv, *a, **k: seen.append((argv[2], marker.is_file()))
                         or subprocess.CompletedProcess(argv, 0, "", ""))
     assert not marker.exists()
     bridge.start("box-1", "auto", svc, "linux")
-    assert ("enable", True) in seen and ("restart", True) in seen, seen
+    assert seen[1:] == [("enable", False), ("restart", True)], seen
     # A kept tunnel: installed with the wait, its first start (and a restart) prompt, its ssh on its own connection.
     calls = []
-    monkeypatch.setattr(tunnel, "_run", lambda *argv: calls.append((argv, tunnel.marker("demo").is_file()))
+    monkeypatch.setattr(tunnel, "_run", lambda *argv: calls.append((argv, tunnel.tunnel_marker("demo").is_file()))
                         or subprocess.CompletedProcess(argv, 0, "", ""))
     assert tunnel.keep("demo", "box", 18700, lambda port: port, "linux")[0] == 18800
     have = tunnel.installed("demo", "linux")
     assert have["spread"] and have["own"] and have["host"] == "box" and have["local"] == 18800
     assert any(a[2:4] == ("enable", "--now") and m for a, m in calls), calls
-    tunnel.marker("demo").unlink()
+    tunnel.tunnel_marker("demo").unlink()
     calls.clear()
     assert tunnel.restart("demo", "linux") == "restarted" and calls[-1][1]
     # An older kept tunnel without the wait is re-installed by setup/upgrade on its port; a current one is left.
     old = tunnel.ssh_argv("box", 18900, 18750)
     tunnel.service_file("older", "linux").write_text(tunnel.systemd_unit("older", old))
-    assert tunnel.refresh("linux") == ["tunnel older: start delay added; replaced the kept tunnel "
+    assert tunnel.refresh_kept("linux") == ["tunnel older: start delay added; replaced the kept tunnel "
                                        f"(systemd user unit, {tunnel.service_file('older', 'linux')})"]
     assert tunnel.installed("older", "linux")["spread"] and tunnel.installed("older", "linux")["local"] == 18900
-    assert tunnel.refresh("linux") == []
-    plist = tunnel.launchd_plist("older", tunnel.spread(old, tunnel.marker("older")))
+    assert tunnel.refresh_kept("linux") == []
+    plist = tunnel.launchd_plist("older", tunnel.spread(old, tunnel.tunnel_marker("older")))
     assert plistlib.loads(plistlib.dumps(plist))["ProgramArguments"][-1] == "box"   # the host stays argv's last word
     tunnel.unkeep("older", "linux")
-    assert not tunnel.marker("older").exists()
+    assert not tunnel.tunnel_marker("older").exists()
 
 def test_bridge_relay_carries_one_connection_and_exits_with_its_session(monkeypatch, request):
     import shutil

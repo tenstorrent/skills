@@ -46,14 +46,19 @@ def spread(argv: list[str], marker: Path) -> list[str]:
     return ["/bin/sh", "-c", SPREAD_SH, str(marker), *argv]
 
 
-def ready(argv: list[str]) -> None:
+def is_spread(argv: list[str]) -> bool:
+    """argv waits the random start delay (spread)."""
+    return argv[:3] == ["/bin/sh", "-c", SPREAD_SH]
+
+
+def skip_next_wait(argv: list[str]) -> None:
     """The next start of this spread service starts at once (an install or restart means to start it now)."""
-    if argv[:3] == ["/bin/sh", "-c", SPREAD_SH]:
+    if is_spread(argv):
         Path(argv[3]).parent.mkdir(parents=True, exist_ok=True)
         Path(argv[3]).touch()
 
 
-def marker(name: str) -> Path:
+def tunnel_marker(name: str) -> Path:
     return HOME_DIR / f"tunnel-{re.sub(r'[^A-Za-z0-9_.-]', '-', name)}.start"
 
 
@@ -121,7 +126,7 @@ def installed(name: str, platform: str | None = None) -> dict | None:
     m = FORWARD.search(line)
     return {"file": str(f), "host": words[-1] if words else "", "local": int(m.group(1)) if m else 0,
             "remote": int(m.group(2)) if m else 0, "own": all(o.search(line) for o in OWN),
-            "spread": argv[:3] == ["/bin/sh", "-c", SPREAD_SH]}
+            "spread": is_spread(argv)}
 
 
 def _run(*argv: str) -> subprocess.CompletedProcess:
@@ -161,12 +166,13 @@ def keep(name: str, host: str, remote: int, pick_port, platform: str | None = No
     platform = platform or sys.platform
     have = installed(name, platform)
     if have and have["host"] == host and have["remote"] == remote and have["local"] and have["own"] and have["spread"]:
+        tunnel_marker(name).touch()   # a stopped one starts at once; a running one skips the next wait once
         how = _start(name, platform)
         return have["local"], f"adopted the kept tunnel already installed ({how}, {have['file']})"
     if have:
         _stop(name, platform)   # frees its port before a new one is picked
     local = pick_port(have["local"] if have and have["local"] else remote + 100)
-    argv = spread(ssh_argv(host, local, remote), marker(name))
+    argv = spread(ssh_argv(host, local, remote), tunnel_marker(name))
     f = service_file(name, platform)
     f.parent.mkdir(parents=True, exist_ok=True)
     HOME_DIR.mkdir(parents=True, exist_ok=True)
@@ -174,7 +180,7 @@ def keep(name: str, host: str, remote: int, pick_port, platform: str | None = No
         durable_write(f, plistlib.dumps(launchd_plist(name, argv)))
     else:
         durable_write(f, systemd_unit(name, argv))
-    ready(argv)
+    skip_next_wait(argv)
     how = _start(name, platform)
     verb = "replaced the kept tunnel" if have else "installed a kept tunnel"
     return local, f"{verb} ({how}, {f})"
@@ -186,7 +192,7 @@ def restart(name: str, platform: str | None = None) -> str:
     if not service_file(name, platform).is_file():
         return "no kept tunnel"
     if installed(name, platform)["spread"]:
-        marker(name).touch()   # a restart asked for now starts at once
+        tunnel_marker(name).touch()   # a restart asked for now starts at once
     if platform == "darwin":
         r = _run("launchctl", "kickstart", "-k", f"gui/{os.getuid()}/{label(name)}")
     else:
@@ -194,7 +200,7 @@ def restart(name: str, platform: str | None = None) -> str:
     return "restarted" if r.returncode == 0 else f"refused: {r.stderr.strip()[:200]}"
 
 
-def refresh(platform: str | None = None) -> list[str]:
+def refresh_kept(platform: str | None = None) -> list[str]:
     """After `ttp setup` or an upgrade: re-install each kept tunnel of ours (its own connection) whose restarts
     do not wait the start delay yet, on the same host and ports, so installed tunnels run the current command."""
     if os.environ.get("TTP_TEST_NO_BRIDGE_REFRESH"):
@@ -221,7 +227,7 @@ def unkeep(name: str, platform: str | None = None) -> str:
         return f"no kept tunnel for {name}"
     _stop(name, platform)
     f.unlink()
-    marker(name).unlink(missing_ok=True)
+    tunnel_marker(name).unlink(missing_ok=True)
     if platform != "darwin":
         _run("systemctl", "--user", "daemon-reload")
     return f"removed the kept tunnel for {name} ({f})"

@@ -315,7 +315,7 @@ def service_argv(cfg: dict, box: str, agent: str, ssh: str | None = None, platfo
     from .tunnel import spread
     return spread([py, str(RELAY), "--tag", f"{box}/{agent}", "--link", link(cfg, agent), *awake,
                    str(relay_dir(box, agent)), *[f"{h['name']}={h['target']}%{h['interface']}" for h in bound], "--",
-                   *argv], start_marker(box, agent))
+                   *argv], bridge_marker(box, agent))
 
 
 def install_relay() -> bool:
@@ -417,7 +417,7 @@ def service_file(box: str, agent: str, platform: str | None = None) -> Path:
     return hoststate.unit_dir() / f"{label(box, agent)}.service"
 
 
-def start_marker(box: str, agent: str) -> Path:
+def bridge_marker(box: str, agent: str) -> Path:
     return HOME_DIR / f"bridge-{box}-{agent}.start"
 
 
@@ -449,25 +449,24 @@ def _box(box: str, script: str, timeout: int = 40, inp: str | None = None) -> su
 
 
 def start(box: str, agent: str, argv: list[str], platform: str | None = None) -> str:
-    from .tunnel import ready   # this start skips the random start delay; later restarts wait it
+    from .tunnel import skip_next_wait   # this start skips the random start delay; later restarts wait it
     platform = platform or sys.platform
     f = service_file(box, agent, platform)
     f.parent.mkdir(parents=True, exist_ok=True)
     HOME_DIR.mkdir(parents=True, exist_ok=True)
     if platform == "darwin":
         durable_write(f, plistlib.dumps(launchd_plist(box, agent, argv)))
-        ready(argv)
+        skip_next_wait(argv)
         from .service import _reload   # bootout, then bootstrap retried past launchd's error 5 right after it
         r = _reload(label(box, agent), f, lambda *a: _run(list(a)))
         return ("launchd agent started" if r.returncode == 0
                 else f"launchd refused it: {(r.stderr or r.stdout).strip()[:200]}")
     durable_write(f, systemd_unit(box, agent, argv))
     _run(["systemctl", "--user", "daemon-reload"])
-    ready(argv)
-    r = _run(["systemctl", "--user", "enable", "--now", "--", f"{label(box, agent)}.service"])
+    r = _run(["systemctl", "--user", "enable", "--", f"{label(box, agent)}.service"])
     if r.returncode == 0:
-        ready(argv)   # enable --now may have started (and so used up) the first one
-        _run(["systemctl", "--user", "restart", "--", f"{label(box, agent)}.service"])
+        skip_next_wait(argv)
+        _run(["systemctl", "--user", "restart", "--", f"{label(box, agent)}.service"])   # one start, stopped or not
     return "systemd user unit started" if r.returncode == 0 else f"systemd refused it: {r.stderr.strip()[:200]}"
 
 
@@ -483,7 +482,7 @@ def stop(box: str, agent: str, platform: str | None = None, remove: bool = False
         _run(["systemctl", "--user", "disable" if remove else "stop", "--now", "--", f"{label(box, agent)}.service"])
     if remove:
         f.unlink()
-        start_marker(box, agent).unlink(missing_ok=True)
+        bridge_marker(box, agent).unlink(missing_ok=True)
     return "stopped and removed" if remove else "stopped"
 
 
