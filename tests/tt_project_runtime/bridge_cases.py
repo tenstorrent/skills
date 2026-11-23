@@ -2512,7 +2512,7 @@ def test_bridge_watch_frees_the_stale_port_restarts_and_heals_within_60s(tmp_pat
 
 
 def test_bridge_watch_leaves_a_session_alone_when_a_forwards_destination_is_down(tmp_path, monkeypatch):
-    # cells: target-down-no-restart, target-up-heals
+    # cells: target-down-no-restart, target-up-heals, no-listener-heals
     from ttp import bridge_watch
     down = "down 2301\nttp-watch-done\n"
     cfg, seen = _watch_env(tmp_path, monkeypatch, "darwin", [down, down])
@@ -2526,6 +2526,11 @@ def test_bridge_watch_leaves_a_session_alone_when_a_forwards_destination_is_down
     assert bridge_watch.run_pass(cfg, "darwin", t0 + 300) == [] and seen["release"] == []   # logged once
     cfg, seen = _watch_env(tmp_path / "b", monkeypatch, "darwin", [down])
     monkeypatch.setattr(bridge_watch, "dest_answers", lambda d: True)
+    out = bridge_watch.run_pass(cfg, "darwin", t0)
+    assert len(seen["release"]) == 1 and any("kickstart" in c for c in seen["run"]) and out[0].endswith("restarted")
+    # no listener on the box at all: the session is dead whatever its target does
+    cfg, seen = _watch_env(tmp_path / "c", monkeypatch, "darwin", ["none 2301\nttp-watch-done\n"])
+    monkeypatch.setattr(bridge_watch, "dest_answers", lambda d: False)
     out = bridge_watch.run_pass(cfg, "darwin", t0)
     assert len(seen["release"]) == 1 and any("kickstart" in c for c in seen["run"]) and out[0].endswith("restarted")
 
@@ -2553,6 +2558,30 @@ def test_bridge_watch_dest_answers_by_the_route_the_relay_takes(monkeypatch):
     assert bridge_watch.dest_answers({"target": "h1", "interface": ""})
     assert not bridge_watch.dest_answers({"target": "h2", "interface": "en9"})
     assert calls == [("direct", ("h1", 22), 5), "closed", ("bound", "h2", "en9", 5)]
+
+
+def test_bridge_watch_check_tells_a_byte_from_silence_from_no_listener(tmp_path):
+    # cells: check-up, check-down, check-none
+    import shutil
+    import socket
+    import subprocess
+    import pytest
+    from ttp import bridge_watch
+    if not (shutil.which("bash") and shutil.which("timeout")):
+        pytest.skip("no bash or timeout here")
+    talk, quiet, closed = socket.socket(), socket.socket(), socket.socket()
+    for sk in (talk, quiet, closed):
+        sk.bind(("127.0.0.1", 0))
+    talk.listen(4)
+    quiet.listen(4)
+    ports = [sk.getsockname()[1] for sk in (talk, quiet, closed)]
+    closed.close()
+    import threading
+    threading.Thread(target=lambda: talk.accept()[0].sendall(b"SSH-2.0"), daemon=True).start()
+    r = subprocess.run(["sh", "-c", bridge_watch.CHECK, "x", *map(str, ports)], capture_output=True, text=True, timeout=30)
+    assert r.stdout.splitlines() == [f"up {ports[0]}", f"down {ports[1]}", f"none {ports[2]}", "ttp-watch-done"], r.stdout
+    talk.close()
+    quiet.close()
 
 
 def test_bridge_watch_resets_a_failed_systemd_unit_before_restarting_it(tmp_path, monkeypatch):

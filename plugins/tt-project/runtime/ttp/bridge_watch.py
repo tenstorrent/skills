@@ -41,12 +41,12 @@ def _home() -> Path:
     from . import bridge
     return bridge.HOME_DIR
 
-# On the box: `up <port>` or `down <port>` per port, then the done line; `nocheck` when it lacks the tools
-# (then nothing is restarted).
+# On the box: per port `up` (a byte came), `down` (it connected, no byte: a stale forward, or a live one whose
+# target is off) or `none` (no listener), then the done line; `nocheck` when it lacks the tools (nothing is restarted).
 CHECK = r"""command -v bash >/dev/null 2>&1 && command -v timeout >/dev/null 2>&1 || { echo ttp-watch-nocheck; exit 0; }
 for p in "$@"; do
-  b=$(timeout 6 bash -c 'exec 3<>"/dev/tcp/127.0.0.1/$0" && head -c 1 <&3' "$p" 2>/dev/null)
-  if [ -n "$b" ]; then echo "up $p"; else echo "down $p"; fi
+  b=$(timeout 6 bash -c 'exec 3<>"/dev/tcp/127.0.0.1/$0" || exit 7; head -c 1 <&3' "$p" 2>/dev/null); rc=$?
+  if [ -n "$b" ]; then echo "up $p"; elif [ $rc = 7 ]; then echo "none $p"; else echo "down $p"; fi
 done
 echo ttp-watch-done"""
 
@@ -169,9 +169,12 @@ def run_pass(cfg: dict, platform: str | None = None, now: float | None = None) -
             continue
         boxes.pop(box, None)
         down = {int(ln.split()[1]) for ln in r.stdout.splitlines() if ln.startswith("down ")}
+        none = {int(ln.split()[1]) for ln in r.stdout.splitlines() if ln.startswith("none ")}
         for t in mine:
-            dead, f = [p for p in t["ports"] if p in down], fails.get(t["service"])
-            bad = [p for p in dead if dest_answers(t["dests"][p])] if t.get("dests") else dead
+            dead, f = [p for p in t["ports"] if p in down or p in none], fails.get(t["service"])
+            # a port with no listener is dead whatever its target does; one that connects but sends nothing may
+            # be a live forward whose target is off
+            bad = [p for p in dead if p in none or dest_answers(t["dests"][p])] if t.get("dests") else dead
             gone = [p for p in dead if p not in bad]   # the forward is up; its destination does not answer
             if gone and off.get(t["service"]) != gone:
                 out.append(f"{t['service']}: port {', '.join(map(str, gone))} on {box}: its destination does not "
