@@ -2574,61 +2574,11 @@ class Batch:
         """Check `head` in the worktree: None when it passes, else (command, output tail). The stale
         version guard (push.stale_versions, with `delivery.plugin_version_guard` on) comes first and
         runs no command. A check none of whose failing tests is new on `head` passes (_judged)."""
-        if self.checks_at is None:
-            self.checks_at = time.time()
-        self._checkout(head)
-        self.at = head
-        stale = push.stale_versions(self.wt, self.tip) if push.version_guard(self.d) else []
-        if stale:
-            msg = (f"{', '.join(stale)}: this change edits the plugin but keeps the version already on "
-                   f"{self.target}; bump it past that (in every manifest, plus a changeset where the "
-                   "repository wants one), commit, then rerun")
-            say(f"{head[:10]}: {msg}")
-            return STALE, msg
-        if not checks:
-            return None
-        try:
-            todo, skipped = push.applicable(self.wt, head, checks, say, self.tip or "")
-        except push.ScopeError as e:
-            say(f"{head[:10]}: {e}")
-            return str(e.check), str(e)
-        for line in skipped:
-            if line not in self.checks.setdefault("skipped", []):
-                self.checks["skipped"].append(str(line))
-        if not todo and push.outside_scope(checks, skipped):
-            say(f"{head[:10]}: {push.OUT_OF_SCOPE}")
-            return None
+        todo, env, verdict = self._plan(head, checks)
         if not todo:
-            say(f"{head[:10]}: {push.NONE_APPLY}")
-            return push.NONE_APPLY, ""
-        say(f"checking {head[:10]}")
-        self.checks["runs"] += 1
-        try:
-            env = self._check_env(head)
-        except push.runnerenv.Unavailable as e:   # its own checks.python_lock edit
-            say(f"{head[:10]}: {e}")
-            return "python env", str(e)
-        tree, run = pushpass.tree_of(self.wt, head), []
-        for n, cmd in enumerate(todo):
-            parts = pushpass.env_parts(self.wt, cmd, env, self.tip or "")
-            eid = pushpass.digest(parts)
-            if hit := pushpass.passed(self.p, tree, str(cmd), eid):
-                say(f"reused pass from {hit.get('batch') or '?'} (tree {tree[:10]}): {cmd}")
-                self.checks["reused"] = self.checks.get("reused", 0) + 1
-                self._passed(cmd)
-            elif carried := self._carried(head, cmd, parts) or self._task_carried(head, cmd, parts, todo[:n], env):
-                say(f"{carried}: {cmd}")
-                self.checks.setdefault("carried", []).append(f"{carried}: {cmd}")
-                self._passed(cmd)
-                if why := pushpass.record(self.p, tree, str(cmd), eid, self.id, parts, head, self.tip or "", carried):
-                    say(f"could not record the pass of {cmd}: {why}")
-            else:
-                if why := pushpass.missed(self.p, tree, str(cmd), parts):
-                    say(f"not reusing a pass: {why}: {cmd}")
-                if self._declined:
-                    say(f"not carrying a pass: {self._declined}: {cmd}")
-                run.append((cmd, eid, parts))
-        if not run:
+            return verdict
+        tree = pushpass.tree_of(self.wt, head)
+        if not (run := self._unpassed(head, todo, env, tree)):
             return None
         self._runners([c for c, _, _ in run], env)
         suite_out: list[str] = []
@@ -2660,29 +2610,13 @@ class Batch:
             slow.unlink(missing_ok=True)   # this head's run only
         try:
             for n, (cmd, eid, parts) in enumerate(run):
-                resume = (pushpass.resume_file(self.p, tree, str(cmd), eid)
-                          if tree and pushpass.resumable(cmd) and not push.remote_host(cmd) else None)
-                extra = pushpass.resume_env(resume, env) if resume else {}
-                if slow and pushpass.resumable(cmd) and not push.remote_host(cmd):
-                    extra |= slowtests.env(slow, {**env, **extra})
-                if done := pushpass.resumed(resume) if resume else []:
-                    say(f"resuming {cmd}: {len(done)} test file(s) passed in an earlier run on tree {tree[:10]}; running the rest")
-                if push.remote_host(cmd):
-                    say(f"running {cmd}{push.where(cmd)}")
+                resume, extra = self._resume(cmd, tree, eid, env, slow)
                 if self.researched and (reuse := self.failed_runs.pop((tree, str(cmd)), None)):
                     rc, tail, reused = *reuse, True   # a search run again (_research) judges this tree's failed run again
                     say(f"{head[:10]} failed {cmd} earlier in this batch (tree {tree[:10]}): judging that run again")
                 else:
-                    slot, reused = own(cmd, slot), False
-                    rc, tail = self._run_check(cmd, {**env, **extra, **slot.env()}, env)
-                    while getattr(cmd, "spilled", False) and (fault := push.remote_fault(cmd, rc, self.wt)):
-                        cmd = self._respill(cmd, head, fault, claims)   # the next spill host, else here
-                        slot = own(cmd, slot)
-                        rc, tail = self._run_check(cmd, {**env, **slot.env()}, env)
-                    if fault := push.remote_fault(cmd, rc, self.wt, str(tail or "")):
-                        raise envfault.Fault(fault)   # the check host, not this head: push_phase holds the batch
-                    if rc != 0 and tree:
-                        self.failed_runs[(tree, str(cmd))] = (rc, tail)
+                    cmd, rc, tail, slot = self._run_own(cmd, head, tree, env, extra, own, slot, claims)
+                    reused = False
                 suite_out.append(tail)
                 if rc != 0:
                     say(f"check failed on {head[:10]}: {cmd}{push.where(cmd)}")
@@ -2708,7 +2642,106 @@ class Batch:
             for claim in claims:
                 claim.close()
             self._spent(started, cpu0)
-        push.record_check_s(self.p, time.time() - started, waits())
+        self._checked(head, time.time() - started, waits(), slow, suite_out)
+        return None
+
+    def _plan(self, head: str, checks: list[str]) -> tuple[list, dict | None, tuple[str, str] | None]:
+        """_check's start: `head` checked out, then (the checks to run there, their env, None), or (no
+        checks, None, _check's verdict) when none is to run: the stale version guard, a check scope that
+        cannot be read, none in scope, or no checks env."""
+        if self.checks_at is None:
+            self.checks_at = time.time()
+        self._checkout(head)
+        self.at = head
+        stale = push.stale_versions(self.wt, self.tip) if push.version_guard(self.d) else []
+        if stale:
+            msg = (f"{', '.join(stale)}: this change edits the plugin but keeps the version already on "
+                   f"{self.target}; bump it past that (in every manifest, plus a changeset where the "
+                   "repository wants one), commit, then rerun")
+            say(f"{head[:10]}: {msg}")
+            return [], None, (STALE, msg)
+        if not checks:
+            return [], None, None
+        try:
+            todo, skipped = push.applicable(self.wt, head, checks, say, self.tip or "")
+        except push.ScopeError as e:
+            say(f"{head[:10]}: {e}")
+            return [], None, (str(e.check), str(e))
+        for line in skipped:
+            if line not in self.checks.setdefault("skipped", []):
+                self.checks["skipped"].append(str(line))
+        if not todo and push.outside_scope(checks, skipped):
+            say(f"{head[:10]}: {push.OUT_OF_SCOPE}")
+            return [], None, None
+        if not todo:
+            say(f"{head[:10]}: {push.NONE_APPLY}")
+            return [], None, (push.NONE_APPLY, "")
+        say(f"checking {head[:10]}")
+        self.checks["runs"] += 1
+        try:
+            return todo, self._check_env(head), None
+        except push.runnerenv.Unavailable as e:   # its own checks.python_lock edit
+            say(f"{head[:10]}: {e}")
+            return [], None, ("python env", str(e))
+
+    def _unpassed(self, head: str, todo: list, env: dict, tree: str) -> list:
+        """(check, env id, env parts) of each of `todo` that must run on `head`: a pass on the same tree
+        and env (pushpass.passed) or one carried over (_carried, _task_carried) is recorded instead."""
+        run = []
+        for n, cmd in enumerate(todo):
+            parts = pushpass.env_parts(self.wt, cmd, env, self.tip or "")
+            eid = pushpass.digest(parts)
+            if hit := pushpass.passed(self.p, tree, str(cmd), eid):
+                say(f"reused pass from {hit.get('batch') or '?'} (tree {tree[:10]}): {cmd}")
+                self.checks["reused"] = self.checks.get("reused", 0) + 1
+                self._passed(cmd)
+            elif carried := self._carried(head, cmd, parts) or self._task_carried(head, cmd, parts, todo[:n], env):
+                say(f"{carried}: {cmd}")
+                self.checks.setdefault("carried", []).append(f"{carried}: {cmd}")
+                self._passed(cmd)
+                if why := pushpass.record(self.p, tree, str(cmd), eid, self.id, parts, head, self.tip or "", carried):
+                    say(f"could not record the pass of {cmd}: {why}")
+            else:
+                if why := pushpass.missed(self.p, tree, str(cmd), parts):
+                    say(f"not reusing a pass: {why}: {cmd}")
+                if self._declined:
+                    say(f"not carrying a pass: {self._declined}: {cmd}")
+                run.append((cmd, eid, parts))
+        return run
+
+    def _resume(self, cmd, tree: str, eid: str, env: dict, slow: Path | None) -> tuple[Path | None, dict]:
+        """(the resume file of `cmd` on `tree`, or None; the env it adds): a resumable local check runs
+        only the test files an earlier run on the tree did not pass, and notes its slow tests in `slow`."""
+        resume = (pushpass.resume_file(self.p, tree, str(cmd), eid)
+                  if tree and pushpass.resumable(cmd) and not push.remote_host(cmd) else None)
+        extra = pushpass.resume_env(resume, env) if resume else {}
+        if slow and pushpass.resumable(cmd) and not push.remote_host(cmd):
+            extra |= slowtests.env(slow, {**env, **extra})
+        if done := pushpass.resumed(resume) if resume else []:
+            say(f"resuming {cmd}: {len(done)} test file(s) passed in an earlier run on tree {tree[:10]}; running the rest")
+        if push.remote_host(cmd):
+            say(f"running {cmd}{push.where(cmd)}")
+        return resume, extra
+
+    def _run_own(self, cmd, head: str, tree: str, env: dict, extra: dict, own, slot, claims: list):
+        """Run `cmd` on its host under the slot `own` gives it; a spilled check whose host fails it is
+        moved on (_respill) to the next spill host, else here. Returns (the check as run, rc, tail, slot).
+        A fault of the check host, not `head`, raises envfault.Fault: push_phase holds the batch."""
+        slot = own(cmd, slot)
+        rc, tail = self._run_check(cmd, {**env, **extra, **slot.env()}, env)
+        while getattr(cmd, "spilled", False) and (fault := push.remote_fault(cmd, rc, self.wt)):
+            cmd = self._respill(cmd, head, fault, claims)   # the next spill host, else here
+            slot = own(cmd, slot)
+            rc, tail = self._run_check(cmd, {**env, **slot.env()}, env)
+        if fault := push.remote_fault(cmd, rc, self.wt, str(tail or "")):
+            raise envfault.Fault(fault)
+        if rc != 0 and tree:
+            self.failed_runs[(tree, str(cmd))] = (rc, tail)
+        return cmd, rc, tail, slot
+
+    def _checked(self, head: str, took_s: float, wait_s: float, slow: Path | None, suite_out: list[str]):
+        """_check's record of a head that passed: its check time, its slow tests and its suite cost."""
+        push.record_check_s(self.p, took_s, wait_s)
         for line in slowtests.lines(slow) if slow else []:
             say(line)
         try:
@@ -3178,6 +3211,104 @@ class Batch:
                 self.checks["cpu_s"] = round(self.checks.get("cpu_s", 0.0) + checkcap.child_cpu_s() - cpu0, 1)
         return None
 
+    def _cap_search(self, tip: str, carried: list, heads: dict, checks: list[str], cap: tuple):
+        """_judge's search of a combined head whose cap probe (_caps) failed only on prompt size cap
+        tests (`cap`): the search runs on cap probes alone, then one full check of the longest prefix
+        that passed them: the entry that breaks a cap goes back to be trimmed (pushq's trim requeue)
+        without a full check of any head that breaks one. Returns (what _judge returns when that prefix
+        passes in full, else None; the prefix the full search goes below; each prefix's failure)."""
+        m = len(carried)
+        lo, hi = 0, m
+        fails = {m: cap}
+        say(f"{heads[m][:10]} breaks a prompt size cap; searching on the cap tests alone")
+        while hi - lo > 1:
+            mid = (lo + hi) // 2
+            heads[mid] = self._head(tip, carried, mid)
+            f = self._caps(heads[mid], checks, carried[mid - 1][1])
+            if f is None:
+                lo = mid
+            elif isinstance(f, tuple):
+                hi, fails[mid] = mid, f
+            else:
+                break
+        # A cap probe that passed is no full pass: below hi the full checks decide.
+        if hi - lo == 1 and lo:
+            say(f"checking the {lo} entr{'y' if lo == 1 else 'ies'} before the one that breaks the cap in full")
+            f = self._check(heads[lo], checks)
+            if f is None:
+                return (lo, heads[lo], fails[hi]), hi, fails
+            hi, fails[lo] = lo, f
+        return None, hi, fails
+
+    def _ids_search(self, tip: str, carried: list, heads: dict, checks: list[str], fails: dict, hi: int, m: int):
+        """_judge's search of a failure whose new tests are known (_judged): on those tests alone
+        (_ids_check), then the longest prefix that passed them runs the checks after the failing one
+        (_rest_check) once; failing there, the search goes below in full. Returns (what _judge returns
+        when that prefix lands or the search yields, else None; lo; hi) for the full search below."""
+        lo = 0
+        while hi - lo > 1 and (ids := self.new_ids.get(fails[hi][1])):
+            top = hi
+            while hi - lo > 1:
+                if self._yield_now((hi - lo - 1).bit_length() + 1):
+                    return (0, None, None), lo, hi
+                mid = (lo + hi) // 2
+                heads[mid] = self._head(tip, carried, mid)
+                f = self._ids_check(heads[mid], fails[top], ids)
+                if f is None:
+                    lo = mid
+                elif isinstance(f, tuple):
+                    hi, fails[mid] = mid, f
+                else:
+                    break
+            if hi - lo > 1 or lo == 0:
+                lo = 0                # a probe that cannot tell, or nothing new passed them: the full checks decide
+                break
+            if self._yield_now():
+                return (0, None, None), lo, hi
+            say(f"checking the {lo} entr{'y' if lo == 1 else 'ies'} that passed the split probes on the rest of the checks")
+            if (f := self._rest_check(heads[lo], checks, fails[top])) is None:
+                return self._lands(lo, heads, m), lo, hi
+            hi, fails[lo], lo = lo, f, 0
+        return None, lo, hi
+
+    def _first_failed(self, tip: str, carried: list, heads: dict, checks: list[str], fails: dict, known: dict,
+                      bad: bool, before: set):
+        """_judge's end when its search reaches entry 1 failing (`fails[1]`): the version guard blames
+        it without running anything; else the tip's own result (its failing ids rerun, then the tip
+        checked alone in full) tells whether entry 1 or the tip is to blame."""
+        if fails[1][0] == STALE:
+            return 0, None, fails[1]        # the version guard blames entry 1 without running anything
+        self.tip_tried = carried[0][0] + 1   # entry 1, and those before it that carried nothing
+        if bad:
+            return self._tip_red(tip, known)
+        if conflictfix.cap_failure(fails[1][1], self.d.get("push_cap_tests")) \
+                and self._caps(tip, checks, tip) is None:
+            say(f"entry 1 breaks a prompt size cap the tip {tip[:10]} keeps (its cap tests alone)")
+            return 0, None, fails[1]
+        if (tf := self._tip_ids(tip, fails[1])) is not None:
+            if tf is True:
+                say(f"they pass on the tip {tip[:10]}: the failure is entry 1's own")
+                return 0, None, fails[1]
+            if self._research(tip, before, tf, "its failing tests rerun on it"):
+                return self._judge(tip, carried, heads, checks)
+            self.message = f"the tip of {self.target} fails its checks on its own: {tf[0]} (its failing tests rerun on it)"
+            say(self.message)
+            self.detail_tip = {"cmd": tf[0], "tail": tf[1]}
+            return 0, None, None
+        if self._yield_now():
+            return 0, None, None
+        say(f"checking the tip {tip[:10]} alone")
+        tf = self._check(tip, checks)
+        if self._research(tip, before, tf, "checked alone"):
+            return self._judge(tip, carried, heads, checks)
+        if tf is not None:
+            self.message = f"the tip of {self.target} fails its checks on its own: {tf[0]}"
+            say(self.message)
+            self.detail_tip = {"cmd": tf[0], "tail": tf[1]}
+            return 0, None, None
+        self.tip_passed = True
+        return 0, None, fails[1]
+
     def _judge(self, tip: str, carried: list, heads: dict, checks: list[str], failed_full: tuple | None = None):
         """Check the full head; when it fails, find the first failing entry by a binary search over
         prefixes (each prefix: entries 1..k plus a bump), checking the tip alone only when prefix 1
@@ -3207,38 +3338,17 @@ class Batch:
         ends tip_failed and names the entries up to it ("tip_tried"), so the later ones stay untried
         and go first in the next batch. A batch with none untried ends at once and names none.
 
-        A combined head gets a cap probe first (_caps). When it fails only on prompt size cap tests,
-        the search runs on cap probes alone, then one full check of the longest prefix that passed
-        them: the entry that breaks a cap goes back to be trimmed (pushq's trim requeue) without a full
-        check of any head that breaks one. A full failure of that prefix searches below it in full.
+        A combined head that breaks a prompt size cap is searched on its cap tests first (_cap_search).
         `failed_full`: the failure of the full head, already checked by the caller (_rescue's rounds)"""
         m = len(carried)
         known = self.m.get("bad_tip") if isinstance(self.m.get("bad_tip"), dict) else {}
         bad = known.get("tip") == tip and not self._known_excused(tip, known)
         before = set(self._excused())
         lo, hi = 0, m
-        capped = not bad and m > 1 and isinstance(cap := self._caps(heads[m], checks, carried[m - 1][1]), tuple)
-        if capped:
-            fails = {m: cap}
-            say(f"{heads[m][:10]} breaks a prompt size cap; searching on the cap tests alone")
-            while hi - lo > 1:
-                mid = (lo + hi) // 2
-                heads[mid] = self._head(tip, carried, mid)
-                f = self._caps(heads[mid], checks, carried[mid - 1][1])
-                if f is None:
-                    lo = mid
-                elif isinstance(f, tuple):
-                    hi, fails[mid] = mid, f
-                else:
-                    break
-            # A cap probe that passed is no full pass: below hi the full checks decide.
-            if hi - lo == 1 and lo:
-                say(f"checking the {lo} entr{'y' if lo == 1 else 'ies'} before the one that breaks the cap in full")
-                f = self._check(heads[lo], checks)
-                if f is None:
-                    return lo, heads[lo], fails[hi]
-                hi, fails[lo] = lo, f
-            lo = 0
+        if not bad and m > 1 and isinstance(cap := self._caps(heads[m], checks, carried[m - 1][1]), tuple):
+            done, hi, fails = self._cap_search(tip, carried, heads, checks, cap)
+            if done:
+                return done
         elif not bad and (kf := self._known_fail(carried)):
             say(f"the full head of these {m} entries failed {kf[0]} in a search stopped for an urgent approval: "
                 "the search resumes without checking it again")
@@ -3251,32 +3361,10 @@ class Batch:
             if not bad and m > 1 and (ids := self.new_ids.get(fail[1])) and (
                     got := self._culprits(tip, carried, fail, ids, checks)):
                 return got
-        # A failure whose new tests are known (_judged) is searched on those tests alone (_ids_check), then
-        # the longest prefix that passed them runs the checks after the failing one (_rest_check) once;
-        # failing there, the search goes below in full.
-        while not bad and hi - lo > 1 and (ids := self.new_ids.get(fails[hi][1])):
-            top = hi
-            while hi - lo > 1:
-                if self._yield_now((hi - lo - 1).bit_length() + 1):
-                    return 0, None, None
-                mid = (lo + hi) // 2
-                heads[mid] = self._head(tip, carried, mid)
-                f = self._ids_check(heads[mid], fails[top], ids)
-                if f is None:
-                    lo = mid
-                elif isinstance(f, tuple):
-                    hi, fails[mid] = mid, f
-                else:
-                    break
-            if hi - lo > 1 or lo == 0:
-                lo = 0                # a probe that cannot tell, or nothing new passed them: the full checks decide
-                break
-            if self._yield_now():
-                return 0, None, None
-            say(f"checking the {lo} entr{'y' if lo == 1 else 'ies'} that passed the split probes on the rest of the checks")
-            if (f := self._rest_check(heads[lo], checks, fails[top])) is None:
-                return self._lands(lo, heads, m)
-            hi, fails[lo], lo = lo, f, 0
+        if not bad:
+            done, lo, hi = self._ids_search(tip, carried, heads, checks, fails, hi, m)
+            if done:
+                return done
         if bad and fails[m][0] != STALE:
             fresh = sum(1 for i, _ in carried if i < int(known.get("fresh") or 0))
             if not fresh:
@@ -3297,40 +3385,8 @@ class Batch:
             if f is None:
                 return self._lands(mid, heads, m)
             hi, fails[mid] = mid, f
-        if hi == 1 and fails[1][0] == STALE:
-            return 0, None, fails[1]        # the version guard blames entry 1 without running anything
         if hi == 1:
-            self.tip_tried = carried[0][0] + 1   # entry 1, and those before it that carried nothing
-        if hi == 1 and bad:
-            return self._tip_red(tip, known)
-        if hi == 1 and fails[1][0] != STALE and conflictfix.cap_failure(fails[1][1], self.d.get("push_cap_tests")) \
-                and self._caps(tip, checks, tip) is None:
-            say(f"entry 1 breaks a prompt size cap the tip {tip[:10]} keeps (its cap tests alone)")
-            return 0, None, fails[1]
-        if hi == 1 and (tf := self._tip_ids(tip, fails[1])) is not None:
-            if tf is True:
-                say(f"they pass on the tip {tip[:10]}: the failure is entry 1's own")
-                return 0, None, fails[1]
-            if self._research(tip, before, tf, "its failing tests rerun on it"):
-                return self._judge(tip, carried, heads, checks)
-            self.message = f"the tip of {self.target} fails its checks on its own: {tf[0]} (its failing tests rerun on it)"
-            say(self.message)
-            self.detail_tip = {"cmd": tf[0], "tail": tf[1]}
-            return 0, None, None
-        if hi == 1 and self._yield_now():
-            return 0, None, None
-        if hi == 1:
-            say(f"checking the tip {tip[:10]} alone")
-            tf = self._check(tip, checks)
-            if self._research(tip, before, tf, "checked alone"):
-                return self._judge(tip, carried, heads, checks)
-            if tf is not None:
-                self.message = f"the tip of {self.target} fails its checks on its own: {tf[0]}"
-                say(self.message)
-                self.detail_tip = {"cmd": tf[0], "tail": tf[1]}
-                return 0, None, None
-            self.tip_passed = True
-            return 0, None, fails[1]
+            return self._first_failed(tip, carried, heads, checks, fails, known, bad, before)
         # Unreached: a prefix that passed in full returned above (_lands), so the search ends at hi 1.
         return hi - 1, heads[hi - 1], fails[hi]
 
