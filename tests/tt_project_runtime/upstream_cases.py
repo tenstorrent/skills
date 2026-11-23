@@ -876,6 +876,61 @@ def test_upstream_resolve_fixed_in_refuses_a_version_without_the_fixing_tasks_la
     assert rc == 0 and "version 0.1.3 not checked: delivery.version_bump is not set" in out
 
 
+
+def test_upstream_resolve_accepts_a_retired_tip_fix_at_a_version_after_the_squash(env, monkeypatch, capsys):
+    """A fix whose landed commit is on a retired tip (the push branch was squashed since) resolves at a
+    version whose first commit is at or after the squash, and at a pre-squash version that carries it on
+    the retired tip; a pre-squash version without it stays refused and records nothing."""
+    from ttp import cli, landed, upstream
+    p = make(env)
+    repo = p.root
+    monkeypatch.chdir(p.base)
+    for r in _git_out(repo, "remote").split():
+        _git_out(repo, "remote", "remove", r)
+    man = repo / "plugins/p/.claude-plugin/plugin.json"
+    man.parent.mkdir(parents=True)
+
+    def commit(msg, version=None, path=None):
+        if version:
+            man.write_text(json.dumps({"name": "p", "version": version}, indent=2) + "\n")
+        if path:
+            (repo / path).write_text(msg + "\n")
+        _git_out(repo, "add", "-A")
+        _git_out(repo, "commit", "-qm", msg)
+        return _git_out(repo, "rev-parse", "HEAD")
+
+    start = _git_out(repo, "rev-parse", "--abbrev-ref", "HEAD")
+    base = commit("p 0.1.0", "0.1.0")
+    _git_out(repo, "checkout", "-qb", "proj")
+    fix = commit("the fix", path="fix.txt")
+    commit("p 0.1.1", "0.1.1")
+    old = commit("p 0.1.2", "0.1.2")
+    _git_out(repo, "reset", "-q", "--soft", base)                 # the squash: one commit, the old tip's tree
+    _git_out(repo, "commit", "-qm", "squash")
+    commit("p 0.1.3", "0.1.3")
+    _git_out(repo, "checkout", "-q", start)
+    assert landed.retire_tip(p, old) == old
+    p.set_config("delivery.push_branch", "proj")
+    p.set_config("delivery.version_bump", {"files": ["plugins/p/.claude-plugin/plugin.json"]})
+    fp = upstream.fingerprint("upstream: squashed fix", "s")
+    tid = p.db.add_task("fix the note", "s", kind="code")
+    p.db.update_task(tid, status="done", result=json.dumps({"status": "done", "resolves": [fp]}))
+    p.db.x("INSERT INTO push_queue(task,branch,head,target,status,created,updated,landed_sha) "
+           "VALUES(?,'b',?,'proj','landed',?,?,?)", (tid, fix, time.time(), time.time(), fix))
+
+    def resolve(v):
+        rc = _upstream_cli(cli, "--resolve", fp, "--fixed-in", v, "--task", str(tid))
+        out = capsys.readouterr()
+        return rc, out.out + out.err
+
+    rc, out = resolve("0.1.0")                                      # before the fix
+    assert rc == 2 and "is not in version 0.1.0" in out and upstream.resolution(fp) is None
+    rc, out = resolve("0.1.1")                                      # carries it on the retired tip
+    assert rc == 0 and f"is in " in out and f"on the retired tip {old[:10]}" in out
+    rc, out = resolve("0.1.3")                                      # after the squash
+    assert rc == 0 and f"is on the retired tip {old[:10]} (0.1.2), which " in out
+    assert upstream.resolution(fp)["fixed_in"] == "0.1.3"
+
 # The text of a reply that went out with its template slot unfilled (a shared text for several replies).
 _SLOT_REPLY = ("[note %s] Correction on the ack: the config key has existed since the 0.2.685 batch (commit "
                "3ebcf99ba), and is in your installed 0.2.697 - it is off by default.")
