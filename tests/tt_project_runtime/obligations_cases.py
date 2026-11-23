@@ -1211,3 +1211,69 @@ def test_a_refused_run_record_is_filed_and_noted_once_and_a_transient_failure_re
     assert ob.file_runs(p, now + 400) == []
     assert [e["text"] for e in ob.get(p.db, oid)["owners"][str(tid)]["evidence"]] == ["commit abc"]
     assert (run_dir / "progress.md").read_text().count("obligation record refused") == 1
+
+
+def test_an_order_start_stamp_is_its_first_owner_runs_own_start_even_when_attached_late(env, monkeypatch):
+    """An owner attached past the start limit whose run began 3 min after the message stamps the order
+    started at that run's start, not at the check: the order is not late."""
+    from ttp import obligations as ob
+    p, d, now, tid, check, mid, raised = _order_setup(env, monkeypatch)
+    p.db.x("INSERT INTO runs(task, role, started, ended, status) VALUES(?,?,?,?,?)",
+           (tid, "worker", now + 180, now + 900, "done"))
+    oid = ob.add_order(p, "build it", mid, [], action_class="read", now=now).split()[1]
+    ob.attach(p, oid, [tid], now=now + 2000)
+    check(now + 2100)
+    assert ob.get(p.db, oid)["promise"]["started"] == now + 180
+    assert ob.order_starts(p.db, now - 1, now + 1, now + 2100) == (1, 0)
+
+
+def test_an_order_closed_by_a_receipt_before_any_start_stamp_counts_its_on_time_run_not_late_forever(
+        env, monkeypatch):
+    from ttp import obligations as ob
+    p, d, now, tid, check, mid, raised = _order_setup(env, monkeypatch)
+    oid = ob.add_order(p, "build it", mid, [tid], action_class="read", now=now).split()[1]
+    p.db.x("INSERT INTO runs(task, role, started, ended, status) VALUES(?,?,?,?,?)",
+           (tid, "worker", now + 300, now + 600, "done"))
+    ob.close_promise(p.db, oid, "delivered", by="coordinator", now=now + 700)   # no check ran in between
+    assert ob.get(p.db, oid)["promise"].get("started") is None
+    assert ob.order_starts(p.db, now - 1, now + 1, now + 9 * 86400) == (1, 0)
+
+
+def test_an_order_whose_owners_are_all_deferred_or_dropped_is_no_late_start(env, monkeypatch):
+    """Owners deferred past the start limit (start_after, a start_when probe) or all cancelled unrun leave
+    the order out of the late count; the deferral is kept on the order, so it holds after the label goes."""
+    import json
+    from ttp import obligations as ob
+    p, d, now, tid, check, mid, raised = _order_setup(env, monkeypatch)
+    ob.add_order(p, "build it later", mid, [tid], action_class="read", now=now)
+    p.db.update_task(tid, labels=json.dumps([f"start_after:{now + 3 * 3600}", "start_why:report after the soak"]),
+                     not_before=now + 3 * 3600)
+    check(now + ob.ORDER_START_S + 60)
+    assert ob.order_starts(p.db, now - 1, now + 1, now + 2 * 3600) == (0, 0)
+    p.db.update_task(tid, labels="[]", not_before=None)   # the deferral passed: its labels are gone
+    assert ob.order_starts(p.db, now - 1, now + 1, now + 2 * 3600) == (0, 0)
+    m2 = p.db.post("in", "build the other thing", chat="c1")
+    p.db.x("UPDATE messages SET ts=? WHERE id=?", (now, m2))
+    t2 = p.db.add_task("other", "s", kind="work", tier="light", origin="user")
+    ob.add_order(p, "build the other thing", m2, [t2], action_class="read", now=now)
+    p.db.update_task(t2, status="cancelled")
+    assert ob.order_starts(p.db, now - 1, now + 1, now + 2 * 3600) == (0, 0)
+    p.db.update_task(t2, status="queued")   # a live unrun owner still counts late
+    assert ob.order_starts(p.db, now - 1, now + 1, now + 2 * 3600) == (1, 1)
+
+
+def test_must_act_lists_an_order_with_no_owner_from_10_minutes_until_an_owner_or_a_reply(env, monkeypatch):
+    from ttp import mustact, obligations as ob
+    p, d, now, tid, check, mid, raised = _order_setup(env, monkeypatch)
+    oid = ob.add_order(p, "build it", mid, [], action_class="change", now=now).split()[1]
+    assert mustact.unowned(p.db, now + 540) == [] and mustact.block(p.db, [], now + 540) == ""
+    line = mustact.block(p.db, [], now + 660)
+    assert f"## {mustact.SECTION}" in line and f"- {oid}: user msg #{mid} (change) has no owner task 11 min" in line
+    ob.attach(p, oid, [tid], now=now + 700)
+    assert mustact.unowned(p.db, now + 720) == []
+    m2 = p.db.post("in", "and the other one", chat="c1")
+    p.db.x("UPDATE messages SET ts=? WHERE id=?", (now, m2))
+    ob.add_order(p, "other", m2, [], action_class="read", now=now)
+    assert len(mustact.unowned(p.db, now + 900)) == 1
+    p.db.post("out", "on it: done by 10:00", chat="c1", kind="reply")
+    assert mustact.unowned(p.db, now + 900) == []

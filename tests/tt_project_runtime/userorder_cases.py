@@ -453,3 +453,24 @@ def test_a_task_citing_a_user_message_on_another_topic_orders_only_the_resources
     assert coord.apply(p, [{"type": "task_add", "title": "now", "spec": "do it now", "resources": ["boxa"],
                             "user_msg": msg3}]) == []
     assert sorted(userorder.active(p.db)) == ["boxa", "boxb-device"]
+
+
+def test_an_order_gets_the_tasks_its_batch_adds_naming_it_as_owners_before_or_after_the_task_add(env):
+    """An order recorded by an `obligation` action gets each task the same batch adds whose spec names its
+    user message, whether the task_add comes before or after it; a task naming another message is not
+    attached, and the order no longer reads 'no owner task'."""
+    from ttp import coordinator as coord, mustact, obligations
+    p = make(env)
+    for first in (True, False):
+        msg = _order_msg(p, "build the deliverable", ago=1200)
+        add = {"type": "task_add", "title": f"build it {first}", "kind": "work", "tier": "light", "priority": 2,
+               "spec": f"Goal: build it.\norder: user msg #{msg}"}
+        other = {"type": "task_add", "title": f"unrelated {first}", "kind": "work", "tier": "light", "priority": 3,
+                 "spec": f"Goal: other work.\nContext: user msg #{msg - 100}"}
+        order = {"type": "obligation", "order": msg, "text": "build the deliverable", "action_class": "read"}
+        acts = [add, other, order] if first else [order, add, other]
+        assert coord.apply(p, acts) == []
+        o = obligations.open_order(p.db, msg)
+        tid = next(t["id"] for t in p.db.q("SELECT id FROM tasks WHERE title=?", (f"build it {first}",)))
+        assert obligations._owner_ids(o) == [tid], (first, o)
+        assert not any(f"user msg #{msg} " in x for x in mustact.unowned(p.db))

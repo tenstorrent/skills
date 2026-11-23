@@ -4443,6 +4443,9 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
             restriction_audit.restriction_tools(p, loosened, list(batch_tasks), notes)
         except Exception as e:
             notes.append(f"restriction tools not checked: {type(e).__name__}: {str(e)[:200]}")
+    for oid, msg, steps in fan_orders:   # an order recorded here gets this batch's tasks naming it as owners
+        if oid is None:
+            notes += _batch_owners(p, msg, list(new_tasks.values()), batch_obls)
     for oid, msg, steps in fan_orders:   # once its owners are attached: every running task it affects is told
         try:
             notes.append(_fan_order(p, oid, msg, steps))
@@ -8118,6 +8121,31 @@ def _echo_kind(entry: dict, withdrawn: bool) -> str:
 
 
 _USER_MSG_ID = re.compile(r"\buser(?:'s)?\s+(?:msgs?|messages?)\s+#?\d+(?:\s*(?:,|&|\band\b)\s*(?:and\s+)?#\d+)*", re.I)
+
+
+def _batch_owners(p, msg: int, tids: list[int], batch_obls: list) -> list[str]:
+    """Attach to the order recorded for user message `msg` each task `tids` (added in the same batch) whose
+    title or spec names it, by its key or 'user msg #<msg>': whichever came first in the batch."""
+    o = obligations.open_order(p.db, msg)
+    if not o:
+        return []
+    have = {int(t) for t in o.get("owners") or {}}
+    named = []
+    for tid in tids:
+        t = p.db.task(int(tid))
+        text = f"{t['title']}\n{t['spec']}" if t else ""
+        if t and int(tid) not in have and (str(msg) in _user_msg_ids(text) or o["id"] in obligations.named(text)):
+            named.append(int(tid))
+    keep, out = obligations.fit_owners(p.db, named, (o.get("promise") or {}).get("class"))
+    if not keep:
+        return [f"order {o['id']}: {w}" for w in out]
+    try:
+        obligations.attach(p, o["id"], keep)
+    except ValueError as e:
+        return [f"order {o['id']}: {e}"]
+    batch_obls.append(o["id"])
+    return [f"order {o['id']} (user msg #{msg}): owner(s) " + ", ".join(f"#{t}" for t in keep)
+            + " attached from this batch"] + [f"order {o['id']}: {w}" for w in out]
 
 
 def _user_msg_ids(text: str) -> set[str]:

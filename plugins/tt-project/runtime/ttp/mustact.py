@@ -58,8 +58,34 @@ def queued(db) -> bool:
     return bool(events(db))
 
 
-def block(db, ids) -> str:
-    """The prompt section naming each must-act item among events `ids`; '' with none."""
+UNOWNED_S = 600   # an open order still with no owner task this long after its message gets a line
+
+
+def unowned(db, now: float | None = None) -> list[str]:
+    """One line per open order with no owner task UNOWNED_S after its message and no reply to its chat
+    since: it clears once an owner or a reply is recorded (the order_late event at its start_by stays)."""
+    now = time.time() if now is None else now
+    out = []
+    for o in obligations.items(db):
+        pr = o.get("promise") or {}
+        if pr.get("order") is None or not obligations._open(o) or obligations._owner_ids(o):
+            continue
+        m = db.one("SELECT ts, chat FROM messages WHERE id=?", (int(pr["order"]),))
+        if not m or now - float(m["ts"]) < UNOWNED_S:
+            continue
+        chat = obligations._chat(pr.get("chat") or m["chat"])
+        if db.one("SELECT id FROM messages WHERE direction='out' AND kind='reply' AND id>? "
+                  "AND (chat IS NULL OR ?='all' OR chat=?) LIMIT 1", (int(pr["order"]), chat, chat)):
+            continue
+        out.append(f"- {o['id']}: user msg #{pr['order']} ({pr.get('class') or 'order'}) has no owner task "
+                   f"{int((now - float(m['ts'])) // 60)} min after it: attach one (`obligation` with key {o['id']} "
+                   f"and `owners`, or a task_add naming {o['id']}) or reply in its chat")
+    return out
+
+
+def block(db, ids, now: float | None = None) -> str:
+    """The prompt section naming each must-act item among events `ids`, and each open order with no owner
+    (unowned); '' with none."""
     out = []
     for ev in events(db, ids):
         it = item(ev)
@@ -78,6 +104,7 @@ def block(db, ids) -> str:
                      "before anything else; `ttp urgent-reply <chat> <text>` posts it mid-turn)")
         owners = f"; owners #{', #'.join(map(str, it.get('tasks') or []))}" if it.get("tasks") else "; no owner task"
         out.append(f"- {it['key']} in chat {it['chat']}{owners}{again}: {first}")
+    out += [x for x in unowned(db, now) if x.split(":", 1)[0] not in {y.split(" in chat", 1)[0] for y in out}]
     if not out:
         return ""
     return (f"## {SECTION}\nEach item below is late or did not hold. Act on every one in this turn: re-order or start its "

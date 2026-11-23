@@ -1641,6 +1641,8 @@ def _check_promise(p, o: dict, st: dict, now: float, raised: list[str]) -> bool:
     fp = f"obligation:{o['id']}:promise"
     kept = _kept(p.db, o, st)
     if kept:
+        if pr.get("order") is not None and pr.get("started") is None:   # closed before the start was stamped
+            pr["started"] = first_run(p.db, _owner_ids(o), _order_ts(p.db, pr))
         o["receipt"] = {"at": now, "task": None, "evidence": kept}
         _retire(p.db, now, "promise kept", prefix=fp)
         return True
@@ -2203,20 +2205,47 @@ def order_starts(db, since: float, until: float, now: float | None = None) -> tu
     out: one closed or dropped with no run started and no owner task ever (a reply, a memory or charter
     change settled it), so the count matches the late orders the coordinator is told about."""
     now = time.time() if now is None else now
-    orders = {int(o["promise"]["order"]): o["promise"] for o in items(db)
+    orders = {int(o["promise"]["order"]): (o, o["promise"]) for o in items(db)
               if (o.get("promise") or {}).get("order") is not None and not _needed_no_task(o)}
     if not orders:
         return 0, 0
     ids = list(orders)
     ts = {r["id"]: float(r["ts"]) for r in db.q(f"SELECT id, ts FROM messages WHERE id IN ({','.join('?' * len(ids))})", ids)}
     n = late = 0
-    for m, pr in orders.items():
+    for m, (o, pr) in orders.items():
         at = ts.get(m)
         if at is None or not since <= at < until or (pr.get("started") is None and now - at <= ORDER_START_S):
             continue   # out of the window, or too new to say
+        start = pr.get("started")
+        start = float(start) if start is not None else first_run(db, _owner_ids(o), at)
+        if start is None and (pr.get("deferred") or _held_by_design(db, _owner_ids(o), at)):
+            continue   # its owners wait by design (a deferral past the start limit), or were all dropped
         n += 1
-        late += (float(pr["started"]) if pr.get("started") is not None else now) - at > ORDER_START_S
+        late += (start if start is not None else now) - at > ORDER_START_S
     return n, late
+
+
+def first_run(db, tids, at: float) -> float | None:
+    """When the first run of tasks `tids` live at or after `at` began (no earlier than `at`), else None."""
+    if not tids:
+        return None
+    q = ",".join("?" * len(tids))
+    r = db.one(f"SELECT MIN(MAX(started, ?)) AS s FROM runs WHERE task IN ({q}) AND role!='coordinator' "
+               f"AND started IS NOT NULL AND (ended IS NULL OR ended>=?)", (at, *tids, at))
+    return float(r["s"]) if r and r["s"] is not None else None
+
+
+def _held_by_design(db, tids, at: float) -> bool:
+    """Whether every owner in `tids` waits by design past the order start limit (start_after, not_before or
+    a start_when probe), or was dropped (cancelled) unrun: such an order is no late start."""
+    from .db import deferral
+    ts = [db.task(int(t)) for t in tids]
+    if not ts or None in ts:
+        return False
+    def waits(t) -> bool:
+        d = deferral(t)
+        return bool(d.get("when")) or max(float(d.get("after") or 0), float(t["not_before"] or 0)) > at + ORDER_START_S
+    return all(t["status"] == "cancelled" for t in ts) or all(waits(t) for t in ts)
 
 
 def order_audit_line(db, now: float | None = None) -> str:
@@ -2239,6 +2268,11 @@ def _order_line(o: dict) -> str:
             f"{o['text']}\nOwner: " + (f"#{', #'.join(map(str, ids))}" if ids else "no task"))
 
 
+def _order_ts(db, pr: dict) -> float:
+    m = db.one("SELECT ts FROM messages WHERE id=?", (int(pr["order"]),))
+    return float(m["ts"]) if m else float(pr.get("start_by") or 0) - ORDER_START_S
+
+
 def _check_order(p, o: dict, now: float, raised: list[str]) -> bool:
     """An open order's start and due checks (after _kept found it not done). Returns whether `o` changed."""
     from . import batchrun, replan, timefmt
@@ -2247,9 +2281,13 @@ def _check_order(p, o: dict, now: float, raised: list[str]) -> bool:
     if pr.get("started") is None and ids:
         q = ",".join("?" * len(ids))
         # A batch member has no run of its own: the live batch run it is in is its run.
-        if db.one(f"SELECT id FROM runs WHERE task IN ({q}) LIMIT 1", ids) or batchrun.held(db) & set(map(int, ids)):
-            pr["started"], changed = now, True
+        at = _order_ts(db, pr)
+        if (run := first_run(db, ids, at)) is not None or batchrun.held(db) & set(map(int, ids)):
+            pr["started"], changed = (now if run is None else run), True   # the owner run's own start
             _retire(db, now, "order started", prefix=f"obligation:{o['id']}:order:late")
+    if pr.get("started") is None and now >= pr["start_by"] and not pr.get("deferred") and \
+            _held_by_design(db, ids, _order_ts(db, pr)):
+        pr["deferred"], changed = now, True   # kept: a deferral label goes once the probe passes
     if pr.get("started") is None and now >= pr["start_by"] and pr.get("late") is None:
         pr["late"], changed = now, True
         fp = f"obligation:{o['id']}:order:late:{int(pr['start_by'])}"
