@@ -2662,7 +2662,7 @@ def test_bridge_watch_takes_no_decision_from_the_time_between_passes(tmp_path, m
     bridge_watch.run_pass(cfg, "darwin", t0)
     bridge_watch.run_pass(cfg, "darwin", t0 + 31)   # second miss: next check 60s later
     assert len(seen["box"]) == 2
-    # a 50s pass, then the next one 30-60s after its end: more than 90s between starts, still backing off
+    # a pass 50s later (after a slow one) is still inside the 60s wait: no early check
     assert bridge_watch.run_pass(cfg, "darwin", t0 + 31 + 50) == [] and len(seen["box"]) == 2
     bridge_watch.run_pass(cfg, "darwin", t0 + 31 + 50 + 600)   # the first pass after a sleep asks the box
     assert len(seen["box"]) == 3
