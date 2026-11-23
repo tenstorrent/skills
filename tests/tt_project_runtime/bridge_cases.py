@@ -2550,38 +2550,49 @@ def test_bridge_watch_dest_answers_by_the_route_the_relay_takes(monkeypatch):
         return Conn()
 
     def bound(host, iface, port=22, timeout=None):
-        calls.append(("bound", host, iface, timeout))
+        calls.append(("bound", host, iface, port, timeout))
         raise OSError("no route")
 
     monkeypatch.setattr(socket, "create_connection", direct)
     monkeypatch.setattr(bridge_relay, "bound_connect", bound)
     assert bridge_watch.dest_answers({"target": "h1", "interface": ""})
     assert not bridge_watch.dest_answers({"target": "h2", "interface": "en9"})
-    assert calls == [("direct", ("h1", 22), 5), "closed", ("bound", "h2", "en9", 5)]
+    assert bridge_watch.dest_answers({"target": "h3", "to": 8022, "interface": ""})   # a watch entry's target port
+    assert calls == [("direct", ("h1", 22), 5), "closed", ("bound", "h2", "en9", 22, 5),
+                     ("direct", ("h3", 8022), 5), "closed"]
 
 
 def test_bridge_watch_check_tells_a_byte_from_silence_from_no_listener(tmp_path):
-    # cells: check-up, check-down, check-none
+    # cells: check-up, check-down, check-none, check-parallel
     import shutil
     import socket
     import subprocess
+    import threading
+    import time
     import pytest
     from ttp import bridge_watch
     if not (shutil.which("bash") and shutil.which("timeout")):
         pytest.skip("no bash or timeout here")
-    talk, quiet, closed = socket.socket(), socket.socket(), socket.socket()
-    for sk in (talk, quiet, closed):
-        sk.bind(("127.0.0.1", 0))
-    talk.listen(4)
-    quiet.listen(4)
-    ports = [sk.getsockname()[1] for sk in (talk, quiet, closed)]
-    closed.close()
-    import threading
-    threading.Thread(target=lambda: talk.accept()[0].sendall(b"SSH-2.0"), daemon=True).start()
-    r = subprocess.run(["sh", "-c", bridge_watch.CHECK, "x", *map(str, ports)], capture_output=True, text=True, timeout=30)
-    assert r.stdout.splitlines() == [f"up {ports[0]}", f"down {ports[1]}", f"none {ports[2]}", "ttp-watch-done"], r.stdout
-    talk.close()
-    quiet.close()
+    talk, closed, quiet = socket.socket(), socket.socket(), [socket.socket() for _ in range(10)]
+    try:
+        for sk in (talk, closed, *quiet):
+            sk.bind(("127.0.0.1", 0))
+        for sk in (talk, *quiet):
+            sk.listen(4)
+        up, none, down = talk.getsockname()[1], closed.getsockname()[1], [sk.getsockname()[1] for sk in quiet]
+        closed.close()
+        threading.Thread(target=lambda: talk.accept()[0].sendall(b"SSH-2.0"), daemon=True).start()
+        t = time.monotonic()
+        r = subprocess.run(["sh", "-c", bridge_watch.CHECK, "x", *map(str, [up, *down, none])], capture_output=True,
+                           text=True, timeout=30)
+        took = time.monotonic() - t
+        lines = r.stdout.splitlines()
+        assert lines[-1] == "ttp-watch-done" and sorted(lines[:-1]) == sorted(
+            [f"up {up}", f"none {none}", *(f"down {p}" for p in down)]), r.stdout
+        assert took < 15   # ten silent ports take one probe's 6 s, far inside the box login's 40 s, not 60 s
+    finally:
+        for sk in (talk, closed, *quiet):
+            sk.close()
 
 
 def test_bridge_watch_resets_a_failed_systemd_unit_before_restarting_it(tmp_path, monkeypatch):
@@ -2607,13 +2618,61 @@ def test_bridge_watch_heals_a_listed_hand_made_service(tmp_path, monkeypatch):
     assert seen["run"][-1] == "systemctl --user restart -- my-forward.service" and out[0].endswith("restarted")
     bridge_watch.run_pass(cfg, "linux", t0 + 30)   # still down, but just restarted: no second restart yet
     assert len(seen["release"]) == 1
-    bridge_watch.run_pass(cfg, "linux", t0 + 60)
-    assert len(seen["release"]) == 2
     for bad in ([{"label": "x y", "box": "b", "port": 2400}], [{"label": "x", "box": "b", "port": 22}],
-                [{"label": "x", "box": "b"}], {"x": 1}):
+                [{"label": "x", "box": "b"}], {"x": 1}, [{"label": "x", "box": "b", "port": 2400, "target": "h"}],
+                [{"label": "x", "box": "b", "port": 2400, "target": "-h:22"}],
+                [{"label": "x", "box": "b", "port": 2400, "target": "h:22", "interface": "e n"}],
+                [{"label": "x", "box": "b", "port": 2400, "extra": 1}]):
         with pytest.raises(bridge.BadConfig):
             bridge.parse({"boxes": {"b": {"login": {}, "agents": {"auto": {"agent": "env", "forward": [{"name": "h", "target": "h.example.com", "port": 2301}]}}}}, "watch": bad})
     assert bridge.parse({"boxes": {"b": {"login": {}, "agents": {"auto": {"agent": "env", "forward": [{"name": "h", "target": "h.example.com", "port": 2301}]}}}}})["watch"] == []
+
+
+def test_bridge_watch_hand_made_service_without_a_target_is_restarted_once_while_it_stays_silent(tmp_path, monkeypatch):
+    # cells: no-target-one-heal, logged-once, heals-again-on-change
+    from ttp import bridge_watch
+    watch = [{"label": "my-forward", "box": "box-2", "port": 2400}]
+    down, none = "down 2400\nttp-watch-done\n", "none 2400\nttp-watch-done\n"
+    cfg, seen = _watch_env(tmp_path, monkeypatch, "linux", [down, down, down, none, down, down], watch=watch,
+                           agents=False)
+    t0 = 1_000_000.0
+    assert bridge_watch.run_pass(cfg, "linux", t0)[0].endswith("restarted") and len(seen["release"]) == 1
+    out = bridge_watch.run_pass(cfg, "linux", t0 + 60)   # still silent: it may be a live forward whose target is off
+    assert len(seen["release"]) == 1 and len(out) == 1 and "names no target" in out[0]
+    assert bridge_watch.run_pass(cfg, "linux", t0 + 600) == [] and len(seen["release"]) == 1   # logged once
+    bridge_watch.run_pass(cfg, "linux", t0 + 630)   # its check changed: no listener now, so it is healed again
+    assert len(seen["release"]) == 2
+    bridge_watch.run_pass(cfg, "linux", t0 + 760)   # changed back to silent: one more heal, then it waits again
+    bridge_watch.run_pass(cfg, "linux", t0 + 1400)
+    assert len(seen["release"]) == 3
+    assert sum(c == "systemctl --user restart -- my-forward.service" for c in seen["run"]) == 3
+
+
+def test_bridge_watch_hand_made_service_with_a_target_heals_only_when_the_target_answers(tmp_path, monkeypatch):
+    # cells: watch-target-down-left-alone, watch-target-up-heals, watch-target-config
+    from ttp import bridge, bridge_watch
+    watch = [{"label": "my-forward", "box": "box-2", "port": 2400, "target": "host-9.example.com:8022",
+              "interface": "en9"}]
+    down = "down 2400\nttp-watch-done\n"
+    cfg, seen = _watch_env(tmp_path, monkeypatch, "linux", [down, down], watch=watch, agents=False)
+    assert cfg["watch"][0] == {"label": "my-forward", "box": "box-2", "port": 2400,
+                                    "target": "host-9.example.com", "to": 8022, "interface": "en9"}
+    asked = []
+    monkeypatch.setattr(bridge_watch, "dest_answers", lambda d: asked.append(d) or False)
+    t0 = 1_000_000.0
+    out = bridge_watch.run_pass(cfg, "linux", t0)
+    assert asked == [{"target": "host-9.example.com", "to": 8022, "interface": "en9"}]
+    assert seen["release"] == [] and not any("restart" in c for c in seen["run"])
+    assert len(out) == 1 and "destination does not answer" in out[0]
+    assert bridge_watch.run_pass(cfg, "linux", t0 + 60) == [] and seen["release"] == []   # logged once
+    cfg, seen = _watch_env(tmp_path / "b", monkeypatch, "linux", [down, down], watch=watch, agents=False)
+    monkeypatch.setattr(bridge_watch, "dest_answers", lambda d: True)
+    assert bridge_watch.run_pass(cfg, "linux", t0)[0].endswith("restarted")
+    assert seen["release"] == [("my-forward", "", [2400])]
+    bridge_watch.run_pass(cfg, "linux", t0 + 60)   # its target answers, so a silent port is stale: healed again
+    assert len(seen["release"]) == 2
+    assert bridge.parse({"boxes": {"b": {"login": {}, "agents": {"auto": {"agent": "env", "forward": [{"name": "h", "target": "h.example.com", "port": 2301}]}}}}, "watch": [{"label": "m", "box": "b", "port": 2400, "target": "10.0.0.5:22"}]})[
+        "watch"][0]["interface"] == ""
 
 
 def test_bridge_watch_service_runs_every_interval_and_on_network_change(tmp_path, monkeypatch):

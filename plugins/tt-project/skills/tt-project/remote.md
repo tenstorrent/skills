@@ -56,7 +56,13 @@
   unreachable box restarts nothing and is checked again within 30-60 s, at once after a wake or a
   network change. A stopped service is left alone. Hand-made ssh forward services join with a
   `"watch"` list in the local bridge config, never shipped with entries:
-  `"watch": [{"label": "<launchd label or systemd unit>", "box": "<ssh alias>", "port": <box port>}]`.
+  `"watch": [{"label": "<launchd label or systemd unit>", "box": "<ssh alias>", "port": <box port>}]`,
+  optionally with `"target": "<host>:<port>"` (what the forward reaches) and `"interface": "<name>"`
+  (the one this computer reaches that target through): a forward whose target does not answer is
+  then left alone the same way. An entry with no target whose port still connects without
+  answering after one restart is not restarted again until its check changes (logged once).
+  The checks of a target open and close a TCP connection to it each pass, which a strict
+  fail2ban on the target's sshd may count.
   Each heal is one JSON line in `~/.tt-project/bridge-heal.log`; `ttp bridge status` shows the
   last three, and `~/.tt-project/bridge-watch.log` has every pass. Optional for a box admin, never
   done by tt-project: `ClientAliveInterval`/`ClientAliveCountMax` in sshd makes the box drop dead

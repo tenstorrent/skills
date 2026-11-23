@@ -12,7 +12,10 @@ a network change. A port whose forward's own destination does not answer from he
 a stale forward: nothing is ended or restarted for it, and it is logged once. A service that keeps failing is restarted at most once per RESTART_GAP_S step.
 
 Besides the sessions `ttp bridge` installs, the config's "watch" list names ssh forward services made by
-hand: {"label": the launchd label or systemd unit, "box": its ssh alias, "port": the box port it forwards}.
+hand: {"label": the launchd label or systemd unit, "box": its ssh alias, "port": the box port it forwards},
+optionally with "target" (the host:port it forwards to) and "interface" (the one this computer reaches it
+through), so a forward whose target is off is left alone the same way. One with no target that still connects
+but sends nothing after a restart is not restarted again until its check result changes.
 Each heal (from the first failed check to the first answer again) is one JSON line in HEAL_LOG; `ttp bridge
 status` shows the last few."""
 from __future__ import annotations
@@ -23,6 +26,7 @@ import shlex
 import socket
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 from .project import durable_append, durable_write
@@ -44,10 +48,11 @@ def _home() -> Path:
 # On the box: per port `up` (a byte came), `down` (it connected, no byte: a stale forward, or a live one whose
 # target is off) or `none` (no listener), then the done line; `nocheck` when it lacks the tools (nothing is restarted).
 CHECK = r"""command -v bash >/dev/null 2>&1 && command -v timeout >/dev/null 2>&1 || { echo ttp-watch-nocheck; exit 0; }
-for p in "$@"; do
-  b=$(timeout 6 bash -c 'exec 3<>"/dev/tcp/127.0.0.1/$0" || exit 7; head -c 1 <&3' "$p" 2>/dev/null); rc=$?
-  if [ -n "$b" ]; then echo "up $p"; elif [ $rc = 7 ]; then echo "none $p"; else echo "down $p"; fi
+for p in "$@"; do   # all ports at once, so the check takes one probe's time whatever their number
+  ( b=$(timeout 6 bash -c 'exec 3<>"/dev/tcp/127.0.0.1/$0" || exit 7; head -c 1 <&3' "$p" 2>/dev/null); rc=$?
+    if [ -n "$b" ]; then echo "up $p"; elif [ $rc = 7 ]; then echo "none $p"; else echo "down $p"; fi ) &
 done
+wait
 echo ttp-watch-done"""
 
 
@@ -62,7 +67,11 @@ def targets(cfg: dict, platform: str | None = None) -> list[dict]:
                 dests = {h["port"]: h for h in fw}
                 out.append({"service": bridge.label(box, an), "box": box, "ports": list(dests), "agent": an,
                             "dests": dests})
-    out += [{"service": w["label"], "box": w["box"], "ports": [w["port"]], "agent": ""} for w in cfg.get("watch", [])]
+    for w in cfg.get("watch", []):
+        t = {"service": w["label"], "box": w["box"], "ports": [w["port"]], "agent": ""}
+        if w.get("target"):
+            t["dests"] = {w["port"]: {"target": w["target"], "to": w["to"], "interface": w["interface"]}}
+        out.append(t)
     return out
 
 
@@ -85,13 +94,15 @@ def _net_stamp(platform: str) -> float:
 
 
 def dest_answers(h: dict) -> bool:
-    """A forward's target answers on port 22 from this computer, by the route the relay itself takes."""
+    """A forward's target answers (on port 22 unless "to" names another) from this computer, by the route the
+    relay itself takes."""
     from . import bridge_relay
+    port = h.get("to", 22)
     try:
         if h["interface"]:
-            s = bridge_relay.bound_connect(h["target"], h["interface"], timeout=5)
+            s = bridge_relay.bound_connect(h["target"], h["interface"], port, timeout=5)
         else:
-            s = socket.create_connection((h["target"], 22), timeout=5)
+            s = socket.create_connection((h["target"], port), timeout=5)
         s.close()
         return True
     except (OSError, ValueError):
@@ -170,11 +181,14 @@ def run_pass(cfg: dict, platform: str | None = None, now: float | None = None) -
         boxes.pop(box, None)
         down = {int(ln.split()[1]) for ln in r.stdout.splitlines() if ln.startswith("down ")}
         none = {int(ln.split()[1]) for ln in r.stdout.splitlines() if ln.startswith("none ")}
+        # a port with no listener is dead whatever its target does; one that connects but sends nothing may be a
+        # live forward whose target is off: its targets are asked all at once
+        ask = [(t["service"], p, t["dests"][p]) for t in mine if t.get("dests") for p in t["ports"] if p in down]
+        with ThreadPoolExecutor(max(1, len(ask))) as ex:
+            answers = dict(zip([a[:2] for a in ask], ex.map(dest_answers, [a[2] for a in ask])))
         for t in mine:
             dead, f = [p for p in t["ports"] if p in down or p in none], fails.get(t["service"])
-            # a port with no listener is dead whatever its target does; one that connects but sends nothing may
-            # be a live forward whose target is off
-            bad = [p for p in dead if p in none or dest_answers(t["dests"][p])] if t.get("dests") else dead
+            bad = [p for p in dead if p in none or answers[t["service"], p]] if t.get("dests") else dead
             gone = [p for p in dead if p not in bad]   # the forward is up; its destination does not answer
             if gone and off.get(t["service"]) != gone:
                 out.append(f"{t['service']}: port {', '.join(map(str, gone))} on {box}: its destination does not "
@@ -197,12 +211,21 @@ def run_pass(cfg: dict, platform: str | None = None, now: float | None = None) -
             if not loaded(t, platform):
                 fails.pop(t["service"], None)
                 continue
+            if not t.get("dests") and f and f["restarts"] and bad == f.get("down") == [p for p in bad if p in down]:
+                # no target to ask: still connecting with nothing to say after a restart may be a live forward whose
+                # target is off, so it waits for its check result to change
+                if not f.get("said"):
+                    out.append(f"{t['service']}: port {', '.join(map(str, bad))} on {box} still does not answer after "
+                               "a restart; its watch entry names no target to ask, so it is not restarted again "
+                               "until its check changes")
+                    f["said"] = True
+                continue
             f = fails.setdefault(t["service"], {"at": now, "event": event, "restarts": 0, "last": 0})
             if now - f["last"] < RESTART_GAP_S[min(f["restarts"], len(RESTART_GAP_S) - 1)]:
                 continue
             freed = release(cfg, t, bad)
             said = restart(t, platform)
-            f.update(restarts=f["restarts"] + 1, last=now)
+            f.update(restarts=f["restarts"] + 1, last=now, down=[p for p in bad if p in down], said=False)
             out.append(f"{t['service']}: port {', '.join(map(str, bad))} on {box} did not answer"
                        f"{'' if freed else ' (still held after the cleanup)'}; {said}")
     names = {t["service"] for t in ts}

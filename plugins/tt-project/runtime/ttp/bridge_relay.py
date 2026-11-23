@@ -512,8 +512,7 @@ if [ -n "$link" ] && [ -L "$link" ]; then   # the agent link of the stale sessio
   esac
 fi
 for port in $ports; do
-  pids=$(listeners "$port" | sort -u)
-  for pid in $pids; do end_one "$port" "$pid"; done
+  for pid in $(listeners "$port" | sort -u); do end_one "$port" "$pid"; done
 done
 for f in "${XDG_CACHE_HOME:-$HOME/.cache}/tt-project/$rec"*.pid; do
   [ -f "$f" ] && [ ! -L "$f" ] || continue

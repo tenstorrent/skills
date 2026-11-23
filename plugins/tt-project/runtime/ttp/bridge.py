@@ -205,11 +205,23 @@ def parse(data: dict) -> dict:
                              "agents": parsed, "hold_check": hold, "gh_pull": b.get("gh_pull", False),
                              "gh_branch_prefixes": grants}
     watch = data.get("watch", [])
-    if not isinstance(watch, list) or not all(isinstance(w, dict) and set(w) == {"label", "box", "port"} for w in watch):
+    if not isinstance(watch, list) or not all(isinstance(w, dict) and {"label", "box", "port"} <= set(w)
+                                              <= {"label", "box", "port", "target", "interface"} for w in watch):
         raise BadConfig('watch: a list of {"label": its launchd label or systemd unit, "box": the ssh alias it '
-                        'forwards to, "port": the box port it forwards}: ssh forward services made by hand')
-    out["watch"] = [{"label": _name(w["label"], "watch label"), "box": _name(w["box"], "watch box"),
-                     "port": _port(w["port"], f"watch {w['label']} port")} for w in watch]
+                        'forwards to, "port": the box port it forwards, optionally "target": the host:port it '
+                        'forwards to and "interface": the one this computer reaches it through}: ssh forward '
+                        'services made by hand')
+    out["watch"] = []
+    for w in watch:
+        host, _, to = str(w.get("target", "")).rpartition(":")
+        if "target" in w and not (isinstance(w["target"], str) and host and not host.startswith("-")
+                                  and not re.search(r"[\s:/@]", host) and to.isdigit() and 0 < int(to) < 65536):
+            raise BadConfig(f"watch {w['label']}: target {w['target']!r} is host:port (a host name or address)")
+        out["watch"].append({"label": _name(w["label"], "watch label"), "box": _name(w["box"], "watch box"),
+                             "port": _port(w["port"], f"watch {w['label']} port"), "target": host,
+                             "to": int(to) if host else 0,
+                             "interface": _name(w["interface"], f"watch {w['label']} interface")
+                             if w.get("interface") else ""})
     if data.get("cert") is not None:
         from . import bridge_cert
         out["cert"] = bridge_cert.parse(data["cert"], out)
