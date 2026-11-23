@@ -430,14 +430,15 @@ def recorded(db, tid: int, carry: dict | None = None, rows: Rows | None = None) 
     return [], ""
 
 
-def landed_at(db, tid: int) -> float | None:
+def landed_at(db, tid: int, rows: Rows | None = None) -> float | None:
     """When task `tid`'s change first landed, from the push records `recorded` judges by (a push queue
     landing of it or a task carrying it on, a detached push, a recorded supersession); None while none
-    exists. A task of a kind that is not pushed (harness, work, question) lands when it is done."""
-    task = db.task(int(tid))
+    exists. A task of a kind that is not pushed (harness, work, question) lands when it is done.
+    `rows`: read once for many tasks (Rows), else read here."""
+    task = rows.tasks.get(int(tid)) if rows else db.task(int(tid))
     if not task:
         return None
-    carry = carriers(db, int(tid))
+    carry = carriers(db, int(tid), rows)
     res = load_result(task.get("result"))
     member = isinstance(res, dict) and isinstance(res.get("batch"), dict) and res["batch"].get("lead") != tid
     branches = {v[0] for v in carry.values() if v[0]} if not member else set()

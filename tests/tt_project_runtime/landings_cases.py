@@ -52,6 +52,35 @@ def test_landings_name_the_cause_of_a_gap_between_runs(env):
     assert landings.dominant(b) == "own job"
 
 
+def test_landings_name_a_late_supersession_record_after_done_not_unknown(env):
+    from ttp import landings
+    p = make(env)
+    now = time.time()
+    # Done after its one run; its change was found on the push branch under another commit only later.
+    tid = p.db.add_task("already on the branch", "s", kind="code", status="done")
+    p.db.x("UPDATE tasks SET created=?, updated=? WHERE id=?", (now - 7200, now - 6400, tid))
+    p.db.x("INSERT INTO runs(task, role, started, ended, status) VALUES(?, 'worker', ?, ?, 'ok')",
+           (tid, now - 7000, now - 6500))
+    p.db.x("INSERT INTO task_superseded(task, head, sha, ts) VALUES(?,?,?,?)", (tid, "h", "s", now - 1000))
+    b = landings.landed(p.db, now - 86400, now)[0]
+    assert b["landed"] == pytest.approx(now - 1000)
+    assert b["causes"].get("late landing record") == pytest.approx(5500)
+    assert "unknown" not in b["causes"]
+
+
+def test_landings_read_the_carrier_links_once_for_all_candidates(env, monkeypatch):
+    from ttp import landed, landings
+    p = make(env)
+    now = time.time()
+    for i in range(5):
+        _landed_code(p, now, title=f"landed change {i}")
+    calls = []
+    real = landed._links
+    monkeypatch.setattr(landed, "_links", lambda db, after: calls.append(after) or real(db, after))
+    assert len(landings.landed(p.db, now - 86400, now)) == 5
+    assert len(calls) <= 2   # the candidates' landing times and the painted tasks' carriers, not one per task
+
+
 def test_landings_open_task_shows_its_current_step_and_how_long(env):
     from ttp import landings
     p = make(env)

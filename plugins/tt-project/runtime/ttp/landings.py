@@ -3,9 +3,9 @@ board's blocking step, the daily review's slowest-landings and recurring-cause l
 
 For a task, the wall time from its creation to its landing (or to now, while it is open) is painted
 interval by interval from: its worker runs, the checks slot waits and check runs of its tasks, its
-review tasks, its push queue rows and their batches, its waiting, queue and lane events, its dependencies and its
-start gate. Where two intervals overlap the more specific one wins (PRIORITY); time nothing explains
-is `queue` before the first run and `unknown` after it.
+review tasks, its push queue rows and their batches, its waiting, queue and lane events, its dependencies, its
+start gate and a supersession recorded after it was done. Where two intervals overlap the more specific one wins
+(PRIORITY); time nothing explains is `queue` before the first run and `unknown` after it.
 """
 from __future__ import annotations
 
@@ -15,7 +15,7 @@ import time
 from pathlib import Path
 
 CAUSES = ("run", "checks run", "checks slot", "review", "push queue or batch", "busy resource", "dependency",
-          "deferral", "own job", "retry wait", "ask or user", "queue", "unknown")
+          "deferral", "own job", "retry wait", "ask or user", "late landing record", "queue", "unknown")
 # Earlier wins on overlap: a worker run outranks everything, a measured wait outranks a marker.
 PRIORITY = {c: i for i, c in enumerate(CAUSES)}
 CLOSED = ("done", "failed", "cancelled")
@@ -90,6 +90,7 @@ class Ctx:
         self.family: dict[int, list[int]] = {}   # the other tasks that carry a task's change on
         self.slots: dict[int, list[dict]] = {}
         self.checks: dict[int, list[dict]] = {}
+        self.superseded: dict[int, list[float]] = {}
         if not ids:
             return
         try:
@@ -105,6 +106,8 @@ class Ctx:
                       f"AND started IS NOT NULL ORDER BY started", every):
             self.runs.setdefault(r["task"], []).append(
                 (float(r["started"]), float(r["ended"] or now), r["status"] or ""))
+        for r in db.q(f"SELECT task, ts FROM task_superseded WHERE task IN ({emark})", every):
+            self.superseded.setdefault(r["task"], []).append(float(r["ts"]))
         kids = ",".join("?" * len(EVENTS))
         for r in db.q(f"SELECT ts, kind, text, data, task FROM events WHERE task IN ({emark}) AND kind IN ({kids}) "
                       f"AND ts>=? ORDER BY ts", (*every, *EVENTS, lo - 1)):
@@ -220,6 +223,10 @@ def intervals(ctx: Ctx, t: dict, end: float) -> list[tuple[float, float, str]]:
     for d in ctx._deps(t):
         done = ctx.done_at(d)
         out.append((created, min(done, end) if done else end, "dependency"))
+    # a done task whose change was found on the push branch under another commit only later (task_superseded)
+    done = ctx.done_at(tid)
+    out += [(done, ts, "late landing record") for m in ctx.members(t) for ts in ctx.superseded.get(m["id"], [])
+            if done and ts <= end]
     nb = _f(t.get("not_before"))
     if nb and created < nb <= first + 60:
         out.append((created, nb, "deferral"))
@@ -272,9 +279,10 @@ def landed(db, since: float, now: float | None = None, kinds=("code",)) -> list[
     cand = db.q(f"SELECT * FROM tasks WHERE kind IN ({','.join('?' * len(kinds))}) AND updated>=? ORDER BY id",
                 (*kinds, since - 30 * DAY_S))
     when = {}
+    rows = lm.Rows(db, [t["id"] for t in cand])
     for t in cand:
         try:
-            at = lm.landed_at(db, t["id"])
+            at = lm.landed_at(db, t["id"], rows)
         except Exception:
             at = None
         if at and since <= at <= now and at >= (_f(t["created"]) or 0):
