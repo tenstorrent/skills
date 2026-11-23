@@ -3649,6 +3649,12 @@ def _manifest_version(repo: Path, rev: str, path: str) -> str:
     return str(v or "")
 
 
+def version_of(text: str) -> str | None:
+    """The version (major.minor.patch) the first VERSION_RE match in `text` holds, or None."""
+    m = VERSION_RE.search(text)
+    return ".".join(m.group(2, 3, 4)) if m else None
+
+
 def pushed_version(p: Project, repo: Path, rev: str) -> str | None:
     """The version `delivery.version_bump` reads at `rev` (its first file), or None when it is not
     set, malformed or has no version there (TTP_PUSHED_VERSION is then empty)."""
@@ -3659,8 +3665,7 @@ def pushed_version(p: Project, repo: Path, rev: str) -> str | None:
     if not cfg:
         return None
     show = _git(repo, "show", f"{rev}:{cfg['files'][0]}")
-    m = VERSION_RE.search(show.stdout) if show.returncode == 0 else None
-    return ".".join(m.group(2, 3, 4)) if m else None
+    return version_of(show.stdout) if show.returncode == 0 else None
 
 
 def version_guard(d: dict) -> bool:

@@ -303,6 +303,12 @@ def _deploy(p: Project, marker: Path, m: dict, poll_s: float | None = None) -> d
 
 # Commands and worktrees ------------------------------------------------------------------------------
 
+KILL_GRACE_S = 5.0                 # how long an ended command gets after TERM, and again after KILL
+REAP_S = 10.0                      # how long a stopped command, and its output reader, are waited for
+PS_S = 10.0                        # the time limit of the `ps` that lists a check's processes (_kill_tree)
+GONE_POLL_S = 0.1                  # how often _kill_tree looks whether TERM ended a check's processes
+
+
 def _kill(proc: subprocess.Popen) -> None:
     """End `proc`'s process group: TERM, a short grace, then KILL whatever is left."""
     try:
@@ -310,7 +316,7 @@ def _kill(proc: subprocess.Popen) -> None:
     except OSError:
         pass
     try:
-        proc.wait(timeout=5)
+        proc.wait(timeout=KILL_GRACE_S)
     except subprocess.TimeoutExpired:
         pass
     try:
@@ -318,37 +324,32 @@ def _kill(proc: subprocess.Popen) -> None:
     except OSError:
         pass
     try:
-        proc.wait(timeout=5)
+        proc.wait(timeout=KILL_GRACE_S)
     except subprocess.TimeoutExpired:
         pass
 
 
-def _tree(pid: int) -> list[int]:
-    """The processes below `pid` (its children, theirs and so on), from `ps`; none where it cannot run."""
-    try:
-        out = subprocess.run(["ps", "-A", "-o", "pid=,ppid="], capture_output=True, text=True, timeout=10).stdout
-    except (OSError, subprocess.SubprocessError):
-        return []
+def _kill_tree(proc: subprocess.Popen) -> None:
+    """End `proc` and every process below it (a check run in this process's group: its pytest and
+    workers; its children, theirs and so on, from `ps`: none more where it cannot run), by pid: TERM,
+    a short grace, then KILL whatever is left."""
     kids: dict[int, list[int]] = {}
+    try:
+        out = subprocess.run(["ps", "-A", "-o", "pid=,ppid="], capture_output=True, text=True, timeout=PS_S).stdout
+    except (OSError, subprocess.SubprocessError):
+        out = ""
     for line in out.splitlines():
         try:
             c, parent = map(int, line.split())
         except ValueError:
             continue
         kids.setdefault(parent, []).append(c)
-    found, todo = [], [pid]
+    pids, todo = [proc.pid], [proc.pid]
     while todo:
         for c in kids.get(todo.pop(), []):
-            if c not in found:
-                found.append(c)
+            if c not in pids[1:]:
+                pids.append(c)
                 todo.append(c)
-    return found
-
-
-def _kill_tree(proc: subprocess.Popen) -> None:
-    """End `proc` and every process below it (a check run in this process's group: its pytest and
-    workers), by pid: TERM, a short grace, then KILL whatever is left."""
-    pids = [proc.pid, *_tree(proc.pid)]
     for sig in (signal.SIGTERM, signal.SIGKILL):
         for pid in pids:
             try:
@@ -356,12 +357,12 @@ def _kill_tree(proc: subprocess.Popen) -> None:
             except OSError:
                 pass
         try:
-            proc.wait(timeout=5)
+            proc.wait(timeout=KILL_GRACE_S)
         except subprocess.TimeoutExpired:
             pass
-        deadline = time.monotonic() + 5
+        deadline = time.monotonic() + KILL_GRACE_S
         while sig == signal.SIGTERM and time.monotonic() < deadline and any(pid_alive(x) for x in pids[1:]):
-            time.sleep(0.1)
+            time.sleep(GONE_POLL_S)
 
 
 def _here(cmd):
@@ -443,13 +444,13 @@ def _streamed(cmd, cwd: Path, env: dict | None, timeout: float | None, group: bo
     except BaseException as e:   # stopped: the command ends with it, and a change it made is still put back
         _kill(proc) if group else _kill_tree(proc) if isinstance(e, Stopped) else proc.kill()
         try:
-            proc.wait(timeout=10)
+            proc.wait(timeout=REAP_S)
         except BaseException:
             pass
         if guard is not None:
             guard.stopped(lambda line: print(line, flush=True))
         raise
-    reader.join(timeout=10)      # a child that left the group may keep the pipe open; do not wait on it
+    reader.join(timeout=REAP_S)  # a child that left the group may keep the pipe open; do not wait on it
     rc = proc.returncode
     if guard is not None:
         changed, said = guard.end()
@@ -458,12 +459,6 @@ def _streamed(cmd, cwd: Path, env: dict | None, timeout: float | None, group: bo
             print(line, flush=True)
         rc = 1 if changed and rc == 0 else rc
     return rc, "\n".join([*over, *tail]), timed_out
-
-
-def _registered(repo: Path, wt: Path) -> bool:
-    out = _git(repo, "worktree", "list", "--porcelain").stdout
-    return any(line == f"worktree {wt}" or (line.startswith("worktree ") and Path(line[9:]).resolve() == wt.resolve())
-               for line in out.splitlines())
 
 
 def _remove_worktree(repo: Path, wt: Path) -> None:
@@ -502,6 +497,11 @@ def _sweep_after_push(p: Project, repo: Path) -> None:
 
 # Conflicts that need no judgment ---------------------------------------------------------------------
 
+STAGE_BASE, STAGE_OURS, STAGE_THEIRS = 1, 2, 3   # a conflicted path's index stages (`git show :<stage>:<path>`)
+MERGE_FILE_MAX = 127               # git merge-file's exit status: its conflict count up to this; above it, an error
+GIT_MARKER = 7                     # git's own conflict marker size (merge3)
+TAG_BYTES = 8                      # random bytes in merge3's conflict marker tag
+
 def merge3(ours: str, base: str, theirs: str, py: bool = False, taken_in: bool = False,
            hunks: bool = False, kinds: set | None = None, superseded: bool = False,
            near: bool = False, imports: bool = False, cells: bool = False,
@@ -523,10 +523,10 @@ def merge3(ours: str, base: str, theirs: str, py: bool = False, taken_in: bool =
     never passes for one; a hunk whose base-to-end part holds more than one separator line is not read.
     git ends every side of a conflict at the end of the file with a newline; the result ends as the
     sides had it (the side that changed it from the base wins)."""
-    tag = secrets.token_hex(8)
+    tag = secrets.token_hex(TAG_BYTES)
     # built, not spelled out: a literal marker line would make this file read as a conflicted one
-    start, mid, end = (f"{c * 7} {side}-{tag}" for c, side in (("<", "ours"), ("|", "base"), (">", "theirs")))
-    sep = "=" * 7
+    start, mid, end = (f"{c * GIT_MARKER} {side}-{tag}" for c, side in (("<", "ours"), ("|", "base"), (">", "theirs")))
+    sep = "=" * GIT_MARKER
     with tempfile.TemporaryDirectory() as d:
         paths = []
         for name, text in (("ours", ours), ("base", base), ("theirs", theirs)):
@@ -535,7 +535,7 @@ def merge3(ours: str, base: str, theirs: str, py: bool = False, taken_in: bool =
             paths.append(str(path))
         r = subprocess.run(["git", "merge-file", "-p", "--diff3", "-L", f"ours-{tag}", "-L", f"base-{tag}",
                             "-L", f"theirs-{tag}", *paths], capture_output=True)
-    if not 0 <= r.returncode < 127:     # an error, or too many conflicts to count
+    if not 0 <= r.returncode < MERGE_FILE_MAX:     # an error, or too many conflicts to count
         return None
     out = r.stdout.decode(errors="replace")
     if r.returncode == 0:
@@ -770,12 +770,6 @@ def _comment_parts(mine: str, old: str, theirs: str) -> str | None:
     return None if both is None else lead + "; ".join(both)
 
 
-def _test_file(path: str) -> bool:
-    """Whether `path` is a test file, where a raised number is an allowance (a size cap) both raises add to."""
-    parts = path.replace("\\", "/").split("/")
-    return any(d in ("tests", "test") for d in parts[:-1]) or parts[-1].startswith("test_")
-
-
 def _edge_ok(k: int, new: list[str], e1: int, e2: int, edit: list[str], old: list[str]) -> bool:
     """Whether lines `new` inserted before old[k] have one place beside the other side's edit of
     old[e1:e2] into `edit`: not inside it, not where the other inserts too, and at its edge only when
@@ -946,18 +940,6 @@ def _py_code(texts: tuple[str, ...]) -> dict[str, str]:
     return out
 
 
-def _code(lines: list[str], no_comments: dict[str, str] | None) -> list[str]:
-    """`lines` as compared for _superseded: blank lines left out; in Python (`no_comments`, _py_code)
-    comments cut and the indent kept; elsewhere runs of spaces count as one."""
-    out = []
-    for line in lines:
-        s = line.rstrip()
-        s = no_comments.get(s, s) if no_comments is not None else " ".join(s.split())
-        if s.strip():
-            out.append(s)
-    return out
-
-
 def _indel(a: list[str], b: list[str]) -> int:
     """Lines to delete and insert to turn `a` into `b` (via their longest common subsequence)."""
     row = [0] * (len(b) + 1)
@@ -968,18 +950,25 @@ def _indel(a: list[str], b: list[str]) -> int:
     return len(a) + len(b) - 2 * row[-1]
 
 
+SUPERSEDED_MAX = 250_000           # line pairs _superseded compares at most; bigger sections are left for judgment
+REWORDED = 0.6                     # difflib ratio above which a line reads as another reworded (_reworded)
+NEAR = 0.8                         # difflib ratio above which an added line nearly repeats another (_near)
+
+
 def _superseded(mine: list[str], old: list[str], theirs: list[str], py: bool,
                 no_comments: dict[str, str] | None = None) -> bool:
     """Whether theirs already makes our side's change of the `old` lines, comments and spacing aside
-    (_code; in Python `no_comments` from _py_code): ours lies on a shortest way from old to theirs, so
+    (blank lines left out; in Python comments cut by `no_comments` from _py_code and the indent kept;
+    elsewhere runs of spaces count as one): ours lies on a shortest way from old to theirs, so
     every line ours removed theirs removed too and every line ours added theirs holds, in order. A
     local fix that upstream shipped in its own words, or a local edit of comments alone. A line ours
     removed must be gone from theirs, not reworded: not when it is close to a line theirs added that
     ours did not (_reworded; in Python the body of a def or class theirs opens is new as a whole,
     _said), and, when ours only removed lines, each must sit in a stretch theirs only deleted. Big
     sections are left for judgment."""
-    m, o, t = (_code(x, (no_comments or {}) if py else None) for x in (mine, old, theirs))
-    if (len(m) + len(o)) * (len(t) + len(o)) > 250_000:
+    cut = (lambda s: (no_comments or {}).get(s, s)) if py else (lambda s: " ".join(s.split()))
+    m, o, t = ([s for line in x if (s := cut(line.rstrip())).strip()] for x in (mine, old, theirs))
+    if (len(m) + len(o)) * (len(t) + len(o)) > SUPERSEDED_MAX:
         return False
     if _indel(o, m) + _indel(m, t) != _indel(o, t):
         return False
@@ -1001,7 +990,7 @@ def _opcodes(a: list[str], b: list[str]) -> list[tuple[str, int, int, int, int]]
 
 def _reworded(a: str, b: str) -> bool:
     """Whether line `b` reads as a rewording of line `a` (most of their text in common)."""
-    return difflib.SequenceMatcher(None, a, b, autojunk=False).ratio() > 0.6
+    return difflib.SequenceMatcher(None, a, b, autojunk=False).ratio() > REWORDED
 
 
 def _clash(mine: list[str], theirs: list[str], py: bool) -> bool:
@@ -1011,9 +1000,11 @@ def _clash(mine: list[str], theirs: list[str], py: bool) -> bool:
     was written for, while ours holds a line indented less, which ends that block before theirs."""
     if _said(mine, py) & _said(theirs, py):
         return True
+    def indent(line: str) -> int:
+        return len(line) - len(line.lstrip(" \t"))
     first = next((line for line in theirs if line.strip()), None)
-    depth = _indent(first) if first else 0
-    return depth > 0 and any(_indent(line) < depth for line in mine if line.strip())
+    depth = indent(first) if first else 0
+    return depth > 0 and any(indent(line) < depth for line in mine if line.strip())
 
 
 def _near(mine: list[str], theirs: list[str], py: bool) -> bool:
@@ -1032,13 +1023,9 @@ def _near(mine: list[str], theirs: list[str], py: bool) -> bool:
             if py and TOP_DEF.match(y):
                 continue
             sm = difflib.SequenceMatcher(None, x, y, autojunk=False)
-            if sm.real_quick_ratio() > 0.8 and sm.quick_ratio() > 0.8 and sm.ratio() > 0.8:
+            if sm.real_quick_ratio() > NEAR and sm.quick_ratio() > NEAR and sm.ratio() > NEAR:
                 return True
     return False
-
-
-def _indent(line: str) -> int:
-    return len(line) - len(line.lstrip(" \t"))
 
 
 def _said(lines: list[str], py: bool) -> set[str]:
@@ -1100,6 +1087,19 @@ def _show(wt: Path, stage: int, path: str) -> bytes | None:
     return r.stdout if r.returncode == 0 else None
 
 
+def _sides(wt: Path, path: str) -> tuple[str, str | None, str] | None:
+    """The conflicted `path`'s three sides in `wt` as text: (ours, base, theirs), base None where both
+    sides created the file. None when a side deleted it, or a side is not text (not UTF-8, or a NUL)."""
+    ours, base, theirs = _show(wt, STAGE_OURS, path), _show(wt, STAGE_BASE, path), _show(wt, STAGE_THEIRS, path)
+    if ours is None or theirs is None:
+        return None
+    try:
+        o, b, t = ours.decode(), (base or b"").decode(), theirs.decode()
+    except UnicodeDecodeError:
+        return None
+    return None if "\0" in o + b + t else (o, None if base is None else b, t)
+
+
 def settle(wt: Path, path: str, version_files: list[str], taken_in: bool = False, hunks: bool = False,
            kinds: set | None = None, superseded: bool = False, near: bool = False, imports: bool = False) -> bool:
     """Settle the conflicted `path` of a stopped rebase in `wt`, if it needs no judgment, and write
@@ -1109,27 +1109,24 @@ def settle(wt: Path, path: str, version_files: list[str], taken_in: bool = False
     top-level def or class name twice where neither side had it twice (it would silently shadow a
     test). `taken_in`, `hunks`, `superseded`, `near`, `imports` and `kinds` are merge3's; a version line taken adds "version" to
     `kinds`. With `hunks`, a Markdown file also settles table rows by cell (merge3's `cells`), and
-    a test file numbers both sides raised (merge3's `counters`, _test_file). A file both sides
+    a test file (under a tests or test folder, or named test_*) numbers both sides raised, where a raised
+    number is an allowance (a size cap) both raises add to (merge3's `counters`). A file both sides
     created is never settled."""
-    ours, base, theirs = _show(wt, 2, path), _show(wt, 1, path), _show(wt, 3, path)
-    if ours is None or theirs is None or base is None:
-        return False                    # deleted on one side, or created on both
-    try:
-        o, b, t = ours.decode(), (base or b"").decode(), theirs.decode()
-    except UnicodeDecodeError:
-        return False
-    if "\0" in o + b + t:
-        return False
+    sides = _sides(wt, path)
+    if sides is None or sides[1] is None:
+        return False                    # deleted on one side, created on both, or not text
+    o, b, t = sides
     how: set = set()
-    if path in version_files and (mv := push.VERSION_RE.search(o)):
-        v = ".".join(mv.group(2, 3, 4))
+    if path in version_files and (v := push.version_of(o)):
         vb, vt = (push.VERSION_RE.sub(lambda m: f"{m.group(1)}{v}{m.group(5)}", x, count=1) for x in (b, t))
         if (vb, vt) != (b, t):
             how.add("version")
         b, t = vb, vt
+    parts = path.replace("\\", "/").split("/")
+    test = any(d in ("tests", "test") for d in parts[:-1]) or parts[-1].startswith("test_")
     merged = merge3(o, b, t, py=path.endswith(".py"), taken_in=taken_in, hunks=hunks, kinds=how,
                     superseded=superseded, near=near, imports=imports,
-                    cells=hunks and path.lower().endswith(".md"), counters=hunks and _test_file(path))
+                    cells=hunks and path.lower().endswith(".md"), counters=hunks and test)
     if merged is None:
         return False
     if path.endswith(".py") and _duplicates(merged) - _duplicates(o) - _duplicates(t):
@@ -1166,36 +1163,20 @@ def release_excludes(cfg: dict | None) -> list[str]:
     return out + [f":(exclude,glob){d + '/' if d else ''}**/CHANGELOG.md" for d in (cfg.get("paths") or [""])]
 
 
-def _union(ours: str, base: str, theirs: str) -> str:
-    """`ours` and then each line `theirs` added to `base` that `ours` lacks: release notes are a list."""
-    have, was = set(ours.splitlines()), set(base.splitlines())
-    more = [ln for ln in theirs.splitlines() if ln not in was and ln not in have and ln.strip()]
-    if not more:
-        return ours
-    return ours + ("" if not ours or ours.endswith("\n") else "\n") + "\n".join(more) + "\n"
-
-
 def settle_release(wt: Path, path: str, cfg: dict | None, kinds: set | None = None) -> bool:
     """Settle a stopped rebase's conflict in a changeset or CHANGELOG (release_kind) of `wt`
     mechanically: True when settled. Both sides' notes are kept: a changeset both sides created
     keeps ours at `path` and theirs as a file of its own beside it (changesets stay separate files);
-    an edit on both sides merges, or takes ours plus the lines theirs added (_union). A side that
-    deleted the file is a real conflict. Adds "release" to `kinds`."""
-    if release_kind(path, cfg) not in ("changeset", "changelog"):
+    an edit on both sides merges, or takes ours plus each line theirs added to the base that ours lacks
+    (release notes are a list). A side that deleted the file is a real conflict. Adds "release" to `kinds`."""
+    if release_kind(path, cfg) not in ("changeset", "changelog") or (sides := _sides(wt, path)) is None:
         return False
-    ours, base, theirs = _show(wt, 2, path), _show(wt, 1, path), _show(wt, 3, path)
-    if ours is None or theirs is None:
-        return False
-    try:
-        o, b, t = ours.decode(), (base or b"").decode(), theirs.decode()
-    except UnicodeDecodeError:
-        return False
-    if "\0" in o + b + t:
-        return False
+    o, base, t = sides
+    b = base or ""
     if o == t:
         text = o
     elif base is None and path != cfg.get("changeset_file") and release_kind(path, cfg) == "changeset":
-        stem, n = path[:-3], 2
+        stem, n = path[:-len(".md")], 2
         while (wt / f"{stem}-{n}.md").exists() or _show(wt, 0, f"{stem}-{n}.md") is not None:
             n += 1
         durable_write(wt / f"{stem}-{n}.md", t)
@@ -1203,7 +1184,10 @@ def settle_release(wt: Path, path: str, cfg: dict | None, kinds: set | None = No
         text = o
     else:
         text = merge3(o, b, t, hunks=True) if base is not None else None
-        text = _union(o, b, t) if text is None else text
+        if text is None:
+            have, was = set(o.splitlines()), set(b.splitlines())
+            more = [ln for ln in t.splitlines() if ln not in was and ln not in have and ln.strip()]
+            text = o + ("" if not o or o.endswith("\n") else "\n") + "\n".join(more) + "\n" if more else o
     durable_write(wt / path, text)
     if kinds is not None:
         kinds.add("release")
@@ -1226,7 +1210,7 @@ def _union3(ours: str, base: str, theirs: str) -> str | None:
             (Path(d) / name).write_bytes(text.encode())
             names.append(str(Path(d) / name))
         r = subprocess.run(["git", "merge-file", "-p", "--union", *names], capture_output=True)
-    if r.returncode < 0 or r.returncode > 127:
+    if r.returncode < 0 or r.returncode > MERGE_FILE_MAX:
         return None
     try:
         return r.stdout.decode()
@@ -1245,14 +1229,10 @@ def settle_union(wt: Path, path: str, globs: list[str], kinds: set | None = None
     import fnmatch
     if not any(fnmatch.fnmatchcase(path, g) for g in globs):
         return False
-    ours, base, theirs = _show(wt, 2, path), _show(wt, 1, path), _show(wt, 3, path)
-    if ours is None or theirs is None:
+    if (sides := _sides(wt, path)) is None:
         return False
-    try:
-        o, b, t = ours.decode(), (base or b"").decode(), theirs.decode()
-    except UnicodeDecodeError:
-        return False
-    if "\0" in o + b + t or (hunks := _doc_hunks(ours, base or b"", theirs)) is None:
+    o, b, t = sides[0], sides[1] or "", sides[2]
+    if (hunks := _doc_hunks(o.encode(), b.encode(), t.encode())) is None:
         return False
     if edit := next((h for h in hunks if h["base"]), None):
         say(f"{path}: both sides change line {edit['line']} (not only add lines there); not settled")
@@ -1357,7 +1337,7 @@ def _held(repo: Path, c: str, onto: str, files: frozenset) -> bool:
                     sides.append(str(Path(d) / name))
                 r = gitmemo.run(["git", "merge-file", "-p", "--diff3", f"--marker-size={_MARK}", *sides],
                                 capture_output=True, timeout=None)
-            if r.returncode < 0 or r.returncode > 127:   # 255: an error (binary)
+            if r.returncode < 0 or r.returncode > MERGE_FILE_MAX:   # 255: an error (binary)
                 return False
             regions, gaps = _regions(r.stdout), _gaps(r.stdout, got)
             if gaps is None or len(gaps) != len(regions) or any(
@@ -1386,7 +1366,11 @@ def _carries(repo: Path, c: str, landed: str, files: frozenset, resolved: list[s
     inside a region the landing resolved: that commit is replayed, so the work lands or comes back as a
     conflict, never dropped. The files whose answer relied on a resolved region's looser rewrites go to
     `resolved`; not a file whose every added line is in the landing verbatim or inside a rewritten line
-    holding all its words (_holds): nothing can be lost there, so nobody is asked to check it."""
+    holding all its words (a rewrite that only adds; a blank line is like none): nothing can be lost
+    there, so nobody is asked to check it."""
+    def holds(a: bytes, b: bytes) -> bool:
+        wa = _words(a)
+        return bool(wa) and wa <= _words(b)
     try:
         for path in files:
             mine, got = _blob(repo, c, path), _blob(repo, landed, path)
@@ -1401,16 +1385,16 @@ def _carries(repo: Path, c: str, landed: str, files: frozenset, resolved: list[s
                     sides.append(str(Path(d) / name))
                 cmd = ["git", "merge-file", "-p", f"--marker-size={_MARK}"]
                 r = gitmemo.run([*cmd, *sides], capture_output=True, timeout=None)
-                if r.returncode < 0 or r.returncode > 127 or not _fits(r.stdout, got):   # 255: an error (binary)
+                if r.returncode < 0 or r.returncode > MERGE_FILE_MAX or not _fits(r.stdout, got):   # 255: an error (binary)
                     return False
                 if r.returncode:    # conflicts: their base side tells what c added in each region
                     r = gitmemo.run([*cmd, "--diff3", *sides], capture_output=True, timeout=None)
-                    gaps = _gaps(r.stdout, got) if 0 < r.returncode <= 127 else None
+                    gaps = _gaps(r.stdout, got) if 0 < r.returncode <= MERGE_FILE_MAX else None
                     regions = _regions(r.stdout)
                     if gaps is None or len(gaps) != len(regions) or not all(
                             _explained(*side, gap) for side, gap in zip(regions, gaps)):
                         return False
-                    if resolved is not None and not all(_explained(*side, gap, _holds)
+                    if resolved is not None and not all(_explained(*side, gap, holds)
                                                         for side, gap in zip(regions, gaps)):
                         resolved.append(path)   # a line survives only as a looser rewrite: worth a check
     except (OSError, subprocess.SubprocessError):
@@ -1418,26 +1402,37 @@ def _carries(repo: Path, c: str, landed: str, files: frozenset, resolved: list[s
     return True
 
 
-def _marked(ln: bytes, ch: bytes) -> bool:
-    """Whether `ln` is a conflict marker line of `ch` (marker size _MARK)."""
-    return ln.startswith(ch * _MARK) and ln[_MARK:_MARK + 1] in (b" ", b"\n", b"\r", b"")
+def _diff3(merged: bytes):
+    """Each line of a diff3-style `merged` (marker size _MARK) as (side, line): side -1 outside a conflict
+    region, 0, 1 or 2 for an ours, base or theirs line inside one, "<" and ">" for a region's opening and
+    closing marker. The base and theirs markers are not yielded."""
+    def marked(ln: bytes, ch: bytes) -> bool:
+        return ln.startswith(ch * _MARK) and ln[_MARK:_MARK + 1] in (b" ", b"\n", b"\r", b"")
+    at = -1
+    for ln in merged.splitlines(keepends=True):
+        if at < 0:
+            at = 0 if marked(ln, b"<") else -1
+            yield ("<" if at == 0 else -1), ln
+        elif marked(ln, b">"):
+            at = -1
+            yield ">", ln
+        elif at == 0 and marked(ln, b"|"):
+            at = 1
+        elif at < 2 and marked(ln, b"="):
+            at = 2
+        else:
+            yield at, ln
 
 
 def _regions(merged: bytes) -> list[tuple[list[bytes], list[bytes], list[bytes]]]:
     """(ours, base, theirs) lines of each conflict region of a diff3-style `merged`."""
-    out, sides, at = [], [[], [], []], -1
-    for ln in merged.splitlines(keepends=True):
-        if at < 0:
-            if _marked(ln, b"<"):
-                sides, at = [[], [], []], 0
-        elif _marked(ln, b">"):
-            out.append(tuple(sides))
-            at = -1
-        elif at == 0 and _marked(ln, b"|"):
-            at = 1
-        elif at < 2 and _marked(ln, b"="):
-            at = 2
-        else:
+    out, sides = [], ([], [], [])
+    for at, ln in _diff3(merged):
+        if at == "<":
+            sides = ([], [], [])
+        elif at == ">":
+            out.append(sides)
+        elif at != -1:
             sides[at].append(ln)
     return out
 
@@ -1453,24 +1448,16 @@ def _doc_hunks(ours: bytes, base: bytes, theirs: bytes) -> list[dict] | None:
             sides.append(str(Path(d) / name))
         r = subprocess.run(["git", "merge-file", "-p", "--diff3", f"--marker-size={_MARK}", *sides],
                            capture_output=True)
-    if not 0 <= r.returncode <= 127:
+    if not 0 <= r.returncode <= MERGE_FILE_MAX:
         return None
     out: list[dict] = []
-    line, at = 1, -1
-    for ln in r.stdout.splitlines(keepends=True):
-        if at < 0:
-            if _marked(ln, b"<"):
-                out.append({"line": line, "ours": 0, "base": 0, "theirs": 0})
-                at = 0
-            else:
-                line += 1
-        elif _marked(ln, b">"):
-            at = -1
-        elif at == 0 and _marked(ln, b"|"):
-            at = 1
-        elif at < 2 and _marked(ln, b"="):
-            at = 2
-        else:
+    line = 1
+    for at, _ln in _diff3(r.stdout):
+        if at == "<":
+            out.append({"line": line, "ours": 0, "base": 0, "theirs": 0})
+        elif at == -1:
+            line += 1
+        elif at != ">":
             out[-1][("ours", "base", "theirs")[at]] += 1
             line += at == 0
     return out
@@ -1517,12 +1504,6 @@ def _similar(a: bytes, b: bytes) -> bool:
     if not wa or not wb:
         return False
     return wa <= wb or wb <= wa or difflib.SequenceMatcher(None, a.strip(), b.strip(), autojunk=False).ratio() >= _SIMILAR
-
-
-def _holds(a: bytes, b: bytes) -> bool:
-    """Whether line `b` holds every word and mark of line `a` (a rewrite that only adds). A blank line is like none."""
-    wa = _words(a)
-    return bool(wa) and wa <= _words(b)
 
 
 def _paired(missing: list[bytes], rewrites: list[bytes], like=None) -> bool:
@@ -1892,7 +1873,9 @@ class Batch:
         """A clean checkout of `tip` in the batch's own worktree, made anew when broken or dirty."""
         _sweep_after_push(self.p, self.repo)
         wt = self.wt
-        ok = (wt / ".git").exists() and _registered(self.repo, wt) and not _rebasing(wt)
+        ok = (wt / ".git").exists() and any(
+            line == f"worktree {wt}" or (line.startswith("worktree ") and Path(line[9:]).resolve() == wt.resolve())
+            for line in _git(self.repo, "worktree", "list", "--porcelain").stdout.splitlines()) and not _rebasing(wt)
         if ok:
             ok = (_git(wt, "checkout", "-q", "--detach", "--force", tip).returncode == 0
                   and _git(wt, "clean", "-fdq").returncode == 0
@@ -2303,8 +2286,9 @@ class Batch:
         import fnmatch
         if not any(fnmatch.fnmatchcase(path, g) for g in self.mechanical):
             return None
-        ours, theirs = _show(wt, 2, path), _show(wt, 3, path)
-        hunks = _doc_hunks(ours, _show(wt, 1, path) or b"", theirs) if ours is not None and theirs is not None else None
+        ours, theirs = _show(wt, STAGE_OURS, path), _show(wt, STAGE_THEIRS, path)
+        hunks = (_doc_hunks(ours, _show(wt, STAGE_BASE, path) or b"", theirs)
+                 if ours is not None and theirs is not None else None)
         return {"file": path, "hunks": (hunks or [])[:20],
                 "commit": _git(wt, "rev-parse", "--verify", "--quiet", "REBASE_HEAD").stdout.strip(),
                 "landed": _git(wt, "rev-list", "-1", onto, "--", path).stdout.strip()}
@@ -2544,8 +2528,7 @@ class Batch:
         if not self.cfg:
             return None
         show = _git(self.repo, "show", f"{head}:{self.cfg['files'][0]}")
-        m = push.VERSION_RE.search(show.stdout) if show.returncode == 0 else None
-        return ".".join(m.group(2, 3, 4)) if m else None
+        return push.version_of(show.stdout) if show.returncode == 0 else None
 
     def _runners(self, cmds: list, env: dict) -> None:
         """Raise envfault.Fault when a check's runner is missing on this host: the batch is held,
