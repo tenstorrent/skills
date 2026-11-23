@@ -1580,7 +1580,7 @@ def test_every_route_to_the_chat_model_starts_under_the_outward_guard(name):
 @_pytest.mark.parametrize("name", sorted(_glm_route_notes()))
 def test_every_route_to_the_chat_model_gets_the_scratch_redirect_in_the_tool_hook(name, monkeypatch, tmp_path):
     """A run marked only as a chat-model run (no arm variable) hits the same write check: a report's
-    `ttp said ... > /tmp/x.json` is redirected to the run's scratch folder, never let through."""
+    `ttp said ... > /tmp/x.json` (an existing temp file) is redirected to the run's scratch folder, never let through."""
     import json
     from ttp import glmguard, hook
     _gg_tmp_taken(monkeypatch)
