@@ -2193,3 +2193,25 @@ def test_a_wait_on_a_live_detached_job_is_stale_only_once_its_log_stops_advancin
     finally:
         for h in held:
             h and h.close()
+
+
+def test_progress_probe_on_a_file_an_enabled_command_schedule_writes_is_no_stall_while_it_runs_cleanly(env):
+    """A probe that only tests a file an enabled command schedule's command writes waits on that schedule's
+    next run, which no turn brings closer: no stall. A disabled or failing schedule, or one that names
+    another file, leaves the stall."""
+    import json as _json
+    p = make(env)
+    probe = "test -e /srv/watch/src-ready"
+    cmd = 'M=/srv/watch; if git -C /srv/src rev-parse -q HEAD; then date > "$M/src-ready"; else rm -f "$M/src-ready"; fi'
+    now = time.time()
+    for i, (enabled, status, command) in enumerate([(1, "ok (0 observations)", cmd), (0, "ok (0 observations)", cmd),
+                                                    (1, "error: timed out after 30 s", cmd),
+                                                    (1, "ok (0 observations)", cmd.replace("src-ready", "src-ok"))]):
+        p.db.x("DELETE FROM schedules")
+        p.db.x("INSERT INTO schedules(name,kind,every_s,enabled,payload,last_status) VALUES('src-check','command',21600,?,?,?)",
+               (enabled, _json.dumps({"command": command}), status))
+        pr = f"{probe} || exit 1" + " " * i   # one task and one distinct probe per case
+        tid = _prog_waiting(p, f"Starts once the source is there {i}", pr)
+        cur = lambda t, tid=tid, pr=pr: pr if t["id"] == tid else None
+        got = _prog_counts(p, tid, pr, cur, [0] * 24, now - 6000, line="not yet")
+        assert any(f"probe:#{tid}" in k for k in got) == (i > 0), (i, got[-1])

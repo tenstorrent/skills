@@ -59,14 +59,21 @@ def is_probe(probe: object, cfg: dict | None = None) -> bool:
     """Whether `probe` is a user pause: plain file tests only, every one a user marker (any of `||`
     and `&&` between them), or an `||` chain with at least one user marker, optionally ending in
     `|| exit 1`."""
-    text = _TAIL.sub("", str(probe or ""), count=1)
-    parts = _OP.split(text)
-    terms = [_TERM.fullmatch(t) for t in parts[0::2]]
-    if not text.strip() or not all(terms):
+    if not (paths := tested_paths(probe)):
         return False
     rx = marker(cfg)
-    user = [bool(rx.search((m.group("p1") or m.group("p2")).strip("'\""))) for m in terms]
-    return all(user) or (any(user) and set(parts[1::2]) <= {"||"})
+    user = [bool(rx.search(p)) for p in paths]
+    return all(user) or (any(user) and set(_OP.split(_TAIL.sub("", str(probe), count=1))[1::2]) <= {"||"})
+
+
+def tested_paths(probe: object) -> list[str]:
+    """The paths `probe` tests when it is plain file tests only (any of `||` and `&&` between them),
+    optionally ending in `|| exit 1`; empty for anything else."""
+    text = _TAIL.sub("", str(probe or ""), count=1)
+    terms = [_TERM.fullmatch(t) for t in _OP.split(text)[0::2]]
+    if not text.strip() or not all(terms):
+        return []
+    return [(m.group("p1") or m.group("p2")).strip("'\"") for m in terms]
 
 
 def _top_level(text: str) -> list[str] | None:

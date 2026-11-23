@@ -292,7 +292,8 @@ BAD_RUNS = ("failed", "timeout", "stalled")
 OWN_WAIT_RE = re.compile(r"detach --check|checks --result|push --result|\bttp ci\b|ack-wait|landed:|ttp landed|"
                          r"upstream --fixed|^\s*test \"\$\(date")
 # A wait no model turn ends while it says a plain not yet (NO_TURN_RCS): a holds folder the user clears, a
-# rollout flag, a PR's state. A user marker file is userpause.user_gated. A broken probe still reports.
+# rollout flag, a PR's state, a file an enabled command schedule writes (_schedule_writes). A user marker
+# file is userpause.user_gated. A broken probe still reports.
 NO_TURN_RE = re.compile(r"(?:^|[\s/'\"])holds/|\bttp\s+rollout\s+(?:on|status)\b|"
                         r"\bgh\s+pr\s+(?:view|status)\b|\bgh\s+api\s+\S*/pulls/\d+")
 NO_TURN_RCS = (1, 75)
@@ -636,6 +637,21 @@ def _outage_hosts(probe: str, outages: dict) -> list[str]:
     return sorted(a for a in outages if a in hosts or any(r == a or r.startswith((a + "-", a + ":")) for r in res))
 
 
+def _schedule_writes(db: DB, probe: str) -> bool:
+    """Whether `probe` only tests files (userpause.tested_paths) each named in the command of an enabled
+    command schedule whose last run did not fail: that schedule's next run ends the wait, not a turn."""
+    if not (paths := userpause.tested_paths(probe)):
+        return False
+    cmds = []
+    for r in db.q("SELECT payload, last_status FROM schedules WHERE enabled=1 AND kind='command'"):
+        try:
+            if not _schedule_failed(r["last_status"]):
+                cmds.append(str(json.loads(r["payload"] or "{}").get("command") or ""))
+        except (ValueError, AttributeError):
+            continue
+    return all(any(re.search(rf"/{re.escape(os.path.basename(x))}(?![\w.-])", c) for c in cmds) for x in paths)
+
+
 def probe_stalls(db: DB, s: dict, st: dict, now: float, current_probe: Callable[[dict], str | None],
                  cfg: dict | None = None, gone: set | None = None, harness=None, root=None) -> list[dict]:
     """Probe stalls; adds to `gone` the raised keys whose count was dropped as no longer valid. `harness`:
@@ -675,8 +691,8 @@ def probe_stalls(db: DB, s: dict, st: dict, now: float, current_probe: Callable[
             if gone is not None:
                 gone.add(f"stall:probe:#{k}")
             continue
-        if rec.get("rc") in NO_TURN_RCS and NO_TURN_RE.search(rec["probe"]):
-            continue   # a holds folder, a rollout flag or a PR's state: no turn ends it, so not yet is no stall
+        if rec.get("rc") in NO_TURN_RCS and (NO_TURN_RE.search(rec["probe"]) or _schedule_writes(db, rec["probe"])):
+            continue   # a holds folder, a rollout flag, a PR's state or a schedule's file: no turn ends it, so not yet is no stall
         if _outage_hosts(rec["probe"], outages):
             rec["outage"] = True   # a machine in a known outage: its repair ends it (the ledger owns the outage)
             if gone is not None:
