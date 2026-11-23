@@ -143,7 +143,7 @@ def failed_of(rc: int | None, output: str, ids: list[str], at: str = "base") -> 
     reports fewer run (passed on exit 0, passed plus failed or errored on exit 1) than it reran (a
     name selection that missed one), proves nothing."""
     if at == "head" and rc in (0, 1):
-        s = sharedchecks.summary(output)
+        s = sharedchecks.pytest_summary(output)
         if s is None or s[1].get("passed", 0) + (sharedchecks.failed(s[1]) if rc == 1 else 0) < len(set(ids)):
             return None
     if rc == 0 or (rc == NO_TESTS and at == "base"):

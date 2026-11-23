@@ -10,7 +10,7 @@ _FAIL = "python3 -m pytest -p no:cacheprovider tests/"
 def _passed_failed(output: str) -> tuple[int, int]:
     # The passed and failed counts of pytest's summary line in `output` (push_cases uses it too).
     from ttp import sharedchecks
-    counts = sharedchecks.summary(output)[1]
+    counts = sharedchecks.pytest_summary(output)[1]
     return counts.get("passed", 0), sharedchecks.failed(counts)
 
 

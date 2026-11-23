@@ -18,11 +18,11 @@ MAX_FAILURE_LINES = 60  # failures-only output: at most this many lines
 
 # pytest (-q, -v, -ra) and unittest: the lines that say what failed and why
 _FAILED_RE = re.compile(r"^(?:FAILED|ERROR)\s+\S|^(?:FAIL|ERROR):\s+\S|^E\s{2,}\S|^\S+\.py:\d+: \w*(?:Error|Exception)\b")
-_TOTALS_RE = re.compile(r"^(?:Ran \d+ tests? in |FAILED \(|OK\b)")   # unittest's; pytest's is sharedchecks.summary
+_TOTALS_RE = re.compile(r"^(?:Ran \d+ tests? in |FAILED \(|OK\b)")   # unittest's; pytest's is sharedchecks.pytest_summary
 
 
 def _totals(line: str) -> bool:
-    return bool(_TOTALS_RE.search(line) or sharedchecks.summary(line))
+    return bool(_TOTALS_RE.search(line) or sharedchecks.pytest_summary(line))
 
 
 def _cut(line: str) -> str:

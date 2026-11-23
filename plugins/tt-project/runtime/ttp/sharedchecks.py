@@ -87,13 +87,13 @@ def failing_ids(output: str) -> tuple[list[str], bool]:
     runner's output gives ([], False)."""
     lines = _ID.findall(output or "")
     ids = sorted(set(lines))
-    s = summary(output)
+    s = pytest_summary(output)
     if not ids or not s:
         return ids, False
     return ids, failed(s[1]) == len(lines)
 
 
-def summary(output: str) -> tuple[str, dict[str, int]] | None:
+def pytest_summary(output: str) -> tuple[str, dict[str, int]] | None:
     """pytest's last summary line in `output` and its counts by label ('failed', 'errors', 'subtests
     passed'), None when it has none."""
     m = None
@@ -110,7 +110,7 @@ def failed(counts: dict[str, int]) -> int:
 def ran_clean(output: str) -> str:
     """pytest's last summary line when it ran to its end with tests passed and none failed or in error, so a
     non-zero exit came after the tests (a session hook such as a conftest guard), else ''."""
-    s = summary(output)
+    s = pytest_summary(output)
     if not s or stopped_early(output) or failed(s[1]) or not s[1].get("passed"):
         return ""
     return s[0]

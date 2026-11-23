@@ -77,18 +77,18 @@ def test_failing_ids_reads_a_summary_whose_count_labels_have_several_words():
     for counts in (many + ", 2 subtests failed", many.replace(f"{len(_IDS)} failed", f"{len(_IDS) + 1} failed")):
         assert sharedchecks.failing_ids(out(_IDS, counts)) == (sorted(_IDS), False), counts
         assert gatejudge.judgeable(1, out(_IDS, counts), {}) == [], counts
-    line, counts = sharedchecks.summary(out([], "1 failed, 2 xfailed, 3 subtests passed, 1 error, 4 warnings"))
+    line, counts = sharedchecks.pytest_summary(out([], "1 failed, 2 xfailed, 3 subtests passed, 1 error, 4 warnings"))
     assert line == "1 failed, 2 xfailed, 3 subtests passed, 1 error, 4 warnings in 12.90s"
     assert counts == {"failed": 1, "xfailed": 2, "subtests passed": 3, "error": 1, "warnings": 4}
     assert sharedchecks.failed(counts) == 2, "xfailed is no failure"
     clean = "173 passed, 2 skipped, 158 subtests passed"
     assert sharedchecks.ran_clean(out([], clean, bars=False) + "ttp-suite: wall 3.2s\n") == clean + " in 12.90s"
     assert sharedchecks.ran_clean(out([], clean + ", 1 subtests failed")) == ""
-    assert sharedchecks.summary("collected 3 items\n") is None
+    assert sharedchecks.pytest_summary("collected 3 items\n") is None
 
 
 def test_trim_and_goal_checks_read_a_summary_whose_count_labels_have_several_words():
-    # Both read pytest's summary through sharedchecks.summary: test output is told apart and its tests counted.
+    # Both read pytest's summary through sharedchecks.pytest_summary: test output is told apart and its tests counted.
     from ttp import goalchecks, trim
     line = "=" * 8 + " 1 failed, 173 passed, 2 skipped, 1 xfailed, 158 subtests passed in 12.90s (0:00:12) " + "=" * 8
     log = "\n".join(["compiling"] * 30 + ["FAILED tests/test_a.py::test_one - AssertionError: boom", line])

@@ -69,7 +69,7 @@ def test_count(output: str, regex: str | None = None) -> int | None:
         last = found[-1]
         return int(last[0] if isinstance(last, tuple) else last)
     for line in reversed(output.splitlines()):
-        pytest = sharedchecks.summary(line)
+        pytest = sharedchecks.pytest_summary(line)
         if pytest:
             return sum(n for label, n in pytest[1].items() if label in _RAN)
         if re.search(r"\bno tests ran\b", line):

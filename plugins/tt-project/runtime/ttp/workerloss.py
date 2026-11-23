@@ -76,7 +76,7 @@ def lost(output: str) -> dict | None:
     if not ended and not left:
         return None
     workers = {pid: (None if status == "None" else int(status)) for pid, status in ended.values()}
-    summary = sharedchecks.summary(output)
+    summary = sharedchecks.pytest_summary(output)
     other = None if summary is None else max(0, sharedchecks.failed(summary[1]) - len(ended) - left)
     return {"workers": workers, "tests": len(ended) + left, "other": other}
 
