@@ -975,11 +975,9 @@ def test_shipped_inventory_without_git(tmp_path):
 
 
 def test_shipped_text_has_no_trailing_whitespace_or_blank_lines_at_end():
-    """`git diff --check` from a clean base stays quiet on the plugin (captured logs aside)."""
+    """`git diff --check` from a clean base stays quiet on the plugin."""
     hits = []
     for rel, text in shipped_text_files():
-        if rel.endswith(".log"):
-            continue
         hits += [f"{rel}:{n}: trailing whitespace" for n, line in enumerate(text.split("\n"), 1)
                  if line != line.rstrip()]
         if text.endswith("\n") and not text.splitlines()[-1].strip():
