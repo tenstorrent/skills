@@ -59,8 +59,7 @@ def targets(cfg: dict, platform: str | None = None) -> list[dict]:
         for an, a in b["agents"].items():
             fw = [h for h in a["forward"] if not h["adopt"]]
             if fw and bridge.service_file(box, an, platform).is_file():
-                dests = {h["port"]: str(bridge.relay_dir(box, an) / f"{h['name']}.sock") if h["interface"]
-                         else f"{h['target']}:22" for h in fw}
+                dests = {h["port"]: h for h in fw}
                 out.append({"service": bridge.label(box, an), "box": box, "ports": list(dests), "agent": an,
                             "dests": dests})
     out += [{"service": w["label"], "box": w["box"], "ports": [w["port"]], "agent": ""} for w in cfg.get("watch", [])]
@@ -85,16 +84,14 @@ def _net_stamp(platform: str) -> float:
     return m
 
 
-def dest_answers(dest: str) -> bool:
-    """A forward's destination (host:22, or a relay socket path) accepts a connection from this computer."""
+def dest_answers(h: dict) -> bool:
+    """A forward's target answers on port 22 from this computer, by the route the relay itself takes."""
+    from . import bridge_relay
     try:
-        if dest.startswith("/"):
-            s = socket.socket(socket.AF_UNIX)
-            s.settimeout(5)
-            s.connect(dest)
+        if h["interface"]:
+            s = bridge_relay.bound_connect(h["target"], h["interface"], timeout=5)
         else:
-            host, _, port = dest.rpartition(":")
-            s = socket.create_connection((host, int(port)), timeout=5)
+            s = socket.create_connection((h["target"], 22), timeout=5)
         s.close()
         return True
     except (OSError, ValueError):
@@ -120,13 +117,13 @@ def _unit(t: dict) -> str:
 
 
 def loaded(t: dict, platform: str) -> bool:
-    """The service is meant to run: loaded in launchd, or active or restarting in systemd (`ttp bridge stop`, or a
-    hand-made service someone stopped, is left stopped)."""
+    """The service is meant to run: loaded in launchd, or active, restarting or failed (its start limit hit) in
+    systemd (`ttp bridge stop`, or a hand-made service someone stopped, is left stopped)."""
     from . import bridge, service
     if platform == "darwin":
         return service.launchd_loaded(t["service"], lambda *a: bridge._run(list(a)))
     r = bridge._run(["systemctl", "--user", "is-active", "--", _unit(t)])
-    return r.stdout.strip() in ("active", "activating", "reloading")
+    return r.stdout.strip() in ("active", "activating", "reloading", "failed")
 
 
 def restart(t: dict, platform: str) -> str:
@@ -138,6 +135,7 @@ def restart(t: dict, platform: str) -> str:
     if platform == "darwin":
         r = bridge._run(["launchctl", "kickstart", "-k", f"gui/{os.getuid()}/{t['service']}"])
     else:
+        bridge._run(["systemctl", "--user", "reset-failed", "--", _unit(t)])   # a hit start limit refuses a restart
         r = bridge._run(["systemctl", "--user", "restart", "--", _unit(t)])
     return "restarted" if r.returncode == 0 else f"restart refused: {(r.stderr or r.stdout).strip()[:160]}"
 
@@ -173,7 +171,7 @@ def run_pass(cfg: dict, platform: str | None = None, now: float | None = None) -
         down = {int(ln.split()[1]) for ln in r.stdout.splitlines() if ln.startswith("down ")}
         for t in mine:
             dead, f = [p for p in t["ports"] if p in down], fails.get(t["service"])
-            bad = [p for p in dead if dest_answers(t.get("dests", {}).get(p, ""))] if t.get("dests") else dead
+            bad = [p for p in dead if dest_answers(t["dests"][p])] if t.get("dests") else dead
             gone = [p for p in dead if p not in bad]   # the forward is up; its destination does not answer
             if gone and off.get(t["service"]) != gone:
                 out.append(f"{t['service']}: port {', '.join(map(str, gone))} on {box}: its destination does not "

@@ -48,9 +48,12 @@
   running `ttp bridge watch`. Each pass logs in once per box and checks every forwarded port end
   to end (it reads the first byte the far service sends, so a watched port must speak first, like
   sshd). A dead port on a service meant to run gets the same cleanup (only this account's sshd
-  session holding exactly that port, TERM then KILL, found even when `ss` hides its pid), then a
-  restart (`launchctl kickstart -k` / `systemctl --user restart`), paced 0, 60, 120, 300 s apart.
-  An unreachable box restarts nothing and backs off 30-300 s, rechecking at once after a wake or a
+  session holding exactly that port, TERM then KILL; a listener `ss` hides is left alone and
+  reported as an owner that cannot be identified, no other session is paused or signalled), then a
+  restart (`launchctl kickstart -k` / `systemctl --user restart`, after `reset-failed` for a unit
+  whose start limit was hit), paced 0, 60, 120, 300 s apart. A forward whose target does not
+  answer from this computer is left alone (logged once; nothing ended or restarted). An
+  unreachable box restarts nothing and is checked again within 30-60 s, at once after a wake or a
   network change. A stopped service is left alone. Hand-made ssh forward services join with a
   `"watch"` list in the local bridge config, never shipped with entries:
   `"watch": [{"label": "<launchd label or systemd unit>", "box": "<ssh alias>", "port": <box port>}]`.
