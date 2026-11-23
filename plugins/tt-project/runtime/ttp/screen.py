@@ -83,7 +83,8 @@ def screen(db: DB, cfg: dict, source: str, text: str, hint: str | None = None, j
     is recorded and counted but never wakes (see mute). `lifecycle` (RECEIPT or ERROR, from a
     receipt source) is kept on the issue with its subject; see settle_receipts. `whole` (a watcher's JSON
     line with "whole": true) keeps the line as one condition: its text is never split at '; '. `key` (a watcher JSON line's
-    "key" field) is the issue's identity instead of its text: the text may change without a new issue.
+    "key" field) is the issue's identity instead of its text: the text may change without a new issue, and a lower valid
+    `hint` lowers the open issue (ignored at info), so a watcher fixed to report info stops its reminders.
     A keyed issue a run that reported nothing closed, raised again under the same key within
     `screen.reraise_window_h` of that close at the same or a lower severity, only counts: it stays
     closed and wakes nobody (a watcher re-sending a known line each wake). A higher severity reopens and wakes.
@@ -186,6 +187,14 @@ def _issue(db: DB, fp: str, source: str, title: str, retitle: str | None, hint: 
                  ("open" if sev != "info" else "ignored", sev, now, _reopens(row, now), json.dumps(history), row["id"]))
             v = Verdict(SEVERITY_RANK.get(sev, 1) >= floor, sev, "regressed after fix", fp, row["id"], "dedupe")
             return _jev_missed(db, row, v)
+        if watch_key and 0 <= seen_at < rank:
+            # The watcher now rates a keyed condition lower (fixed to report info): the row follows it down.
+            history = json.loads(row.get("history") or "[]")
+            history.append({"ts": now, "action": "lowered", "by": "the watcher", "why": f"{row['severity']} to {hint}"})
+            row = {**row, "severity": hint, "status": "ignored" if hint == "info" else row["status"]}
+            db.x("UPDATE issues SET severity=?, status=?, history=? WHERE id=?",
+                 (hint, row["status"], json.dumps(history), row["id"]))
+            rank = seen_at
         if seen_at > rank and seen_at >= floor:
             # The watcher now rates it higher than before (a condition kept quiet that turned serious).
             db.x("UPDATE issues SET status='open', severity=?, opened=CASE WHEN status='open' THEN opened ELSE ? END, "
