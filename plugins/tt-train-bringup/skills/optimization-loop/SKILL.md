@@ -262,6 +262,14 @@ Measurement rules, all in one place:
   timing run. Check before the run and record what was running; a run taken beside a CPU reference
   is a diagnostic, not a result row, however clean its telemetry looks.
 - No forbidden fidelity, batch or run type, in any run, including clock experiments.
+- Variable-length inputs (packed multimodal sequences of a diffusion model): the step time depends
+  on which sequences the step draws. Time A and B on the same fixed list of sequences (the same
+  host-drawn order, timesteps and noise), report ms per step together with tokens per second, and
+  profile the slice at the worst-case packed length the plan budgets for, plus a typical one when
+  they differ much.
+- A change to the timestep embedding, the AdaLN modulation or their dtype re-runs the composite
+  phase's timestep sweep (PCC near the noise end as well as at mid t) before its row is accepted;
+  the loss at random timesteps rarely lands where the error is.
 
 Tracy never runs on the full model, and no full-step time is ever projected from a profile. The
 full-model number is the MFU run without the profiler; Tracy ranks items and diffs a change. It

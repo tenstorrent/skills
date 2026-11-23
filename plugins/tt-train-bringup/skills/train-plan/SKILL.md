@@ -163,6 +163,30 @@ from this the recompute policy (none, per block, per sub-module), whether the
 optimiser state can be fp32, and whether the full model fits on one chip at the target sequence
 length at all. Recompute multiplies every forward cost in the loop, so it must be fixed here.
 
+### Diffusion transformers
+
+A diffusion transformer (DiT) trained with flow matching changes several artefacts:
+
+- Loss and data: the model predicts a velocity on a noised latent, and the loss is an MSE on the
+  generated modality's rows only (no vocabulary, no LM head, no logits term in the budget). The
+  timestep, the noise and the data order are random every step; plan them as inputs drawn on the
+  host CPU in a fixed order (sequence, then timestep, then noise), so a GPU golden and the device
+  see the same numbers sequence by sequence and a checkpoint can carry the generator state.
+- Packed sequences: a sample is often a packed multimodal sequence (text, audio and video rows) whose
+  length varies from sample to sample. Budget memory at the worst-case packed length, which is the
+  sequence length of the plan, and count attention FLOPs at that length without causal halving.
+- Timesteps are per row: rows of one sequence can carry different timesteps (a conditioning
+  modality is often at t = 0), so the timestep embedding and its AdaLN modulation are per row
+  group. List them in the inventory with their dtype; they are small in FLOPs and large in
+  numerics risk at small t.
+- Freeze map: LoRA usually targets the attention q, k, v and output projections and the
+  feed-forward projections of every transformer block, matched by block name. The patch,
+  condition and timestep embeddings, and the AdaLN modulation layers that read only the timestep
+  embedding, need no gradient at all; the backward still passes through the scale and shift they
+  apply to the hidden states and through the frozen output head.
+- Fit: a multi-billion-parameter DiT in bf16 often does not fit one chip; the weights then decide
+  the layout (tensor parallel across the mesh) before the batch does.
+
 ## 5. Hardware ceiling
 
 Characterise the authorised chips on day 1, before any model code, with the plugin's scripts
