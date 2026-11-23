@@ -3357,14 +3357,14 @@ def test_wakecost_cold_resumes_cap_the_default_compaction_point_at_a_wake_usd_re
     from ttp import coordsession as cs, wakecost
     p = make(env)
     cfg = p.config()
-    cfg["waste"]["wake_usd"] = 1.5
+    cfg["waste"]["wake_usd"] = 2.4
     cold = lambda: _cstat_run(p, time.time(), 1.875, session="resume", fc=150000, write=150000)
     warm = lambda: _cstat_run(p, time.time(), 0.1625, session="resume", fc=150000, read=150000, write=1000)
     cold(), cold()
     assert "cold_cap_tokens" not in wakecost.cold_cap(cfg, p.db, p.runs, {"id": "s1"}, None, "claude")
-    cold(), cold(), warm()   # 4 of 5 cold; $1e-5 per weighted token, 1.25 per cache-write token
+    cold(), cold(), warm()   # 4 of 5 cold; $1e-5 per weighted token, a cold 1h write 2x input
     st = wakecost.cold_cap(cfg, p.db, p.runs, {"id": "s1"}, None, "claude")
-    assert st["cold_cap_tokens"] == 120000   # $1.50 / $12.50 per million cache-write tokens
+    assert st["cold_cap_tokens"] == 120000   # $2.40 / $20 per million 1h cache-write tokens (not $12.50 at 5m)
     big = _cs_state(context_tokens=130000, base_tokens=60000, cold_cap_tokens=st["cold_cap_tokens"])
     assert cs.limit(_cs_cfg(compact_growth_tokens=225000), big) == 120000
     assert cs.limit(_cs_cfg(compact_growth_tokens=225000), {**big, "cold_cap_tokens": 0}) == 285000

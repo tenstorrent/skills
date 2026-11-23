@@ -30,6 +30,7 @@ CHARS_PER_TOKEN = 4
 COLD_SHARE = 0.5         # a resumed wake whose cache writes are at least this share of its context resumed cold
 COLD_RATE = 0.5          # the share of cold resumed wakes at which the compaction point is capped
 COLD_MIN_WAKES = 3       # resumed wakes in the window needed to judge the rate
+COLD_WRITE_INPUTS = 2.0  # a cold resume writes at 1h when a next wake looks likely (cachettl._cold): 2x input
 
 
 def threshold(cfg: dict) -> float:
@@ -177,7 +178,7 @@ def cold_cap(cfg: dict, db, runs_dir, session_state: dict, current: dict | None,
         st.pop("cold_cap_tokens", None)
         return st
     from .budget import estimate_cost
-    per_mtok = estimate_cost(db, cfg, provider, model or "", {"cache_write": 1_000_000})
+    per_mtok = estimate_cost(db, cfg, provider, model or "", {"input": int(COLD_WRITE_INPUTS * 1_000_000)})
     if per_mtok <= 0:
         st.pop("cold_cap_tokens", None)
         return st
