@@ -21,6 +21,7 @@ from pathlib import Path
 
 LABEL = "ponytail_lane:"     # ponytail_lane:<added lines at queue time, empty when unknown>: the review runs the lane
 FILE = "ponytail.json"       # {"verdict": "pass"|"fail", "head": <sha>, "findings": [{"severity", "text"}], "thread": bool}
+                             # (+ "model": the one it ran on, when the subagent tool refused the pinned one)
 ENV = "TTP_PONYTAIL_LANE"    # 1: this run's hand-off needs FILE (hook.handoff_problem)
 FAILED = "the ponytail lane failed it"   # lane_problem's prefix for a valid fail verdict
 WHY = re.compile(r"(?im)^[ \t>*-]*why this size:[ \t]*\S")
@@ -158,18 +159,42 @@ def skill_file() -> str:
     return "skills/tt-ponytail-review/SKILL.md"
 
 
-def spec_line(cfg: dict, added: int | None) -> str:
-    """The review spec's lane step; with `added` over the landing limit, the size rule too."""
-    model = _review(cfg).get("ponytail_model") or "opus"
+def model(cfg: dict, provider: str | None = None) -> str:
+    """The model the lane's subagent is pinned to on `provider` (None: the core provider), or "" for the
+    strongest one its subagent tool offers: review.ponytail_model (default opus) on Claude, where that
+    provider's tiers name it or where it has none configured, else that provider's deep-tier model unless
+    it is the account default ("") or chosen at run time ("auto")."""
+    want = _review(cfg).get("ponytail_model") or "opus"
+    prov = provider or cfg.get("core_provider") or "claude"
+    tiers = (((cfg.get("providers") or {}).get(prov) or {}).get("tiers") or {})
+    named = [str((t or {}).get("model") or "") for t in tiers.values() if isinstance(t, dict)]
+    if prov == "claude" or not tiers or want in named:
+        return want
+    deep = str((tiers.get("deep") or {}).get("model") or "")
+    return "" if deep in ("", "auto") else deep
+
+
+def pinned(cfg: dict, provider: str | None = None) -> str:
+    """How a lane step names its subagent's model on `provider` (model)."""
+    name = model(cfg, provider)
+    return f"pinned to model `{name}`" if name else "on the strongest model your subagent tool offers"
+
+
+def spec_line(cfg: dict, added: int | None, provider: str | None = None) -> str:
+    """The review spec's lane step for a review run on `provider` (None: the core provider); with `added`
+    over the landing limit, the size rule too."""
+    pin = pinned(cfg, provider)
     line = (f"Ponytail lane (review.ponytail_lane): beside correctness, run a separate ponytail review. Start one "
-            f"fresh-context subagent pinned to model `{model}`, given only the change's spec and its diff, and "
+            f"fresh-context subagent {pin}, given only the change's spec and its diff, and "
             f"have it read skill `tt-ponytail-review` at `{skill_file()}` and apply it. It fails the change on any "
             f"`block` finding (code that should not exist, a copied or vendored tree unless the spec has a line "
             f"`vendored: <user msg>`); a `note` (a small leftover that can wait) does not. Write its "
             f"verdict unedited to `$TTP_RUN_DIR/{FILE}` as {{\"verdict\": \"pass\" or \"fail\", \"head\": "
             f"\"<full sha reviewed>\", \"findings\": [{{\"severity\": \"block\" or \"note\", \"text\": "
             f"\"...\"}}], \"thread\": true}} before any `ttp push` or push list; "
-            f"with no subagent tool, run the lane yourself last and set \"thread\": false. A fail fails this "
+            f"if the tool refuses that model, start it on the strongest model the tool offers and add "
+            f"\"model\": \"<the model it ran on>\"; only with no subagent tool at all, run the lane yourself last and "
+            f"set \"thread\": false. A fail fails this "
             f"review (its findings become the fix follow-ups); landing, the push queue and a draft PR's next "
             f"step need both verdicts to pass.")
     if added is not None and (cap := limit(cfg)) and added > cap:

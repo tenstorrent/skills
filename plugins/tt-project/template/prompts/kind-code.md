@@ -35,7 +35,8 @@
   unbounded wait or I/O in a db transaction. Hand off
   a `self_check` line (also in `on_pass`): what you ticked and tried.
 - Before the hand-off, run the review's ponytail lane on your own final diff: one fresh-context
-  subagent pinned to model `opus`, given only your spec and `git diff <base>..HEAD`, that reads skill
+  subagent {ponytail_pin} (if the tool refuses it, the strongest model the tool offers), given only your
+  spec and `git diff <base>..HEAD`, that reads skill
   `tt-ponytail-review` at `{ponytail_skill}` and applies it, searching the repository (`git grep`) for
   an existing function that already decides each rule or helper the diff adds. Fix every `block` finding
   (most often such a helper or rule: reuse or refactor it), commit, and say in `self_check` what it found.

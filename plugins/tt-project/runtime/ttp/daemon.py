@@ -13347,7 +13347,7 @@ class Daemon:
                 else:
                     task = self._fresh_feed(task)
                     prompt, lost = worker_task(self.p, task, cwd, branch, wake=note.get("wake"),
-                                               conflict=note.get(conflictfix.KEY)), None
+                                               conflict=note.get(conflictfix.KEY), provider=run_prov), None
                 prompt += startcheck.prompt_lines(found)   # a resumed session is told too
                 prompt += probewake.prompt_lines(woke_probe, lambda ts: timefmt.long(ts, self.p))
                 on_arm = bool(routed and routed.get(codearm.KEY) and run_prov == routed["to"])
@@ -20519,7 +20519,7 @@ class Daemon:
             if not ponytail.WHY.search(text) and (why := ponytail.size_problem(cfg, added, text, None)):
                 self._size_refused(task, full, why)
                 return None
-            lines.append(ponytail.spec_line(cfg, added))
+            lines.append(ponytail.spec_line(cfg, added, pin_of(task).get("provider")))
             lane = ponytail.label(added)
         fups = load_result(task.get("result")).get("followups")
         fups = [coord.clip(f["title"], 120) for f in fups if isinstance(f, dict) and f.get("title")] \
@@ -21593,7 +21593,7 @@ class Daemon:
                 if ponytail.on(cfg) and ponytail.labelled(task) is None:
                     labels = json.loads(task.get("labels") or "[]")
                     self.p.db.update_task(task["id"], labels=[*labels, ponytail.label(added)])
-                return f"{head[:12]}: {why}. {ponytail.spec_line(cfg, added)}"
+                return f"{head[:12]}: {why}. {ponytail.spec_line(cfg, added, task.get('provider'))}"
         return ""
 
     def _branch_tip(self, branch: str) -> tuple[str, str]:

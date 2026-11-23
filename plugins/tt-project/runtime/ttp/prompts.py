@@ -15,7 +15,7 @@ from . import chaincap, conflictfix, ctxblock, overlap, relay, replymsg, setting
 from . import knownpaths, preempt, sidefx, spans, specfold, streamguard
 from .db import continues_id, load_result
 from .hook import unread_update
-from .ponytail import skill_file
+from .ponytail import pinned, skill_file
 from .project import rebase_replace
 from .project import (CORRECTIONS_HEADER, OWN_FLAG, WORKER_MEMORY_CHARS, WORKER_PINNED_MIN_CHARS, WORKER_RANKED_MIN_CHARS,
                       Project, code_tasks_may_push, own_push, push_allowed, push_queue_on, task_may_self_land, worker_memory,
@@ -864,11 +864,13 @@ def restart_block(p: Project, prev: dict) -> str:
 
 
 def worker_task(p: Project, task: dict, cwd: str, branch: str | None, wake: dict | None = None,
-                conflict: dict | None = None) -> str:
+                conflict: dict | None = None, provider: str | None = None) -> str:
     """The per-task part of a worker's prompt, after worker_system(): the rules for its kind, the
     task itself, and a pointer back at the restrictions at the end. `wake` (the daemon's run note) marks a run
     that wakes a waiting task, at a tier that may be below the task's own. `conflict` (the run
-    note's conflict_fix) marks a push-conflict fix: a light one gets conflict_fix_task's short prompt."""
+    note's conflict_fix) marks a push-conflict fix: a light one gets conflict_fix_task's short prompt.
+    `provider` (the one this run starts on; None: the task's pin, else the core provider) picks the
+    model a code worker's ponytail lane names."""
     cfg = p.config()
     kind = task["kind"] or "work"
     history = ""
@@ -984,7 +986,8 @@ def worker_task(p: Project, task: dict, cwd: str, branch: str | None, wake: dict
     parts = [
         restart_block(p, prev),
         streamguard.prompt_block(prev),
-        _sections(_raw(p, f"kind-{kind}.md"), cfg).replace("{ponytail_skill}", skill_file()),
+        _sections(_raw(p, f"kind-{kind}.md"), cfg).replace("{ponytail_skill}", skill_file())
+        .replace("{ponytail_pin}", pinned(cfg, provider or task.get("provider"))),
         worker_memory_block(p),
         worker_rules(p, task),
         f"# YOUR TASK #{task['id']}: {task['title']}\n"

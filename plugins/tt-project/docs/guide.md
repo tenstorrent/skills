@@ -457,7 +457,10 @@ coordinator with that evidence.
   keeps its wording through template upgrades without merge conflicts.
 - Ponytail lane (`review.ponytail_lane`, on by default): a daemon-queued code review also runs a
   separate ponytail review (skill `tt-ponytail-review`) in a fresh-context subagent on
-  `review.ponytail_model` (default `opus`), and writes its verdict to `ponytail.json` in the run dir.
+  `review.ponytail_model` (default `opus`) where the review's provider can start it (Claude, or a provider
+  whose tiers name it), else on that provider's deep-tier model, or the strongest model its subagent tool
+  offers when that tier uses the account default or `auto`. A subagent tool that refuses the named model
+  gets its strongest one, recorded as `model` in the verdict, which goes to `ponytail.json` in the run dir.
   The review counts as passed only when both verdicts pass. Each finding carries a `severity`: a `block`
   finding (code that should not exist, a copied or vendored tree unless the spec has a `vendored: <user msg>`
   line, the size rule) or one with no severity fails it; `note` findings (small leftovers that can wait)

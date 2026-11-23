@@ -364,6 +364,45 @@ def test_the_lane_text_names_the_skill_file_to_read():
     assert m.group(1).endswith("tt-ponytail-review/SKILL.md") and Path(m.group(1)).is_file(), line
 
 
+def test_the_lane_pins_a_model_the_reviews_provider_can_start_and_falls_back_on_a_refused_one():
+    """A Claude review keeps review.ponytail_model (opus); a Codex-only project's review names no Claude
+    model its subagent tool would refuse (the Codex tiers use the account default), and a provider whose
+    deep tier names a model gets that one. Every line says what to do when the tool refuses the named
+    model, so the lane still runs and records the model it ran on."""
+    import copy
+    from ttp import ponytail
+    from ttp.project import DEFAULT_CONFIG
+    cfg = copy.deepcopy(DEFAULT_CONFIG)
+    assert ponytail.model(cfg) == "opus" and "pinned to model `opus`" in ponytail.spec_line(cfg, None)
+    codex = {**cfg, "core_provider": "codex", "providers_allowed": ["codex"]}
+    for line in (ponytail.spec_line(codex, None), ponytail.spec_line(cfg, None, "codex"),
+                 ponytail.spec_line(cfg, None, "cursor")):
+        assert "opus" not in line and "on the strongest model your subagent tool offers" in line, line
+    named = copy.deepcopy(codex)
+    named["providers"]["codex"]["tiers"]["deep"]["model"] = "codex-deep"
+    assert "pinned to model `codex-deep`" in ponytail.spec_line(named, None)
+    named["review"]["ponytail_model"] = "codex-deep"
+    named["providers"]["codex"]["tiers"]["deep"]["model"] = "codex-big"
+    named["providers"]["codex"]["tiers"]["light"]["model"] = "codex-deep"
+    assert ponytail.model(named) == "codex-deep"
+    for line in (ponytail.spec_line(cfg, None), ponytail.spec_line(codex, None)):
+        assert "if the tool refuses that model, start it on the strongest model the tool offers" in line, line
+        assert '"model": "<the model it ran on>"' in line and "only with no subagent tool at all" in line, line
+
+
+def test_a_code_workers_own_lane_names_the_model_of_the_provider_it_runs_on(env):
+    """The code worker's own lane step names opus on Claude and no Claude model on Codex, with the
+    refused-model fallback either way."""
+    from ttp import prompts
+    p = make(env)
+    tid = p.db.add_task("fix", "a spec", kind="code", tier="standard", priority=3, budget_usd=8.0, labels=[])
+    claude = " ".join(prompts.worker_task(p, p.db.task(tid), str(p.root), None).split())
+    codex = " ".join(prompts.worker_task(p, p.db.task(tid), str(p.root), None, provider="codex").split())
+    assert "subagent pinned to model `opus` (if the tool refuses it, the strongest model the tool offers)" in claude
+    assert "subagent on the strongest model your subagent tool offers" in codex and "`opus`" not in codex
+    assert "{ponytail_pin}" not in claude + codex
+
+
 def test_a_code_tasks_own_ponytail_lane_names_the_skill_file_and_a_repository_search(env):
     """A code worker's own lane step names the ponytail review skill's file, as a review's does, and
     has the subagent search the repository for an existing function that already decides each rule
