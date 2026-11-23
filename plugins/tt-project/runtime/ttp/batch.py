@@ -2574,7 +2574,7 @@ class Batch:
         """Check `head` in the worktree: None when it passes, else (command, output tail). The stale
         version guard (push.stale_versions, with `delivery.plugin_version_guard` on) comes first and
         runs no command. A check none of whose failing tests is new on `head` passes (_judged)."""
-        todo, env, verdict = self._plan(head, checks)
+        todo, env, verdict = Batch._plan(self, head, checks)   # by the class: _check also runs on stand-ins for a Batch
         if not todo:
             return verdict
         tree = pushpass.tree_of(self.wt, head)
@@ -2712,10 +2712,10 @@ class Batch:
     def _resume(self, cmd, tree: str, eid: str, env: dict, slow: Path | None) -> tuple[Path | None, dict]:
         """(the resume file of `cmd` on `tree`, or None; the env it adds): a resumable local check runs
         only the test files an earlier run on the tree did not pass, and notes its slow tests in `slow`."""
-        resume = (pushpass.resume_file(self.p, tree, str(cmd), eid)
-                  if tree and pushpass.resumable(cmd) and not push.remote_host(cmd) else None)
+        local = pushpass.resumable(cmd) and not push.remote_host(cmd)
+        resume = pushpass.resume_file(self.p, tree, str(cmd), eid) if tree and local else None
         extra = pushpass.resume_env(resume, env) if resume else {}
-        if slow and pushpass.resumable(cmd) and not push.remote_host(cmd):
+        if slow and local:
             extra |= slowtests.env(slow, {**env, **extra})
         if done := pushpass.resumed(resume) if resume else []:
             say(f"resuming {cmd}: {len(done)} test file(s) passed in an earlier run on tree {tree[:10]}; running the rest")
@@ -2726,15 +2726,20 @@ class Batch:
     def _run_own(self, cmd, head: str, tree: str, env: dict, extra: dict, own, slot, claims: list):
         """Run `cmd` on its host under the slot `own` gives it; a spilled check whose host fails it is
         moved on (_respill) to the next spill host, else here. Returns (the check as run, rc, tail, slot).
-        A fault of the check host, not `head`, raises envfault.Fault: push_phase holds the batch."""
-        slot = own(cmd, slot)
-        rc, tail = self._run_check(cmd, {**env, **extra, **slot.env()}, env)
-        while getattr(cmd, "spilled", False) and (fault := push.remote_fault(cmd, rc, self.wt)):
-            cmd = self._respill(cmd, head, fault, claims)   # the next spill host, else here
+        A fault of the check host, not `head`, raises envfault.Fault: push_phase holds the batch. A
+        raise closes the slot it took (the caller's finally closes only the one it handed in)."""
+        try:
             slot = own(cmd, slot)
-            rc, tail = self._run_check(cmd, {**env, **slot.env()}, env)
-        if fault := push.remote_fault(cmd, rc, self.wt, str(tail or "")):
-            raise envfault.Fault(fault)
+            rc, tail = self._run_check(cmd, {**env, **extra, **slot.env()}, env)
+            while getattr(cmd, "spilled", False) and (fault := push.remote_fault(cmd, rc, self.wt)):
+                cmd = self._respill(cmd, head, fault, claims)   # the next spill host, else here
+                slot = own(cmd, slot)
+                rc, tail = self._run_check(cmd, {**env, **slot.env()}, env)
+            if fault := push.remote_fault(cmd, rc, self.wt, str(tail or "")):
+                raise envfault.Fault(fault)
+        except BaseException:
+            slot.close()
+            raise
         if rc != 0 and tree:
             self.failed_runs[(tree, str(cmd))] = (rc, tail)
         return cmd, rc, tail, slot
@@ -3291,10 +3296,8 @@ class Batch:
                 return 0, None, fails[1]
             if self._research(tip, before, tf, "its failing tests rerun on it"):
                 return self._judge(tip, carried, heads, checks)
-            self.message = f"the tip of {self.target} fails its checks on its own: {tf[0]} (its failing tests rerun on it)"
-            say(self.message)
-            self.detail_tip = {"cmd": tf[0], "tail": tf[1]}
-            return 0, None, None
+            return self._tip_fails(f"the tip of {self.target} fails its checks on its own: {tf[0]} "
+                                   "(its failing tests rerun on it)", tf[0], tf[1])
         if self._yield_now():
             return 0, None, None
         say(f"checking the tip {tip[:10]} alone")
@@ -3302,10 +3305,7 @@ class Batch:
         if self._research(tip, before, tf, "checked alone"):
             return self._judge(tip, carried, heads, checks)
         if tf is not None:
-            self.message = f"the tip of {self.target} fails its checks on its own: {tf[0]}"
-            say(self.message)
-            self.detail_tip = {"cmd": tf[0], "tail": tf[1]}
-            return 0, None, None
+            return self._tip_fails(f"the tip of {self.target} fails its checks on its own: {tf[0]}", tf[0], tf[1])
         self.tip_passed = True
         return 0, None, fails[1]
 
@@ -3700,11 +3700,15 @@ class Batch:
 
     def _tip_red(self, tip: str, known: dict) -> tuple[int, None, None]:
         """tip_failed for a tip known to fail on its own, without checking it alone again."""
-        self.message = (f"the tip of {self.target} fails its checks on its own (known from earlier batches, "
-                        f"not checked alone again), and no entry here fixes it")
-        say(self.message)
-        self.detail_tip = {"cmd": known.get("cmd") or "the push checks",
-                           "tail": f"{tip[:10]} failed its checks on its own in earlier batches"}
+        return self._tip_fails(f"the tip of {self.target} fails its checks on its own (known from earlier batches, "
+                        f"not checked alone again), and no entry here fixes it", known.get("cmd") or "the push checks",
+                        f"{tip[:10]} failed its checks on its own in earlier batches")
+
+    def _tip_fails(self, message: str, cmd: str, tail: str) -> tuple[int, None, None]:
+        """tip_failed: the tip of the target fails its checks on its own (`cmd`, its output `tail`)."""
+        self.message = message
+        say(message)
+        self.detail_tip = {"cmd": cmd, "tail": tail}
         return 0, None, None
 
 

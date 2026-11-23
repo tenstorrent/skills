@@ -3865,9 +3865,8 @@ def next_version(repo: Path, tip: str, files: list[str]) -> str | None:
     at_tip = []
     for f in files:
         show = _git(repo, "show", f"{tip}:{f}")
-        m = VERSION_RE.search(show.stdout) if show.returncode == 0 else None
-        if m:
-            at_tip.append(tuple(int(x) for x in m.group(2, 3, 4)))
+        if v := version_of(show.stdout) if show.returncode == 0 else None:
+            at_tip.append(tuple(int(x) for x in v.split(".")))
     if not at_tip:
         return None
     major, minor, patch = max(at_tip)
