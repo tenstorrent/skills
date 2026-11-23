@@ -1,0 +1,39 @@
+#!/usr/bin/env bash
+# Check a host before a Claude bring-up run. Prints each check; exits 1 if any required one fails.
+#   preflight.sh --hf-model org/name --tt-metal /path/to/tt-metal [--mesh 1x4]
+set -uo pipefail
+HF_MODEL= TT= MESH=1x4
+while [ $# -gt 0 ]; do case $1 in
+  --hf-model) HF_MODEL=$2;; --tt-metal) TT=$2;; --mesh) MESH=$2;; *) echo "unknown option $1" >&2; exit 2;; esac; shift 2; done
+[ -n "$HF_MODEL" ] && [ -n "$TT" ] || { echo "need --hf-model and --tt-metal" >&2; exit 2; }
+FAIL=0
+ok()   { echo "ok    $*"; }
+bad()  { echo "FAIL  $*"; FAIL=1; }
+info() { echo "info  $*"; }
+PY="$TT/python_env/bin/python"
+
+[ -d "$TT/build/lib" ] && [ -x "$PY" ] && ok "tt-metal built with python_env ($(git -C "$TT" rev-parse --short HEAD))" \
+  || bad "tt-metal not built: run ./build_metal.sh and ./create_venv.sh in $TT"
+"$PY" - "$HF_MODEL" 2>/dev/null <<'P' && ok "weights for $HF_MODEL in the HF cache" || bad "weights for $HF_MODEL not in the HF cache (HF_HOME=${HF_HOME:-default})"
+import sys
+from huggingface_hub import snapshot_download
+snapshot_download(sys.argv[1], local_files_only=True)
+P
+"$PY" - 2>/dev/null <<'P' && ok "HF token can read the gated GPQA dataset" || bad "no access to Idavidrein/gpqa: log in with an account that accepted its terms (with a custom HF_HOME, set HF_TOKEN_PATH to the token file)"
+from huggingface_hub import hf_hub_download
+hf_hub_download("Idavidrein/gpqa", "gpqa_diamond.csv", repo_type="dataset")
+P
+docker info >/dev/null 2>&1 && ok "docker works (needed for SWE task containers)" || bad "docker not usable by $(whoami)"
+info "disk free under $TT: $(df -h --output=avail "$TT" | tail -1 | tr -d ' ')"
+info "RAM available: $(free -g | awk '/Mem:/{print $7}') GB"
+for m in $(awk '$3 ~ /^nfs/ {print $2}' /etc/fstab); do
+  mountpoint -q "$m" && ok "mount $m" || bad "fstab mount $m is not mounted"; done
+command -v tt-smi >/dev/null && info "firmware: $(tt-smi -s --snapshot_no_tty 2>/dev/null | grep -o '"fw_bundle_version": "[^"]*"' | sort -u | tr '\n' ' ')"
+R=${MESH%x*}; C=${MESH#*x}
+(cd "$TT" && timeout 300 "$PY" -c "
+import ttnn, torch
+m = ttnn.open_mesh_device(ttnn.MeshShape($R, $C))
+t = ttnn.from_torch(torch.ones(32, 32), device=m, layout=ttnn.TILE_LAYOUT, mesh_mapper=ttnn.ReplicateTensorToMesh(m))
+assert float(ttnn.to_torch(ttnn.get_device_tensors(t)[0]).sum()) == 1024
+ttnn.close_mesh_device(m)" >/dev/null 2>&1) && ok "$MESH mesh opens" || bad "$MESH mesh does not open (check tt-smi, links, a cold power cycle)"
+exit $FAIL
