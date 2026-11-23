@@ -159,7 +159,7 @@ def skill_file() -> str:
     return "skills/tt-ponytail-review/SKILL.md"
 
 
-def model(cfg: dict, provider: str | None = None) -> str:
+def lane_model(cfg: dict, provider: str | None = None) -> str:
     """The model the lane's subagent is pinned to on `provider` (None: the core provider), or "" for the
     strongest one its subagent tool offers: review.ponytail_model (default opus) on Claude, where that
     provider's tiers name it or where it has none configured, else that provider's deep-tier model unless
@@ -175,8 +175,8 @@ def model(cfg: dict, provider: str | None = None) -> str:
 
 
 def pinned(cfg: dict, provider: str | None = None) -> str:
-    """How a lane step names its subagent's model on `provider` (model)."""
-    name = model(cfg, provider)
+    """How a lane step names its subagent's model on `provider` (lane_model)."""
+    name = lane_model(cfg, provider)
     return f"pinned to model `{name}`" if name else "on the strongest model your subagent tool offers"
 
 

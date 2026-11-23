@@ -373,7 +373,7 @@ def test_the_lane_pins_a_model_the_reviews_provider_can_start_and_falls_back_on_
     from ttp import ponytail
     from ttp.project import DEFAULT_CONFIG
     cfg = copy.deepcopy(DEFAULT_CONFIG)
-    assert ponytail.model(cfg) == "opus" and "pinned to model `opus`" in ponytail.spec_line(cfg, None)
+    assert ponytail.lane_model(cfg) == "opus" and "pinned to model `opus`" in ponytail.spec_line(cfg, None)
     codex = {**cfg, "core_provider": "codex", "providers_allowed": ["codex"]}
     for line in (ponytail.spec_line(codex, None), ponytail.spec_line(cfg, None, "codex"),
                  ponytail.spec_line(cfg, None, "cursor")):
@@ -384,7 +384,7 @@ def test_the_lane_pins_a_model_the_reviews_provider_can_start_and_falls_back_on_
     named["review"]["ponytail_model"] = "codex-deep"
     named["providers"]["codex"]["tiers"]["deep"]["model"] = "codex-big"
     named["providers"]["codex"]["tiers"]["light"]["model"] = "codex-deep"
-    assert ponytail.model(named) == "codex-deep"
+    assert ponytail.lane_model(named) == "codex-deep"
     for line in (ponytail.spec_line(cfg, None), ponytail.spec_line(codex, None)):
         assert "if the tool refuses that model, start it on the strongest model the tool offers" in line, line
         assert '"model": "<the model it ran on>"' in line and "only with no subagent tool at all" in line, line

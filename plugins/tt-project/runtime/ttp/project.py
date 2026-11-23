@@ -475,7 +475,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
                "carried_hold_max_h": 24, "auto_fix_rounds": 1, "hop_max": 2,
                "fork_target": 0.9,   # hourly.py: the share of worker and review runs started from a fork or resume
                # ponytail.py: a code change's review also runs the ponytail lane on ponytail_model (where its
-               # provider can start it, else that provider's own strongest model: ponytail.model); a change
+               # provider can start it, else that provider's own strongest model: ponytail.lane_model); a change
                # adding more lines than ponytail_land_lines (landing) or ponytail_pr_lines (a draft PR, the
                # stricter: other teams' repos) needs a `why this size:` line and a passed lane (0: off).
                # Defaults from this repo's landed commits (n=5643 at 0.2.1379, added lines per commit:
