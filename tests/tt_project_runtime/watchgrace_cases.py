@@ -64,7 +64,6 @@ def test_watchgrace_a_check_failing_past_its_grace_raises_one_normal_line_then_q
         clock["t"] += 10 * 60
         assert run() == "ok (1 observations)"   # never an error run
     assert len(_raised(p)) == 1, _raised(p)   # the repeats wake nobody inside the rewake window
-    assert p.db.kv("watch_grace:rt")["relay-route"]["raised"] == "normal"
     p.db.x("INSERT INTO schedules(name, kind, every_s, enabled, payload) VALUES(?,?,?,?,?)",
            ("rt", "command", 600, 1, json.dumps({"command": "x", "grace_min": 10})))
     assert "relay-route: down for 41 min (past its 10 min grace)" in _cli_out(cli, p, "rt")
@@ -86,11 +85,10 @@ def test_watchgrace_step_forget_and_status():
     assert wg.step(st, "k", 0, 0, "high") == (wg.PASS, "high")
     assert wg.step(st, "k", 100, 600, "high") == (wg.HOLD, None)
     assert wg.status(st, 600, now=400) == ["k: retrying for 5 min (5 min of grace left)"]
-    assert wg.step(st, "k", 700, 600, "high") == (wg.RAISE, "high")   # its own rating, at least normal
-    assert wg.step(st, "k", 800, 600, "high") == (wg.REPEAT, "high")
-    assert wg.step(st, "k", 900, 600, "critical") == (wg.RAISE, "critical")   # a real escalation
-    assert wg.step(st, "k", 950, 600, "normal") == (wg.REPEAT, "normal")   # rated lower: its issue follows down
-    assert wg.step(st, "k", 960, 600, "low") == (wg.REPEAT, "normal")   # never under normal
+    assert wg.step(st, "k", 700, 600, "high") == (wg.PASS, "high")   # its own rating, at least normal
+    assert wg.step(st, "k", 800, 600, "normal") == (wg.PASS, "normal")
+    assert wg.step(st, "k", 900, 600, "low") == (wg.PASS, "normal")   # never under normal
+    assert wg.step({"k": {"first": 0, "raised": "high"}}, "k", 700, 600, "normal") == (wg.PASS, "normal")   # old state loads
     assert wg.status(st, 600, "other") == ["other: ok"]
     assert wg.forget(st, set()) == {} and wg.forget(st, {"k"}) == st
 

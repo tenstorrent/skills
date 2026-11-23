@@ -87,8 +87,8 @@ def test_a_lowered_keyed_issue_cleared_and_back_after_the_reraise_window_wakes(e
     see, p, scr = _hint_rig(env, monkeypatch)
     assert see(0, "normal", rewake_after_s=None).wake
     assert not see(1, "info", rewake_after_s=None).wake
-    scr.close_watcher_issues(p.db, "watcher:hw", why=scr.CLEAN_RUN_WHY, now=scr.time.time())
-    # Back at its old severity past the reraise window (default 6 h): a recurrence, not a flap.
+    # A clean run leaves the ignored row as it is: back at its old severity past the reraise window
+    # (default 6 h) is a recurrence, not a flap.
     v = see(1 + scr.RERAISE_WINDOW_H + 1, "normal", rewake_after_s=None)
     assert v.wake and v.reason == "now normal"
     assert p.db.one("SELECT severity, status FROM issues") == {"severity": "normal", "status": "open"}

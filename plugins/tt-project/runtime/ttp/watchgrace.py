@@ -4,11 +4,9 @@ A check of a route that heals on its own (a tunnel, a relay, a flaky link) would
 coordinator, page another project or open an issue on a short blip that is gone by the next run.
 With `grace_min` set, a keyed line (one with a JSON `"key"`) at `normal` or above (or with no
 severity) is held until that key has been reported for that long: before then nothing is observed,
-paged or counted. The first run past the grace raises it once, at the line's own severity but at
-least `normal`; later runs report it the same way (its own rating, at least `normal`) under the same
-key, so its open issue stays up and reminds by its rewake rule (a line rated above what was raised
-raises again: a real escalation). Keyed `low` and `info` lines (a routine "in sync")
-are never held or raised: they pass through as rated (holds).
+paged or counted. Every run past the grace reports it at the line's own severity but at least
+`normal`; the screen decides what that wakes (its open issue reminds by its rewake rule). Keyed `low`
+and `info` lines (a routine "in sync") are never held: they pass through as rated (holds).
 
 Error lines (`"error": true` or `"side"`: the check could not run) share one clock, ERROR_KEY: inside
 the grace they are a retry, held like a keyed line, so the run is not a failed run and the schedule's
@@ -26,8 +24,8 @@ from __future__ import annotations
 
 import time
 
-KV = "watch_grace:"   # + schedule name: {"<key>": {"first": ts, "last": ts, "raised": severity|None}}
-HOLD, RAISE, REPEAT, PASS = "hold", "raise", "repeat", "pass"
+KV = "watch_grace:"   # + schedule name: {"<key>": {"first": ts, "last": ts}}
+HOLD, PASS = "hold", "pass"
 _RANK = {"info": 0, "low": 0, "normal": 1, "high": 2, "critical": 3}
 ERROR_KEY = "(check could not run)"   # the one clock of a schedule's error lines
 
@@ -47,9 +45,8 @@ def grace_s(payload: dict | None) -> float:
 
 
 def step(state: dict, key: str, now: float, grace: float, severity: str | None) -> tuple[str, str | None]:
-    """One sighting of `key`: (HOLD, None) while inside the grace, (RAISE, severity) the first time
-    past it or on a higher rating, (REPEAT, its rating but at least normal)
-    after. Updates `state` in place."""
+    """One sighting of `key`: (HOLD, None) while inside the grace, (PASS, its rating but at least
+    normal) past it. Updates `state` in place."""
     if grace <= 0:
         return PASS, severity
     e = state.get(key)
@@ -58,12 +55,7 @@ def step(state: dict, key: str, now: float, grace: float, severity: str | None) 
     e["last"] = now
     if now - float(e["first"]) < grace:
         return HOLD, None
-    sev = severity if _RANK.get(severity or "", -1) > _RANK["normal"] else "normal"
-    raised = e.get("raised")
-    if raised is None or _RANK.get(sev, 1) > _RANK.get(raised, 1):
-        e["raised"] = sev
-        return RAISE, sev
-    return REPEAT, sev
+    return PASS, severity if _RANK.get(severity or "", -1) > _RANK["normal"] else "normal"
 
 
 def forget(state: dict, seen: set[str]) -> dict:
@@ -72,7 +64,7 @@ def forget(state: dict, seen: set[str]) -> dict:
 
 
 def status(state: dict, grace: float, key: str | None = None, now: float | None = None) -> list[str]:
-    """One line per key: `ok`, `retrying` (inside its grace) or `down` (raised past it)."""
+    """One line per key: `ok`, `retrying` (inside its grace) or `down` (past it)."""
     now = time.time() if now is None else now
     keys = [key] if key else sorted(state)
     out = []
