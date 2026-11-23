@@ -10321,12 +10321,13 @@ class Daemon:
 
     def _waste_ledger(self, db) -> str:
         """The daily review's waste ledger (waste.py): its lines for the spec, one low line to the user's
-        chat, and over target one fix task for the largest bucket unless one is still open."""
+        chat, and over target one fix task for the largest bucket unless one is still open or one of the
+        last 7 days already names every run flagged now (its `Flagged runs:` line)."""
         from . import waste
         now = time.time()
         db.set_kv(WASTE_LEDGER_KV, now)
         cfg = waste.settings(self.cfg)
-        rep = waste.report(db, now - 86400, now, self.cfg)
+        rep = waste.report(db, now - 86400, now, self.cfg, p=self.p)
         if rep["total"] <= 0:
             return ""
         head = waste.line(self.p.name, rep)
@@ -10341,6 +10342,12 @@ class Daemon:
                   (f'%"{label}"%',)):
             return out + f"\nA fix task for {waste.LABELS[bucket]} is still open."
         b = rep["buckets"][bucket]
+        flagged = set(b["run_ids"])
+        for t in db.q("SELECT id, spec FROM tasks WHERE labels LIKE ? AND created >= ?",
+                      (f'%"{label}"%', now - waste.DUP_WINDOW_S)):
+            m = re.search(r"^Flagged runs: ([\d, ]+)$", t["spec"] or "", re.M)
+            if m and flagged <= {int(x) for x in re.findall(r"\d+", m.group(1))}:
+                return out + f"\nFix task #{t['id']} already covers these {waste.LABELS[bucket]}."
         ids = ", ".join(f"#{t}" for t in b["tasks"][:10]) or "none named"
         tid = db.add_task(
             f"waste: cut {waste.LABELS[bucket]} (${b['usd']:.2f} in 24 h)",
@@ -10353,7 +10360,8 @@ class Daemon:
             f"--json`), fix the cause in this project's own harness, prompts, config or schedules, and say "
             f"what changed with the before and after figures. A fault in tt-project itself goes in an "
             f"`upstream:` follow-up, not here. Never retry the same approach.\n"
-            f"conclusion: the cause and the fix, with figures.",
+            f"conclusion: the cause and the fix, with figures.\n"
+            f"Flagged runs: {', '.join(str(i) for i in sorted(flagged))}",
             kind="harness", tier="standard", priority=2, origin="daemon", labels=[label])
         return out + f"\nQueued fix task #{tid} for {waste.LABELS[bucket]}."
 

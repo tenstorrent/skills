@@ -15,7 +15,9 @@ its own runs. Each run that ended in the window counts once, in the first bucket
                  same hand-off body: review_payload label; a review without one is unknown, not waste)
   review_rounds  reviews past the `waste.review_rounds`th round of one change's chain
   crashed        crashed, stalled or timed-out runs (budget.wasted) on tasks that later finished
-  over_runs      a task's runs past its `waste.max_runs`th
+  over_runs      a task's runs past its `waste.max_runs`th that brought no new result. One that did (the run
+                 stop's progress test, runcap.progress, and not its previous run's hand-off again) is a
+                 continuation: listed apart with its rank and the limit, and not avoidable
   costly_wake    the part of a coordinator wake over `waste.wake_usd`, unless the host slept SLEPT_COLD_S since
                  the wake before (no prompt cache outlives that: its cold rewrite is the sleep's)
 
@@ -31,7 +33,7 @@ from __future__ import annotations
 
 import re
 
-from . import budget, chainprio
+from . import budget, chainprio, runcap
 from .db import CHANGES_NEEDED, load_result
 from .reviewreuse import FORCED_LABEL, HEAD_LABEL, PAYLOAD_LABEL
 from .util import task_labels
@@ -142,26 +144,49 @@ def _slept_cold(db, r, sleeps: list) -> bool:
     return sum(max(0.0, min(b, start) - max(a, since)) for a, b in sleeps) >= SLEPT_COLD_S
 
 
-def report(db, since: float, now: float, cfg: dict | None = None) -> dict:
-    """{total, avoidable, retained, share, buckets: {name: {usd, runs, tasks, retained_usd, retained_tasks}}}
-    for runs that ended in [since, now)."""
+def _said(h: dict) -> tuple:
+    return h.get("status"), " ".join(str(h.get("summary") or "").split())
+
+
+def _continued(db, p, r: dict, prev: dict | None) -> bool:
+    """Run `r`, past the per-task limit, brought a new result: progress by the run stop's own test (a commit,
+    or a done or waiting hand-off that is not its previous run's again). Unknown evidence is no result."""
+    task = db.one("SELECT * FROM tasks WHERE id=?", (r["task"],)) or {}
+    if not runcap.progress(p, task, r):
+        return False
+    h = runcap.handoff(r)
+    return h.get("status") not in runcap.PROGRESS or _said(h) != _said(runcap.handoff(prev) if prev else {})
+
+
+def report(db, since: float, now: float, cfg: dict | None = None, p=None) -> dict:
+    """{total, avoidable, retained, share, buckets: {name: {usd, runs, run_ids, tasks, retained_usd,
+    retained_tasks}}, continued: {usd, runs: [{run, task, rank}], limit}} for runs that ended in [since, now).
+    `p` lets over_runs read a code run's commits; without it a run with no done or waiting hand-off stays
+    avoidable."""
     cfg = settings(cfg)
-    runs = db.q("SELECT id, task, role, started, ended, status, note, cost_usd FROM runs "
+    runs = db.q("SELECT id, task, role, dir, started, ended, status, note, cost_usd FROM runs "
                 "WHERE ended IS NOT NULL AND ended >= ? AND ended < ? ORDER BY id", (since, now))
     sets = _task_sets(db, cfg) if runs else {}
     moved = _moved_at(db, cfg)
     max_runs = int(cfg.get("max_runs") or 0)
     rank: dict[int, int] = {}
     count: dict[int, int] = {}
+    prev: dict[int, dict] = {}
+    last: dict[int, dict] = {}
     ids = sorted({r["task"] for r in runs if r["task"] is not None})
     for i in range(0, len(ids), 500):
         part = ids[i:i + 500]
-        for r in db.q(f"SELECT id, task FROM runs WHERE task IN ({','.join('?' * len(part))}) "
+        for r in db.q(f"SELECT id, task, dir FROM runs WHERE task IN ({','.join('?' * len(part))}) "
                       "ORDER BY started, id", part):
             count[r["task"]] = rank[r["id"]] = count.get(r["task"], 0) + 1
+            if r["task"] in last:
+                prev[r["id"]] = last[r["task"]]
+            last[r["task"]] = r
     wake = float(cfg.get("wake_usd") or 0)
     sleeps = db.kv("host_sleeps", []) or [] if wake else []   # the daemon's record of this host's sleeps
-    buckets = {b: {"usd": 0.0, "runs": 0, "tasks": {}, "retained_usd": 0.0, "retained_tasks": {}} for b in BUCKETS}
+    buckets = {b: {"usd": 0.0, "runs": 0, "run_ids": [], "tasks": {}, "retained_usd": 0.0, "retained_tasks": {}}
+               for b in BUCKETS}
+    continued = {"usd": 0.0, "runs": [], "limit": max_runs}
     total = 0.0
     for r in runs:
         cost, task = float(r["cost_usd"] or 0), r["task"]
@@ -186,12 +211,17 @@ def report(db, since: float, now: float, cfg: dict | None = None) -> dict:
             got = "review_rounds"
         elif task in sets["done"] and budget.wasted(r):
             got = "crashed"
-        elif max_runs and rank.get(r["id"], 0) > max_runs:
-            got = "over_runs"
+        elif max_runs and rank.get(r["id"], 0) > max_runs and cost > 0:
+            if _continued(db, p, r, prev.get(r["id"])):
+                continued["usd"] += cost
+                continued["runs"].append({"run": r["id"], "task": task, "rank": rank[r["id"]]})
+            else:
+                got = "over_runs"
         if got and usd > 0:
             b = buckets[got]
             b["usd"] += usd
             b["runs"] += 1
+            b["run_ids"].append(r["id"])
             if task is not None:
                 named = sets["rejected_of"][task] if got == "rejected" else task
                 b["tasks"][named] = b["tasks"].get(named, 0.0) + usd
@@ -205,7 +235,7 @@ def report(db, since: float, now: float, cfg: dict | None = None) -> dict:
     retained = sum(b["retained_usd"] for b in buckets.values())
     return {"total": total, "avoidable": avoidable, "retained": retained,
             "share": max(avoidable - retained, 0.0) / total if total else 0.0,
-            "target": float(cfg.get("target_share") or 0), "buckets": buckets}
+            "target": float(cfg.get("target_share") or 0), "buckets": buckets, "continued": continued}
 
 
 def lines(rep: dict) -> list[str]:
@@ -221,6 +251,11 @@ def lines(rep: dict) -> list[str]:
         out.append(f"{LABELS[name]}: ${b['usd']:.2f} ({share:.0%}), {b['runs']} run(s)" + (f"; {top}" if top else "")
                    + (f"; ${b['retained_usd']:.2f} of it kept by a successor's work ({kept}), not saved"
                       if b["retained_usd"] > 0 else ""))
+    c = rep.get("continued") or {}
+    if c.get("runs"):
+        named = ", ".join(f"run {x['run']} (#{x['task']}, run {x['rank']})" for x in c["runs"][:5])
+        out.append(f"runs past the per-task limit ({c['limit']}) that brought a new result: ${c['usd']:.2f}, "
+                   f"{len(c['runs'])} run(s), not avoidable; {named}")
     return out
 
 

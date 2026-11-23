@@ -694,7 +694,8 @@ DEFAULT_CONFIG: dict[str, Any] = {
                 "auto_depend": True, "early_deps": True, "split_hours": 2.0},
     # The daily waste ledger (waste.py, `ttp waste`): a project whose avoidable share passes target_share
     # gets one fix task for its largest bucket (fix_task); wake_usd, max_runs and review_rounds are the
-    # limits past which a coordinator wake, a task's runs and a change's review rounds count as avoidable.
+    # limits past which a coordinator wake, a task's runs (those with no new result) and a change's review
+    # rounds count as avoidable.
     # moved_at (epoch, no default): runs started after it count as a stand-in's after a project move.
     "waste": {"target_share": 0.10, "wake_usd": 1.0, "max_runs": 4, "review_rounds": 2, "fix_task": True},
     # Batch runs (batchrun.py): a code task's run also takes up to batch_max ready code tasks of its repo

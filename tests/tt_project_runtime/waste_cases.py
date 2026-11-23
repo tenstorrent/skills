@@ -288,3 +288,77 @@ def test_waste_ledger_counts_no_costly_wake_after_a_long_host_sleep_and_queues_n
     assert waste.over(rep) and waste.fix_bucket(rep) == "" and "most in coordinator wakes" in waste.line("demo", rep)
     _waste_run(p, None, 1.3, later, role="coordinator")
     assert waste.fix_bucket(waste.report(p.db, later - 86400, later, p.config())) == "costly_wake"
+
+
+def _handoff_run(p, task, cost, started, result=None):
+    """A run with a run dir; `result` (a dict) is its result.json, None leaves it unwritten."""
+    import json as _json
+    d = p.base / "runs-test" / f"{task}-{int(started)}"
+    d.mkdir(parents=True, exist_ok=True)
+    if result is not None:
+        (d / "result.json").write_text(_json.dumps(result))
+    p.db.x("INSERT INTO runs(task, role, provider, status, dir, started, ended, cost_usd) VALUES(?,?,?,?,?,?,?,?)",
+           (task, "worker", "claude", "ok", str(d), started, started + 60, cost))
+
+
+def test_over_runs_keeps_a_continuation_with_a_new_result_apart_and_counts_repeats_and_unknown(env):
+    from ttp import runcap, waste
+    p = make(env)
+    now = 1_000_000.0
+    useful = _waste_task(p, "long bench", kind="work")
+    repeat = _waste_task(p, "stuck wait", kind="work")
+    unknown = _waste_task(p, "silent code", kind="code")
+    for t in (useful, repeat, unknown):
+        for i in range(4):   # runs 1-4 are within the limit
+            _handoff_run(p, t, 0.1, now - 5000 + i * 100, {"status": "waiting", "summary": f"step {i}"})
+    _handoff_run(p, useful, 1.0, now - 3000, {"status": "waiting", "summary": "cells a, b measured"})
+    _handoff_run(p, useful, 2.0, now - 2900, {"status": "done", "summary": "all cells measured"})
+    _handoff_run(p, repeat, 1.5, now - 3000, {"status": "waiting", "summary": "step 3"})   # its previous hand-off again
+    _handoff_run(p, repeat, 0.5, now - 2900, {"status": "failed", "summary": "no change"})  # no progress
+    _handoff_run(p, unknown, 0.7, now - 3000)   # no hand-off; without `p` its commits are unknown
+    rep = waste.report(p.db, now - 86400, now, p.config())
+    b = rep["buckets"]["over_runs"]
+    assert round(b["usd"], 2) == 2.7 and b["runs"] == 3 and set(b["tasks"]) == {repeat, unknown}
+    c = rep["continued"]
+    assert round(c["usd"], 2) == 3.0 and c["limit"] == 4 and [(x["task"], x["rank"]) for x in c["runs"]] == \
+        [(useful, 5), (useful, 6)]
+    assert round(rep["avoidable"], 2) == 2.7 and round(rep["total"], 2) == 0.1 * 12 + 5.7   # raw total kept
+    line = next(x for x in waste.lines(rep) if "brought a new result" in x)
+    run5 = c["runs"][0]["run"]
+    assert line.startswith("runs past the per-task limit (4) that brought a new result: $3.00, 2 run(s), "
+                           "not avoidable") and f"run {run5} (#{useful}, run 5)" in line
+    # the run stop reads the same test: the repeat's failed run is idle, the useful ones are not
+    rows = {r["id"]: r for r in p.db.q("SELECT * FROM runs")}
+    task = lambda i: p.db.one("SELECT * FROM tasks WHERE id=?", (i,))   # noqa: E731
+    assert not runcap.idle(p, task(useful), rows[run5])
+    assert runcap.idle(p, task(repeat), max((r for r in rows.values() if r["task"] == repeat), key=lambda r: r["id"]))
+    # a commit inside a code run is a new result when `p` can read git
+    import ttp.chaincap as chaincap
+    real = chaincap.code_commits
+    chaincap.code_commits = lambda *a, **k: 1
+    try:
+        rep2 = waste.report(p.db, now - 86400, now, p.config(), p=p)
+    finally:
+        chaincap.code_commits = real
+    assert [x["task"] for x in rep2["continued"]["runs"]] == [useful, useful, unknown]
+
+
+def test_the_waste_fix_task_is_not_queued_again_for_runs_a_diagnosis_already_covers(env):
+    import time as _time
+    from ttp import daemon as dmod
+    p = make(env)
+    now = _time.time()
+    f = _waste_task(p, "broken idea", status="failed")
+    _waste_run(p, f, 5.0, now)
+    d = dmod.Daemon(p.base)
+    d.alert = lambda *a, **k: None
+    assert "Queued fix task #" in d._waste_ledger(p.db)
+    fix = p.db.one("SELECT id, spec FROM tasks WHERE labels LIKE '%waste_fix:failed_task%'")
+    run = p.db.one("SELECT id FROM runs WHERE task=?", (f,))["id"]
+    assert f"\nFlagged runs: {run}" in fix["spec"]
+    p.db.update_task(fix["id"], status="done")                    # diagnosed, same runs still in the window
+    assert f"Fix task #{fix['id']} already covers" in d._waste_ledger(p.db)
+    assert len(p.db.q("SELECT id FROM tasks WHERE labels LIKE '%waste_fix:%'")) == 1
+    _waste_run(p, f, 3.0, now)                                    # a new flagged run: a new diagnosis
+    assert "Queued fix task #" in d._waste_ledger(p.db)
+    assert len(p.db.q("SELECT id FROM tasks WHERE labels LIKE '%waste_fix:%'")) == 2

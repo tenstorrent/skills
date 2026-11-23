@@ -2543,7 +2543,7 @@ def cmd_waste(a) -> None:
         since = parse_since(a.since, now, DAY_S, p)
     except ValueError as e:
         die(str(e))
-    rep = waste.report(p.db, since, now, p.config())
+    rep = waste.report(p.db, since, now, p.config(), p=p)
     if a.json:
         print(json.dumps(rep, indent=1))
         return

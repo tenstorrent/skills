@@ -68,17 +68,23 @@ def self_wait(run: dict) -> bool:
     return h.get("status") == "waiting" and unblock.classify_wait(h)[0] == "self"
 
 
-def idle(p, task: dict, run: dict) -> bool:
-    """Whether `run` spent money and made no progress: no done or waiting hand-off, no commit inside it."""
-    if not float(run.get("cost_usd") or 0) or handoff(run).get("status") in PROGRESS:
-        return False
-    if task.get("kind") not in ("code", "harness"):
+def progress(p, task: dict, run: dict) -> bool | None:
+    """Whether `run` made progress: a done or waiting hand-off, or a commit inside it; None when git (or no
+    `p`) leaves a code run's commits unknown. The waste ledger reads the same test (waste.py, over_runs)."""
+    if handoff(run).get("status") in PROGRESS:
         return True
+    if task.get("kind") not in ("code", "harness"):
+        return False
     try:
         win = [(int(run["started"]), -int(-float(run["ended"]) // 1))]
-        return not chaincap.code_commits(p, task, wins=win)
+        return bool(chaincap.code_commits(p, task, wins=win))
     except Exception:
-        return False   # git unreadable: no proof it made nothing
+        return None
+
+
+def idle(p, task: dict, run: dict) -> bool:
+    """Whether `run` spent money and made no progress; git unreadable is no proof it made nothing."""
+    return bool(float(run.get("cost_usd") or 0)) and progress(p, task, run) is False
 
 
 def why(p, cfg: dict, task: dict, rows: list[dict]) -> str:
