@@ -551,8 +551,9 @@ _LINKS = re.compile(r"(?<![\w./-])(?:ln\s|cp\s(?:[^;&|\n]*\s)?-[A-Za-z]*s)")
 
 def _tmp_entry(path: str, made: set[str]) -> str:
     """The system temp dir entry (`/tmp/<name>`) a write to `path` lands in when it is the run's own: a plain name
-    that does not exist yet, or one the run made (`made`) that still resolves inside the temp dir; '' for any other
-    path, an existing temp file it did not make, a glob or variable (`/tmp/*`) and a link out of it too."""
+    that does not exist yet, or one the run made (`made`) that is no link and that `path` still resolves inside;
+    '' for any other path, an existing temp file it did not make, a glob or variable (`/tmp/*`) and a link out of
+    the entry too, even to another temp entry."""
     path = os.path.normpath(path)
     for t in _TMP:
         if path.startswith(t + "/"):
@@ -561,8 +562,8 @@ def _tmp_entry(path: str, made: set[str]) -> str:
             if not re.fullmatch(r"[\w.@%+=:,-]+", name):
                 return ""
             if top in made:
-                real = os.path.realpath(t)
-                return top if os.path.realpath(path).startswith(real + "/") else ""
+                real, there = os.path.realpath(top), os.path.realpath(path)
+                return top if not os.path.islink(top) and (there == real or there.startswith(real + "/")) else ""
             return "" if os.path.lexists(top) else top
     return ""
 

@@ -85,6 +85,11 @@ def test_failing_ids_reads_a_summary_whose_count_labels_have_several_words():
     assert sharedchecks.ran_clean(out([], clean, bars=False) + "ttp-suite: wall 3.2s\n") == clean + " in 12.90s"
     assert sharedchecks.ran_clean(out([], clean + ", 1 subtests failed")) == ""
     assert sharedchecks.pytest_summary("collected 3 items\n") is None
+    # Another tool's line after pytest's ('12 packages installed in 3.1s') is no summary: the ids stay found.
+    tail = "12 packages installed in 3.1s\n"
+    assert sharedchecks.failing_ids(out(_IDS, many) + tail) == (sorted(_IDS), True)
+    assert sharedchecks.pytest_summary(out([], "2 passed") + tail) == ("2 passed in 12.90s", {"passed": 2})
+    assert sharedchecks.pytest_summary(tail) is None and sharedchecks.ran_clean(out(_IDS, many) + tail) == ""
 
 
 def test_trim_and_goal_checks_read_a_summary_whose_count_labels_have_several_words():

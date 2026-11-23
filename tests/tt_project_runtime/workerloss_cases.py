@@ -43,6 +43,8 @@ def test_worker_loss_alone_with_clean_exits_is_infra_and_nothing_else_is():
     assert errs["other"] == 1 and not workerloss.only(errs), "an error besides the loss is a real failure"
     subs = workerloss.lost(_lost_log([0]).replace("1 failed,", "1 failed, 2 subtests failed, 9 subtests passed,"))
     assert subs["other"] == 2 and not workerloss.only(subs), "a summary with several-word labels counts its failures"
+    later = workerloss.lost(_lost_log([0], failed=3) + "12 packages installed in 3.1s\n")
+    assert later["other"] == 2 and not workerloss.only(later), "another tool's line after pytest's is no summary"
 
 
 def test_worker_loss_collector_reads_as_the_whole_output_and_keeps_no_quoted_line():

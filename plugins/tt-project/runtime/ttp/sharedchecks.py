@@ -65,10 +65,12 @@ FAILING_KEY, COMPLETE_KEY = "failing_tests", "failing_tests_complete"
 
 _ID = re.compile(r"^(?:FAILED|ERROR) (\S+::[^\s\[]*(?:\[.*?\])?)(?=\s|$)", re.M)
 # pytest's last summary line: bare under -q, wrapped in '=' at the default verbosity. A plugin's count
-# label may take several words ('158 subtests passed').
-_LABEL = r"\d+ [a-z]+(?: [a-z]+)*"
+# label may take several words ('158 subtests passed'); each ends in a pytest outcome, so another tool's
+# line printed after it ('12 packages installed in 3.1s') is none.
+_OUTCOME = r"(?:passed|failed|errors?|skipped|deselected|xfailed|xpassed|warnings?|rerun)"
+_LABEL = rf"\d+ (?:[a-z]+ )*{_OUTCOME}"
 _SUMMARY = re.compile(rf"^(?:=+ )?(({_LABEL}(?:, {_LABEL})*) in [\d.]+s\b[^=\n]*?)(?: =+)?\s*$", re.M)
-_COUNT = re.compile(r"(\d+) ([a-z]+(?: [a-z]+)*)")
+_COUNT = re.compile(rf"(\d+) ((?:[a-z]+ )*{_OUTCOME})\b")
 
 
 def settings(cfg: dict) -> dict:

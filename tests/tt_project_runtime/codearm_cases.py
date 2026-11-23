@@ -823,9 +823,12 @@ def test_glm_guard_lets_a_run_write_its_own_new_temp_entries_and_keeps_every_oth
         fd, taken = tempfile.mkstemp(dir="/tmp")
         os.close(fd)
         os.symlink(str(tmp_path), f"{u}-ln")
+        os.symlink(taken, f"{u}-lt")   # a link to another temp entry, whatever the test's basetemp
+        os.symlink(taken, f"{u}-rc/lt")
         with open(rd / glmguard.TMP_MADE, "a") as f:
-            f.write(f"{u}-ln\n")
+            f.write(f"{u}-ln\n{u}-lt\n")
         for c in (f"echo x > {taken}", f"rm {taken}", "rm -rf /tmp/*", "echo x > /tmp/$X/y", f"echo x > {u}-ln/f",
+                  f"echo x > {u}-lt", f"echo x > {u}-rc/lt",
                   f"ln -s ~/.bashrc {u}-l2", f"cp -s ~/.bashrc {u}-l3", f"cp -as ~/.bashrc {u}-l4",
                   f"rm {proj}/tt-project/state/logs/changes-pre-expiry.json"):
             assert "outside its worktree" in (ask(c) or ""), c
@@ -833,7 +836,7 @@ def test_glm_guard_lets_a_run_write_its_own_new_temp_entries_and_keeps_every_oth
         assert ask(f"echo x > {u}-dev", {**e, glmguard.RUN_ENV: glmguard.DEVICE}), "a device run's scratch is its plan's"
         assert glmguard.writes_outside(f"echo x > {u}-new", str(wt), str(rd), e, inline=True), "the post-run scan too"
     finally:
-        for p in (f"{u}-rc", f"{u}-ln", taken):
+        for p in (f"{u}-rc/lt", f"{u}-rc", f"{u}-ln", f"{u}-lt", taken):
             if os.path.islink(p) or os.path.isfile(p):
                 os.unlink(p)
             elif os.path.isdir(p):
