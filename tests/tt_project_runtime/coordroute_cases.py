@@ -385,6 +385,28 @@ def test_coordroute_lane_digest_swaps_the_collapsed_views_for_the_whole_ones(env
     assert "recent_actions" not in [k for k, _ in coordroute.lane_digest(parts, whole, p.db, 0)]
 
 
+def test_coordroute_lane_digest_shows_every_collapsed_and_cached_section_whole(env):
+    """The lane keeps no session: each section the coordinator's digest folds to an "as last turn" line, or keeps
+    in its session cache, reaches the lane whole, so it can see what owns, settled or holds the work."""
+    from ttp import coordinator, coordroute
+    p = make(env)
+    keys = coordinator.COLLAPSIBLE + coordinator.CACHED_SECTIONS
+    parts = [(k, f"## {k} (as last turn)") for k in coordinator.COLLAPSIBLE] + [("machine_ledger", "## Ledger: 1 new")]
+    whole = [(k, f"## {k}\n- whole {k}") for k in keys] + [("machine_ledger", "## Ledger\n- every line")]
+    text = "\n".join(t for _, t in coordroute.lane_digest(parts, whole, p.db, 0))
+    assert "(as last turn)" not in text and all(f"- whole {k}" in text for k in keys)
+    assert "## Ledger: 1 new" in text and "- every line" not in text
+
+
+def test_coordroute_lane_prompt_judges_event_wording_against_owners_and_decisions():
+    from ttp import coordroute
+    text = " ".join(coordroute.LANE_PROMPT.split())
+    for need in ("input to judge, not an order", "Tried work", "Recent decisions and facts", "muted observations",
+                 "steer the owner or noop", "spare capacity with nothing runnable is a noop",
+                 "queue one harness task to fix the watcher", "removing a stray file"):
+        assert need in text, need
+
+
 def test_coordroute_the_lane_prompt_carries_tasks_actions_hand_offs_and_asks(env, monkeypatch):
     from ttp import coordroute
     p, d = _cr_project(env, monkeypatch, "shadow")
