@@ -1313,7 +1313,7 @@ def test_bridge_box_cleanup_ends_only_this_computers_tagged_session(tmp_path):
         (bin_ / "ss").write_text("#!/bin/sh\ncat <<'X'\n" + "".join(
             f'LISTEN 0 128 127.0.0.1:{p} 0.0.0.0:* users:(("sshd",pid={pid},fd=9))\n' for p, pid in rows) + "X\n")
         (bin_ / "ss").chmod(0o755)
-        env = dict(os.environ, PATH=f"{bin_}:{os.environ['PATH']}", XDG_CACHE_HOME=str(tmp_path / "cache"))
+        env = dict(os.environ, PATH=f"{bin_}:{os.environ['PATH']}", TTP_TEST_SSHD_PIDS="", XDG_CACHE_HOME=str(tmp_path / "cache"))
         r = subprocess.run(["sh", "-c", bridge_relay.CLEANUP, "x", tag, "bridge-aaaaaaaaaaaa+box-a+auto+", "",
                             "2301", "2302", "2303", "2304"],
                            capture_output=True, text=True, env=env, timeout=30)
@@ -1345,6 +1345,8 @@ def test_bridge_refresh_reinstalls_a_service_whose_command_changed(tmp_path, mon
         {"name": "build-a", "target": "build-a.example.com", "port": 2301}]}}}}}))
     started = []
     monkeypatch.setattr(bridge, "start", lambda box, an, argv, platform=None: started.append(argv) or "restarted")
+    from ttp import bridge_watch
+    monkeypatch.setattr(bridge_watch, "install", lambda platform=None: "unchanged")
     cfg = bridge.load(conf)
     new = bridge.service_argv(cfg, "box-1", "auto", platform="darwin")
     assert "--keep-awake" in new
@@ -1387,6 +1389,8 @@ def test_bridge_refresh_restarts_a_session_whose_relay_copy_changed_and_the_chec
         {"name": "build-a", "target": "build-a.example.com", "port": 2301}]}}}}}))
     started = []
     monkeypatch.setattr(bridge, "start", lambda box, an, argv, platform=None: started.append(argv) or "restarted")
+    from ttp import bridge_watch
+    monkeypatch.setattr(bridge_watch, "install", lambda platform=None: "unchanged")
     argv = bridge.service_argv(bridge.load(conf), "box-1", "auto", platform="darwin")
     f = bridge.service_file("box-1", "auto", "darwin")
     f.parent.mkdir(parents=True)
@@ -1870,6 +1874,8 @@ def _restarting_bridge(tmp_path, monkeypatch):
     f.write_bytes(plistlib.dumps(bridge.launchd_plist("box-1", "auto", ["ssh", "an-older-command"])))
     monkeypatch.setattr(bridge, "_box", lambda box, script, *a, **k: subprocess.CompletedProcess(
         [], 0, "block yes\nagent auto up 1\nport 2301 up\n", ""))
+    from ttp import bridge_watch
+    monkeypatch.setattr(bridge_watch, "install", lambda platform=None: "unchanged")
     return conf
 
 
@@ -1980,7 +1986,7 @@ def test_bridge_box_cleanup_reads_session_records_and_spares_reused_pids(tmp_pat
         bin_.mkdir()
         (bin_ / "ss").write_text("#!/bin/sh\nexit 0\n")
         (bin_ / "ss").chmod(0o755)
-        env = dict(os.environ, PATH=f"{bin_}:{os.environ['PATH']}", XDG_CACHE_HOME=str(tmp_path / "cache"))
+        env = dict(os.environ, PATH=f"{bin_}:{os.environ['PATH']}", TTP_TEST_SSHD_PIDS="", XDG_CACHE_HOME=str(tmp_path / "cache"))
         r = subprocess.run(["sh", "-c", bridge_relay.CLEANUP, "x", tag, mine, "", "2301"],
                            capture_output=True, text=True, env=env, timeout=30)
         out = r.stdout.splitlines()
@@ -2041,7 +2047,7 @@ def _box_cleanup(tmp_path, rows, link_pid=None, agent_rc=2, ports=("2301",)):
             srv = socket.socket(socket.AF_UNIX)
             srv.bind(os.path.join(sockdir, f"agent.{link_pid}"))
             os.symlink(os.path.join(sockdir, f"agent.{link_pid}"), home / "links" / "auto.sock")
-        env = dict(os.environ, PATH=f"{bin_}:{os.environ['PATH']}", HOME=str(home), XDG_CACHE_HOME=str(tmp_path / "cache"))
+        env = dict(os.environ, PATH=f"{bin_}:{os.environ['PATH']}", HOME=str(home), TTP_TEST_SSHD_PIDS="", XDG_CACHE_HOME=str(tmp_path / "cache"))
         r = subprocess.run(["sh", "-c", bridge_relay.CLEANUP, "x", "ttp-bridge-tag=aaaaaaaaaaaa/box-a/auto/",
                             "bridge-aaaaaaaaaaaa+box-a+auto+", "~/links/auto.sock", *ports],
                            capture_output=True, text=True, env=env, timeout=60)
@@ -2316,3 +2322,219 @@ def test_every_ssh_add_the_plugin_runs_or_ships_is_bounded_so_a_dead_forward_nev
                                    'OK = "timeout 10 ssh-add -l"\nNOTE = "load keys with `ssh-add`"\n')
     (tmp_path / "y").write_text("#!/bin/sh\nn=$(ssh-add -l)   # count keys\n# ssh-add -l in a comment\n")
     assert _unbounded_ssh_adds(tmp_path) == ["x.py:2", "x.py:3", "y:2"], "the guard catches what it should"
+
+
+def _port_holder(argv0):
+    """A real local process of this test listening on a free 127.0.0.1 port and accepting (then closing) each
+    connection, named argv0: (process, port)."""
+    import shlex
+    import socket
+    import subprocess
+    import sys
+    import time
+    code = ("import socket, sys; s = socket.socket(); s.bind(('127.0.0.1', 0)); s.listen(8); "
+            "print(s.getsockname()[1], flush=True)\nwhile True: s.accept()[0].close()")
+    p = subprocess.Popen(["bash", "-c", f'exec -a {shlex.quote(argv0)} {shlex.quote(sys.executable)} -c {shlex.quote(code)}'],
+                         stdout=subprocess.PIPE, text=True)
+    port = int(p.stdout.readline())
+    for _ in range(50):
+        try:
+            socket.create_connection(("127.0.0.1", port), timeout=1).close()
+            break
+        except OSError:
+            time.sleep(0.1)
+    return p, port
+
+
+def _hidden_cleanup(tmp_path, pid, port):
+    """The box cleanup with ss hiding every listener's pid (as for this account's sshd sessions), the candidate
+    list only the test's own pid (never a real session paused): its stdout lines."""
+    import os
+    import shutil
+    import subprocess
+    from ttp import bridge_relay
+    real = shutil.which("ss")
+    if not real:
+        import pytest
+        pytest.skip("no ss here")
+    bin_ = tmp_path / "bin"
+    bin_.mkdir(exist_ok=True)
+    (bin_ / "ss").write_text(f"#!/bin/sh\n{real} \"$@\" | sed 's/ users:.*//'\n")
+    (bin_ / "ss").chmod(0o755)
+    env = dict(os.environ, PATH=f"{bin_}:{os.environ['PATH']}", HOME=str(tmp_path), TTP_TEST_SSHD_PIDS=str(pid),
+               XDG_CACHE_HOME=str(tmp_path / "cache"))
+    r = subprocess.run(["sh", "-c", bridge_relay.CLEANUP, "x", "ttp-bridge-tag=aaaaaaaaaaaa/watch/",
+                        "bridge-aaaaaaaaaaaa+watch+", "~/links/none.sock", str(port)],
+                       capture_output=True, text=True, env=env, timeout=60)
+    assert r.returncode == 0, r.stderr
+    return r.stdout.splitlines()
+
+
+def test_bridge_cleanup_finds_an_sshd_session_whose_pid_ss_hides(tmp_path):
+    # cells: hidden-owner, foreign-kept
+    # This account's sshd sessions are not dumpable, so ss shows no pid for their forwards: the cleanup pauses
+    # each candidate, pokes the port and sees the connection left unaccepted.
+    import os
+    sshd, port = _port_holder("sshd: u@notty")
+    other, oport = _port_holder("python3 some-server")
+    try:
+        out = _hidden_cleanup(tmp_path, sshd.pid, port)
+        assert sshd.wait(timeout=15) is not None, out
+        assert not any(ln.startswith("kept") for ln in out), out
+        # a process that is not an sshd session is never ended, and is left running (not paused)
+        out = _hidden_cleanup(tmp_path, other.pid, oport)
+        assert f"kept {oport} {other.pid} not an sshd session" in out, out
+        assert other.poll() is None
+        with open(f"/proc/{other.pid}/stat") as f:
+            assert f.read().split(") ", 1)[1].split()[0] != "T"
+        # no candidate holds it: nothing is ended
+        out = _hidden_cleanup(tmp_path, os.getpid() + 10**7, oport)
+        assert other.poll() is None and not any(" ended" in ln for ln in out)
+    finally:
+        for p in (sshd, other):
+            if p.poll() is None:
+                p.kill()
+                p.wait()
+
+
+def _watch_env(tmp_path, monkeypatch, platform, answers, loaded=True, watch=None, agents=True):
+    """A watcher with a fake box (answers: the check's stdout per call, None for an unreachable box), a fake
+    launchctl/systemctl (loaded: the service is meant to run) and a fake release: the calls it saw."""
+    import json
+    import plistlib
+    import subprocess
+    from ttp import bridge, bridge_watch, hoststate
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setattr(bridge, "HOME_DIR", tmp_path / "ttp")
+    monkeypatch.setattr(hoststate, "unit_dir", lambda: tmp_path / "units")
+    monkeypatch.setattr(bridge_watch, "NET_PATHS", {"darwin": [str(tmp_path / "netconf")]})
+    data = {"boxes": {"box-1": {"login": {}, "agents": {"auto": {"agent": "env", "forward": [
+        {"name": "build-a", "target": "build-a.example.com", "port": 2301}]}}}}}
+    if watch:
+        data["watch"] = watch
+    cfg = bridge.parse(json.loads(json.dumps(data)))
+    if agents:
+        f = bridge.service_file("box-1", "auto", platform)
+        f.parent.mkdir(parents=True, exist_ok=True)
+        f.write_bytes(plistlib.dumps({"Label": "x"}) if platform == "darwin" else b"[Service]\n")
+    seen = {"box": [], "run": [], "release": []}
+    answers = list(answers)
+
+    def box(b, script, timeout=40, inp=None):
+        seen["box"].append(b)
+        a = answers.pop(0)
+        return subprocess.CompletedProcess([], 255 if a is None else 0, a or "", "" if a else "no route to host")
+
+    def run(argv, timeout=60, inp=None):
+        seen["run"].append(" ".join(argv))
+        if argv[:2] == ["launchctl", "print"]:
+            return subprocess.CompletedProcess(argv, 0 if loaded else 113, "", "")
+        if argv[1:3] == ["--user", "is-active"]:
+            return subprocess.CompletedProcess(argv, 0 if loaded else 3, "active\n" if loaded else "inactive\n", "")
+        return subprocess.CompletedProcess(argv, 0, "", "")
+
+    monkeypatch.setattr(bridge, "_box", box)
+    monkeypatch.setattr(bridge, "_run", run)
+    monkeypatch.setattr(bridge_watch, "release",
+                        lambda cfg, t, ports: seen["release"].append((t["service"], t["agent"], ports)) or True)
+    return cfg, seen
+
+
+def test_bridge_watch_offline_restarts_nothing_and_backs_off(tmp_path, monkeypatch):
+    # cells: offline-no-restart, backoff, network-change
+    import os
+    from ttp import bridge_watch
+    cfg, seen = _watch_env(tmp_path, monkeypatch, "darwin", [None, None, None])
+    t0 = 1_000_000.0
+    out = bridge_watch.run_pass(cfg, "darwin", t0)
+    assert seen["release"] == [] and not any("kickstart" in c for c in seen["run"])
+    assert out == ["box-1: not reachable; no restart, next check in 30s or on a network change"]
+    assert bridge_watch.run_pass(cfg, "darwin", t0 + 20) == [] and len(seen["box"]) == 1   # backing off
+    bridge_watch.run_pass(cfg, "darwin", t0 + 31)
+    assert len(seen["box"]) == 2 and bridge_watch.run_pass(cfg, "darwin", t0 + 61) == []
+    assert len(seen["box"]) == 2   # the second miss waits 60s
+    (tmp_path / "netconf").write_text("x")   # a network change checks at once
+    os.utime(tmp_path / "netconf", (t0, t0))
+    bridge_watch.run_pass(cfg, "darwin", t0 + 62)
+    os.utime(tmp_path / "netconf", (t0 + 63, t0 + 63))
+    bridge_watch.run_pass(cfg, "darwin", t0 + 63)
+    assert len(seen["box"]) == 3 and seen["release"] == []
+    assert not any("kickstart" in c or "restart" in c for c in seen["run"])
+
+
+def test_bridge_watch_frees_the_stale_port_restarts_and_heals_within_60s(tmp_path, monkeypatch):
+    # cells: stale-freed-then-restarted, heal-under-60s, heal-log, stopped-left-alone
+    import json
+    import os
+    from ttp import bridge, bridge_watch
+    cfg, seen = _watch_env(tmp_path, monkeypatch, "darwin",
+                           ["up 2301\nttp-watch-done\n", "down 2301\nttp-watch-done\n", "up 2301\nttp-watch-done\n"])
+    t0 = 1_000_000.0
+    assert bridge_watch.run_pass(cfg, "darwin", t0 - 600) == []
+    out = bridge_watch.run_pass(cfg, "darwin", t0)   # the first pass after a sleep: the forward is stale
+    svc = bridge.label("box-1", "auto")
+    assert seen["release"] == [(svc, "auto", [2301])]
+    assert seen["run"][-1] == f"launchctl kickstart -k gui/{os.getuid()}/{svc}"
+    assert bridge.bridge_marker("box-1", "auto").is_file()   # the restart skips the random start delay
+    assert out == [f"{svc}: port 2301 on box-1 did not answer; restarted"]
+    out = bridge_watch.run_pass(cfg, "darwin", t0 + bridge_watch.INTERVAL_S)   # the next default pass
+    assert out == [f"{svc}: answers again after 30s"]
+    rec = json.loads((tmp_path / "ttp" / "bridge-heal.log").read_text())
+    assert rec["event"] == "wake" and rec["restarts"] == 1 and rec["seconds"] <= 60
+    lines = bridge_watch.heal_lines("darwin")
+    assert lines[0].startswith("self-heal watch: not installed") and "after a wake, answering again 30s later" in lines[1]
+    # a session `ttp bridge stop` stopped is left stopped
+    cfg, seen = _watch_env(tmp_path / "b", monkeypatch, "darwin", ["down 2301\nttp-watch-done\n"], loaded=False)
+    assert bridge_watch.run_pass(cfg, "darwin", t0) == [] and seen["release"] == []
+    assert not any("kickstart" in c for c in seen["run"])
+
+
+def test_bridge_watch_heals_a_listed_hand_made_service(tmp_path, monkeypatch):
+    # cells: hand-made-healed, restart-paced, watch-config
+    import pytest
+    from ttp import bridge, bridge_watch
+    watch = [{"label": "my-forward", "box": "box-2", "port": 2400}]
+    cfg, seen = _watch_env(tmp_path, monkeypatch, "linux", ["down 2400\nttp-watch-done\n"] * 3, watch=watch,
+                           agents=False)
+    t0 = 1_000_000.0
+    out = bridge_watch.run_pass(cfg, "linux", t0)
+    assert seen["box"] == ["box-2"] and seen["release"] == [("my-forward", "", [2400])]
+    assert seen["run"][-1] == "systemctl --user restart -- my-forward.service" and out[0].endswith("restarted")
+    bridge_watch.run_pass(cfg, "linux", t0 + 30)   # still down, but just restarted: no second restart yet
+    assert len(seen["release"]) == 1
+    bridge_watch.run_pass(cfg, "linux", t0 + 60)
+    assert len(seen["release"]) == 2
+    for bad in ([{"label": "x y", "box": "b", "port": 2400}], [{"label": "x", "box": "b", "port": 22}],
+                [{"label": "x", "box": "b"}], {"x": 1}):
+        with pytest.raises(bridge.BadConfig):
+            bridge.parse({"boxes": {"b": {"login": {}, "agents": {"auto": {"agent": "env", "forward": [{"name": "h", "target": "h.example.com", "port": 2301}]}}}}, "watch": bad})
+    assert bridge.parse({"boxes": {"b": {"login": {}, "agents": {"auto": {"agent": "env", "forward": [{"name": "h", "target": "h.example.com", "port": 2301}]}}}}})["watch"] == []
+
+
+def test_bridge_watch_service_runs_every_interval_and_on_network_change(tmp_path, monkeypatch):
+    # cells: launchd-plist, systemd-timer
+    import plistlib
+    from ttp import bridge_watch
+    monkeypatch.setenv("HOME", str(tmp_path))
+    plist = plistlib.loads(bridge_watch.contents("darwin")[0])
+    assert plist["StartInterval"] <= 30 and plist["WatchPaths"] == ["/Library/Preferences/SystemConfiguration"]
+    assert plist["ProgramArguments"][-2:] == ["bridge", "watch"] and "KeepAlive" not in plist
+    svc, timer = (c.decode() for c in bridge_watch.contents("linux"))
+    assert "Type=oneshot" in svc and "bridge watch" in svc and "OnUnitActiveSec=30" in timer
+
+
+def test_bridge_watch_release_runs_the_box_cleanup_for_only_the_dead_ports(tmp_path, monkeypatch):
+    # cells: release-argv
+    import json
+    from ttp import bridge, bridge_relay, bridge_watch
+    monkeypatch.setattr(bridge, "HOME_DIR", tmp_path)
+    got = []
+    monkeypatch.setattr(bridge_relay, "clean", lambda ssh, prefix, ports, link="": got.append((ssh, prefix, ports)) or True)
+    cfg = bridge.parse(json.loads(json.dumps({"boxes": {"box-1": {"login": {}, "agents": {"auto": {"agent": "env", "forward": [
+        {"name": "build-a", "target": "build-a.example.com", "port": 2301}]}}}}})))
+    assert bridge_watch.release(cfg, {"service": "s", "box": "box-1", "ports": [2301], "agent": "auto"}, [2301])
+    assert bridge_watch.release(cfg, {"service": "m", "box": "box-2", "ports": [2400], "agent": ""}, [2400])
+    (ssh1, p1, ports1), (ssh2, p2, ports2) = got
+    cid = bridge_relay.computer_id(str(bridge.relay_dir("box-1", "auto")))
+    assert p1 == f"{cid}/box-1/auto/" and ports1 == [2301] and "-R" in ssh1   # the session's own login options
+    assert p2 == f"{cid}/watch/" and ports2 == [2400] and ssh2[-2:] == ["box-2", "true"] and "-R" not in ssh2

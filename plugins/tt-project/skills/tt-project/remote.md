@@ -43,6 +43,21 @@
   free; else it logs the held port and its pid and cleans again after 5, 20 and 60 s before the
   supervisor takes over. Nothing to do by hand; `ttp bridge doctor` names a held port, and
   `ttp setup`/upgrade refresh changed services.
+- Self-heal watch: `ttp bridge setup` (and every refresh) installs one watcher per workstation
+  (launchd every 30 s and on a network change on macOS, a systemd user timer every 30 s on Linux)
+  running `ttp bridge watch`. Each pass logs in once per box and checks every forwarded port end
+  to end (it reads the first byte the far service sends, so a watched port must speak first, like
+  sshd). A dead port on a service meant to run gets the same cleanup (only this account's sshd
+  session holding exactly that port, TERM then KILL, found even when `ss` hides its pid), then a
+  restart (`launchctl kickstart -k` / `systemctl --user restart`), paced 0, 60, 120, 300 s apart.
+  An unreachable box restarts nothing and backs off 30-300 s, rechecking at once after a wake or a
+  network change. A stopped service is left alone. Hand-made ssh forward services join with a
+  `"watch"` list in the local bridge config, never shipped with entries:
+  `"watch": [{"label": "<launchd label or systemd unit>", "box": "<ssh alias>", "port": <box port>}]`.
+  Each heal is one JSON line in `~/.tt-project/bridge-heal.log`; `ttp bridge status` shows the
+  last three, and `~/.tt-project/bridge-watch.log` has every pass. Optional for a box admin, never
+  done by tt-project: `ClientAliveInterval`/`ClientAliveCountMax` in sshd makes the box drop dead
+  sessions itself.
 - A `ttp bridge` session never relies on ssh exiting by itself: open forwarded-agent channels can
   keep ssh up after its remote command ended, holding connections to the local agent until the
   agent runs out of open files. The relay ends ssh with its whole process group (SIGTERM, then

@@ -1,0 +1,236 @@
+"""`ttp bridge watch`: one pass of this computer's bridge health check, run by a service `ttp bridge
+setup` installs (launchd: every INTERVAL_S and on each network change; systemd: a user timer).
+
+After a sleep or a network change, the box's sshd can keep the old session and its forwarded ports for
+hours, so the new session fails on its forwards until someone restarts it by hand. Each pass asks every
+box, in one login, whether each forwarded port answers end to end (a connection to it gets the first
+bytes of the host's ssh banner). A port that does not answer gets the box cleanup (bridge_relay.CLEANUP:
+it ends only this account's sshd session holding exactly that port, SIGTERM then SIGKILL) and its service
+is restarted at once, skipping the random start delay. A box that cannot be reached (this computer is
+offline, or the box is down) restarts nothing: it is asked again after a growing pause, or at once on a
+wake or a network change. A service that keeps failing is restarted at most once per RESTART_GAP_S step.
+
+Besides the sessions `ttp bridge` installs, the config's "watch" list names ssh forward services made by
+hand: {"label": the launchd label or systemd unit, "box": its ssh alias, "port": the box port it forwards}.
+Each heal (from the first failed check to the first answer again) is one JSON line in HEAL_LOG; `ttp bridge
+status` shows the last few."""
+from __future__ import annotations
+
+import json
+import os
+import shlex
+import sys
+import time
+from pathlib import Path
+
+from .project import durable_write
+
+LABEL = "com.tt-project.bridge-watch"
+INTERVAL_S = 30
+NET_PATHS = {"darwin": ["/Library/Preferences/SystemConfiguration"]}   # launchd runs the pass when it changes
+BACKOFF_S = (30, 60, 120, 300)        # the next check of a box that could not be reached
+RESTART_GAP_S = (0, 60, 120, 300)   # the least time between restarts of one service that keeps failing
+#                                     (a restarted session needs some seconds to log in and forward its ports)
+WAKE_GAP_S = 3 * INTERVAL_S          # a longer gap since the last pass: this computer slept
+STATE, HEAL_LOG = "bridge-watch.json", "bridge-heal.log"   # in the bridge home (~/.tt-project)
+
+
+def _home() -> Path:
+    from . import bridge
+    return bridge.HOME_DIR
+
+# On the box: `up <port>` or `down <port>` per port, then the done line; `nocheck` when it lacks the tools
+# (then nothing is restarted).
+CHECK = r"""command -v bash >/dev/null 2>&1 && command -v timeout >/dev/null 2>&1 || { echo ttp-watch-nocheck; exit 0; }
+for p in "$@"; do
+  b=$(timeout 6 bash -c 'exec 3<>"/dev/tcp/127.0.0.1/$0" && head -c 1 <&3' "$p" 2>/dev/null)
+  if [ -n "$b" ]; then echo "up $p"; else echo "down $p"; fi
+done
+echo ttp-watch-done"""
+
+
+def targets(cfg: dict, platform: str | None = None) -> list[dict]:
+    """The installed bridge sessions and the config's watched services: {service, box, ports, agent}."""
+    from . import bridge
+    out = []
+    for box, b in cfg["boxes"].items():
+        for an, a in b["agents"].items():
+            ports = [h["port"] for h in a["forward"] if not h["adopt"]]
+            if ports and bridge.service_file(box, an, platform).is_file():
+                out.append({"service": bridge.label(box, an), "box": box, "ports": ports, "agent": an})
+    out += [{"service": w["label"], "box": w["box"], "ports": [w["port"]], "agent": ""} for w in cfg.get("watch", [])]
+    return out
+
+
+def _load() -> dict:
+    try:
+        d = json.loads((_home() / STATE).read_text())
+        return d if isinstance(d, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def _net_stamp(platform: str) -> float:
+    m = 0.0
+    for p in NET_PATHS.get(platform, []):
+        try:
+            m = max(m, os.stat(p).st_mtime)
+        except OSError:
+            pass
+    return m
+
+
+def release(cfg: dict, t: dict, ports: list[int]) -> bool:
+    """The box cleanup for the ports that did not answer; True once they are free."""
+    from . import bridge, bridge_relay
+    if t["agent"]:
+        ssh, prefix = bridge.ssh_argv(cfg, t["box"], t["agent"]), f"{t['box']}/{t['agent']}/"
+    else:   # a hand-made service: no tag or record of ours, so only a session with no command of its own is ended
+        ssh, prefix = ["ssh", "-T", "-o", "BatchMode=yes", "-o", "ControlMaster=no", "-o", "ControlPath=none",
+                       "--", bridge.sshcmd.check_host(t["box"]), "true"], "watch/"
+    d = bridge.relay_dir(t["box"], t["agent"] or "watch")
+    d.parent.mkdir(parents=True, exist_ok=True)   # computer_id keeps its file beside the relay dirs
+    cid = bridge_relay.computer_id(str(d))
+    return bridge_relay.clean(ssh, f"{cid}/{prefix}", ports)
+
+
+def loaded(t: dict, platform: str) -> bool:
+    """The service is meant to run: loaded in launchd, or active or restarting in systemd (`ttp bridge stop`, or a
+    hand-made service someone stopped, is left stopped)."""
+    from . import bridge
+    if platform == "darwin":
+        return bridge._run(["launchctl", "print", f"gui/{os.getuid()}/{t['service']}"]).returncode == 0
+    unit = t["service"] if t["service"].endswith(".service") else t["service"] + ".service"
+    r = bridge._run(["systemctl", "--user", "is-active", "--", unit])
+    return r.stdout.strip() in ("active", "activating", "reloading")
+
+
+def restart(t: dict, platform: str) -> str:
+    from . import bridge
+    if t["agent"]:
+        bridge.bridge_marker(t["box"], t["agent"]).touch()   # skip the random start delay
+    if platform == "darwin":
+        r = bridge._run(["launchctl", "kickstart", "-k", f"gui/{os.getuid()}/{t['service']}"])
+    else:
+        unit = t["service"] if t["service"].endswith(".service") else t["service"] + ".service"
+        r = bridge._run(["systemctl", "--user", "restart", "--", unit])
+    return "restarted" if r.returncode == 0 else f"restart refused: {(r.stderr or r.stdout).strip()[:160]}"
+
+
+def run_pass(cfg: dict, platform: str | None = None, now: float | None = None) -> list[str]:
+    """One pass: what it did, one line per action (nothing when all answer)."""
+    from . import bridge
+    platform, now = platform or sys.platform, time.time() if now is None else now
+    st, out = _load(), []
+    boxes, fails = st.setdefault("boxes", {}), st.setdefault("fail", {})
+    last, net = st.get("last", 0), _net_stamp(platform)
+    event = ("network change" if net and st.get("net") and net > st["net"]
+             else "wake" if last and now - last > WAKE_GAP_S else "")
+    st.update(last=now, net=net)
+    ts = targets(cfg, platform)
+    for box in dict.fromkeys(t["box"] for t in ts):
+        mine = [t for t in ts if t["box"] == box]
+        bs = boxes.get(box, {})
+        if bs.get("next", 0) > now and not event:
+            continue
+        ports = sorted({p for t in mine for p in t["ports"]})
+        r = bridge._box(box, "sh -c " + shlex.quote(CHECK) + " ttp-watch " + " ".join(map(str, ports)), timeout=40)
+        if "ttp-watch-nocheck" in r.stdout:
+            boxes.pop(box, None)
+            continue
+        if "ttp-watch-done" not in r.stdout:   # offline or the box is down: no restart, ask again later
+            n = bs.get("n", 0) + 1
+            boxes[box] = {"n": n, "next": now + BACKOFF_S[min(n, len(BACKOFF_S)) - 1]}
+            if n == 1:
+                out.append(f"{box}: not reachable; no restart, next check in {BACKOFF_S[0]}s or on a network change")
+            continue
+        boxes.pop(box, None)
+        down = {int(ln.split()[1]) for ln in r.stdout.splitlines() if ln.startswith("down ")}
+        for t in mine:
+            bad, f = [p for p in t["ports"] if p in down], fails.get(t["service"])
+            if not bad:
+                if f:
+                    rec = {"service": t["service"], "box": box, "failed_at": f["at"], "event": f["event"],
+                           "healed_at": now, "seconds": round(now - f["at"]), "restarts": f["restarts"]}
+                    _home().mkdir(parents=True, exist_ok=True)
+                    with open(_home() / HEAL_LOG, "a") as fh:
+                        fh.write(json.dumps(rec) + "\n")
+                    out.append(f"{t['service']}: answers again after {rec['seconds']}s")
+                    del fails[t["service"]]
+                continue
+            if not loaded(t, platform):
+                fails.pop(t["service"], None)
+                continue
+            f = fails.setdefault(t["service"], {"at": now, "event": event, "restarts": 0, "last": 0})
+            if now - f["last"] < RESTART_GAP_S[min(f["restarts"], len(RESTART_GAP_S) - 1)]:
+                continue
+            freed = release(cfg, t, bad)
+            said = restart(t, platform)
+            f.update(restarts=f["restarts"] + 1, last=now)
+            out.append(f"{t['service']}: port {', '.join(map(str, bad))} on {box} did not answer"
+                       f"{'' if freed else ' (still held after the cleanup)'}; {said}")
+    st["fail"] = {k: v for k, v in fails.items() if k in {t["service"] for t in ts}}
+    _home().mkdir(parents=True, exist_ok=True)
+    durable_write(_home() / STATE, json.dumps(st))
+    return out
+
+
+def heal_lines(platform: str | None = None, n: int = 3) -> list[str]:
+    """`ttp bridge status`'s lines on the watch: installed or not, and the last n heals."""
+    try:
+        rows = [json.loads(ln) for ln in (_home() / HEAL_LOG).read_text().splitlines()[-n:] if ln.strip()]
+    except (OSError, ValueError):
+        rows = []
+    out = [f"self-heal watch: {'installed' if service_files(platform)[0].is_file() else 'not installed (`ttp bridge setup`)'}"]
+    for r in rows:
+        out.append(f"  healed {r['service']} on {r['box']}: down at {time.strftime('%Y-%m-%d %H:%M %Z', time.localtime(r['failed_at']))}"
+                   f"{' after a ' + r['event'] if r.get('event') else ''}, answering again {r['seconds']}s later"
+                   f" ({r['restarts']} restart(s))")
+    return out
+
+
+def argv() -> list[str]:
+    return ["/usr/bin/env", f"PYTHONPATH={Path(__file__).resolve().parent.parent}", sys.executable, "-m", "ttp",
+            "bridge", "watch"]
+
+
+def service_files(platform: str | None = None) -> list[Path]:
+    if (platform or sys.platform) == "darwin":
+        return [Path.home() / "Library" / "LaunchAgents" / f"{LABEL}.plist"]
+    from . import hoststate
+    return [hoststate.unit_dir() / f"{LABEL}.service", hoststate.unit_dir() / f"{LABEL}.timer"]
+
+
+def contents(platform: str) -> list[bytes]:
+    log = str(_home() / "bridge-watch.log")
+    if platform == "darwin":
+        import plistlib
+        return [plistlib.dumps({"Label": LABEL, "ProgramArguments": argv(), "RunAtLoad": True,
+                                "StartInterval": INTERVAL_S, "WatchPaths": NET_PATHS["darwin"],
+                                "ProcessType": "Background", "StandardOutPath": log, "StandardErrorPath": log})]
+    from .tunnel import _unit_escape
+    return [(f"[Unit]\nDescription=tt-project: bridge health check\n\n[Service]\nType=oneshot\n"
+             f"ExecStart={_unit_escape(' '.join(shlex.quote(a) for a in argv()))}\n").encode(),
+            (f"[Unit]\nDescription=tt-project: bridge health check every {INTERVAL_S}s\n\n[Timer]\n"
+             f"OnBootSec={INTERVAL_S}\nOnUnitActiveSec={INTERVAL_S}\nAccuracySec=5\n\n"
+             "[Install]\nWantedBy=timers.target\n").encode()]
+
+
+def install(platform: str | None = None) -> str:
+    """Install or update the watch service; only what changed is rewritten and reloaded."""
+    from . import bridge
+    platform = platform or sys.platform
+    files, data = service_files(platform), contents(platform)
+    if all(f.is_file() and f.read_bytes() == d for f, d in zip(files, data)):
+        return "unchanged"
+    _home().mkdir(parents=True, exist_ok=True)
+    for f, d in zip(files, data):
+        f.parent.mkdir(parents=True, exist_ok=True)
+        durable_write(f, d)
+    if platform == "darwin":
+        from .service import _reload
+        r = _reload(LABEL, files[0], lambda *a: bridge._run(list(a)))
+        return "launchd agent started" if r.returncode == 0 else f"launchd refused it: {(r.stderr or r.stdout).strip()[:200]}"
+    bridge._run(["systemctl", "--user", "daemon-reload"])
+    r = bridge._run(["systemctl", "--user", "enable", "--now", "--", f"{LABEL}.timer"])
+    return "systemd user timer started" if r.returncode == 0 else f"systemd refused it: {r.stderr.strip()[:200]}"

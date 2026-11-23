@@ -204,6 +204,12 @@ def parse(data: dict) -> dict:
         out["boxes"][box] = {"login": {"agent": login.get("agent", ""), "identity": login.get("identity", "")},
                              "agents": parsed, "hold_check": hold, "gh_pull": b.get("gh_pull", False),
                              "gh_branch_prefixes": grants}
+    watch = data.get("watch", [])
+    if not isinstance(watch, list) or not all(isinstance(w, dict) and set(w) == {"label", "box", "port"} for w in watch):
+        raise BadConfig('watch: a list of {"label": its launchd label or systemd unit, "box": the ssh alias it '
+                        'forwards to, "port": the box port it forwards}: ssh forward services made by hand')
+    out["watch"] = [{"label": _name(w["label"], "watch label"), "box": _name(w["box"], "watch box"),
+                     "port": _port(w["port"], f"watch {w['label']} port")} for w in watch]
     if data.get("cert") is not None:
         from . import bridge_cert
         out["cert"] = bridge_cert.parse(data["cert"], out)
@@ -546,6 +552,8 @@ def setup(cfg: dict, boxes: list[str], platform: str | None = None) -> list[str]
         if cfg["boxes"][box].get("gh_pull"):   # its delivery.gh_route "workstation" calls (ghqueue)
             from .ghqueue import service_argv as gh_argv
             out.append(f"{box} {GH_PULL}: {start(box, GH_PULL, gh_argv(box), platform)}")
+    from . import bridge_watch
+    out.append(f"self-heal watch: {bridge_watch.install(platform)}")
     return out
 
 
@@ -586,6 +594,11 @@ def refresh(platform: str | None = None, path: Path | None = None, restarted: di
             if restarted is not None:
                 restarted[(box, an)] = said
             out.append(f"bridge {box} {an}: {'service command' if old != argv else 'relay'} changed; {said}")
+    if have or cfg.get("watch"):
+        from . import bridge_watch
+        said = bridge_watch.install(platform)
+        if said != "unchanged":
+            out.append(f"bridge self-heal watch: {said}")
     return out
 
 
@@ -718,5 +731,7 @@ def status(cfg: dict, boxes: list[str], platform: str | None = None, deep: bool 
                     lines.append("  the link answers but the agent holds no keys: load the key into it on this computer")
                 for t in tail:
                     lines.append(f"  log: {t[:200]}")
+    from . import bridge_watch
+    lines += bridge_watch.heal_lines(platform)
     lines.append(keep_awake_line(cfg, boxes, platform))
     return lines, 1 if bad else 0

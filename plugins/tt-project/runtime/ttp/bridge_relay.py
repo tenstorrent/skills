@@ -456,7 +456,9 @@ AGENT_OK = ("ok() { t=; command -v timeout >/dev/null 2>&1 && t='timeout 10'; "
 # On the box (POSIX sh; ss, else /proc): $1 the tag prefix, $2 the record name prefix, $3 the agent
 # link (a '~/' path, or empty), then the ports. Prints `ended <port> <pid> <age s>` per session it ends,
 # `kept <port> <pid> <why>` per one it leaves and, last, `held <port> <pid or ?>` per port still held;
-# <port> is `link` or `rec` for a session found by the agent link or its record.
+# <port> is `link` or `rec` for a session found by the agent link or its record. A port whose listener's
+# process is hidden (sshd sessions are often unreadable to their own account) is matched to one of the
+# account's sshd sessions by pausing each for a moment (hidden()); the usual checks then decide.
 CLEANUP = r"""tag=$1; rec=$2; link=$3; shift 3; me=$(id -u); ports="$*"; seen=
 case $link in '~/'*) link=$HOME/${link#'~/'};; esac
 mine=$$; p=$$   # this cleanup's own shell, its sshd and their ancestors are never ended
@@ -481,6 +483,30 @@ held() {   # the port has a listener, whether or not this account can see its pr
   fi
 }
 any_held() { for q in $ports; do held "$q" && return 0; done; return 1; }
+poke() {   # one connection to the port, closed at once
+  if command -v nc >/dev/null 2>&1; then nc -z -w 2 127.0.0.1 "$1" >/dev/null 2>&1
+  elif command -v bash >/dev/null 2>&1; then timeout 3 bash -c 'exec 3<>"/dev/tcp/127.0.0.1/$0"' "$1" >/dev/null 2>&1
+  else return 1; fi
+}
+queued() { ss -Hltn 2>/dev/null | awk -v a="127.0.0.1:$1" '$4 == a {print $2; exit}'; }   # its unaccepted connections
+paused=; trap '[ -z "$paused" ] || kill -CONT "$paused" 2>/dev/null' EXIT HUP INT TERM
+owns() {   # $1 port, $2 pid: paused, the pid leaves a connection to the port unaccepted
+  paused=$2; kill -STOP "$2" 2>/dev/null || { paused=; return 1; }
+  poke "$1"; q=$(queued "$1"); kill -CONT "$2" 2>/dev/null; paused=
+  [ "${q:-0}" -gt 0 ]
+}
+hidden() {   # $1 port held by a listener whose process this account cannot see (a privilege-separated sshd):
+  # the account's own sshd session that, paused for a moment, leaves a connection to it unaccepted while
+  # running it accepts one at once; twice, so a slow accept elsewhere never names the wrong session
+  command -v ss >/dev/null 2>&1 || return 0
+  if [ -n "${TTP_TEST_SSHD_PIDS+x}" ]; then cands=$TTP_TEST_SSHD_PIDS
+  else cands=$(ps -u "$me" -o pid=,comm= 2>/dev/null | awk '$2 == "sshd" || $2 == "sshd-session" {print $1}'); fi
+  for c in $cands; do
+    case " $mine " in *" $c "*) continue;; esac
+    owns "$1" "$c" || continue
+    poke "$1"; sleep 1; [ "$(queued "$1")" = 0 ] && owns "$1" "$c" && { echo "$c"; return; }
+  done
+}
 alive() { kill -0 "$1" 2>/dev/null && case "$(ps -o stat= -p "$1" 2>/dev/null)" in *Z*) false;; esac; }   # a zombie has ended
 """ + AGENT_OK + r"""
 end_one() {   # $1 the port (or link, rec), $2 the pid
@@ -510,7 +536,9 @@ if [ -n "$link" ] && [ -L "$link" ]; then   # the agent link of the stale sessio
   esac
 fi
 for port in $ports; do
-  for pid in $(listeners "$port" | sort -u); do end_one "$port" "$pid"; done
+  pids=$(listeners "$port" | sort -u)
+  [ -n "$pids" ] || ! held "$port" || pids=$(hidden "$port")
+  for pid in $pids; do end_one "$port" "$pid"; done
 done
 for f in "${XDG_CACHE_HOME:-$HOME/.cache}/tt-project/$rec"*.pid; do
   [ -f "$f" ] && [ ! -L "$f" ] || continue

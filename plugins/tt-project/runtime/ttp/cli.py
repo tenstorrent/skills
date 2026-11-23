@@ -2838,6 +2838,11 @@ def cmd_bridge(a) -> None:
     if a.action == "cert":
         _bridge_cert(a, cfg)
         return
+    if a.action == "watch":   # one pass of the self-heal check (its service runs this)
+        from . import bridge_watch
+        for line in bridge_watch.run_pass(cfg):
+            print(f"{time.strftime('%Y-%m-%d %H:%M:%S')} {line}", flush=True)
+        return
     boxes = a.boxes or list(cfg["boxes"])
     unknown = [b for b in boxes if b not in cfg["boxes"]]
     if unknown:
@@ -16083,13 +16088,15 @@ def ttp_parser():
 
     s = sub.add_parser("bridge", help="ssh access bridge: lab boxes reach hosts through this computer's ssh agents, "
                        "no key stored on a box, failing closed while this computer sleeps (config ~/.config/tt-project/bridge.json)")
-    s.add_argument("action", choices=["setup", "status", "doctor", "stop", "show", "cert", "gh-pull"],
+    s.add_argument("action", choices=["setup", "status", "doctor", "stop", "show", "cert", "gh-pull", "watch"],
                    help="setup: write each box's ssh config block and start the kept sessions; status: one line per box "
                    "and agent (exit 1 when one is down); doctor: status and what to do; stop: stop the sessions "
                    "(the box's logins through them then fail); show: print the block and session commands, change nothing; "
                    "cert status|renew|remove|trust --print|schedule [boxes]: the offline mode's short-lived certificates "
                    "(off unless the config has a \"cert\" section); gh-pull: run the boxes' gh calls queued by "
-                   "delivery.gh_route \"workstation\" with this computer's gh (default: the boxes with \"gh_pull\": true)")
+                   "delivery.gh_route \"workstation\" with this computer's gh (default: the boxes with \"gh_pull\": true); "
+                   "watch: one pass of the self-heal check `setup` installs (a forwarded port that no longer answers "
+                   "on the box: free its stale session there and restart its service)")
     s.add_argument("boxes", nargs="*", help="the boxes (their ssh aliases; default: all in the config); "
                    "with cert, the cert action first")
     s.add_argument("--print", action="store_true", help="with cert trust: print the authorized_keys line")
