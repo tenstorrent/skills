@@ -172,36 +172,23 @@ collect; small shapes are for debugging only.
 
 ## Diffusion transformers
 
-A DiT trained with flow matching (the plan's "Diffusion transformers") adds these rules:
+A DiT trained with flow matching adds three rules:
 
-- The loss. With x_t a mix of the clean latent x0 and the noise at time t, the model predicts the
-  velocity and the loss is the MSE against the target velocity (x0 - noise, or its negative: take
-  the sign and the time convention from the reference's own training code, never from memory),
-  over the generated modality's rows only. Conditioning rows and padding are inputs, never in the
-  loss. The batch loss is the mean over sequences of each sequence's MSE.
-- Random numbers come from the host. The sequence order, caption dropout, timesteps and noise are
-  drawn on the host CPU in a fixed order and uploaded as inputs; no device or torch RNG runs in the
-  training step. Then the device and a GPU golden can be compared sequence by sequence, not only as
-  curves, and a resumed run draws exactly what an uninterrupted one would when the checkpoint
-  carries the generator state.
-- Packed variable-length sequences. Each sequence is its own packed micro-batch (or the packed
-  batch carries a block mask): pad to the tile size with a mask so padded rows neither attend nor
-  are attended, and drop them from the loss. Shapes change from step to step; keep the number of
-  distinct padded lengths small (round up to a bucket) so the program cache does not recompile
-  every step.
-- Per-row timesteps. The timestep embedding and the AdaLN scale and shift it drives are per row
-  group, not one vector per batch.
-- LoRA on DiT blocks. Wrap exactly the projections the recipe's targets match (usually attention
-  q, k, v, out and the feed-forward projections of each block) and name the modules as the
-  reference does (`transformer_blocks.<i>.<path>`), so adapters load and save by name. On a
-  tensor-parallel layout the adapters follow the mesh code rules above.
-- Timestep precision. Near pure noise (small t when t = 0 is noise) the sinusoidal timestep
-  features and the AdaLN modulation they drive (a small scale added to 1) are where bf16 loses
-  bits: a device forward can match the reference within a fraction of a percent at mid and large
-  t and be several percent off near the noise end, with identical weights and inputs. The PCC
-  harness sweeps t explicitly, including values within a few percent of the noise end: the
-  timestep embedding, the AdaLN tables, the first and last block and the loss, each against the
-  reference at every t. Random draws alone rarely land there.
+- The loss. The model predicts a velocity on x_t, a mix of the clean latent and the noise at time
+  t. Take the target's sign (x0 - noise or its negative) and the time convention (which end of t is
+  noise) from the reference's own training code, never from memory. The MSE covers the generated
+  modality's rows only; conditioning rows and padding are inputs. The batch loss is the mean of the
+  per-sequence MSEs.
+- Random numbers come from the host. Data order, caption dropout, timesteps and noise are drawn on
+  the host CPU in a fixed order and uploaded as inputs; no device or torch RNG runs in the step, and
+  a checkpoint carries the generator state. The device and a GPU golden then compare sequence by
+  sequence, and a resumed run draws what an uninterrupted one would.
+- Precision near the noise end. There the sinusoidal timestep features and the per-row AdaLN
+  modulation they drive (a small scale added to 1) lose bits in bf16: a forward can match within a
+  fraction of a percent at mid t and be several percent off near the noise end. The PCC harness
+  sweeps t explicitly into the last few percent before the noise end and compares the timestep
+  embedding, the AdaLN tables, the first and last block and the loss at each t; random draws rarely
+  land there.
 
 ## Baseline measurement
 

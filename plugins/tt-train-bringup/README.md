@@ -26,13 +26,9 @@ changes only; no full-step time is projected from them, and the result is the fu
 without the profiler (see the
 [measurement protocol](skills/optimization-loop/SKILL.md#measurement-protocol)).
 
-Diffusion transformers (flow-matching fine-tuning of a DiT, e.g. LoRA on video latents) follow the
-same phases with their own rules: velocity target and MSE on the generated rows, every random number
-drawn on the host CPU in a fixed order so a GPU golden and the device compare sequence by sequence,
-memory at the worst-case packed sequence, per-row timesteps, and a PCC sweep near the noise end
-where the timestep embedding loses precision (see
-[train-plan](skills/train-plan/SKILL.md#diffusion-transformers) and
-[composite-bringup](skills/composite-bringup/SKILL.md#diffusion-transformers)).
+Diffusion transformers (flow-matching fine-tuning of a DiT) follow the same phases with a few extra
+rules: see [train-plan](skills/train-plan/SKILL.md#diffusion-transformers) and
+[composite-bringup](skills/composite-bringup/SKILL.md#diffusion-transformers).
 
 Hardware telemetry: `scripts/tt_telemetry_sampler.py` (pyluwen, 20 Hz per-chip clock/power CSV),
 `scripts/tt_telemetry_summary.py` (settled clock, critical chip, power cap) and
