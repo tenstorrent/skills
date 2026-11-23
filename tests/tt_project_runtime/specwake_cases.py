@@ -975,3 +975,29 @@ def test_reply_of_reads_an_ack_wait_probes_peer_cursor_and_satisfying_reply():
     assert "--after cursor): aaaa1111, bbbb2222" in text and "`--after fedcba9876543210`" in text
     assert probewake.reply_of(probewake.record("test -e /tmp/x", 0, "replied: note fedcba9876543210", 1.0)) is None
     assert "satisfied" not in probewake.prompt_lines(probewake.record("test -e /tmp/x", 0, "ok", 1.0))
+
+
+def test_a_planned_check_due_under_a_dormant_spec_update_starts_no_run_and_the_update_waits_for_the_wait_end(
+        env, monkeypatch, tmp_path):
+    # A gate-judged planned check is no spec wake: the pending update neither escalates it nor is marked seen.
+    from ttp import waketier as wt
+    p = make(env)
+    d, tid, flag, runs, idle = _deferred_flow(p, monkeypatch, tmp_path)
+    slept_on = json.loads(p.db.task(tid)["result"])["spec_seen"]
+    _edit_spec(p, tid, "also report the peak memory", wake_now=False)
+    d.tick()
+    res = json.loads(p.db.task(tid)["result"])
+    _gate_set(p, tid, **{wt.PLAN: {**res[wt.PLAN], "at": [time.time() - 1, res[wt.PLAN]["at"][1]]}})
+    d._probe_rc[tid] = (1, time.time(), res["retry_when"])   # its probe still says "not yet": the check is due
+    d.probe_waiting()
+    assert json.loads(p.db.task(tid)["result"]).get(wt.KEY) == "plan_check"
+    for _ in range(4):
+        d.tick()
+        time.sleep(0.05)
+    res = json.loads(p.db.task(tid)["result"])
+    assert runs() == 1 and idle(), res
+    assert res["spec_seen"] == slept_on and not res.get("escalated_wake"), res
+    flag.write_text("")   # the wait ends: its run reads the update at the task's own tier
+    assert _run_until(d, p, lambda: runs() == 2)
+    wake = _last_wake(p, tid)
+    assert wake.get("reason") == "spec_change" and wake.get("tier") == "standard" and wake.get("escalated") is True, wake

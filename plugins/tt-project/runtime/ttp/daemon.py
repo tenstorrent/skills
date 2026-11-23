@@ -17258,10 +17258,11 @@ class Daemon:
         if rc not in NOT_YET_RCS or probe != prev.get("retry_when") or at < float(prev.get("waiting_since") or 0) \
                 or prev.get("woke") or not (chk := waketier.due(prev, now)):
             return False
+        extra = {waketier.PLAN: chk["plan"], waketier.PLAN_BY: chk["by"], waketier.PLAN_TIER: chk["tier"]}
+        if chk["by"] in ("jev", "plain") and SPEC_SEEN_KEY in prev:
+            extra[SPEC_SEEN_KEY] = prev[SPEC_SEEN_KEY]   # the gate judges it by its plan: a spec change sleeps on
         self._wake_waiting(task, f"its planned {chk['what']} check ({chk['n']} of {chk['of']}): is the wait still "
-                           f"on track (started, running, no errors)?", now,
-                           {waketier.PLAN: chk["plan"], waketier.PLAN_BY: chk["by"], waketier.PLAN_TIER: chk["tier"]},
-                           kind="plan_check")
+                           f"on track (started, running, no errors)?", now, extra, kind="plan_check")
         return True
 
     def _hold_waiting(self, task: dict, prev: dict, now: float) -> bool:
