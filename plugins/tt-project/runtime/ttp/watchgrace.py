@@ -5,8 +5,9 @@ coordinator, page another project or open an issue on a short blip that is gone 
 With `grace_min` set, a keyed line (one with a JSON `"key"`) at `normal` or above (or with no
 severity) is held until that key has been reported for that long: before then nothing is observed,
 paged or counted. The first run past the grace raises it once, at the line's own severity but at
-least `normal`; later runs report it at `low` under the same key (a line rated above what was raised
-still goes through as rated: a real escalation). Keyed `low` and `info` lines (a routine "in sync")
+least `normal`; later runs report it at that raised severity under the same key, so its open issue
+keeps it and reminds by its rewake rule (a line rated above what was raised still goes through as
+rated: a real escalation). Keyed `low` and `info` lines (a routine "in sync")
 are never held or raised: they pass through as rated (holds).
 
 Error lines (`"error": true` or `"side"`: the check could not run) share one clock, ERROR_KEY: inside
@@ -47,7 +48,7 @@ def grace_s(payload: dict | None) -> float:
 
 def step(state: dict, key: str, now: float, grace: float, severity: str | None) -> tuple[str, str | None]:
     """One sighting of `key`: (HOLD, None) while inside the grace, (RAISE, severity) the first time
-    past it or on a higher rating, (REPEAT, "low") after. Updates `state` in place."""
+    past it or on a higher rating, (REPEAT, the raised severity) after. Updates `state` in place."""
     if grace <= 0:
         return PASS, severity
     e = state.get(key)
@@ -61,7 +62,7 @@ def step(state: dict, key: str, now: float, grace: float, severity: str | None) 
     if raised is None or _RANK.get(sev, 1) > _RANK.get(raised, 1):
         e["raised"] = sev
         return RAISE, sev
-    return REPEAT, "low"
+    return REPEAT, raised
 
 
 def forget(state: dict, seen: set[str]) -> dict:

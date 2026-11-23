@@ -84,7 +84,8 @@ def screen(db: DB, cfg: dict, source: str, text: str, hint: str | None = None, j
     receipt source) is kept on the issue with its subject; see settle_receipts. `whole` (a watcher's JSON
     line with "whole": true) keeps the line as one condition: its text is never split at '; '. `key` (a watcher JSON line's
     "key" field) is the issue's identity instead of its text: the text may change without a new issue, and a lower valid
-    `hint` lowers the open issue (ignored at info), so a watcher fixed to report info stops its reminders.
+    `hint` lowers the open issue (ignored at info), so a watcher fixed to report info stops its reminders; a hint
+    back up to no more than it was lowered from within `screen.reraise_window_h` restores it quietly (a flap).
     A keyed issue a run that reported nothing closed, raised again under the same key within
     `screen.reraise_window_h` of that close at the same or a lower severity, only counts: it stays
     closed and wakes nobody (a watcher re-sending a known line each wake). A higher severity reopens and wakes.
@@ -190,11 +191,11 @@ def _issue(db: DB, fp: str, source: str, title: str, retitle: str | None, hint: 
         history = json.loads(row.get("history") or "[]") if watch_key else []
         since = next((i for i in range(len(history), 0, -1) if history[i - 1].get("action") == "reopened"), 0)
         ceiling = max((SEVERITY_RANK.get(h.get("from") or "", -1) for h in history[since:]
-                       if h.get("action") == "lowered"), default=-1)
+                       if h.get("action") == "lowered" and now - float(h.get("ts") or 0) <= reraise_s), default=-1)
         if watch_key and (0 <= seen_at < rank or rank < seen_at <= ceiling):
             # The watcher now rates a keyed condition lower (fixed to report info): the row follows it down.
-            # Back up to no more than it was before: restored quietly, so a flapping watcher reminds only
-            # by the rewake rule below.
+            # Back up to no more than it was before, within the reraise window: restored quietly, so a
+            # flapping watcher reminds only by the rewake rule below. Later, a recurrence raises and wakes.
             history.append({"ts": now, "action": "lowered" if seen_at < rank else "restored", "by": "the watcher",
                             "why": f"{row['severity']} to {hint}", "from": row["severity"]})
             row = {**row, "severity": hint,

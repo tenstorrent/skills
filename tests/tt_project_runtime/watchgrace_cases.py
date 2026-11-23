@@ -48,7 +48,7 @@ def test_watchgrace_a_check_that_fails_then_recovers_inside_its_grace_raises_not
     assert _raised(p) == []
 
 
-def test_watchgrace_a_check_failing_past_its_grace_raises_one_normal_line_then_low_repeats(env, monkeypatch):
+def test_watchgrace_a_check_failing_past_its_grace_raises_one_normal_line_then_quiet_repeats(env, monkeypatch):
     from ttp import cli
     p, d, clock, out, run = _grace_watcher(env, monkeypatch)
     out["stdout"] = json.dumps({"text": "route to the relay: unreachable", "severity": "normal", "key": "relay-route"})
@@ -63,7 +63,7 @@ def test_watchgrace_a_check_failing_past_its_grace_raises_one_normal_line_then_l
     for _ in range(3):
         clock["t"] += 10 * 60
         assert run() == "ok (1 observations)"   # never an error run
-    assert len(_raised(p)) == 1, _raised(p)   # the low repeats wake nobody
+    assert len(_raised(p)) == 1, _raised(p)   # the repeats wake nobody inside the rewake window
     assert p.db.kv("watch_grace:rt")["relay-route"]["raised"] == "normal"
     p.db.x("INSERT INTO schedules(name, kind, every_s, enabled, payload) VALUES(?,?,?,?,?)",
            ("rt", "command", 600, 1, json.dumps({"command": "x", "grace_min": 10})))
@@ -87,7 +87,7 @@ def test_watchgrace_step_forget_and_status():
     assert wg.step(st, "k", 100, 600, "high") == (wg.HOLD, None)
     assert wg.status(st, 600, now=400) == ["k: retrying for 5 min (5 min of grace left)"]
     assert wg.step(st, "k", 700, 600, "high") == (wg.RAISE, "high")   # its own rating, at least normal
-    assert wg.step(st, "k", 800, 600, "high") == (wg.REPEAT, "low")
+    assert wg.step(st, "k", 800, 600, "high") == (wg.REPEAT, "high")
     assert wg.step(st, "k", 900, 600, "critical") == (wg.RAISE, "critical")   # a real escalation
     assert wg.status(st, 600, "other") == ["other: ok"]
     assert wg.forget(st, set()) == {} and wg.forget(st, {"k"}) == st
@@ -248,3 +248,24 @@ def test_a_paged_to_line_is_filed_once_per_key_across_quiet_runs_until_a_day_pas
     assert not p.db.kv(dm.PAGED_KEY + "hw"), "a day unreported: forgotten"
     run(line)
     assert len(_notes_to("ops")) == 5 and "still" not in _notes_to("ops")[-1]["spec"]
+
+
+def test_watchgrace_repeats_keep_the_keyed_issue_reminding_and_a_fixed_watcher_still_lowers_it(env, monkeypatch):
+    p, d, clock, out, run = _grace_watcher(env, monkeypatch)
+    down = {"text": "route to the relay: unreachable", "severity": "normal", "key": "relay-route"}
+    out["stdout"] = json.dumps(down)
+    run()
+    clock["t"] += 11 * 60
+    run()
+    assert [r["severity"] for r in _raised(p)] == ["normal"]
+    for _ in range(7):   # an hour apart, past the default 6 h rewake
+        clock["t"] += 3600
+        run()
+    assert [r["severity"] for r in _raised(p)] == ["normal", "normal"], _raised(p)
+    assert p.db.one("SELECT severity, status FROM issues") == {"severity": "normal", "status": "open"}
+    # The watcher fixed to print the key at info (never held): the issue follows it down.
+    clock["t"] += 3600
+    out["stdout"] = json.dumps({**down, "severity": "info"})
+    run()
+    assert p.db.one("SELECT severity, status FROM issues") == {"severity": "info", "status": "ignored"}
+
