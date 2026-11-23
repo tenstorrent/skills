@@ -710,8 +710,9 @@ def test_glm_guard_reads_a_copied_or_closed_fd_as_no_file_after_a_cd_outside_the
 @_pytest.mark.parametrize("cmd", [
     "cd /work/repo && echo x > f", "cd /work/repo && echo x >> f 2>&1", "cd /work/repo && echo x >&f",
     "cd /work/repo && ls 2>err.log", "ls &>/tmp/x", "ls 2>&1 >/tmp/x", "ls >&/tmp/x"])
-def test_glm_guard_still_refuses_a_redirect_to_a_file_outside_the_worktree(cmd, tmp_path):
+def test_glm_guard_still_refuses_a_redirect_to_a_file_outside_the_worktree(cmd, tmp_path, monkeypatch):
     from ttp import glmguard
+    _gg_tmp_taken(monkeypatch)
     wt, rd = _gg_run(tmp_path)
     assert glmguard.shell_refusal(cmd, str(wt), str(rd), {"TTP_PROJECT": str(tmp_path / "proj"), **_GG_RUN_ENV}), cmd
 
@@ -1582,6 +1583,7 @@ def test_every_route_to_the_chat_model_gets_the_scratch_redirect_in_the_tool_hoo
     `ttp said ... > /tmp/x.json` is redirected to the run's scratch folder, never let through."""
     import json
     from ttp import glmguard, hook
+    _gg_tmp_taken(monkeypatch)
     flag = glmguard.run_env("claude", _glm_route_notes()[name])[glmguard.RUN_ENV]
     wt, rd = _glm_run_env(monkeypatch, tmp_path, flag)
     glmguard.mark_run(rd, False, cwd=str(wt))
