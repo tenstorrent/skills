@@ -177,7 +177,8 @@ def report(db, since: float, now: float, cfg: dict | None = None, p=None) -> dic
     for i in range(0, len(ids), 500):
         part = ids[i:i + 500]
         for r in db.q(f"SELECT id, task, dir FROM runs WHERE task IN ({','.join('?' * len(part))}) "
-                      "ORDER BY started, id", part):
+                      f"AND status NOT IN ({','.join('?' * len(runcap.FREE))}) ORDER BY started, id",
+                      (*part, *runcap.FREE)):   # as the run stop counts: one that never reached the model is no run
             count[r["task"]] = rank[r["id"]] = count.get(r["task"], 0) + 1
             if r["task"] in last:
                 prev[r["id"]] = last[r["task"]]

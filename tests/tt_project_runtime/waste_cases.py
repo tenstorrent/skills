@@ -290,7 +290,7 @@ def test_waste_ledger_counts_no_costly_wake_after_a_long_host_sleep_and_queues_n
     assert waste.fix_bucket(waste.report(p.db, later - 86400, later, p.config())) == "costly_wake"
 
 
-def _handoff_run(p, task, cost, started, result=None):
+def _handoff_run(p, task, cost, started, result=None, status="ok"):
     """A run with a run dir; `result` (a dict) is its result.json, None leaves it unwritten."""
     import json as _json
     d = p.base / "runs-test" / f"{task}-{int(started)}"
@@ -298,7 +298,7 @@ def _handoff_run(p, task, cost, started, result=None):
     if result is not None:
         (d / "result.json").write_text(_json.dumps(result))
     p.db.x("INSERT INTO runs(task, role, provider, status, dir, started, ended, cost_usd) VALUES(?,?,?,?,?,?,?,?)",
-           (task, "worker", "claude", "ok", str(d), started, started + 60, cost))
+           (task, "worker", "claude", status, str(d), started, started + 60, cost))
 
 
 def test_over_runs_keeps_a_continuation_with_a_new_result_apart_and_counts_repeats_and_unknown(env, monkeypatch):
@@ -339,6 +339,22 @@ def test_over_runs_keeps_a_continuation_with_a_new_result_apart_and_counts_repea
     monkeypatch.setattr(chaincap, "code_commits", lambda *a, **k: 1)
     rep2 = waste.report(p.db, now - 86400, now, p.config(), p=p)
     assert [x["task"] for x in rep2["continued"]["runs"]] == [useful, useful, unknown, rework]
+
+
+def test_over_runs_skips_runs_that_never_reached_the_model_in_rank_and_repeat(env):
+    """A run that ended on a limit, auth or fallback (runcap.FREE) is no run to over_runs, as to the run stop:
+    it takes no rank and is not the previous hand-off the next run is compared with."""
+    from ttp import runcap, waste
+    p = make(env)
+    now = 1_000_000.0
+    for free in runcap.FREE:
+        t = _waste_task(p, f"wait through a {free}", kind="work")
+        for i in range(4):
+            _handoff_run(p, t, 0.1, now - 5000 + i * 100, {"status": "waiting", "summary": f"step {i}"})
+        _handoff_run(p, t, 0.0, now - 3100, status=free)
+        _handoff_run(p, t, 0.4, now - 3000, {"status": "waiting", "summary": "step 3"})   # run 4's again
+    rep = waste.report(p.db, now - 86400, now, p.config())
+    assert rep["buckets"]["over_runs"]["runs"] == len(runcap.FREE) and not rep["continued"]["runs"]
 
 
 def test_the_waste_fix_task_is_not_queued_again_for_runs_a_diagnosis_already_covers(env):
