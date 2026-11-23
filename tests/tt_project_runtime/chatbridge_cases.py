@@ -1839,16 +1839,14 @@ def test_a_model_missing_notice_is_sent_once_until_a_check_lists_the_model_again
     assert not route.read_served(p.state).get("chat", {}).get("ok")
     assert alerts == [] and route.holds(p.db) == {}
     refused_run(0)
-    for n in range(1, 6):   # unreachable checks, refused runs, a hold ended by a config round trip
+    for n in range(1, 6):   # unreachable checks and refused runs
         check()
         assert not route.read_served(p.state)["chat"]["ok"]
-        if n == 3:
-            p.set_config("providers.chat.tiers.light.model", "example-org/model-b")
-            d._load_config()
+        if n == 3:   # a hold ended by its quiet retry: the next refusal holds again, unannounced
+            h = route.holds(p.db)["light|" + _RT_MODEL]
+            p.db.set_kv(route.MISSING + "light|" + _RT_MODEL, {**h, "retry": True, "at": 0})
             d.check_route_models()
             assert route.holds(p.db) == {}
-            p.set_config("providers.chat.tiers.light.model", _RT_MODEL)
-            d._load_config()
         refused_run(n)
         assert route.held(p.db, d.cfg, "light") == _RT_MODEL
     up.models = []   # an empty list proves nothing either

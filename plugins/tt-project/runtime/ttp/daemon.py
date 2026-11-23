@@ -4823,9 +4823,9 @@ class Daemon:
         now = time.time()
         for tier, model, why in route.release(self.p.db, self.cfg, route.read_served(self.p.state), now):
             log(self.p, f"route: tier {tier} routes again ({model}: {why})")
-        for model in route.served_again(self.p.db, route.read_served(self.p.state), now):
-            self.alert(f"route-model-served:{route.TO}|{model}", route.served_notice(route.TO, model),
-                       severity="low", every_s=0)
+            if why == route.LISTED and route.clear_notice(self.p.db, model):
+                self.alert(f"route-model-served:{route.TO}|{model}", route.served_notice(route.TO, model),
+                           severity="low", every_s=0)
         if os.environ.get("TTP_TEST_NO_MODELS_PROBE") or (self._models_probe and self._models_probe.is_alive()):
             return
         if now - self._models_tried < served.CHECK_S or not (alias := route.chat_alias(self.cfg)):

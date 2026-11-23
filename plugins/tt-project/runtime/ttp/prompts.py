@@ -15,6 +15,7 @@ from . import chaincap, conflictfix, ctxblock, overlap, relay, replymsg, setting
 from . import knownpaths, preempt, sidefx, spans, specfold, streamguard
 from .db import continues_id, load_result
 from .hook import unread_update
+from .ponytail import skill_file
 from .project import rebase_replace
 from .project import (CORRECTIONS_HEADER, OWN_FLAG, WORKER_MEMORY_CHARS, WORKER_PINNED_MIN_CHARS, WORKER_RANKED_MIN_CHARS,
                       Project, code_tasks_may_push, own_push, push_allowed, push_queue_on, task_may_self_land, worker_memory,
@@ -177,12 +178,6 @@ REVIEW_PUSH_SECTIONS = ("## Pushing a reviewed change", "## Approving into the p
 
 
 OWN_SECTION = "## Publishing onto its own PR branch"   # kind-review.md's `ttp push --own` section
-
-
-def _ponytail_skill() -> str:
-    """The ponytail review skill's file, as review specs name it (ponytail.spec_line)."""
-    from .ponytail import skill_file
-    return skill_file()
 
 
 def _sections(text: str, cfg: dict) -> str:
@@ -989,7 +984,7 @@ def worker_task(p: Project, task: dict, cwd: str, branch: str | None, wake: dict
     parts = [
         restart_block(p, prev),
         streamguard.prompt_block(prev),
-        _sections(_raw(p, f"kind-{kind}.md"), cfg).replace("{ponytail_skill}", _ponytail_skill()),
+        _sections(_raw(p, f"kind-{kind}.md"), cfg).replace("{ponytail_skill}", skill_file()),
         worker_memory_block(p),
         worker_rules(p, task),
         f"# YOUR TASK #{task['id']}: {task['title']}\n"
