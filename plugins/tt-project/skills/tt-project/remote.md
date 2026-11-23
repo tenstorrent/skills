@@ -60,7 +60,8 @@
   optionally with `"target": "<host>:<port>"` (what the forward reaches) and `"interface": "<name>"`
   (the one this computer reaches that target through): a forward whose target does not answer is
   then left alone the same way. An entry with no target whose port still connects without
-  answering after one restart is not restarted again until its check changes (logged once).
+  answering after one restart is not restarted again until its check changes or this computer
+  wakes or changes network (logged once).
   The checks of a target open and close a TCP connection to it each pass, which a strict
   fail2ban on the target's sshd may count.
   Each heal is one JSON line in `~/.tt-project/bridge-heal.log`; `ttp bridge status` shows the

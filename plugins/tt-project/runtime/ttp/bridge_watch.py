@@ -15,7 +15,8 @@ Besides the sessions `ttp bridge` installs, the config's "watch" list names ssh 
 hand: {"label": the launchd label or systemd unit, "box": its ssh alias, "port": the box port it forwards},
 optionally with "target" (the host:port it forwards to) and "interface" (the one this computer reaches it
 through), so a forward whose target is off is left alone the same way. One with no target that still connects
-but sends nothing after a restart is not restarted again until its check result changes.
+but sends nothing after a restart is not restarted again until its check result changes or this computer wakes
+or changes network (which can leave the forward stale again).
 Each heal (from the first failed check to the first answer again) is one JSON line in HEAL_LOG; `ttp bridge
 status` shows the last few."""
 from __future__ import annotations
@@ -161,6 +162,9 @@ def run_pass(cfg: dict, platform: str | None = None, now: float | None = None) -
     event = ("network change" if net and st.get("net") and net > st["net"]
              else "wake" if last and now - last > WAKE_GAP_S else "")
     st.update(last=now, net=net)
+    if event:   # a wake or network change can leave any forward stale again
+        for f in fails.values():
+            f.pop("down", None)
     ts = targets(cfg, platform)
     for box in dict.fromkeys(t["box"] for t in ts):
         mine = [t for t in ts if t["box"] == box]

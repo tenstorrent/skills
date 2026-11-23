@@ -214,6 +214,8 @@ def parse(data: dict) -> dict:
     out["watch"] = []
     for w in watch:
         host, _, to = str(w.get("target", "")).rpartition(":")
+        if "interface" in w and "target" not in w:
+            raise BadConfig(f"watch {w['label']}: an interface goes with the target it reaches")
         if "target" in w and not (isinstance(w["target"], str) and host and not host.startswith("-")
                                   and not re.search(r"[\s:/@]", host) and to.isdigit() and 0 < int(to) < 65536):
             raise BadConfig(f"watch {w['label']}: target {w['target']!r} is host:port (a host name or address)")

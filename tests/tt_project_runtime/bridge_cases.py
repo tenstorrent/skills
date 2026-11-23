@@ -2622,6 +2622,7 @@ def test_bridge_watch_heals_a_listed_hand_made_service(tmp_path, monkeypatch):
                 [{"label": "x", "box": "b"}], {"x": 1}, [{"label": "x", "box": "b", "port": 2400, "target": "h"}],
                 [{"label": "x", "box": "b", "port": 2400, "target": "-h:22"}],
                 [{"label": "x", "box": "b", "port": 2400, "target": "h:22", "interface": "e n"}],
+                [{"label": "x", "box": "b", "port": 2400, "interface": "en9"}],
                 [{"label": "x", "box": "b", "port": 2400, "extra": 1}]):
         with pytest.raises(bridge.BadConfig):
             bridge.parse({"boxes": {"b": {"login": {}, "agents": {"auto": {"agent": "env", "forward": [{"name": "h", "target": "h.example.com", "port": 2301}]}}}}, "watch": bad})
@@ -2629,23 +2630,26 @@ def test_bridge_watch_heals_a_listed_hand_made_service(tmp_path, monkeypatch):
 
 
 def test_bridge_watch_hand_made_service_without_a_target_is_restarted_once_while_it_stays_silent(tmp_path, monkeypatch):
-    # cells: no-target-one-heal, logged-once, heals-again-on-change
+    # cells: no-target-one-heal, logged-once, heals-again-on-change, heals-again-after-wake
     from ttp import bridge_watch
     watch = [{"label": "my-forward", "box": "box-2", "port": 2400}]
     down, none = "down 2400\nttp-watch-done\n", "none 2400\nttp-watch-done\n"
-    cfg, seen = _watch_env(tmp_path, monkeypatch, "linux", [down, down, down, none, down, down], watch=watch,
-                           agents=False)
+    cfg, seen = _watch_env(tmp_path, monkeypatch, "linux", [down, down, down, none, down, down, down, down],
+                           watch=watch, agents=False)
     t0 = 1_000_000.0
     assert bridge_watch.run_pass(cfg, "linux", t0)[0].endswith("restarted") and len(seen["release"]) == 1
     out = bridge_watch.run_pass(cfg, "linux", t0 + 60)   # still silent: it may be a live forward whose target is off
     assert len(seen["release"]) == 1 and len(out) == 1 and "names no target" in out[0]
-    assert bridge_watch.run_pass(cfg, "linux", t0 + 600) == [] and len(seen["release"]) == 1   # logged once
-    bridge_watch.run_pass(cfg, "linux", t0 + 630)   # its check changed: no listener now, so it is healed again
+    assert bridge_watch.run_pass(cfg, "linux", t0 + 120) == [] and len(seen["release"]) == 1   # logged once
+    bridge_watch.run_pass(cfg, "linux", t0 + 180)   # its check changed: no listener now, so it is healed again
     assert len(seen["release"]) == 2
-    bridge_watch.run_pass(cfg, "linux", t0 + 760)   # changed back to silent: one more heal, then it waits again
-    bridge_watch.run_pass(cfg, "linux", t0 + 1400)
+    bridge_watch.run_pass(cfg, "linux", t0 + 240)   # changed back to silent: one more heal, paced, then it waits
+    bridge_watch.run_pass(cfg, "linux", t0 + 330)
+    bridge_watch.run_pass(cfg, "linux", t0 + 400)
     assert len(seen["release"]) == 3
-    assert sum(c == "systemctl --user restart -- my-forward.service" for c in seen["run"]) == 3
+    bridge_watch.run_pass(cfg, "linux", t0 + 700)   # a wake can leave the forward stale again: one more restart
+    assert len(seen["release"]) == 4
+    assert sum(c == "systemctl --user restart -- my-forward.service" for c in seen["run"]) == 4
 
 
 def test_bridge_watch_hand_made_service_with_a_target_heals_only_when_the_target_answers(tmp_path, monkeypatch):
