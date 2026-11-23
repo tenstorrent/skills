@@ -51,8 +51,8 @@ RECENT_ACTIONS = 20            # the coordinator's last actions a lane turn is s
 OPUS = "opus"                  # a turn record's `by` for the coordinator's own session; lane turns carry none
 # Digest sections the lane sees whole, not as the "as last turn" lines the coordinator's session gets: it has no
 # earlier turn to have seen them in. Open tasks and workers' notes, hand-offs and task results, and pending asks;
-# lane_digest adds every collapsible section (Tried work, muted observations, the user's latest words) and the
-# cached ones (recent decisions and facts, the user's corrections) the coordinator's session keeps from before.
+# lane_digest adds every collapsible section (Tried work, muted observations, the user's latest words), the
+# machine ledger (its outages and conditions; capped by coordinator.ledger_whole) and the cached ones (recent decisions and facts, the user's corrections) the coordinator's session keeps from before.
 LANE_VIEWS = ("tasks", "finished", "results", "followups", "asks")
 FAIL_COOL_S = 1800             # a lane turn the endpoint failed: the coordinator's own session for this long
 SUSPEND_MIN = 10               # lane turns before the rates below judge it
@@ -478,7 +478,7 @@ def lane_digest(parts: list, whole: list, db, n: int = RECENT_ACTIONS, fmt=None,
     LANE_VIEWS, collapsible and cached sections whole, and the recent actions. The same section builders as the coordinator's digest
     (coordinator.digest_parts): nothing here is a second copy."""
     from .coordinator import CACHED_SECTIONS, COLLAPSIBLE
-    views = LANE_VIEWS + COLLAPSIBLE + CACHED_SECTIONS
+    views = LANE_VIEWS + COLLAPSIBLE + CACHED_SECTIONS + ("machine_ledger",)
     full = dict(whole or [])
     out = [(k, full.get(k, text) if k in views else text) for k, text in parts if k != "routine_lane"]
     have = {k for k, _ in out}

@@ -387,7 +387,8 @@ def test_coordroute_lane_digest_swaps_the_collapsed_views_for_the_whole_ones(env
 
 def test_coordroute_lane_digest_shows_every_collapsed_and_cached_section_whole(env):
     """The lane keeps no session: each section the coordinator's digest folds to an "as last turn" line, or keeps
-    in its session cache, reaches the lane whole, so it can see what owns, settled or holds the work."""
+    in its session cache, and the machine ledger with its outages, reach the lane whole, so it can see what owns,
+    settled or holds the work."""
     from ttp import coordinator, coordroute
     p = make(env)
     keys = coordinator.COLLAPSIBLE + coordinator.CACHED_SECTIONS
@@ -395,7 +396,7 @@ def test_coordroute_lane_digest_shows_every_collapsed_and_cached_section_whole(e
     whole = [(k, f"## {k}\n- whole {k}") for k in keys] + [("machine_ledger", "## Ledger\n- every line")]
     text = "\n".join(t for _, t in coordroute.lane_digest(parts, whole, p.db, 0))
     assert "(as last turn)" not in text and all(f"- whole {k}" in text for k in keys)
-    assert "## Ledger: 1 new" in text and "- every line" not in text
+    assert "## Ledger: 1 new" not in text and "- every line" in text
 
 
 def test_coordroute_lane_prompt_judges_event_wording_against_owners_and_decisions():
