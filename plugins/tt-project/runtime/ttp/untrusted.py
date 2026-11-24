@@ -711,15 +711,15 @@ def _mark_words(cmd: str) -> list[str] | None:
         return None
 
 
-def _mark_uncomment(cmd: str) -> str:
-    """`cmd` without its comments: from a `#` that starts a word outside quotes to the line's end. With a
-    ${...} expansion in `cmd` nothing is cut: a `#` inside one is a literal (`${x:- #}`), and its end is
-    hard to find (`${x:-'}' #}`)."""
+def _mark_uncomment(cmd: str) -> str | None:
+    """`cmd` without its comments: from a `#` that starts a word outside quotes to the line's end. None
+    (unsure) when `cmd` also has a ${...} expansion: a `#` inside one is a literal (`${x:- #}`), its end
+    is hard to find (`${x:-'}' #}`), and a kept comment's quote would hide the next line from the split."""
     from .hook import _quoting
-    if "${" in cmd:
-        return cmd
     flags = _quoting(cmd)
     cuts = [i for i, c in enumerate(cmd) if c == "#" and (i == 0 or cmd[i - 1] in " \t\n;&|(" and not flags[i - 1][0])]
+    if cuts and "${" in cmd:
+        return None
     out, end = [], 0
     for i in cuts:
         if i >= end:
@@ -728,19 +728,19 @@ def _mark_uncomment(cmd: str) -> str:
     return "".join(out) + cmd[end:]
 
 
-def _mark_data_bodies(cmd: str) -> str:
+def _mark_data_bodies(cmd: str) -> str | None:
     """`cmd` with comments cut from its command lines (_mark_uncomment; body lines stay as written) and without
     the bodies of heredocs that are only data: a quoted delimiter on a cat (or another _data_body piece) or on
     a tee into files, neither piped on, while every other command is only data too (_data_only), so none
-    reads the file back into code (`xargs rm < list.txt`). A comment ending in a backslash keeps everything:
-    _heredocs joins backslash-newlines, which would stretch the comment over the next line."""
+    reads the file back into code (`xargs rm < list.txt`). None (unsure) as _mark_uncomment, or when a comment
+    ends in a backslash: _heredocs joins backslash-newlines, which would stretch it over the next line."""
     from .hook import HEREDOC_RE, READERS, _chain, _data_body, _data_only, _heredocs, _pieces, _runs_inside
     lines, bodies = _heredocs(cmd)
     if not bodies:
         return _mark_uncomment(cmd)
-    if re.search(r"#[^\n]*\\\n", cmd):
-        return cmd
-    bare = _mark_uncomment("\n".join(lines)).split("\n")
+    if re.search(r"#[^\n]*\\\n", cmd) or (bare := _mark_uncomment("\n".join(lines))) is None:
+        return None
+    bare = bare.split("\n")
     text = "\n".join(bare)
 
     def tee(i: int, pos: int) -> bool:
@@ -826,6 +826,8 @@ def _mark_bash(cmd: str, depth: int = 0) -> bool:
         return True
     cmd, inner = got
     cmd = _mark_data_bodies(cmd)
+    if cmd is None:
+        return True
     if any(t.strip() != RUN_MARK and _mark_bash(t, depth + 1) for t in inner):
         return True   # (a bare `name` substitution runs a command found on PATH, never the run folder's file)
     words = _mark_words(cmd)
