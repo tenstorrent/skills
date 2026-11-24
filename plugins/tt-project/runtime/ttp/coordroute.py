@@ -345,12 +345,12 @@ def _refusal(a) -> str:
         return f"{t} pins a provider, model or effort"
     if t == "task_add":
         if a.get("tier") == "deep" or a.get("user_deep") or a.get("force") or a.get("reply_chat") \
-                or a.get("user_msg") or a.get("untrusted_input") is False:
-            return "task_add with deep tier, force, a chat, a user order or a cleared label"
+                or a.get("user_msg") or a.get("untrusted_input") is False or a.get("untrusted_write") is True:
+            return "task_add with deep tier, force, a chat, a user order or an untrusted-label change"
     if t == "task_update":
-        if "pr_branch" in a or a.get("untrusted_input") is False or a.get("wake_now") \
-                or a.get("status") == "cancelled":
-            return "task_update setting pr_branch, a cleared label, wake_now or cancelling"
+        if "pr_branch" in a or a.get("untrusted_input") is False or a.get("untrusted_write") is not None \
+                or a.get("wake_now") or a.get("status") == "cancelled":
+            return "task_update setting pr_branch, an untrusted label, wake_now or cancelling"
     if t == "obligation" and not (set(a) <= {"type", "key", "owners", "why"} and a.get("key") and a.get("owners")):
         return "obligation beyond attaching owners"
     return ""

@@ -1462,3 +1462,78 @@ def test_gh_retire_runs_with_this_hosts_own_logged_in_gh_while_the_route_is_unse
     rows = [json.loads(x) for x in (ghqueue.outbox() / ghqueue.DELETED).read_text().splitlines()]
     assert (rows[-1]["branch"], rows[-1]["tip"], rows[-1]["rc"]) == (branch, head, 0)
     assert not [f.name for f in ghqueue.outbox().glob("*.q")], "nothing was queued for a workstation"
+
+
+def test_retire_from_a_task_run_deletes_the_branch_a_raw_ref_delete_stays_refused(
+        env, monkeypatch, capsys):
+    """`ttp push --retire` from inside a task run: the delete its gh route sends passes the run's gh
+    wrapper, while the same raw `gh api -X DELETE` a model sends from that run stays refused. The
+    guard tells the two apart by a one-shot grant file under the project's state folder, a folder a
+    run's tools cannot write, never by the command's wording. Retire's own checks (an open PR) stay."""
+    from ttp import ghqueue, ghroute
+    p, repo, _origin, _other = _push_setup(env, monkeypatch, ["true"])
+    # a task run: the plugin's gh wrapper first on PATH, a stub gh behind it
+    run = env["tmp"] / "run"
+    (run / "bin").mkdir(parents=True)
+    shutil.copy(RUNTIME.parent / "template" / "bin" / "gh", run / "bin" / "gh")
+    (run / "runtime").symlink_to(RUNTIME, target_is_directory=True)
+    calls = run / "calls"
+    stub = run / "stub" / "gh"
+    (run / "stub").mkdir()
+    stub.write_text("#!/bin/sh\n"
+                    f'printf "%s\\n" "$*" >> "{calls}"\n'
+                    'case "$*" in "pr list"*) echo "[]";; *) :;; esac\n')
+    stub.chmod(0o755)
+    monkeypatch.setenv("TTP_PYTHON", sys.executable)
+    monkeypatch.setenv("TTP_RUN_DIR", str(run / "rundir"))
+    monkeypatch.setenv("PATH", f"{run / 'bin'}{os.pathsep}{run / 'stub'}{os.pathsep}{os.environ['PATH']}")
+    monkeypatch.setattr(ghroute, "local_ok", lambda: True)   # this host's gh is logged in
+    monkeypatch.setattr(ghqueue, "repo_of", lambda cwd: "acme/widgets")
+    branch, tip = "ttp/t9-gone", "ab" * 20
+    _git_out(repo, "branch", branch)
+    monkeypatch.setattr(ghqueue, "own_branch", lambda gh, argv: ("", tip))
+    (p.state / "pushes").mkdir(parents=True, exist_ok=True)
+    (p.state / "pushes" / "r.json").write_text(json.dumps({"kind": "batch", "outcome": "pushed",
+                                                           "target": f"origin/{branch}"}))
+    # a raw ref delete from the run: refused
+    wrapper = str(run / "bin" / "gh")
+    raw = ["api", "-X", "DELETE", f"repos/acme/widgets/git/refs/heads/{branch}"]
+    out = subprocess.run([wrapper, *raw], capture_output=True, text=True, timeout=60)
+    assert out.returncode == 1 and "never writes git refs" in out.stderr
+    # retire: the delete its route sends must pass the same wrapper
+    capsys.readouterr()
+    assert ghqueue.retire(branch, str(repo)) == 0, capsys.readouterr().err
+    got = calls.read_text().splitlines()
+    assert got[-1].startswith("api -X DELETE") and branch in got[-1], got
+    # the harness's grant never widens the raw route: a second delete on the same grant is refused
+    out = subprocess.run([wrapper, *raw], capture_output=True, text=True, timeout=60)
+    assert out.returncode == 1 and "never writes git refs" in out.stderr
+    # retire's own checks stay: an open PR on the branch refuses the retire
+    stub.write_text("#!/bin/sh\n"
+                    f'printf "%s\\n" "$*" >> "{calls}"\n'
+                    'case "$*" in "pr list"*) echo "[{\"number\": 4}]";; *) :;; esac\n')
+    assert ghqueue.retire(branch, str(repo)) == 1 and "open PR" in capsys.readouterr().err
+
+
+def test_a_retire_grant_covers_only_its_own_call_and_only_from_the_state_folder(env, monkeypatch):
+    """credguard.ref_grant: a grant passes only when the file it names sits under the project's
+    state folder, holds exactly this argv, and has not been used; anything else is refused."""
+    from ttp import credguard
+    p = make(env)
+    monkeypatch.setenv("TTP_PROJECT", str(p.base))
+    d = p.state / credguard.REF_GRANT_DIR
+    d.mkdir(parents=True)
+    argv = ["api", "-X", "DELETE", "repos/acme/widgets/git/refs/heads/ttp/x"]
+    monkeypatch.delenv(credguard.REF_GRANT_ENV, raising=False)
+    assert not credguard.ref_grant(argv), "no env var: no grant"
+    outside = env["tmp"] / "grant.json"
+    outside.write_text(json.dumps({"argv": argv}))
+    monkeypatch.setenv(credguard.REF_GRANT_ENV, str(outside))
+    assert not credguard.ref_grant(argv), "a file outside the state folder grants nothing"
+    mine = d / "g.json"
+    mine.write_text(json.dumps({"argv": ["api", "-X", "DELETE", "repos/acme/widgets/git/refs/heads/main"]}))
+    monkeypatch.setenv(credguard.REF_GRANT_ENV, str(mine))
+    assert not credguard.ref_grant(argv), "the grant covers a different argv"
+    mine.write_text(json.dumps({"argv": argv}))
+    assert credguard.ref_grant(argv) and not mine.exists(), "one shot: the grant is consumed"
+    assert not credguard.ref_grant(argv), "a second call on the same grant is refused"

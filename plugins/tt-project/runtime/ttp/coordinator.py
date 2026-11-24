@@ -2733,6 +2733,12 @@ def _claims_checked(p: Project, a: dict, notes: list) -> tuple[str, list]:
     return text, false
 
 
+def _write_label_from_run() -> bool:
+    """True inside a task run (not the coordinator session), which may never move the write label:
+    it grants gh and curl writes, so only the coordinator sets or clears it."""
+    return bool(os.environ.get("TTP_TASK")) and not coordtools.coordinator_run()
+
+
 def untrusted_update(task: dict, a: dict, upd: dict) -> str:
     """A task_update's `untrusted_input` (untrusted.py): true adds the label; false clears it, only with a
     `text` naming who vouched for the task's source, and never from inside a task run (a worker's
@@ -2770,7 +2776,7 @@ def untrusted_write_update(task: dict, a: dict, upd: dict) -> None:
         return
     if not isinstance(want, bool):
         raise ValueError(f"#{task['id']} rejected: untrusted_write is true or false")
-    if os.environ.get("TTP_TASK") and not coordtools.coordinator_run():
+    if _write_label_from_run():
         raise ValueError(f"#{task['id']} rejected: a task run cannot set or clear "
                          f"{untrusted.WRITE_LABEL}; only the coordinator can")
     labels = upd.get("labels")
@@ -3140,8 +3146,11 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                 labels += _pin_mark(db, a.get("pin_required"), pin, old or followup)
                 if a.get("untrusted_input") is True or untrusted.spec_sources(a.get("spec") or ""):
                     labels.append(untrusted.LABEL)   # untrusted.py: its run's narrowed policy, no routing
-                if a.get("untrusted_write") is True:   # only the field sets it, never the spec's wording
-                    labels.append(untrusted.WRITE_LABEL)
+                if a.get("untrusted_write") is True:
+                    if _write_label_from_run():   # a run cannot pre-authorize writes for its successor
+                        raise ValueError("task_add rejected: a task run cannot set "
+                                         f"{untrusted.WRITE_LABEL}; only the coordinator can")
+                    labels.append(untrusted.WRITE_LABEL)   # only the field sets it, never the spec's wording
                 labels = untrusted.inherit(labels, old, followup, carried and carried[0])
                 clash = _file_overlaps(p, kind, a.get("spec") or "", {old["id"]} if old else set())
                 if dropped := _exempt_overlap_deps(p, old or followup, deps):

@@ -713,3 +713,8 @@ def test_a_run_can_neither_set_nor_clear_untrusted_write(env, monkeypatch):
     notes = coord.apply(p, [{"type": "task_update", "id": tid, "untrusted_write": False}])
     assert any("only the coordinator" in n for n in notes), notes
     assert untrusted.WRITE_LABEL in json.loads(p.db.task(tid)["labels"])
+    # nor can it pre-authorize a successor task
+    notes = coord.apply(p, [{"type": "task_add", "title": "post more", "spec": "s", "untrusted_write": True}])
+    assert any("only the coordinator" in n for n in notes), notes
+    made = p.db.one("SELECT * FROM tasks WHERE title='post more'")
+    assert made is None or untrusted.WRITE_LABEL not in json.loads(made["labels"] or "[]")

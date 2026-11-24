@@ -21,6 +21,7 @@ import hashlib
 import json
 import os
 import re
+import secrets
 import shutil
 import subprocess
 import sys
@@ -30,6 +31,7 @@ from pathlib import Path
 
 from . import aitag
 from .ghroute import HELD_RC, SETTING, WORKSTATION, _with_repo, is_write, local_inputs, mark, repo_of
+from .credguard import REF_GRANT_DIR, REF_GRANT_ENV
 
 OUTBOX = "gh-outbox"
 READ_FRESH_S = 600            # a read's answer older than this is asked again
@@ -750,6 +752,20 @@ def publish(branch: str, cwd: str | None = None, home=None) -> int:
     return _queued(sent, data, repo, cwd, home, f"git push {branch} ({sha[:12]})")
 
 
+def _grant(p, argv: list[str]) -> str:
+    """The path of a one-shot grant letting this retire route's ref write through the run's gh wrapper:
+    a file under the project's state folder (which a run's tools cannot write) holding exactly
+    `argv`. The wrapper checks it against credguard.REF_GRANT_ENV and consumes it; "" with no project
+    here (then the refusal stands, as it should)."""
+    if p is None:
+        return ""
+    d = p.state / REF_GRANT_DIR
+    d.mkdir(parents=True, exist_ok=True, mode=0o700)
+    f = d / (secrets.token_hex(8) + ".json")
+    f.write_text(json.dumps({"argv": argv}))
+    return str(f)
+
+
 def retire(branch: str, cwd: str | None = None, home=None) -> int:
     """`ttp push --retire <branch>`: delete one of the project's own published branches through the
     workstation, or with this host's own gh while delivery.gh_route is unset and that gh is logged in.
@@ -849,4 +865,12 @@ def retire(branch: str, cwd: str | None = None, home=None) -> int:
         print(f"ttp push --retire: refused: could not save `{branch}`'s tip {tip} first.", file=sys.stderr)
         return 1
     print(f"ttp push --retire: saved {tip} as {ref} and {saved}.", file=sys.stderr)
-    return ask(delete, key)
+    grant = _grant(p, delete) if here_gh else ""   # the wrapper's ref-write refusal checks this
+    if grant:
+        os.environ[REF_GRANT_ENV] = grant
+    try:
+        return ask(delete, key)
+    finally:
+        os.environ.pop(REF_GRANT_ENV, None)
+        if grant:
+            Path(grant).unlink(missing_ok=True)   # one-shot: consumed by the wrapper, or stale
