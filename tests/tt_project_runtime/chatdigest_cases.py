@@ -328,9 +328,9 @@ def _cd_due(p, tid):
 
 
 def test_a_finished_reply_chat_task_raises_reply_due_and_never_posts_its_hand_off(env, monkeypatch):
-    """cells: handoff. the user's chat gets the coordinator's plain outcome
-    summary, never a worker's raw hand-off. The daemon raises one reply_due event naming the chat and
-    the landing facts, with the hand-off enclosed as data, and arms the fallback."""
+    """cells: handoff. The user's chat gets the coordinator's plain outcome summary, never a
+    worker's raw hand-off. The daemon raises one reply_due event naming the chat and the landing
+    facts, with the hand-off enclosed as data, and arms the fallback."""
     from ttp import chatdigest, coordinator as coord, pushq
     monkeypatch.setenv("TTP_TEST_CHAT_DIGEST", "on")
     p = make(env)
