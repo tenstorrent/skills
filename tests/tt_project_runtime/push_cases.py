@@ -8148,7 +8148,7 @@ def test_a_passed_probe_reads_the_push_queues_rejected_commit_git_before_its_fin
     passed(rid, {"status": "done", "summary": "passes", "push": [{"branch": cbranch, "head": chead}]})
     t = s.p.db.task(rid)
     assert t["status"] == "queued" and f"carries unreviewed commits from #{x}" in json.loads(t["result"])["woke"]
-    assert reads == [False, False], f"the rejected-commit check read git inside the transaction: {reads}"
+    assert reads == [False] * 3, f"the rejected-commit check read git inside the transaction: {reads}"
     # Nothing else spawns inside either probe-pass transaction but local ref-metadata git, millisecond
     # reads a settled design accepts there: a code task's _auto_review (rev-parse, remote, diff --numstat,
     # a one-commit rev-list) and a review's check_approval (rev-parse, merge-base --is-ancestor). No
@@ -22341,6 +22341,33 @@ def test_a_code_hand_off_passes_when_it_declares_the_landing_or_the_carried_comm
     assert not pushq.carried(s.p, s.p.db.task(d), _git_out(s.repo, "rev-parse", s.p.db.task(d)["branch"])).get(y)
     t = _carry_hand_off(env, s, d)
     assert t["status"] == "done" and carryback.KEY not in json.loads(t["result"]), dict(t)
+
+
+def test_a_task_built_on_a_base_carrying_rejected_commits_is_not_sent_back_for_them(env, monkeypatch):
+    # F was told to build on X's branch (its fork point is X's head) and X's review failed: X's commits
+    # are its assigned base, so it is not sent back and gets no landing wait; its review still names
+    # them as inherited. G, on the same base, picked Y's rejected commit itself: sent back once, for Y only.
+    from ttp import carryback, pushq, worktree
+    from ttp.daemon import Daemon
+    s = _pq(env, monkeypatch)
+    monkeypatch.setattr(Daemon, "_precheck", lambda self, task, head: None)
+    x, xbranch, xhead, _ = _pq_stacked(s, "rejected", review="failed")
+    y, _, yhead, _ = _pq_stacked(s, "also-rejected", review="failed")
+    f, _, fhead, _ = _pq_stacked(s, "fix", on=xbranch)
+    g, _, _, _ = _pq_stacked(s, "picks-own", on=xbranch, picks=[yhead])
+    for tid in (f, g):
+        worktree.record_fork_point(s.p.root, tid, xhead)
+    assert list(pushq.carried(s.p, s.p.db.task(f), fhead)) == [x], "the review judges the base's commits"
+    assert pushq.carried(s.p, s.p.db.task(f), fhead, since_start=True) == {}
+    t = _carry_hand_off(env, s, f)
+    res = json.loads(t["result"])
+    assert t["status"] == "done" and carryback.KEY not in res and "retry_when" not in res, dict(t)
+    assert s.p.db.q("SELECT id FROM tasks WHERE kind='review' AND labels LIKE ?", (f'%auto_review:{f}"%',))
+    t = _carry_hand_off(env, s, g)
+    res = json.loads(t["result"])
+    assert t["status"] == "queued" and res[carryback.KEY]["tasks"] == [y], dict(t)
+    assert f"ttp landed --task {y}" in res["woke"] and f"#{x}" not in res["woke"], res["woke"]
+    assert _carry_hand_off(env, s, g)["status"] == "done", "once per task"
 
 
 def test_a_follow_up_of_a_done_fix_re_works_the_change_its_chain_fixed(env):

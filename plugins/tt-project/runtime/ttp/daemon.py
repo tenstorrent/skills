@@ -8575,10 +8575,10 @@ class Daemon:
             extra[carryback.KEY] = cmark   # kept for the task's life: one send-back per task
         elif new == "done" and not approval and status == "ok" and not root_sent and task["kind"] == "code" \
                 and task["branch"]:
-            try:   # memoized by _prefetch_git: the same read the review's queueing makes below
+            try:   # memoized by _prefetch_git, which reads both this and the full answer the review's queueing reads
                 head = pushq._commit(self.p, task["branch"])
-                found = carryback.pending(db, task, pushq.carried(self.p, task, head, self.cfg) if head else {},
-                                          load_result(task["result"]))
+                own = pushq.carried(self.p, task, head, self.cfg, since_start=True) if head else {}
+                found = carryback.pending(db, task, own, load_result(task["result"]))
             except Exception:   # never lose a hand-off to the check itself
                 found = {}
                 log(self.p, f"task {task['id']}: checking carried commits failed: "

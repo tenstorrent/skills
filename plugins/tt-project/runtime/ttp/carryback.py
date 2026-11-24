@@ -11,6 +11,9 @@ on `landed:#<id>` with the reason. Carried commits pass with no send-back when:
 - the task declared that wait: `landed:#<id>` (or `ttp landed --task <id>`) in its start_when, spec
   or its last waiting hand-off (chaincap.waits_landing);
 - they are on the push branch already (pushq.carried leaves out landed and rebased copies);
+- they were on the base the task was told to build on (its fork point: a `pr_branch:`, a stacked
+  start, a fix chain's reviewed head): the daemon reads pushq.carried `since_start`, and the review
+  judges those commits and names them as inherited. Only what the task brought in itself counts;
 - that task's change is approved for the push queue (reviewhold.approved_row);
 - the task re-works that task's own change (reworks): it continues it, or the failed review of it, or
   delivers onto its branch (`pr_branch:`). Its commits are the change under re-work, not a stack.

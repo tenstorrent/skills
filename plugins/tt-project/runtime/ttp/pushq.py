@@ -910,10 +910,12 @@ def _inherited(p: Project, task: dict, entries: list[dict], tip: str, now: float
     Only a rejected task's own work counts as its own: what its starts reach (_fork_bases: the commit it
     started from, its dependencies' branches, its fork point) is not, so a dependent's failed review
     never blocks its prerequisite.
+    An entry with `base_of` (a task id) leaves out what that task's fork point (FORK_POINT_REF) holds and
+    rebased copies of it: the base it was told to build on, so only what it brought in itself counts.
     Within a gitmemo scope the answer is kept by task, heads and tip: prefetch_git reads it before the
     transaction that judges a hand-off, so its git (`git show -p` among it) never holds the write lock."""
     key = ("pushq.inherited", task["id"], str(task.get("depends_on") or ""),
-           tuple((e.get("branch"), e["head"]) for e in entries), tip)
+           tuple((e.get("branch"), e["head"], e.get("base_of")) for e in entries), tip)
     return gitmemo.cached(key, lambda: _read_inherited(p, task, entries, tip, now))
 
 
@@ -961,9 +963,13 @@ def _read_inherited(p: Project, task: dict, entries: list[dict], tip: str, now: 
     for e in entries:
         adds = _git(p, "rev-list", "--no-merges", "--right-only", "--cherry-pick", f"{tip}...{e['head']}",
                     timeout=INHERIT_GIT_S).stdout.split()
-        hits = {c: c for c in adds if c in rejected_set}
-        rest = [c for c in adds if c not in hits]
-        hits |= {c: rejected_ids[i] for i, c in _patch_ids(p, rest).items() if i in rejected_ids}
+        start = f"{FORK_POINT_REF}{e['base_of']}" if e.get("base_of") else ""
+        base = set(_git(p, "rev-list", "--no-merges", start, "--not", tip, timeout=INHERIT_GIT_S).stdout.split()
+                   if start in forks else ())
+        base_ids = _patch_ids(p, sorted(base))
+        hits = {c: c for c in adds if c in rejected_set and c not in base}
+        rest = [c for c in adds if c not in hits and c not in base]
+        hits |= {c: rejected_ids[i] for i, c in _patch_ids(p, rest).items() if i in rejected_ids and i not in base_ids}
         for c, src in hits.items():
             subject = _git(p, "log", "-1", "--format=%h %s", c, timeout=INHERIT_GIT_S).stdout.strip()
             for tid in sorted(t for t, own in by_task.items() if src in own):
@@ -983,11 +989,14 @@ def head_row(db, head: str) -> dict | None:
                   "ORDER BY id DESC LIMIT 1", (head, *want))
 
 
-def carried(p: Project, task: dict, head: str, cfg: dict | None = None) -> dict[int, list[str]]:
+def carried(p: Project, task: dict, head: str, cfg: dict | None = None,
+            since_start: bool = False) -> dict[int, list[str]]:
     """What check_approval would refuse in a head the daemon is about to queue a review of: {task id:
     ["<short sha> <subject>", ...]} of the commits `head` carries from other tasks whose latest review
-    failed (see _inherited), judged as the auto review of code task `task` will be. {} when the queue
-    is off, the target was never fetched, or git fails or hangs: the approval still checks it."""
+    failed (see _inherited), judged as the auto review of code task `task` will be. `since_start`: only
+    those `task` brought in beyond the base it was told to build on (its fork point), not what that base
+    already held. {} when the queue is off, the target was never fetched, or git fails or hangs: the
+    approval still checks it."""
     tgt = target(p) if enabled(p, cfg) else None
     tip = _tracking_tip(p, *tgt) if tgt else ""
     if not tip or not task.get("branch"):
@@ -995,7 +1004,11 @@ def carried(p: Project, task: dict, head: str, cfg: dict | None = None) -> dict[
     review = {"id": -1, "parent": None, "title": "", "spec": "", "depends_on": json.dumps([task["id"]]),
               "labels": json.dumps([f"auto_review:{task['id']}"])}
     try:
-        return _inherited(p, review, [{"branch": task["branch"], "head": head}], tip, time.time()).get(head, {})
+        entry = {"branch": task["branch"], "head": head}
+        found = _inherited(p, review, [entry], tip, time.time()).get(head, {})
+        if found and since_start:   # a subset of the full answer: read only when that has any
+            found = _inherited(p, review, [{**entry, "base_of": task["id"]}], tip, time.time()).get(head, {})
+        return found
     except (subprocess.SubprocessError, OSError):
         return {}
 
@@ -1015,7 +1028,7 @@ def prefetch_git(p: Project, task: dict, result: dict, cfg: dict | None = None) 
     if task.get("kind") == "code":
         head = _commit(p, task["branch"]) if task.get("branch") else ""
         if head:
-            carried(p, task, head, cfg)
+            carried(p, task, head, cfg, since_start=True)   # the full answer too, read first
         return
     entries = result.get("push")
     d = _delivery(p, cfg)
