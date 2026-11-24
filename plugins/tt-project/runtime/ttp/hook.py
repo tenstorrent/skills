@@ -824,7 +824,6 @@ def _fed_shell_texts(text: str, pieces: list, is_shell) -> list[tuple[int, str, 
     """(piece index, the text it prints, the piece it pipes into) for each echo or printf piece of
     `text` (split into `pieces`) that pipes into a piece `is_shell` accepts: what it prints runs as
     commands, into a local shell (`echo cmd | bash`) or one fed over ssh."""
-
     out = []
     for k, (s, e, _) in enumerate(pieces):
         if _first_word(text[s:e]) not in ("echo", "printf"):
