@@ -2733,7 +2733,7 @@ def _claims_checked(p: Project, a: dict, notes: list) -> tuple[str, list]:
     return text, false
 
 
-def _task_run() -> bool:
+def _in_task_run() -> bool:
     """True inside a task run's process (not the coordinator session): it may clear neither label."""
     return bool(os.environ.get("TTP_TASK")) and not coordtools.coordinator_run()
 
@@ -2753,7 +2753,7 @@ def untrusted_update(task: dict, a: dict, upd: dict) -> str:
         if untrusted.LABEL not in labels:
             upd["labels"] = labels + [untrusted.LABEL]
         return ""
-    if _task_run():
+    if _in_task_run():
         raise ValueError(f"#{task['id']} rejected: a task run cannot clear {untrusted.LABEL}; only the coordinator can")
     why = " ".join(str(a.get("text") or "").split())
     if not why:
@@ -2775,7 +2775,7 @@ def untrusted_write_update(task: dict, a: dict, upd: dict) -> str:
         return ""
     if not isinstance(want, bool):
         raise ValueError(f"#{task['id']} rejected: untrusted_write is true or false")
-    if _task_run():
+    if _in_task_run():
         raise ValueError(f"#{task['id']} rejected: a task run cannot set or clear "
                          f"{untrusted.WRITE_LABEL}; only the coordinator can")
     labels = upd.get("labels")
@@ -3150,7 +3150,7 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                 if a.get("untrusted_input") is True or untrusted.spec_sources(a.get("spec") or ""):
                     labels.append(untrusted.LABEL)   # untrusted.py: its run's narrowed policy, no routing
                 if a.get("untrusted_write") is True:
-                    if _task_run():   # a run cannot pre-authorize writes for its successor
+                    if _in_task_run():   # a run cannot pre-authorize writes for its successor
                         raise ValueError("task_add rejected: a task run cannot set "
                                          f"{untrusted.WRITE_LABEL}; only the coordinator can")
                     labels.append(untrusted.WRITE_LABEL)   # only the field sets it, never the spec's wording
