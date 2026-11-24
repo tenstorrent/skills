@@ -667,6 +667,14 @@ def test_glmassist_cli_advise_refuses_outside_an_armed_run_and_answers_inside_on
     diff = "spec: fix it\n+    x = f\"`ttp advise` $HOME $(id)\"\n"   # a pasted diff never meets a shell
     monkeypatch.setattr("sys.stdin", io.StringIO(diff))
     assert _cr_main("advise", "-") == 0 and glmassist.calls(run_dir)[1]["q"] == diff.strip()
+    for stdin in ("", " \n\t"):   # an empty question is refused before it spends an advisor call
+        monkeypatch.setattr("sys.stdin", io.StringIO(stdin))
+        assert _cr_main("advise", "-") != 0 and "give the question" in capsys.readouterr().err
+    tty = io.StringIO("never read")
+    tty.isatty = lambda: True
+    monkeypatch.setattr("sys.stdin", tty)
+    assert _cr_main("advise", "-") != 0 and "pipe it in" in capsys.readouterr().err and tty.tell() == 0
+    assert len(glmassist.calls(run_dir)) == 2
 
 
 def test_glmassist_a_glm_work_run_is_launched_with_its_switches_in_its_note_and_prompt(env, monkeypatch):

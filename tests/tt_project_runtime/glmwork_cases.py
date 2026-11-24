@@ -468,6 +468,6 @@ def test_a_glm_code_run_spends_an_opus_advisor_call_on_a_correctness_review_of_i
         assert prov == "chat" and len(step) == 2
         # With the advisor on, one of its calls reviews the final diff for correctness, and none is spent on the
         # size lane; without it the run reviews its diff itself and is never sent to a command it cannot use.
-        # A run whose advisor calls are used up still reviews its diff itself.
         assert ("| ttp advise -`" in step[1]) is advisor and ("not through `ttp advise`" in step[1]) is advisor
-        assert "most likely to break it in your self_check" in step[1]
+        # The self-review is there with the advisor on too, so a run whose advisor calls are used up still has it.
+        assert "Reread your diff as that reviewer" in step[1] and "most likely to break it in your self_check" in step[1]

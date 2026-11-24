@@ -12854,9 +12854,11 @@ def cmd_advise(a) -> None:
     p = Project(os.environ["TTP_PROJECT"]) if os.environ.get("TTP_PROJECT") else None
     task = os.environ.get("TTP_TASK") or ""
     try:
-        if not a.question and a.check_step is None:
-            raise ValueError("give the question, or with --plan the task in your own words")
+        if a.question == ["-"] and sys.stdin.isatty():
+            raise ValueError("`-` reads the question from stdin: pipe it in")
         question = sys.stdin.read() if a.question == ["-"] else " ".join(a.question)
+        if not question.strip() and a.check_step is None:
+            raise ValueError("give the question, or with --plan the task in your own words")
         row = glmassist.ask(run_dir, question, cwd=os.getcwd(), plan=a.plan,
                             db=p.db if p and p.exists() else None, source=f"advisor:{task or 'run'}",
                             step=a.check_step)
