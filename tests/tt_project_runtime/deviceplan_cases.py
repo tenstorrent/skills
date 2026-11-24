@@ -824,6 +824,23 @@ def test_replayed_gate_cut_off_by_the_tool_time_limit_runs_once_more_and_a_faile
     assert "longer tool timeout; cut off again, it hands back" in deviceplan.glm_lines()
 
 
+def test_a_gate_cut_off_that_cannot_record_its_retry_stops_the_run_at_once(tmp_path, monkeypatch):
+    """Replay: a symlink planted at the cut-off record made every cut-off read as the first one:
+    durable_append refuses a symlink and returns False, which the guard took as a recorded retry, so
+    the run never stopped. After: a cut-off whose retry cannot be recorded stops the run at once."""
+    from ttp import glmguard, hook
+    run, _ = _dp_run(tmp_path)
+    monkeypatch.setenv("TTP_RUN_DIR", str(run))
+    (tmp_path / "cut-off record").write_text("")
+    (run / glmguard.GATE_TIMEOUTS).symlink_to(tmp_path / "cut-off record")   # never appended to
+    cut = "Exit code 143\nCommand timed out after 2m 0s"
+    post = lambda c, err: hook._gate_stop({"tool_name": "Bash", "tool_input": {"command": c}, "error": err}, str(run))
+    for _ in range(2):   # never a first retry: each cut-off stops the run
+        assert "cut off by the tool's time limit" in post("ttp checks 2>&1 | tail -30", cut)
+        assert json.loads((run / "glm_guard.json").read_text())["kind"] == glmguard.GATE
+    assert (run / glmguard.GATE_TIMEOUTS).is_symlink(), "nothing was written through the symlink"
+
+
 def _src_asker(tmp_path, answers, seen):
     cur, _ = _src_project(tmp_path)
     left = list(answers)

@@ -1074,8 +1074,8 @@ def gate_stop(run_dir, cmd: str, rc, output: str, env=None) -> str | None:
         if norm not in seen:
             try:
                 from .project import durable_append
-                durable_append(f, norm + "\n")
-                return None
+                if durable_append(f, norm + "\n"):
+                    return None
             except OSError:
                 pass   # no record of the retry: the cut-off stops the run, as before
         why = f"a gate was cut off by the tool's time limit twice (exit {rc}): `{norm[:160]}`"
