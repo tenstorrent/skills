@@ -47,6 +47,7 @@ import json
 import os
 import re
 import shlex
+import shutil
 
 LABEL = "untrusted_input"   # modelpick.UNTRUSTED
 WRITE_LABEL = "untrusted_write"
@@ -652,26 +653,30 @@ def _mark_prose(clause: str) -> bool:
     """Whether a quoted clause names RUN_MARK only as a word of prose: it has spaces, each mention is a
     whole word (trailing .,:!), and no word before one is a command (on PATH, a runner or feed), `.` or an
     option (a builtin's `history -w`, `enable -f`), so the clause run as a command line could not take
-    the mark as its argument."""
+    the mark as its argument. A script that cuts the name out of such text (a split or slice) is not
+    seen, as names built at run time never are."""
     words = clause.split()
     at = [i for i, w in enumerate(words) if RUN_MARK in w]
     if len(words) < 2 or not at or any(words[i].rstrip(".,:!") != RUN_MARK for i in at):
         return False
-    import shutil
     return not any(w == "." or w.startswith("-") or shutil.which(w) or MARK_RUNNER_RE.fullmatch(w)
                    or w in MARK_FEEDS for w in words[:at[-1]])
 
 
-def _mark_quiet(cmd: str, words: list[str]) -> list[str] | None:
-    """`words` with each prose mention of RUN_MARK (_mark_prose) read as MARK_PROSE_PLACE, for a command whose
-    only code runners are script interpreters (MARK_SCRIPT_RE); None when anything else may run code or
-    split text into words (a shell, eval, sed, xargs, a read loop, `.`), or the words do not line up."""
+def _mark_quiet(cmd: str, words: list[str]) -> tuple[list[str], str] | None:
+    """`cmd` and its `words` with each prose mention of RUN_MARK (_mark_prose) read as MARK_PROSE_PLACE, for a
+    command whose only code runners are script interpreters (MARK_SCRIPT_RE); None when anything else may
+    run code or split text into words (a shell, eval, sed, xargs, a read loop, `.`), or the words do not
+    line up. A clause counts only where the shell quotes all of it, so no mention it hides is a word."""
     if any(w == "." or w in MARK_FEEDS or (MARK_RUNNER_RE.fullmatch(os.path.basename(w))
                                             and not MARK_SCRIPT_RE.fullmatch(os.path.basename(w))) for w in words):
         return None
-    quiet = _mark_words(MARK_PROSE_RE.sub(
-        lambda m: m[0].replace(RUN_MARK, MARK_PROSE_PLACE) if _mark_prose(m[2]) else m[0], cmd))
-    return quiet if quiet is not None and len(quiet) == len(words) else None
+    from .hook import _quoting
+    flags = _quoting(cmd)
+    text = MARK_PROSE_RE.sub(lambda m: m[0].replace(RUN_MARK, MARK_PROSE_PLACE) if _mark_prose(m[2]) and all(
+        f[0] for f in flags[m.start():m.end()]) else m[0], cmd)
+    quiet = _mark_words(text)
+    return (quiet, text) if quiet is not None and len(quiet) == len(words) else None
 
 
 def _mark_words(cmd: str) -> list[str] | None:
@@ -695,10 +700,8 @@ def _mark_fed(words: list[str], named: bool, quiet: list[str] | None = None) -> 
     here-string or heredoc that gives the name (`< <(ls .../<mark>)`, `<<< ".../<mark>"`) may feed a
     compound command (a loop's `done`, `}`, `)`) whose body the split here cannot see: then any such
     command anywhere in the line counts. `quiet` (_mark_quiet): the words with prose mentions read as
-    text, which is what the code and its heredoc get; an earlier command of a pipeline still passes
-    every mention on."""
+    text, which is what the code gets; an earlier command of a pipeline still passes every mention on."""
     quiet = quiet or words
-    named = named and any(RUN_MARK in w for w in quiet)
     seg, seen, mention, here, target, fed, coded, given = [], False, False, False, False, False, False, False
     said = False   # a mention, prose too, in the segment or its redirects: passed down a pipe
     for w, q in zip(words + [";"], quiet + [";"]):
@@ -753,7 +756,8 @@ def _mark_bash(cmd: str, depth: int = 0) -> bool:
         return True
     if any(">" in w and set(w) <= set("&<>|") and RUN_MARK in n for w, n in zip(words, words[1:])):
         return True   # a redirect into it
-    if _mark_fed(words, RUN_MARK in cmd, None if inner else _mark_quiet(cmd, words)):
+    quiet = None if inner else _mark_quiet(cmd, words)
+    if _mark_fed(words, RUN_MARK in (quiet[1] if quiet else cmd), quiet and quiet[0]):
         return True   # code, or a command run from piped input, that may get its name
     segs = _segments(cmd, strip=False)
     for seg in segs:

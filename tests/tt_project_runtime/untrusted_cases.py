@@ -686,6 +686,8 @@ MARK_CODE_EFFECT = [   # code that reads or changes the record itself, or gets i
     f"sh -c 'rm a {_M}'", f"python3 -c \"print('rm {_M}')\" | sh",
     f"python3 -c \"import os; os.remove('{_M}')\" # 'a {_M} b'",
     f"python3 -c \"import os; os.system('. {_M}')\"", f"python3 -c \"import os; os.system('history -w {_M}')\"",
+    f"sh <<EOF\nrm a#b {_M}\nEOF", f"cat <<EOF | sh\nrm a#b {_M}\nEOF", f"python3 -c 'print(1)' ; sh <<EOF\nrm a#b {_M}\nEOF",
+    f'python3 x.py "a/b" c {_M}" now"', f'python3 x.py \\" c {_M}" now"',   # quotes the shell pairs otherwise
 ]
 
 
