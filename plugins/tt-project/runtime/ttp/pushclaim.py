@@ -72,6 +72,10 @@ _NEGATED = re.compile(r"(?:\bnot|\bnever|n't|\bbe|\bwill|\bwould|\bto)"
 _NOT_REFS = {"the", "a", "an", "it", "its", "origin", "remote", "github", "branch", "upstream"}
 # A claim that the run's change landed, naming no commit: "the change landed", "it was pushed".
 _LANDED_VERB = re.compile(r"(?i)\b(landed|pushed|merged)\b")
+# Words saying the verb's subject is the run's own work ("the change landed", "landed the fix"),
+# so a verb about something else ("pushed the data to a folder") is no claim of a landing.
+_LANDED_SUBJECT = re.compile(r"(?i)\b(?:changes?|works?|fix(es)?|patch(es)?|commits?|head|branch(es)?"
+                             r"|it|this|everything|pr|diffs?)\b")
 UNVERIFIED_CLAIM = "(unverified)"      # a landed-claim this project cannot check, never a plain 'landed'
 NOT_LANDED = "not landed"              # the correction a claim off the push branch reads
 
@@ -187,6 +191,11 @@ def landed_claims(p, text: str, repo) -> list[tuple[int, int, str, tuple]]:
             continue   # hedged, negated, or about another task or run
         if any(m.start() < e and s < m.end() for s, e in taken):
             continue
+        # the sentence must name the run's own work as what landed ("the change landed", "landed
+        # the fix"), so a verb about something else ("pushed the data to a folder") is no claim
+        hi = next((i for i in (text.find(c, m.end()) for c in ".!?\n") if i > m.end()), len(text))
+        if not _LANDED_SUBJECT.search(text[lo:hi]) or text[m.end():].startswith(" " + UNVERIFIED_CLAIM):
+            continue   # not about this run's work, or the claim is already marked
         out.append((m.start(), m.end(), "", None))
     return out
 
@@ -225,8 +234,8 @@ def correct_landed_claims(p, text: str, repo, head: str = "", tid: int = 0,
         if rc == landed.NOT_YET:
             where = short_ref(*(claim_target or target)) if (claim_target or target) else "the push branch"
             fixes.append((start, end, f"{NOT_LANDED}: {what[:12] if what else 'it'} is not on {where}"))
-        elif rc == landed.CANNOT:
-            fixes.append((start, end, text[start:end] + " " + UNVERIFIED_CLAIM))
+        elif rc == landed.CANNOT and not text[end:].startswith(" " + UNVERIFIED_CLAIM):
+            fixes.append((start, end, text[start:end] + " " + UNVERIFIED_CLAIM))   # never marked twice
     for start, end, fix in sorted(fixes, reverse=True):
         text = text[:start] + fix + text[end:]
     return text
