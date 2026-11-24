@@ -255,12 +255,13 @@ def run_pass(cfg: dict, platform: str | None = None, now: float | None = None) -
                                "until its check changes")
                     f["said"] = True
                 continue
-            f = fails.setdefault(t["service"], {"at": now, "event": event, "restarts": 0, "last": 0})
-            if now - f["last"] < RESTART_GAP_S[min(f["restarts"], len(RESTART_GAP_S) - 1)]:
+            if f and now - f["last"] < RESTART_GAP_S[min(f["restarts"], len(RESTART_GAP_S) - 1)]:
                 continue
+            # a login under way is no failure yet: a spared session that comes up records no heal
             if t["agent"] and none >= set(t["ports"]) and (age := login_age(t, platform)) is not None and age < LOGIN_S:
                 out.append(f"{t['service']}: still logging in ({age}s); not restarted this pass")
                 continue
+            f = fails.setdefault(t["service"], {"at": now, "event": event, "restarts": 0, "last": 0})
             freed = release(cfg, t, bad)
             said = restart(t, platform)
             f.update(restarts=f["restarts"] + 1, last=now, down=[p for p in bad if p in down], said=False)

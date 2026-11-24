@@ -2565,6 +2565,7 @@ def test_bridge_watch_leaves_a_live_session_alone_when_one_forward_is_slow(tmp_p
 
 def test_bridge_watch_spares_a_session_still_logging_in(tmp_path, monkeypatch):
     # cells: young-login-spared, old-login-restarted, unknown-age-restarted, systemd-main-pid, etime-days
+    import json
     import subprocess
     from ttp import bridge, bridge_watch
     none = "none 2301\nttp-watch-done\n"
@@ -2589,6 +2590,7 @@ def test_bridge_watch_spares_a_session_still_logging_in(tmp_path, monkeypatch):
         # its service manager started it 8 s ago: no listener yet is a login still under way, not a stale session
         assert bridge_watch.run_pass(cfg, platform, t0 - 30) == [f"{svc}: still logging in (8s); not restarted this pass"]
         assert seen["release"] == [] and not any("kickstart" in c or "restart --" in c for c in seen["run"])
+        assert not json.loads((bridge.HOME_DIR / bridge_watch.STATE).read_text())["fail"]   # no failure: no heal later
         ps["etime"] = "10:00\n"   # a session up 10 min with no listener is stale: restarted on the first pass
         out = bridge_watch.run_pass(cfg, platform, t0)
         assert seen["release"] == [(svc, "auto", [2301])] and out[0].endswith("restarted")
