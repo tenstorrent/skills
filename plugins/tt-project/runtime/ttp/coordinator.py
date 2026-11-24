@@ -2733,9 +2733,8 @@ def _claims_checked(p: Project, a: dict, notes: list) -> tuple[str, list]:
     return text, false
 
 
-def _write_label_from_run() -> bool:
-    """True inside a task run (not the coordinator session), which may never move the write label:
-    it grants gh and curl writes, so only the coordinator sets or clears it."""
+def _task_run() -> bool:
+    """True inside a task run's process (not the coordinator session): it may clear neither label."""
     return bool(os.environ.get("TTP_TASK")) and not coordtools.coordinator_run()
 
 
@@ -2754,7 +2753,7 @@ def untrusted_update(task: dict, a: dict, upd: dict) -> str:
         if untrusted.LABEL not in labels:
             upd["labels"] = labels + [untrusted.LABEL]
         return ""
-    if os.environ.get("TTP_TASK") and not coordtools.coordinator_run():
+    if _task_run():
         raise ValueError(f"#{task['id']} rejected: a task run cannot clear {untrusted.LABEL}; only the coordinator can")
     why = " ".join(str(a.get("text") or "").split())
     if not why:
@@ -2767,16 +2766,16 @@ def untrusted_update(task: dict, a: dict, upd: dict) -> str:
     return why
 
 
-def untrusted_write_update(task: dict, a: dict, upd: dict) -> None:
+def untrusted_write_update(task: dict, a: dict, upd: dict) -> str:
     """A task_update's `untrusted_write` (untrusted.py): true adds the write label, false clears it.
     A task run can do neither: the label widens what its run may send, so only the coordinator
-    moves it. Writes upd["labels"]."""
+    moves it. Writes upd["labels"]; returns "set"/"cleared" when the label moved, else ""."""
     want = a.get("untrusted_write")
     if want is None:
-        return
+        return ""
     if not isinstance(want, bool):
         raise ValueError(f"#{task['id']} rejected: untrusted_write is true or false")
-    if _write_label_from_run():
+    if _task_run():
         raise ValueError(f"#{task['id']} rejected: a task run cannot set or clear "
                          f"{untrusted.WRITE_LABEL}; only the coordinator can")
     labels = upd.get("labels")
@@ -2784,8 +2783,12 @@ def untrusted_write_update(task: dict, a: dict, upd: dict) -> None:
     if want:
         if untrusted.WRITE_LABEL not in labels:
             upd["labels"] = labels + [untrusted.WRITE_LABEL]
-    elif untrusted.WRITE_LABEL in labels:
+            return "set"
+        return ""
+    if untrusted.WRITE_LABEL in labels:
         upd["labels"] = [lb for lb in labels if lb != untrusted.WRITE_LABEL]
+        return "cleared"
+    return ""
 
 
 def apply(p: Project, actions: list[dict], default_chat: str | None = None, user_turn: bool = False,
@@ -3147,7 +3150,7 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                 if a.get("untrusted_input") is True or untrusted.spec_sources(a.get("spec") or ""):
                     labels.append(untrusted.LABEL)   # untrusted.py: its run's narrowed policy, no routing
                 if a.get("untrusted_write") is True:
-                    if _write_label_from_run():   # a run cannot pre-authorize writes for its successor
+                    if _task_run():   # a run cannot pre-authorize writes for its successor
                         raise ValueError("task_add rejected: a task run cannot set "
                                          f"{untrusted.WRITE_LABEL}; only the coordinator can")
                     labels.append(untrusted.WRITE_LABEL)   # only the field sets it, never the spec's wording
@@ -3412,7 +3415,12 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                     upd["labels"] = _branch_labels(upd.get("labels", json.loads(task["labels"] or "[]")), want)
                     branch_line = f"pr_branch: `{want}`" if want else 'pr_branch: ""'
                 cleared = untrusted_update(task, a, upd)
-                untrusted_write_update(task, a, upd)
+                write_moved = untrusted_write_update(task, a, upd)
+                if write_moved:   # the audit trail of a power grant being moved
+                    db.x("INSERT INTO events(ts,source,kind,severity,text,data,status,task) VALUES(?,?,?,?,?,?,?,?)",
+                         (time.time(), "coordinator", untrusted.WRITE_LABEL, "low",
+                          f"#{task['id']}: {untrusted.WRITE_LABEL} {write_moved}",
+                          json.dumps({"to": write_moved == "set"}), "handled", task["id"]))
                 if a.get("start_after") is not None or a.get("start_when") is not None \
                         or (a.get("why") is not None and deferral(task).get("when")):
                     if task["status"] in ("running", *TERMINAL_TASK_STATES):

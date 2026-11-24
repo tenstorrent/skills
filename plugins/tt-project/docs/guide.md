@@ -4835,7 +4835,8 @@ Workers can read Slack links you paste, using your Slack connector if you have o
     or form body or an upload; wget with a post body or `--method`. A task that must post carries the
     label `untrusted_write` too: only the coordinator sets it, with `untrusted_write` true or false
     on a task_add or task_update (a task run can do neither), and never from a spec's wording;
-    pushes and credential reads stay refused with it.
+    pushes and credential reads stay refused with it. The write label is never inherited: a
+    successor task must be granted it again.
   - Credential reads outside the run's worktree, in a Bash command's words (also inside `sh -c`) or a
     Read, Grep or Glob path: a file in a credential folder (`~/.ssh`, `~/.aws`, `~/.azure`, `~/.gnupg`,
     `~/.docker`, `~/.kube`, `~/.password-store`, gh's and gcloud's config, the keyrings), a known

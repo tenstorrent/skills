@@ -692,6 +692,9 @@ def test_only_the_coordinator_sets_untrusted_write_and_its_run_only_gains_writes
     assert untrusted.WRITE_LABEL not in json.loads(p.db.task(task["id"])["labels"])
     assert coord.apply(p, [{"type": "task_update", "id": task["id"], "untrusted_write": True}]) == []
     assert untrusted.WRITE_LABEL in json.loads(p.db.task(task["id"])["labels"])
+    ev = p.db.one("SELECT * FROM events WHERE kind=? AND task=? ORDER BY id DESC LIMIT 1",
+                  (untrusted.WRITE_LABEL, task["id"]))
+    assert ev and "set" in ev["text"] and json.loads(ev["data"]) == {"to": True}, "the move is on record"
 
 
 def test_a_run_can_neither_set_nor_clear_untrusted_write(env, monkeypatch):
