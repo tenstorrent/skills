@@ -178,14 +178,12 @@ def test_a_run_a_host_reboot_or_crash_cut_never_counts_toward_a_model_route_roll
     from ttp import rollout, rollout_health as rh
     p = make(env, "replay")
     tid = p.db.add_task("t", "s", kind="code", tier="standard")
-    for i in range(400):                    # the baseline: 1% of the off-arm runs failed
-        p.db.x("INSERT INTO runs(task,role,provider,model,status,started,ended) VALUES(?,'worker','claude','opus',?,?,?)",
-               (tid, "failed" if i < 4 else "ok", time.time() - 100 * _RH - 5, time.time() - 100 * _RH))
+    _ro_task_runs(p, 400, 4, 100, glm=False)   # the baseline: 1% of the off-arm runs failed
     now, since, th = time.time(), time.time() - 10 * _RH, rh.thresholds(None)
     reboot = {"not_waste": "reboot", "lost_to_reboot": "b0", "boot_at": 1.0, "shutdown": "unclean"}
     for ago, status, cut in _REBOOT_WINDOW:
         _ro_glm_run(p, tid, status, ago, reboot if cut else None)
-    for flag in ("glm_code", "glm_device", "glm_work"):
+    for flag in _ARMS:
         v = rh.signals(p.db, since, now, th, rollout.FLAGS[flag]["area"], flag)
         assert v["failing"] == [] and v["failed"] == 0 and v["runs"] == 22, (flag, v)
     p.db.x("UPDATE runs SET note=NULL WHERE provider='chat'")   # before the fix: the same runs, counted
