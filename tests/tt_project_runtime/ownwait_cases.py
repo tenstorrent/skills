@@ -240,7 +240,9 @@ def test_a_hand_off_waiting_on_the_landing_of_a_failed_review_its_branch_carries
     wait = {"waiting_for": "A's landing", "retry_when": f"ttp landed --task {a}"}
     # While a fix of A's failed review is open, its landing lands A: B's wait is a real one.
     assert json.loads(_reply_wait_hand_off(p, d, tmp_path, b, **wait)["result"])["status"] == "waiting"
-    p.db.update_task(fix, status="done")
+    p.db.update_task(fix, status="done")   # done too: its review lands it
+    assert json.loads(_reply_wait_hand_off(p, d, tmp_path, b, **wait)["result"])["status"] == "waiting"
+    p.db.update_task(fix, status="cancelled")   # no fix left: A lands only through B's review
     t = _reply_wait_hand_off(p, d, tmp_path, b, **wait)
     res = json.loads(t["result"])
     assert res["status"] == "done" and "retry_when" not in res and f"#{a}" in res["summary"], res

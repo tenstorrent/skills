@@ -8207,16 +8207,17 @@ class Daemon:
                 refusal = ""   # its own detached push is under way: wait on that push's outcome
                 if chaincap.waits_landing(result.get("retry_when"), task["id"]):
                     result = {**result, "retry_when": probe}
-        anc = 0
+        anc = []
         if waiting and not refusal and (anc := ownwait.stack_ancestor_wait(self.p, task, result, bool(jobs))):
+            named = ", ".join(f"#{i}" for i in anc)
             # A fix on an unlanded stack: its review queues only once it hands off, and the stack lands
             # through the head's review, so waiting on an ancestor's landing never ends. Done instead.
-            summary = (f"{summary} (handed off done: it sat on the landing of #{anc}, a task in its own stack; "
+            summary = (f"{summary} (handed off done: it sat on the landing of {named}, in its own stack; "
                        f"the head's review approves the stack)")[:1500]
             result = {**{k: v for k, v in result.items() if k not in WAIT_KEYS + ("retry_when_orig",)},
                 "status": "done", "summary": summary}
             waiting, rstatus = False, "done"
-            log(self.p, f"task {task['id']} hand-off: its wait on #{anc}'s landing is in its own stack: taken as done")
+            log(self.p, f"task {task['id']} hand-off: its wait on {named}'s landing is in its own stack: taken as done")
         both = on_pass_both_warning(result) if waiting else ""
         if both:
             log(self.p, f"task {r['task']} hand-off: {both}")
@@ -8608,7 +8609,7 @@ class Daemon:
                 head = pushq._commit(self.p, task["branch"])
                 own = pushq.carried(self.p, task, head, self.cfg, since_start=True) if head else {}
                 found = {t: v for t, v in carryback.pending(db, task, own, load_result(task["result"])).items()
-                         if t != anc}   # its wait on that landing was just taken as done: never ordered again
+                         if t not in anc}   # its wait on that landing was just taken as done: never ordered again
             except Exception:   # never lose a hand-off to the check itself
                 found = {}
                 log(self.p, f"task {task['id']}: checking carried commits failed: "
@@ -18432,8 +18433,6 @@ class Daemon:
         """A waiting code task whose retry_when is the landing of a task in its own stack
         (ownwait.stack_ancestor_wait), such as one whose branch came to hold that task's head after it
         handed off: its hand-off is finished again model-free, which takes it as done. False when not."""
-        if task["kind"] != "code" or task["status"] != "queued":
-            return False
         try:
             if not ownwait.stack_ancestor_wait(self.p, task, prev):
                 return False

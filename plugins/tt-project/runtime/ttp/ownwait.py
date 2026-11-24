@@ -72,13 +72,13 @@ def own_landing_wait(task: dict, result: dict, cfg: dict, job_in_flight: bool = 
             f"Instead {way}.")
 
 
-def stack_ancestor_wait(p, task: dict, result: dict, job_in_flight: bool = False) -> int:
-    """The id of the unlanded task in `task`'s own stack that its waiting hand-off waits on, 0 when it
+def stack_ancestor_wait(p, task: dict, result: dict, job_in_flight: bool = False) -> list[int]:
+    """The ids of the unlanded tasks in `task`'s own stack that its waiting hand-off waits on, [] when it
     does not. Only a plain landing wait counts (`landed:#<id>`, `ttp landed --task <id>`, an `&&` chain
     of them, a trailing `|| exit 1` aside): another term in it is a real second condition. A task is in
     the stack when it re-works that task (carryback.reworks) or its branch holds that task's head."""
     if job_in_flight or not isinstance(result, dict) or not isinstance(task, dict) or task.get("kind") != "code":
-        return 0
+        return []
     from . import landed
     for key in ("retry_when", "waiting_for"):
         probe = result.get(key)
@@ -89,21 +89,21 @@ def stack_ancestor_wait(p, task: dict, result: dict, job_in_flight: bool = False
         if not ids or rest or task["id"] in ids:
             continue
         if all(_in_stack(p, task, tid) and landed.check(p, p.root, tid=tid, fetch=False)[0] != 0 for tid in ids):
-            return ids[0]
-    return 0
+            return ids
+    return []
 
 
 def _in_stack(p, task: dict, tid: int) -> bool:
     """Whether `task` re-works task `tid` or its branch contains `tid`'s head commit, even when `tid`'s
     latest review failed: those commits then reach the push branch only through this branch's review.
-    Not while a fix chain of that failed review is open: its landing lands `tid` (landed.carriers), so
-    carryback.order's wait on it ends."""
+    Not while a fix chain of that failed review is open or done: its landing lands `tid`
+    (landed.carriers), so carryback.order's wait on it ends."""
     from . import carryback, reviewhold
     if carryback.reworks(p.db, task, tid):
         return True
     other = p.db.task(tid) or {}
     mine, theirs = task.get("branch"), other.get("branch")
-    if not (mine and theirs) or reviewhold.chain_state(p.db, tid, {task["id"]})[0] == "open":
+    if not (mine and theirs) or reviewhold.chain_state(p.db, tid, {task["id"]})[0] in ("open", "done"):
         return False
     import subprocess
     try:

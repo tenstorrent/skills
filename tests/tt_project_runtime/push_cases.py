@@ -22312,8 +22312,10 @@ def test_a_wait_on_a_rejected_landing_its_branch_carries_is_taken_as_done_and_ne
     s = _pq(env, monkeypatch)
     monkeypatch.setattr(Daemon, "_precheck", lambda self, task, head: None)
     x, xbranch, _, _ = _pq_stacked(s, "rejected", review="failed")
-    c, _, _, _ = _pq_stacked(s, "stacked", on=xbranch)
-    t = _carry_hand_off(env, s, c, status="waiting", waiting_for="needs its code", retry_when=f"ttp landed --task {x}")
+    y, ybranch, _, _ = _pq_stacked(s, "also-rejected", on=xbranch, review="failed")
+    c, _, _, _ = _pq_stacked(s, "stacked", on=ybranch)
+    t = _carry_hand_off(env, s, c, status="waiting", waiting_for="needs their code",
+                        retry_when=f"ttp landed --task {x} && ttp landed --task {y}")
     res = json.loads(t["result"])
     assert t["status"] == "done" and carryback.KEY not in res and "woke" not in res, dict(t)
     assert s.p.db.q("SELECT id FROM tasks WHERE kind='review' AND labels LIKE ?", (f'%auto_review:{c}"%',))
