@@ -6,7 +6,7 @@ something that must not be disturbed. The lock names reach it in $TTP_LOCK_NAMES
 yield: the command's process group is stopped (SIGTERM, then SIGKILL after 10 s), the locks are
 released and `ttp lock` exits 75, so the task hands itself back as waiting. Exit 1 means keep going.
 Any other answer, or none in time, is reported once and never stops the command. `locks.yield_exempt`
-(globs of lock names) and `--no-yield` opt a call out (a rollout or a heal take). Unset, nothing runs.
+(globs of lock names) and `--no-yield` opt a call out (a rollout or heal take). Unset, nothing runs.
 """
 from __future__ import annotations
 
@@ -25,27 +25,31 @@ MIN_INTERVAL_S = 0.1   # a smaller configured interval would spin
 BUSY_RC = 75           # the exit of a busy or, now, yielded lock
 
 
+def _locks(cfg: dict) -> dict:
+    return cfg.get("locks") if isinstance(cfg.get("locks"), dict) else {}
+
+
 def command(cfg: dict) -> str:
     """The configured probe, or "" when unset (nothing runs)."""
-    v = (cfg.get("locks") or {}).get("yield_probe") if isinstance(cfg.get("locks"), dict) else None
+    v = _locks(cfg).get("yield_probe")
     return v.strip() if isinstance(v, str) else ""
 
 
 def every_s(cfg: dict) -> float:
     try:
-        v = float((cfg.get("locks") or {}).get("yield_every_s") or EVERY_S)
-    except (TypeError, ValueError, AttributeError):
+        v = float(_locks(cfg).get("yield_every_s") or EVERY_S)
+    except (TypeError, ValueError):
         v = EVERY_S
     return v if v > 0 else EVERY_S
 
 
-def armed(cfg: dict, names: list[str], root, no_yield: bool = False) -> "Probe | None":
-    """The probe watching a `ttp lock` of `names`, or None when off: unset, `no_yield` (--no-yield),
-    or every name matches a `locks.yield_exempt` glob."""
+def armed(cfg: dict, names: list[str], root) -> "Probe | None":
+    """The probe watching a `ttp lock` of `names`, or None when it is off: config unset, or every
+    name matches a `locks.yield_exempt` glob."""
     cmd = command(cfg)
-    globs = (cfg.get("locks") or {}).get("yield_exempt") or []
+    globs = _locks(cfg).get("yield_exempt") or []
     keep = [n for n in names if not any(isinstance(g, str) and fnmatch.fnmatch(n, g) for g in globs)]
-    if no_yield or not cmd or not keep:
+    if not cmd or not keep:
         return None
     return Probe(cmd, every_s(cfg), keep, root)
 
@@ -68,11 +72,8 @@ class Probe:
                 pass
             why = self.ask()
             if why is not None:
-                if popen.poll() is not None:
-                    return popen.returncode   # it ended between the probe's answer and this
                 print(f"ttp lock: yielding {', '.join(self.names)}: {why}", file=sys.stderr, flush=True)
-                self.stop(popen)
-                return BUSY_RC
+                return self.stop(popen)
             at = time.time() + self.interval
 
     def ask(self) -> "str | None":
@@ -83,25 +84,29 @@ class Probe:
                                text=False, stderr="stdout")
         if res.rc == 0:
             said = res.out.decode(errors="replace").strip().splitlines()
-            return said[0][:LINE_MAX] if said and said[0].strip() else "the project's yield probe asked for the resource"
+            line = next((ln.strip() for ln in said if ln.strip()), "")
+            return line[:LINE_MAX] if line else "the project's yield probe asked for the resource"
         if res.rc != 1 and not self.told:   # a broken or slow probe never stops the command
             self.told = True
             how = f"exited {res.rc}" if res.rc is not None else (res.error or "gave no answer")
             print(f"ttp lock: yield probe {how}; ignored, the command runs on", file=sys.stderr, flush=True)
         return None
 
-    def stop(self, popen: subprocess.Popen) -> None:
-        """Stop the command's whole process group: SIGTERM, then SIGKILL after KILL_AFTER_S."""
+    def stop(self, popen: subprocess.Popen) -> int:
+        """Stop the command's whole process group: SIGTERM, then SIGKILL after KILL_AFTER_S, and
+        return BUSY_RC. A command that ended on its own before the signal returns its own rc."""
         for sig, grace in ((signal.SIGTERM, KILL_AFTER_S), (signal.SIGKILL, None)):
+            mine = True
             try:
                 os.killpg(popen.pid, sig)   # the command runs in a group of its own for this
             except OSError:
-                pass
+                mine = False   # already gone: it ended on its own, not for this yield
             try:
                 popen.wait(grace)
-                return
             except subprocess.TimeoutExpired:
-                pass
+                continue
+            return BUSY_RC if mine else popen.returncode
+        return BUSY_RC
 
 
 def run_whole(cmd: list, env: dict, probe: "Probe | None") -> int:
