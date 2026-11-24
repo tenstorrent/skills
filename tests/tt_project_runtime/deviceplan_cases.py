@@ -833,6 +833,8 @@ def test_a_planned_job_may_use_the_runs_own_scratch_folder_and_nothing_else_may_
     }
     flagged = [k for k, st in still.items() if deviceplan.unsourced(st, srcs, task)]
     assert flagged == list(still), flagged
+    assert deviceplan.unsourced(plan(own.replace("-t 120", "-t no")), srcs, task), \
+        "the host line's words are no values a step may use"
 
 
 def test_a_device_plan_still_unsourced_after_its_re_plan_never_reaches_the_run(tmp_path):

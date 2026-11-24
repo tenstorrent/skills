@@ -244,7 +244,8 @@ def ask(run_dir, question: str, *, cwd: str, plan: bool = False, db=None, source
             row.update(source_error=why[:300])
             got, more = _opus_call(run or _run, argv, deviceplan.SOURCE_FIX.format(why=why, sources=block) + answer,
                                    left, cwd, model, usage)
-            answer, usd = fix_json(got or answer, usd + more)   # the re-plan's own block is checked again
+            answer, usd = got or answer, usd + more
+            answer, usd = fix_json(answer, usd)   # the re-plan's own block is checked again
         row.update(ok=bool(answer), answer=answer[:4000])
         if step is not None:
             row.update(step=str(step), verdict="ok" if answer.lower().startswith("ok") else "stop")

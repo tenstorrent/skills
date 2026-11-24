@@ -829,7 +829,8 @@ def unsourced(steps: list[dict], srcs: list[dict], task: str = "", root=None) ->
     root = Path(root) if root else None
     scripts = {x["script"] for x in srcs if "script" in x}
     known = [w for x in srcs if "cmd" in x for w in _src_segments(x["cmd"])]
-    named, digits = set(norm(task).split()), set(re.findall(r"\d+", task or ""))
+    mine = re.sub(r"(?m)^this host is .*$", "", task or "")   # assist()'s host line names no value a step may use
+    named, digits = set(norm(mine).split()), set(re.findall(r"\d+", mine))
     tid = re.match(r"task id (\d+)", task or "")
     own, wrote = SCRATCH.format(tid.group(1)) if tid else "", set()
     bad = []
