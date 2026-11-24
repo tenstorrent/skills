@@ -2994,6 +2994,46 @@ def test_after_push_deploy_restart_pending_is_owned_and_rechecked_after_its_wait
 
 
 
+@pytest.mark.parametrize('case', ['held_in_grace', 'held_past_grace', 'files_behind', 'daemon_dead'])
+def test_after_push_deploy_restart_held_by_a_live_stream_pages_only_past_its_grace(env, tmp_path, monkeypatch, case):
+    """Files at the release, daemon alive on the old one, its restart held by a live realtime stream on
+    this host: pending past delivery.deploy_restart_wait_s, up to delivery.deploy_restart_held_s; past
+    that one page, worded as a pending restart. Files not upgraded (its upgrade failed), or a dead daemon,
+    page at once."""
+    from ttp import deploy, occupancy, overview, release
+    p = make(env)
+    p.set_config('delivery.deploy_restart_wait_s', 600)
+    p.set_config('delivery.deploy_restart_held_s', 3600)
+    monkeypatch.setattr(occupancy, 'blocks', lambda target, step='test', now=None:
+                        'stay off for restart: box: a live realtime stream holds it' if step == 'restart' else '')
+    _deploy_lib('0.5.0')
+    files = '0.4.9' if case == 'files_behind' else '0.5.0'
+    _, db = _deploy_project(tmp_path, 'alpha', files, running='0.4.9')
+    now = time.time()
+    deploy.record(p, overview.deployed(names=['alpha']), now)
+    pages, page = _deploy_pager(p)
+    if case == 'daemon_dead':
+        db.set_kv('daemon', {'pid': 0, 'host': 'testhost'})
+    if case == 'files_behind':
+        db.set_kv(release.KV_AUTO, {'key': f'0.5.0 {DEPLOY_C[:12]}', 'outcome': 'failed', 'why': 'merge conflict'})
+    ticks = [now + 1 + deploy.PROBE_S * i for i in range(int(4000 / deploy.PROBE_S))]
+    for t in ticks[:2] if case in ('files_behind', 'daemon_dead') else ticks:
+        deploy.tick(p, page, t)
+        if case == 'held_in_grace' and t > now + 3500:
+            break
+    sent = p.db.q("SELECT text,severity FROM messages WHERE direction='out' AND kind='alert' AND ref='deploy-behind:alpha'")
+    if case == 'held_in_grace':
+        assert not sent and p.db.kv(deploy.CHECKS)['deploy:alpha:0.5.0']['outcome'] == 'pending'
+    elif case == 'held_past_grace':
+        assert len(sent) == 1 and sent[0]['severity'] == 'normal', sent
+        assert sent[0]['text'].startswith('Restart pending: alpha has tt-project 0.5.0 on disk'), sent
+        assert 'its restart is still held: stay off for restart' in sent[0]['text'] and 'Deploy failed' not in sent[0]['text']
+    else:
+        assert len(sent) == 1 and sent[0]['text'].startswith('Deploy failed:'), sent
+        assert 'held' not in p.db.kv(deploy.CHECKS)['deploy:alpha:0.5.0']
+        assert sent[0]['severity'] == ('high' if case == 'daemon_dead' else 'normal')
+
+
 def test_deploy_pending_is_one_live_line_per_project_that_a_newer_release_updates_and_catching_up_clears(env, tmp_path):
     """Three releases in a row while a project waits on its merge: one live status line, naming the
     newest release in plain words, never one feed line per release. It clears with a short line once

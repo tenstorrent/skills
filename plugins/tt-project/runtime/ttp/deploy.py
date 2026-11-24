@@ -22,6 +22,7 @@ CHECKS = "deploy_checks"
 ALERTED = "deploy_alerted"   # the last deploy alert record() sent or updated: pushq sends no after_push alert of its own
 GRACE_S = 300
 RESTART_WAIT_S = 900         # default delivery.deploy_restart_wait_s
+RESTART_HELD_S = 7200        # default delivery.deploy_restart_held_s
 PROBE_S = 60
 HISTORY = 20
 TAKEOVERS = "deploy_takeovers"   # project name -> the host-side takeover attempts of its overdue merge
@@ -68,15 +69,30 @@ def holds_redeploy(name: str, since: float, now: float) -> bool:
     return report["rc"] != overview.OK or not row or float(row.get("daemon_started") or 0) < since
 
 
-def restart_wait(p) -> float:
+def restart_wait(p, key: str = "deploy_restart_wait_s", default: float = RESTART_WAIT_S) -> float:
     """delivery.deploy_restart_wait_s of the reporting project: how long a daemon may take to restart onto
-    files already at the release before that counts as failed."""
+    files already at the release before that counts as failed (another delivery.<key> in seconds: `key`)."""
     try:
-        return float(project.push_queue_number("deploy_restart_wait_s",
-                                               (p.config().get("delivery") or {}).get("deploy_restart_wait_s",
-                                                                                      RESTART_WAIT_S)))
+        return float(project.push_queue_number(key, (p.config().get("delivery") or {}).get(key, default)))
     except (ValueError, AttributeError, TypeError):
-        return RESTART_WAIT_S
+        return default
+
+
+def _restart_held(p, rec: dict, row: dict, now: float) -> None:
+    """A restart the project's live daemon owes (files at the release) while a live realtime stream holds
+    restarts on this host (occupancy.py; service.restart refuses meanwhile) is not late: its re-check moves
+    to restart_wait after each probe that finds it held, up to delivery.deploy_restart_held_s after the
+    project fell behind, and once the hold ends the daemon gets restart_wait again. Past that grace assess
+    pages it as a held restart (kind "held")."""
+    from . import occupancy
+    why = (rec.get("restart") and row.get("settling") and row.get("daemon_alive")
+           and occupancy.blocks(project.hostname(), "restart"))
+    if why:
+        rec["held"] = why
+        cap = float(rec.get("since") or now) + restart_wait(p, "deploy_restart_held_s", RESTART_HELD_S)
+        rec["due"] = max(float(rec.get("due") or 0), min(now + restart_wait(p), cap))
+    elif rec.pop("held", None):
+        rec["due"] = max(float(rec.get("due") or 0), now + restart_wait(p))
 
 
 def registered_here(name: str, registry: dict | None = None) -> bool:
@@ -102,7 +118,8 @@ def assess(rec: dict, row: dict, now: float, where=None) -> tuple[str, str, str]
     """(outcome, kind, reason) of one probe: done; pending (an accepted owned merge before its deadline);
     or failed, kind "down" (a daemon that is down outside an upgrade) or "fault" (a current upgrade error):
     at once, whatever the deadline; "missed" (an accepted step past its deadline: a merge's takeover plus
-    GRACE_S, a pending restart's bounded wait) or "unowned" (never accepted).
+    GRACE_S, a pending restart's bounded wait), "held" (that restart still held past its grace,
+    _restart_held) or "unowned" (never accepted).
     Shared by record, tick and holds, so the alert clears exactly when its condition does. Times are
     shown in the zone of `where` (the reporting project)."""
     if row["state"] == overview.OK:
@@ -117,6 +134,8 @@ def assess(rec: dict, row: dict, now: float, where=None) -> tuple[str, str, str]
         # Accepted once, later steps of the same merge (files landed, a restart) wait for the same deadline.
         if now < rec["due"]:
             return "pending", "", reason
+        if rec.get("held"):
+            return "failed", "held", f"its restart is still held: {rec['held']}; {reason}"
         at = timefmt.long(takeover, where) if takeover else "unknown"
         what = "still behind at its re-check" if rec.get("restart") else "missed takeover"
         return "failed", "missed", f"{what} {at} (owner {rec.get('owner') or 'unknown'}); {reason}"
@@ -403,8 +422,10 @@ def _alert(p, rec: dict, kind: str, reason: str, now: float, alert=None) -> str:
     key = behind_key(rec["name"])
     sev = "high" if kind == "down" else "normal"
     since = float(rec.get("since") or ((rec.get("history") or [{}])[0].get("at")) or now)
-    text = (f"Deploy failed: {rec['name']} is not running tt-project {rec['target']} (the newest release; "
-            f"behind since {timefmt.long(since, p)}, {_span(now - since)}): {reason}.")
+    what = (f"Restart pending: {rec['name']} has tt-project {rec['target']} on disk but its daemon has not "
+            f"restarted onto it" if kind == "held" else
+            f"Deploy failed: {rec['name']} is not running tt-project {rec['target']}")
+    text = f"{what} (the newest release; behind since {timefmt.long(since, p)}, {_span(now - since)}): {reason}."
     ep = p.db.one("SELECT id, message, severity FROM alerts WHERE key=? AND cleared IS NULL ORDER BY id DESC LIMIT 1",
                   (key,))
     if ep and SEVERITY_RANK.get(sev, 1) <= SEVERITY_RANK.get(ep["severity"], 1):
@@ -558,6 +579,7 @@ def tick(p, alert, now: float | None = None) -> None:
                 rec["closed"] = now
                 _log(p, rec["name"], f"deploy of {rec.get('target')} skipped: release {release.hold_text(hold, p)}")
                 continue
+            _restart_held(p, rec, row, now)
             outcome, kind, reason = _judge(p, rec, row, takeovers.setdefault(rec["name"], {}), now, start=True)
             _settle(rec, outcome, now)
             if outcome == "failed" and _mark(rec, kind, now):

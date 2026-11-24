@@ -801,6 +801,7 @@ EXTRA_KEYS = {
     # own_push_reserved_lane: `ttp push --own` checks take the remote's own-branch push lane (push.own_lane_key;
     # default on, false: an ordinary turn behind task checks).
     # deploy_restart_wait_s: how long `ttp deployed --after-push` lets a daemon restart onto new files (deploy.py).
+    # deploy_restart_held_s: how long a live realtime stream on its host may hold that restart before it pages.
     # plugin_version_guard: refuse a change that edits plugins/<name>/ but keeps the tip's manifest version (off).
     # push_solo_paths: pathspecs a batch takes at most one routine change touching (pushq.SOLO_PATHS, off); push_cap_tests:
     # the name regex of prompt size cap tests, whose lone failure sends a trim-to-fit fix (conflictfix.CAP_TESTS).
@@ -833,7 +834,7 @@ EXTRA_KEYS = {
                  "push_setup_fault_escalate_after", "after_push", "push_upstream",
                  "push_solo_paths", "push_cap_tests", "push_entry_checks", "push_rerun_s", "push_hard_tests", "mechanical_merge_paths",
                  "after_push_timeout_s", "backup_remote", "fast_forward_also", "mirror_remotes",
-                 "allow_protected_push_branch", "own_push", "own_push_remote", "own_push_reserved_lane", "deploy_restart_wait_s", "after_push_retry_s", "after_push_defer_alert_h", "plugin_version_guard",
+                 "allow_protected_push_branch", "own_push", "own_push_remote", "own_push_reserved_lane", "deploy_restart_wait_s", "deploy_restart_held_s", "after_push_retry_s", "after_push_defer_alert_h", "plugin_version_guard",
                  "checks_fast_globs", "checks_fast_exclude",   # these two: `ttp checks` fast path (push.FAST_GLOBS),
                  "checks_targeted", "checks_targeted_always",   # a task's `ttp checks` runs the tests its diff reaches (testpick)
                  "task_checks",   # a task's own `ttp checks` list (testpick.task_set); unset: the push checks
@@ -1219,7 +1220,7 @@ PUSH_QUEUE_DEFAULTS = {"push_queue": False, "push_batch_s": 300, "push_batch_max
                        "push_age_s": 14400,
                        "push_landing_alert_h": 4, "push_script_torn_escalate_after": 3,
                        "push_setup_fault_escalate_after": 3,
-                       "after_push_timeout_s": 1800, "deploy_restart_wait_s": 900,
+                       "after_push_timeout_s": 1800, "deploy_restart_wait_s": 900, "deploy_restart_held_s": 7200,
                        "after_push_retry_s": 300, "after_push_defer_alert_h": 24}
 # key: (minimum, whether the minimum itself is allowed, whole numbers only)
 PUSH_QUEUE_NUMBERS = {"push_batch_s": (0, True, False), "push_batch_max": (1, True, True),
@@ -1228,6 +1229,7 @@ PUSH_QUEUE_NUMBERS = {"push_batch_s": (0, True, False), "push_batch_max": (1, Tr
                       "push_script_torn_escalate_after": (0, True, True),
                       "push_setup_fault_escalate_after": (0, True, True),
                       "after_push_timeout_s": (0, False, False), "deploy_restart_wait_s": (0, True, False),
+                      "deploy_restart_held_s": (0, True, False),
                       "after_push_retry_s": (60, True, False), "after_push_defer_alert_h": (0, True, False)}
 
 

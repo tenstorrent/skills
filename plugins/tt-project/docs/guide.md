@@ -3875,7 +3875,10 @@ the pick order, so it takes the first starts. A resumed resource ramps only its 
   that task to end, and reports it as a stuck owner after 6 h. A live daemon
   whose files are already at the release but that has not restarted onto them (or not yet
   ticked on them) is pending too, owned by that daemon, and is re-checked after
-  `delivery.deploy_restart_wait_s` (default 900). A daemon that
+  `delivery.deploy_restart_wait_s` (default 900). While a live realtime stream holds restarts
+  on its host, that re-check moves on with the hold, up to `delivery.deploy_restart_held_s`
+  (default 7200) after the project fell behind; past that it pages once as a pending restart
+  with the hold's reason, not as a failed deploy. A daemon that
   stops or fails to come up (high), or an upgrade error for this release, alerts at the next
   probe (about a minute), not at takeover. A takeover still behind after its last try, or a
   restart still behind at its re-check, alerts at normal severity. A project behind is one
