@@ -172,3 +172,41 @@ def test_a_remote_confirmed_hand_off_keeps_its_landed_claim(env, monkeypatch):
                                   push_verified=True)
     res = json.loads(p.db.task(tid)["result"])
     assert "not landed" not in res["summary"] and head[:10] in res["summary"], res["summary"]
+
+
+def _daemon_finish(env, monkeypatch, fetchable: bool):
+    """The daemon's real finish of a hand-off that claims a landing that never happened: the claim's
+    one refresh fetch runs in the pre-transaction prefetch (_prefetch_lint), so inside the finish
+    transaction the check only reads the fetched ref. Returns (project, result)."""
+    from ttp.daemon import Daemon
+    from ttp.providers.base import RunUsage as Usage
+    monkeypatch.setenv("TTP_TX_GUARD", "1")   # a fetch left inside the transaction is refused
+    p, repo, head = _claim_replay_setup(env, monkeypatch, landed=False)
+    if not fetchable:
+        _git_out(repo, "remote", "set-url", "origin", str(env["tmp"] / "gone.git"))
+    tid = p.db.add_task("harden the runtime", "s", kind="code", origin="coordinator")
+    p.db.update_task(tid, status="running", branch="ttp/t1")
+    run_dir = env["tmp"] / f"run-{tid}"
+    run_dir.mkdir()
+    handoff = {"status": "done", "summary": _claim_text("sha", head)}
+    (run_dir / "result.json").write_text(json.dumps(handoff))
+    d = Daemon(p.base)
+    d._prefetch_lint(tid, handoff, run_dir)   # the daemon asks before the transaction opens
+    with d._finish_tx(tid):
+        d._finish_worker({"task": tid}, Usage(cost_usd=1.0), "ok", run_dir)
+    return p, json.loads(p.db.task(tid)["result"])
+
+
+def test_the_daemon_s_finish_transaction_corrects_a_false_landed_claim(env, monkeypatch):
+    """Replay of the daemon's finish path under the transaction guard: the claim's refresh fetch
+    runs before the write transaction opens, so a hand-off claiming a landing that never happened
+    still reads 'not landed' once the finish is recorded."""
+    p, res = _daemon_finish(env, monkeypatch, fetchable=True)
+    assert "not landed" in res["summary"] and "landed at" not in res["summary"], res["summary"]
+
+
+def test_the_daemon_s_finish_transaction_marks_a_claim_it_cannot_check(env, monkeypatch):
+    """The same finish with a push branch that cannot be fetched: the claim is marked
+    '(unverified)', never left reading a plain 'landed'."""
+    p, res = _daemon_finish(env, monkeypatch, fetchable=False)
+    assert "(unverified)" in res["summary"] and "not landed" not in res["summary"], res["summary"]

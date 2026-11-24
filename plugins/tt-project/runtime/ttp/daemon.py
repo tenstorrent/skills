@@ -879,6 +879,7 @@ LOG_FAIL_S = 300   # a daemon.log that cannot be written says so on stderr at mo
 LOG_MAX_BYTES = 16 * 1024 * 1024   # past this daemon.log rotates to LOG_OLD; one old copy is kept
 LOG_OLD = "daemon.log.1"
 SLOP_BLOCKS_MAX = 256   # tasks whose review's de-slop block Daemon._slop_blocks holds before it starts over
+CLAIM_CACHE_MAX = 256    # tasks whose landed-claim fetch cache Daemon._claim_fetch holds before it starts over
 _LOG_FAIL = {"t": float("-inf"), "n": 0}   # when stderr last said so; lines dropped since the last one written
 # A finish round's log lines (Daemon._finish_rounds): written once it commits or fails, dropped when
 # it rolls back to run again (GitMiss), so a retried round never logs a line twice.
@@ -1426,6 +1427,7 @@ class Daemon:
         self._writeups: dict[int, dict] = {}   # task -> the Opus write-up made before its finish transaction (_prewrite)
         self._git_memo: dict[int, dict] = {}   # task -> git facts its hand-off is judged by, read before the tx (_prefetch_git)
         self._git_attempts: dict[int, gitmemo.Attempt] = {}   # task -> its finish's gitreplay attempt, from the warm-up
+        self._claim_fetch: dict[int, dict] = {}   # task -> its landed-claim check's fetch cache, read before the tx
         self._slop_blocks: dict[int, tuple[str, str]] = {}   # task -> (head, its review's de-slop block), read before the tx
         self._start_rc: dict[int, tuple[int | str, float, str]] = {}   # a start_when's last not-yet or broken verdict
         self._premise_runs: dict[int, tuple] = {}   # task -> its running premise command: (Pending, started, cmd)
@@ -7657,6 +7659,18 @@ class Daemon:
                 handoffcheck.prefetch(self.p, self.cfg, task, result, run_dir)
         except Exception as e:   # verdict runs them again inside the transaction
             log(self.p, f"task {task_id}: the hand-off checks failed to run early: {type(e).__name__}: {e}")
+        if task:   # the landed-claim check's one fetch: inside the transaction a git network call is
+            # refused (db.TxNetworkError) and the error swallowed, so the cache is warmed here
+            try:
+                head = pushq._commit(self.p, task["branch"]) if task["branch"] else ""
+                if len(self._claim_fetch) >= CLAIM_CACHE_MAX:
+                    self._claim_fetch.clear()
+                self._claim_fetch[task_id] = pushclaim.prefetch(
+                    self.p, str(result.get("summary") or "") if isinstance(result, dict) else "",
+                    self.p.root, head, task_id)
+            except Exception as e:
+                log(self.p, f"task {task_id}: asking the push branch for its landed-claim check failed: "
+                            f"{type(e).__name__}: {e}")
         self._prefetch_git(task, result)
         return task
 
@@ -8613,9 +8627,12 @@ class Daemon:
             # a hand-off the remote check just confirmed is left as written: its verdict outranks
             # the local tracking ref, which may lag the pushes it confirmed
             fixed = summary if push_verified else pushclaim.correct_landed_claims(
-                self.p, summary, self.p.root, head_sha, task["id"])
+                self.p, summary, self.p.root, head_sha, task["id"],
+                fetches=self._claim_fetch.get(task["id"]))
         except Exception:   # a fault leaves the text as written
             fixed = summary
+            log(self.p, f"task {task['id']}: its landed-claim check failed: "
+                        + traceback.format_exc().replace("\n", " | ")[:500])
         if fixed != summary:
             log(self.p, f"task {task['id']}: its hand-off's landed-claim corrected to: {fixed[:300]}")
             summary = fixed

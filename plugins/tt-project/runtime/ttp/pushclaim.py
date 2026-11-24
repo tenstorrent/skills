@@ -202,7 +202,7 @@ def landed_claims(p, text: str, repo) -> list[tuple[int, int, str, tuple]]:
 
 
 def correct_landed_claims(p, text: str, repo, head: str = "", tid: int = 0,
-                          remote_missing: bool = False) -> str:
+                          remote_missing: bool = False, fetches: dict | None = None) -> str:
     """`text` (a hand-off summary or a note) with its landed-claims checked model-free: a phrase
     saying the run's change landed, was pushed or sits on the push branch stays only when a push
     receipt (landed.recorded) or the branch's local tracking ref holds the commit it names — the
@@ -212,7 +212,9 @@ def correct_landed_claims(p, text: str, repo, head: str = "", tid: int = 0,
     again after the push branch is fetched once: a landing another route pushed must not read
     'not landed' because the ref lags behind it. Claims naming another ref are the remote
     checks' business and are left as written. `remote_missing`: the remote check settled every
-    claim of this task false, so each is rewritten to read 'not landed', whatever ref it named."""
+    claim of this task false, so each is rewritten to read 'not landed', whatever ref it named.
+    `fetches`: a cache filled before the write transaction (prefetch), so the one fetch runs
+    outside it and this reads the refreshed ref; None makes its own."""
     from . import landed
     if not text:
         return text
@@ -224,7 +226,8 @@ def correct_landed_claims(p, text: str, repo, head: str = "", tid: int = 0,
         except Exception:
             pass
     fixes = []
-    fetches = {}   # the push branch's fetch, asked once for claims the local ref cannot confirm
+    if fetches is None:   # the push branch's fetch, asked once for claims the local ref cannot confirm
+        fetches = {}
     for start, end, sha, claim_target in landed_claims(p, text, repo):
         what = sha or head
         if remote_missing:
@@ -250,6 +253,17 @@ def correct_landed_claims(p, text: str, repo, head: str = "", tid: int = 0,
     for start, end, fix in sorted(fixes, reverse=True):
         text = text[:start] + fix + text[end:]
     return text
+
+
+def prefetch(p, text: str, repo, head: str = "", tid: int = 0) -> dict:
+    """The fetch cache correct_landed_claims reads inside the transaction that records a hand-off:
+    its one bounded refresh of the push branch is asked here, before that transaction opens (db.py
+    refuses a git network call inside one), by running the check on `text` once and keeping the
+    cache its fetch filled. The corrected text that run writes is thrown away: the finish records
+    the one its own call makes with this cache."""
+    fetches: dict = {}
+    correct_landed_claims(p, text, repo, head, tid, fetches=fetches)
+    return fetches
 
 
 def _structured(p, result: dict) -> list[dict]:
