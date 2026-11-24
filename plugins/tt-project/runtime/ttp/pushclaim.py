@@ -209,6 +209,18 @@ def _names_push_branch(sentence: str, target) -> bool:
     return bool(re.search(rf"(?<![\w.-]){full}(?![\w/-])|(?<![\w/.-]){name}(?![\w/-])", sentence))
 
 
+def _named_sha_missing(sentence: str, repo) -> bool:
+    """Whether a claim's sentence names a commit this repository does not have (another
+    repository's sha, or a mis-typed one), with the sha-phrase parses: the claim is about
+    that commit, which no check here can read, so it stays as written."""
+    for rx in (_TAG, _REF_SHA, _SHA_REF):
+        for m in rx.finditer(sentence):
+            sha = next((g for g in m.groups() if re.fullmatch(r"[0-9a-f]{7,40}", g or "")), None)
+            if sha and not _commit(repo, sha):
+                return True
+    return False
+
+
 def landed_claims(p, text: str, repo) -> list[tuple[int, int, str, tuple]]:
     """The (start, end, sha, target) of each phrase in `text` claiming a landing: the push phrases
     text_claims parses (same regexes, negation and overlap rules; the sha resolved in `repo`), then
@@ -216,7 +228,8 @@ def landed_claims(p, text: str, repo) -> list[tuple[int, int, str, tuple]]:
     branch, or says 'landed' while naming no other destination ("pushed the fix to my branch",
     "merged into the work branch" name one, so they are left out). A phrase about another task
     or run (its sentence names its id) is left out: the check would read this run's head, not that
-    task's."""
+    task's. A sentence naming a sha this repository does not hold is left out too: the claim is
+    about another repository's commit, no check here can read it."""
     target = _default(p, repo)
     out = [(start, end, full,
             (_ref(repo, ref, tag=tag) if ref and ref.lower() not in _NOT_REFS else None) or target)
@@ -235,6 +248,8 @@ def landed_claims(p, text: str, repo) -> list[tuple[int, int, str, tuple]]:
         hi = min((i for i in (text.find(c, m.end()) for c in ".!?\n") if i >= m.end()), default=len(text))
         if not _LANDED_SUBJECT.search(text[lo:hi]) or text[m.end():].startswith(" " + UNVERIFIED_CLAIM):
             continue   # not about this run's work, or the claim is already marked
+        if _named_sha_missing(text[lo:hi], repo):
+            continue   # names a commit this repo does not have: another repo's business
         # a sha-less claim is a push-branch claim only when its sentence names that branch, or
         # says 'landed' naming no destination: a push or merge to the run's own branch, a PR
         # branch or a fork is another destination's business and stays as written.

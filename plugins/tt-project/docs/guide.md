@@ -4371,9 +4371,10 @@ A hand-off or note that says the run's change landed, was pushed or sits on the 
 checked against that branch before the task is recorded: `landed.check` is the one decider, one
 bounded fetch of the branch runs before the write, a fetch that fails marks the claim
 "(unverified)" instead of settling it, and a claim the branch does not hold is rewritten to read
-"not landed: <sha> is not on <push branch>". A claim naming a commit is checked as written. A
-claim naming no commit is checked only when its sentence names the push branch, or says "landed"
-while naming no other destination. Known gap: a sha-less push claim naming another destination
+"not landed: <sha> is not on <push branch>". A claim naming a commit is checked as written;
+a sentence naming a sha this repository does not hold is another repository's commit and stays as
+written. A claim naming no commit is checked only when its sentence names the push branch, or says
+"landed" while naming no other destination. Known gap: a sha-less push claim naming another destination
 (the run's own branch, a PR branch, a fork) is not checked.
 
 ## A report-only next step settles a wait without a model

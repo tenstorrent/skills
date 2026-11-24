@@ -128,6 +128,17 @@ def test_a_landed_claim_s_sentence_ends_at_its_nearest_stop(env, monkeypatch):
         assert "not landed" in fixed and head[:12] in fixed, (text, fixed)
 
 
+def test_a_claim_naming_a_sha_this_repo_does_not_have_stays_as_written(env, monkeypatch):
+    """A sentence naming a sha the sha-phrase parse drops (a sha this repository does not hold)
+    is no sha-less claim checked against the task head: the claim is about another repository's
+    commit, which no check here can read, so the sentence stays as written."""
+    from ttp import pushclaim
+    p, repo, head = _claim_replay_setup(env, monkeypatch, landed=False)
+    for text in ("Sent the fix to the push queue; it landed as 1a2b3c4.",
+                 "The fix landed as 1a2b3c4 and the checks passed."):
+        assert pushclaim.correct_landed_claims(p, text, p.root, head) == text, text
+
+
 def test_a_sha_less_claim_naming_the_push_branch_is_checked(env, monkeypatch):
     """A sha-less claim whose sentence names the push branch is checked against the task head even
     when its verb is a push or a merge: the correction still reads 'not landed' when the branch
