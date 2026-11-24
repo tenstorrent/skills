@@ -688,6 +688,10 @@ MARK_CODE_EFFECT = [   # code that reads or changes the record itself, or gets i
     f"python3 -c \"import os; os.system('. {_M}')\"", f"python3 -c \"import os; os.system('history -w {_M}')\"",
     f"sh <<EOF\nrm a#b {_M}\nEOF", f"cat <<EOF | sh\nrm a#b {_M}\nEOF", f"python3 -c 'print(1)' ; sh <<EOF\nrm a#b {_M}\nEOF",
     f'python3 x.py "a/b" c {_M}" now"', f'python3 x.py \\" c {_M}" now"',   # quotes the shell pairs otherwise
+    f"python3 -c \"import os,sys; os.remove(sys.argv[2])\" 'a {_M}' a#b {_M}",   # a bare one beside prose
+    f"perl -e 'unlink $ARGV[1]; print \"the {_M}\"' a#b {_M}",
+    f"perl -e \"unlink qw'a {_M}'\"", f"ruby -e \"File.delete(*%w'a {_M}')\"",   # word lists
+    f"tclsh <<EOF\nforeach f \"a {_M}\" {{file delete $f}}\nEOF",
 ]
 
 

@@ -643,9 +643,10 @@ def _mark_subst(cmd: str) -> tuple[str, list[str]] | None:
 
 # Script interpreters: a mention of the mark only in a quoted prose clause of their program or arguments
 # (receipt or note text a script writes) is inert, as a quoted prose argument to any other command is.
-MARK_SCRIPT_RE = re.compile(r"python[\d.]*|perl|ruby|node|deno|bun|php|lua|tclsh")
-# A quoted clause with no shell or code punctuation: text, never a path, option or command list.
-MARK_PROSE_RE = re.compile(r"(['\"])([^'\"\n;&|<>(){}\[\]`$\\=*?/]*)\1")
+MARK_SCRIPT_RE = re.compile(r"python[\d.]*|perl|ruby|node|deno|bun|php|lua")
+# A quoted clause with no shell or code punctuation: text, never a path, option or command list, nor a
+# word list or other prefixed literal (perl qw'', ruby %w'', tcl {*}"").
+MARK_PROSE_RE = re.compile(r"(?<![\w%}])(['\"])([^'\"\n;&|<>(){}\[\]`$\\=*?/]*)\1")
 MARK_PROSE_PLACE = "run-mark-prose"   # what a prose mention reads as
 
 
@@ -654,7 +655,7 @@ def _mark_prose(clause: str) -> bool:
     whole word (trailing .,:!), and no word before one is a command (on PATH, a runner or feed), `.` or an
     option (a builtin's `history -w`, `enable -f`), so the clause run as a command line could not take
     the mark as its argument. A script that cuts the name out of such text (a split or slice) is not
-    seen, as names built at run time never are."""
+    seen, as names built at run time never are (perl's glob splits its text too)."""
     words = clause.split()
     at = [i for i, w in enumerate(words) if RUN_MARK in w]
     if len(words) < 2 or not at or any(words[i].rstrip(".,:!") != RUN_MARK for i in at):
@@ -667,7 +668,8 @@ def _mark_quiet(cmd: str, words: list[str]) -> tuple[list[str], str] | None:
     """`cmd` and its `words` with each prose mention of RUN_MARK (_mark_prose) read as MARK_PROSE_PLACE, for a
     command whose only code runners are script interpreters (MARK_SCRIPT_RE); None when anything else may
     run code or split text into words (a shell, eval, sed, xargs, a read loop, `.`), or the words do not
-    line up. A clause counts only where the shell quotes all of it, so no mention it hides is a word."""
+    line up, or a mention is left outside prose. A clause counts only where the shell quotes all of it,
+    so no mention it hides is a word."""
     if any(w == "." or w in MARK_FEEDS or (MARK_RUNNER_RE.fullmatch(os.path.basename(w))
                                             and not MARK_SCRIPT_RE.fullmatch(os.path.basename(w))) for w in words):
         return None
@@ -675,6 +677,8 @@ def _mark_quiet(cmd: str, words: list[str]) -> tuple[list[str], str] | None:
     flags = _quoting(cmd)
     text = MARK_PROSE_RE.sub(lambda m: m[0].replace(RUN_MARK, MARK_PROSE_PLACE) if _mark_prose(m[2]) and all(
         f[0] for f in flags[m.start():m.end()]) else m[0], cmd)
+    if RUN_MARK in text:
+        return None
     quiet = _mark_words(text)
     return (quiet, text) if quiet is not None and len(quiet) == len(words) else None
 
