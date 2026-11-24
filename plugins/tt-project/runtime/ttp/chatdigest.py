@@ -415,12 +415,12 @@ def fallback_s(cfg: dict | None) -> float:
 
 
 def handoff(db, cfg: dict | None, task: dict, new: str, text: str, now: float | None = None, p=None,
-            facts: dict | None = None) -> list[int]:
+            facts: dict | None = None) -> None:
     """A finished reply_chat task's hand-off never posts to its chat; the user gets the coordinator's
     plain outcome summary instead. This raises one REPLY_DUE event that wakes the coordinator, naming
     the chat and the landing facts, with the hand-off enclosed as data only, and arms the model-free
     fallback line for the case no reply reaches the chat in time (fallbacks). The hand-off's promises
-    still record in its chat. The message ids posted (always []: nothing posts here)."""
+    still record in its chat. Nothing posts here."""
     from . import msgparts, spans
     chat = "all" if task.get("reply_chat") in (None, "", "all") else task["reply_chat"]
     now = time.time() if now is None else now
@@ -445,7 +445,6 @@ def handoff(db, cfg: dict | None, task: dict, new: str, text: str, now: float | 
             obligations.record_promises(p, [(0, chat, body)], {}, now=now, by_task=tid)
         except Exception:
             pass
-    return []
 
 
 def fallbacks(p, now: float | None = None) -> list[int]:
@@ -480,8 +479,8 @@ def _replied(db, item: dict) -> bool:
     from . import obligations
     chat = item.get("chat")
     mine = [d for d in obligations.delivered_since(db, float(item.get("at") or 0))
-            if d.get("chat") == chat]
-    if int(item.get("task") or 0) in [d["task"] for d in mine]:
+            if d.get("chat") == chat or (d.get("chat") is None and chat == "all")]
+    if int(item.get("task") or 0) in [t for d in mine for t in d["tasks"]]:
         return True
     delivering = {d["message"] for d in mine}   # a reply about another task, not this chat's answer
     rows = db.q("SELECT id FROM messages WHERE direction='out' AND ts>=? AND channel='chat' "

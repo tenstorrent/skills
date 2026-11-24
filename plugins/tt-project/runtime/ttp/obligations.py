@@ -1886,6 +1886,8 @@ def audit_line(db, since: float, now: float | None = None) -> str:
 
 # delivery ----------------------------------------------------------------------------------------
 DELIVER_REF_RE = re.compile(r"(?:(?P<oid>o\d+)|#?(?P<task>\d+))")
+DELIVERIES = "reply_deliveries"   # kv: message id -> the task ids its `delivers` named (chatdigest._replied)
+DELIVERIES_KEPT = 500            # entries kept: the replies a fallback window can still ask about
 
 
 def _owner_ids(o: dict) -> list[int]:
@@ -1991,13 +1993,16 @@ def deliver(p, sent: list[tuple[int, str | None, list]], now: float | None = Non
     """Mark the obligations this batch's replies deliver (message id, chat, the reply's `delivers`: obligation
     ids, or owner task ids standing for every open obligation they own). One closes as soon as every owner
     task finished too; check() closes one whose owners finish later. A promise is delivered only by a reply
-    to its own chat. Returns a note per reference."""
+    to its own chat. Each reply's named task ids are kept (DELIVERIES), open obligation or not. Returns a
+    note per reference."""
     now = time.time() if now is None else now
     notes = []
     with p.db.tx():
         st = _load(p.db)
+        named: dict[str, list[int]] = {}   # message id -> the task ids its refs named
         for mid, chat, refs in sent:
             chat = _chat(chat)
+            ids = named.setdefault(str(mid), [])
             for ref in refs or []:
                 m = DELIVER_REF_RE.fullmatch(str(ref).strip())
                 if not m:
@@ -2009,8 +2014,11 @@ def deliver(p, sent: list[tuple[int, str | None, list]], now: float | None = Non
                     if o and o.get("promise") and o["promise"]["chat"] != chat:
                         notes.append(f"delivers {m['oid']}: that promise was made in chat {o['promise']['chat']}; "
                                      f"only a reply there delivers it")
-                        continue
+                        continue   # never a delivery here, so it names no task here either
+                    if o:
+                        ids += _owner_ids(o)   # the reply is about these tasks even once the obligation is gone
                 else:
+                    ids.append(int(m["task"]))   # named even when no open obligation owns it
                     hits = [o for o in st["items"].values() if _open(o) and int(m["task"]) in _owner_ids(o)
                             and (not o.get("promise") or o["promise"]["chat"] == chat)]
                 if not hits:
@@ -2027,21 +2035,25 @@ def deliver(p, sent: list[tuple[int, str | None, list]], now: float | None = Non
                     else:
                         notes.append(f"{o['id']} delivered by reply #{mid}; it closes once "
                                      f"#{', #'.join(map(str, _owner_ids(o)))} finish")
+        rec = {**(p.db.kv(DELIVERIES) or {}),   # what each reply's `delivers` named
+               **{k: v for k, v in named.items() if v}}
+        if len(rec) > DELIVERIES_KEPT:   # bounded: the newest entries are the ones asked about
+            rec = dict(sorted(rec.items(), key=lambda kv: int(kv[0]))[-DELIVERIES_KEPT:])
+        p.db.set_kv(DELIVERIES, rec)
         p.db.set_kv(KV, st)
     return notes
 
 
 def delivered_since(db, since: float) -> list[dict]:
-    """The reply deliveries at/after `since`, one row per owner of each delivered obligation:
-    {task, chat, message, at}. A reply's `delivers` names a task or an obligation, so a reader can
-    tell a reply about one task from a reply about another (chatdigest._replied)."""
-    out = []
-    for o in items(db):
-        d = o.get("delivered") or {}
-        if d and float(d.get("at") or 0) >= float(since):
-            out += [{"task": t, "chat": d.get("chat"), "message": d.get("message"),
-                     "at": float(d.get("at") or 0)} for t in _owner_ids(o)]
-    return out
+    """The replies at/after `since` that named `delivers`, one row each: {message, chat, tasks}, the
+    task ids its refs named (an id with no open obligation still names its task). A reply about one
+    task is not another's answer, whatever later happens to the obligations (chatdigest._replied)."""
+    named = db.kv(DELIVERIES) or {}
+    rows = {r["id"]: r for r in (db.q(f"SELECT id, ts, chat FROM messages WHERE id IN "
+                                     f"({','.join('?' * len(named))})", [int(k) for k in named])
+                                if named else [])}
+    return [{"message": i, "chat": rows[i]["chat"], "tasks": list(named[str(i)] or [])}
+            for i in sorted(rows) if rows[i]["ts"] >= float(since)]
 
 
 def deliver_twins(p, twins: list[tuple], now: float | None = None) -> list[str]:

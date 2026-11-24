@@ -508,6 +508,25 @@ def test_a_reply_delivering_one_task_leaves_the_other_s_fallback_armed(env, monk
     assert p.db.kv(chatdigest.FALLBACK_KV) == []
 
 
+def test_a_reply_delivering_one_obligation_free_task_leaves_the_other_s_fallback_armed(env, monkeypatch):
+    """Two plain reply_chat tasks (no obligation between them) in one chat: a reply whose `delivers`
+    names only A is about A, never the chat's answer for B, so B's outcome line still posts."""
+    from ttp import chatdigest, coordinator as coord, pushq
+    monkeypatch.setenv("TTP_TEST_CHAT_DIGEST", "on")
+    p = make(env)
+    a, b = _cd_task(p, "first task", chat="c1"), _cd_task(p, "second task", chat="c1")
+    pushq._reply(p.db, a, "done", "First done.")
+    pushq._reply(p.db, b, "done", "Second done.")
+    now = time.time()
+    coord.apply(p, [{"type": "reply", "chat": "c1", "text": "The first one is done and live.",
+                     "delivers": [f"#{a['id']}"]}], turn=2)
+    got = chatdigest.fallbacks(p, now + chatdigest.DEFAULT_FALLBACK_S + 60)
+    lines = p.db.q("SELECT text FROM messages WHERE ref=?", (chatdigest.FALLBACK_REF,))
+    assert len(got) == 1 and len(lines) == 1, "only B's fallback line posts"
+    assert lines[0]["text"].startswith(f"#{b['id']} ")
+    assert p.db.kv(chatdigest.FALLBACK_KV) == [], "armed once, spent once"
+
+
 def test_a_promise_in_a_finished_task_s_hand_off_is_owed_until_the_coordinator_replies(env, monkeypatch):
     """#8608 posted 'I will post the finished rows when they end.'; the promise records from the
     hand-off (by_task), a later task replying there adopts it, and its own reply delivers it."""
