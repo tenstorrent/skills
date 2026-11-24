@@ -145,7 +145,7 @@ def problems(text: str, cfg: dict) -> list[str]:
 # --- wiring: what each project's messages link to -------------------------------------------------
 
 SECRET_RE = re.compile(r"secret|credential|passwd|password|token|\.pem$|\.key$|\.env$|id_rsa|\.p12$|\.pfx$", re.I)
-_GIT_CACHE: dict[tuple, dict] = {}   # (repo root, sha, remote) -> {"files": set, "base": str, "single": str}
+_GIT_CACHE: dict[str, tuple] = {}   # repo root -> ((sha, links.repo), {"files": set, "base": str, "single": str}): the latest only
 
 
 def config(p, db=None) -> dict:
@@ -248,26 +248,27 @@ def _git_cfg(p, links: dict) -> dict | None:
         tip = targets_tip(repo, ref) if ref else ""   # the pushed commit: only a pushed path has a public blob
     except Exception:
         tip = ""
-    key = (str(repo), ref, tip, str(links.get("repo") or ""))
-    if key not in _GIT_CACHE:
+    sha = _git(repo, "rev-parse", "--verify", "-q", tip).stdout.strip() if tip else ""
+    key = (sha, str(links.get("repo") or ""))   # the commit, not the ref name: the push branch moves
+    hit = _GIT_CACHE.get(str(repo))
+    if not hit or hit[0] != key:
         base = files = single = ""
-        sha = _git(repo, "rev-parse", "--verify", "-q", tip).stdout.strip() if tip else ""
         if sha:
             out = _git(repo, "ls-tree", "-r", "--name-only", sha)
             files = set(out.stdout.split()) if out.returncode == 0 else set()
             single = _github_repo(p, links)
             base = f"https://github.com/{single}/blob/{sha}/" if single else ""
-        _GIT_CACHE[key] = {"files": files, "base": base, "single": single}
-    return _GIT_CACHE[key]
+        hit = _GIT_CACHE[str(repo)] = (key, {"files": files, "base": base, "single": single})
+    return hit[1]
 
 
 def _github_repo(p, links: dict) -> str:
     """The project's own 'owner/repo' from its remotes, else links.repo (the remote may not be
     GitHub itself, e.g. a relay)."""
     from .push import _git
-    out = _git(Path(p.root), "remote", "get-url", "--push", "--all")
-    for url in out.stdout.split("\n"):
-        if m := re.search(r"github\.com[:/]([\w.-]+)/([\w.-]+?)(?:\.git)?$", url.strip()):
+    out = _git(Path(p.root), "remote", "-v")   # "<name>\t<url> (push)" per remote
+    for line in out.stdout.split("\n"):
+        if m := re.search(r"github\.com[:/]([\w.-]+)/([\w.-]+?)(?:\.git)? \(push\)$", line.strip()):
             return f"{m.group(1)}/{m.group(2)}"
     return str(links.get("repo") or "")
 

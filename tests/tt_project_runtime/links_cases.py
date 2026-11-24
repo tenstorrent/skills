@@ -251,3 +251,38 @@ def test_the_web_app_keeps_its_token_for_token_free_links():
     js = (pathlib.Path(ttp.__file__).parent / "web/app.js").read_text()
     assert 'localStorage.getItem("ttp_token")' in js and 'localStorage.setItem("ttp_token"' in js
     assert 'Q.get("task")' in js   # a #task=N link opens its page
+
+
+def test_the_git_cache_follows_the_pushed_commit_not_the_ref_name(tmp_path):
+    import subprocess
+    from ttp import links
+    root = tmp_path / "repo"
+    subprocess.run(["git", "init", "-q", str(root)], check=True)
+    subprocess.run(["git", "-C", str(root), "remote", "add", "origin",
+                    "https://github.com/example-org/example-repo.git"], check=True)
+
+    def commit(name):
+        (root / name).write_text("x\n")
+        for args in (["add", name], ["-c", "user.email=t@example.com", "-c", "user.name=t",
+                                     "commit", "-m", "add " + name]):
+            subprocess.run(["git", "-C", str(root), *args], check=True, capture_output=True)
+        return subprocess.run(["git", "-C", str(root), "rev-parse", "HEAD"],
+                              check=True, capture_output=True, text=True).stdout.strip()
+
+    class P:
+        def config(self):
+            return {"delivery": {"push_branch": "origin/main"}}
+    P.root, P.state = str(root), root / "tt-project/state"
+    p = P()
+
+    def cfg():
+        return links.config(p)
+
+    sha1 = commit("old.txt")
+    subprocess.run(["git", "-C", str(root), "update-ref", "refs/remotes/origin/main", sha1], check=True)
+    assert cfg()["file_url"]("old.txt") == f"https://github.com/example-org/example-repo/blob/{sha1}/old.txt"
+    sha2 = commit("new.txt")
+    subprocess.run(["git", "-C", str(root), "update-ref", "refs/remotes/origin/main", sha2], check=True)
+    out = cfg()   # the tracking ref kept its name: the cache must follow the commit it points at
+    assert out["file_url"]("new.txt") == f"https://github.com/example-org/example-repo/blob/{sha2}/new.txt"
+    assert links._GIT_CACHE[str(root)][0][0] == sha2   # bounded: the latest commit per repo
