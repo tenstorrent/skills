@@ -188,8 +188,9 @@ def forward_listen(entry: dict, argv: list[str], name: str | None = None) -> int
     # links on it, so a link opens this project's pages on this machine, never whatever answers
     # on the host's own port here.
     from . import weblink
-    base, probed = weblink.tunnel_base(name), time.time()
-    if base and "--link-base" not in argv:
+    probed = time.time()
+    base = None if "--link-base" in argv else weblink.tunnel_base(name)
+    if base:
         argv = [*argv, "--link-base", base, "--link-as", name]
     limit = _listen_timeout(argv)
     deadline = time.time() + limit if limit > 0 else None

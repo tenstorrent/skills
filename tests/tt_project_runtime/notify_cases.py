@@ -883,7 +883,7 @@ def test_a_listener_picks_up_a_link_base_that_answers_after_it_started(env, monk
     monkeypatch.setattr(cli, "here", lambda: None)
 
     def second(n):   # past the once-a-minute recheck bound: a message that should get the link
-        if n == 31:  # 31 naps of 2 s: the clock has moved a minute since the failed check
+        if n == int(cli.LINK_BASE_RECHECK_S / 2) + 1:   # the clock step is 2 s a nap
             p.db.post("out", f"second, about #{task}", chat="c1", kind="reply", severity="normal")
     _fake_clock(cli, monkeypatch, on_nap=second)
     try:

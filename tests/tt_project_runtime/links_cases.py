@@ -184,7 +184,7 @@ def test_the_web_app_linkifies_its_messages_and_asks(env):
         with pytest.raises(urllib.error.HTTPError):
             urllib.request.urlopen(req, timeout=10)
     finally:
-        srv.shutdown()
+        _stop(srv)
 
 
 def test_ids_link_to_their_web_app_page_and_unresolved_ones_get_labelled(env):
