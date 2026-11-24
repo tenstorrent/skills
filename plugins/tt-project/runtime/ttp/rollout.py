@@ -406,7 +406,8 @@ def fix_live(repo: Any, target: Any, commits: list[str]) -> tuple[float, str]:
     """(when, commit) the fix's `commits` first went live in `target`: the earliest daemon start whose runtime
     holds them after an older start that did not; (0.0, "") when no start on record ran one (pushed, not live)
     or the oldest start on record already held it (the log no longer shows when it went live). A start whose
-    commit is older than the fix cannot hold it and is read without a branch check."""
+    commit is older than the fix cannot hold it and is read without a branch check (a runtime built from the
+    fix's branch long before it landed then reads as not holding it: a later live time, never an earlier one)."""
     from . import landed
     starts = daemon_starts(target)
     out = landed._git(repo, "log", "--no-walk", "--ignore-missing", "--format=%H %ct", *commits,

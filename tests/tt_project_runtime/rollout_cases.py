@@ -1390,15 +1390,26 @@ def test_rollout_status_shows_the_stops_a_fix_took_out_of_the_count(env, monkeyp
 
 
 def test_a_fix_is_live_from_the_first_start_that_ran_it_after_one_that_did_not(env, monkeypatch):
-    """A fix reverted and redeployed went live at its first start; one the oldest start on record already ran has
-    no known live time, and an unverified start names no runtime."""
+    """A fix reverted and redeployed went live at its first start, not its redeploy."""
     from ttp import rollout
     p, target, fix, head, older = _rearm_setup(env, monkeypatch)
     t = float(int(time.time()) - 7200)
-    _daemon_starts(monkeypatch, target, [(t, head), (t + 60, older), (t + 120, head)], provenance="unverified")
+    _daemon_starts(monkeypatch, target, [(t, older), (t + 60, head), (t + 120, older), (t + 180, head)])
+    assert rollout.fix_live(p.root, target, [head]) == (t + 60, head[:12])
+
+
+def test_a_fix_the_oldest_start_on_record_already_ran_has_no_live_time(env, monkeypatch):
+    """A log that no longer shows a start without the fix cannot tell when it went live."""
+    from ttp import rollout
+    p, target, fix, head, older = _rearm_setup(env, monkeypatch)
+    t = float(int(time.time()) - 7200)
+    _daemon_starts(monkeypatch, target, [(t, head), (t + 60, older), (t + 120, head)])
     assert rollout.fix_live(p.root, target, [head]) == (0.0, "")
-    _daemon_starts(monkeypatch, target, [(t + 180, older), (t + 240, head), (t + 300, older), (t + 360, head)])
-    assert rollout.fix_live(p.root, target, [head]) == (t + 240, head[:12])
-    target.logs.joinpath("daemon.log").unlink()
-    _daemon_starts(monkeypatch, target, [(t + 420, head), (t + 480, older), (t + 540, head)])
-    assert rollout.fix_live(p.root, target, [head]) == (0.0, "")
+
+
+def test_an_unverified_daemon_start_names_no_runtime(env, monkeypatch):
+    """A start whose code is not verified is no evidence of what the project ran."""
+    from ttp import rollout
+    p, target, fix, head, older = _rearm_setup(env, monkeypatch)
+    _daemon_starts(monkeypatch, target, [(time.time() - 120, older), (time.time() - 60, head)], provenance="unverified")
+    assert rollout.daemon_starts(target) == []
