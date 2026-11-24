@@ -460,19 +460,19 @@ def landed_at(db, tid: int, rows: Rows | None = None) -> float | None:
     member = isinstance(res, dict) and isinstance(res.get("batch"), dict) and res["batch"].get("lead") != tid
     branches = {v[0] for v in carry.values() if v[0]} if not member else set()
     marks = ",".join("?" * len(carry))
-    gone = "(SELECT sha FROM task_dropped WHERE task=?)"   # landings that do not carry it (drop)
+    gone = _gone_shas(db, int(tid), carry, rows)   # the drop rule recorded() judges by
     times = []
     try:
         times += [r["updated"] for r in db.q(
-            f"SELECT updated FROM push_queue WHERE status IN ('pushed','landed') AND "
-            f"(landed_sha IS NOT NULL OR pushed_sha IS NOT NULL) AND (task IN ({marks}) OR branch IN "
-            f"(SELECT value FROM json_each(?))) AND COALESCE(landed_sha, pushed_sha) NOT IN {gone}",
-            (*carry, json.dumps(sorted(branches)), int(tid)))]
+            f"SELECT updated, COALESCE(landed_sha, pushed_sha) AS sha FROM push_queue WHERE "
+            f"status IN ('pushed','landed') AND (landed_sha IS NOT NULL OR pushed_sha IS NOT NULL) "
+            f"AND (task IN ({marks}) OR branch IN (SELECT value FROM json_each(?)))",
+            (*carry, json.dumps(sorted(branches)))) if r["sha"] not in gone]
     except Exception:
         pass   # a database without the push queue
     for table in ("task_landings", "task_superseded"):
-        times += [r["ts"] for r in db.q(f"SELECT ts FROM {table} WHERE task IN ({marks}) AND sha NOT IN {gone}",
-                                        (*carry, int(tid)))]
+        times += [r["ts"] for r in db.q(f"SELECT ts, sha FROM {table} WHERE task IN ({marks})", list(carry))
+                  if r["sha"] not in gone]
     if not times and task.get("status") == "done" and (task.get("kind") != "code" or (member and res.get("landed"))):
         times.append(task.get("updated"))
     times = [float(t) for t in times if t]

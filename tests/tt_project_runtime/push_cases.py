@@ -143,10 +143,6 @@ def test_a_landing_that_left_a_tasks_commits_out_reads_dropped_until_its_change_
     assert landed.landed_at(p.db, lost) is not None
 
 
-    assert landed.recorded(p.db, lost)[0] == [relanded] and landed.check(p, repo, tid=lost)[0] == 0
-    assert landed.landed_at(p.db, lost) is not None
-
-
 def test_a_supersession_recorded_after_a_drop_verdict_wins_the_sha_back_until_a_later_drop(env):
     """A drop verdict hides a sha only until a supersession for the same sha is recorded after it, and
     a drop recorded after the supersession wins the sha back: the record times decide, the same
@@ -161,6 +157,7 @@ def test_a_supersession_recorded_after_a_drop_verdict_wins_the_sha_back_until_a_
            (tid, "h", sha, time.time()))
     assert landed.recorded(p.db, tid) == ([sha], "the commit recorded as superseding it")
     assert landed.recorded(p.db, tid, rows=landed.Rows(p.db, [tid])) == landed.recorded(p.db, tid)
+    assert landed.landed_at(p.db, tid) is not None, "landing times read the revived sha the same way"
     p.db.x("INSERT INTO task_superseded(task, head, sha, ts) VALUES(?,?,?,?)",
            (tid, "h", other, time.time()))
     landed.drop(p, tid, [other], "the recorded commit does not carry it after all", event=False)
