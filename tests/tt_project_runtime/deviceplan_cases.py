@@ -1161,6 +1161,16 @@ def test_audit4291_c21_c22_box_a_read_only_device_run_never_feeds_or_copies_a_sc
     assert "a script fed to a remote shell" in deviceplan.store(tmp_path / "p", _dp_steps_plan(['ssh box-a sh < f.sh']), ws, {})
 
 
+def test_bash_s_with_an_argument_reads_its_script_from_stdin_locally_and_over_ssh():
+    """cells: bash-s-arg: `bash -s x` runs its script from stdin (x is $1), one rule for local shells
+    and remote ones: the fed script is what the guard reads, never the $1 argument."""
+    from ttp import deviceplan, hook
+    assert hook._reads_stdin_script(["bash", "-s", "x"]) and not hook._reads_stdin_script(["bash", "x"])
+    assert hook._ran("cat f.sh | bash -s x") == {"f.sh"}
+    assert deviceplan.ssh_shell(["ssh", "box-a", "bash", "-s", "x"])
+    assert deviceplan.fed_script("ssh box-a 'bash -s x' < f.sh")
+
+
 def test_audit4291_c18_box_a_remote_mkdir_outside_the_plan_stays_refused(tmp_path):
     """cells: stopped-still-stopped: a remote mkdir that is no plan step is refused, wrapped in the box's lock or a
     device tool's background runner alike."""

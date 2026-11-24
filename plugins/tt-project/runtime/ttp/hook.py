@@ -820,6 +820,24 @@ def _into_shell(line: str, pieces: list[tuple[int, int, str]], k: int) -> bool:
         and _first_word(line[pieces[k + 1][0]:pieces[k + 1][1]]) in SHELLS
 
 
+def _fed_shell_texts(text: str, is_shell) -> list[tuple[int, str, str]]:
+    """(piece index, the text it prints, the piece it pipes into) for each echo or printf piece of
+    `text` that pipes into a piece `is_shell` accepts: what it prints runs as commands, into a local
+    shell (`echo cmd | bash`) or one fed over ssh."""
+    pieces = _pieces(text)
+    out = []
+    for k, (s, e, _) in enumerate(pieces):
+        if _first_word(text[s:e]) not in ("echo", "printf"):
+            continue
+        for nxt in _chain(text, pieces, k):
+            if is_shell(nxt):
+                argv = next(iter(_segments(text[s:e])), [])
+                out.append((k, " ".join(w for w in argv[1:] if not w.startswith("-"))
+                                    .replace("\\n", "\n"), nxt))
+                break
+    return out
+
+
 def _blank(piece: str) -> str:
     """`piece` with each quoted span holding whitespace (text, not a word) replaced by `''`; a one-word span (a
     path, a flag) and a redirection's target stay."""
@@ -873,14 +891,14 @@ def _split(text: str, strip: bool = True) -> tuple[str, str]:
     commands = "\n".join(lines)
     pieces = _pieces(commands) if INERT_RE.search(commands) else []
     stripped, fed = commands, []
+    feeds = {k: text for k, text, _ in _fed_shell_texts(commands, lambda p: _first_word(p) in SHELLS)}
     for k in reversed(range(len(pieces))):
         s, e, sep = pieces[k]
         piece = commands[s:e]
         if _data_only(piece, sep, commands, _chain(commands, pieces, k)):
             stripped = stripped[:s] + _blank(piece) + stripped[e:]
-        elif _first_word(piece) in ("echo", "printf") and _into_shell(commands, pieces, k):
-            argv = next(iter(_segments(piece)), [])
-            fed.append(" ".join(w for w in argv[1:] if not w.startswith("-")).replace("\\n", "\n"))
+        elif k in feeds:
+            fed.append(feeds[k])
     scan = [stripped]
     run = [stripped if strip else commands] + fed
     for i, body, pos in bodies:
@@ -1126,7 +1144,7 @@ def _interpreter_args(argv: list[str]) -> str | None:
         return None
     shell = re.match(r"[a-z]*sh$", name)
     inline = ("-c", "-m") if shell or name.startswith("python") else ("-e", "-E", "--eval", "-p", "--print")
-    skip = False
+    from_stdin, skip = False, False
     for a in rest:
         if skip:     # bash -o errexit, bash -O extglob: an option's value, not the script
             skip = False
@@ -1134,10 +1152,12 @@ def _interpreter_args(argv: list[str]) -> str | None:
             return ""
         elif a == "-":
             return "-"
+        elif shell and a == "-s":   # bash -s x reads its script from stdin; x is $1, not a script
+            from_stdin = True
         elif shell and a in ("-o", "+o", "-O", "+O"):
             skip = True
         elif not a.startswith(("-", "+")):
-            return a
+            return "-" if from_stdin else a
     return "-"
 
 

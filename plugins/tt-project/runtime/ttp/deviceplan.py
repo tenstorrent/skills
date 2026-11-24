@@ -194,16 +194,12 @@ def ssh_target(w, strict: bool = False):
 def ssh_shell(w) -> bool:
     """The ssh call `w` runs a remote shell that reads its commands from stdin: no remote command, or one
     there (wrappers such as sudo dropped, `cd d && bash -s` too) is an interpreter with no script of its
-    own (`bash -s`, `python3 -`) that reads what the local side feeds it."""
+    own (`bash -s`, `python3 -`) that reads what the local side feeds it: hook's own rule for that
+    (hook._reads_stdin_script) decides each remote segment."""
     from . import hook
     got = ssh_target(list(w))
-    return bool(got) and (not got[1].strip() or any(
-        hook.INTERPRETER_RE.match(os.path.basename(s[0])) and ("-" in s or "-s" in s or all(a.startswith("-") for a in s[1:]))
-        for s in hook._segments(got[1])))
-
-
-def _ssh_shell_bodies(cmd: str) -> list[str]:
-    return [text for _, text in _ssh_shell_feeds(cmd)]
+    return bool(got) and (not got[1].strip()
+                          or any(hook._reads_stdin_script(s) for s in hook._segments(got[1])))
 
 
 def _ssh_shell_feeds(cmd: str) -> list[tuple[str, str]]:
@@ -211,17 +207,16 @@ def _ssh_shell_feeds(cmd: str) -> list[tuple[str, str]]:
     (`ssh box <<EOF`, `cat <<EOF | ssh box bash`) and what echo or printf pipes into one (`echo cmd | ssh box
     bash`); hook._split keeps only a local shell's."""
     from . import hook
+
+    def fed_ssh(piece: str) -> bool:
+        """`piece` is an ssh call feeding a remote shell that runs what it is fed."""
+        return os.path.basename(hook._first_word(piece)) == "ssh" and ssh_shell(hook._first_argv(piece))
+
     out = [(ssh_target(list(argv))[0], ln) for argv, body in hook._heredoc_readers(cmd) if ssh_shell(argv)
            for ln in body]
-    for line in cmd.split("\n"):
-        pieces = hook._pieces(line)
-        for k, (s, e, _) in enumerate(pieces):
-            if hook._first_word(line[s:e]) not in ("echo", "printf"):
-                continue
-            for nxt in hook._chain(line, pieces, k):
-                if os.path.basename(hook._first_word(nxt)) == "ssh" and ssh_shell(hook._first_argv(nxt)):
-                    text = " ".join(w for w in next(iter(hook._segments(line[s:e])), [])[1:] if not w.startswith("-"))
-                    out.append((ssh_target(list(hook._first_argv(nxt)))[0], text.replace("\\n", "\n")))
+    for line in cmd.split("\n"):   # hook's fed-text reader, with an ssh call as the shell it feeds
+        out += [(ssh_target(list(hook._first_argv(nxt)))[0], text)
+                for _, text, nxt in hook._fed_shell_texts(line, fed_ssh)]
     return out
 
 
@@ -230,7 +225,7 @@ def _segs(cmd: str):
     when it cannot be read: a backquote hides a command from that parser."""
     from . import glmguard, hook
     try:   # heredoc bodies no shell reads: gone, before REDIRECT takes their `<<`
-        cmd = "\n".join([hook._split(cmd)[0], *_ssh_shell_bodies(cmd)])
+        cmd = "\n".join([hook._split(cmd)[0], *(text for _, text in _ssh_shell_feeds(cmd))])
     except Exception:
         return None
     if "`" in cmd:
