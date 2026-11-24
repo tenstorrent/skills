@@ -165,6 +165,24 @@ def test_a_drain_intent_holds_and_steers_from_its_start_and_after_an_early_retur
     assert hostcycle.hold(q, c["at"] + ml.POWER_CYCLE_LEAD_S) is None
 
 
+def test_a_power_cycle_intent_is_announced_once_in_the_recording_projects_chat(env, monkeypatch):
+    from ttp import machine_ledger as ml
+    p, q = _hold_setup(env, monkeypatch)
+    mine = ml.add_power_cycle("testhost", "10m", p.name, "kernel update")
+    ml.add_power_cycle("testhost", "20m", q.name, "firmware update")
+    gone = ml.add_power_cycle("testhost", "10m", p.name, "old")
+    ml.close_change(gone["id"], "test")
+    feed = "SELECT text FROM messages WHERE direction='out' AND severity='low' AND text LIKE '%power-cycled at%'"
+    d = _hold_daemon(p.base, [])
+    for _ in range(2):
+        d.announce_power_cycles(time.time())
+    (row,) = p.db.q(feed)
+    assert f"machine change #{mine['id']}" in row["text"] and "kernel update" in row["text"]
+    assert not q.db.q(feed), "each intent is announced by the project that recorded it"
+    marked = {c["id"]: c.get("announced") for c in ml.changes()}
+    assert marked[mine["id"]] and not any(v for k, v in marked.items() if k != mine["id"]), "the ledger notes it"
+
+
 def test_a_drain_does_not_reuse_an_intent_planned_for_later(env, monkeypatch, capsys):
     from ttp import cli, hostcycle
     from ttp import machine_ledger as ml
@@ -1018,6 +1036,12 @@ def test_journal_lines_that_do_not_stop_the_host_name_no_initiator():
                  "cron[1]: (root) CMD (/usr/sbin/shutdown -r now)",
                  "systemd-logind[1]: New session 4 of user someuser."]:
         assert initiator.parse(f"Oct 25 10:00:00 testhost {line}\n") == (None, None), line
+    for cmd, shown in (("/usr/bin/systemctl soft-reboot", "systemctl soft-reboot"), ("/sbin/init 6", "init 6"),
+                       ("/usr/sbin/shutdown -h now", "shutdown -h now")):   # the one decider, ruleguard._halt, reads them
+        line = f"Oct 25 10:00:00 testhost sudo[1]:  someuser : TTY=pts/1 ; USER=root ; COMMAND={cmd}\n"
+        assert initiator.parse(line)[0] == f"someuser ran `{shown}` via sudo (journal)", cmd
+    for cmd in ("/usr/sbin/shutdown -c", "/sbin/init 3", "/usr/bin/ipmitool -H peer chassis power cycle", "/usr/bin/systemctl -H peer reboot"):
+        assert initiator.parse(f"Oct 25 10:00:00 testhost sudo[1]:  someuser : USER=root ; COMMAND={cmd}\n") == (None, None), cmd
     # The last stop in the boot wins: a hung `shutdown` followed by the power key is the power key.
     two = ("Oct 25 10:00:00 testhost sudo[1]:  someuser : TTY=pts/1 ; USER=root ; COMMAND=/sbin/shutdown -h now\n"
            "Oct 25 10:09:00 testhost systemd-logind[2]: Power key pressed.\n")

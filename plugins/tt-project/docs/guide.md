@@ -4971,7 +4971,8 @@ Workers can read Slack links you paste, using your Slack connector if you have o
   the command names, and a git hook, git config or ssh config an earlier, separate command
   planted that a later key use runs: a write those make is not blocked. Which tools each provider covers is in providers.md.
 - A project's own rule checks (ruleguard.py) run in the same hook, for every provider and model,
-  GLM runs included. They read settings only, never charter wording, and all ship empty or off:
+  GLM runs included. They read settings only, never charter wording, and all but `host_reboot`
+  ship empty or off:
   - `protected_paths`: the paths in `guards.protected_paths` above (a served tree, a forbidden
     directory; `*` globs work), also inside an ssh remote command.
   - `slurm_nodes`: with `guards.slurm` true, an `srun`, `sbatch` or `salloc` (also over ssh) naming
@@ -4983,6 +4984,19 @@ Workers can read Slack links you paste, using your Slack connector if you have o
     `--tags` or the current branch) is refused: `ttp push` lands it after its review.
   - `user_undo`: a command that replays the undo of a machine change recorded with
     `ttp machines change add ... --user-msg <id>` (a change the user ordered) is refused.
+  - `host_reboot` (on by default): a command that reboots, halts or powers off a host (`reboot`,
+    `shutdown`, `poweroff`, `halt`, `init 0|6`, `systemctl reboot|poweroff|halt|kexec` or their
+    targets, `kexec -e`, a write to `/proc/sysrq-trigger`, logind's Reboot or PowerOff over D-Bus,
+    `ipmitool [chassis] power cycle|reset|off|soft`, an http call naming a power cycle or reboot),
+    here or over ssh, is refused unless an open power-cycle intent for that host (`ttp machines
+    change add <alias> "<why>" --power-cycle-at <t>`) holds now and was recorded at least
+    `guards.reboot_lead_s` (default 120 s, never under 60 s) before. The project that records an
+    intent announces it in its chat as a low alert within a minute, so every reboot a run makes is on
+    the ledger and announced first. A reset of a held machine still needs no ask. Not seen: programs
+    a command calls in turn, a device broker's own recovery, which is no run's command, an ssh chain
+    more than 3 hops deep, a heredoc that only holds data (it is refused, never passed) and a `sed`
+    program that writes to sysrq. One decider (`ruleguard._halt`) reads every stop command, the
+    reboot notice's journal lines included.
   Each refusal is one line naming the rule and its setting. `ttp guards [project]` lists the rules
   and their settings, and `ttp stats --guards` counts fires per rule and model (from each run's
   `ruleguard.jsonl`). `guards.off` (a list of rule names) turns rules off; only the user may set it.

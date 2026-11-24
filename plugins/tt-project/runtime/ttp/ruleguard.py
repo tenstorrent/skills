@@ -20,6 +20,16 @@ alike) and the GLM shell (glmenv.refusal) ask it. RULES, with the setting each r
   pushes only what the push queue approved.
 - user_undo (the shared machine-change ledger): a command that replays the undo of an entry recorded
   as user-ordered (`ttp machines change add ... --user-msg <id>`) is refused, naming the entries.
+- host_reboot (the shared machine-change ledger and guards.reboot_lead_s): a command that reboots,
+  halts or powers off a host (reboot, shutdown, poweroff, halt, systemctl reboot|poweroff|halt|kexec or
+  their targets, kexec -e, a write to /proc/sysrq-trigger, logind's Reboot or PowerOff over D-Bus,
+  ipmitool [chassis] power cycle|reset|off|soft, an http call naming a power cycle or reboot), here or in
+  text ssh runs on another host, is refused unless an open power-cycle intent for that host (`ttp
+  machines change add <alias> "<why>" --power-cycle-at <t>`) holds now and was recorded at least
+  guards.reboot_lead_s (default REBOOT_LEAD_S, never under REBOOT_LEAD_MIN_S) earlier. The recording
+  project's daemon announces each intent in its chat (daemon.announce_power_cycles) within a minute.
+  A ledger that cannot be read refuses. Programs a command calls in turn are not seen; a device
+  broker's own recovery is no run's command and is not checked.
 guards.off, a list of rule names, turns rules off for one project; only the user's own word sets it
 (coordinator.NEEDS_USER). Each refusal is one line naming its rule and setting, and is counted in the
 run folder (FIRES) by rule and model; `ttp stats --guards` sums them and `ttp guards` lists the rules.
@@ -34,7 +44,7 @@ import subprocess
 import time
 from pathlib import Path
 
-RULES = ("protected_paths", "slurm_nodes", "landing_push", "user_undo")
+RULES = ("protected_paths", "slurm_nodes", "landing_push", "user_undo", "host_reboot")
 OFF_KEY = "guards.off"
 SLURM_KEY = "guards.slurm"
 FIRES = "ruleguard.jsonl"
@@ -47,6 +57,20 @@ _ANY_SUBST = re.compile(r"(?:-u\s*|--user[=\s]+)\$\([^)]*\)")
 HELD_STATES = ("drain", "drng", "down", "resv", "reserved", "maint")
 PUSH_VALUE_OPTS = {"--repo", "--receive-pack", "--exec", "-o", "--push-option"}
 UNDO_MIN_CHARS = 8
+REBOOT_KEY = "guards.reboot_lead_s"
+REBOOT_LEAD_S = 120          # an intent this old was announced: the daemon announces within a minute
+REBOOT_LEAD_MIN_S = 60
+HALTS = {"reboot", "poweroff", "halt", "shutdown"}
+SYSTEMCTL_VALUE_OPTS = {"-H", "--host", "-M", "--machine", "-t", "--type", "-p", "--property", "-s", "--signal",
+                        "--when", "--boot-loader-entry", "--message"}
+SYSTEMCTL_HALTS = {"reboot", "poweroff", "halt", "kexec", "soft-reboot"}
+HALT_TARGET = re.compile(r"(?:reboot|poweroff|halt|kexec|soft-reboot)\.target")
+KEXEC_LOAD = {"-l", "--load", "-p", "--load-panic", "-u", "--unload", "-s", "--kexec-file-syscall"}
+IPMI_HALT = re.compile(r"\bpower (?:cycle|reset|off|soft)\b|\braw 0x0*0 0x0*2\b")   # raw: chassis control
+HTTP_CLIENTS = {"curl", "wget", "http", "https", "xh"}
+HTTP_HALT = re.compile(r"(?i)power[-_ ]?(?:cycle|off|reset)|/reboot\b")
+RAW_HALTS = (re.compile(r"/proc/sysrq-trigger"),   # write-only: any command naming it writes it
+             re.compile(r"org\.freedesktop\.login1[\s\S]*\b(?:Reboot|PowerOff|Halt|KExec)\b"))
 
 
 def off(cfg: dict) -> set[str]:
@@ -105,13 +129,15 @@ def bash_refusal(command: str, segments: list[list[str]], cfg: dict, cwd: str = 
     """Why the shell `command` (its simple commands `segments`) breaks one of the rules, else None;
     the refusal is counted (fire)."""
     env = os.environ if env is None else env
-    for rule, check in (("slurm_nodes", _slurm), ("landing_push", _push), ("user_undo", _undo)):
+    for rule, check in (("slurm_nodes", _slurm), ("landing_push", _push), ("user_undo", _undo),
+                        ("host_reboot", _reboot)):
         if not on(rule, cfg):
             continue
         try:
             why = check(command, segments, cfg, cwd or os.getcwd(), env)
         except Exception as e:
-            why = f"{rule}: the check could not run ({type(e).__name__}), so it refuses" if rule == "slurm_nodes" else None
+            why = f"{rule}: the check could not run ({type(e).__name__}), so it refuses" \
+                if rule in ("slurm_nodes", "host_reboot") else None
         if why:
             fire(rule, why)
             return why
@@ -294,6 +320,117 @@ def _undo(command, segments, cfg, cwd, env) -> str | None:
     return None
 
 
+# -- host_reboot ---------------------------------------------------------------------------------------
+
+def _halt(argv: list[str]) -> bool:
+    """Whether simple command `argv` reboots, halts or powers off a host."""
+    from .coordfix import _ipmi_words
+    name, words = (os.path.basename(argv[0]), argv[1:]) if argv else ("", [])
+    plain = [w for w in words if not w.startswith("-")]
+    if name in HALTS:
+        return not (name == "shutdown" and "-c" in words)   # shutdown -c cancels one
+    if name in ("init", "telinit"):
+        return plain[:1] in (["0"], ["6"])
+    if name == "systemctl":
+        plain = [w for i, w in enumerate(words) if not w.startswith("-") and (i == 0 or words[i - 1] not in SYSTEMCTL_VALUE_OPTS)]
+        return bool(plain) and (plain[0] in SYSTEMCTL_HALTS or plain[0] in ("start", "isolate")
+                                and any(HALT_TARGET.fullmatch(w) for w in plain[1:]))
+    if name == "kexec":
+        return "-e" in words or "--exec" in words or not KEXEC_LOAD & set(words)
+    if name == "ipmitool":
+        return bool(IPMI_HALT.search(" ".join(_ipmi_words(words))))
+    return name in HTTP_CLIENTS and any(HTTP_HALT.search(w) for w in words)
+
+
+def _named_host(argv: list[str]) -> str | None:
+    """The host an ipmitool or systemctl call acts on (-H), else None."""
+    return next(iter(_opt(argv[1:], "-H", "--host")), None) \
+        if argv and os.path.basename(argv[0]) in ("ipmitool", "systemctl") else None
+
+
+def _url_host(argv: list[str]) -> str | None:
+    if not argv or os.path.basename(argv[0]) not in HTTP_CLIENTS:
+        return None
+    m = next((m for w in argv[1:] if (m := re.match(r"\w+://(?:[^@/\s]*@)?([\w.-]+)", w))), None)
+    return m.group(1) if m else None
+
+
+def _ssh_to(argv: list[str]) -> tuple[str, list[str]] | None:
+    """(the host, the remote command's words) of ssh call `argv`, else None."""
+    from . import pathguard
+    if not argv or os.path.basename(argv[0]) != "ssh" or (remote := pathguard._ssh_remote(argv[1:])) is None:
+        return None
+    return argv[len(argv) - len(remote) - 1].rsplit("@", 1)[-1], remote
+
+
+def _halts(command: str, segments: list[list[str]], host: str | None = None, depth: int = 0):
+    """(host, the command) for each part of `command` (its simple commands `segments`) that reboots or
+    powers off a host; host None is this one. Text ssh runs on another host, its command or a heredoc fed
+    to it, is read as run there. Not read (accepted gaps): ssh chains over 3 hops, a `sed` program that writes
+    to sysrq; a heredoc that only holds data and is read by a shell or ssh is refused (fails safe)."""
+    from . import hook, sidefx
+    for s in segments:
+        if (hop := _ssh_to(s)) and hop[1] and depth < 3:
+            text = " ".join(hop[1])
+            yield from _halts(text, hook._all_segments(text), hop[0], depth + 1)
+        elif _halt(s):
+            yield _named_host(s) or _url_host(s) or host, " ".join(s)
+    # sidefx._local_text drops a heredoc fed to ssh or piped on: read it where it runs
+    for argv, body in hook._heredoc_readers(command):
+        on, hop = host, _ssh_to(argv)
+        while hop:   # ssh a sudo ssh b <<EOF: b reads it
+            on, hop = hop[0], _ssh_to(list(hook._first_argv(" ".join(hop[1]))))
+        if depth < 3 and (_ssh_to(argv) or os.path.basename(argv[0]) in hook.SHELLS):
+            text = "\n".join(body)
+            yield from _halts(text, hook._all_segments(hook._split(text)[0]), on, depth + 1)
+    here = sidefx._local_text(command)
+    if m := next((m for r in RAW_HALTS if (m := r.search(here))), None):
+        yield host, m.group(0)
+
+
+def reboot_lead_s(cfg: dict) -> float:
+    g = cfg.get("guards") if isinstance(cfg.get("guards"), dict) else {}
+    v = g.get("reboot_lead_s")
+    return max(REBOOT_LEAD_MIN_S, float(v)) if isinstance(v, (int, float)) and not isinstance(v, bool) else REBOOT_LEAD_S
+
+
+def _local_names() -> list[str]:
+    from . import machines, project
+    mine = machines.here()
+    return [n for n in ((mine[0] if mine else ""), project.hostname()) if n]
+
+
+def _announced(host: str | None, lead: float, now: float) -> bool:
+    """An open power-cycle intent for `host` (None: this one) holds now, was recorded `lead` ago and was
+    announced in its project's chat (the daemon marks it `announced`)."""
+    from . import machine_ledger as ml, machines
+    names = _local_names() if host is None or host.lower() in machines.local_names() else [host]
+    for c in ml.changes():
+        if c.get("kind") != ml.POWER_CYCLE or now - float(c.get("added") or now) < lead or not c.get("announced"):
+            continue
+        start, end = ml.cycle_window(c)
+        on = ml.on_machine(str(c.get("alias")))
+        if start <= now <= end and any(on(n) for n in names):
+            return True
+    return False
+
+
+def _reboot(command, segments, cfg, *_) -> str | None:   # cwd and env: unused
+    found = list(_halts(command, segments))
+    if not found:
+        return None
+    lead, now = reboot_lead_s(cfg), time.time()
+    for host, what in found:
+        if not _announced(host, lead, now):
+            alias = host or (_local_names() or ["<alias>"])[0]
+            return (f"host_reboot (the machine-change ledger): `{what[:120]}` reboots or powers off "
+                    f"{host or 'this host'}, and no power-cycle intent for it was recorded at least {lead:.0f}s "
+                    f"before now and announced. Record it first: `ttp machines change add {alias} \"<why>\" --power-cycle-at "
+                    f"<time>`; this project's daemon announces it in its chat; then run the command inside its "
+                    f"window, {lead:.0f}s or more after recording (guards.reboot_lead_s)")
+    return None
+
+
 def listing(cfg: dict) -> list[str]:
     """One line per rule: on or off, and what it reads (`ttp guards`)."""
     from . import machine_ledger, pathguard
@@ -309,5 +446,7 @@ def listing(cfg: dict) -> list[str]:
                           + ("; slurm_queue_pinned: on" if (cfg.get('guards') or {}).get('slurm_queue_pinned') else ""),
            "landing_push": "delivery.push_branch, fast_forward_also, mirror_remotes, channel_tags: "
                            + (", ".join(sorted(branches | tags)) or "none"),
-           "user_undo": f"user-ordered ledger entries: {', '.join(ordered) or 'none'}"}
+           "user_undo": f"user-ordered ledger entries: {', '.join(ordered) or 'none'}",
+           "host_reboot": f"power-cycle intents on the ledger, recorded {reboot_lead_s(cfg):.0f}s ahead "
+                          f"(guards.reboot_lead_s)"}
     return [f"{r}: {'off (guards.off)' if r in dead else 'on'}; {src[r]}" for r in RULES]

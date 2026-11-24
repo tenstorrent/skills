@@ -604,6 +604,10 @@ CAT_SUBST_RE = re.compile(r"\$\(\s*(?:cat\s+|<\s*)[\"']?([^\s\"')]+)|`\s*cat\s+[
 # Commands that copy or rename a file: what runs the new name runs the old one's text
 COPIES = {"mv", "cp", "ln", "install"}
 OPTS_WITH_VALUE = {"-u", "--unset", "-C", "--chdir", "-s", "--signal", "-k", "--kill-after", "-n", "--adjustment"}
+# sudo's options that take a value: its -n, -s and -k take none (`sudo -n reboot` runs reboot)
+SUDO_OPTS_WITH_VALUE = {"-u", "--user", "-g", "--group", "-C", "--close-from", "-h", "--host", "-p", "--prompt",
+                        "-r", "--role", "-t", "--type", "-U", "--other-user", "-D", "--chdir", "-R", "--chroot",
+                        "-T", "--command-timeout"}
 # xargs options whose value is the rest of the word or else the next one (`-a FILE`, `-I {}`), and its long
 # ones that take the next word when they carry no `=` (getopt takes an unambiguous prefix too)
 XARGS_VALUE_LETTERS = "adEILnPs"
@@ -846,6 +850,18 @@ def _heredocs(text: str) -> tuple[list[str], list[tuple[int, list[str], int]]]:
     return lines, bodies
 
 
+def _heredoc_readers(text: str):
+    """(argv, the body's lines) for each heredoc body of `text` and each command that reads it: the command
+    the heredoc is on and the ones it pipes into (`cat <<EOF | ssh box bash` is read by cat, ssh)."""
+    lines, bodies = _heredocs(text)
+    for i, body, pos in bodies:
+        ps = _pieces(lines[i])
+        k = next(k for k, (s, e, _) in enumerate(ps) if s <= pos <= e)
+        for piece in (lines[i][ps[k][0]:ps[k][1]], *_chain(lines[i], ps, k)):
+            if argv := list(_first_argv(piece)):
+                yield argv, body
+
+
 def _split(text: str, strip: bool = True) -> tuple[str, str]:
     """(what runs as shell commands, what to scan) for a command line or a script. Heredoc bodies
     are commands only when a shell reads them; bodies only data (_data_only) are dropped from both,
@@ -1045,16 +1061,17 @@ def _segments(cmd: str, strip: bool = True) -> list[list[str]]:
 def _strip_prefix(argv: list[str], ttp_wrappers: list[list[str]] | None = None) -> list[str]:
     """`argv` without its wrappers; each `ttp lock|clip|detach|sandbox|secret env ... --` stripped is added to
     `ttp_wrappers` when given."""
-    i, xargs = 0, False
+    i, xargs, sudo = 0, False, False
     while i < len(argv):
         w = argv[i]
         if xargs and w.startswith("-") and w != "-":   # xargs -a FILE, --arg-file FILE, -0I {} ...
             i += 2 if _xargs_takes_next(w) else 1
-        elif w in OPTS_WITH_VALUE:   # env -u NAME, timeout -s KILL, nice -n 5 ...
+        elif w in (SUDO_OPTS_WITH_VALUE if sudo else OPTS_WITH_VALUE):   # env -u NAME, timeout -s KILL, nice -n 5 ...
             i += 2
         elif re.match(r"^\w+\+?=", w) or w.startswith("-") or re.fullmatch(r"\d+[smhd]?", w) \
                 or os.path.basename(w) in WRAPPERS or w in RESERVED:
-            xargs = os.path.basename(w) == "xargs"
+            if not w.startswith("-"):
+                xargs, sudo = os.path.basename(w) == "xargs", os.path.basename(w) == "sudo"
             i += 1
         elif w == "ttp" and (argv[i + 1:i + 2] in (["lock"], ["clip"], ["detach"], ["sandbox"])
                              or argv[i + 1:i + 3] == ["secret", "env"]) and "--" in argv[i:]:

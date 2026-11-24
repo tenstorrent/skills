@@ -39,7 +39,7 @@ def _device_hook(monkeypatch, tmp_path, device_host=True, no_device="1"):
 
 @pytest.mark.parametrize("cmd", [
     "tt-smi -r 0", "sudo tt-smi -glx_reset", "tt-smi --reset=0,1", "ttp sandbox -- tt-smi -r",
-    "ttp clip -- tt-flash --fw-tar fw.tar", "bash -c 'tt-topology -l mesh'", "ipmitool chassis power cycle",
+    "ttp clip -- tt-flash --fw-tar fw.tar", "bash -c 'tt-topology -l mesh'", "ipmitool mc reset cold",
     "ttp lock build -- tt-smi -r",
     "cat {dev}/0", "dd if={dev}/0 of=x bs=1 count=1", "head -c1 {dev}/0", "cp {dev}/0 x",
     "python3 -c 'open(1)' {dev}/0", "echo x > {dev}/0", "TT_VISIBLE_DEVICES=0 pytest -q",

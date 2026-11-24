@@ -196,7 +196,8 @@ def test_kill_guard_inside_ssh_refuses_pattern_kills_and_allows_printed_pids(kil
     t = kill_tree
     for cmd in ("ssh host 'pkill -f sleep'", "ssh -p 2222 -o BatchMode=yes host killall sleep",
                 f"ssh host 'pkill -P {t.child}'", "ssh -t host 'sudo pkill sleep'", "ssh host \"bash -c 'pkill x'\"",
-                "ssh host <<'EOF'\npkill -f sleep\nEOF", "ssh host bash -s <<EOF\nkillall sleep\nEOF"):
+                "ssh host <<'EOF'\npkill -f sleep\nEOF", "ssh host bash -s <<EOF\nkillall sleep\nEOF",
+                "cat <<EOF | ssh host bash\nkillall sleep\nEOF"):
         assert "another machine" in (_kill_refusal(cmd, t) or ""), cmd
     for cmd in ("ssh host 'kill $(pgrep sleep)'", "ssh host 'kill $(cat /tmp/job.pid)'", "ssh host 'kill -9 -1'",
                 "ssh host 'kill -- -1'", "ssh host 'pgrep x | xargs kill'"):

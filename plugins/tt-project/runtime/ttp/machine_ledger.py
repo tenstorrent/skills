@@ -636,6 +636,18 @@ def _close(cid: int, why: str, by: str, now: float) -> dict:
     raise ValueError(f"no open machine change #{cid}")
 
 
+def mark_announced(cid: int, now: float | None = None) -> None:
+    """Note that power-cycle intent #cid was announced in its project's chat (the host_reboot rule reads it)."""
+    now = time.time() if now is None else now
+    with _locked():
+        doc = _read(LEDGER, {"next": 1, "changes": []})
+        for c in doc.get("changes", []):
+            if c.get("id") == cid and not c.get("announced"):
+                c["announced"] = now
+                _write(LEDGER, doc)
+                return
+
+
 def set_test(cid: int, by: str, test: bool, now: float | None = None, queue: Path | None = None) -> dict:
     """Flag entry #cid, open or closed, as made for a test (`test`) or not, after the fact: `ttp ttr` then labels
     the incidents inside its window afresh. Only its author or its machine's recovery owner (`by`) may. Keeps

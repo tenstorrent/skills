@@ -552,19 +552,4 @@ def _ssh_command(argv: list[str]) -> str:
 def _ssh_heredocs(text: str) -> list[str]:
     """The bodies of heredocs that an ssh command reads (they run on the other host)."""
     from . import hook
-    out, lines = [], text.split("\n")
-    for k, line in enumerate(lines):
-        if "<<" not in line or not re.search(r"(?<![\w.-])ssh(?![\w.-])", line):
-            continue
-        rest = lines[k + 1:]
-        for m in hook.HEREDOC_RE.finditer(line):
-            piece, _ = hook._piece_at(line, m.start())
-            body = []
-            for b in rest:
-                if (b.lstrip("\t") if m[1] == "-" else b) == m[3]:
-                    break
-                body.append(b)
-            rest = rest[len(body) + 1:]
-            if hook._first_word(piece) == "ssh":
-                out.append("\n".join(body))
-    return out
+    return ["\n".join(body) for argv, body in hook._heredoc_readers(text) if os.path.basename(argv[0]) == "ssh"]

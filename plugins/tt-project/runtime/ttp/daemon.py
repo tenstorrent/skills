@@ -3074,6 +3074,10 @@ class Daemon:
             return
         self._machines_routed = now
         try:
+            self.announce_power_cycles(now)
+        except Exception:
+            log(self.p, "power-cycle announcements failed\n" + traceback.format_exc())
+        try:
             self.power_cycle_notices(now)
         except Exception:
             log(self.p, "power-cycle notices failed\n" + traceback.format_exc())
@@ -3137,6 +3141,23 @@ class Daemon:
         if told != seen:
             self.p.db.set_kv(HOST_CYCLE_SEEN_KEY, dict(list(told.items())[-50:]))
         return c
+
+    def announce_power_cycles(self, now: float) -> None:
+        """Each power-cycle intent this project recorded on the shared ledger, announced once in its chat as
+        a low alert as soon as it is seen, before its time, and marked `announced` on the ledger once posted: a
+        run's reboot command passes the host_reboot rule (ruleguard) only for an announced intent, recorded
+        guards.reboot_lead_s ago."""
+        for c in machine_ledger.changes():
+            if c.get("kind") != machine_ledger.POWER_CYCLE or c.get("by") != self.p.name \
+                    or machine_ledger.cycle_window(c)[1] < now:
+                continue
+            when = timefmt.short(float(c["at"]), self.p, now)
+            why = str(c.get("what") or "").split(": ", 1)[1] if ": " in str(c.get("what") or "") else ""
+            self.alert(f"power-cycle-announce:{c['id']}",
+                       f"{c['alias']} is to be rebooted or power-cycled at {when} (machine change #{c['id']})"
+                       + (f": {why}" if why else ""), severity="low", every_s=30 * 86400)
+            if not c.get("announced") and f"power-cycle-announce:{c['id']}" in self.p.db.kv("alerts_sent", {}):
+                machine_ledger.mark_announced(int(c["id"]), now)
 
     def power_cycle_notices(self, now: float) -> None:
         """A planned power cycle (machine_ledger.add_power_cycle) close at hand: tell each running worker

@@ -202,6 +202,86 @@ def test_user_undo_refuses_replaying_the_undo_of_a_user_ordered_change(rule_home
     assert _rg_fired(rule_home.run) == ["user_undo"]
 
 
+def _rg_power_shims(rule_home):
+    """reboot, shutdown, systemctl, ipmitool and kexec shims first on PATH that only log: no test reaches a
+    real power call."""
+    for name in ("reboot", "shutdown", "systemctl", "ipmitool", "kexec"):
+        (rule_home.fake / "bin" / name).write_text(f'#!/bin/sh\necho {name} "$@" >> "$FAKE_SLURM/power.log"\n')
+        (rule_home.fake / "bin" / name).chmod(0o755)
+    return rule_home.fake / "power.log"
+
+
+REBOOTS = ("sudo reboot", "shutdown -r now", "systemctl reboot", "sudo systemctl --no-pager poweroff",
+           "systemctl start reboot.target", "kexec -e", "echo b | sudo tee /proc/sysrq-trigger",
+           "echo b > /proc/sysrq-trigger", "sh -c 'sync; reboot'", "init 6", "sudo -n reboot", "sudo -u root -n reboot",
+           "echo b | sudo dd of=/proc/sysrq-trigger", "python3 -c \"open('/proc/sysrq-trigger','w').write('b')\"",
+           "busctl call org.freedesktop.login1 /org/freedesktop/login1 org.freedesktop.login1.Manager Reboot b true")
+
+
+def test_host_reboot_refuses_a_reboot_with_no_power_cycle_intent_on_the_ledger(rule_home, monkeypatch):
+    from ttp import machine_ledger
+    log = _rg_power_shims(rule_home)
+    monkeypatch.setenv("TTP_HOST", "testhost")
+    monkeypatch.setattr(machine_ledger, "changes", lambda open_only=True: [])
+    for cmd in REBOOTS + ("ssh box sudo reboot", "ssh -p 22 me@box 'echo b > /proc/sysrq-trigger'",
+                          "ipmitool -I lanplus -H box-bmc -U admin chassis power cycle", "ipmitool -H box-bmc power off",
+                          "curl -X POST http://box:8080/power_cycle", "ipmitool -H box-bmc raw 0x00 0x02 0x02"):
+        why = _rg_deny(cmd, rule_home.work)
+        assert why and why.startswith("host_reboot") and "--power-cycle-at" in why, cmd
+    for cmd in ("systemctl status reboot.target", "shutdown -c", "kexec -l /boot/vmlinuz", "echo reboot later",
+                "ipmitool -H box-bmc chassis power status", "git log --grep reboot", "ipmitool raw 0x06 0x01",
+                "ttp machines change add box 'kernel update' --power-cycle-at 10m"):
+        assert _rg_deny(cmd, rule_home.work) is None, cmd
+    assert not log.exists(), "the hook only decides: nothing ran"
+    assert set(_rg_fired(rule_home.run)) == {"host_reboot"}
+
+
+def test_host_reboot_refuses_inside_the_lead_time_and_passes_an_announced_intent_for_that_host(rule_home, monkeypatch):
+    from ttp import glmenv, machine_ledger, ruleguard
+    log = _rg_power_shims(rule_home)
+    monkeypatch.setenv("TTP_HOST", "testhost")
+    now = time.time()
+    entries = [{"id": 5, "alias": "testhost", "kind": machine_ledger.POWER_CYCLE, "at": now + 60, "added": now - 30,
+                "announced": now - 20},
+               {"id": 6, "alias": "box", "kind": machine_ledger.POWER_CYCLE, "at": now + 60, "added": now - 600,
+                "announced": now - 590},
+               {"id": 7, "alias": "far", "kind": machine_ledger.POWER_CYCLE, "at": now + 7200, "added": now - 600,
+                "announced": now - 590},
+               {"id": 8, "alias": "mute", "kind": machine_ledger.POWER_CYCLE, "at": now + 60, "added": now - 600}]
+    monkeypatch.setattr(machine_ledger, "changes", lambda open_only=True: entries)
+    why = _rg_deny("sudo reboot", rule_home.work)
+    assert why and why.startswith("host_reboot") and f"{ruleguard.REBOOT_LEAD_S}s" in why, "recorded 30s ago: too soon"
+    assert glmenv.refusal("sudo systemctl reboot", str(rule_home.work)), "the GLM shell asks it too"
+    for cmd in ("ssh box sudo reboot", "ipmitool -H box-bmc chassis power cycle", "ssh me@box 'echo b > /proc/sysrq-trigger'"):
+        assert _rg_deny(cmd, rule_home.work) is None, cmd   # box's intent was recorded 10 minutes ago
+    for cmd in ("ssh box sudo tee /proc/sysrq-trigger",
+                "ssh box busctl call org.freedesktop.login1 /org/freedesktop/login1 org.freedesktop.login1.Manager Reboot b false"):
+        assert _rg_deny(cmd, rule_home.work) is None, cmd   # unquoted, so it runs on box
+    assert _rg_deny("ssh box cat > /proc/sysrq-trigger", rule_home.work), "a local redirect is this host's"
+    for cmd in ("ssh box sudo bash <<EOF\necho b > /proc/sysrq-trigger\nEOF", "ssh box sudo bash <<EOF\nreboot\nEOF",
+                "cat <<EOF | ssh box bash\nreboot\nEOF"):
+        assert _rg_deny(cmd, rule_home.work) is None, cmd   # a heredoc fed to ssh runs on box
+    for cmd in ("ssh other <<EOF\necho b > /proc/sysrq-trigger\nEOF", "ssh other sudo bash <<EOF\nreboot\nEOF",
+                "bash <<EOF\necho b > /proc/sysrq-trigger\nEOF", "cat <<EOF | bash\necho b > /proc/sysrq-trigger\nEOF",
+                "cat <<EOF | ssh other bash\nreboot\nEOF", "ssh box sudo ssh other <<EOF\nreboot\nEOF"):
+        assert _rg_deny(cmd, rule_home.work), cmd
+    assert _rg_deny("ssh other sudo reboot", rule_home.work), "another host's intent does not cover this one"
+    assert _rg_deny("ssh far sudo reboot", rule_home.work), "outside the intent's window"
+    assert _rg_deny("ssh mute sudo reboot", rule_home.work), "an intent never announced in its chat"
+    assert _rg_deny("ssh box 'echo b > /proc/sysrq-trigger'; echo b > /proc/sysrq-trigger", rule_home.work), \
+        "box's intent does not cover the local write beside it"
+    entries[0]["added"] = now - 600
+    assert _rg_deny("sudo reboot", rule_home.work) is None
+    rule_home.cfg["guards"] = {"reboot_lead_s": 900}
+    assert _rg_deny("sudo reboot", rule_home.work), "the project's lead time"
+    rule_home.cfg["guards"] = {"reboot_lead_s": 0}
+    assert ruleguard.reboot_lead_s(rule_home.cfg) == ruleguard.REBOOT_LEAD_MIN_S, "never under a minute"
+    monkeypatch.setattr(machine_ledger, "changes", lambda open_only=True: 1 / 0)
+    assert "could not run" in _rg_deny("sudo reboot", rule_home.work), "an unreadable ledger refuses"
+    assert _rg_deny("ls", rule_home.work) is None, "only reboot commands read it"
+    assert not log.exists()
+
+
 def test_guards_off_turns_one_rule_off_and_only_the_user_may_set_it(rule_home, monkeypatch):
     from ttp import coordinator, glmenv, machine_ledger
     monkeypatch.setattr(machine_ledger, "changes", lambda open_only=True: [

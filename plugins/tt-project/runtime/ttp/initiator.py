@@ -13,8 +13,8 @@ order; each is bounded and never raises:
    MARK_ENTRIES lines of sudo and pkexec; then the WINDOW_S before the shutdown marker found in the
    first (logind's 'System is rebooting/powering down', systemd reaching the reboot or poweroff target,
    a 'shutdown scheduled' line). A sudo or
-   pkexec COMMAND that runs reboot, shutdown, poweroff or halt (or `systemctl reboot|poweroff|halt|
-   kexec`), or logind's 'Power key pressed': the last one wins. Else the line nearest before the marker
+   pkexec COMMAND that stops this host (what ruleguard._halt decides, one aimed at another host
+   aside), or logind's 'Power key pressed': the last one wins. Else the line nearest before the marker
    of a system unit, or of systemd starting one, that names a power cycle, reboot or shutdown:
    '<unit> (<message>)'. A unit systemd only started is named only when its own lines (the last
    UNIT_ENTRIES with its _SYSTEMD_UNIT, read the same way) show it logged after its start: one armed just
@@ -64,7 +64,6 @@ TEXT_CHARS = 120
 _LINE = re.compile(r"\s(?P<ident>[\w.@-]+)(?:\[\d+\])?:\s(?P<msg>.*)$")
 _DENIED = re.compile(r"insufficient permissions|not seeing messages from other users|permission denied", re.I)
 _NO_STORE = re.compile(r"no persistent journal|no journal files were found|is not available", re.I)
-_STOPS = {"reboot", "shutdown", "poweroff", "halt"}
 KERNEL_ENTRIES = 300
 KERNEL_IDENTS = ("kernel", "systemd-oomd")
 # (label, pattern) per kind of kernel fault, matched on the kernel's and systemd-oomd's own lines only.
@@ -76,7 +75,6 @@ KERNEL_FAULTS = (
                                  re.I)),
     ("lockup", re.compile(r"soft lockup|hard lockup|watchdog: BUG|NMI watchdog: .*lockup", re.I)),
 )
-_SYSTEMCTL_STOPS = {"reboot", "poweroff", "halt", "kexec"}
 _LEDGER_WORDS = re.compile(r"power[ _-]?cycl|reboot|power[ _-]?off|shut[ _-]?down", re.I)
 _STOP_WORDS = re.compile(r"power[ _-]?cycl|\breboot|power[ _-]?off|\bshutdown\b|\bhalt\b|kexec|watchdog", re.I)
 _MARKER_LOGIND = re.compile(r"^System is (rebooting|powering down|halting)|shutdown scheduled"
@@ -260,9 +258,9 @@ def _stop_command(cmd: str) -> str | None:
         words = cmd.split()
     if not words:
         return None
-    prog = Path(words[0]).name
-    if prog in _STOPS or (prog == "systemctl" and _SYSTEMCTL_STOPS & set(words[1:])):
-        return _clip(" ".join([prog, *words[1:]]), 60)
+    from . import ruleguard
+    if ruleguard._halt(words) and not (ruleguard._named_host(words) or ruleguard._url_host(words)):   # not another host's
+        return _clip(" ".join([Path(words[0]).name, *words[1:]]), 60)
     return None
 
 
