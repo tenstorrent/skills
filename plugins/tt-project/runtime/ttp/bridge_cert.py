@@ -420,9 +420,10 @@ def schedule_argv(config: Path | None) -> list[str]:
 def schedule(config: Path | None, platform: str | None = None) -> str:
     """Run `renew` every 30 minutes as a user service on this computer."""
     from .bridge import _run as brun
+    from .release import service_runtime
     platform = platform or sys.platform
     argv = schedule_argv(config)
-    env = {"PYTHONPATH": str(Path(__file__).resolve().parent.parent), "HOME": str(Path.home()),
+    env = {"PYTHONPATH": str(service_runtime()), "HOME": str(Path.home()),
            "PATH": os.environ.get("PATH", "/usr/bin:/bin")}
     HOME_DIR.mkdir(parents=True, exist_ok=True)
     if platform == "darwin":

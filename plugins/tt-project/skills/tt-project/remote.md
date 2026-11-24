@@ -52,7 +52,9 @@
   reported as an owner that cannot be identified, no other session is paused or signalled), then a
   restart (`launchctl kickstart -k` / `systemctl --user restart`, after `reset-failed` for a unit
   whose start limit was hit), paced 0, 60, 120, 300 s apart. A forward whose target does not
-  answer from this computer is left alone (logged once; nothing ended or restarted). An
+  answer from this computer is left alone (logged once; nothing ended or restarted); once it
+  answers again, a port that still fails gets one restart, even while the session's other ports
+  answer (a session rebuilt while the target was off can stay broken for it). An
   unreachable box restarts nothing and is checked again within 30-60 s, at once after a network
   change. A stopped service is left alone. Hand-made ssh forward services join with a
   `"watch"` list in the local bridge config, never shipped with entries:

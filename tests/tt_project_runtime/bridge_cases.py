@@ -2563,6 +2563,32 @@ def test_bridge_watch_leaves_a_live_session_alone_when_one_forward_is_slow(tmp_p
     assert seen["release"] == [] and len(out) == 1 and "port 2302" in out[0] and "destination does not" in out[0]
 
 
+def test_bridge_watch_heals_a_session_rebuilt_while_a_destination_was_off(tmp_path, monkeypatch):
+    # cells: target-off-logged, target-back-still-failing-restarted, healed-next-pass, slow-port-spared-again
+    from ttp import bridge, bridge_watch
+    mixed, both = "up 2301\ndown 2302\nttp-watch-done\n", "up 2301\nup 2302\nttp-watch-done\n"
+    cfg, seen = _watch_env(tmp_path, monkeypatch, "darwin", [mixed, mixed, both, mixed, mixed])
+    cfg = bridge.parse({"boxes": {"box-1": {"login": {}, "agents": {"auto": {"agent": "env", "forward": [
+        {"name": "build-a", "target": "build-a.example.com", "port": 2301},
+        {"name": "build-b", "target": "build-b.example.com", "port": 2302}]}}}}})
+    off = {"build-b.example.com"}   # build-b's host is off (its VPN reconnecting) when the session was rebuilt
+    monkeypatch.setattr(bridge_watch, "dest_answers", lambda d: d["target"] not in off)
+    t0, svc = 1_000_000.0, bridge.label("box-1", "auto")
+    out = bridge_watch.run_pass(cfg, "darwin", t0)
+    assert len(out) == 1 and "port 2302" in out[0] and "destination does not answer" in out[0]
+    assert seen["release"] == []
+    off.clear()   # its host answers again, but the session's forward to it still closes before the banner:
+    #               the next pass restarts it, though the session's other port answers
+    out = bridge_watch.run_pass(cfg, "darwin", t0 + bridge_watch.INTERVAL_S)
+    assert seen["release"] == [(svc, "auto", [2302])] and out[0].endswith("restarted")
+    out = bridge_watch.run_pass(cfg, "darwin", t0 + 2 * bridge_watch.INTERVAL_S)   # healed within 2 passes
+    assert out == [f"{svc}: answers again after {bridge_watch.INTERVAL_S}s"]
+    # one restart for the outage only: a later silent port of the live session whose target answers is only slow
+    for i in (3, 4):
+        assert bridge_watch.run_pass(cfg, "darwin", t0 + i * bridge_watch.INTERVAL_S) == []
+    assert len(seen["release"]) == 1
+
+
 def test_bridge_watch_spares_a_session_still_logging_in(tmp_path, monkeypatch):
     # cells: young-login-spared, old-login-restarted, unknown-age-restarted, systemd-main-pid, etime-days
     import json
@@ -2793,6 +2819,43 @@ def test_bridge_watch_service_runs_every_interval_and_on_network_change(tmp_path
     assert plist["ProgramArguments"][-2:] == ["bridge", "watch"] and "KeepAlive" not in plist
     svc, timer = (c.decode() for c in bridge_watch.contents("linux"))
     assert "Type=oneshot" in svc and "bridge watch" in svc and "OnUnitActiveSec=30" in timer
+
+
+def test_bridge_services_run_the_installed_release_wherever_setup_ran_from(tmp_path, monkeypatch):
+    # cells: watch-launchd, watch-systemd, gh-pull, cert-renew-launchd, cert-renew-systemd, no-install-this-copy
+    import plistlib
+    import subprocess
+    from pathlib import Path
+    from ttp import bridge, bridge_cert, bridge_watch, ghqueue, hoststate, release
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setattr(hoststate, "unit_dir", lambda: tmp_path / "units")
+    monkeypatch.setattr(bridge, "_run", lambda argv, timeout=60, inp=None: subprocess.CompletedProcess(argv, 0, "", ""))
+    here = str(Path(bridge_watch.__file__).resolve().parent.parent)   # the copy setup runs from (a worktree's, say)
+
+    def written() -> dict:
+        cert = {}
+        for platform in ("darwin", "linux"):
+            bridge_cert.schedule(None, platform)
+            cert[platform] = ((tmp_path / "Library" / "LaunchAgents" / f"{bridge_cert.LABEL}.plist").read_bytes()
+                              if platform == "darwin" else
+                              b"".join(f.read_bytes() for f in sorted((tmp_path / "units").glob(f"{bridge_cert.LABEL}*"))))
+        return {"watch-launchd": " ".join(plistlib.loads(bridge_watch.contents("darwin")[0])["ProgramArguments"]),
+                "watch-systemd": bridge_watch.contents("linux")[0].decode(),
+                "gh-pull": " ".join(ghqueue.service_argv("box-1")),
+                "cert-renew-launchd": str(plistlib.loads(cert["darwin"])["EnvironmentVariables"]),
+                "cert-renew-systemd": cert["linux"].decode()}
+    for mod in (release, bridge_cert):
+        monkeypatch.setattr(mod, "HOME_DIR", tmp_path / "ttp")
+    # no `ttp setup` has installed a release yet: this copy is the only one there is
+    assert all(f"PYTHONPATH={here}" in v or f"'PYTHONPATH': '{here}'" in v for v in written().values())
+    rt = tmp_path / "ttp" / "lib" / "9.9.9" / "runtime"
+    (rt / "ttp").mkdir(parents=True)
+    (rt / "ttp" / "__init__.py").write_text('__version__ = "9.9.9"\n')
+    (tmp_path / "ttp" / "lib" / "current").symlink_to("9.9.9")
+    # setup installed 9.9.9 and points current at it: every service it writes runs that release, never this copy,
+    # by its versioned path (an upgrade changes the unit, so its service restarts onto the new code)
+    for cell, v in written().items():
+        assert str(rt.resolve()) in v and here not in v, cell
 
 
 def test_bridge_watch_release_runs_the_box_cleanup_for_only_the_dead_ports(tmp_path, monkeypatch):

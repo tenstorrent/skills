@@ -169,6 +169,14 @@ def installed() -> Path:
     return HOME_DIR / "lib" / "current"
 
 
+def service_runtime() -> Path:
+    """The runtime a user service runs: the installed release (lib/<version>/runtime, so an upgrade rewrites the
+    unit and restarts the service onto it) once `ttp setup` put one there, never the copy setup ran from (a
+    worktree's goes away); else this copy."""
+    rt = installed() / "runtime"
+    return rt.resolve() if (rt / "ttp" / "__init__.py").is_file() else Path(__file__).resolve().parent.parent
+
+
 def runtime_version(runtime: Path) -> str:
     try:
         m = re.search(r'__version__ = "([^"]+)"', (runtime / "ttp" / "__init__.py").read_text())

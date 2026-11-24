@@ -12,7 +12,8 @@ change. No pass measures the time since the last one: a sleep longer than BACKOF
 so the first pass after waking checks every box. A port whose forward's own destination does not answer
 from here (its host is off) is not a stale forward: nothing is ended or restarted for it, and it is logged
 once. Nor is a silent port of a bridge session another of whose ports answers: the session is live and its
-target only slow. Nor is a bridge session none of whose ports has a listener yet while its login (its ssh, a
+target only slow; unless that port failed while its destination was off (a session rebuilt then, after a VPN
+reconnect say, can stay broken for it): once the destination answers it gets one restart if it still fails. Nor is a bridge session none of whose ports has a listener yet while its login (its ssh, a
 relay reconnect included) is younger than LOGIN_S: the next pass decides. A service that keeps failing is restarted
 at most once per RESTART_GAP_S step.
 
@@ -220,8 +221,11 @@ def run_pass(cfg: dict, platform: str | None = None, now: float | None = None) -
         with ThreadPoolExecutor(max(1, len(ask))) as ex:
             answers = dict(zip([a[:2] for a in ask], ex.map(dest_answers, [a[2] for a in ask])))
         for t in mine:
-            dead = [p for p in t["ports"]
-                    if p in none or p in down and not (t["service"] in live and answers[t["service"], p])]
+            # a port that failed while its destination was off is not spared once it answers: a session (re)built
+            # then can stay broken for it, so it gets one restart if the port still fails
+            was_off = set(off.get(t["service"], []))
+            dead = [p for p in t["ports"] if p in none or p in down
+                    and not (t["service"] in live and answers[t["service"], p] and p not in was_off)]
             f = fails.get(t["service"])
             bad = [p for p in dead if p in none or answers[t["service"], p]] if t.get("dests") else dead
             gone = [p for p in dead if p not in bad]   # the forward is up; its destination does not answer
@@ -290,8 +294,8 @@ def heal_lines(platform: str | None = None, n: int = 3) -> list[str]:
 
 
 def argv() -> list[str]:
-    return ["/usr/bin/env", f"PYTHONPATH={Path(__file__).resolve().parent.parent}", sys.executable, "-m", "ttp",
-            "bridge", "watch"]
+    from .release import service_runtime
+    return ["/usr/bin/env", f"PYTHONPATH={service_runtime()}", sys.executable, "-m", "ttp", "bridge", "watch"]
 
 
 def service_files(platform: str | None = None) -> list[Path]:

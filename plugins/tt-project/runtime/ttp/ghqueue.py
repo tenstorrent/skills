@@ -687,8 +687,9 @@ def pull(box: str, gh: str | None = None, prefixes=()) -> str:
 
 def service_argv(box: str) -> list[str]:
     """The workstation service that keeps pulling `box`'s queue."""
-    return ["/usr/bin/env", f"PYTHONPATH={Path(__file__).resolve().parent.parent}", sys.executable, "-m", "ttp",
-            "bridge", "gh-pull", box, "--loop"]
+    from .release import service_runtime
+    return ["/usr/bin/env", f"PYTHONPATH={service_runtime()}", sys.executable, "-m", "ttp", "bridge", "gh-pull", box,
+            "--loop"]
 
 
 def queue_argv(args: list[str]) -> list[str]:
