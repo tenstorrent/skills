@@ -171,7 +171,7 @@ def config(p, db=None) -> dict:
             "jira_keys": [str(k) for k in (links.get("jira_keys") or [])],
             "repos": links.get("repos") or {},
             "single_repo": (repo or {}).get("single") or str(links.get("repo") or ""),
-            "file_url": file_url, "is_file": is_file, "ref_ok": exists, "ref_url": _ref_url(p, web, exists)}
+            "file_url": file_url, "is_file": is_file, "ref_ok": exists, "ref_url": _ref_url(web, exists)}
 
 def _exists(p, db):
     """Whether id `n` names a record of `kind`; a bare '#N' names a task (a run or message id
@@ -185,7 +185,7 @@ def _exists(p, db):
     return exists
 
 
-def _ref_url(p, web, exists):
+def _ref_url(web, exists):
     """A project id -> its web app page, None when the id names no record (never a guessed page)."""
     if not web:
         return None   # no page to link to: leave ids as written rather than label every one wrong
