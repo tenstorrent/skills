@@ -768,6 +768,60 @@ def test_store_hands_back_a_device_plan_still_unsourced(tmp_path):
     assert [s["source"] for s in deviceplan.plan(cur)["steps"]] == ["run 101", "run 101"]
 
 
+def test_replayed_bare_bookkeeping_plan_step_is_not_offered_to_copy_and_the_full_call_passes(tmp_path):
+    """Replay: an earlier done run's plan had a bare `ttp audit why` step; its log holds the full call that ran
+    (with `--serves` and `--undo`), which contains the bare one, so the copy list offered `ttp audit why`. The next
+    plan copied it into a read step and the plan check refused it ("say why"), ending the run. Before: the bare call
+    was listed. After: no ttp call the plan check refuses is listed, and the step written as the full call passes."""
+    from ttp import deviceplan
+    cur, _ = _src_project(tmp_path)
+    d = cur.parent / "98"
+    d.mkdir()
+    (d / "result.json").write_text(json.dumps({"status": "done"}))
+    full = 'ttp audit why "read the backstop rules" --serves 98 --undo "none: read-only"'
+    rows = [{"cmd": 'ttp audit why 2>&1; echo "---"; ttp advise --plan "read the backstop rules"', "rc": None,
+             "tail": "say why: ttp audit why ..."},
+            {"cmd": 'ttp audit why "x" --serves "a read" --undo "none"', "rc": None,
+             "tail": "ttp: --serves 'a read': name an obligation, a task or a message"},
+            {"cmd": full, "rc": None, "tail": "recorded"}]
+    (d / deviceplan.STEPS).write_text("".join(json.dumps(r) + "\n" for r in rows))
+    (d / deviceplan.PLAN_FILE).write_text(json.dumps({"steps": [
+        {"n": 1, "host": "local", "command": "ttp audit why", "check": True}]}))
+    cmds = [x["cmd"] for x in deviceplan.copy_sources(cur, {}) if "cmd" in x]
+    assert "ttp audit why" not in cmds and _SRC_HEALTH in cmds, cmds
+    reads = "; ttp said power cycle backstop; ttp memory proj --search backstop; grep -n backstop /srv/notes | head -40"
+    one = lambda c: [{"n": 2, "command": c, "check": False, "source": "run 98"}]
+    srcs = deviceplan.copy_sources(cur, {})
+    assert "say why" in deviceplan.unsourced(one("ttp audit why" + reads), srcs), "a bare call still goes back"
+    assert not deviceplan.unsourced(one(full.replace("98", "103") + reads), srcs)
+    ws = str(tmp_path)
+    plan = _src_plan((_SRC_HEALTH, "run 101"), (full.replace("98", "103") + reads, "run 98"))
+    assert deviceplan.store(cur, plan, ws, {}) is None and not (cur / "glm_guard.json").exists()
+
+
+def test_replayed_gate_cut_off_by_the_tool_time_limit_runs_once_more_and_a_failed_gate_still_stops(
+        tmp_path, monkeypatch):
+    """Replay: `ttp checks 2>&1 | tail -30` ran past the agent tool's 2-minute limit, which killed it (exit 143,
+    "Command timed out after 2m 0s"); the guard counted that as a failed gate and ended the run. Before: the first
+    cut-off stopped the run. After: the first cut-off of a gate goes on (the run is told to rerun it detached), a
+    second of the same command stops it, and a gate that ran and failed stops it at once."""
+    from ttp import deviceplan, glmguard, hook
+    run, _ = _dp_run(tmp_path)
+    monkeypatch.setenv("TTP_RUN_DIR", str(run))
+    cut = "Exit code 143\nCommand timed out after 2m 0s"
+    post = lambda c, err: hook._gate_stop({"tool_name": "Bash", "tool_input": {"command": c}, "error": err}, str(run))
+    gate = "ttp checks 2>&1 | tail -30"
+    assert post(gate, cut) == "" and not (run / "glm_guard.json").exists(), "a cut-off is no failed check"
+    assert "time limit twice" in post(gate, cut)
+    assert json.loads((run / "glm_guard.json").read_text())["kind"] == glmguard.GATE
+    for c, err in ((gate, "Exit code 1\nFAILED tests/test_x.py::test_y"),
+                   ("ttp checks", "Exit code 143\nterminated by the checks' own stop"),
+                   ("ttp checks", "Exit code 1\nCommand timed out after 2m 0s")):
+        (run / "glm_guard.json").unlink(missing_ok=True)
+        assert "a gate failed" in post(c, err), (c, err)
+    assert "--detach" in deviceplan.glm_lines() and "cut off again, it hands back" in deviceplan.glm_lines()
+
+
 def _src_asker(tmp_path, answers, seen):
     cur, _ = _src_project(tmp_path)
     left = list(answers)

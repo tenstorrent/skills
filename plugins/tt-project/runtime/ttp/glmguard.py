@@ -1046,12 +1046,34 @@ def is_gate(cmd: str, gates=(), env=None) -> bool:
                for seg in hook._all_segments(plain) + hook._segments(plain, strip=False) if seg)
 
 
+TOOL_TIMEOUT = re.compile(r"(?m)^Command timed out after \d")   # the agent tool's own cut-off line
+GATE_TIMEOUTS = "glm_gate_timeouts"   # the gates the tool's time limit cut off once in this run
+
+
 def gate_stop(run_dir, cmd: str, rc, output: str, env=None) -> str | None:
     """On a device run on the chat model, a gate command that failed (`rc` neither 0 nor busy) ends the run
-    as a hand-back to Opus with the command and its output; returns why, None when the run goes on."""
+    as a hand-back to Opus with the command and its output; returns why, None when the run goes on. A gate
+    the agent tool's time limit cut off (exit 124, 137 or 143 with the tool's cut-off line) did not fail: the
+    run goes on to run it once more, and only a second cut-off of the same command ends the run."""
     g = glm_run(env)
     if not g or not g["device"] or rc in (0, BUSY, None) or not is_gate(cmd, g["gates"], env):
         return None
-    why = f"a gate failed (exit {rc}): `{' '.join(cmd.split())[:160]}`"
+    norm = " ".join(cmd.split())
+    if rc in (124, 137, 143) and TOOL_TIMEOUT.search(output or "") and run_dir:
+        f = Path(run_dir) / GATE_TIMEOUTS
+        try:
+            seen = f.read_text().splitlines()
+        except OSError:
+            seen = []
+        if norm not in seen:
+            try:
+                with f.open("a") as fh:
+                    fh.write(norm + "\n")
+                return None
+            except OSError:
+                pass   # no record of the retry: the cut-off stops the run, as before
+        why = f"a gate was cut off by the tool's time limit twice (exit {rc}): `{norm[:160]}`"
+    else:
+        why = f"a gate failed (exit {rc}): `{norm[:160]}`"
     hit(run_dir, why, GATE, output or "")
     return why

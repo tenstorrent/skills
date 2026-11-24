@@ -596,7 +596,9 @@ def glm_lines() -> str:
             "words>\"`; it prints the plan. Reads run freely; every command that changes state must be one of its "
             "steps, as written (fill only its <placeholders>); a reset, power cycle, flash or firmware step needs "
             "`ttp advise --check-step N` to answer ok first. A check step that exits nonzero or prints an error has "
-            "failed: stop there, run no later step and hand the task back to Opus. A step outside the plan "
+            "failed: stop there, run no later step and hand the task back to Opus. One the tool's time limit cut off has not "
+            "failed: run it once more, `ttp checks` as `ttp checks --detach` waiting with the `--result` probe it prints, "
+            "any other with a longer tool timeout; cut off again, it hands back. A step outside the plan "
             "also hands it back; any other refusal says the allowed way: take it and carry on. Use the plan's paths and names exactly, even one that "
             "looks like a typo. On each other host the plan names a scratch folder (`ttp advise --plan` prints it): "
             "write, copy and remove only inside it there, outside a step.")
@@ -669,7 +671,9 @@ def copy_sources(run_dir, s: dict | None = None) -> list[dict]:
     """The commands a device plan copies from, newest first, deduplicated and capped (SOURCE_LINES, SOURCE_BYTES):
     the steps of recent runs that ended done which ran with exit 0 (their plan's steps first, then their logged
     host and lock steps), and the project's own scripts those steps ran (paths in the project tree) plus
-    route.glm_work.device_scripts. Each is {"cmd", "src"} or {"script", "src"}. Model-free."""
+    route.glm_work.device_scripts. A plan step counts as run when a command that passed contains it, so a bare
+    `ttp audit why` step matches the full call that ran; a ttp call `_ttp_bad` refuses is never listed. Each is
+    {"cmd", "src"} or {"script", "src"}. Model-free."""
     if not run_dir:
         return []
     runs = Path(run_dir).parent
@@ -685,8 +689,9 @@ def copy_sources(run_dir, s: dict | None = None) -> list[dict]:
 
     def add(key, val, src):
         nonlocal size
-        if val in seen or len(out) >= SOURCE_LINES or size + len(val) > SOURCE_BYTES or key == "cmd" and publish_step(val):
-            return   # no device plan copies a publish step
+        if val in seen or len(out) >= SOURCE_LINES or size + len(val) > SOURCE_BYTES or key == "cmd" and (
+                publish_step(val) or any(w[0] == "ttp" and _ttp_bad(w) for w in _src_segments(val))):
+            return   # no device plan copies a publish step, or a ttp call the plan check refuses (`unsourced`)
         seen.add(val)
         size += len(val)
         out.append({key: val, "src": src})
