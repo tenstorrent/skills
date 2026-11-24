@@ -2580,6 +2580,28 @@ def test_exempt_lock_names_and_no_yield_never_stop_the_command(env, tmp_path):
     assert out.read_text() == "done\n" * 2, out.read_text()   # both runs finished
 
 
+def test_a_command_that_ignores_sigterm_is_killed_after_the_grace(env, tmp_path):
+    # The yield's SIGTERM is ignored, so the group is SIGKILLed after the grace and the lock is
+    # still given way.
+    p = make(env)
+    flip = tmp_path / "flip"
+    _yield_probe(p, tmp_path, f"[ -e {shlex.quote(str(flip))} ] && exit 0\nexit 1")
+    p.set_config("locks.yield_every_s", 1)
+    t = subprocess.Popen([sys.executable, str(TTP), "lock", "rig", "--", "bash", "-c",
+                          f"trap '' TERM; echo start >> {shlex.quote(str(tmp_path / 'marks'))}; sleep 30"],
+                         env=_lock_env(env, p), stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    try:
+        _until_or_ended(lambda: (tmp_path / "marks").exists(), [t])
+        at = time.time()
+        flip.touch()
+        assert t.wait(timeout=60) == 75, t.stderr.read()
+        took = time.time() - at
+        assert 9 < took < 40, took   # the ~10 s grace, then the kill
+    finally:
+        if t.poll() is None:
+            t.kill()
+
+
 def test_the_whole_run_path_yields_to_the_probe_too(env, tmp_path):
     p = make(env)
     _yield_probe(p, tmp_path, "echo stream; exit 0")

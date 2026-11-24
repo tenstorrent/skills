@@ -94,19 +94,24 @@ class Probe:
 
     def stop(self, popen: subprocess.Popen) -> int:
         """Stop the command's whole process group: SIGTERM, then SIGKILL after KILL_AFTER_S, and
-        return BUSY_RC. A command that ended on its own before the signal returns its own rc."""
+        return BUSY_RC. A command that ended on its own (its rc, or a signal that is not ours)
+        returns that instead: a finished command is never reported as a yield."""
         for sig, grace in ((signal.SIGTERM, KILL_AFTER_S), (signal.SIGKILL, None)):
-            mine = True
+            if popen.poll() is not None:
+                return popen.returncode   # it ended on its own: never report a finished command as yielded
             try:
                 os.killpg(popen.pid, sig)   # the command runs in a group of its own for this
+                sent = True
             except OSError:
-                mine = False   # already gone: it ended on its own, not for this yield
+                sent = False   # it left the group (setsid) or just ended between check and signal
             try:
                 popen.wait(grace)
             except subprocess.TimeoutExpired:
-                continue
-            return BUSY_RC if mine else popen.returncode
-        return BUSY_RC
+                if sent:
+                    continue   # it ignores SIGTERM: the SIGKILL comes next
+                return BUSY_RC   # out of reach; the resource is still yielded
+            # Our signal ended it (or a shell that trapped it ended with 128+sig): a yield.
+            return BUSY_RC if sent else (popen.returncode if popen.returncode is not None else BUSY_RC)
 
 
 def run_whole(cmd: list, env: dict, probe: "Probe | None") -> int:
