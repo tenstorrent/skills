@@ -436,13 +436,19 @@ def test_a_service_change_in_a_heredoc_over_ssh_runs_only_as_a_plan_step(tmp_pat
     assert "it changes a service's state" in (ref(other) or ""), other
 
 
-def test_device_planner_is_told_to_publish_with_ttp_push_and_to_name_remote_scratch_from_its_task_id():
+def test_device_planner_is_told_to_publish_with_ttp_push_and_to_name_remote_scratch_from_its_task_id(monkeypatch):
     """A plan stepped `git push` and failed its own check; another named its remote scratch folder with a made-up
-    task number the GLM run then corrected, so the run went out of plan. The planner gets the task id."""
-    from ttp import deviceplan
+    task number the GLM run then corrected, so the run went out of plan. A third stepped a read over ssh to the host
+    it ran on, whose alias did not resolve there, and its gate failed. The planner gets the task id and its host."""
+    from ttp import deviceplan, machines
+    monkeypatch.setattr(machines, "here", lambda known=None: ("box-a", {}))
     assert "never `git push`" in deviceplan.DEVICE_PLAN and "scratch folder given with the task" in deviceplan.DEVICE_PLAN
     assert deviceplan.assist(None, {}, {"id": 42, "title": "stage a venv", "spec": "on box-a"})["task"].startswith(
-        "task id 42, scratch folder /tmp/ttp-42 on each other host\nstage a venv")
+        "task id 42, scratch folder /tmp/ttp-42 on each other host\nthis host is box-a: a step on it runs locally, "
+        "with host local and no ssh\nstage a venv")
+    monkeypatch.setattr(machines, "here", lambda known=None: None)
+    monkeypatch.setenv("TTP_HOST", "box1")
+    assert "this host is box1:" in deviceplan.assist(None, {}, {"id": 42, "title": "t", "spec": "s"})["task"]
     assert deviceplan.assist(None, {}, {"title": "t", "spec": "s"})["task"] == "t\ns"
     assert "paths and names exactly" in deviceplan.glm_lines()
 
@@ -783,6 +789,50 @@ def test_an_unsourced_device_plan_goes_back_to_the_planner_once_with_why_and_the
     assert "copy every check and job-submit command verbatim" in seen[0].lower()
     assert len(seen) == 2 and "fails its source check" in seen[1] and "9000" in seen[1] and _SRC_HEALTH in seen[1]
     assert row["ok"] and "9000" in row["source_error"] and deviceplan.plan(cur) and glmassist.planned(cur)
+
+
+def test_a_re_plan_whose_json_breaks_gets_the_json_fix_up_too_and_reaches_the_run(tmp_path):
+    """Replay: the source re-plan came back with a broken JSON block (a key missing its opening quote) and the plan
+    step failed with no device step run. Its block now gets the same one JSON fix-up as the first plan."""
+    from ttp import deviceplan, glmassist
+    seen = []
+    bad = _src_plan(('ttp lock box1 -- ssh box1 "curl -fsS -m 10 http://127.0.0.1:9000/health"', "memory"))
+    good = _src_plan((_SRC_HEALTH, "run 101"))
+    broken = good.replace('{"host"', '{\n     host"', 1)
+    assert deviceplan.parse_why(broken)[1] and not deviceplan.parse_why(good)[1]
+    cur, call = _src_asker(tmp_path, [bad, broken, good], seen)
+    row = glmassist.ask(cur, "check box1", cwd=str(tmp_path), plan=True, run=call, binary="claude")
+    assert len(seen) == 3 and "fails its source check" in seen[1] and broken in seen[2]
+    assert row["ok"] and row["source_error"] and row["plan_error"] and not row.get("handed_back")
+    assert deviceplan.plan(cur) and glmassist.planned(cur) and not (cur / "glm_guard.json").exists()
+
+
+def test_a_planned_job_may_use_the_runs_own_scratch_folder_and_nothing_else_may_differ(tmp_path):
+    """Replay: a plan copied a passing run's job submit into its own scratch folder, running the heartbeat script an
+    earlier step wrote there under a new name, and the source check stopped it. Only the folder may differ, and a
+    renamed file only when the plan writes it first with the same extension; command, verb and limit stay."""
+    from ttp import deviceplan
+    cur, _ = _src_project(tmp_path)
+    srcs = deviceplan.copy_sources(cur, {})
+    task = deviceplan.assist(None, {}, {"id": 103, "title": "heartbeat on box1", "spec": "run it"})["task"]
+    own = _SRC_SUBMIT.replace("/tmp/ttb101", "/tmp/ttp-103")
+    renamed = own.replace("hb.sh", "hb2.sh")
+    write = 'ttp lock box1 -- ssh box1 "printf \'cat hb\\n\' > /tmp/ttp-103/hb2.sh"'
+    plan = lambda *cs: [{"n": i + 1, "command": c, "check": "printf" not in c, "source": "run 101"}
+                        for i, c in enumerate(cs)]
+    assert not deviceplan.unsourced(plan(own), srcs, task)
+    assert not deviceplan.unsourced(plan(write, renamed), srcs, task)
+    still = {
+        "renamed script the plan never writes": plan(renamed),
+        "written only after the job": plan(renamed, write),
+        "other extension": plan(write.replace("hb2.sh", "hb2.py"), renamed.replace("hb2.sh", "hb2.py")),
+        "another broker verb": plan(own.replace("run-bg", "reset")),
+        "another time limit": plan(own.replace("-t 120", "-t 7200")),
+        "more in the job's command": plan(own.replace("hb.sh'", "hb.sh; tt-smi -r'")),
+        "another task's scratch folder": plan(_SRC_SUBMIT.replace("/tmp/ttb101", "/tmp/ttp-99")),
+    }
+    flagged = [k for k, st in still.items() if deviceplan.unsourced(st, srcs, task)]
+    assert flagged == list(still), flagged
 
 
 def test_a_device_plan_still_unsourced_after_its_re_plan_never_reaches_the_run(tmp_path):

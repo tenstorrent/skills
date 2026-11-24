@@ -223,15 +223,19 @@ def ask(run_dir, question: str, *, cwd: str, plan: bool = False, db=None, source
         if not exe:
             raise RuntimeError("no claude binary on this host")
         answer, usd = _opus_call(run or _run, argv, text, timeout, cwd, model, usage)
-        left = timeout - (now() - t0)   # the fix-up never runs past max_minutes
-        if device and answer and not answer.lower().startswith("needs_opus:") \
-                and (why := deviceplan.parse_why(answer)[1]):
-            # A bad plan never reaches GLM: Opus fixes its own block once, in this plan step.
-            row.update(plan_error=why[:300])
-            if left < 30.0:
-                raise RuntimeError(f"the plan does not parse ({why[:200]}) and no time is left to fix it")
-            got, more = _opus_call(run or _run, argv, deviceplan.FIX.format(why=why) + answer, left, cwd, model, usage)
-            answer, usd = got or answer, usd + more
+
+        def fix_json(answer, usd):
+            left = timeout - (now() - t0)   # the fix-up never runs past max_minutes
+            if device and answer and not answer.lower().startswith("needs_opus:") \
+                    and (why := deviceplan.parse_why(answer)[1]):
+                # A bad plan never reaches GLM: Opus fixes its own block once, in this plan step.
+                row.update(plan_error=why[:300])
+                if left < 30.0:
+                    raise RuntimeError(f"the plan does not parse ({why[:200]}) and no time is left to fix it")
+                got, more = _opus_call(run or _run, argv, deviceplan.FIX.format(why=why) + answer, left, cwd, model, usage)
+                return got or answer, usd + more
+            return answer, usd
+        answer, usd = fix_json(answer, usd)
         left = timeout - (now() - t0)
         if device and answer and not answer.lower().startswith("needs_opus:") and left >= 30.0 \
                 and (why := deviceplan.source_why(run_dir, answer)):
@@ -240,7 +244,7 @@ def ask(run_dir, question: str, *, cwd: str, plan: bool = False, db=None, source
             row.update(source_error=why[:300])
             got, more = _opus_call(run or _run, argv, deviceplan.SOURCE_FIX.format(why=why, sources=block) + answer,
                                    left, cwd, model, usage)
-            answer, usd = got or answer, usd + more
+            answer, usd = fix_json(got or answer, usd + more)   # the re-plan's own block is checked again
         row.update(ok=bool(answer), answer=answer[:4000])
         if step is not None:
             row.update(step=str(step), verdict="ok" if answer.lower().startswith("ok") else "stop")
