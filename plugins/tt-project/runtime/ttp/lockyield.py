@@ -156,8 +156,8 @@ def run_whole(cmd: list, env: dict, probe: "Probe | None") -> int:
     of its own watched by it."""
     if probe is None:
         return subprocess.call(cmd, env=env)
-    # own session: the probe stops the command's whole process group, so a run's kill of this process
-    # is passed on to that group (a SIGKILL by the watchdog)
+    # a run's kill of this process is passed on to the command's group (signals forwarded, a watchdog)
+    # own session: the probe stops the command's whole process group
     proc = subprocess.Popen(cmd, env=env, start_new_session=True)
     probe.guard(proc)
 

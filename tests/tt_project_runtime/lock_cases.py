@@ -1061,10 +1061,10 @@ def test_a_held_label_naming_a_kernel_thread_is_holder_unverifiable_and_its_run_
                  (tid, time.time(), gone, boot_id()))
     lbl = f"task #{tid} (run {rid})"
     bad = {"holder": lbl, **here, "pid": kt}
-    assert locks.pid_alive(bad) is None
+    assert locks.pid_pid_alive(bad) is None
     assert locks._pid_note(bad) == f", pid {kt} is a kernel thread here: holder unverifiable"
     good = {"holder": lbl, **here, "pid": os.getpid()}    # a valid label: unchanged
-    assert locks.pid_alive(good) is True and locks._pid_note(good) == f", pid {os.getpid()} alive"
+    assert locks.pid_pid_alive(good) is True and locks._pid_note(good) == f", pid {os.getpid()} alive"
     note = locks._holder_note(bad, where=p)
     assert f"holder unverifiable; pid {gone} gone (run {rid}'s worker)" in note, note
     assert "stale" not in note      # its task is not done
@@ -1141,9 +1141,9 @@ def test_lock_probe_judges_a_pid_from_another_pid_namespace_through_that_namespa
     monkeypatch.setattr(locks, "_PROC", str(tmp_path / "no-proc"))
     # Same namespace: judged directly, /proc never scanned.
     same = {"pid": os.getpid(), "node": me, "pidns": locks._pid_ns()}
-    assert locks._pid_note(same) == f", pid {os.getpid()} alive" and locks.pid_alive(same) is True
+    assert locks._pid_note(same) == f", pid {os.getpid()} alive" and locks.pid_pid_alive(same) is True
     assert locks._pid_note({"pid": 2, "node": "another-host", "pidns": "pid:[999]"}) == ", pid 2"
-    assert locks.pid_alive({"pid": 2, "node": "another-host", "pidns": "pid:[999]"}) is None
+    assert locks.pid_pid_alive({"pid": 2, "node": "another-host", "pidns": "pid:[999]"}) is None
     cases = [
         ("live", [(4321, "pid:[999]", "4321 2", "S")], True, ", pid 2 (from another PID namespace; pid 4321 here) alive"),
         ("dead", [(4321, "pid:[999]", "4321 1", "S"), (4322, "pid:[5]", "4322 2", "S")], False,
@@ -1163,7 +1163,7 @@ def test_lock_probe_judges_a_pid_from_another_pid_namespace_through_that_namespa
         for name, procs, alive, note in cases:
             monkeypatch.setattr(locks, "_PROC", str(_fake_pidns_proc(tmp_path / name, procs)))
             assert locks._pid_note(foreign) == note, name
-            assert locks.pid_alive(foreign) is alive, name
+            assert locks.pid_pid_alive(foreign) is alive, name
             held.seek(0)
             held.truncate()
             held.write(json.dumps({"holder": f"task #{t} (run 99)", "since": time.time(), "command": "x", **foreign}))
@@ -1174,7 +1174,7 @@ def test_lock_probe_judges_a_pid_from_another_pid_namespace_through_that_namespa
             assert alive is not None or rec["note"].endswith("; no record of run 99 to judge it through)"), rec
         # A side that cannot tell its own namespace judges nothing, as before.
         monkeypatch.setattr(locks, "_pid_ns", lambda: None)
-        assert locks._pid_note(foreign) == ", pid 2" and locks.pid_alive(foreign) is None
+        assert locks._pid_note(foreign) == ", pid 2" and locks.pid_pid_alive(foreign) is None
     finally:
         held.close()
 
@@ -1400,7 +1400,7 @@ def test_lock_probe_in_a_sandbox_judges_an_unseen_foreign_holder_through_its_run
         # The taker shares this namespace (a probe in the taker's own sandbox): its ns_pid answers.
         mine = {**agent, "ns_pid": os.getpid(), "ns_pidns": locks._pid_ns()}
         assert locks._pid_note(mine) == f", pid 4243 (from another PID namespace; its taker is pid {os.getpid()} here) alive"
-        assert locks.pid_alive(mine) is True and probe(mine)[:2] == (True, False)
+        assert locks.pid_pid_alive(mine) is True and probe(mine)[:2] == (True, False)
         gone = subprocess.Popen(["true"])
         gone.wait()
         assert "alive unknown: " in locks._pid_note({**mine, "ns_pid": gone.pid}), "a gone taker proves nothing"
@@ -2090,7 +2090,7 @@ def test_a_push_batch_carrying_an_urgent_approval_lands_ahead_of_an_earlier_urge
         _until_or_ended(lambda: "start land" in marks.read_text() or "start hot" in marks.read_text(), procs[1:])
         go_b.touch()
         t.join(60)
-        assert not t.is_alive() and got and got[0][0] == 0, got
+        assert not t.is_pid_alive() and got and got[0][0] == 0, got
         assert _ended(procs) == [0, 0]
     finally:
         go.touch()
@@ -2320,7 +2320,7 @@ def test_a_push_batch_checks_ttp_lock_goes_ahead_of_an_earlier_suite_waiter_only
         assert (seen.find("start late") % 10**6 < seen.find("start suite") % 10**6) == (mode == "target"), seen
         go_b.touch()
         t.join(60)
-        assert not t.is_alive() and got and got[0][0] == 0, got
+        assert not t.is_pid_alive() and got and got[0][0] == 0, got
         assert _ended(procs) == [0, 0]
     finally:
         go.touch()
@@ -2623,7 +2623,7 @@ def test_a_signal_to_a_probed_ttp_lock_reaches_the_whole_command_group(env, tmp_
             t.kill()
 
 
-def _alive(pid):
+def _pid_alive(pid):
     try:
         return Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[0] != "Z"
     except (OSError, IndexError):
@@ -2639,11 +2639,11 @@ def _caller_is_killed_the_command_ends(t, pidfile, sig):
         os.killpg(t.pid, sig)
         t.wait(timeout=30)
         deadline = time.time() + 25   # a watchdog's SIGTERM comes at once; a trapped one dies at its KILL
-        while _alive(pid) and time.time() < deadline:
+        while _pid_alive(pid) and time.time() < deadline:
             time.sleep(0.2)
-        assert not _alive(pid), f"the command survived {sig.name} to its ttp lock's process group"
+        assert not _pid_alive(pid), f"the command survived {sig.name} to its ttp lock's process group"
     finally:
-        if _alive(pid):
+        if _pid_alive(pid):
             os.kill(pid, signal.SIGKILL)
         if t.poll() is None:
             t.kill()
