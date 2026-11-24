@@ -792,7 +792,7 @@ def _copy_of(a: list[str], b: list[str], named: set, digits: set, own: str = "")
     if len(a) != len(b) or os.path.basename(a[0]) != os.path.basename(b[0]):
         return False
     for x, y in zip(a, b):
-        if x == y or HOLE in x or HOLE in y or x in named or _scratch_word(x, y, own):
+        if x == y or HOLE in x or HOLE in y or x in named or _scratch_word(x, y, own, " ".join(b)):
             continue
         if re.sub(r"\d+", "0", x) == re.sub(r"\d+", "0", y) and set(re.findall(r"\d+", x)) <= digits:
             continue
@@ -803,11 +803,13 @@ def _copy_of(a: list[str], b: list[str], named: set, digits: set, own: str = "")
 TMP_DIR = re.compile(r"/tmp/[\w.-]+")
 
 
-def _scratch_word(x: str, y: str, own: str) -> bool:
+def _scratch_word(x: str, y: str, own: str, src: str) -> bool:
     """Word `x` is source word `y` with the run's own scratch folder `own` where `y` has another run's `/tmp`
-    folder; the rest of the word, file names included, stays as it is."""
-    return bool(own) and own in x and \
-        re.sub(re.escape(own) + r"(?![\w.-])", "@scratch@", x) == TMP_DIR.sub("@scratch@", y)
+    folder (one the source segment `src` names a path in, so never a file directly in /tmp); the rest of the
+    word, file names included, stays as it is."""
+    dirs = {m.group() for m in TMP_DIR.finditer(src) if src.startswith("/", m.end())}
+    return bool(own) and own in x and re.sub(re.escape(own) + r"(?![\w.-])", "@scratch@", x) == \
+        TMP_DIR.sub(lambda m: "@scratch@" if m.group() in dirs else m.group(), y)
 
 
 def unsourced(steps: list[dict], srcs: list[dict], task: str = "", root=None) -> str:
