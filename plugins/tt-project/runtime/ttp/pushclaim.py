@@ -69,6 +69,10 @@ _SHA_REF = re.compile(rf"\b(?:pushed|landed)\s+(?:commit\s+)?(?:as\s+|at\s+)?{_S
 _NEGATED = re.compile(r"(?:\bnot|\bnever|n't|\bbe|\bwill|\bwould|\bto)"
                       r"(?:\s+(?:yet|been|being|get|got|gotten|already|actually|really|ever))*\s+$", re.I)
 _NOT_REFS = {"the", "a", "an", "it", "its", "origin", "remote", "github", "branch", "upstream"}
+# A claim that the run's change landed, naming no commit: "the change landed", "it was pushed".
+_LANDED_VERB = re.compile(r"(?i)\b(landed|pushed|merged)\b")
+UNVERIFIED_CLAIM = "(unverified)"      # a landed-claim this project cannot check, never a plain 'landed'
+NOT_LANDED = "not landed"              # the correction a claim off the push branch reads
 
 
 def _git(repo, *args: str, timeout: float = 30) -> subprocess.CompletedProcess:
@@ -152,6 +156,79 @@ def text_claims(p, text: str, repo=None) -> list[dict]:
             out.append({"repo": str(repo), "remote": target[0], "ref": target[1], "sha": full,
                         "source": "its summary", "strict": False})
     return out
+
+
+def landed_claims(p, text: str, repo) -> list[tuple[int, int, str, tuple]]:
+    """The (start, end, sha, target) of each phrase in `text` claiming a landing: the push phrases
+    text_claims parses (same regexes, negation and overlap rules; the sha resolved in `repo`), then
+    a claim verb naming no commit ("the change landed", target None). A phrase about another task
+    or run (its sentence names its id) is left out: the check would read this run's head, not that
+    task's."""
+    target = _default(p, repo)
+    out, taken = [], []
+    for rx, order in ((_TAG, "ref_sha"), (_REF_SHA, "ref_sha"), (_SHA_REF, "sha_ref")):
+        for m in rx.finditer(text or ""):
+            if _NEGATED.search(text[max(0, m.start() - 40):m.start()]) \
+                    or any(m.start() < e and s < m.end() for s, e in taken):
+                continue   # one phrase, one claim, hedged or negated ones are none
+            ref, sha = (m.group(1), m.group(2)) if order == "ref_sha" else (m.group(2), m.group(1))
+            full = _commit(repo, sha)
+            t = _ref(repo, ref, tag=rx is _TAG) if ref and ref.lower() not in _NOT_REFS else None
+            if not full or not full.startswith(sha.lower()):
+                continue   # a word or ref name, or another repository's commit
+            taken.append((m.start(), m.end()))
+            out.append((m.start(), m.end(), full, t or _default(p, repo)))
+    from . import claimcheck   # its task and run id rules: the claim is about that id, not this run
+    for m in _LANDED_VERB.finditer(text or ""):
+        lo = max(text.rfind(c, 0, m.start()) for c in ".!?\n") + 1
+        if _NEGATED.search(text[max(0, m.start() - 40):m.start()]) \
+                or claimcheck._TASK.search(text[lo:m.start()]) or claimcheck._RUN.search(text[lo:m.start()]):
+            continue   # hedged, negated, or about another task or run
+        if any(m.start() < e and s < m.end() for s, e in taken):
+            continue
+        out.append((m.start(), m.end(), "", None))
+    return out
+
+
+def correct_landed_claims(p, text: str, repo, head: str = "", tid: int = 0,
+                          remote_missing: bool = False) -> str:
+    """`text` (a hand-off summary or a note) with its landed-claims checked model-free: a phrase
+    saying the run's change landed, was pushed or sits on the push branch stays only when a push
+    receipt (landed.recorded) or the branch's local tracking ref holds the commit it names — the
+    task's `head` when it names none; one the branch disproves is rewritten to read "not landed:
+    <sha> is not on <push branch>", and one this project cannot check keeps its words marked
+    (unverified), never a plain 'landed'. Claims naming another ref are the remote checks' business
+    and are left as written. `remote_missing`: the remote check settled every claim of this task
+    false, so each is rewritten to read 'not landed', whatever ref it named."""
+    from . import landed
+    if not text:
+        return text
+    target = _default(p, repo)
+    receipts = set()
+    if tid:
+        try:
+            receipts = set(landed.recorded(p.db, tid)[0])
+        except Exception:
+            pass
+    fixes = []
+    for start, end, sha, claim_target in landed_claims(p, text, repo):
+        what = sha or head
+        if remote_missing:
+            rc = landed.NOT_YET
+        elif claim_target not in (None, target):
+            continue   # another ref's claim: the remote checks own it
+        elif sha and sha in receipts:
+            continue   # the push queue recorded this landing: the claim stands
+        else:
+            rc, why = landed.check(p, repo, what, fetch=False) if what else (landed.CANNOT, "no commit named")
+        if rc == landed.NOT_YET:
+            where = short_ref(*(claim_target or target)) if (claim_target or target) else "the push branch"
+            fixes.append((start, end, f"{NOT_LANDED}: {what[:12] if what else 'it'} is not on {where}"))
+        elif rc == landed.CANNOT:
+            fixes.append((start, end, text[start:end] + " " + UNVERIFIED_CLAIM))
+    for start, end, fix in sorted(fixes, reverse=True):
+        text = text[:start] + fix + text[end:]
+    return text
 
 
 def _structured(p, result: dict) -> list[dict]:

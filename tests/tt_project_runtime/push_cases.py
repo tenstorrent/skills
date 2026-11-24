@@ -12397,24 +12397,20 @@ def _claim_setup(env, monkeypatch, tmp_path, on_pass):
     return p, dmod.Daemon(p.base), tid, path, head, origin
 
 
-def test_a_checks_pass_done_claiming_a_push_the_remote_lacks_fails_and_never_records_done(env, monkeypatch, tmp_path):
-    """Replay: checks pass, the on_pass done says 'pushed <sha> to <branch>' though nothing was published.
-    The task waits in `pushing` until the remote is asked, then fails naming remote, ref and sha."""
+def test_a_checks_pass_done_claiming_a_push_the_remote_lacks_reads_not_landed_and_goes_to_review(
+        env, monkeypatch, tmp_path):
+    """Replay: checks pass, the on_pass done says 'pushed <sha> to <branch>' though nothing was
+    published. The claim is checked model-free against the push branch: the stored text reads
+    'not landed', and the task goes to its normal review instead of failing on the false word."""
     p, d, tid, path, head, _ = _claim_setup(env, monkeypatch, tmp_path,
                                             {"status": "done", "summary": "pushed {head} to origin/proj"})
     _settle_probe(d, tid)
     task = p.db.task(tid)
-    assert task["status"] == "pushing", (task["status"], task["result"])
-    assert "verifying its claimed push" in task["blocked_reason"]
-    assert (tmp_path / f"run-{tid}" / "push_claim_handoff.json").is_file()
-    assert not p.db.q("SELECT id FROM events WHERE kind='task_done' AND task=?", (tid,))
-    d.verify_pushes()
-    task = p.db.task(tid)
     res = json.loads(task["result"])
-    assert task["status"] != "done" and res["status"] == "failed", (task["status"], res)
-    assert "claimed a push that is not on the remote" in res["summary"]
-    assert f"{head[:12]} is not on origin/proj" in res["summary"]   # remote, ref and sha
-    assert not p.db.q("SELECT id FROM events WHERE kind='task_done' AND task=?", (tid,))
+    assert task["status"] not in ("failed", "pushing"), (task["status"], res)
+    assert "not landed" in res["summary"] and f"{head[:12]} is not on origin/proj" in res["summary"], res
+    assert "pushed" not in res["summary"], res     # the false word is never shown as written
+    assert not p.db.q("SELECT id FROM events WHERE kind='task_failed' AND task=?", (tid,))
 
 
 def test_a_checks_pass_done_whose_claimed_push_is_on_the_remote_is_done_with_the_proof(env, monkeypatch, tmp_path):
@@ -12484,13 +12480,16 @@ def test_a_split_hand_off_that_stopped_its_own_unpublished_push_keeps_its_outcom
     assert not p.db.q("SELECT id FROM events WHERE task=? AND severity IN ('high','critical')", (tid,))
 
 
-@pytest.mark.parametrize("hand", [
-    {"summary": "pushed {head} to origin/proj; continuing the tests"},          # its summary claims it
-    {"summary": "fix committed", "pushed": [{"sha": "{head}", "branch": "proj"}]},  # its pushed list does
-    {"summary": "fix committed and unpublished", "followups": []},              # no split
+@pytest.mark.parametrize("hand, fails", [
+    ({"summary": "pushed {head} to origin/proj; continuing the tests"}, False),   # its summary claims it
+    ({"summary": "fix committed", "pushed": [{"sha": "{head}", "branch": "proj"}]}, True),  # its pushed list
+    ({"summary": "fix committed and unpublished", "followups": []}, True),        # no split
 ])
 def test_a_hand_off_that_claims_a_push_or_does_not_split_still_fails_on_a_stopped_push(
-        env, monkeypatch, tmp_path, hand):
+        env, monkeypatch, tmp_path, hand, fails):
+    """A push the run sent a stop signal claims nothing (its own hand-off says why). A summary's
+    claim is corrected to read 'not landed' (the text claim, never a failure of its own), while a
+    `pushed` list or a split-less hand-off still claims the stopped push and fails as before."""
     p, d, tid, path, head, _ = _claim_setup(env, monkeypatch, tmp_path, {**_SPLIT, **hand})
     if "pushed" in hand:   # _claim_setup fills in only the on_pass strings
         p.db.update_task(tid, result=p.db.task(tid)["result"].replace("{head}", head))
@@ -12501,6 +12500,10 @@ def test_a_hand_off_that_claims_a_push_or_does_not_split_still_fails_on_a_stoppe
     d.verify_pushes()
     task = p.db.task(tid)
     res = json.loads(task["result"])
+    if not fails:   # its summary claimed a push that never happened: corrected, not failed
+        assert task["status"] not in ("failed", "pushing") and "not landed" in res["summary"], (task["status"], res)
+        assert res["status"] != "failed", res
+        return
     assert task["status"] != "done" and res["status"] == "failed", (task["status"], res)
     assert "claimed a push that is not on the remote" in res["summary"] and head[:12] in res["summary"]
 
@@ -12568,9 +12571,14 @@ def test_an_unreadable_remote_keeps_a_claimed_push_waiting_with_backoff_and_fail
         env, monkeypatch, tmp_path):
     from ttp import daemon as dmod, pushclaim
     p, d, tid, path, head, origin = _claim_setup(env, monkeypatch, tmp_path,
-                                                 {"status": "done", "summary": "pushed {head} to origin/proj"})
+                                                 {"status": "done", "summary": "fix shipped",
+                                                  "pushed": [{"sha": "{head}", "ref": "origin/proj"}]})
+    for f in (lambda: p.db.update_task(tid, result=p.db.task(tid)["result"].replace("{head}", head)),
+              lambda: (tmp_path / f"run-{tid}" / "result.json").write_text(
+                  (tmp_path / f"run-{tid}" / "result.json").read_text().replace("{head}", head))):
+        f()   # _claim_setup fills in only the on_pass strings: the structured claim's sha too
     _settle_probe(d, tid)
-    assert p.db.task(tid)["status"] == "pushing"
+    assert p.db.task(tid)["status"] == "pushing"   # a structured push claim still waits on the remote
     _git_out(p.root, "remote", "set-url", "origin", str(tmp_path / "no-such-remote.git"))
     clock = [time.time()]
     fake = types.SimpleNamespace(**{k: getattr(time, k) for k in dir(time) if not k.startswith("_")})

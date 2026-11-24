@@ -7510,6 +7510,16 @@ class Daemon:
             said = str(handoff.get("summary") or "")
             if state == pushclaim.CONFIRMED:
                 handoff = {**handoff, "summary": f"{said} (push verified: {why})"[:1500]}
+            elif state == pushclaim.MISSING and (t := db.task(tid)) and t["kind"] == "code" \
+                    and all(c.get("source") == "its summary" for c in (pv.get("claims") or [])):
+                # A code task's landing is the push queue's job (review, then push): its summary
+                # claiming a landing that never happened is a false word, not a failed push. Correct
+                # the text and let the hand-off go to its normal review; only a run that was itself
+                # meant to push (its markers, its pushed list) fails as before.
+                handoff = {**handoff, "summary": pushclaim.correct_landed_claims(
+                    self.p, said, self.p.root, "", tid, remote_missing=True)[:1500]}
+                log(self.p, f"task {tid}: claimed push is not on the remote; its text is corrected "
+                            f"and it goes to review: {why[:200]}")
             else:
                 if state == pushclaim.UNKNOWN:
                     why = f"the remote could not be read for {int(pushclaim.BOUND_S // 3600)} h: {why}"
@@ -8594,6 +8604,19 @@ class Daemon:
                 reason = (f"its head carries commits of {', '.join(f'#{t}' for t in found)}, whose review failed; "
                           f"sent back once")
                 log(self.p, f"task {task['id']}: run {r.get('id')} {reason}")
+        # A hand-off's claim that its change landed or was pushed is checked model-free against the
+        # push branch (pushclaim.correct_landed_claims): a commit the branch does not hold makes the
+        # stored text read 'not landed', wherever that text goes (result, digest, chat, notes).
+        try:
+            head_sha = pushq._commit(self.p, task["branch"]) if task["branch"] else ""
+            fixed = pushclaim.correct_landed_claims(self.p, summary, self.p.root, head_sha, task["id"])
+        except Exception:   # a fault leaves the text as written
+            fixed = summary
+        if fixed != summary:
+            log(self.p, f"task {task['id']}: its hand-off's landed-claim corrected to: {fixed[:300]}")
+            summary = fixed
+            if isinstance(result, dict):
+                result = {**result, "summary": summary}
         if new == "done" and not approval and not push_verified and status == "ok" \
                 and self._defer_for_push(r, task, run_dir, usage, ended, result, summary):
             return
