@@ -16352,8 +16352,8 @@ class Daemon:
 
     def resume_after_reboot(self) -> None:
         """Right after the reap, start the runs a host reboot cut short, ahead of the tick's slower steps
-        and the post-outage ramp, so they resume within seconds of the daemon starting. Every other
-        dispatch hold applies: pause, settle, host cycle, budget gates and the per-task checks."""
+        and outside the post-outage ramp. Every other dispatch hold applies: pause, settle, host cycle,
+        budget gates and the per-task checks."""
         if self.cfg_status == "unavailable" or self.p.db.kv("paused", False) or self.settling() \
                 or self.host_cycle_held(time.time()):
             return
