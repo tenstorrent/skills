@@ -680,13 +680,13 @@ def _quoting(line: str) -> list[tuple[bool, int]]:
             q = "" if c == '"' else q
         elif c in "'\"":
             q = c
-        elif c == "#" and ((j := _before(line, out, i)) < 0 or (not out[j][0] and line[j] in COMMENT_START_AFTER
+        elif c == "#" and ((j := _read_before(line, out, i)) < 0 or (not out[j][0] and line[j] in COMMENT_START_AFTER
                                                                  and not (line[j] == ")" and in_word))):
             q = "#"
         else:
             inert = False
             if c == "(":
-                j = _before(line, out, i)
+                j = _read_before(line, out, i)
                 opens.append((i, not (j < 0 or (not out[j][0] and line[j] in WORD_START_AFTER))))
                 depth += 1
             elif c == ")":
@@ -701,7 +701,7 @@ def _quoting(line: str) -> list[tuple[bool, int]]:
     return out
 
 
-def _before(line: str, out: list[tuple[bool, int]], i: int) -> int:
+def _read_before(line: str, out: list[tuple[bool, int]], i: int) -> int:
     """Index of the character bash reads before line[i], skipping backslash-newlines (-1: none)."""
     j = i - 1
     while j > 0 and line[j] == "\n" and line[j - 1] == "\\" and out[j][0]:
@@ -712,7 +712,7 @@ def _before(line: str, out: list[tuple[bool, int]], i: int) -> int:
 def _comment_starts(line: str, flags: list[tuple[bool, int]]) -> list[int]:
     """Indexes of the `#`s where _quoting starts a comment: inert, while what bash reads before it is not."""
     return [i for i, c in enumerate(line) if c == "#" and flags[i][0]
-            and ((j := _before(line, flags, i)) < 0 or not flags[j][0])]
+            and ((j := _read_before(line, flags, i)) < 0 or not flags[j][0])]
 
 
 # A character that can start a quoted, escaped or comment run (_quoting)
