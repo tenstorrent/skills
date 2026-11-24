@@ -399,16 +399,26 @@ def daemon_starts(p) -> list[tuple[float, str]]:
     return sorted(out)
 
 
+FIX_CLOCK_SLACK_S = 86400   # committer clocks of other hosts may run behind
+
+
 def fix_live(repo: Any, target: Any, commits: list[str]) -> tuple[float, str]:
     """(when, commit) the fix's `commits` first went live in `target`: the earliest daemon start whose runtime
     holds them after an older start that did not; (0.0, "") when no start on record ran one (pushed, not live)
-    or the oldest start on record already held it (the log no longer shows when it went live)."""
+    or the oldest start on record already held it (the log no longer shows when it went live). A start whose
+    commit is older than the fix cannot hold it and is read without a branch check."""
     from . import landed
+    starts = daemon_starts(target)
+    out = landed._git(repo, "log", "--no-walk", "--ignore-missing", "--format=%H %ct", *commits,
+                      *{c for _, c in starts}).stdout.split()
+    when = dict(zip(out[::2], map(int, out[1::2])))
+    ct = lambda c: next((t for full, t in when.items() if full.startswith(c)), None)   # noqa: E731
+    since = min((ct(c) or 0 for c in commits), default=0) - FIX_CLOCK_SLACK_S
     holds: dict[str, bool] = {}
     before = None
-    for ts, c in daemon_starts(target):
+    for ts, c in starts:
         if c not in holds:
-            full = landed._commit(repo, c)
+            full = landed._commit(repo, c) if (ct(c) or since) >= since else ""
             holds[c] = bool(full) and any(landed.on_branch(repo, x, full) for x in commits)
         if holds[c]:
             return (ts, c) if before is False else (0.0, "")
