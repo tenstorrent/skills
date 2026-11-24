@@ -642,11 +642,18 @@ QUOTING_RUNS = {"": re.compile(r"[^'\"\\#()]+"), "'": re.compile(r"[^']+"), '"':
                 "#": re.compile(r"[^\n]+")}
 
 
+# A `#` starts a comment exactly where bash can start a new word: after one of these characters.
+# Not after a redirect operator (`echo a>#b` names the file `#b`, a comment there is a syntax error)
+# nor after the `)` that closes a $(...) or $((...)): its text joins the current word.
+COMMENT_START_AFTER = " \t\n;&|()"
+
+
 def _quoting(line: str) -> list[tuple[bool, int]]:
     """Per character of `line`: whether it is quoted (or escaped, or in a comment), and the depth
     of parentheses around it. A run of characters that changes neither is copied in one step, so a long
     word costs no per-character loop."""
     out, q, depth, esc, i = [], "", 0, False, 0
+    opens, dollar = [], False   # per open `(`: whether it opened a $(...); `dollar`: the `)` before this one closed one
     while i < len(line):
         if not esc and (m := QUOTING_RUNS[q].match(line, i)):
             out.extend([(q != "", depth)] * (m.end() - i))
@@ -668,12 +675,19 @@ def _quoting(line: str) -> list[tuple[bool, int]]:
             q = "" if c == '"' else q
         elif c in "'\"":
             q = c
-        elif c == "#" and (i == 0 or line[i - 1] in " \t\n;&|("):
+        elif c == "#" and (i == 0 or (line[i - 1] in COMMENT_START_AFTER
+                                      and not (line[i - 1] == ")" and dollar))):
             q = "#"
         else:
             inert = False
-            depth += c == "("
-            depth = max(0, depth - (c == ")"))
+            if c == "(":
+                opens.append(line[i - 1] == "$")
+                depth += 1
+            elif c == ")":
+                dollar = bool(opens.pop()) if opens else False
+                depth = max(0, depth - 1)
+            else:
+                dollar = False
         out.append((inert, depth))
         i += 1
     return out

@@ -716,6 +716,13 @@ MARK_CODE_EFFECT = [   # code that reads or changes the record itself, or gets i
     f": ${{x}} # it's\nrm {_M} # '", f"echo ${{y}} # \"\nrm {_M}\n# \"",
     f"cat <<'EOF'\nx\nEOF\n# it's \\\nrm {_M}\n# '", f"cat > a.md <<'EOF'\nok\nEOF\n# say \"hi \\\nrm {_M}\n# \"",
     f"cat > l.txt <<'EOF'\n{_M}\nEOF\nLESSOPEN='|xargs rm < %s' less l.txt",
+    # a `#` starts a comment wherever bash starts a new word, so a kept comment's quote cannot hide
+    # the next line: also right after `)` (review #9688), never inside a word, after a redirect
+    # operator or after the `)` of a $(...) or $((...)), where it is literal word text
+    f"(true)# it's\nrm {_M} # '", f"cat <<'EOF'\nx\nEOF\n(true)# it's\nrm {_M} # '",
+    *[f"{lead}# it's\nrm {_M} # '" for lead in ("true ", "true\t", "true\n", "true;", "true &", "true |")],
+    f"(# it's\nrm {_M} # '\ntrue)",   # `(`: a comment can open a subshell's first word
+    f"xargs $(true)#note; rm {_M}", f"python3 x.py >#out {_M}",   # no comment starts there
 ]
 MARK_DATA_HEREDOCS = [   # a body only cat or tee writes to another file is data, as is a comment
     f"cat > notes.md <<'EOF'\nthe {_M} record\nEOF", f"tee notes.md <<'EOF'\nthe {_M} record\nEOF",
