@@ -642,10 +642,11 @@ QUOTING_RUNS = {"": re.compile(r"[^'\"\\#()]+"), "'": re.compile(r"[^']+"), '"':
                 "#": re.compile(r"[^\n]+")}
 
 
-# A `#` starts a comment exactly where bash can start a new word: after one of these characters.
-# Not after a redirect operator (`echo a>#b` names the file `#b`, a comment there is a syntax error)
-# nor after the `)` that closes a $(...) or $((...)): its text joins the current word.
-COMMENT_START_AFTER = " \t\n;&|()"
+# A `#` starts a comment exactly where bash starts a new word: after one of these characters, unquoted
+# and unescaped (`a\\ #b` is one word), redirect operators included (`echo a>#b` comments out `#b`).
+# Not after the `)` of a paren that continues a word ($(...), <(...), a=(...), @(...)): the `#` joins it.
+COMMENT_START_AFTER = " \t\n;&|()<>"
+WORD_START_AFTER = " \t\n;&|()"   # a `(` here opens a subshell or (( )); anywhere else it continues a word
 
 
 def _quoting(line: str) -> list[tuple[bool, int]]:
@@ -653,7 +654,7 @@ def _quoting(line: str) -> list[tuple[bool, int]]:
     of parentheses around it. A run of characters that changes neither is copied in one step, so a long
     word costs no per-character loop."""
     out, q, depth, esc, i = [], "", 0, False, 0
-    opens, dollar = [], False   # per open `(`: whether it opened a $(...); `dollar`: the `)` before this one closed one
+    opens, in_word = [], False   # per open `(`: whether it continues a word; `in_word`: the last `)` closed one
     while i < len(line):
         if not esc and (m := QUOTING_RUNS[q].match(line, i)):
             out.extend([(q != "", depth)] * (m.end() - i))
@@ -661,6 +662,7 @@ def _quoting(line: str) -> list[tuple[bool, int]]:
             continue
         c = line[i]
         inert = True
+        bare = i == 0 or not out[i - 1][0]   # the character before is unquoted and unescaped
         if q == "#" and c == "\n":
             q = ""
         if esc:
@@ -675,19 +677,17 @@ def _quoting(line: str) -> list[tuple[bool, int]]:
             q = "" if c == '"' else q
         elif c in "'\"":
             q = c
-        elif c == "#" and (i == 0 or (line[i - 1] in COMMENT_START_AFTER
-                                      and not (line[i - 1] == ")" and dollar))):
+        elif c == "#" and (i == 0 or (bare and line[i - 1] in COMMENT_START_AFTER
+                                      and not (line[i - 1] == ")" and in_word))):
             q = "#"
         else:
             inert = False
             if c == "(":
-                opens.append(i > 0 and line[i - 1] == "$")
+                opens.append(not (bare and (i == 0 or line[i - 1] in WORD_START_AFTER)))
                 depth += 1
             elif c == ")":
-                dollar = bool(opens.pop()) if opens else False
+                in_word = opens.pop() if opens else False
                 depth = max(0, depth - 1)
-            else:
-                dollar = False
         out.append((inert, depth))
         i += 1
     return out

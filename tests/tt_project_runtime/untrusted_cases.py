@@ -717,11 +717,14 @@ MARK_CODE_EFFECT = [   # code that reads or changes the record itself, or gets i
     f"cat <<'EOF'\nx\nEOF\n# it's \\\nrm {_M}\n# '", f"cat > a.md <<'EOF'\nok\nEOF\n# say \"hi \\\nrm {_M}\n# \"",
     f"cat > l.txt <<'EOF'\n{_M}\nEOF\nLESSOPEN='|xargs rm < %s' less l.txt",
     # a `#` starts a comment wherever bash starts a new word, so a kept comment's quote cannot hide
-    # the next line; inside a word, after a redirect operator or after the `)` of a $(...) it is literal
+    # the next line: after each break character, `)` included, and the same after a heredoc
     f"(true)# it's\nrm {_M} # '", f"cat <<'EOF'\nx\nEOF\n(true)# it's\nrm {_M} # '",
-    *[f"{lead}# it's\nrm {_M} # '" for lead in ("true ", "true\t", "true\n", "true;", "true &", "true |")],
+    *[f"{lead}# it's\nrm {_M} # '" for lead in ("true ", "true\t", "true\n", "true;", "true &", "true |",
+                                                "((1))", "case x in x)", "true <", "true >")],
     f"(# it's\nrm {_M} # '\ntrue)",   # `(`: a comment can open a subshell's first word
-    f"xargs $(true)#note; rm {_M}", f"python3 x.py >#out {_M}", f"rm <#in {_M}",   # no comment starts there
+    # inside a word, after an escaped break or after a word's `)` the `#` is literal and cuts nothing
+    f"echo a#b; rm {_M}", f"echo a\\ #b; rm {_M}", f"echo a\\;#b; rm {_M}",
+    f"xargs $(true)#note; rm {_M}", f"cat <(true)#x; rm {_M}", f"a=(1)#x; rm {_M}",
 ]
 MARK_DATA_HEREDOCS = [   # a body only cat or tee writes to another file is data, as is a comment
     f"cat > notes.md <<'EOF'\nthe {_M} record\nEOF", f"tee notes.md <<'EOF'\nthe {_M} record\nEOF",
@@ -729,6 +732,19 @@ MARK_DATA_HEREDOCS = [   # a body only cat or tee writes to another file is data
     f"cat <<'EOF' > a.md\n# {_M}\nthe {_M} record\nEOF", f"git commit -F - <<'EOF'\nthe {_M} record\nEOF",
     f"ls # {_M} note", f"cat > m.txt <<'EOF'\nthe {_M} record\nEOF\nwc -c m.txt",
 ]
+
+
+def test_a_comment_starts_where_bash_starts_a_word():
+    """One rule for every _quoting reader, checked against bash: after an unescaped break character or a
+    redirect, and after a `)` that closes a subshell, (( )) or case pattern, but not one that ends a word."""
+    from ttp.hook import _quoting
+    starts = ["#c", "a #c", "a\t#c", "a;#c", "a&#c", "a|#c", "(#c)", "(a)#c", "((1))#c", "case x in x)#c",
+              "a<#c", "a>#c", "a>>#c"]
+    words = ["a#c", "a\\ #c", "a\\;#c", "a\\)#c", "'a'#c", "{ a;}#c", "$(a)#c", "$((1))#c", "<(a)#c",
+             "a=(1)#c", "@(a)#c"]
+    for cmd in starts + words:
+        i = cmd.index("#c")
+        assert (_quoting(cmd)[i][0] and not _quoting(cmd)[i - 1][0] if i else True) == (cmd in starts), cmd
 
 
 def test_the_noted_receipt_writer_naming_the_record_in_prose_passes(env, tmp_path, monkeypatch):

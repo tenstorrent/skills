@@ -715,12 +715,14 @@ def _mark_uncomment(cmd: str) -> str | None:
     """`cmd` without its comments: from a `#` that starts a word outside quotes to the line's end. None
     (unsure) when `cmd` also has a ${...} expansion or a $'...' quote: a `#` inside one is a literal
     (`${x:- #}`), its end is hard to find (`${x:-'}' #}`, `$'\\' #'`), and a kept comment's quote would
-    hide the next line from the split. Cuts come from _quoting's comment state: a `#` whose comment
-    starts turns the flag on while the break character before it stays off, and no other `#` does."""
+    hide the next line from the split. Also None for a `#` right after an unquoted `)`: a case pattern's
+    `)` inside $(...) or an extglob's makes the paren count unsure. Cuts come from _quoting's comment
+    state: a `#` whose comment starts turns the flag on while the character before it stays off."""
     from .hook import _quoting
     flags = _quoting(cmd)
     cuts = [i for i, c in enumerate(cmd) if c == "#" and flags[i][0] and (i == 0 or not flags[i - 1][0])]
-    if cuts and ("${" in cmd or "$'" in cmd):
+    if cuts and ("${" in cmd or "$'" in cmd) or any(
+            cmd[i - 1:i + 1] == ")#" and not flags[i - 1][0] for i in range(1, len(cmd))):
         return None
     out, end = [], 0
     for i in cuts:
