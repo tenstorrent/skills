@@ -152,6 +152,30 @@ def test_a_sha_less_claim_naming_the_push_branch_is_checked(env, monkeypatch):
         assert "not landed" in fixed and head[:12] in fixed, (text, fixed)
 
 
+def test_a_hand_off_with_a_push_still_in_flight_is_not_locally_corrected(env, monkeypatch, tmp_path):
+    """A hand-off whose run started a push that is still running is settled by the remote check:
+    the local landed-claim check must not write 'not landed' about a push that has not happened
+    yet, into the pushing record that the remote check then verifies."""
+    from ttp.daemon import Daemon
+    from ttp.providers.base import RunUsage as Usage
+    from ttp import push
+    p, repo, head = _claim_replay_setup(env, monkeypatch, landed=False)
+    tid = p.db.add_task("harden the runtime", "s", kind="code", origin="coordinator")
+    p.db.update_task(tid, status="running", branch="ttp/t1")
+    (p.state / push.DETACHED).mkdir(parents=True, exist_ok=True)
+    (p.state / push.DETACHED / f"t{tid}-x.json").write_text(json.dumps(
+        {"run": 9, "status": "running", "target": "origin/proj", "head": head}))
+    run_dir = env["tmp"] / f"run-{tid}"
+    run_dir.mkdir()
+    (run_dir / "result.json").write_text(json.dumps(
+        {"status": "done", "summary": f"Hardening landed at {head[:10]}."}))
+    Daemon(p.base)._finish_worker({"task": tid}, Usage(cost_usd=1.0), "ok", run_dir)
+    task, res = p.db.task(tid), None
+    res = json.loads(task["result"])
+    assert task["status"] == "pushing", (task["status"], res)   # its push is checked on the remote
+    assert res["summary"] == f"Hardening landed at {head[:10]}.", res   # as written, not 'not landed'
+
+
 def test_a_text_claim_the_local_check_cannot_settle_is_corrected_by_the_remote_check(env, monkeypatch, tmp_path):
     """Replay of a code task whose hand-off claims a push that never happened: the local check
     cannot read the branch, so the claim waits for the remote one; when the remote says the push is

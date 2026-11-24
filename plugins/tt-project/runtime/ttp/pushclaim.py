@@ -417,6 +417,23 @@ def _splits(result: dict) -> bool:
                                           for f in fups)
 
 
+def claims_in_flight(p, cs: list[dict]) -> list[dict]:
+    """The claims whose pushes have not written an outcome yet: a detached push still queued or
+    running (not one that ended), and a pushed list nothing has settled. The remote check owns
+    these; a hand-off waiting on them must not first read a local correction about a push that
+    has not happened yet."""
+    out = []
+    for c in cs:
+        if c.get("source") == "its summary":
+            continue   # the local landed-claim check's own domain
+        if "marker" in c:
+            if _read_marker(p, c["marker"]).get("status") in ("queued", "running"):
+                out.append(c)
+        elif c.get("source") == "its pushed list":
+            out.append(c)
+    return out
+
+
 def claims(p, task: dict, result: dict, run: dict | None) -> list[dict]:
     """What a done hand-off claims was pushed: its summary's lines, its `pushed` list and its run's
     detached pushes. Local reads only (no network): it runs inside the run's finishing transaction.

@@ -8622,11 +8622,14 @@ class Daemon:
         # A hand-off's claim that its change landed or was pushed is checked model-free against the
         # push branch (pushclaim.correct_landed_claims): a commit the branch does not hold makes the
         # stored text read 'not landed', wherever that text goes (result, digest, chat, notes).
+        # A hand-off waiting on a push still on its way is settled by the remote check, which
+        # must not find a local correction written about a push that has not happened yet.
+        in_flight = pushclaim.claims_in_flight(self.p, self._claimed_pushes(r, task, result))
         try:
             head_sha = pushq._commit(self.p, task["branch"]) if task["branch"] else ""
             # a hand-off the remote check just confirmed is left as written: its verdict outranks
             # the local tracking ref, which may lag the pushes it confirmed
-            fixed = summary if push_verified else pushclaim.correct_landed_claims(
+            fixed = summary if push_verified or in_flight else pushclaim.correct_landed_claims(
                 self.p, summary, self.p.root, head_sha, task["id"],
                 fetches=self._claim_fetch.get(task["id"]))
         except Exception:   # a fault leaves the text as written
