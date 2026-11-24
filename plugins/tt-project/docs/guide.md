@@ -4373,9 +4373,20 @@ bounded fetch of the branch runs before the write, a fetch that fails marks the 
 "(unverified)" instead of settling it, and a claim the branch does not hold is rewritten to read
 "not landed: <sha> is not on <push branch>". A claim naming a commit is checked as written;
 a sentence naming a sha this repository does not hold is another repository's commit and stays as
-written. A claim naming no commit is checked only when its sentence names the push branch, or says
-"landed" while naming no other destination. Known gap: a sha-less push claim naming another destination
-(the run's own branch, a PR branch, a fork) is not checked.
+written. One parse reads every sha a sentence names, so its rules hold everywhere: case does not
+matter, a negated phrase ("never pushed as <sha>") names no commit, and an all-hex word with no
+digit ("defaced") is a word, not a sha. A claim naming no commit is checked only when its sentence
+names the push branch, or says "landed" while naming no other destination. A done hand-off waiting
+on its own push still in flight is left to the remote check; a blocked, failed or approval-needing
+one is corrected here.
+
+Known gaps (these claims pass unchecked, as written):
+- a sha-less push claim naming another destination (the run's own branch, a PR branch, a fork);
+- any claim in a sentence that also names a sha, with a digit, this repository does not hold;
+- a claim about another task or run (its sentence names that id);
+- a hedged or negated phrase ("should have landed", "not yet pushed"), and wording the parse
+  does not know ("shipped", "made it into main");
+- quoted text written to a script and run later.
 
 ## A report-only next step settles a wait without a model
 

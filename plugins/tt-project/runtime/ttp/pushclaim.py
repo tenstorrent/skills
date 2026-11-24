@@ -150,10 +150,12 @@ def _default(p, repo) -> tuple[str, str] | None:
     return (remote, f"refs/heads/{branch}") if remote in _remotes(repo) else None
 
 
-def _sha_phrases(text: str, repo) -> list[tuple[int, int, str, str, bool]]:
+def _sha_phrases(text: str, repo, foreign: list | None = None) -> list[tuple[int, int, str, str, bool]]:
     """(start, end, sha, ref, is-tag) of each phrase naming a push with a commit: the one parse
     both readers of these phrases follow — same regexes, same negation and one-claim-a-phrase
-    overlap rules; the sha resolves as a commit of `repo`, or the phrase is no claim."""
+    overlap rules; the sha resolves as a commit of `repo`, or the phrase is no claim. `foreign`, when
+    given, gets the (start, end) of each phrase whose sha (it has a digit: 'defaced' is a word)
+    this repository does not hold: a claim about another repository's commit."""
     out, taken = [], []
     for rx, order in ((_TAG, "ref_sha"), (_REF_SHA, "ref_sha"), (_SHA_REF, "sha_ref")):
         for m in rx.finditer(text or ""):
@@ -164,6 +166,8 @@ def _sha_phrases(text: str, repo) -> list[tuple[int, int, str, str, bool]]:
             ref, sha = (m.group(1), m.group(2)) if order == "ref_sha" else (m.group(2), m.group(1))
             full = _commit(repo, sha)
             if not full or not full.startswith(sha.lower()):
+                if foreign is not None and re.search(r"\d", sha):
+                    foreign.append((m.start(), m.end()))
                 continue   # a word or ref name, or another repository's commit
             out.append((m.start(), m.end(), full, ref or "", rx is _TAG))
     return out
@@ -209,18 +213,6 @@ def _names_push_branch(sentence: str, target) -> bool:
     return bool(re.search(rf"(?<![\w.-]){full}(?![\w/-])|(?<![\w/.-]){name}(?![\w/-])", sentence))
 
 
-def _named_sha_missing(sentence: str, repo) -> bool:
-    """Whether a claim's sentence names a commit this repository does not have (another
-    repository's sha, or a mis-typed one), with the sha-phrase parses: the claim is about
-    that commit, which no check here can read, so it stays as written."""
-    for rx in (_TAG, _REF_SHA, _SHA_REF):
-        for m in rx.finditer(sentence):
-            sha = next((g for g in m.groups() if re.fullmatch(r"[0-9a-f]{7,40}", g or "")), None)
-            if sha and not _commit(repo, sha):
-                return True
-    return False
-
-
 def landed_claims(p, text: str, repo) -> list[tuple[int, int, str, tuple]]:
     """The (start, end, sha, target) of each phrase in `text` claiming a landing: the push phrases
     text_claims parses (same regexes, negation and overlap rules; the sha resolved in `repo`), then
@@ -230,10 +222,10 @@ def landed_claims(p, text: str, repo) -> list[tuple[int, int, str, tuple]]:
     or run (its sentence names its id) is left out: the check would read this run's head, not that
     task's. A sentence naming a sha this repository does not hold is left out too: the claim is
     about another repository's commit, no check here can read it."""
-    target = _default(p, repo)
+    target, foreign = _default(p, repo), []
     out = [(start, end, full,
             (_ref(repo, ref, tag=tag) if ref and ref.lower() not in _NOT_REFS else None) or target)
-           for start, end, full, ref, tag in _sha_phrases(text, repo)]
+           for start, end, full, ref, tag in _sha_phrases(text, repo, foreign)]
     taken = [(start, end) for start, end, *_ in out]
     from . import claimcheck   # its task and run id rules: the claim is about that id, not this run
     for m in _LANDED_VERB.finditer(text or ""):
@@ -248,7 +240,7 @@ def landed_claims(p, text: str, repo) -> list[tuple[int, int, str, tuple]]:
         hi = min((i for i in (text.find(c, m.end()) for c in ".!?\n") if i >= m.end()), default=len(text))
         if not _LANDED_SUBJECT.search(text[lo:hi]) or text[m.end():].startswith(" " + UNVERIFIED_CLAIM):
             continue   # not about this run's work, or the claim is already marked
-        if _named_sha_missing(text[lo:hi], repo):
+        if any(lo <= s < hi for s, _ in foreign):
             continue   # names a commit this repo does not have: another repo's business
         # a sha-less claim is a push-branch claim only when its sentence names that branch, or
         # says 'landed' naming no destination: a push or merge to the run's own branch, a PR

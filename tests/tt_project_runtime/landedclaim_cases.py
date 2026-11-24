@@ -139,6 +139,21 @@ def test_a_claim_naming_a_sha_this_repo_does_not_have_stays_as_written(env, monk
         assert pushclaim.correct_landed_claims(p, text, p.root, head) == text, text
 
 
+def test_the_foreign_sha_rule_follows_the_one_sha_phrase_parse(env, monkeypatch):
+    """Review #9726: the sha a sentence names is read by the one sha-phrase parse, so its case,
+    negation and word rules hold here too: an uppercase foreign sha leaves the claim as written; a
+    negated phrase ('never pushed as <sha>') or an all-hex word ('defaced') names no commit, so the
+    sentence's bare claim is still checked against the task head."""
+    from ttp import pushclaim
+    p, repo, head = _claim_replay_setup(env, monkeypatch, landed=False)
+    text = "The fix landed as 1A2B3C4 and the checks passed."
+    assert pushclaim.correct_landed_claims(p, text, p.root, head) == text
+    for text in ("The change landed; the draft was never pushed as 1a2b3c4.",
+                 "The fix landed as defaced."):
+        fixed = pushclaim.correct_landed_claims(p, text, p.root, head)
+        assert "not landed" in fixed and head[:12] in fixed, (text, fixed)
+
+
 def test_a_sha_less_claim_naming_the_push_branch_is_checked(env, monkeypatch):
     """A sha-less claim whose sentence names the push branch is checked against the task head even
     when its verb is a push or a merge: the correction still reads 'not landed' when the branch
@@ -152,10 +167,9 @@ def test_a_sha_less_claim_naming_the_push_branch_is_checked(env, monkeypatch):
         assert "not landed" in fixed and head[:12] in fixed, (text, fixed)
 
 
-def test_a_hand_off_with_a_push_still_in_flight_is_not_locally_corrected(env, monkeypatch, tmp_path):
-    """A hand-off whose run started a push that is still running is settled by the remote check:
-    the local landed-claim check must not write 'not landed' about a push that has not happened
-    yet, into the pushing record that the remote check then verifies."""
+def _in_flight_finish(env, monkeypatch, handoff_status: str):
+    """The daemon's finish of a hand-off (`handoff_status`) claiming 'landed at <head>' while its
+    run's detached push is still running. Returns (task, result, head)."""
     from ttp.daemon import Daemon
     from ttp.providers.base import RunUsage as Usage
     from ttp import push
@@ -168,12 +182,29 @@ def test_a_hand_off_with_a_push_still_in_flight_is_not_locally_corrected(env, mo
     run_dir = env["tmp"] / f"run-{tid}"
     run_dir.mkdir()
     (run_dir / "result.json").write_text(json.dumps(
-        {"status": "done", "summary": f"Hardening landed at {head[:10]}."}))
+        {"status": handoff_status, "summary": f"Hardening landed at {head[:10]}."}))
     Daemon(p.base)._finish_worker({"task": tid}, Usage(cost_usd=1.0), "ok", run_dir)
-    task, res = p.db.task(tid), None
-    res = json.loads(task["result"])
+    task = p.db.task(tid)
+    return task, json.loads(task["result"]), head
+
+
+def test_a_hand_off_with_a_push_still_in_flight_is_not_locally_corrected(env, monkeypatch, tmp_path):
+    """A hand-off whose run started a push that is still running is settled by the remote check:
+    the local landed-claim check must not write 'not landed' about a push that has not happened
+    yet, into the pushing record that the remote check then verifies."""
+    task, res, head = _in_flight_finish(env, monkeypatch, "done")
     assert task["status"] == "pushing", (task["status"], res)   # its push is checked on the remote
     assert res["summary"] == f"Hardening landed at {head[:10]}.", res   # as written, not 'not landed'
+
+
+@pytest.mark.parametrize("handoff_status", ["blocked", "failed"])
+def test_a_hand_off_not_deferred_to_the_remote_check_is_corrected_despite_a_push_in_flight(
+        env, monkeypatch, handoff_status):
+    """Review #9726: only a hand-off the remote check will settle skips the local correction. A
+    blocked or failed one is never deferred, so its false 'landed at <sha>' still reads 'not landed'."""
+    task, res, head = _in_flight_finish(env, monkeypatch, handoff_status)
+    assert task["status"] != "pushing", task["status"]
+    assert "not landed" in res["summary"] and head[:12] in res["summary"], res
 
 
 def test_a_text_claim_the_local_check_cannot_settle_is_corrected_by_the_remote_check(env, monkeypatch, tmp_path):

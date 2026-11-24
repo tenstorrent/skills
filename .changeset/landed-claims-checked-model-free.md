@@ -20,5 +20,11 @@ so the next sentence never changes its destination. A hand-off waiting on a push
 text is left alone until the push lands or is shown missing, never corrected locally about a push
 that has not happened yet.
 
-Known gaps: a sha-less push claim naming another destination is not checked; unusual phrasings pass
-unchecked; quoted text written to a script and run later is not checked.
+The sha a sentence names is read by the one sha-phrase parse, so a foreign sha is matched in any case,
+a negated phrase ('never pushed as <sha>') names none, and an all-hex word with no digit is a word.
+Only a done hand-off the remote check will settle skips the local correction while its push is in
+flight; a blocked, failed or approval-needing one is corrected locally, and its claims are read once.
+
+Known gaps: a sha-less push claim naming another destination is not checked; a sentence that also
+names a foreign sha stays as written; claims about another task or run, hedged phrasing and unusual
+wording pass unchecked; quoted text written to a script and run later is not checked.

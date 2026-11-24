@@ -7425,10 +7425,12 @@ class Daemon:
             log(self.p, f"task {task['id']}: reading its push claims failed: {type(e).__name__}: {e}")
             return []
 
-    def _defer_for_push(self, r: dict, task: dict, run_dir: Path, usage, ended, result, summary: str) -> bool:
-        """A done hand-off that claims a push waits in `pushing` until verify_pushes finds the push on
-        the remote; True when it does. Offline: it runs inside on_pass's finishing transaction."""
-        if not (cs := self._claimed_pushes(r, task, result)):
+    def _defer_for_push(self, r: dict, task: dict, run_dir: Path, usage, ended, result, summary: str,
+                        cs: list[dict]) -> bool:
+        """A done hand-off that claims a push (`cs`, its _claimed_pushes) waits in `pushing` until
+        verify_pushes finds the push on the remote; True when it does. Offline: it runs inside
+        on_pass's finishing transaction."""
+        if not cs:
             return False
         db, now = self.p.db, time.time()
         saved = dict(result) if isinstance(result, dict) else {}
@@ -8622,9 +8624,12 @@ class Daemon:
         # A hand-off's claim that its change landed or was pushed is checked model-free against the
         # push branch (pushclaim.correct_landed_claims): a commit the branch does not hold makes the
         # stored text read 'not landed', wherever that text goes (result, digest, chat, notes).
-        # A hand-off waiting on a push still on its way is settled by the remote check, which
-        # must not find a local correction written about a push that has not happened yet.
-        in_flight = pushclaim.claims_in_flight(self.p, self._claimed_pushes(r, task, result))
+        # A hand-off deferred to the remote check while a push is still on its way is settled there,
+        # and must not carry a local correction written about a push that has not happened yet; a
+        # hand-off that is not deferred (blocked, failed, needing approval) is corrected here.
+        defers = new == "done" and not approval and not push_verified and status == "ok"
+        cs = self._claimed_pushes(r, task, result) if defers else []
+        in_flight = pushclaim.claims_in_flight(self.p, cs)
         try:
             head_sha = pushq._commit(self.p, task["branch"]) if task["branch"] else ""
             # a hand-off the remote check just confirmed is left as written: its verdict outranks
@@ -8641,8 +8646,9 @@ class Daemon:
             summary = fixed
             if isinstance(result, dict):
                 result = {**result, "summary": summary}
-        if new == "done" and not approval and not push_verified and status == "ok" \
-                and self._defer_for_push(r, task, run_dir, usage, ended, result, summary):
+            if defers:   # what the corrected text still claims (a disproven claim waits on no remote check)
+                cs = self._claimed_pushes(r, task, result)
+        if defers and self._defer_for_push(r, task, run_dir, usage, ended, result, summary, cs):
             return
         if new in ("done", "pushing"):
             self._mark_verified(task, approval, extra)
