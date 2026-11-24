@@ -37,8 +37,9 @@ def _sr_events(p):
 
 
 def _sr_runs(p, status=None):
-    return p.db.q("SELECT id, priority, status FROM tasks WHERE origin='schedule' AND labels=?"
-                  + (" AND status=?" if status else ""), (json.dumps(["daily-review"]),) + ((status,) if status else ()))
+    from ttp import schedule as sched
+    return p.db.q(f"SELECT id, priority, status FROM tasks WHERE {sched.RUN_SQL}"
+                  + (" AND status=?" if status else ""), ("daily-review",) + ((status,) if status else ()))
 
 
 def _sr_check(d):
@@ -63,6 +64,30 @@ def test_a_healthy_project_raises_nothing_and_calls_no_model(env, monkeypatch):
     assert not called and not _sr_events(p) and len(_sr_runs(p)) == 1
     assert p.db.kv(selfreview.STATE_KEY) is None
     assert selfreview.line(p.db, time.time(), d.cfg["created"]) == "self-review: last ran 5 h ago"
+
+
+def test_a_review_run_with_an_extra_label_is_its_periods_run_and_clears_the_overdue_episode(env):
+    """A daily-review run that gained a label later (an urgent stamp) was missed by an exact-list match,
+    so an older receipt read as the last and the project stayed overdue: membership finds it."""
+    from ttp import selfreview
+    p = make(env)
+    d = _sr_daemon(p)
+    _sr_receipt(p, 30)
+    _sr_work(p)
+    _sr_check(d)
+    run = _sr_runs(p, "queued")
+    assert len(run) == 1 and p.db.kv(selfreview.STATE_KEY), "overdue: one run queued"
+    rid = run[0]["id"]
+    p.db.x("UPDATE tasks SET labels=?, status='done', result=? WHERE id=?",
+           (json.dumps(["daily-review", "urgent_since:1700000000"]), json.dumps({"summary": "ok"}), rid))
+    p.db.x("INSERT INTO runs(task, role, started, ended, status) VALUES(?,?,?,?,?)",
+           (rid, "worker", time.time() - 120, time.time() - 60, "done"))
+    _sr_check(d)
+    assert p.db.kv(selfreview.STATE_KEY) is None and not p.db.q(
+        "SELECT id FROM events WHERE source='daemon:self-review' AND status='queued'")
+    assert len(_sr_runs(p)) == 2 and not _sr_runs(p, "queued"), "no second run for the period"
+    assert selfreview.line(p.db, time.time(), d.cfg["created"]) == "self-review: last ran 0 h ago"
+    assert not selfreview.active_since(p.db, time.time() - 1800), "its own run is no activity"
 
 
 def test_an_idle_project_is_not_overdue(env):

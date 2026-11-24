@@ -10098,8 +10098,8 @@ class Daemon:
         spent = sched.spent_today(db, s["name"]) if s["budget_usd_day"] is not None else 0.0
         if s["budget_usd_day"] is not None and spent >= float(s["budget_usd_day"]) - 0.005:
             return f"{held}: daily budget used"
-        open_ = db.one("SELECT id, created FROM tasks WHERE origin='schedule' AND labels=? AND status NOT IN "
-                       "('done','failed','cancelled') ORDER BY id DESC LIMIT 1", (json.dumps([s["name"]]),))
+        open_ = db.one(f"SELECT id, created FROM tasks WHERE {sched.RUN_SQL} AND status NOT IN "
+                       "('done','failed','cancelled') ORDER BY id DESC LIMIT 1", (s["name"],))
         if open_:
             age, hold = time.time() - float(open_["created"] or 0), sched.open_run_hold_s(s)
             if age < hold:
@@ -10464,9 +10464,8 @@ class Daemon:
         db = self.p.db
         return bool(db.one("SELECT id FROM messages WHERE direction='in' AND ts>?", (since,))
                     or db.one("SELECT runs.id FROM runs LEFT JOIN tasks ON tasks.id=runs.task "
-                              "WHERE runs.role!='coordinator' AND (runs.started>? OR runs.ended>?) AND NOT "
-                              "(COALESCE(tasks.origin,'')='schedule' AND COALESCE(tasks.labels,'')=?)",
-                              (since, since, json.dumps([schedule]))))
+                              f"WHERE runs.role!='coordinator' AND (runs.started>? OR runs.ended>?) AND NOT ({sched.RUN_SQL})",
+                              (since, since, schedule)))
 
     def observe(self, source: str, text: str, hint: str | None = None, rewake_after_s: float | None = None,
                 repeat: bool = False, lifecycle: str | None = None, whole: bool = False,
@@ -16935,7 +16934,7 @@ class Daemon:
             if c.get("kind") == machine_ledger.POWER_CYCLE and isinstance(at, (int, float)) \
                     and -machine_ledger.POWER_CYCLE_LEAD_S <= self.boot_at - at <= hostcycle.WINDOW_S:
                 who = f"machine change #{c.get('id')}" + (f" by {c['by']}" if c.get("by") else "")
-                return {"reason": str(c.get("what") or ""), "path": who, "planner": who, "project": self.p.name}
+                return {"reason": str(c.get("what") or ""), "path": who, "planner": who, "project": str(c.get("by") or "")}
         return None
 
     def _notice_cycle(self, boot: str) -> dict | None:
@@ -16954,7 +16953,7 @@ class Daemon:
         why = f"the device broker announced a power cycle of this host ({n.get('state') or 'announced'}: " \
               f"{n.get('reason') or 'no reason given'})"
         where = str(n.get("path") or "its power-cycle notice")
-        return {"reason": why, "path": where, "planner": f"the device broker ({where})", "project": self.p.name}
+        return {"reason": why, "path": where, "planner": f"the device broker ({where})", "project": ""}
 
     def _other_projects(self) -> list[str]:
         """The names of this user's other projects (the registry), longest first; [] when unreadable."""

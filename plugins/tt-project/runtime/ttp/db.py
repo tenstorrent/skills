@@ -1395,8 +1395,17 @@ def unplanned_abrupt(boot: dict) -> bool:
     return boot.get("shutdown") != "orderly" and not boot.get("planned")
 
 
+def _planned_by(planned: dict) -> str:
+    """Who planned a reboot: the project that did, else its planner without the record in parentheses
+    ("the device broker"), so a reboot no project planned is never put on this one."""
+    project = str(planned.get("project") or "")
+    if re.fullmatch(r"[\w.-]+", project):
+        return project
+    return re.sub(r"\s*\(.*\)\s*$", "", str(planned.get("by") or ""))[:60].strip()
+
+
 def host_line(boots: list[dict], where=None) -> str:
-    """'host: N reboots in 24 h (K planned: by <project>) (last HH:MM <zone>: <cause>), M runs cut short:
+    """'host: N reboots in 24 h (K planned: by <project, else its planner>) (last HH:MM <zone>: <cause>), M runs cut short:
     R resumed (K with work kept, $B), L not restarted, $A of work lost' for the boots of the last day, as
     DB.boots returns them, in the home zone `where`; '' when there were none. A run a later run resumed
     kept its work; one a later run of its task followed was restarted. The cause is what the last boot's
@@ -1411,8 +1420,7 @@ def host_line(boots: list[dict], where=None) -> str:
     kept_usd = sum(float(x.get("usd") or 0) for x in kept)
     lost_usd = max(0.0, sum(float(b.get("lost_usd") or 0) for b in boots) - kept_usd)
     planned = [b for b in boots if b.get("planned")]
-    by = sorted({str(b["planned"]["project"]) for b in planned
-                 if isinstance(b["planned"], dict) and re.fullmatch(r"[\w.-]+", str(b["planned"].get("project") or ""))})
+    by = sorted({_planned_by(b["planned"]) for b in planned if isinstance(b["planned"], dict)} - {""})
     from .timefmt import short
     last = short(float(boots[-1]["ts"]), where)
     ini = boots[-1].get("initiator") if isinstance(boots[-1].get("initiator"), dict) else {}

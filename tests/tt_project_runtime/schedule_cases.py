@@ -552,6 +552,16 @@ def test_a_suggested_daily_cap_is_runs_a_day_times_the_median_run_cost_and_needs
     assert sched.below_suggestion(p.db) == [] and not any("under their suggestion" in x for x in audit.lines(p.db, p=p))
     sched.upsert(p.db, "watch", "command", "1h", payload={"command": "true"})
     _finished_runs(p, "watch", [1.0] * 3)
+    # A run that carries a later label (an urgent stamp) is still one of its runs, counted once.
+    tid = p.db.add_task("[filler] urgent run", "x", origin="schedule")
+    p.db.x("UPDATE tasks SET labels=?, status='done', spent_usd=? WHERE id=?",
+           (json.dumps(["filler", "urgent_since:1700000000"]), 3.0, tid))
+    p.db.x("UPDATE tasks SET labels='not json' WHERE id=(SELECT MIN(id) FROM tasks)")   # never raises
+    hint = sched.suggest_cap(p.db, row())
+    assert hint == {"runs_day": 24, "median_usd": 0.2, "runs": 10, "usd": 6.0}, hint
+    assert sched.suggest_cap(p.db, row(), n=1) is None and \
+        [r["spent_usd"] for r in p.db.q(f"SELECT spent_usd FROM tasks WHERE {sched.RUN_SQL} ORDER BY id DESC LIMIT 1",
+                                        ("filler",))] == [3.0]
     assert sched.suggest_cap(p.db, p.db.one("SELECT * FROM schedules WHERE name='watch'")) is None, "llm only"
 
 
@@ -1581,10 +1591,13 @@ def test_a_completed_window_is_not_run_again_and_a_failed_one_is_retried_and_the
     assert len(_window_tasks(p)) == 4
 
 
+@pytest.mark.parametrize("labels", [["filler"], ["filler", "urgent_since:1700000000"]])
 @pytest.mark.parametrize("age_h, held", [(0.5, True), (2.0, False)])
-def test_an_open_run_holds_its_schedule_only_for_one_period(env, age_h, held):
+def test_an_open_run_holds_its_schedule_only_for_one_period(env, age_h, held, labels):
     """A run stuck open (waiting, never closed) held its llm schedule forever; now it holds the next
-    trigger for the schedule's own period only, then the trigger admits and the release is logged."""
+    trigger for the schedule's own period only, then the trigger admits and the release is logged.
+    A label added to the run later (an urgent stamp) leaves it the schedule's run."""
+    from ttp import schedule as sched
     from ttp.daemon import Daemon
     p = make(env)
     d = Daemon(p.base)
@@ -1592,10 +1605,10 @@ def test_an_open_run_holds_its_schedule_only_for_one_period(env, age_h, held):
     _filler(p, skip_if_idle=False)   # every 1 h
     tid = p.db.add_task("[filler] open", "x", origin="schedule")
     p.db.x("UPDATE tasks SET labels=?, status='waiting', created=? WHERE id=?",
-           (json.dumps(["filler"]), time.time() - age_h * 3600, tid))
+           (json.dumps(labels), time.time() - age_h * 3600, tid))
     d.run_schedules()
     status = p.db.one("SELECT last_status FROM schedules WHERE name='filler'")["last_status"]
-    n = p.db.one("SELECT COUNT(*) n FROM tasks WHERE origin='schedule' AND labels=?", (json.dumps(["filler"]),))["n"]
+    n = p.db.one(f"SELECT COUNT(*) n FROM tasks WHERE {sched.RUN_SQL}", ("filler",))["n"]
     log = (p.logs / "daemon.log").read_text() if (p.logs / "daemon.log").exists() else ""
     if held:
         assert status == "skipped: previous run still open" and n == 1, status

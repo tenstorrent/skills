@@ -67,9 +67,8 @@ def record_off(db: DB, name: str, enabled: bool | None, by: str, user: bool, now
 
 def _task(db: DB, done: bool) -> dict | None:
     """The latest daily-review run task: the latest done one with a summary (its receipt), or the latest at all."""
-    rows = db.q("SELECT id, status, result, spec, blocked_reason, created, updated FROM tasks WHERE origin='schedule' "
-                "AND labels=?" + (" AND status='done'" if done else "") + " ORDER BY id DESC LIMIT 20",
-                (json.dumps([NAME]),))
+    rows = db.q(f"SELECT id, status, result, spec, blocked_reason, created, updated FROM tasks WHERE {sched.RUN_SQL}"
+                + (" AND status='done'" if done else "") + " ORDER BY id DESC LIMIT 20", (NAME,))
     if not done:
         return rows[0] if rows else None
     return next((r for r in rows if _summary(r)), None)
@@ -96,8 +95,7 @@ def active_since(db: DB, since: float) -> bool:
     return bool(db.one("SELECT id FROM messages WHERE direction='in' AND ts>? AND COALESCE(provenance,'')!='system' "
                        "LIMIT 1", (since,))
                 or db.one("SELECT runs.id FROM runs LEFT JOIN tasks ON tasks.id=runs.task WHERE runs.role!='coordinator' "
-                          "AND (runs.started>? OR runs.ended>?) AND NOT (COALESCE(tasks.origin,'')='schedule' AND "
-                          "COALESCE(tasks.labels,'')=?) LIMIT 1", (since, since, json.dumps([NAME]))))
+                          f"AND (runs.started>? OR runs.ended>?) AND NOT ({sched.RUN_SQL}) LIMIT 1", (since, since, NAME)))
 
 
 def skip_cause(status: str) -> str:

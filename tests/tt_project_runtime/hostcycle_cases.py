@@ -681,6 +681,7 @@ def test_an_abrupt_reboot_the_device_broker_announced_relaunches_the_task_that_h
         assert t["status"] == "queued" and tid in [x["id"] for x in p.db.ready_tasks()], dict(t)
         cycle = d._planned_cycle("an-earlier-boot")
         assert "device broker" in cycle["planner"] and "tray 2 dropped" in cycle["reason"], cycle
+        assert cycle["project"] == "", "no project planned the broker's cycle"
     else:
         assert t["status"] == "blocked" and "held board" in t["blocked_reason"], dict(t)
         assert d._planned_cycle("an-earlier-boot") is None
@@ -1474,3 +1475,28 @@ def test_the_reboot_record_and_host_line_say_when_in_the_home_zone_and_why(env, 
     assert "Kernel fault before it: out of memory" in feed or "kernel fault before it: out of memory" in feed, feed
     line = dbm.host_line(p.db.boots(0), p)
     assert f"(last {back}: someuser ran `reboot` via sudo (journal); kernel: out of memory: " in line, line
+
+
+def test_the_host_line_puts_a_planned_reboot_on_whoever_planned_it_never_on_this_project():
+    from ttp import db as dbm
+    boot = lambda planned: {"ts": time.time() - 600, "shutdown": "abrupt", "planned": planned}
+    broker = {"reason": "the device broker announced a power cycle", "record": "/run/notice.json",
+              "by": "the device broker (/run/notice.json)", "project": ""}
+    line = dbm.host_line([boot(broker)])
+    assert "(1 planned: by the device broker)" in line, line
+    ledger = {"reason": "kernel update", "record": "machine change #3 by other-proj",
+              "by": "machine change #3 by other-proj", "project": "other-proj"}
+    line = dbm.host_line([boot(broker), boot(ledger)])
+    assert "(2 planned: by other-proj, the device broker)" in line, line
+
+
+def test_a_ledger_power_cycle_is_put_on_the_project_that_recorded_it(env, monkeypatch):
+    from ttp import machine_ledger as ml
+    from ttp.daemon import Daemon
+    p, _q = _hold_setup(env, monkeypatch)
+    d = Daemon(p.base)
+    d.boot_at = time.time()
+    p.db.set_kv("boot_prev", {"prev_boot": "an-earlier-boot", "boot": next(iter(d.boots))})
+    ml.add_power_cycle("testhost", "1m", "other", why="kernel update")
+    cycle = d._ledger_cycle("an-earlier-boot")
+    assert cycle and cycle["project"] == "other" and cycle["planner"].endswith(" by other"), cycle

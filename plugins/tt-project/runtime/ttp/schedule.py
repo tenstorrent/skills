@@ -56,6 +56,12 @@ from zoneinfo import ZoneInfo
 from .db import DB
 from . import timefmt
 
+# A schedule's run task: origin 'schedule' with the schedule's name (the one bound `?`) among its labels.
+# Labels added later (an urgent_since: stamp) ride along, so membership, never the exact list; a malformed
+# labels column reads as no labels instead of raising in json_each.
+RUN_SQL = ("COALESCE(tasks.origin,'')='schedule' AND EXISTS (SELECT 1 FROM json_each(CASE WHEN "
+           "json_valid(tasks.labels) THEN tasks.labels ELSE '[]' END) WHERE value=?)")
+
 _EVERY = re.compile(r"^\s*(\d+)\s*([smhdw])\s*$")
 _UNIT = {"s": 1, "m": 60, "h": 3600, "d": 86400, "w": 7 * 86400}
 
@@ -340,8 +346,8 @@ def suggest_cap(db: DB, row: dict, n: int = CAP_RUNS) -> dict | None:
     if row.get("kind") != "llm" or not int(row.get("every_s") or 0):
         return None
     costs = [float(r["spent_usd"]) for r in db.q(
-        "SELECT spent_usd FROM tasks WHERE origin='schedule' AND labels=? AND status IN ('done','failed','cancelled') "
-        "AND spent_usd > 0 ORDER BY id DESC LIMIT ?", (json.dumps([row["name"]]), n))]
+        f"SELECT spent_usd FROM tasks WHERE {RUN_SQL} AND status IN ('done','failed','cancelled') "
+        "AND spent_usd > 0 ORDER BY id DESC LIMIT ?", (row["name"], n))]
     if len(costs) < CAP_MIN_RUNS:
         return None
     costs.sort()
