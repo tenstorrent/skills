@@ -741,8 +741,8 @@ def _mark_data_bodies(cmd: str) -> str:
     from .hook import HEREDOC_RE, READERS, _chain, _data_body, _data_only, _heredocs, _pieces, _runs_inside
     # a comment ending in a backslash must not swallow the line after it: _heredocs joins
     # backslash-newlines before comments are cut, so cut such a comment tail at its own line first.
-    # shortcut: the cut also hits a heredoc body line ending in a backslash; its comment tail is
-    # gone from the body, which no interpreter reads as code once the tail holds no command
+    # shortcut: the cut also hits a heredoc body line ending in a backslash, dropping its
+    # comment-shaped tail from the body; for a shell reading the body that tail was a comment
     cmd = "\n".join(_mark_uncomment(line) if line.endswith("\\") else line for line in cmd.split("\n"))
     lines, bodies = _heredocs(cmd)
     if not bodies:
