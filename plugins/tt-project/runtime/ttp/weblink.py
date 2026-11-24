@@ -113,9 +113,10 @@ def local(p, url: str | None, repair: bool = True) -> tuple[str, int]:
     return bad_line(what, why, tried), UNVERIFIED
 
 
-def link(p) -> str | None:
+def link(p, db=None) -> str | None:
+    """`db`: the caller's own connection, for threads the daemon's p.db does not belong to."""
     from .web import token
-    port = (p.db.kv("web") or {}).get("port") or p.config().get("web", {}).get("port")
+    port = ((db or p.db).kv("web") or {}).get("port") or p.config().get("web", {}).get("port")
     return f"http://127.0.0.1:{port}/#token={token(p)}" if port else None
 
 

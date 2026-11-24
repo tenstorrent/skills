@@ -744,6 +744,7 @@ def web_seen(db: DB, seen: int) -> None:
 
 def state_payload(p: Project, db: DB) -> dict:
     from . import links   # the web app's rendering of what chats read: references linkified
+    lc = links.config(p, db)   # named apart from the project config below (cfg)
     now = time.time()
     tz = timefmt.zone(p)
     tasks = db.q("SELECT id,title,kind,status,priority,tier,provider,budget_usd,spent_usd,attempts,max_attempts,"
@@ -826,7 +827,7 @@ def state_payload(p: Project, db: DB) -> dict:
                        "WHERE status IN ('open','tracking') ORDER BY last_seen DESC LIMIT 100"),
         "schedules": sched.with_costs(db, timefmt.home(p)),
         # the web app's rendering of the same messages the user reads in chats: links, not raw text
-        "attention": [{**a, "text": links.linkify(a["text"], links.config(p))} for a in attention(db, now, p)],
+        "attention": [{**a, "text": links.linkify(a["text"], lc)} for a in attention(db, now, p)],
         "notify": notify_state(p, db),
         "secrets": secrets_state(),
         "feed": sorted(alerts.feed(db, now) + uncommitted_feed(db) + startgate.feed(db, warn_s, now)
@@ -919,13 +920,14 @@ class Handler(BaseHTTPRequestHandler):
                 q = parse_qs(url.query)
                 after = int(q.get("after", ["0"])[0])
                 from . import links
+                cfg = links.config(self._proj(), db)   # this request's own connection, one config
                 rows = db.q("SELECT m.id,m.ts,m.direction,m.chat,m.channel,m.kind,m.severity,"
                             # a relayer's findings have no user's words: show the findings, labeled
                             "CASE m.kind WHEN 'finding' THEN 'relayer findings: ' || COALESCE(m.context,'') "
                             "ELSE m.text END text,c.label chat_label FROM messages m LEFT JOIN chats c ON c.id=m.chat "
                             "WHERE m.id>? ORDER BY m.id LIMIT 300", (after,))
                 for r in rows:
-                    r["text"] = links.linkify(r["text"], links.config(self._proj()))
+                    r["text"] = links.linkify(r["text"], cfg)
                 return self._send(200, rows)
             if url.path == "/api/file":
                 # The read-only file view a message's file link opens: the project tree and the

@@ -42,7 +42,6 @@ KIND = {"task": "task", "run": "run", "review": "task", "msg": "msg", "message":
 TABLES = {"task": "tasks", "run": "runs", "msg": "messages"}   # where each kind of id lives
 # A path-like token: at least one '/', then an optional :line or :line-line suffix kept in the text.
 PATH = r"(?<![\w`~/.-])(?P<p>(?:~|\.{1,2})?/?(?:[\w.+@-]+/)+[\w.+@-]+)(?P<line>:\d+(?:-\d+)?)?"
-TICKETS = "links.jira_keys"   # the settings name appears in the check's findings
 
 
 def _ticket_re(cfg: dict) -> str:
@@ -126,7 +125,7 @@ def problems(text: str, cfg: dict) -> list[str]:
             continue
         if cfg.get("is_file") and cfg["is_file"](m.group("p")) and not (file_url and file_url(m.group("p"))):
             out.append(f"project file {m.group('p')} has no link (no web app file view)")
-    ref = cfg.get("ref_url")
+    ref = cfg.get("ref_ok") or cfg.get("ref_url")
     for m in ID_REF_RE.finditer(text):
         if any(a <= m.start() < b for a, b in taken):
             continue
@@ -145,12 +144,13 @@ SECRET_RE = re.compile(r"secret|credential|passwd|password|token|\.pem$|\.key$|\
 _GIT_CACHE: dict[tuple, dict] = {}   # (repo root, sha, remote) -> {"files": set, "base": str, "single": str}
 
 
-def config(p) -> dict:
+def config(p, db=None) -> dict:
     """The `cfg` linkify() reads, from the project's settings and repo. The git lookups are cached
     for the process; a settings change is picked up on the next start."""
     links = p.config().get("links") or {}
     repo = _git_cfg(p, links)
-    web = _web_base(p)
+    web = _web_base(p, db)
+    exists = _exists(p, db)
 
     def file_url(path: str) -> str | None:
         if (repo and repo["files"] and path in repo["files"] and repo["base"]):
@@ -167,21 +167,27 @@ def config(p) -> dict:
             "jira_keys": [str(k) for k in (links.get("jira_keys") or [])],
             "repos": links.get("repos") or {},
             "single_repo": (repo or {}).get("single", str(links.get("repo") or "")),
-            "file_url": file_url, "is_file": is_file, "ref_url": _ref_url(p, web)}
+            "file_url": file_url, "is_file": is_file, "ref_ok": exists, "ref_url": _ref_url(p, web, exists)}
 
-def _ref_url(p, web):
-    """A project id -> its web app page ('' when the web app has no link): a task, run or message
-    row must exist for the number, so a #N that resolves to nothing is never given a guessed page."""
-    def ref(n: int, kind: str):
-        if not web:
-            return None
+def _exists(p, db):
+    """Whether id `n` names a record of `kind` ('' = the id kinds in turn). `db` is the caller's
+    own connection: p.db belongs to the thread that opened it."""
+    def exists(n: int, kind: str) -> bool:
         try:
-            for k in ((kind,) if kind else ("task",)):
-                if p.db.one(f"SELECT 1 FROM {TABLES[k]} WHERE id=?", (n,)):
-                    return f"{web}&{k}={n}"
-        except Exception:   # a closed or missing db never breaks a message
-            return None
-        return None
+            return any((db or p.db).one(f"SELECT 1 FROM {TABLES[k]} WHERE id=?", (n,))
+                       for k in ((kind,) if kind else ("task",)))
+        except Exception:   # a db fault never breaks a message
+            return False
+    return exists
+
+
+def _ref_url(p, web, exists):
+    """A project id -> its web app page, None when the id names no record (never a guessed page)."""
+    if not web:
+        return None   # no page to link to: leave ids as written rather than label every one wrong
+    def ref(n: int, kind: str):
+        k = KIND.get(kind, kind) or "task"   # a bare '#N' pages as the task it names
+        return f"{web}&{k}={n}" if exists(n, kind) else None
     return ref
 
 
@@ -201,7 +207,7 @@ def readable(p, path: str) -> Path | None:
     return None if SECRET_RE.search(q.name) else q
 
 
-def _web_base(p) -> str | None:
+def _web_base(p, db) -> str | None:
     """The web app's own link (its pages hang off its token fragment), None when there is none.
     links.web_base is the address the user opens the web app at, when it differs from what the
     web app itself reports."""
@@ -211,7 +217,7 @@ def _web_base(p) -> str | None:
         if set_:
             return f"{set_}/#token={token(p)}"
         from . import weblink
-        return weblink.link(p)
+        return weblink.link(p, db)
     except Exception:
         return None
 
@@ -219,12 +225,13 @@ def _web_base(p) -> str | None:
 def _git_cfg(p, links: dict) -> dict | None:
     """The repo's file list at the pushed commit, the blob base for links to it, and the project's
     own GitHub repo, cached per process; None when the project has no git repo or push branch."""
-    from .push import _git, targets_tip, target
+    from .push import _git, targets_tip
     repo = Path(p.root)
     if _git(repo, "rev-parse", "--show-toplevel").returncode != 0:
         return None
     ref = str((p.config().get("delivery") or {}).get("push_branch") or "")
-    key = (str(repo), ref, str(links.get("repo") or ""))
+    tip = targets_tip(repo, ref) if ref else ""
+    key = (str(repo), ref, tip, str(links.get("repo") or ""))
     if key not in _GIT_CACHE:
         sha = ""
         base = files = single = ""

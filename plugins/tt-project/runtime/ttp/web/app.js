@@ -11,7 +11,8 @@ const isHttp = (url) => /^https?:\/\//i.test(String(url || ""));
 const link = (url, label) => isHttp(url) ? `<a href="${esc(url)}" target="_blank" rel="noopener">${label}</a>` : label;
 const ago = R.ago;
 // Message text arrives linkified (markdown [text](url)); only http(s) targets become anchors.
-const mdLinks = (html) => html.replace(/\[([^\]]+)\]\((https?:\/\/[^)\s]+)\)/g, (m, t, u) => link(u, t));
+const mdLinks = (html) => html.replace(/\[([^\]]+)\]\((https?:\/\/[^)\s]+)\)/g, (m, t, u) => link(u.replace(/&amp;/g, "&"), t));
+// ^ the fragment's & separators arrive &amp;-escaped from esc(); a URL keeps its real &
 const showFile = async (path) => {
   const r = await api("/api/file?path=" + encodeURIComponent(path));
   const v = $("#fileview");
@@ -381,7 +382,7 @@ async function refresh() {
   document.title = `${unseen ? "(" + unseen + ") " : ""}${st.project.name} · tt-project`;
   board(st);
   const muted = (s) => [{ key: "empty", html: `<p class="muted">${s}</p>` }];
-  const attn = (st.attention || []).map((m) => ({ key: `${m.kind}:${m.id}`, html: `<div class="attn"><span class="when">${agoH(m.ts)} ago · ${m.kind === "ask" ? "ask " + m.id + (m.auto ? "; " + esc(m.auto) : "") : "problem"}</span><div>${esc(m.text)}</div></div>` }));
+  const attn = (st.attention || []).map((m) => ({ key: `${m.kind}:${m.id}`, html: `<div class="attn"><span class="when">${agoH(m.ts)} ago · ${m.kind === "ask" ? "ask " + m.id + (m.auto ? "; " + esc(m.auto) : "") : "problem"}</span><div>${mdLinks(esc(m.text))}</div></div>` }));
   R.rows($("#attention"), attn.length ? attn : muted("Nothing needs you right now."));
   const feed = (st.feed || []).map((m) => ({ key: m.id != null ? `id:${m.id}` : `${m.kind}:${m.ts}:${m.text}`, html: `<div class="row"><span class="when">${agoH(m.ts)} ago</span>` +
     `<span class="meta">${m.state === "cleared" ? "cleared" + (m.cleared_at ? " " + at(m.cleared_at) : "") : m.state === "status" ? "status, clears itself" : m.state === "acked" ? "acknowledged" + (m.acked_why ? ": " + esc(m.acked_why) : "") : esc(m.kind === "alert" ? "note" : m.kind)}</span>` +

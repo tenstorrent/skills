@@ -128,8 +128,14 @@ def test_the_web_app_linkifies_its_messages_and_asks(env):
             req = urllib.request.Request(f"http://127.0.0.1:{srv.server_address[1]}{path}",
                                          headers={"X-TTP-Token": tok} if tok else {})
             return json.loads(urllib.request.urlopen(req, timeout=10).read())
+        p.db.set_kv("web", {"port": 9})   # a web app link exists: ids resolve to its pages
+        task = p.db.x("INSERT INTO tasks(created,title,spec) VALUES(?,?,?)", (0, "t", ""))
+        p.db.post("out", f"#{task} finished", kind="reply", severity="normal")
         rows = [r for r in get("/api/messages") if "EX-8" in r["text"]]
         assert rows and "](https://example.atlassian.net/browse/EX-8)" in rows[0]["text"], rows
+        # an id reference resolves from the web app's own thread and connection, not p.db
+        id_rows = [r for r in get("/api/messages") if f"#{task}" in r["text"]]
+        assert id_rows and f"&task={task}" in id_rows[0]["text"], id_rows
         assert any("](https://example.atlassian.net/browse/EX-9)" in a["text"]
                    for a in web.state_payload(p, p.db)["attention"])
         # a file link opens exactly what /api/file serves, and nothing outside the project tree
@@ -162,6 +168,16 @@ def test_ids_link_to_their_web_app_page_and_unresolved_ones_get_labelled(env):
     p.set_config("links.web_base", "https://example.org/app")
     assert "https://example.org/app/#token=" in links.for_user(p, f"#{task}")
     assert links.problems("#4 needs a look", links.config(p)) and links.problems(f"#{task} done", links.config(p)) == []
+
+
+def test_an_alert_text_reaches_the_user_linkified_from_a_fresh_connection(env):
+    from ttp import notifier
+    p = make(env)
+    p.db.set_kv("web", {"port": 8123})
+    task = p.db.x("INSERT INTO tasks(created,title,spec) VALUES(?,?,?)", (0, "t", ""))
+    p.db.post("out", f"alert about #{task}", kind="alert", severity="high")
+    rows = [r for r in notifier.alerts_since(p, 0, "high") if not r.get("cleared")]
+    assert rows and f"#{task} (" in rows[0]["text"] and f"&task={task}" in rows[0]["text"], rows
 
 
 def test_the_check_command_names_what_a_message_left_unlinked(env, capsys):
