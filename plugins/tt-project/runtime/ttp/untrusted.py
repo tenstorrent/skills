@@ -712,18 +712,14 @@ def _mark_words(cmd: str) -> list[str] | None:
 
 
 def _mark_uncomment(cmd: str) -> str:
-    """`cmd` without its comments: from a `#` that starts a word outside quotes and outside a
-    ${...} expansion (a `#` there is a literal, not a comment) to the line's end."""
+    """`cmd` without its comments: from a `#` that starts a word outside quotes to the line's end. With a
+    ${...} expansion in `cmd` nothing is cut: a `#` inside one is a literal (`${x:- #}`), and its end is
+    hard to find (`${x:-'}' #}`)."""
     from .hook import _quoting
+    if "${" in cmd:
+        return cmd
     flags = _quoting(cmd)
-    cuts, depth = [], 0   # depth: inside a ${...} parameter expansion
-    for i, c in enumerate(cmd):
-        if c == "}" and depth:
-            depth -= 1
-        elif c == "{" and i and cmd[i - 1] == "$" and not flags[i - 1][0]:
-            depth += 1
-        elif c == "#" and not depth and (i == 0 or cmd[i - 1] in " \t\n;&|(" and not flags[i - 1][0]):
-            cuts.append(i)
+    cuts = [i for i, c in enumerate(cmd) if c == "#" and (i == 0 or cmd[i - 1] in " \t\n;&|(" and not flags[i - 1][0])]
     out, end = [], 0
     for i in cuts:
         if i >= end:
@@ -733,20 +729,17 @@ def _mark_uncomment(cmd: str) -> str:
 
 
 def _mark_data_bodies(cmd: str) -> str:
-    """`cmd` with comments cut from its command lines (_mark_uncomment; body lines stay as written,
-    bar a comment tail ending in a backslash, cut before the join below) and without the bodies
-    of heredocs that are only data: a quoted delimiter on a cat (or another _data_body piece) or on
+    """`cmd` with comments cut from its command lines (_mark_uncomment; body lines stay as written) and without
+    the bodies of heredocs that are only data: a quoted delimiter on a cat (or another _data_body piece) or on
     a tee into files, neither piped on, while every other command is only data too (_data_only), so none
-    reads the file back into code (`xargs rm < list.txt`)."""
+    reads the file back into code (`xargs rm < list.txt`). A comment ending in a backslash keeps everything:
+    _heredocs joins backslash-newlines, which would stretch the comment over the next line."""
     from .hook import HEREDOC_RE, READERS, _chain, _data_body, _data_only, _heredocs, _pieces, _runs_inside
-    # a comment ending in a backslash must not swallow the line after it: _heredocs joins
-    # backslash-newlines before comments are cut, so cut such a comment tail at its own line first.
-    # shortcut: the cut also hits a heredoc body line ending in a backslash, dropping its
-    # comment-shaped tail from the body; for a shell reading the body that tail was a comment
-    cmd = "\n".join(_mark_uncomment(line) if line.endswith("\\") else line for line in cmd.split("\n"))
     lines, bodies = _heredocs(cmd)
     if not bodies:
         return _mark_uncomment(cmd)
+    if re.search(r"#[^\n]*\\\n", cmd):
+        return cmd
     bare = _mark_uncomment("\n".join(lines)).split("\n")
     text = "\n".join(bare)
 

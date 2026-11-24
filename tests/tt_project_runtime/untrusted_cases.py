@@ -709,6 +709,8 @@ MARK_CODE_EFFECT = [   # code that reads or changes the record itself, or gets i
     f"cat <<'EOF'\nx\nEOF\necho hi # note \\\nrm {_M}",
     f"cat > a.md <<'EOF'\nok\nEOF\n# c \\\nrm {_M}",
     f": ${{x:- #}} ; rm {_M}",
+    f": ${{x:-'}}' #}} ; rm {_M}", f": ${{x:-\\}} #}} ; rm {_M}",
+    f"perl -e '$x = q(\n #); unlink \"{_M}\"; \\\n0'",   # a `#` in a multi-line quote, its line ending in a backslash
     f"cat > l.txt <<'EOF'\n{_M}\nEOF\nLESSOPEN='|xargs rm < %s' less l.txt",
 ]
 MARK_DATA_HEREDOCS = [   # a body only cat or tee writes to another file is data, as is a comment
