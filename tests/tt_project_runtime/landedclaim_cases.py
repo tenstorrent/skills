@@ -93,7 +93,8 @@ def test_a_push_of_something_else_is_no_landing_claim(env, monkeypatch):
                  "Pushed the fix to my branch for review.",
                  "Merged main into the work branch and reran the tests.",
                  "Pushed branch ttp/t12-x and opened a draft PR.",
-                 "The change landed in the upstream repository."):
+                 "The change landed in the upstream repository.",
+                 "The change landed onto my/repo."):
         assert pushclaim.correct_landed_claims(p, text, p.root, head) == text, text
 
 
