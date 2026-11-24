@@ -1390,6 +1390,32 @@ def test_gh_workstation_retire_runs_again_after_a_failed_delete_and_finds_a_tip_
     assert ghqueue.retire(branch, str(repo)) == 0 and len(sent) == n
 
 
+def test_gh_retire_accepts_this_projects_own_single_push_receipt_and_still_refuses_other_receipts(
+        env, monkeypatch, capsys):
+    """A single `ttp push --own` writes status/exit/own and no `outcome` into its receipt: a pushed one
+    to the same remote branch shows the project pushed it, as a batch's `outcome` does. A failed push,
+    one not of an own branch, one to another branch and a receipt of neither schema still do not."""
+    from ttp import ghqueue, ghroute
+    p, repo, _origin, _other = _push_setup(env, monkeypatch, ["true"])
+    _workstation(env, monkeypatch)
+    monkeypatch.chdir(repo)
+    monkeypatch.setattr(ghroute, "_value", lambda cfg=None, cwd=None: ghroute.WORKSTATION)
+    monkeypatch.setattr(ghqueue, "repo_of", lambda cwd: "acme/widgets")
+    branch = "ttp/t8-single"
+    (p.state / "pushes").mkdir(parents=True, exist_ok=True)
+    own = {"status": "pushed", "exit": 0, "own": True, "task": 8, "run": "r1",
+           "target": f"origin/{branch}", "head": "0" * 40}
+    for receipt, owned in ((own, True), ({**own, "status": "failed", "exit": 1}, False),
+                           ({**own, "own": False}, False), ({**own, "target": "origin/ttp/t9-other"}, False),
+                           ({"target": f"origin/{branch}", "pushed": True}, False)):
+        (p.state / "pushes" / "1.json").write_text(json.dumps(receipt))
+        capsys.readouterr()
+        assert ghqueue.retire(branch, str(repo)) == 1   # no tip here in either case
+        err = capsys.readouterr().err
+        assert ("no publish or push record" in err) != owned, (receipt, err)
+        assert owned == ("tip is not here to save first" in err), (receipt, err)
+
+
 def test_gh_retire_runs_with_this_hosts_own_logged_in_gh_while_the_route_is_unset(env, monkeypatch):
     """`ttp push --retire` with delivery.gh_route unset and this host's gh logged in: the open-PR read and
     the branch delete run with that gh at once, through answer()'s same checks, nothing queued for a
