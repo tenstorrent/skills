@@ -74,8 +74,9 @@ _TAG = re.compile(rf"\bpushed\s+(?:the\s+)?tag\s+{_REF}\s+(?:at|to|on)\s+{_SHA}"
 _REF_SHA = re.compile(rf"\b(?:pushed|landed)\s+(?:to|on|onto)\s+{_REF}\s+(?:as|at)\s+{_SHA}", re.I)
 _SHA_REF = re.compile(rf"\b(?:pushed|landed)\s+(?:commit\s+)?(?:as\s+|at\s+)?{_SHA}(?:\s+(?:to|on|onto)\s+{_REF})?",
                       re.I)
-_NEGATED = re.compile(r"(?:\bnot|\bnever|n't|\bbe|\bwill|\bwould|\bto)"
-                      r"(?:\s+(?:yet|been|being|get|got|gotten|already|actually|really|ever))*\s+$", re.I)
+_NEGATED = re.compile(r"(?:\bnot|\bnever|n't|\bbe|\bwill|\bwould|\bto"
+                      r"|(?:\b(?:should|may|might|could|must)\s+have)"
+                      r")(?:\s+(?:yet|been|being|get|got|gotten|already|actually|really|ever))*\s+$", re.I)
 _NOT_REFS = {"the", "a", "an", "it", "its", "origin", "remote", "github", "branch", "upstream"}
 # A claim that the run's change landed, naming no commit: "the change landed", "it was pushed".
 _LANDED_VERB = re.compile(r"(?i)\b(landed|pushed|merged)\b")
@@ -92,8 +93,18 @@ _LANDED_SUBJECT = re.compile(r"(?i)\b(?:changes?|works?|fix(es)?|patch(es)?|comm
 _LANDED_DEST = re.compile(r"(?i)\b(?:upstream|forks?|repo(?:sitory)?s?|pull request|pr|main|master"
                            r"|trunk|(?!(?:the|this)\s+branch)\w+\s+branch(?:es)?)\b")
 _SLASH_DEST = re.compile(r"(?i)\b(?:into|onto|to|on)\s+([a-z0-9_./-]+/[a-z0-9_./-]+)")
+# A reply's claim that its own change is deployed: a be-verb + "live" ("is live", "went live"),
+# "deployed", or "in the running version". A live sentence must also name the work itself
+# (_LIVE_SUBJECT), so "the fix is live" is a claim and "we have live users" is not.
+_LIVE_CLAIM = re.compile(r"(?i)\b(?:is|are|was|were|be|been|being|goes|went|gone|comes?|came)"
+                         r"(?:\s+\w+){0,2}?\s+live\b|\bdeployed\b|\bin the running version\b")
+_LIVE_SUBJECT = re.compile(r"(?i)\b(?:changes?|works?|fix(es)?|patch(es)?|commits?|head|branch(es)?"
+                           r"|pr|diffs?|checks?|guards?|watchers?|routes?|flags?|prompts?|plugins?|"
+                           r"versions?)\b")
+_SHA_SCAN = re.compile(r"(?<![0-9a-f])[0-9a-f]{7,40}(?![0-9a-f])")
 UNVERIFIED_CLAIM = "(unverified)"      # a landed-claim this project cannot check, never a plain 'landed'
 NOT_LANDED = "not landed"              # the correction a claim off the push branch reads
+NOT_LIVE = "not live yet"            # the correction a claim the running version lacks reads
 
 
 def _git(repo, *args: str, timeout: float = 30) -> subprocess.CompletedProcess:
@@ -250,6 +261,83 @@ def landed_claims(p, text: str, repo) -> list[tuple[int, int, str, tuple]]:
             continue
         out.append((m.start(), m.end(), "", None))
     return out
+
+
+def live_claims(text: str, repo) -> list[tuple[int, int, str]]:
+    """The (start, end, sha) of each phrase in `text` claiming a change of this project is live in
+    the running version: a be-verb + "live" ("is live", "went live"), "deployed" or "in the running
+    version", under the same sentence splitting, negation/hedge, task/run-id and
+    one-claim-a-phrase rules as landed_claims. The sha is the first commit of its sentence the
+    repository holds, else "": a live line must name one."""
+    out, taken = [], []
+    from . import claimcheck   # its task and run id rules: the claim is about that id, not this run
+    for m in _LIVE_CLAIM.finditer(text or ""):
+        if re.search(r"\b(?:not|never|n't)\b", m.group(0)):
+            continue   # "is not live (yet)" claims nothing
+        lo = max(text.rfind(c, 0, m.start()) for c in ".!?\n") + 1
+        hi = min((i for i in (text.find(c, m.end()) for c in ".!?\n") if i >= m.end()), default=len(text))
+        if _NEGATED.search(text[max(0, m.start() - NEG_WINDOW):m.start()]) \
+                or claimcheck._TASK.search(text[lo:m.start()]) or claimcheck._RUN.search(text[lo:m.start()]):
+            continue   # hedged, negated, or about another task or run
+        if any(m.start() < e and s < m.end() for s, e in taken) or not _LIVE_SUBJECT.search(text[lo:hi]):
+            continue   # a phrase landed_claims owns, or a sentence not about this project's own work
+        toks = _SHA_SCAN.findall(text[lo:hi])
+        sha = next((w for w in toks if _commit(repo, w)), "")
+        if not sha and any(re.search(r"\d", w) for w in toks):
+            continue   # names a sha this repository does not hold: another repository's business
+        taken.append((m.start(), m.end()))
+        out.append((m.start(), m.end(), sha))
+    return out
+
+
+def _in_running(repo, sha: str, running: str) -> bool | None:
+    """Whether `sha` is an ancestor of (or equals) `running`, the commit the daemon's own receipt
+    names; None when that cannot be told (no running commit, or git failed)."""
+    if not running:
+        return None
+    return {0: True, 1: False}.get(_git(Path(repo), "merge-base", "--is-ancestor", sha, running).returncode)
+
+
+def correct_reply_claims(p, text: str, repo, running: str = "") -> str:
+    """A coordinator reply or notify `text` with its landed/live claims checked model-free, the
+    way a hand-off's are (correct_landed_claims): a 'landed'/'pushed' line must name a commit the
+    push branch holds, a 'live' one a commit the running version contains; a line that names none,
+    or whose commit fails the check, is rewritten in place to read "not landed"/"not live yet"
+    with why. A claim this project cannot check keeps its words marked (unverified), never a false
+    'not landed'. `running`: the commit of the runtime the project's daemon is running."""
+    from . import landed
+    if not text:
+        return text
+    target, fetches, fixes = _default(p, repo), {}, []
+    for start, end, sha, claim_target in landed_claims(p, text, repo):
+        if claim_target not in (None, target):
+            continue   # another ref's claim: the remote checks own it
+        if not sha or not target:   # a reply's landed line names its commit; none is a failed claim
+            fixes.append((start, end, f"{NOT_LANDED}: no commit named" if target and not sha
+                          else text[start:end] + " " + UNVERIFIED_CLAIM))
+            continue
+        rc, why = landed.check(p, repo, sha, fetch=False)
+        if rc == landed.NOT_YET and target and _fetch(Path(repo), *target, fetches):
+            rc, why = landed.check(p, repo, sha, fetch=False)   # the local tracking ref may lag a landing
+        elif rc == landed.NOT_YET:
+            rc, why = (landed.CANNOT, "cannot fetch the push branch")
+        if rc == landed.NOT_YET:
+            fixes.append((start, end, f"{NOT_LANDED}: {sha[:12]} is not on {short_ref(*target)}"))
+        elif rc == landed.CANNOT and not text[end:].startswith(" " + UNVERIFIED_CLAIM):
+            fixes.append((start, end, text[start:end] + " " + UNVERIFIED_CLAIM))
+    for start, end, sha in live_claims(text, repo):
+        if text[end:].startswith(" " + UNVERIFIED_CLAIM):   # already marked, never twice
+            continue
+        where = _in_running(repo, sha, running)
+        if where is None and not sha:
+            fixes.append((start, end, f"{NOT_LIVE}: no commit named"))
+        elif where is None:
+            fixes.append((start, end, text[start:end] + " " + UNVERIFIED_CLAIM))
+        elif not where:
+            fixes.append((start, end, f"{NOT_LIVE}: {sha[:12]} is not in the running version"))
+    for start, end, fix in sorted(fixes, reverse=True):
+        text = text[:start] + fix + text[end:]
+    return text
 
 
 def correct_landed_claims(p, text: str, repo, head: str = "", tid: int = 0,

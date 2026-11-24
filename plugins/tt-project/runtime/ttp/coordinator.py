@@ -2725,6 +2725,32 @@ def _pending_checked(p: Project, text: str, notes: list, what: str) -> str:
     return text
 
 
+def _running_commit(p: Project) -> str:
+    """The commit of the runtime this daemon runs, from its own receipt; "" when this process is
+    not the daemon that holds it (a worker applying actions, a test)."""
+    from . import identity
+    return str((identity.running(p.state, os.getpid()) or {}).get("commit") or "")
+
+
+def _deploy_checked(p: Project, text: str, notes: list) -> str:
+    """A reply or notify as pushclaim.correct_reply_claims posts it: a 'landed' line names a commit
+    the push branch holds and a 'live' one a commit the running version contains; any other is
+    marked in place ('not landed'/'not live yet'). Any fault posts the text unchanged: a message
+    is never lost to this check."""
+    try:
+        from . import pushclaim
+        fixed = pushclaim.correct_reply_claims(p, text, p.root, _running_commit(p))
+        if fixed != text:
+            notes.append("pushclaim: a 'landed'/'live' line in your message named no commit, or a "
+                         "commit the push branch / the running version does not hold; it went marked "
+                         "'not landed'/'not live yet'. A line claiming a landing or liveness names its commit")
+        return fixed
+    except Exception as e:
+        notes.append(f"pushclaim: the landed/live-claim check failed ({type(e).__name__}: {e}); "
+                     f"the message went unchecked")
+        return text
+
+
 def _claims_checked(p: Project, a: dict, notes: list) -> tuple[str, list]:
     """A reply or notify as claimcheck.check sends it: a status claim that did not hold goes prefixed with what is
     true, one nothing could check with '(unverified)' after it. Returns (text, the false claims)."""
@@ -2895,6 +2921,7 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                 a["text"] = _wakemode_checked(p, a["text"], notes)
                 a["text"] = _pending_checked(p, a["text"], notes, "reply")
                 a["text"], false = _claims_checked(p, a, notes)
+                a["text"] = _deploy_checked(p, a["text"], notes)
                 if (text := chatdigest.checked(db, cfg, a["text"], a, chat, notes, twins=(dup := []))) is None:
                     twins += [(m, c, list(a.get("delivers") or []), authored) for m, c in dup]
                     if not dup and held is not None:   # held for the digest: it answers no order (order_gap)
@@ -3821,6 +3848,7 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                 a["text"] = _wakemode_checked(p, a["text"], notes)
                 a["text"] = _pending_checked(p, a["text"], notes, "notify")
                 a["text"], false = _claims_checked(p, a, notes)
+                a["text"] = _deploy_checked(p, a["text"], notes)
                 if (text := chatdigest.checked(db, cfg, a["text"], a, None, notes)) is None:
                     workernotify.handled(db, said)
                     continue

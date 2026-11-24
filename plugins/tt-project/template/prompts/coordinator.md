@@ -31,6 +31,7 @@ Each user message a turn handles gets its order (`key`+`order` links an open obl
 reason on a reply or noop (`order` names it); else it comes back once. A change or device order's owner is no
 question, plan or review task. A reply reporting a run's result lists its run ids in `cites`; one already
 cited in that chat is refused unless `repeat` is true (the user asked again).
+A 'landed' or 'live' line in a reply or notify names its commit (on the push branch / in the running version); the harness marks a line that does not check out.
 A reply or notify saying something holds carries `claims`: `{text, task|action|expect, due}` (`action`: this
 batch's task_add index; `expect`: read-only probe, rc 0 = holds; `state`: task status). Check it live first. Act on every `Must act now` item
 in the same turn: start, re-order or close it, or a `noop` whose `why` names its key and what is

@@ -326,3 +326,120 @@ def test_the_daemon_s_finish_transaction_marks_a_claim_it_cannot_check(env, monk
     '(unverified)', never left reading a plain 'landed'."""
     p, res = _daemon_finish(env, monkeypatch, fetchable=False)
     assert "(unverified)" in res["summary"] and "not landed" not in res["summary"], res["summary"]
+
+
+# The reply-path check: a coordinator reply or notify's own 'landed'/'live' lines are checked
+# against the push branch and the daemon's running commit before the message is sent.
+
+_REPLY_4303 = (
+    "The 'landed' check is live on every project (tt-project 0.2.1525). When a run says it "
+    "landed something, the harness now checks the push branch without a model, and the message "
+    "reads 'not landed' if the commit isn't there.\n\n"
+    "The rollback-count fix is live too. another project's GLM device stops that already-live fixes "
+    "covered no longer count, so only 1 of its 6 counts (the refused git push). GLM device work "
+    "in tt-buddy stays off until the broker-only check (task #9695) is live. I'll turn it back "
+    "on then and tell you.")
+
+_REPLY_4310 = (
+    "The project's GLM code route is back on since 10:30 PST. Both failed runs behind its 05:47 PST "
+    "switch-off were cut by the dev box's reboots; without them it's 0 of 22 "
+    "failed. Runs a host reboot or crash kills no longer count toward any switch-off, on every "
+    "flag and project (task #9712).\n\n"
+    "another project's GLM device route: its fix is in a second review, so it's later than the 10:05 "
+    "PST I gave. Likely live about 12:30 PST; I turn the route on then and tell you.\n\n"
+    "Daily GLM code report: GLM landed 38 code tasks since 11-18, at about Opus's rate and a bit "
+    "cheaper ($3.66 vs $4.26 per landing). But fewer pass review first time (55% vs 62%) and they "
+    "take twice as long to land (102 vs 50 min median). GLM did 45% of model-hours here in the "
+    "last 24 h. All 10 bounces to Opus were guard stops; none got through.")
+
+
+def test_a_reply_s_false_live_lines_are_marked_and_true_ones_pass(env, monkeypatch):
+    """Replay of the 09:41 reply: its two 'live' lines name no commit, so both
+    are marked 'not live yet: no commit named' before the reply is sent."""
+    from ttp import pushclaim
+    p, repo, head = _claim_replay_setup(env, monkeypatch, landed=True)
+    base = _git_out(repo, "rev-parse", "HEAD~1")
+    expected = ("The 'landed' check not live yet: no commit named on every project (tt-project "
+                "0.2.1525). When a run says it not landed: no commit named something, the harness "
+                "now checks the push branch without a model, and the message reads 'not landed' "
+                "if the commit isn't there.\n\nThe rollback-count fix not live yet: no commit "
+                "named too. another project's GLM device stops that already-live fixes covered no longer "
+                "count, so only 1 of its 6 counts (the refused git push). GLM device work in "
+                "tt-buddy stays off until the broker-only check (task #9695) is live. I'll turn "
+                "it back on then and tell you.")
+    fixed = pushclaim.correct_reply_claims(p, _REPLY_4303, p.root, running=head)
+    assert fixed == expected, (fixed, expected)   # every line, whole: the gap shows here
+    # a true live line: the named commit is an ancestor of the running one
+    text = f"The fix is live (commit {base})."
+    assert pushclaim.correct_reply_claims(p, text, p.root, running=head) == text
+    # a landed line naming a commit on the push branch passes; one that names none is marked
+    assert pushclaim.correct_reply_claims(p, f"Hardening landed at {head[:10]}.", p.root) == \
+        f"Hardening landed at {head[:10]}."
+    fixed = pushclaim.correct_reply_claims(p, "The fix landed.", p.root)
+    assert "not landed: no commit named" in fixed, fixed
+    _commit(repo, "off-branch.txt", "off\n")            # a commit the push branch does not hold
+    off = _git_out(repo, "rev-parse", "HEAD")
+    _git_out(repo, "reset", "-q", "--hard", head)
+    fixed = pushclaim.correct_reply_claims(p, f"Hardening landed at {off[:10]}.", p.root)
+    assert f"not landed: {off[:12]} is not on origin/proj" in fixed, fixed
+
+
+def test_a_reply_with_no_landed_or_live_claim_goes_unchanged(env, monkeypatch):
+    """Replay of the GLM report reply: its 'landed'/'live' words are about other tasks and
+    other projects, so none is a claim and the reply posts exactly as written."""
+    from ttp import pushclaim
+    p, repo, head = _claim_replay_setup(env, monkeypatch, landed=True)
+    assert pushclaim.correct_reply_claims(p, _REPLY_4310, p.root, running=head) == _REPLY_4310
+
+
+def test_a_live_claim_naming_a_commit_the_running_version_lacks_is_marked(env, monkeypatch):
+    """A 'live' line naming a commit the daemon's running version does not contain reads 'not
+    live yet'; a version number instead of a commit is no commit at all."""
+    from ttp import pushclaim
+    p, repo, head = _claim_replay_setup(env, monkeypatch, landed=True)
+    _commit(repo, "side.txt", "side\n")
+    side = _git_out(repo, "rev-parse", "HEAD")   # a commit the running version does not hold
+    _git_out(repo, "reset", "-q", "--hard", head)
+    fixed = pushclaim.correct_reply_claims(p, f"The fix is live (commit {side[:10]}).", p.root, running=head)
+    assert f"not live yet: {side[:10]} is not in the running version" in fixed, fixed
+    fixed = pushclaim.correct_reply_claims(p, "The fix is live (0.2.1525).", p.root, running=head)
+    assert "not live yet: no commit named" in fixed, fixed
+    # a sha this repository does not hold is another repo's commit: unchecked, as written
+    fixed = pushclaim.correct_reply_claims(p, "The fix is live (commit 9aa4c1f88ea7).", p.root, running=head)
+    assert fixed == "The fix is live (commit 9aa4c1f88ea7).", fixed
+    # the running version unknown: a live claim naming a commit cannot be checked, so it is
+    # marked (unverified), never left reading a plain 'live'
+    fixed = pushclaim.correct_reply_claims(p, f"The fix is live (commit {head[:10]}).", p.root)
+    assert "(unverified)" in fixed and "not live yet" not in fixed, fixed
+
+
+def test_hedged_landed_and_live_claims_are_not_claims(env, monkeypatch):
+    """'should have landed' and its hedge kin hedge a landed claim out of existence (the
+    ponytail-lane follow-up); the unhedged sha-less landed claim is still corrected."""
+    from ttp import pushclaim
+    p, repo, head = _claim_replay_setup(env, monkeypatch, landed=False)
+    for text in ("The fix should have landed.", "The fix may have landed.",
+                 "The fix might have landed.", "The fix could have landed.",
+                 "The fix should have gone live."):
+        assert pushclaim.correct_reply_claims(p, text, p.root, running=head) == text, text
+    fixed = pushclaim.correct_reply_claims(p, "The fix landed.", p.root)
+    assert "not landed: no commit named" in fixed, fixed
+
+
+def test_the_reply_path_marks_a_false_live_line_before_sending(env, monkeypatch):
+    """The whole send path: a reply action claiming a landing or liveness the push branch and the
+    running version do not hold is posted marked, and the coordinator is told in its notes."""
+    from ttp import coordinator as coord
+    p, repo, head = _claim_replay_setup(env, monkeypatch, landed=True)
+    (p.state / "heartbeat").write_text(json.dumps(
+        {"pid": os.getpid(), "receipt": {"pid": os.getpid(), "commit": head}}))
+    coord.apply(p, [{"type": "reply", "chat": "c1", "text": _REPLY_4303}])
+    sent = p.db.q("SELECT text FROM messages WHERE direction='out' AND kind='reply'")
+    assert len(sent) == 1, sent
+    assert "not live yet: no commit named" in sent[0]["text"], sent[0]["text"]
+    # the rejection note reaches the coordinator in its next digest (NOTES_KEY)
+    assert any("names its commit" in n for n in p.db.kv(coord.NOTES_KEY) or []), p.db.kv(coord.NOTES_KEY)
+    # an ordinary answer with no claim posts as written
+    notes = coord.apply(p, [{"type": "reply", "chat": "c1", "text": "On it. I'll report by 14:00."}])
+    sent = p.db.q("SELECT text FROM messages WHERE direction='out' AND kind='reply' ORDER BY id DESC LIMIT 1")
+    assert sent[0]["text"] == "On it. I'll report by 14:00." and not notes, (sent, notes)
