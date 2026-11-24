@@ -2742,8 +2742,9 @@ def _deploy_checked(p: Project, text: str, notes: list) -> str:
         fixed = pushclaim.correct_reply_claims(p, text, p.root, _running_commit(p))
         if fixed != text:
             notes.append("pushclaim: a 'landed'/'live' line in your message named no commit, or a "
-                         "commit the push branch / the running version does not hold; it went marked "
-                         "'not landed'/'not live yet'. A line claiming a landing or liveness names its commit")
+                         "commit the push branch / the running version does not hold; it went "
+                         "marked 'not landed'/'not live yet' or '(unverified)'. A line claiming a "
+                         "landing or liveness names its commit")
         return fixed
     except Exception as e:
         notes.append(f"pushclaim: the landed/live-claim check failed ({type(e).__name__}: {e}); "

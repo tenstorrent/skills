@@ -4396,14 +4396,17 @@ Known gaps (these claims pass unchecked, as written):
 - quoted text written to a script and run later.
 
 Known gaps of the reply check:
-- the hedges cover "should/may/might/could have" (perfect), not "should be live", which reads
-  as a forecast and passes as written;
+- the hedges cover "should/may/might/could have" (perfect), not "should be live": a forecast
+  naming no commit is marked "not live yet" like a claim (the hedge window sits before the
+  matched be-verb, so "should be" cannot hedge it);
 - the settled sha-less landed parse marks a sentence that only describes the check itself (it
   says "landed" and "the push branch"): a reply explaining the rule can be marked as a claim;
 - "live" is checked by ancestry against the daemon receipt's commit, which only a project whose
   own repository holds the runtime's commits can read; elsewhere the line reads "(unverified)";
 - a 'landed'/'live' line about another project's repo names a commit this repository does not
   hold, so it passes as another repository's business;
+- "becomes live" is not parsed ("become live" needs "be", already matched, but the be-verb
+  list has no "become"), so it passes as written;
 - a mid-turn `ttp urgent-reply` posts before the turn's checks run.
 
 ## A report-only next step settles a wait without a model
