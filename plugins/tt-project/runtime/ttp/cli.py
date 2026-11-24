@@ -3704,6 +3704,7 @@ def cmd_push(a) -> None:
     (`delivery.push_queue`). `--move-tag <tag> <commit>` moves a delivery.channel_tags tag forward
     (channeltag.move). Exit codes are in `push.py`."""
     from . import push
+    gitmemo.forget_repo()   # as `ttp checks`: the worktree is the cwd, whatever repository a caller's GIT_DIR names
     if a.result:
         sys.exit(push.result(Path(a.result), pushed_only=a.pushed))
     kept = {k: os.environ.get(k) for k in (push.OWN_BRANCH_ENV, push.LAND_ENV)}
@@ -4601,6 +4602,9 @@ def _cmd_checks(a) -> None:
     # it this was started: a repo-relative check started in a subdirectory would test the wrong place.
     # Which worktree that is, the line naming it and the stale-tree warning: checktree.
     from . import checktree
+    # The worktree is the cwd or --worktree, never a caller's GIT_DIR or GIT_WORK_TREE: git would follow them
+    # past `-C`, check their tree under this one's name and take every repository for theirs.
+    gitmemo.forget_repo()
     # Real paths: checks.pid and checks.json record them, and a re-queue cds there, never through a link.
     where = os.path.realpath(getattr(a, "worktree", None) or str(Path.cwd()))
     if not Path(where).is_dir():
@@ -4616,7 +4620,6 @@ def _cmd_checks(a) -> None:
     head = pinned or subprocess.run([*git, "rev-parse", "HEAD"], capture_output=True, text=True).stdout.strip()
     if not top or not head:
         die("ttp checks: run it in the change's git worktree (or pass --worktree <path>)")
-    gitmemo.forget_repo()   # the worktree is found: a caller's GIT_DIR names no other repo from here
     print(checktree.line(head, top), flush=True)
     # The scan runs in the detached checks, not in their launcher: its caller (the daemon starting a
     # review's pre-checks) can wait for it holding the project's write turn, which the scan may need.

@@ -4689,6 +4689,16 @@ def _rc_commit(repo, name, data=b"x\n"):
     subprocess.run([*git, "commit", "-qm", name], check=True)
 
 
+def test_a_bundle_step_git_refuses_reports_gits_own_words(tmp_path):
+    """A scratch step that fails (here update-ref of a commit the repository lacks) says which step and
+    what git said, never only a bare exit code, and sends nothing."""
+    from ttp import remotecheck
+    repo = _rc_repo(tmp_path)
+    why = remotecheck._send_bundle("box1", str(repo), "0" * 39 + "1", "refs/heads/x", [], "/m", False,
+                                   time.time() + 60)
+    assert "failed (git update-ref exit" in why and "fatal:" in why
+
+
 def test_a_remote_check_from_a_worktree_of_an_alternates_mirror_sends_its_bundle_whatever_git_dir_is_set(tmp_path):
     """Replay: run with the caller's GIT_DIR and GIT_WORK_TREE naming a worktree of a bare mirror that
     borrows its objects (alternates), the bundle's scratch `git init --bare` exited 128 (GIT_WORK_TREE

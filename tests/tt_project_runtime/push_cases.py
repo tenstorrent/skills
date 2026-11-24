@@ -15914,6 +15914,18 @@ def test_checks_in_a_worktree_of_an_alternates_mirror_run_that_repos_checks_what
     assert "sets no delivery.push_checks for this repo" in capsys.readouterr().err
 
 
+def test_push_drops_a_callers_git_dir_before_it_finds_the_worktree(env, tmp_path, monkeypatch):
+    """`ttp push` reads its worktree and its repository's checks (push.harness_repo) as `ttp checks` does:
+    a caller's GIT_DIR or GIT_WORK_TREE, which git follows past `-C`, is gone before either is read."""
+    from ttp import cli
+    _checks_repo(env, tmp_path, monkeypatch)
+    monkeypatch.setenv("GIT_DIR", str(tmp_path / "elsewhere" / ".git"))
+    monkeypatch.setenv("GIT_WORK_TREE", str(tmp_path / "elsewhere"))
+    with pytest.raises(SystemExit):
+        cli.main(["push", "--result", str(tmp_path / "no-marker")])
+    assert "GIT_DIR" not in os.environ and "GIT_WORK_TREE" not in os.environ
+
+
 def test_single_repo_push_checks_are_unchanged(env, tmp_path, monkeypatch):
     """With no push_checks_by_repo, a code repo gets delivery.push_checks as before and every
     fingerprint of the check settings is the one it was."""
