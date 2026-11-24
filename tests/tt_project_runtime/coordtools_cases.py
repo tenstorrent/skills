@@ -723,9 +723,11 @@ READ_ONLY_CALLS = ["cat notes.md | head -20", "grep -rn lock src 2>/dev/null", "
                    "git log --oneline -5", "git -C repo show HEAD:a.py", "git status && git diff", "git merge-base a b",
                    "git fetch origin", "ttp eta 12", "ttp paths", "ttp task demo show 5", "ttp quarantine list",
                    "ttp memory --search lock", "ttp audit fixes", "launchctl print gui/501/x",
-                   "systemctl --user status ttp --no-pager", "ssh box true", "ssh -o ConnectTimeout=5 box 'cat /x | grep y'"]
+                   "systemctl --user status ttp --no-pager", "ssh box true", "ssh -o ConnectTimeout=5 box 'cat /x | grep y'",
+                   "python3 - <<'EOF'\nimport json\nprint(json.load(open('a.json')))\nEOF"]
 CHANGING_CALLS = ["rm -rf build", "echo x > notes.md", "ttp note hi", "git commit -m fix", "ssh box rm x",
-                  "launchctl load x.plist", "frobnicate --all", "git branch topic", "sed -i s/a/b/ f", "cat a | tee b"]
+                  "launchctl load x.plist", "frobnicate --all", "git branch topic", "sed -i s/a/b/ f", "cat a | tee b",
+                  "python3 - <<'EOF'\nopen('a.json', 'w').write('{}')\nEOF"]
 
 
 # Reads a coordinator wake ran and the audit flagged as changes (0.2.1157), and their writing neighbours.
@@ -783,7 +785,12 @@ SHELL_READS = ["head -5 a.txt", "cat a b", "ls -la x", "grep -n foo f.py", "sed 
                "ttp detach --list", "ttp detach --check job1", "ttp obligation list", "ttp stats", "ttp deployed",
                "ttp --version", "python3 -c 'import json; print(json.load(open(\"a.json\"))[\"k\"])'",
                "python3 -I -c 'print(1)'", "python3 -c \"print(open('a', 'rb').read())\"",
-               "cat a.txt | head -3 2>/dev/null"]
+               "cat a.txt | head -3 2>/dev/null",
+               # a quoted python heredoc is judged like `python3 -c`; `T=<ttp>; $T ...` reads the assigned name
+               "python3 - <<'EOF'\nprint(open('a').read())\nEOF", "python3 -I - <<EOF\nprint(1)\nEOF",
+               "T=/opt/ttp/bin/ttp; $T status p", "T=/x/ttp; for t in 1 2; do $T task p show $t; done",
+               "while true; do ls; break; done", ": ; continue", "ttp memory p --search lock",
+               "ttp rollout status"]
 SHELL_CHANGES = ["git worktree remove /w", "git -C /r worktree remove /w", "sed -i s/a/b/ f", "echo hi > f",
                  "cat a > b", "for f in a b; do echo $f > out; done", "for f in a b; do rm $f; done",
                  "echo $(rm x)", "echo $((1 + 2))", "echo `ls`", "for 1x in a; do ls; done",
@@ -800,7 +807,10 @@ SHELL_CHANGES = ["git worktree remove /w", "git -C /r worktree remove /w", "sed 
                  "python3 -c 'import os as o; o.remove(\"f\")'", "python3 -c \"open('f', chr(119))\"",
                  "python3 -c 'f = open; f(\"f\", \"w\")'", "python3 -c \"g = getattr\"",
                  "python3 -c \"import sys; sys.modules['os'].remove('f')\"", "python3 -c \"print(\"",
-                 "diff <(rm x) y", "case x in a) rm y;; esac"]
+                 "diff <(rm x) y", "case x in a) rm y;; esac",
+                 "python3 - <<'EOF'\nopen('f', 'w')\nEOF", "python3 - <<EOF\nprint('$(rm x)')\nEOF",
+                 "python3 - <<'EOF' > out.txt\nprint(1)\nEOF", "cat <<EOF > f\nx\nEOF",
+                 "T=/x/rm; $T -rf y", "T=/x/ttp $T status", "$T status"]
 
 
 @pytest.mark.parametrize("cmd,reads", [(c, True) for c in SHELL_READS] + [(c, False) for c in SHELL_CHANGES])

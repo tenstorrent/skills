@@ -109,7 +109,7 @@ PLAIN_READS = {"cat", "head", "tail", "less", "more", "ls", "stat", "wc", "diff"
                "false", "df", "ps", "pgrep", "uptime", "free", "nproc", "basename", "dirname", "tr", "column", "nl",
                "comm", "paste", "tac", "seq", "sleep", "cd", "xxd", "od", "strings", "env", "printenv", "lsof",
                "lspci", "lsusb", "lsblk", "lscpu", "lsmod", "modinfo", "sensors", "zcat", "zgrep", "squeue", "sinfo",
-               "sacct", "sshare", "sprio"}
+               "sacct", "sshare", "sprio", ":", "continue", "break"}
 WRAPPERS = {"timeout": 1, "nice": 0, "time": 0, "nohup": 0, "command": 0, "stdbuf": 0, "env": 0}   # words they take
 GIT_READS = {"log", "show", "status", "diff", "rev-parse", "merge-base", "ls-remote", "fetch", "ls-files", "ls-tree",
              "cat-file", "blame", "describe", "shortlog", "rev-list", "for-each-ref", "name-rev", "show-ref", "grep",
@@ -121,7 +121,8 @@ TTP_READS = READ_COMMANDS + (("paths",), ("list",), ("show",), ("quarantine", "l
                              ("push", "--queue"), ("push", "--result"), ("--help",), ("-h",), ("help",),
                              ("--version",), ("task", "*", "eta"), ("bridge", "status"), ("overview",), ("runs",), ("schedules", "*", "grace"),
                              ("schedules", "*", "show"), ("schedules", "*", "list"), ("obligation", "list"),
-                             ("task", "show"), ("occupancy",))   # the project may be left out: it is the one here
+                             ("task", "show"), ("occupancy",), ("rollout", "status"), ("note", "--status"),
+                             ("upstream", "--note-state"), ("memory", "*", "--search"))   # the project may be left out: it is the one here
 SHELL_KEYWORDS = {"do", "then", "else", "elif", "if", "while", "until", "!", "{"}   # lead a command; `done`/`fi` end one
 PY_NAMES = re.compile(r"python(3(\.\d+)?)?")
 # python -c code that may write or run something else (besides an open() whose mode is not a plain read
@@ -417,6 +418,34 @@ def _words_read(w: list[str], depth: int) -> bool:
     return False
 
 
+def _vars_resolved(simple: list[list[str]]) -> list[list[str]]:
+    """`simple` with each `$NAME` word replaced by the value a `NAME=value` word earlier on the
+    command line assigns: the coordinator's `T=<path to ttp>; $T status ...` pattern, whose command
+    name the word lists cannot read. Only a command made of assignments sets a value (a `T=x cmd` prefix
+    does not change what `$T` expands to); a `$NAME` with no assignment stays as written."""
+    env: dict[str, str] = {}
+    out: list[list[str]] = []
+    for w in simple:
+        if all(re.fullmatch(r"[A-Za-z_]\w*=.*", x) for x in w):
+            env.update(x.split("=", 1) for x in w)
+        out.append([(env.get(x[1:], x) if x.startswith("$") and x[1:] in env else x) for x in w])
+    return out
+
+
+PY_HEREDOC = re.compile(r"""\b(python(?:3(?:\.\d+)?)?((?:\s+-[ISEBsuOq]+)*))\s+-\s*<<-?\s*(['"]?)(\w+)\3[ \t]*\n(.*?)\n\4[ \t]*(?=\n|$)""",
+                        re.S)
+
+
+def _py_heredocs_inlined(cmd: str) -> str:
+    """`cmd` with each `python3 - <<'EOF' ... EOF` written as `python3 -c '<code>'`, so _python_reads judges
+    the code; a heredoc whose unquoted body the shell would expand (`$`, a backtick) stays as written."""
+    def inline(m: re.Match) -> str:
+        if not m.group(3) and re.search(r"[$`]", m.group(5)):
+            return m.group(0)
+        return f"{m.group(1)} -c {shlex.quote(m.group(5))}"
+    return PY_HEREDOC.sub(inline, cmd)
+
+
 def reads_only(cmd: str, depth: int = 0) -> bool:
     """True when every simple command in the shell command `cmd` only reads (the tables above; an ssh
     command by what it runs remotely; `python3 -c` by its code; the body of a for, if or while line and
@@ -424,9 +453,9 @@ def reads_only(cmd: str, depth: int = 0) -> bool:
     unknown command counts as a change."""
     if depth > 2:
         return False
-    cmd = _substituted(str(cmd or ""), depth)
+    cmd = _substituted(_py_heredocs_inlined(str(cmd or "")), depth)
     simple = _simple(cmd) if cmd is not None else None
-    simple = _unwrapped(simple) if simple else None
+    simple = _unwrapped(_vars_resolved(simple)) if simple else None
     if not simple or not all(_words_read(w, depth) for w in simple):
         return False
     try:   # the outside-writes classifier as a second look (tee, -o, sed -i, inline code) at each local
