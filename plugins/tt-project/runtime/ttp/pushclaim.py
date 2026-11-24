@@ -310,7 +310,7 @@ def correct_reply_claims(p, text: str, repo, running: str = "") -> str:
     from . import landed
     if not text:
         return text
-    target, fetches, fixes, landed_spans = _default(p, repo), {}, [], []
+    target, fetches, fixes = _default(p, repo), {}, []
     for start, end, sha, claim_target in landed_claims(p, text, repo):
         if claim_target not in (None, target):
             continue   # another ref's claim: the remote checks own it
@@ -327,11 +327,11 @@ def correct_reply_claims(p, text: str, repo, running: str = "") -> str:
             fixes.append((start, end, f"{NOT_LANDED}: {sha[:12]} is not on {short_ref(*target)}"))
         elif rc == landed.CANNOT and not text[end:].startswith(" " + UNVERIFIED_CLAIM):
             fixes.append((start, end, text[start:end] + " " + UNVERIFIED_CLAIM))
-        landed_spans.append((start, end))   # its fix owns the span; a live fix never splices into it
+    landed_fixes = [(s, e) for s, e, _ in fixes]   # a landed fix owns its span; one splice a span
     for start, end, sha in live_claims(text, repo):
         if text[end:].startswith(" " + UNVERIFIED_CLAIM):   # already marked, never twice
             continue
-        if any(s < end and start < e for s, e in landed_spans):
+        if any(s < end and start < e for s, e in landed_fixes):
             continue   # the landed fix already owns this span: one fix per span, never two splices
         if not running:   # the running commit is unknown: the claim cannot be checked
             fixes.append((start, end, text[start:end] + " " + UNVERIFIED_CLAIM))
