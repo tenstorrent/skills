@@ -729,8 +729,7 @@ def _mark_data_bodies(cmd: str) -> str:
     the bodies of heredocs that are only data: a quoted delimiter on a cat (or another _data_body piece) or on
     a tee into files, neither piped on, while every other command is only data too (_data_only), so none
     reads the file back into code (`xargs rm < list.txt`)."""
-    from .hook import (HEREDOC_RE, READERS, _chain, _data_body, _data_only, _first_word, _heredocs, _pieces,
-                       _runs_inside)
+    from .hook import HEREDOC_RE, READERS, _chain, _data_body, _data_only, _heredocs, _pieces, _runs_inside
     lines, bodies = _heredocs(cmd)
     if not bodies:
         return _mark_uncomment(cmd)
@@ -745,9 +744,10 @@ def _mark_data_bodies(cmd: str) -> str:
             and m[0] == HEREDOC_RE.match(lines[i], pos)[0] and (_data_body(bare, i, pos) or tee(i, pos))}
     held = {(i, s) for k, (i, _, pos) in enumerate(bodies) if k in data
             for s, e, _ in _pieces(bare[i]) if s <= pos <= e}
-    def inert(piece: str, sep: str, after: list[str]) -> bool:   # only prints or reads (READERS), nothing runs
+
+    def inert(piece: str, sep: str, after: list[str]) -> bool:   # prints, or a bare reader word (no VAR= or env)
         return _data_only(piece, sep, text, after) or all(
-            _first_word(p) in READERS and not _runs_inside(p) for p in (piece, *after))
+            p.split()[:1] and p.split()[0] in READERS and not _runs_inside(p) for p in (piece, *after))
     pieces = [(j, line, _pieces(line)) for j, line in enumerate(bare)]
     if any((j, s) not in held and line[s:e].strip() and not inert(line[s:e], sep, _chain(line, ps, n))
            for j, line, ps in pieces for n, (s, e, sep) in enumerate(ps)):
