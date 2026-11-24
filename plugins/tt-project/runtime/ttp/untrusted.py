@@ -648,6 +648,10 @@ MARK_SCRIPT_RE = re.compile(r"python[\d.]*|perl|ruby|node|deno|bun|php|lua")
 # word list or other prefixed literal (perl qw'', ruby %w'', tcl {*}"").
 MARK_PROSE_RE = re.compile(r"(?<![\w%}])(['\"])([^'\"\n;&|<>(){}\[\]`$\\=*?/]*)\1")
 MARK_PROSE_PLACE = "run-mark-prose"   # what a prose mention reads as
+# What may stand before a quoted clause that is code, not prose: an interpreter's program option (python -c,
+# perl -le, node --eval, php -r) or a here-string, whose clause is the program itself, or a quote operator
+# with space before its delimiter (perl qw "..", q #..#, ruby %q ..).
+MARK_CODE_QUOTE_RE = re.compile(r"(?:(?:^|\s)-\w*[ceErRBpP]|--eval|--print|<<<|\bq[qwxr]?|%\w*)[\s#]*$")
 
 
 def _mark_prose(clause: str) -> bool:
@@ -669,14 +673,15 @@ def _mark_quiet(cmd: str, words: list[str]) -> tuple[list[str], str] | None:
     command whose only code runners are script interpreters (MARK_SCRIPT_RE); None when anything else may
     run code or split text into words (a shell, eval, sed, xargs, a read loop, `.`), or the words do not
     line up, or a mention is left outside prose. A clause counts only where the shell quotes all of it,
-    so no mention it hides is a word."""
+    so no mention it hides is a word, and never as a program's own text or a quote operator's
+    (MARK_CODE_QUOTE_RE)."""
     if any(w == "." or w in MARK_FEEDS or (MARK_RUNNER_RE.fullmatch(os.path.basename(w))
                                             and not MARK_SCRIPT_RE.fullmatch(os.path.basename(w))) for w in words):
         return None
     from .hook import _quoting
     flags = _quoting(cmd)
     text = MARK_PROSE_RE.sub(lambda m: m[0].replace(RUN_MARK, MARK_PROSE_PLACE) if _mark_prose(m[2]) and all(
-        f[0] for f in flags[m.start():m.end()]) else m[0], cmd)
+        f[0] for f in flags[m.start():m.end()]) and not MARK_CODE_QUOTE_RE.search(cmd[:m.start()]) else m[0], cmd)
     if RUN_MARK in text:
         return None
     quiet = _mark_words(text)

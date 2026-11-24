@@ -692,6 +692,9 @@ MARK_CODE_EFFECT = [   # code that reads or changes the record itself, or gets i
     f"perl -e 'unlink $ARGV[1]; print \"the {_M}\"' a#b {_M}",
     f"perl -e \"unlink qw'a {_M}'\"", f"ruby -e \"File.delete(*%w'a {_M}')\"",   # word lists
     f"tclsh <<EOF\nforeach f \"a {_M}\" {{file delete $f}}\nEOF",
+    f"perl -e 'unlink qw \"{_M} .\"'", f"perl -e \"unlink qw\t'{_M} is'\"",   # a space before the delimiter
+    f"ruby -e 'File.delete %q {_M} '", f"perl -le 'print readline F if open F, q! {_M}!'",   # the program itself
+    f"python3 <<<'the {_M} now'",
 ]
 
 
