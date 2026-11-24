@@ -480,10 +480,11 @@ def landed_at(db, tid: int, rows: Rows | None = None, carry: dict | None = None)
 
 
 def landed_when(p, tid: int, rows: Rows | None = None) -> float | None:
-    """When task `tid`'s change first reached the push branch: the committer date of the commit that
-    carried it there (its recorded landing, or the head and the superseding commit a recorded
-    supersession names), never later than the record time `landed_at` judges by. The record time
-    alone when the repository cannot read the commits; None while neither is known."""
+    """When task `tid`'s change first reached the push branch: the record time `landed_at` judges by,
+    or, when a recorded supersession or squash carried it, the earlier committer date of the
+    superseding commit or of the head it names once that head was on the push branch (on_push). A
+    push queue landing keeps its record time: its commit is dated at the rebase, before its checks
+    ran. The record time alone when the repository cannot read the commits; None while neither is known."""
     return landed_whens(p, (tid,), rows).get(int(tid))
 
 
@@ -493,13 +494,18 @@ def landed_whens(p, tids, rows: Rows | None = None) -> dict[int, float | None]:
     `rows` when given, else read here once for all of them."""
     tids = [int(t) for t in tids]
     rows = Rows(p.db, tids) if rows is None else rows
-    at, want = {}, {}
+    at, want, tip = {}, {}, None
     for tid in tids:
         carry = carriers(p.db, tid, rows)
         at[tid] = landed_at(p.db, tid, rows, carry)
         sup = [r for r in rows.superseded if r["task"] in carry]
-        want[tid] = [str(s) for s in [*recorded(p.db, tid, carry, rows)[0],
-                                      *(r["head"] for r in sup if r.get("head"))]]
+        heads = [str(r["head"]) for r in sup if r.get("head")]
+        if heads and tip is None:
+            try:
+                tip = _commit(p.root, _push_ref(p, p.root))
+            except (ValueError, OSError, subprocess.SubprocessError):
+                tip = ""
+        want[tid] = [str(r["sha"]) for r in sup] + [h for h in heads if tip and on_push(p, p.root, [h], tip)]
     dates = commit_dates(p, [s for v in want.values() for s in v])
     return {tid: min([t for t in [at[tid], *(dates.get(s) for s in want[tid])] if t], default=None)
             for tid in tids}
