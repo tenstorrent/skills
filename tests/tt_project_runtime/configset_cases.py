@@ -440,6 +440,9 @@ def test_upgrade_leaves_an_owner_set_retired_key_inert_with_one_note_and_no_refu
     text = p.config_path.read_text()
     assert cli._drop_retired_keys(p) == [] and cli._move_max_workers(p) == "" and cli._auto_cache_ttl(p) == ""
     assert p.config_path.read_text() == text, "the second upgrade changes nothing"
+    from ttp.project import set_account_setting
+    set_account_setting("machine.max_workers", 8)   # the user raises the machine's cap later: no upgrade lowers it
+    assert cli._move_max_workers(p) == "" and account_value("machine.max_workers") == 8
     assert refusals() == [], "the owner guard was never asked to remove an owner's value"
     assert not [r for r in configwho.history(p) if r.get("refused")]
 

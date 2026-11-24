@@ -14755,9 +14755,14 @@ def _move_max_workers(p: Project) -> str:
         raw = p.raw_config()
         if p.config_status == "unavailable" or not _config_has(raw, "machine.max_workers"):
             return ""
+        from . import configwho
+        mine = configwho.owned(p, "machine.max_workers", raw)   # its owner's copy stays (configwho.guard), inert:
+        if mine and "machine.max_workers" in p.db.kv_dict(KEPT_KEYS_KV)[0]:   # moved once, never again
+            return ""
         v = (raw.get("machine") or {}).get("max_workers")
         if why := max_workers_problem(v):
-            note = f"removed machine.max_workers from project.json: {why}"
+            note = (f"machine.max_workers in project.json is ignored: {why}" if mine
+                    else f"removed machine.max_workers from project.json: {why}")
         else:
             have = account_value("machine.max_workers")
             keep = v if max_workers_problem(have) else min(v, have)
@@ -14765,8 +14770,7 @@ def _move_max_workers(p: Project) -> str:
                 set_account_setting("machine.max_workers", keep)
             note = (f"moved machine.max_workers {v} from project.json to the machine's account settings "
                     f"(now {keep}, for every project here: ttp config --account machine.max_workers)")
-        from . import configwho
-        if configwho.owned(p, "machine.max_workers", raw):   # its owner's copy stays (configwho.guard), inert
+        if mine:
             return "\n".join(_kept_once(p, "machine.max_workers", f"{note}; kept the project.json copy, which "
                                                                    f"nothing reads, because its owner set it"))
         p.unset_config("machine.max_workers", by={"by": "default", "via": "upgrade: moved to the account settings"})
