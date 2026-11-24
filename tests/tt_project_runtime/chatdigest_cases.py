@@ -456,9 +456,9 @@ def test_the_coordinator_s_reply_closes_the_delivery(env, monkeypatch):
 
 
 def test_one_task_s_fallback_line_never_disarms_another_s_in_the_same_chat(env, monkeypatch):
-    """#9703: two tasks finish in one chat and the coordinator stays silent (the case the fallback
-    exists for). The first task's bound passes first and its line posts; that reply-shaped row must
-    not read as the coordinator's answer for the second task, whose line still posts at its bound."""
+    """Two tasks finish in one chat and the coordinator stays silent (the case the fallback exists
+    for). The first task's bound passes first and its line posts; that reply-shaped row must not
+    read as the coordinator's answer for the second task, whose line still posts at its bound."""
     from ttp import chatdigest, pushq
     monkeypatch.setenv("TTP_TEST_CHAT_DIGEST", "on")
     p = make(env)
@@ -485,7 +485,7 @@ def test_one_task_s_fallback_line_never_disarms_another_s_in_the_same_chat(env, 
 
 
 def test_a_reply_delivering_one_task_leaves_the_other_s_fallback_armed(env, monkeypatch):
-    """#9703: a coordinator reply about one task is not an answer for another in the same chat: a
+    """A coordinator reply about one task is not an answer for another in the same chat: a
     reply whose `delivers` names only A leaves B armed, and B's outcome line still posts."""
     from ttp import chatdigest, coordinator as coord, pushq
     monkeypatch.setenv("TTP_TEST_CHAT_DIGEST", "on")
