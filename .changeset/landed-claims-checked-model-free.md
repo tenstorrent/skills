@@ -12,9 +12,13 @@ another route pushed is never called 'not landed' on a lagging ref.
 A sha-less claim is checked against the push branch only when its sentence names that branch, or
 says 'landed' naming no other destination; a push or merge to the run's own branch, a PR branch or
 a fork stays as written. A sentence naming a sha this repository does not hold is no sha-less
-claim: it is another repository's commit, no check here can read it, and it stays as written. Destination words match only as whole words, a slash token counts only as
-a ref a movement word names (never a ratio, 'and/or' or a file path), and a claim's sentence ends
-at its nearest stop, so the next sentence never changes its destination.
+claim: it is another repository's commit, no check here can read it, and it stays as written.
+Destination words match only as whole words, a slash token counts only as a ref a movement word
+names (never a ratio, 'and/or' or a file path), and a claim's sentence ends at its nearest stop,
+so the next sentence never changes its destination. A hand-off waiting on a push still on its way
+(a detached push queued or running, an unsettled pushed list) is the remote check's to settle: its
+text is left alone until the push lands or is shown missing, never corrected locally about a push
+that has not happened yet.
 
 Known gaps: a sha-less push claim naming another destination is not checked; unusual phrasings pass
 unchecked; quoted text written to a script and run later is not checked.
