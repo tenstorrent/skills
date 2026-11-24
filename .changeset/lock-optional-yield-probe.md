@@ -9,3 +9,6 @@ process group, SIGKILL after 10 s), releases the lock and exits 75, so the task 
 waiting; exit 1 keeps it running, and any other answer is reported once and never stops it.
 `locks.yield_exempt` (globs of lock names) and `--no-yield` opt a call out, for rollout and heal
 takes. Off by default: unset, nothing runs.
+`ttp lock --probe` and a lock take (before the command starts) ask the probe too, so a yielded task
+stays waiting while it says yield. A probed command's group ends with `ttp lock`, also on SIGKILL, and
+a signal to a whole-run `ttp lock` reaches it.

@@ -9227,6 +9227,18 @@ def cmd_lock(a) -> None:
         from . import userorder
         ordered = userorder.holding(p.db, cfg, p.db.task(int(otask)), [L["name"] for L in todo])
         return (ordered, userorder.line(p, otask, *ordered)) if ordered else None
+    yprobe = None if a.no_yield else lockyield.armed(cfg, [L["name"] for L in todo], p.root)
+    yielded: list = []   # the probe is asked once per take, just before the command starts
+
+    def _yield_first(held=()) -> None:
+        # A task that yielded waits on `ttp lock --probe`, and a take right after it is asked too:
+        # the probe saying yield means the command never starts (exit 75, the locks released).
+        if yprobe is not None and not yielded:
+            yielded.append(1)
+            if (why := yprobe.ask()) is not None:
+                for f in held:
+                    f.close()
+                die(yprobe.says(why).removeprefix("ttp lock: "), UPGRADE_BUSY)
     if held_by := _ordered():
         if a.probe:
             print(json.dumps({"name": held_by[0][0], "free": False, "line": held_by[1], "user_order": held_by[0][2]})
@@ -9252,6 +9264,11 @@ def cmd_lock(a) -> None:
         except OSError as e:
             _unwritable(e, L)
     if a.probe:   # a paused `ttp lock` exits 75, so its probe must too
+        if yprobe is not None and (why := yprobe.ask()) is not None:   # a yielding take exits 75: so does its probe
+            line = yprobe.says(why).removeprefix("ttp lock: ")
+            print(json.dumps({"name": todo[0]["name"], "free": False, "line": line, "yield": True})
+                  if a.json else line)
+            sys.exit(UPGRADE_BUSY)
         from . import pregrant
         # A free lock is free for a task only once the project's pre-grant check grants it too (asked
         # only for a known task: the probe of a task's retry_when names it with --task).
@@ -9335,7 +9352,6 @@ def cmd_lock(a) -> None:
             for aid in ids:
                 activity.append(p.state, {"ev": "release", "id": aid, "end": time.time(), "rc": rc})
 
-    yprobe = None if a.no_yield else lockyield.armed(cfg, [L["name"] for L in todo], p.root)
     whole = {lk.canonical(cfg, x.get("resource") or "") for x in spec.get("exclusive") or []}
     # run.json alone is not the hold: one recorded lost (its keeper died, another task took the slot)
     # still lists it. Only a slot the run's own lineage holds now covers the command (hold.covers).
@@ -9508,6 +9524,7 @@ def cmd_lock(a) -> None:
                 lk.dequeue(t)
             tickets.clear()
             _wait_occupied()   # a stream that went live while this queued: the slot is kept, the start waits
+            _yield_first(fs)
             for L in todo:   # as the task's run does once it has its slot (runner._take_exclusive)
                 if L["mine"]:
                     lk.unreserve(L["mark"], L["own"])
@@ -9544,6 +9561,8 @@ def cmd_lock(a) -> None:
             # The command runs only once both are in place (start_gated): a kill in between never runs it.
             proc, gate = lk.start_gated(cmd, child_env, own_group=yprobe is not None)
             started.append(proc)
+            if yprobe is not None:
+                yprobe.guard(proc)
             keeper = lk.keep_open(fs, proc.pid)
             lk.hand_to_command(fs, proc.pid)
             lk.let_go(gate)

@@ -50,7 +50,7 @@ def armed(cfg: dict, names: list[str], root) -> "Probe | None":
     globs = [g for g in (_locks(cfg).get("yield_exempt") or []) if isinstance(g, str)]
     if isinstance(_locks(cfg).get("yield_exempt"), str):   # a bare string would glob per character
         globs = []
-    keep = [n for n in names if not any(isinstance(g, str) and fnmatch.fnmatch(n, g) for g in globs)]
+    keep = [n for n in names if not any(fnmatch.fnmatch(n, g) for g in globs)]
     if not cmd or not keep:
         return None
     return Probe(cmd, every_s(cfg), keep, root)
@@ -63,9 +63,45 @@ class Probe:
         self.cmd, self.names, self.root = cmd, names, root
         self.interval = max(interval, MIN_INTERVAL_S)
         self.told = False   # a broken probe is reported once, however often it is asked
+        self.dog = None     # (pipe, process) of the watchdog that ends the command's group if we die
+
+    def guard(self, popen: subprocess.Popen) -> None:
+        """Start the command's watchdog (runner's): it ends the command's group, which a run's kill
+        of this process (a SIGKILL no handler sees) does not reach, once this process is gone."""
+        from .runner import _start_watchdog
+        w, proc = _start_watchdog(popen.pid)
+        self.dog = (w, proc) if proc else None
+
+    def _unguard(self, normal: bool) -> None:
+        """The command is over: a word on the pipe tells the watchdog so (no word: it ends the group)."""
+        if self.dog is None:
+            return
+        (w, proc), self.dog = self.dog, None
+        try:
+            if normal:
+                os.write(w, b"1")
+        except OSError:
+            pass
+        os.close(w)
+        try:
+            proc.wait(KILL_AFTER_S + 5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+
+    def says(self, why: str) -> str:
+        return f"ttp lock: yielding {', '.join(self.names)}: {why}"
 
     def wait(self, popen: subprocess.Popen) -> int:
         """Wait for the command, asking the probe every interval; BUSY_RC once it yields."""
+        ok = False
+        try:
+            rc = self._wait(popen)
+            ok = True
+            return rc
+        finally:
+            self._unguard(ok)
+
+    def _wait(self, popen: subprocess.Popen) -> int:
         at = time.time() + self.interval   # the first ask comes one interval after the command starts
         while True:
             try:
@@ -74,7 +110,7 @@ class Probe:
                 pass
             why = self.ask()
             if why is not None:
-                print(f"ttp lock: yielding {', '.join(self.names)}: {why}", file=sys.stderr, flush=True)
+                print(self.says(why), file=sys.stderr, flush=True)
                 return self.stop(popen)
             at = time.time() + self.interval
 
@@ -113,7 +149,6 @@ class Probe:
                 continue   # it ignores this signal: the SIGKILL comes next
             # Our signal ended it (or a shell that trapped it ended with 128+sig): a yield.
             return BUSY_RC if sent else (popen.returncode if popen.returncode is not None else BUSY_RC)
-        return BUSY_RC   # out of reach (its group escaped); the resource is still yielded
 
 
 def run_whole(cmd: list, env: dict, probe: "Probe | None") -> int:
@@ -121,5 +156,19 @@ def run_whole(cmd: list, env: dict, probe: "Probe | None") -> int:
     of its own watched by it."""
     if probe is None:
         return subprocess.call(cmd, env=env)
-    # own session: the probe stops the command's whole process group
-    return probe.wait(subprocess.Popen(cmd, env=env, start_new_session=True))
+    # own session: the probe stops the command's whole process group, so a run's kill of this process
+    # is passed on to that group (a SIGKILL by the watchdog)
+    proc = subprocess.Popen(cmd, env=env, start_new_session=True)
+    probe.guard(proc)
+
+    def _forward(signum, _frame):
+        try:
+            os.killpg(proc.pid, signum)
+        except OSError:
+            pass
+    old = {s: signal.signal(s, _forward) for s in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP)}
+    try:
+        return probe.wait(proc)
+    finally:
+        for s, h in old.items():
+            signal.signal(s, h)

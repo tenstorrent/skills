@@ -2538,7 +2538,8 @@ def test_the_yield_probe_stops_the_command_and_ttp_lock_exits_75(env, tmp_path):
         assert "yielding rig:" in err, err
         assert "term" in marks.read_text(), "the command's process group never got the SIGTERM"
         assert "rig" in log.read_text()            # $TTP_LOCK_NAMES carried the lock name
-        assert _lock_probe(_lock_env(env, p), "rig").returncode == 0   # the lock was released
+        # the lock was released (the probe still says yield, so ask without it)
+        assert _lock_probe(_lock_env(env, p), "rig", extra=("--no-yield",)).returncode == 0
     finally:
         if t.poll() is None:
             t.kill()
@@ -2620,6 +2621,93 @@ def test_a_signal_to_a_probed_ttp_lock_reaches_the_whole_command_group(env, tmp_
     finally:
         if t.poll() is None:
             t.kill()
+
+
+def _alive(pid):
+    try:
+        return Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[0] != "Z"
+    except (OSError, IndexError):
+        return False
+
+
+def _caller_is_killed_the_command_ends(t, pidfile, sig):
+    """The `ttp lock` caller `t` (the leader of its own group) gets `sig` for its whole group: the
+    probed command, which runs in a group of its own, must end too."""
+    _until_or_ended(lambda: pidfile.exists() and pidfile.read_text().strip(), [t])
+    pid = int(pidfile.read_text())
+    try:
+        os.killpg(t.pid, sig)
+        t.wait(timeout=30)
+        deadline = time.time() + 25   # a watchdog's SIGTERM comes at once; a trapped one dies at its KILL
+        while _alive(pid) and time.time() < deadline:
+            time.sleep(0.2)
+        assert not _alive(pid), f"the command survived {sig.name} to its ttp lock's process group"
+    finally:
+        if _alive(pid):
+            os.kill(pid, signal.SIGKILL)
+        if t.poll() is None:
+            t.kill()
+
+
+@pytest.mark.parametrize("sig", [signal.SIGTERM, signal.SIGKILL])
+def test_a_kill_of_a_probed_ttp_locks_group_ends_the_command(env, tmp_path, sig):
+    p = make(env)
+    _yield_probe(p, tmp_path, "exit 1")
+    pidfile = tmp_path / "pid"
+    t = subprocess.Popen([sys.executable, str(TTP), "lock", "rig", "--", "sh", "-c",
+                          f"echo $$ > {shlex.quote(str(pidfile))}; sleep 30"],
+                         env=_lock_env(env, p), stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                         start_new_session=True)
+    _caller_is_killed_the_command_ends(t, pidfile, sig)
+
+
+@pytest.mark.parametrize("sig", [signal.SIGTERM, signal.SIGKILL])
+def test_a_kill_of_a_probed_whole_run_ttp_locks_group_ends_the_command(env, tmp_path, sig):
+    p = make(env)
+    _yield_probe(p, tmp_path, "exit 1")
+    mine, other, paths, run_dir, ran, job, _ = _run_listing_the_board(env, p, tmp_path, 71)
+    from ttp import hold
+    pidfile = tmp_path / "pid"
+    with _whole_run_hold(paths[0], hold.label(f"task #{mine['id']}", 71, hold.WHOLE_RUN)):
+        t = subprocess.Popen([sys.executable, str(TTP), "lock", "board", "--", "sh", "-c",
+                              f"echo $$ > {shlex.quote(str(pidfile))}; sleep 30"],
+                             env=dict(job, TTP_DETACHED="", TTP_DETACH_RC=""), stdout=subprocess.PIPE,
+                             stderr=subprocess.PIPE, start_new_session=True)
+        _caller_is_killed_the_command_ends(t, pidfile, sig)
+
+
+def test_the_yield_probe_also_answers_ttp_lock_probe_and_the_take(env, tmp_path):
+    # A task that yielded waits on `ttp lock --probe`: it must stay busy while the probe says yield,
+    # and a take then exits 75 without ever starting the command.
+    p = make(env)
+    flip = tmp_path / "flip"
+    _yield_probe(p, tmp_path, f"[ -e {shlex.quote(str(flip))} ] && echo busy now && exit 0\nexit 1")
+    run_env = _lock_env(env, p)
+    ran = tmp_path / "ran"
+    take = [sys.executable, str(TTP), "lock", "rig", "--", "sh", "-c", f"echo x >> {shlex.quote(str(ran))}"]
+    assert _lock_probe(run_env, "rig").returncode == 0           # the probe says keep going: free
+    assert subprocess.run(take, env=run_env, capture_output=True, timeout=60).returncode == 0
+    ran.unlink()
+    flip.touch()
+    t = _lock_probe(run_env, "rig")
+    assert t.returncode == 75 and "yielding rig: busy now" in t.stdout, (t.returncode, t.stdout, t.stderr)
+    t = subprocess.run(take, env=run_env, capture_output=True, text=True, timeout=60)
+    assert t.returncode == 75 and "yielding rig: busy now" in t.stderr, (t.returncode, t.stderr)
+    assert not ran.exists(), "the command ran although the probe said yield"
+    assert _lock_probe(run_env, "rig", extra=("--no-yield",)).returncode == 0   # an opt-out call is not held
+    p.set_config("locks.yield_exempt", ["ri*"])
+    assert _lock_probe(run_env, "rig").returncode == 0
+    assert _lock_probe(run_env, "rig").returncode == 0           # (and the lock was released by the refusal)
+
+
+def test_a_broken_yield_probe_leaves_ttp_lock_probe_and_the_take_alone(env, tmp_path):
+    p = make(env)
+    _yield_probe(p, tmp_path, "exit 3")
+    run_env = _lock_env(env, p)
+    assert _lock_probe(run_env, "rig").returncode == 0
+    t = subprocess.run([sys.executable, str(TTP), "lock", "rig", "--", "sh", "-c", "echo ran"],
+                       env=run_env, capture_output=True, text=True, timeout=60)
+    assert t.returncode == 0 and t.stdout == "ran\n", (t.returncode, t.stderr)
 
 
 def test_the_whole_run_path_yields_to_the_probe_too(env, tmp_path):
