@@ -19,9 +19,7 @@ def _wu_bin(env, monkeypatch, text="Opus wrote this: it works.", rc=0):
 
 def _wu_due_texts(p, tid):
     """The hand-off texts the daemon handed the coordinator for `tid` (its reply_due events)."""
-    from ttp import spans
-    return [spans.strip(r["text"].partition("Hand-off: ")[2]).strip()
-            for r in p.db.q("SELECT text FROM events WHERE kind='reply_due' AND task=?", (tid,))]
+    return _cd_hand_offs(p.db.q("SELECT text FROM events WHERE kind='reply_due' AND task=?", (tid,)))
 
 
 def _wu_finish(env, p, result, *, provider="chat", kind="work", chat="c1", status="ok"):
@@ -38,9 +36,7 @@ def _wu_finish(env, p, result, *, provider="chat", kind="work", chat="c1", statu
     d._prewrite(run, run_dir)   # the daemon does this before its finish rounds
     with d.p.db.tx():
         d._finish_worker(run, Usage(cost_usd=1.0), status, run_dir)
-    from ttp import spans
-    ev = p.db.q("SELECT text FROM events WHERE kind='reply_due' AND task=?", (tid,))
-    replies = [spans.strip(r["text"].partition("Hand-off: ")[2]).strip() for r in ev]
+    replies = _wu_due_texts(p, tid)
     return p.db.task(tid), replies, run_dir
 
 

@@ -2031,6 +2031,19 @@ def deliver(p, sent: list[tuple[int, str | None, list]], now: float | None = Non
     return notes
 
 
+def delivered_since(db, since: float) -> list[dict]:
+    """The reply deliveries at/after `since`, one row per owner of each delivered obligation:
+    {task, chat, message, at}. A reply's `delivers` names a task or an obligation, so a reader can
+    tell a reply about one task from a reply about another (chatdigest._replied)."""
+    out = []
+    for o in items(db):
+        d = o.get("delivered") or {}
+        if d and float(d.get("at") or 0) >= float(since):
+            out += [{"task": t, "chat": d.get("chat"), "message": d.get("message"),
+                     "at": float(d.get("at") or 0)} for t in _owner_ids(o)]
+    return out
+
+
 def deliver_twins(p, twins: list[tuple], now: float | None = None) -> list[str]:
     """Replies not sent because they nearly repeat a post the same user read in another chat
     (chatdigest.twin): (first message, chat, delivers, text). That first post delivers exactly what the

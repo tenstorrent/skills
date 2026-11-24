@@ -40,7 +40,6 @@ import time
 from pathlib import Path
 
 from . import ctxfork, timefmt
-from .db import REPLIES_ONLY
 from .project import durable_append, durable_write
 
 SAMPLES = "host-load.jsonl"     # in the state folder: {"ts", "load1", "cores"} per line

@@ -18,9 +18,7 @@ def _reply_hand_off(env, p, result: dict, chat="c1", kind="work"):
     d = Daemon(p.base)
     with d.p.db.tx():
         d._finish_worker({"task": tid}, Usage(cost_usd=1.0), "ok", run_dir)
-    from ttp import spans
-    replies = [spans.strip(r["text"].partition("Hand-off: ")[2]).strip()
-                for r in p.db.q("SELECT text FROM events WHERE kind='reply_due' AND task=?", (tid,))]
+    replies = _cd_hand_offs(p.db.q("SELECT text FROM events WHERE kind='reply_due' AND task=?", (tid,)))
     return p.db.task(tid), replies
 
 

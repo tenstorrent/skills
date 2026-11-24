@@ -327,6 +327,13 @@ def _cd_due(p, tid):
     return p.db.one("SELECT * FROM events WHERE kind='reply_due' AND task=? ORDER BY id DESC", (tid,))
 
 
+def _cd_hand_offs(rows) -> list[str]:
+    """The hand-off texts enclosed in reply_due event rows: the event text carries the spans-wrapped
+    hand-off after 'Hand-off: '. Shared by the reply, writeup and handoffcheck case files."""
+    from ttp import spans
+    return [spans.strip(r["text"].partition("Hand-off: ")[2]).strip() for r in rows]
+
+
 def test_a_finished_reply_chat_task_raises_reply_due_and_never_posts_its_hand_off(env, monkeypatch):
     """cells: handoff. The user's chat gets the coordinator's plain outcome summary, never a
     worker's raw hand-off. The daemon raises one reply_due event naming the chat and the landing
@@ -446,6 +453,57 @@ def test_the_coordinator_s_reply_closes_the_delivery(env, monkeypatch):
     assert owed["delivered"], "the reply with `delivers` is the delivery"
     now = time.time()
     assert chatdigest.fallbacks(p, now + chatdigest.DEFAULT_FALLBACK_S + 60) == []
+
+
+def test_one_task_s_fallback_line_never_disarms_another_s_in_the_same_chat(env, monkeypatch):
+    """#9703: two tasks finish in one chat and the coordinator stays silent (the case the fallback
+    exists for). The first task's bound passes first and its line posts; that reply-shaped row must
+    not read as the coordinator's answer for the second task, whose line still posts at its bound."""
+    from ttp import chatdigest, pushq
+    monkeypatch.setenv("TTP_TEST_CHAT_DIGEST", "on")
+    p = make(env)
+    a = _cd_task(p, "first task", chat="c1")
+    b = _cd_task(p, "second task", chat="c1")
+    pushq._reply(p.db, a, "done", "First done.")
+    pushq._reply(p.db, b, "done", "Second done.")
+    assert len(p.db.kv(chatdigest.FALLBACK_KV)) == 2
+    st = p.db.kv(chatdigest.FALLBACK_KV)     # the first task finishes minutes before the second
+    for item in st:
+        if item["task"] == a["id"]:
+            item["due"] = time.time() - 1
+    p.db.set_kv(chatdigest.FALLBACK_KV, st)
+    first = chatdigest.fallbacks(p)
+    assert len(first) == 1
+    texts = [m["text"] for m in p.db.q("SELECT text FROM messages WHERE chat='c1' ORDER BY id")]
+    assert len(texts) == 1 and texts[0].startswith(f"#{a['id']} ")
+    assert p.db.one("SELECT ref FROM messages WHERE id=?", (first[0],))["ref"] == chatdigest.FALLBACK_REF
+    now = time.time()
+    got = chatdigest.fallbacks(p, now + chatdigest.DEFAULT_FALLBACK_S + 60)
+    texts = [m["text"] for m in p.db.q("SELECT text FROM messages WHERE chat='c1' ORDER BY id")]
+    assert len(got) == 1 and len(texts) == 2 and texts[1].startswith(f"#{b['id']} "), "B still posts"
+    assert p.db.kv(chatdigest.FALLBACK_KV) == [], "armed once, spent once"
+
+
+def test_a_reply_delivering_one_task_leaves_the_other_s_fallback_armed(env, monkeypatch):
+    """#9703: a coordinator reply about one task is not an answer for another in the same chat: a
+    reply whose `delivers` names only A leaves B armed, and B's outcome line still posts."""
+    from ttp import chatdigest, coordinator as coord, pushq
+    monkeypatch.setenv("TTP_TEST_CHAT_DIGEST", "on")
+    p = make(env)
+    a = _cd_promised_task(p)      # its promise gives the reply's `delivers` a record to land on
+    pushq._reply(p.db, dict(p.db.task(a)), "done", "Column posted.")
+    b = _cd_task(p, "second task", chat="c1")
+    pushq._reply(p.db, b, "done", "Second done.")
+    now = time.time()
+    coord.apply(p, [{"type": "reply", "chat": "c1", "text": "The column is in: 9 of 12 agree.",
+                     "delivers": [f"#{a}"]}], turn=2)
+    got = chatdigest.fallbacks(p, now + chatdigest.DEFAULT_FALLBACK_S + 60)
+    lines = p.db.q("SELECT text FROM messages WHERE ref=?", (chatdigest.FALLBACK_REF,))
+    assert len(got) == 1 and len(lines) == 1, "only B's fallback line posts"
+    assert lines[0]["text"].startswith(f"#{b['id']} ")
+    texts = [m["text"] for m in p.db.q("SELECT text FROM messages WHERE chat='c1' ORDER BY id")]
+    assert any(t.startswith("The column is in") for t in texts), "the reply itself reached the chat"
+    assert p.db.kv(chatdigest.FALLBACK_KV) == []
 
 
 def test_a_promise_in_a_finished_task_s_hand_off_is_owed_until_the_coordinator_replies(env, monkeypatch):

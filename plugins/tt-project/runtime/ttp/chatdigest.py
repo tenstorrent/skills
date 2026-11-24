@@ -32,7 +32,9 @@ Daemon hand-offs (handoff): a finished task's hand-off never posts to its chat. 
 REPLY_DUE event per finished reply_chat task, naming its chat and its landing facts with the hand-off
 enclosed as data, and the coordinator replies to the chat in plain words; the task's promises still record
 in its chat (obligations.record_promises, by_task this task). A fallback outcome line (outcome_line) posts
-model-free, from records only, when no reply reaches that chat within coordinator.reply_fallback_s.
+model-free, from records only, when no reply delivers that task to that chat within
+coordinator.reply_fallback_s; a reply about another task, or another task's fallback line, never
+disarms it.
 Every daemon path that posts kind info or reply to a chat goes through status_wait, hold or checked (a guard
 test reads the posting code paths)."""
 from __future__ import annotations
@@ -366,6 +368,7 @@ def flush(p, cfg: dict | None, now: float | None = None) -> list[int]:
 
 REPLY_DUE = "reply_due"          # the event a finished reply_chat task raises for the coordinator
 FALLBACK_KV = "reply_fallback"   # kv: the armed fallbacks [{chat, task, title, at, due, facts}]
+FALLBACK_REF = FALLBACK_KV      # ref on a posted fallback line: it is never a coordinator reply
 DEFAULT_FALLBACK_S = 1200       # coordinator.reply_fallback_s: how long the coordinator has to reply
 LINE_MAX = 300                  # a fallback outcome line stays under this
 HANDOFF_CHARS = 3500            # the enclosed hand-off is cut at this many chars
@@ -425,7 +428,7 @@ def handoff(db, cfg: dict | None, task: dict, new: str, text: str, now: float | 
     now = time.time() if now is None else now
     f = {"status": new, **(facts or {})}
     tid = int(task["id"])
-    body = msgparts.cut(text, "the hand-off")[:HANDOFF_CHARS]
+    body = text[:HANDOFF_CHARS]   # its callers cut it already (msgparts.cut); only the char bound is ours
     db.x("INSERT INTO events(ts,source,kind,severity,text,status,task,data) VALUES(?,?,?,?,?,?,?,?)",
          (now, "task:%d" % tid, REPLY_DUE, "normal",
           "#%d %s -> %s in chat %s: %s. Reply to that chat in plain words with the outcome (what is "
@@ -448,8 +451,8 @@ def handoff(db, cfg: dict | None, task: dict, new: str, text: str, now: float | 
 
 
 def fallbacks(p, now: float | None = None) -> list[int]:
-    """Post the fallback outcome line (outcome_line) for each armed chat no reply reached within its
-    bound. The message ids."""
+    """Post the fallback outcome line (outcome_line) for each armed task no reply delivered to its
+    chat within its bound (_replied). The message ids."""
     from . import msgparts
     now = time.time() if now is None else now
     due = []
@@ -459,7 +462,7 @@ def fallbacks(p, now: float | None = None) -> list[int]:
         for item in st:
             if now < float(item.get("due") or 0):
                 keep.append(item)
-            elif not _replied(p.db, item):   # a reply reached that chat: no fallback is needed
+            elif not _replied(p.db, item):   # a reply delivered this task: no fallback is needed
                 due.append(item)
         if len(keep) != len(st):
             p.db.set_kv(FALLBACK_KV, keep)
@@ -467,17 +470,26 @@ def fallbacks(p, now: float | None = None) -> list[int]:
     for item in due:
         out += msgparts.post(p.db, outcome_line(item, item.get("facts") or {}),
                              chat=None if item.get("chat") == "all" else item.get("chat"),
-                             kind="reply", severity="normal")
+                             kind="reply", severity="normal", ref=FALLBACK_REF)
     return out
 
 
 def _replied(db, item: dict) -> bool:
-    """Whether the coordinator's reply (kind reply) reached the chat of `item` since its hand-off
-    armed the fallback; a routine digest or info post never counts as one."""
+    """Whether the coordinator answered this task in the chat its hand-off named since the fallback
+    was armed: a reply delivering it (its `delivers` record names the task or its obligation), else
+    any reply to that chat that delivered nothing. Another task's fallback line never counts, and
+    neither does a reply about another task: one task's outcome never silences another's."""
+    from . import obligations
     chat = item.get("chat")
-    return bool(db.one("SELECT 1 FROM messages WHERE direction='out' AND ts>=? AND channel='chat' "
-                       "AND kind='reply' AND (chat=? OR (chat IS NULL AND ?='all')) LIMIT 1",
-                       (float(item.get("at") or 0), chat, chat)))
+    mine = [d for d in obligations.delivered_since(db, float(item.get("at") or 0))
+            if d.get("chat") == chat]
+    if int(item.get("task") or 0) in [d["task"] for d in mine]:
+        return True
+    delivering = {d["message"] for d in mine}   # a reply about another task, not this chat's answer
+    rows = db.q("SELECT id FROM messages WHERE direction='out' AND ts>=? AND channel='chat' "
+                "AND kind='reply' AND IFNULL(ref,'')!=? AND (chat=? OR (chat IS NULL AND ?='all'))",
+                (float(item.get("at") or 0), FALLBACK_REF, chat, chat))
+    return any(r["id"] not in delivering for r in rows)
 
 
 def counts(db) -> dict:
