@@ -217,8 +217,8 @@ def correct_landed_claims(p, text: str, repo, head: str = "", tid: int = 0,
             rc = landed.NOT_YET
         elif claim_target not in (None, target):
             continue   # another ref's claim: the remote checks own it
-        elif sha and sha in receipts:
-            continue   # the push queue recorded this landing: the claim stands
+        elif sha and sha in receipts or not sha and receipts:
+            continue   # the push receipts hold this task's landing: the claim stands
         else:
             rc, why = landed.check(p, repo, what, fetch=False) if what else (landed.CANNOT, "no commit named")
         if rc == landed.NOT_YET:
