@@ -725,3 +725,40 @@ def test_a_finish_task_queued_before_a_hold_cannot_apply_without_override_hold(e
     text = (p.logs / "upgrade.log").read_text()
     assert "release hold overridden by `ttp upgrade demo --override-hold`" in text
     assert [ln.split(" mode=")[1].split()[0] for ln in _upgrade_log_lines(p)][-2:] == ["apply", "apply+override-hold"]
+
+
+def test_the_harness_launcher_runs_the_held_runtime_while_an_upgrade_rewrites_it_and_the_merged_one_after(tmp_path):
+    """git writes a harness's runtime file by file: while project.runtime_hold holds it, the launcher runs the
+    whole copy from before, never new code beside a package that lacks the module it imports; after the hold,
+    the merged runtime. A held copy whose holder is gone is never run."""
+    from ttp import project
+    h = tmp_path / "harness"
+    (h / "bin").mkdir(parents=True)
+    (h / ".git").mkdir()
+    shutil.copy2(RUNTIME.parent / "template" / "bin" / "ttp", h / "bin" / "ttp")
+    pkg = h / "runtime" / "ttp"
+    pkg.mkdir(parents=True)
+    (pkg / "__init__.py").write_text('__version__ = "1"\n')
+    (pkg / "cli.py").write_text("def main():\n    print('old')\n")
+    clean = {k: v for k, v in os.environ.items() if k not in ("PYTHONPATH", "TTP_PYTHON")}
+
+    def launch():
+        r = subprocess.run([sys.executable, str(h / "bin" / "ttp")], capture_output=True, text=True,
+                           env=clean, timeout=60)
+        return r.stdout.strip() or r.stderr.strip().splitlines()[-1]
+    with project.runtime_hold(h):
+        # The merge has written the new cli.py, not yet the module it imports.
+        (pkg / "cli.py").write_text("from . import extra\n\ndef main():\n    print(extra.SAY)\n")
+        assert launch() == "old"
+        (pkg / "extra.py").write_text("SAY = 'new'\n")
+        assert launch() == "old"
+    assert launch() == "new" and not list((h / ".git").iterdir())
+    # A copy left by an upgrade that died mid-merge: its holder pid is gone, so the launcher runs the tree.
+    gone = subprocess.Popen([sys.executable, "-c", "pass"])
+    gone.wait()
+    stale = h / ".git" / project.RUNTIME_HOLD / "ttp"
+    stale.mkdir(parents=True)
+    (stale / "__init__.py").write_text('__version__ = "0"\n')
+    (stale / "cli.py").write_text("def main():\n    print('stale')\n")
+    (stale.parent / project.HOLD_PID).write_text(str(gone.pid))
+    assert launch() == "new"

@@ -1166,7 +1166,12 @@ def _rearm_setup(env, monkeypatch):
 def _rearm_runs(target, status):
     """A run of `target` whose hand-off says `status`, as its runs folder holds it."""
     (target.runs / "7").mkdir(parents=True, exist_ok=True)
-    (target.runs / "7" / "result.json").write_text(json.dumps({"status": status, "summary": "the replay"}))
+    res = target.runs / "7" / "result.json"
+    res.write_text(json.dumps({"status": status, "summary": "the replay"}))
+    # Finished after the rollback: a file's time comes from a coarser clock than time.time() and can read a
+    # few milliseconds before a rollback recorded just ahead of it, so it is set rather than left to the write.
+    after = time.time() + 1
+    os.utime(res, (after, after))
     return "7"
 
 

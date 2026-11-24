@@ -944,6 +944,48 @@ def test_listen_prints_a_reply_posted_to_every_chat_and_never_reads_past_it_unpr
     assert relayers.wakes({"chat": None, "kind": "info", "severity": "high"}, "c1") == "now"
 
 
+def test_listen_on_a_half_updated_runtime_prints_the_reply_once_plain_and_re_executes_going_on_after_it(
+        env, monkeypatch, capsys):
+    """Code loaded before an upgrade imports a module the package on disk lacks (a lazy import of the
+    linkifier): the waiting reply goes out once, as plain text, and once the files settled the listener runs
+    its launcher again with the same arguments, starting after what it printed, so the reply never repeats."""
+    import ttp
+    from ttp import checkcap, cli
+    p = make(env)
+    _relay_chat(p)
+    monkeypatch.setattr(cli, "here", lambda: None)
+    monkeypatch.setattr(checkcap, "upgraded", lambda: "")   # no version or tree change: only the import fails
+    reply = p.db.post("out", "see https://example.com/x", kind="reply", chat="c1")
+    monkeypatch.delattr(ttp, "links", raising=False)
+    monkeypatch.setitem(sys.modules, "ttp.links", None)      # `from . import links` raises ImportError
+    for k in (cli.LISTEN_FROM_ENV, cli.LISTEN_REEXEC_ENV):
+        monkeypatch.setenv(k, "")
+    argv = ["/x/bin/ttp", "listen", "demo", "--chat", "c1", "--ack", "0", "--holder", "h/a"]
+    monkeypatch.setattr(sys, "argv", argv)
+    execs = []
+
+    class Exec(Exception):
+        pass
+
+    def execv(exe, args):
+        execs.append(args)
+        raise Exec
+    monkeypatch.setattr(cli.os, "execv", execv)
+    monkeypatch.setattr(cli.os.path, "isfile", lambda path: path == argv[0])
+    _, naps = _fake_clock(cli, monkeypatch)
+    capsys.readouterr()
+    with pytest.raises(Exec):
+        cli.main(argv[1:])
+    out = capsys.readouterr().out
+    assert out.count(f"[#{reply} ") == 1 and "see https://example.com/x" in out and "](" not in out, out
+    assert execs == [[sys.executable] + argv] and 4 <= len(naps) <= 6, (execs, naps)
+    assert os.environ[cli.LISTEN_FROM_ENV] == str(reply)
+    # The re-executed listener (the linkifier loads again) starts after the reply it printed, despite --ack 0.
+    monkeypatch.delitem(sys.modules, "ttp.links")
+    cli.main(["listen", "demo", "--chat", "c1", "--ack", "0", "--timeout", "4", "--holder", "h/a"])
+    assert capsys.readouterr().out == "" and cli.LISTEN_FROM_ENV not in os.environ
+
+
 def test_remote_listen_and_connect_retry_without_holder_on_an_older_runtime_but_stop_on_a_lease_refusal(
         env, monkeypatch, capsys):
     """An older runtime there rejects --holder (exit 2, 'unrecognized arguments'): listen and connect

@@ -44,7 +44,7 @@ from .project import (NAME_RE, Project, hostname, load_registry, load_secrets, r
                       durable_append, durable_write, write_json, ACCOUNT_KEYS, ACCOUNT_USER_ONLY, account_keys, DEFAULT_CONFIG, deep_merge,
                       load_account_settings, set_account_setting, max_workers_problem, zombie, device_timeout_max, command_env,
                       NOTE_RUN_ENV, in_run, replace_copy, sync_all, MEMORY_AUDIENCES, append_text,
-                      open_append_or_null, tree_writes)
+                      open_append_or_null, runtime_hold, tree_writes)
 from . import gitmemo
 
 RUNTIME = Path(__file__).resolve().parent.parent              # .../runtime (plugin or project copy)
@@ -1585,6 +1585,9 @@ def cmd_listen(a) -> None:
         die(f"unknown chat {a.chat}; run `ttp connect {a.name}` first")
     floor = chat_floor(row["min_severity"], p.config()["notify"].get("chat_min_severity"))
     after = int(row["last_read"] or 0)
+    # A listener that re-executed itself on a changed runtime (_listen_reexec) goes on after what it printed,
+    # which with --ack is past the acknowledged mark: nothing it printed comes again.
+    after = max(after, int(os.environ.pop(LISTEN_FROM_ENV, "") or 0))
     # One relayer per chat id (relayers.claim): another relayer's listener is refused, so it never
     # takes this chat's replies; what one took over a lapsed lease is delivered again to the owner.
     from . import relayers
@@ -1699,12 +1702,12 @@ def _listen_loop(p: Project, db, a, after: int, floor: str) -> None:
     ones at once, broadcast alerts batched over relay.batch_s (--batch), routine updates never
     (--all prints everything). Each printed line wakes a relayer chat, so fewer lines cost less."""
     from .web import cleared
-    from . import relayers
+    from . import checkcap, relayers
     deadline = time.time() + a.timeout if a.timeout else None
     parent = _STARTED_BY[1] if _STARTED_BY[0] == os.getpid() else os.getppid()
     window = relayers.batch_s(p.config(), getattr(a, "batch", None))
     pending: list = []
-    read, beat = after, time.time()
+    read, beat, broke = after, time.time(), 0.0
     while True:
         if os.getppid() != parent:
             return      # whoever started this listener is gone; nobody would read what it prints
@@ -1721,7 +1724,13 @@ def _listen_loop(p: Project, db, a, after: int, floor: str) -> None:
         if ready or (pending and (late or time.time() >= min(m["ts"] for m in pending) + window)):
             ready, pending = sorted(ready + pending, key=lambda m: m["id"]), []
             for m in ready:
-                print(_listen_line(p, m), flush=True)
+                try:
+                    line = _listen_line(p, m)
+                except Exception as e:  # noqa: BLE001 - a line that cannot be rendered goes out plain, never lost
+                    line = _listen_line(p, m, plain=True)
+                    if isinstance(e, ImportError):   # a module the loaded code imports is gone or not yet there
+                        broke = broke or time.time()
+                print(line, flush=True)
         # Read up to the newest message, short of one still waiting for its batch: a listener that
         # ends before printing it leaves it for the next one. With --ack, only an acknowledgement
         # marks messages read, so what was printed to a reader that is gone comes back.
@@ -1736,17 +1745,65 @@ def _listen_loop(p: Project, db, a, after: int, floor: str) -> None:
                 return
         if late:
             return
+        # Code an upgrade changed on disk under this long-running listener: run it again with that code
+        # (the cursor above is saved first), once the files settled, so a lazy import never meets a mix.
+        new = checkcap.upgraded()
+        if new or (broke and time.time() - broke >= checkcap.UPGRADE_SETTLE_S):
+            _listen_reexec(new or "import-failure", read)
+            broke = 0.0
         if time.time() - beat > 60:
             beat = time.time()
             relayers.touch(p, a.chat, getattr(a, "holder", ""), beat)
         time.sleep(poll_s(2))
 
 
-def _listen_line(p: Project, m: dict) -> str:
-    from . import links
+def _listen_line(p: Project, m: dict, plain: bool = False) -> str:
+    """The line a listener prints for message `m`, its text linkified (links.for_user), or as it is
+    (`plain`: when the linkifier cannot load or fails, the message still goes out)."""
     kind = f"ask {m['id']}" if m["kind"] == "ask" else m["kind"]   # "ask N": "#N" reads as a task
     who = "coordinator" if m["chat"] else f"{p.name} ({kind}, {m['severity']})"
+    if plain:
+        return f"[#{m['id']} {who}] {m['text']}"
+    from . import links
     return f"[#{m['id']} {who}] {links.for_user(p, m['text'], links.MD)}"
+
+
+LISTEN_FROM_ENV = "TTP_LISTEN_FROM"     # _listen_reexec: the last message id the listener before the exec printed
+LISTEN_REEXEC_ENV = "TTP_LISTEN_REEXEC"  # ... and when it re-executed after an import failure
+
+
+def _listen_reexec(new: str, read: int) -> None:
+    """Run this listener again, as the same process (its pid stays in the chat's lock), through the launcher
+    that started it with the same arguments and the runtime installed now (`new`: checkcap.upgraded's
+    answer, or "import-failure"), going on after message `read`. A version it re-executed for already
+    (checkcap.REEXEC_ENV), or an import failure within LISTEN_REEXEC_S of its last such re-execution, is
+    never re-executed for again, so a runtime that stays broken prints plain lines instead of looping.
+    Returns only when it did not re-execute."""
+    from . import checkcap
+    if new == "import-failure":
+        try:
+            if time.time() - float(os.environ.get(LISTEN_REEXEC_ENV) or 0) < LISTEN_REEXEC_S:
+                return
+        except ValueError:
+            pass
+        os.environ[LISTEN_REEXEC_ENV] = repr(time.time())
+    else:
+        os.environ[checkcap.REEXEC_ENV] = new
+    os.environ[LISTEN_FROM_ENV] = str(read)
+    launcher = sys.argv[0]
+    cmd = ([sys.executable, launcher] if os.path.isfile(launcher) and not launcher.endswith(".py")
+           else [sys.executable, "-m", "ttp"])
+    print(f"ttp: runtime {__version__} changed on disk ({new}): listener re-executing with the installed one "
+          f"(same pid), going on after #{read}", file=sys.stderr, flush=True)
+    sys.stdout.flush()
+    try:
+        os.execv(sys.executable, cmd + sys.argv[1:])
+    except OSError as e:
+        os.environ.pop(LISTEN_FROM_ENV, None)
+        print(f"ttp: listener could not re-execute ({e}); listening on with this runtime", file=sys.stderr)
+
+
+LISTEN_REEXEC_S = 300.0
 
 
 def _listen_write(db, sql: str, args: tuple, what: str) -> None:
@@ -14636,7 +14693,7 @@ def _upgrade(p: Project, auto: bool = False, explicit: bool = False, took_over: 
         die(f"upgrade not applied; the running harness is unchanged. {moved}", 1)
     genv = {**os.environ, release.GUARD_ENV: "1"}
     upjournal.step(p, "merging", base=base, merged=_git(h, "rev-parse", merged))
-    with tree_writes(h):
+    with tree_writes(h), runtime_hold(h):
         r = subprocess.run(["git", "-C", str(h), *ident, "merge", "--ff-only", merged], capture_output=True,
                            text=True, env=genv)
         if r.returncode != 0:   # the daemon committed charter or memory meanwhile: those touch other files

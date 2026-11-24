@@ -9,6 +9,7 @@
 import os
 import re
 import sys
+import time
 
 HERE = os.path.dirname(os.path.realpath(__file__))
 RUNTIME = os.path.join(os.path.dirname(HERE), "runtime")
@@ -25,6 +26,17 @@ if (sys.argv[1:2] in (["setup"], ["upgrade"]) and os.path.isdir(RUNTIME)
                  "`<plugin-root>/bin/ttp %s` from the plugin instead" % (HERE, installed, sys.argv[1]))
     if os.path.realpath(installed) != os.path.realpath(__file__):
         os.execv(sys.executable, [sys.executable, installed] + sys.argv[1:])
+# While `ttp upgrade` rewrites a harness's files one by one, it holds a whole copy of the runtime from
+# before in .git (project.runtime_hold): run that copy, never a half-written mix, while its holder lives
+# (a crashed upgrade's copy an hour old is never run, whoever has its pid by then).
+HOLD = os.path.join(os.path.dirname(HERE), ".git", "ttp-runtime-hold")
+try:
+    with open(os.path.join(HOLD, ".pid")) as f:
+        if os.fstat(f.fileno()).st_mtime > time.time() - 3600:
+            os.kill(int(f.read()), 0)
+            RUNTIME = HOLD
+except (OSError, ValueError):
+    pass
 # Only this launcher's own runtime may run: inside a worker PYTHONPATH names the harness's runtime, and
 # `ttp setup` would silently reinstall that one.
 if not os.path.isfile(os.path.join(RUNTIME, "ttp", "__init__.py")):

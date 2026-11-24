@@ -3108,6 +3108,42 @@ def tree_writes(harness: str | Path) -> Iterator[None]:
                 note_protected(f, after.get(f))
 
 
+RUNTIME_HOLD = "ttp-runtime-hold"   # in a harness's .git: the runtime its launcher (bin/ttp) runs while held
+HOLD_PID = ".pid"                   # in it: the process holding it (the launcher ignores a dead one's)
+
+
+@contextmanager
+def runtime_hold(harness: str | Path) -> Iterator[None]:
+    """While git rewrites a harness checkout's files one by one (the upgrade's merge), its launcher runs a
+    whole copy of the runtime from before (.git/RUNTIME_HOLD, made and renamed into place first): a process
+    starting meanwhile never sees new code beside an old module, nor beside a module git has not written
+    yet or has already removed. The copy is renamed away once the merge ends, so the next launch runs the
+    merged runtime whole. Without a copy (no .git directory, or it could not be made) git writes as before."""
+    h = Path(harness)
+    hold, src = h / ".git" / RUNTIME_HOLD, h / "runtime"
+    tmp = hold.with_name(f"{hold.name}.{os.getpid()}")
+    for d in (tmp, hold):   # a crashed upgrade's copy (its holder gone)
+        shutil.rmtree(d, ignore_errors=True)
+    try:
+        shutil.copytree(src, tmp, symlinks=True, ignore=shutil.ignore_patterns("__pycache__"))
+        (tmp / HOLD_PID).write_text(str(os.getpid()))
+        os.rename(tmp, hold)
+        held = True
+    except OSError:
+        shutil.rmtree(tmp, ignore_errors=True)
+        held = False
+    try:
+        yield
+    finally:
+        if held:
+            gone = hold.with_name(f"{hold.name}.gone.{os.getpid()}")
+            try:
+                os.rename(hold, gone)
+            except OSError:
+                pass
+            shutil.rmtree(gone, ignore_errors=True)
+
+
 def replace_copy(src: str | Path, dst: str | Path, *, follow_symlinks: bool = True) -> str:
     """shutil.copy2 that never rewrites `dst` in place (shutil.copytree's copy_function for installed
     trees): a temporary file renamed over it, with the source's mode and times, so a script a shell is
