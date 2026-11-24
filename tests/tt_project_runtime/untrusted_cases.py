@@ -784,6 +784,7 @@ def test_a_first_word_found_on_path_is_never_prose(env, tmp_path, monkeypatch):
     assert not untrusted._mark_prose(f"mkdir {_M} here"), "a name MARK_FILE_COMMANDS adds"
     assert untrusted._mark_prose(f"the {_M} record"), "plain prose"
     monkeypatch.setenv("PATH", real)
+    assert not untrusted._mark_prose(f"cat the {_M} record"), "the accepted gap: a reader word refuses"
     assert _why(tmp_path, "Bash", {"command": f"python3 x.py 'the {_M} record stands'"}) == ""
 
 
