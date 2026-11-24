@@ -235,8 +235,9 @@ def correct_landed_claims(p, text: str, repo, head: str = "", tid: int = 0,
     'not landed' because the ref lags behind it. Claims naming another ref are the remote
     checks' business and are left as written. Known gap: a sha-less claim naming another
     destination (pushed to its own branch, merged into a PR branch) names no ref the remote
-    checks can read, so it is not checked either and stays as written; a destination the
-    sentence names before its verb ("in my branch the fix landed") is not seen either. `remote_missing`: the remote check settled every
+    checks can read, so it is not checked either and stays as written; a destination its
+    sentence names before the verb ("in my branch the fix landed") is not seen either.
+    `remote_missing`: the remote check settled every
     claim of this task false, so each is rewritten to read 'not landed', whatever ref it named.
     `fetches`: a cache filled before the write transaction (prefetch), so the one fetch runs
     outside it and this reads the refreshed ref; None makes its own."""
