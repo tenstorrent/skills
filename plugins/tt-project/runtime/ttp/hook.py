@@ -645,7 +645,8 @@ QUOTING_RUNS = {"": re.compile(r"[^'\"\\#()]+"), "'": re.compile(r"[^']+"), '"':
 # A `#` starts a comment where bash starts a new word: after one of these characters, unquoted and
 # unescaped (`a\ #b` is one word; a backslash-newline is skipped), redirect operators included (`echo a>#b`
 # comments out `#b`). Not after the `)` of a paren that continues a word ($(...), <(...), a=(...), @(...)):
-# the `#` joins it. A known gap: `f()#c` and `if(true)#c` are comments in bash, read here as words.
+# the `#` joins it. Never inside (( )) or $(( )): bash reads no comment in arithmetic. A known gap:
+# `f()#c` and `if(true)#c` are comments in bash, read here as words.
 COMMENT_START_AFTER = " \t\n;&|()<>"
 WORD_START_AFTER = " \t\n;&|()"   # a `(` here opens a subshell or (( )); anywhere else it continues a word
 # A case or esac in command position: a `)` after an open case, back to the innermost `(`, ends a pattern
@@ -681,7 +682,8 @@ def _quoting(line: str) -> list[tuple[bool, int]]:
         elif c in "'\"":
             q = c
         elif c == "#" and ((j := _read_before(line, out, i)) < 0 or (not out[j][0] and line[j] in COMMENT_START_AFTER
-                                                                 and not (line[j] == ")" and in_word))):
+                                                                 and not (line[j] == ")" and in_word)
+                                                                 and not any(line[k + 1] == "(" for k, _ in opens))):
             q = "#"
         else:
             inert = False

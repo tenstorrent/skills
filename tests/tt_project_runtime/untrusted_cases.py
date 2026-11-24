@@ -722,6 +722,7 @@ MARK_CODE_EFFECT = [   # code that reads or changes the record itself, or gets i
     *[f"{lead}# it's\nrm {_M} # '" for lead in ("true ", "true\t", "true\n", "true;", "true &", "true |",
                                                 "((1))", "case x in x)", "true <", "true >", "true \\\n")],
     f"(# it's\nrm {_M} # '\ntrue)",   # `(`: a comment can open a subshell's first word
+    f"(( x=1 #')); rm {_M}",   # arithmetic reads no comment: bash runs the rm
     # inside a word, after an escaped break or after a word's `)` the `#` is literal and cuts nothing
     f"echo a#b; rm {_M}", f"echo a\\ #b; rm {_M}", f"echo a\\;#b; rm {_M}",
     f"xargs $(true)#note; rm {_M}", f"cat <(true)#x; rm {_M}", f"a=(1)#x; rm {_M}",
@@ -741,7 +742,8 @@ def test_a_comment_starts_where_bash_starts_a_word():
     starts = ["#c", "a #c", "a\t#c", "a;#c", "a&#c", "a|#c", "(#c)", "(a)#c", "((1))#c", "case x in x)#c",
               "a<#c", "a>#c", "a>>#c", "a \\\n#c", "a\\\\\n#c", "(case x in x)#c\n:;; esac)"]
     words = ["a#c", "a\\ #c", "a\\;#c", "a\\)#c", "'a'#c", "{ a;}#c", "$(a)#c", "$((1))#c", "<(a)#c",
-             "a=(1)#c", "@(a)#c", "$(case x in x) :;; esac)#c"]
+             "a=(1)#c", "@(a)#c", "$(case x in x) :;; esac)#c",
+             "(( a #c))", "$((1 #c))", "for ((i=0; i<1; i++ #c)); do :; done"]
     for cmd in starts + words:
         assert (cmd.index("#c") in _comment_starts(cmd, _quoting(cmd))) == (cmd in starts), cmd
 
