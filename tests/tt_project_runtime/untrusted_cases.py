@@ -717,8 +717,7 @@ MARK_CODE_EFFECT = [   # code that reads or changes the record itself, or gets i
     f"cat <<'EOF'\nx\nEOF\n# it's \\\nrm {_M}\n# '", f"cat > a.md <<'EOF'\nok\nEOF\n# say \"hi \\\nrm {_M}\n# \"",
     f"cat > l.txt <<'EOF'\n{_M}\nEOF\nLESSOPEN='|xargs rm < %s' less l.txt",
     # a `#` starts a comment wherever bash starts a new word, so a kept comment's quote cannot hide
-    # the next line: also right after `)` (review #9688), never inside a word, after a redirect
-    # operator or after the `)` of a $(...) or $((...)), where it is literal word text
+    # the next line; inside a word, after a redirect operator or after the `)` of a $(...) it is literal
     f"(true)# it's\nrm {_M} # '", f"cat <<'EOF'\nx\nEOF\n(true)# it's\nrm {_M} # '",
     *[f"{lead}# it's\nrm {_M} # '" for lead in ("true ", "true\t", "true\n", "true;", "true &", "true |")],
     f"(# it's\nrm {_M} # '\ntrue)",   # `(`: a comment can open a subshell's first word
