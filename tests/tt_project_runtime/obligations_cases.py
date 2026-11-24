@@ -1283,68 +1283,139 @@ def test_must_act_lists_an_order_with_no_owner_from_10_minutes_until_an_owner_or
     assert mustact.unowned(p.db, now + 900) == []
 
 
-def _receipt_order_setup(env, monkeypatch):
-    """A change order owned by a code task, in a project whose repo pushes to a bare origin: the
-    replayed case's shape. Returns (p, repo, tid, oid, mid)."""
+def _receipt_order_setup(env, monkeypatch, status="running"):
+    """A change order owned by a code task whose own branch carries one fresh unpushed commit (the
+    11-24 replay's shape: a run recording its receipt while its change is still unreviewed), in a
+    project whose repo pushes to a bare origin. Returns (p, repo, tid, oid)."""
+    from ttp import obligations as ob
+    p, repo, origin, other = _push_setup(env, monkeypatch, ["true"])
+    mid = p.db.post("in", "please build the deliverable", chat="c1")
+    tid = p.db.add_task("build the deliverable", "s", kind="code", tier="standard", origin="coordinator")
+    branch = f"ttp/t{tid}-build"
+    _git_out(repo, "checkout", "-q", "-b", branch)   # the daemon cuts the task branch at the tip
+    _commit(repo, "change.txt", "change\n")          # the run's fresh commit, unreviewed, not pushed
+    p.db.update_task(tid, branch=branch)
+    oid = ob.add_order(p, "build the deliverable", mid, [tid], action_class="change").split()[1]
+    ob.attach(p, oid, [tid])          # a run may record for its task only once it owns the order
+    p.db.update_task(tid, status=status)   # after attach: a closed task cannot be attached
+    return p, repo, tid, oid
+
+
+def test_a_run_s_receipt_with_only_unreviewed_commits_keeps_the_order_open(env, monkeypatch):
+    """Replay of the 11-24 case: a run records its change order's receipt right after committing,
+    before any review or push. The receipt text is kept as progress, the order stays open and the
+    run is told why, no matter which hex ids its evidence names."""
+    from ttp import obligations as ob
+    p, repo, tid, oid = _receipt_order_setup(env, monkeypatch)
+    head = _git_out(repo, "rev-parse", "HEAD")
+    run_dir = env["tmp"] / "run-r"; run_dir.mkdir()
+    msg = ob.record(p, oid, "receipt", f"commit {head} built and checked", tid, run_dir=str(run_dir))
+    o = ob.get(p.db, oid)
+    assert o["receipt"] is None and o.get("unverified") is None, "an unlanded change must not close it"
+    assert o["owners"][str(tid)]["evidence"][-1]["text"] == f"commit {head} built and checked", \
+        "kept as progress"
+    assert "not landed" in msg and "not landed" in (run_dir / "progress.md").read_text(), \
+        (msg, "the run is told why")
+
+
+def test_a_change_order_closes_once_its_owner_s_commit_is_on_the_push_branch(env, monkeypatch):
+    """The same receipt once the owner's commit is on the push branch closes the order."""
+    from ttp import obligations as ob
+    p, repo, tid, oid = _receipt_order_setup(env, monkeypatch, status="done")
+    _git_out(repo, "push", "-q", "origin", f"{_git_out(repo, 'rev-parse', 'HEAD')}:refs/heads/proj")
+    assert "no longer owed" in ob.record(p, oid, "receipt", "built and checked", tid)
+    o = ob.get(p.db, oid)
+    assert o["receipt"] is not None and "unverified" not in o, o
+
+
+def test_a_check_that_cannot_run_marks_the_order_unverified_and_keeps_it_open(env, monkeypatch):
+    """A fetch that cannot read the push branch keeps the order open, marked unverified in lines()."""
+    from ttp import obligations as ob
+    p, repo, tid, oid = _receipt_order_setup(env, monkeypatch, status="done")
+    _git_out(repo, "remote", "set-url", "origin", str(env["tmp"] / "gone.git"))
+    _git_out(repo, "update-ref", "-d", "refs/remotes/origin/proj")
+    msg = ob.record(p, oid, "receipt", "built and checked", tid)
+    o = ob.get(p.db, oid)
+    assert o["receipt"] is None and "unverified" in msg and o.get("unverified"), (msg, o.get("unverified"))
+    assert any("unverified" in ln for ln in ob.lines(p.db, open_only=True)), ob.lines(p.db, open_only=True)
+
+
+def test_a_change_order_owned_by_a_work_task_closes_on_its_receipt(env, monkeypatch):
+    """A change order owned by a work task (no repo change to land) closes on its receipt unchecked."""
+    from ttp import obligations as ob
+    p, repo, origin, other = _push_setup(env, monkeypatch, ["true"])
+    mid = p.db.post("in", "please roll the config out", chat="c1")
+    tid = p.db.add_task("roll the config out", "s", kind="work", tier="light", origin="coordinator")
+    oid = ob.add_order(p, "roll the config out", mid, [tid], action_class="change").split()[1]
+    ob.attach(p, oid, [tid])
+    assert "no longer owed" in ob.record(p, oid, "receipt", "the rollout is done and checked", tid)
+    assert ob.get(p.db, oid)["receipt"] is not None
+
+
+def test_ownerless_orders_and_coordinator_receipts_close_a_change_order_unchanged(env, monkeypatch):
+    """An ownerless change order, and a coordinator receipt on an owned one, close unchecked."""
+    from ttp import obligations as ob
+    p, repo, tid, oid = _receipt_order_setup(env, monkeypatch)   # unlanded change, live code owner
+    mid = p.db.post("in", "please build another one", chat="c1")
+    ownerless = ob.add_order(p, "build another one", mid, [], action_class="change").split()[1]
+    assert "no longer owed" in ob.record(p, ownerless, "receipt", "built and checked", None)
+    assert ob.get(p.db, ownerless)["receipt"] is not None
+    assert "no longer owed" in ob.record(p, oid, "receipt", "built and checked", None)
+    assert ob.get(p.db, oid)["receipt"] is not None, "a coordinator receipt is trusted"
+
+
+def test_a_hex_token_in_a_receipt_that_is_not_a_commit_cannot_hold_an_order(env, monkeypatch):
+    """No commit id is parsed out of the receipt text: a hex token that is not a commit neither
+    marks the order unverified nor holds it open once its owner's commit landed."""
+    from ttp import obligations as ob
+    p, repo, tid, oid = _receipt_order_setup(env, monkeypatch, status="done")
+    _git_out(repo, "push", "-q", "origin", f"{_git_out(repo, 'rev-parse', 'HEAD')}:refs/heads/proj")
+    assert "no longer owed" in ob.record(p, oid, "receipt", "release 5f1c9d2e3b is out", tid)
+    o = ob.get(p.db, oid)
+    assert o["receipt"] is not None and o.get("unverified") is None, o
+
+
+def test_a_change_order_of_a_code_owner_without_commits_closes_unchanged(env, monkeypatch):
+    """A code owner that ended with no commits of its own has nothing to land: its receipt closes
+    the order unchecked."""
     from ttp import obligations as ob
     p, repo, origin, other = _push_setup(env, monkeypatch, ["true"])
     mid = p.db.post("in", "please build the deliverable", chat="c1")
     tid = p.db.add_task("build the deliverable", "s", kind="code", tier="standard", origin="coordinator")
     oid = ob.add_order(p, "build the deliverable", mid, [tid], action_class="change").split()[1]
-    ob.attach(p, oid, [tid])          # a run may record for its task only once it owns the order
-    return p, repo, tid, oid, mid
-
-
-def test_a_change_order_receipt_counts_only_once_its_commit_lands(env, monkeypatch):
-    """Replay of the run that recorded `ttp obligation receipt <key> "commit <sha> ..."` right after
-    committing, before any review or push: the order stays open with the text as progress and the run
-    hears why; once the commit is on the push branch the same receipt closes it; a check that cannot
-    run keeps it open and marked unverified."""
-    from ttp import obligations as ob
-    p, repo, tid, oid, mid = _receipt_order_setup(env, monkeypatch)
-    _commit(repo, "change.txt", "change\n")          # the run's fresh commit, not pushed
-    head = _git_out(repo, "rev-parse", "HEAD")
-    run_dir = env["tmp"] / "run-r"; run_dir.mkdir()
-    msg = ob.record(p, oid, "receipt", f"commit {head} landed", tid, run_dir=str(run_dir))
+    ob.attach(p, oid, [tid])
+    p.db.update_task(tid, status="done")   # no branch, no commits
+    assert "no longer owed" in ob.record(p, oid, "receipt", "built and checked", tid)
     o = ob.get(p.db, oid)
-    assert o["receipt"] is None and o.get("unverified") is None, "an unlanded commit must not close it"
-    assert o["owners"][str(tid)]["evidence"][-1]["text"] == f"commit {head} landed", "kept as progress"
-    assert "not landed" in msg and "is not on origin/proj" in msg, msg
-    assert "not landed" in (run_dir / "progress.md").read_text(), "the run is told why"
-    # the same receipt once its commit is on the push branch closes it
-    _git_out(repo, "push", "-q", "origin", f"{head}:refs/heads/proj")
-    assert "no longer owed" in ob.record(p, oid, "receipt", f"commit {head} landed", tid, run_dir=str(run_dir))
-    assert ob.get(p.db, oid)["receipt"] is not None
-    # a check that cannot run keeps the order open, marked unverified
-    mid2 = p.db.post("in", "please build another", chat="c1")
-    tid2 = p.db.add_task("build another", "s", kind="code", tier="standard", origin="coordinator")
-    oid2 = ob.add_order(p, "build another", mid2, [tid2], action_class="change").split()[1]
-    ob.attach(p, oid2, [tid2])
+    assert o["receipt"] is not None and o.get("unverified") is None, o
+
+
+def test_a_later_decided_check_clears_a_stale_unverified_mark(env, monkeypatch):
+    """A receipt the check could not run on marks the order unverified; once the check can decide
+    again the stale mark is cleared while the order stays open until its change lands."""
+    from ttp import obligations as ob
+    p, repo, tid, oid = _receipt_order_setup(env, monkeypatch, status="done")
     _git_out(repo, "remote", "set-url", "origin", str(env["tmp"] / "gone.git"))
     _git_out(repo, "update-ref", "-d", "refs/remotes/origin/proj")
-    msg = ob.record(p, oid2, "receipt", f"commit {head} landed", tid2)
-    o = ob.get(p.db, oid2)
-    assert o["receipt"] is None and "unverified" in msg and o.get("unverified"), (msg, o.get("unverified"))
-    assert any("unverified" in ln for ln in ob.lines(p.db, open_only=True)), ob.lines(p.db, open_only=True)
+    ob.record(p, oid, "receipt", "built and checked", tid)
+    assert ob.get(p.db, oid).get("unverified"), "the check could not run"
+    _git_out(repo, "remote", "set-url", "origin", str(env["tmp"] / "origin.git"))
+    msg = ob.record(p, oid, "receipt", "built and checked", tid)
+    o = ob.get(p.db, oid)
+    assert o["receipt"] is None and "not landed" in msg and o.get("unverified") is None, (msg, o)
+    _git_out(repo, "push", "-q", "origin", f"{_git_out(repo, 'rev-parse', 'HEAD')}:refs/heads/proj")
+    assert "no longer owed" in ob.record(p, oid, "receipt", "built and checked", tid)
 
 
-def test_a_change_order_receipt_from_an_owner_that_already_landed_closes_as_today(env, monkeypatch):
+def test_an_owner_with_a_recorded_landing_closes_as_today(env, monkeypatch):
     """A change order whose owner's landing is recorded (the push queue wrote its landing) closes on
-    a receipt as it always did; a coordinator receipt (no owner task) on an unlanded order keeps it
-    open with its text as progress."""
-    from ttp import landed, obligations as ob
-    from pathlib import Path
-    p, repo, tid, oid, mid = _receipt_order_setup(env, monkeypatch)
+    a receipt as it always did."""
+    from ttp import obligations as ob
+    p, repo, tid, oid = _receipt_order_setup(env, monkeypatch, status="done")
     p.db.x("INSERT INTO task_landings(marker, task, sha, target, ts) VALUES('m1', ?, ?, 'origin/proj', 0)",
            (tid, _git_out(repo, "rev-parse", "HEAD")))
     assert "no longer owed" in ob.record(p, oid, "receipt", "commit 12ab34cd56 built it", tid)
-    mid2 = p.db.post("in", "please build another one", chat="c1")
-    tid2 = p.db.add_task("build another one", "s", kind="code", tier="standard", origin="coordinator")
-    oid2 = ob.add_order(p, "build another one", mid2, [tid2], action_class="change").split()[1]
-    ob.attach(p, oid2, [tid2])
-    msg = ob.record(p, oid2, "receipt", "the deliverable is built and checked", None)   # no owner run
-    o = ob.get(p.db, oid2)
-    assert o["receipt"] is None and "not landed" in msg and o.get("unverified") is None, (msg, o)
+    assert ob.get(p.db, oid)["receipt"] is not None
 
 
 def test_the_daemon_files_a_change_order_receipt_only_once_it_lands(env, monkeypatch):
@@ -1355,14 +1426,12 @@ def test_the_daemon_files_a_change_order_receipt_only_once_it_lands(env, monkeyp
     import time as _t
     from ttp import obligations as ob
     monkeypatch.setenv("TTP_TX_GUARD", "1")     # a fetch inside the write transaction is refused
-    p, repo, tid, oid, mid = _receipt_order_setup(env, monkeypatch)
-    _commit(repo, "change.txt", "change\n")
-    head = _git_out(repo, "rev-parse", "HEAD")
+    p, repo, tid, oid = _receipt_order_setup(env, monkeypatch, status="done")
     run_dir = env["tmp"] / f"run-{tid}"; run_dir.mkdir()
     p.db.x("INSERT INTO runs(task, role, started, status, dir) VALUES(?, 'worker', ?, 'running', ?)",
            (tid, _t.time(), str(run_dir)))
     (run_dir / ob.RUN_FILE).write_text(json.dumps(
-        {"ts": _t.time(), "id": oid, "kind": "receipt", "evidence": f"commit {head} landed",
+        {"ts": _t.time(), "id": oid, "kind": "receipt", "evidence": "built and checked",
          "task": str(tid), "milestone": None}) + "\n")
     ob.file_runs(p)
     o = ob.get(p.db, oid)

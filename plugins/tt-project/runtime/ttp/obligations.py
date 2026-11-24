@@ -15,9 +15,9 @@ running or waiting, a re-attach. An owner waiting on a `ttp detach` job of its o
 or a new file matching the results glob it declared (`ttp detach --results <glob>`) (_job_results): a
 pid or a growing log alone never counts. An overdue owner with such a live job that reported nothing
 is named with its job and both ways to report (anomaly_text). A receipt (`ttp obligation receipt <id>
-"<evidence>"`) ends the obligation; on an order of the change class it does so only once the change is
-on the push branch (landed.check decides; _receipt_landing), else the text lands as progress and the
-order stays owed, marked unverified when the check cannot run. An owner task that ends (done, failed, cancelled, or gone) without one
+"<evidence>"`) ends the obligation; on an order of the change class a code owner's receipt does so
+only once its change is on the push branch (landed.check decides; _receipt_landing), else the text
+lands as progress and the order stays owed, marked unverified when the check cannot run. An owner task that ends (done, failed, cancelled, or gone) without one
 leaves it owed. Owners that cannot act are not aged (_owner_cover): one that ended leaves the overdue set
 while another owner is still live, and once every owner ended without a receipt the obligation raises one
 episode, "no live owner is left", when the newest owner's clock runs out. An owner blocked on an open user
@@ -308,8 +308,8 @@ def _owner_note(o: dict, p) -> str:
             f"This task is a required owner. Record durable progress with evidence (a commit, a file, a URL) "
             f"at least every {CLOCK_S // 3600} h: `ttp obligation progress {o['id']} \"<evidence>\"`. Once "
             f"the deliverable exists and you checked it: `ttp obligation receipt {o['id']} \"<evidence>\"`"
-            + (" only once the change landed on the push branch (a receipt naming a commit that is not on it "
-               "keeps this order open)" if change else "")
+            + (" only once the change landed on the push branch (an unlanded code owner's receipt keeps "
+               "this order open)" if change else "")
             + ". Running, waiting or finishing this task without a receipt leaves it owed."
             + "".join("\n\n" + _milestone_note(p, o["id"], m) for m in (o.get("milestones") or {}).values()))
 
@@ -468,31 +468,38 @@ def _receipt_landing(p, oid: str, kind: str, evidence: str, milestone: str | Non
                     task: int | None) -> tuple[str, str] | None:
     """How a receipt on `oid` stands with the push branch: ("not-landed", why) when the change is
     not on it, ("unverified", why) when the check cannot run, None when the receipt may close the
-    order. Decided by the landed check on the receipt's own commit (a sha its evidence names), else
-    its owner task's head, so a receipt filed before anything landed cannot close a change order.
-    Plain obligations, milestone receipts, orders whose class is not change, projects with no way to
-    check (landed.can_check) and an owner whose landing is recorded close as they do today; a receipt record() would refuse anyway (the order is closed or dropped, a non-owner files it) is skipped,
-    so its fetch is never paid. Known gap: a receipt naming another repository's sha reads
-    'unverified' (check reads this project's root only). Runs before record()'s transaction: the
-    check's one bounded fetch of the push branch is a network call that transaction refuses
-    (db.py raises TxNetworkError)."""
+    order. Checked only where a check is possible: owners that are code tasks with commits of their
+    own (a live one counts: its commits may still land), in a project landed.check can decide for
+    (a push branch). Work, harness and question owners, a done code task without commits, ownerless
+    orders and the coordinator's own receipt (task None, trusted) close unchecked, as before; no
+    commit id is read out of the receipt text, so a hex token that is not a commit cannot hold the
+    order open. Runs before record()'s transaction: the check's one bounded fetch of the push branch
+    is a network call that transaction refuses (db.py raises TxNetworkError)."""
     from . import landed
     o = get(p.db, oid)
     if kind != "receipt" or milestone is not None or not o \
-            or (o.get("promise") or {}).get("class") != "change" or not landed.can_check(p):
+            or (o.get("promise") or {}).get("class") != "change":
         return None
-    if o["receipt"] or o.get("dropped") or (task is not None and str(task) not in o["owners"]):
-        return None   # record() refuses it; the fetch is not paid
-    owners = [task] if task is not None else sorted(int(t) for t in o["owners"])
+    if o["receipt"] or o.get("dropped") or task is None or str(task) not in o["owners"]:
+        return None   # record() refuses it; the coordinator's receipt is trusted to close it
+    owners = sorted(int(t) for t in o["owners"])
     if any(p.db.task(t) and landed.recorded(p.db, t)[0] for t in owners):
         return None   # its owner's landing is recorded: the receipt closes it as today
-    outs = ([landed.check(p, p.root, sha)] if (sha := landed.literal_sha(evidence or ""))
-            else [landed.check(p, p.root, tid=t) for t in owners])
-    if any(rc == 0 for rc, _ in outs):
+    gate = []
+    for t in owners:
+        row = p.db.task(t)
+        if row is not None and row.get("kind") == "code":
+            resolved = landed.task_shas(p, t)
+            if resolved[0] or row.get("status") != "done":   # a live code task's commits may still land
+                gate.append((t, resolved))
+    if not gate or not landed._has_push_branch(p):
         return None
+    outs = [landed.check(p, p.root, tid=t, resolved=resolved) for t, resolved in gate]
+    if any(rc == 0 for rc, _ in outs):
+        return None   # any gated owner's commit on the push branch closes the order
     cannot = next((w for rc, w in outs if rc == landed.CANNOT), None)
-    if not outs or cannot is not None:   # the push branch could not be read: never a false 'not landed'
-        return ("unverified", cannot or "no commit named")
+    if cannot is not None:   # the push branch could not be read: never a false 'not landed'
+        return ("unverified", cannot)
     return ("not-landed", outs[0][1])
 
 
@@ -555,6 +562,7 @@ def record(p, oid: str, kind: str, evidence: str, task: int | None, now: float |
                     o["unverified"] = {"at": now, "task": task, "evidence": evidence, "why": landing[1]}
                     msg = f"cannot check the landing ({landing[1]}); {oid} stays owed, marked unverified"
                 else:
+                    o.pop("unverified", None)   # a decided check clears a stale unverified mark
                     msg = f"not landed: {landing[1]}; record the receipt after it lands"
                 run_note = f"obligation receipt on {oid}: {msg}"
             elif own is not None and (rest := _parts_open(p.db, o, str(task))):
