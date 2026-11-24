@@ -200,8 +200,9 @@ def test_a_hand_off_with_a_push_still_in_flight_is_not_locally_corrected(env, mo
 @pytest.mark.parametrize("handoff_status", ["blocked", "failed", "needs_review"])
 def test_a_hand_off_not_deferred_to_the_remote_check_is_corrected_despite_a_push_in_flight(
         env, monkeypatch, handoff_status):
-    """Only a hand-off the remote check will settle skips the local correction. A
-    blocked, failed or approval-needing one is never deferred, so its false 'landed at <sha>' still reads 'not landed'."""
+    """Only a hand-off the remote check will settle skips the local correction. A blocked,
+    failed or approval-needing one is never deferred, so its false 'landed at <sha>' still
+    reads 'not landed'."""
     task, res, head = _in_flight_finish(env, monkeypatch, handoff_status)
     assert task["status"] != "pushing", task["status"]
     assert "not landed" in res["summary"] and head[:12] in res["summary"], res
