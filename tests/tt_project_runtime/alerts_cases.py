@@ -3008,7 +3008,7 @@ def test_after_push_deploy_restart_held_by_a_live_stream_pages_only_past_its_gra
                         'stay off for restart: box: a live realtime stream holds it' if step == 'restart' else '')
     _deploy_lib('0.5.0')
     files = '0.4.9' if case == 'files_behind' else '0.5.0'
-    _, db = _deploy_project(tmp_path, 'alpha', files, running='0.4.9')
+    base, db = _deploy_project(tmp_path, 'alpha', files, running='0.4.9')
     now = time.time()
     deploy.record(p, overview.deployed(names=['alpha']), now)
     pages, page = _deploy_pager(p)
@@ -3024,6 +3024,10 @@ def test_after_push_deploy_restart_held_by_a_live_stream_pages_only_past_its_gra
     sent = p.db.q("SELECT text,severity FROM messages WHERE direction='out' AND kind='alert' AND ref='deploy-behind:alpha'")
     if case == 'held_in_grace':
         assert not sent and p.db.kv(deploy.CHECKS)['deploy:alpha:0.5.0']['outcome'] == 'pending'
+        _deploy_lib('0.5.1')   # a newer release while the restart is still held keeps it pending
+        (base / 'harness' / 'runtime' / 'ttp' / '__init__.py').write_text('__version__ = "0.5.1"\n')
+        result = deploy.record(p, overview.deployed(names=['alpha']), t + 1)
+        assert result['rc'] == 0 and result['projects'][0]['outcome'] == 'pending', result['text']
     elif case == 'held_past_grace':
         assert len(sent) == 1 and sent[0]['severity'] == 'normal', sent
         assert sent[0]['text'].startswith('Restart pending: alpha has tt-project 0.5.0 on disk'), sent

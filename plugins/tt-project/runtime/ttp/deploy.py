@@ -505,6 +505,7 @@ def record(p, report: dict, now: float | None = None) -> dict:
                 t.pop("parked", None)
                 t.pop("gave_up", None)
                 t.pop("owner_wait", None)
+            _restart_held(p, rec, row, now)
             outcome, kind, reason = _judge(p, rec, row, takeovers.setdefault(row["name"], {}), now)
             row["outcome"] = outcome
             if outcome == "done" and not old:
