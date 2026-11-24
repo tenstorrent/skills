@@ -11,7 +11,8 @@ parallelize, serve or release the model.
 ## Prerequisites
 
 1. Follow [model-bringup startup](../model-bringup/SKILL.md#startup).
-2. Validate `MODEL_DIR/doc/model_contract.json`.
+2. Validate `MODEL_DIR/doc/model_contract.json`;
+   [resolve required assets when needed](references/validation-gates.md#required-assets).
 3. Read [family contracts](references/family-contracts.md).
 4. Confirm the fresh output and forbidden read roots.
 5. Use `$tt-device-usage` before any device action.
@@ -26,27 +27,11 @@ parallelize, serve or release the model.
 6. Define host preprocessing and postprocessing boundaries.
 7. Implement TTNN modules with intermediate parity tests.
 8. Assemble the complete functional inference graph.
-9. Compare every declared raw output.
+9. Compare every declared raw output;
+   [align top-k selections](references/validation-gates.md#top-k-selection) before PCC.
 10. Validate state reset and sequence behavior when required.
-11. Run the contract's task metric.
+11. [Estimate and run the contract's task metric](references/validation-gates.md#task-evaluation).
 12. Run `$stage-review` and repair every finding.
-
-When top-k selection determines a downstream tensor's query axis, run the reference and TTNN
-selectors independently and retain each selected candidate's upstream index. Always align the
-downstream tensors by those indices before computing PCC; comparing rank positions can pair
-different candidates. Do not supply reference indices to the TTNN inference path for an
-acceptance test. Report the shared count, each selected count, and unmatched candidates
-separately. Aligned PCC on shared candidates alone does not establish end-to-end correctness:
-assess selection coverage, run the contract's task metric at its stage, and check rank order
-separately if it is part of the declared output semantics.
-
-When a required source, checkpoint, or evaluation dataset is missing locally, look for an
-existing copy and then check the contract's authoritative source, access terms, download size,
-and available storage. If it can be fetched, download it into an ignored local artifact directory,
-verify its integrity and expected contents, record its source and version, and continue the
-declared validation. Do not stop at "not available locally" or substitute a smaller sample for
-the required metric. Record a blocked metric with the exact failed access or download attempt
-only when the asset cannot be obtained; never commit downloaded weights or datasets.
 
 ## Required boundaries
 
