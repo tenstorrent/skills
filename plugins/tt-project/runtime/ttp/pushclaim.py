@@ -327,13 +327,16 @@ def correct_reply_claims(p, text: str, repo, running: str = "") -> str:
     for start, end, sha in live_claims(text, repo):
         if text[end:].startswith(" " + UNVERIFIED_CLAIM):   # already marked, never twice
             continue
-        where = _in_running(repo, sha, running)
-        if where is None and not sha:
-            fixes.append((start, end, f"{NOT_LIVE}: no commit named"))
-        elif where is None:
+        if not running:   # the running commit is unknown: the claim cannot be checked
             fixes.append((start, end, text[start:end] + " " + UNVERIFIED_CLAIM))
-        elif not where:
-            fixes.append((start, end, f"{NOT_LIVE}: {sha[:12]} is not in the running version"))
+        elif not sha:     # a live line names its commit, and the check is possible
+            fixes.append((start, end, f"{NOT_LIVE}: no commit named"))
+        else:
+            where = _in_running(repo, sha, running)
+            if where is None:   # git failed: fail open
+                fixes.append((start, end, text[start:end] + " " + UNVERIFIED_CLAIM))
+            elif not where:
+                fixes.append((start, end, f"{NOT_LIVE}: {sha[:12]} is not in the running version"))
     for start, end, fix in sorted(fixes, reverse=True):
         text = text[:start] + fix + text[end:]
     return text

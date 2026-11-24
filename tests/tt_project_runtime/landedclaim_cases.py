@@ -411,6 +411,10 @@ def test_a_live_claim_naming_a_commit_the_running_version_lacks_is_marked(env, m
     # marked (unverified), never left reading a plain 'live'
     fixed = pushclaim.correct_reply_claims(p, f"The fix is live (commit {head[:10]}).", p.root)
     assert "(unverified)" in fixed and "not live yet" not in fixed, fixed
+    # a sha-less live claim is a hard mark only when the check was possible: with the running
+    # commit unknown it reads (unverified), never a 'not live yet' the check cannot support
+    fixed = pushclaim.correct_reply_claims(p, "The fix is live.", p.root)
+    assert "(unverified)" in fixed and "not live yet" not in fixed, fixed
 
 
 def test_hedged_landed_and_live_claims_are_not_claims(env, monkeypatch):
