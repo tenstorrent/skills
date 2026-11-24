@@ -47,7 +47,9 @@ def armed(cfg: dict, names: list[str], root) -> "Probe | None":
     """The probe watching a `ttp lock` of `names`, or None when it is off: config unset, or every
     name matches a `locks.yield_exempt` glob."""
     cmd = command(cfg)
-    globs = _locks(cfg).get("yield_exempt") or []
+    globs = [g for g in (_locks(cfg).get("yield_exempt") or []) if isinstance(g, str)]
+    if isinstance(_locks(cfg).get("yield_exempt"), str):   # a bare string would glob per character
+        globs = []
     keep = [n for n in names if not any(isinstance(g, str) and fnmatch.fnmatch(n, g) for g in globs)]
     if not cmd or not keep:
         return None
