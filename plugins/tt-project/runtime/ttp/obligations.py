@@ -15,7 +15,9 @@ running or waiting, a re-attach. An owner waiting on a `ttp detach` job of its o
 or a new file matching the results glob it declared (`ttp detach --results <glob>`) (_job_results): a
 pid or a growing log alone never counts. An overdue owner with such a live job that reported nothing
 is named with its job and both ways to report (anomaly_text). A receipt (`ttp obligation receipt <id>
-"<evidence>"`) ends the obligation. An owner task that ends (done, failed, cancelled, or gone) without one
+"<evidence>"`) ends the obligation; on an order of the change class it does so only once the change is
+on the push branch (landed.check decides; _receipt_landing), else the text lands as progress and the
+order stays owed, marked unverified when the check cannot run. An owner task that ends (done, failed, cancelled, or gone) without one
 leaves it owed. Owners that cannot act are not aged (_owner_cover): one that ended leaves the overdue set
 while another owner is still live, and once every owner ended without a receipt the obligation raises one
 episode, "no live owner is left", when the newest owner's clock runs out. An owner blocked on an open user
@@ -301,11 +303,14 @@ def _milestone_note(p, oid: str, m: dict) -> str:
 
 
 def _owner_note(o: dict, p) -> str:
+    change = (o.get("promise") or {}).get("class") == "change"
     return (f"## Obligation {o['id']} (urgent, owed to the user)\n{o['text']}\n"
             f"This task is a required owner. Record durable progress with evidence (a commit, a file, a URL) "
             f"at least every {CLOCK_S // 3600} h: `ttp obligation progress {o['id']} \"<evidence>\"`. Once "
-            f"the deliverable exists and you checked it: `ttp obligation receipt {o['id']} \"<evidence>\"`. "
-            f"Running, waiting or finishing this task without a receipt leaves it owed."
+            f"the deliverable exists and you checked it: `ttp obligation receipt {o['id']} \"<evidence>\"`"
+            + (" only once the change landed on the push branch (a receipt naming a commit that is not on it "
+               "keeps this order open)" if change else "")
+            + ". Running, waiting or finishing this task without a receipt leaves it owed."
             + "".join("\n\n" + _milestone_note(p, o["id"], m) for m in (o.get("milestones") or {}).values()))
 
 
@@ -459,16 +464,54 @@ def _record_progress(own: dict, evidence: str, now: float) -> None:
     own["evidence"] = (own.get("evidence") or [])[-(EVIDENCE_KEPT - 1):] + [{"at": now, "text": evidence}]
 
 
+def _receipt_landing(p, oid: str, kind: str, evidence: str, milestone: str | None,
+                    task: int | None) -> tuple[str, str] | None:
+    """How a receipt on `oid` stands with the push branch: ("not-landed", why) when the change is
+    not on it, ("unverified", why) when the check cannot run, None when the receipt may close the
+    order. Decided by the landed check on the receipt's own commit (a sha its evidence names), else
+    its owner task's head, so a receipt filed before anything landed cannot close a change order.
+    Plain obligations, milestone receipts, orders whose class is not change, projects with no way to
+    check (landed.can_check) and an owner whose landing is recorded close as they do today; a record
+    record() would refuse anyway (the order is closed or dropped, a non-owner files it) is skipped,
+    so its fetch is never paid. Known gap: a receipt naming another repository's sha reads
+    'unverified' (check reads this project's root only). Runs before record()'s transaction: the
+    check's one bounded fetch of the push branch is a network call that transaction refuses
+    (db.py raises TxNetworkError)."""
+    from . import landed
+    o = get(p.db, oid)
+    if kind != "receipt" or milestone is not None or not o \
+            or (o.get("promise") or {}).get("class") != "change" or not landed.can_check(p):
+        return None
+    if o["receipt"] or o.get("dropped") or (task is not None and str(task) not in o["owners"]):
+        return None   # record() refuses it; the fetch is not paid
+    owners = [task] if task is not None else sorted(int(t) for t in o["owners"])
+    if any(p.db.task(t) and landed.recorded(p.db, t)[0] for t in owners):
+        return None   # its owner's landing is recorded: the receipt closes it as today
+    outs = ([landed.check(p, p.root, sha)] if (sha := landed.literal_sha(evidence or ""))
+            else [landed.check(p, p.root, tid=t) for t in owners])
+    if any(rc == 0 for rc, _ in outs):
+        return None
+    cannot = next((w for rc, w in outs if rc == landed.CANNOT), None)
+    if not outs or cannot is not None:   # the push branch could not be read: never a false 'not landed'
+        return ("unverified", cannot or "no commit named")
+    return ("not-landed", outs[0][1])
+
+
 def record(p, oid: str, kind: str, evidence: str, task: int | None, now: float | None = None,
-           milestone: str | None = None) -> str:
+           milestone: str | None = None, run_dir: str | None = None) -> str:
     """File durable progress or a receipt. Progress counts only from a required owner, and resets only
-    that owner's clock. Returns what was done, in a few words."""
+    that owner's clock. Returns what was done, in a few words. A receipt on a change order closes it
+    only once its change is on the push branch (the landed check decides; see _receipt_landing): one
+    that is not is kept as progress, and one this project cannot check leaves the order open, marked
+    unverified. `run_dir`: the run whose record this is, told the reason a receipt was not filed."""
     if kind not in ("progress", "receipt"):
         raise ValueError(f"unknown record kind {kind!r}")
     evidence = " ".join(str(evidence or "").split())[:EVIDENCE_MAX]
     if not evidence:
         raise ValueError(f"{kind} needs evidence: a commit, a file or a URL")
     now = time.time() if now is None else now
+    run_note = ""
+    landing = _receipt_landing(p, oid, kind, evidence, milestone, task)   # before the transaction: its fetch is a network call
     with p.db.tx():
         st = _load(p.db)
         o = _need(st, oid)
@@ -506,17 +549,30 @@ def record(p, oid: str, kind: str, evidence: str, task: int | None, now: float |
             if _accepts(o) and (why := _receipt_unmet(p.db, o, evidence, task)):
                 raise ValueError(f"{oid}: receipt refused: {why}, so the acceptance is not met. Record it once an "
                                  f"owner meets it, or give evidence that does (a commit, a file, a met hand-off)")
-            if own is not None and (rest := _parts_open(p.db, o, str(task))):
+            if landing:
+                if own is not None:
+                    _record_progress(own, evidence, now)   # the receipt text is kept as progress
+                if landing[0] == "unverified":
+                    o["unverified"] = {"at": now, "task": task, "evidence": evidence, "why": landing[1]}
+                    msg = f"cannot check the landing ({landing[1]}); {oid} stays owed, marked unverified"
+                else:
+                    msg = f"not landed: {landing[1]}; record the receipt after it lands"
+                run_note = f"obligation receipt on {oid}: {msg}"
+            elif own is not None and (rest := _parts_open(p.db, o, str(task))):
                 own["receipt"] = {"at": now, "evidence": evidence}
                 _record_progress(own, evidence, now)
                 p.db.set_kv(KV, st)
                 return (f"#{task}'s part of {oid} has its receipt; {oid} stays owed until "
                         f"{', '.join(rest)} have receipts or the coordinator files the receipt")
-            o["receipt"] = {"at": now, "task": task, "evidence": evidence}
-            _retire(p.db, now, "obligation receipt", prefix=f"obligation:{oid}:milestone:")
-            _retire(p.db, now, "promise kept", prefix=f"obligation:{oid}:promise")
-            msg = f"{oid} has its receipt; it is no longer owed"
+            else:
+                o["receipt"] = {"at": now, "task": task, "evidence": evidence}
+                o.pop("unverified", None)
+                _retire(p.db, now, "obligation receipt", prefix=f"obligation:{oid}:milestone:")
+                _retire(p.db, now, "promise kept", prefix=f"obligation:{oid}:promise")
+                msg = f"{oid} has its receipt; it is no longer owed"
         p.db.set_kv(KV, st)
+    if run_note:
+        _run_note(run_dir, run_note)   # outside the transaction: a file write holds no db lock
     return msg
 
 
@@ -561,6 +617,7 @@ def reopen(p, oid: str, why: str, now: float | None = None) -> str:
             return f"{oid} has no receipt; nothing to reopen"
         o.setdefault("reopened", []).append({"at": now, "why": why, "receipt": o["receipt"], "parts": parts})
         o["receipt"] = None
+        o.pop("unverified", None)   # the mark of the receipt being undone goes with it
         for own in o["owners"].values():
             own["progress"] = max(float(own.get("progress") or 0), now)
         p.db.set_kv(KV, st)
@@ -585,8 +642,18 @@ def _refuse(run_dir: Path, key: str, why: str) -> None:
     from .project import durable_append
     try:
         durable_append(Path(run_dir) / REFUSED_FILE, key + "\n")
-        durable_append(Path(run_dir) / "progress.md", f"{time.strftime('%H:%M:%S')} daemon: obligation record "
-                                                      f"refused, not filed: {why}\n")
+    except OSError:
+        pass
+    _run_note(run_dir, f"obligation record refused, not filed: {why}")
+
+
+def _run_note(run_dir: str | Path | None, line: str) -> None:
+    """One daemon line in a run's progress.md, where its worker reads the answers it is given."""
+    if not run_dir:
+        return
+    from .project import durable_append
+    try:
+        durable_append(Path(run_dir) / "progress.md", f"{time.strftime('%H:%M:%S')} daemon: {line}\n")
     except OSError:
         pass
 
@@ -630,7 +697,8 @@ def file_runs(p, now: float | None = None) -> list[str]:
                 if old and float(rec.get("ts") or 0) < float(r["started"] or 0) + RUN_FILES_DAYS * 86400:
                     continue
                 record(p, str(rec["id"]), str(rec["kind"]), str(rec.get("evidence") or ""), int(r["task"]),
-                       now=min(float(rec.get("ts") or now), now), milestone=rec.get("milestone"))
+                       now=min(float(rec.get("ts") or now), now), milestone=rec.get("milestone"),
+                       run_dir=r["dir"])
             except (ValueError, KeyError, TypeError) as e:
                 out.append(f"run {r['id']}: {str(e)[:200]}")
                 _refuse(r["dir"], key, str(e)[:200])
@@ -1221,6 +1289,8 @@ def lines(db, now: float | None = None, where=None, open_only: bool = False) -> 
                      else "promised; ") + _promise_state(o, now, where)
             if (pr.get("claim") or {}).get("last") == CLAIM_UNREACHABLE:
                 state += "; unchecked: its check's host did not answer (exit 255), retrying"
+            if o.get("unverified") and not o["receipt"]:
+                state += f"; receipt unverified ({str(o['unverified'].get('why'))[:80]})"
             if pr.get("order") is not None and not pr.get("started"):
                 state += f"; not started (start by {timefmt.long(pr['start_by'], where)})"
         else:
