@@ -370,25 +370,61 @@ def test_a_landed_code_change_carries_its_landing_facts_to_the_event(env, monkey
     assert "landed as abcdef1" in ev["text"]
 
 
+# The replay case of  (task the hand-off plus its shipped-by tail reached
+# the user's chat): sanitized -- no hosts, names or URLs -- but shaped like a worker's real hand-off.
+_CD_HANDOFF = """Two fixes are on the branch (commit 16b5701a4, on top of cf33224a2). It is ready for review.
+
+**1. Older hosts keep the listener alive**
+- The `--holder` retry is now one helper, `_drop_unrecognized`: when the host rejects the flag, it drops the flag and its value and retries.
+- A project upgraded before its host keeps its listener. Tests fail without the change.
+
+**2. A late base is picked up**
+- While the base is unset it is decided again for each batch and each reconnect.
+- The forward path records one row per change of the base.
+
+Tests: 4 new tests. The smoke suite and the plugin validation passed; run 20377. Some remote and
+timezone tests fail the same way at the base commit."""
+_CD_SHIPPED = "(shipped by review #9674: pushed b40ca7854 as 0.2.1519 to relay/x)"
+_CD_FIXTURE = _CD_HANDOFF + "\n" + _CD_SHIPPED
+
+
+def test_a_replay_of_the_raw_hand_off_reply_never_reaches_the_chat(env, monkeypatch):
+    """The replay of reply #4268 (): a finished reply_chat task's hand-off -- even one
+    with its shipped-by tail -- never posts to the chat. It goes to the coordinator as a reply_due
+    event, and only a record-built outcome line can reach the chat, after the bound."""
+    from ttp import chatdigest, pushq
+    monkeypatch.setenv("TTP_TEST_CHAT_DIGEST", "on")
+    p = make(env)
+    t = _cd_task(p, "Message links: older hosts keep the forwarded listener alive", chat="c1")
+    now = time.time()
+    pushq._reply(p.db, t, "done", _CD_FIXTURE, facts=pushq.landing_facts("b40ca7854", "0.2.1519", "relay/x"))
+    assert not [m for m in p.db.q("SELECT text FROM messages WHERE direction='out'")], "nothing posts"
+    for bad in ("16b5701a4", "smoke suite", "shipped by review", "Two fixes are on the branch"):
+        assert not any(bad in m["text"] for m in p.db.q("SELECT text FROM messages")), bad
+    ev = _cd_due(p, t["id"])
+    assert ev and json.loads(ev["data"])["chat"] == "c1"
+    assert "16b5701a4" in ev["text"] and "Hand-off" in ev["text"]      # enclosed data only
+    assert chatdigest.fallbacks(p, p.config(), now + 10) == [], "the coordinator is still answering"
+
+
 def test_the_fallback_outcome_line_posts_from_records_only_once_the_bound_passes(env, monkeypatch):
     """No coordinator reply within `coordinator.reply_fallback_s`: one short model-free outcome line
-    built from records (never hand-off prose) posts to the chat; a reply before the bound posts
-    nothing."""
+    built from records (never hand-off prose) posts to the chat; a chat the coordinator answered in
+    time gets nothing."""
     from ttp import chatdigest, pushq
     monkeypatch.setenv("TTP_TEST_CHAT_DIGEST", "on")
     p = make(env)
     t = _cd_task(p, "Reply path: the user's chat gets the coordinator's plain summary", chat="c1")
-    pushq._reply(p.db, t, "done", _CD_TABLE + " (shipped by review #9674: pushed b40ca78 as 0.2.1519)",
-                 facts=pushq.landing_facts("b40ca7854", "0.2.1519", "relay/smartonTT/tt-project"))
+    pushq._reply(p.db, t, "done", _CD_FIXTURE, facts=pushq.landing_facts("b40ca7854", "0.2.1519", "relay/x"))
     now = time.time()
     assert chatdigest.fallbacks(p, p.config(), now + 10) == []       # inside the bound: nothing posts
     got = chatdigest.fallbacks(p, p.config(), now + chatdigest.DEFAULT_FALLBACK_S + 60)
     assert got and len(got) == 1
     text = p.db.one("SELECT text FROM messages WHERE id=?", (got[0],))["text"]
     assert len(text) <= 300 and "landed as b40ca78" in text and "0.2.1519" in text
-    assert "shipped by review" not in text and "Opus" not in text   # no hand-off prose
-    assert p.db.kv(chatdigest.FALLBACK_KV) == []                    # armed once, spent once
-    # A chat the coordinator answered in time gets no fallback.
+    assert not any(w in text for w in ("16b5701a4", "smoke suite", "shipped by review", "Opus"))
+    assert p.db.kv(chatdigest.FALLBACK_KV) == [], "armed once, spent once"
+    # A chat the coordinator answered in time gets no fallback line.
     t2 = _cd_task(p, "second task", chat="c2")
     pushq._reply(p.db, t2, "done", "Rows posted.", facts={"need": "run the Mac upgrade"})
     p.db.post("out", "The fix is live as 0.2.1519; run the Mac upgrade.", chat="c2", kind="reply")

@@ -84,3 +84,4 @@
 +85: task_update `budget_usd` (raise only) and the `--end-when` rule for a pause guarding a multi-step operation
 +143: task_add/task_update untrusted_write (the write label that lets an untrusted run post)
 +90: task ids as `task #N`, user messages by time or wording, never `#N`
++120: the reply_due rule: the coordinator answers a finished reply-chat task in plain words, `delivers` naming the task
