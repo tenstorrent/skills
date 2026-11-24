@@ -16089,7 +16089,7 @@ TASK_TIERS = ("light", "standard", "deep")                              # as cha
 # `ttp --help` lists the commands in these groups; a command in none is listed under "other".
 COMMAND_GROUPS = (
     ("everyday", ("new", "connect", "web", "status", "say", "listen", "list", "overview", "find", "task",
-                  "memory", "obligation", "config", "guards", "pause", "resume", "drain", "alerts", "rollout", "issues", "mute",
+                  "memory", "obligation", "config", "guards", "links", "pause", "resume", "drain", "alerts", "rollout", "issues", "mute",
                   "quarantine", "machines", "runs", "logs", "doctor")),
     ("inside a run", ("note", "advise", "steer", "urgent-reply", "notify", "progress", "checks", "checks-shard", "checks-yield", "lock",
                       "occupancy", "host-run", "detach", "devq", "push", "install-check", "land", "express", "clip", "sandbox", "pool-wait", "pool-admit",
