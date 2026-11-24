@@ -4721,7 +4721,9 @@ def test_setup_box_mount_probe_survives_a_plugin_upgrade_and_names_the_site_file
     assert probe[0] == str(BOX_PY.resolve()) and probe[1:3] == ["--site", str(site)]
     assert "a plugin upgrade may remove" in out and "ttp machines change edit <id> --until-probe" in out
     lib = tmp_path / "ttp-home" / "lib"
-    shutil.copytree(BOX_PY.parent.parent, lib / "0.0.1" / "skills" / "setup-box")
+    # a sibling pytest worker importing the scripts races a .pyc into __pycache__: never copy it
+    shutil.copytree(BOX_PY.parent.parent, lib / "0.0.1" / "skills" / "setup-box",
+                   ignore=shutil.ignore_patterns("__pycache__"))
     (lib / "current").symlink_to(lib / "0.0.1")
     probe, out = until_probe()
     assert probe[0] == str(lib / "current" / "skills" / "setup-box" / "scripts" / "box.py")
