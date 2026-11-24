@@ -219,13 +219,13 @@ def landing_times(db) -> dict[int, float | None]:
     follows: dict[int, set[int]] = {}
     for r in db.q("SELECT id, kind, branch, labels, title FROM tasks WHERE kind='review' OR labels LIKE '%continues:%' "
                   "OR labels LIKE '%review_fix:%' OR labels LIKE '%rebases:%' OR labels LIKE '%pr_branch:%' "
-                  "OR labels LIKE '%auto_review:%' OR title LIKE '%rebas%' OR title LIKE '%review%'"):
+                  "OR labels LIKE '%relands:%' OR labels LIKE '%auto_review:%' OR title LIKE '%rebas%' OR title LIKE '%review%'"):
         try:
             labels = json.loads(r["labels"] or "[]")
         except (ValueError, TypeError):
             labels = []
         labels = [lb for lb in labels if isinstance(lb, str)] if isinstance(labels, list) else []
-        ids = {int(lb.partition(":")[2]) for lb in labels if lb.startswith(("continues:", "review_fix:"))
+        ids = {int(lb.partition(":")[2]) for lb in labels if lb.startswith(("continues:", "review_fix:", "relands:"))
                and lb.partition(":")[2].isdigit()}
         if (s := review_subject({"labels": r["labels"], "title": r["title"]})) is not None:
             ids.add(s)

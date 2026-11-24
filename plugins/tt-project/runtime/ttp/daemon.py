@@ -5479,7 +5479,7 @@ class Daemon:
 
     def _landing_drops(self) -> None:
         """landed.drops, model-free, once per push-branch tip: a done code task recorded as landed whose own
-        change is not on the push branch (a successor's rebase or batch left it out, the squash lost it) is
+        change is not on the push branch (a successor's rebase or batch left it out) is
         dropped from the landing record with one coordinator event. A task found carried is not judged again."""
         if not landed._has_push_branch(self.p):
             return

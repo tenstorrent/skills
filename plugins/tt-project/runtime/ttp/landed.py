@@ -311,7 +311,7 @@ def redone(title: str | None, spec: str | None = "") -> set[int]:
 
 _CARRIER_SQL = ("SELECT id, kind, branch, labels, title FROM tasks WHERE id>? AND (kind='review' "
                 "OR labels LIKE '%continues:%' OR labels LIKE '%review_fix:%' OR labels LIKE '%rebases:%' "
-                "OR labels LIKE '%follows:%' OR labels LIKE '%pr_branch:%' OR labels LIKE '%auto_review:%' OR title LIKE '%rebas%' "
+                "OR labels LIKE '%follows:%' OR labels LIKE '%relands:%' OR labels LIKE '%pr_branch:%' OR labels LIKE '%auto_review:%' OR title LIKE '%rebas%' "
                 "OR title LIKE '%re-land%' OR title LIKE '%reland%' "
                 "OR title LIKE '%review%') ORDER BY id")
 
@@ -331,7 +331,7 @@ def _links(db, after: int) -> list[tuple[int, str, str, set[int], set[str], set[
         except (ValueError, TypeError):
             labels = []
         labels = [lb for lb in labels if isinstance(lb, str)] if isinstance(labels, list) else []
-        ids = {int(lb.partition(":")[2]) for lb in labels if lb.startswith(("continues:", "review_fix:"))
+        ids = {int(lb.partition(":")[2]) for lb in labels if lb.startswith(("continues:", "review_fix:", "relands:"))
                and lb.partition(":")[2].isdigit()}
         if (s := review_subject({"labels": r["labels"], "title": r["title"]})) is not None:
             ids.add(s)
@@ -928,14 +928,14 @@ def dropped(db, tid: int) -> str:
 
 def drop(p, tid: int, shas: list[str], why: str, event: bool = True) -> None:
     """Record that the landings `shas` recorded for task `tid` do not carry its change (a successor's rebase or
-    batch left its commits out, the history squash lost them, a forward revert took them off): recorded,
+    batch left its commits out, a forward revert took them off): recorded,
     landed_at and the tried ledger stop counting them, and `landed:#<id>` waits, naming `why`. A later landing
     or `ttp task <project> superseded <id> <sha>` counts again. `event`: wake the coordinator once per task."""
     now = time.time()
     for sha in dict.fromkeys(s for s in shas if s):
         p.db.x("INSERT INTO task_dropped(task, sha, why, ts) VALUES(?,?,?,?) ON CONFLICT(task, sha) DO NOTHING",
                (int(tid), sha, why, now))
-    fp = f"{DROP_EVENT}:{int(tid)}"
+    fp = f"{DROP_EVENT}:{int(tid)}:{min(shas, default='')[:12]}"   # a later drop of a re-landed change wakes again
     if event and not p.db.one("SELECT id FROM events WHERE fingerprint=?", (fp,)):
         p.db.x("INSERT INTO events(ts,source,kind,fingerprint,severity,text,status,task) VALUES(?,?,?,?,?,?,?,?)",
                (now, "daemon", DROP_EVENT, fp, "normal",

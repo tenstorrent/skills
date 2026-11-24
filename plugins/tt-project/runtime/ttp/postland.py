@@ -288,7 +288,8 @@ def apply(p: Project, job: dict, got: dict) -> str:
                     landed.drop(p, e["task"], list(dict.fromkeys([*landed.recorded(db, e["task"])[0], e["sha"]])),
                                 f"forward revert #{tid} of {span} after post-landing tests failed", event=False)
             fix = db.add_task(f"Fix {who}{REVERT_TITLE_TAIL}", kind="code", labels=[
-                f"start_when:landed:#{tid}", f"start_why:revert #{tid} lands", f"deferred_since:{time.time():.0f}"],
+                f"start_when:landed:#{tid}", f"start_why:revert #{tid} lands", f"deferred_since:{time.time():.0f}",
+                *([f"relands:{e['task']}"] if e.get("task") else [])],
                 spec=(f"Post-landing checks (delivery.post_land_checks) failed after {who} landed as {e['sha'][:10]}. "
                       f"Revert #{tid} (commit {c['revert_head'][:10]}, branch {c['revert_branch']}) takes {span} "
                       f"off {job['target']}; this starts once it has landed. Re-apply {span} on top of the revert "
