@@ -702,12 +702,15 @@ MARK_CODE_EFFECT = [   # code that reads or changes the record itself, or gets i
     f"cat > {_M} <<'EOF'\nx\nEOF", f"tee $TTP_RUN_DIR/{_M} <<'EOF'\nx\nEOF",
     f"cat > x.sh <<'EOF'\nrm {_M}\nEOF\nbash x.sh", f"tee x.sh <<'EOF'\nrm {_M}\nEOF\nbash x.sh",
     f"cat > n.md <<'EOF'\nthe {_M} record\nEOF\nrm {_M}",
+    f"cat > l.txt <<'EOF'\n{_M}\nEOF\nxargs rm < l.txt",   # the written file read back into code
+    f"perl <<'EOF'\n$x = q( #); unlink \"{_M}\";\nEOF",   # a `#` in an interpreter's body is no shell comment
+    f"ls # cat > a.md <<'EOF'\nrm {_M}\nEOF", f"python3 x.py 'mkdir {_M} now'",
 ]
 MARK_DATA_HEREDOCS = [   # a body only cat or tee writes to another file is data, as is a comment
     f"cat > notes.md <<'EOF'\nthe {_M} record\nEOF", f"tee notes.md <<'EOF'\nthe {_M} record\nEOF",
     f"tee notes.md > /dev/null <<'EOF'\nthe {_M} record\nEOF\necho done",
     f"cat <<'EOF' > a.md\n# {_M}\nthe {_M} record\nEOF", f"git commit -F - <<'EOF'\nthe {_M} record\nEOF",
-    f"ls # {_M} note",
+    f"ls # {_M} note", f"cat > m.txt <<'EOF'\nthe {_M} record\nEOF\nwc -c m.txt",
 ]
 
 
@@ -730,11 +733,11 @@ def test_prose_verdicts_are_the_same_with_no_commands_on_path(tmp_path, monkeypa
     """Whether a word before the mark is a command comes from a fixed list, never a PATH lookup, so the same
     quoted sentence passes or is refused on every host."""
     from ttp import untrusted
-    clauses = [f"ls {_M} now", f"the {_M} record", f"make {_M} here", f"rm {_M} now", f"then shred {_M} too"]
+    clauses = [f"ls {_M} now", f"the {_M} record", f"mkdir {_M} here", f"rm {_M} now", f"then shred {_M} too"]
     seen = [untrusted._mark_prose(c) for c in clauses]
     (tmp_path / "empty").mkdir()
     monkeypatch.setenv("PATH", str(tmp_path / "empty"))
-    assert [untrusted._mark_prose(c) for c in clauses] == seen == [True, True, True, False, False]
+    assert [untrusted._mark_prose(c) for c in clauses] == seen == [True, True, False, False, False]
 
 
 @pytest.mark.parametrize("cmd", MARK_DATA_HEREDOCS)

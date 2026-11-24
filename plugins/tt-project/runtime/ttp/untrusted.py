@@ -583,11 +583,14 @@ def _unsingle(cmd: str) -> str:
 
 
 MARK_FEEDS = frozenset(("read", "mapfile", "readarray", "xargs", "parallel"))   # turn their input into words or commands
-# Commands that act on a file named as their argument, or run one: a word of a prose clause before the mark that
-# is one of these (or a runner or feed) makes it a command line, the same on every host (no PATH lookup)
-MARK_FILE_COMMANDS = frozenset(("rm", "unlink", "mv", "cp", "ln", "truncate", "shred", "touch", "chmod", "chattr",
-                                "tee", "dd", "install", "history", "source", "enable", "sed", "awk", "gawk", "find",
-                                "rsync", "tar", "zip", "eval", "exec", "sudo", "env", "command", "builtin"))
+# Commands that change or create a file named as their argument, or run another command: a word of a prose clause
+# before the mark that is one of these (or a runner or feed) makes it a command line, the same on every host (no
+# PATH lookup). Readers (MARK_READERS) stay prose: naming the file to one has no effect on it.
+MARK_FILE_COMMANDS = frozenset((
+    "rm", "rmdir", "unlink", "mv", "cp", "ln", "truncate", "shred", "touch", "chmod", "chown", "chattr", "mkdir",
+    "mkfifo", "mknod", "tee", "dd", "install", "patch", "nano", "rsync", "scp", "tar", "zip", "unzip", "gzip",
+    "gunzip", "bzip2", "xz", "cpio", "git", "make", "sort", "uniq", "split", "csplit", "history", "enable", "sudo",
+    "env", "command", "builtin", "nohup", "timeout"))
 MARK_SUBST_DEPTH = 4   # nested substitutions read; deeper ones count as a write
 
 
@@ -722,25 +725,39 @@ def _mark_uncomment(cmd: str) -> str:
 
 
 def _mark_data_bodies(cmd: str) -> str:
-    """`cmd` without the bodies of heredocs that are only data: a quoted delimiter on a cat (or another
-    _data_body piece), or on a tee into files nothing runs, neither piped on into code."""
-    from .hook import HEREDOC_RE, _data_body, _first_argv, _heredocs, _pieces, _ran, _runs_inside
+    """`cmd` with comments cut from its command lines (_mark_uncomment; body lines stay as written) and without
+    the bodies of heredocs that are only data: a quoted delimiter on a cat (or another _data_body piece) or on
+    a tee into files, neither piped on, while every other command is only data too (_data_only), so none
+    reads the file back into code (`xargs rm < list.txt`)."""
+    from .hook import (HEREDOC_RE, READERS, _chain, _data_body, _data_only, _first_word, _heredocs, _pieces,
+                       _runs_inside)
     lines, bodies = _heredocs(cmd)
+    if not bodies:
+        return _mark_uncomment(cmd)
+    bare = _mark_uncomment("\n".join(lines)).split("\n")
+    text = "\n".join(bare)
 
     def tee(i: int, pos: int) -> bool:
-        s, e, sep = next(p for p in _pieces(lines[i]) if p[0] <= pos <= p[1])
-        piece, argv = lines[i][s:e], _first_argv(lines[i][s:e])
-        return bool(HEREDOC_RE.match(lines[i], pos)[2]) and piece.split()[:1] == ["tee"] and sep not in ("|", "|&") \
-            and not _runs_inside(piece) and not any(_mark_path(a) or os.path.basename(a) in _ran(cmd) for a in argv[1:])
-    data = {k for k, (i, _, pos) in enumerate(bodies) if _data_body(lines, i, pos) or tee(i, pos)}
-    if not data:
-        return cmd
+        s, e, sep = next(p for p in _pieces(bare[i]) if p[0] <= pos <= p[1])
+        return bool(HEREDOC_RE.match(bare[i], pos)[2]) and bare[i][s:e].split()[:1] == ["tee"] \
+            and sep not in ("|", "|&") and not _runs_inside(bare[i][s:e])
+    data = {k for k, (i, _, pos) in enumerate(bodies) if (m := HEREDOC_RE.match(bare[i], pos))
+            and m[0] == HEREDOC_RE.match(lines[i], pos)[0] and (_data_body(bare, i, pos) or tee(i, pos))}
+    held = {(i, s) for k, (i, _, pos) in enumerate(bodies) if k in data
+            for s, e, _ in _pieces(bare[i]) if s <= pos <= e}
+    def inert(piece: str, sep: str, after: list[str]) -> bool:   # only prints or reads (READERS), nothing runs
+        return _data_only(piece, sep, text, after) or all(
+            _first_word(p) in READERS and not _runs_inside(p) for p in (piece, *after))
+    pieces = [(j, line, _pieces(line)) for j, line in enumerate(bare)]
+    if any((j, s) not in held and line[s:e].strip() and not inert(line[s:e], sep, _chain(line, ps, n))
+           for j, line, ps in pieces for n, (s, e, sep) in enumerate(ps)):
+        data = set()
     out = []
-    for i, line in enumerate(lines):
+    for i, line in enumerate(bare):
         out.append(line)
         for k, (j, body, pos) in enumerate(bodies):
             if j == i and k not in data:
-                out += body + [HEREDOC_RE.match(line, pos)[3]]
+                out += body + [HEREDOC_RE.match(lines[i], pos)[3]]
     return "\n".join(out)
 
 
@@ -801,7 +818,7 @@ def _mark_bash(cmd: str, depth: int = 0) -> bool:
     if got is None or (got[1] and depth >= MARK_SUBST_DEPTH):
         return True
     cmd, inner = got
-    cmd = _mark_uncomment(_mark_data_bodies(cmd))
+    cmd = _mark_data_bodies(cmd)
     if any(t.strip() != RUN_MARK and _mark_bash(t, depth + 1) for t in inner):
         return True   # (a bare `name` substitution runs a command found on PATH, never the run folder's file)
     words = _mark_words(cmd)
