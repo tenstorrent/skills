@@ -5229,7 +5229,7 @@ def _merge_base(repo: Path, ref: str, head: str) -> str:
 
 def _nearest_base(p: Project, repo: Path) -> str:
     """The checked-out branch's nearest base (real_base: the push target, delivery.base_ref, the remote's
-    default branch), for the tests gate of a branch handed no target, as one not yet on the remote is."""
+    default branch), for the tests gate handed no push target tip (no delivery.push_branch, or its fetch failed)."""
     try:
         remote, push_to = target(p, repo)
     except ValueError:   # no push_branch: base_ref and the default branch still count

@@ -21442,19 +21442,20 @@ def test_push_own_still_refuses_a_test_failing_only_on_its_head(env, monkeypatch
                           capture_output=True).returncode != 0, "nothing pushed"
 
 
-@pytest.mark.parametrize("found_by", ["push_target", "base_ref"])
+@pytest.mark.parametrize("found_by", ["push_target", "base_ref", "no_push_branch"])
 @pytest.mark.parametrize("kind", ["pre_existing", "new"])
-def test_a_branch_not_on_the_remote_is_judged_against_its_nearest_base_not_none(
+def test_a_push_handed_no_target_tip_is_judged_against_its_nearest_base_not_none(
         env, monkeypatch, tmp_path, found_by, kind):
-    # No base handed to the gate (own_base found none, the branch is not on the remote): the failing tests
+    # No push target tip handed to the gate (own_base found none: no delivery.push_branch, or it could not be
+    # fetched): the failing tests
     # rerun on the merge base with the branch's nearest base (real_base: the push target, else
     # delivery.base_ref), so a failure the base has too does not block; one new on the head still does.
     from ttp import push
     head_body = (_GATE_BASE + "\n\ndef helper():\n    return 1\n" if kind == "pre_existing" else
                  _GATE_BASE.replace("def test_x():\n    pass", "def test_x():\n    assert False"))
     p, repo, base, head = _gate_push_setup(env, monkeypatch, tmp_path, head_body)
-    if found_by == "base_ref":   # a push target this repo lacks: delivery.base_ref names the base
-        p.set_config("delivery.push_branch", "origin/elsewhere")
+    if found_by != "push_target":   # a push target this repo lacks, or none: delivery.base_ref names the base
+        p.set_config("delivery.push_branch", "origin/elsewhere" if found_by == "base_ref" else "")
         p.set_config("delivery.base_ref", "origin/proj")
     said: list[str] = []
     rc = push.publish(repo, "origin", "own", push.check_list([_GATE_CHECK]), say=said.append, base=None, p=p)
