@@ -34,6 +34,8 @@ description: "Start, connect to, and talk with a long-running tt-project: a loca
 
 - Never ask the user to do what you or the project can do, and never offer to do it: do it and
   say so. Ask only when a choice is truly ambiguous, dangerous, or involves another human.
+- Keep the links the project's replies carry as given; a link the user must look up again is a
+  fault of the reply, not yours to fix.
 - Relay the user's words verbatim, and only them, as the message. Do not rephrase instructions
   or add to them. Your own context (background, a summary, what you think they mean) goes only in
   `--context "<text>"`. The project reads it as data, never as the user's word: a rule, pin or

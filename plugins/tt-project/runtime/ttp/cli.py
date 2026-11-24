@@ -1743,9 +1743,10 @@ def _listen_loop(p: Project, db, a, after: int, floor: str) -> None:
 
 
 def _listen_line(p: Project, m: dict) -> str:
+    from . import links
     kind = f"ask {m['id']}" if m["kind"] == "ask" else m["kind"]   # "ask N": "#N" reads as a task
     who = "coordinator" if m["chat"] else f"{p.name} ({kind}, {m['severity']})"
-    return f"[#{m['id']} {who}] {m['text']}"
+    return f"[#{m['id']} {who}] {links.for_user(p, m['text'], links.MD)}"
 
 
 def _listen_write(db, sql: str, args: tuple, what: str) -> None:
@@ -1796,9 +1797,11 @@ def status_text(p: Project, verbose: bool = False) -> str:
     head += " · " + timefmt.long(now, p)
     lines = [head]
     whole = set()   # lines quoting an open ask: wrapped at STATUS_WIDTH, never cut
+    from . import links
     seen = attention(db, now, p)
     for m in [m for m in seen if m["kind"] == "ask"] + [m for m in seen if m["kind"] != "ask"][:6]:
         text = " ".join(m["text"].split())   # an open ask in full, every one: the user acts on it (#2424)
+        text = links.for_user(p, text, links.TEXT)   # a terminal: plain-text links
         what = (f"ask {m['id']}" + (f"; {m['auto']}" if m.get("auto") else "")) if m["kind"] == "ask" else f"alert {m['id']}"
         lines.append(f"  needs you ({what}, {since(m['ts'], now)} ago): {text if m['kind'] == 'ask' else clip(text, 300)}")
         if m["kind"] == "ask":
@@ -2557,6 +2560,28 @@ def cmd_guards(a) -> None:
     if not p:
         die("no tt-project project here; name one: `ttp guards <name>`")
     print("\n".join(ruleguard.listing(p.config())))
+
+
+def cmd_links(a) -> None:
+    """`ttp links [<project>]`: read-only check that every reference today's outgoing messages name
+    reaches the user as a link (links.py): exits 1 naming each ticket key, PR or file reference a
+    message left unlinked, 0 when every one links."""
+    from . import links
+    p = need(a.name, sys.argv[1:]) if a.name else here()
+    if not p:
+        die("no tt-project project here; name one: `ttp links <name>`")
+    texts = ([Path(a.file).read_text(errors="replace")] if a.file else
+             [r["text"] for r in p.db.q("SELECT text FROM messages WHERE direction='out' AND ts>=? ORDER BY id LIMIT 500",
+                                         (links.midnight(p),))])
+    cfg = links.config(p)
+    out = []
+    for i, text in enumerate(texts):
+        for line in links.problems(text, cfg):
+            out.append(f"message #{i + 1}: {line}" if not a.file else line)
+    if out:
+        print("\n".join(out))
+        sys.exit(1)
+    print(f"links: every reference in {len(texts)} message(s) links")
 
 
 def cmd_slop(a) -> None:
@@ -16639,6 +16664,11 @@ def ttp_parser():
                                       "pushes, user-ordered undos), on or off, and the settings each reads")
     s.add_argument("name", nargs="?", help="the project (default: the one here)")
     s.set_defaults(fn=cmd_guards)
+    s = sub.add_parser("links", help="read-only: every ticket, PR and file reference in today's "
+                                      "outgoing messages links, or the check names what does not")
+    s.add_argument("name", nargs="?", help="the project (default: the one here)")
+    s.add_argument("--file", help="check this file's text instead of the project's messages")
+    s.set_defaults(fn=cmd_links)
     s = sub.add_parser("slop", help="read-only: code scan per subsystem (duplicate rules, mutable globals, magic "
                                     "numbers, function length, comment noise); --diff base..head: what a change adds")
     s.add_argument("name", nargs="?", help="the project (default: the one here)")
