@@ -129,7 +129,9 @@ tick() {
      find "$dir" -name '*.jsonl' -empty | while read -r f; do rm -f "$f" "${f%.jsonl}.meta.json"; done)
   fi
   local d dirs=("$dir")  # the agent may read only these (and run the allowed commands)
-  for d in "$TT" /dev/tenstorrent ${INPUTS:+"$(dirname "$INPUTS")"}; do [ -d "$d" ] && dirs+=("$d"); done
+  # The run folder (parent of the checkout, unless that is $HOME) holds logs and eval runs too.
+  local run; run=$(dirname "$TT"); [ "$run" = "$HOME" ] && run=$TT
+  for d in "$run" "$TT" /dev/tenstorrent ${INPUTS:+"$(dirname "$INPUTS")"}; do [ -d "$d" ] && dirs+=("$d"); done
   [ -z "$AT" ] && [ -d "$TASKS" ] && dirs+=("$TASKS")
   err=$(mktemp)
   out=$(cd "$dir" && timeout 1200 claude -p --model "$MODEL" --no-session-persistence --output-format json \
