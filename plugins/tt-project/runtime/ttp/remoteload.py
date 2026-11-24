@@ -73,7 +73,7 @@ def factor() -> float:
     checks.spill_load_near (checkspill.load_near) and checks.load_guard (testslots.load_guard_factor); 0 (the guard
     off) holds none."""
     from . import checkspill, testslots
-    return min(f, checkspill.load_near()) if (f := testslots.load_guard_factor()) else 0.0
+    return min(f, checkspill.load_near() or f) if (f := testslots.load_guard_factor()) else 0.0
 
 
 def _starts_file(host: str):

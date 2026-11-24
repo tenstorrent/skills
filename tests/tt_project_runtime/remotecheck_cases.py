@@ -3123,6 +3123,8 @@ def test_two_quick_spill_grants_on_one_host_sum_within_its_idle_cores(env, tmp_p
         monkeypatch.setenv("TTP_CHECKS_SPILL_LOAD_NEAR", "0.5")
         assert checkspill.load_near() == 0.5
         assert "no check starts at 0.5 x or above" in checkspill._near(16, 2.0, 2.0 + 8)
+        monkeypatch.setenv("TTP_CHECKS_SPILL_LOAD_NEAR", "0")   # 0 turns the gate off, as checks.load_guard 0 does
+        assert checkspill._near(16, 15.0, 99.0) == ""
     finally:
         first.close()
 
