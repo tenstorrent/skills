@@ -7665,7 +7665,7 @@ class Daemon:
                 head = pushq._commit(self.p, task["branch"]) if task["branch"] else ""
                 if len(self._claim_fetch) >= CLAIM_CACHE_MAX:
                     self._claim_fetch.clear()
-                self._claim_fetch[task_id] = pushclaim.prefetch(
+                self._claim_fetch[task_id] = pushclaim.prefetch_claims(
                     self.p, str(result.get("summary") or "") if isinstance(result, dict) else "",
                     self.p.root, head, task_id)
             except Exception as e:

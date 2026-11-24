@@ -255,7 +255,7 @@ def correct_landed_claims(p, text: str, repo, head: str = "", tid: int = 0,
     return text
 
 
-def prefetch(p, text: str, repo, head: str = "", tid: int = 0) -> dict:
+def prefetch_claims(p, text: str, repo, head: str = "", tid: int = 0) -> dict:
     """The fetch cache correct_landed_claims reads inside the transaction that records a hand-off:
     its one bounded refresh of the push branch is asked here, before that transaction opens (db.py
     refuses a git network call inside one), by running the check on `text` once and keeping the
