@@ -9,6 +9,8 @@
 # --at replays a past run: the transcripts are copied cut at that time, and the agent is told to ignore live host
 # state. --since sets the window start instead of the previous report's time (or the run start).
 set -uo pipefail
+PATH="$HOME/.local/bin:$PATH"  # claude installs here; ssh and nohup shells often lack it
+command -v claude >/dev/null || { echo "claude not found on PATH" >&2; exit 2; }
 SESSION= TT= INPUTS= HOURS=1 MODEL=claude-opus-5-5 STARTED= LOG= DRY=no ONCE=no AT= PROJ= SINCE_OPT=
 while [ $# -gt 0 ]; do case $1 in
   --dry-run) DRY=yes; shift; continue;; --once) ONCE=yes; shift; continue;;

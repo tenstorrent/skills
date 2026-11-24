@@ -6,6 +6,8 @@
 #             [--session name] [--overseer-interval hours] [--no-overseer] [--dry-run]
 # --dry-run writes inputs.json, prompt.md and the config dir, and prints the commands instead of starting them.
 set -euo pipefail
+PATH="$HOME/.local/bin:$PATH"  # claude installs here; ssh and nohup shells often lack it
+command -v claude >/dev/null || { echo "claude not found on PATH" >&2; exit 2; }
 HERE=$(cd "$(dirname "$0")" && pwd); PLUGINS=$(cd "$HERE/../../.." && pwd)
 HF_MODEL= TT= BUDGET=48 SCOPE=open RESETS=no NOTES= EXTRA='{}' SESSION= MODEL=${CLAUDE_MODEL:-claude-opus-5-5}
 OVERSEER=1 CONFIG_DIR= EFFORT= DRY= RUN_DIR=
