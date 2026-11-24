@@ -198,6 +198,49 @@ def test_a_finished_secret_read_in_an_untrusted_run_still_stops_it(tmp_path, mon
         assert streamguard.take_warnings(run_dir) == [], cmd
 
 
+SG_MARK = "untrusted" + "-input"
+# Upstream note 207fceced864ee8b, as fixtures: a finished script that only wrote a receipt whose text
+# names the run's record of untrusted input was stopped after it had run, before its hand-off.
+SG_PROSE_RECEIPT = ("python3 -c \"import json; json.dump({'note': 'receipts only, the protected "
+                    f"{SG_MARK} history was not read or changed.'}}, open('receipt.json', 'w'))\"")
+SG_MARK_CHANGE = f"python3 -c \"import os; os.remove('{SG_MARK}')\""
+
+
+def _sg_receipt_run(tmp_path, monkeypatch, cmd):
+    """A finished Codex call to `cmd` in an untrusted run, after the child saved a receipt (as the call
+    would) and a done hand-off; returns (exit.json, run dir, receipt path)."""
+    monkeypatch.setenv("TTP_UNTRUSTED_INPUT", "1")
+    receipt = tmp_path / "receipt.json"
+    wrapped = f"bash -lc {shlex.quote(cmd)}"
+    save = (f"open({str(receipt)!r}, 'w').write('{{\"status\": \"retired\"}}'); "
+            f"open({str(tmp_path / 'run' / 'result.json')!r}, 'w').write('{{\"status\": \"done\"}}')")
+    ex, run_dir = _sg_run(tmp_path, monkeypatch, "codex", [_sg_codex_line(wrapped), save, json.dumps(
+        {"type": "item.completed", "item": {"id": "item_1", "type": "command_execution", "command": wrapped,
+                                            "exit_code": 0, "status": "completed"}})], exec_lines=(1,))
+    return ex, run_dir, receipt
+
+
+def test_a_finished_receipt_writer_naming_the_mark_in_prose_goes_on(tmp_path, monkeypatch):
+    from ttp import streamguard
+    ex, run_dir, receipt = _sg_receipt_run(tmp_path, monkeypatch, SG_PROSE_RECEIPT)
+    assert ex["stopped"] is None and streamguard.take(run_dir) is None
+    assert streamguard.take_warnings(run_dir) == []
+    assert json.loads(receipt.read_text()) == {"status": "retired"}
+    assert json.loads((run_dir / "result.json").read_text()) == {"status": "done"}
+
+
+def test_a_finished_change_to_the_mark_still_stops_and_keeps_the_saved_receipt(tmp_path, monkeypatch):
+    """The stop names the refused call and leaves what the run saved before it: the next run is told its
+    worktree is kept, so it reads the receipt back rather than repeating the action."""
+    from ttp import streamguard
+    ex, run_dir, receipt = _sg_receipt_run(tmp_path, monkeypatch, SG_MARK_CHANGE)
+    got = streamguard.take(run_dir)
+    assert ex["stopped"] == "guard" and got and streamguard.must_stop(got["why"])
+    assert json.loads(receipt.read_text()) == {"status": "retired"}
+    block = streamguard.prompt_block({streamguard.KEY: got})
+    assert "leave it as it is" in block and "worktree, branch and commits are kept" in block
+
+
 def test_a_finished_refusal_of_another_kind_in_an_untrusted_run_warns_and_goes_on(tmp_path, monkeypatch):
     from ttp import streamguard
     monkeypatch.setenv("TTP_UNTRUSTED_INPUT", "1")

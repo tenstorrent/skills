@@ -660,6 +660,58 @@ def test_a_write_through_a_substitution_pipe_or_read_loop_is_still_refused(env, 
     assert "leave it as it is" in _why(tmp_path, "Bash", {"command": cmd}), cmd
 
 
+# Upstream note 207fceced864ee8b, replayed as a fixture (the original packet is on another host and its
+# write is never replayed): a script that only reads saved receipts and writes a packet file, whose
+# narrative text names the record, was refused and its run stopped after the command had finished.
+MARK_NOTE_REPLAY = (
+    "python3 - <<'PY'\nimport json, pathlib\n"
+    "got = [json.loads(p.read_text()) for p in sorted(pathlib.Path('receipts').glob('*.json'))]\n"
+    "pathlib.Path('packet').mkdir(exist_ok=True)\n"
+    f"note = 'receipts only, the protected {_M} history was not read or changed.'\n"
+    "json.dump({'receipts': len(got), 'note': note}, open('packet/retirement-disposition.json', 'w'))\nPY")
+MARK_PROSE_WRITERS = [   # code that writes receipts or packets naming the record only in its prose
+    MARK_NOTE_REPLAY,
+    f"python3 -c \"import json; json.dump({{'why': 'left {_M} untouched.'}}, open('evidence/receipt.json', 'w'))\"",
+    f"python3 tools/write_receipt.py --note 'the {_M} history was not read'",
+    f"node -e \"require('fs').writeFileSync('packet/d.json', JSON.stringify({{note: 'no {_M} history read'}}))\"",
+    f"perl -e 'print \"kept {_M} as it is\"' > packet/note.txt",
+]
+MARK_CODE_EFFECT = [   # code that reads or changes the record itself, or gets its name as a word to act on
+    f"python3 -c \"import os; os.system('rm {_M}')\"", f"python3 -c \"import os; os.system('rm -f a {_M}')\"",
+    f"python3 -c \"import os; os.system('cd x; rm {_M}')\"", f"python3 -c \"open('{_M}', 'w')\"",
+    f"python3 -c \"import os; os.remove('$TTP_RUN_DIR/{_M}')\"", f"python3 - <<'PY'\nimport os\nos.remove('{_M}')\nPY",
+    f"python3 -c \"print(open('{_M}').read())\"", f"python3 x.py {_M}", f"perl -e 'unlink \"{_M}\"'",
+    f"echo 'a {_M}' | python3 -c 'import sys,os; os.remove(sys.stdin.read().split()[1])'",
+    f"echo 'a {_M}' | xargs rm", f"rm $(echo 'a {_M}')", f"bash -c \"x='a {_M}'; rm $x\"",
+    f"sh -c 'rm a {_M}'", f"python3 -c \"print('rm {_M}')\" | sh",
+    f"python3 -c \"import os; os.remove('{_M}')\" # 'a {_M} b'",
+    f"python3 -c \"import os; os.system('. {_M}')\"", f"python3 -c \"import os; os.system('history -w {_M}')\"",
+]
+
+
+def test_the_noted_receipt_writer_naming_the_record_in_prose_passes(env, tmp_path, monkeypatch):
+    """Replay of note 207fceced864ee8b: the script's only mention of the record is a sentence in the
+    packet it writes, which is text, not a read or write of the file."""
+    from ttp import untrusted
+    _untrusted_run(env, tmp_path, monkeypatch, ["untrusted_input"])
+    assert untrusted.mark_refusal("Bash", {"command": MARK_NOTE_REPLAY}) is None
+    assert _why(tmp_path, "Bash", {"command": MARK_NOTE_REPLAY}) == ""
+
+
+@pytest.mark.parametrize("cmd", MARK_PROSE_WRITERS)
+def test_a_script_writing_receipt_prose_that_names_the_mark_passes(env, tmp_path, monkeypatch, cmd):
+    _untrusted_run(env, tmp_path, monkeypatch, [])
+    assert _why(tmp_path, "Bash", {"command": cmd}) == "", cmd
+
+
+@pytest.mark.parametrize("cmd", MARK_CODE_EFFECT)
+def test_code_that_reads_or_changes_the_mark_is_still_refused(env, tmp_path, monkeypatch, cmd):
+    """Prose is only a quoted clause with no path, option or command before the name, given to a script
+    interpreter: a shell, eval, xargs, a pipe or a substitution that splits it into words still counts."""
+    _untrusted_run(env, tmp_path, monkeypatch, [])
+    assert "leave it as it is" in _why(tmp_path, "Bash", {"command": cmd}), cmd
+
+
 def test_only_the_coordinator_sets_untrusted_write_and_its_run_only_gains_writes(
         env, tmp_path, monkeypatch):
     """task_add/task_update `untrusted_write` (true adds the label, false clears it) is the only way

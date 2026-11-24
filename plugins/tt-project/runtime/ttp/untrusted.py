@@ -640,34 +640,89 @@ def _mark_subst(cmd: str) -> tuple[str, list[str]] | None:
     return "".join(out), inner
 
 
-def _mark_fed(words: list[str], named: bool) -> bool:
+# Script interpreters: a mention of the mark only in a quoted prose clause of their program or arguments
+# (receipt or note text a script writes) is inert, as a quoted prose argument to any other command is.
+MARK_SCRIPT_RE = re.compile(r"python[\d.]*|perl|ruby|node|deno|bun|php|lua|tclsh")
+# A quoted clause with no shell or code punctuation: text, never a path, option or command list.
+MARK_PROSE_RE = re.compile(r"(['\"])([^'\"\n;&|<>(){}\[\]`$\\=*?/]*)\1")
+MARK_PROSE_PLACE = "run-mark-prose"   # what a prose mention reads as
+
+
+def _mark_prose(clause: str) -> bool:
+    """Whether a quoted clause names RUN_MARK only as a word of prose: it has spaces, each mention is a
+    whole word (trailing .,:!), and no word before one is a command (on PATH, a runner or feed), `.` or an
+    option (a builtin's `history -w`, `enable -f`), so the clause run as a command line could not take
+    the mark as its argument."""
+    words = clause.split()
+    at = [i for i, w in enumerate(words) if RUN_MARK in w]
+    if len(words) < 2 or not at or any(words[i].rstrip(".,:!") != RUN_MARK for i in at):
+        return False
+    import shutil
+    return not any(w == "." or w.startswith("-") or shutil.which(w) or MARK_RUNNER_RE.fullmatch(w)
+                   or w in MARK_FEEDS for w in words[:at[-1]])
+
+
+def _mark_quiet(cmd: str, words: list[str]) -> list[str] | None:
+    """`words` with each prose mention of RUN_MARK (_mark_prose) read as MARK_PROSE_PLACE, for a command whose
+    only code runners are script interpreters (MARK_SCRIPT_RE); None when anything else may run code or
+    split text into words (a shell, eval, sed, xargs, a read loop, `.`), or the words do not line up."""
+    if any(w == "." or w in MARK_FEEDS or (MARK_RUNNER_RE.fullmatch(os.path.basename(w))
+                                            and not MARK_SCRIPT_RE.fullmatch(os.path.basename(w))) for w in words):
+        return None
+    quiet = _mark_words(MARK_PROSE_RE.sub(
+        lambda m: m[0].replace(RUN_MARK, MARK_PROSE_PLACE) if _mark_prose(m[2]) else m[0], cmd))
+    return quiet if quiet is not None and len(quiet) == len(words) else None
+
+
+def _mark_words(cmd: str) -> list[str] | None:
+    """`cmd` split into shell words and operators, a heredoc's body lines as commands; None when it
+    does not parse."""
+    from .hook import _quoting
+    try:
+        flags = _quoting(cmd)
+        lex = shlex.shlex(re.sub("\n", lambda m: "\n" if flags[m.start()][0] else ";\n;", cmd), posix=True,
+                          punctuation_chars=";&|()<>")
+        lex.whitespace_split = True
+        return list(lex)
+    except ValueError:
+        return None
+
+
+def _mark_fed(words: list[str], named: bool, quiet: list[str] | None = None) -> bool:
     """Whether a command that runs code or turns its input into words (MARK_RUNNER_RE, `.`, MARK_FEEDS)
     may get the mark's name: in its own words or redirects, from an earlier command of its pipeline that
     names it, or from a heredoc or here-string when the line names it (`named`). An input redirect,
     here-string or heredoc that gives the name (`< <(ls .../<mark>)`, `<<< ".../<mark>"`) may feed a
     compound command (a loop's `done`, `}`, `)`) whose body the split here cannot see: then any such
-    command anywhere in the line counts."""
+    command anywhere in the line counts. `quiet` (_mark_quiet): the words with prose mentions read as
+    text, which is what the code and its heredoc get; an earlier command of a pipeline still passes
+    every mention on."""
+    quiet = quiet or words
+    named = named and any(RUN_MARK in w for w in quiet)
     seg, seen, mention, here, target, fed, coded, given = [], False, False, False, False, False, False, False
-    for w in words + [";"]:
+    said = False   # a mention, prose too, in the segment or its redirects: passed down a pipe
+    for w, q in zip(words + [";"], quiet + [";"]):
         if target:
-            target, mention = False, mention or RUN_MARK in w
-            fed = fed or given and RUN_MARK in w
+            target, mention, said = False, mention or RUN_MARK in q, said or RUN_MARK in w
+            fed = fed or given and RUN_MARK in q
         elif w and set(w) <= set("&<>") and set(w) & set("<>"):
             heredoc = w.startswith("<<") and not w.startswith("<<<")
             target, here, given = True, here or w.startswith("<<"), "<" in w and not heredoc
             fed = fed or heredoc and named
         elif w and set(w) <= set(";&|()<>"):
-            m = mention or any(RUN_MARK in x for x in seg)
-            run = [x for x in seg if x not in ("{", "}", "!", "if", "then", "else", "elif", "do", "while", "until")]
-            code = any(MARK_RUNNER_RE.fullmatch(os.path.basename(x)) for x in (seg[1:] if _mark_awk_read(run) else seg))
+            m = mention or any(RUN_MARK in x for _, x in seg)
+            run = [x for x, _ in seg if x not in ("{", "}", "!", "if", "then", "else", "elif", "do", "while", "until")]
+            plain = [x for x, _ in seg]
+            code = any(MARK_RUNNER_RE.fullmatch(os.path.basename(x)) for x in (plain[1:] if _mark_awk_read(run) else plain))
             code = code or run[:1] == ["."] or bool(run[:1]) and run[0] in MARK_FEEDS
             coded = coded or code
             if code and (m or seen or here and named) or coded and fed:
                 return True
-            seen = (seen or m) if w in ("|", "|&") else False
-            seg, mention, here = [], False, False
+            said = said or any(RUN_MARK in x for x, _ in seg)
+            seen = (seen or said) if w in ("|", "|&") else False
+            seg, mention, here, said = [], False, False, False
         else:
-            seg.append(w)
+            seg.append((w, q))
     return False
 
 
@@ -693,18 +748,12 @@ def _mark_bash(cmd: str, depth: int = 0) -> bool:
     cmd, inner = got
     if any(t.strip() != RUN_MARK and _mark_bash(t, depth + 1) for t in inner):
         return True   # (a bare `name` substitution runs a command found on PATH, never the run folder's file)
-    try:
-        import shlex
-        flags = _quoting(cmd)
-        lex = shlex.shlex(re.sub("\n", lambda m: "\n" if flags[m.start()][0] else ";\n;", cmd), posix=True,
-                          punctuation_chars=";&|()<>")
-        lex.whitespace_split = True
-        words = list(lex)
-    except ValueError:
+    words = _mark_words(cmd)
+    if words is None:
         return True
     if any(">" in w and set(w) <= set("&<>|") and RUN_MARK in n for w, n in zip(words, words[1:])):
         return True   # a redirect into it
-    if _mark_fed(words, RUN_MARK in cmd):
+    if _mark_fed(words, RUN_MARK in cmd, None if inner else _mark_quiet(cmd, words)):
         return True   # code, or a command run from piped input, that may get its name
     segs = _segments(cmd, strip=False)
     for seg in segs:
