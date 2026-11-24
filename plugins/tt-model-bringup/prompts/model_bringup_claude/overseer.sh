@@ -1,17 +1,19 @@
 #!/usr/bin/env bash
-# Hourly overseer for a Claude bring-up run (started by launch.sh). Each tick, one read-only `claude -p` agent
-# looks at the session's transcripts and the host and writes a short report; it is typed into the session and
-# appended to overseer.log. Read-only is enforced by tool settings (see CLAUDE_ARGS), not only by the prompt.
+# Hourly overseer for a Claude bring-up run (started by launch.sh). Each tick, one fresh read-only `claude -p` agent
+# reports facts: what progressed since the previous report (whose text and time it gets from overseer.log), and the
+# devices, CPU, disk and budget. The report is typed into the session and appended to overseer.log. Read-only is
+# enforced by tool settings (RO/NO below), not only by the prompt.
 #   overseer.sh --session NAME --tt /path/to/tt-metal --inputs .../inputs.json [--interval 1] [--model M]
-#               [--started-at EPOCH] [--log FILE] [--project-dir DIR] [--dry-run] [--once] [--at ISO-UTC]
-# --dry-run prints the report instead of sending or logging. --at replays a past run: the transcripts are copied
-# cut at that time, and the agent is told to ignore live host state.
+#               [--started-at EPOCH] [--log FILE] [--project-dir DIR] [--dry-run] [--once] [--at ISO-UTC] [--since ISO-UTC]
+# --dry-run prints the report instead of sending or logging (it still reads the previous report from the log).
+# --at replays a past run: the transcripts are copied cut at that time, and the agent is told to ignore live host
+# state. --since sets the window start instead of the previous report's time (or the run start).
 set -uo pipefail
-SESSION= TT= INPUTS= HOURS=1 MODEL=claude-sonnet-5-5 STARTED= LOG= DRY=no ONCE=no AT= PROJ=
+SESSION= TT= INPUTS= HOURS=1 MODEL=claude-sonnet-5-5 STARTED= LOG= DRY=no ONCE=no AT= PROJ= SINCE_OPT=
 while [ $# -gt 0 ]; do case $1 in
   --dry-run) DRY=yes; shift; continue;; --once) ONCE=yes; shift; continue;;
   --session) SESSION=$2;; --tt) TT=$2;; --inputs) INPUTS=$2;; --interval) HOURS=$2;; --model) MODEL=$2;;
-  --started-at) STARTED=$2;; --log) LOG=$2;; --at) AT=$2;; --project-dir) PROJ=$2;;
+  --started-at) STARTED=$2;; --log) LOG=$2;; --at) AT=$2;; --project-dir) PROJ=$2;; --since) SINCE_OPT=$2;;
   *) echo "unknown option $1" >&2; exit 2;; esac; shift 2; done
 [ -n "$TT" ] || { echo "need --tt" >&2; exit 2; }
 [ "$DRY" = yes ] || [ -n "$SESSION" ] || { echo "need --session (or --dry-run)" >&2; exit 2; }
@@ -60,33 +62,42 @@ EOF
 
 prompt() {  # $1: transcript dir the agent reads
   cat <<EOF
-You oversee an autonomous Claude Code session that is bringing a model up on Tenstorrent hardware. Now is $NOW.
-Write a short status report for that session on where things stand now and what happened in the last $HOURS h.
-Only read; change nothing.
+You check on an autonomous Claude Code session that is bringing a model up on Tenstorrent hardware. Report facts only:
+what progressed between $SINCE (the previous check, or the run start) and now, $NOW. The session diagnoses and
+decides: no diagnosis beyond the evidence, no instructions. Only read; change nothing.
 
 Where things are:
 - tt-metal checkout (the session's working directory): $TT
 - run settings and budget (budget_hours, started_at): ${INPUTS:-none}${STARTED:+; the run was launched at $(date -u -d "@$STARTED" +%FT%TZ)}
 - transcripts: $1. The main session is the most recently modified *.jsonl there, its subagents are
   <session-id>/subagents/agent-<id>.jsonl, large tool outputs are in <session-id>/tool-results/, and background job
-  output is in $TASKS/<project>/<session-id>/tasks/<id>.output. Never read a whole transcript: use tail, grep, jq, wc.
-  Bash runs only simple read-only commands (ls, cat, head, tail, grep, jq, wc, find, ps, pgrep, fuser, df, du, free,
-  uptime, date) and pipes between them; loops, \$(...), redirections and other commands are denied.
+  output is in $TASKS/<project>/<session-id>/tasks/<id>.output.
+- Bash runs only simple read-only commands (ls, cat, head, tail, grep, jq, wc, find, stat, ps, pgrep, fuser, df, du,
+  free, uptime, date) and pipes between them; loops, \$(...), redirections and other commands are denied.
 
 Step 1. Run this command exactly as written, first. It lists every subagent and background job, unfinished first:
 jq -rn '$INV' $1/*.jsonl $1/*/subagents/*.jsonl
 
-Step 2. For each UNFINISHED line, and only those, find out what it is doing: for a job, what its command runs or waits
-for (grep its id in the transcript of its owner, the "by" column) and whether that can still happen, its output and
-logs, its process (ps); for a subagent, its last tool calls and text (tail of its transcript) and which job it waits on.
-A wait on a job that already finished, or on a condition that cannot become true (for example pgrep -f matching its
-own command line), never ends.
+Step 2. For the main session and each UNFINISHED item, find what progressed since $SINCE: new results, files written,
+logs that grew. Tool calls alone are not progress (a sleep or poll loop is not). Look only at the window, never read
+whole files:
+- a transcript's records in the window (count them with | wc -l):
+  jq -c 'select(.timestamp > "$SINCE" and .message) | [.timestamp[11:19], .type, (.message.content | if type == "string" then .[:200] else map(.text // .input.command // (.content | tostring)) | map(.[:200]?) | join(" ; ") end)]' FILE | tail -n 30
+  and its last record: tail -n 1 FILE | jq -r .timestamp
+- outputs and logs: find DIR -newermt "$SINCE" -type f; stat -c '%y %s %n' FILE; tail -n 20 FILE for the new lines.
+- devices or CPU: who holds /dev/tenstorrent/* (fuser, ps) and whether that process is doing work.
 
-Answer in plain text, no headings or markdown. First exactly one line per UNFINISHED item, in the list's order: its
-id, owner and task in a few words, a verdict (progressing, slow, stuck, waiting on a finished job; for a subagent also
-name the job it waits on) and the evidence (times, last log lines). Then one line each for the main session (when it
-last acted and what it waits for), devices (who holds /dev/tenstorrent/*: fuser, ps; is it doing work), CPU and
-memory, disk (df on the checkout), budget used and left. Name what looks wrong; do not give instructions.
+$(if [ -n "$PREV" ]; then echo "The previous report (check at $SINCE), one item per line:"; echo "$PREV" | sed 's/ | /\n/g' | sed 's/^/> /'
+  echo "For anything with no progress since $SINCE, say whether this previous report also showed none."
+  else echo "This is the first check: there is no previous report, so do not mention one."; fi)
+
+Answer in plain text, no headings or markdown, one line per item: the id (main for the main session), what it is in a
+few words, "progressed" or "NO PROGRESS since <time of its last progress, not of its last record or poll>" (adding
+"also none in previous report" when so), and the evidence with sizes and times the next check can compare against
+(for example "log X 12.3 MB, last write 10:41Z; transcript last record 04:49Z"). If everything progressed, one line
+for all of them is enough. Then one line for resources, for example "Resources: devices held by <pid/command>, busy
+or idle since <time>; load 0.3/16, RAM 236/261 GB free; disk 1.6 TB free (df on the checkout); budget 19 h used, 29 h
+left". Spell out a resource in more detail only if it looks short or changed a lot since the previous report.
 EOF
   [ -n "$AT" ] && echo "
 This is a replay of a past run: assume now is $NOW; the transcripts were cut at that time. Ignore live host state
@@ -95,11 +106,18 @@ outside $1, including job outputs, are gone."
 }
 
 tick() {
-  local dir=$PROJ tmp= out report cost line err
+  local dir=$PROJ tmp= out report cost line err last
   NOW=$(date -u +%FT%TZ)
   [ -d "$PROJ" ] || { log "no transcripts at $PROJ, nothing sent"; return; }
+  [ -n "$AT" ] && { NOW=$(date -u -d "$AT" +%FT%TZ) || { log "bad --at $AT"; return; }; }
+  # Window: from the previous report (its line starts with the time it covered up to) or the run start, to now.
+  last=$(grep -F "$PREFIX" "$LOG" 2>/dev/null | tail -n 1)
+  PREV=${last#*"$PREFIX" }; [ -n "$last" ] || PREV=
+  SINCE=${last%% *}
+  [ -n "$last" ] || SINCE=$( { [ -n "$STARTED" ] && date -u -d "@$STARTED" +%FT%TZ; } ||
+    { [ -f "${INPUTS:-}" ] && jq -er .started_at "$INPUTS"; } || date -u -d "$NOW - $HOURS hours" +%FT%TZ)
+  [ -n "$SINCE_OPT" ] && SINCE=$(date -u -d "$SINCE_OPT" +%FT%TZ)
   if [ -n "$AT" ]; then  # replay: copy the transcripts cut at --at
-    NOW=$(date -u -d "$AT" +%FT%TZ) || { log "bad --at $AT"; return; }
     tmp=$(mktemp -d); dir=$tmp/proj
     (cd "$PROJ" && find . -name '*.jsonl' -o -name '*.meta.json' -o -path '*/tool-results/*' -type f ! -newermt "$NOW" \
       | while read -r f; do mkdir -p "$dir/$(dirname "$f")"
@@ -126,7 +144,7 @@ tick() {
   # One line for tmux: a newline would submit the message early.
   line="$PREFIX $(echo "$report" | sed '/^[[:space:]]*$/d' | paste -sd'|' | sed 's/|/ | /g')"
   if [ "$DRY" = yes ]; then printf '%s\n(%s)\n' "$line" "$cost"; return; fi
-  log "($cost) $line"
+  printf '%s (%s) %s\n' "$NOW" "$cost" "$line" >> "$LOG"  # stamped with the window end
   # Never type into a dialog: the keystrokes would answer it. Retry next tick.
   if tmux capture-pane -p -t "$SESSION" | grep -Eq "$DIALOG"; then  # the visible screen
     log "dialog or prompt on screen, report not sent"; return; fi
