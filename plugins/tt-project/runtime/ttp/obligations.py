@@ -488,11 +488,17 @@ def _receipt_landing(p, oid: str, kind: str, milestone: str | None,
     gate = []
     for t in owners:
         row = p.db.task(t)
-        if row is not None and row.get("kind") == "code":
-            resolved = landed.task_shas(p, t)
-            if resolved[0] or row.get("status") != "done":   # a live code task's commits may still land
+        if row is None or row.get("kind") != "code":
+            continue
+        resolved = landed.task_shas(p, t)
+        if resolved[0]:   # a recorded landing, or a done owner's own branch commits
+            gate.append((t, resolved))
+        elif row.get("status") != "done":   # a live code task with commits of its own: they may still land
+            branch = row.get("branch") or ""
+            head = landed._commit(p.root, f"refs/heads/{branch}") if branch else ""
+            if head and head != landed._start(p.root, branch):   # its branch moved: it has commits
                 gate.append((t, resolved))
-    if not gate or not landed._has_push_branch(p):
+    if not gate or not landed.has_push_branch(p):
         return None
     outs = [landed.check(p, p.root, tid=t, resolved=resolved) for t, resolved in gate]
     if any(rc == 0 for rc, _ in outs):

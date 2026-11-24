@@ -1283,17 +1283,19 @@ def test_must_act_lists_an_order_with_no_owner_from_10_minutes_until_an_owner_or
     assert mustact.unowned(p.db, now + 900) == []
 
 
-def _receipt_order_setup(env, monkeypatch, status="running"):
+def _receipt_order_setup(env, monkeypatch, status="running", own_commit=True):
     """A change order owned by a code task whose own branch carries one fresh unpushed commit (the
     11-24 replay's shape: a run recording its receipt while its change is still unreviewed), in a
-    project whose repo pushes to a bare origin. Returns (p, repo, tid, oid)."""
+    project whose repo pushes to a bare origin. `own_commit=False` leaves the branch where the
+    daemon cut it. Returns (p, repo, tid, oid)."""
     from ttp import obligations as ob
     p, repo, origin, other = _push_setup(env, monkeypatch, ["true"])
     mid = p.db.post("in", "please build the deliverable", chat="c1")
     tid = p.db.add_task("build the deliverable", "s", kind="code", tier="standard", origin="coordinator")
     branch = f"ttp/t{tid}-build"
     _git_out(repo, "checkout", "-q", "-b", branch)   # the daemon cuts the task branch at the tip
-    _commit(repo, "change.txt", "change\n")          # the run's fresh commit, unreviewed, not pushed
+    if own_commit:
+        _commit(repo, "change.txt", "change\n")      # the run's fresh commit, unreviewed, not pushed
     p.db.update_task(tid, branch=branch)
     oid = ob.add_order(p, "build the deliverable", mid, [tid], action_class="change").split()[1]
     ob.attach(p, oid, [tid])          # a run may record for its task only once it owns the order
@@ -1316,6 +1318,16 @@ def test_a_run_s_receipt_with_only_unreviewed_commits_keeps_the_order_open(env, 
         "kept as progress"
     assert "not landed" in msg and "not landed" in (run_dir / "progress.md").read_text(), \
         (msg, "the run is told why")
+
+
+def test_a_running_code_owner_without_commits_closes_its_change_order(env, monkeypatch):
+    """A running code owner whose branch never moved has no commits of its own to land: its change
+    order's receipt closes the order unchecked, with no 'has not finished' hold."""
+    from ttp import obligations as ob
+    p, repo, tid, oid = _receipt_order_setup(env, monkeypatch, own_commit=False)
+    assert "no longer owed" in ob.record(p, oid, "receipt", "built and checked", tid)
+    o = ob.get(p.db, oid)
+    assert o["receipt"] is not None and o.get("unverified") is None, o
 
 
 def test_a_change_order_closes_once_its_owner_s_commit_is_on_the_push_branch(env, monkeypatch):
@@ -1377,7 +1389,7 @@ def test_a_hex_token_in_a_receipt_that_is_not_a_commit_cannot_hold_an_order(env,
 
 def test_a_change_order_in_a_project_with_only_a_landed_probe_closes_unchanged(env, monkeypatch):
     """No push branch to check against, only a landed probe: a change order's receipt closes
-    unchecked, as before the gate existed (review #9690's finding (d))."""
+    unchecked, as before the gate existed."""
     from ttp import obligations as ob
     p, repo, tid, oid = _receipt_order_setup(env, monkeypatch, status="done")
     p.set_config("delivery.push_branch", "")

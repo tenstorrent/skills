@@ -557,7 +557,7 @@ def commits_sha(p, shas: list[str], tip: str = "") -> str:
     there ("This reverts commit <sha>"); "" when one is missing, none is given or git cannot read them. A
     batch run's hand-off lists each member's own commits, so this finds a member's landing with no trailer
     in its message."""
-    if not shas or not tip and not _has_push_branch(p):
+    if not shas or not tip and not has_push_branch(p):
         return ""
     try:
         tip = _commit(p.root, tip or _push_ref(p, p.root))
@@ -577,7 +577,7 @@ def trailer_sha(p, tid: int, since: float | None = None, tip: str = "") -> str:
     committed after `since`; "" when none, or no push branch. Batch runs before commits_sha committed each
     member with that trailer, so this finds such a member's landing that no hand-off names. `tip`: look
     from that commit (one the push queue landed) instead of the push branch's ref."""
-    if not tip and not _has_push_branch(p):
+    if not tip and not has_push_branch(p):
         return ""
     try:
         tip = _commit(p.root, tip or _push_ref(p, p.root))
@@ -1150,15 +1150,19 @@ def landed_probe(p) -> str:
     return str((p.config().get("delivery") or {}).get("landed_probe") or "").strip()
 
 
-def _has_push_branch(p) -> bool:
+def has_push_branch(p) -> bool:
+    """Whether delivery.push_branch is set: a landing can be checked against the push branch."""
     return bool(str((p.config().get("delivery") or {}).get("push_branch") or "").strip())
+
+
+_has_push_branch = has_push_branch   # daemon.py still calls the private name
 
 
 def can_check(p) -> bool:
     """Whether a `landed:#<id>` wait can ever pass here: a push branch, else a landed probe. Without
     either the harness chains with depends_on, the coordinator's task_add/task_update turn `landed:#<id>`
     into depends_on, `ttp task` refuses it (NO_CHECK), and the daemon's probes (DONE_ENV) wait on the task being done."""
-    return _has_push_branch(p) or bool(landed_probe(p))
+    return has_push_branch(p) or bool(landed_probe(p))
 
 
 NO_CHECK = ("`landed:#<id>` cannot be checked in this project: it sets neither delivery.push_branch nor "
@@ -1249,7 +1253,7 @@ def check(p, repo: Path, sha: str | None = None, tid: int | None = None, onto: s
     `fetch` False: local refs only). With no push branch, a task's landing is delivery.landed_probe's
     answer (with `fetch` False it is not run: NOT_YET), and without that key CANNOT naming the fix.
     `resolved`: the (shas, src) task_shas returns, when the caller already read it."""
-    if tid is not None and onto is None and not _has_push_branch(p):
+    if tid is not None and onto is None and not has_push_branch(p):
         if not p.db.task(tid):
             return CANNOT, f"no task #{tid} in this project"
         if not (cmd := landed_probe(p)):
@@ -1288,7 +1292,7 @@ def check(p, repo: Path, sha: str | None = None, tid: int | None = None, onto: s
             continue
         if any(_commit(repo, s) and on_branch(repo, s, tip) for s in shas):
             return _not_dropped(p, repo, tid, tip, shas, src, onto) or (0, f"{what} is on {ref}")
-    if p is not None and _has_push_branch(p) and onto == _push_ref(p, repo) and (found := on_push(p, repo, shas, "")):
+    if p is not None and has_push_branch(p) and onto == _push_ref(p, repo) and (found := on_push(p, repo, shas, "")):
         return _not_dropped(p, repo, tid, tip, shas, src, onto) or (0, f"{what} is on {onto}, at its retired tip {found[:10]}")
     return NOT_YET, f"{what} is not on {onto} yet"
 

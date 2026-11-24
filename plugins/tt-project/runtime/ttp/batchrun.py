@@ -97,7 +97,7 @@ def _branch_commits(p, branch: str | None) -> list[str]:
     names none, read when the batch settles (a superset: they land together or it counts as left out)."""
     from . import landed
     try:
-        if not branch or not landed._has_push_branch(p):
+        if not branch or not landed.has_push_branch(p):
             return []
         r = landed._git(p.root, "rev-list", "--no-merges", f"{landed._push_ref(p, p.root)}..{branch}")
         return r.stdout.split()[:200] if r.returncode == 0 else []
