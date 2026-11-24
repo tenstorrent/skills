@@ -33,8 +33,8 @@ REPLY_DUE event per finished reply_chat task, naming its chat and its landing fa
 enclosed as data, and the coordinator replies to the chat in plain words; the task's promises still record
 in its chat (obligations.record_promises, by_task this task). A fallback outcome line (outcome_line) posts
 model-free, from records only, when no reply delivers that task to that chat within
-coordinator.reply_fallback_s; a reply about another task, or another task's fallback line, never
-disarms it.
+coordinator.reply_fallback_s; a reply that delivers another task, or another task's fallback
+line, never disarms it.
 Every daemon path that posts kind info or reply to a chat goes through status_wait, hold or checked (a guard
 test reads the posting code paths)."""
 from __future__ import annotations
