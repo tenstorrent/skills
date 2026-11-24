@@ -370,8 +370,8 @@ def test_a_landed_code_change_carries_its_landing_facts_to_the_event(env, monkey
     assert "landed as abcdef1" in ev["text"]
 
 
-# The replay case of  (task the hand-off plus its shipped-by tail reached
-# the user's chat): sanitized -- no hosts, names or URLs -- but shaped like a worker's real hand-off.
+# A sanitized fixture shaped like a worker's hand-off plus its shipped-by tail (the shape of the
+# post the user objected to), with no hostnames, names or internal URLs in it.
 _CD_HANDOFF = """Two fixes are on the branch (commit 16b5701a4, on top of cf33224a2). It is ready for review.
 
 **1. Older hosts keep the listener alive**
@@ -389,9 +389,9 @@ _CD_FIXTURE = _CD_HANDOFF + "\n" + _CD_SHIPPED
 
 
 def test_a_replay_of_the_raw_hand_off_reply_never_reaches_the_chat(env, monkeypatch):
-    """The replay of reply #4268 (): a finished reply_chat task's hand-off -- even one
-    with its shipped-by tail -- never posts to the chat. It goes to the coordinator as a reply_due
-    event, and only a record-built outcome line can reach the chat, after the bound."""
+    """A finished reply_chat task's hand-off, with its shipped-by tail, never posts to the chat:
+    it goes to the coordinator as a reply_due event, and only a record-built outcome line can reach
+    the chat, after the bound."""
     from ttp import chatdigest, pushq
     monkeypatch.setenv("TTP_TEST_CHAT_DIGEST", "on")
     p = make(env)
