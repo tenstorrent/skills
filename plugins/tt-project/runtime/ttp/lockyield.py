@@ -1,0 +1,110 @@
+# SPDX-FileCopyrightText: © 2026 Tenstorrent USA, Inc.
+# SPDX-License-Identifier: Apache-2.0
+"""A project's optional yield probe for `ttp lock` (config `locks.yield_probe`): a quick, read-only
+shell command asked while the locked command runs, so a project can give the resource way to
+something that must not be disturbed. The lock names reach it in $TTP_LOCK_NAMES. Exit 0 means
+yield: the command's process group is stopped (SIGTERM, then SIGKILL after 10 s), the locks are
+released and `ttp lock` exits 75, so the task hands itself back as waiting. Exit 1 means keep going.
+Any other answer, or none in time, is reported once and never stops the command. `locks.yield_exempt`
+(globs of lock names) and `--no-yield` opt a call out (a rollout or a heal take). Unset, nothing runs.
+"""
+from __future__ import annotations
+
+import fnmatch
+import os
+import signal
+import subprocess
+import sys
+import time
+
+EVERY_S = 15.0       # config locks.yield_every_s: how often the probe is asked while the command runs
+KILL_AFTER_S = 10.0   # a yielded command gets SIGTERM, then SIGKILL once this is up
+BUSY_RC = 75          # the exit of a busy or, now, yielded lock
+
+
+def command(cfg: dict) -> str:
+    """The configured probe, or "" when unset (nothing runs)."""
+    v = (cfg.get("locks") or {}).get("yield_probe") if isinstance(cfg.get("locks"), dict) else None
+    return v.strip() if isinstance(v, str) else ""
+
+
+def every_s(cfg: dict) -> float:
+    try:
+        v = float((cfg.get("locks") or {}).get("yield_every_s") or EVERY_S)
+    except (TypeError, ValueError, AttributeError):
+        v = EVERY_S
+    return v if v > 0 else EVERY_S
+
+
+def armed(cfg: dict, names: list[str], root, no_yield: bool = False) -> "Probe | None":
+    """The probe watching a `ttp lock` of `names`, or None when off: unset, `no_yield` (--no-yield),
+    or every name matches a `locks.yield_exempt` glob."""
+    cmd = command(cfg)
+    globs = (cfg.get("locks") or {}).get("yield_exempt") or []
+    keep = [n for n in names if not any(isinstance(g, str) and fnmatch.fnmatch(n, g) for g in globs)]
+    if no_yield or not cmd or not keep:
+        return None
+    return Probe(cmd, every_s(cfg), keep, root)
+
+
+class Probe:
+    """One `ttp lock` command's probe: asks it on a timer while the command runs."""
+
+    def __init__(self, cmd: str, interval: float, names: list[str], root) -> None:
+        self.cmd, self.names, self.root = cmd, names, root
+        self.interval = max(interval, 0.1)
+        self.told = False   # a broken probe is reported once, however often it is asked
+
+    def wait(self, popen: subprocess.Popen) -> int:
+        """Wait for the command, asking the probe every interval; BUSY_RC once it yields."""
+        at = time.time() + self.interval   # the first ask comes one interval after the command starts
+        while True:
+            try:
+                return popen.wait(timeout=max(0.0, at - time.time()))
+            except subprocess.TimeoutExpired:
+                pass
+            why = self.ask()
+            if why is not None:
+                if popen.poll() is not None:
+                    return popen.returncode   # it ended between the probe's answer and this
+                print(f"ttp lock: yielding {', '.join(self.names)}: {why}", file=sys.stderr, flush=True)
+                self.stop(popen)
+                return BUSY_RC
+            at = time.time() + self.interval
+
+    def ask(self) -> "str | None":
+        """Run the probe: the one line saying why it yields, or None to keep the command running."""
+        from . import boundedchild
+        res = boundedchild.run(["/bin/sh", "-c", self.cmd], max(0.1, min(self.interval, 10.0)),
+                               cwd=str(self.root), env={**os.environ, "TTP_LOCK_NAMES": ",".join(self.names)},
+                               text=False, stderr="stdout")
+        if res.rc == 0:
+            said = res.out.decode(errors="replace").strip().splitlines()
+            return said[0][:200] if said and said[0].strip() else "the project's yield probe asked for the resource"
+        if res.rc != 1 and not self.told:   # a broken or slow probe never stops the command
+            self.told = True
+            how = f"exited {res.rc}" if res.rc is not None else (res.error or "gave no answer")
+            print(f"ttp lock: yield probe {how}; ignored, the command runs on", file=sys.stderr, flush=True)
+        return None
+
+    def stop(self, popen: subprocess.Popen) -> None:
+        """Stop the command's whole process group: SIGTERM, then SIGKILL after KILL_AFTER_S."""
+        for sig, grace in ((signal.SIGTERM, KILL_AFTER_S), (signal.SIGKILL, None)):
+            try:
+                os.killpg(popen.pid, sig)   # the command runs in a group of its own for this
+            except OSError:
+                pass
+            try:
+                popen.wait(grace)
+                return
+            except subprocess.TimeoutExpired:
+                pass
+
+
+def run_whole(cmd: list, env: dict, probe: "Probe | None") -> int:
+    """The exclusive whole-run path: `subprocess.call` without a probe, else the command in a group
+    of its own watched by it."""
+    if probe is None:
+        return subprocess.call(cmd, env=env)
+    # own session: the probe stops the command's whole process group
+    return probe.wait(subprocess.Popen(cmd, env=env, start_new_session=True))

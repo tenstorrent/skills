@@ -9121,7 +9121,7 @@ def cmd_lock(a) -> None:
     (hold.covers: the run itself, a later run of the task, or the keeper whose hold lists this job)
     probes free (exit 0, held_for_caller in --json) unless paused: its `ttp lock` runs under that hold.
     """
-    from . import hold, lockprobe, locks as lk
+    from . import hold, lockprobe, lockyield, locks as lk
     cmd = list(a.command or [])
     while cmd and cmd[0] == "--disruptive":   # given after the resource, where the command's words start
         a.disruptive, cmd = True, cmd[1:]
@@ -9332,6 +9332,7 @@ def cmd_lock(a) -> None:
             for aid in ids:
                 activity.append(p.state, {"ev": "release", "id": aid, "end": time.time(), "rc": rc})
 
+    yprobe = None if a.no_yield else lockyield.armed(cfg, [L["name"] for L in todo], p.root)
     whole = {lk.canonical(cfg, x.get("resource") or "") for x in spec.get("exclusive") or []}
     # run.json alone is not the hold: one recorded lost (its keeper died, another task took the slot)
     # still lists it. Only a slot the run's own lineage holds now covers the command (hold.covers).
@@ -9349,7 +9350,8 @@ def cmd_lock(a) -> None:
             print(f"ttp lock: {L['name']} is held already by this task's whole run; "
                   f"{'taking the rest' if todo else 'running the command under it'}", file=sys.stderr, flush=True)
         if not todo:
-            sys.exit(_logged("exclusive", run_held, lambda: subprocess.call(cmd, env=child_env)))
+            sys.exit(_logged("exclusive", run_held,
+                             lambda: lockyield.run_whole(cmd, child_env, yprobe)))
     what = ",".join(L["name"] for L in todo)   # what the messages and the retry_when name
     from . import pregrant
     from .runner import PRE_GRANT_FRESH_S
@@ -9534,7 +9536,7 @@ def cmd_lock(a) -> None:
             # and its label names the command (hand_to_command). The command never gets them: a process
             # it leaves running (a daemon, a `setsid ... &`) would keep the lock for as long as it lives.
             # The command runs only once both are in place (start_gated): a kill in between never runs it.
-            proc, gate = lk.start_gated(cmd, child_env)
+            proc, gate = lk.start_gated(cmd, child_env, own_group=yprobe is not None)
             started.append(proc)
             keeper = lk.keep_open(fs, proc.pid)
             lk.hand_to_command(fs, proc.pid)
@@ -9546,7 +9548,7 @@ def cmd_lock(a) -> None:
                 from . import fgwait   # a long foreground command holds the worker's slot: say so (steer)
                 fg = fgwait.watch(wait_dir, [L["name"] for L in todo], list(cmd))
                 try:
-                    return proc.wait()
+                    return proc.wait() if yprobe is None else yprobe.wait(proc)
                 finally:
                     if fg:   # a note already under way finishes (steer and progress) before this exits
                         fg.cancel()
@@ -17139,6 +17141,8 @@ def ttp_parser():
     s.add_argument("--timeout", type=float, default=None,
                    help="give up after this many seconds (exit 75); 0 waits as long as it takes; "
                         "inside a run: at most half its stall limit")
+    s.add_argument("--no-yield", action="store_true",
+                   help="never stop this command for the project's yield probe (locks.yield_probe)")
     s.add_argument("--disruptive", action="store_true",
                    help="the command may reset, power-cycle or reboot what it holds: `ttp machines activity` "
                         "and the resume note after a reboot list it first")

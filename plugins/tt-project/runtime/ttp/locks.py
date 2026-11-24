@@ -382,14 +382,17 @@ _GATE = (
     "    sys.exit(126 if isinstance(e, PermissionError) else 127)\n")
 
 
-def start_gated(cmd: list, env: dict) -> tuple[subprocess.Popen, int]:
+def start_gated(cmd: list, env: dict, own_group: bool = False) -> tuple[subprocess.Popen, int]:
     """Starts `cmd` behind a gate that execs it (same pid) only once let_go writes to the returned fd, so
     the keeper (keep_open) and the label (hand_to_command) are in place before the command runs: a
     SIGKILL of `ttp lock` in between never leaves the command running with the lock free or named for the
-    dead `ttp lock`. The gate reads EOF then and exits 125 without running the command."""
+    dead `ttp lock`. The gate reads EOF then and exits 125 without running the command. `own_group` puts the
+    command in a group of its own, so a yield probe (lockyield.py) can stop its whole group."""
     r, w = os.pipe()
     try:
-        proc = subprocess.Popen([sys.executable, "-I", "-S", "-c", _GATE, str(r), *cmd], env=env, pass_fds=[r])
+        # own session: the yield probe stops the command's whole process group
+        proc = subprocess.Popen([sys.executable, "-I", "-S", "-c", _GATE, str(r), *cmd], env=env,
+                                pass_fds=[r], start_new_session=own_group)
     except BaseException:
         os.close(w)
         raise

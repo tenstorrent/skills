@@ -214,7 +214,12 @@ DEFAULT_CONFIG: dict[str, Any] = {
     # wait_alert_min: a waiter on a lock past this many minutes raises one lock-wait:<name> alert per
     # lock, naming its holder (lockreap.py); 0: off. wide: lock names that count as site- or cluster-wide
     # in the lock order a lock-cycle alert checks, beside the words of lockcycle.WIDE_WORDS.
-    "locks": {"pre_grant_check": "", "pre_grant_timeout_s": 10, "wait_alert_min": 30, "wide": []},
+    # yield_probe: while `ttp lock` runs a command, this read-only shell command is asked every
+    # yield_every_s (15) s with the lock names in $TTP_LOCK_NAMES; its exit 0 stops the command
+    # (SIGTERM, then SIGKILL) and exits 75, so the resource goes to what the probe says needs it.
+    # yield_exempt: globs of lock names whose commands are never stopped (a rollout or heal take).
+    "locks": {"pre_grant_check": "", "pre_grant_timeout_s": 10, "wait_alert_min": 30, "wide": [],
+              "yield_probe": "", "yield_every_s": 15, "yield_exempt": []},
     "shared_resources": [],             # resources whose slots and pause all the user's projects share
     # Machines in the user's list (ttp machines) this project uses, beside those its resources and
     # shared_resources name: the change ledger, health coverage and idle capacity read only these.

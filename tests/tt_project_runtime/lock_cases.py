@@ -2504,3 +2504,95 @@ def test_flocked_makes_the_lock_file_and_excludes_others(tmp_path):
                 fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
     with open(path) as f:
         fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+
+def _yield_probe(p, tmp_path, body):
+    """Set config locks.yield_probe to a script that logs its $TTP_LOCK_NAMES to a log, then runs
+    `body`; (log, yield.log) is the log's path."""
+    hook, log = tmp_path / "yield.sh", tmp_path / "yield.log"
+    hook.write_text(f"#!/bin/sh\necho \"$TTP_LOCK_NAMES\" >> {shlex.quote(str(log))}\n{body}\n")
+    hook.chmod(0o755)
+    p.set_config("locks.yield_probe", shlex.quote(str(hook)))
+    return log
+
+
+def test_the_yield_probe_stops_the_command_and_ttp_lock_exits_75(env, tmp_path):
+    # The probe flips to 0 once the command runs, so the lock is given way: the command's whole
+    # group is stopped, the lock is released and `ttp lock` exits 75.
+    p = make(env)
+    flip = tmp_path / "flip"
+    log = _yield_probe(p, tmp_path, f"[ -e {shlex.quote(str(flip))} ] && exit 0\nexit 1")
+    p.set_config("locks.yield_every_s", 1)
+    marks = tmp_path / "marks"
+    t = subprocess.Popen([sys.executable, str(TTP), "lock", "rig", "--", "bash", "-c",
+                          f"echo start >> {shlex.quote(str(marks))}; "
+                          f"trap 'echo term >> {shlex.quote(str(marks))}' TERM; sleep 30"],
+                         env=_lock_env(env, p), stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    try:
+        _until_or_ended(lambda: marks.exists(), [t])
+        yielded = time.time()
+        flip.touch()
+        assert t.wait(timeout=30) == 75, t.stderr.read()
+        err = t.stderr.read()
+        assert time.time() - yielded < 6, "the probe did not yield within about two intervals"
+        assert "yielding rig:" in err, err
+        assert "term" in marks.read_text(), "the command's process group never got the SIGTERM"
+        assert "rig" in log.read_text()            # $TTP_LOCK_NAMES carried the lock name
+        assert _lock_probe(_lock_env(env, p), "rig").returncode == 0   # the lock was released
+    finally:
+        if t.poll() is None:
+            t.kill()
+
+
+def test_a_broken_yield_probe_never_stops_the_command(env, tmp_path):
+    p = make(env)
+    _yield_probe(p, tmp_path, "exit 3")
+    p.set_config("locks.yield_every_s", 1)
+    t = subprocess.run([sys.executable, str(TTP), "lock", "rig", "--", "sh", "-c",
+                        "sleep 2.5; echo done"], env=_lock_env(env, p), capture_output=True,
+                       text=True, timeout=60)
+    assert t.returncode == 0 and t.stdout.strip() == "done", (t.returncode, t.stderr)
+    assert t.stderr.count("yield probe exited 3; ignored") == 1, t.stderr   # reported once, however often asked
+
+
+def test_without_a_yield_probe_nothing_changes(env, tmp_path):
+    p = make(env)
+    t = subprocess.run([sys.executable, str(TTP), "lock", "rig", "--", "sh", "-c", "echo hi"],
+                       env=_lock_env(env, p), capture_output=True, text=True, timeout=60)
+    assert t.returncode == 0 and t.stdout == "hi\n" and "yield" not in t.stderr, (t.returncode, t.stderr)
+
+
+def test_exempt_lock_names_and_no_yield_never_stop_the_command(env, tmp_path):
+    p = make(env)
+    _yield_probe(p, tmp_path, "exit 0")   # would yield at its first ask
+    p.set_config("locks.yield_every_s", 1)
+    run_env = _lock_env(env, p)
+    out = tmp_path / "ran"
+    t = subprocess.run([sys.executable, str(TTP), "lock", "--no-yield", "rig", "--", "sh", "-c",
+                        f"echo done > {shlex.quote(str(out))}"], env=run_env, capture_output=True,
+                       text=True, timeout=60)
+    assert t.returncode == 0, t.stderr
+    p.set_config("locks.yield_exempt", ["ri*"])
+    t = subprocess.run([sys.executable, str(TTP), "lock", "rig", "--", "sh", "-c",
+                        f"echo done >> {shlex.quote(str(out))}"], env=run_env, capture_output=True,
+                       text=True, timeout=60)
+    assert t.returncode == 0 and "yield" not in t.stderr, (t.returncode, t.stderr)
+    assert out.read_text() == "done\n" * 2, out.read_text()   # both runs finished
+
+
+def test_the_whole_run_path_yields_to_the_probe_too(env, tmp_path):
+    p = make(env)
+    _yield_probe(p, tmp_path, "echo stream; exit 0")
+    p.set_config("locks.yield_every_s", 1)
+    mine, other, paths, run_dir, ran, job, _ = _run_listing_the_board(env, p, tmp_path, 71)
+    from ttp import hold
+    marks = tmp_path / "marks"
+    with _whole_run_hold(paths[0], hold.label(f"task #{mine['id']}", 71, hold.WHOLE_RUN)):
+        started = time.time()
+        t = subprocess.run([sys.executable, str(TTP), "lock", "board", "--", "sh", "-c",
+                            f"echo start >> {shlex.quote(str(marks))}; sleep 30"],
+                           env=dict(job, TTP_DETACHED="", TTP_DETACH_RC=""), capture_output=True,
+                           text=True, timeout=60)
+    assert t.returncode == 75 and time.time() - started < 6, (t.returncode, t.stderr)
+    assert t.stderr.count("yielding board: stream") == 1, t.stderr
+    assert "start" in marks.read_text() and "yield probe" not in t.stderr
