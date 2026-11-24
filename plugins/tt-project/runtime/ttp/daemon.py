@@ -8610,7 +8610,10 @@ class Daemon:
         # stored text read 'not landed', wherever that text goes (result, digest, chat, notes).
         try:
             head_sha = pushq._commit(self.p, task["branch"]) if task["branch"] else ""
-            fixed = pushclaim.correct_landed_claims(self.p, summary, self.p.root, head_sha, task["id"])
+            # a hand-off the remote check just confirmed is left as written: its verdict outranks
+            # the local tracking ref, which may lag the pushes it confirmed
+            fixed = summary if push_verified else pushclaim.correct_landed_claims(
+                self.p, summary, self.p.root, head_sha, task["id"])
         except Exception:   # a fault leaves the text as written
             fixed = summary
         if fixed != summary:

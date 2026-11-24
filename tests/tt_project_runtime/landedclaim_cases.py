@@ -116,3 +116,59 @@ def _digest_result(p, tid):
     """The task's stored summary as the digest reads it."""
     return json.loads(p.db.task(tid)["result"])["summary"]
 
+
+
+def test_a_landing_the_tracking_ref_lags_is_refreshed_before_not_landed(env, monkeypatch):
+    """Replay of a hand-off whose push another route landed: the local tracking ref still lags
+    behind the remote, and the landing is real. The claim is refreshed from the remote before it
+    is called 'not landed', so the stored summary keeps the landing as a landing."""
+    from ttp.daemon import Daemon
+    from ttp.providers.base import RunUsage as Usage
+    p, repo, origin, other = _push_setup(env, monkeypatch, ["true"])
+    old = _git_out(repo, "rev-parse", "refs/remotes/origin/proj")
+    _commit(repo, "change.txt", "change\n")
+    head = _git_out(repo, "rev-parse", "HEAD")
+    _git_out(repo, "push", "-q", "origin", f"{head}:refs/heads/proj")
+    _git_out(repo, "update-ref", "refs/remotes/origin/proj", old)   # the tracking ref lags the push
+    tid = p.db.add_task("harden the runtime", "s", kind="code", origin="coordinator")
+    p.db.update_task(tid, status="running", branch="ttp/t1")
+    run_dir = env["tmp"] / f"run-{tid}"
+    run_dir.mkdir()
+    (run_dir / "result.json").write_text(json.dumps({"status": "done",
+        "summary": f"Hardening landed at {head[:10]}.",
+        "push": [{"branch": "origin/proj", "head": head}]}))
+    Daemon(p.base)._finish_worker({"task": tid}, Usage(cost_usd=1.0), "ok", run_dir)
+    res = json.loads(p.db.task(tid)["result"])
+    assert "not landed" not in res["summary"], res["summary"]
+
+
+def test_a_refresh_that_cannot_run_marks_the_claim_unverified(env, monkeypatch):
+    """A claim the local ref cannot confirm is refreshed from the remote; a refresh that cannot
+    run leaves the claim marked '(unverified)', never 'not landed' on the stale local ref."""
+    from ttp import pushclaim
+    p, repo, head = _claim_replay_setup(env, monkeypatch, landed=False)
+    _git_out(repo, "remote", "set-url", "origin", str(env["tmp"] / "gone.git"))
+    fixed = pushclaim.correct_landed_claims(p, _claim_text("sha", head), p.root)
+    assert "(unverified)" in fixed and "not landed" not in fixed, fixed
+
+
+def test_a_remote_confirmed_hand_off_keeps_its_landed_claim(env, monkeypatch):
+    """A hand-off the remote check already confirmed is left as written: its verdict outranks the
+    local tracking ref, which may lag the pushes it confirmed."""
+    from ttp.daemon import Daemon
+    from ttp.providers.base import RunUsage as Usage
+    p, repo, origin, other = _push_setup(env, monkeypatch, ["true"])
+    _commit(repo, "change.txt", "change\n")
+    head = _git_out(repo, "rev-parse", "HEAD")
+    _git_out(repo, "push", "-q", "origin", f"{head}:refs/heads/proj")
+    _git_out(repo, "update-ref", "refs/remotes/origin/proj", _git_out(repo, "rev-parse", "HEAD~1"))
+    tid = p.db.add_task("harden the runtime", "s", kind="code", origin="coordinator")
+    p.db.update_task(tid, status="running", branch="ttp/t1")
+    run_dir = env["tmp"] / f"run-{tid}"
+    run_dir.mkdir()
+    (run_dir / "result.json").write_text(json.dumps({"status": "done",
+        "summary": f"Hardening landed at {head[:10]}."}))
+    Daemon(p.base)._finish_worker({"task": tid}, Usage(cost_usd=1.0), "ok", run_dir,
+                                  push_verified=True)
+    res = json.loads(p.db.task(tid)["result"])
+    assert "not landed" not in res["summary"] and head[:10] in res["summary"], res["summary"]

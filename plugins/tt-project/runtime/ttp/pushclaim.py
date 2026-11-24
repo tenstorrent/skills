@@ -201,6 +201,21 @@ def landed_claims(p, text: str, repo) -> list[tuple[int, int, str, tuple]]:
     return out
 
 
+def _refresh(p, repo, done: dict) -> bool:
+    """Whether the push branch's tracking ref was just fetched: the local ref can lag a landing
+    another route pushed, so a claim it cannot confirm asks the remote first. `done` keeps the
+    answer: the branch is fetched once, not once per claim."""
+    if "ok" in done:
+        return done["ok"]
+    from . import push
+    try:
+        remote, branch = push.target(p, Path(repo))
+        done["ok"] = bool(_fetch(Path(repo), remote, f"refs/heads/{branch}", {}))
+    except (ValueError, OSError):
+        done["ok"] = False
+    return done["ok"]
+
+
 def correct_landed_claims(p, text: str, repo, head: str = "", tid: int = 0,
                           remote_missing: bool = False) -> str:
     """`text` (a hand-off summary or a note) with its landed-claims checked model-free: a phrase
@@ -208,9 +223,11 @@ def correct_landed_claims(p, text: str, repo, head: str = "", tid: int = 0,
     receipt (landed.recorded) or the branch's local tracking ref holds the commit it names — the
     task's `head` when it names none; one the branch disproves is rewritten to read "not landed:
     <sha> is not on <push branch>", and one this project cannot check keeps its words marked
-    (unverified), never a plain 'landed'. Claims naming another ref are the remote checks' business
-    and are left as written. `remote_missing`: the remote check settled every claim of this task
-    false, so each is rewritten to read 'not landed', whatever ref it named."""
+    (unverified), never a plain 'landed'. A claim the local tracking ref cannot confirm is decided
+    again after the push branch is fetched once: a landing another route pushed must not read
+    'not landed' because the ref lags behind it. Claims naming another ref are the remote
+    checks' business and are left as written. `remote_missing`: the remote check settled every
+    claim of this task false, so each is rewritten to read 'not landed', whatever ref it named."""
     from . import landed
     if not text:
         return text
@@ -222,6 +239,7 @@ def correct_landed_claims(p, text: str, repo, head: str = "", tid: int = 0,
         except Exception:
             pass
     fixes = []
+    refreshed = {}   # the push branch's fetch, asked once for claims the local ref cannot confirm
     for start, end, sha, claim_target in landed_claims(p, text, repo):
         what = sha or head
         if remote_missing:
@@ -232,6 +250,12 @@ def correct_landed_claims(p, text: str, repo, head: str = "", tid: int = 0,
             continue   # the push receipts hold this task's landing: the claim stands
         else:
             rc, why = landed.check(p, repo, what, fetch=False) if what else (landed.CANNOT, "no commit named")
+            if rc == landed.NOT_YET and what:
+                # the local tracking ref can lag a landing another route pushed: fetch the branch
+                # once, then decide again. A refresh that cannot run marks the claim, never a
+                # 'not landed' the ref's own staleness wrote.
+                rc, why = (landed.check(p, repo, what, fetch=False) if _refresh(p, repo, refreshed)
+                           else (landed.CANNOT, "cannot fetch the push branch"))
         if rc == landed.NOT_YET:
             where = short_ref(*(claim_target or target)) if (claim_target or target) else "the push branch"
             fixes.append((start, end, f"{NOT_LANDED}: {what[:12] if what else 'it'} is not on {where}"))
