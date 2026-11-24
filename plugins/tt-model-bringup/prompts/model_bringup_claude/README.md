@@ -56,6 +56,8 @@ A dedicated config dir per run is the recommended way: the run gets no shared se
 or memory from your own Claude setup (memory is per project anyway), and its transcripts are easy to find. Claude
 Code's default effort for `claude-opus-5-5` is medium; all runs so far used the default.
 
+Reading outside the run folder is left to the agent: the config dir pre-accepts auto mode's one-time notice about reads outside the working directories, so a read elsewhere does not stop the run at a dialog, and the prompt's "This run" section asks it to read other folders only when that helps and never change them. The run folder (`--run-dir`, default the folder above the checkout, never your home) is a working directory.
+
 Several runs on one host: give each its own `--config-dir` and `--session` (and its own `TMUX_TMPDIR` if you want
 separate tmux servers; then attach with the same `TMUX_TMPDIR`).
 
@@ -67,7 +69,7 @@ history (crashes, a board that needed a power cycle), local paths, pinned weight
 from the checkpoint and its config. Keep it short. For example:
 
 ```
-- Work only in /data/runs/my-model; pip installs go into tt-metal's python_env, nothing system-wide.
+- Install what you need inside /data/runs/my-model (packages, tools, extra environments); keep tt-metal's python_env able to run device code.
 - This host is also a CI runner: do not touch the runner service or its containers.
 - Weights are pinned to revision <sha> in $HF_HOME; do not download another.
 - The host lost the PCIe link to one board last week; it came back after a cold power cycle.

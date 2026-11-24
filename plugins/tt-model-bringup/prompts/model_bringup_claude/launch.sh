@@ -19,7 +19,7 @@ while [ $# -gt 0 ]; do case $1 in
 [ -n "$HF_MODEL" ] && [ -n "$TT" ] || { echo "need --hf-model and --tt-metal" >&2; exit 2; }
 MODEL_DIR=$(echo "$HF_MODEL" | tr 'A-Z' 'a-z' | tr '/.-' '___')
 SESSION=${SESSION:-bringup-$MODEL_DIR}
-RUN_DIR=${RUN_DIR:-$(dirname "$TT")}
+RUN_DIR=${RUN_DIR:-$(dirname "$TT")}; [ "$RUN_DIR" = "$HOME" ] && RUN_DIR=$TT  # never make the whole home a working dir
 RUN="$TT/models/autoports/$MODEL_DIR/bringup/agentic_evals"; mkdir -p "$RUN"
 
 # A dedicated Claude config dir: only the login, a theme, onboarding done and the folder trust below. Reused if present.
@@ -44,7 +44,7 @@ if not os.path.exists(s):
 j = os.path.join(d, ".claude.json")
 if not os.path.exists(j):
     u = load(uj)
-    c = {"hasCompletedOnboarding": True, **{k: u[k] for k in ("oauthAccount", "userID") if k in u}}
+    c = {"hasCompletedOnboarding": True, "hasSeenAutoModeOutsideReadPrompt": True, **{k: u[k] for k in ("oauthAccount", "userID") if k in u}}
     json.dump(c, open(j, "w"), indent=2)
 P
   export CLAUDE_CONFIG_DIR=$CONFIG_DIR  # for the folder trust, the overseer and the session below
@@ -61,7 +61,7 @@ P
 PROMPT="$RUN/prompt.md"
 sed "s|HF_MODEL|$HF_MODEL|g" "$HERE/brief.md" > "$PROMPT"
 { echo; echo "## This run"; echo
-  echo "- Machine: $(hostname). Work only in $TT and its worktrees. HF_HOME=${HF_HOME:-~/.cache/huggingface}."
+  echo "- Machine: $(hostname). Your run folder is $RUN_DIR (tt-metal checkout: $TT). Other folders on this machine belong to other work: read them only when that helps, and do not change them. HF_HOME=${HF_HOME:-~/.cache/huggingface}."
   echo "- Budget: $BUDGET h from now; write started_at (UTC) at the start."
   if [ "$RESETS" = yes ]; then echo "- Bounded board resets (tt-smi -r, whole board) and multi-chip health checks are authorized."
   else echo "- Board resets are not authorized on this machine."; fi
