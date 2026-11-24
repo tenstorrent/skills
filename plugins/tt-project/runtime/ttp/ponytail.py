@@ -27,6 +27,13 @@ FAILED = "the ponytail lane failed it"   # lane_problem's prefix for a valid fai
 WHY = re.compile(r"(?im)^[ \t>*-]*why this size:[ \t]*\S")
 
 
+def midline_problem(text: str) -> str:
+    """Why a `why this size:` in `text` counts for nothing: it is only mid-line (WHY reads a line start)."""
+    if re.search(r"(?i)why this size:", text or "") and not WHY.search(text or ""):
+        return "its `why this size:` is mid-line and is not read: put it on its own line, with the reason after it"
+    return ""
+
+
 def _review(cfg: dict) -> dict:
     return cfg.get("review") or {}
 

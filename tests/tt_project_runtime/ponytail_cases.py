@@ -132,6 +132,16 @@ def test_ponytail_size_and_verdict_rules(env, tmp_path, monkeypatch):
     assert "ponytail" in handoff_problem(run / "result.json", lane=True)
 
 
+def test_a_why_this_size_only_mid_line_is_refused_with_the_hint_to_put_it_on_its_own_line(tmp_path):
+    from ttp.hook import handoff_problem
+    f = tmp_path / "result.json"
+    f.write_text(json.dumps({"status": "done", "summary": "Added the table. why this size: it needs both columns"}))
+    assert "put it on its own line" in handoff_problem(f)
+    for ok in ("Added the table.\nwhy this size: it needs both columns", "- why this size: x", "no size reason at all"):
+        f.write_text(json.dumps({"status": "done", "summary": ok}))
+        assert not handoff_problem(f), ok
+
+
 def test_a_draft_pr_over_the_pr_size_is_refused_without_a_reason(env, tmp_path, monkeypatch):
     """The gh wrapper refuses a run's draft PR adding more than review.ponytail_pr_lines over its base
     unless the body or task spec gives `why this size:` and the lane passed this head."""

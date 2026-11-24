@@ -214,6 +214,8 @@ def handoff_problem(path: Path, lane: bool | None = None) -> str | None:
             (why := ponytail.lane_problem(path.parent)) and not why.startswith(ponytail.FAILED):
         return (f"{why}: run the ponytail lane (skill tt-ponytail-review, in a fresh-context subagent) and "
                 f"write its verdict to {ponytail.FILE} in the run dir first")
+    if why := ponytail.midline_problem(str(data.get("summary") or "")):
+        return f"{RESULT_FILE}: {why}"
     if "then" in data:
         from . import thenwaits
         if why := thenwaits.problem(data):
