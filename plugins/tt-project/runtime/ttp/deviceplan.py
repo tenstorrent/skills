@@ -64,7 +64,10 @@ STEPS = "device_steps.jsonl"     # in the run folder: each command the run ran, 
 KV = "glm_device"                # the project's counters (counters())
 AUDIT_LABEL = "device_audit"
 RETRY_LABEL = "device_audit_retry"
-DEFAULTS = {"power_routes": ["broker"], "device_scripts": [], "device_audits": 20}
+# device_tools: the programs or scripts that drive a box's chips (validation, fabric or link checks), run only as
+# an argument of a power route (the box's device broker); tt-smi and ipmitool resets are power_refusal's
+DEFAULTS = {"power_routes": ["broker"], "device_scripts": [], "device_audits": 20,
+            "device_tools": ["run_cluster_validation", "test_system_health", "test_tt_fabric"]}
 FENCE = re.compile(r"```(?:json)?\s*(\{.*?\})\s*```", re.S)
 PROSE = re.compile(r"[A-Z][a-z]+(?:,?\s+[a-z][a-z'-]*){2,}[.:]?$")   # "Check the holder first." is no command
 IPMI_POWER = re.compile(r"(?:chassis\s+)?power\s+(?!status\b)\S+|raw\b|mc\s+reset\b|chassis\s+bootdev\b")
@@ -75,7 +78,8 @@ PLAN_RULES = (
     "user-ordered changes recorded for it (`ttp machines change list <alias>`), whose undo it never runs; and the gates: "
     "holds and pauses, Slurm nodes held by others, protected paths. Power cycles and resets go only through the "
     "project's approved routes (its broker or the scripts its settings name), never raw `ipmitool chassis power`, "
-    "raw IPMI bytes or `tt-smi -glx_reset` outside them. Stop at the first failed check and hand back; post nothing "
+    "raw IPMI bytes or `tt-smi -glx_reset` outside them. On a box with a device broker, device jobs (validation, "
+    "fabric or link checks, resets, tt-smi) go only through the broker. Stop at the first failed check and hand back; post nothing "
     "to a person.")
 SOURCE_RULES = (
     "Copy every check and job-submit command verbatim from the commands to copy from (listed with the task) or "
@@ -113,13 +117,14 @@ CHECK = ("The agent is about to run step {n} of the plan below on a device. From
 
 
 def settings(cfg: dict) -> dict:
-    """{"on", "power_routes", "device_scripts", "device_audits"} from route.glm_work."""
+    """{"on", "power_routes", "device_scripts", "device_tools", "device_audits"} from route.glm_work."""
     g = (cfg.get("route") or {}).get("glm_work")
     g = g if isinstance(g, dict) else {}
     def words(k):
         v = g.get(k)
         return [str(x).strip() for x in v if str(x).strip()] if isinstance(v, list) else list(DEFAULTS[k])
     return {"on": g.get(KEY) is True, "power_routes": words("power_routes"), "device_scripts": words("device_scripts"),
+            "device_tools": words("device_tools"),
             "device_audits": int(glmassist._num(g.get("device_audits"), 0, 1000, DEFAULTS["device_audits"]))}
 
 
@@ -304,6 +309,36 @@ def power_refusal(cmd: str, routes=("broker",)) -> str | None:
     return None
 
 
+# a program that only names its words (`grep run_cluster_validation log`, `git commit -m ...`): any other program
+# naming a device tool may run it (`python3 x/fabric_check.py`, `env A=1 ./tool`, `xargs ./tool`)
+NAMERS = LISTERS | {"grep", "egrep", "fgrep", "rg", "cat", "head", "tail", "less", "wc", "file", "which", "type", "git"}
+
+
+def direct_tool(cmd: str, routes=("broker",), tools=tuple(DEFAULTS["device_tools"])) -> str | None:
+    """Why `cmd` runs a device tool (route.glm_work.device_tools: validation, fabric or link checks) on a box's
+    chips directly, here or over ssh, and not as the job of a power route (the box's device broker), else None. A
+    tool called with only --help or -h prints its usage and is not refused; a part that cannot be read fails closed
+    on the tools' names."""
+    from . import hook
+    names = {t for t in tools if t}
+    why = ("a direct device tool runs only as a job of the box's device broker "
+           f"({', '.join(routes) or 'none set'}): run it through the box's device broker: ")
+    for x in _words(cmd):
+        if x is None:
+            if any(re.search(r"(?<![\w.-])" + re.escape(t) + r"(?![\w-])", hook._split(cmd)[0]) for t in names):
+                return why + cmd[:120]
+            continue
+        w = x[0]
+        if _matches(w[0], routes) or os.path.basename(w[0]) in NAMERS:
+            continue
+        words = " ".join(w).split()   # a quoted command line is read word by word too
+        at = [i for i, a in enumerate(words)
+              if os.path.basename(a) in names or os.path.splitext(os.path.basename(a))[0] in names]
+        if at and not (len(at) == 1 and words[at[0] + 1:] in (["--help"], ["-h"])):   # only its usage: no device
+            return why + " ".join(w)[:120]
+    return None
+
+
 def risky(cmd: str, routes=tuple(DEFAULTS["power_routes"])) -> bool:
     """A reset, power cycle, flash or firmware step: it needs an Opus check before it runs. Read on the program's
     name (`grep reset log` is a read), and for a route on its words (`broker reset box-a`). A script run by its
@@ -424,7 +459,7 @@ def _gates(st: dict) -> list[str]:
 
 
 def _static(cmd: str, s: dict, cwd: str, run_dir: str = "") -> str | None:
-    if why := power_refusal(cmd, s["power_routes"]):
+    if why := power_refusal(cmd, s["power_routes"]) or direct_tool(cmd, s["power_routes"], s["device_tools"]):
         return why
     segs = _segs(cmd)
     if any(os.path.basename(w[0]) == "ssh" and not ssh_target(w, strict=True) for w in segs or []) or \
@@ -511,8 +546,8 @@ def refusal(cmd: str, cwd: str = "", env=None, cfg: dict | None = None) -> str |
     if not marked(run_dir):
         return None
     s = settings(cfg if cfg is not None else _cfg())
-    if why := power_refusal(cmd, s["power_routes"]):
-        return why
+    if why := power_refusal(cmd, s["power_routes"]) or direct_tool(cmd, s["power_routes"], s["device_tools"]):
+        return why   # a step of the plan too: the plan check refuses it, and a plan stored before this rule may hold it
     ws = cwd or os.getcwd()
     from . import glmguard
     got = plan(run_dir)

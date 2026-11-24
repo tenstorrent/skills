@@ -271,6 +271,8 @@ SECRET_TEXT_WHY = "a script's text names a key or credential file, which may rea
 REFUSAL_KEY = "glm_refusals"      # route.glm_refusals: {"hand_back_after": 3, "redirect": true}
 HAND_BACK_AFTER = 3
 _OUTSIDE = "outside its worktree"
+_PUBLISH = ("commit on your branch and hand off done; the review publishes the head, so skip every publish, push or "
+            "`published` step your spec or the publish rules above give")
 _OWN_TREE = ("change only files in your worktree and `$TMPDIR`, and say in your hand-off "
              "what else should change")
 RULES = (
@@ -292,8 +294,7 @@ RULES = (
     ("outward", HARMFUL, r"`ttp (?:notify|say|ask|note)\b", "post outward (`ttp notify`, `ttp say`, "
      "`ask`, `ttp note --to`/`--reply`)", 'put what a person should read in your hand-off summary; a plain `ttp note "<text>"` '
      "goes to your task's own log"),
-    ("publish", HARMFUL, r"lands a head|never `git push`", "run `git push`, `ttp land` or `ttp express`",
-     "commit on your branch and hand off done; the review publishes the head"),
+    ("publish", HARMFUL, r"lands a head|never `git push`", "run `git push`, `ttp land` or `ttp express`", _PUBLISH),
     ("post", HARMFUL, r"post to GitHub|send data to a service|reaches a person or another service|connector tool",
      "post to GitHub (`gh` writes), send HTTP posts or mail, or call a connector tool",
      "put the text in your hand-off summary; `gh pr view` and `gh pr diff` only read and run"),

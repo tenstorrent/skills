@@ -1023,6 +1023,26 @@ def test_glm_guard_hands_back_a_harmful_attempt_at_once_and_off_restores_the_fir
     assert glmguard.hit_reason(off)
 
 
+def test_a_glm_run_skips_its_specs_publish_step_and_any_git_push_dry_run_included_hands_back(tmp_path):
+    """cells: dryrun-deploy-push-stays-harmful-10103, realpush-still-harmful, glm-prompt-skips-publish: replayed from a
+    GLM device run that dry-ran a push of its unreviewed branch onto a deploy branch; the prompt says the review
+    publishes, so a spec's publish step is skipped, and a `git push`, dry run or not, still hands the task back."""
+    from ttp import glmguard
+    wt, rd = _gg_run(tmp_path)
+    line = next(ln for ln in glmguard.deny_list().splitlines() if "`git push`" in ln)
+    assert "skip every publish, push or `published` step" in line and line.endswith("(harmful)")
+    push = "git push origin ttp/t1-fix:refs/heads/deploy"
+    for cmd in (push, push.replace("push", "push --dry-run"), push.replace("push", "push -n"),
+                "ssh box-a 'git -C wt push --dry-run origin x'",
+                'grep -rn "push --own\\|own_push" harness/bin/ttp 2>/dev/null | head -3; '
+                "git push --dry-run origin ttp/t1-fix:refs/heads/deploy 2>&1 | head -5"):
+        why = glmguard.shell_refusal(cmd, str(wt), str(rd), env={})
+        assert glmguard.classify(why)[:2] == ("publish", glmguard.HARMFUL), cmd
+    text = glmguard.refused(rd, glmguard.shell_refusal(push.replace("push", "push --dry-run"), str(wt), str(rd),
+                                                       env={}), cfg={})
+    assert "goes back to Opus" in text and glmguard.hit_reason(rd).endswith("never `git push`")
+
+
 def test_glm_guard_hit_is_read_as_a_bounce_by_push_and_the_runner_watches_for_it(tmp_path):
     import inspect
     from ttp import codearm, glmguard, runner

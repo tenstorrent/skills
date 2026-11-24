@@ -51,6 +51,87 @@ def test_the_seventh_check_allows_power_only_through_the_approved_routes():
     assert deviceplan.risky("broker reset box-a") and not deviceplan.risky("git reset --hard")
 
 
+
+# Replay of a device plan that ran a cluster validator, its all-link traffic pass included, straight on the box's
+# chips (paths, box and checkout made generic): only the box's device broker runs a device tool.
+_DP_VALIDATOR = ("./build/tools/scaleout/cluster_validation/run_cluster_validation --cabling-descriptor-path "
+                 "/path/to/cabling.textproto --global-descriptor-path /path/to/global.yaml")
+_DP_DIRECT_STEPS = [f"cd wt/work && {_DP_VALIDATOR} 2>&1 | tee /tmp/validator.log",
+                    "echo \"exit: ${PIPESTATUS[0]:-$?}\"; grep -Ei 'link|mismatch|error' /tmp/validator.log | head -50",
+                    f"{_DP_VALIDATOR} --send-traffic 2>&1 | tee /tmp/validator_traffic.log"]
+_DP_VIA_BROKER = f"ttp lock box-a -- ssh box-a 'broker submit box-a -- {_DP_VALIDATOR} --send-traffic'"
+
+
+def _dp_steps_plan(cmds):
+    return "Validate the links.\n```json\n" + json.dumps(
+        {"steps": [{"host": "local", "command": c, "check": False} for c in cmds]}) + "\n```"
+
+
+def test_a_plan_running_a_device_tool_outside_the_boxs_broker_goes_back_to_opus(tmp_path):
+    """cells: plan-10103-traffic-refused: replay: the advisor planned the validator, then its traffic pass, as local
+    steps on the box; nothing stopped them. Each is refused by its step, the read between them and the broker's job pass."""
+    from ttp import deviceplan
+    run, _ = _dp_run(tmp_path)
+    why = deviceplan.store(run, _dp_steps_plan(_DP_DIRECT_STEPS), str(tmp_path), {})
+    assert why.startswith("step 1: a direct device tool") and "run it through the box's device broker" in why
+    assert deviceplan.plan(run) is None and deviceplan.bounce_kind(run) == "plan"
+    run2 = tmp_path / "r2"
+    run2.mkdir()
+    why = deviceplan.store(run2, _dp_steps_plan([_DP_VIA_BROKER, *_DP_DIRECT_STEPS[1:]]), str(tmp_path), {})
+    assert why.startswith("step 3: a direct device tool"), "the traffic pass is refused by itself"
+    run3 = tmp_path / "r3"
+    run3.mkdir()
+    help_step = "cd wt && " + _DP_VALIDATOR.split()[0] + " --help"   # prints usage, opens no device
+    assert deviceplan.store(run3, _dp_steps_plan([help_step, _DP_VIA_BROKER, _DP_DIRECT_STEPS[1]]), str(tmp_path),
+                            {}) is None
+    assert "device jobs (validation, fabric or link checks, resets, tt-smi) go only through the broker" in \
+        deviceplan.DEVICE_PLAN
+
+
+def test_a_device_tool_runs_only_as_the_brokers_job_in_every_form():
+    """cells: runtime-direct-tool-refused, broker-submit-allowed, device-tool-help-not-refused: a tool called with only
+    --help or -h prints its usage (a replayed advisor step); any other direct call is refused."""
+    from ttp import deviceplan
+    v = _DP_VALIDATOR
+    tool = v.split()[0]
+    for c in (v, f"ttp lock box-a -- {v}", f"ssh box-a '{v} --send-traffic'", f"bash -c '{v}'", f"sudo {v}",
+              f"timeout 600 {v}", f"env A=1 {v}", f"nohup sh -c '{v}' &", f"echo `{v}`", f"xargs -a list {v}",
+              "python3 tools/test_system_health.py", "/opt/x/test_tt_fabric --gtest_filter='*'",
+              f"other-cli run-bg box-a '{v}'", f"{tool} --help --send-traffic", f"{tool} -h; {tool}",
+              f"other-cli run-bg box-a '{tool} --help; {tool}'"):
+        assert "run it through the box's device broker" in deviceplan.direct_tool(c), c
+    for c in (f"broker submit box-a -- {v}", _DP_VIA_BROKER, "grep run_cluster_validation /tmp/v.log",
+              "ls build/tools/scaleout/cluster_validation/run_cluster_validation", _DP_DIRECT_STEPS[1],
+              'git commit -m "add the run_cluster_validation step"', "tt-smi -s", f"{tool} --help 2>&1 | head -50",
+              f"cd wt && {tool} -h > /tmp/usage.txt", f"ssh box-a '{tool} --help'",
+              "python3 tools/test_system_health.py -h"):
+        assert deviceplan.direct_tool(c) is None, c
+    s = deviceplan.settings(_dp_cfg(device_tools=["fabric_check"], power_routes=["./bin/devq"]))
+    assert deviceplan.direct_tool("python3 tools/fabric_check.py", s["power_routes"], s["device_tools"])
+    assert deviceplan.direct_tool(f"./bin/devq submit -- python3 tools/fabric_check.py", s["power_routes"],
+                                  s["device_tools"]) is None, "a project names its own broker and tools"
+    assert deviceplan.direct_tool(f"broker submit box-a -- {v}", s["power_routes"], s["device_tools"]) is None
+
+
+def test_a_glm_device_run_never_runs_a_device_tool_outside_the_broker_even_as_a_plan_step(tmp_path):
+    """A plan stored before the plan check refused it still lists the direct validator: the run is refused and goes
+    back to Opus; the broker's job and the reads run, and resets, power cycles, flashes and reboots still stop."""
+    from ttp import deviceplan
+    run, e = _dp_run(tmp_path)
+    ws = str(tmp_path)
+    (run / deviceplan.PLAN_FILE).write_text(json.dumps({"steps": [
+        {"n": i + 1, "host": "local", "command": c, "check": False}
+        for i, c in enumerate([*_DP_DIRECT_STEPS, _DP_VIA_BROKER])]}))
+    for c in _DP_DIRECT_STEPS[::2]:
+        assert "run it through the box's device broker" in deviceplan.refusal(c, ws, e, {}), c
+    for c in (_DP_DIRECT_STEPS[1], _DP_VIA_BROKER, "tt-smi -s", _DP_VALIDATOR.split()[0] + " --help"):
+        assert deviceplan.refusal(c, ws, e, {}) is None, c
+    for c in ("tt-smi -r 0", "ipmitool chassis power cycle", "tt-flash --fw-tar fw.tar.gz", "sudo reboot"):
+        assert deviceplan.refusal(c, ws, e, {}), c
+    assert deviceplan.hook_refusal(_DP_DIRECT_STEPS[2], ws, e)
+    assert deviceplan.bounce_kind(run) == "guard", "a harmful refusal: the run is handed back to Opus"
+
+
 def test_device_route_is_off_by_default_and_opens_the_device_keep_only_with_its_setting(env):
     from ttp import deviceplan, glmwork, rollout
     p = make(env)
