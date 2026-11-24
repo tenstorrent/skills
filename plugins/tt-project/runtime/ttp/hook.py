@@ -830,11 +830,10 @@ def _fed_shell_texts(text: str, pieces: list, is_shell) -> list[tuple[int, str, 
         if _first_word(text[s:e]) not in ("echo", "printf"):
             continue
         for nxt in _chain(text, pieces, k):
-            if is_shell(nxt):
+            if is_shell(nxt):   # every shell piece in the chain it pipes through, as deviceplan read it
                 argv = next(iter(_segments(text[s:e])), [])
                 out.append((k, " ".join(w for w in argv[1:] if not w.startswith("-"))
                                     .replace("\\n", "\n"), nxt))
-                break
     return out
 
 
