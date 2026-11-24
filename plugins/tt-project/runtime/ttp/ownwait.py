@@ -16,7 +16,8 @@ settle itself.
 - stack_ancestor_wait: a code task whose wait is the landing of an unlanded task in its own stack (it
   continues or delivers onto that task's branch, or its branch holds that task's head) cannot end either:
   its review queues only once it hands off, and the stack lands through the head's review. The daemon
-  takes that hand-off as done, so the head's review approves the stack.
+  takes that hand-off as done, so the head's review approves the stack, and finishes a task already
+  asleep on such a wait the same way when its probe is next due (Daemon._stack_wait_done).
 """
 from __future__ import annotations
 
@@ -93,8 +94,8 @@ def stack_ancestor_wait(p, task: dict, result: dict, job_in_flight: bool = False
 
 
 def _in_stack(p, task: dict, tid: int) -> bool:
-    """Whether `task` re-works task `tid` or its branch contains `tid`'s head commit (not when `tid`'s
-    latest review failed: a branch carrying such commits waits on their landing, as carryback.order says)."""
+    """Whether `task` re-works task `tid` or its branch contains `tid`'s head commit, even when `tid`'s
+    latest review failed: those commits then reach the push branch only through this branch's review."""
     from . import carryback
     if carryback.reworks(p.db, task, tid):
         return True
@@ -102,12 +103,8 @@ def _in_stack(p, task: dict, tid: int) -> bool:
     mine, theirs = task.get("branch"), other.get("branch")
     if not (mine and theirs):
         return False
-    import subprocess, time
-    from . import pushq
+    import subprocess
     try:
-        if tid in pushq._verdicts(p.db, {"id": -1, "labels": "[]", "depends_on": "[]", "spec": "", "title": ""},
-                                  {mine}, time.time())[0]:
-            return False   # its latest review failed: carryback's send-back, which waits on its landing
         return subprocess.run(["git", "-C", str(p.root), "merge-base", "--is-ancestor", theirs, mine],
                               capture_output=True, timeout=30).returncode == 0
     except (OSError, subprocess.SubprocessError):

@@ -15981,6 +15981,8 @@ class Daemon:
             elif t["id"] in self._probes or now - self._probed.get(t["id"], 0) < self._probe_gap(t["id"]) \
                     and not checksgone.ended_since(probe, self._probed.get(t["id"], 0)):
                 continue   # checks that just ended are asked at once: their end wakes model-free, not the timer
+            if self._stack_wait_done(t, prev):
+                continue
             self._start_probe(t["id"], probe, now)
             got = self._probe_rc.get(t["id"])
             if t["id"] not in self._probes and got and got[2] == probe and (t["not_before"] or 0) > now \
@@ -18423,6 +18425,32 @@ class Daemon:
         if problem := on_pass_problem(on_pass):
             return "unclear", problem
         return "pushed", r, run_dir, with_waiting_followups(on_pass, full)
+
+    def _stack_wait_done(self, task: dict, prev: dict) -> bool:
+        """A waiting code task whose retry_when is the landing of a task in its own stack
+        (ownwait.stack_ancestor_wait), such as one whose branch came to hold that task's head after it
+        handed off: its hand-off is finished again model-free, which takes it as done. False when not."""
+        if task["kind"] != "code" or task["status"] != "queued":
+            return False
+        try:
+            if not ownwait.stack_ancestor_wait(self.p, task, prev):
+                return False
+        except Exception as e:   # the probe runs as before
+            log(self.p, f"task {task['id']}: could not check its stack wait: {type(e).__name__}: {e}")
+            return False
+        r = self.p.db.one("SELECT * FROM runs WHERE task=? AND role!='coordinator' ORDER BY id DESC LIMIT 1",
+                          (task["id"],))
+        if not r or r["status"] == "running" or not r["dir"]:
+            return False
+        run_dir = Path(r["dir"])
+        full = _read_result(run_dir / RESULT_FILE) or {}
+        if full.get("status") != "waiting" or not _same_probe(full, prev) or _detached_jobs(run_dir):
+            return False
+        from .providers.base import RunUsage
+        self._probe_rc.pop(task["id"], None)
+        with self._finish_tx(task["id"]):
+            self._finish_worker(r, RunUsage(), "ok", run_dir, "model-free", handoff=full)
+        return True
 
     def _push_finished_unpushed(self, task: dict, now: float) -> None:
         """Its `ttp push --result <marker> --pushed` probe exited 3: the push finished without landing,

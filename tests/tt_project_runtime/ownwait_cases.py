@@ -170,7 +170,7 @@ def test_a_fix_on_an_unlanded_stack_that_waits_on_its_ancestors_landing_is_hande
     assert json.loads(t["result"])["status"] == "waiting"
 
 
-def test_a_branch_holding_an_unlanded_ancestors_head_is_in_its_stack_unless_that_reviews_failed(env, monkeypatch):
+def test_a_branch_holding_an_unlanded_ancestors_head_is_in_its_stack_even_when_its_review_failed(env, monkeypatch):
     import subprocess
     from ttp import ownwait, pushq
     p = make(env)
@@ -191,4 +191,74 @@ def test_a_branch_holding_an_unlanded_ancestors_head_is_in_its_stack_unless_that
     assert ownwait._in_stack(p, p.db.task(b), a)       # ttp/a's head is an ancestor of ttp/b
     assert not ownwait._in_stack(p, p.db.task(a), b)   # not the other way round
     monkeypatch.setattr(pushq, "_verdicts", lambda *x, **k: ({a: 99}, set(), {}))
-    assert not ownwait._in_stack(p, p.db.task(b), a)   # a's review failed: the send-back's wait stands
+    assert ownwait._in_stack(p, p.db.task(b), a)   # a's review failed: its commits land only through ttp/b
+
+
+def _stack_git(p):
+    import subprocess
+    git = lambda *a: subprocess.run(["git", "-C", str(p.root), *a], check=True, capture_output=True)
+    git("init", "-q")
+    git("config", "user.email", "t@example.com")
+    git("config", "user.name", "t")
+    git("commit", "-q", "--allow-empty", "-m", "base")
+    git("branch", "-M", "main")
+    git("checkout", "-q", "-b", "ttp/a")
+    git("commit", "-q", "--allow-empty", "-m", "a")
+    git("checkout", "-q", "-b", "ttp/b")
+    git("commit", "-q", "--allow-empty", "-m", "b")
+    git("checkout", "-q", "-b", "ttp/c", "main")
+    git("commit", "-q", "--allow-empty", "-m", "c")
+    git("checkout", "-q", "main")
+    return git
+
+
+def test_a_hand_off_waiting_on_the_landing_of_a_failed_review_its_branch_carries_is_done(env, tmp_path, monkeypatch):
+    # Task B's branch holds task A's head and A's latest review failed; B hands off waiting on A's landing.
+    # A lands only through B's review, which queues once B ends: the daemon takes the hand-off as done.
+    # Task C, whose branch does not hold A's head, keeps the same wait.
+    from ttp import landed, pushq
+    from ttp.daemon import Daemon
+    p = make(env)
+    _stack_git(p)
+    d = Daemon(p.base)
+    a, b, c = (p.db.add_task(n, "s", kind="code", tier="standard", origin="user") for n in "abc")
+    for tid, br in ((a, "ttp/a"), (b, "ttp/b"), (c, "ttp/c")):
+        p.db.update_task(tid, branch=br)
+    p.db.update_task(a, status="done")
+    monkeypatch.setattr(pushq, "_verdicts", lambda *x, **k: ({a: 99}, set(), {}))
+    monkeypatch.setattr(landed, "check", lambda *x, **k: (1, "not landed"))
+    t = _reply_wait_hand_off(p, d, tmp_path, b, waiting_for="A's landing", retry_when=f"ttp landed --task {a}")
+    res = json.loads(t["result"])
+    assert res["status"] == "done" and "retry_when" not in res and f"#{a}" in res["summary"], res
+    assert f"task {b} hand-off: its wait on #{a}'s landing" in (p.state / "logs" / "daemon.log").read_text()
+    t = _reply_wait_hand_off(p, d, tmp_path, c, waiting_for="A's landing", retry_when=f"ttp landed --task {a}")
+    assert json.loads(t["result"])["status"] == "waiting"
+
+
+def test_a_task_already_waiting_on_a_landing_its_branch_came_to_carry_finishes_model_free(env, tmp_path, monkeypatch):
+    # Task B waits on A's landing while its branch does not hold A's head: a real wait, re-checked unchanged.
+    # Once B's branch holds A's head, the re-check finishes B's hand-off as done without a model run.
+    from ttp import landed
+    from ttp.daemon import Daemon
+    p = make(env)
+    git = _stack_git(p)
+    d = Daemon(p.base)
+    a, b = (p.db.add_task(n, "s", kind="code", tier="standard", origin="user") for n in "ab")
+    p.db.update_task(a, branch="ttp/a")
+    p.db.update_task(b, branch="ttp/c")
+    monkeypatch.setattr(landed, "check", lambda *x, **k: (1, "not landed"))
+    run_dir = tmp_path / "run-b"
+    run_dir.mkdir()
+    (run_dir / "result.json").write_text(json.dumps({"status": "waiting", "summary": "needs A",
+                                                     "waiting_for": "A's landing", "retry_when": f"ttp landed --task {a}"}))
+    rid = p.db.x("INSERT INTO runs(task,role,status,dir) VALUES(?,?,?,?)", (b, "worker", "done", str(run_dir)))
+    from ttp.providers.base import RunUsage
+    p.db.update_task(b, status="running")
+    d._finish_worker(p.db.one("SELECT * FROM runs WHERE id=?", (rid,)), RunUsage(), "ok", run_dir)
+    t = p.db.task(b)
+    assert t["status"] == "queued" and json.loads(t["result"])["status"] == "waiting"
+    assert not d._stack_wait_done(t, json.loads(t["result"]))
+    git("branch", "-f", "ttp/c", "ttp/b")   # B's branch now holds A's head
+    assert d._stack_wait_done(p.db.task(b), json.loads(p.db.task(b)["result"]))
+    res = json.loads(p.db.task(b)["result"])
+    assert res["status"] == "done" and "retry_when" not in res and f"#{a}" in res["summary"], res
