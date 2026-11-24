@@ -472,7 +472,7 @@ def fallbacks(p, now: float | None = None) -> list[int]:
 def _replied(db, item: dict) -> bool:
     """Whether a message reached the chat of `item` since its hand-off armed the fallback."""
     chat = item.get("chat")
-    return bool(db.one("SELECT 1 FROM messages WHERE direction='out' AND ts>=? AND channel IS NULL "
+    return bool(db.one("SELECT 1 FROM messages WHERE direction='out' AND ts>=? AND channel='chat' "
                        "AND (chat=? OR (chat IS NULL AND ?='all')) LIMIT 1",
                        (float(item.get("at") or 0), chat, chat)))
 
