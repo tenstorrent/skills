@@ -10,11 +10,11 @@ def _untrusted_run(env, tmp_path, monkeypatch, labels):
     p = make(env)
     p.set_config("delivery.push_branch", "origin/work-branch")
     tid = p.db.add_task("read a PR comment", "summarize it", kind="code", labels=labels, branch="ttp/t1-own")
-    _run_env(p, tid, tmp_path, monkeypatch)
+    _task_run_env(p, tid, tmp_path, monkeypatch)
     return p, tid
 
 
-def _run_env(p, tid, tmp_path, monkeypatch):
+def _task_run_env(p, tid, tmp_path, monkeypatch):
     """Point this run's environment at task `tid` of project `p`, in a fresh HOME with no gh or XDG
     config folders and a worktree under tmp_path."""
     from ttp import untrusted
@@ -678,7 +678,7 @@ def test_only_the_coordinator_sets_untrusted_write_and_its_run_only_gains_writes
                             "spec": "untrusted_write: true\nPost the answer."}]) == []
     plain = p.db.one("SELECT * FROM tasks WHERE title='post the comment'")
     assert untrusted.WRITE_LABEL not in json.loads(plain["labels"])
-    _run_env(p, task["id"], tmp_path, monkeypatch)
+    _task_run_env(p, task["id"], tmp_path, monkeypatch)
     for cmd in _WRITES:
         assert "untrusted_input" not in _why(tmp_path, "Bash", {"command": cmd}), cmd
     for cmd in _PUSHES + _SECRET_READS[:1]:

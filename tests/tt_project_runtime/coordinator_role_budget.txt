@@ -82,3 +82,4 @@
 +185: another project's status or alerts reach the user only when they change this project's work or needs
 +324: release-flag rule: flag-gated work waits on the flag itself (`ttp rollout on`), never a note or someone's word
 +85: task_update `budget_usd` (raise only) and the `--end-when` rule for a pause guarding a multi-step operation
++143: task_add/task_update untrusted_write (the write label that lets an untrusted run post)
