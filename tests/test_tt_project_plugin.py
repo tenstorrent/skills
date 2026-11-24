@@ -2505,7 +2505,7 @@ def test_worker_prompt_detached_driver_retries_transient_faults():
     text = (PLUGIN / "template/prompts/worker.md").read_text()
     assert "Retry transient faults" in text
     assert "bounded backoff" in text
-    assert "Prefer `on_pass_cmd` to a light-wake `next_step`" in text
+    assert "Steps left after the wait (a push, a tag move) go in an `on_pass_cmd`" in text
 
 
 BOX_PY = SKILLS / "setup-box" / "scripts" / "box.py"

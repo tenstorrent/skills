@@ -29362,7 +29362,7 @@ def test_the_worker_system_prompt_carries_only_the_rules_its_task_needs_and_stay
         s = rendered({"kind": kind})
         assert "NEVER mark a PR ready for review" not in s and "Never open, update or close a pull request" in s
     # Waiting detail (drivers, on_pass_cmd, wake tiers) only for kinds that can wait.
-    assert "on_pass_cmd" in rendered(code) and "Prefer `on_pass_cmd`" in rendered(code)
+    assert "on_pass_cmd" in rendered(code) and "Steps left after the wait" in rendered(code)
     for t in (question, {"kind": "plan"}):
         s = rendered(t)
         assert "on_pass_cmd" not in s and "wake_tier" not in s

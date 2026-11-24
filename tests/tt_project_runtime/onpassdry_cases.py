@@ -253,6 +253,26 @@ def test_a_checks_result_wait_counts_its_on_pass_fallback_only_when_that_on_pass
             assert got["verdict"] == "ok" and onpassdry.KEY not in res and res.get("waiting_since"), (on_pass, got)
 
 
+def test_a_checks_wait_whose_on_pass_cmd_only_tests_is_handed_back_so_a_step_left_in_words_runs(env, monkeypatch, tmp_path):
+    # A checks wait whose on_pass names a push and a tag move but whose on_pass_cmd only tests a file would be
+    # recorded done once the checks pass, the steps never run: the hand-off goes back to its session instead.
+    p = make(env)
+    from ttp import onpassdry
+    from ttp.daemon import Daemon
+    _sessions(env, monkeypatch, "s1")
+    d = Daemon(p.base)
+    probe = f"ttp checks --result {tmp_path / 'checks'}"
+    on_pass = {"status": "done", "summary": "pushed with ttp push and moved the tag"}
+    t = _hand_off_waiting(env, p, d, monkeypatch, f"test -f {tmp_path / 'checks.rc'}", probe=probe, on_pass=on_pass)
+    res = load_result(t["result"])
+    got = json.loads((pathlib.Path(_last_run(p, t["id"])["dir"]) / onpassdry.FILE).read_text())
+    assert got["verdict"] == onpassdry.NO_RESULT and got["only_tests"] and res[onpassdry.KEY]["no_result"]
+    assert "it only tests" in res["woke"] and "a `then` entry" in res["woke"]
+    # A command that runs the step is the fallback's to settle.
+    t = _hand_off_waiting(env, p, d, monkeypatch, "echo pushed", title="runs its step", probe=probe, on_pass=on_pass)
+    assert onpassdry.KEY not in load_result(t["result"])
+
+
 def test_a_valid_on_pass_cmd_passes_its_dry_run_and_still_records_done_model_free(env, monkeypatch):
     p = make(env)
     from ttp import onpassdry, daemon as dmod
@@ -328,7 +348,13 @@ def test_the_dry_run_check_reads_programs_scripts_and_variables_without_running_
     # Nothing in it writes a hand-off; a `ttp checks --result` wait's valid on_pass is its fallback.
     for cmd in ("true", "bash plain.sh", "python3 -c 'print(1)'", "true " + "x" * 5000):
         assert verdict(cmd) == onpassdry.NO_RESULT, cmd
-    assert verdict("true", fallback=True) == "ok"
+    assert verdict("echo checked", fallback=True) == "ok"
+    # Under that fallback a command that only tests runs no step: its on_pass would end the task.
+    for cmd in ("true", "test -f checks.rc", "[ -s out ] && test -d x", ":"):
+        got = onpassdry.check(cmd, tmp_path, e, True, 30)
+        assert got["verdict"] == onpassdry.NO_RESULT and got["only_tests"], cmd
+        assert "on_pass_cmd or a `then` entry" in onpassdry.handback_text(got)
+    assert not onpassdry.check("test -f checks.rc", tmp_path, e, False, 30).get("only_tests")
     # A check that runs out of time is inconclusive, never a crash.
     assert onpassdry.check("bash missing.sh", tmp_path, e, False, 0)["verdict"] == "inconclusive"
 

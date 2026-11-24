@@ -232,12 +232,12 @@ No `result.json`, no credit.
   (`grep RUNNING`) or a marker file. A wait for a broker hold to end uses `ttp broker-released` on
   its /health answer and log tail: a `device_released` event is not the only sign.
 <!-- /ttp:if device -->
-  When only checking the outcome is left, make that check the `on_pass_cmd`: once `retry_when`
+  Steps left after the wait (a push, a tag move) go in an `on_pass_cmd`, which
+  `on_pass.summary` only describes; one needing a run gets no `on_pass`. Once `retry_when`
   passes the daemon runs it model-free from the project root with your HOME (600 s default;
   prefer absolute paths). Exit 0 with a `done` or `needs_review` hand-off in
   `$TTP_RESULT` (else `on_pass`) ends the task; anything else wakes it with the output tail. It may use `ttp note` (also `--to`), nothing else that needs a run, and
-  never acts as the user. Make it safe to run twice. Prefer `on_pass_cmd` to a light-wake `next_step`
-  for a mechanical check. A checks pass alone: `ttp checks --result <run dir> --passed`.
+  never acts as the user. Make it safe to run twice. A checks pass alone: `ttp checks --result <run dir> --passed`.
   A known sequence of waits (checks, then `landed:#<id>`): list the later ones in `then` (up to 4,
   each may add `on_pass_cmd`, `retry_after_s`); the daemon moves through them model-free.
   An exit-0 probe's `probe_match` (`pass`/`fail`/`wait` substrings) and `on_pass` (`{probe_out}` ok) settle clear hits model-free.

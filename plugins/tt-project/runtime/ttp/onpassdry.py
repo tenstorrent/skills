@@ -24,7 +24,9 @@ and the task's notes. A check that could not finish (a timeout) records 'dry run
 No hand-off writer (verdict NO_RESULT, handed back as a problem is): a command that would exit 0
 without recording done once its probe passes. Nothing in it, a script it names or a program it starts
 mentions TTP_RESULT, it starts no `ttp` and no `python -m` module (either may write it), and its
-retry_when is no `ttp checks --result` wait whose on_pass is the fallback. A command that sets
+retry_when is no `ttp checks --result` wait whose on_pass is the fallback. Nor a command that only tests
+(each program it starts is in TESTS: `test -f <file>`, `true`) where that fallback ends the task: it runs no
+step, so any step its hand-off left in prose would never run; handed back the same way. A command that sets
 TTP_RESULT itself is refused the same way: the daemon reads only the $TTP_RESULT it sets.
 ENV is never set by the daemon now; set by hand, `ttp note`, `notify`, `push` and `land` do nothing
 under it and `ttp lock`, `devq submit|start|clear` and a starting `detach` are refused (cli.dry_run_stub)."""
@@ -56,6 +58,7 @@ ON_PASS_VARS = ("TTP_RESULT", "TTP_NOTE_RUN_DIR", "TTP_TASK", "TTP_TASK_ID")   #
 BUILTINS = frozenset(". : [ [[ alias bg break builtin cd command continue declare echo eval exec exit export false fg "
                      "getopts hash jobs kill let local printf pushd popd pwd read readonly return set shift source "
                      "test times trap true type typeset ulimit umask unalias unset wait".split())
+TESTS = frozenset("test [ [[ true :".split())   # programs that only test: an on_pass_cmd of these alone runs no step
 KEYWORDS = frozenset("if then else elif fi do done while until ! { } time".split())
 WRAPPERS = frozenset("env exec nohup command nice setsid stdbuf timeout".split())
 SHELLS = frozenset("sh bash dash zsh ksh".split())
@@ -201,9 +204,10 @@ class _Deadline(Exception):
 def check(cmd: str, cwd: Path, env: dict, fallback: bool, timeout: float) -> dict:
     """Validate `cmd` for its run once its probe passes, without running it (module docstring):
     {cmd, rc: None, verdict ('ok', CRASH, NO_RESULT or 'inconclusive'), why, output, checked, took_s}.
-    `fallback`: its hand-off's on_pass is recorded when the command writes nothing."""
+    `fallback`: its hand-off's on_pass (done or needs_review) is recorded when the command writes nothing, so
+    one that only tests (TESTS) is refused: it runs no step."""
     started = time.monotonic()
-    problems, checked, reads, unknown = [], [], [], False
+    problems, checked, reads, unknown, progs = [], [], [], False, []
 
     def run(argv: list[str]) -> boundedchild.Result:
         left = timeout - (time.monotonic() - started)
@@ -261,6 +265,7 @@ def check(cmd: str, cwd: Path, env: dict, fallback: bool, timeout: float) -> dic
             if not words:
                 continue
             prog, args = words[0], words[1:]
+            progs.append(prog)
             if prog in ("cd", "pushd", "popd"):
                 moved = True
                 continue
@@ -307,6 +312,10 @@ def check(cmd: str, cwd: Path, env: dict, fallback: bool, timeout: float) -> dic
     out = {"cmd": cmd, "rc": None, "output": "\n".join(problems) or "(not run)", "checked": checked}
     if problems:
         out.update(verdict=CRASH, why=problems[0])
+    elif fallback and progs and set(progs) <= TESTS:
+        out.update(verdict=NO_RESULT, only_tests=True,
+                   why=("it only tests, so it runs no step: once its probe passes your on_pass ends the task and "
+                        "any step it names only in words (a push, a tag move, a check of their outcome) never runs"))
     elif not (fallback or unknown or mentions(cmd, cwd, "TTP_RESULT", reads)):
         out.update(verdict=NO_RESULT, why=("nothing in it, or a script or program it names, writes a hand-off to "
                                            "$TTP_RESULT, so once its probe passes it would wake a model run instead "
@@ -367,6 +376,12 @@ def said(got: dict) -> str:
 
 
 def handback_text(got: dict) -> str:
+    if got.get("only_tests"):
+        return (f"the dry run of your hand-off's on_pass_cmd failed its contract ({said(got)}): {got.get('why')}. "
+                f"Put every step left after the wait in on_pass_cmd or a `then` entry's on_pass_cmd, with "
+                f"on_pass.summary saying only what they do; give no on_pass for a step no command can run "
+                f"model-free (the pass then wakes you); or drop on_pass_cmd if nothing is left. Then write the waiting hand-off again. "
+                f"Command: {got['cmd'][:300]}")
     if got.get("verdict") == NO_RESULT:
         return (f"the dry run of your hand-off's on_pass_cmd failed its contract ({said(got)}): {got.get('why')}. "
                 f"On a passed probe it must exit 0 with a done or needs_review hand-off written to the "
