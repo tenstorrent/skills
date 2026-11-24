@@ -61,7 +61,7 @@ def ssh_refusal(cmd: str) -> str | None:
     return None
 
 
-def items(alias: str, now: float | None = None, where=None) -> list[dict]:
+def inventory(alias: str, now: float | None = None, where=None) -> list[dict]:
     """Every project's live work on machine `alias`, as {kind, project, text} items: holders of
     its shared device locks, open tasks whose resources name it, and open machine-change ledger
     entries that leave a standing setup. A probe the owner project's config gives
@@ -173,7 +173,7 @@ def _text_names(alias: str, text: str) -> bool:
     return any(tok.split(":", 1)[0].startswith(alias + "-") for tok in re.split(r"\s", text))
 
 
-def line(alias: str, its: list[dict]) -> str:
+def still_on_line(alias: str, its: list[dict]) -> str:
     """'still on <alias>: <project>: <item>; ...' for the items `items` returned."""
     return "still on " + alias + ": " + "; ".join(f"{i['project']}: {i['text']}" for i in its)
 

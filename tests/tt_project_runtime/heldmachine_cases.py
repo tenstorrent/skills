@@ -33,26 +33,26 @@ def test_the_inventory_lists_every_projects_locks_tasks_and_standing_changes(env
     held = locks.try_take(locks.slot_paths(shared.root() / f"{_HM_BOX}-dev", f"{_HM_BOX}-dev", 1),
                           "beta task #5 (run 3)", extra={"project": "beta", "task_id": 5, "run_id": 3})
     try:
-        its = heldwork.items(_HM_BOX)
+        its = heldwork.inventory(_HM_BOX)
         got = [(i["kind"], i["project"]) for i in its]
         assert ("lock", "beta") in got and ("task", "beta") in got and ("change", "alpha") in got, its
         assert all(not (i["kind"] == "change" and i["project"] != "alpha") for i in its)
         assert not any("probe of a counter" in i["text"] for i in its), "a noop undo is no standing setup"
-        text = heldwork.line(_HM_BOX, its)
+        text = heldwork.still_on_line(_HM_BOX, its)
         assert text.startswith(f"still on {_HM_BOX}: ") and "task #5" in text and "open change" in text
     finally:
         held.close()
-    assert all(i["project"] != "beta" for i in heldwork.items(_HM_BOX) if i["kind"] == "lock")
+    assert all(i["project"] != "beta" for i in heldwork.inventory(_HM_BOX) if i["kind"] == "lock")
 
 
 def test_a_live_probe_runs_and_a_hold_turns_it_into_unverified(env):
     from ttp import fleethold, heldwork, machine_ledger as ml
     alpha, beta = _hm_setup(env, probe="echo service-active")
     ml.add_change(_HM_BOX, "sync cron line", "crontab -r", by="beta", expires="1h")
-    [before] = [i for i in heldwork.items(_HM_BOX) if i["kind"] == "change"]
+    [before] = [i for i in heldwork.inventory(_HM_BOX) if i["kind"] == "change"]
     assert "live probe: service-active" in before["text"], before
     _hm_hold()
-    [held_item] = [i for i in heldwork.items(_HM_BOX) if i["kind"] == "change"]
+    [held_item] = [i for i in heldwork.inventory(_HM_BOX) if i["kind"] == "change"]
     assert "unverified: owner beta must confirm" in held_item["text"], held_item
     fleethold.lift(_HM_BOX, True, "test")
 
@@ -140,7 +140,7 @@ def test_schedules_and_watcher_scripts_that_name_the_machine_are_listed(env):
     sched.upsert(beta.db, "journal-prompt-check", "command", "10m",
                  payload={"command": f"sh {script}"})
     sched.upsert(beta.db, "unrelated", "command", "10m", payload={"command": "echo nothing"})
-    got = heldwork.items(_HM_BOX)
+    got = heldwork.inventory(_HM_BOX)
     kinds = [(i["kind"], i["project"]) for i in got if i["kind"] == "schedule"]
     assert ("schedule", "alpha") in kinds and ("schedule", "beta") in kinds, got
     texts = [i["text"] for i in got if i["kind"] == "schedule"]
