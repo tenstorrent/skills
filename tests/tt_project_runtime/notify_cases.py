@@ -551,7 +551,6 @@ def test_a_say_chat_gets_replies_to_its_own_messages_never_the_projects_alerts_o
     p.db.post("out", "should I drop the old branch?", kind="ask", severity="high")
     assert coord.apply(p, [{"type": "reply", "text": "thanks, queued a fix"}], default_chat=chat) == []
     p.db.x("UPDATE messages SET ts=? WHERE id>=?", (time.time() - 3600, alert))
-    assert hourly.main_chat(p.db) == "c1", "the hourly status never goes to a say chat"
     capsys.readouterr()
     cli.main(["listen", "demo", "--chat", chat, "--once"])
     out = capsys.readouterr().out

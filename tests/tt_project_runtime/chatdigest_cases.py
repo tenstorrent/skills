@@ -419,9 +419,13 @@ def test_the_fallback_outcome_line_posts_from_records_only_once_the_bound_passes
     assert len(text) <= 300 and "landed as b40ca78" in text and "0.2.1519" in text
     assert not any(w in text for w in ("16b5701a4", "smoke suite", "shipped by review", "Opus"))
     assert p.db.kv(chatdigest.FALLBACK_KV) == [], "armed once, spent once"
-    # A chat the coordinator answered in time gets no fallback line.
+    # A chat the coordinator answered in time gets no fallback line; a routine info post is not an
+    # answer, and the fallback still fires.
     t2 = _cd_task(p, "second task", chat="c2")
     pushq._reply(p.db, t2, "done", "Rows posted.", facts={"need": "run the Mac upgrade"})
+    p.db.post("out", "Finished since the last status (1):", chat="c2", kind="info", severity="normal")
+    got2 = chatdigest.fallbacks(p, now + chatdigest.DEFAULT_FALLBACK_S + 60)
+    assert got2 and len(got2) == 1
     p.db.post("out", "The fix is live as 0.2.1519; run the Mac upgrade.", chat="c2", kind="reply")
     assert chatdigest.fallbacks(p, now + chatdigest.DEFAULT_FALLBACK_S + 60) == []
 

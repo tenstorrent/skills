@@ -265,16 +265,6 @@ def changes(old: dict, new: dict) -> list[str]:
     return got
 
 
-def main_chat(db) -> str | None:
-    """The chat the user wrote in last, else the one active last; never a reply-only chat (a one-off
-    `ttp say` caller's), which gets no status."""
-    r = (db.one("SELECT m.chat FROM messages m LEFT JOIN chats c ON c.id=m.chat WHERE m.direction='in' "
-                "AND m.chat IS NOT NULL AND c.min_severity IS NOT ? ORDER BY m.id DESC LIMIT 1", (REPLIES_ONLY,))
-         or db.one("SELECT id chat FROM chats WHERE min_severity IS NOT ? ORDER BY COALESCE(last_active, created) DESC "
-                   "LIMIT 1", (REPLIES_ONLY,)))
-    return r["chat"] if r else None
-
-
 def due(p, now: float | None = None) -> tuple[str, str] | None:
     """(table, why) when a post is due (module doc), else None; records only the first pass's baseline and
     the time of an unchanged check."""

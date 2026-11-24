@@ -449,31 +449,34 @@ def handoff(db, cfg: dict | None, task: dict, new: str, text: str, now: float | 
 
 def fallbacks(p, now: float | None = None) -> list[int]:
     """Post the fallback outcome line (outcome_line) for each armed chat no reply reached within its
-    bound (a message out to that chat since the hand-off). The message ids."""
+    bound. The message ids."""
     from . import msgparts
     now = time.time() if now is None else now
-    st = p.db.kv(FALLBACK_KV) or []
+    due = []
+    with p.db.tx():   # one read-decide-write pass: a hand-off arming a fallback is never lost
+        st = p.db.kv(FALLBACK_KV) or []
+        keep = []
+        for item in st:
+            if now < float(item.get("due") or 0):
+                keep.append(item)
+            elif not _replied(p.db, item):   # a reply reached that chat: no fallback is needed
+                due.append(item)
+        if len(keep) != len(st):
+            p.db.set_kv(FALLBACK_KV, keep)
     out: list[int] = []
-    keep = []
-    for item in st:
-        if now < float(item.get("due") or 0):
-            keep.append(item)
-            continue
-        if _replied(p.db, item):
-            continue   # the coordinator's reply reached that chat: no fallback is needed
+    for item in due:
         out += msgparts.post(p.db, outcome_line(item, item.get("facts") or {}),
                              chat=None if item.get("chat") == "all" else item.get("chat"),
                              kind="reply", severity="normal")
-    if len(keep) != len(st):
-        p.db.set_kv(FALLBACK_KV, keep)
     return out
 
 
 def _replied(db, item: dict) -> bool:
-    """Whether a message reached the chat of `item` since its hand-off armed the fallback."""
+    """Whether the coordinator's reply (kind reply) reached the chat of `item` since its hand-off
+    armed the fallback; a routine digest or info post never counts as one."""
     chat = item.get("chat")
     return bool(db.one("SELECT 1 FROM messages WHERE direction='out' AND ts>=? AND channel='chat' "
-                       "AND (chat=? OR (chat IS NULL AND ?='all')) LIMIT 1",
+                       "AND kind='reply' AND (chat=? OR (chat IS NULL AND ?='all')) LIMIT 1",
                        (float(item.get("at") or 0), chat, chat)))
 
 
