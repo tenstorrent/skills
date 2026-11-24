@@ -430,6 +430,18 @@ def test_hedged_landed_and_live_claims_are_not_claims(env, monkeypatch):
     assert "not landed: no commit named" in fixed, fixed
 
 
+def test_a_live_claim_inside_a_landed_fix_span_is_left_to_the_landed_fix(env, monkeypatch):
+    """A sentence both parses catch ("was pushed <sha> live"): the landed fix owns the span and
+    the live fix never splices into the same text twice, which corrupts the message."""
+    from ttp import pushclaim
+    p, repo, head = _claim_replay_setup(env, monkeypatch, landed=False)
+    base = _git_out(repo, "rev-parse", "HEAD~1")
+    fixed = pushclaim.correct_reply_claims(p, f"The fix was pushed {head[:10]} live.", p.root,
+                                           running=base)
+    assert "not landed" in fixed and "is not on origin/proj" in fixed, fixed
+    assert "not live yet" not in fixed, fixed   # one fix per span, not two spliced into one
+
+
 def test_the_reply_path_marks_a_false_live_line_before_sending(env, monkeypatch):
     """The whole send path: a reply action claiming a landing or liveness the push branch and the
     running version do not hold is posted marked, and the coordinator is told in its notes."""
