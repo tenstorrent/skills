@@ -111,7 +111,7 @@ def items(alias: str, now: float | None = None, where=None) -> list[dict]:
         text = "open change " + ml.change_line(c, now, where, clip=ml.DIGEST_LINE_CHARS)
         if probe := _probe_for(str(c.get("by")), alias):
             text += " — " + (_unverified(c.get("by")) if held
-                              else "live probe: " + _probe(c.get("by"), alias, probe))
+                              else "live probe: " + _run_probe(c.get("by"), alias, probe))
         out.append({"kind": "change", "project": str(c.get("by") or "?"), "text": text})
     out += _schedules(alias)
     return out
@@ -143,7 +143,7 @@ def _schedules(alias: str) -> list[dict]:
             payload = payload if isinstance(payload, dict) else {}
             texts = [r.get("name") or "", json.dumps(payload)]
             texts += _script_texts(base.parent, str(payload.get("command") or ""))
-            if any(_names_machine(alias, t) for t in texts):
+            if any(_text_names(alias, t) for t in texts):
                 out.append({"kind": "schedule", "project": name,
                             "text": f"{r.get('kind')} schedule {r.get('name')!r} names this machine"})
     return out
@@ -165,7 +165,7 @@ def _script_texts(root, command: str) -> list[str]:
     return out
 
 
-def _names_machine(alias: str, text: str) -> bool:
+def _text_names(alias: str, text: str) -> bool:
     """Whether `text` names machine `alias` (or a resource on it) as a whole word or token."""
     from . import responsibilities as rs
     if rs._word(alias, text):
@@ -207,11 +207,11 @@ def _probe_for(owner: str, alias: str) -> str:
     return probe.strip() if isinstance(probe, str) and probe.strip() else ""
 
 
-def _probe(owner: str, alias: str, probe: str) -> str:
+def _run_probe(owner: str, alias: str, probe: str) -> str:
     """One run of `probe` in the owner project's root, bounded by PROBE_TIMEOUT_S: its one-line
     output, or the unverified mark when it cannot tell."""
-    from . import ends
-    base = next((b for n, b in _projects() if n == owner), None)
+    from . import ends, responsibilities as rs
+    base = next((b for n, b in rs._projects(project.hostname()) if n == owner), None)
     if base is None:
         return _unverified(owner)
     rc, out = ends.probe_once(project.Project(base), probe, PROBE_TIMEOUT_S)
@@ -221,17 +221,13 @@ def _probe(owner: str, alias: str, probe: str) -> str:
 
 
 def _config(owner: str) -> dict:
-    base = next((b for n, b in _projects() if n == owner), None)
+    from . import responsibilities as rs
+    base = next((b for n, b in rs._projects(project.hostname()) if n == owner), None)
     try:
         cfg = json.loads((base / "harness" / "project.json").read_text())
     except (OSError, ValueError, TypeError):
         return {}
     return cfg if isinstance(cfg, dict) else {}
-
-
-def _projects():
-    from . import responsibilities as rs
-    return rs._projects(project.hostname())
 
 
 def _unverified(owner) -> str:
