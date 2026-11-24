@@ -695,6 +695,19 @@ MARK_CODE_EFFECT = [   # code that reads or changes the record itself, or gets i
     f"perl -e 'unlink qw \"{_M} .\"'", f"perl -e \"unlink qw\t'{_M} is'\"",   # a space before the delimiter
     f"ruby -e 'File.delete %q {_M} '", f"perl -le 'print readline F if open F, q! {_M}!'",   # the program itself
     f"python3 <<<'the {_M} now'",
+    f"rm a#b {_M}", f"rm a#b $TTP_RUN_DIR/{_M}", f"rm x#'y' {_M}",   # a `#` inside a word starts no comment
+    # a heredoc body run, piped on into code, written to the record, or written to a file run afterwards
+    f"bash <<'EOF'\nthe {_M} record\nEOF", f"cat <<'EOF' | sh\nthe {_M} record\nEOF",
+    f"python3 - <<'EOF'\nthe {_M} record\nEOF", f"tee n.md <<'EOF' | bash\nthe {_M} record\nEOF",
+    f"cat > {_M} <<'EOF'\nx\nEOF", f"tee $TTP_RUN_DIR/{_M} <<'EOF'\nx\nEOF",
+    f"cat > x.sh <<'EOF'\nrm {_M}\nEOF\nbash x.sh", f"tee x.sh <<'EOF'\nrm {_M}\nEOF\nbash x.sh",
+    f"cat > n.md <<'EOF'\nthe {_M} record\nEOF\nrm {_M}",
+]
+MARK_DATA_HEREDOCS = [   # a body only cat or tee writes to another file is data, as is a comment
+    f"cat > notes.md <<'EOF'\nthe {_M} record\nEOF", f"tee notes.md <<'EOF'\nthe {_M} record\nEOF",
+    f"tee notes.md > /dev/null <<'EOF'\nthe {_M} record\nEOF\necho done",
+    f"cat <<'EOF' > a.md\n# {_M}\nthe {_M} record\nEOF", f"git commit -F - <<'EOF'\nthe {_M} record\nEOF",
+    f"ls # {_M} note",
 ]
 
 
@@ -709,6 +722,24 @@ def test_the_noted_receipt_writer_naming_the_record_in_prose_passes(env, tmp_pat
 
 @pytest.mark.parametrize("cmd", MARK_PROSE_WRITERS)
 def test_a_script_writing_receipt_prose_that_names_the_mark_passes(env, tmp_path, monkeypatch, cmd):
+    _untrusted_run(env, tmp_path, monkeypatch, [])
+    assert _why(tmp_path, "Bash", {"command": cmd}) == "", cmd
+
+
+def test_prose_verdicts_are_the_same_with_no_commands_on_path(tmp_path, monkeypatch):
+    """Whether a word before the mark is a command comes from a fixed list, never a PATH lookup, so the same
+    quoted sentence passes or is refused on every host."""
+    from ttp import untrusted
+    clauses = [f"ls {_M} now", f"the {_M} record", f"make {_M} here", f"rm {_M} now", f"then shred {_M} too"]
+    seen = [untrusted._mark_prose(c) for c in clauses]
+    (tmp_path / "empty").mkdir()
+    monkeypatch.setenv("PATH", str(tmp_path / "empty"))
+    assert [untrusted._mark_prose(c) for c in clauses] == seen == [True, True, True, False, False]
+
+
+@pytest.mark.parametrize("cmd", MARK_DATA_HEREDOCS)
+def test_a_heredoc_body_cat_or_tee_writes_to_a_file_passes(env, tmp_path, monkeypatch, cmd):
+    """Its lines are text, never commands: a prose line naming the record is no access to it."""
     _untrusted_run(env, tmp_path, monkeypatch, [])
     assert _why(tmp_path, "Bash", {"command": cmd}) == "", cmd
 

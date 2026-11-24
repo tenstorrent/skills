@@ -47,7 +47,6 @@ import json
 import os
 import re
 import shlex
-import shutil
 
 LABEL = "untrusted_input"   # modelpick.UNTRUSTED
 WRITE_LABEL = "untrusted_write"
@@ -584,6 +583,11 @@ def _unsingle(cmd: str) -> str:
 
 
 MARK_FEEDS = frozenset(("read", "mapfile", "readarray", "xargs", "parallel"))   # turn their input into words or commands
+# Commands that act on a file named as their argument, or run one: a word of a prose clause before the mark that
+# is one of these (or a runner or feed) makes it a command line, the same on every host (no PATH lookup)
+MARK_FILE_COMMANDS = frozenset(("rm", "unlink", "mv", "cp", "ln", "truncate", "shred", "touch", "chmod", "chattr",
+                                "tee", "dd", "install", "history", "source", "enable", "sed", "awk", "gawk", "find",
+                                "rsync", "tar", "zip", "eval", "exec", "sudo", "env", "command", "builtin"))
 MARK_SUBST_DEPTH = 4   # nested substitutions read; deeper ones count as a write
 
 
@@ -656,15 +660,16 @@ MARK_CODE_QUOTE_RE = re.compile(r"(?:(?:^|\s)-\w*[ceErRBpP]|--eval|--print|<<<|\
 
 def _mark_prose(clause: str) -> bool:
     """Whether a quoted clause names RUN_MARK only as a word of prose: it has spaces, each mention is a
-    whole word (trailing .,:!), and no word before one is a command (on PATH, a runner or feed), `.` or an
-    option (a builtin's `history -w`, `enable -f`), so the clause run as a command line could not take
-    the mark as its argument. A script that cuts the name out of such text (a split or slice) is not
-    seen, as names built at run time never are (perl's glob splits its text too)."""
+    whole word (trailing .,:!), and no word before one is a command (MARK_FILE_COMMANDS, a runner or feed),
+    `.` or an option (a builtin's `history -w`, `enable -f`), so the clause run as a command line could not
+    take the mark as its argument."""
+    # shortcut: a script that cuts the name out of such text (a split or slice) is not seen, as names built at
+    # run time never are (perl's glob splits its text too)
     words = clause.split()
     at = [i for i, w in enumerate(words) if RUN_MARK in w]
     if len(words) < 2 or not at or any(words[i].rstrip(".,:!") != RUN_MARK for i in at):
         return False
-    return not any(w == "." or w.startswith("-") or shutil.which(w) or MARK_RUNNER_RE.fullmatch(w)
+    return not any(w == "." or w.startswith("-") or w in MARK_FILE_COMMANDS or MARK_RUNNER_RE.fullmatch(w)
                    or w in MARK_FEEDS for w in words[:at[-1]])
 
 
@@ -697,9 +702,46 @@ def _mark_words(cmd: str) -> list[str] | None:
         lex = shlex.shlex(re.sub("\n", lambda m: "\n" if flags[m.start()][0] else ";\n;", cmd), posix=True,
                           punctuation_chars=";&|()<>")
         lex.whitespace_split = True
+        lex.commenters = ""   # a `#` inside a word is part of it (`rm a#b`); _mark_uncomment drops real comments
         return list(lex)
     except ValueError:
         return None
+
+
+def _mark_uncomment(cmd: str) -> str:
+    """`cmd` without its comments: from a `#` that starts a word outside quotes to the line's end."""
+    from .hook import _quoting
+    flags = _quoting(cmd)
+    cuts = [i for i, c in enumerate(cmd) if c == "#" and (i == 0 or cmd[i - 1] in " \t\n;&|(" and not flags[i - 1][0])]
+    out, end = [], 0
+    for i in cuts:
+        if i >= end:
+            out.append(cmd[end:i])
+            end = cmd.find("\n", i) if "\n" in cmd[i:] else len(cmd)
+    return "".join(out) + cmd[end:]
+
+
+def _mark_data_bodies(cmd: str) -> str:
+    """`cmd` without the bodies of heredocs that are only data: a quoted delimiter on a cat (or another
+    _data_body piece), or on a tee into files nothing runs, neither piped on into code."""
+    from .hook import HEREDOC_RE, _data_body, _first_argv, _heredocs, _pieces, _ran, _runs_inside
+    lines, bodies = _heredocs(cmd)
+
+    def tee(i: int, pos: int) -> bool:
+        s, e, sep = next(p for p in _pieces(lines[i]) if p[0] <= pos <= p[1])
+        piece, argv = lines[i][s:e], _first_argv(lines[i][s:e])
+        return bool(HEREDOC_RE.match(lines[i], pos)[2]) and piece.split()[:1] == ["tee"] and sep not in ("|", "|&") \
+            and not _runs_inside(piece) and not any(_mark_path(a) or os.path.basename(a) in _ran(cmd) for a in argv[1:])
+    data = {k for k, (i, _, pos) in enumerate(bodies) if _data_body(lines, i, pos) or tee(i, pos)}
+    if not data:
+        return cmd
+    out = []
+    for i, line in enumerate(lines):
+        out.append(line)
+        for k, (j, body, pos) in enumerate(bodies):
+            if j == i and k not in data:
+                out += body + [HEREDOC_RE.match(line, pos)[3]]
+    return "\n".join(out)
 
 
 def _mark_fed(words: list[str], named: bool, quiet: list[str] | None = None) -> bool:
@@ -746,7 +788,8 @@ def _mark_bash(cmd: str, depth: int = 0) -> bool:
     into it, a path to it given to any other command, or a mention that reaches a command that runs code
     or turns its input into words (_mark_fed) counts. A substitution is read as its own command, and
     its output as the mark's name when its text names it; next to a heredoc any substitution counts. A
-    heredoc's body lines are read as commands, so one naming the mark as a bare word or path counts."""
+    heredoc's body lines are read as commands, so one naming the mark as a bare word or path counts, unless
+    the body is only data (_mark_data_bodies). A `#` starts a comment only where it starts a word."""
     if RUN_MARK not in cmd:
         return False
     from .hook import _quoting, _segments, _strip_prefix
@@ -758,6 +801,7 @@ def _mark_bash(cmd: str, depth: int = 0) -> bool:
     if got is None or (got[1] and depth >= MARK_SUBST_DEPTH):
         return True
     cmd, inner = got
+    cmd = _mark_uncomment(_mark_data_bodies(cmd))
     if any(t.strip() != RUN_MARK and _mark_bash(t, depth + 1) for t in inner):
         return True   # (a bare `name` substitution runs a command found on PATH, never the run folder's file)
     words = _mark_words(cmd)
@@ -768,7 +812,7 @@ def _mark_bash(cmd: str, depth: int = 0) -> bool:
     quiet = None if inner else _mark_quiet(cmd, words)
     if _mark_fed(words, RUN_MARK in (quiet[1] if quiet else cmd), quiet and quiet[0]):
         return True   # code, or a command run from piped input, that may get its name
-    segs = _segments(cmd, strip=False)
+    segs = _segments(cmd, strip=False, commenters="")
     for seg in segs:
         if not any(RUN_MARK in w for w in seg):
             continue

@@ -1048,15 +1048,15 @@ def git_push_bypass(segments: list[list[str]]) -> str | None:
             "plain `git` from PATH" if os.environ.get("TTP_TASK") else None)
 
 
-def _segments(cmd: str, strip: bool = True) -> list[list[str]]:
+def _segments(cmd: str, strip: bool = True, commenters: str = "#") -> list[list[str]]:
     """The simple commands in `cmd`, each without its leading variable assignments and wrappers
     (env, nohup, timeout 60, `ttp lock res --` ...): what actually runs first in each. `strip`
-    False keeps them."""
+    False keeps them; `commenters` "" reads a `#` as part of its word."""
     # A line break ends a command; it stays a line break too, so a `#` comment (a script's #! line) ends there
     flags = _quoting(cmd)
     cmd = re.sub("\n", lambda m: "\n" if flags[m.start()][0] else ";\n;", cmd)
     try:
-        words = _words(cmd, ";&|()<>")
+        words = _words(cmd, ";&|()<>", commenters)
     except ValueError:
         words = cmd.split()
     out, seg, target = [], [], False
