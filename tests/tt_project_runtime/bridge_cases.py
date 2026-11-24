@@ -2589,6 +2589,33 @@ def test_bridge_watch_heals_a_session_rebuilt_while_a_destination_was_off(tmp_pa
     assert len(seen["release"]) == 1
 
 
+def test_bridge_watch_keeps_the_owed_restart_through_the_restart_gap(tmp_path, monkeypatch):
+    # cells: restarted-before-outage, owed-restart-waits-the-gap, no-false-heal, restarted-once-the-gap-passes
+    from ttp import bridge, bridge_watch
+    mixed, down = "up 2301\ndown 2302\nttp-watch-done\n", "down 2301\ndown 2302\nttp-watch-done\n"
+    cfg, seen = _watch_env(tmp_path, monkeypatch, "darwin", [down, down] + [mixed] * 8)
+    cfg = bridge.parse({"boxes": {"box-1": {"login": {}, "agents": {"auto": {"agent": "env", "forward": [
+        {"name": "build-a", "target": "build-a.example.com", "port": 2301},
+        {"name": "build-b", "target": "build-b.example.com", "port": 2302}]}}}}})
+    off = set()
+    monkeypatch.setattr(bridge_watch, "dest_answers", lambda d: d["target"] not in off)
+    t0, svc, step = 1_000_000.0, bridge.label("box-1", "auto"), bridge_watch.INTERVAL_S
+    bridge_watch.run_pass(cfg, "darwin", t0)              # both down: the first restart
+    bridge_watch.run_pass(cfg, "darwin", t0 + 2 * step)   # still down: the second, so the next waits its gap
+    assert len(seen["release"]) == 2
+    off.add("build-b.example.com")   # the session came back while build-b's host was off
+    bridge_watch.run_pass(cfg, "darwin", t0 + 3 * step)
+    off.clear()
+    gap = bridge_watch.RESTART_GAP_S[2]
+    t = t0 + 4 * step
+    while t < t0 + 2 * step + gap:   # build-b answers, its forward still fails: the restart waits out the gap
+        assert not any("answers again" in ln for ln in bridge_watch.run_pass(cfg, "darwin", t)), t
+        assert len(seen["release"]) == 2
+        t += step
+    out = bridge_watch.run_pass(cfg, "darwin", t)
+    assert seen["release"][-1] == (svc, "auto", [2302]) and out[-1].endswith("restarted"), out
+
+
 def test_bridge_watch_spares_a_session_still_logging_in(tmp_path, monkeypatch):
     # cells: young-login-spared, old-login-restarted, unknown-age-restarted, systemd-main-pid, etime-days
     import json

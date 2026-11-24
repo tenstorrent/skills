@@ -229,11 +229,12 @@ def run_pass(cfg: dict, platform: str | None = None, now: float | None = None) -
             f = fails.get(t["service"])
             bad = [p for p in dead if p in none or answers[t["service"], p]] if t.get("dests") else dead
             gone = [p for p in dead if p not in bad]   # the forward is up; its destination does not answer
-            if gone and off.get(t["service"]) != gone:
+            owed = [p for p in bad if p in was_off]    # its one restart is owed: kept marked until it runs
+            if gone and [p for p in off.get(t["service"], []) if p not in owed] != gone:
                 out.append(f"{t['service']}: port {', '.join(map(str, gone))} on {box}: its destination does not "
                            "answer from here; nothing restarted")
-            if gone:
-                off[t["service"]] = gone
+            if gone or owed:
+                off[t["service"]] = [p for p in t["ports"] if p in gone or p in owed]
             else:
                 off.pop(t["service"], None)
             if not bad:
@@ -268,6 +269,10 @@ def run_pass(cfg: dict, platform: str | None = None, now: float | None = None) -
             f = fails.setdefault(t["service"], {"at": now, "event": event, "restarts": 0, "last": 0})
             freed = release(cfg, t, bad)
             said = restart(t, platform)
+            if gone:
+                off[t["service"]] = gone
+            else:
+                off.pop(t["service"], None)
             f.update(restarts=f["restarts"] + 1, last=now, down=[p for p in bad if p in down], said=False)
             out.append(f"{t['service']}: port {', '.join(map(str, bad))} on {box} did not answer"
                        f"{'' if freed else ' (still held after the cleanup)'}; {said}")

@@ -170,9 +170,9 @@ def installed() -> Path:
 
 
 def service_runtime() -> Path:
-    """The runtime a user service runs: the installed release (lib/<version>/runtime, so an upgrade rewrites the
-    unit and restarts the service onto it) once `ttp setup` put one there, never the copy setup ran from (a
-    worktree's goes away); else this copy."""
+    """The runtime a user service runs: the installed release (lib/<version>/runtime) once `ttp setup` put one
+    there, never the copy setup ran from (a worktree's goes away); else this copy. A service written again by a
+    later setup or upgrade moves onto the new release; one only installed once keeps the release it got."""
     rt = installed() / "runtime"
     return rt.resolve() if (rt / "ttp" / "__init__.py").is_file() else Path(__file__).resolve().parent.parent
 
