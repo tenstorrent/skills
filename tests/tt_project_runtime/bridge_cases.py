@@ -2563,6 +2563,49 @@ def test_bridge_watch_leaves_a_live_session_alone_when_one_forward_is_slow(tmp_p
     assert seen["release"] == [] and len(out) == 1 and "port 2302" in out[0] and "destination does not" in out[0]
 
 
+def test_bridge_watch_spares_a_session_still_logging_in(tmp_path, monkeypatch):
+    # cells: young-login-spared, old-login-restarted, unknown-age-restarted, systemd-main-pid, etime-days
+    import subprocess
+    from ttp import bridge, bridge_watch
+    none = "none 2301\nttp-watch-done\n"
+    for platform, show in (("darwin", "\tstate = running\n\tpid = 4242\n"), ("linux", "4242\n")):
+        cfg, seen = _watch_env(tmp_path / platform, monkeypatch, platform, [none] * 4)
+        fake, ps = bridge._run, {"pgrep": "4250\n", "etime": "00:08\n"}
+
+        def run(argv, timeout=60, inp=None, fake=fake, ps=ps, show=show):
+            if argv[:2] == ["launchctl", "print"] or argv[1:4] == ["--user", "show", "-p"]:
+                seen["run"].append(" ".join(argv))
+                return subprocess.CompletedProcess(argv, 0, show, "")
+            if argv[0] == "pgrep":
+                assert argv[-2:] == ["4242", "ssh"]   # the service's own ssh child, by exact name
+                return subprocess.CompletedProcess(argv, 0 if ps["pgrep"] else 1, ps["pgrep"], "")
+            if argv[0] == "ps":
+                assert argv[-1] == "4250"
+                return subprocess.CompletedProcess(argv, 0, ps["etime"], "")
+            return fake(argv, timeout, inp)
+
+        monkeypatch.setattr(bridge, "_run", run)
+        t0, svc = 1_000_000.0, bridge.label("box-1", "auto")
+        # its service manager started it 8 s ago: no listener yet is a login still under way, not a stale session
+        assert bridge_watch.run_pass(cfg, platform, t0 - 30) == [f"{svc}: still logging in (8s); not restarted this pass"]
+        assert seen["release"] == [] and not any("kickstart" in c or "restart --" in c for c in seen["run"])
+        ps["etime"] = "10:00\n"   # a session up 10 min with no listener is stale: restarted on the first pass
+        out = bridge_watch.run_pass(cfg, platform, t0)
+        assert seen["release"] == [(svc, "auto", [2301])] and out[0].endswith("restarted")
+        ps["etime"] = "00:08\n"   # the restarted session logging in is spared too, once its restart gap has passed
+        t1 = t0 + bridge_watch.RESTART_GAP_S[1]
+        assert bridge_watch.run_pass(cfg, platform, t1) == [f"{svc}: still logging in (8s); not restarted this pass"]
+        assert len(seen["release"]) == 1
+        ps["etime"] = "1-02:03:04\n"
+        assert bridge_watch.login_age({"service": svc}, platform) == 93784
+        ps["etime"] = "garbage\n"
+        assert bridge_watch.login_age({"service": svc}, platform) is None
+        # no ssh yet (its random start wait) or an unreadable age: restarted as before, once its gap allows
+        ps["pgrep"] = ""
+        out = bridge_watch.run_pass(cfg, platform, t1 + 30)
+        assert len(seen["release"]) == 2 and out[0].endswith("restarted")
+
+
 def test_bridge_watch_dest_answers_by_the_route_the_relay_takes(monkeypatch):
     # cells: direct-target, interface-target
     import socket

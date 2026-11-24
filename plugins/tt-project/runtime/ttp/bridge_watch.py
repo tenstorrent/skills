@@ -12,7 +12,9 @@ change. No pass measures the time since the last one: a sleep longer than BACKOF
 so the first pass after waking checks every box. A port whose forward's own destination does not answer
 from here (its host is off) is not a stale forward: nothing is ended or restarted for it, and it is logged
 once. Nor is a silent port of a bridge session another of whose ports answers: the session is live and its
-target only slow. A service that keeps failing is restarted at most once per RESTART_GAP_S step.
+target only slow. Nor is a bridge session none of whose ports has a listener yet while its login (its ssh, a
+relay reconnect included) is younger than LOGIN_S: the next pass decides. A service that keeps failing is restarted
+at most once per RESTART_GAP_S step.
 
 Besides the sessions `ttp bridge` installs, the config's "watch" list names ssh forward services made by
 hand: {"label": the launchd label or systemd unit, "box": its ssh alias, "port": the box port it forwards},
@@ -26,6 +28,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shlex
 import socket
 import sys
@@ -41,6 +44,7 @@ NET_PATHS = {"darwin": ["/Library/Preferences/SystemConfiguration"]}   # launchd
 BACKOFF_S = (30, 60)                  # the next check of a box that could not be reached: never over a minute
 RESTART_GAP_S = (0, 60, 120, 300)   # the least time between restarts of one service that keeps failing
 #                                     (a restarted session needs some seconds to log in and forward its ports)
+LOGIN_S = INTERVAL_S                # a session's login younger than this may not have set up its forwards yet
 STATE, HEAL_LOG = "bridge-watch.json", "bridge-heal.log"   # in the bridge home (~/.tt-project)
 
 
@@ -154,6 +158,26 @@ def restart(t: dict, platform: str) -> str:
     return "restarted" if r.returncode == 0 else f"restart refused: {(r.stderr or r.stdout).strip()[:160]}"
 
 
+def login_age(t: dict, platform: str) -> int | None:
+    """Seconds since the bridge session's ssh started (its service's newest ssh child: the relay's current login);
+    None when unknown, or when it has none yet (its random start wait, which a restart skips)."""
+    from . import bridge
+    if platform == "darwin":
+        r = bridge._run(["launchctl", "print", f"gui/{os.getuid()}/{t['service']}"])
+        pid = re.search(r"^\s*pid = (\d+)$", r.stdout, re.M)
+    else:
+        r = bridge._run(["systemctl", "--user", "show", "-p", "MainPID", "--value", "--", _unit(t)])
+        pid = re.fullmatch(r"\s*([1-9]\d*)\s*", r.stdout)
+    ssh = pid and bridge._run(["pgrep", "-n", "-x", "-P", pid.group(1), "ssh"]).stdout.split()
+    if not ssh:
+        return None
+    m = re.fullmatch(r"\s*(?:(?:(\d+)-)?(\d+):)?(\d+):(\d+)\s*", bridge._run(["ps", "-o", "etime=", "-p", ssh[0]]).stdout)
+    if not m:
+        return None
+    d, h, mi, sec = (int(x or 0) for x in m.groups())
+    return ((d * 24 + h) * 60 + mi) * 60 + sec
+
+
 def run_pass(cfg: dict, platform: str | None = None, now: float | None = None) -> list[str]:
     """One pass: what it did, one line per action (nothing when all answer)."""
     from . import bridge
@@ -233,6 +257,9 @@ def run_pass(cfg: dict, platform: str | None = None, now: float | None = None) -
                 continue
             f = fails.setdefault(t["service"], {"at": now, "event": event, "restarts": 0, "last": 0})
             if now - f["last"] < RESTART_GAP_S[min(f["restarts"], len(RESTART_GAP_S) - 1)]:
+                continue
+            if t["agent"] and none >= set(t["ports"]) and (age := login_age(t, platform)) is not None and age < LOGIN_S:
+                out.append(f"{t['service']}: still logging in ({age}s); not restarted this pass")
                 continue
             freed = release(cfg, t, bad)
             said = restart(t, platform)
