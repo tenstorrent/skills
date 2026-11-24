@@ -219,7 +219,7 @@ def _incidents(db, cfg: dict, runs: list[dict], tasks: dict, until: float) -> in
 def quality(db, cfg: dict, tids, tasks: dict, runs: dict, reviews: dict, fixes: dict, requeued: set,
             days: float, until: float, fixed: dict | None = None) -> dict:
     """One arm's quality over tasks `tids` (the module doc); a bounce `fixed` (rollout.fixed_stops) lists from
-    before its fix went live is not counted and lands in q["not_counted"]."""
+    before its fix went live is not counted: a task whose every bounce that is lands in q["not_counted"]."""
     from . import effort, rollout
     q = {"tasks": 0, "done": 0, "failed": 0, "reopened": 0, "reviewed": 0, "first_pass": 0, "fix_rounds": 0,
          "bounces": 0, "decided": 0, "glm_runs": 0, "incidents": 0}
@@ -240,8 +240,9 @@ def quality(db, cfg: dict, tids, tasks: dict, runs: dict, reviews: dict, fixes: 
         q["decided"] += _outcome_at(t, rv, rs) is not None
         bounced = [r for r in rs if (_note(r["note"]).get(route.KEY) or {}).get("fallback") == route.BOUNCE]
         off = [f for r in bounced if (f := rollout.not_counted(fixed or {}, r["id"], r["ended"] or r["started"]))]
-        q["not_counted"] += off
-        q["bounces"] += len(off) < len(bounced) or effort.wants_deep(t.get("result"))
+        deep = effort.wants_deep(t.get("result"))
+        q["not_counted"] += off if off and len(off) == len(bounced) and not deep else []   # the task's bounce it took out
+        q["bounces"] += len(off) < len(bounced) or deep
         glm_runs += [r for r in rs if on_glm(r["provider"], r["model"], r["note"])]
     q["glm_runs"] = len(glm_runs)
     q["incidents"] = _incidents(db, cfg, glm_runs, tasks, until)

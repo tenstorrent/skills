@@ -1290,12 +1290,15 @@ def _land_fix(p, repo, title, path):
     return fix, head
 
 
-def _daemon_starts(target, starts):
-    """`target`'s daemon log as its daemon writes it: one start line per (time, commit), stamped in local time."""
-    target.logs.mkdir(parents=True, exist_ok=True)
-    (target.logs / "daemon.log").write_text("".join(
-        f"{time.strftime('%Y-%m-%dT%H:%M:%S', time.localtime(ts))} daemon start pid=1 host=h boot=b version=0.0.1 "
-        f"commit={c[:12]} instance=i\n" for ts, c in starts))
+def _daemon_starts(monkeypatch, target, starts, provenance="verified"):
+    """`target`'s daemon log written by the daemon's own logger: one start line per (time, commit)."""
+    from ttp import daemon
+    stamp = time.strftime
+    for ts, c in starts:
+        with monkeypatch.context() as m:
+            m.setattr(time, "strftime", lambda fmt, *_a, ts=ts: stamp(fmt, time.localtime(ts)))
+            daemon.log(target, f"{daemon.START}1 host=h boot=b version=0.0.1 commit={c[:12]} instance=i "
+                               f"provenance={provenance} harness_head=none runtime_tree=none")
 
 
 def _stopped_window(env, monkeypatch, tmp_path):
@@ -1308,7 +1311,7 @@ def _stopped_window(env, monkeypatch, tmp_path):
     cfg = _dp_cfg(device=True, device_audits=2)
     t = target.db.task(target.db.add_task("soak", "Run the soak on the box.", kind="work"))
     base = float(int(time.time()) - 7200)
-    _daemon_starts(target, [(base, older), (base + 600, head_a), (base + 1200, head_b)])
+    _daemon_starts(monkeypatch, target, [(base, older), (base + 600, head_a), (base + 1200, head_b)])
     plan = [(60, "power"), (120, "power"), (180, "out_of_plan"), (240, ""), (700, "gate"), (760, "gate"),
             (820, ""), (1300, "guard"), (1360, ""), (1420, "")]
     runs = {}
@@ -1350,11 +1353,11 @@ def test_a_stop_after_its_fix_went_live_still_counts(env, monkeypatch, capsys, t
 
 def test_a_pushed_fix_no_daemon_ran_is_refused_and_excludes_nothing(env, monkeypatch, capsys, tmp_path):
     """Pushed is not live: a fix no daemon start of the project ran is refused and no stop stops counting."""
-    from ttp import deviceplan, rollout
+    from ttp import rollout
     p, target, cfg, fix_a, fix_b, runs = _stopped_window(env, monkeypatch, tmp_path)
     fix_c, _ = _land_fix(p, p.root, "fix c", "fixc.txt")
     code, out = _roll(capsys, "fixed", "glm_device", target.name, "--fix", str(fix_c), "--runs", "8")
-    assert code == 2 and "pushed but not live" in out and not rollout.fixed_stops(target.name, "glm_device"), out
+    assert code == 2 and "is not live in" in out and not rollout.fixed_stops(target.name, "glm_device"), out
 
 
 def test_another_projects_fix_record_excludes_no_stop(env, monkeypatch, capsys, tmp_path):
@@ -1362,7 +1365,8 @@ def test_another_projects_fix_record_excludes_no_stop(env, monkeypatch, capsys, 
     from ttp import deviceplan
     p, target, cfg, fix_a, fix_b, runs = _stopped_window(env, monkeypatch, tmp_path)
     other = _second_project(env, "neighbour")
-    _daemon_starts(other, [(time.time() - 7200, _git_out(p.root, "rev-parse", "HEAD"))])
+    _daemon_starts(monkeypatch, other, [(time.time() - 7200, _git_out(p.root, "rev-parse", "HEAD~2")),
+                                        (time.time() - 3600, _git_out(p.root, "rev-parse", "HEAD"))])
     for fix, ids in ((fix_a, "1,2,3"), (fix_b, "5,6")):
         code, out = _roll(capsys, "fixed", "glm_device", other.name, "--fix", str(fix), "--runs", ids)
         assert code == 0, out
@@ -1382,4 +1386,19 @@ def test_rollout_status_shows_the_stops_a_fix_took_out_of_the_count(env, monkeyp
     p, target, cfg, fix_a, fix_b, runs = _stopped_window(env, monkeypatch, tmp_path)
     _roll(capsys, "fixed", "glm_device", target.name, "--fix", str(fix_a), "--runs", "1,2,3")
     code, out = _roll(capsys, "status")
-    assert f"in {target.name}: 3 stops not counted: fixed by task #{fix_a} (live " in out, out
+    assert f"in {target.name}: fixed by task #{fix_a} (live " in out and "covers stops 1,2,3; those from before" in out, out
+
+
+def test_a_fix_is_live_from_the_first_start_that_ran_it_after_one_that_did_not(env, monkeypatch):
+    """A fix reverted and redeployed went live at its first start; one the oldest start on record already ran has
+    no known live time, and an unverified start names no runtime."""
+    from ttp import rollout
+    p, target, fix, head, older = _rearm_setup(env, monkeypatch)
+    t = float(int(time.time()) - 7200)
+    _daemon_starts(monkeypatch, target, [(t, head), (t + 60, older), (t + 120, head)], provenance="unverified")
+    assert rollout.fix_live(p.root, target, [head]) == (0.0, "")
+    _daemon_starts(monkeypatch, target, [(t + 180, older), (t + 240, head), (t + 300, older), (t + 360, head)])
+    assert rollout.fix_live(p.root, target, [head]) == (t + 240, head[:12])
+    target.logs.joinpath("daemon.log").unlink()
+    _daemon_starts(monkeypatch, target, [(t + 420, head), (t + 480, older), (t + 540, head)])
+    assert rollout.fix_live(p.root, target, [head]) == (0.0, "")

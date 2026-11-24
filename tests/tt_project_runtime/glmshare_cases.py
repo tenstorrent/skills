@@ -449,7 +449,7 @@ def test_glm_share_bounces_a_live_fix_covers_no_longer_count_toward_the_rollback
     bounced = [_gs_run(target, tid, t0 + 7200, 1, note={route.KEY: {"to": route.TO, "fallback": route.BOUNCE}})
                for tid in glm[:2]]
     assert glmshare.judge(target, _GS_CFG, now)["state"] == "worse"
-    _daemon_starts(target, [(t0 + 86400, head)])
+    _daemon_starts(monkeypatch, target, [(t0, older), (t0 + 86400, head)])
     code, out = _roll(capsys, "fixed", "glm_work", target.name, "--fix", str(fix), "--runs", ",".join(map(str, bounced)))
     v = glmshare.judge(target, _GS_CFG, now)
     assert code == 0 and v["state"] != "worse" and f"2 stops not counted: fixed by task #{fix}" in v["why"], (out, v)

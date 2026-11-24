@@ -901,6 +901,8 @@ def _picked_by(got: dict) -> str:
     return f"jev judgment={got.get('judgment')}"
 
 
+START = "daemon start pid="   # the daemon log line naming the runtime a start ran (rollout.daemon_starts reads it)
+
 def log(p: Project, msg: str) -> None:
     """Append a line to daemon.log. Never raises on a write failure (a full or read-only state
     filesystem): the line is dropped, stderr says so once per LOG_FAIL_S, and the next line written
@@ -1686,7 +1688,7 @@ class Daemon:
         signal.signal(signal.SIGTERM, self._on_stop_signal)
         signal.signal(signal.SIGINT, self._on_stop_signal)
         r = self.identity
-        log(self.p, f"daemon start pid={os.getpid()} host={hostname()} boot={self.boot} version={r['version']} "
+        log(self.p, f"{START}{os.getpid()} host={hostname()} boot={self.boot} version={r['version']} "
                     f"commit={r['commit'] or 'none'} instance={r['instance']} provenance={r['provenance']} "
                     f"harness_head={r['harness_head'] or 'none'} runtime_tree={r['runtime_tree'] or 'none'}")
         try:   # before any worker starts: they inherit it

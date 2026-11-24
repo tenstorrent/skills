@@ -345,8 +345,9 @@ FIXED_OP = "stops_fixed"   # a live guard fix's list of the stops it covers (`tt
 
 def fixed_stops(project: str, *flags: str) -> dict[str, dict]:
     """{run id: the newest `ttp rollout fixed` record listing it} for `project`'s stops on `flags`."""
-    return {str(run): r for f in flags for r in ledger(f)
-            if r.get("op") == FIXED_OP and r.get("project") == project for run in r.get("runs") or []}
+    recs = sorted((r for f in flags for r in ledger(f) if r.get("op") == FIXED_OP and r.get("project") == project),
+                  key=lambda r: float(r.get("ts") or 0))
+    return {str(run): r for r in recs for run in r.get("runs") or []}
 
 
 def not_counted(fixed: dict[str, dict], run: Any, ts: float) -> dict | None:
@@ -367,46 +368,82 @@ def not_counted_line(recs: list[dict], where: Any = None) -> str:
                      for (fix, live), n in by.items())
 
 
+def fixed_line(rec: dict, where: Any = None) -> str:
+    """'fixed by task #M (live HH:MM ZZZ) covers stops R1,R2; those from before it went live are not counted'."""
+    from . import timefmt
+    return (f"fixed by task #{rec.get('fix')} (live {timefmt.short(float(rec.get('live') or 0), where)}) covers stops "
+            f"{','.join(rec.get('runs') or [])}; those from before it went live are not counted")
+
+
 def daemon_starts(p) -> list[tuple[float, str]]:
-    """(time, commit) of each daemon start `p`'s daemon log and its rotated copy still hold, oldest first:
-    the runtime the project ran from then on."""
-    from .daemon import LOG_OLD
+    """(time, commit) of each verified daemon start `p`'s daemon log and its rotated copy still hold, oldest
+    first: the runtime the project ran from then on. A start whose code is not verified names no runtime."""
+    from .daemon import LOG_OLD, START
     out = []
     for name in (LOG_OLD, "daemon.log"):
         try:
             with open(p.logs / name, encoding="utf-8", errors="replace") as f:
                 for line in f:
                     stamp, _, msg = line.partition(" ")
-                    if not msg.startswith("daemon start pid="):
+                    if not msg.startswith(START):
                         continue
-                    commit = next((w[len("commit="):] for w in msg.split() if w.startswith("commit=")), "none")
+                    kv = dict(w.split("=", 1) for w in msg.split() if "=" in w)
+                    if kv.get("provenance") != "verified" or kv.get("commit", "none") == "none":
+                        continue
                     try:   # daemon.log stamps local time
-                        ts = time.mktime(time.strptime(stamp, "%Y-%m-%dT%H:%M:%S"))
+                        out.append((time.mktime(time.strptime(stamp, "%Y-%m-%dT%H:%M:%S")), kv["commit"]))
                     except ValueError:
                         continue
-                    if commit != "none":
-                        out.append((ts, commit))
         except OSError:
             pass
     return sorted(out)
 
 
 def fix_live(repo: Any, target: Any, commits: list[str]) -> tuple[float, str]:
-    """(when, commit) the fix's `commits` went live in `target`: the first start of the newest run of daemon
-    starts whose runtime holds them; (0.0, "") when no start on record ran one (pushed, not live). A fix live
-    before the log's oldest start dates from that start: later than it was, so no stop is let off wrongly."""
+    """(when, commit) the fix's `commits` first went live in `target`: the earliest daemon start whose runtime
+    holds them after an older start that did not; (0.0, "") when no start on record ran one (pushed, not live)
+    or the oldest start on record already held it (the log no longer shows when it went live)."""
     from . import landed
     holds: dict[str, bool] = {}
-    live, at = 0.0, ""
-    for ts, c in reversed(daemon_starts(target)):
+    before = None
+    for ts, c in daemon_starts(target):
         if c not in holds:
             full = landed._commit(repo, c)
             holds[c] = bool(full) and any(landed.on_branch(repo, x, full) for x in commits)
         if holds[c]:
-            live, at = ts, c
-        elif live:
-            break
-    return live, at
+            return (ts, c) if before is False else (0.0, "")
+        before = False
+    return 0.0, ""
+
+
+def _landed_fix(fix: Any, project: str) -> tuple[str, Any, Any, list[str]]:
+    """(why not, this project, PROJECT, the fix's commits) for a run's claim that fix task
+    `fix` is on the push branch (`ttp landed --task`) and that PROJECT is registered on this machine."""
+    from . import landed, project as project_mod
+    p = project_mod.here()
+    if p is None:
+        return "no project here to read the fix task's landing from", None, None, []
+    shas, note = landed.task_shas(p, fix)
+    code, why = landed.check(p, p.root, tid=fix, resolved=(shas, note))
+    if code != 0:
+        return f"fix task #{fix} is not on the push branch ({why})", p, None, []
+    target = local_projects().get(project)
+    if target is None:
+        return f"{project} is not registered on this machine", p, None, []
+    commits = [c for c in (landed._commit(p.root, sha) for sha in shas) if c]
+    if not commits:
+        return f"cannot read fix task #{fix}'s commits ({note})", p, target, []
+    return "", p, target, commits
+
+
+def fixed_shown(flag: str) -> list[dict]:
+    """The `ttp rollout fixed` records status shows for `flag`: the newest per project and fix, recorded since the
+    project was last re-armed (an older one covers stops outside the judged window)."""
+    newest: dict[tuple, dict] = {}
+    for r in ledger(flag):
+        if r.get("op") == FIXED_OP and float(r.get("ts") or 0) >= armed_at(str(r.get("project")), flag):
+            newest[(r.get("project"), r.get("fix"))] = r
+    return list(newest.values())
 
 
 def fixed_refusal(a) -> tuple[str, dict]:
@@ -419,24 +456,15 @@ def fixed_refusal(a) -> tuple[str, dict]:
         return "needs FLAG PROJECT --fix TASK --runs R1,R2", {}
     if not all(r.isdigit() for r in runs):
         return f"--runs takes run ids, not {','.join(runs)}", {}
-    from . import landed, project as project_mod
-    p = project_mod.here()
-    if p is None:
-        return "no project here to read the fix task's landing from", {}
-    shas, note = landed.task_shas(p, fix)
-    code, why = landed.check(p, p.root, tid=fix, resolved=(shas, note))   # `ttp landed --task`
-    if code != 0:
-        return f"fix task #{fix} is not on the push branch ({why})", {}
-    target = local_projects().get(project)
-    if target is None:
-        return f"{project} is not registered on this machine", {}
-    commits = [c for c in (landed._commit(p.root, sha) for sha in shas) if c]
-    if not commits:
-        return f"cannot read fix task #{fix}'s commits ({note})", {}
+    why, p, target, commits = _landed_fix(fix, project)
+    if why:
+        return why, {}
     live, commit = fix_live(p.root, target, commits)
     if not live:
-        return f"fix task #{fix} is pushed but not live in {project}: no daemon start on record ran it", {}
-    return "", {"project": project, "fix": fix, "runs": runs, "live": live, "live_commit": commit}
+        return (f"fix task #{fix} is not live in {project}: no daemon start on record shows it go live "
+                "(pushed but not run, or live before the log's oldest start)"), {}
+    return "", {"project": project, "fix": fix, "runs": [str(int(r)) for r in runs], "live": live,
+                "live_commit": commit}
 
 
 def record_fixed(flag: str, rec: dict, reason: str = "", by: str = "user") -> str:
@@ -445,8 +473,7 @@ def record_fixed(flag: str, rec: dict, reason: str = "", by: str = "user") -> st
     with _locked():
         _op(FIXED_OP, flag, reason or f"stops fixed by task #{rec['fix']}", by, **rec)
     target = local_projects().get(rec["project"])
-    return (f"{flag}: in {rec['project']}, stops {','.join(rec['runs'])} from before the fix went live no longer "
-            f"count toward its rollback; " + not_counted_line([rec] * len(rec["runs"]), target))
+    return f"{flag}: in {rec['project']}, " + fixed_line(rec, target) + " toward its rollback"
 
 
 def arm(flag: str, reason: str = "", by: str = "user", project: str = "", evidence: dict | None = None) -> str:
@@ -747,7 +774,7 @@ def status(projects: dict | None = None) -> dict:
                           "rolled_back": rolled_back(f, cfg), "overrides": over.get(f, []),
                           "armed": next((r for r in reversed(ledger(f))
                                          if r.get("op") == "project_arm" and r.get("run")), None),
-                          "fixed": [r for r in ledger(f) if r.get("op") == FIXED_OP]}
+                          "fixed": fixed_shown(f)}
                       for f, m in sorted(FLAGS.items())}}
 
 
@@ -768,29 +795,19 @@ def rearm_refusal(a) -> tuple[str, dict]:
         return f"the account setting rollout.{RUN_REARM_KEY} is off", {}
     if not fix or not replay:
         return "a run's re-arm carries its evidence: --fix TASK and --replay RUN", {}
-    from . import landed, project as project_mod
-    p = project_mod.here()
-    if p is None:
-        return "no project here to read the fix task's landing from", {}
     back = rolled_back(a.target).get(project) or {}
     if not back:
         return f"{project} is not rolled back for {a.target}; nothing to re-arm", {}
-    shas, note = landed.task_shas(p, fix)
-    code, why = landed.check(p, p.root, tid=fix, resolved=(shas, note))   # `ttp landed --task`
-    if code != 0:
-        return f"fix task #{fix} is not on the push branch ({why})", {}
-    target = local_projects().get(project)
-    if target is None:
-        return f"{project} is not registered on this machine", {}
+    why, p, target, commits = _landed_fix(fix, project)
+    if why:
+        return why, {}
     receipt, why = rearm_deployed(target)
     if not receipt:
         return f"cannot tell what {project} runs ({why})", {}
     if not (commit := str(receipt.get("commit") or "")):
         return f"cannot tell what {project} runs (its running receipt names no commit)", {}
-    commits = [landed._commit(p.root, sha) for sha in shas]
-    if not any(commits):
-        return f"cannot read fix task #{fix}'s commits to judge what {project} runs ({note})", {}
-    if not any(c and landed.on_branch(p.root, c, commit) for c in commits):
+    from . import landed
+    if not any(landed.on_branch(p.root, c, commit) for c in commits):
         return f"{project} runs {commit[:12]}, which does not contain fix task #{fix}", {}
     why = rearm_replay(replay, target, p, float(back.get("ts") or 0))
     if why:
@@ -898,8 +915,7 @@ def run(a) -> int:
                           f"deployed {str(rec.get('deployed'))[:12]}, replay {rec.get('replay')}")
                 projects = local_projects() if e["fixed"] else {}
                 for rec in e["fixed"]:
-                    print(f"  in {rec.get('project')}: " + not_counted_line(
-                        [rec] * len(rec.get("runs") or []), projects.get(rec.get("project"))))
+                    print(f"  in {rec.get('project')}: " + fixed_line(rec, projects.get(rec.get("project"))))
                 for o in e["overrides"]:
                     print(f"  overridden in {o['project']} by its own setting since {o['at']} "
                           f"({e['key']} = {json.dumps(o['value'])})")
