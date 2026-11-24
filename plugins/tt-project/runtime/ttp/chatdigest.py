@@ -376,13 +376,11 @@ HANDOFF_CHARS = 3500            # the enclosed hand-off is cut at this many char
 
 def outcome_words(facts: dict) -> str:
     """The landing facts of a finished reply_chat task in words, for the reply_due event and the
-    fallback line: how the task ended, what landed where, and whether it is deployed."""
+    fallback line: how the task ended, and what landed where."""
     bits = [str(facts.get("status") or "done")]
     if facts.get("landed"):
         bit = ("landed as " + str(facts.get("sha") or "?")[:7]
                + f" (version {facts.get('version') or '?'}) on {facts.get('branch') or '?'}")
-        if facts.get("deploy"):
-            bit += ", " + str(facts["deploy"])
         bits.append(bit)
     else:
         bits.append("not landed")
@@ -391,7 +389,7 @@ def outcome_words(facts: dict) -> str:
 
 def outcome_line(item: dict, facts: dict) -> str:
     """The fallback line for a chat the coordinator did not reply to: the task, whether it landed
-    (commit and version), whether it is deployed, and any user step on record. No hand-off prose.
+    (commit and version), and any user step on record. No hand-off prose.
     `item` is the armed fallback: {chat, task, title, facts}."""
     head = f"#{item['task']} " + " ".join(str(item.get("title") or "").split())
     line = f"{head[:200]}: {outcome_words(facts)}"

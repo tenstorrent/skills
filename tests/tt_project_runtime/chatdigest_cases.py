@@ -358,8 +358,8 @@ def test_a_finished_reply_chat_task_raises_reply_due_and_never_posts_its_hand_of
 
 
 def test_a_landed_code_change_carries_its_landing_facts_to_the_event(env, monkeypatch):
-    """The reply_due event of a task the push queue settled carries what landed where, and whether the
-    installed release runs it, so the coordinator can say what is live without a hand-off."""
+    """The reply_due event of a task the push queue settled carries what landed where, and claims nothing
+    about whether it is installed or live: that is the coordinator's own reply to say."""
     from ttp import chatdigest, pushq
     p = make(env)
     t = _cd_task(p, "fix the reply path", chat="c1")
@@ -368,7 +368,8 @@ def test_a_landed_code_change_carries_its_landing_facts_to_the_event(env, monkey
     assert ev
     f = json.loads(ev["data"])["facts"]
     assert (f["landed"], f["sha"], f["version"], f["branch"]) == (True, "abcdef1234", "0.2.1520", "relay/x")
-    assert f["deploy"] in ("deployed", "pending install", "not deployed")
+    assert "deploy" not in f
+    assert not any(w in chatdigest.outcome_words(f) for w in ("deploy", "install", "live"))
     assert "landed as abcdef1" in ev["text"]
 
 
@@ -425,6 +426,7 @@ def test_the_fallback_outcome_line_posts_from_records_only_once_the_bound_passes
     text = p.db.one("SELECT text FROM messages WHERE id=?", (got[0],))["text"]
     assert len(text) <= 300 and "landed as b40ca78" in text and "0.2.1519" in text
     assert not any(w in text for w in ("16b5701a4", "smoke suite", "shipped by review", "Opus"))
+    assert not any(w in text for w in ("deploy", "install", "live")), "no claim about deploy state"
     assert p.db.kv(chatdigest.FALLBACK_KV) == [], "armed once, spent once"
     # A chat the coordinator answered in time gets no fallback line; a routine info post is not an
     # answer, and the fallback still fires.

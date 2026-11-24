@@ -735,14 +735,10 @@ def _dropped_told(db, b, m: dict) -> None:
 
 
 def landing_facts(sha: str | None, version: str | None, branch: str | None) -> dict:
-    """The landing facts a reply_due event carries: what landed where, and whether the installed
-    release runs it. Model-free, from records only; `landed` is false when no commit or version is
-    on record (nothing landed)."""
-    cur = release.runtime_version(release.installed())
-    return {"landed": bool(sha or version), "sha": sha, "version": version, "branch": branch,
-            "deploy": "deployed" if version and cur == version
-            else ("pending install" if version and release.is_newer(version, cur)
-                  else "not deployed")}
+    """The landing facts a reply_due event carries: what landed where. Model-free, from records only;
+    `landed` is false when no commit or version is on record (nothing landed). Whether the change is
+    live is the coordinator's own reply to say."""
+    return {"landed": bool(sha or version), "sha": sha, "version": version, "branch": branch}
 
 
 def _reply(db, task: dict, new: str, text: str, need: str | None = None, facts: dict | None = None) -> None:
