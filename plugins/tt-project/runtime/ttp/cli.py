@@ -1953,7 +1953,7 @@ def status_text(p: Project, verbose: bool = False) -> str:
     from . import fleethold, heldwork
     for hold in sorted(fleethold.active().values(), key=lambda x: x.get("id") or 0):
         lines.append(fleethold.line(hold, p))
-        if its := heldwork.inventory(hold.get("alias"), where=p):
+        if its := heldwork.live_items(hold.get("alias"), where=p):
             lines.append(heldwork.still_on_line(hold.get("alias"), its))
     try:   # the occupancy watchdog's flags: jobs of this project that ran under a live realtime stream
         from . import occupancy
@@ -12707,7 +12707,7 @@ def _machine_outage(a) -> None:
         return
     if not was:   # a first record: each owner project is told what of its work is on the machine
         from . import heldwork
-        heldwork.notes(p, heldwork.inventory(a.alias), why=f"{a.alias} has a known outage")
+        heldwork.notes(p, heldwork.live_items(a.alias), why=f"{a.alias} has a known outage")
     print(ml.outage_line(a.alias, ml.outages().get(a.alias) or rec, p))
 
 

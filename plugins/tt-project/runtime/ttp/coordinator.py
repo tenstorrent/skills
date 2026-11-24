@@ -5669,7 +5669,7 @@ def pause_machine(p: Project, alias: str, paused: bool, reason: str = "", by: st
         sync_shared_pauses(p, db)
         if new:   # each owner project is told what of its work is still on the machine
             from . import heldwork
-            heldwork.notes(p, heldwork.inventory(alias), why=f"{alias} is held machine-wide")
+            heldwork.notes(p, heldwork.live_items(alias), why=f"{alias} is held machine-wide")
         till = pauseends.describe(fleethold.entry(hold), p)
         return (f"{alias} held machine-wide (hold {hold['id']}" + ("" if new else ", updated") + ")"
                 + (f" ({hold['reason']})" if hold.get("reason") else "")

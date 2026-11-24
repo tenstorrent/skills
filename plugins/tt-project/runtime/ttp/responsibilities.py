@@ -550,7 +550,7 @@ def machine_status(alias: str | None = None, now: float | None = None, where=Non
         v["outage"] = outs.get(a)
         if v["outage"] or fleethold.active().get(a):   # held or out: what of any project's work is on it
             from . import heldwork
-            v["still_on"] = heldwork.inventory(a, now=now, where=where)
+            v["still_on"] = heldwork.live_items(a, now=now, where=where)
     return list(view.values())
 
 

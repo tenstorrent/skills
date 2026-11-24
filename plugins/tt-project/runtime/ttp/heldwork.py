@@ -61,7 +61,7 @@ def ssh_refusal(cmd: str) -> str | None:
     return None
 
 
-def inventory(alias: str, now: float | None = None, where=None) -> list[dict]:
+def live_items(alias: str, now: float | None = None, where=None) -> list[dict]:
     """Every project's live work on machine `alias`, as {kind, project, text} items: holders of
     its shared device locks, open tasks whose resources name it, and open machine-change ledger
     entries that leave a standing setup. A probe the owner project's config gives
