@@ -193,8 +193,9 @@ def _other_destination(text: str) -> bool:
     never a ratio (682/682), "and/or" or a file path."""
     if _LANDED_DEST.search(text):
         return True
+    toks = [m.group(1).rstrip(".") for m in _SLASH_DEST.finditer(text)]   # a sentence's full stop is no ref
     return any(tok.lower() != "and/or" and not re.fullmatch(r"\d+/\d+", tok) and "." not in tok
-               for tok in (m.group(1) for m in _SLASH_DEST.finditer(text)))
+               for tok in toks)
 
 
 def _names_push_branch(sentence: str, target) -> bool:
