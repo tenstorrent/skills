@@ -946,7 +946,8 @@ def drop(p, tid: int, shas: list[str], why: str, event: bool = True) -> None:
     or `ttp task <project> superseded <id> <sha>` counts again. `event`: wake the coordinator once per task."""
     now = time.time()
     for sha in dict.fromkeys(s for s in shas if s):
-        p.db.x("INSERT INTO task_dropped(task, sha, why, ts) VALUES(?,?,?,?) ON CONFLICT(task, sha) DO NOTHING",
+        p.db.x("INSERT INTO task_dropped(task, sha, why, ts) VALUES(?,?,?,?) "
+               "ON CONFLICT(task, sha) DO UPDATE SET why=excluded.why, ts=excluded.ts",
                (int(tid), sha, why, now))
     fp = f"{DROP_EVENT}:{int(tid)}:{min(shas, default='')[:12]}"   # a later drop of a re-landed change wakes again
     if event and not p.db.one("SELECT id FROM events WHERE fingerprint=?", (fp,)):

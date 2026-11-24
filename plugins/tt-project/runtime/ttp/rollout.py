@@ -662,6 +662,8 @@ def rearm_refusal(a) -> tuple[str, dict]:
     p = project_mod.here()
     if p is None:
         return "no project here to read the fix task's landing from", {}
+    if a.target and project not in rolled_back(a.target):
+        return f"{project} is not rolled back for {a.target}; nothing to re-arm", {}
     code, why = landed.check(p, p.root, tid=fix, fetch=False)
     if code != 0:
         return f"fix task #{fix} is not on the push branch ({why})", {}
@@ -671,7 +673,7 @@ def rearm_refusal(a) -> tuple[str, dict]:
     commit = release.runtime_commit(target.harness / "runtime")
     if commit in (None, "", "unknown"):
         return f"cannot tell what {project} runs (no installed release)", {}
-    shas, _ = landed.recorded(p.db, fix)
+    shas, _ = landed.task_shas(p, fix)
     if not any(landed.on_branch(p.root, sha, commit) for sha in shas):
         return f"{project} runs {commit[:12]}, which does not contain fix task #{fix}", {}
     why = rearm_replay(replay, target, p)
