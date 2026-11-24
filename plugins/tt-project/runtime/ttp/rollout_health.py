@@ -18,8 +18,8 @@ failed runs are its runs on the arm, against the baseline's runs off it; a landi
 when the task's latest run was on the arm. Work it never ran is left out, and a stuck task left out is listed
 under "reported", never "failing". A flag whose arm runs are coordinator turns (FLAGS "runs": "coordinator")
 is judged on those turns; no landing or stuck task is its. A flag with no arm changes how every task runs, so
-its signals stay project-wide. A task waiting in a live batch run (batchrun.held) is never stuck: its lead
-runs for it.
+its signals stay project-wide. A run a host reboot or crash cut counts toward no flag (_runs). A task waiting
+in a live batch run (batchrun.held) is never stuck: its lead runs for it.
 """
 from __future__ import annotations
 
@@ -111,13 +111,15 @@ class _Scope:
 
 def _runs(db, a: float, b: float, scope: _Scope | None = None) -> dict[str, list[int]]:
     """{kind/tier: [runs, failed]} of the worker runs that ended in [a, b) in `scope` (a coordinator-turn arm:
-    its coordinator turns), login failures left out."""
+    its coordinator turns), login failures and runs a host reboot or crash cut (finish_run's lost_to_reboot,
+    lost_to_crash) left out: the host failed them, not the route; their reruns count on their own outcome."""
     scope = scope or _Scope(None)
     role = "r.role='coordinator'" if scope.arm and scope.coord else "r.role!='coordinator'"
     out: dict[str, list[int]] = {}
     for r in db.q("SELECT r.status, r.provider, r.model, r.note, t.kind, COALESCE(t.assigned_tier, t.tier) tier "
                   f"FROM runs r LEFT JOIN tasks t ON t.id=r.task WHERE {role} AND r.ended>=? AND r.ended<? AND "
-                  "r.status NOT IN ('running','auth')", (a, b)):
+                  "r.status NOT IN ('running','auth') AND COALESCE(r.note,'') NOT LIKE '%\"lost_to_reboot\"%' "
+                  "AND COALESCE(r.note,'') NOT LIKE '%\"lost_to_crash\"%'", (a, b)):
         if not scope.run(r):
             continue
         n = out.setdefault(_group(r), [0, 0])

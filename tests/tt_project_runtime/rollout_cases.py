@@ -157,6 +157,48 @@ def test_health_signals_fail_only_past_their_threshold_and_sample_minimum(env):
     assert "bogus" not in rh.thresholds({"thresholds": {"bogus": 1}})
 
 
+# A replay of a real model-route rollback (sanitized): the 24 window runs on the GLM arm before the
+# health watch switched the flag off, as (hours before the check, status, cut by a host reboot). Both
+# "lost" runs died when their host rebooted; the daemon marked them at its next start.
+_REBOOT_WINDOW = [(9.9, "ok", 0), (9.1, "ok", 0), (9.0, "ok", 0), (8.7, "ok", 0), (7.9, "ok", 0),
+                  (7.6, "ok", 0), (7.3, "ok", 0), (7.2, "ok", 0), (6.9, "fallback", 0), (6.7, "lost", 1),
+                  (6.3, "fallback", 0), (4.0, "fallback", 0), (3.6, "ok", 0), (2.5, "ok", 0), (2.0, "ok", 0),
+                  (2.0, "fallback", 0), (1.7, "fallback", 0), (1.5, "ok", 0), (1.1, "ok", 0), (1.1, "ok", 0),
+                  (1.0, "ok", 0), (0.7, "ok", 0), (0.6, "fallback", 0), (0.01, "lost", 1)]
+
+
+def _ro_glm_run(p, tid, status, ago_h, note=None):
+    end = time.time() - ago_h * _RH
+    p.db.x("INSERT INTO runs(task,role,provider,model,status,started,ended,note) VALUES(?,'worker','chat',"
+           "'zai-org/GLM-5.3',?,?,?,?)", (tid, status, end - 60, end, json.dumps(note) if note else None))
+
+
+def test_a_run_a_host_reboot_or_crash_cut_never_counts_toward_a_model_route_rollback(env):
+    # cells: reboot_replay, reboot_cut_every_glm_flag, crash_cut, genuine_failure_counts, other_loss_counts
+    from ttp import rollout, rollout_health as rh
+    p = make(env, "replay")
+    tid = p.db.add_task("t", "s", kind="code", tier="standard")
+    for i in range(400):                    # the baseline: 1% of the off-arm runs failed
+        p.db.x("INSERT INTO runs(task,role,provider,model,status,started,ended) VALUES(?,'worker','claude','opus',?,?,?)",
+               (tid, "failed" if i < 4 else "ok", time.time() - 100 * _RH - 5, time.time() - 100 * _RH))
+    now, since, th = time.time(), time.time() - 10 * _RH, rh.thresholds(None)
+    reboot = {"not_waste": "reboot", "lost_to_reboot": "b0", "boot_at": 1.0, "shutdown": "unclean"}
+    for ago, status, cut in _REBOOT_WINDOW:
+        _ro_glm_run(p, tid, status, ago, reboot if cut else None)
+    for flag in ("glm_code", "glm_device", "glm_work"):
+        v = rh.signals(p.db, since, now, th, rollout.FLAGS[flag]["area"], flag)
+        assert v["failing"] == [] and v["failed"] == 0 and v["runs"] == 22, (flag, v)
+    p.db.x("UPDATE runs SET note=NULL WHERE provider='chat'")   # before the fix: the same runs, counted
+    assert rh.signals(p.db, since, now, th, "route", "glm_code")["failing"] == [
+        "failed runs 8% against 1% for the same task kinds (24 runs)"]
+    p.db.x("UPDATE runs SET note=? WHERE provider='chat' AND status='lost'", (json.dumps({"lost_to_crash": True}),))
+    assert rh.signals(p.db, since, now, th, "route", "glm_code")["failing"] == [], "a crash cut is left out too"
+    _ro_glm_run(p, tid, "failed", 0.5)
+    _ro_glm_run(p, tid, "lost", 0.4)        # lost to something else: the task's own failure
+    got = rh.signals(p.db, since, now, th, "route", "glm_code")
+    assert got["failing"] == ["failed runs 8% against 1% for the same task kinds (24 runs)"], got
+
+
 def _ro_kind_runs(p, kind, n, failed, ago_h):
     tid = p.db.add_task("r", "s", kind=kind)
     for i in range(n):
