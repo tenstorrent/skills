@@ -201,7 +201,7 @@ def landed_claims(p, text: str, repo) -> list[tuple[int, int, str, tuple]]:
     return out
 
 
-def _refresh(p, repo, done: dict) -> bool:
+def _fetched_push_branch(p, repo, done: dict) -> bool:
     """Whether the push branch's tracking ref was just fetched: the local ref can lag a landing
     another route pushed, so a claim it cannot confirm asks the remote first. `done` keeps the
     answer: the branch is fetched once, not once per claim."""
@@ -254,7 +254,7 @@ def correct_landed_claims(p, text: str, repo, head: str = "", tid: int = 0,
                 # the local tracking ref can lag a landing another route pushed: fetch the branch
                 # once, then decide again. A refresh that cannot run marks the claim, never a
                 # 'not landed' the ref's own staleness wrote.
-                rc, why = (landed.check(p, repo, what, fetch=False) if _refresh(p, repo, refreshed)
+                rc, why = (landed.check(p, repo, what, fetch=False) if _fetched_push_branch(p, repo, refreshed)
                            else (landed.CANNOT, "cannot fetch the push branch"))
         if rc == landed.NOT_YET:
             where = short_ref(*(claim_target or target)) if (claim_target or target) else "the push branch"
