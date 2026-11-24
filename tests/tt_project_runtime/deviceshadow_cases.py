@@ -412,6 +412,10 @@ def test_device_shadow_copy_finds_nested_and_bare_repos_and_always_holds_a_code_
     import subprocess
     from ttp import deviceshadow
     monkeypatch.setattr(deviceshadow, "COPY_RETRY_S", 0)
+    # A fixed commit date: the shas are then the same every run, so the spec below always names a
+    # base the parser reads (a sha prefix with no a-f letter is a plain number, never a sha).
+    for var in ("GIT_AUTHOR_DATE", "GIT_COMMITTER_DATE"):
+        monkeypatch.setenv(var, "2026-01-01T00:00:00+0000")
 
     def git(repo, *args):
         return subprocess.run(["git", "-C", str(repo), *args], check=True, capture_output=True,
