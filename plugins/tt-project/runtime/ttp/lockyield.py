@@ -17,9 +17,12 @@ import subprocess
 import sys
 import time
 
-EVERY_S = 15.0       # config locks.yield_every_s: how often the probe is asked while the command runs
-KILL_AFTER_S = 10.0   # a yielded command gets SIGTERM, then SIGKILL once this is up
-BUSY_RC = 75          # the exit of a busy or, now, yielded lock
+EVERY_S = 15.0        # config locks.yield_every_s: how often the probe is asked while the command runs
+KILL_AFTER_S = 10.0    # a yielded command gets SIGTERM, then SIGKILL once this is up
+PROBE_TIMEOUT_S = 10.0   # the most a probe answer may take; a slower one counts as broken
+LINE_MAX = 200         # how much of the probe's answer is kept
+MIN_INTERVAL_S = 0.1   # a smaller configured interval would spin
+BUSY_RC = 75           # the exit of a busy or, now, yielded lock
 
 
 def command(cfg: dict) -> str:
@@ -52,7 +55,7 @@ class Probe:
 
     def __init__(self, cmd: str, interval: float, names: list[str], root) -> None:
         self.cmd, self.names, self.root = cmd, names, root
-        self.interval = max(interval, 0.1)
+        self.interval = max(interval, MIN_INTERVAL_S)
         self.told = False   # a broken probe is reported once, however often it is asked
 
     def wait(self, popen: subprocess.Popen) -> int:
@@ -75,12 +78,12 @@ class Probe:
     def ask(self) -> "str | None":
         """Run the probe: the one line saying why it yields, or None to keep the command running."""
         from . import boundedchild
-        res = boundedchild.run(["/bin/sh", "-c", self.cmd], max(0.1, min(self.interval, 10.0)),
+        res = boundedchild.run(["/bin/sh", "-c", self.cmd], max(MIN_INTERVAL_S, min(self.interval, PROBE_TIMEOUT_S)),
                                cwd=str(self.root), env={**os.environ, "TTP_LOCK_NAMES": ",".join(self.names)},
                                text=False, stderr="stdout")
         if res.rc == 0:
             said = res.out.decode(errors="replace").strip().splitlines()
-            return said[0][:200] if said and said[0].strip() else "the project's yield probe asked for the resource"
+            return said[0][:LINE_MAX] if said and said[0].strip() else "the project's yield probe asked for the resource"
         if res.rc != 1 and not self.told:   # a broken or slow probe never stops the command
             self.told = True
             how = f"exited {res.rc}" if res.rc is not None else (res.error or "gave no answer")
