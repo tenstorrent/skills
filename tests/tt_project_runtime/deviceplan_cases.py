@@ -807,10 +807,21 @@ def test_a_re_plan_whose_json_breaks_gets_the_json_fix_up_too_and_reaches_the_ru
     assert deviceplan.plan(cur) and glmassist.planned(cur) and not (cur / "glm_guard.json").exists()
 
 
+def test_a_re_plan_whose_json_fix_up_has_no_time_left_still_books_its_cost(tmp_path):
+    from ttp import deviceplan, glmassist
+    seen, ticks = [], iter([0, 0, 0] + [10 ** 6] * 9)
+    bad = _src_plan(('ttp lock box1 -- ssh box1 "curl -fsS -m 10 http://127.0.0.1:9000/health"', "memory"))
+    broken = _src_plan((_SRC_HEALTH, "run 101")).replace('{"host"', '{\n     host"', 1)
+    cur, call = _src_asker(tmp_path, [bad, broken], seen)
+    row = glmassist.ask(cur, "check box1", cwd=str(tmp_path), plan=True, run=call, binary="claude",
+                        now=lambda: next(ticks))
+    assert len(seen) == 2 and not row["ok"] and "no time is left" in row["error"]
+    assert row["cost_usd"] == 1.0, "both calls are paid for"
+
+
 def test_a_planned_job_may_use_the_runs_own_scratch_folder_and_nothing_else_may_differ(tmp_path):
-    """Replay: a plan copied a passing run's job submit into its own scratch folder, running the heartbeat script an
-    earlier step wrote there under a new name, and the source check stopped it. Only the folder may differ, and a
-    renamed file only when the plan writes it first with the same extension; command, verb and limit stay."""
+    """Replay: a plan copied a passing run's job submit into its own scratch folder and the source check stopped it.
+    Only the folder may differ: the command, broker verb, limit and script (its name too) stay as the source's."""
     from ttp import deviceplan
     cur, _ = _src_project(tmp_path)
     srcs = deviceplan.copy_sources(cur, {})
@@ -821,11 +832,9 @@ def test_a_planned_job_may_use_the_runs_own_scratch_folder_and_nothing_else_may_
     plan = lambda *cs: [{"n": i + 1, "command": c, "check": "printf" not in c, "source": "run 101"}
                         for i, c in enumerate(cs)]
     assert not deviceplan.unsourced(plan(own), srcs, task)
-    assert not deviceplan.unsourced(plan(write, renamed), srcs, task)
     still = {
         "renamed script the plan never writes": plan(renamed),
-        "written only after the job": plan(renamed, write),
-        "other extension": plan(write.replace("hb2.sh", "hb2.py"), renamed.replace("hb2.sh", "hb2.py")),
+        "renamed script written with new content": plan(write, renamed),
         "another broker verb": plan(own.replace("run-bg", "reset")),
         "another time limit": plan(own.replace("-t 120", "-t 7200")),
         "more in the job's command": plan(own.replace("hb.sh'", "hb.sh; tt-smi -r'")),

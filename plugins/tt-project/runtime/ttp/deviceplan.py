@@ -785,14 +785,14 @@ def _needs(st: dict, segs) -> list[list[str]]:
             and not re.search(r"[$=#]", w[0])]
 
 
-def _copy_of(a: list[str], b: list[str], named: set, digits: set, own: str = "", wrote=()) -> bool:
+def _copy_of(a: list[str], b: list[str], named: set, digits: set, own: str = "") -> bool:
     """Segment `a` of the plan is source segment `b` but for <placeholders>, words the task names, numbers
     the task names (a port or device id differs only when the task gives the new one; a scratch path is made
     from its task id) and the run's own scratch folder `own` (_scratch_word)."""
     if len(a) != len(b) or os.path.basename(a[0]) != os.path.basename(b[0]):
         return False
     for x, y in zip(a, b):
-        if x == y or HOLE in x or HOLE in y or x in named or _scratch_word(x, y, own, wrote):
+        if x == y or HOLE in x or HOLE in y or x in named or _scratch_word(x, y, own):
             continue
         if re.sub(r"\d+", "0", x) == re.sub(r"\d+", "0", y) and set(re.findall(r"\d+", x)) <= digits:
             continue
@@ -803,18 +803,11 @@ def _copy_of(a: list[str], b: list[str], named: set, digits: set, own: str = "",
 TMP_DIR = re.compile(r"/tmp/[\w.-]+")
 
 
-def _scratch_word(x: str, y: str, own: str, wrote) -> bool:
+def _scratch_word(x: str, y: str, own: str) -> bool:
     """Word `x` is source word `y` with the run's own scratch folder `own` where `y` has another run's `/tmp`
-    folder, and a file in it named otherwise only when an earlier step of the plan writes that file (`wrote`, file
-    names) and its extension is the same. The rest of the word stays as it is."""
-    if not own or own not in x:
-        return False
-    a, b = re.sub(re.escape(own) + r"(?![\w.-])", "@scratch@", x), TMP_DIR.sub("@scratch@", y)
-    if a == b:
-        return True
-    ext = lambda m: f"@scratch@/@{os.path.splitext(m.group(1))[1]}@"
-    a = re.sub(r"@scratch@/([\w.-]+)(?![\w./-])", lambda m: ext(m) if m.group(1) in wrote else m.group(0), a)
-    return a == re.sub(r"@scratch@/([\w.-]+)(?![\w./-])", ext, b)
+    folder; the rest of the word, file names included, stays as it is."""
+    return bool(own) and own in x and \
+        re.sub(re.escape(own) + r"(?![\w.-])", "@scratch@", x) == TMP_DIR.sub("@scratch@", y)
 
 
 def unsourced(steps: list[dict], srcs: list[dict], task: str = "", root=None) -> str:
@@ -832,7 +825,7 @@ def unsourced(steps: list[dict], srcs: list[dict], task: str = "", root=None) ->
     mine = re.sub(r"(?m)^this host is .*$", "", task or "")   # assist()'s host line names no value a step may use
     named, digits = set(norm(mine).split()), set(re.findall(r"\d+", mine))
     tid = re.match(r"task id (\d+)", task or "")
-    own, wrote = SCRATCH.format(tid.group(1)) if tid else "", set()
+    own = SCRATCH.format(tid.group(1)) if tid else ""
     bad = []
     for st in steps:
         segs = _src_segments(st["command"])
@@ -845,11 +838,9 @@ def unsourced(steps: list[dict], srcs: list[dict], task: str = "", root=None) ->
             bad.append(f"step {st['n']} is marked {cite[:120]}")
             continue
         miss = [w for w in need if not (_script(w[0], root, scripts) or cite in w and _script(cite, root, scripts)
-                                        or any(_copy_of(w, k, named, digits, own, wrote) for k in known))]
+                                        or any(_copy_of(w, k, named, digits, own) for k in known))]
         if miss:
             bad.append(f"step {st['n']} (`{' '.join(miss[0])[:120]}`) matches no listed command or cited script")
-        if own:   # files this step writes in the run's own scratch folder (> or tee)
-            wrote |= set(re.findall(r"(?:>>?|\btee\s+(?:-a\s+)?)\s*['\"]?" + re.escape(own) + r"/([\w.-]+)", st["command"]))
     return "; ".join(bad)
 
 
