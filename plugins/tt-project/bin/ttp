@@ -29,7 +29,6 @@ if (sys.argv[1:2] in (["setup"], ["upgrade"]) and os.path.isdir(RUNTIME)
 # While a merge rewrites a harness's files one by one, it holds a whole copy of the runtime from
 # before in .git (project.runtime_hold): run the newest such copy whose holder lives, never a
 # half-written mix, and note this process in it, so it stays whole while this runs from it.
-RUNTIME = os.path.join(os.path.dirname(HERE), "runtime")
 try:
     GIT, best = os.path.join(os.path.dirname(HERE), ".git"), (0.0, "")
     if not os.path.isdir(GIT):     # a linked worktree: its .git file names the git dir
@@ -46,8 +45,14 @@ try:
                 mtime = os.fstat(f.fileno()).st_mtime
                 if mtime <= time.time() - 3600:
                     continue          # a crashed merge's copy is never run, whoever has its pid by then
-                os.kill(int(f.read()), 0)
+                holder = int(f.read())
         except (OSError, ValueError):
+            continue
+        try:
+            os.kill(holder, 0)
+        except PermissionError:
+            pass          # the holder lives (another user's process): its copy is the one to run
+        except OSError:
             continue
         if mtime > best[0]:
             best = (mtime, os.path.join(GIT, name))
