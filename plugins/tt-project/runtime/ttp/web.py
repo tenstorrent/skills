@@ -930,8 +930,9 @@ class Handler(BaseHTTPRequestHandler):
                     r["text"] = links.linkify(r["text"], cfg)
                 return self._send(200, rows)
             if url.path == "/api/file":
-                # The read-only file view a message's file link opens: the project tree and the
-                # tt-project home only, secrets and anything outside refused (links.readable).
+                # The read-only file view a message's file link opens: files git tracks in the
+                # project tree and run outputs only; credentials, tokens and databases refused
+                # (links.readable).
                 from . import links
                 q = parse_qs(url.query)
                 f = links.readable(self._proj(), q.get("path", [""])[0])

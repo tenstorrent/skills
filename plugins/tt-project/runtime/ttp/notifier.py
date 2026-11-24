@@ -81,10 +81,13 @@ def alerts_since(p: Project, after: int, floor: str = "high") -> list[dict]:
                     f"AND id>? AND severity IN ({','.join('?' * len(levels))}) ORDER BY id LIMIT 50",
                     (after, *levels))
         now = time.time()
-        from . import links   # an alert's references reach the user as links
+        from . import links   # an alert is an outgoing message to the user: its references become links
+        try:
+            lc = links.config(p, db)
+        except Exception:   # a links fault leaves alerts unlinked, never drops them
+            lc = {}
         for r in rows:
-            # an alert is an outgoing message to the user: its references become links
-            r["text"] = links.linkify(r["text"], links.config(p, db), links.TEXT)
+            r["text"] = links.for_user(p, r["text"], links.TEXT, lc)
             # Information (a host reboot) is never pushed as an alert; the cursor still moves past it.
             # So is a quiet alert: another project on this machine already raised the same condition.
             r["cleared"] = r["kind"] == "info" or r.pop("channel") == "quiet" or cleared(db, r, now)

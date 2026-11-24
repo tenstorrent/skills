@@ -29,9 +29,10 @@ def test_linkify_links_pr_words_only_with_one_repo_and_a_number_is_an_id_link():
     # a '#N' is a tt-project id: it links to its web app page
     assert links.linkify("see #5", CFG) == "see [#5](http://127.0.0.1:9/#token=ab&task=5)"
     for text, kind in (("task #5", "task"), ("run #5", "run"), ("review #5", "task"), ("msg #5", "msg"),
-                       ("ask #5", "msg"), ("run 5", "run")):
+                       ("ask #5", "msg")):
         out = links.linkify(text, CFG)
         assert f"&{kind}=5" in out and f"[{text}]" in out, (text, out)
+    assert links.linkify("run 5", CFG) == "run 5"   # without '#', a short number is a count
     # one that resolves to nothing is labelled, never left bare and never given a guessed repo
     assert links.linkify("see #1234", CFG) == "see #1234 (unresolved reference)"
     assert links.linkify("task #4", CFG) == "task #4"      # kinded and unresolved: its kind labels it
@@ -74,21 +75,37 @@ def test_problems_names_the_three_shapes_and_the_bare_number():
     assert links.problems(text, full) == []
 
 
-def test_readable_keeps_the_file_view_inside_the_project_tree(tmp_path):
-    from ttp import links
-    (tmp_path / "state/runs/1").mkdir(parents=True)
-    (tmp_path / "state/runs/1/result.json").write_text("{}")
-    (tmp_path / "web.token").write_text("x")
-    (tmp_path / "note.txt").write_text("in")
+def test_readable_serves_only_tracked_files_and_run_outputs_never_credentials(tmp_path, monkeypatch):
+    import subprocess
+    from ttp import credguard, links, project
+    home, root = tmp_path / "home", tmp_path / "proj"
+    monkeypatch.setenv("HOME", str(home))
+    state = root / "tt-project/state"
+    (state / "runs/1").mkdir(parents=True)
+    (state / "runs/1/result.json").write_text("{}")
+    subprocess.run(["git", "init", "-q", str(root)], check=True)
+    (root / "src.py").write_text("x = 1\n")
+    (root / "untracked.txt").write_text("u")
+    subprocess.run(["git", "-C", str(root), "add", "src.py"], check=True)
+    cred = sorted(Path(x) for x in credguard.credential_files() if str(x).startswith(str(home)))[0]
+    fakes = {"cred": cred, "store": home / "store/s.json",
+             "token": state / "web.token", "db": root / "tt-project.db", "gitcfg": root / ".git/config"}
+    for f in fakes.values():
+        f.parent.mkdir(parents=True, exist_ok=True)
+        if f.name != "config":
+            f.write_text("fake")
+    subprocess.run(["git", "-C", str(root), "add", "-f", str(fakes["db"])], check=True)   # tracked, still refused
+    monkeypatch.setattr(project, "secrets_path", lambda: fakes["store"])
 
     class P:
-        root = str(tmp_path)
-    assert links.readable(P, "state/runs/1/result.json") == (tmp_path / "state/runs/1/result.json").resolve()
-    assert links.readable(P, str(tmp_path / "state/runs/1/result.json")) is not None
-    assert links.readable(P, "/etc/passwd") is None                       # outside the roots
-    assert links.readable(P, "../outside.txt") is None
-    assert links.readable(P, "web.token") is None                        # a secret stays unreadable
-    assert links.readable(P, "note.txt") == (tmp_path / "note.txt").resolve()
+        pass
+    P.root, P.state = root, state
+    assert links.readable(P, "src.py") == (root / "src.py").resolve()            # tracked source
+    assert links.readable(P, str(state / "runs/1/result.json")) is not None      # a run's output
+    assert links.readable(P, "untracked.txt") is None                           # not tracked
+    assert links.readable(P, "/etc/passwd") is None and links.readable(P, "../x") is None
+    for what, f in fakes.items():
+        assert links.readable(P, str(f)) is None, what
 
 
 def test_the_listener_line_and_status_ask_linkify_outgoing_text(env):
@@ -135,14 +152,14 @@ def test_the_web_app_linkifies_its_messages_and_asks(env):
         assert rows and "](https://example.atlassian.net/browse/EX-8)" in rows[0]["text"], rows
         # an id reference resolves from the web app's own thread and connection, not p.db
         id_rows = [r for r in get("/api/messages") if f"#{task}" in r["text"]]
-        assert id_rows and f"&task={task}" in id_rows[0]["text"], id_rows
+        assert id_rows and f"#task={task}" in id_rows[0]["text"], id_rows
         assert any("](https://example.atlassian.net/browse/EX-9)" in a["text"]
                    for a in web.state_payload(p, p.db)["attention"])
         # a file link opens exactly what /api/file serves, and nothing outside the project tree
-        (p.root / "state/runs/1").mkdir(parents=True, exist_ok=True)
-        (p.root / "state/runs/1/result.json").write_text('{"status": "done"}')
+        (p.state / "runs/1").mkdir(parents=True, exist_ok=True)
+        (p.state / "runs/1/result.json").write_text('{"status": "done"}')
         web.token(p)
-        row = get(f"/api/file?path={urllib.parse.quote(str(p.root / 'state/runs/1/result.json'))}")
+        row = get(f"/api/file?path={urllib.parse.quote(str(p.state / 'runs/1/result.json'))}")
         assert row["text"] == '{"status": "done"}'
         req = urllib.request.Request(f"http://127.0.0.1:{srv.server_address[1]}/api/file?path=/etc/passwd")
         with pytest.raises(urllib.error.HTTPError):
@@ -159,14 +176,14 @@ def test_ids_link_to_their_web_app_page_and_unresolved_ones_get_labelled(env):
     msg = p.db.post("out", "task %d is running" % task, kind="reply", severity="normal")
     from ttp import links
     out = links.for_user(p, f"#{task} and run 777 and msg #{msg} and #4 and review #{task}")
-    assert f"#{task}" in out and "](" in out and f"&task={task}" in out, out  # a task id resolves
-    assert "run 777" in out and "&run=777" in out, out                   # a run id
-    assert f"msg #{msg}" in out and f"&msg={msg}" in out, out            # a message id
-    assert f"[review #{task}](http://127.0.0.1:8123/#token=" in out, out  # a review names its task
+    assert f"#{task}" in out and "](" in out and f"#task={task}" in out, out  # a task id resolves
+    assert "run 777" in out and "#run=777" in out, out                   # a run id
+    assert f"msg #{msg}" in out and f"#msg={msg}" in out, out            # a message id
+    assert f"[review #{task}](http://127.0.0.1:8123/#task={task})" in out, out  # a review names its task
     assert "#4 (unresolved reference)" in out, out                       # an id that matches nothing
     assert "(unresolved" not in links.for_user(p, f"#{task}")          # resolution is not labelling
     p.set_config("links.web_base", "https://example.org/app")
-    assert "https://example.org/app/#token=" in links.for_user(p, f"#{task}")
+    assert f"https://example.org/app/#task={task}" in links.for_user(p, f"#{task}")
     assert links.problems("#4 needs a look", links.config(p)) and links.problems(f"#{task} done", links.config(p)) == []
 
 
@@ -177,7 +194,7 @@ def test_an_alert_text_reaches_the_user_linkified_from_a_fresh_connection(env):
     task = p.db.x("INSERT INTO tasks(created,title,spec) VALUES(?,?,?)", (0, "t", ""))
     p.db.post("out", f"alert about #{task}", kind="alert", severity="high")
     rows = [r for r in notifier.alerts_since(p, 0, "high") if not r.get("cleared")]
-    assert rows and f"#{task} (" in rows[0]["text"] and f"&task={task}" in rows[0]["text"], rows
+    assert rows and f"#{task} (" in rows[0]["text"] and f"#task={task}" in rows[0]["text"], rows
 
 
 def test_the_check_command_names_what_a_message_left_unlinked(env, capsys):
@@ -195,3 +212,42 @@ def test_the_check_command_names_what_a_message_left_unlinked(env, capsys):
     out = capsys.readouterr().out
     for shape in ("EX-1", "#2", "#3", "result.json"):
         assert shape in out, out
+
+
+def test_problems_reports_no_ticket_without_jira_keys(env):
+    from ttp import cli, links
+    none = {"repos": {}, "jira_keys": [], "file_url": None, "is_file": lambda p: False,
+            "single_repo": "", "jira_base": "", "ref_url": lambda n, kind: None}
+    assert links.problems("-3 and x-12 and run-4", none) == []
+    assert "ABC-12" in " ".join(links.problems("ABC-12 broke", dict(none, jira_keys=["ABC"])))
+    p = make(env)
+    p.db.post("out", "retry -3 then x-12", kind="reply", severity="normal")
+    cli.cmd_links(types.SimpleNamespace(name=p.name, file=None))   # exits 0: no SystemExit
+
+
+def test_no_outgoing_link_carries_the_web_token_and_a_second_pass_changes_nothing(env):
+    from ttp import links, web
+    p = make(env)
+    p.db.set_kv("web", {"port": 8123})
+    tok = web.token(p).strip()
+    task = p.db.x("INSERT INTO tasks(created,title,spec) VALUES(?,?,?)", (0, "t", ""))
+    p.db.x("INSERT INTO runs(id,task,role) VALUES(?,?,?)", (777, task, "worker"))
+    (p.state / "runs/777").mkdir(parents=True, exist_ok=True)
+    (p.state / "runs/777/result.json").write_text("{}")
+    text = f"#{task}, run 777, review #{task} and {p.state / 'runs/777/result.json'}"
+    for fmt in (links.MD, links.TEXT):
+        out = links.for_user(p, text, fmt)
+        assert out.count("http://127.0.0.1:8123/#") == 4, out
+        assert tok not in out and "token" not in out, out
+        assert links.for_user(p, out, fmt) == out                # idempotent in both shapes
+    p.set_config("links.web_base", "https://example.org/app")
+    assert tok not in links.for_user(p, f"#{task}")
+    assert links.for_user(p, "the queue runs 4 at a time, task 2 of 5") == "the queue runs 4 at a time, task 2 of 5"
+
+
+def test_the_web_app_keeps_its_token_for_token_free_links():
+    import pathlib
+    import ttp
+    js = (pathlib.Path(ttp.__file__).parent / "web/app.js").read_text()
+    assert 'localStorage.getItem("ttp_token")' in js and 'localStorage.setItem("ttp_token"' in js
+    assert 'Q.get("task")' in js   # a #task=N link opens its page

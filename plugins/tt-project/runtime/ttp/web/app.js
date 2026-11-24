@@ -45,17 +45,22 @@ const zoneFmt = (day) => {
 };
 const at = (ts) => ts ? zoneFmt(Math.abs(ts - Date.now() / 1000) >= 20 * 3600).format(new Date(ts * 1000)) : "—";
 
-let TOKEN = new URLSearchParams(location.hash.slice(1)).get("token") || sessionStorage.getItem("ttp_token") || "";
+// Message links carry no token (they reach chats and logs): the browser keeps the one the `ttp web`
+// link brought, in localStorage, which is scoped to this origin and port, so a link opened in a new
+// tab finds it. With none stored, ask for that link once.
+const tokenOf = (s) => new URLSearchParams(String(s || "").split("#").pop()).get("token") || "";
+let TOKEN = tokenOf(location.hash) || localStorage.getItem("ttp_token") || sessionStorage.getItem("ttp_token") || "";
+if (!TOKEN) TOKEN = tokenOf(prompt("Paste the link `ttp web` printed (it carries the access token):"));
 const Q = new URLSearchParams(location.hash.slice(1));
 const FILE = Q.get("file");            // a file link a message carries
 const TASK = Q.get("task"), RUN = Q.get("run"), MSG = Q.get("msg");   // and an id link: its page
-// The token lives only in this tab's sessionStorage and goes out as the X-TTP-Token header, never
-// in a cookie (cookies are not scoped by port). Expire the cookie older versions wrote.
+// The token goes out as the X-TTP-Token header, never in a cookie (cookies are not scoped by port).
+// Expire the cookie older versions wrote.
 document.cookie = "ttp_token=; Max-Age=0; SameSite=Strict; path=/";
-if (TOKEN) { sessionStorage.setItem("ttp_token", TOKEN); history.replaceState(null, "", location.pathname); }
+if (TOKEN) { localStorage.setItem("ttp_token", TOKEN); history.replaceState(null, "", location.pathname); }
 const api = async (path, body) => {
   const r = await fetch(path, { method: body ? "POST" : "GET", headers: { "X-TTP-Token": TOKEN, "Content-Type": "application/json" }, body: body ? JSON.stringify(body) : undefined });
-  if (r.status === 401) { document.body.innerHTML = "<main><p>Open this page with the link printed by <code>ttp web</code> (it carries the access token).</p></main>"; throw new Error("auth"); }
+  if (r.status === 401) { localStorage.removeItem("ttp_token"); document.body.innerHTML = "<main><p>Open this page with the link printed by <code>ttp web</code> (it carries the access token).</p></main>"; throw new Error("auth"); }
   return r.json();
 };
 
