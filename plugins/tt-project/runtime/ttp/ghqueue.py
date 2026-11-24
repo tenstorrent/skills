@@ -551,6 +551,13 @@ def _durable(f: Path, row: dict) -> None:
     durable_append(f, json.dumps(row) + "\n")
 
 
+def _record_delete(d, repo, branch, tip, rc, project, task, at) -> None:
+    """Keep one branch delete's tip in `d`'s DELETED record, so the branch can be restored."""
+    Path(d).mkdir(parents=True, exist_ok=True, mode=0o700)
+    _durable(Path(d) / DELETED, {"repo": repo, "branch": branch, "tip": tip, "rc": rc, "project": project,
+                                 "task": task, "at": at})
+
+
 def put(results, home=None) -> int:
     """Store the workstation's answers to calls taken here; returns how many were stored."""
     d, n = outbox(home), 0
@@ -572,8 +579,7 @@ def put(results, home=None) -> int:
                 and any(_DELETE_PATH.fullmatch(a) for a in argv[1:]):
             repo, branch = delete_target(v["argv"])
             done.update(tip=tip, branch=branch)
-            _durable(d / DELETED, {"repo": repo, "branch": branch, "tip": tip, "rc": done["rc"], "project": v.get("project"),
-                         "task": v.get("task"), "at": done["at"]})
+            _record_delete(d, repo, branch, tip, done["rc"], v.get("project"), v.get("task"), done["at"])
         _write(d / f"{key}.done", done)
         (d / f"{key}.taken").unlink(missing_ok=True)
         n += 1
@@ -614,41 +620,42 @@ def publish_here(gh: str, argv: list[str], bundle: bytes) -> tuple[int, str]:
     return 0, f"pushed {sha} to {repo} branch {branch}"
 
 
-def answer(entry: dict, gh: str | None = None, prefixes=()) -> dict | None:
+def answer(entry: dict, gh: str | None = None, prefixes=(), where: str = "on the workstation") -> dict | None:
     """Run one taken call with this computer's gh, if allowed() here (`prefixes`: the branch prefixes this
-    computer's bridge config grants beyond ttp/); its answer."""
+    computer's bridge config grants beyond ttp/; `where`: how its refusals and faults say where they happened); its
+    answer."""
     key = entry.get("key")
     if not isinstance(key, str) or not _KEY.fullmatch(key):
         return None
     try:
         stdin = base64.b64decode(entry.get("stdin") or "", validate=True)
     except (ValueError, TypeError):
-        return {"key": key, "rc": 1, "stdout": "", "stderr": "refused on the workstation: stdin is not base64"}
+        return {"key": key, "rc": 1, "stdout": "", "stderr": f"refused {where}: stdin is not base64"}
     argv = entry.get("argv")
     if why := allowed(argv, stdin, prefixes):
-        return {"key": key, "rc": 1, "stdout": "", "stderr": f"refused on the workstation: {why}"}
+        return {"key": key, "rc": 1, "stdout": "", "stderr": f"refused {where}: {why}"}
     gh = gh or shutil.which("gh", path=os.environ.get("PATH", "") + ":/opt/homebrew/bin:/usr/local/bin") or "gh"
     if argv[0] == PUBLISH:
         rc, said = publish_here(gh, argv, stdin)
         return {"key": key, "rc": rc, "stdout": f"{said}\n" if rc == 0 else "", "stderr": "" if rc == 0 else said,
                 **({"pushed": argv[3]} if rc == 0 else {})}
     if argv[:2] == ["pr", "close"] and (why := own_draft(gh, argv)):
-        return {"key": key, "rc": 1, "stdout": "", "stderr": f"refused on the workstation: {why}"}
+        return {"key": key, "rc": 1, "stdout": "", "stderr": f"refused {where}: {why}"}
     if argv[:2] == ["run", "rerun"] and (why := own_draft_run(gh, argv)):
-        return {"key": key, "rc": 1, "stdout": "", "stderr": f"refused on the workstation: {why}"}
+        return {"key": key, "rc": 1, "stdout": "", "stderr": f"refused {where}: {why}"}
     if argv[:2] == ["repo", "fork"] and (why := fork_free(gh, argv)):
-        return {"key": key, "rc": 1, "stdout": "", "stderr": f"refused on the workstation: {why}"}
+        return {"key": key, "rc": 1, "stdout": "", "stderr": f"refused {where}: {why}"}
     tip = ""
     if argv[0] == "api" and _delete(argv, prefixes) == "":
         why, tip = own_branch(gh, argv)
         if why:
-            return {"key": key, "rc": 1, "stdout": "", "stderr": f"refused on the workstation: {why}"}
+            return {"key": key, "rc": 1, "stdout": "", "stderr": f"refused {where}: {why}"}
     try:
         p = subprocess.run([gh, *argv], input=stdin, capture_output=True, timeout=GH_TIMEOUT_S)
     except subprocess.TimeoutExpired:
-        out = {"key": key, "rc": 124, "stdout": "", "stderr": f"gh timed out after {GH_TIMEOUT_S}s on the workstation"}
+        out = {"key": key, "rc": 124, "stdout": "", "stderr": f"gh timed out after {GH_TIMEOUT_S}s {where}"}
     except OSError as e:
-        return {"key": key, "rc": 127, "stdout": "", "stderr": f"gh could not run on the workstation: {e}"}
+        return {"key": key, "rc": 127, "stdout": "", "stderr": f"gh could not run {where}: {e}"}
     else:
         out = {"key": key, "rc": p.returncode, "stdout": p.stdout.decode("utf-8", "replace"),
                "stderr": p.stderr.decode("utf-8", "replace")}
@@ -758,15 +765,13 @@ def retire(branch: str, cwd: str | None = None, home=None) -> int:
         if not here_gh:
             return enqueue(argv, None, cwd, home, grants, key)
         argv = _with_repo(argv, repo)
-        got = answer({"key": _key(repo, argv, b""), "argv": argv, "stdin": ""}, prefixes=grants) or {}
+        got = answer({"key": _key(repo, argv, b""), "argv": argv, "stdin": ""}, prefixes=grants, where="here") or {}
         sys.stdout.write(str(got.get("stdout") or ""))
         sys.stderr.write(str(got.get("stderr") or ""))
         rc = got.get("rc") if isinstance(got.get("rc"), int) else 1
         if got.get("tip"):
-            outbox(home).mkdir(parents=True, exist_ok=True, mode=0o700)
-            _durable(outbox(home) / DELETED, {"repo": repo, "branch": branch, "tip": got["tip"], "rc": rc,
-                                              "project": _project(cwd), "task": os.environ.get("TTP_TASK", ""),
-                                              "at": time.time()})
+            _record_delete(outbox(home), repo, branch, got["tip"], rc, _project(cwd), os.environ.get("TTP_TASK", ""),
+                           time.time())
         return rc
 
     # Only a delete that succeeded answers a new request. A failed one (refused or not run on the
@@ -817,6 +822,9 @@ def retire(branch: str, cwd: str | None = None, home=None) -> int:
     got = io.StringIO()
     with contextlib.redirect_stdout(got):
         rc = ask(["pr", "list", "--head", branch, "--state", "open", "--json", "number"])
+    if rc and here_gh:
+        print(f"ttp push --retire: the open-PR check on `{branch}` failed (exit {rc}).", file=sys.stderr)
+        return rc
     if rc:
         print(f"ttp push --retire: the open-PR check on `{branch}` is not answered yet (exit {rc}); "
               "run the same call again once it is.", file=sys.stderr)
