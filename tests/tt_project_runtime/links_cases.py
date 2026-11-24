@@ -135,6 +135,13 @@ def _web_app(proj):
     return srv
 
 
+def _stop(*servers):
+    """Stop a test's web apps, so no server thread or port outlives the test."""
+    for s in servers:
+        s.shutdown()
+        s.server_close()
+
+
 def test_the_web_app_linkifies_its_messages_and_asks(env):
     p = make(env)
     p.set_config("links.jira_base", "https://jira.example.com")
@@ -206,9 +213,12 @@ def test_an_alert_text_reaches_the_user_linkified_from_a_fresh_connection(env):
     p.db.set_kv("web", {"port": srv.server_address[1]})
     task = p.db.x("INSERT INTO tasks(created,title,spec) VALUES(?,?,?)", (0, "t", ""))
     p.db.post("out", f"alert about #{task}", kind="alert", severity="high")
-    rows = [r for r in notifier.alerts_since(p, 0, "high") if not r.get("cleared")]
-    assert rows and f"#{task} (" in rows[0]["text"] and f"#task={task}" in rows[0]["text"], rows
-    weblink._ANSWERED.clear()
+    try:
+        rows = [r for r in notifier.alerts_since(p, 0, "high") if not r.get("cleared")]
+        assert rows and f"#{task} (" in rows[0]["text"] and f"#task={task}" in rows[0]["text"], rows
+        weblink._ANSWERED.clear()
+    finally:
+        _stop(srv)
 
 
 def test_the_check_command_names_what_a_message_left_unlinked(env, capsys):
@@ -315,31 +325,34 @@ def test_a_viewer_s_links_open_only_its_own_project_s_web_app(env, monkeypatch):
     mine = _web_app(types.SimpleNamespace(name="other"))   # what the host's own port serves here
     p.db.set_kv("web", {"port": mine.server_address[1]})
 
-    # the viewer's kept tunnel: its local port answers as this project, so links build on it
-    monkeypatch.setattr(tunnel, "installed", lambda name: {"local": app.server_address[1]})
-    line = cli._listen_line(p, m)
-    assert f"(http://127.0.0.1:{app.server_address[1]}/#task={task})" in line, line
-    assert f":{mine.server_address[1]}/" not in line, line
+    try:
+        # the viewer's kept tunnel: its local port answers as this project, so links build on it
+        monkeypatch.setattr(tunnel, "installed", lambda name: {"local": app.server_address[1]})
+        line = cli._listen_line(p, m)
+        assert f"(http://127.0.0.1:{app.server_address[1]}/#task={task})" in line, line
+        assert f":{mine.server_address[1]}/" not in line, line
 
-    # no kept tunnel, and the project's own port answers as another project: no URL at all
-    monkeypatch.setattr(tunnel, "installed", lambda name: None)
-    line = cli._listen_line(p, m)
-    assert "#task=" not in line and f"task #{task}" in line, line
+        # no kept tunnel, and the project's own port answers as another project: no URL at all
+        monkeypatch.setattr(tunnel, "installed", lambda name: None)
+        line = cli._listen_line(p, m)
+        assert "#task=" not in line and f"task #{task}" in line, line
 
-    # a viewer on another machine with no checked base: this host's port is never printed
-    monkeypatch.setenv("SSH_CONNECTION", "203.0.113.10 55555 22")
-    line = cli._listen_line(p, m)
-    assert "http://" not in line, line
+        # a viewer on another machine with no checked base: this host's port is never printed
+        monkeypatch.setenv("SSH_CONNECTION", "203.0.113.10 55555 22")
+        line = cli._listen_line(p, m)
+        assert "http://" not in line, line
 
-    # a forwarder's checked base: the host builds its links on it and records the proof
-    monkeypatch.delenv("SSH_CONNECTION")
-    passed = f"http://127.0.0.1:{app.server_address[1]}/"
-    base = cli.links_show_base(p, passed, 7, "the name the base answered as")
-    assert base == passed
-    assert f"(http://127.0.0.1:{app.server_address[1]}/#task={task})" in cli._listen_line(p, m, base=base)
-    rows = json.loads((p.state / "link-forwards.json").read_text())
-    assert rows[-1]["chat"] == 7 and rows[-1]["base"] == passed
-    assert rows[-1]["project"] == "the name the base answered as" and rows[-1]["ts"] > 0
+        # a forwarder's checked base: the host builds its links on it and records the proof
+        monkeypatch.delenv("SSH_CONNECTION")
+        passed = f"http://127.0.0.1:{app.server_address[1]}/"
+        base = cli.links_show_base(p, passed, 7, "the name the base answered as")
+        assert base == passed
+        assert f"(http://127.0.0.1:{app.server_address[1]}/#task={task})" in cli._listen_line(p, m, base=base)
+        rows = json.loads((p.state / "link-forwards.json").read_text())
+        assert rows[-1]["chat"] == 7 and rows[-1]["base"] == passed
+        assert rows[-1]["project"] == "the name the base answered as" and rows[-1]["ts"] > 0
+    finally:
+        _stop(app, mine)
 
 
 def test_the_notifier_s_alerts_use_the_viewer_s_checked_base(env, monkeypatch):
@@ -353,14 +366,17 @@ def test_the_notifier_s_alerts_use_the_viewer_s_checked_base(env, monkeypatch):
     other = _web_app(types.SimpleNamespace(name="other"))   # another project's app
     p.db.set_kv("web", {"port": other.server_address[1]})   # its own port serves another project
 
-    monkeypatch.setattr(tunnel, "installed", lambda name: {"local": app.server_address[1]})
-    rows = [r for r in notifier.alerts_since(p, 0, "high") if not r.get("cleared")]
-    assert rows and f"http://127.0.0.1:{app.server_address[1]}/#task={task}" in rows[0]["text"], rows
+    try:
+        monkeypatch.setattr(tunnel, "installed", lambda name: {"local": app.server_address[1]})
+        rows = [r for r in notifier.alerts_since(p, 0, "high") if not r.get("cleared")]
+        assert rows and f"http://127.0.0.1:{app.server_address[1]}/#task={task}" in rows[0]["text"], rows
 
-    monkeypatch.setattr(tunnel, "installed", lambda name: None)
-    weblink._ANSWERED.clear()
-    rows = [r for r in notifier.alerts_since(p, 0, "high") if not r.get("cleared")]
-    assert rows and "#task=" not in rows[0]["text"], rows
+        monkeypatch.setattr(tunnel, "installed", lambda name: None)
+        weblink._ANSWERED.clear()
+        rows = [r for r in notifier.alerts_since(p, 0, "high") if not r.get("cleared")]
+        assert rows and "#task=" not in rows[0]["text"], rows
+    finally:
+        _stop(app, other)
 
 
 def test_the_web_app_renders_its_message_links_relative_to_itself(env):
@@ -373,3 +389,83 @@ def test_the_web_app_renders_its_message_links_relative_to_itself(env):
     assert links.linkify(f"task #{task}", cfg) == f"[task #{task}](#task={task})"
     attention = web.state_payload(p, p.db)["attention"]
     assert attention and "](#task=" in attention[0]["text"] and "127.0.0.1" not in attention[0]["text"]
+
+
+
+
+@pytest.mark.parametrize("rejections", [
+    ["ttp: error: unrecognized arguments: --link-base http://127.0.0.1:18800/ --link-as demo"],
+    ["ttp: error: unrecognized arguments: --link-base http://127.0.0.1:18800/",
+     "ttp: error: unrecognized arguments: --link-as demo"],
+    ["ttp: error: unrecognized arguments: --holder mac/a --link-base http://127.0.0.1:18800/ "
+     "--link-as demo"],
+], ids=["both link flags", "one flag at a time", "holder and both link flags"])
+def test_an_older_project_host_still_gets_its_listener_s_messages(env, monkeypatch, capsys, rejections):
+    """A laptop upgraded before its project host: the host's older parser rejects the newer
+    optional flags, and the listener retries without the ones it names and relays its messages
+    (it would otherwise exit on the parse error and show nothing). Without the link flags the
+    host prints no URL at all, which is the safe fallback, never another project's page."""
+    from ttp import cli, tunnel, weblink
+    rejects, sent = [*rejections], []
+    named = {f for f in ("--holder", "--link-base", "--link-as") if f in " ".join(rejections)}
+
+    def ssh(entry, argv, capture=False):
+        sent.append(list(argv))
+        if rejects:
+            return subprocess.CompletedProcess(argv, 2, "", rejects.pop(0))
+        print("[#7 demo (reply, normal)] hi")
+        return subprocess.CompletedProcess(argv, 0, "", "")
+    monkeypatch.setattr(cli, "_ssh", ssh)
+    monkeypatch.setattr(cli, "_ssh_relay", lambda entry, argv, shown: ssh(entry, argv))
+    monkeypatch.setattr(cli, "flush_outbox", lambda *a, **k: None)
+    monkeypatch.setattr(tunnel, "installed", lambda name: {"local": 18800})
+    monkeypatch.setattr(weblink, "checked_base", lambda base, name: base)   # the tunnel answers
+    assert cli.forward_listen({"host": "far", "dir": "/x"},
+                              ["listen", "demo", "--chat", "c1", "--holder", "mac/a"], "demo") == 0
+    assert sent[0][-4:] == ["--link-base", "http://127.0.0.1:18800/", "--link-as", "demo"], sent[0]
+    assert len(sent) == len(rejections) + 1, sent
+    assert all(f not in sent[-1] for f in named), (named, sent[-1])
+    assert capsys.readouterr().out == "[#7 demo (reply, normal)] hi\n", "the listener keeps relaying"
+
+
+def test_a_forwarded_listener_picks_up_a_link_base_that_comes_up_after_it_started(env, monkeypatch):
+    """The forwarder decides the link base again on each reconnect while it has none, so a kept
+    tunnel or web app still coming up when the listener started still carries links once it
+    answers, without the listener restarting."""
+    from ttp import cli, weblink
+    argvs, answers = [], iter([None, None, "http://127.0.0.1:18800/"])
+
+    def forward(entry, argv, quiet=False, shown=None, failure=None):
+        argvs.append(list(argv))
+        return 255 if len(argvs) < 3 else 0     # two drops, then a clean end
+    monkeypatch.setattr(cli, "forward", forward)
+    monkeypatch.setattr(cli, "flush_outbox", lambda *a, **k: None)
+    monkeypatch.setattr(cli.time, "sleep", lambda s: None)
+    monkeypatch.setattr(cli, "LINK_BASE_RECHECK_S", 0.0)   # every reconnect re-decides at once
+    monkeypatch.setattr(weblink, "tunnel_base", lambda name: next(answers))
+    assert cli.forward_listen({"host": "far", "dir": "/x"}, ["listen", "demo", "--chat", "c1"],
+                              "demo") == 0
+    assert len(argvs) == 3 and "--link-base" not in argvs[0], argvs[0]
+    assert argvs[2][-4:] == ["--link-base", "http://127.0.0.1:18800/", "--link-as", "demo"], argvs[2]
+
+
+def test_the_forwarded_base_proof_row_records_once_per_change(env):
+    """A listener that re-decides its link base records one proof row per change of it, not one
+    per batch: the row is what proves a viewer's checked base reached this host."""
+    from ttp import cli
+    p = make(env)
+    app = _web_app(p)
+    try:
+        passed = f"http://127.0.0.1:{app.server_address[1]}/"
+        rows = lambda: json.loads((p.state / "link-forwards.json").read_text())
+        assert cli.links_show_base(p, passed, 7, "demo") == passed
+        assert rows() == [{"chat": 7, "base": passed, "project": "demo",
+                            "ts": rows()[-1]["ts"]}] and len(rows()) == 1
+        # the same base again: nothing new is recorded
+        assert cli.links_show_base(p, passed, 7, "demo", noted=passed) == passed
+        assert len(rows()) == 1
+        # a changed base: one more row, naming it
+        assert cli.links_show_base(p, "http://127.0.0.1:9/", 7, "demo", noted=passed)
+        assert [r["base"] for r in rows()] == [passed, "http://127.0.0.1:9/"]
+    finally:
+        _stop(app)

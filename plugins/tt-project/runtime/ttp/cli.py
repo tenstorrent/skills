@@ -34,7 +34,7 @@ _STARTED_BY = (os.getpid(), os.getppid())
 
 from . import __version__, poll_s  # noqa: E402
 from .db import CHANGES_NEEDED, REPLIES_ONLY, SUPERSEDED, chat_floor, task_outcome
-from . import outbox, redact
+from . import links, outbox, redact
 from .devq import unmask_devices
 from .detach import VERDICT_SH as _DETACH_VERDICT_SH
 from . import chatgone, checksqueue, checkwait, hoststate, runnerenv, setupfault, sshcmd, syntaxfault, timefmt, workerloss
@@ -127,7 +127,7 @@ RUNWATCH_STALE_S = 180   # `ttp runs live` reads afresh once the daemon's runwat
 LISTEN_GRACE_S = 60     # a listener reconnecting within this says nothing about the drop
 LISTEN_CONNECTED_S = 25  # an ssh session that lasted this long had connected (ConnectTimeout is 20 s)
 LISTEN_REPLACED = 3   # a newer listener for the same chat took over; this one stops and does not reconnect
-_UNSET_BASE = object()   # an unset link base: _listen_line decides it
+LINK_BASE_RECHECK_S = 60   # how often a listener re-decides a link base whose check failed
 REPLACED_MARK = "ttp: replaced by a newer listener"   # its stderr line, read even when ssh reports a drop
 _MSG_LINE = re.compile(r"\[#(\d+) ")
 
@@ -188,7 +188,8 @@ def forward_listen(entry: dict, argv: list[str], name: str | None = None) -> int
     # links on it, so a link opens this project's pages on this machine, never whatever answers
     # on the host's own port here.
     from . import weblink
-    if (base := weblink.tunnel_base(name)) and "--link-base" not in argv:
+    base, probed = weblink.tunnel_base(name), time.time()
+    if base and "--link-base" not in argv:
         argv = [*argv, "--link-base", base, "--link-as", name]
     limit = _listen_timeout(argv)
     deadline = time.time() + limit if limit > 0 else None
@@ -196,6 +197,12 @@ def forward_listen(entry: dict, argv: list[str], name: str | None = None) -> int
     delay, told, held, tries = 5.0, False, False, 0
     down_since, connected, drop = None, False, None
     while True:
+        if base is None and name and time.time() - probed >= LINK_BASE_RECHECK_S:
+            # a tunnel or web app still coming up: the base is decided again, so links arrive
+            # without restarting the listener (a base that answered is kept by weblink's cache)
+            probed = time.time()
+            if (base := weblink.tunnel_base(name)) and "--link-base" not in argv:
+                argv = [*argv, "--link-base", base, "--link-as", name]
         start = time.time()
         failed = flush_outbox(name, entry, quiet=held) if name else None
         held = held or failed is not None
@@ -318,8 +325,8 @@ def forward(entry: dict, argv: list[str], quiet: bool = False, shown: set[int] |
         # The far side said so before it went: whatever ssh reports (255, 143), this is no drop.
         sys.stderr.write(r.stderr)
         return LISTEN_REPLACED
-    if _old_holder(r, argv):   # an older runtime there has no listener lease: relay without it
-        return forward(entry, _drop_holder(argv), quiet, shown, failure)
+    if (dropped := _drop_unrecognized(argv, r)) is not None:   # an older runtime there: retry without what it lacks
+        return forward(entry, dropped, quiet, shown, failure)
     if failure is not None and _dropped(r.returncode):   # the caller explains the drop, if it lasts
         failure.append(r.stderr or "")
     elif r.returncode == SSH_FAILED:   # ssh itself failed: the project's state is kept there
@@ -339,16 +346,26 @@ def forward(entry: dict, argv: list[str], quiet: bool = False, shown: set[int] |
     return r.returncode
 
 
-def _old_holder(r: subprocess.CompletedProcess, argv: list[str]) -> bool:
-    """Whether the far side's parser rejected --holder (a runtime older than the listener lease),
-    not a lease refusal, which also exits 2 but names no unknown option."""
+_NEWER_FLAGS = ("--holder", "--link-base", "--link-as")   # newer optional flags an older runtime lacks
+
+
+def _drop_unrecognized(argv: list[str], r: subprocess.CompletedProcess) -> list[str] | None:
+    """argv without the newer optional flags the far side's parser named as unrecognized, each with
+    its value: a runtime older than a flag keeps working without it, so the caller retries. None
+    when the far side rejected nothing of ours: a lease refusal also exits 2 but names no unknown
+    option, and is never retried."""
     err = r.stderr or ""
-    return r.returncode == 2 and "--holder" in argv and "unrecognized arguments" in err and "--holder" in err
-
-
-def _drop_holder(argv: list[str]) -> list[str]:
-    i = argv.index("--holder")
-    return argv[:i] + argv[i + 2:]
+    drop = {f for f in _NEWER_FLAGS if f in err and f in argv}
+    if r.returncode != 2 or "unrecognized arguments" not in err or not drop:
+        return None
+    out, i = [], 0
+    while i < len(argv):
+        if argv[i] in drop:
+            i += 2          # the flag and the value behind it go together
+        else:
+            out.append(argv[i])
+            i += 1
+    return out
 
 
 def _send_say(entry: dict, argv: list[str], client_id: str, capture: bool = False) -> subprocess.CompletedProcess:
@@ -1196,11 +1213,12 @@ def connect_remote(name: str, entry: dict, argv: list[str]) -> int:
     home = [] if timefmt.in_ssh_login() else ["--home-tz", timefmt.detect_local(), "--home-from", hostname()]
     r = _ssh(entry, [*argv, *home], capture=True)
     while r.returncode == 2:   # an older runtime there: connect without what it lacks (one parse error names all)
-        old_tz, old_holder = bool(home) and "--home-tz" in (r.stderr or ""), _old_holder(r, argv)
-        if not (old_tz or old_holder):
+        old_tz = bool(home) and "--home-tz" in (r.stderr or "")
+        dropped = _drop_unrecognized(argv, r)
+        if not (old_tz or dropped is not None):
             break
         home = [] if old_tz else home
-        argv = _drop_holder(argv) if old_holder else argv
+        argv = dropped if dropped is not None else argv
         r = _ssh(entry, [*argv, *home], capture=True)
     if r.returncode == SSH_FAILED:
         _unreachable(entry, r.stderr)
@@ -1579,13 +1597,16 @@ def _register_say_chat(db, chat: str, label: str, caller: str) -> None:
     db.set_kv(chatgone.SAY_FROM + chat, top)
 
 
-def links_show_base(p, passed: str | None, chat=None, answered_as: str = "") -> str | None:
+def links_show_base(p, passed: str | None, chat=None, answered_as: str = "",
+                    noted: str | None = None) -> str | None:
     """The link base this process's viewer sees (links.show_base). A listener that a viewer's own
-    side checked a base for has that check recorded in the project's state, as its proof."""
+    side checked a base for has that check recorded in the project's state, as its proof.
+    `noted`: the base this chat last recorded, so a listener that re-decides its base records one
+    row per change of it, not one per batch."""
     try:
         from . import links
         base = links.show_base(p, passed=passed)
-        if passed and base and chat is not None:
+        if passed and base and chat is not None and base != noted:
             links.note_forward(p, chat, base, answered_as)
         return base
     except Exception:
@@ -1732,6 +1753,7 @@ def _listen_loop(p: Project, db, a, after: int, floor: str) -> None:
     window = relayers.batch_s(p.config(), getattr(a, "batch", None))
     base = links_show_base(p, getattr(a, "link_base", None), getattr(a, "chat", None),
                            getattr(a, "link_as", ""))
+    noted, probed = base, time.time()
     pending: list = []
     read, beat, broke = after, time.time(), 0.0
     while True:
@@ -1748,6 +1770,13 @@ def _listen_loop(p: Project, db, a, after: int, floor: str) -> None:
             (ready if how == "now" else pending if how == "batch" else []).append(m)
         late = deadline and time.time() > deadline
         if ready or (pending and (late or time.time() >= min(m["ts"] for m in pending) + window)):
+            if base is None and time.time() - probed >= LINK_BASE_RECHECK_S:
+                # a base whose check failed (a tunnel or web app still coming up) is decided
+                # again, bounded, so later batches carry links without restarting the listener
+                probed = time.time()
+                base = links_show_base(p, getattr(a, "link_base", None), getattr(a, "chat", None),
+                                       getattr(a, "link_as", ""), noted=noted)
+                noted = base or noted
             ready, pending = sorted(ready + pending, key=lambda m: m["id"]), []
             for m in ready:
                 try:
@@ -1785,7 +1814,7 @@ def _listen_loop(p: Project, db, a, after: int, floor: str) -> None:
         time.sleep(poll_s(2))
 
 
-def _listen_line(p: Project, m: dict, plain: bool = False, base=_UNSET_BASE) -> str:
+def _listen_line(p: Project, m: dict, plain: bool = False, base=links.UNSET) -> str:
     """The line a listener prints for message `m`, its text linkified (links.for_user), or as it is
     (`plain`: when the linkifier cannot load or fails, the message still goes out). `base`: the
     link base this viewer's message links use; an unset base is decided here (links.show_base),
@@ -1795,7 +1824,7 @@ def _listen_line(p: Project, m: dict, plain: bool = False, base=_UNSET_BASE) -> 
     if plain:
         return f"[#{m['id']} {who}] {m['text']}"
     from . import links
-    if base is _UNSET_BASE:
+    if base is links.UNSET:
         base = links.show_base(p)
     return f"[#{m['id']} {who}] {links.for_user(p, m['text'], links.MD, base=base)}"
 

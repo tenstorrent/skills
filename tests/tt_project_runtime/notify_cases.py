@@ -862,6 +862,40 @@ def test_listen_wakes_a_relayer_only_for_user_facing_messages_and_batches_broadc
     assert alert < alert2
 
 
+def test_a_listener_picks_up_a_link_base_that_answers_after_it_started(env, monkeypatch, capsys):
+    """A web app or kept tunnel still coming up when the listener starts: the first message goes
+    out with no URL (its base never checked), and the base is decided again about once a minute,
+    so messages from later batches carry the checked link without the listener restarting."""
+    from ttp import cli, weblink
+    p = make(env)
+    _relay_chat(p)
+    weblink._ANSWERED.clear()
+    task = p.db.x("INSERT INTO tasks(created,title,spec) VALUES(?,?,?)", (0, "t", ""))
+    srv = _web_app(p)                     # this project's web app, still coming up
+    p.db.set_kv("web", {"port": srv.server_address[1]})
+    p.db.post("out", f"first, about #{task}", chat="c1", kind="reply", severity="normal")
+    checks, real = [0], weblink.page_answers
+
+    def first_fails(*a):
+        checks[0] += 1
+        return real(*a) if checks[0] > 1 else False   # its first check fails, later ones answer
+    monkeypatch.setattr(weblink, "page_answers", first_fails)
+    monkeypatch.setattr(cli, "here", lambda: None)
+
+    def second(n):   # past the once-a-minute recheck bound: a message that should get the link
+        if n == 31:  # 31 naps of 2 s: the clock has moved a minute since the failed check
+            p.db.post("out", f"second, about #{task}", chat="c1", kind="reply", severity="normal")
+    _fake_clock(cli, monkeypatch, on_nap=second)
+    try:
+        cli.main(["listen", "demo", "--chat", "c1", "--timeout", "70"])
+    finally:
+        _stop(srv)
+    first_line, second_line = capsys.readouterr().out.strip().splitlines()
+    assert "first" in first_line and "http" not in first_line, first_line
+    assert "second" in second_line, second_line
+    assert f"(http://127.0.0.1:{srv.server_address[1]}/#task={task})" in second_line, second_line
+
+
 def test_listen_never_marks_an_alert_still_waiting_for_its_batch_read(env, monkeypatch, capsys):
     """A listener that ends before its batch window leaves the waiting alert for the next one."""
     from ttp import cli
