@@ -7,9 +7,10 @@ linkify(text, cfg, fmt) turns each reference into a link: a configured Jira key 
 Jira base's browse page; owner/repo#N and repo#N (a configured short name) link to the GitHub issue
 URL (GitHub forwards a PR); 'PR/pull request/issue #N' links only when the project has exactly one
 GitHub repo; a path in the project's repo that exists at the pushed commit links to the GitHub blob
-at that commit, one on the project host to the web app's file view. A '#N' (bare or with a kind
-word: 'task', 'run', 'review', 'msg') is a tt-project id: it links to the web app's page for that
-task, run or message, and one that resolves to none is labelled, never left bare. Existing URLs,
+at that commit, one on the project host to the web app's file view. A '#N' after 'task', 'run',
+'review' or 'ask' (a list such as 'tasks #N, #M and #K' too) links to the web app's page for it. A
+chat message's '#N' ('Re #N', 'msg #N', 'user msg #N') never links: message and task ids overlap. A
+bare '#N' links as a task only when no message has that id; one naming nothing is labelled. Existing URLs,
 markdown links, code spans and code fences are left alone, so a second pass links nothing twice.
 Stored records stay raw; callers linkify only at the outgoing boundary (the listener's line, the
 web app's message list and asks, `ttp status`).
@@ -35,15 +36,26 @@ PROTECTED = re.compile(
 REF = r"(?<![\w/.-])(?P<rname>[A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.-]+)?)(?<!\.)#(?P<rnum>\d+)\b"
 # 'PR/pull request/issue #N': no repo named, so a repo is picked only when the project has one.
 PR_PHRASE = r"(?i:\b(?:PRs?|pull requests?|issues?)\s*:?\s*)(?P<pnum>#\d+\b)"
-# A tt-project id: bare '#N', or with its kind word ('task #N', 'run 20240', 'review #N', 'msg #N',
-# 'ask #N'). Resolution (cfg's ref_url) decides whether it links; 'msg'/'message'/'ask' name a
-# message row (an ask is a message), 'review' names the review task. Without the '#' a kind word
-# takes only a 3+ digit id: 'run 4 at a time' and 'task 2 of 5' are counts.
-ID_REF = (r"(?i:(?:(?P<ikind>task|run|review|msg|message|ask)\b\s*:?\s*)?(?<![\w/])#(?P<inum>\d+)\b"
+# A tt-project id: bare '#N', or with its kind word ('task #N', 'run 20240', 'review #N', 'ask #N',
+# 'tasks #N, #M and #K': a list's ids share its word). Resolution (cfg's ref_url) decides whether it
+# links; 'review' names the review task, 'ask' its message row. 'Re'/'msg'/'message' name a chat
+# message and stay plain. Without the '#' a kind word takes only a 3+ digit id: 'run 4 at a time'
+# and 'task 2 of 5' are counts.
+ID_REF = (r"(?i:(?:\b(?P<ikind>tasks?|runs?|reviews?|asks?|msgs?|messages?|re)\b\s*:?\s*)?(?<![\w/])"
+          r"#(?P<inum>\d+)\b(?P<ilist>(?:\s*,\s*(?:and\s+|or\s+)?#\d+\b|\s+(?:and|or|&)\s+#\d+\b)*)"
           r"|\b(?P<kkind>task|run|review)\s+(?P<knum>\d{3,})\b)")
 ID_REF_RE = re.compile(ID_REF)
-KIND = {"task": "task", "run": "run", "review": "task", "msg": "msg", "message": "msg", "ask": "msg"}
+KIND = {"task": "task", "run": "run", "review": "task", "ask": "msg"}
 TABLES = {"task": "tasks", "run": "runs", "msg": "messages"}   # where each kind of id lives
+PLAIN = ("msg", "msgs", "message", "messages", "re")   # chat message words: never a link (ids overlap tasks')
+
+
+def _kind(word: str) -> str:
+    """The kind a matched word names ('' for a bare id): plural words name their singular."""
+    w = word.lower()
+    return KIND.get(w) or KIND.get(w[:-1], "") if w else ""
+
+
 # A path-like token: at least one '/', then an optional :line or :line-line suffix kept in the text.
 PATH = r"(?<![\w`~/.-])(?P<p>(?:~|\.{1,2})?/?(?:[\w.+@-]+/)+[\w.+@-]+)(?P<line>:\d+(?:-\d+)?)?"
 
@@ -75,6 +87,15 @@ def linkify(text: str, cfg: dict, fmt: str = MD) -> str:
     single = str(cfg.get("single_repo") or "")
     file_url = cfg.get("file_url")
     ref = cfg.get("ref_url")
+    ok = cfg.get("ref_ok")
+
+    def id_link(text_: str, n: int, kind: str) -> str:
+        url = ref(n, kind) if ref else None
+        if url:
+            return _fmt(text_, url, fmt)
+        if kind or ref is None or (ok and ok(n, "msg")):
+            return text_   # a kinded id keeps its own label; a bare message id is plain text
+        return f"{text_} (unresolved reference)"   # a bare id naming nothing is never left bare
 
     def one(m: re.Match) -> str:
         g = m.groupdict()   # whichever alternative matched, None for the absent groups
@@ -86,13 +107,17 @@ def linkify(text: str, cfg: dict, fmt: str = MD) -> str:
         if g.get("pnum") is not None:
             return _fmt(m.group(0), repo_url(single, int(g["pnum"].lstrip("#"))), fmt) if single else m.group(0)
         if g.get("inum") is not None or g.get("knum") is not None:
-            n = int(g["inum"] or g["knum"])
             word = (g.get("ikind") or g.get("kkind") or "").lower()
-            url = ref(n, KIND.get(word, word)) if ref else None
-            if url:
-                return _fmt(m.group(0), url, fmt)
-            # a kinded id keeps its own label; a bare one gets one, so it is never left bare
-            return m.group(0) if (word or ref is None) else f"{m.group(0)} (unresolved reference)"
+            if word in PLAIN:
+                return m.group(0)
+            ilist = g.get("ilist") or ""
+            head = m.group(0)[:len(m.group(0)) - len(ilist)]
+            kind = _kind(word)
+
+            def item(x: re.Match) -> str:   # a list id not of its word's kind reads as a bare id,
+                url = ref(int(x.group(1)), kind) if ref else None   # as a second pass would read it
+                return _fmt(x.group(0), url, fmt) if url else id_link(x.group(0), int(x.group(1)), "")
+            return id_link(head, int(g["inum"] or g["knum"]), kind) + re.sub(r"#(\d+)", item, ilist)
         url = file_url(g["p"]) if file_url else None
         return _fmt(m.group(0), url, fmt) if url else m.group(0)
 
@@ -136,12 +161,16 @@ def problems(text: str, cfg: dict) -> list[str]:
     for m in ID_REF_RE.finditer(text):
         if any(a <= m.start() < b for a, b in taken):
             continue
-        n = int(m.group("inum") or m.group("knum"))
-        word = (m.group("ikind") or m.group("kkind") or "").lower()
-        if not ref or not ref(n, KIND.get(word, word)):
-            out.append(f"{m.group(0)}: no task, run or message of this project; if it is a PR or "
-                       f"issue, name its repo")
         taken.append(m.span())
+        word = (m.group("ikind") or m.group("kkind") or "").lower()
+        if word in PLAIN:
+            continue   # a chat message id is left plain on purpose
+        ids = [int(m.group("inum") or m.group("knum"))] + [int(x) for x in re.findall(r"#(\d+)", m.group("ilist") or "")]
+        for i, n in enumerate(ids):
+            kinds = [_kind(word)] + ([""] if i and word else [])   # a list id may also read as bare
+            if not ref or not any(ref(n, k) or (not k and ref(n, "msg")) for k in kinds):
+                out.append(f"{m.group(0)}: no task, run or message #{n} of this project; if it is a PR "
+                           f"or issue, name its repo")
     return out
 
 
@@ -183,12 +212,16 @@ def config(p, db=None, base=UNSET) -> dict:
             "file_url": file_url, "is_file": is_file, "ref_ok": exists, "ref_url": _ref_url(web, exists)}
 
 def _exists(p, db):
-    """Whether id `n` names a record of `kind`; a bare '#N' names a task (a run or message id
-    says its kind). `db` is the caller's own connection: p.db belongs to the thread that opened it."""
+    """Whether id `n` names a record of `kind`; a bare '#N' names a task only when no chat message
+    has that id (the two id ranges overlap). `db` is the caller's own connection: p.db belongs to
+    the thread that opened it."""
+    def one(k: str, n: int) -> bool:
+        return bool((db or p.db).one(f"SELECT 1 FROM {TABLES[k]} WHERE id=?", (n,)))
+
     def exists(n: int, kind: str) -> bool:
         try:
-            k = KIND.get(kind, kind) or "task"
-            return bool((db or p.db).one(f"SELECT 1 FROM {TABLES[k]} WHERE id=?", (n,)))
+            k = KIND.get(kind, kind)
+            return one(k, n) if k else (one("task", n) and not one("msg", n))
         except Exception:   # a db fault never breaks a message
             return False
     return exists
@@ -199,7 +232,7 @@ def _ref_url(web, exists):
     if web is None:
         return None   # no page to link to: leave ids as written rather than label every one wrong
     def ref(n: int, kind: str):
-        k = KIND.get(kind, kind) or "task"   # a bare '#N' pages as the task it names
+        k = KIND.get(kind, kind) or "task"   # a bare '#N' that resolves pages as the task it names
         return f"{web}#{k}={n}" if exists(n, kind) else None
     return ref
 

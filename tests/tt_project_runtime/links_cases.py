@@ -28,8 +28,7 @@ def test_linkify_links_pr_words_only_with_one_repo_and_a_number_is_an_id_link():
     assert links.linkify("PR #9", {"single_repo": ""}) == "PR #9"          # no single repo: stays
     # a '#N' is a tt-project id: it links to its web app page
     assert links.linkify("see #5", CFG) == "see [#5](http://127.0.0.1:9/#token=ab&task=5)"
-    for text, kind in (("task #5", "task"), ("run #5", "run"), ("review #5", "task"), ("msg #5", "msg"),
-                       ("ask #5", "msg")):
+    for text, kind in (("task #5", "task"), ("run #5", "run"), ("review #5", "task"), ("ask #5", "msg")):
         out = links.linkify(text, CFG)
         assert f"&{kind}=5" in out and f"[{text}]" in out, (text, out)
     assert links.linkify("run 5", CFG) == "run 5"   # without '#', a short number is a count
@@ -42,6 +41,26 @@ def test_linkify_links_pr_words_only_with_one_repo_and_a_number_is_an_id_link():
     # a second pass adds nothing
     once = links.linkify("task #5 needs a look", CFG)
     assert links.linkify(once, CFG) == once
+
+
+def test_message_ids_never_become_task_links():
+    from ttp import links
+    tasks = {9675, 9707, 9720, 9733, 4311}   # 4311 is also a chat message id below
+    cfg = {"ref_ok": lambda n, kind: n == 4311 if kind == "msg" else kind in ("", "task") and n in tasks,
+           "ref_url": lambda n, kind: f"http://w/#task={n}" if kind in ("", "task") and n in tasks - {4311} else None}
+    for text in ("Re #4311: two things", "user msg #4311 asked", "message #4311", "msg #9733", "Re: #9733"):
+        assert links.linkify(text, cfg) == text, text   # a chat message's id never links
+    assert links.linkify("see #4311", cfg) == "see #4311"   # a bare id a message also has: plain, unlabelled
+    assert links.linkify("task #9733 done", cfg) == "[task #9733](http://w/#task=9733) done"
+    out = links.linkify("tasks #9675, #9707 and #9720 landed", cfg)
+    assert out == ("[tasks #9675](http://w/#task=9675), [#9707](http://w/#task=9707) and "
+                   "[#9720](http://w/#task=9720) landed"), out
+    assert links.linkify(out, cfg) == out
+    assert links.problems("Re #4311, see #4311 and tasks #9675, #9707", cfg) == []
+    assert "#99" in " ".join(links.problems("tasks #9675 and #99", cfg))
+    once = links.linkify("tasks #9675 and #99, run #1 and #9733", cfg)   # a list id not of its word's kind
+    assert "#99 (unresolved reference)" in once and "[#9733](http://w/#task=9733)" in once, once
+    assert links.linkify(once, cfg) == once                              # reads the same on a second pass
 
 
 def test_linkify_never_links_twice_or_inside_protected_spans():
@@ -166,7 +185,7 @@ def test_the_web_app_linkifies_its_messages_and_asks(env):
             return json.loads(urllib.request.urlopen(req, timeout=10).read())
         p.db.set_kv("web", {"port": 9})   # a web app link exists: ids resolve to its pages
         task = p.db.x("INSERT INTO tasks(created,title,spec) VALUES(?,?,?)", (0, "t", ""))
-        p.db.post("out", f"#{task} finished", kind="reply", severity="normal")
+        p.db.post("out", f"task #{task} finished", kind="reply", severity="normal")
         rows = [r for r in get("/api/messages") if "EX-8" in r["text"]]
         assert rows and "](https://jira.example.com/browse/EX-8)" in rows[0]["text"], rows
         # an id reference resolves from the web app's own thread and connection, not p.db
@@ -194,16 +213,21 @@ def test_ids_link_to_their_web_app_page_and_unresolved_ones_get_labelled(env):
     p.db.x("INSERT INTO runs(id,task,role) VALUES(?,?,?)", (777, task, "worker"))
     msg = p.db.post("out", "task %d is running" % task, kind="reply", severity="normal")
     from ttp import links
-    out = links.for_user(p, f"#{task} and run 777 and msg #{msg} and #4 and review #{task}")
+    out = links.for_user(p, f"#4 or task #{task} and run 777 and ask #{msg} and review #{task}")
     assert f"#{task}" in out and "](" in out and f"#task={task}" in out, out  # a task id resolves
     assert "run 777" in out and "#run=777" in out, out                   # a run id
-    assert f"msg #{msg}" in out and f"#msg={msg}" in out, out            # a message id
+    assert f"ask #{msg}" in out and f"#msg={msg}" in out, out            # an ask: its message page
     assert f"[review #{task}](http://127.0.0.1:8123/#task={task})" in out, out  # a review names its task
     assert "#4 (unresolved reference)" in out, out                       # an id that matches nothing
-    assert "(unresolved" not in links.for_user(p, f"#{task}")          # resolution is not labelling
+    assert "(unresolved" not in links.for_user(p, f"task #{task}")          # resolution is not labelling
     p.set_config("links.web_base", "https://example.org/app")
-    assert f"https://example.org/app/#task={task}" in links.for_user(p, f"#{task}")
-    assert links.problems("#4 needs a look", links.config(p)) and links.problems(f"#{task} done", links.config(p)) == []
+    assert f"https://example.org/app/#task={task}" in links.for_user(p, f"task #{task}")
+    assert links.problems("#4 needs a look", links.config(p)) and links.problems(f"task #{task} done", links.config(p)) == []
+    assert links.for_user(p, f"see #{msg}") == f"see #{msg}"   # a bare id a chat message has: never a task link
+    other = p.db.x("INSERT INTO tasks(created,title,spec) VALUES(?,?,?)", (0, "u", ""))
+    while p.db.q("SELECT 1 FROM messages WHERE id=?", (other,)):
+        other = p.db.x("INSERT INTO tasks(created,title,spec) VALUES(?,?,?)", (0, "u", ""))
+    assert f"#task={other}" in links.for_user(p, f"see #{other}")   # one only a task has still links
 
 
 def test_an_alert_text_reaches_the_user_linkified_from_a_fresh_connection(env):
@@ -212,7 +236,7 @@ def test_an_alert_text_reaches_the_user_linkified_from_a_fresh_connection(env):
     srv = _web_app(p)                      # a web app this machine reaches and that answers as p
     p.db.set_kv("web", {"port": srv.server_address[1]})
     task = p.db.x("INSERT INTO tasks(created,title,spec) VALUES(?,?,?)", (0, "t", ""))
-    p.db.post("out", f"alert about #{task}", kind="alert", severity="high")
+    p.db.post("out", f"alert about task #{task}", kind="alert", severity="high")
     try:
         rows = [r for r in notifier.alerts_since(p, 0, "high") if not r.get("cleared")]
         assert rows and f"#{task} (" in rows[0]["text"] and f"#task={task}" in rows[0]["text"], rows
@@ -258,14 +282,14 @@ def test_no_outgoing_link_carries_the_web_token_and_a_second_pass_changes_nothin
     p.db.x("INSERT INTO runs(id,task,role) VALUES(?,?,?)", (777, task, "worker"))
     (p.state / "runs/777").mkdir(parents=True, exist_ok=True)
     (p.state / "runs/777/result.json").write_text("{}")
-    text = f"#{task}, run 777, review #{task} and {p.state / 'runs/777/result.json'}"
+    text = f"task #{task}, run 777, review #{task} and {p.state / 'runs/777/result.json'}"
     for fmt in (links.MD, links.TEXT):
         out = links.for_user(p, text, fmt)
         assert out.count("http://127.0.0.1:8123/#") == 4, out
         assert tok not in out and "token" not in out, out
         assert links.for_user(p, out, fmt) == out                # idempotent in both shapes
     p.set_config("links.web_base", "https://example.org/app")
-    assert tok not in links.for_user(p, f"#{task}")
+    assert tok not in links.for_user(p, f"task #{task}")
     assert links.for_user(p, "the queue runs 4 at a time, task 2 of 5") == "the queue runs 4 at a time, task 2 of 5"
 
 
@@ -361,7 +385,7 @@ def test_the_notifier_s_alerts_use_the_viewer_s_checked_base(env, monkeypatch):
     p = make(env)
     weblink._ANSWERED.clear()
     task = p.db.x("INSERT INTO tasks(created,title,spec) VALUES(?,?,?)", (0, "t", ""))
-    p.db.post("out", f"alert about #{task}", kind="alert", severity="high")
+    p.db.post("out", f"alert about task #{task}", kind="alert", severity="high")
     app = _web_app(p)                                       # this project's web app
     other = _web_app(types.SimpleNamespace(name="other"))   # another project's app
     p.db.set_kv("web", {"port": other.server_address[1]})   # its own port serves another project
@@ -383,7 +407,7 @@ def test_the_web_app_renders_its_message_links_relative_to_itself(env):
     p = make(env)
     task = p.db.x("INSERT INTO tasks(created,title,spec) VALUES(?,?,?)", (0, "t", ""))
     p.db.set_kv("web", {"port": 8123})   # the host's own port: irrelevant to the page it serves
-    p.db.post("out", f"is #{task} on track?", kind="ask", severity="normal")
+    p.db.post("out", f"is task #{task} on track?", kind="ask", severity="normal")
     from ttp import links, web
     cfg = links.config(p, p.db, base="")
     assert links.linkify(f"task #{task}", cfg) == f"[task #{task}](#task={task})"
