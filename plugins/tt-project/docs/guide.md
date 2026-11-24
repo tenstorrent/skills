@@ -4365,6 +4365,17 @@ mark to the first unblock action.
   ended on a remote error puts its entries back with no try, no death and no backoff.
 - A batch cut short by a reboot still resumes at once, with no try counted.
 
+## A hand-off's landed claims are checked without a model
+
+A hand-off or note that says the run's change landed, was pushed or sits on the push branch is
+checked against that branch before the task is recorded: `landed.check` is the one decider, one
+bounded fetch of the branch runs before the write, a fetch that fails marks the claim
+"(unverified)" instead of settling it, and a claim the branch does not hold is rewritten to read
+"not landed: <sha> is not on <push branch>". A claim naming a commit is checked as written. A
+claim naming no commit is checked only when its sentence names the push branch, or says "landed"
+while naming no other destination. Known gap: a sha-less push claim naming another destination
+(the run's own branch, a PR branch, a fork) is not checked.
+
 ## A report-only next step settles a wait without a model
 
 A task that hands off `waiting` on its own `ttp checks --result` or `ttp push --result` and whose `next_step` only says to report what happened ("report the push", "record the checks result and finish") needs no model once the result is in: the daemon records the hand-off's `on_pass` (or `done` with its summary) itself, as it does for a hand-off with no `next_step`. Only one short sentence of that kind counts. A step with a second action, a command, a rebase, a PR or shell punctuation keeps the wake. A spec change without `wake_now` or an `urgent:` line already sleeps until the wait ends, and a needs_review hand-off of an urgent or owed task is already reviewed at once; neither needed a change.
