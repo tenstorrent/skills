@@ -7,8 +7,8 @@ estimate, `shown` the corrected one, `conservative`, `due`), and a settling row 
 delivered (`delivered`) or closed without delivery (`closed`). Obligation promises older than the ledger are
 backfilled once from their due and receipt.
 
-The correction: per task kind, the median of actual / raw-estimated time over the last 14 days, bounded
-(CLAMP) and used only from MIN_SAMPLES deliveries on, multiplies the time left in eta.py's estimates. It is
+The correction: per task kind, the trailing 7-day median of actual / promised time, bounded (CLAMP)
+and used only from MIN_SAMPLES deliveries on, multiplies the time left in eta.py's estimates. It is
 kept in the project's kv (`eta_factors`) so every estimate reads the same one. Config `eta`: `correction`
 (false: off), `min_samples`, `clamp` [low, high], `conservative_x` (the conservative time's multiple of
 the time left when too few deliveries give a measured one), `ledger` (false: record nothing),
@@ -34,10 +34,9 @@ from pathlib import Path
 
 NAME = "eta-ledger.jsonl"
 KEY = "eta_factors"
-CLAMP = (0.5, 3.0)
-MIN_SAMPLES = 5
+CLAMP = (0.7, 2.0)
+MIN_SAMPLES = 10
 CONSERVATIVE_X = 2.0
-WINDOW_S = 14 * 86400
 WEEK_S = 7 * 86400
 MOVE_S = 900
 REPEAT_S = 3600
@@ -486,18 +485,18 @@ def _clamp(c: dict) -> tuple[float, float]:
 
 
 def factors(db, where, now: float) -> dict:
-    """The per-kind correction from the last 14 days: median of actual / raw estimate, bounded, used from
-    `min_samples` deliveries."""
+    """The per-kind correction: the trailing 7-day median of actual / promised, bounded, used from
+    `min_samples` deliveries on."""
     c = cfg(where)
     lo, hi = _clamp(c)
     try:
         need = max(1, int(c.get("min_samples", MIN_SAMPLES)))
     except (TypeError, ValueError):
         need = MIN_SAMPLES
-    ps = [p for p in pairs(read(db), now - WINDOW_S) if p["kind"] != "promise"]
+    ps = [p for p in pairs(read(db), now - WEEK_S) if p["kind"] != "promise"]
     by: dict[str, list[float]] = {}
     for p in ps:
-        by.setdefault(p["kind"], []).append(p["actual"] / p["raw"])
+        by.setdefault(p["kind"], []).append(p["actual"] / p["promised"])
     out = {k: round(min(hi, max(lo, statistics.median(v))), 3) for k, v in by.items() if len(v) >= need}
     cons = None
     if len(ps) >= need:
