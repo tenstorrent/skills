@@ -83,7 +83,7 @@ def test_deadwait_check_reads_a_fixed_number_of_rows_sets_however_many_producers
     held_by = {x: [p.db.task(w)] for x, w in fx.values()}
     p.db.conn.set_trace_callback(seen.append)
     many = statements(held_by, t0)
-    assert one <= 10 and many <= one + 4, (one, many, seen)   # the one raise: its insert and kv write
+    assert one <= 11 and many <= one + 4, (one, many, seen)   # the one raise: its insert and kv write; task_dropped is one read
     assert statements(held_by, t0 + 3) <= 2, seen
     p.db.conn.set_trace_callback(None)
 
