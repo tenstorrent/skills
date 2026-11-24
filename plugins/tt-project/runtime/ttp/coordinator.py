@@ -658,6 +658,8 @@ EFFORT_EVENT_TRIGGERS = {
     "restriction_tools": "conflict",
     # the limits the plan was made against changed: re-plan (budgetkind.py)
     budgetkind.KIND: "budget",
+    # the user's chat waits on the coordinator's own words: never held for a later wake
+    chatdigest.REPLY_DUE: "reply",
 }
 UNBLOCK_KINDS = frozenset(EFFORT_EVENT_TRIGGERS)
 EFFORT_SEVERITIES = ("high", "critical")   # an event or alert this severe is not routine, unless a known case
