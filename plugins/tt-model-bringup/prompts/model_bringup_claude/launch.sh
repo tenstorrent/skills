@@ -51,7 +51,7 @@ tmux new-session -d -s "$SESSION" -c "$TT" bash -lc "
   exec bash"
 # Budget watchdog: tell the session when the budget is reached.
 nohup bash -c "sleep \$(python3 -c 'print(int($BUDGET*3600))'); tmux send-keys -t $SESSION -l 'Budget reached: start nothing new; finish and commit REPORT.md.'; tmux send-keys -t $SESSION Enter" >/dev/null 2>&1 &
-# Overseer: every OVERSEER hours, a report on subagents, jobs, devices, CPU, disk and budget (overseer.sh).
+# Overseer: every OVERSEER hours, a read-only agent reports on subagents, jobs, devices, CPU, disk and budget.
 [ -n "$OVERSEER" ] && nohup "$HERE/overseer.sh" --session "$SESSION" --tt "$TT" --inputs "$RUN/inputs.json" \
-  --interval "$OVERSEER" --model "$MODEL" --started-at "$(date +%s)" >/dev/null 2>&1 &
+  --interval "$OVERSEER" --started-at "$(date +%s)" >/dev/null 2>&1 &
 echo "started tmux session $SESSION (prompt: $PROMPT)${OVERSEER:+; overseer every $OVERSEER h, log $RUN/overseer.log}"

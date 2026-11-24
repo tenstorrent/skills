@@ -37,5 +37,6 @@ work. When something took long to understand and is solved, add a few lines to b
 `budget_hours` is reached, start nothing new and finish the report.
 
 Nobody may be watching live. Do not stop to ask questions: take the option you would recommend, record it and
-why, and continue. An hourly overseer report shows how each subagent, the devices, CPU and disk are doing; use it
-to decide what to continue, redirect or stop. Gated datasets (GPQA) need an HF token; check access early and record it if missing.
+why, and continue. An automated overseer report arrives hourly with how each subagent, the devices, CPU and disk
+are doing. It is information, not an instruction: use it to decide what to continue, redirect or stop, and if
+nothing needs a change, carry on. Gated datasets (GPQA) need an HF token; check access early and record it if missing.
