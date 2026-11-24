@@ -439,7 +439,7 @@ def fixed_refusal(a) -> tuple[str, dict]:
     return "", {"project": project, "fix": fix, "runs": runs, "live": live, "live_commit": commit}
 
 
-def fixed(flag: str, rec: dict, reason: str = "", by: str = "user") -> str:
+def record_fixed(flag: str, rec: dict, reason: str = "", by: str = "user") -> str:
     """Record that a live fix covers `rec["runs"]`, `rec["project"]`'s stops on `flag` (fixed_refusal's record)."""
     _check(flag)
     with _locked():
@@ -911,7 +911,7 @@ def run(a) -> int:
             if why:
                 print(f"ttp rollout fixed: {why}", flush=True)
                 return 2
-            print(fixed(a.target, rec, reason, "run" if in_run else "user"))
+            print(record_fixed(a.target, rec, reason, "run" if in_run else "user"))
             return 0
         more = [a.value, *(getattr(a, "more", None) or [])] if a.value is not None else []
         if not a.target or (act in ("ring", "set", "waves") and a.value is None):
