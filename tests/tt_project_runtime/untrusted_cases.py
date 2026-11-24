@@ -722,7 +722,7 @@ MARK_CODE_EFFECT = [   # code that reads or changes the record itself, or gets i
     f"(true)# it's\nrm {_M} # '", f"cat <<'EOF'\nx\nEOF\n(true)# it's\nrm {_M} # '",
     *[f"{lead}# it's\nrm {_M} # '" for lead in ("true ", "true\t", "true\n", "true;", "true &", "true |")],
     f"(# it's\nrm {_M} # '\ntrue)",   # `(`: a comment can open a subshell's first word
-    f"xargs $(true)#note; rm {_M}", f"python3 x.py >#out {_M}",   # no comment starts there
+    f"xargs $(true)#note; rm {_M}", f"python3 x.py >#out {_M}", f"rm <#in {_M}",   # no comment starts there
 ]
 MARK_DATA_HEREDOCS = [   # a body only cat or tee writes to another file is data, as is a comment
     f"cat > notes.md <<'EOF'\nthe {_M} record\nEOF", f"tee notes.md <<'EOF'\nthe {_M} record\nEOF",

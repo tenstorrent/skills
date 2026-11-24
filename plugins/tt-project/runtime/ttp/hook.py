@@ -681,7 +681,7 @@ def _quoting(line: str) -> list[tuple[bool, int]]:
         else:
             inert = False
             if c == "(":
-                opens.append(line[i - 1] == "$")
+                opens.append(i > 0 and line[i - 1] == "$")
                 depth += 1
             elif c == ")":
                 dollar = bool(opens.pop()) if opens else False
