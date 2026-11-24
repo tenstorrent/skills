@@ -355,8 +355,8 @@ class Rows:
         self.links = _links(db, min(tids, default=0))
         self.pushed = _pushed(db)
         self.landings = db.q("SELECT task, sha FROM task_landings ORDER BY marker")
-        self.superseded = db.q("SELECT task, sha FROM task_superseded ORDER BY ts")
-        self.dropped = db.q("SELECT task, sha FROM task_dropped")
+        self.superseded = db.q("SELECT task, sha, ts FROM task_superseded ORDER BY ts")
+        self.dropped = db.q("SELECT task, sha, ts FROM task_dropped")
 
 
 def carriers(db, tid: int, rows: Rows | None = None) -> dict[int, tuple[str, int | None, str]]:
@@ -393,6 +393,20 @@ def _pushed(db) -> list[dict]:
         return []
 
 
+def _dropped(db, tid: int, carry: dict, rows: "Rows | None") -> set[str]:
+    """The shas whose drop verdict still stands for task `tid`: a drop beats every landing record at
+    that sha until a supersession is recorded after it, and a drop recorded after the supersession
+    wins again (the record times decide)."""
+    dropped = db.q("SELECT task, sha, ts FROM task_dropped WHERE task=?", (tid,)) if rows is None \
+        else [r for r in rows.dropped if r["task"] == tid]
+    latest: dict = {}
+    found = db.q("SELECT sha, ts FROM task_superseded WHERE task IN (%s)" % ",".join("?" * len(carry)),
+                 list(carry)) if rows is None else [r for r in rows.superseded if r["task"] in carry]
+    for r in found:
+        latest[r["sha"]] = max(latest.get(r["sha"], 0.0), float(r["ts"]))
+    return {r["sha"] for r in dropped if float(r["ts"]) >= latest.get(r["sha"], 0.0)}
+
+
 def recorded(db, tid: int, carry: dict | None = None, rows: Rows | None = None) -> tuple[list[str], str]:
     """The landed commits saved for task `tid` or a task that carries it on (`carry`, else
     carriers): a push queue row it or its branch landed in, a successful detached push, a recorded
@@ -412,8 +426,7 @@ def recorded(db, tid: int, carry: dict | None = None, rows: Rows | None = None) 
     member = isinstance(res, dict) and isinstance(res.get("batch"), dict) and res["batch"].get("lead") != tid
     if member and res.get("landed"):
         return [str(res["landed"])], "its own commit on the push branch"
-    gone = {r["sha"] for r in (db.q("SELECT task, sha FROM task_dropped WHERE task=?", (tid,)) if rows is None
-                               else rows.dropped) if r["task"] == tid}
+    gone = _dropped(db, tid, carry, rows)
     pushed = _pushed(db) if rows is None else rows.pushed
     hits = [r for r in pushed if (r["landed_sha"] or r["pushed_sha"]) not in gone | {None, ""}
             and (r["task"] in carry or (r["branch"] in branches and not member))]

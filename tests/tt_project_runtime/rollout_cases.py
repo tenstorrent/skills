@@ -79,9 +79,11 @@ def test_a_run_may_read_or_roll_back_but_never_widen_the_rollout(env, capsys, mo
     from ttp import rollout
     _roll(capsys, "set", "deslop", "1")
     monkeypatch.setenv("TTP_RUN_DIR", "/nonexistent")
-    for argv in (("ring", "x", "0"), ("set", "deslop", "2"), ("promote", "deslop"), ("arm", "deslop")):
+    for argv in (("ring", "x", "0"), ("set", "deslop", "2"), ("promote", "deslop")):
         code, out = _roll(capsys, *argv)
         assert code == 2 and "only the user's terminal" in out
+    code, out = _roll(capsys, "arm", "deslop")
+    assert code == 2 and "unfreezing a flag stays with the user" in out, "a run never unfreezes a flag"
     assert rollout.level("deslop") == 1 and rollout.settings().get("rings") is None
     assert _roll(capsys, "status")[0] == 0
     assert _roll(capsys, "rollback", "deslop", "--reason", "bad")[0] == 0
@@ -756,9 +758,11 @@ def test_waves_are_set_and_cleared_only_from_the_terminal(env, capsys, monkeypat
     code, out = _roll(capsys, "waves", "deslop", "alpha")
     assert code == 2 and "no wave gate" in out
     monkeypatch.setenv("TTP_RUN_DIR", "/nonexistent")
-    for argv in (("waves", "glm_work", "clear"), ("set", "glm_work", "auto"), ("arm", "glm_work", "alpha")):
+    for argv in (("waves", "glm_work", "clear"), ("set", "glm_work", "auto")):
         code, out = _roll(capsys, *argv)
         assert code == 2 and "only the user's terminal" in out
+    code, out = _roll(capsys, "arm", "glm_work", "alpha")
+    assert code == 2 and "rollout.run_rearm is off" in out
     monkeypatch.delenv("TTP_RUN_DIR")
     assert _roll(capsys, "set", "glm_work", "auto")[0] == 0
     code, out = _roll(capsys, "waves", "glm_work", "clear")
@@ -1142,3 +1146,82 @@ def test_arm_with_a_project_restores_only_that_project(env, capsys):
     assert rollout.on("glm_device", "alpha"), "the project is back at its pre-rollback state"
     assert not rollout.on("glm_device", p.name), "the other rolled-back project stays rolled back"
     assert p.name in rollout.rolled_back("glm_device") and "alpha" not in rollout.rolled_back("glm_device")
+
+
+def _rearm_setup(env, monkeypatch):
+    """A fix task landed on the push branch, and a second project that runs a release built from it:
+    what a run's re-arm checks. Returns (project, target, fix task, landed head)."""
+    p, repo, origin, other = _push_setup(env, monkeypatch, ["true"])
+    target = _second_project(env, "rearmed")
+    fix = p.db.add_task("the fix", "s", kind="code", status="done", branch="ttp/t9-fix")
+    _commit(repo, "fix.txt", "the fix\n")
+    _git_out(repo, "push", "-q", "origin", "HEAD:proj")
+    head = _git_out(repo, "rev-parse", "HEAD")
+    now = time.time()
+    p.db.x("INSERT INTO push_queue(task, branch, head, target, status, landed_sha, pushed_sha, created, updated) "
+           "VALUES(?,?,?,?,?,?,?,?,?)", (fix, "ttp/t9-fix", head, "origin/proj", "landed", head, head, now, now))
+    return p, target, fix, head
+
+
+def _rearm_runs(target, status):
+    """A run of `target` whose hand-off says `status`, as its runs folder holds it."""
+    (target.runs / "7").mkdir(parents=True, exist_ok=True)
+    (target.runs / "7" / "result.json").write_text(json.dumps({"status": status, "summary": "the replay"}))
+    return "7"
+
+
+def test_a_run_rearm_is_refused_without_the_setting_the_evidence_or_a_deployed_fix(env, monkeypatch, capsys):
+    """A run's `arm FLAG PROJECT` needs the account setting on, a fix that landed and is deployed, and
+    a replay that passed; each missing piece refuses with its own reason and nothing is re-armed."""
+    from ttp import project, rollout
+    p, target, fix, head = _rearm_setup(env, monkeypatch)
+    _roll(capsys, "set", "glm_device", "2")
+    rollout.stop_project("glm_device", target.name, "a step GLM took on its own")
+    monkeypatch.setenv("TTP_RUN_DIR", str(p.state / "runs" / "55"))
+    monkeypatch.setenv("TTP_RUN_ID", "55")
+    monkeypatch.setenv("TTP_TASK", "77")
+    code, out = _roll(capsys, "arm", "glm_device", target.name, "--fix", str(fix), "--replay", _rearm_runs(target, "done"))
+    assert code == 2 and "rollout.run_rearm is off" in out, "the setting is off by default"
+    project.set_account_setting("rollout.run_rearm", True)
+    code, out = _roll(capsys, "arm", "glm_device", target.name)
+    assert code == 2 and "carries its evidence" in out, "no --fix and --replay"
+    never = p.db.add_task("a change that never landed", "s", status="done")
+    code, out = _roll(capsys, "arm", "glm_device", target.name, "--fix", str(never), "--replay", "7")
+    assert code == 2 and "is not on the push branch" in out, "the named fix task never landed"
+    code, out = _roll(capsys, "arm", "glm_device", target.name, "--fix", str(fix), "--replay", "7")
+    assert code == 2 and "which does not contain fix task" in out, "what the target runs holds no fix"
+    source = target.harness / "runtime" / "ttp" / "SOURCE_COMMIT"
+    assert source.is_file()   # the release the bootstrap installed records its commit
+    source.write_text(head)   # the target now runs a release that contains the fix
+    code, out = _roll(capsys, "arm", "glm_device", target.name, "--fix", str(fix), "--replay", "8")
+    assert code == 2 and "names neither a result file nor a run" in out, "no such run of the target"
+    code, out = _roll(capsys, "arm", "glm_device", target.name, "--fix", str(fix),
+                      "--replay", _rearm_runs(target, "failed"))
+    assert code == 2 and "did not pass" in out, "a failing replay is no evidence"
+    assert target.name in rollout.rolled_back("glm_device"), "nothing was re-armed"
+
+
+def test_a_run_re_arms_one_project_on_evidence_and_records_it_in_the_ledger(env, monkeypatch, capsys):
+    """With the setting on and every check passing, a run's `arm FLAG PROJECT --fix --replay` re-arms
+    that one project, records who armed it and the evidence in the ledger, and status shows it."""
+    from ttp import project, rollout
+    p, target, fix, head = _rearm_setup(env, monkeypatch)
+    _roll(capsys, "set", "glm_device", "2")
+    rollout.stop_project("glm_device", target.name, "a step GLM took on its own")
+    assert not rollout.on("glm_device", target.name)
+    project.set_account_setting("rollout.run_rearm", True)
+    (target.harness / "runtime" / "ttp").mkdir(parents=True, exist_ok=True)
+    (target.harness / "runtime" / "ttp" / "SOURCE_COMMIT").write_text(head)
+    monkeypatch.setenv("TTP_RUN_DIR", str(p.state / "runs" / "55"))
+    monkeypatch.setenv("TTP_RUN_ID", "55")
+    monkeypatch.setenv("TTP_TASK", "77")
+    code, out = _roll(capsys, "arm", "glm_device", target.name, "--fix", str(fix),
+                      "--replay", _rearm_runs(target, "done"), "--reason", "fix landed and its replay passed")
+    assert code == 0 and "re-armed in " + target.name in out and "on for it again" in out
+    assert rollout.on("glm_device", target.name) and target.name not in rollout.rolled_back("glm_device")
+    rec = rollout.ledger("glm_device")[-1]
+    assert (rec["op"], rec["project"], rec["by"]) == ("project_arm", target.name, "run")
+    assert (rec["run"], rec["run_task"], rec["fix"]) == ("55", "77", fix)
+    assert rec["deployed"] == head and rec["replay"] == "7" and rec["run_project"] == str(p.base)
+    code, out = _roll(capsys, "status")
+    assert code == 0 and f"last re-armed in {target.name} by a run: fix #{fix}" in out and "replay 7" in out

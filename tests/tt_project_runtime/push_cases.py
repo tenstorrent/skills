@@ -143,6 +143,36 @@ def test_a_landing_that_left_a_tasks_commits_out_reads_dropped_until_its_change_
     assert landed.landed_at(p.db, lost) is not None
 
 
+    assert landed.recorded(p.db, lost)[0] == [relanded] and landed.check(p, repo, tid=lost)[0] == 0
+    assert landed.landed_at(p.db, lost) is not None
+
+
+def test_a_supersession_recorded_after_a_drop_verdict_wins_the_sha_back_until_a_later_drop(env):
+    """A drop verdict hides a sha only until a supersession for the same sha is recorded after it, and
+    a drop recorded after the supersession wins the sha back: the record times decide, the same
+    through Rows (the one read deadwait judges many held producers from)."""
+    from ttp import landed
+    p = make(env)
+    tid = p.db.add_task("dropped and superseded", "s", kind="code", status="done", branch="ttp/t9")
+    sha, other = "a" * 40, "b" * 40
+    landed.drop(p, tid, [sha], "the rebase left its commits out", event=False)
+    assert landed.recorded(p.db, tid) == ([], ""), "the drop verdict hides the landing"
+    p.db.x("INSERT INTO task_superseded(task, head, sha, ts) VALUES(?,?,?,?)",
+           (tid, "h", sha, time.time()))
+    assert landed.recorded(p.db, tid) == ([sha], "the commit recorded as superseding it")
+    assert landed.recorded(p.db, tid, rows=landed.Rows(p.db, [tid])) == landed.recorded(p.db, tid)
+    p.db.x("INSERT INTO task_superseded(task, head, sha, ts) VALUES(?,?,?,?)",
+           (tid, "h", other, time.time()))
+    landed.drop(p, tid, [other], "the recorded commit does not carry it after all", event=False)
+    assert landed.recorded(p.db, tid)[0] == [sha], "the revived sha keeps its verdict; the other's is its own"
+    # The same sha dropped after its supersession goes back to dropped: record times decide.
+    gone = p.db.add_task("dropped after its supersession", "s", kind="code", status="done", branch="ttp/t10")
+    late = "c" * 40
+    p.db.x("INSERT INTO task_superseded(task, head, sha, ts) VALUES(?,?,?,?)", (gone, "h", late, time.time()))
+    landed.drop(p, gone, [late], "the recorded commit does not carry it after all", event=False)
+    assert landed.recorded(p.db, gone) == ([], "")
+
+
 def test_a_landing_that_lacks_a_tasks_head_is_carried_once_its_commit_is_on_the_push_branch(env, monkeypatch):
     """Whether a task's change is on the push branch is one rule (landed.on_push): a recorded landing
     that lacks the task's head still carries it once another push put the head on the push branch as

@@ -5217,8 +5217,10 @@ daemon tick, so a change needs no restart.
 
 `ttp rollout status` shows it; `ttp rollout ring <project> 0|1|2|exclude|include`, `set <flag> off|0|1|2`
 and `promote <flag>` change it; `rollback <flag>` turns a flag off and freezes it until `arm <flag>` (a fix
-landed). Only the user's terminal widens a flag or edits the ring lists; a run may read the state or roll a
-flag back. The command writes only the account settings and the ledger, never a project's charter, memory,
+landed). Only the user's terminal widens a flag or edits the ring lists; a run may read the state, roll a
+flag back or, when the account setting `rollout.run_rearm` is on, re-arm one rolled-back project with
+`ttp rollout arm FLAG PROJECT --fix TASK --replay RUN`: the fix task's change must be on the push branch
+and deployed to that project, and the replay of the rollback's cause must have passed. The command writes only the account settings and the ledger, never a project's charter, memory,
 config or state. The shipped defaults list no project: which projects are in ring 1 is the account's setting.
 
 Health watch. Every 15 minutes the daemon compares each project that has a flag on with its own trailing 7 days
@@ -5250,7 +5252,8 @@ judged on none of these: the watch never rolls it back, and `ttp rollout rollbac
 limits are settings (`rollout.thresholds`: `failed_runs_pts`, `min_runs`, `land_time_x`, `cost_x`,
 `min_landings`, `stuck_h`, `baseline_days`, `soak_h_0`, `soak_h_1`, `max_window_h`). A rollback raises a normal
 alert for the project's coordinator; the flag stays off there until `ttp rollout arm <flag> <project>`, which
-restarts that project's judging window at the re-arm. A `ttp rollout rollback` by hand turns the flag off
+restarts that project's judging window at the re-arm; a project's own coordinator may run that re-arm
+itself, on that evidence, behind the account setting `rollout.run_rearm`. A `ttp rollout rollback` by hand turns the flag off
 everywhere until `ttp rollout arm <flag>`, which puts it back at the level it had before the rollback. A flag
 promotes one ring only when every project listed in its current ring has voted clean (enough samples, no failing
 signal) after the ring's soak (1 h in ring 0, 24 h in ring 1). Too few samples never promote: after 72 h a low

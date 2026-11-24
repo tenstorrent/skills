@@ -161,7 +161,7 @@ def stop_project(flag: str, project: str, why: str, by: str = "daemon") -> bool:
     return True
 
 
-WHO = {"user": "the user"}   # the ledger's `by` values, as the digest words them
+WHO = {"user": "the user", "run": "a run"}   # the ledger's `by` values, as the digest words them
 
 
 DIGEST_HEADER = "## Rollout flags (the state is the signal: never hold flag-gated work for a note or someone's word)"
@@ -340,9 +340,10 @@ def armed_at(project: str, *flags: str) -> float:
                 if r.get("op") == "project_arm" and r.get("project") == project), default=0.0)
 
 
-def arm(flag: str, reason: str = "", by: str = "user", project: str = "") -> str:
+def arm(flag: str, reason: str = "", by: str = "user", project: str = "", evidence: dict | None = None) -> str:
     """Unfreeze a rolled-back flag, back at the level it had before the rollback (a level set by hand
-    after the rollback wins); with `project`, re-arm that project's own rollback."""
+    after the rollback wins); with `project`, re-arm that project's own rollback. `evidence`: what a
+    run's re-arm checked, written into the ledger record ("" from the user's terminal)."""
     _check(flag)
     if project:
         with _locked():
@@ -351,7 +352,7 @@ def arm(flag: str, reason: str = "", by: str = "user", project: str = "") -> str
                 return f"{flag} is not rolled back in {project}; nothing changed"
             back.pop(project)
             _put("project_rollback", flag, back or None)
-            _op("project_arm", flag, reason or "fix landed", by, project=project)
+            _op("project_arm", flag, reason or "fix landed", by, project=project, **(evidence or {}))
         p = local_projects().get(project)
         return f"{flag} re-armed in {project}: {'on' if on(flag, project, _raw(p) if p else None) else 'off'} for it again"
     with _locked():
@@ -634,19 +635,90 @@ def status(projects: dict | None = None) -> dict:
     return {"rings": cfg.get("rings") or {}, "excluded": cfg.get("excluded") or [],
             "flags": {f: {"level": level(f, cfg), "key": m["key"], "frozen": bool(frozen(f)),
                           "shadow": bool(m.get("shadow")), "waves": waves(f, cfg), "wave": wave_at(f, cfg),
-                          "rolled_back": rolled_back(f, cfg), "overrides": over.get(f, [])}
+                          "rolled_back": rolled_back(f, cfg), "overrides": over.get(f, []),
+                          "armed": next((r for r in reversed(ledger(f))
+                                         if r.get("op") == "project_arm" and r.get("run")), None)}
                       for f, m in sorted(FLAGS.items())}}
+
+
+
+RUN_REARM_KEY = "run_rearm"   # rollout.*: whether a run may re-arm one project with evidence
+
+
+def rearm_refusal(a) -> tuple[str, dict]:
+    """(why a run may not re-arm, the evidence its re-arm records) for `arm FLAG PROJECT --fix TASK
+    --replay RUN`: the setting `rollout.run_rearm` must be on, the fix task's change must be on the
+    push branch and deployed to PROJECT, and the replay of the rollback's cause must have passed.
+    Unfreezing a whole flag, rings, waves and promotion stay with the user."""
+    project = (a.value or "").strip()
+    fix, replay = getattr(a, "fix", None), (getattr(a, "replay", "") or "").strip()
+    if not project:
+        return "a run re-arms one rolled-back project; unfreezing a flag stays with the user", {}
+    if not settings().get(RUN_REARM_KEY):
+        return f"the account setting rollout.{RUN_REARM_KEY} is off", {}
+    if not fix or not replay:
+        return "a run's re-arm carries its evidence: --fix TASK and --replay RUN", {}
+    from . import landed, project as project_mod, release
+    p = project_mod.here()
+    if p is None:
+        return "no project here to read the fix task's landing from", {}
+    code, why = landed.check(p, p.root, tid=fix, fetch=False)
+    if code != 0:
+        return f"fix task #{fix} is not on the push branch ({why})", {}
+    target = local_projects().get(project)
+    if target is None:
+        return f"{project} is not registered on this machine", {}
+    commit = release.runtime_commit(target.harness / "runtime")
+    if commit in (None, "", "unknown"):
+        return f"cannot tell what {project} runs (no installed release)", {}
+    shas, _ = landed.recorded(p.db, fix)
+    if not any(landed.on_branch(p.root, sha, commit) for sha in shas):
+        return f"{project} runs {commit[:12]}, which does not contain fix task #{fix}", {}
+    why = rearm_replay(replay, target, p)
+    if why:
+        return why, {}
+    return "", {"run": os.environ.get("TTP_RUN_ID") or "", "run_project": os.environ.get("TTP_PROJECT") or "",
+                "run_task": os.environ.get("TTP_TASK") or "", "fix": fix, "deployed": commit,
+                "replay": replay}
+
+
+def rearm_replay(ref: str, target, p) -> str:
+    """Why `--replay REF` is no evidence of a passed replay ("" when it is): REF is a result.json
+    path, or a run id read from the re-armed project's runs, else this project's, and the run's
+    hand-off must say the replay passed ("done")."""
+    from pathlib import Path
+    path = Path(ref)
+    if not path.is_file() and ref.isdigit():
+        path = next((q.runs / ref / "result.json" for q in (target, p)
+                     if (q.runs / ref / "result.json").is_file()), path)
+    try:
+        data = json.loads(path.read_text(encoding="utf-8", errors="replace"))
+    except OSError:
+        return f"no passing replay: {ref} names neither a result file nor a run here"
+    except ValueError:
+        return f"no passing replay: {ref} is not a result record"
+    if not isinstance(data, dict) or data.get("status") != "done":
+        status = data.get("status") if isinstance(data, dict) else "nothing"
+        return f"no passing replay: {ref} did not pass (its result says {status})"
+    return ""
 
 
 def run(a) -> int:
     """`ttp rollout ACTION ...`: the terminal's (the user's) edit of the rollout state. A run's own call may
-    only read it (`status`, or `on`, a wait's probe) or roll a flag back (that only reduces a flag's reach);
+    only read it (`status`, or `on`, a wait's probe), roll a flag back (that only reduces a flag's reach)
+    or re-arm one project (rearm_refusal: on the evidence its fix landed, deployed and its replay passed);
     promotion is the watcher's, the wave moves the gate's, and the ring and wave lists are the user's."""
     in_run = bool(os.environ.get("TTP_RUN_DIR"))
     act = a.action
-    if in_run and act not in ("status", "rollback", "on"):   # waves and arm too: the user's terminal only
+    evidence: dict = {}
+    if in_run and act == "arm":   # one project, on evidence; everything else stays the user's
+        why, evidence = rearm_refusal(a)
+        if why:
+            print(f"ttp rollout arm: {why}", flush=True)
+            return 2
+    elif in_run and act not in ("status", "rollback", "on"):
         print(f"ttp rollout {act}: only the user's terminal changes the rollout state; a run may read it "
-              "(status, on) or roll a flag back", flush=True)
+              "(status, on), roll a flag back or re-arm one project on evidence", flush=True)
         return 2
     try:
         if act == "on":
@@ -684,6 +756,10 @@ def run(a) -> int:
                           + (f"  (auto: waves 0..{e['wave']} on)" if e["level"] == AUTO else ""))
                 for n, r in sorted(e["rolled_back"].items()):
                     print(f"  rolled back in {n} alone: {r.get('why')}  (`ttp rollout arm {f} {n}`)")
+                if e.get("armed"):
+                    rec = e["armed"]
+                    print(f"  last re-armed in {rec.get('project')} by a run: fix #{rec.get('fix')}, "
+                          f"deployed {str(rec.get('deployed'))[:12]}, replay {rec.get('replay')}")
                 for o in e["overrides"]:
                     print(f"  overridden in {o['project']} by its own setting since {o['at']} "
                           f"({e['key']} = {json.dumps(o['value'])})")
@@ -707,7 +783,7 @@ def run(a) -> int:
         elif act == "rollback":
             print(rollback(a.target, reason or "rolled back by hand", "run" if in_run else "user"))
         elif act == "arm":
-            print(arm(a.target, reason, project=a.value or ""))
+            print(arm(a.target, reason, "run" if in_run else "user", project=a.value or "", evidence=evidence))
         elif act == "waves":
             print(set_waves(a.target, more))
     except ValueError as e:

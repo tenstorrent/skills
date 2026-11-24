@@ -17884,11 +17884,17 @@ def ttp_parser():
                    help="status; ring PROJECT 0|1|2|exclude|include; set FLAG off|0|1|2|auto; promote FLAG (one ring "
                         "wider); rollback FLAG (off and frozen); arm FLAG [PROJECT] (a fix landed: unfreeze and "
                         "restore the level the flag had before its rollback, or re-arm one project the wave "
-                        "gate or health watch switched off); waves FLAG <p1,p2> <p3> ... | clear (auto's waves); "
-                        "on FLAG [PROJECT] (a wait's probe: exit 0 while the flag is on for the project)")
+                        "gate or health watch switched off; a run re-arms one project only, with --fix and "
+                        "--replay evidence, when rollout.run_rearm is on); waves FLAG <p1,p2> <p3> ... | clear "
+                        "(auto's waves); on FLAG [PROJECT] (a wait's probe: exit 0 while the flag is on for the "
+                        "project)")
     s.add_argument("target", nargs="?", help="the project (ring) or the flag")
     s.add_argument("value", nargs="?", help="the ring (ring), the level (set), the project (arm) or the first wave")
     s.add_argument("more", nargs="*", help="the further waves (waves)")
+    s.add_argument("--fix", type=int, metavar="TASK", help="arm: the task whose fix landed; a run's re-arm "
+                   "checks it is on the push branch and deployed to the project")
+    s.add_argument("--replay", metavar="RESULT", help="arm: a passing replay of the rollback's cause, as a "
+                   "result.json path or a run id; a run's re-arm needs it")
     s.add_argument("--reason", help="why (kept in the rollout ledger)")
     s.add_argument("--json", action="store_true", help="status as JSON")
     s.set_defaults(fn=cmd_rollout)
