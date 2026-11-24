@@ -9528,9 +9528,10 @@ def cmd_lock(a) -> None:
                     pending.append(signum)
                     return
                 try:
-                    # a probed command runs in a group of its own: signal all of it
-                    os.killpg(started[0].pid, signum) if yprobe is not None \
-                        else started[0].send_signal(signum)
+                    if yprobe is None:
+                        started[0].send_signal(signum)
+                    else:   # a probed command runs in a group of its own: signal all of it
+                        os.killpg(started[0].pid, signum)
                 except OSError:
                     pass
 
