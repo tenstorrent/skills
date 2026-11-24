@@ -64,3 +64,7 @@ every +265: the ETA format a worker posts and the devq fence's further lines on 
 every +103: device profiling points to the optional tt-profiler skill, else tt-metal's docs
 every +45: a fix on an unlanded stack hands off done, never waiting on its own stack landing
 code +40: a fix on an unlanded stack hands off done, never waiting on its own stack landing (the line counts in the code prompt too)
+code +32: drafts written for others carry the AI tag too, and direct claude.ai Slack connector sends need none
+question +32: drafts written for others carry the AI tag too, and direct claude.ai Slack connector sends need none (the line counts in the question prompt too)
+every +32: drafts written for others carry the AI tag too, and direct claude.ai Slack connector sends need none (the line counts in every prompt)
+system +32: drafts written for others carry the AI tag too, and direct claude.ai Slack connector sends need none (the line counts in the system prompt too)

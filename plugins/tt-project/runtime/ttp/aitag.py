@@ -1,7 +1,8 @@
 # SPDX-FileCopyrightText: © 2026 Tenstorrent USA, Inc.
 # SPDX-License-Identifier: Apache-2.0
-"""AI-authorship disclosure: what a run posts where people other than the user read it ends with a tag
-(delivery.ai_tag, default "[authored by AI]"; "" turns the guard off).
+"""AI-authorship disclosure: what a run posts where people other than the user read it, and every draft
+or text it writes for the user to post anywhere, ends with a tag (delivery.ai_tag, default "[Authored by
+AI]"; "" turns the guard off).
 
 Three guards refuse a post without it, model-free; the refusal tells the run to add the tag:
 
@@ -17,7 +18,9 @@ Three guards refuse a post without it, model-free; the refusal tells the run to 
   whose name says they post: send, post, reply, draft or create a message, comment, issue, page or
   email (Slack, Jira, Confluence, mail). Each text field (text, message, body, comment, description,
   and the like) of such a call must end with the tag. An event or invite tool counts when its input
-  names guests (attendees, invitees).
+  names guests (attendees, invitees). A direct post through the claude.ai Slack connector
+  (`mcp__claude_ai_Slack__`, a tool not named draft) is exempt: the connector already labels it as
+  written by Claude. Its drafts still need the tag.
 - The Bash PreToolUse hook (http_problem here, also for Codex runs): a `curl` or `wget` that sends a body
   to a literal GitHub, Slack, Jira or Confluence URL that posts (HTTP_POST_URL_RE).
 
@@ -41,7 +44,7 @@ import re
 
 KEY = "ai_tag"
 SETTING = f"delivery.{KEY}"
-DEFAULT = "[authored by AI]"
+DEFAULT = "[Authored by AI]"
 
 # The last line of a post discloses AI authorship in other words.
 SIMILAR_RE = re.compile(r"(?<![A-Za-z])(?:authored|written|drafted|generated|posted|created|made)\s+(?:by|with|using)\s+"
@@ -219,6 +222,8 @@ _READS = r"(?:get|list|search|read|fetch|find|lookup|delete|remove)"
 NOT_POST_RE = re.compile(rf"(?:^|_){_READS}(?:_|$)|^{_READS}(?=[A-Z_]|$)")
 # An event or invite others get only when it names guests (an event on one's own calendar is not a post).
 EVENT_TOOL_RE = re.compile(r"(?:create|update|edit|add|schedule|send|quick)[\w-]*?(?:event|invit|meeting)", re.I)
+# The claude.ai Slack connector labels its own posts as written by Claude; its drafts are the user's to send.
+LABELLED_SERVER_RE = re.compile(r"^claude_ai_slack$", re.I)
 GUEST_KEY_RE = re.compile(r"attendee|guest|invitee|participant|recipient", re.I)
 # A field of its input that carries the text people read (key words compared without case, `_` or `-`).
 TEXT_KEYS = ("text", "message", "body", "comment", "description", "markdown", "html", "content")
@@ -284,8 +289,9 @@ def posts(tool_name: str, tool_input=None) -> bool:
     input names guests)."""
     if not tool_name.startswith("mcp__"):
         return False
-    own = tool_name.split("__", 2)[-1]
-    if NOT_POST_RE.search(own):
+    parts = tool_name.split("__", 2)
+    server, own = (parts[1] if len(parts) > 2 else ""), parts[-1]
+    if NOT_POST_RE.search(own) or LABELLED_SERVER_RE.match(server) and "draft" not in own.lower():
         return False
     return bool(POST_TOOL_RE.search(own)) or bool(EVENT_TOOL_RE.search(own)) and _guests(tool_input)
 

@@ -4078,8 +4078,12 @@ the pick order, so it takes the first starts. A resumed resource ramps only its 
   details the reader can live without (numbers, lists or internal ids only when they bear on the
   question or the reader needs them to act). The worker and coordinator prompts and the relay skill
   say so. It is guidance, not a gate: no guard checks a post's length or wording.
-- `delivery.ai_tag` (default `[authored by AI]`; `""` turns it off) is the AI-authorship tag that
-  everything a run posts where people other than the user read it ends with. Prompts state the rule,
+- `delivery.ai_tag` (default `[Authored by AI]`, matched in any case; `""` turns it off) is the
+  AI-authorship tag that everything a run posts where people other than the user read it, and every
+  draft or text it writes for the user to post anywhere (Jira, GitHub, Slack drafts, documents,
+  emails), ends with. A direct post through the claude.ai Slack connector needs none: the connector
+  already labels it as written by Claude (its drafts still do). A project's own setting is kept as
+  it is. Prompts state the rule,
   and two model-free guards refuse a post whose last text line lacks the tag (or a similar disclosure
   such as "Generated with Claude Code"; trailing HTML and a hidden `<!-- ttp -->` line may follow):
   the worker `gh` wrapper for `gh issue create`, `gh issue comment`, `gh pr comment`, `gh pr review`,
@@ -4087,7 +4091,7 @@ the pick order, so it takes the first starts. A resumed resource ramps only its 
   review, issue, release, gist-comment or team-discussion posts through `gh api` (REST and GraphQL);
   for Claude Code runs, a PreToolUse hook on connector tools (`mcp__*`) whose name says they send,
   post, draft or create a message, comment, issue, page or email (Slack, Jira, Confluence, mail), or
-  an event or invite that names guests; and the Bash hook (Claude Code and Codex runs) on `curl` or
+  an event or invite that names guests (not the claude.ai Slack connector's direct posts); and the Bash hook (Claude Code and Codex runs) on `curl` or
   `wget` sending a body to a literal GitHub, Slack (messages, webhooks), Jira (issues, comments) or
   Confluence (pages, comments) URL that posts (not on a local host); a structured body (Confluence
   storage, Jira ADF, Slack `blocks`) is one post judged by its last text. PR bodies, edits of an issue's or PR's own body and

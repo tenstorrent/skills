@@ -32,7 +32,7 @@ def test_workers_gh_refuses_comments_reviews_and_issues_without_the_ai_tag(env, 
                  ("issue", "create", "-t", "Bug", "-b", "Steps"), ("pr", "review", "7", "-c", "-b", "Nit"),
                  ("pr", "review", "7", "--approve", "--body", "LGTM")):
         rc, err, ran = gh(*args)
-        assert rc == 1 and ran == [] and "AI-authorship tag '[authored by AI]' (delivery.ai_tag)" in err, (args, err)
+        assert rc == 1 and ran == [] and "AI-authorship tag '[Authored by AI]' (delivery.ai_tag)" in err, (args, err)
     for args in (("pr", "comment", "7", "-b", tagged), ("issue", "create", "-t", "Bug", "-b", tagged),
                  ("pr", "review", "7", "--approve"), ("pr", "comment", "7", "--delete-last", "--yes")):
         rc, err, ran = gh(*args)
@@ -134,7 +134,7 @@ def _post_hook(monkeypatch, tmp_path, p, tool, tool_input):
 def test_connector_posts_without_the_ai_tag_are_refused_by_the_pre_tool_hook(env, tmp_path, monkeypatch):
     p = make(env)
     tag = "\n\n[authored by AI]"
-    refused = (("mcp__claude_ai_Slack__slack_send_message", {"channel_id": "C1", "message": "Build is green"}),
+    refused = (("mcp__slack__slack_send_message", {"channel_id": "C1", "message": "Build is green"}),
                ("mcp__claude_ai_Slack__slack_send_message_draft", {"channel_id": "C1", "message": "hi"}),
                ("mcp__claude_ai_Atlassian__createJiraIssue", {"projectKey": "X", "summary": "s", "description": "d"}),
                ("mcp__claude_ai_Atlassian__addCommentToJiraIssue", {"issueIdOrKey": "X-1", "commentBody": "c"}),
@@ -147,8 +147,8 @@ def test_connector_posts_without_the_ai_tag_are_refused_by_the_pre_tool_hook(env
                    "type": "doc", "content": [{"type": "paragraph", "content": [{"type": "text", "text": "d"}]}]}}}))
     for tool, inp in refused:
         why = _post_hook(monkeypatch, tmp_path, p, tool, inp)
-        assert why and "AI-authorship tag '[authored by AI]'" in why, (tool, why)
-    passed = (("mcp__claude_ai_Slack__slack_send_message", {"channel_id": "C1", "message": "Build is green" + tag}),
+        assert why and "AI-authorship tag '[Authored by AI]'" in why, (tool, why)
+    passed = (("mcp__slack__slack_send_message", {"channel_id": "C1", "message": "Build is green" + tag}),
               ("mcp__claude_ai_Atlassian__createJiraIssue", {"projectKey": "X", "summary": "s",
                                                              "description": "d" + tag, "contentFormat": "markdown"}),
               ("mcp__claude_ai_Gmail__create_draft", {"to": ["a@example.com"], "subject": "s", "body": "Hi" + tag,
@@ -201,7 +201,7 @@ def test_replies_and_notifies_to_the_user_go_out_untagged_while_posts_to_others_
     # The same words posted where others read them are refused until they end with the tag.
     from ttp import aitag
     assert aitag.gh_problem("pr", ["comment", "7", "-b", "Review is ready."], p.config())
-    assert aitag.tool_problem("mcp__claude_ai_Slack__slack_send_message", {"message": "Review is ready."}, p.config())
+    assert aitag.tool_problem("mcp__slack__slack_send_message", {"message": "Review is ready."}, p.config())
     # Both coordinator modes carry the rule once: the session role is coordinator.md then
     # coordinator-session.md, so the rule lives only in coordinator.md.
     from ttp.prompts import coordinator_role, coordinator_session_role
@@ -211,7 +211,7 @@ def test_replies_and_notifies_to_the_user_go_out_untagged_while_posts_to_others_
         assert "replies" in text[at - 150:at + 200].lower() and "never" in text[at - 150:at + 200], name
     prompts = pathlib.Path(aitag.__file__).parents[2] / "template" / "prompts"
     worker = (prompts / "worker.md").read_text()
-    assert "Posts others (not the user) read end with `[authored by AI]`" in worker
+    assert "Posts and drafts others (not the user) read end with `[Authored by AI]`" in worker
 
 
 
@@ -238,7 +238,7 @@ def test_text_for_other_people_answers_what_was_asked_in_one_shared_wording(env)
     for name in ("stateless", "session"):
         assert "Posts and drafts people other than the user read" in texts[name] and texts[name].count("AI-authorship tag") == 1
     assert "post-ready draft you post" in " ".join(texts["relay skill"].split())
-    assert "Posts others (not the user) read end with `[authored by AI]`" in texts["worker"]
+    assert "Posts and drafts others (not the user) read end with `[Authored by AI]`" in texts["worker"]
 
 def test_gh_close_comments_release_notes_and_more_api_posts_need_the_ai_tag(env, tmp_path):
     from ttp import prguard
@@ -262,7 +262,7 @@ def test_gh_close_comments_release_notes_and_more_api_posts_need_the_ai_tag(env,
                ("api", "orgs/o/teams/t/discussions/3/comments", "-f", "body=hi"))
     for args in refused:
         w = why(*args, stdin="Shipped." if "-" in args else None)
-        assert w and "AI-authorship tag '[authored by AI]'" in w, (args, w)
+        assert w and "AI-authorship tag '[Authored by AI]'" in w, (args, w)
     for args in (("issue", "close", "7"), ("pr", "close", "7", "-d"), ("issue", "close", "7", "-c", tagged),
                  ("issue", "close", "7", "-r", "not planned"), ("pr", "reopen", "7", "-c", tagged),
                  ("release", "create", "v1", "--generate-notes"), ("release", "create", "v1", "--notes-from-tag"),
@@ -326,7 +326,7 @@ def test_curl_and_wget_posts_to_github_slack_jira_and_confluence_need_the_ai_tag
         "curl -d @missing.json https://slack.com/api/chat.postMessage")
     for cmd in refused:
         why = bash(cmd.replace("cd /tmp && ", ""))
-        assert why and "AI-authorship tag '[authored by AI]'" in why, (cmd, why)
+        assert why and "AI-authorship tag '[Authored by AI]'" in why, (cmd, why)
         assert ("cannot read" in why) == ("@-" in cmd or "missing" in cmd), (cmd, why)
     passed = (
         "curl --json '{\"channel\": \"C1\", \"text\": \"Build is green\\n[authored by AI]\"}' "
@@ -444,3 +444,34 @@ def test_composed_messages_to_the_user_drop_the_tag_of_each_model_written_part(e
     # relay itself drops it from a text it is handed: the in-place update writes the message without db.post.
     assert not userstep.relay(p.db, p.db.task(tid), "sign-in", {"check": CHECK}, "Sign in again.\n[authored by AI]")
     assert _step_posts(p)[-1]["text"] == "Sign in again." == userstep.for_task(p.db, tid)[0]["text"]
+
+
+def test_the_default_tag_is_capitalised_while_a_lowercase_tag_and_a_projects_own_setting_still_hold(env):
+    from ttp import aitag
+    p = make(env)
+    assert aitag.DEFAULT == "[Authored by AI]" == aitag.tag(p.config()) == aitag.tag(None)
+    # Matching ignores case: a post ending with the old lowercase tag still passes the default.
+    for body in ("Looks good.\n\n[authored by AI]", "Looks good. [AUTHORED BY AI]", "Looks good.\n[Authored by AI]"):
+        assert aitag.ends_with_tag(body, aitag.DEFAULT), body
+        assert aitag.gh_problem("pr", ["comment", "7", "-b", body], p.config()) is None, body
+    # A project's explicit setting is its own: never rewritten to the new default.
+    p.set_config("delivery.ai_tag", "[authored by AI]")
+    assert aitag.tag(p.config()) == "[authored by AI]"
+    assert "'[authored by AI]'" in aitag.gh_problem("pr", ["comment", "7", "-b", "Looks good."], p.config())
+
+
+def test_a_direct_post_through_the_claude_ai_slack_connector_needs_no_tag_but_its_drafts_and_other_posts_do(env):
+    """The claude.ai Slack connector labels its own posts as written by Claude, so a direct send needs no
+    tag; a draft it writes is the user's to send and still does, as does any other Slack server or connector."""
+    from ttp import aitag
+    p = make(env)
+    untagged = {"channel_id": "C1", "message": "Build is green"}
+    for tool in ("mcp__claude_ai_Slack__slack_send_message", "mcp__claude_ai_slack__slack_send_message",
+                 "mcp__claude_ai_Slack__slack_schedule_message"):
+        assert not aitag.posts(tool, untagged) and aitag.tool_problem(tool, untagged, p.config()) is None, tool
+    for tool in ("mcp__claude_ai_Slack__slack_send_message_draft", "mcp__claude_ai_Slack__slack_create_draft",
+                 "mcp__slack__slack_send_message", "mcp__claude_ai_Atlassian__addCommentToJiraIssue"):
+        why = aitag.tool_problem(tool, untagged, p.config())
+        assert why and "'[Authored by AI]'" in why, tool
+    tagged = {"channel_id": "C1", "message": "Build is green\n\n[Authored by AI]"}
+    assert aitag.tool_problem("mcp__claude_ai_Slack__slack_send_message_draft", tagged, p.config()) is None

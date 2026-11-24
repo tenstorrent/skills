@@ -37,7 +37,7 @@ import uuid
 from pathlib import Path
 
 from . import runtimeload   # first of its own: its LOADED_AT is when the daemon imported its code
-from . import blindreview, deviceplan, glmassist
+from . import aitag, blindreview, deviceplan, glmassist
 from . import rolerestore
 from . import codearm
 from . import glmwork
@@ -609,7 +609,7 @@ PR_FIX_ROUNDS = 2
 PR_FINISH_LINE = ("Take it to the finish line for human review: CI green (a check that also fails on the base "
                   "branch does not hold it), every bot comment and review thread fixed or answered, and the "
                   "description current with the head (what it changes, how it was tested). Never mark it ready, "
-                  "merge it or request reviewers. Anything you post on GitHub ends with [authored by AI].")
+                  "merge it or request reviewers. Anything you post on GitHub ends with {tag}.")
 PROBE_EVERY_S = 180     # how often a waiting task's `retry_when` (or a deferred one's `start_when`) probe runs
 NOT_YET_RCS = (1, 75, 255)   # probe exits meaning "not yet": 1, EX_TEMPFAIL (a busy `ttp lock`), ssh unreachable
 PREMISE_HELD = "its premise command (`premise_cmd:`)"   # _start_hold's held_by words for an unrun premise
@@ -22049,7 +22049,7 @@ class Daemon:
             f"Pull request {url} still has open findings after task #{src['id']} ({src['title']}) finished: {what}.",
             "This task owns them now; no other task does. Fix or answer each bot review comment on the PR "
             "(answers end with the hidden line <!-- ttp -->) and get CI green.",
-            PR_FINISH_LINE,
+            PR_FINISH_LINE.format(tag=aitag.tag(self.cfg) or aitag.DEFAULT),
             f"{on}. {deliver}",
             f"Put {url} in the hand-off's `pr`."])
         with db.tx():
@@ -22082,11 +22082,11 @@ class Daemon:
             f"human review: {what}.",
             "This task owns that now; no other task does. Fix or answer each failing check, bot comment and "
             "review thread (answers end with the hidden line <!-- ttp -->).",
-            PR_FINISH_LINE,
+            PR_FINISH_LINE.format(tag=aitag.tag(self.cfg) or aitag.DEFAULT),
             "A person opened this PR: never rewrite their text. Keep the harness's part of the description in "
             "one marked section at its end, between the lines <!-- ttp:purview --> and <!-- /ttp:purview -->, "
             "added if missing and rewritten in place after that (one current place, the person's words "
-            "untouched, no comment trail); it ends with [authored by AI].",
+            f"untouched, no comment trail); it ends with {aitag.tag(self.cfg) or aitag.DEFAULT}.",
             deliver, f"Put {url} in the hand-off's `pr`."])
         rounds = db.one("SELECT COUNT(*) n FROM tasks WHERE labels LIKE ?", (f'%"pr_fix:{key}"%',))["n"]
         if rounds >= PR_FIX_ROUNDS or coord.next_task_slot(db, coord.task_cap(self.cfg)) is not None:

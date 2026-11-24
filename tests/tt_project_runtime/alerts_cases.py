@@ -2079,7 +2079,7 @@ def test_a_person_opened_draft_short_of_ready_gets_one_finishing_task(env, monke
     fix = _pr_fixes(p)
     assert len(fix) == 1 and fix[0]["title"].startswith("Finish PR: ") and fix[0]["kind"] == "code"
     assert "<!-- ttp:purview -->" in fix[0]["spec"] and '"pr_branch:b9"' in fix[0]["labels"]
-    assert "Never mark it ready" in fix[0]["spec"] and "[authored by AI]" in fix[0]["spec"]
+    assert "Never mark it ready" in fix[0]["spec"] and "[Authored by AI]" in fix[0]["spec"]
     assert not _pr_fixes(p, 5), "PR 5's head is no branch of the project"
     rec = p.db.kv(prguard.FINDINGS_KEY)["acme/widgets#9"]
     assert rec["purview"] and rec["finish"] == "finishing" and rec["owner"] == fix[0]["id"]

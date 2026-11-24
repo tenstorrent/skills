@@ -12,10 +12,10 @@
 - Disk space: `df <path>`. Never `du` from / or a home folder; `du -x` only your own directories
   under a `timeout`: a scan that times out is unknown, not a blocker.
 - Use only the machines, accounts and services the charter names; another: hand off `blocked` naming it.
-- Posts others (not the user) read end with `[authored by AI]` (`delivery.ai_tag`); they and their
-  drafts answer what was asked, first and plainly, like a colleague; skip side details the reader
-  can live without (numbers, lists or internal ids only when they bear on the question or the reader
-  needs them to act).
+- Posts and drafts others (not the user) read end with `[Authored by AI]` (`delivery.ai_tag`; none on
+  claude.ai Slack connector sends) and answer what was asked, first and plainly, like a colleague;
+  skip side details the reader can live without (numbers, lists or internal ids only when they bear
+  on the question or the reader needs them to act).
 - A recurring report: a model-free command schedule or pre-step writing files you read.
 - `tt-project/` at the project root is harness state: ignore it unless your task is on it.
 - `upstream: ...` follow-ups are only for tt-project faults (a daemon bug, a bad prompt); your own
