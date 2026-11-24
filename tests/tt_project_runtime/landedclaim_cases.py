@@ -116,6 +116,18 @@ def test_a_plain_landed_sentence_that_names_no_destination_is_checked(env, monke
         assert "not landed" in fixed and head[:12] in fixed, (text, fixed)
 
 
+def test_a_landed_claim_s_sentence_ends_at_its_nearest_stop(env, monkeypatch):
+    """The next sentence's words (a branch, a PR, an upstream note) never change the claim's
+    destination: each plain claim is checked against the task head."""
+    from ttp import pushclaim
+    p, repo, head = _claim_replay_setup(env, monkeypatch, landed=False)
+    for text in ("The fix landed. Next: rebase on main.",
+                 "The fix landed. I opened a PR for the docs.",
+                 "The fix landed\nSee the upstream note later."):
+        fixed = pushclaim.correct_landed_claims(p, text, p.root, head)
+        assert "not landed" in fixed and head[:12] in fixed, (text, fixed)
+
+
 def test_a_sha_less_claim_naming_the_push_branch_is_checked(env, monkeypatch):
     """A sha-less claim whose sentence names the push branch is checked against the task head even
     when its verb is a push or a merge: the correction still reads 'not landed' when the branch

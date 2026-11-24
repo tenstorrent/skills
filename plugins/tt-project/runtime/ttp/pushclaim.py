@@ -232,7 +232,7 @@ def landed_claims(p, text: str, repo) -> list[tuple[int, int, str, tuple]]:
             continue
         # the sentence must name the run's own work as what landed ("the change landed", "landed
         # the fix"), so a verb about something else ("pushed the data to a folder") is no claim
-        hi = next((i for i in (text.find(c, m.end()) for c in ".!?\n") if i > m.end()), len(text))
+        hi = min((i for i in (text.find(c, m.end()) for c in ".!?\n") if i >= m.end()), default=len(text))
         if not _LANDED_SUBJECT.search(text[lo:hi]) or text[m.end():].startswith(" " + UNVERIFIED_CLAIM):
             continue   # not about this run's work, or the claim is already marked
         # a sha-less claim is a push-branch claim only when its sentence names that branch, or
