@@ -114,8 +114,9 @@ def pace_from(cfg: dict) -> str:
 def ceiling(cfg: dict) -> int | None:
     """machine.max_workers (an account setting, so the same in every project): the user's fixed ceiling,
     or None when unset or not a whole number of 1 or more (config_problems names a bad one)."""
+    from .project import max_workers_problem
     v = ((cfg or {}).get("machine") or {}).get("max_workers")
-    return v if isinstance(v, int) and not isinstance(v, bool) and v >= 1 else None
+    return None if v is None or max_workers_problem(v) else v
 
 
 def levels(sig: dict, pace: str = "moderate") -> dict:
