@@ -28102,6 +28102,21 @@ def _checks_repo(env, tmp_path, monkeypatch):
     return p, repo, run, git
 
 
+def _alternates_mirror_worktree(tmp_path):
+    """A worktree off a bare mirror that borrows its objects from another repository
+    (objects/info/alternates), as large mirrored repos are kept: (the worktree, its git dir)."""
+    src, mirror, wt = tmp_path / "src", tmp_path / "mirror.git", tmp_path / "mirror-wt"
+    g = ["git", "-C", str(src), "-c", "user.email=t@example.com", "-c", "user.name=t"]
+    subprocess.run(["git", "init", "-q", str(src)], check=True)
+    (src / "a.txt").write_text("a\n")
+    subprocess.run([*g, "add", "a.txt"], check=True)
+    subprocess.run([*g, "commit", "-qm", "a"], check=True)
+    subprocess.run(["git", "clone", "-q", "--bare", "--shared", str(src), str(mirror)], check=True)
+    assert (mirror / "objects" / "info" / "alternates").is_file()
+    subprocess.run(["git", "-C", str(mirror), "worktree", "add", "-q", "--detach", str(wt)], check=True)
+    return wt, mirror / "worktrees" / wt.name
+
+
 def test_ttp_checks_reuses_a_recorded_pass_only_for_the_same_tree_and_commands(env, tmp_path, monkeypatch, capsys):
     from ttp import cli
     p, repo, run, git = _checks_repo(env, tmp_path, monkeypatch)

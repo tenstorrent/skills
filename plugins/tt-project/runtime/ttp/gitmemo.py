@@ -64,6 +64,10 @@ FINISH_WALL_S = 90.0    # nor past this long: the reads it learns between rounds
 PREFETCH_GIT_S = 60.0   # all git one finish's warm-up (Daemon._prefetch_git) runs, together
 PURE_FLOOR_S = 10.0   # a git check (check-ref-format, var, version: no repository read, no lock) gets at least this
 FLOOR_S = 2.0   # the least a git call started with its bounded() deadline about to pass gets (or the whole budget)
+# What points git at one repository whatever its -C or --git-dir names: a caller (a hook, a script
+# working in a worktree) may leave them set, so a step that found its repository drops them (forget_repo).
+REPO_ENV = ("GIT_DIR", "GIT_WORK_TREE", "GIT_COMMON_DIR", "GIT_INDEX_FILE", "GIT_OBJECT_DIRECTORY",
+            "GIT_ALTERNATE_OBJECT_DIRECTORIES", "GIT_IMPLICIT_WORK_TREE", "GIT_PREFIX")
 # git's own options that take the next argument (git -C <dir> <verb> ...)
 _OPTS_WITH_VALUE = frozenset({"-C", "-c", "--git-dir", "--work-tree", "--namespace", "--exec-path", "--config-env"})
 # Verbs that only read the repository (a scratch GIT_INDEX_FILE aside): bounded() caps them anywhere.
@@ -88,6 +92,15 @@ class Spent(subprocess.TimeoutExpired):
 
     def __str__(self) -> str:
         return f"Command {self.cmd!r} not started: its {self.budget} was spent"
+
+
+def forget_repo() -> None:
+    """Drop REPO_ENV from this process (and what it starts): once its repository is found, every git call
+    names its own (-C, --git-dir), and an inherited GIT_DIR would make `git init <dir>` write elsewhere and
+    GIT_WORK_TREE fail `git init --bare` (exit 128)."""
+    import os
+    for k in REPO_ENV:
+        os.environ.pop(k, None)
 
 
 def is_read(args: tuple | list) -> bool:

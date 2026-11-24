@@ -20,6 +20,7 @@ host=$1
 shift
 [ -n "$FAKE_SSH_LOG" ] && echo "$host" >> "$FAKE_SSH_LOG"
 [ -n "$FAKE_SSH_ARGS" ] && echo "$all" >> "$FAKE_SSH_ARGS"
+unset GIT_DIR GIT_WORK_TREE   # a real host never gets this side's git variables
 if [ "$host" = down ]; then echo "ssh: connect to host down port 22: Connection refused" >&2; exit 255; fi
 [ -n "$FAKE_REMOTE_TMP" ] && export TMPDIR="$FAKE_REMOTE_TMP" TTP_HOME="$FAKE_REMOTE_TMP/../host-home"
 if [ -n "$FAKE_SSH_NOGIT" ]; then
@@ -4686,6 +4687,15 @@ def _rc_commit(repo, name, data=b"x\n"):
     git = ["git", "-C", str(repo), "-c", "user.email=t@example.com", "-c", "user.name=t"]
     subprocess.run([*git, "add", "-A"], check=True)
     subprocess.run([*git, "commit", "-qm", name], check=True)
+
+
+def test_a_remote_check_from_a_worktree_of_an_alternates_mirror_sends_its_bundle_whatever_git_dir_is_set(tmp_path):
+    """Replay: run with the caller's GIT_DIR and GIT_WORK_TREE naming a worktree of a bare mirror that
+    borrows its objects (alternates), the bundle's scratch `git init --bare` exited 128 (GIT_WORK_TREE
+    without GIT_DIR) and the check never ran. The bundle carries the borrowed objects and the check runs."""
+    wt, gitdir = _alternates_mirror_worktree(tmp_path)
+    rc, said = _rc_run(tmp_path, wt, "cat a.txt", GIT_DIR=str(gitdir), GIT_WORK_TREE=str(wt))
+    assert rc == 0 and "a" in said.split() and "exit 128" not in said, said
 
 
 def test_a_remote_check_sends_only_new_objects_to_the_hosts_mirror_and_leaves_no_ref_or_checkout(tmp_path):

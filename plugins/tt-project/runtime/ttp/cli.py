@@ -4616,6 +4616,7 @@ def _cmd_checks(a) -> None:
     head = pinned or subprocess.run([*git, "rev-parse", "HEAD"], capture_output=True, text=True).stdout.strip()
     if not top or not head:
         die("ttp checks: run it in the change's git worktree (or pass --worktree <path>)")
+    gitmemo.forget_repo()   # the worktree is found: a caller's GIT_DIR names no other repo from here
     print(checktree.line(head, top), flush=True)
     # The scan runs in the detached checks, not in their launcher: its caller (the daemon starting a
     # review's pre-checks) can wait for it holding the project's write turn, which the scan may need.

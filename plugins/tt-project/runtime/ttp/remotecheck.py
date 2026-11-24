@@ -622,6 +622,8 @@ def main(args: list[str]) -> int:
         _say(f"no commit {commit[:12]} in this checkout; nothing to copy" if commit and top
              else "not in a git checkout with a commit; nothing to copy")
         return 2
+    from . import gitmemo
+    gitmemo.forget_repo()   # every later git call names `top` or its scratch repository
     why = ""
     for wait in (None, *MUX_BACKOFF_S):
         if wait is not None:
@@ -843,10 +845,13 @@ def _send_bundle(host, top, sha, dst, have, mirror, direct, deadline) -> str:
               # another check seeding the same step got there first: its commit is what this one needs
               + (f" || git -C {m} cat-file -e {sha}^{{commit}}" if dst.startswith("refs/heads/base/") else ""))
     with tempfile.TemporaryDirectory(prefix="ttp-bundle.") as scratch:
-        subprocess.run(["git", "init", "-q", "--bare", scratch], check=True, capture_output=True)
-        Path(scratch, "objects", "info", "alternates").write_text(_objects(top) + "\n")
-        subprocess.run(["git", "--git-dir", scratch, "update-ref", "refs/heads/ttp-send", sha], check=True,
-                       capture_output=True)
+        step, r = "init", subprocess.run(["git", "init", "-q", "--bare", scratch], capture_output=True, text=True)
+        if not r.returncode:
+            Path(scratch, "objects", "info", "alternates").write_text(_objects(top) + "\n")
+            step, r = "update-ref", subprocess.run(["git", "--git-dir", scratch, "update-ref", "refs/heads/ttp-send",
+                                                    sha], capture_output=True, text=True)
+        if r.returncode:   # git's own words, never a bare exit code
+            return f"{label} failed (git {step} exit {r.returncode}: {' '.join(r.stderr.split())[:200]})"
         src_rc, rc, why, text = _copy(host, ["git", "--git-dir", scratch, "bundle", "create", "-q", "-",
                                              "refs/heads/ttp-send", *(["--not", *have] if have else [])],
                                       script, direct, deadline, label)

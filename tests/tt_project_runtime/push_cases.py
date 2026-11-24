@@ -15884,6 +15884,36 @@ def test_push_checks_by_repo_picks_each_repos_list(env, tmp_path, monkeypatch, c
         "true", f"echo harness >> {log}", f"echo work >> {log}"]
 
 
+def test_checks_in_a_worktree_of_an_alternates_mirror_run_that_repos_checks_whatever_git_dir_is_set(
+        env, tmp_path, monkeypatch, capsys):
+    """Replay: `ttp checks` started with the caller's GIT_DIR and GIT_WORK_TREE naming a worktree of a bare
+    mirror that borrows its objects (alternates) took every repository for the harness (its
+    push_checks_by_repo.harness list ran) and then made no clean checkout (git init wrote under GIT_DIR:
+    no .git/objects/info/alternates). It runs the list that repository gets, in a clean checkout of its
+    head; with none configured it says so and fails, running nothing."""
+    from ttp import cli
+    p, repo, run, git = _checks_repo(env, tmp_path, monkeypatch)
+    log = tmp_path / "log"
+    p.set_config("delivery.push_checks", [f"echo code >> {log}; cat a.txt >> {log}"])
+    p.set_config("delivery.push_checks_by_repo", {"harness": [f"echo harness >> {log}"]})
+    wt, gitdir = _alternates_mirror_worktree(tmp_path)
+    monkeypatch.chdir(wt)
+    monkeypatch.setenv("GIT_DIR", str(gitdir))
+    monkeypatch.setenv("GIT_WORK_TREE", str(wt))
+    cli.main(["checks"])
+    out = capsys.readouterr().out
+    assert log.read_text().split() == ["code", "a"], out
+    assert "running in a clean checkout" in out
+    rec = json.loads((run / "checks.json").read_text())
+    assert rec["passed"] is True and rec["checks_from"] == "delivery.push_checks"
+    p.set_config("delivery.push_checks", [])
+    log.unlink()
+    with pytest.raises(SystemExit) as e:
+        cli.main(["checks", "--fresh"])
+    assert e.value.code and not log.exists()
+    assert "sets no delivery.push_checks for this repo" in capsys.readouterr().err
+
+
 def test_single_repo_push_checks_are_unchanged(env, tmp_path, monkeypatch):
     """With no push_checks_by_repo, a code repo gets delivery.push_checks as before and every
     fingerprint of the check settings is the one it was."""
