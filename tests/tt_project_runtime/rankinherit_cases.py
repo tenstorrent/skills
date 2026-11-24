@@ -78,7 +78,7 @@ def test_a_run_whose_supervisor_is_gone_is_lost_though_its_lease_is_young(env, t
     (run_dir / "runner.pid").write_text(f"{os.getpid()}\n{runner.proc_start(os.getpid())}\n")
     assert d._run_alive(dict(row, pid=os.getpid())) is True
     (run_dir / "runner.pid").unlink()
-    assert d._run_alive(dict(row, pid=gone.pid)) is True   # nothing recorded: the lease still speaks for it
+    assert d._run_alive(dict(row, pid=gone.pid)) is False   # a gone recorded process is gone, record or no record
     (run_dir / "runner.pid").write_text(f"{gone.pid}\n123456\n")
     assert d._run_alive(dict(row, boot_id="another-boot")) is False
     (run_dir / "runner.pid").write_text(f"{os.getpid()}\n{runner.proc_start(os.getpid())}\n")

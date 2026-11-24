@@ -17091,6 +17091,62 @@ def test_a_live_supervisor_with_a_stale_lease_is_ended_as_hung_after_the_thresho
             proc.wait()
 
 
+def test_a_run_whose_recorded_pid_is_gone_is_lost_at_once_and_replaced(env, tmp_path):
+    """A supervisor that died leaves a lease it renewed moments before and no start-time record:
+    the run is lost on the first reap, not LEASE_STALE_S later, and its task is requeued at once
+    with no retry delay, so the replacement starts in the same tick's dispatch."""
+    p = make(env)
+    from ttp.daemon import Daemon
+    d = Daemon(p.base)
+    gone = subprocess.Popen(["true"])
+    gone.wait()   # the pid the run row records: its process is gone
+    tid = p.db.add_task("job", "s", kind="work", tier="light", origin="user")
+    p.db.update_task(tid, status="running")
+    run_dir = tmp_path / "gone"
+    run_dir.mkdir()
+    (run_dir / "output.jsonl").write_text("")
+    (run_dir / "lease").touch()   # renewed moments before the supervisor died
+    rid = p.db.x("INSERT INTO runs(task,role,provider,started,status,dir,boot_id,pid) VALUES(?,?,?,?,?,?,?,?)",
+                 (tid, "worker", "fake", time.time() - 60, "running", str(run_dir), d.boot, gone.pid))
+    d.reap_runs()
+    row = p.db.one("SELECT status, note FROM runs WHERE id=?", (rid,))
+    assert row["status"] == "lost" and json.loads(row["note"])["lost_to_crash"] is True
+    t = p.db.task(tid)
+    assert t["status"] == "queued" and t["attempts"] == 0 and not t["not_before"], \
+        "a lost run's task is requeued at once: no attempt, no retry delay"
+    d.dispatch()
+    assert p.db.one("SELECT COUNT(*) n FROM runs WHERE task=? AND status='running'", (tid,))["n"] == 1, \
+        "the replacement run starts in the same tick's dispatch"
+
+
+def test_a_live_supervisor_with_no_start_record_is_never_lost(env, tmp_path):
+    """The other side of the dead-pid rule: a supervisor whose process is up keeps its run running,
+    start record or no start record, lease young or stale (the stale one takes the hung path)."""
+    p = make(env)
+    from ttp.daemon import Daemon
+    d = Daemon(p.base)
+    live = subprocess.Popen(["sleep", "30"])
+    try:
+        tid = p.db.add_task("job", "s", kind="work", tier="light", origin="user")
+        p.db.update_task(tid, status="running")
+        run_dir = tmp_path / "live"
+        run_dir.mkdir()
+        (run_dir / "output.jsonl").write_text("")
+        (run_dir / "lease").touch()
+        rid = p.db.x("INSERT INTO runs(task,role,provider,started,status,dir,boot_id,pid) VALUES(?,?,?,?,?,?,?,?)",
+                     (tid, "worker", "fake", time.time() - 60, "running", str(run_dir), d.boot, live.pid))
+        d.reap_runs()
+        assert p.db.one("SELECT status FROM runs WHERE id=?", (rid,))["status"] == "running"
+        old = time.time() - 999
+        os.utime(run_dir / "lease", (old, old))
+        d.reap_runs()
+        assert p.db.one("SELECT status FROM runs WHERE id=?", (rid,))["status"] == "running", \
+            "a live process with a stale lease goes the hung path, never lost"
+    finally:
+        live.kill()
+        live.wait()
+
+
 def test_a_reused_supervisor_pid_is_reaped_as_lost_and_never_signalled(env, tmp_path):
     p = make(env)
     from ttp.daemon import Daemon

@@ -4465,6 +4465,8 @@ class Daemon:
             return bool(r["pid"]) and _alive(r["pid"]) and self._is_supervisor(r) is True
         if fresh and this_boot and r["pid"] and self._is_supervisor(r) is False:
             return False   # its supervisor is gone though its last lease is young: lost now, not 3 min on (L7)
+        if this_boot and r["pid"] and not _alive(r["pid"]):
+            return False   # its recorded process is gone, whatever its lease says: lost now, not LEASE_STALE_S on
         return fresh or (this_boot and bool(r["pid"]) and _alive(r["pid"]) and self._is_supervisor(r) is not False)
 
     def _is_supervisor(self, r: dict) -> bool | None:
