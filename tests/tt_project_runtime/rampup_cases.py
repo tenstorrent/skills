@@ -71,13 +71,13 @@ def test_dispatch_after_an_outage_starts_urgent_work_first_and_widens_step_by_st
 
 
 def _cut_run(p, tmp_path, tid, boot, pid, lease_age=20.0):
-    """A run of task tid recorded running under `boot` with supervisor `pid`, its lease `lease_age` s old."""
+    """A run of task tid recorded running under `boot` with supervisor `pid`, its lease and output `lease_age` s old."""
     p.db.update_task(tid, status="running")
     run_dir = tmp_path / f"run{tid}"
     run_dir.mkdir()
-    (run_dir / "output.jsonl").write_text("")
-    (run_dir / "lease").touch()
-    os.utime(run_dir / "lease", (time.time() - lease_age, time.time() - lease_age))
+    for name in ("output.jsonl", "lease"):
+        (run_dir / name).touch()
+        os.utime(run_dir / name, (time.time() - lease_age, time.time() - lease_age))
     return p.db.x("INSERT INTO runs(task,role,provider,started,status,dir,boot_id,pid) VALUES(?,?,?,?,?,?,?,?)",
                   (tid, "worker", "fake", time.time() - 1800, "running", str(run_dir), boot, pid))
 
@@ -93,6 +93,7 @@ def test_runs_a_reboot_cut_resume_on_the_first_tick_ahead_of_its_slow_steps_and_
     try:
         p.set_config("budget.ramp_start", 1)
         d.cfg = p.config()
+        d.boot_at = time.time() - 10   # this boot began after the cut runs' last sign of life (20 s ago)
         gone = subprocess.Popen(["true"])
         gone.wait()
         cut = [p.db.add_task(f"cut {i}", "s", kind="work", tier="light", origin="user", priority=3) for i in range(3)]

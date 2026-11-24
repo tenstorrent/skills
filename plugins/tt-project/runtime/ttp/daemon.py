@@ -16338,17 +16338,22 @@ class Daemon:
 
     def _reboot_resumes(self) -> set[int]:
         """Queued tasks whose latest run a host reboot cut short (finish_run's lost_to_reboot, this boot)."""
+        boots = sorted(b for b in self.boots if b)
+        if not boots:
+            return set()
+        # A cut run's `ended` is its last sign of life, before the boot: match this boot's id in its note.
         rows = self.p.db.q(
-            "SELECT r.task, r.note FROM runs r JOIN tasks t ON t.id=r.task WHERE r.ended>? AND r.status='lost' "
-            "AND r.role!='coordinator' AND t.status='queued' AND r.note LIKE '%lost_to_reboot%' AND NOT EXISTS "
+            "SELECT r.task, r.note FROM runs r JOIN tasks t ON t.id=r.task WHERE r.status='lost' "
+            "AND r.role!='coordinator' AND t.status='queued' AND r.note LIKE '%lost_to_reboot%' AND ("
+            + " OR ".join("r.note LIKE ?" for _ in boots) + ") AND NOT EXISTS "
             "(SELECT 1 FROM runs n WHERE n.id>r.id AND n.task=r.task AND n.role!='coordinator')",
-            (time.time() - 2 * 86400,))
+            tuple(f"%{b}%" for b in boots))
         return {r["task"] for r in rows if self._this_boot(json.loads(r["note"] or "{}").get("lost_to_reboot"))}
 
     def resume_after_reboot(self) -> None:
-        """Right after the reap, start the runs a host reboot cut short, ahead of the tick's other steps
-        (minutes on the first tick after a boot) and the post-outage ramp: a reboot's runs resume within
-        seconds of the daemon starting. The same holds as for dispatch: pause, settle, host cycle, gates."""
+        """Right after the reap, start the runs a host reboot cut short, ahead of the tick's slower steps
+        and the post-outage ramp, so they resume within seconds of the daemon starting. Every other
+        dispatch hold applies: pause, settle, host cycle, budget gates and the per-task checks."""
         if self.cfg_status == "unavailable" or self.p.db.kv("paused", False) or self.settling() \
                 or self.host_cycle_held(time.time()):
             return
