@@ -637,7 +637,7 @@ def code_text(cmd: str, interp: bool = False, py_code: bool = False) -> str:
     file (`cat > t.py <<'EOF' ... project.db ...`) opens nothing; an unquoted one runs its `$(...)` and backticks,
     and one a shell or interpreter reads runs, so they stay. `interp`: a quoted body that a script interpreter reads
     (python, node, perl) also goes when it has no call that opens a file (OPENER_RE): a test string naming a key.
-    `py_code`: a quoted body python reads keeps only its code (_py_code)."""
+    `py_code`: a quoted body python reads keeps only its code (_py_without_text)."""
     from . import hook, pathguard
     lines, bodies = hook._heredocs(cmd)
 
@@ -652,16 +652,20 @@ def code_text(cmd: str, interp: bool = False, py_code: bool = False) -> str:
         return bool(py_code and hook.HEREDOC_RE.match(lines[i], pos)[2]
                     and re.fullmatch(r"python[\d.]*", hook._first_word(hook._piece_at(lines[i], pos)[0])))
     return "\n".join(lines + [ln for i, body, pos in bodies if not data(i, pos, body)
-                              for ln in (_py_code(body) if python(i, pos) else body)])
+                              for ln in (_py_without_text(body) if python(i, pos) else body)])
 
 
+# Not pathguard.RUN_CODE_RE: that one also matches `run` and backticks, which would keep nearly every python script
+# whole, and lacks eval/compile/runpy, which run python text.
 _RUNS_TEXT = re.compile(r"\b(?:exec\w*|eval|compile|system|popen|Popen|subprocess|spawn\w*|check_output|check_call|runpy)\b")
 
 
-def _py_code(body: list[str]) -> list[str]:
+def _py_without_text(body: list[str]) -> list[str]:
     """A python script without its comments and multi-line string literals (docstrings, code it writes into a file):
     text no call reads as a path. Its one-line literals stay (`connect('/x/project.db')` opens that file); a script
     tokenize cannot read stays whole, and so does one that runs text (exec, a shell, a subprocess): a literal may be code."""
+    # shortcut: a multi-line literal later used as a database path (`p = """/x/project.db"""`, then `connect(p)`) is
+    # blanked and passes; the guard is a denylist, not a parser, and the post-run audit backs it.
     import io
     import tokenize
     src = "\n".join(body) + "\n"

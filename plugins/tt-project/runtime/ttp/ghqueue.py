@@ -792,11 +792,11 @@ def retire(branch: str, cwd: str | None = None, home=None) -> int:
     from .benchrun import json_lines
     published = [r for r in json_lines(outbox(home) / PUBLISHED) if isinstance(r, dict) and r.get("repo") == repo
                  and r.get("branch") == branch and r.get("project") == _project(cwd)]
+    from .push import pushed as landed
     pushed = p is not None and any(
         (v := _load(f)) and str(v.get("target") or "").endswith("/" + branch)
         # a push batch's receipt, or this project's own single push (`ttp push --own`)
-        and (v.get("outcome") == "pushed" or (v.get("status") == "pushed" and v.get("exit") == 0
-                                              and v.get("own") is True))
+        and (v.get("kind") == "batch" or v.get("own") is True) and landed(f)
         for f in (p.state / "pushes").glob("*.json"))
     # No publish record: the local branch, else origin's remote-tracking ref, else the head its newest
     # task handed off on a shared branch.
