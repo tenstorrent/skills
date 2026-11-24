@@ -471,8 +471,7 @@ def _receipt_landing(p, oid: str, kind: str, evidence: str, milestone: str | Non
     order. Decided by the landed check on the receipt's own commit (a sha its evidence names), else
     its owner task's head, so a receipt filed before anything landed cannot close a change order.
     Plain obligations, milestone receipts, orders whose class is not change, projects with no way to
-    check (landed.can_check) and an owner whose landing is recorded close as they do today; a record
-    record() would refuse anyway (the order is closed or dropped, a non-owner files it) is skipped,
+    check (landed.can_check) and an owner whose landing is recorded close as they do today; a receipt record() would refuse anyway (the order is closed or dropped, a non-owner files it) is skipped,
     so its fetch is never paid. Known gap: a receipt naming another repository's sha reads
     'unverified' (check reads this project's root only). Runs before record()'s transaction: the
     check's one bounded fetch of the push branch is a network call that transaction refuses
