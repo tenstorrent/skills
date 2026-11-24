@@ -75,7 +75,7 @@ _REF_SHA = re.compile(rf"\b(?:pushed|landed)\s+(?:to|on|onto)\s+{_REF}\s+(?:as|a
 _SHA_REF = re.compile(rf"\b(?:pushed|landed)\s+(?:commit\s+)?(?:as\s+|at\s+)?{_SHA}(?:\s+(?:to|on|onto)\s+{_REF})?",
                       re.I)
 _NEGATED = re.compile(r"(?:\bnot|\bnever|n't|\bbe|\bwill|\bwould|\bto"
-                      r"|(?:\b(?:should|may|might|could|must)\s+have)"
+                      r"|(?:\b(?:should|may|might|could)\s+have)"
                       r")(?:\s+(?:yet|been|being|get|got|gotten|already|actually|really|ever))*\s+$", re.I)
 _NOT_REFS = {"the", "a", "an", "it", "its", "origin", "remote", "github", "branch", "upstream"}
 # A claim that the run's change landed, naming no commit: "the change landed", "it was pushed".
@@ -101,7 +101,6 @@ _LIVE_CLAIM = re.compile(r"(?i)\b(?:is|are|was|were|be|been|being|goes|went|gone
 _LIVE_SUBJECT = re.compile(r"(?i)\b(?:changes?|works?|fix(es)?|patch(es)?|commits?|head|branch(es)?"
                            r"|pr|diffs?|checks?|guards?|watchers?|routes?|flags?|prompts?|plugins?|"
                            r"versions?)\b")
-_SHA_SCAN = re.compile(r"(?<![0-9a-f])[0-9a-f]{7,40}(?![0-9a-f])")
 UNVERIFIED_CLAIM = "(unverified)"      # a landed-claim this project cannot check, never a plain 'landed'
 NOT_LANDED = "not landed"              # the correction a claim off the push branch reads
 NOT_LIVE = "not live yet"            # the correction a claim the running version lacks reads
@@ -238,7 +237,7 @@ def landed_claims(p, text: str, repo) -> list[tuple[int, int, str, tuple]]:
             (_ref(repo, ref, tag=tag) if ref and ref.lower() not in _NOT_REFS else None) or target)
            for start, end, full, ref, tag in _sha_phrases(text, repo, foreign)]
     taken = [(start, end) for start, end, *_ in out]
-    from . import claimcheck   # its task and run id rules: the claim is about that id, not this run
+    from . import claimcheck, landed   # their task/run-id rules and sha scan: one parser, reused
     for m in _LANDED_VERB.finditer(text or ""):
         lo = max(text.rfind(c, 0, m.start()) for c in ".!?\n") + 1
         if _NEGATED.search(text[max(0, m.start() - NEG_WINDOW):m.start()]) \
@@ -270,7 +269,7 @@ def live_claims(text: str, repo) -> list[tuple[int, int, str]]:
     one-claim-a-phrase rules as landed_claims. The sha is the first commit of its sentence the
     repository holds, else "": a live line must name one."""
     out, taken = [], []
-    from . import claimcheck   # its task and run id rules: the claim is about that id, not this run
+    from . import claimcheck, landed   # their task/run-id rules and sha scan: one parser, reused
     for m in _LIVE_CLAIM.finditer(text or ""):
         if re.search(r"\b(?:not|never|n't)\b", m.group(0)):
             continue   # "is not live (yet)" claims nothing
@@ -281,7 +280,7 @@ def live_claims(text: str, repo) -> list[tuple[int, int, str]]:
             continue   # hedged, negated, or about another task or run
         if any(m.start() < e and s < m.end() for s, e in taken) or not _LIVE_SUBJECT.search(text[lo:hi]):
             continue   # a phrase landed_claims owns, or a sentence not about this project's own work
-        toks = _SHA_SCAN.findall(text[lo:hi])
+        toks = landed._LITERAL_SHA.findall(text[lo:hi])
         sha = next((w for w in toks if _commit(repo, w)), "")
         if not sha and any(re.search(r"\d", w) for w in toks):
             continue   # names a sha this repository does not hold: another repository's business
