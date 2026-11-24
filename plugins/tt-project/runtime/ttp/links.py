@@ -1,8 +1,7 @@
 # SPDX-FileCopyrightText: © 2026 Tenstorrent USA, Inc.
 # SPDX-License-Identifier: Apache-2.0
-"""Clickable links for every ticket, PR/issue and file path a message to the user names, model-free
-(user order of 2026-11-23: "make sure all tickets and PRs and file paths always show as links, so I
-don't have to manually look them up").
+"""Clickable links for every ticket, PR/issue, file path and project id a message to the user
+names, model-free: the user never has to look a reference up by hand.
 
 linkify(text, cfg, fmt) turns each reference into a link: a configured Jira key KEY-N links to the
 Jira base's browse page; owner/repo#N and repo#N (a configured short name) link to the GitHub issue
