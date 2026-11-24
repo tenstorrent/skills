@@ -16,6 +16,7 @@
   claude.ai Slack connector sends) and answer what was asked, first and plainly, like a colleague;
   skip side details the reader can live without (numbers, lists or internal ids only when they bear
   on the question or the reader needs them to act).
+- Name PRs `owner/repo#N` or by URL, tickets by key, files by full path: the harness links them.
 - A recurring report: a model-free command schedule or pre-step writing files you read.
 - `tt-project/` at the project root is harness state: ignore it unless your task is on it.
 - `upstream: ...` follow-ups are only for tt-project faults (a daemon bug, a bad prompt); your own

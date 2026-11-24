@@ -10,6 +10,15 @@ const esc = (s) => String(s == null ? "" : s).replace(/[&<>"']/g, (c) => ({ "&":
 const isHttp = (url) => /^https?:\/\//i.test(String(url || ""));
 const link = (url, label) => isHttp(url) ? `<a href="${esc(url)}" target="_blank" rel="noopener">${label}</a>` : label;
 const ago = R.ago;
+// Message text arrives linkified (markdown [text](url)); only http(s) targets become anchors.
+const mdLinks = (html) => html.replace(/\[([^\]]+)\]\((https?:\/\/[^)\s]+)\)/g, (m, t, u) => link(u, t));
+const showFile = async (path) => {
+  const r = await api("/api/file?path=" + encodeURIComponent(path));
+  const v = $("#fileview");
+  v.innerHTML = r.error ? ('<p class="meta">' + esc(r.error) + ": " + esc(path) + "</p>")
+                       : ("<b>" + esc(r.name) + "</b><pre>" + esc(r.text) + "</pre>");
+  v.classList.add("on");
+};
 const money = (x) => `$${(+x || 0).toFixed(2)}`;
 // Every time is shown in the project's home zone (the daemon sends it), with its abbreviation: never
 // this browser's zone or the zone of the machine the project runs on.
@@ -27,6 +36,7 @@ const zoneFmt = (day) => {
 const at = (ts) => ts ? zoneFmt(Math.abs(ts - Date.now() / 1000) >= 20 * 3600).format(new Date(ts * 1000)) : "—";
 
 let TOKEN = new URLSearchParams(location.hash.slice(1)).get("token") || sessionStorage.getItem("ttp_token") || "";
+const FILE = new URLSearchParams(location.hash.slice(1)).get("file");   // a file link a message carries
 // The token lives only in this tab's sessionStorage and goes out as the X-TTP-Token header, never
 // in a cookie (cookies are not scoped by port). Expire the cookie older versions wrote.
 document.cookie = "ttp_token=; Max-Age=0; SameSite=Strict; path=/";
@@ -416,7 +426,7 @@ async function pollChat() {
     const d = document.createElement("div"); d.className = `msg ${m.direction} sev-${m.severity}`;
     const where = m.chat === null ? (m.direction === "out" ? " · to everyone" : "")
       : m.chat === "web" ? "" : ` · chat ${esc(m.chat_label || m.chat)}`;
-    d.innerHTML = `<div class="b">${esc(m.text)}</div><div class="meta">${agoH(m.ts)} ago${where}</div>`;
+    d.innerHTML = `<div class="b">${mdLinks(esc(m.text))}</div><div class="meta">${agoH(m.ts)} ago${where}</div>`;
     log.appendChild(d); });
   R.tick();
   if (rows.length && atBottom) log.scrollTop = log.scrollHeight;
@@ -424,6 +434,7 @@ async function pollChat() {
 $("#say").onsubmit = async (e) => { e.preventDefault(); const t = $("#msg").value.trim(); if (!t) return; $("#msg").value = ""; await api("/api/say", { text: t }); pollChat(); };
 
 refresh(); pollChat();
+if (FILE) showFile(FILE).catch(() => {});
 // A hidden tab still looks once 30 s have passed since its last look (by the clock:
 // browsers slow timers in long-hidden tabs), so its notifications still come; it also looks when shown.
 let lastLook = Date.now();
