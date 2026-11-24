@@ -3350,6 +3350,7 @@ ACCOUNT_KEYS = {"budget": {"global_daily_usd", "day_start", "timezone", "push_sp
                            "priority_beyond_cap",   # push and urgent runs beyond checks.host_max (checkcap.priority_beyond_cap)
                            "dirty_max_mb", "io_full_max",   # the disk gate on new local runs (diskgate)
                            "spill_hosts",   # the spill pool every project's checks may use (checkspill.account_hosts)
+                           "spill_load_near", "spill_hold_s",   # the spill load gate and grant hold (checkspill.load_near, hold_s)
                            "no_spill_hosts",   # hosts no project's checks spill to (checkspill.no_spill; a run only adds)
                            "smoke_max_s",
                            *CPU_GROUP_KEYS},   # the landing check time limit (gatetime.max_s), project first

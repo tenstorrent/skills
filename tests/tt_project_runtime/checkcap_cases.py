@@ -12119,7 +12119,7 @@ def test_push_checks_on_a_remote_host_skip_this_hosts_load_guard_checks_slot_and
 
 def test_push_checks_on_an_overloaded_remote_host_wait_for_it_and_say_so(env, monkeypatch):
     """#153, #8016: checks run on a host whose runnable demand is near its cores (checks.load_guard, at most
-    checkspill.LOAD_NEAR x) wait for it to drop and say which host and why; they never start there anyway,
+    checks.spill_load_near x) wait for it to drop and say which host and why; they never start there anyway,
     however long it stays overloaded, and say so again past checks.push_load_wait_s."""
     from ttp import push, remoteload
     p = make(env)
@@ -12133,8 +12133,8 @@ def test_push_checks_on_an_overloaded_remote_host_wait_for_it_and_say_so(env, mo
     assert slot.f is None and len(told) == 1, told
     assert "check host checkhost's CPU is overloaded" in told[0] and "90.0 cores" in told[0] and "64 cores" in told[0]
     assert "waiting for it to drop" in told[0] and "300s" in told[0]
-    # 55 of 64 cores is past 0.8 x even with checks.load_guard 1: it waits.
-    assert remoteload.factor() == 0.8
+    # 55 of 64 cores is past 0.75 x even with checks.load_guard 1: it waits.
+    assert remoteload.factor() == 0.75
     _remote_load(monkeypatch, {"checkhost": [(55.0, 64)] * 6 + [(20.0, 64)]})
     told, now = [], [0.0]
     def sleep(_s):
@@ -12245,15 +12245,15 @@ def test_remote_checks_started_just_now_count_as_load_so_parallel_starts_never_p
     """#8016: the 1-minute load shows none of the runs started there in the last minute, so each start from
     this machine is recorded and counts one run's cores (checklane.run_cores) until it shows: a host at 3 of
     64 cores takes a few starts, then holds the next until its earlier ones age out."""
-    from ttp import checklane, remoteload
+    from ttp import checklane, checkspill, remoteload
     make(env)
     _remote_load(monkeypatch, {"checkhost": [(3.0, 64)]})
     per = checklane.run_cores(None, 64)
     fits = sum(1 for _ in range(40) if not remoteload.held("checkhost", start=True))
-    assert 1 <= fits < 40 and fits == sum(1 for k in range(40) if 3 + k * per < 0.8 * 64), (fits, per)
+    assert 1 <= fits < 40 and fits == sum(1 for k in range(40) if 3 + k * per < checkspill.load_near() * 64), (fits, per)
     why = remoteload.held("checkhost")
     assert why and "just started there from this machine" in why, why
-    later = time.time() + remoteload.LAG_S + 1
+    later = time.time() + checkspill.hold_s() + 1
     assert remoteload.held("checkhost", now=lambda: later) == "", "older starts show in the load by then"
 
 

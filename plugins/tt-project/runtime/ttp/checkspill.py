@@ -65,6 +65,12 @@ small fixed count; a host whose load does not read gets checklane.default_slots 
 per slot it uses there (spill/<alias>.<n>.json in the checks slot folder), so its own runs never
 take more. A claim whose remote ttp-check.* folder is not made yet (the few seconds of its copy) is
 counted by neither, so the host can take one run more than its slots in that gap: a bound, not a guard.
+A run's claim records the test workers it was granted there, and for checks.spill_hold_s (hold_s, default
+90 s; less if the run ends first) they count as the host's load, which does not show them yet: each pick
+checks the host's load again and sizes its workers under the host's reservation lock (<alias>.reserve there,
+_reserving), so runs of any project here starting at once each see the others' grants, and none starts on a
+host whose load with them is at or above checks.spill_load_near (load_near, default 0.75) x its cores. Both
+are account settings, as every project here shares the claims. A dead run's claim counts for nothing (holders).
 A run's folder that no process uses and whose run script is gone (its host or link died before it could
 clean up) does not count, and is removed once stale (_PROBE).
 An entry of either list may be a table instead of an alias, `{"host": "<alias>", "max_runs": 1, "jobs": 16}`
@@ -114,6 +120,7 @@ gets a copy of the commit only, so it never spills either; it splits off to run 
 """
 from __future__ import annotations
 
+import contextlib
 import fcntl
 import hashlib
 import json
@@ -157,8 +164,10 @@ FAILS_FILE = "checks-spill-fails.json"   # in the project state: where each head
 FAILS_KEEP_S = 2 * 86400
 FAULT_VOIDS_S = 3600   # a spill host's own fault (exit 75) voids the failures recorded there this recently (fail_void)
 PROBE_TIMEOUT_S = 30
-LOAD_NEAR = 0.8   # no check starts on a spill host whose 1-minute load (with this machine's runs not yet in it) is this x its cores
-LOAD_LAG_S = 90.0   # a claim this recent may not show in its host's 1-minute load yet: its cores count as load
+LOAD_NEAR = 0.75   # default checks.spill_load_near (load_near): no check starts on a spill host whose 1-minute load,
+# with this machine's runs granted there and not yet in it, is this x its cores
+LOAD_LAG_S = 90.0   # default checks.spill_hold_s (hold_s): a claim this recent may not show in its host's 1-minute
+# load yet, so its granted workers count as load
 BACKOFF_S, BACKOFF_MAX_S = 60.0, 900.0   # an unreachable host is not probed again for this long, doubling per failure
 DEVICE_SUFFIX = "-device"
 DEVICE_WHY = "a device job runs there: "   # how a device-busy reason starts (device_busy, _device_holders)
@@ -791,45 +800,70 @@ def remote_only(cfg: dict | None) -> bool:
     return netwait.workstation(cfg)
 
 
-def workers(cores: int, load: float | None, others: int = 0, cap: int = 0) -> int:
+def workers(cores: int, load: float | None, reserved: int = 0, cap: int = 0) -> int:
     """The test workers a run spilled to a host of `cores` takes: the cores its 1-minute `load` leaves idle,
-    less one run's cores (checklane.run_cores) for each of this machine's `others` claims there whose load
-    may not show yet, at most `cap` (one run's limit, testslots.sizes) and its cores, at least 1; 0 when the
+    less the `reserved` workers this machine's runs were granted there whose load may not show yet
+    (_pending_cores), at most `cap` (one run's limit, testslots.sizes) and its cores, at least 1; 0 when the
     load did not read (the run then sizes itself)."""
-    from . import checklane
     if load is None or cores <= 0:
         return 0
-    idle = int(cores - load) - others * checklane.run_cores(None, cores)
-    return max(1, min(cap or cores, cores, idle))
+    return max(1, min(cap or cores, cores, int(cores - load) - reserved))
 
 
-def workers_why(cores: int, load: float | None, others: int = 0, cap: int = 0) -> tuple[int, str]:
+def workers_why(cores: int, load: float | None, reserved: int = 0, cap: int = 0) -> tuple[int, str]:
     """workers(), and what sized it, for the spill line and status (no silent throttling): the host's idle
-    cores, those kept for this machine's `others` runs there, one run's limit `cap` (checks.test_run_max), and
-    why a run gets a single worker."""
-    n = workers(cores, load, others, cap)
+    cores, those `reserved` for this machine's runs just granted there, one run's limit `cap`
+    (checks.test_run_max), and why a run gets a single worker."""
+    n = workers(cores, load, reserved, cap)
     if not n:
         return 0, "test workers it sizes itself (the host's load did not read)"
-    from . import checklane
     raw = int(cores - load)
-    kept = others * checklane.run_cores(None, cores)
     why = f"{n} test worker(s), its idle cores (load {load:g} of {cores})"
-    if others:
-        why += f", less {kept} kept for {others} other run(s) of this machine there"
-    if cap and n == cap and cap < min(cores, raw - kept):
+    if reserved:
+        why += f", less {reserved} reserved for this machine's runs just granted there"
+    if cap and n == cap and cap < min(cores, raw - reserved):
         why += f", at most {cap} per run (limit checks.test_run_max)"
-    if raw - kept < 1:
+    if raw - reserved < 1:
         why += (f"; only 1 because {max(0, raw)} core(s) are idle"
-                + (f" and {kept} are kept for this machine's other runs there" if others else ""))
+                + (f" and {reserved} are reserved for this machine's runs just granted there" if reserved else ""))
     return n, why
 
 
 def _size(cfg: dict, host: str) -> tuple[int, str]:
-    """workers_why for a run to `host` from its last probe (_READ), before this run's claim there."""
+    """workers_why for a run to `host` from its last probe (_READ), less the workers this machine's runs were
+    granted there that its load may not show yet (_pending_cores): call it under _reserving(host) to claim."""
     from . import testslots
     cores, load = _READ.get(host, (0, None))
     top = testslots.sizes(cfg, cores) if cores > 0 else None   # one run's limit, sized to that host
-    return workers_why(cores, load, _ours(host), top[1] if top else 0)
+    return workers_why(cores, load, _pending_cores(host, cores) if cores > 0 else 0, top[1] if top else 0)
+
+
+def _setting(env: str, key: str, default: float) -> float:
+    """A float checks setting every project on this machine shares: `env`, else the account's checks.`key`,
+    else `default`; a value below 0 or malformed is skipped."""
+    from . import project
+    for v in (os.environ.get(env), (project.load_account_settings().get("checks") or {}).get(key)):
+        if v in (None, "") or isinstance(v, bool):
+            continue
+        try:
+            if (f := float(v)) >= 0:
+                return f
+        except (TypeError, ValueError):
+            continue
+    return default
+
+
+def load_near() -> float:
+    """checks.spill_load_near (TTP_CHECKS_SPILL_LOAD_NEAR, else the account's; default LOAD_NEAR): no check
+    starts on a spill host whose 1-minute load plus this machine's runs granted there and not yet in it is at
+    or above this x its cores. Account-wide, like the reservations it reads (_reserving)."""
+    return _setting("TTP_CHECKS_SPILL_LOAD_NEAR", "spill_load_near", LOAD_NEAR)
+
+
+def hold_s() -> float:
+    """checks.spill_hold_s (TTP_CHECKS_SPILL_HOLD_S, else the account's; default LOAD_LAG_S): how long a
+    run's granted workers on a spill host count as its load (_pending_cores) unless the run ends first."""
+    return _setting("TTP_CHECKS_SPILL_HOLD_S", "spill_hold_s", LOAD_LAG_S)
 
 
 def _probe_all(items: list[tuple[str, bool]]) -> dict:
@@ -1137,20 +1171,49 @@ def probe(alias: str, beside_device: bool = False) -> tuple[int, str, str]:
     _READ[alias] = (cores, load)
     _note_host(alias, cores=cores, load=load)
     _CHECKS_RUNNING[alias] = running
-    # This machine's runs started there in the last LOAD_LAG_S count as load already: many picks at once
-    # each see the same 1-minute load, which shows none of them yet.
+    # This machine's runs granted there in the last hold_s count as load already: many picks at once
+    # each see the same 1-minute load, which shows none of them yet. pick checks again as it claims (_near).
     seen = None if load is None else load + _pending_cores(alias, cores)
-    if seen is not None and cores > 0 and seen >= LOAD_NEAR * cores:
-        return 0, (f"its load is near its cores (load {load:g}"
-                   + (f", {seen - load:g} more for this machine's runs just started" if seen > load else "")
-                   + f", of {cores} cores; no check starts at {LOAD_NEAR:g} x or above, "
-                   f"{running} check(s) running)"), note
+    if why := _near(cores, load, seen, running):
+        return 0, why, note
     n = checklane.host_slots(cores, mem_kib / (1024 * 1024) if mem_kib else None, seen, running)
     if n > 0:
         return n, "", note
     return 0, (f"its {running} running check(s) fill it" if load is None
                else f"its idle cores and memory fit no check now (load {load:g} of {cores} cores, "
                     f"{running} check(s) running)"), note
+
+
+def _near(cores: int, load: float | None, seen: float | None, running: int | None = None) -> str:
+    """Why no check starts on a host of `cores` whose 1-minute `load` is `seen` with this machine's runs granted
+    there and not in it yet: at or above load_near() x its cores; else ""."""
+    f = load_near()
+    if load is None or seen is None or cores <= 0 or seen < f * cores:
+        return ""
+    return (f"its load is near its cores (load {load:g}"
+            + (f", {seen - load:g} more for this machine's runs just started" if seen > load else "")
+            + f", of {cores} cores; no check starts at {f:g} x or above (checks.spill_load_near)"
+            + (f", {running} check(s) running)" if running is not None else ")"))
+
+
+@contextlib.contextmanager
+def _reserving(host: str):
+    """Hold `host`'s reservation lock (<host>.reserve in claim_dir, which every project on this machine
+    shares) while a run checks the host's load again with the runs granted there (_near), sizes its workers
+    (_size) and writes them in its claim: concurrent picks then each see the others' grants, never the same
+    idle cores. Waits for the lock; one that cannot be opened is not held."""
+    fh = None
+    try:
+        claim_dir().mkdir(parents=True, exist_ok=True)
+        fh = open(claim_dir() / f"{host}.reserve", "a+")
+        fcntl.flock(fh, fcntl.LOCK_EX)
+    except OSError:
+        pass
+    try:
+        yield
+    finally:
+        if fh is not None:
+            fh.close()
 
 
 def _failed(alias: str, why: str) -> tuple[int, str, str]:
@@ -1522,7 +1585,13 @@ def admit_pinned(p, hosts: list[str], tell, what: str = "", bound: float | None 
             if why.startswith(_OUT_OF_REACH):
                 got[host] = Claim(host, None)   # nothing to count it by: no hold
                 continue
-            if not why and (c := _claim(host, free, {**rec, "host": host})) is not None:
+            c = None
+            if not why:
+                with _reserving(host):   # as pick claims: runs granted there since the probe count (_near)
+                    cores, load = _READ.get(host, (0, None))
+                    why = _near(cores, load, None if load is None else load + _pending_cores(host, cores))
+                    c = None if why else _claim(host, free, {**rec, "host": host, "since": time.time()})
+            if c is not None:
                 got[host] = c
                 continue
             why = why or (f"its {free} free check slot(s) are claimed by this machine's "
@@ -1602,10 +1671,11 @@ def _run_cores(r: dict, cores: int) -> int:
 
 
 def _pending_cores(host: str, cores: int, now: float | None = None) -> int:
-    """The cores of this machine's claims on `host` from the last LOAD_LAG_S: not in its 1-minute load yet."""
-    now = time.time() if now is None else now
+    """The cores of this machine's live claims on `host` from the last hold_s: not in its 1-minute load yet. A
+    claim leaves it when its run ends (Claim.close) or dies (holders: its lock is gone)."""
+    now, hold = time.time() if now is None else now, hold_s()
     return sum(_run_cores(r, cores) for r in holders()
-               if r.get("host") == host and now - float(r.get("since") or 0) < LOAD_LAG_S)
+               if r.get("host") == host and now - float(r.get("since") or 0) < hold)
 
 
 def used_share(host: str, recs: list | None = None, now: float | None = None) -> float:
@@ -1621,7 +1691,7 @@ def used_share(host: str, recs: list | None = None, now: float | None = None) ->
         return float(len(ours))
     at = float(st.get("at") or 0)
     fresh = now - at < 300 and st.get("load") is not None
-    since = at - LOAD_LAG_S if fresh else 0.0   # runs just before the probe may not show in its load yet
+    since = at - hold_s() if fresh else 0.0   # runs just before the probe may not show in its load yet
     load = float(st["load"]) if fresh else 0.0
     return (load + sum(_run_cores(r, cores) for r in ours if float(r.get("since") or 0) >= since)) / cores
 
@@ -1865,7 +1935,9 @@ def pick(p, cfg: dict, tell, what: str = "", off: str = "", why_here: str = "") 
     (pre_check) lets the run go to, claimed; None when none is. One host of a machine with several (target) is
     probed, claimed and held by its own name, its machine's lock held too. Each host skipped is told with why.
     `off`: OFF_ENV's value, whose hosts (kept_off) are skipped. `why_here`: why the run tries them now (default:
-    the slots here stayed busy). The claim's `workers` are sized to the host's idle cores at its probe (workers).
+    the slots here stayed busy). The claim's `workers` are sized to the host's idle cores at its probe less the
+    workers this machine's runs were granted there in the last hold_s, under the host's reservation lock
+    (_reserving), which also skips a host near its cores by then (_near).
     LAST_BUSY lists after it the hosts skipped only as busy (a lock, a device job, the hook's "not now", full
     slots), never one not allowed, paused, kept off or out of reach (_OUT_OF_REACH)."""
     LAST_BUSY.clear()
@@ -1939,8 +2011,22 @@ def pick(p, cfg: dict, tell, what: str = "", off: str = "", why_here: str = "") 
     order = [c for c in cands if c[3]] + sorted(first, key=lambda c: (own(c[2]) > 0, -(c[6] - _inflight(c[2])),
                                                                       -c[8][0], c[9]))
     for alias, machine, host, why, usable, dev, free, note, size, _ in order:
-        if not why and (got := _claim(host, free, {**rec, "host": host,
-                                                   **({"beside": dev[:300]} if dev else {})})) is not None:
+        got = None
+        if not why:
+            # The probe may be seconds old and other runs here may have been granted this host since: under its
+            # reservation lock the run checks its load again with their workers, sizes its own from what they
+            # leave and writes them in its claim (_pending_cores reads it), so runs starting together add up.
+            with _reserving(host):
+                cores, load = _READ.get(host, (0, None))
+                why = _near(cores, load, None if load is None else load + _pending_cores(host, cores))
+                if not why:
+                    size = _size(cfg, host)
+                    if jobs := limits(cfg, alias).get("jobs"):   # the host entry's own test workers, not its idle cores
+                        size = jobs, f"{jobs} test worker(s), its jobs setting"
+                    got = _claim(host, free, {**rec, "host": host, "since": time.time(),
+                                              **({"beside": dev[:300]} if dev else {}),
+                                              **({"workers": size[0]} if size[0] else {})})   # its cores (_run_cores)
+        if got is not None:
             got.lock = _hold(p, cfg, machine, what)
             if got.lock is None:
                 got.close()
@@ -1948,10 +2034,6 @@ def pick(p, cfg: dict, tell, what: str = "", off: str = "", why_here: str = "") 
                 LAST_BUSY.append(alias)
                 continue
             got.workers, sized = size
-            if jobs := limits(cfg, alias).get("jobs"):   # the host entry's own test workers, instead of its idle cores
-                got.workers, sized = jobs, f"{jobs} test worker(s), its jobs setting"
-            got.note({**rec, "host": host, **({"beside": dev[:300]} if dev else {}),
-                      **({"workers": got.workers} if got.workers else {})})   # its cores, for used_share
             note_here(p.name, "")   # this run is on a spill host now: no reason to show it here
             more = [c[0] for c in first if c[0] != alias]
             tell(f"spilling to {alias}: "

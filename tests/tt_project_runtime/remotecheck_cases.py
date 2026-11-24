@@ -3023,7 +3023,7 @@ def test_spill_host_slots_follow_idle_cores_and_memory_and_the_probe_reads_its_l
     assert checkspill.probe("h") == (checklane.default_slots(64, 200), "", ""), "an unread load: '-'"
     out["line"] = f"ttp-spill 64 {200 * gib} 2 60"
     n, why, _ = checkspill.probe("h")
-    assert n == 0 and "load 60, of 64 cores" in why and "0.8 x" in why, why
+    assert n == 0 and "load 60, of 64 cores" in why and "0.75 x" in why, why
     out["line"] = "ttp-spill 64 x 2"
     assert checkspill.probe("h")[0] == 0 and "probe failed" in checkspill.probe("h")[1]
 
@@ -3052,14 +3052,14 @@ def _spill_hosts_read(monkeypatch, loads: dict, cores=64, mem_gib=200):
 
 def test_spill_never_starts_a_check_on_a_host_whose_load_is_near_its_cores(env, tmp_path, monkeypatch):
     """#8016 (runs kept choking one box): a host whose 1-minute load is at or above
-    checkspill.LOAD_NEAR x its cores gets no new check, whatever its slots; this machine's runs started there
-    within LOAD_LAG_S count as load already (the 1-minute load shows them late), so a burst of picks fills a
+    checks.spill_load_near (checkspill.load_near) x its cores gets no new check, whatever its slots; this machine's runs granted there
+    within checks.spill_hold_s count as load already (the 1-minute load shows them late), so a burst of picks fills a
     host only to the gate and then waits, never piling on."""
     from ttp import checkspill
     p, repo, run, remote = _spill_setup(env, tmp_path, monkeypatch, ["check-host-a", "check-host-b"])
     _spill_hosts_read(monkeypatch, {"check-host-a": 52, "check-host-b": 4})
     n, why, _ = checkspill.probe("check-host-a")
-    assert n == 0 and "load 52, of 64 cores" in why and "0.8 x" in why, why
+    assert n == 0 and "load 52, of 64 cores" in why and "0.75 x" in why, why
     told, got = [], []
     try:
         while len(got) < 20 and (c := checkspill.pick(p, p.config(), told.append, "pytest -q")) is not None:
@@ -3068,11 +3068,94 @@ def test_spill_never_starts_a_check_on_a_host_whose_load_is_near_its_cores(env, 
         assert len(got) < 20, "the gate held the burst"
         assert "check-host-a (its load is near its cores (load 52, of 64 cores" in told[-1], told[-1]
         assert checkspill._pending_cores("check-host-b", 64) > 0
-        later = time.time() + checkspill.LOAD_LAG_S + 1
+        later = time.time() + checkspill.hold_s() + 1
         assert checkspill._pending_cores("check-host-b", 64, now=later) == 0, "the load shows them by then"
     finally:
         for c in got:
             c.close()
+
+
+def test_concurrent_spill_picks_see_each_others_grants_before_they_claim(env, tmp_path, monkeypatch):
+    """Runs starting together on one spill host: a run whose probe read the host's load before another run here
+    claimed it checks the load again with that run's granted workers under the host's reservation lock
+    (_reserving) before it claims. Before, it claimed on its probe alone, so runs seconds apart each saw the
+    same idle cores and all started: a host at load 40 of 64 took both, past the 0.75 x gate."""
+    from ttp import checkspill
+    p, repo, run, remote = _spill_setup(env, tmp_path, monkeypatch, ["check-host-a", "check-host-b"])
+    _spill_hosts_read(monkeypatch, {"check-host-a": 40, "check-host-b": 44})   # a has the most free slots
+    real, other, told = checkspill._probe_all, [], []
+
+    def probe_then_other_run_claims(items):
+        got = real(items)   # this run's probe is read: then another run here takes check-host-a
+        if not other:
+            other.append(None)
+            other[0] = checkspill.pick(p, p.config(), lambda _: None, "pytest -q")
+        return got
+    monkeypatch.setattr(checkspill, "_probe_all", probe_then_other_run_claims)
+    try:
+        mine = checkspill.pick(p, p.config(), told.append, "pytest -q")
+        assert other[0] is not None and other[0].host == "check-host-a" and other[0].workers == 8
+        assert mine is not None and mine.host == "check-host-b", told
+        assert "check-host-a (its load is near its cores (load 40, 8 more for this machine's runs just started, " \
+               "of 64 cores; no check starts at 0.75 x or above (checks.spill_load_near)" in told[-1], told[-1]
+    finally:
+        for c in (other[0] if other else None, mine):
+            if c is not None:
+                c.close()
+
+
+def test_two_quick_spill_grants_on_one_host_sum_within_its_idle_cores(env, tmp_path, monkeypatch):
+    """A run's test workers are its host's idle cores less the workers this machine's runs were granted there
+    and its load does not show yet, never a run's cores per claim: two runs at once on a small host share its
+    idle cores. A threshold set lower (checks.spill_load_near) skips the host sooner."""
+    from ttp import checkspill
+    p, repo, run, remote = _spill_setup(env, tmp_path, monkeypatch, ["check-host-a"])
+    _spill_hosts_read(monkeypatch, {"check-host-a": 2})
+    first = checkspill.pick(p, p.config(), lambda _: None, "pytest -q")
+    try:
+        assert first is not None and first.workers == 8
+        checkspill._READ["check-host-a"] = (16, 6.0)   # a 16-core host at load 6: 10 idle, 8 of them granted
+        n, why = checkspill._size(p.config(), "check-host-a")
+        assert (n, first.workers + n) == (2, 10), why
+        assert "less 8 reserved for this machine's runs just granted there" in why, why
+        checkspill._READ["check-host-a"] = (16, 2.0)
+        assert checkspill._near(16, 2.0, 2.0 + checkspill._pending_cores("check-host-a", 16)) == ""
+        monkeypatch.setenv("TTP_CHECKS_SPILL_LOAD_NEAR", "0.5")
+        assert checkspill.load_near() == 0.5
+        assert "no check starts at 0.5 x or above" in checkspill._near(16, 2.0, 2.0 + 8)
+    finally:
+        first.close()
+
+
+def test_a_spill_grant_lapses_when_its_run_ends_or_after_the_hold_and_a_dead_runs_never_blocks(env, tmp_path,
+                                                                                              monkeypatch):
+    """A granted run's workers count as its host's load until the run ends (Claim.close) or for
+    checks.spill_hold_s (default 90 s); a claim whose run died (its pid gone or its lock free) counts for
+    nothing, so a stale reservation never holds a host."""
+    import fcntl
+    from ttp import checkspill
+    p, repo, run, remote = _spill_setup(env, tmp_path, monkeypatch, ["check-host-a"])
+    _spill_hosts_read(monkeypatch, {"check-host-a": 4})
+    assert checkspill.hold_s() == 90.0
+    got = checkspill.pick(p, p.config(), lambda _: None, "pytest -q")
+    assert checkspill._pending_cores("check-host-a", 64) == 8
+    monkeypatch.setenv("TTP_CHECKS_SPILL_HOLD_S", "5")
+    assert checkspill._pending_cores("check-host-a", 64, now=time.time() + 6) == 0, "the hold lapsed"
+    got.close()
+    assert checkspill._pending_cores("check-host-a", 64) == 0, "its run ended"
+    dead = subprocess.Popen(["true"])
+    dead.wait()
+    d = checkspill.claim_dir()
+    stale = {"host": "check-host-a", "project": p.name, "since": time.time(), "workers": 60}
+    (d / "check-host-a.7.json").write_text(json.dumps({**stale, "pid": os.getpid()}))   # its lock is free
+    with open(d / "check-host-a.8.json", "a+") as f:
+        f.write(json.dumps({**stale, "pid": dead.pid}))   # held, but its run is gone
+        f.flush()
+        fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        assert checkspill._pending_cores("check-host-a", 64) == 0
+        again = checkspill.pick(p, p.config(), lambda _: None, "pytest -q")
+        assert again is not None and again.workers == 8
+        again.close()
 
 
 def test_an_unreachable_spill_host_backs_off_and_its_share_spreads_over_the_others(env, tmp_path, monkeypatch):
@@ -3343,13 +3426,13 @@ def test_a_run_held_here_by_the_load_guard_or_a_cap_goes_to_a_spill_host_at_its_
 
 def test_a_spilled_run_gets_test_workers_sized_to_the_hosts_idle_cores_outside_its_pass_key(env, tmp_path, monkeypatch):
     """#2210: -n is sized per run to the spill host's idle cores (cores less its 1-minute load, less a run's
-    cores per other claim of ours there, within one run's limit), exported as the test-slot grant the suite's
+    workers granted to our runs there not yet in that load, within one run's limit), exported as the test-slot grant the suite's
     conftest reads; the grant is no part of the pass key, so a run here of the same tree reuses the pass."""
     from ttp import checkspill, cli, push, testslots
     assert checkspill.workers(16, 3.5) == 12 and checkspill.workers(16, 3.5, cap=8) == 8
     assert checkspill.workers(16, None) == 0 and checkspill.workers(0, 1.0) == 0
     assert checkspill.workers(4, 9.0) == 1, "an overloaded host still runs one worker"
-    assert checkspill.workers(32, 0.0, others=1) < 32
+    assert checkspill.workers(32, 0.0, reserved=8) == 24
     assert checkspill.workers_env(0) == {}
     assert checkspill.workers_env(3) == {testslots.SLOTS_ENV: "3", testslots.HELD_ENV: "3", testslots.XDIST_ENV: "3"}
     p, repo, run, remote = _spill_setup(env, tmp_path, monkeypatch, ["check-host-a"])
@@ -3442,8 +3525,8 @@ def test_a_spilled_run_held_to_one_worker_says_why(env, tmp_path, monkeypatch):
     from ttp import checkspill
     n, why = checkspill.workers_why(4, 9.0)
     assert n == 1 and "only 1 because 0 core(s) are idle" in why, why
-    n, why = checkspill.workers_why(10, 4.0, others=1)
-    assert n == 1 and "kept for 1 other run(s)" in why and "only 1 because" in why, why
+    n, why = checkspill.workers_why(10, 4.0, reserved=8)
+    assert n == 1 and "less 8 reserved for this machine's runs just granted there" in why and "only 1 because" in why, why
     n, why = checkspill.workers_why(64, 0.0, cap=8)
     assert n == 8 and "at most 8 per run (limit checks.test_run_max)" in why, why
     assert checkspill.workers_why(16, None)[1].startswith("test workers it sizes itself")

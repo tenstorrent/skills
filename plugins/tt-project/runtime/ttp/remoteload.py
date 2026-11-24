@@ -3,9 +3,9 @@
 A check that runs on another machine (its own "host", delivery.checks_host, a spill host: push.remote_host)
 uses none of this machine's CPU, so it neither waits for this machine's load guard (testslots.load_guard)
 nor takes its host-wide checks slot or test slots (push.run_slot). It waits instead while that host's
-runnable demand is near its cores (at or above checkspill.LOAD_NEAR x them, or checks.load_guard x them
+runnable demand is near its cores (at or above checks.spill_load_near x them, or checks.load_guard x them
 where lower), and never starts there while it is: checks.push_load_wait_s only says how often it tells the
-wait again. Runs from this machine that started there in the last LAG_S count in its demand, one run's
+wait again. Runs from this machine that started there in the last checks.spill_hold_s count in its demand, one run's
 cores each (checklane.run_cores), since the host's reading may not show them yet: many runs waiting for
 one host start a few at a time as its demand allows, never all at once.
 
@@ -29,7 +29,6 @@ SAMPLE_S = 1
 TIMEOUT_S = 15
 POLL_S = 15.0
 TELL_MIN_S = 60.0   # the wait is told again at most this often
-LAG_S = 90.0   # a run started this recently may not show in its host's demand yet (_starts)
 SEP = "--ttp-sample--"
 SCRIPT = f"cat /proc/stat && sleep {SAMPLE_S} && echo {SEP} && cat /proc/stat"
 SSH = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8", "-o", "ForwardAgent=no"]   # no agent use there
@@ -71,9 +70,10 @@ def reading(host: str, run=subprocess.run, clock=time.monotonic, fresh: bool = F
 
 def factor() -> float:
     """The share of a check host's cores its demand may reach before no new run starts there: the lower of
-    checkspill.LOAD_NEAR and checks.load_guard (testslots.load_guard_factor); 0 (the guard off) holds none."""
+    checks.spill_load_near (checkspill.load_near) and checks.load_guard (testslots.load_guard_factor); 0 (the guard
+    off) holds none."""
     from . import checkspill, testslots
-    return min(f, checkspill.LOAD_NEAR) if (f := testslots.load_guard_factor()) else 0.0
+    return min(f, checkspill.load_near()) if (f := testslots.load_guard_factor()) else 0.0
 
 
 def _starts_file(host: str):
@@ -82,18 +82,21 @@ def _starts_file(host: str):
 
 
 def _starts(text: str, now: float) -> list[float]:
-    """The start times in a starts file's `text` from the last LAG_S."""
+    """The start times in a starts file's `text` from the last checks.spill_hold_s (checkspill.hold_s): a run
+    started this recently may not show in its host's demand yet."""
+    from . import checkspill
+    hold = checkspill.hold_s()
     try:
         got = json.loads(text or "[]")
     except ValueError:
         return []
-    return [float(t) for t in got if isinstance(t, (int, float)) and 0 <= now - float(t) < LAG_S] \
+    return [float(t) for t in got if isinstance(t, (int, float)) and 0 <= now - float(t) < hold] \
         if isinstance(got, list) else []
 
 
 def held(host: str, start: bool = False, fresh: bool = False, now: Callable[[], float] = time.time) -> str:
     """Why no new check run may start on `host` now, or "": its demand, with one run's cores for each run
-    this machine started there in the last LAG_S, is at or above factor() x its cores. With `start` the
+    this machine started there in the last checks.spill_hold_s, is at or above factor() x its cores. With `start` the
     answer "" also records this run's start (under the host's starts file lock, so runs waiting together
     each see the others). An unreadable host never holds a run."""
     from . import checklane
@@ -124,7 +127,7 @@ def held(host: str, start: bool = False, fresh: bool = False, now: Callable[[], 
             fh.close()
     return (f"the check host {host}'s CPU is overloaded: its runnable demand of {r[0]:.1f} cores"
             + (f" (and {len(recent)} run(s) just started there from this machine)" if recent else "")
-            + f" is near its {r[1]} cores (no check starts at {f:g} x or above: checkspill.LOAD_NEAR, "
+            + f" is near its {r[1]} cores (no check starts at {f:g} x or above: checks.spill_load_near, "
               "CPU limit checks.load_guard)")
 
 
