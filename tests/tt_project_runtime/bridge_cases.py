@@ -2589,6 +2589,33 @@ def test_bridge_watch_heals_a_session_rebuilt_while_a_destination_was_off(tmp_pa
     assert len(seen["release"]) == 1
 
 
+def test_bridge_watch_keeps_the_owed_restart_when_the_restart_is_refused(tmp_path, monkeypatch):
+    # cells: owed-restart-refused-stays-owed, restarted-on-a-later-pass, then-spared-as-slow
+    from ttp import bridge, bridge_watch
+    mixed = "up 2301\ndown 2302\nttp-watch-done\n"
+    cfg, seen = _watch_env(tmp_path, monkeypatch, "darwin", [mixed] * 40)
+    cfg = bridge.parse({"boxes": {"box-1": {"login": {}, "agents": {"auto": {"agent": "env", "forward": [
+        {"name": "build-a", "target": "build-a.example.com", "port": 2301},
+        {"name": "build-b", "target": "build-b.example.com", "port": 2302}]}}}}})
+    off = {"build-b.example.com"}
+    monkeypatch.setattr(bridge_watch, "dest_answers", lambda d: d["target"] not in off)
+    said = ["restart refused: service not loaded", "restarted"]
+    monkeypatch.setattr(bridge_watch, "restart", lambda t, platform: said.pop(0))
+    t0, step = 1_000_000.0, bridge_watch.INTERVAL_S
+    bridge_watch.run_pass(cfg, "darwin", t0)   # the session rebuilt while build-b's host was off
+    off.clear()
+    out = bridge_watch.run_pass(cfg, "darwin", t0 + step)
+    assert len(seen["release"]) == 1 and "refused" in out[-1], out
+    t = t0 + 2 * step
+    while len(seen["release"]) < 2 and t < t0 + 3600:   # the refused restart is still owed
+        bridge_watch.run_pass(cfg, "darwin", t)
+        t += step
+    assert len(seen["release"]) == 2 and said == []
+    for i in range(3):   # the restart ran: a still-silent port of the live session is only slow
+        bridge_watch.run_pass(cfg, "darwin", t + i * 4000)
+    assert len(seen["release"]) == 2
+
+
 def test_bridge_watch_keeps_the_owed_restart_through_the_restart_gap(tmp_path, monkeypatch):
     # cells: restarted-before-outage, owed-restart-waits-the-gap, no-false-heal, restarted-once-the-gap-passes
     from ttp import bridge, bridge_watch

@@ -13,9 +13,10 @@ so the first pass after waking checks every box. A port whose forward's own dest
 from here (its host is off) is not a stale forward: nothing is ended or restarted for it, and it is logged
 once. Nor is a silent port of a bridge session another of whose ports answers: the session is live and its
 target only slow; unless that port failed while its destination was off (a session rebuilt then, after a VPN
-reconnect say, can stay broken for it): once the destination answers it gets one restart if it still fails. Nor is a bridge session none of whose ports has a listener yet while its login (its ssh, a
-relay reconnect included) is younger than LOGIN_S: the next pass decides. A service that keeps failing is restarted
-at most once per RESTART_GAP_S step.
+reconnect say, can stay broken for it): once the destination answers it gets one restart if it still fails,
+owed until a restart really runs. Nor is a bridge session none of whose ports has a listener yet while its
+login (its ssh, a relay reconnect included) is younger than LOGIN_S: the next pass decides. A service that
+keeps failing is restarted at most once per RESTART_GAP_S step.
 
 Besides the sessions `ttp bridge` installs, the config's "watch" list names ssh forward services made by
 hand: {"label": the launchd label or systemd unit, "box": its ssh alias, "port": the box port it forwards},
@@ -233,10 +234,7 @@ def run_pass(cfg: dict, platform: str | None = None, now: float | None = None) -
             if gone and [p for p in off.get(t["service"], []) if p not in owed] != gone:
                 out.append(f"{t['service']}: port {', '.join(map(str, gone))} on {box}: its destination does not "
                            "answer from here; nothing restarted")
-            if gone or owed:
-                off[t["service"]] = [p for p in t["ports"] if p in gone or p in owed]
-            else:
-                off.pop(t["service"], None)
+            off[t["service"]] = [p for p in t["ports"] if p in gone or p in owed]
             if not bad:
                 if gone:
                     continue
@@ -269,16 +267,14 @@ def run_pass(cfg: dict, platform: str | None = None, now: float | None = None) -
             f = fails.setdefault(t["service"], {"at": now, "event": event, "restarts": 0, "last": 0})
             freed = release(cfg, t, bad)
             said = restart(t, platform)
-            if gone:
+            if said == "restarted":   # a refused restart leaves the owed one marked
                 off[t["service"]] = gone
-            else:
-                off.pop(t["service"], None)
             f.update(restarts=f["restarts"] + 1, last=now, down=[p for p in bad if p in down], said=False)
             out.append(f"{t['service']}: port {', '.join(map(str, bad))} on {box} did not answer"
                        f"{'' if freed else ' (still held after the cleanup)'}; {said}")
     names = {t["service"] for t in ts}
     st["fail"] = {k: v for k, v in fails.items() if k in names}
-    st["unreachable"] = {k: v for k, v in off.items() if k in names}
+    st["unreachable"] = {k: v for k, v in off.items() if k in names and v}
     _home().mkdir(parents=True, exist_ok=True)
     durable_write(_home() / STATE, json.dumps(st))
     return out
