@@ -1375,6 +1375,17 @@ def test_a_hex_token_in_a_receipt_that_is_not_a_commit_cannot_hold_an_order(env,
     assert o["receipt"] is not None and o.get("unverified") is None, o
 
 
+def test_a_change_order_in_a_project_with_only_a_landed_probe_closes_unchanged(env, monkeypatch):
+    """No push branch to check against, only a landed probe: a change order's receipt closes
+    unchecked, as before the gate existed (review #9690's finding (d))."""
+    from ttp import obligations as ob
+    p, repo, tid, oid = _receipt_order_setup(env, monkeypatch, status="done")
+    p.set_config("delivery.push_branch", "")
+    p.set_config("delivery.landed_probe", "true")
+    assert "no longer owed" in ob.record(p, oid, "receipt", "built and checked", tid)
+    assert ob.get(p.db, oid)["receipt"] is not None
+
+
 def test_a_change_order_of_a_code_owner_without_commits_closes_unchanged(env, monkeypatch):
     """A code owner that ended with no commits of its own has nothing to land: its receipt closes
     the order unchecked."""
