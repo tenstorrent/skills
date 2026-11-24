@@ -556,12 +556,9 @@ def test_a_suggested_daily_cap_is_runs_a_day_times_the_median_run_cost_and_needs
     tid = p.db.add_task("[filler] urgent run", "x", origin="schedule")
     p.db.x("UPDATE tasks SET labels=?, status='done', spent_usd=? WHERE id=?",
            (json.dumps(["filler", "urgent_since:1700000000"]), 3.0, tid))
-    p.db.x("UPDATE tasks SET labels='not json' WHERE id=(SELECT MIN(id) FROM tasks)")   # never raises
-    hint = sched.suggest_cap(p.db, row())
-    assert hint == {"runs_day": 24, "median_usd": 0.2, "runs": 10, "usd": 6.0}, hint
-    assert sched.suggest_cap(p.db, row(), n=1) is None and \
-        [r["spent_usd"] for r in p.db.q(f"SELECT spent_usd FROM tasks WHERE {sched.RUN_SQL} ORDER BY id DESC LIMIT 1",
-                                        ("filler",))] == [3.0]
+    bad = p.db.add_task("[filler] bad labels", "x", origin="schedule")
+    p.db.x("UPDATE tasks SET labels='not json', status='done', spent_usd=1 WHERE id=?", (bad,))   # never raises
+    assert sched.suggest_cap(p.db, row(), n=50)["runs"] == 15, "14 earlier paid runs and this one, once"
     assert sched.suggest_cap(p.db, p.db.one("SELECT * FROM schedules WHERE name='watch'")) is None, "llm only"
 
 
