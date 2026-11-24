@@ -9099,7 +9099,10 @@ def cmd_lock(a) -> None:
     Nested: a `ttp lock` inside one that holds the same lock in the same or a stronger mode (or
     inside an exclusive task's run while its lineage holds it, hold.covers; a hold recorded lost does
     not) just runs, saying so on stderr. An exclusive one inside a shared
-    hold of the lock exits 2 at once: it could only wait for itself.
+    hold of the lock exits 2 at once: it could only wait for itself. A project's yield probe (config
+    locks.yield_probe, asked every locks.yield_every_s while the command runs) can stop the command:
+    its exit 0 stops the command's process group, releases the lock and exits 75. `--no-yield` and
+    config locks.yield_exempt (globs of lock names) opt a call out.
 
     Inside a run, waiting is reported in the run's progress (a wait is not a stall), does not count
     toward the run's wall clock (which grows by at most its own length this way), and gives up after
