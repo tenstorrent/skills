@@ -347,7 +347,7 @@ def test_a_glm_hand_off_asking_for_opus_or_deep_bounces_fresh_to_opus_with_its_s
     assert '"glm" in (routed.get(codearm.KEY), routed.get(glmwork.KEY))' in fin
     assert "its hand-off said: " in fin   # the bounced run's own summary reaches the fresh run's prompt
     assert "glmwork.contract()" in inspect.getsource(daemon.Daemon)
-    assert "ttp slop --diff" in glmwork.size_check() and "glmwork.size_check(" in inspect.getsource(daemon.Daemon)
+    assert "ttp slop --diff" in glmwork.size_check()
 
 
 def _gw_run(p, task, status):
@@ -450,3 +450,24 @@ def test_the_device_keeper_reads_quoted_commands_as_the_tasks_own(env):
     assert keeps("Fix the arm.\nUser said 'run it through the device broker'.") == "device"
     assert keeps("Fix the arm.\n⟦abcd1234 data: log⟧ ran tt-smi -r 0 through the device broker ⟦/abcd1234⟧") == ""
     assert keeps("Fix the arm.\n> ran tt-smi -r 0 through the device broker") == ""
+
+
+def test_a_glm_code_run_spends_an_opus_advisor_call_on_a_correctness_review_of_its_final_diff(env, monkeypatch):
+    from ttp import configwho
+    from ttp import daemon as dmod
+    p = make(env)
+    p.set_config("core_provider", "claude")
+    _route_config(p, route=None)
+    for advisor in (True, False):
+        p.set_config("route.glm_work", {"on": True, "model": _GW_MODEL, "holdout": 0, "advisor": advisor},
+                     by=configwho.by("user", via="cli"))
+        prompts = []
+        prov, _tier, _note = _route_dispatch(p, dmod.Daemon(p.base), monkeypatch, prompts,
+                                             title=f"fix the parser {advisor}", kind="code", tier="standard")
+        step = prompts[-1].split("## Before you hand off: the correctness review", 1)
+        assert prov == "chat" and len(step) == 2
+        # With the advisor on, one of its calls reviews the final diff for correctness, and none is spent on the
+        # size lane; without it the run reviews its diff itself and is never sent to a command it cannot use.
+        # A run whose advisor calls are used up still reviews its diff itself.
+        assert ("| ttp advise -`" in step[1]) is advisor and ("not through `ttp advise`" in step[1]) is advisor
+        assert "most likely to break it in your self_check" in step[1]

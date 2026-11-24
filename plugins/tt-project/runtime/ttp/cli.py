@@ -12856,7 +12856,8 @@ def cmd_advise(a) -> None:
     try:
         if not a.question and a.check_step is None:
             raise ValueError("give the question, or with --plan the task in your own words")
-        row = glmassist.ask(run_dir, " ".join(a.question), cwd=os.getcwd(), plan=a.plan,
+        question = sys.stdin.read() if a.question == ["-"] else " ".join(a.question)
+        row = glmassist.ask(run_dir, question, cwd=os.getcwd(), plan=a.plan,
                             db=p.db if p and p.exists() else None, source=f"advisor:{task or 'run'}",
                             step=a.check_step)
     except ValueError as e:
@@ -17880,7 +17881,8 @@ def ttp_parser():
         s.set_defaults(fn=cmd_pause)
     s = sub.add_parser("advise", help="inside a GLM-arm run with route.glm_work.advisor or plan_first on: ask Opus a "
                                        "read-only question (--plan: the plan to follow), within the run's limits")
-    s.add_argument("question", nargs="*", help="the question, or with --plan the task in your own words")
+    s.add_argument("question", nargs="*", help="the question (`-`: read it from stdin), or with --plan the task in "
+                                                 "your own words")
     s.add_argument("--plan", action="store_true", help="ask for the plan a plan-first run follows")
     s.add_argument("--check-step", metavar="N", help="a device run: ask Opus to check step N of its plan before a "
                                                     "reset, power cycle, flash or firmware step")
