@@ -4384,8 +4384,7 @@ Known gaps (these claims pass unchecked, as written):
 - a sha-less push claim naming another destination (the run's own branch, a PR branch, a fork);
 - any claim in a sentence that also names a sha, with a digit, this repository does not hold;
 - a claim about another task or run (its sentence names that id);
-- a hedged or negated phrase ("should have landed", "not yet pushed"), and wording the parse
-  does not know ("shipped", "made it into main");
+- wording the parse does not know ("shipped", "made it into main");
 - quoted text written to a script and run later.
 
 ## A report-only next step settles a wait without a model
