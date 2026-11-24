@@ -27303,6 +27303,7 @@ def test_durable_write_syncs_renames_and_keeps_the_mode(env, monkeypatch):
 # Every place the runtime writes a file directly, and why it need not survive a power cut. Anything
 # else goes through project.durable_write / durable_append / write_json.
 DURABLE_EXEMPT = {
+    ("project.py", "(tmp / HOLD_PID).write_text("): "the holder pid in an upgrade's runtime copy, removed when the upgrade ends; a cut pid only makes the launcher run the harness tree as before; never state",
     ("ghqueue.py", '(Path(t) / "b.bundle").write_bytes('): "the bundle to publish, in a temporary folder removed when the publish ends; never state",
     ("ghhold.py", "(d / name).write_text("): "a run's zsh startup file in its own run folder, rewritten at every run start; never state",
     ("ghhold.py", "(run_dir / MARK).write_text("): "a run's gh-unguarded mark in its own run folder: its existence is the signal, so a cut write still marks; never state",
