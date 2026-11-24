@@ -255,14 +255,14 @@ def _commands(cmd: str, depth: int = 0) -> list[tuple[list[str], list[str]]]:
     from . import hook
     run = hook._split(cmd, strip=False)[0]
     flags = hook._quoting(run)
-    kept, comment, last = [], False, 0
+    kept, comment, last, starts = [], False, 0, set(hook._comment_starts(run, flags))
     for m in re.finditer("[#\n]", run):   # drop '#' comments (a '#' starting an unquoted word) up to their newline
         i, c = m.start(), m[0]
         if not comment:
             kept.append(run[last:i])
         if c == "\n" and not flags[i][0]:
             comment = False
-        elif c == "#" and flags[i][0] and (i == 0 or (not flags[i - 1][0] and run[i - 1] in " \t\n;&|(")):
+        elif i in starts:
             comment = True
         if not comment:
             kept.append(c)

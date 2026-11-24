@@ -642,11 +642,14 @@ QUOTING_RUNS = {"": re.compile(r"[^'\"\\#()]+"), "'": re.compile(r"[^']+"), '"':
                 "#": re.compile(r"[^\n]+")}
 
 
-# A `#` starts a comment exactly where bash starts a new word: after one of these characters, unquoted
-# and unescaped (`a\\ #b` is one word), redirect operators included (`echo a>#b` comments out `#b`).
-# Not after the `)` of a paren that continues a word ($(...), <(...), a=(...), @(...)): the `#` joins it.
+# A `#` starts a comment where bash starts a new word: after one of these characters, unquoted and
+# unescaped (`a\ #b` is one word; a backslash-newline is skipped), redirect operators included (`echo a>#b`
+# comments out `#b`). Not after the `)` of a paren that continues a word ($(...), <(...), a=(...), @(...)):
+# the `#` joins it. A known gap: `f()#c` and `if(true)#c` are comments in bash, read here as words.
 COMMENT_START_AFTER = " \t\n;&|()<>"
 WORD_START_AFTER = " \t\n;&|()"   # a `(` here opens a subshell or (( )); anywhere else it continues a word
+# A case or esac in command position: a `)` after an open case, back to the innermost `(`, ends a pattern
+CASE_RE = re.compile(r"(?:^|[;&|({\n])(?:[ \t]*(?:then|do|else|!)(?=[ \t]))*[ \t]*(case|esac)(?=[ \t\n;&|()<>]|$)")
 
 
 def _quoting(line: str) -> list[tuple[bool, int]]:
@@ -654,7 +657,8 @@ def _quoting(line: str) -> list[tuple[bool, int]]:
     of parentheses around it. A run of characters that changes neither is copied in one step, so a long
     word costs no per-character loop."""
     out, q, depth, esc, i = [], "", 0, False, 0
-    opens, in_word = [], False   # per open `(`: whether it continues a word; `in_word`: the last `)` closed one
+    opens, in_word = [], False   # per open `(`: (index, whether it continues a word); `in_word`: the last `)` closed one
+    cases = [(m.start(1), 1 if m[1] == "case" else -1) for m in CASE_RE.finditer(line)] if "case" in line else []
     while i < len(line):
         if not esc and (m := QUOTING_RUNS[q].match(line, i)):
             out.extend([(q != "", depth)] * (m.end() - i))
@@ -662,7 +666,6 @@ def _quoting(line: str) -> list[tuple[bool, int]]:
             continue
         c = line[i]
         inert = True
-        bare = i == 0 or not out[i - 1][0]   # the character before is unquoted and unescaped
         if q == "#" and c == "\n":
             q = ""
         if esc:
@@ -677,20 +680,39 @@ def _quoting(line: str) -> list[tuple[bool, int]]:
             q = "" if c == '"' else q
         elif c in "'\"":
             q = c
-        elif c == "#" and (i == 0 or (bare and line[i - 1] in COMMENT_START_AFTER
-                                      and not (line[i - 1] == ")" and in_word))):
+        elif c == "#" and ((j := _before(line, out, i)) < 0 or (not out[j][0] and line[j] in COMMENT_START_AFTER
+                                                                 and not (line[j] == ")" and in_word))):
             q = "#"
         else:
             inert = False
             if c == "(":
-                opens.append(not (bare and (i == 0 or line[i - 1] in WORD_START_AFTER)))
+                j = _before(line, out, i)
+                opens.append((i, not (j < 0 or (not out[j][0] and line[j] in WORD_START_AFTER))))
                 depth += 1
             elif c == ")":
-                in_word = opens.pop() if opens else False
-                depth = max(0, depth - 1)
+                start = opens[-1][0] if opens else -1
+                if sum(n for k, n in cases if start < k < i and not out[k][0]) > 0:
+                    in_word = False   # a case pattern's `)`: it closes no paren
+                else:
+                    in_word = opens.pop()[1] if opens else False
+                    depth = max(0, depth - 1)
         out.append((inert, depth))
         i += 1
     return out
+
+
+def _before(line: str, out: list[tuple[bool, int]], i: int) -> int:
+    """Index of the character bash reads before line[i], skipping backslash-newlines (-1: none)."""
+    j = i - 1
+    while j > 0 and line[j] == "\n" and line[j - 1] == "\\" and out[j][0]:
+        j -= 2
+    return j
+
+
+def _comment_starts(line: str, flags: list[tuple[bool, int]]) -> list[int]:
+    """Indexes of the `#`s where _quoting starts a comment: inert, while what bash reads before it is not."""
+    return [i for i, c in enumerate(line) if c == "#" and flags[i][0]
+            and ((j := _before(line, flags, i)) < 0 or not flags[j][0])]
 
 
 # A character that can start a quoted, escaped or comment run (_quoting)

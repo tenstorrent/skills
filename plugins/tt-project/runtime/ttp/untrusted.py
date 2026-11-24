@@ -716,13 +716,12 @@ def _mark_uncomment(cmd: str) -> str | None:
     (unsure) when `cmd` also has a ${...} expansion or a $'...' quote: a `#` inside one is a literal
     (`${x:- #}`), its end is hard to find (`${x:-'}' #}`, `$'\\' #'`), and a kept comment's quote would
     hide the next line from the split. Also None for a `#` right after an unquoted `)`: a case pattern's
-    `)` inside $(...) or an extglob's makes the paren count unsure. Cuts come from _quoting's comment
-    state: a `#` whose comment starts turns the flag on while the character before it stays off."""
-    from .hook import _quoting
+    `)` or a function's `()` can end a word or start a comment where _quoting cannot tell. Cuts are
+    hook._comment_starts, the one comment-start rule every _quoting reader shares."""
+    from .hook import _comment_starts, _quoting
     flags = _quoting(cmd)
-    cuts = [i for i, c in enumerate(cmd) if c == "#" and flags[i][0] and (i == 0 or not flags[i - 1][0])]
-    if cuts and ("${" in cmd or "$'" in cmd) or any(
-            cmd[i - 1:i + 1] == ")#" and not flags[i - 1][0] for i in range(1, len(cmd))):
+    cuts = _comment_starts(cmd, flags)
+    if cuts and ("${" in cmd or "$'" in cmd) or any(not flags[m.start()][0] for m in re.finditer(r"\)#", cmd)):
         return None
     out, end = [], 0
     for i in cuts:
