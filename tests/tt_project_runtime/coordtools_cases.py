@@ -790,7 +790,7 @@ SHELL_READS = ["head -5 a.txt", "cat a b", "ls -la x", "grep -n foo f.py", "sed 
                "python3 - <<'EOF'\nprint(open('a').read())\nEOF", "python3 -I - <<EOF\nprint(1)\nEOF",
                "T=/opt/ttp/bin/ttp; $T status p", "T=/x/ttp; for t in 1 2; do $T task p show $t; done",
                "while true; do ls; break; done", ": ; continue", "ttp memory p --search lock",
-               "ttp rollout status"]
+               "ttp rollout status", "ttp note --status", "ttp upstream p --note-state abc"]
 SHELL_CHANGES = ["git worktree remove /w", "git -C /r worktree remove /w", "sed -i s/a/b/ f", "echo hi > f",
                  "cat a > b", "for f in a b; do echo $f > out; done", "for f in a b; do rm $f; done",
                  "echo $(rm x)", "echo $((1 + 2))", "echo `ls`", "for 1x in a; do ls; done",

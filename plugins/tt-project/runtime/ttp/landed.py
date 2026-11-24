@@ -479,26 +479,23 @@ def landed_at(db, tid: int, rows: Rows | None = None, carry: dict | None = None)
     return min(times) if times else None
 
 
-def landed_when(p, tid: int, rows: Rows | None = None) -> float | None:
-    """When task `tid`'s change first reached the push branch: the record time `landed_at` judges by,
-    or, when a recorded supersession or squash carried it, the earlier committer date of the
-    superseding commit or of the head it names once that head was on the push branch (on_push). A
-    push queue landing keeps its record time: its commit is dated at the rebase, before its checks
-    ran. The record time alone when the repository cannot read the commits; None while neither is known."""
-    return landed_whens(p, (tid,), rows).get(int(tid))
-
-
 def landed_whens(p, tids, rows: Rows | None = None) -> dict[int, float | None]:
-    """landed_when's answer for each task in `tids`, their commit dates read in one git call: the
-    per-task carrier chain and record time (landed_at) and recorded commits (recorded) are read from
-    `rows` when given, else read here once for all of them."""
+    """{task: when its change first reached the push branch} for each task in `tids`: the record time
+    `landed_at` judges by, or, when a recorded supersession or squash carried it (one whose drop
+    verdict does not stand), the earlier committer date of the superseding commit or of the head it
+    names once that head was on the push branch (on_push). A head's date is when it was committed on
+    its branch, which a fast-forward carried unchanged. A push queue landing keeps its record time: its
+    commit is dated at the rebase, before its checks ran. A date before the task was created (work
+    that existed already) is not its landing. None while nothing is known. `rows`: read once for all
+    of them (Rows), else read here."""
     tids = [int(t) for t in tids]
     rows = Rows(p.db, tids) if rows is None else rows
     at, want, tip = {}, {}, None
     for tid in tids:
         carry = carriers(p.db, tid, rows)
         at[tid] = landed_at(p.db, tid, rows, carry)
-        sup = [r for r in rows.superseded if r["task"] in carry]
+        gone = _gone_shas(p.db, tid, carry, rows)
+        sup = [r for r in rows.superseded if r["task"] in carry and r["sha"] not in gone]
         heads = [str(r["head"]) for r in sup if r.get("head")]
         if heads and tip is None:
             try:
@@ -507,30 +504,22 @@ def landed_whens(p, tids, rows: Rows | None = None) -> dict[int, float | None]:
                 tip = ""
         want[tid] = [str(r["sha"]) for r in sup] + [h for h in heads if tip and on_push(p, p.root, [h], tip)]
     dates = commit_dates(p, [s for v in want.values() for s in v])
-    return {tid: min([t for t in [at[tid], *(dates.get(s) for s in want[tid])] if t], default=None)
-            for tid in tids}
+    made = {tid: float((rows.tasks.get(tid) or {}).get("created") or 0) for tid in tids}
+    return {tid: min([t for t in [at[tid], *(dates.get(s) for s in want[tid])] if t and t >= made[tid]],
+                     default=at[tid]) for tid in tids}
 
 
 def commit_dates(p, shas) -> dict[str, float]:
-    """{sha: committer date} of the shas the repository has, in one git call; one call each when a
-    sha is unknown (git show fails on any unknown rev, so they are then read one by one). A commit's
-    committer date is when it was created on its branch: for a landing, when the change reached the
-    push branch."""
+    """{sha: committer date} of the shas the repository has, in one git call (unknown ones are left
+    out)."""
     shas = [s for s in dict.fromkeys(str(s) for s in shas) if s]
     out: dict[str, float] = {}
-    if not shas:
-        return out
-    r = _git(p.root, "show", "-s", "--format=%H %ct", *shas)
-    if r.returncode == 0:
-        for ln in r.stdout.splitlines():
+    if shas:
+        r = _git(p.root, "log", "--no-walk", "--ignore-missing", "--format=%H %ct", *shas)
+        for ln in r.stdout.splitlines() if r.returncode == 0 else []:
             sha, _, ts = ln.partition(" ")
-            out[sha] = float(ts)
-    else:   # one unknown rev fails the whole call: read the revs one at a time
-        for s in shas:
-            one = _git(p.root, "show", "-s", "--format=%ct", s)
-            got = one.stdout.strip()
-            if one.returncode == 0 and got.isdigit():
-                out[s] = float(got)
+            if ts.isdigit():
+                out[sha] = float(ts)
     return out
 
 

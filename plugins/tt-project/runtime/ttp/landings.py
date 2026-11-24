@@ -280,10 +280,13 @@ def landed(db, since: float, now: float | None = None, kinds=("code",), p=None) 
                 (*kinds, since - 30 * DAY_S))
     when = {}
     rows = lm.Rows(db, [t["id"] for t in cand])
-    when0 = lm.landed_whens(p, [t["id"] for t in cand], rows) if p is not None else {}
+    try:
+        when0 = lm.landed_whens(p, [t["id"] for t in cand], rows) if p is not None else {}
+    except Exception:
+        when0 = {}   # git or the repository unreadable: the record times stand
     for t in cand:
         try:
-            at = when0.get(t["id"]) if p is not None else lm.landed_at(db, t["id"], rows)
+            at = when0[t["id"]] if t["id"] in when0 else lm.landed_at(db, t["id"], rows)
         except Exception:
             at = None
         if at and since <= at <= now and at >= (_f(t["created"]) or 0):
