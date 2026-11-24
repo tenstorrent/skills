@@ -11999,7 +11999,7 @@ class Daemon:
         model-free outcome line built from records."""
         from . import chatdigest
         try:
-            chatdigest.fallbacks(self.p, self.cfg)
+            chatdigest.fallbacks(self.p)
         except Exception:
             log(self.p, "reply fallbacks: check failed\n" + traceback.format_exc())
 

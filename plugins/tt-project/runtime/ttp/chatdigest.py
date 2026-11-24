@@ -439,7 +439,7 @@ def handoff(db, cfg: dict | None, task: dict, new: str, text: str, now: float | 
     return []
 
 
-def fallbacks(p, cfg: dict | None, now: float | None = None) -> list[int]:
+def fallbacks(p, now: float | None = None) -> list[int]:
     """Post the fallback outcome line (outcome_line) for each armed chat no reply reached within its
     bound (a message out to that chat since the hand-off). The message ids."""
     from . import msgparts

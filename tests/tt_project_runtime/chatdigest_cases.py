@@ -404,7 +404,7 @@ def test_a_replay_of_the_raw_hand_off_reply_never_reaches_the_chat(env, monkeypa
     ev = _cd_due(p, t["id"])
     assert ev and json.loads(ev["data"])["chat"] == "c1"
     assert "16b5701a4" in ev["text"] and "Hand-off" in ev["text"]      # enclosed data only
-    assert chatdigest.fallbacks(p, p.config(), now + 10) == [], "the coordinator is still answering"
+    assert chatdigest.fallbacks(p, now + 10) == [], "the coordinator is still answering"
 
 
 def test_the_fallback_outcome_line_posts_from_records_only_once_the_bound_passes(env, monkeypatch):
@@ -417,8 +417,8 @@ def test_the_fallback_outcome_line_posts_from_records_only_once_the_bound_passes
     t = _cd_task(p, "Reply path: the user's chat gets the coordinator's plain summary", chat="c1")
     pushq._reply(p.db, t, "done", _CD_FIXTURE, facts=pushq.landing_facts("b40ca7854", "0.2.1519", "relay/x"))
     now = time.time()
-    assert chatdigest.fallbacks(p, p.config(), now + 10) == []       # inside the bound: nothing posts
-    got = chatdigest.fallbacks(p, p.config(), now + chatdigest.DEFAULT_FALLBACK_S + 60)
+    assert chatdigest.fallbacks(p, now + 10) == []       # inside the bound: nothing posts
+    got = chatdigest.fallbacks(p, now + chatdigest.DEFAULT_FALLBACK_S + 60)
     assert got and len(got) == 1
     text = p.db.one("SELECT text FROM messages WHERE id=?", (got[0],))["text"]
     assert len(text) <= 300 and "landed as b40ca78" in text and "0.2.1519" in text
@@ -428,7 +428,7 @@ def test_the_fallback_outcome_line_posts_from_records_only_once_the_bound_passes
     t2 = _cd_task(p, "second task", chat="c2")
     pushq._reply(p.db, t2, "done", "Rows posted.", facts={"need": "run the Mac upgrade"})
     p.db.post("out", "The fix is live as 0.2.1519; run the Mac upgrade.", chat="c2", kind="reply")
-    assert chatdigest.fallbacks(p, p.config(), now + chatdigest.DEFAULT_FALLBACK_S + 60) == []
+    assert chatdigest.fallbacks(p, now + chatdigest.DEFAULT_FALLBACK_S + 60) == []
 
 
 def test_the_coordinator_s_reply_closes_the_delivery(env, monkeypatch):
@@ -446,7 +446,7 @@ def test_the_coordinator_s_reply_closes_the_delivery(env, monkeypatch):
     owed = next(o for o in obligations.items(p.db) if (o.get("promise") or {}).get("chat") == "c1")
     assert owed["delivered"], "the reply with `delivers` is the delivery"
     now = time.time()
-    assert chatdigest.fallbacks(p, p.config(), now + chatdigest.DEFAULT_FALLBACK_S + 60) == []
+    assert chatdigest.fallbacks(p, now + chatdigest.DEFAULT_FALLBACK_S + 60) == []
 
 
 def test_a_promise_in_a_finished_task_s_hand_off_is_owed_until_the_coordinator_replies(env, monkeypatch):
