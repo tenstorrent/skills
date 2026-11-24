@@ -64,6 +64,11 @@ def shim_on(path: str) -> str | None:
     return next((c for c in _ghs(path) if is_shim(c)), None)
 
 
+def real_on(path: str) -> str | None:
+    """The first gh on `path` that is not the harness wrapper (the binary it forwards to)."""
+    return next((c for c in _ghs(path) if not is_shim(c)), None)
+
+
 def first_gh(path: str) -> str | None:
     """The first gh on `path` (the one a bare `gh` runs)."""
     return next(_ghs(path), None)

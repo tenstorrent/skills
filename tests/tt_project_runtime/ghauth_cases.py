@@ -1481,9 +1481,15 @@ def test_retire_from_a_task_run_deletes_the_branch_a_raw_ref_delete_stays_refuse
     stub = run / "stub" / "gh"
     (run / "stub").mkdir()
     stub.write_text("#!/bin/sh\n"
-                    f'printf "%s\\n" "$*" >> "{calls}"\n'
+                    f'printf "%s %s\\n" "$*" "$GH_CONFIG_DIR" >> "{calls}"\n'
                     'case "$*" in "pr list"*) echo "[]";; *) :;; esac\n')
     stub.chmod(0o755)
+    # the run's gh login is held from its agent: the real gh must still get it back
+    from ttp import ghhold
+    held = run / "held-gh"
+    monkeypatch.setenv("GH_CONFIG_DIR", str(run / "empty-gh"))
+    monkeypatch.setenv(ghhold.HOLD_ENV, str(run / "empty-gh"))
+    monkeypatch.setenv(ghhold.HELD + "GH_CONFIG_DIR", str(held))
     monkeypatch.setenv("TTP_PYTHON", sys.executable)
     monkeypatch.setenv("TTP_RUN_DIR", str(run / "rundir"))
     monkeypatch.setenv("PATH", f"{run / 'bin'}{os.pathsep}{run / 'stub'}{os.pathsep}{os.environ['PATH']}")
@@ -1504,7 +1510,7 @@ def test_retire_from_a_task_run_deletes_the_branch_a_raw_ref_delete_stays_refuse
     capsys.readouterr()
     assert ghqueue.retire(branch, str(repo)) == 0, capsys.readouterr().err
     got = calls.read_text().splitlines()
-    assert got[-1].startswith("api -X DELETE") and branch in got[-1], got
+    assert got[-1].startswith("api -X DELETE") and branch in got[-1] and got[-1].endswith(str(held)), got
     # the harness's grant never widens the raw route: a second delete on the same grant is refused
     out = subprocess.run([wrapper, *raw], capture_output=True, text=True, timeout=60)
     assert out.returncode == 1 and "never writes git refs" in out.stderr
@@ -1513,6 +1519,15 @@ def test_retire_from_a_task_run_deletes_the_branch_a_raw_ref_delete_stays_refuse
                     f'printf "%s\\n" "$*" >> "{calls}"\n'
                     'case "$*" in "pr list"*) echo "[{\"number\": 4}]";; *) :;; esac\n')
     assert ghqueue.retire(branch, str(repo)) == 1 and "open PR" in capsys.readouterr().err
+    # past the wrapper, its untrusted-input check still holds: no write label, no delete
+    from ttp import untrusted
+    stub.write_text("#!/bin/sh\n"
+                    f'printf "%s\\n" "$*" >> "{calls}"\n'
+                    'case "$*" in "pr list"*) echo "[]";; *) :;; esac\n')
+    monkeypatch.setenv(untrusted.ENV, "1")
+    n = len(calls.read_text().splitlines())
+    assert ghqueue.retire(branch, str(repo)) == 1 and untrusted.WRITE_LABEL in capsys.readouterr().err
+    assert not any(c.startswith("api -X DELETE") for c in calls.read_text().splitlines()[n:])
 
 
 def test_a_run_written_state_file_and_env_var_no_longer_open_a_ref_delete(env, monkeypatch):

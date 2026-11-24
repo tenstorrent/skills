@@ -750,22 +750,13 @@ def publish(branch: str, cwd: str | None = None, home=None) -> int:
     return _queued(sent, data, repo, cwd, home, f"git push {branch} ({sha[:12]})")
 
 
-def _real_gh() -> str | None:
-    """The host's real gh binary: the first one on PATH that is not the harness's own wrapper (the
-    binary that wrapper forwards to). The retire route calls it directly, so no file or variable a
-    run can write or set authorizes the delete. None: only wrappers on PATH, and the delete falls to
-    the wrapper's own refusal."""
-    from . import ghhold
-    return next((c for c in ghhold._ghs(os.environ.get("PATH", "")) if not ghhold.is_shim(c)), None)
-
-
 def retire(branch: str, cwd: str | None = None, home=None) -> int:
     """`ttp push --retire <branch>`: delete one of the project's own published branches through the
     workstation, or with this host's own gh while delivery.gh_route is unset and that gh is logged in.
     Refused unless this project pushed it (a publish here, or its push records), its prefix is allowed, no open PR uses it (a gh read, held until answered) and no open task or worktree here uses it.
     The tip is saved first, as refs/ttp-private/retired/<branch> and a bundle under state/retired/; the
     workstation reads the tip again and refuses the default branch. The delete this host runs itself
-    goes straight to the real gh binary (_real_gh), never the run's gh wrapper: no file or variable
+    goes straight to the real gh binary (ghhold.real_on), never the run's gh wrapper: no file or variable
     a run can write or set authorizes it."""
     from . import ghroute
     here_gh = ghroute._value(cwd=cwd) == "" and ghroute.local_ok()   # unset route, this host's gh logged in
@@ -777,7 +768,13 @@ def retire(branch: str, cwd: str | None = None, home=None) -> int:
         if not here_gh:
             return enqueue(argv, None, cwd, home, grants, key)
         argv = _with_repo(argv, repo)
-        got = answer({"key": _key(repo, argv, b""), "argv": argv, "stdin": ""}, gh=_real_gh(),
+        from . import ghhold, untrusted
+        if why := untrusted.gh_refusal(argv):   # the wrapper's own check, which the real gh skips
+            print(f"ttp push --retire: {why}", file=sys.stderr)
+            return 1
+        ghhold.restore(os.environ)   # the run's held gh login, put back as the wrapper does
+        got = answer({"key": _key(repo, argv, b""), "argv": argv, "stdin": ""},
+                     gh=ghhold.real_on(os.environ.get("PATH", "")),
                      prefixes=grants, where="here") or {}
         sys.stdout.write(str(got.get("stdout") or ""))
         sys.stderr.write(str(got.get("stderr") or ""))

@@ -266,6 +266,17 @@ def _strip_repo(args: list[str]) -> list[str]:
     return out
 
 
+def gh_refusal(args: list[str]) -> str | None:
+    """Why a run reading untrusted input may not make this gh call (`args` after `gh`): a write
+    without the write label. None otherwise; fails closed."""
+    if not os.environ.get("TTP_RUN_DIR") or not active():
+        return None
+    try:
+        return write_refusal("gh") if gh_write(args) and not writes_allowed() else None
+    except Exception as e:
+        return f"refused: the untrusted-input guard failed ({type(e).__name__})"
+
+
 def gh_write(args: list[str]) -> bool:
     """gh `args` (after `gh`) may write to GitHub: an api call with a write method, body or mutation,
     or any other subcommand that is no read (READ_GROUPS, READ_VERBS)."""
