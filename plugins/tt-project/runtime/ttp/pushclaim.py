@@ -201,21 +201,6 @@ def landed_claims(p, text: str, repo) -> list[tuple[int, int, str, tuple]]:
     return out
 
 
-def _fetched_push_branch(p, repo, done: dict) -> bool:
-    """Whether the push branch's tracking ref was just fetched: the local ref can lag a landing
-    another route pushed, so a claim it cannot confirm asks the remote first. `done` keeps the
-    answer: the branch is fetched once, not once per claim."""
-    if "ok" in done:
-        return done["ok"]
-    from . import push
-    try:
-        remote, branch = push.target(p, Path(repo))
-        done["ok"] = bool(_fetch(Path(repo), remote, f"refs/heads/{branch}", {}))
-    except (ValueError, OSError):
-        done["ok"] = False
-    return done["ok"]
-
-
 def correct_landed_claims(p, text: str, repo, head: str = "", tid: int = 0,
                           remote_missing: bool = False) -> str:
     """`text` (a hand-off summary or a note) with its landed-claims checked model-free: a phrase
@@ -239,7 +224,7 @@ def correct_landed_claims(p, text: str, repo, head: str = "", tid: int = 0,
         except Exception:
             pass
     fixes = []
-    refreshed = {}   # the push branch's fetch, asked once for claims the local ref cannot confirm
+    fetches = {}   # the push branch's fetch, asked once for claims the local ref cannot confirm
     for start, end, sha, claim_target in landed_claims(p, text, repo):
         what = sha or head
         if remote_missing:
@@ -254,7 +239,8 @@ def correct_landed_claims(p, text: str, repo, head: str = "", tid: int = 0,
                 # the local tracking ref can lag a landing another route pushed: fetch the branch
                 # once, then decide again. A refresh that cannot run marks the claim, never a
                 # 'not landed' the ref's own staleness wrote.
-                rc, why = (landed.check(p, repo, what, fetch=False) if _fetched_push_branch(p, repo, refreshed)
+                rc, why = (landed.check(p, repo, what, fetch=False)
+                           if target and _fetch(Path(repo), *target, fetches)
                            else (landed.CANNOT, "cannot fetch the push branch"))
         if rc == landed.NOT_YET:
             where = short_ref(*(claim_target or target)) if (claim_target or target) else "the push branch"
