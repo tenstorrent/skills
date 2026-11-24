@@ -3113,18 +3113,6 @@ HOLD_PID = ".pid"                   # in one: the process holding it (the launch
 HOLD_PIDS = ".pids"                 # in one: each process a launcher started on it (it notes itself there)
 
 
-def note_hold_use(runtime: Path) -> None:
-    """A process whose code is the hold copy `runtime` notes its pid in the copy, so the next hold
-    keeps the copy whole while it still runs from it: children that never see the launcher (they get
-    the copy through PYTHONPATH or a boot script) register themselves this way at import."""
-    if runtime.parent.name == ".git" and runtime.name.startswith(RUNTIME_HOLD):
-        try:
-            with open(runtime / HOLD_PIDS, "a") as f:
-                f.write(f"{os.getpid()}\n")
-        except OSError:
-            pass
-
-
 def _hold_pids(file: Path) -> list[int]:
     """The process numbers a hold copy's `file` names (.pid: its holder; .pids: what its launcher
     started on it); text that is no such numbers reads as none."""

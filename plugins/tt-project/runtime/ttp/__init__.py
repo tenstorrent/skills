@@ -5,13 +5,18 @@ __version__ = "0.2.1516"
 
 
 def _hold_use() -> None:
-    """Note this process on the runtime hold copy it runs from (project.note_hold_use)."""
-    from pathlib import Path
-    try:
-        from .project import note_hold_use
-        note_hold_use(Path(__file__).resolve().parent.parent)
-    except Exception:
-        pass    # never a reason a ttp process fails to start
+    """Note this process on the runtime hold copy it runs from, so a later hold keeps the copy whole
+    while it still imports from it. A child that gets the copy through PYTHONPATH never sees the
+    launcher, which records the processes it starts itself."""
+    import os
+    hold = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))   # .git/<hold>/<this package>
+    if (os.path.basename(os.path.dirname(hold)) == ".git"                 # project.RUNTIME_HOLD's shape
+            and os.path.basename(hold).startswith("ttp-runtime-hold")):
+        try:
+            with open(os.path.join(hold, ".pids"), "a") as f:             # project.HOLD_PIDS
+                f.write("%d\n" % os.getpid())
+        except OSError:
+            pass
 
 
 def poll_s(default: float) -> float:

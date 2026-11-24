@@ -833,3 +833,15 @@ def test_a_child_that_gets_a_hold_copy_through_pythonpath_is_noted_and_kept(tmp_
         child.wait()
     with project.runtime_hold(h):
         assert not copy.exists(), "with the child gone the copy is dropped"
+
+
+def test_the_launcher_and_the_runtime_agree_on_the_hold_copy_names():
+    """The hold copy's name and its .pids marker are spelled in the launcher, in the runtime's
+    import hook and in project.py's constants: one of them drifting silently breaks the hold, so
+    they are checked against the constants the cleanup reads."""
+    from ttp import project
+    launcher = (RUNTIME.parent / "bin" / "ttp").read_text()
+    assert (RUNTIME.parent / "template" / "bin" / "ttp").read_text() == launcher
+    for text in (launcher, (RUNTIME / "ttp" / "__init__.py").read_text()):
+        assert f'"{project.RUNTIME_HOLD}' in text, "a hold copy's name must stay in step"
+        assert f'"{project.HOLD_PIDS}"' in text, "the copy's user list must stay in step"
