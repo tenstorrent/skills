@@ -738,7 +738,6 @@ def landing_facts(sha: str | None, version: str | None, branch: str | None) -> d
     """The landing facts a reply_due event carries: what landed where, and whether the installed
     release runs it. Model-free, from records only; `landed` is false when no commit or version is
     on record (nothing landed)."""
-    from . import release
     cur = release.runtime_version(release.installed())
     return {"landed": bool(sha or version), "sha": sha, "version": version, "branch": branch,
             "deploy": "deployed" if version and cur == version

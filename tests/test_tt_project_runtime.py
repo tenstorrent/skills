@@ -16916,8 +16916,10 @@ def test_a_killed_supervisor_ends_its_agent_and_the_handoff_still_counts(env):
     t = p.db.task(tid)
     assert t["status"] == "done" and "pushed the fix" in t["result"], "a finished task was queued to be redone"
     assert len(p.db.q("SELECT id FROM events WHERE kind='task_done' AND task=?", (tid,))) == 1
-    assert p.db.q("SELECT id FROM messages WHERE direction='out' AND chat='c1' AND text LIKE '%pushed the fix%'")
-
+    ev = p.db.one("SELECT text FROM events WHERE kind='reply_due' AND task=?", (tid,))
+    assert ev and "pushed the fix" in ev["text"], "the hand-off reached the coordinator's reply turn"
+    assert not p.db.q("SELECT id FROM messages WHERE direction='out' AND chat='c1'"
+                      " AND text LIKE '%pushed the fix%'"), "the raw hand-off never posts to the chat"
 
 @pytest.mark.parametrize("ended", ["timeout", "stalled", "reboot"])
 def test_a_handoff_written_before_a_run_ends_badly_is_kept(env, tmp_path, ended):
