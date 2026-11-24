@@ -36,7 +36,7 @@ import sys
 import time
 from pathlib import Path
 
-from . import gitmemo
+from . import gitmemo, landed
 from .project import Project, durable_write
 from .liveness import pid_alive
 
@@ -284,6 +284,9 @@ def apply(p: Project, job: dict, got: dict) -> str:
                                   spec=f"Forward revert of {span} by the post-landing checks.")
                 pushq.approve(p, tid, None, {"entries": [{"branch": c["revert_branch"], "head": c["revert_head"]}],
                                              "target": job["target"]})
+                if e.get("task"):   # no longer landed: landed:#<task> and the ledgers wait for its fix's landing
+                    landed.drop(p, e["task"], list(dict.fromkeys([*landed.recorded(db, e["task"])[0], e["sha"]])),
+                                f"forward revert #{tid} of {span} after post-landing tests failed", event=False)
             fix = db.add_task(f"Fix {who}{REVERT_TITLE_TAIL}", kind="code", labels=[
                 f"start_when:landed:#{tid}", f"start_why:revert #{tid} lands", f"deferred_since:{time.time():.0f}"],
                 spec=(f"Post-landing checks (delivery.post_land_checks) failed after {who} landed as {e['sha'][:10]}. "

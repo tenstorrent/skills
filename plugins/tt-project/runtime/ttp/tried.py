@@ -240,6 +240,13 @@ def landing_times(db) -> dict[int, float | None]:
         if tid in when:
             for i in follows[tid]:
                 when[i] = _earliest(when.get(i), when[tid]) if i in when else when[tid]
+    # A task whose landing a successor dropped (landed.drop) keeps only the landings that still carry it.
+    from . import landed   # late: landed's imports reach this module
+    for tid in {r["task"] for r in db.q("SELECT task FROM task_dropped")} & when.keys():
+        if (at := landed.landed_at(db, tid)) is None:
+            when.pop(tid)
+        else:
+            when[tid] = at
     return when
 
 

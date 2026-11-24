@@ -1429,6 +1429,7 @@ class Daemon:
         self._premise_runs: dict[int, tuple] = {}   # task -> its running premise command: (Pending, started, cmd)
         self._premise_ok: dict[int, tuple[float, str]] = {}   # task -> when its premise command last exited 0, cmd
         self._carry_seen: dict[int, str] = {}   # task -> the push-branch tip _landed_carries last judged it at
+        self._drop_tip, self._drop_ok = "", set()   # _landing_drops: the tip it last judged, tasks found carried
         self._checks_gone_at: dict[int, tuple[str, float]] = {}   # task -> probe on gone checks, first seen (checksgone)
         self._host_up: dict[str, tuple[bool, float]] = {}   # host a probe's 255 named -> ssh reached it, when
         self._down_n: dict[int, int] = {}   # task -> its probe's confirmed-down answers in a row (downwait.gap)
@@ -5463,6 +5464,10 @@ class Daemon:
         except Exception:
             log(self.p, "landed carries not checked: " + traceback.format_exc().replace("\n", " | ")[:1500])
         try:
+            self._landing_drops()
+        except Exception:
+            log(self.p, "dropped landings not checked: " + traceback.format_exc().replace("\n", " | ")[:1500])
+        try:
             self._premise_cmds(time.time())
         except Exception:
             log(self.p, "premise commands not tended: " + traceback.format_exc().replace("\n", " | ")[:1500])
@@ -5471,6 +5476,19 @@ class Daemon:
                 log(self.p, f"task {tid}: {what}")
         except Exception:
             log(self.p, "premise checks not tended: " + traceback.format_exc().replace("\n", " | ")[:1500])
+
+    def _landing_drops(self) -> None:
+        """landed.drops, model-free, once per push-branch tip: a done code task recorded as landed whose own
+        change is not on the push branch (a successor's rebase or batch left it out, the squash lost it) is
+        dropped from the landing record with one coordinator event. A task found carried is not judged again."""
+        if not landed._has_push_branch(self.p):
+            return
+        tip = landed._commit(self.p.root, landed._push_ref(self.p, self.p.root))
+        if not tip or tip == self._drop_tip:
+            return
+        self._drop_tip = tip
+        for tid, why in landed.drops(self.p, skip=self._drop_ok):
+            log(self.p, f"task {tid}: recorded as landed but dropped: {why}")
 
     def _landed_carries(self, now: float) -> None:
         """premise.landed_carry, model-free: close each ready rebase or carry code task that never ran and

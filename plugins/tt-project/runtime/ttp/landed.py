@@ -356,6 +356,7 @@ class Rows:
         self.pushed = _pushed(db)
         self.landings = db.q("SELECT task, sha FROM task_landings ORDER BY marker")
         self.superseded = db.q("SELECT task, sha FROM task_superseded ORDER BY ts")
+        self.dropped = db.q("SELECT task, sha FROM task_dropped")
 
 
 def carriers(db, tid: int, rows: Rows | None = None) -> dict[int, tuple[str, int | None, str]]:
@@ -411,13 +412,15 @@ def recorded(db, tid: int, carry: dict | None = None, rows: Rows | None = None) 
     member = isinstance(res, dict) and isinstance(res.get("batch"), dict) and res["batch"].get("lead") != tid
     if member and res.get("landed"):
         return [str(res["landed"])], "its own commit on the push branch"
+    gone = {r["sha"] for r in (db.q("SELECT task, sha FROM task_dropped WHERE task=?", (tid,)) if rows is None
+                               else rows.dropped) if r["task"] == tid}
     pushed = _pushed(db) if rows is None else rows.pushed
-    hits = [r for r in pushed if (r["landed_sha"] or r["pushed_sha"])
+    hits = [r for r in pushed if (r["landed_sha"] or r["pushed_sha"]) not in gone | {None, ""}
             and (r["task"] in carry or (r["branch"] in branches and not member))]
     if hits:
         return [r["landed_sha"] or r["pushed_sha"] for r in hits], via("its push queue landing", hits[-1]["task"])
     landings = db.q("SELECT task, sha FROM task_landings ORDER BY marker") if rows is None else rows.landings
-    hits = [r for r in landings if r["task"] in carry]
+    hits = [r for r in landings if r["task"] in carry and r["sha"] not in gone]
     if hits:
         return list(dict.fromkeys(r["sha"] for r in hits)), via("its detached push landing", hits[-1]["task"])
     if rows is None:
@@ -425,6 +428,7 @@ def recorded(db, tid: int, carry: dict | None = None, rows: Rows | None = None) 
                      % ",".join("?" * len(carry)), list(carry))
     else:
         found = [r for r in rows.superseded if r["task"] in carry]
+    found = [r for r in found if r["sha"] not in gone]
     if found:
         return [r["sha"] for r in found], via("the commit recorded as superseding it", found[-1]["task"])
     return [], ""
@@ -443,16 +447,19 @@ def landed_at(db, tid: int, rows: Rows | None = None) -> float | None:
     member = isinstance(res, dict) and isinstance(res.get("batch"), dict) and res["batch"].get("lead") != tid
     branches = {v[0] for v in carry.values() if v[0]} if not member else set()
     marks = ",".join("?" * len(carry))
+    gone = "(SELECT sha FROM task_dropped WHERE task=?)"   # landings that do not carry it (drop)
     times = []
     try:
         times += [r["updated"] for r in db.q(
             f"SELECT updated FROM push_queue WHERE status IN ('pushed','landed') AND "
             f"(landed_sha IS NOT NULL OR pushed_sha IS NOT NULL) AND (task IN ({marks}) OR branch IN "
-            f"(SELECT value FROM json_each(?)))", (*carry, json.dumps(sorted(branches))))]
+            f"(SELECT value FROM json_each(?))) AND COALESCE(landed_sha, pushed_sha) NOT IN {gone}",
+            (*carry, json.dumps(sorted(branches)), int(tid)))]
     except Exception:
         pass   # a database without the push queue
     for table in ("task_landings", "task_superseded"):
-        times += [r["ts"] for r in db.q(f"SELECT ts FROM {table} WHERE task IN ({marks})", list(carry))]
+        times += [r["ts"] for r in db.q(f"SELECT ts FROM {table} WHERE task IN ({marks}) AND sha NOT IN {gone}",
+                                        (*carry, int(tid)))]
     if not times and task.get("status") == "done" and (task.get("kind") != "code" or (member and res.get("landed"))):
         times.append(task.get("updated"))
     times = [float(t) for t in times if t]
@@ -473,6 +480,8 @@ def task_shas(p, tid: int) -> tuple[list[str], str]:
     shas, why = recorded(db, tid)
     if shas:
         return shas, why
+    if lost := dropped(db, tid):   # its branch is still an ancestor after a revert: never read as landed
+        return [], f"#{tid} dropped: {lost}"
     head = _commit(p.root, f"refs/heads/{branch}") if branch else ""
     if not head:
         return [], f"#{tid} has no landing recorded and no branch"
@@ -908,6 +917,101 @@ def superseded_rows(p, tid: int) -> list[dict]:
     return out
 
 
+DROP_EVENT = "landing_dropped"
+
+
+def dropped(db, tid: int) -> str:
+    """Why task `tid`'s recorded landings do not carry its change (drop), the latest first; "" when none was."""
+    r = db.one("SELECT why FROM task_dropped WHERE task=? ORDER BY ts DESC LIMIT 1", (int(tid),))
+    return r["why"] if r else ""
+
+
+def drop(p, tid: int, shas: list[str], why: str, event: bool = True) -> None:
+    """Record that the landings `shas` recorded for task `tid` do not carry its change (a successor's rebase or
+    batch left its commits out, the history squash lost them, a forward revert took them off): recorded,
+    landed_at and the tried ledger stop counting them, and `landed:#<id>` waits, naming `why`. A later landing
+    or `ttp task <project> superseded <id> <sha>` counts again. `event`: wake the coordinator once per task."""
+    now = time.time()
+    for sha in dict.fromkeys(s for s in shas if s):
+        p.db.x("INSERT INTO task_dropped(task, sha, why, ts) VALUES(?,?,?,?) ON CONFLICT(task, sha) DO NOTHING",
+               (int(tid), sha, why, now))
+    fp = f"{DROP_EVENT}:{int(tid)}"
+    if event and not p.db.one("SELECT id FROM events WHERE fingerprint=?", (fp,)):
+        p.db.x("INSERT INTO events(ts,source,kind,fingerprint,severity,text,status,task) VALUES(?,?,?,?,?,?,?,?)",
+               (now, "daemon", DROP_EVENT, fp, "normal",
+                f"#{tid} was recorded as landed, but its change is not on the push branch: {why}. Re-land it "
+                f"(a code task that continues #{tid}), or record where it did land with `ttp task <project> "
+                f"superseded {tid} <sha>`; landed:#{tid} waits until then."[:4000], "queued", int(tid)))
+
+
+def carried(p, repo: Path, tid: int, tip: str, shas: list[str] | None = None, src: str = "",
+            rows: Rows | None = None) -> str:
+    """Why task `tid`'s recorded landing (`shas`/`src`, else recorded) does not carry its change: the head
+    it handed off (integrate.member_head) is in none of those landed commits (on_branch: an ancestor, or an
+    equivalent by patch, author and subject, or replay trailer; each a short range from where it forked),
+    no ancestor of the push branch's `tip` or a retired tip, and none holds most of its lines (_holds_part).
+    "" when it is, when nothing is recorded, or when no head was recorded to judge by."""
+    from . import integrate   # late: integrate loads worktree, whose imports reach this module
+    if shas is None:
+        shas, src = recorded(p.db, tid, rows=rows)
+    head = integrate.member_head(repo, tid) if shas else ""
+    if not head or any(_commit(repo, s) and on_branch(repo, head, _commit(repo, s)) for s in shas) \
+            or any(t and _git(repo, "merge-base", "--is-ancestor", head, t).returncode == 0
+                   for t in (tip, *retired_tips(p))) \
+            or any(_commit(repo, s) and _holds_part(repo, head, _commit(repo, s)) for s in shas):
+        return ""
+    return (f"{src or 'its landing'} ({', '.join(s[:10] for s in shas)}) does not hold its own head "
+            f"{head[:10]}, which is on no push branch tip")
+
+
+# Release bookkeeping a later batch rewrites anyway: never evidence that a change landed or was lost
+_BOOKKEEPING = (":!*.changeset/*", ":!*plugin.json", ":!*/__init__.py", ":!*smoke.txt")
+
+
+def _holds_part(repo: Path, head: str, sha: str) -> bool:
+    """Whether commit `sha` holds most of `head`'s change from where they forked: at least half its added
+    lines (bookkeeping files and short lines aside) are lines of the same file at `sha`. A review fix,
+    rebase or narrowing that reworked the commits keeps most of them; a successor that dropped them keeps
+    few (only lines the files already had). True when there is nothing to judge."""
+    mb = _git(repo, "merge-base", head, sha).stdout.strip()
+    added = held = 0
+    for f in _git(repo, "diff", "--name-only", mb, head, "--", ".", *_BOOKKEEPING).stdout.split() if mb else []:
+        have = {x.strip() for x in _git(repo, "show", f"{sha}:{f}").stdout.splitlines()}
+        for x in _git(repo, "diff", "-U0", mb, head, "--", f).stdout.splitlines():
+            if x.startswith("+") and not x.startswith("+++") and len(x.strip()) > 12:
+                added, held = added + 1, held + (x[1:].strip() in have)
+    return 2 * held >= added
+
+
+def drops(p, days: float = 14, record: bool = True, skip: set[int] | None = None) -> list[tuple[int, str]]:
+    """[(task, why)] of each done code task of the last `days` recorded as landed whose change is not on the
+    push branch (carried). `record`: drop each one (an event apiece); `skip`: tasks already found carried,
+    and each found carried is added to it. The daemon runs this once per push-branch tip."""
+    repo = p.root
+    try:
+        tip = _commit(repo, _push_ref(p, repo))
+    except ValueError:
+        return []
+    if not tip:
+        return []
+    skip = set() if skip is None else skip
+    ids = [t["id"] for t in p.db.q(
+        "SELECT id FROM tasks WHERE kind='code' AND status='done' AND COALESCE(updated, 0) >= ? AND "
+        "id NOT IN (SELECT task FROM task_abandoned) ORDER BY id", (time.time() - days * 86400,)) if t["id"] not in skip]
+    rows, out = Rows(p.db, ids), []
+    for tid in ids:
+        shas, src = recorded(p.db, tid, rows=rows)
+        if not shas:
+            continue
+        if why := carried(p, repo, tid, tip, shas, src):
+            out.append((tid, why))
+            if record:
+                drop(p, tid, shas, why)
+        else:
+            skip.add(tid)
+    return out
+
+
 def abandoned(db, tid: int) -> tuple[str, float] | None:
     """(why, when) of `ttp task abandon` for task `tid`, None when it was not abandoned."""
     r = db.one("SELECT why, ts FROM task_abandoned WHERE task=?", (int(tid),))
@@ -1055,6 +1159,17 @@ def _start(repo: Path, branch: str) -> str:
     return log[-1] if log else ""
 
 
+def _not_dropped(p, repo: Path, tid: int | None, tip: str, shas: list[str], src: str, onto: str) -> tuple[int, str] | None:
+    """check's NOT_YET for task `tid` whose landing record is on the push branch but does not carry its own
+    change (carried; it is dropped there and then), else None. Its own branch's commits need no such check."""
+    if tid is None or p is None or src.startswith("its branch") or onto != _push_ref(p, repo):
+        return None
+    if not (lost := carried(p, repo, tid, tip, shas, src)):
+        return None
+    drop(p, tid, shas, lost)
+    return NOT_YET, f"#{tid} dropped: {lost}"
+
+
 def check(p, repo: Path, sha: str | None = None, tid: int | None = None, onto: str | None = None,
           fetch: bool = True) -> tuple[int, str]:
     """(exit code, words) for `ttp landed`: a sha, or task `tid`'s landing, on `onto` (default the
@@ -1089,7 +1204,7 @@ def check(p, repo: Path, sha: str | None = None, tid: int | None = None, onto: s
         full = _commit(repo, sha or "")
         if not full:
             return CANNOT, f"no commit {sha} in {repo}"
-        shas, what = [full], (sha or "")[:10]
+        shas, what, src = [full], (sha or "")[:10], ""
     for fetching in (False, True) if fetch else (False,):
         tip, ref = _tip(repo, onto, fetching)
         if not tip:
@@ -1097,9 +1212,9 @@ def check(p, repo: Path, sha: str | None = None, tid: int | None = None, onto: s
                 return CANNOT, ref
             continue
         if any(_commit(repo, s) and on_branch(repo, s, tip) for s in shas):
-            return 0, f"{what} is on {ref}"
+            return _not_dropped(p, repo, tid, tip, shas, src, onto) or (0, f"{what} is on {ref}")
     if p is not None and _has_push_branch(p) and onto == _push_ref(p, repo) and (found := on_push(p, repo, shas, "")):
-        return 0, f"{what} is on {onto}, at its retired tip {found[:10]}"
+        return _not_dropped(p, repo, tid, tip, shas, src, onto) or (0, f"{what} is on {onto}, at its retired tip {found[:10]}")
     return NOT_YET, f"{what} is not on {onto} yet"
 
 

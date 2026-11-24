@@ -31,7 +31,8 @@ STAMP_SQL = ("SELECT (SELECT count(*) || ':' || max(id) || ':' || max(updated) F
              "(SELECT count(*) || ':' || max(id) || ':' || max(updated) FROM push_queue), "
              "(SELECT count(*) || ':' || max(rowid) FROM task_landings), "
              "(SELECT count(*) || ':' || max(rowid) FROM task_superseded), "
-             "(SELECT count(*) || ':' || total(task) || ':' || max(ts) FROM task_abandoned)")
+             "(SELECT count(*) || ':' || total(task) || ':' || max(ts) FROM task_abandoned), "
+             "(SELECT count(*) || ':' || max(rowid) FROM task_dropped)")
 _last: dict[str, tuple] = {}   # db path -> (inputs, saved state after, when) of its last full check
 
 

@@ -102,6 +102,47 @@ def test_a_finished_worktree_stays_while_a_detached_push_runs_in_it(env, monkeyp
     assert not path.exists() and res["why"] is None
 
 
+def test_a_landing_that_left_a_tasks_commits_out_reads_dropped_until_its_change_lands(env, monkeypatch):
+    """A push queue row credits a task with a landing whose commit does not hold its change (a successor's
+    rebase or batch left its commits out): landed.check reads "dropped", one event wakes the coordinator,
+    and recorded, landed_at, task_shas and the tried ledger stop counting it, the same through Rows. A
+    reworked landing holding most of its lines still counts; so does a recorded supersession once its
+    change is on the push branch."""
+    from ttp import integrate, landed, tried
+    p, repo, other, tid, path, branch, head = _landed_setup(env, monkeypatch)
+    lost, lpath, lbranch = _code_task(p, "lost")
+    body = "".join(f"the lost change, line number {i}\n" for i in range(8))
+    _commit(lpath, "lost.txt", body)
+    lhead = _git_out(lpath, "rev-parse", "HEAD")
+    integrate.record_member_head(repo, lost, lhead)
+    batch = _git_out(repo, "rev-parse", "origin/proj")   # a batch commit that left the lost change out
+    now = time.time()
+    p.db.x("INSERT INTO push_queue(task, branch, head, target, status, landed_sha, created, updated) "
+           "VALUES(?, ?, ?, 'origin/proj', 'landed', ?, ?, ?)", (lost, lbranch, lhead, batch, now, now))
+    assert landed.recorded(p.db, lost)[0] == [batch] and lost in tried.landing_times(p.db)
+    assert [t for t, _ in landed.drops(p, record=False)] == [lost], "the sweep names only the lost task"
+    rc, why = landed.check(p, repo, tid=lost)
+    assert rc != 0 and f"#{lost} dropped: " in why, why
+    assert landed.check(p, repo, tid=lost)[0] != 0
+    (ev,) = p.db.q("SELECT * FROM events WHERE kind=?", (landed.DROP_EVENT,))
+    assert ev["task"] == lost and f"superseded {lost} <sha>" in ev["text"], "one event, however often it is read"
+    assert landed.recorded(p.db, lost) == ([], "") == landed.recorded(p.db, lost, rows=landed.Rows(p.db, [lost]))
+    assert landed.landed_at(p.db, lost) is None and lost not in tried.landing_times(p.db)
+    assert landed.task_shas(p, lost)[1].startswith(f"#{lost} dropped: ")
+    assert landed.drops(p) == [] and landed.check(p, repo, tid=tid)[0] == 0, "the carried task is untouched"
+    # A re-land reworded into one commit with one line changed holds most of the change: carried.
+    (other / "lost.txt").write_text(body.replace("number 3", "number three"))
+    _git_out(other, "add", "lost.txt")
+    _git_out(other, "commit", "-qm", "re-land of the lost change, reworked")
+    relanded = _git_out(other, "rev-parse", "HEAD")
+    _git_out(other, "push", "-q", "origin", "HEAD:proj")
+    _git_out(repo, "fetch", "-q", "origin")
+    assert landed._holds_part(repo, lhead, relanded) and not landed._holds_part(repo, lhead, batch)
+    p.db.x("INSERT INTO task_superseded(task, head, sha, ts) VALUES(?,?,?,?)", (lost, lhead, relanded, now))
+    assert landed.recorded(p.db, lost)[0] == [relanded] and landed.check(p, repo, tid=lost)[0] == 0
+    assert landed.landed_at(p.db, lost) is not None
+
+
 def test_local_only_clears_a_branch_recorded_as_superseded_by_a_commit_on_the_push_branch(env, monkeypatch, capsys):
     """A re-land after a push conflict puts a task's work on the push branch as one new commit with
     another patch and subject: the check flags it until a task records the commit that carries it.

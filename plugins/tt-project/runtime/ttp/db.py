@@ -203,6 +203,12 @@ CREATE TABLE IF NOT EXISTS task_class_fix (task INTEGER PRIMARY KEY, fix_task IN
 -- A done code or harness task whose work will never land, with why and when (`ttp task abandon`, landed.py).
 CREATE TABLE IF NOT EXISTS task_abandoned (task INTEGER PRIMARY KEY, why TEXT NOT NULL, ts REAL NOT NULL);
 
+-- A landing recorded for a task that does not carry its change: a successor's rebase or batch dropped its
+-- commits, the history squash lost them, or a forward revert took them off (landed.drop). Landing records
+-- with that sha no longer count for the task; a later landing or supersession does.
+CREATE TABLE IF NOT EXISTS task_dropped (task INTEGER NOT NULL, sha TEXT NOT NULL, why TEXT NOT NULL,
+  ts REAL NOT NULL, PRIMARY KEY(task, sha));
+
 -- One row per Jev call: its use, decision, cost, estimated cost avoided, whether it changed the rules'
 -- decision (NULL: not known) and later outcome (jevuse.py).
 CREATE TABLE IF NOT EXISTS jev_calls (

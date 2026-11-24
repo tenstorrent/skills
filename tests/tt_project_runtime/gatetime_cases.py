@@ -585,6 +585,8 @@ def test_post_land_mixed_failure_reverts_and_fixes_only_the_tests_not_quarantine
     assert g("diff", "--name-only", pushed, rev["head"]) == "pl1.txt"
     assert f"again at {pushed[:12]}: {_PL_X}" in p.db.task(tid)["spec"]
     assert _PL_X in gatejudge.active(p.state, time.time()), "still quarantined, never counted as passed"
+    (drop,) = p.db.q("SELECT * FROM task_dropped")   # the reverted change no longer counts as landed
+    assert fix["title"].startswith(f"Fix #{drop['task']} ") and drop["why"].startswith("forward revert #"), drop
 
 
 def test_post_land_failure_of_a_quarantined_test_whose_owner_finished_is_reverted_and_fixed(env, tmp_path, monkeypatch):
