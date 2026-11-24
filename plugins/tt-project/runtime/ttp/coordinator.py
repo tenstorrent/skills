@@ -5667,6 +5667,9 @@ def pause_machine(p: Project, alias: str, paused: bool, reason: str = "", by: st
             raise ValueError(pauseends.NEEDS_END.replace("a resource pause", "a machine hold"))
         hold, new = fleethold.set_hold(alias, reason, by, p.name, end, user_msg=user_msg)
         sync_shared_pauses(p, db)
+        if new:   # each owner project is told what of its work is still on the machine
+            from . import heldwork
+            heldwork.notes(p, heldwork.items(alias), why=f"{alias} is held machine-wide")
         till = pauseends.describe(fleethold.entry(hold), p)
         return (f"{alias} held machine-wide (hold {hold['id']}" + ("" if new else ", updated") + ")"
                 + (f" ({hold['reason']})" if hold.get("reason") else "")

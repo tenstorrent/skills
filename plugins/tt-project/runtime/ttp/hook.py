@@ -1591,6 +1591,8 @@ def _pre_tool_use(payload: dict, made: list[str] | None = None) -> tuple[dict | 
     if not why:
         why = device_command(commands, cmd)
     if not why:
+        why = held_machine(cmd)
+    if not why:
         why = local_guard(payload)
     if not why:
         from . import fgwait
@@ -1619,6 +1621,13 @@ def gh_form(segments: list[list[str]], cwd: str) -> str | None:
             if why:
                 return why
     return None
+
+
+def held_machine(cmd: str) -> str | None:
+    """Why a command that reaches a machine held machine-wide or under a known outage may not
+    run (heldwork.ssh_refusal): no ssh, scp or rsync to a machine the user took out of service."""
+    from . import heldwork
+    return heldwork.ssh_refusal(cmd)
 
 
 def local_guard(payload: dict) -> str | None:

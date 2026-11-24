@@ -1950,9 +1950,11 @@ def status_text(p: Project, verbose: bool = False) -> str:
         lines.append(b["line"])
     for pp in h["providers_paused"]:
         lines.append(f"{pp['provider']} paused until {at(pp['until'], now, tz)}: {pp['note']} — fix: {pp['fix']}")
-    from . import fleethold
+    from . import fleethold, heldwork
     for hold in sorted(fleethold.active().values(), key=lambda x: x.get("id") or 0):
         lines.append(fleethold.line(hold, p))
+        if its := heldwork.items(hold.get("alias"), where=p):
+            lines.append(heldwork.line(hold.get("alias"), its))
     try:   # the occupancy watchdog's flags: jobs of this project that ran under a live realtime stream
         from . import occupancy
         occupancy.WHERE = p
@@ -12533,7 +12535,7 @@ def cmd_machines(a) -> None:
         return _machine_activity(a)
     if a.action == "status":
         from . import responsibilities
-        view = responsibilities.machine_status(a.alias)
+        view = responsibilities.machine_status(a.alias, where=here())
         if a.json:
             print(json.dumps(view, indent=2, sort_keys=True))
         elif not view:
@@ -12692,6 +12694,7 @@ def _machine_outage(a) -> None:
         if not got:
             print("no known outages")
         return
+    was = (ml.outage_entries().get(a.alias) or {}).get(by)
     try:
         rec = ml.set_outage(a.alias, a.why, by, a.expires, owner=a.owner or "", covers=a.covers, where=p,
                             queue=queue)
@@ -12702,6 +12705,9 @@ def _machine_outage(a) -> None:
     if rec.get("queued"):
         print(_queued_line(rec, p))
         return
+    if not was:   # a new outage: each owner project is told what of its work is still on the machine
+        from . import heldwork
+        heldwork.notes(p, heldwork.items(a.alias), why=f"{a.alias} has a known outage")
     print(ml.outage_line(a.alias, ml.outages().get(a.alias) or rec, p))
 
 

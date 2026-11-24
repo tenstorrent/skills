@@ -501,9 +501,9 @@ def _project_aliases(harness: Path, known: dict) -> list[str]:
     return machine_ledger.project_machines(cfg if isinstance(cfg, dict) else {}, known)
 
 
-def machine_status(alias: str | None = None, now: float | None = None) -> list[dict]:
+def machine_status(alias: str | None = None, now: float | None = None, where=None) -> list[dict]:
     """The machine view: one record per machine (or just `alias`), read-only from every project."""
-    from . import globalcap, machine_ledger, pauseends, shared
+    from . import fleethold, globalcap, machine_ledger, pauseends, shared
     now = time.time() if now is None else now
     known = machines.load()
     aliases = [alias] if alias else sorted(known)
@@ -548,6 +548,9 @@ def machine_status(alias: str | None = None, now: float | None = None) -> list[d
         v["conditions"] = [machine_ledger.condition_line(c, now)
                            for k, c in machine_ledger.conditions().items() if c.get("alias") == a]
         v["outage"] = outs.get(a)
+        if v["outage"] or fleethold.active().get(a):   # held or out: what of any project's work is on it
+            from . import heldwork
+            v["still_on"] = heldwork.items(a, now=now, where=where)
     return list(view.values())
 
 
@@ -613,6 +616,9 @@ def machine_lines(rec: dict) -> list[str]:
         out.append("  " + outage_line(a, rec["outage"]))
     for c in rec["changes"]:
         out.append(f"  change: {c}")
+    if rec.get("still_on"):
+        from . import heldwork
+        out.append("  " + heldwork.line(a, rec["still_on"]))
     for c in rec["checks"]:
         out.append(f"  heal check {c['project']}/{c['check']}: {c['status']}"
                    + (f", {c['fixed_today']} fixed today" if c["fixed_today"] else ""))
