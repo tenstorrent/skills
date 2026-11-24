@@ -1418,7 +1418,7 @@ def test_an_owner_with_a_recorded_landing_closes_as_today(env, monkeypatch):
     assert ob.get(p.db, oid)["receipt"] is not None
 
 
-def test_the_daemon_files_a_change_order_receipt_only_once_it_lands(env, monkeypatch):
+def test_the_daemon_files_a_change_order_receipt_as_progress_until_it_lands(env, monkeypatch):
     """The daemon's own path (file_runs) under the transaction guard: a run's receipt record for a
     change order whose commit never landed is filed as progress, the order stays open, and the
     fetch the check needs runs before the write transaction."""

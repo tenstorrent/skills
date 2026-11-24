@@ -464,7 +464,7 @@ def _record_progress(own: dict, evidence: str, now: float) -> None:
     own["evidence"] = (own.get("evidence") or [])[-(EVIDENCE_KEPT - 1):] + [{"at": now, "text": evidence}]
 
 
-def _receipt_landing(p, oid: str, kind: str, evidence: str, milestone: str | None,
+def _receipt_landing(p, oid: str, kind: str, milestone: str | None,
                     task: int | None) -> tuple[str, str] | None:
     """How a receipt on `oid` stands with the push branch: ("not-landed", why) when the change is
     not on it, ("unverified", why) when the check cannot run, None when the receipt may close the
@@ -517,7 +517,7 @@ def record(p, oid: str, kind: str, evidence: str, task: int | None, now: float |
         raise ValueError(f"{kind} needs evidence: a commit, a file or a URL")
     now = time.time() if now is None else now
     run_note = ""
-    landing = _receipt_landing(p, oid, kind, evidence, milestone, task)   # before the transaction: its fetch is a network call
+    landing = _receipt_landing(p, oid, kind, milestone, task)   # before the transaction: its fetch is a network call
     with p.db.tx():
         st = _load(p.db)
         o = _need(st, oid)
