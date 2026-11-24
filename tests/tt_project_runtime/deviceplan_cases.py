@@ -803,8 +803,9 @@ def test_replayed_gate_cut_off_by_the_tool_time_limit_runs_once_more_and_a_faile
         tmp_path, monkeypatch):
     """Replay: `ttp checks 2>&1 | tail -30` ran past the agent tool's 2-minute limit, which killed it (exit 143,
     "Command timed out after 2m 0s"); the guard counted that as a failed gate and ended the run. Before: the first
-    cut-off stopped the run. After: the first cut-off of a gate goes on (the run is told to rerun it detached), a
-    second of the same command stops it, and a gate that ran and failed stops it at once."""
+    cut-off stopped the run. After: the first cut-off of `ttp checks` goes on (the run is told to rerun it with a longer timeout), a
+    second of the same command stops it, and a gate that ran and failed, or another gate cut off (a device check on a
+    box that may hang), stops it at once."""
     from ttp import deviceplan, glmguard, hook
     run, _ = _dp_run(tmp_path)
     monkeypatch.setenv("TTP_RUN_DIR", str(run))
@@ -816,10 +817,11 @@ def test_replayed_gate_cut_off_by_the_tool_time_limit_runs_once_more_and_a_faile
     assert json.loads((run / "glm_guard.json").read_text())["kind"] == glmguard.GATE
     for c, err in ((gate, "Exit code 1\nFAILED tests/test_x.py::test_y"),
                    ("ttp checks", "Exit code 143\nterminated by the checks' own stop"),
-                   ("ttp checks", "Exit code 1\nCommand timed out after 2m 0s")):
+                   ("ttp checks", "Exit code 1\nCommand timed out after 2m 0s"),
+                   ("broker status box-a", cut)):
         (run / "glm_guard.json").unlink(missing_ok=True)
         assert "a gate failed" in post(c, err), (c, err)
-    assert "--detach" in deviceplan.glm_lines() and "cut off again, it hands back" in deviceplan.glm_lines()
+    assert "longer tool timeout; cut off again, it hands back" in deviceplan.glm_lines()
 
 
 def _src_asker(tmp_path, answers, seen):

@@ -596,9 +596,8 @@ def glm_lines() -> str:
             "words>\"`; it prints the plan. Reads run freely; every command that changes state must be one of its "
             "steps, as written (fill only its <placeholders>); a reset, power cycle, flash or firmware step needs "
             "`ttp advise --check-step N` to answer ok first. A check step that exits nonzero or prints an error has "
-            "failed: stop there, run no later step and hand the task back to Opus. One the tool's time limit cut off has not "
-            "failed: run it once more, `ttp checks` as `ttp checks --detach` waiting with the `--result` probe it prints, "
-            "any other with a longer tool timeout; cut off again, it hands back. A step outside the plan "
+            "failed: stop there, run no later step and hand the task back to Opus. A `ttp checks` the tool's time limit cut "
+            "off has not failed: run it once more with a longer tool timeout; cut off again, it hands back. A step outside the plan "
             "also hands it back; any other refusal says the allowed way: take it and carry on. Use the plan's paths and names exactly, even one that "
             "looks like a typo. On each other host the plan names a scratch folder (`ttp advise --plan` prints it): "
             "write, copy and remove only inside it there, outside a step.")
