@@ -832,9 +832,14 @@ def test_a_planned_job_may_use_the_runs_own_scratch_folder_and_nothing_else_may_
     plan = lambda *cs: [{"n": i + 1, "command": c, "check": "printf" not in c, "source": "run 101"}
                         for i, c in enumerate(cs)]
     in_tmp = _SRC_SUBMIT.replace("/tmp/ttb101/hb.sh", "/tmp/hb.sh")   # a source running a file directly in /tmp
-    srcs = srcs + [{"cmd": in_tmp}, {"cmd": _SRC_SUBMIT.replace("/tmp/ttb101", "/var/tmp/ttb101")}]
+    srcs = srcs + [{"cmd": in_tmp}, {"cmd": _SRC_SUBMIT.replace("/tmp/ttb101", "/var/tmp/ttb101")},
+                   {"cmd": "srun python3 /tmp/bench.py"}, {"cmd": "srun python3 /tmp/tt99/run.py"}]
     assert not deviceplan.unsourced(plan(own), srcs, task)
     assert not deviceplan.unsourced(plan(in_tmp.replace("/tmp/ttb101", "/tmp/ttp-103")), srcs, task)
+    assert not deviceplan.unsourced(plan("srun python3 /tmp/ttp-103/run.py"), srcs, task), \
+        "a source /tmp folder used as a folder still swaps to the run's own scratch folder"
+    assert deviceplan.unsourced(plan("srun python3 /tmp/ttp-103"), srcs, task), \
+        "the bare scratch folder the task names replaces no source word: _scratch_word alone decides swaps"
     still = {
         "the bare scratch folder for a file in /tmp": plan(own.replace("/tmp/ttp-103/hb.sh", "/tmp/ttp-103")),
         "renamed script the plan never writes": plan(renamed),

@@ -828,6 +828,7 @@ def unsourced(steps: list[dict], srcs: list[dict], task: str = "", root=None) ->
     named, digits = set(norm(mine).split()), set(re.findall(r"\d+", mine))
     tid = re.match(r"task id (\d+)", task or "")
     own = SCRATCH.format(tid.group(1)) if tid else ""
+    named.discard(own)   # the task head's scratch folder is no free word: _scratch_word alone decides its swaps
     bad = []
     for st in steps:
         segs = _src_segments(st["command"])
