@@ -641,7 +641,6 @@ def status(projects: dict | None = None) -> dict:
                       for f, m in sorted(FLAGS.items())}}
 
 
-
 RUN_REARM_KEY = "run_rearm"   # rollout.*: whether a run may re-arm one project with evidence
 
 
