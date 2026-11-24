@@ -832,7 +832,7 @@ def test_a_planned_job_may_use_the_runs_own_scratch_folder_and_nothing_else_may_
     plan = lambda *cs: [{"n": i + 1, "command": c, "check": "printf" not in c, "source": "run 101"}
                         for i, c in enumerate(cs)]
     in_tmp = _SRC_SUBMIT.replace("/tmp/ttb101/hb.sh", "/tmp/hb.sh")   # a source running a file directly in /tmp
-    srcs = srcs + [{"cmd": in_tmp}]
+    srcs = srcs + [{"cmd": in_tmp}, {"cmd": _SRC_SUBMIT.replace("/tmp/ttb101", "/var/tmp/ttb101")}]
     assert not deviceplan.unsourced(plan(own), srcs, task)
     assert not deviceplan.unsourced(plan(in_tmp.replace("/tmp/ttb101", "/tmp/ttp-103")), srcs, task)
     still = {
@@ -843,6 +843,7 @@ def test_a_planned_job_may_use_the_runs_own_scratch_folder_and_nothing_else_may_
         "another time limit": plan(own.replace("-t 120", "-t 7200")),
         "more in the job's command": plan(own.replace("hb.sh'", "hb.sh; tt-smi -r'")),
         "another task's scratch folder": plan(_SRC_SUBMIT.replace("/tmp/ttb101", "/tmp/ttp-99")),
+        "the same name in another folder": plan(_SRC_SUBMIT.replace("/tmp/ttb101", "/var/tmp/ttp-103")),
     }
     flagged = [k for k, st in still.items() if deviceplan.unsourced(st, srcs, task)]
     assert flagged == list(still), flagged

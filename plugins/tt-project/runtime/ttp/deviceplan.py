@@ -800,7 +800,7 @@ def _copy_of(a: list[str], b: list[str], named: set, digits: set, own: str = "")
     return True
 
 
-TMP_DIR = re.compile(r"/tmp/[\w.-]+")
+TMP_DIR = re.compile(r"(?<![\w./-])/tmp/[\w.-]+")
 
 
 def _scratch_word(x: str, y: str, own: str, src: str) -> bool:
@@ -808,7 +808,7 @@ def _scratch_word(x: str, y: str, own: str, src: str) -> bool:
     folder (one the source segment `src` names a path in, so never a file directly in /tmp); the rest of the
     word, file names included, stays as it is."""
     dirs = {m.group() for m in TMP_DIR.finditer(src) if src.startswith("/", m.end())}
-    return bool(own) and own in x and re.sub(re.escape(own) + r"(?![\w.-])", "@scratch@", x) == \
+    return bool(own) and own in x and re.sub(r"(?<![\w./-])" + re.escape(own) + r"(?![\w.-])", "@scratch@", x) == \
         TMP_DIR.sub(lambda m: "@scratch@" if m.group() in dirs else m.group(), y)
 
 
