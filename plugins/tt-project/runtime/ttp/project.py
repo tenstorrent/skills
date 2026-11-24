@@ -443,7 +443,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
     # drafts_during_freeze: opening and updating draft PRs needs no ask even under a code freeze.
     # Off: a draft PR under a code freeze needs the user's word (coordinator prompt and ask gate).
     # links: what outgoing messages turn into clickable links (links.py; ticket linking stays off
-    # until set). jira_base: the Jira instance's base URL ("https://<instance>.atlassian.net");
+    # until set). jira_base: the Jira instance's base URL (e.g. "https://jira.example.com");
     # jira_keys: the project keys whose KEY-N references link to its browse page (only these keys:
     # look-alikes such as model names or hashes never link); repos: short repo name -> "owner/repo",
     # so 'name#N' links and bare 'PR #N' links when the project's one repo; repo: this project's

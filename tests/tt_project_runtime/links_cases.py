@@ -3,7 +3,7 @@
 # there): helpers, fixtures and imports come from that file. Add new link tests here.
 from __future__ import annotations
 
-CFG = {"jira_base": "https://example.atlassian.net", "jira_keys": ["EX"],
+CFG = {"jira_base": "https://jira.example.com", "jira_keys": ["EX"],
        "repos": {"smi": "example-org/example-smi"}, "single_repo": "",
        "file_url": lambda p: f"http://127.0.0.1:9/#token=ab&file={p}" if p.endswith(".json") else None,
        "is_file": lambda p: p.endswith(".json"),
@@ -14,7 +14,7 @@ def test_linkify_turns_each_reference_shape_into_a_link():
     from ttp import links
     out = links.linkify("EX-7 fixed, see smi#12 and example-org/example-repo#3, "
                         "state/runs/9/result.json and the code span `EX-7` stays", CFG)
-    assert "[EX-7](https://example.atlassian.net/browse/EX-7)" in out
+    assert "[EX-7](https://jira.example.com/browse/EX-7)" in out
     assert "[smi#12](https://github.com/example-org/example-smi/issues/12)" in out
     assert "[example-org/example-repo#3](https://github.com/example-org/example-repo/issues/3)" in out
     assert "[state/runs/9/result.json](http://127.0.0.1:9/#token=ab&file=state/runs/9/result.json)" in out
@@ -68,7 +68,7 @@ def test_problems_names_the_three_shapes_and_the_bare_number():
     out = " ".join(links.problems(text, none))
     for what in ("MINFRA-2596", "#288", "#64844", "result.json"):
         assert what in out, out
-    full = {"jira_base": "https://example.atlassian.net", "jira_keys": ["MINFRA"],
+    full = {"jira_base": "https://jira.example.com", "jira_keys": ["MINFRA"],
             "repos": {}, "single_repo": "example-org/example-smi",
             "file_url": lambda p: "http://127.0.0.1:9/#token=ab&file=" + p, "is_file": lambda p: True,
             "ref_url": lambda n, kind: "x" if n in (288, 64844) else None}
@@ -110,22 +110,22 @@ def test_readable_serves_only_tracked_files_and_run_outputs_never_credentials(tm
 
 def test_the_listener_line_and_status_ask_linkify_outgoing_text(env):
     p = make(env)
-    p.set_config("links.jira_base", "https://example.atlassian.net")
+    p.set_config("links.jira_base", "https://jira.example.com")
     p.set_config("links.jira_keys", ["EX"])
     p.set_config("links.repos", {"smi": "example-org/example-smi"})
     from ttp import cli, links
     m = {"id": 1, "kind": "reply", "severity": "normal", "chat": None, "text": "EX-7 done, see smi#1"}
-    assert "(https://example.atlassian.net/browse/EX-7)" in cli._listen_line(p, m)
+    assert "(https://jira.example.com/browse/EX-7)" in cli._listen_line(p, m)
     assert "(https://github.com/example-org/example-smi/issues/1)" in cli._listen_line(p, m)
     assert links.for_user(p, "PR #1", links.TEXT) == "PR #1"   # no single repo: nothing to link
     p.db.post("out", "ask about EX-7", kind="ask", severity="normal")
     lines = cli.status_text(p).splitlines()
-    assert any("needs you" in l and "(https://example.atlassian.net/browse/EX-7)" in l for l in lines), lines
+    assert any("needs you" in l and "(https://jira.example.com/browse/EX-7)" in l for l in lines), lines
 
 
 def test_the_web_app_linkifies_its_messages_and_asks(env):
     p = make(env)
-    p.set_config("links.jira_base", "https://example.atlassian.net")
+    p.set_config("links.jira_base", "https://jira.example.com")
     p.set_config("links.jira_keys", ["EX"])
     p.db.post("out", "EX-8 shipped", kind="reply", severity="normal")
     p.db.post("out", "asking about EX-9", kind="ask", severity="normal")
@@ -149,11 +149,11 @@ def test_the_web_app_linkifies_its_messages_and_asks(env):
         task = p.db.x("INSERT INTO tasks(created,title,spec) VALUES(?,?,?)", (0, "t", ""))
         p.db.post("out", f"#{task} finished", kind="reply", severity="normal")
         rows = [r for r in get("/api/messages") if "EX-8" in r["text"]]
-        assert rows and "](https://example.atlassian.net/browse/EX-8)" in rows[0]["text"], rows
+        assert rows and "](https://jira.example.com/browse/EX-8)" in rows[0]["text"], rows
         # an id reference resolves from the web app's own thread and connection, not p.db
         id_rows = [r for r in get("/api/messages") if f"#{task}" in r["text"]]
         assert id_rows and f"#task={task}" in id_rows[0]["text"], id_rows
-        assert any("](https://example.atlassian.net/browse/EX-9)" in a["text"]
+        assert any("](https://jira.example.com/browse/EX-9)" in a["text"]
                    for a in web.state_payload(p, p.db)["attention"])
         # a file link opens exactly what /api/file serves, and nothing outside the project tree
         (p.state / "runs/1").mkdir(parents=True, exist_ok=True)
