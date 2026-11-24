@@ -322,6 +322,15 @@ def _safe_way(key: str, new) -> bool:
     return key in SAFE_WHEN_OFF and new is not _ABSENT and value in (False, "", [])
 
 
+def owned(p, key: str, raw: dict) -> list[str]:
+    """The keys at or under dotted `key` that project.json `raw` holds and whose recorded setter is the user or a
+    coordinator: removing one is a change guard() refuses an automated setter, so an upgrade leaves them."""
+    if not p.established():
+        return []
+    return [k for k in [key] + sorted(k for k in _all(p.db) if k.startswith(key + "."))
+            if at(raw, k) is not _ABSENT and role(lookup(p.db, k, raw)) in OWNERS]
+
+
 def guard(p, key: str, setter: dict | None, before, after) -> bool:
     """Before set_config or unset_config writes `after` over `before`: True when there is nothing to
     write (an automated setter writing what an owner's value already is: the owner's record stays).

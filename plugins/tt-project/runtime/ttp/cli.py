@@ -14697,6 +14697,9 @@ def _auto_cache_ttl(p: Project) -> str:
         coord = p.raw_config().get("coordinator")
         if not (isinstance(coord, dict) and "cache_ttl" in coord and not str(coord["cache_ttl"] or "").strip()):
             return ""
+        from . import configwho
+        if configwho.owned(p, "coordinator.cache_ttl", p.raw_config()):   # its owner's "" stays (configwho.guard)
+            return ""
         p.set_config("coordinator.cache_ttl", "auto", by={"by": "upgrade", "via": "upgrade"})
     except Exception:
         return ""
@@ -14762,6 +14765,10 @@ def _move_max_workers(p: Project) -> str:
                 set_account_setting("machine.max_workers", keep)
             note = (f"moved machine.max_workers {v} from project.json to the machine's account settings "
                     f"(now {keep}, for every project here: ttp config --account machine.max_workers)")
+        from . import configwho
+        if configwho.owned(p, "machine.max_workers", raw):   # its owner's copy stays (configwho.guard), inert
+            return "\n".join(_kept_once(p, "machine.max_workers", f"{note}; kept the project.json copy, which "
+                                                                   f"nothing reads, because its owner set it"))
         p.unset_config("machine.max_workers", by={"by": "default", "via": "upgrade: moved to the account settings"})
     except Exception:
         return ""
@@ -14770,7 +14777,9 @@ def _move_max_workers(p: Project) -> str:
 
 def _drop_retired_keys(p: Project) -> list[str]:
     """Each project.RETIRED_KEYS key project.json still holds is removed and recorded in config provenance;
-    no other key is touched and a second run changes nothing. One note line per key removed."""
+    no other key is touched and a second run changes nothing. One note line per key removed. A key the user
+    or a coordinator set stays (configwho.guard refuses its removal; nothing reads it), named once (_kept_once)."""
+    from . import configwho
     from .project import RETIRED_KEYS
     out = []
     try:
@@ -14780,12 +14789,33 @@ def _drop_retired_keys(p: Project) -> list[str]:
         for key, why in RETIRED_KEYS.items():
             if not _config_has(raw, key):
                 continue
-            if p.unset_config(key, by={"by": "default", "via": "upgrade: retired key"}):
-                out.append(f"upgrade note: removed {key} from project.json, a key this plugin no longer reads ({why})")
+            if mine := configwho.owned(p, key, raw):
+                out += _kept_once(p, key, f"kept {', '.join(mine)} in project.json, a key this plugin no longer "
+                                          f"reads ({why}), because its owner set it")
+                continue
+            try:
+                if p.unset_config(key, by={"by": "default", "via": "upgrade: retired key"}):
+                    out.append(f"upgrade note: removed {key} from project.json, a key this plugin no longer "
+                               f"reads ({why})")
+            except ValueError:   # refused (configwho.Protected, routeguard): left, and the other keys still go
+                continue
             raw = p.raw_config()
     except Exception:
         return out
     return out
+
+
+KEPT_KEYS_KV = "upgrade_kept_owner_keys"   # kv: {key: when} of the owner-set keys an upgrade left and named
+
+
+def _kept_once(p: Project, key: str, what: str) -> list[str]:
+    """The upgrade note for an owner-set key the upgrade leaves in project.json, the first time only: later
+    upgrades leave it silently. Removing it stays its owner's (`ttp config NAME KEY ''`)."""
+    seen, _ = p.db.kv_dict(KEPT_KEYS_KV)
+    if key in seen:
+        return []
+    p.db.set_kv(KEPT_KEYS_KV, {**seen, key: time.time()})
+    return [f"upgrade note: {what}; `ttp config {p.name} {key} ''` removes it"]
 
 
 def _config_has(raw: dict, key: str) -> bool:

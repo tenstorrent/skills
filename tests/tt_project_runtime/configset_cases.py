@@ -405,6 +405,45 @@ def test_upgrade_drops_retired_keys_once_and_keeps_the_rest(env):
     assert cli._drop_retired_keys(p) == [] and p.config_path.read_text() == text, "a rerun is a no-op"
 
 
+def test_upgrade_leaves_an_owner_set_retired_key_inert_with_one_note_and_no_refusal(env):
+    """A retired key the user set (effort_ab.enabled false, at the CLI) loops no more: the upgrade leaves it and
+    its user record (configwho.guard refuses an upgrade's removal; nothing reads it), names it in one note the
+    first time, raises no refusal, and still drops the retired keys after it. Two upgrades in a row: no refusal,
+    no second note. The upgrade's other migrations leave an owner's value the same way."""
+    # cells: kept-with-provenance, one-note, no-refusal, later-keys-dropped, second-upgrade-silent,
+    #        max-workers-owner, cache-ttl-owner
+    from ttp import cli, configwho
+    from ttp.project import account_value
+    p = make(env)
+    user = {"by": "user", "via": "cli"}
+    p.set_config("effort_ab.enabled", False, by=user)
+    p.set_config("effort_ab.jev_pick", True, by=user)
+    p.set_config("coordinator.cache_ttl", "", by=user)
+    before = p.raw_config()   # machine.max_workers as an older release let the user set it in project.json
+    _with_raw(p, machine={"max_workers": 3})
+    configwho.changed(p, "machine.max_workers", user, before, p.raw_config())
+    _with_raw(p, bridge={"agent_alert_grace_min": 5})   # an older template's, after effort_ab in RETIRED_KEYS
+
+    def refusals():
+        return p.db.q("SELECT text FROM events WHERE kind='config_overwrite_refused'")
+
+    first = cli._drop_retired_keys(p)
+    assert len(first) == 2 and "kept effort_ab.enabled" in first[0] and "its owner set it" in first[0], first
+    assert "removed bridge.agent_alert_grace_min" in first[1], first
+    raw = p.raw_config()
+    assert raw["effort_ab"] == {"enabled": False, "jev_pick": True} and "bridge" not in raw
+    assert configwho.role(configwho.lookup(p.db, "effort_ab.enabled", raw)) == "user"
+    assert "moved machine.max_workers 3" in cli._move_max_workers(p) and account_value("machine.max_workers") == 3
+    assert cli._auto_cache_ttl(p) == ""
+    raw = p.raw_config()
+    assert raw["machine"]["max_workers"] == 3 and raw["coordinator"]["cache_ttl"] == ""
+    text = p.config_path.read_text()
+    assert cli._drop_retired_keys(p) == [] and cli._move_max_workers(p) == "" and cli._auto_cache_ttl(p) == ""
+    assert p.config_path.read_text() == text, "the second upgrade changes nothing"
+    assert refusals() == [], "the owner guard was never asked to remove an owner's value"
+    assert not [r for r in configwho.history(p) if r.get("refused")]
+
+
 def test_a_run_sets_a_dollar_cap_only_on_the_users_own_message_carrying_the_setting(env, monkeypatch, capsys):
     """A cap change the user wrote in chat as the setting itself is applied by a run with --user-msg,
     recorded as the user's with the message id, only when that message is the user's own and carries the
