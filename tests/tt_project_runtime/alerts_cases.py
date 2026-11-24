@@ -4143,6 +4143,43 @@ def test_the_desktop_notifier_counts_only_an_ssh_connect_failure_as_a_host_down(
     assert notifier._remote_alerts(entry, "a1", 0, "high") == ([], True, None)
 
 
+def test_the_alert_poll_passes_the_viewer_s_checked_link_base_to_the_project_host(monkeypatch):
+    """The notifier's machine tells the project host which local address answers as this project,
+    so an alert's links open this project's pages there and never another app on that port."""
+    from types import SimpleNamespace
+    from ttp import notifier, tunnel, weblink
+    seen = []
+    monkeypatch.setattr(notifier.subprocess, "run",
+                        lambda argv, **k: seen.append(argv) or SimpleNamespace(returncode=0, stdout="[]", stderr=""))
+    entry = {"dir": "/w/a1", "host": "host-a"}
+
+    def installed(name):
+        return {"local": 18800} if name == "a1" else None
+    monkeypatch.setattr(tunnel, "installed", installed)
+    monkeypatch.setattr(weblink, "checked_base", lambda base, name: base)   # the tunnel answers
+    assert notifier._remote_alerts(entry, "a1", 0, "high") == ([], True, None)
+    cmd = " ".join(seen[-1][4:])
+    assert "--link-base" in cmd and "http://127.0.0.1:18800/" in cmd, cmd
+
+    seen.clear()   # an older host there: asked again without the passed base
+    monkeypatch.setattr(notifier.subprocess, "run", _older_host(seen))
+    assert notifier._remote_alerts(entry, "a1", 0, "high") == ([], True, None)
+    assert " --link-base" not in " ".join(seen[-1][4:])
+
+
+def _older_host(seen):
+    """A host whose older ttp rejects --link-base: the poll asks again without the passed base."""
+    from types import SimpleNamespace
+    runs = [SimpleNamespace(returncode=2, stdout="",
+                            stderr="unrecognized arguments: --link-base http://127.0.0.1:18800/ --link-as a1"),
+            SimpleNamespace(returncode=0, stdout="[]", stderr="")]
+
+    def run(argv, **k):
+        seen.append(argv)
+        return runs.pop(0)
+    return run
+
+
 def _daemon_notifier(monkeypatch, projects):
     """A notifier over remote `projects` {name: host} whose answers come from `up` {host: bool} and
     `hb` {name: health dict or None}. Returns (poll(t, state), up, hb, shown, reg)."""

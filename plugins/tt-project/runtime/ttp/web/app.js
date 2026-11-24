@@ -6,12 +6,15 @@ const $ = (s) => document.querySelector(s);
 const R = window.TTPRender, put = (el, html) => R.patch(el, html), text = (el, s) => R.text(el, s);
 const agoH = R.agoHtml;
 const esc = (s) => String(s == null ? "" : s).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
-// A link only to an http(s) URL: any other value (javascript:, data:, ...) shows as plain text.
+// A link only to an http(s) URL, or to this app's own page anchors (#task=N, #file=...), which a
+// message link is: relative to the origin this page was served from, so it opens this project.
 const isHttp = (url) => /^https?:\/\//i.test(String(url || ""));
-const link = (url, label) => isHttp(url) ? `<a href="${esc(url)}" target="_blank" rel="noopener">${label}</a>` : label;
+const own = (u) => /^#(task|run|msg)=\d+$|^#file=/.test(String(u || ""));
+const link = (url, label) => (isHttp(url) || own(url)) ? `<a href="${esc(url)}" target="_blank" rel="noopener">${label}</a>` : label;
 const ago = R.ago;
-// Message text arrives linkified (markdown [text](url)); only http(s) targets become anchors.
-const mdLinks = (html) => html.replace(/\[([^\]]+)\]\((https?:\/\/[^)\s]+)\)/g, (m, t, u) => link(u.replace(/&amp;/g, "&"), t));
+// Message text arrives linkified (markdown [text](url)); http(s) targets and this app's own
+// page anchors (#task=N, #file=...) become anchors, anything else stays text.
+const mdLinks = (html) => html.replace(/\[([^\]]+)\]\((https?:\/\/[^)\s]+|#[^\s)]+)\)/g, (m, t, u) => link(u.replace(/&amp;/g, "&"), t));
 // ^ the fragment's & separators arrive &amp;-escaped from esc(); a URL keeps its real &
 const showFile = async (path) => {
   const r = await api("/api/file?path=" + encodeURIComponent(path));

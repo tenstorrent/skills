@@ -4097,7 +4097,13 @@ the pick order, so it takes the first starts. A resumed resource ramps only its 
   the tt-project home only, secrets refused). A '#N' names a project id: it links to the web app's
   page for that task, run or message (`web_base` is the address you open the web app at, when it
   differs from the address the web app itself reports), and one that matches no task, run or message
-  is labelled, never left bare. `ttp links` reports references today's messages left
+  is labelled, never left bare. A web-app link is built for the machine that shows it: the side that
+  prints (a listener, the desktop notifier) rewrites the base to the address that machine reaches
+  this project's web app at, checked to answer as this project, and with no checked address the
+  reference stays plain (`task #N`, no URL); the web app links its pages relative to its own origin,
+  so a browser on any machine opens the same project. The check asks the web app's token-free
+  `/api/name`, which answers with the project's name (and nothing else) to whoever can already
+  reach the web app's port. `ttp links` reports references today's messages left
   unlinked. Set account-wide (`ttp config --account links.jira_base ...`) so every project on a
   host links the same tickets.
 - `delivery.ai_tag` (default `[Authored by AI]`, matched in any case; `""` turns it off) is the

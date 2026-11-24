@@ -7566,6 +7566,31 @@ def test_a_run_end_is_recorded_whole_or_not_at_all(env, tmp_path, monkeypatch):
     assert p.db.spent_since(0) == 0.75 and p.db.task(tid)["spent_usd"] == 0.75, "booked twice"
 
 
+def test_a_forwarded_listener_s_arguments_parse_on_the_host(env):
+    """A base the viewer's forwarder appends must be accepted by the host's parser: a listener
+    that dies on unrecognized arguments would print nothing at all."""
+    from ttp import cli
+    ap, _ = cli.ttp_parser()
+    argv = ["listen", "demo", "--chat", "c1", "--holder", "h",
+            "--link-base", "http://127.0.0.1:18800/", "--link-as", "demo", "--once"]
+    a = ap.parse_args(cli.ttp_argv(_, argv))
+    assert a.link_base == "http://127.0.0.1:18800/" and a.link_as == "demo" and a.once
+
+
+def test_a_forwarded_listener_passes_this_machine_s_checked_link_base(env, monkeypatch):
+    """The forwarder tells the project host which address this machine reaches the project's web
+    app at, so the host builds the message links on it and a #task link opens this project's
+    pages here, never whatever answers on the host's own port on this machine."""
+    from ttp import cli, tunnel, weblink
+    argvs: list = []
+    monkeypatch.setattr(cli, "forward", lambda entry, argv, **k: argvs.append(argv) or 0)
+    monkeypatch.setattr(tunnel, "installed", lambda name: {"local": 18800})
+    monkeypatch.setattr(weblink, "checked_base", lambda base, name: base)   # the tunnel answers
+    assert cli.forward_listen({"host": "box", "dir": "/x"}, ["listen", "demo", "--chat", "c1"],
+                              "demo") == 0
+    assert argvs[0][-4:] == ["--link-base", "http://127.0.0.1:18800/", "--link-as", "demo"], argvs
+
+
 def test_remote_listener_reconnects_after_a_network_drop(env, monkeypatch):
     from ttp import cli
     results = iter([255, 255, 0])
@@ -27720,7 +27745,9 @@ def test_web_app_links_only_http_urls_and_uses_no_inline_handlers():
     js = (RUNTIME / "ttp" / "web" / "app.js").read_text()
     assert not re.search(r'\bon[a-z]+="', js), re.findall(r'\bon[a-z]+="[^"]*', js)
     assert '"\'": "&#39;"' in js and "[&<>\"']" in js
-    assert js.count('href="${') == 1 and 'isHttp(url) ? `<a href="${esc(url)}"' in js
+    assert js.count('href="${') == 1 and '(isHttp(url) || own(url)) ? `<a href="${esc(url)}"' in js
+    # a message link is this app's own page anchor, so a browser on any machine opens this project
+    assert 'own = (u) => /^#(task|run|msg)=\\d+$|^#file=/' in js
     assert "link(r.url," in js and "isHttp(t.pr_url) ? link(t.pr_url" in js
     assert 'data-schedule="${esc(s.name)}"' in js and '$("#schedlist").addEventListener("change"' in js
     assert 'closest("[data-task-act]")' in js and "window.taskAct" not in js and "window.setSched" not in js

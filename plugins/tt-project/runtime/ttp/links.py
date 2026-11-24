@@ -16,7 +16,10 @@ web app's message list and asks, `ttp status`).
 """
 from __future__ import annotations
 
+import json
+import os
 import re
+import time
 from pathlib import Path
 from urllib.parse import quote
 
@@ -148,19 +151,25 @@ SECRET_RE = re.compile(r"secret|credential|passwd|password|token|\.pem$|\.key$|\
 _GIT_CACHE: dict[str, tuple] = {}   # repo root -> ((sha, links.repo), {"files": set, "base": str, "single": str}): the latest only
 
 
-def config(p, db=None) -> dict:
+UNSET = object()   # config(): the caller has not decided a base, so the project's own is used
+FORWARDS = "link-forwards.json"   # state file: the checked bases viewers passed to this host
+FORWARD_ROWS = 50   # kept entries: a viewer's proof, not a log
+
+
+def config(p, db=None, base=UNSET) -> dict:
     """The `cfg` linkify() reads, from the project's settings and repo. The git lookups are cached
-    for the process; a settings change is picked up on the next start."""
+    for the process; a settings change is picked up on the next start. `base`: the link base the
+    caller decided for its viewer ("" for the web app's own pages, None for no web links)."""
     links = p.config().get("links") or {}
     repo = _git_cfg(p, links)
-    web = _web_base(p, db)
+    web = _web_base(p, db) if base is UNSET else base
     exists = _exists(p, db)
 
     def file_url(path: str) -> str | None:
         if (repo and repo["files"] and path in repo["files"] and repo["base"]):
             return repo["base"] + path
         q = readable(p, path)
-        if q and web:
+        if q and web is not None:
             return f"{web}#file={quote(str(q))}"
         return None
 
@@ -187,7 +196,7 @@ def _exists(p, db):
 
 def _ref_url(web, exists):
     """A project id -> its web app page, None when the id names no record (never a guessed page)."""
-    if not web:
+    if web is None:
         return None   # no page to link to: leave ids as written rather than label every one wrong
     def ref(n: int, kind: str):
         k = KIND.get(kind, kind) or "task"   # a bare '#N' pages as the task it names
@@ -275,11 +284,50 @@ def _github_repo(p, links: dict) -> str:
     return str(links.get("repo") or "")
 
 
-def for_user(p, text: str, fmt: str = MD, cfg: dict | None = None) -> str:
-    """One message to the user, linkified (the outgoing boundary callers use). `cfg`: a config()
-    the caller built once for many messages."""
+def show_base(p, db=None, passed: str | None = None) -> str | None:
+    """The base a message's web-app links use for a viewer on this machine: the address this
+    machine reaches the project's web app at, checked to answer as this project. `passed`: a base
+    the viewer's own side checked and sent along (a listener or alert poll forwarded over ssh).
+    None when nothing checks out, so the message names its references with no URL: a link is never
+    printed for a base that does not answer as this project, and a host never gives its own port
+    to a viewer on another machine, where that port is a different app's."""
+    from . import weblink
+    set_ = str((p.config().get("links") or {}).get("web_base") or "").rstrip("/")
+    if set_:
+        return f"{set_}/"   # the user's own declared address for this project's web app
+    passed = weblink.local_base(passed or "")
+    if passed:
+        return passed   # the viewer's side checked it; its loopback is not this host's to check
+    remote = os.environ.get("SSH_CONNECTION") or os.environ.get("SSH_CLIENT")
+    return None if remote else (weblink.tunnel_base(p.name)
+                                or weblink.checked_base(weblink.page(p, db) or "", p.name))
+
+
+def note_forward(p, chat, base: str, answered_as: str) -> None:
+    """Record that a viewer's side checked a link base and passed it here: the chat it listens on,
+    the base, the project name the base answered as, and when. Model-free proof the viewer's
+    links land in this project's web app, kept in the project's state."""
+    from .project import durable_write
+    f = p.state / FORWARDS
     try:
-        return linkify(text, config(p) if cfg is None else cfg, fmt)
+        rows = json.loads(f.read_text() or "[]")
+        if not isinstance(rows, list):
+            raise ValueError
+    except (OSError, ValueError):
+        rows = []
+    rows.append({"chat": chat, "base": base, "project": answered_as, "ts": time.time()})
+    try:
+        durable_write(f, json.dumps(rows[-FORWARD_ROWS:], indent=1))
+    except OSError:
+        pass   # a record that cannot be written must not end the listener
+
+
+def for_user(p, text: str, fmt: str = MD, cfg: dict | None = None, base=UNSET) -> str:
+    """One message to the user, linkified (the outgoing boundary callers use). `cfg`: a config()
+    the caller built once for many messages, then `base` is its own; `base` otherwise: the link
+    base this viewer's side decided, decided here when the caller leaves it unset."""
+    try:
+        return linkify(text, config(p, base=base) if cfg is None else cfg, fmt)
     except Exception:   # a linkifier fault must never lose a message
         return text
 

@@ -127,6 +127,7 @@ RUNWATCH_STALE_S = 180   # `ttp runs live` reads afresh once the daemon's runwat
 LISTEN_GRACE_S = 60     # a listener reconnecting within this says nothing about the drop
 LISTEN_CONNECTED_S = 25  # an ssh session that lasted this long had connected (ConnectTimeout is 20 s)
 LISTEN_REPLACED = 3   # a newer listener for the same chat took over; this one stops and does not reconnect
+_UNSET_BASE = object()   # an unset link base: _listen_line decides it
 REPLACED_MARK = "ttp: replaced by a newer listener"   # its stderr line, read even when ssh reports a drop
 _MSG_LINE = re.compile(r"\[#(\d+) ")
 
@@ -183,6 +184,12 @@ def forward_listen(entry: dict, argv: list[str], name: str | None = None) -> int
     """
     from . import sshfail
     once = "--once" in argv
+    # This machine's checked address for that project's web app: the host builds its message
+    # links on it, so a link opens this project's pages on this machine, never whatever answers
+    # on the host's own port here.
+    from . import weblink
+    if (base := weblink.tunnel_base(name)) and "--link-base" not in argv:
+        argv = [*argv, "--link-base", base, "--link-as", name]
     limit = _listen_timeout(argv)
     deadline = time.time() + limit if limit > 0 else None
     shown: set[int] = set()
@@ -1572,6 +1579,19 @@ def _register_say_chat(db, chat: str, label: str, caller: str) -> None:
     db.set_kv(chatgone.SAY_FROM + chat, top)
 
 
+def links_show_base(p, passed: str | None, chat=None, answered_as: str = "") -> str | None:
+    """The link base this process's viewer sees (links.show_base). A listener that a viewer's own
+    side checked a base for has that check recorded in the project's state, as its proof."""
+    try:
+        from . import links
+        base = links.show_base(p, passed=passed)
+        if passed and base and chat is not None:
+            links.note_forward(p, chat, base, answered_as)
+        return base
+    except Exception:
+        return None   # a runtime half-updated under the listener: plain text, never a lost message
+
+
 def cmd_listen(a) -> None:
     p = need(a.name, sys.argv[1:])
     db = p.db
@@ -1710,6 +1730,8 @@ def _listen_loop(p: Project, db, a, after: int, floor: str) -> None:
         pass
     parent = _STARTED_BY[1] if _STARTED_BY[0] == os.getpid() else os.getppid()
     window = relayers.batch_s(p.config(), getattr(a, "batch", None))
+    base = links_show_base(p, getattr(a, "link_base", None), getattr(a, "chat", None),
+                           getattr(a, "link_as", ""))
     pending: list = []
     read, beat, broke = after, time.time(), 0.0
     while True:
@@ -1729,7 +1751,7 @@ def _listen_loop(p: Project, db, a, after: int, floor: str) -> None:
             ready, pending = sorted(ready + pending, key=lambda m: m["id"]), []
             for m in ready:
                 try:
-                    line = _listen_line(p, m)
+                    line = _listen_line(p, m, base=base)
                 except Exception as e:  # noqa: BLE001 - a line that cannot be rendered goes out plain, never lost
                     line = _listen_line(p, m, plain=True)
                     if isinstance(e, ImportError):   # a module the loaded code imports is gone or not yet there
@@ -1763,15 +1785,19 @@ def _listen_loop(p: Project, db, a, after: int, floor: str) -> None:
         time.sleep(poll_s(2))
 
 
-def _listen_line(p: Project, m: dict, plain: bool = False) -> str:
+def _listen_line(p: Project, m: dict, plain: bool = False, base=_UNSET_BASE) -> str:
     """The line a listener prints for message `m`, its text linkified (links.for_user), or as it is
-    (`plain`: when the linkifier cannot load or fails, the message still goes out)."""
+    (`plain`: when the linkifier cannot load or fails, the message still goes out). `base`: the
+    link base this viewer's message links use; an unset base is decided here (links.show_base),
+    a decided None means this viewer gets plain references with no URL."""
     kind = f"ask {m['id']}" if m["kind"] == "ask" else m["kind"]   # "ask N": "#N" reads as a task
     who = "coordinator" if m["chat"] else f"{p.name} ({kind}, {m['severity']})"
     if plain:
         return f"[#{m['id']} {who}] {m['text']}"
     from . import links
-    return f"[#{m['id']} {who}] {links.for_user(p, m['text'], links.MD)}"
+    if base is _UNSET_BASE:
+        base = links.show_base(p)
+    return f"[#{m['id']} {who}] {links.for_user(p, m['text'], links.MD, base=base)}"
 
 
 LISTEN_FROM_ENV = "TTP_LISTEN_FROM"     # _listen_reexec: the last message id the listener before the exec printed
@@ -1862,10 +1888,11 @@ def status_text(p: Project, verbose: bool = False) -> str:
     lines = [head]
     whole = set()   # lines quoting an open ask: wrapped at STATUS_WIDTH, never cut
     from . import links
+    base = links_show_base(p, None)
     seen = attention(db, now, p)
     for m in [m for m in seen if m["kind"] == "ask"] + [m for m in seen if m["kind"] != "ask"][:6]:
         text = " ".join(m["text"].split())   # an open ask in full, every one: the user acts on it (#2424)
-        text = links.for_user(p, text, links.TEXT)   # a terminal: plain-text links
+        text = links.for_user(p, text, links.TEXT, base=base)   # a terminal: plain-text links
         what = (f"ask {m['id']}" + (f"; {m['auto']}" if m.get("auto") else "")) if m["kind"] == "ask" else f"alert {m['id']}"
         lines.append(f"  needs you ({what}, {since(m['ts'], now)} ago): {text if m['kind'] == 'ask' else clip(text, 300)}")
         if m["kind"] == "ask":
@@ -2264,7 +2291,8 @@ def cmd_status(a) -> None:
         return
     if a.json:
         from .web import state_payload
-        print(redact.scrub(json.dumps(state_payload(p, p.db), default=str, indent=1)))
+        print(redact.scrub(json.dumps(state_payload(p, p.db, links_show_base(p, None)), default=str,
+                                      indent=1)))
     else:
         print(redact.scrub(status_text(p, verbose=a.verbose)))   # a live run's notes are read as they are
         from .project import secrets_state
@@ -15918,7 +15946,9 @@ def cmd_alerts(a) -> None:
             ep["cleared_why"] if ep["cleared"] else f"{ep['acked']['why']} (kept in the feed until it clears)"))
         return
     from .notifier import alerts_since, health
-    rows = alerts_since(p, a.after, a.floor)
+    rows = alerts_since(p, a.after, a.floor,
+                        base=links_show_base(p, getattr(a, "link_base", None), None,
+                                             getattr(a, "link_as", "")))
     if a.json:
         print(json.dumps({"alerts": rows, "health": health(p)} if a.health else rows))
     else:
@@ -16376,6 +16406,8 @@ def ttp_parser():
     s.add_argument("--batch", type=float, metavar="S",
                    help="hold broadcast alerts up to S seconds to print them together (default relay.batch_s, 120)")
     s.add_argument("--holder", help=argparse.SUPPRESS)   # the relayer listening (relayers.holder_id)
+    s.add_argument("--link-base", help=argparse.SUPPRESS)   # the viewer's checked web-app link base
+    s.add_argument("--link-as", help=argparse.SUPPRESS)    # the project name that base answered as
     s.add_argument("--all", action="store_true",
                    help="print every message at once, routine updates included (default: only replies, asks "
                         "and alerts, which are what a relayer passes on)")
@@ -17971,6 +18003,8 @@ def ttp_parser():
     s.add_argument("--ack", type=int, metavar="ID", help="acknowledge the alert of this message id (the id status and the web app show): "
                    "it closes, or a keyed one moves to the feed while it holds")
     s.add_argument("--why", help="reason for acknowledging the alert (required with --ack)")
+    s.add_argument("--link-base", help=argparse.SUPPRESS)   # the viewer's checked web-app link base
+    s.add_argument("--link-as", help=argparse.SUPPRESS)    # the project name that base answered as
     s.set_defaults(fn=cmd_alerts)
 
     s = sub.add_parser("rollout", help="release rings: show or change which projects a flagged change is on for")

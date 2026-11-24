@@ -68,9 +68,11 @@ SHOWN = re.compile(r"(?:usernoted:\s*|\d{4}-\d\d-\d\d[ T][\d:.+-]+\s+\w+\s+usern
 LOG_RECORD = re.compile(r"\d{4}-\d\d-\d\d[ T]\d")   # `log show --style compact`: a line starting a record
 
 
-def alerts_since(p: Project, after: int, floor: str = "high") -> list[dict]:
+def alerts_since(p: Project, after: int, floor: str = "high", base=None) -> list[dict]:
     """Broadcasts at or above the floor after `after`. Ones whose condition has since cleared are
-    returned marked `cleared`, so the reader moves its cursor past them without showing them."""
+    returned marked `cleared`, so the reader moves its cursor past them without showing them.
+    `base`: the link base this machine's viewer sees; decided here (links.show_base) when the
+    caller has none of its own."""
     from .web import cleared
     rank = SEVERITY_RANK.get(floor, 2)
     # Filter severity in the query: a page of quieter broadcasts would otherwise stall the cursor.
@@ -83,7 +85,7 @@ def alerts_since(p: Project, after: int, floor: str = "high") -> list[dict]:
         now = time.time()
         from . import links   # an alert is an outgoing message to the user: its references become links
         try:
-            lc = links.config(p, db)
+            lc = links.config(p, db, base=base if base is not None else links.show_base(p, db))
         except Exception:   # a links fault leaves alerts unlinked, never drops them
             lc = {}
         for r in rows:
@@ -130,14 +132,26 @@ def _remote_alerts(entry: dict, name: str, after: int, floor: str, state: dict |
         return None, False, None
     ask = now - float(no_health.get(host, 0)) >= HEALTH_RETRY_S
     cmd = sshcmd.remote_cmd(entry, ["alerts", name, "--after", after, "--floor", floor, "--json"])
+    from . import weblink
+    if base := weblink.tunnel_base(name):   # this machine's checked address for that project's app
+        cmd += " --link-base " + shlex.quote(base) + " --link-as " + shlex.quote(name)
+
+    def poll(asked: str) -> subprocess.CompletedProcess:
+        return subprocess.run(["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", "--", host,
+                               cmd + asked], capture_output=True, text=True, timeout=40)
+
     for flag in (" --health", "") if ask else ("",):
         try:
-            out = subprocess.run(["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", "--", host,
-                                  cmd + flag], capture_output=True, text=True, timeout=40)
+            out = poll(flag)
+            while out.returncode == 2 and "unrecognized arguments" in (out.stderr or ""):
+                if "--link-base" not in (out.stderr or ""):
+                    break
+                cmd = cmd.rsplit(" --link-base", 1)[0]   # an older ttp there: pass no base
+                out = poll(flag)
         except (OSError, subprocess.SubprocessError):
             return None, False, None
         if flag and out.returncode == 2 and "unrecognized arguments" in (out.stderr or ""):
-            no_health[host] = now
+            no_health[host] = now   # an older ttp there: ask without --health for an hour
             continue
         break
     if out.returncode != 0:

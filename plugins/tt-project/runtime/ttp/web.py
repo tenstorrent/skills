@@ -742,9 +742,11 @@ def web_seen(db: DB, seen: int) -> None:
         pass
 
 
-def state_payload(p: Project, db: DB) -> dict:
+def state_payload(p: Project, db: DB, base: str = "") -> dict:
+    """`base`: what this payload's links are built on: "" (the page's own origin) for a browser,
+    the decided base for a payload read outside one (`ttp status --json`)."""
     from . import links   # the web app's rendering of what chats read: references linkified
-    lc = links.config(p, db)   # named apart from the project config below (cfg)
+    lc = links.config(p, db, base=base)
     now = time.time()
     tz = timefmt.zone(p)
     tasks = db.q("SELECT id,title,kind,status,priority,tier,provider,budget_usd,spent_usd,attempts,max_attempts,"
@@ -899,6 +901,10 @@ class Handler(BaseHTTPRequestHandler):
             if STATIC.resolve() not in f.parents or not f.is_file():
                 return self._send(404, {"error": "not found"})
             return self._send(200, f.read_bytes(), TYPES.get(f.suffix, "application/octet-stream"))
+        if url.path == "/api/name":
+            # Token-free: the name check a message link's base has to pass before it is printed,
+            # so a viewer never opens another project's app that listens on the same port.
+            return self._send(200, {"project": self._proj().name})
         if not self._auth():
             return self._send(401, {"error": "token required"})
         db = DB(self._proj().state / "project.db")
@@ -920,7 +926,9 @@ class Handler(BaseHTTPRequestHandler):
                 q = parse_qs(url.query)
                 after = int(q.get("after", ["0"])[0])
                 from . import links
-                cfg = links.config(self._proj(), db)   # this request's own connection, one config
+                # its own origin: the page's links are relative, so a browser on any machine
+                # (its own port, a tunnel) opens this project and never another app's port
+                cfg = links.config(self._proj(), db, base="")
                 rows = db.q("SELECT m.id,m.ts,m.direction,m.chat,m.channel,m.kind,m.severity,"
                             # a relayer's findings have no user's words: show the findings, labeled
                             "CASE m.kind WHEN 'finding' THEN 'relayer findings: ' || COALESCE(m.context,'') "

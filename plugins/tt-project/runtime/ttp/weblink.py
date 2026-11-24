@@ -68,6 +68,51 @@ def verify(url: str, name: str, waits=WAITS) -> tuple[str, str]:
     return kind, why
 
 
+# --- the base a viewer reaches this project's web app at (message links) ---------------------------
+BASE = re.compile(r"^http://127\.0\.0\.1:(\d+)/$")   # a local forward only: never another address
+_ANSWERED: dict[str, str] = {}   # page base -> the project name it answered as, this process only
+
+
+def local_base(url: str) -> str | None:
+    """`url` when it names a local page base, else None: a base a viewer sends along is only
+    ever its own local forward, never another address."""
+    return url if BASE.match(url or "") else None
+
+
+def page_answers(base: str, name: str, timeout: float = 5) -> bool:
+    """True when `base` answers as this project's web app: its token-free /api/name names this
+    project, so a link built on that base opens this project's pages and never whatever else
+    listens on that port."""
+    if not BASE.match(base or ""):
+        return False
+    try:
+        with urllib.request.urlopen(f"{base}api/name", timeout=timeout) as r:
+            got = json.loads(r.read() or b"null")
+    except (urllib.error.URLError, OSError, ValueError):
+        return False
+    return isinstance(got, dict) and got.get("project") == name
+
+
+def checked_base(base: str | None, name: str) -> str | None:
+    """`base` when it answers as this project's web app, else None. A base that answers is kept
+    for this process (a listener prints line after line); one that does not is retried next time."""
+    if base and _ANSWERED.get(base) == name:
+        return base
+    if not page_answers(base or "", name):
+        _ANSWERED.pop(base or "", None)
+        return None
+    _ANSWERED[base] = name
+    return base
+
+
+def tunnel_base(name: str) -> str | None:
+    """The address this machine reaches that project's web app at: its kept tunnel's local port,
+    checked to answer as that project. None with no kept tunnel, or when the check fails."""
+    from . import tunnel
+    t = tunnel.installed(name) or {} if name else {}
+    return checked_base(f"http://127.0.0.1:{t['local']}/", name) if t.get("local") else None
+
+
 def masked(url: str, note: str) -> str:
     """The link with its access token cut to the first 4 characters, then note (where the full one is)."""
     base, _, tok = url.partition("#token=")

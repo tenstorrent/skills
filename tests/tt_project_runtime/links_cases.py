@@ -123,6 +123,18 @@ def test_the_listener_line_and_status_ask_linkify_outgoing_text(env):
     assert any("needs you" in l and "(https://jira.example.com/browse/EX-7)" in l for l in lines), lines
 
 
+def _web_app(proj):
+    """A live web app for `proj` (a Project, or any object with a .name): the port it answers on.
+    Only /api/name of it is asked here, so a fake project object is enough for a foreign app."""
+    import http.server
+    import threading
+    from ttp import web
+    handler = type("Handler", (web.Handler,), {"daemon_ref": type("H", (), {"p": proj})})
+    srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), handler)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    return srv
+
+
 def test_the_web_app_linkifies_its_messages_and_asks(env):
     p = make(env)
     p.set_config("links.jira_base", "https://jira.example.com")
@@ -188,13 +200,15 @@ def test_ids_link_to_their_web_app_page_and_unresolved_ones_get_labelled(env):
 
 
 def test_an_alert_text_reaches_the_user_linkified_from_a_fresh_connection(env):
-    from ttp import notifier
+    from ttp import notifier, weblink
     p = make(env)
-    p.db.set_kv("web", {"port": 8123})
+    srv = _web_app(p)                      # a web app this machine reaches and that answers as p
+    p.db.set_kv("web", {"port": srv.server_address[1]})
     task = p.db.x("INSERT INTO tasks(created,title,spec) VALUES(?,?,?)", (0, "t", ""))
     p.db.post("out", f"alert about #{task}", kind="alert", severity="high")
     rows = [r for r in notifier.alerts_since(p, 0, "high") if not r.get("cleared")]
     assert rows and f"#{task} (" in rows[0]["text"] and f"#task={task}" in rows[0]["text"], rows
+    weblink._ANSWERED.clear()
 
 
 def test_the_check_command_names_what_a_message_left_unlinked(env, capsys):
@@ -286,3 +300,76 @@ def test_the_git_cache_follows_the_pushed_commit_not_the_ref_name(tmp_path):
     out = cfg()   # the tracking ref kept its name: the cache must follow the commit it points at
     assert out["file_url"]("new.txt") == f"https://github.com/example-org/example-repo/blob/{sha2}/new.txt"
     assert links._GIT_CACHE[str(root)][0][0] == sha2   # bounded: the latest commit per repo
+
+
+def test_a_viewer_s_links_open_only_its_own_project_s_web_app(env, monkeypatch):
+    """The replay of the real case: on the viewer's machine the project host's own port is
+    another project's web app, so a link built on it opens the wrong project."""
+    import types
+    from ttp import cli, links, tunnel, weblink
+    p = make(env)
+    weblink._ANSWERED.clear()
+    task = p.db.x("INSERT INTO tasks(created,title,spec) VALUES(?,?,?)", (0, "t", ""))
+    m = {"id": 1, "kind": "reply", "severity": "normal", "chat": 0, "text": f"task #{task} done"}
+    app = _web_app(p)                                   # this project's web app
+    mine = _web_app(types.SimpleNamespace(name="other"))   # what the host's own port serves here
+    p.db.set_kv("web", {"port": mine.server_address[1]})
+
+    # the viewer's kept tunnel: its local port answers as this project, so links build on it
+    monkeypatch.setattr(tunnel, "installed", lambda name: {"local": app.server_address[1]})
+    line = cli._listen_line(p, m)
+    assert f"(http://127.0.0.1:{app.server_address[1]}/#task={task})" in line, line
+    assert f":{mine.server_address[1]}/" not in line, line
+
+    # no kept tunnel, and the project's own port answers as another project: no URL at all
+    monkeypatch.setattr(tunnel, "installed", lambda name: None)
+    line = cli._listen_line(p, m)
+    assert "#task=" not in line and f"task #{task}" in line, line
+
+    # a viewer on another machine with no checked base: this host's port is never printed
+    monkeypatch.setenv("SSH_CONNECTION", "203.0.113.10 55555 22")
+    line = cli._listen_line(p, m)
+    assert "http://" not in line, line
+
+    # a forwarder's checked base: the host builds its links on it and records the proof
+    monkeypatch.delenv("SSH_CONNECTION")
+    passed = f"http://127.0.0.1:{app.server_address[1]}/"
+    base = cli.links_show_base(p, passed, 7, "the name the base answered as")
+    assert base == passed
+    assert f"(http://127.0.0.1:{app.server_address[1]}/#task={task})" in cli._listen_line(p, m, base=base)
+    rows = json.loads((p.state / "link-forwards.json").read_text())
+    assert rows[-1]["chat"] == 7 and rows[-1]["base"] == passed
+    assert rows[-1]["project"] == "the name the base answered as" and rows[-1]["ts"] > 0
+
+
+def test_the_notifier_s_alerts_use_the_viewer_s_checked_base(env, monkeypatch):
+    import types
+    from ttp import notifier, tunnel, weblink
+    p = make(env)
+    weblink._ANSWERED.clear()
+    task = p.db.x("INSERT INTO tasks(created,title,spec) VALUES(?,?,?)", (0, "t", ""))
+    p.db.post("out", f"alert about #{task}", kind="alert", severity="high")
+    app = _web_app(p)                                       # this project's web app
+    other = _web_app(types.SimpleNamespace(name="other"))   # another project's app
+    p.db.set_kv("web", {"port": other.server_address[1]})   # its own port serves another project
+
+    monkeypatch.setattr(tunnel, "installed", lambda name: {"local": app.server_address[1]})
+    rows = [r for r in notifier.alerts_since(p, 0, "high") if not r.get("cleared")]
+    assert rows and f"http://127.0.0.1:{app.server_address[1]}/#task={task}" in rows[0]["text"], rows
+
+    monkeypatch.setattr(tunnel, "installed", lambda name: None)
+    weblink._ANSWERED.clear()
+    rows = [r for r in notifier.alerts_since(p, 0, "high") if not r.get("cleared")]
+    assert rows and "#task=" not in rows[0]["text"], rows
+
+
+def test_the_web_app_renders_its_message_links_relative_to_itself(env):
+    p = make(env)
+    task = p.db.x("INSERT INTO tasks(created,title,spec) VALUES(?,?,?)", (0, "t", ""))
+    p.db.set_kv("web", {"port": 8123})   # the host's own port: irrelevant to the page it serves
+    p.db.post("out", f"is #{task} on track?", kind="ask", severity="normal")
+    from ttp import links, web
+    cfg = links.config(p, p.db, base="")
+    assert links.linkify(f"task #{task}", cfg) == f"[task #{task}](#task={task})"
+    attention = web.state_payload(p, p.db)["attention"]
+    assert attention and "](#task=" in attention[0]["text"] and "127.0.0.1" not in attention[0]["text"]
