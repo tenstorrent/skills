@@ -258,6 +258,7 @@ ACTIONS_SCHEMA: dict[str, Any] = {
             "continues": {"type": "integer"}, "resource": {"type": "string"}, "machine": {"type": "string"}, "paused": {"type": "boolean"},
             "user_asked": {"type": "boolean"}, "user_end": {"type": "boolean"}, "outage": {"type": "boolean"},
             "user_msg": {"type": "integer"}, "untrusted_input": {"type": "boolean"},
+            "untrusted_write": {"type": "boolean"},
             "reason": {"type": "string"}, "supersedes": {"type": "array", "items": {"type": "string"}}, "permanent": {"type": "boolean"},
             "replaces": {"type": "string"}, "over": {"type": "string"}, "both_hold": {"type": "boolean"},
             "expires": {"type": "string"}, "until": {"type": "string"}, "until_probe": {"type": "string"},
@@ -2760,6 +2761,27 @@ def untrusted_update(task: dict, a: dict, upd: dict) -> str:
     return why
 
 
+def untrusted_write_update(task: dict, a: dict, upd: dict) -> None:
+    """A task_update's `untrusted_write` (untrusted.py): true adds the write label, false clears it.
+    A task run can do neither: the label widens what its run may send, so only the coordinator
+    moves it. Writes upd["labels"]."""
+    want = a.get("untrusted_write")
+    if want is None:
+        return
+    if not isinstance(want, bool):
+        raise ValueError(f"#{task['id']} rejected: untrusted_write is true or false")
+    if os.environ.get("TTP_TASK") and not coordtools.coordinator_run():
+        raise ValueError(f"#{task['id']} rejected: a task run cannot set or clear "
+                         f"{untrusted.WRITE_LABEL}; only the coordinator can")
+    labels = upd.get("labels")
+    labels = json.loads(task["labels"] or "[]") if labels is None else labels
+    if want:
+        if untrusted.WRITE_LABEL not in labels:
+            upd["labels"] = labels + [untrusted.WRITE_LABEL]
+    elif untrusted.WRITE_LABEL in labels:
+        upd["labels"] = [lb for lb in labels if lb != untrusted.WRITE_LABEL]
+
+
 def apply(p: Project, actions: list[dict], default_chat: str | None = None, user_turn: bool = False,
           turn: int | None = None, messages: list[int] | None = None, lean: bool = False,
           applied: list | None = None, skip_actions: frozenset | set = frozenset(),
@@ -3118,6 +3140,8 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                 labels += _pin_mark(db, a.get("pin_required"), pin, old or followup)
                 if a.get("untrusted_input") is True or untrusted.spec_sources(a.get("spec") or ""):
                     labels.append(untrusted.LABEL)   # untrusted.py: its run's narrowed policy, no routing
+                if a.get("untrusted_write") is True:   # only the field sets it, never the spec's wording
+                    labels.append(untrusted.WRITE_LABEL)
                 labels = untrusted.inherit(labels, old, followup, carried and carried[0])
                 clash = _file_overlaps(p, kind, a.get("spec") or "", {old["id"]} if old else set())
                 if dropped := _exempt_overlap_deps(p, old or followup, deps):
@@ -3379,6 +3403,7 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                     upd["labels"] = _branch_labels(upd.get("labels", json.loads(task["labels"] or "[]")), want)
                     branch_line = f"pr_branch: `{want}`" if want else 'pr_branch: ""'
                 cleared = untrusted_update(task, a, upd)
+                untrusted_write_update(task, a, upd)
                 if a.get("start_after") is not None or a.get("start_when") is not None \
                         or (a.get("why") is not None and deferral(task).get("when")):
                     if task["status"] in ("running", *TERMINAL_TASK_STATES):

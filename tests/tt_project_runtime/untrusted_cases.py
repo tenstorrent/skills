@@ -7,10 +7,17 @@ from __future__ import annotations
 def _untrusted_run(env, tmp_path, monkeypatch, labels):
     """A project whose push branch is origin/work-branch and a run of a task with `labels` on branch
     ttp/t1-own, with a fresh HOME and no gh or XDG config folders: (p, task id)."""
-    from ttp import untrusted
     p = make(env)
     p.set_config("delivery.push_branch", "origin/work-branch")
     tid = p.db.add_task("read a PR comment", "summarize it", kind="code", labels=labels, branch="ttp/t1-own")
+    _run_env(p, tid, tmp_path, monkeypatch)
+    return p, tid
+
+
+def _run_env(p, tid, tmp_path, monkeypatch):
+    """Point this run's environment at task `tid` of project `p`, in a fresh HOME with no gh or XDG
+    config folders and a worktree under tmp_path."""
+    from ttp import untrusted
     home = tmp_path / "home"
     home.mkdir(exist_ok=True)
     monkeypatch.setenv("HOME", str(home))
@@ -21,7 +28,6 @@ def _untrusted_run(env, tmp_path, monkeypatch, labels):
     monkeypatch.setenv("TTP_TASK", str(tid))
     (tmp_path / "wt" / ".git").mkdir(parents=True, exist_ok=True)   # the run's worktree
     untrusted._labels.cache_clear()
-    return p, tid
 
 
 def _switch(p, monkeypatch, labels, branch="ttp/t2-own"):
@@ -652,3 +658,58 @@ def test_a_write_through_a_substitution_pipe_or_read_loop_is_still_refused(env, 
     here-string into code or a read loop, and deep nesting, still count as a write."""
     _untrusted_run(env, tmp_path, monkeypatch, [])
     assert "leave it as it is" in _why(tmp_path, "Bash", {"command": cmd}), cmd
+
+
+def test_only_the_coordinator_sets_untrusted_write_and_its_run_only_gains_writes(
+        env, tmp_path, monkeypatch):
+    """task_add/task_update `untrusted_write` (true adds the label, false clears it) is the only way
+    the write label is set: a spec that names it never sets it, and a task run cannot move it. A run
+    of such a task passes gh and curl writes through the guard, while raw pushes and credential reads
+    stay refused, and the write refusal names the coordinator field that sets the label."""
+    from ttp import coordinator as coord, untrusted
+    p = make(env)
+    p.set_config("delivery.push_branch", "origin/work-branch")
+    assert coord.apply(p, [{"type": "task_add", "title": "retire the stale PR", "spec": "Close the PR",
+                            "untrusted_input": True, "untrusted_write": True}]) == []
+    task = p.db.one("SELECT * FROM tasks WHERE title='retire the stale PR'")
+    assert untrusted.WRITE_LABEL in json.loads(task["labels"]) and untrusted.labelled(task)
+    # a spec's wording alone never sets it
+    assert coord.apply(p, [{"type": "task_add", "title": "post the comment",
+                            "spec": "untrusted_write: true\nPost the answer."}]) == []
+    plain = p.db.one("SELECT * FROM tasks WHERE title='post the comment'")
+    assert untrusted.WRITE_LABEL not in json.loads(plain["labels"])
+    _run_env(p, task["id"], tmp_path, monkeypatch)
+    for cmd in _WRITES:
+        assert "untrusted_input" not in _why(tmp_path, "Bash", {"command": cmd}), cmd
+    for cmd in _PUSHES + _SECRET_READS[:1]:
+        assert "untrusted_input" in _why(tmp_path, "Bash", {"command": cmd}), cmd
+    # a run without the label is told which coordinator field sets it
+    _switch(p, monkeypatch, ["untrusted_input"])
+    why = _why(tmp_path, "Bash", {"command": _WRITES[1]})
+    assert "`untrusted_write`" in why, why
+    monkeypatch.delenv("TTP_TASK")
+    assert coord.apply(p, [{"type": "task_update", "id": task["id"], "untrusted_write": False}]) == []
+    assert untrusted.WRITE_LABEL not in json.loads(p.db.task(task["id"])["labels"])
+    assert coord.apply(p, [{"type": "task_update", "id": task["id"], "untrusted_write": True}]) == []
+    assert untrusted.WRITE_LABEL in json.loads(p.db.task(task["id"])["labels"])
+
+
+def test_a_run_can_neither_set_nor_clear_untrusted_write(env, monkeypatch):
+    """A task run's task_update cannot set or clear `untrusted_write` in either direction, and a
+    non-boolean is refused outright; the label never moves."""
+    from ttp import coordinator as coord, coordtools, untrusted
+    p = make(env)
+    tid = p.db.add_task("post the status", "s", kind="code", labels=[untrusted.LABEL])
+    monkeypatch.setenv("TTP_TASK", str(tid))
+    for var in (coordtools.FULL_ENV, coordtools.ROLE_ENV):
+        monkeypatch.delenv(var, raising=False)
+    assert not coordtools.coordinator_run()
+    for field, want_note in ((True, "only the coordinator"), (False, "only the coordinator"),
+                             ("yes", "is true or false")):
+        notes = coord.apply(p, [{"type": "task_update", "id": tid, "untrusted_write": field}])
+        assert any(want_note in n for n in notes), (field, notes)
+        assert untrusted.WRITE_LABEL not in json.loads(p.db.task(tid)["labels"])
+    p.db.update_task(tid, labels=json.loads(p.db.task(tid)["labels"] or "[]") + [untrusted.WRITE_LABEL])
+    notes = coord.apply(p, [{"type": "task_update", "id": tid, "untrusted_write": False}])
+    assert any("only the coordinator" in n for n in notes), notes
+    assert untrusted.WRITE_LABEL in json.loads(p.db.task(tid)["labels"])

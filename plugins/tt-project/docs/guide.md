@@ -4830,7 +4830,8 @@ Workers can read Slack links you paste, using your Slack connector if you have o
     subcommand but reads (`view`, `list`, `diff`, `checks`, `status` and the like), so `gh pr comment`,
     `gh issue create` and `gh pr review`; curl with a method other than GET, HEAD or OPTIONS, a data
     or form body or an upload; wget with a post body or `--method`. A task that must post carries the
-    label `untrusted_write` too, set by whoever writes the task and never read from its wording;
+    label `untrusted_write` too: only the coordinator sets it, with `untrusted_write` true or false
+    on a task_add or task_update (a task run can do neither), and never from a spec's wording;
     pushes and credential reads stay refused with it.
   - Credential reads outside the run's worktree, in a Bash command's words (also inside `sh -c`) or a
     Read, Grep or Glob path: a file in a credential folder (`~/.ssh`, `~/.aws`, `~/.azure`, `~/.gnupg`,

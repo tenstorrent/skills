@@ -17,8 +17,9 @@ set TTP_UNTRUSTED_INPUT=1 (a benchmark cell without a project). Then, model-free
   input body, or a GraphQL mutation; every other gh subcommand but the reads READ_VERBS names (so
   `gh pr comment`, `gh issue create`, `gh pr review`); curl with -X/--request other than GET or HEAD,
   a data or form body, --json or -T; wget with a post body or --method. A task that needs such a
-  write carries the label `untrusted_write` (WRITE_LABEL), set by whoever writes the task, never
-  read from its wording; pushes and credential reads stay refused with it;
+  write carries the label `untrusted_write` (WRITE_LABEL), set only by the coordinator's
+  `untrusted_write` field and never read from a spec's wording; pushes and credential reads
+  stay refused with it;
 - reads of credential files outside the run's worktree are refused (cred_path): a path whose folder
   is a credential store (CRED_DIRS), whose name is a credential file (CRED_FILES), a private key or
   certificate (CRED_SUFFIXES, id_* but .pub), or names a token, secret, credential, password or API
@@ -310,7 +311,8 @@ def http_write(argv: list[str]) -> bool:
 
 def write_refusal(what: str) -> str:
     return WHY(label=LABEL, what=f"sends no write through {what}") + (
-        f"Report what you found in the hand-off; a task that must post carries the label {WRITE_LABEL}")
+        f"Report what you found in the hand-off; a task that must post carries the label {WRITE_LABEL} "
+        "(the coordinator's `untrusted_write` field on task_add/task_update)")
 
 
 def _top(cwd: str) -> str:
