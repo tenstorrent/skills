@@ -5,7 +5,8 @@
 Claude Code calls it after every tool use. Codex (where its hooks are on) sends the same payload
 fields and takes the same replies; providers/codex.py passes it per run. If the coordinator has changed the task since the
 worker started (it appends to `$TTP_RUN_DIR/steer.md`), the new part is handed to the worker as
-added context, once. Workers on providers without hooks get it printed by `ttp note` and `ttp steer`
+added context, once (a chat provider's mini-swe-agent run gets it after a command's output from its command
+layer, glmenv.with_update). Workers on providers without hooks get it printed by `ttp note` and `ttp steer`
 (take_update); either way steer.offset marks it read and steer.reads records when. The hook's first
 tool event in a run writes HOOKED_FILE there: from then on `ttp note` and `ttp steer` leave updates
 to the hook (Codex may run without it, so this is known per run, not per provider). A Bash call's
@@ -116,9 +117,9 @@ def mark_hooked(run_dir: Path) -> None:
 
 def steer_hooked(run_dir: Path, provider: str, spec: dict | None = None) -> bool:
     """Whether this run's update hook hands steer.md over: the run's own marker (HOOKED_FILE; Codex
-    and Cursor workers may run the hook) or its provider's steer_hook class flag — never a run with
-    a harness (a chat provider's mini-swe-agent run): it inherits the class flag from Claude Code
-    runs, but its agent has no hook, so `ttp note` or `ttp steer` carries its updates."""
+    and Cursor workers may run the hook, a chat provider's mini-swe-agent run writes it from its
+    command layer, glmenv.with_update) or its provider's steer_hook class flag — never the class flag
+    for a run with a harness: it inherits it from Claude Code runs, but its agent has no hook."""
     if spec is None:
         try:
             spec = json.loads((run_dir / "run.json").read_text())
@@ -126,7 +127,7 @@ def steer_hooked(run_dir: Path, provider: str, spec: dict | None = None) -> bool
             spec = {}
         spec = spec if isinstance(spec, dict) else {}
     if spec.get("harness"):
-        return False
+        return hooked(run_dir)
     try:
         from .providers import get_provider
         return hooked(run_dir) or bool(getattr(get_provider(provider), "steer_hook", False))

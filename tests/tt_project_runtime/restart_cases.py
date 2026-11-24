@@ -67,6 +67,26 @@ def test_a_restart_line_requeues_the_run_with_the_new_spec_keeping_branch_worktr
     assert "costs no attempt" in head
 
 
+def test_a_restart_line_stops_a_chat_providers_mini_swe_agent_run_like_any_other(env, tmp_path, monkeypatch):
+    """A restart never waits on the worker reading steer.md: a chat-provider run with a harness and no tool hook
+    is stopped at once and requeued with the new spec, as a Claude run is."""
+    from ttp import coordinator as coord, preempt
+    from ttp.daemon import Daemon
+    p = make(env)
+    _rs_live(monkeypatch)
+    tid, rid, run_dir = _rs_running(p, tmp_path)
+    p.db.x("UPDATE runs SET provider='chat' WHERE id=?", (rid,))
+    (run_dir / "run.json").write_text(json.dumps({"harness": {"kind": "mini-swe-agent", "version": "2.4.6"}}))
+    assert coord.apply(p, [{"type": "task_update", "id": tid,
+                            "spec": "Build only the CPU target.\nrestart: it is rebuilding the device target"}]) == []
+    assert (run_dir / "STOP").read_text() == preempt.RESTART_TEXT and (run_dir / preempt.RESTART_FILE).exists()
+    (run_dir / "exit.json").write_text(json.dumps({"rc": 143, "stopped": "shutdown", "ended": time.time()}))
+    Daemon(p.base).reap_runs()
+    t = p.db.task(tid)
+    assert t["status"] == "queued" and "Build only the CPU target." in t["spec"]
+    assert t["blocked_reason"] == "restarted by the coordinator: it is rebuilding the device target"
+
+
 def test_a_run_holding_a_lock_stops_only_after_the_release(env, tmp_path, monkeypatch):
     from ttp import coordinator as coord, preempt
     from ttp.daemon import Daemon

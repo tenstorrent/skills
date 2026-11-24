@@ -17933,7 +17933,7 @@ class Daemon:
         changed after the run started and the steer.md update carrying the change was not read before
         the run ended; else None. A stretch of the harness's own drift notes carries no instruction, so
         it is not a missed update. A worker with the update hook (hook.steer_hooked: the provider's
-        steer_hook class flag or the run's HOOKED_FILE; a mini-swe-agent run has none) has read up to
+        steer_hook class flag or the run's HOOKED_FILE, which a mini-swe-agent run's command layer writes) has read up to
         its steer.offset; one without gets it from `ttp note` or `ttp steer` (which advance
         that offset too) or reads steer.md itself, so only an update newer than its
         result.json is surely unread. A model-free on_pass is checked in _probe_passed instead."""

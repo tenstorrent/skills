@@ -1110,6 +1110,43 @@ def test_the_guarded_environment_ends_a_run_on_a_refused_command_and_runs_the_re
     assert codearm.bounce_reason(json.loads((rd / "result.json").read_text())).startswith("guard: ")
 
 
+def test_the_guarded_environment_hands_a_coordinator_update_to_the_model_at_its_next_command(tmp_path, monkeypatch):
+    """mini-swe-agent has no tool hook, so its command layer is the update hook: an update the coordinator appends
+    to steer.md mid-run follows the next command's output (a redirect's too), marked read as the Claude hook marks
+    it, once; the run then counts as hooked, so `ttp note` leaves updates to it and the daemon reads its offset."""
+    import json
+    from ttp import cli, glmenv, hook
+    wt, rd = _gg_run(tmp_path)
+    _gg_tmp_taken(monkeypatch)
+    monkeypatch.setenv("TTP_RUN_DIR", str(rd))
+    monkeypatch.setenv("TTP_CODE_ARM_GUARD", "1")
+    monkeypatch.setenv("TTP_TASK", "7")
+    monkeypatch.delenv("TTP_DETACHED", raising=False)
+    (rd / "run.json").write_text(json.dumps({"harness": {"kind": "mini-swe-agent", "version": "2.4.6"}}))
+
+    class Base:
+        def execute(self, action, cwd="", *, timeout=None):
+            return {"output": "ok", "returncode": 0}
+    if glmenv.LocalEnvironment is not object:
+        pytest.skip("minisweagent is importable here: its own environment class is the base")
+    env = type("Env", (glmenv.GuardedEnvironment, Base), {})()
+    assert not hook.steer_hooked(rd, "chat"), "before its first command a mini run is not counted as hooked"
+    assert env.execute({"command": "ls"}, str(wt)) == {"output": "ok", "returncode": 0}, "no update: output as is"
+    (rd / "steer.md").write_text("\n## Update Thu 10:06 PST\nbuild only the CPU target\n")
+    got = env.execute({"command": "ls"}, str(wt))
+    assert got["returncode"] == 0 and got["output"].startswith("ok\n\nUpdate for your task #7 from the project coordinator")
+    assert got["output"].endswith("build only the CPU target")
+    size = (rd / "steer.md").stat().st_size
+    assert (rd / hook.OFFSET_FILE).read_text() == str(size) and (rd / hook.READS_FILE).read_text().endswith(f" {size}\n")
+    assert hook.steer_hooked(rd, "chat") and not cli.print_update(), "`ttp note` leaves updates to the command layer"
+    assert env.execute({"command": "ls"}, str(wt))["output"] == "ok", "handed over once"
+    with open(rd / "steer.md", "a") as f:
+        f.write("\n## Update Thu 10:20 PST\nkeep notes in the worktree\n")
+    got = env.execute({"command": "echo x > /tmp/notes.md"}, str(wt))   # a redirect carries it too
+    assert got["returncode"] == 2 and "$TMPDIR" in got["output"] and got["output"].endswith("keep notes in the worktree")
+    assert "build only" not in got["output"] and hook.unread_update(rd)[0] == ""
+
+
 def test_glmharness_writes_a_guarded_mini_run_with_the_prompt_on_stdin_and_the_bridge_as_its_model(tmp_path):
     from ttp import glmenv, glmharness
     rd = tmp_path / "run"

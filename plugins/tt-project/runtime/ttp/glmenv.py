@@ -16,6 +16,10 @@ call:
 An outward post (glmguard.outward_shell) is not run but recorded as a draft for an Opus step, and the run goes on;
 on a device task a failed gate command ends the run as a hand-back to Opus with its output (glmguard.gate_stop).
 
+It is also the run's update hook: the coordinator's unread update (hook.take_update, steer.md) follows each
+command's output, marked read, so it reaches the model at its next tool call as Claude Code's PostToolUse hook
+hands it over (with_update; the run's HOOKED_FILE marker then leaves `ttp note` and `ttp steer` to it).
+
 `ttp push` stays the one way to publish: it runs the project's checks first and refuses a run that handed its
 task back (cli.glm_gate and `_cmd_push`). The module imports minisweagent only inside the mini process; refusal()
 needs nothing but the standard library, so the harness's tests run without it.
@@ -117,10 +121,29 @@ def digest(output: str, returncode, save_dir, limit: int = DIGEST_BYTES) -> str:
     return shown if len(shown) < len(output) else output
 
 
+def with_update(got, run_dir: str):
+    """`got` (a command's result) with the coordinator's unread update after its output, marked read (hook.take_update,
+    as the Claude Code hook hands it over); the run marked as hooked (hook.mark_hooked), so `ttp note` and `ttp steer`
+    leave updates to this layer and the daemon reads its steer.offset as a hooked run's."""
+    if not run_dir or not isinstance(got, dict):
+        return got
+    from . import hook
+    try:
+        hook.mark_hooked(Path(run_dir))
+        text = hook.take_update(Path(run_dir))
+    except OSError:   # unread stays unread: the next command or `ttp note` hands it over
+        return got
+    return {**got, "output": f"{got.get('output') or ''}\n\n{text}"} if text else got
+
+
 class GuardedEnvironment(LocalEnvironment):
-    """mini-swe-agent's local environment with the GLM arm's side-effect guard in front of each command."""
+    """mini-swe-agent's local environment with the GLM arm's side-effect guard in front of each command, and the
+    coordinator's unread update after each command's output."""
 
     def execute(self, action: dict, cwd: str = "", *, timeout: int | None = None):
+        return with_update(self._guarded(action, cwd, timeout=timeout), os.environ.get("TTP_RUN_DIR", ""))
+
+    def _guarded(self, action: dict, cwd: str = "", *, timeout: int | None = None):
         command = str(action.get("command") or "")
         run_dir = os.environ.get("TTP_RUN_DIR", "")
         if draft := glmguard.outward_shell(command):   # an outward post: a draft for Opus, the run goes on
