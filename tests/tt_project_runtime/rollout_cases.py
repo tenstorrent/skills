@@ -1186,6 +1186,8 @@ def test_a_run_rearm_is_refused_without_the_setting_the_evidence_or_a_deployed_f
     code, out = _roll(capsys, "arm", "glm_device", target.name)
     assert code == 2 and "carries its evidence" in out, "no --fix and --replay"
     never = p.db.add_task("a change that never landed", "s", status="done")
+    path = env["tmp"] / "replay.json"
+    path.write_text(json.dumps({"status": "done", "summary": "the replay"}))
     code, out = _roll(capsys, "arm", "glm_device", target.name, "--fix", str(never), "--replay", "7")
     assert code == 2 and "is not on the push branch" in out, "the named fix task never landed"
     code, out = _roll(capsys, "arm", "glm_device", target.name, "--fix", str(fix), "--replay", "7")
@@ -1198,6 +1200,11 @@ def test_a_run_rearm_is_refused_without_the_setting_the_evidence_or_a_deployed_f
     code, out = _roll(capsys, "arm", "glm_device", target.name, "--fix", str(fix),
                       "--replay", _rearm_runs(target, "failed"))
     assert code == 2 and "did not pass" in out, "a failing replay is no evidence"
+    path.write_text("not a result record")
+    code, out = _roll(capsys, "arm", "glm_device", target.name, "--fix", str(fix), "--replay", str(path))
+    assert code == 2 and "is not a result record" in out, "an unreadable path is no evidence"
+    code, out = _roll(capsys, "arm", "glm_device", "unknown-project", "--fix", str(fix), "--replay", "7")
+    assert code == 2 and "is not rolled back" in out, "a healthy project has nothing to re-arm"
     assert target.name in rollout.rolled_back("glm_device"), "nothing was re-armed"
 
 
