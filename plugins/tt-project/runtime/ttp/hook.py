@@ -820,11 +820,11 @@ def _into_shell(line: str, pieces: list[tuple[int, int, str]], k: int) -> bool:
         and _first_word(line[pieces[k + 1][0]:pieces[k + 1][1]]) in SHELLS
 
 
-def _fed_shell_texts(text: str, is_shell) -> list[tuple[int, str, str]]:
+def _fed_shell_texts(text: str, pieces: list, is_shell) -> list[tuple[int, str, str]]:
     """(piece index, the text it prints, the piece it pipes into) for each echo or printf piece of
-    `text` that pipes into a piece `is_shell` accepts: what it prints runs as commands, into a local
-    shell (`echo cmd | bash`) or one fed over ssh."""
-    pieces = _pieces(text)
+    `text` (split into `pieces`) that pipes into a piece `is_shell` accepts: what it prints runs as
+    commands, into a local shell (`echo cmd | bash`) or one fed over ssh."""
+
     out = []
     for k, (s, e, _) in enumerate(pieces):
         if _first_word(text[s:e]) not in ("echo", "printf"):
@@ -891,7 +891,7 @@ def _split(text: str, strip: bool = True) -> tuple[str, str]:
     commands = "\n".join(lines)
     pieces = _pieces(commands) if INERT_RE.search(commands) else []
     stripped, fed = commands, []
-    feeds = {k: text for k, text, _ in _fed_shell_texts(commands, lambda p: _first_word(p) in SHELLS)}
+    feeds = {k: text for k, text, _ in _fed_shell_texts(commands, pieces, lambda p: _first_word(p) in SHELLS)}
     for k in reversed(range(len(pieces))):
         s, e, sep = pieces[k]
         piece = commands[s:e]

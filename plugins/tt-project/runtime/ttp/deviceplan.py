@@ -216,7 +216,7 @@ def _ssh_shell_feeds(cmd: str) -> list[tuple[str, str]]:
            for ln in body]
     for line in cmd.split("\n"):   # hook's fed-text reader, with an ssh call as the shell it feeds
         out += [(ssh_target(list(hook._first_argv(nxt)))[0], text)
-                for _, text, nxt in hook._fed_shell_texts(line, fed_ssh)]
+                for _, text, nxt in hook._fed_shell_texts(line, hook._pieces(line), fed_ssh)]
     return out
 
 
