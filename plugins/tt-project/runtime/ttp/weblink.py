@@ -113,18 +113,10 @@ def local(p, url: str | None, repair: bool = True) -> tuple[str, int]:
     return bad_line(what, why, tried), UNVERIFIED
 
 
-def page(p, db=None) -> str | None:
-    """The web app's address without its token: what message links point at (the browser holds the
-    token). `db`: the caller's own connection, for threads the daemon's p.db does not belong to."""
-    port = ((db or p.db).kv("web") or {}).get("port") or p.config().get("web", {}).get("port")
-    return f"http://127.0.0.1:{port}/" if port else None
-
-
-def link(p, db=None) -> str | None:
-    """The web app's address with its access token, for `ttp web` alone."""
+def link(p) -> str | None:
     from .web import token
-    base = page(p, db)
-    return f"{base}#token={token(p)}" if base else None
+    port = (p.db.kv("web") or {}).get("port") or p.config().get("web", {}).get("port")
+    return f"http://127.0.0.1:{port}/#token={token(p)}" if port else None
 
 
 def _ssh_ok(host: str) -> str:

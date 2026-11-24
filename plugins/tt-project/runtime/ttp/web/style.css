@@ -56,9 +56,6 @@ button:focus-visible, input:focus-visible { outline: 2px solid var(--accent); ou
 .msg { margin: 6px 0; max-width: 80ch; } .msg.in { margin-left: auto; text-align: right; }
 .msg .b { display: inline-block; padding: 7px 10px; border-radius: 8px; background: var(--bg); white-space: pre-wrap; text-align: left; }
 .msg.in .b { background: var(--accent); color: #fff; }
-/* A message's id link lands on the row it names; one pulse marks it. */
-.flash { animation: flash 3s ease-in-out 2; }
-@keyframes flash { 50% { background: var(--accent); } }
 .msg .sev-high .b, .msg.sev-high .b { border: 1px solid var(--red); }
 form#say { display: flex; gap: 8px; margin-top: 8px; } form#say input { flex: 1; }
 .board { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 12px; margin-bottom: 12px; }

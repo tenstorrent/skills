@@ -4085,21 +4085,6 @@ the pick order, so it takes the first starts. A resumed resource ramps only its 
   details the reader can live without (numbers, lists or internal ids only when they bear on the
   question or the reader needs them to act). The worker and coordinator prompts and the relay skill
   say so. It is guidance, not a gate: no guard checks a post's length or wording.
-- `links` (defaults empty) turns references in what the project tells the user into clickable links,
-  model-free, on the outgoing boundary only (the listener's lines, the web app's message list and
-  asks, `ttp status`): `jira_base` is the Jira instance's base URL and `jira_keys` the project keys
-  whose `KEY-N` references link to its browse page; `repos` maps a short repo name to `owner/repo`
-  (`"name#N"` then links, and a bare `PR #N` links when the project's one repo is `repo`); `repo`
-  is the project's own GitHub `owner/repo` when its git remote is not GitHub itself. Ticket
-  linking stays off until `jira_base` is set, and only configured keys link, so look-alikes
-  (hashes, model names) never do. A repo file at the pushed commit links to the GitHub blob, a
-  file on the project host to the web app's read-only file view (`/api/file`, the project tree and
-  the tt-project home only, secrets refused). A '#N' names a project id: it links to the web app's
-  page for that task, run or message (`web_base` is the address you open the web app at, when it
-  differs from the address the web app itself reports), and one that matches no task, run or message
-  is labelled, never left bare. `ttp links` reports references today's messages left
-  unlinked. Set account-wide (`ttp config --account links.jira_base ...`) so every project on a
-  host links the same tickets.
 - `delivery.ai_tag` (default `[Authored by AI]`, matched in any case; `""` turns it off) is the
   AI-authorship tag that everything a run posts where people other than the user read it, and every
   draft or text it writes for the user to post anywhere (Jira, GitHub, Slack drafts, documents,

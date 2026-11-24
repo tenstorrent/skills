@@ -743,8 +743,6 @@ def web_seen(db: DB, seen: int) -> None:
 
 
 def state_payload(p: Project, db: DB) -> dict:
-    from . import links   # the web app's rendering of what chats read: references linkified
-    lc = links.config(p, db)   # named apart from the project config below (cfg)
     now = time.time()
     tz = timefmt.zone(p)
     tasks = db.q("SELECT id,title,kind,status,priority,tier,provider,budget_usd,spent_usd,attempts,max_attempts,"
@@ -826,8 +824,7 @@ def state_payload(p: Project, db: DB) -> dict:
         "issues": db.q("SELECT id,source,title,severity,status,count,first_seen,last_seen,task FROM issues "
                        "WHERE status IN ('open','tracking') ORDER BY last_seen DESC LIMIT 100"),
         "schedules": sched.with_costs(db, timefmt.home(p)),
-        # the web app's rendering of the same messages the user reads in chats: links, not raw text
-        "attention": [{**a, "text": links.linkify(a["text"], lc)} for a in attention(db, now, p)],
+        "attention": attention(db, now, p),
         "notify": notify_state(p, db),
         "secrets": secrets_state(),
         "feed": sorted(alerts.feed(db, now) + uncommitted_feed(db) + startgate.feed(db, warn_s, now)
@@ -919,28 +916,12 @@ class Handler(BaseHTTPRequestHandler):
             if url.path == "/api/messages":
                 q = parse_qs(url.query)
                 after = int(q.get("after", ["0"])[0])
-                from . import links
-                cfg = links.config(self._proj(), db)   # this request's own connection, one config
                 rows = db.q("SELECT m.id,m.ts,m.direction,m.chat,m.channel,m.kind,m.severity,"
                             # a relayer's findings have no user's words: show the findings, labeled
                             "CASE m.kind WHEN 'finding' THEN 'relayer findings: ' || COALESCE(m.context,'') "
                             "ELSE m.text END text,c.label chat_label FROM messages m LEFT JOIN chats c ON c.id=m.chat "
                             "WHERE m.id>? ORDER BY m.id LIMIT 300", (after,))
-                for r in rows:
-                    r["text"] = links.linkify(r["text"], cfg)
                 return self._send(200, rows)
-            if url.path == "/api/file":
-                # The read-only file view a message's file link opens: files git tracks in the
-                # project tree and run outputs only; credentials, tokens and databases refused
-                # (links.readable).
-                from . import links
-                q = parse_qs(url.query)
-                f = links.readable(self._proj(), q.get("path", [""])[0])
-                why = "not a readable project file" if f is None else \
-                    "too large to show" if f.stat().st_size > 256 * 1024 else ""
-                if why:
-                    return self._send(404, {"error": why})
-                return self._send(200, {"name": f.name, "text": f.read_text(errors="replace")[:256 * 1024]})
             if url.path.startswith("/api/run/"):
                 run_id = int(url.path.rsplit("/", 1)[-1])
                 r = db.one("SELECT dir, task FROM runs WHERE id=?", (run_id,))
