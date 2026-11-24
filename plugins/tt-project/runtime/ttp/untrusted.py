@@ -712,10 +712,18 @@ def _mark_words(cmd: str) -> list[str] | None:
 
 
 def _mark_uncomment(cmd: str) -> str:
-    """`cmd` without its comments: from a `#` that starts a word outside quotes to the line's end."""
+    """`cmd` without its comments: from a `#` that starts a word outside quotes and outside a
+    ${...} expansion (a `#` there is a literal, not a comment) to the line's end."""
     from .hook import _quoting
     flags = _quoting(cmd)
-    cuts = [i for i, c in enumerate(cmd) if c == "#" and (i == 0 or cmd[i - 1] in " \t\n;&|(" and not flags[i - 1][0])]
+    cuts, depth = [], 0   # depth: inside a ${...} parameter expansion
+    for i, c in enumerate(cmd):
+        if c == "}" and depth:
+            depth -= 1
+        elif c == "{" and i and cmd[i - 1] == "$" and not flags[i - 1][0]:
+            depth += 1
+        elif c == "#" and not depth and (i == 0 or cmd[i - 1] in " \t\n;&|(" and not flags[i - 1][0]):
+            cuts.append(i)
     out, end = [], 0
     for i in cuts:
         if i >= end:
@@ -725,11 +733,15 @@ def _mark_uncomment(cmd: str) -> str:
 
 
 def _mark_data_bodies(cmd: str) -> str:
-    """`cmd` with comments cut from its command lines (_mark_uncomment; body lines stay as written) and without
-    the bodies of heredocs that are only data: a quoted delimiter on a cat (or another _data_body piece) or on
+    """`cmd` with comments cut from its command lines (_mark_uncomment; body lines stay as written,
+    bar a comment tail ending in a backslash, cut before the join below) and without the bodies
+    of heredocs that are only data: a quoted delimiter on a cat (or another _data_body piece) or on
     a tee into files, neither piped on, while every other command is only data too (_data_only), so none
     reads the file back into code (`xargs rm < list.txt`)."""
     from .hook import HEREDOC_RE, READERS, _chain, _data_body, _data_only, _heredocs, _pieces, _runs_inside
+    # a comment ending in a backslash must not swallow the line after it: _heredocs joins
+    # backslash-newlines before comments are cut, so cut such a comment tail at its own line first
+    cmd = "\n".join(_mark_uncomment(line) if line.endswith("\\") else line for line in cmd.split("\n"))
     lines, bodies = _heredocs(cmd)
     if not bodies:
         return _mark_uncomment(cmd)

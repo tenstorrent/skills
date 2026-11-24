@@ -705,6 +705,11 @@ MARK_CODE_EFFECT = [   # code that reads or changes the record itself, or gets i
     f"cat > l.txt <<'EOF'\n{_M}\nEOF\nxargs rm < l.txt",   # the written file read back into code
     f"perl <<'EOF'\n$x = q( #); unlink \"{_M}\";\nEOF",   # a `#` in an interpreter's body is no shell comment
     f"ls # cat > a.md <<'EOF'\nrm {_M}\nEOF", f"python3 x.py 'mkdir {_M} now'",
+    # a comment ending in a backslash must not swallow the line after it, and a `#` inside a
+    # ${...} expansion is literal, not a comment (review #9685)
+    f"cat <<'EOF'\nx\nEOF\necho hi # note \\\nrm {_M}",
+    f"cat > a.md <<'EOF'\nok\nEOF\n# c \\\nrm {_M}",
+    f": ${{x:- #}} ; rm {_M}",
     f"cat > l.txt <<'EOF'\n{_M}\nEOF\nLESSOPEN='|xargs rm < %s' less l.txt",
 ]
 MARK_DATA_HEREDOCS = [   # a body only cat or tee writes to another file is data, as is a comment
