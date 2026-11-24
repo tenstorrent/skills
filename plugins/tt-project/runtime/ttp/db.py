@@ -1396,10 +1396,13 @@ def unplanned_abrupt(boot: dict) -> bool:
 
 
 def _planned_by(planned: dict) -> str:
-    """Who planned a reboot: the project that did, else its planner without the record in parentheses
-    ("the device broker"), so a reboot no project planned is never put on this one."""
+    """Who planned a reboot: the project whose host-cycle record or machine-change ledger entry did,
+    else its planner without the record in parentheses ("the device broker"), so a reboot no project
+    planned is never put on one. A broker notice older daemons stored with this project's name still
+    reads as the broker's."""
     project = str(planned.get("project") or "")
-    if re.fullmatch(r"[\w.-]+", project):
+    by = str(planned.get("by") or "")
+    if by.startswith(("host-cycle record", "machine change #")) and re.fullmatch(r"[\w.-]+", project):
         return project
     return re.sub(r"\s*\(.*\)\s*$", "", str(planned.get("by") or ""))[:60].strip()
 

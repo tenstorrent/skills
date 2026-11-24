@@ -124,6 +124,23 @@ def test_a_lost_runner_s_task_is_ready_again_on_the_same_pass_that_finds_it(env,
     assert time.time() - t0 < 120   # the whole find-and-requeue is far inside the 2 min target
 
 
+def test_a_run_a_reboot_cut_waits_for_its_replacement_from_the_daemon_start_not_through_the_downtime(
+        env, tmp_path):
+    p = make(env)
+    from ttp import replacegap
+    from ttp.daemon import Daemon
+    d = Daemon(p.base)
+    tid = p.db.add_task("build", "s", kind="work", tier="light", origin="user")
+    _lost_to_reboot(p, d, tmp_path, tid)
+    lost = p.db.one("SELECT id, note FROM runs WHERE task=? AND status='lost'", (tid,))
+    assert json.loads(lost["note"])["daemon_at"] == d._started, lost["note"]
+    p.db.x("UPDATE runs SET ended=? WHERE id=?", (d._started - 300, lost["id"]))   # 5 min of downtime
+    p.db.x("INSERT INTO runs(task,role,provider,started,ended,status) VALUES(?,?,?,?,?,?)",
+           (tid, "worker", "fake", d._started + 60, d._started + 90, "ok"))
+    got = replacegap.gaps(p.db, 86400.0, d._started + 120)
+    assert [round(g["gap_s"]) for g in got] == [60], got   # not 360: the host was down, nobody could start it
+
+
 def test_replacement_gaps_run_from_the_last_sign_of_life_to_the_next_worker_run(env):
     p = make(env)
     from ttp import replacegap

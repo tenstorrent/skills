@@ -6684,7 +6684,7 @@ class Daemon:
         # hand-off that stands is an outcome, not a loop.
         if status == "lost" and r["boot_id"] and not self._this_boot(r["boot_id"]):
             note.update(not_waste="reboot", lost_to_reboot=self.boot, boot_at=self.boot_at,
-                        shutdown=self._shutdown(r["boot_id"]))
+                        daemon_at=self._started, shutdown=self._shutdown(r["boot_id"]))
         elif status in bud.WASTED and handed_off:
             note["not_waste"] = "handoff"
         elif net_lost or refused_net:

@@ -1514,6 +1514,22 @@ def test_the_host_line_puts_a_planned_reboot_on_whoever_planned_it_never_on_this
     assert "(2 planned: by other-proj, the device broker)" in line, line
 
 
+def test_replay_broker_power_cycle_reboots_are_never_put_on_this_project():
+    """Two broker fallback power cycles in a day, as stored: an older daemon put its own name on the
+    broker's notice, the other no record explained. Neither reads as this project's doing."""
+    from ttp import db as dbm
+    t = time.time()
+    notice = {"reason": "the device broker announced a power cycle of this host (possible: chip fault)",
+              "record": "/run/device-broker/power-cycle-pending.json",
+              "by": "the device broker (/run/device-broker/power-cycle-pending.json)", "project": "this-proj"}
+    boots = [{"ts": t - 6 * 3600, "shutdown": "orderly", "planned": notice, "lost": []},
+             {"ts": t - 600, "shutdown": "orderly", "planned": None, "lost": [],
+              "initiator": {"text": "power-cycle fallback service (journal)"}}]
+    line = dbm.host_line(boots)
+    assert "(1 planned: by the device broker)" in line and "this-proj" not in line, line
+    assert ": power-cycle fallback service (journal))" in line, line
+
+
 def test_a_ledger_power_cycle_is_put_on_the_project_that_recorded_it(env, monkeypatch):
     from ttp import machine_ledger as ml
     from ttp.daemon import Daemon
