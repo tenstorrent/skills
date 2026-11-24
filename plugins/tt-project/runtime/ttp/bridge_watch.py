@@ -1,5 +1,5 @@
-"""`ttp bridge watch`: one pass of this computer's bridge health check, run by a service `ttp bridge
-setup` installs (launchd: every INTERVAL_S and on each network change; systemd: a user timer).
+"""`ttp bridge watch`: one pass of this computer's bridge health check (more during a fast window,
+below), run by a service `ttp bridge setup` installs (launchd: every INTERVAL_S and on each network change; systemd: a user timer).
 
 After a sleep or a network change, the box's sshd can keep the old session and its forwarded ports for
 hours, so the new session fails on its forwards until someone restarts it by hand. Each pass asks every
@@ -9,8 +9,10 @@ it ends only this account's sshd session holding exactly that port, SIGTERM then
 is restarted at once, skipping the random start delay. A box that cannot be reached (this computer is
 offline, or the box is down) restarts nothing: it is asked again within BACKOFF_S, or at once on a network
 change. No pass measures the time since the last one: a sleep longer than BACKOFF_S ends every backoff,
-so the first pass after waking checks every box. A port whose forward's own destination does not answer
-from here (its host is off) is not a stale forward: nothing is ended or restarted for it, and it is logged
+so the first pass after waking checks every box. A network change also opens a fast window: `ttp bridge
+watch` checks again every FAST_STEP_S, ignoring the backoff, until every box answers and no service still
+fails, for at most FAST_S; the steady interval and the backoff then apply again. A port whose forward's
+own destination does not answer from here (its host is off) is not a stale forward: nothing is ended or restarted for it, and it is logged
 once. Nor is a silent port of a bridge session another of whose ports answers: the session is live and its
 target only slow; unless that port failed while its destination was off (a session rebuilt then, after a VPN
 reconnect say, can stay broken for it): once the destination answers it gets one restart if it still fails,
@@ -47,6 +49,7 @@ BACKOFF_S = (30, 60)                  # the next check of a box that could not b
 RESTART_GAP_S = (0, 60, 120, 300)   # the least time between restarts of one service that keeps failing
 #                                     (a restarted session needs some seconds to log in and forward its ports)
 LOGIN_S = INTERVAL_S                # a session's login younger than this may not have set up its forwards yet
+FAST_S, FAST_STEP_S = 120, 5        # after a network change: a check every FAST_STEP_S until all answer, at most FAST_S
 STATE, HEAL_LOG = "bridge-watch.json", "bridge-heal.log"   # in the bridge home (~/.tt-project)
 
 
@@ -190,13 +193,15 @@ def run_pass(cfg: dict, platform: str | None = None, now: float | None = None) -
     event = "network change" if net and st.get("net") and net > st["net"] else ""
     st["net"] = net
     if event:   # a network change can leave any forward stale again
+        st["fast_until"] = now + FAST_S
         for f in fails.values():
             f.pop("down", None)
+    fast, waiting = st.get("fast_until", 0) > now, False
     ts = targets(cfg, platform)
     for box in dict.fromkeys(t["box"] for t in ts):
         mine = [t for t in ts if t["box"] == box]
         bs = boxes.get(box, {})
-        if bs.get("next", 0) > now and not event:
+        if bs.get("next", 0) > now and not fast:
             continue
         ports = sorted({p for t in mine for p in t["ports"]})
         r = bridge._box(box, "sh -c " + shlex.quote(CHECK) + " ttp-watch " + " ".join(map(str, ports)), timeout=40)
@@ -263,8 +268,10 @@ def run_pass(cfg: dict, platform: str | None = None, now: float | None = None) -
             # a login under way is no failure yet: a spared session that comes up records no heal
             if t["agent"] and none >= set(t["ports"]) and (age := login_age(t, platform)) is not None and age < LOGIN_S:
                 out.append(f"{t['service']}: still logging in ({age}s); not restarted this pass")
+                waiting = True
                 continue
-            f = fails.setdefault(t["service"], {"at": now, "event": event, "restarts": 0, "last": 0})
+            f = fails.setdefault(t["service"], {"at": now, "event": event or ("network change" if fast else ""),
+                                                "restarts": 0, "last": 0})
             freed = release(cfg, t, bad)
             said = restart(t, platform)
             if said == "restarted":   # a refused restart leaves the owed one marked
@@ -275,9 +282,22 @@ def run_pass(cfg: dict, platform: str | None = None, now: float | None = None) -
     names = {t["service"] for t in ts}
     st["fail"] = {k: v for k, v in fails.items() if k in names}
     st["unreachable"] = {k: v for k, v in off.items() if k in names and v}
+    # the fast window ends once every box answers and no service still fails (one held for its check to change aside)
+    if not fast or not (any(t["box"] in boxes for t in ts) or waiting or any(not f.get("said") for f in st["fail"].values())):
+        st.pop("fast_until", None)
     _home().mkdir(parents=True, exist_ok=True)
     durable_write(_home() / STATE, json.dumps(st))
     return out
+
+
+def run_window(cfg: dict, platform: str | None = None, clock=time.time, sleep=time.sleep):
+    """`ttp bridge watch`: a pass, then one every FAST_STEP_S while a network change's fast window stays open;
+    yields each pass's lines as it ends."""
+    while True:
+        yield from run_pass(cfg, platform, clock())
+        if _load().get("fast_until", 0) <= clock() + FAST_STEP_S:
+            return
+        sleep(FAST_STEP_S)
 
 
 def heal_lines(platform: str | None = None, n: int = 3) -> list[str]:
