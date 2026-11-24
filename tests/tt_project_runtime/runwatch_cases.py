@@ -224,9 +224,12 @@ def test_missed_update_counts_a_codex_or_cursor_run_whose_hook_ran_as_hooked(env
     later = (m_dir / "result.json").stat().st_mtime + 60
     os.utime(m_dir / "steer.md", (later, later))   # an update after the hand-off is surely unread
     assert d._missed_update(m, task, m_dir)["text"].endswith("new order")
-    # Its command layer hands updates over (glmenv.with_update, which marks the run): read up to steer.offset.
+    # Its command layer hands updates over (glmenv.with_update, which marks the run): read up to steer.offset,
+    # so an unread update older than its hand-off is missed too.
+    earlier = (m_dir / "result.json").stat().st_mtime - 60
+    os.utime(m_dir / "steer.md", (earlier, earlier))
     hook.mark_hooked(m_dir)
-    assert d._missed_update(m, task, m_dir)["text"].endswith("new order")
+    assert d._missed_update(m, task, m_dir)["text"].endswith("new order"), "a hooked mini run read as unhooked"
     hook.mark_seen(m_dir, (m_dir / "steer.md").stat().st_size)
     assert d._missed_update(m, task, m_dir) is None, "a hooked mini run's read update counted as missed"
 
