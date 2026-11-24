@@ -496,11 +496,9 @@ def deploy_status(name: str, entry: dict, target: str, commit: str | None, now: 
             if not at_target:
                 return done(PENDING, *_behind(name, db, state, files, now, where, target, commit))
             return done(PENDING, f"files at {files}, daemon {daemon}", "this project's service", "when its daemon starts")
-        r = identity.running(state, pid)
+        r, why = identity.verified_receipt(state, pid)
         if not r:
-            return done(CANNOT, f"daemon {pid} reports no runtime receipt (running version unverified)")
-        if r.get("provenance") != "verified":
-            return done(CANNOT, f"receipt unverified: {r.get('why') or 'unknown provenance'}")
+            return done(CANNOT, why)
         rv, rc = str(r.get("version") or "?"), r.get("commit")
         row.update(running_version=rv, running_commit=rc, instance=r.get("instance"),
                    daemon_started=float(r.get("started") or 0))

@@ -143,11 +143,12 @@ def test_a_landing_that_left_a_tasks_commits_out_reads_dropped_until_its_change_
     assert landed.landed_at(p.db, lost) is not None
 
 
-def test_a_supersession_recorded_after_a_drop_verdict_wins_the_sha_back_until_a_later_drop(env):
+def test_a_supersession_recorded_after_a_drop_verdict_wins_the_sha_back_until_a_later_drop(env, monkeypatch):
     """A drop verdict hides a sha only until a supersession for the same sha is recorded after it, and
     a drop recorded after the supersession wins the sha back: the record times decide, the same
-    through Rows (the one read deadwait judges many held producers from)."""
-    from ttp import landed
+    through Rows (the one read deadwait judges many held producers from). The daemon's automatic
+    re-checks do not undo a supersession recorded after the drop they re-derive."""
+    from ttp import integrate, landed
     p = make(env)
     tid = p.db.add_task("dropped and superseded", "s", kind="code", status="done", branch="ttp/t9")
     sha, other = "a" * 40, "b" * 40
@@ -170,6 +171,26 @@ def test_a_supersession_recorded_after_a_drop_verdict_wins_the_sha_back_until_a_
     assert landed.recorded(p.db, gone) == ([], "")
     landed.drop(p, tid, [sha], "the revived sha was re-judged not to carry it", event=False)
     assert landed.recorded(p.db, tid) == ([], ""), "a re-drop of the revived sha refreshes its verdict"
+    # The daemon's own re-derivation must not undo the recorded verdict: a sha a supersession won back
+    # stays landed through drops() and check(), until a new drop verdict refreshes it.
+    p, repo, other, ftid, path, branch, head = _landed_setup(env, monkeypatch)
+    lost, lpath, lbranch = _code_task(p, "narrowed")
+    _commit(lpath, "narrowed.txt", "the narrowed change\n")
+    lhead = _git_out(lpath, "rev-parse", "HEAD")
+    integrate.record_member_head(repo, lost, lhead)
+    batch = _git_out(repo, "rev-parse", "origin/proj")   # a batch commit that left the change out
+    now = time.time()
+    p.db.x("INSERT INTO push_queue(task, branch, head, target, status, landed_sha, created, updated) "
+           "VALUES(?, ?, ?, 'origin/proj', 'landed', ?, ?, ?)", (lost, lbranch, lhead, batch, now, now))
+    assert [t for t, _ in landed.drops(p)] == [lost], "the daemon's sweep records the drop"
+    p.db.x("INSERT INTO task_superseded(task, head, sha, ts) VALUES(?,?,?,?)",
+           (lost, lhead, batch, time.time()))
+    assert landed.recorded(p.db, lost)[0] == [batch], "the supersession wins the sha back"
+    assert landed.drops(p) == [], "a re-check does not re-drop what the supersession revived"
+    assert landed.check(p, repo, tid=lost) == (0, f"#{lost} (its push queue landing) is on origin/proj"), \
+        "the landed: check keeps the revived sha landed"
+    landed.drop(p, lost, [batch], "the recorded commit does not carry it after all", event=False)
+    assert landed.recorded(p.db, lost) == ([], ""), "an explicit drop recorded later wins the sha back"
 
 
 def test_a_landing_that_lacks_a_tasks_head_is_carried_once_its_commit_is_on_the_push_branch(env, monkeypatch):

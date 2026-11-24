@@ -1160,7 +1160,7 @@ def _rearm_setup(env, monkeypatch):
     now = time.time()
     p.db.x("INSERT INTO push_queue(task, branch, head, target, status, landed_sha, pushed_sha, created, updated) "
            "VALUES(?,?,?,?,?,?,?,?,?)", (fix, "ttp/t9-fix", head, "origin/proj", "landed", head, head, now, now))
-    return p, target, fix, head
+    return p, target, fix, head, _git_out(p.root, "rev-parse", head + "^")
 
 
 def _rearm_runs(target, status):
@@ -1170,11 +1170,21 @@ def _rearm_runs(target, status):
     return "7"
 
 
+def _rearm_daemon(target, commit):
+    """The target's daemon runs `commit`: its heartbeat carries a verified receipt naming it, and its
+    daemon record names the live pid identity.probe looks for."""
+    from ttp.project import hostname
+    pid = os.getpid()
+    (target.state / "heartbeat").write_text(json.dumps({"pid": pid, "receipt": {
+        "pid": pid, "version": "0.0.1", "commit": commit, "provenance": "verified"}}))
+    target.db.set_kv("daemon", {"pid": pid, "host": hostname()})
+
+
 def test_a_run_rearm_is_refused_without_the_setting_the_evidence_or_a_deployed_fix(env, monkeypatch, capsys):
     """A run's `arm FLAG PROJECT` needs the account setting on, a fix that landed and is deployed, and
     a replay that passed; each missing piece refuses with its own reason and nothing is re-armed."""
     from ttp import project, rollout
-    p, target, fix, head = _rearm_setup(env, monkeypatch)
+    p, target, fix, head, older = _rearm_setup(env, monkeypatch)
     _roll(capsys, "set", "glm_device", "2")
     rollout.stop_project("glm_device", target.name, "a step GLM took on its own")
     monkeypatch.setenv("TTP_RUN_DIR", str(p.state / "runs" / "55"))
@@ -1191,12 +1201,17 @@ def test_a_run_rearm_is_refused_without_the_setting_the_evidence_or_a_deployed_f
     code, out = _roll(capsys, "arm", "glm_device", target.name, "--fix", str(never), "--replay", "7")
     assert code == 2 and "is not on the push branch" in out, "the named fix task never landed"
     code, out = _roll(capsys, "arm", "glm_device", target.name, "--fix", str(fix), "--replay", "7")
+    assert code == 2 and "cannot tell what" in out and "runs" in out, "no verified running receipt names what the target runs"
+    _rearm_daemon(target, older)
+    code, out = _roll(capsys, "arm", "glm_device", target.name, "--fix", str(fix), "--replay", "7")
     assert code == 2 and "which does not contain fix task" in out, "what the target runs holds no fix"
-    source = target.harness / "runtime" / "ttp" / "SOURCE_COMMIT"
-    assert source.is_file()   # the release the bootstrap installed records its commit
-    source.write_text(head)   # the target now runs a release that contains the fix
+    _rearm_daemon(target, head)
     code, out = _roll(capsys, "arm", "glm_device", target.name, "--fix", str(fix), "--replay", "8")
     assert code == 2 and "names neither a result file nor a run" in out, "no such run of the target"
+    old = time.time() - 3600
+    os.utime(path, (old, old))
+    code, out = _roll(capsys, "arm", "glm_device", target.name, "--fix", str(fix), "--replay", str(path))
+    assert code == 2 and "finished before the rollback" in out, "a replay from before the rollback answers nothing"
     code, out = _roll(capsys, "arm", "glm_device", target.name, "--fix", str(fix),
                       "--replay", _rearm_runs(target, "failed"))
     assert code == 2 and "did not pass" in out, "a failing replay is no evidence"
@@ -1208,17 +1223,34 @@ def test_a_run_rearm_is_refused_without_the_setting_the_evidence_or_a_deployed_f
     assert target.name in rollout.rolled_back("glm_device"), "nothing was re-armed"
 
 
+def test_a_run_rearm_reads_the_running_daemon_not_the_files_on_disk(env, monkeypatch, capsys):
+    """A re-arm reads the fix's deployment from the target daemon's verified receipt, as `ttp
+    deployed` does: files an upgrade merged but the daemon has not restarted onto do not count."""
+    from ttp import project, rollout
+    p, target, fix, head, older = _rearm_setup(env, monkeypatch)
+    _roll(capsys, "set", "glm_device", "2")
+    rollout.stop_project("glm_device", target.name, "a step GLM took on its own")
+    project.set_account_setting("rollout.run_rearm", True)
+    monkeypatch.setenv("TTP_RUN_DIR", str(p.state / "runs" / "55"))
+    monkeypatch.setenv("TTP_RUN_ID", "55")
+    monkeypatch.setenv("TTP_TASK", "77")
+    (target.harness / "runtime" / "ttp" / "SOURCE_COMMIT").write_text(head)   # the files hold the fix
+    _rearm_daemon(target, older)   # ... while the daemon still runs the release before it
+    code, out = _roll(capsys, "arm", "glm_device", target.name, "--fix", str(fix),
+                      "--replay", _rearm_runs(target, "done"))
+    assert code == 2 and "does not contain fix task" in out, "the files cannot answer for the running daemon"
+
+
 def test_a_run_re_arms_one_project_on_evidence_and_records_it_in_the_ledger(env, monkeypatch, capsys):
     """With the setting on and every check passing, a run's `arm FLAG PROJECT --fix --replay` re-arms
     that one project, records who armed it and the evidence in the ledger, and status shows it."""
     from ttp import project, rollout
-    p, target, fix, head = _rearm_setup(env, monkeypatch)
+    p, target, fix, head, older = _rearm_setup(env, monkeypatch)
     _roll(capsys, "set", "glm_device", "2")
     rollout.stop_project("glm_device", target.name, "a step GLM took on its own")
     assert not rollout.on("glm_device", target.name)
     project.set_account_setting("rollout.run_rearm", True)
-    (target.harness / "runtime" / "ttp").mkdir(parents=True, exist_ok=True)
-    (target.harness / "runtime" / "ttp" / "SOURCE_COMMIT").write_text(head)
+    _rearm_daemon(target, head)
     monkeypatch.setenv("TTP_RUN_DIR", str(p.state / "runs" / "55"))
     monkeypatch.setenv("TTP_RUN_ID", "55")
     monkeypatch.setenv("TTP_TASK", "77")

@@ -104,6 +104,18 @@ def running(state: Path, pid: int) -> dict | None:
     return None
 
 
+def verified_receipt(state: Path, pid: int) -> tuple[dict | None, str]:
+    """(receipt, why not): the running daemon's receipt when its provenance is verified — the record
+    `ttp deployed` judges a deploy by and a rollout re-arm reads the fix's deployment from; None with
+    why when the daemon reports no receipt or its provenance is unverified."""
+    r = running(state, pid)
+    if not r:
+        return None, f"daemon {pid} reports no runtime receipt (running version unverified)"
+    if r.get("provenance") != "verified":
+        return None, f"receipt unverified: {r.get('why') or 'unknown provenance'}"
+    return r, ""
+
+
 HEARTBEAT_FRESH_S = 120   # a heartbeat this recent stands for a live daemon the pid probe cannot see
 
 

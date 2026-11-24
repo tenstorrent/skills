@@ -939,23 +939,36 @@ def dropped(db, tid: int) -> str:
     return r["why"] if r else ""
 
 
-def drop(p, tid: int, shas: list[str], why: str, event: bool = True) -> None:
+def _revived_shas(db, tid: int) -> set[str]:
+    """Shas of task `tid` whose drop verdict a supersession recorded after it beat (the record times
+    _gone_shas judges by): they count as landed until a drop newer than that supersession."""
+    gone = _gone_shas(db, tid, carriers(db, tid), None)
+    return {r["sha"] for r in db.q("SELECT sha FROM task_dropped WHERE task=?", (tid,))} - gone
+
+
+def drop(p, tid: int, shas: list[str], why: str, event: bool = True, recheck: bool = False) -> list[str]:
     """Record that the landings `shas` recorded for task `tid` do not carry its change (a successor's rebase or
     batch left its commits out, a forward revert took them off): recorded,
     landed_at and the tried ledger stop counting them, and `landed:#<id>` waits, naming `why`. A later landing
-    or `ttp task <project> superseded <id> <sha>` counts again. `event`: wake the coordinator once per task."""
+    or `ttp task <project> superseded <id> <sha>` counts again. `event`: wake the coordinator once per task.
+    Returns the shas it recorded; `recheck` (an automatic re-derivation of the same verdict) records
+    none of the shas a supersession won back, so the recorded verdict, not the re-derived one, stands."""
     now = time.time()
-    for sha in dict.fromkeys(s for s in shas if s):
+    revived = _revived_shas(p.db, tid) if recheck else set()
+    live = [s for s in dict.fromkeys(s for s in shas if s) if s not in revived]
+    for sha in live:
         p.db.x("INSERT INTO task_dropped(task, sha, why, ts) VALUES(?,?,?,?) "
                "ON CONFLICT(task, sha) DO UPDATE SET why=excluded.why, ts=excluded.ts",
                (int(tid), sha, why, now))
-    fp = f"{DROP_EVENT}:{int(tid)}:{min(shas, default='')[:12]}"   # a later drop of a re-landed change wakes again
-    if event and not p.db.one("SELECT id FROM events WHERE fingerprint=?", (fp,)):
+    fp = f"{DROP_EVENT}:{int(tid)}:{min(live, default='')[:12]}"   # a later drop of a re-landed change wakes again
+    if event and live and not p.db.one("SELECT id FROM events WHERE fingerprint=?", (fp,)):
         p.db.x("INSERT INTO events(ts,source,kind,fingerprint,severity,text,status,task) VALUES(?,?,?,?,?,?,?,?)",
                (now, "daemon", DROP_EVENT, fp, "normal",
                 f"#{tid} was recorded as landed, but its change is not on the push branch: {why}. Re-land it "
                 f"(a code task that continues #{tid}), or record where it did land with `ttp task <project> "
                 f"superseded {tid} <sha>`; landed:#{tid} waits until then."[:4000], "queued", int(tid)))
+    return live
+
 
 
 def carried(p, repo: Path, tid: int, tip: str, shas: list[str] | None = None, src: str = "",
@@ -1017,9 +1030,10 @@ def drops(p, days: float = 14, record: bool = True, skip: set[int] | None = None
         if not shas:
             continue
         if why := carried(p, repo, tid, tip, shas, src):
-            out.append((tid, why))
-            if record:
-                drop(p, tid, shas, why)
+            if record and not drop(p, tid, shas, why, recheck=True):
+                skip.add(tid)   # a supersession recorded after its drop keeps the sha landed
+            else:
+                out.append((tid, why))
         else:
             skip.add(tid)
     return out
@@ -1179,16 +1193,18 @@ def _not_dropped(p, repo: Path, tid: int | None, tip: str, shas: list[str], src:
         return None
     if not (lost := carried(p, repo, tid, tip, shas, src)):
         return None
-    drop(p, tid, shas, lost)
+    if not drop(p, tid, shas, lost, recheck=True):
+        return None   # a supersession recorded after its drop keeps the sha landed
     return NOT_YET, f"#{tid} dropped: {lost}"
 
 
 def check(p, repo: Path, sha: str | None = None, tid: int | None = None, onto: str | None = None,
-          fetch: bool = True) -> tuple[int, str]:
+          fetch: bool = True, resolved: tuple[list[str], str] | None = None) -> tuple[int, str]:
     """(exit code, words) for `ttp landed`: a sha, or task `tid`'s landing, on `onto` (default the
     push branch). Reads the local ref first and fetches only when that says not yet (never with
     `fetch` False: local refs only). With no push branch, a task's landing is delivery.landed_probe's
-    answer (with `fetch` False it is not run: NOT_YET), and without that key CANNOT naming the fix."""
+    answer (with `fetch` False it is not run: NOT_YET), and without that key CANNOT naming the fix.
+    `resolved`: the (shas, src) task_shas returns, when the caller already read it."""
     if tid is not None and onto is None and not _has_push_branch(p):
         if not p.db.task(tid):
             return CANNOT, f"no task #{tid} in this project"
@@ -1208,6 +1224,8 @@ def check(p, repo: Path, sha: str | None = None, tid: int | None = None, onto: s
             shas, src = recorded(p.db, tid)
             if not shas:
                 return CANNOT, f"#{tid} was abandoned, its work will never land ({gone[0]}): re-point what waits on it"
+        elif resolved is not None:
+            shas, src = resolved
         else:
             shas, src = task_shas(p, tid)
         if not shas:

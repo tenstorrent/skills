@@ -647,7 +647,8 @@ RUN_REARM_KEY = "run_rearm"   # rollout.*: whether a run may re-arm one project 
 def rearm_refusal(a) -> tuple[str, dict]:
     """(why a run may not re-arm, the evidence its re-arm records) for `arm FLAG PROJECT --fix TASK
     --replay RUN`: the setting `rollout.run_rearm` must be on, the fix task's change must be on the
-    push branch and deployed to PROJECT, and the replay of the rollback's cause must have passed.
+    push branch and running in PROJECT's daemon (its verified receipt, the record `ttp deployed`
+    judges a deploy by), and the replay of the rollback's cause must have passed after the rollback.
     Unfreezing a whole flag, rings, waves and promotion stay with the user."""
     project = (a.value or "").strip()
     fix, replay = getattr(a, "fix", None), (getattr(a, "replay", "") or "").strip()
@@ -657,25 +658,31 @@ def rearm_refusal(a) -> tuple[str, dict]:
         return f"the account setting rollout.{RUN_REARM_KEY} is off", {}
     if not fix or not replay:
         return "a run's re-arm carries its evidence: --fix TASK and --replay RUN", {}
-    from . import landed, project as project_mod, release
+    from . import landed, project as project_mod
     p = project_mod.here()
     if p is None:
         return "no project here to read the fix task's landing from", {}
-    if a.target and project not in rolled_back(a.target):
+    back = rolled_back(a.target).get(project) or {}
+    if not back:
         return f"{project} is not rolled back for {a.target}; nothing to re-arm", {}
-    code, why = landed.check(p, p.root, tid=fix)   # `ttp landed --task`: fetch only if the local ref says not yet
+    shas, note = landed.task_shas(p, fix)
+    code, why = landed.check(p, p.root, tid=fix, resolved=(shas, note))   # `ttp landed --task`
     if code != 0:
         return f"fix task #{fix} is not on the push branch ({why})", {}
     target = local_projects().get(project)
     if target is None:
         return f"{project} is not registered on this machine", {}
-    commit = release.runtime_commit(target.harness / "runtime")
-    if commit in (None, "", "unknown"):
-        return f"cannot tell what {project} runs (no installed release)", {}
-    shas, _ = landed.task_shas(p, fix)
-    if not any(landed.on_branch(p.root, sha, commit) for sha in shas):
+    receipt, why = rearm_deployed(target)
+    if not receipt:
+        return f"cannot tell what {project} runs ({why})", {}
+    if not (commit := str(receipt.get("commit") or "")):
+        return f"cannot tell what {project} runs (its running receipt names no commit)", {}
+    commits = [landed._commit(p.root, sha) for sha in shas]
+    if not any(commits):
+        return f"cannot read fix task #{fix}'s commits to judge what {project} runs ({note})", {}
+    if not any(c and landed.on_branch(p.root, c, commit) for c in commits):
         return f"{project} runs {commit[:12]}, which does not contain fix task #{fix}", {}
-    why = rearm_replay(replay, target, p)
+    why = rearm_replay(replay, target, p, float(back.get("ts") or 0))
     if why:
         return why, {}
     return "", {"run": os.environ.get("TTP_RUN_ID") or "", "run_project": os.environ.get("TTP_PROJECT") or "",
@@ -683,10 +690,21 @@ def rearm_refusal(a) -> tuple[str, dict]:
                 "replay": replay}
 
 
-def rearm_replay(ref: str, target, p) -> str:
+def rearm_deployed(target) -> tuple[dict | None, str]:
+    """(receipt, why not): the running daemon's verified receipt, read the way `ttp deployed` reads a
+    deployment (identity.verified_receipt; identity.probe names the running daemon's pid)."""
+    from . import identity, project as project_mod
+    s = identity.probe(target.state, target.db.kv("daemon", {}), project_mod.hostname())
+    if not s["alive"] or not s["pid"]:
+        return None, "its daemon is not running here"
+    return identity.verified_receipt(target.state, s["pid"])
+
+
+def rearm_replay(ref: str, target, p, not_before: float = 0.0) -> str:
     """Why `--replay REF` is no evidence of a passed replay ("" when it is): REF is a result.json
     path, or a run id read from the re-armed project's runs, else this project's, and the run's
-    hand-off must say the replay passed ("done")."""
+    hand-off must say the replay passed ("done") and have ended after `not_before` (the rollback it
+    answers: an older passing run is no evidence the cause is fixed)."""
     from pathlib import Path
     path = Path(ref)
     if not path.is_file() and ref.isdigit():
@@ -701,6 +719,8 @@ def rearm_replay(ref: str, target, p) -> str:
     if not isinstance(data, dict) or data.get("status") != "done":
         status = data.get("status") if isinstance(data, dict) else "nothing"
         return f"no passing replay: {ref} did not pass (its result says {status})"
+    if path.stat().st_mtime < not_before:
+        return f"no passing replay: {ref} finished before the rollback it must answer"
     return ""
 
 
