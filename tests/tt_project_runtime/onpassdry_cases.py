@@ -8,13 +8,13 @@ from ttp.db import load_result
 _ON_PASS = {"status": "done", "summary": "job passed"}
 
 
-def _hand_off_waiting(env, p, d, monkeypatch, cmd, title="waits on its job", probe="false", on_pass=_ON_PASS):
+def _hand_off_waiting(env, p, d, monkeypatch, cmd, title="waits on its job", probe="false", on_pass=_ON_PASS, **extra):
     """A fake worker run of a new task that hands off `waiting` with on_pass_cmd `cmd` (and `on_pass`,
     left out when None); the task's row."""
     monkeypatch.setenv("TTP_FAKE_SESSION", "s1")
     monkeypatch.setenv("TTP_FAKE_RESULT", json.dumps({
         "status": "waiting", "summary": "job runs", "waiting_for": "its job", "retry_when": probe,
-        "retry_after_s": 600, "on_pass_cmd": cmd, **({"on_pass": on_pass} if on_pass is not None else {})}))
+        "retry_after_s": 600, "on_pass_cmd": cmd, **({"on_pass": on_pass} if on_pass is not None else {}), **extra}))
     tid = p.db.add_task(title, "run the job", kind="work", tier="light", origin="user")
     d.dispatch()
     _finish_runs(p, d)
@@ -268,9 +268,17 @@ def test_a_checks_wait_whose_on_pass_cmd_only_tests_is_handed_back_so_a_step_lef
     got = json.loads((pathlib.Path(_last_run(p, t["id"])["dir"]) / onpassdry.FILE).read_text())
     assert got["verdict"] == onpassdry.NO_RESULT and got["only_tests"] and res[onpassdry.KEY]["no_result"]
     assert "it only tests" in res["woke"] and "a `then` entry" in res["woke"]
-    # A command that runs the step is the fallback's to settle.
+    # A command that runs the step is the fallback's to settle; so is a test before a `then` stage that runs it.
     t = _hand_off_waiting(env, p, d, monkeypatch, "echo pushed", title="runs its step", probe=probe, on_pass=on_pass)
     assert onpassdry.KEY not in load_result(t["result"])
+    t = _hand_off_waiting(env, p, d, monkeypatch, "test -f x", title="then pushes", probe=probe, on_pass=on_pass,
+                          then=[{"retry_when": "true", "on_pass_cmd": "echo pushed"}])
+    assert onpassdry.KEY not in load_result(t["result"])
+    # No session to hand back to: the on_pass is dropped, so the passed checks wake the task instead.
+    monkeypatch.delenv("TTP_FAKE_SESSIONS", raising=False)
+    t = _hand_off_waiting(env, p, d, monkeypatch, "test -f x", title="no session", probe=probe, on_pass=on_pass)
+    res = load_result(t["result"])
+    assert onpassdry.KEY not in res and "on_pass" not in res and res[onpassdry.NOTE_KEY].startswith("WARNING")
 
 
 def test_a_valid_on_pass_cmd_passes_its_dry_run_and_still_records_done_model_free(env, monkeypatch):
@@ -350,11 +358,13 @@ def test_the_dry_run_check_reads_programs_scripts_and_variables_without_running_
         assert verdict(cmd) == onpassdry.NO_RESULT, cmd
     assert verdict("echo checked", fallback=True) == "ok"
     # Under that fallback a command that only tests runs no step: its on_pass would end the task.
-    for cmd in ("true", "test -f checks.rc", "[ -s out ] && test -d x", ":"):
+    for cmd in ("true", "test -f checks.rc", "[ -s out ] && test -d x", ":", "cd sub && /usr/bin/test -f x",
+                "[ -f x ] || exit 1"):
         got = onpassdry.check(cmd, tmp_path, e, True, 30)
         assert got["verdict"] == onpassdry.NO_RESULT and got["only_tests"], cmd
         assert "on_pass_cmd or a `then` entry" in onpassdry.handback_text(got)
     assert not onpassdry.check("test -f checks.rc", tmp_path, e, False, 30).get("only_tests")
+    assert onpassdry.check("test -f checks.rc", tmp_path, e, True, 30, ends=False)["verdict"] == "ok"
     # A check that runs out of time is inconclusive, never a crash.
     assert onpassdry.check("bash missing.sh", tmp_path, e, False, 0)["verdict"] == "inconclusive"
 

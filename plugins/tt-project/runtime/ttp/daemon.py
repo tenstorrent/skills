@@ -18602,6 +18602,8 @@ class Daemon:
         extra[onpassdry.NOTE_KEY] = warn
         _task_note(run_dir, warn)
         log(self.p, f"task {task['id']} {warn}")
+        if got.get("only_tests"):   # its on_pass would end the task with no step run: the pass wakes it instead
+            result = {k: v for k, v in result.items() if k != "on_pass"}
         return result, f"{warn}\n{summary}"[:1500]
 
     def _job_failed(self, task: dict, now: float) -> None:
@@ -18898,7 +18900,7 @@ class Daemon:
                     and not on_pass_problem(result["on_pass"])
                 # Checked, never run: it may publish, and it must not before its probe passes.
                 got = onpassdry.check(cmd, self.p.root, self._on_pass_env(r["task"]), fallback,
-                                      onpassdry.timeout_s(self.cfg))
+                                      onpassdry.timeout_s(self.cfg), ends=not result.get(thenwaits.KEY))
             if got["verdict"] in (onpassdry.CRASH, onpassdry.NO_RESULT) and session:
                 spec = _read_result(run_dir / "run.json") or {}
                 cwd, env = str(spec.get("cwd") or ""), spec.get("env") if isinstance(spec.get("env"), dict) else {}

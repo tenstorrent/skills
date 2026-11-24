@@ -58,7 +58,7 @@ ON_PASS_VARS = ("TTP_RESULT", "TTP_NOTE_RUN_DIR", "TTP_TASK", "TTP_TASK_ID")   #
 BUILTINS = frozenset(". : [ [[ alias bg break builtin cd command continue declare echo eval exec exit export false fg "
                      "getopts hash jobs kill let local printf pushd popd pwd read readonly return set shift source "
                      "test times trap true type typeset ulimit umask unalias unset wait".split())
-TESTS = frozenset("test [ [[ true :".split())   # programs that only test: an on_pass_cmd of these alone runs no step
+TESTS = frozenset("test [ [[ true : exit".split())   # programs that only test: an on_pass_cmd of these alone runs no step
 KEYWORDS = frozenset("if then else elif fi do done while until ! { } time".split())
 WRAPPERS = frozenset("env exec nohup command nice setsid stdbuf timeout".split())
 SHELLS = frozenset("sh bash dash zsh ksh".split())
@@ -201,11 +201,11 @@ class _Deadline(Exception):
     pass
 
 
-def check(cmd: str, cwd: Path, env: dict, fallback: bool, timeout: float) -> dict:
+def check(cmd: str, cwd: Path, env: dict, fallback: bool, timeout: float, ends: bool = True) -> dict:
     """Validate `cmd` for its run once its probe passes, without running it (module docstring):
     {cmd, rc: None, verdict ('ok', CRASH, NO_RESULT or 'inconclusive'), why, output, checked, took_s}.
     `fallback`: its hand-off's on_pass (done or needs_review) is recorded when the command writes nothing, so
-    one that only tests (TESTS) is refused: it runs no step."""
+    one that only tests (TESTS) is refused: it runs no step, unless a `then` stage follows (`ends` False)."""
     started = time.monotonic()
     problems, checked, reads, unknown, progs = [], [], [], False, []
 
@@ -265,10 +265,10 @@ def check(cmd: str, cwd: Path, env: dict, fallback: bool, timeout: float) -> dic
             if not words:
                 continue
             prog, args = words[0], words[1:]
-            progs.append(prog)
             if prog in ("cd", "pushd", "popd"):
                 moved = True
                 continue
+            progs.append(os.path.basename(prog))
             if prog in (".", "source"):
                 if args and (path := file_at(args[0], moved, "sourced")):
                     parses("sh", shutil.which("bash", path=env.get("PATH")) or shell, path)
@@ -312,7 +312,7 @@ def check(cmd: str, cwd: Path, env: dict, fallback: bool, timeout: float) -> dic
     out = {"cmd": cmd, "rc": None, "output": "\n".join(problems) or "(not run)", "checked": checked}
     if problems:
         out.update(verdict=CRASH, why=problems[0])
-    elif fallback and progs and set(progs) <= TESTS:
+    elif fallback and ends and progs and set(progs) <= TESTS:
         out.update(verdict=NO_RESULT, only_tests=True,
                    why=("it only tests, so it runs no step: once its probe passes your on_pass ends the task and "
                         "any step it names only in words (a push, a tag move, a check of their outcome) never runs"))
