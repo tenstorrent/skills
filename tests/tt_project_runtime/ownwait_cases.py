@@ -170,9 +170,9 @@ def test_a_fix_on_an_unlanded_stack_that_waits_on_its_ancestors_landing_is_hande
     assert json.loads(t["result"])["status"] == "waiting"
 
 
-def test_a_branch_holding_an_unlanded_ancestors_head_is_in_its_stack_even_when_its_review_failed(env, monkeypatch):
+def test_a_branch_holding_an_unlanded_ancestors_head_is_in_its_stack_even_when_its_review_failed(env):
     import subprocess
-    from ttp import ownwait, pushq
+    from ttp import ownwait
     p = make(env)
     git = lambda *a: subprocess.run(["git", "-C", str(p.root), *a], check=True, capture_output=True)
     git("init", "-q")
@@ -190,8 +190,18 @@ def test_a_branch_holding_an_unlanded_ancestors_head_is_in_its_stack_even_when_i
     p.db.update_task(b, branch="ttp/b")
     assert ownwait._in_stack(p, p.db.task(b), a)       # ttp/a's head is an ancestor of ttp/b
     assert not ownwait._in_stack(p, p.db.task(a), b)   # not the other way round
-    monkeypatch.setattr(pushq, "_verdicts", lambda *x, **k: ({a: 99}, set(), {}))
+    fix = _failed_review_fix(p, a)
+    assert not ownwait._in_stack(p, p.db.task(b), a)   # an open fix of a's failed review lands a itself
+    p.db.update_task(fix, status="cancelled")
     assert ownwait._in_stack(p, p.db.task(b), a)   # a's review failed: its commits land only through ttp/b
+
+
+def _failed_review_fix(p, tid):
+    """Task `tid`'s review failed and a fix of it is open: returns the fix's id."""
+    r = p.db.add_task(f"Review #{tid}", "r", kind="review", origin="daemon", depends_on=[tid],
+                      labels=[f"auto_review:{tid}"])
+    p.db.update_task(r, status="failed")
+    return p.db.add_task(f"Fix review #{r}", "f", kind="code", origin="daemon", labels=[f"continues:{r}"])
 
 
 def _stack_git(p):
@@ -216,7 +226,7 @@ def test_a_hand_off_waiting_on_the_landing_of_a_failed_review_its_branch_carries
     # Task B's branch holds task A's head and A's latest review failed; B hands off waiting on A's landing.
     # A lands only through B's review, which queues once B ends: the daemon takes the hand-off as done.
     # Task C, whose branch does not hold A's head, keeps the same wait.
-    from ttp import landed, pushq
+    from ttp import landed
     from ttp.daemon import Daemon
     p = make(env)
     _stack_git(p)
@@ -225,14 +235,17 @@ def test_a_hand_off_waiting_on_the_landing_of_a_failed_review_its_branch_carries
     for tid, br in ((a, "ttp/a"), (b, "ttp/b"), (c, "ttp/c")):
         p.db.update_task(tid, branch=br)
     p.db.update_task(a, status="done")
-    monkeypatch.setattr(pushq, "_verdicts", lambda *x, **k: ({a: 99}, set(), {}))
+    fix = _failed_review_fix(p, a)
     monkeypatch.setattr(landed, "check", lambda *x, **k: (1, "not landed"))
-    t = _reply_wait_hand_off(p, d, tmp_path, b, waiting_for="A's landing", retry_when=f"ttp landed --task {a}")
+    wait = {"waiting_for": "A's landing", "retry_when": f"ttp landed --task {a}"}
+    # While a fix of A's failed review is open, its landing lands A: B's wait is a real one.
+    assert json.loads(_reply_wait_hand_off(p, d, tmp_path, b, **wait)["result"])["status"] == "waiting"
+    p.db.update_task(fix, status="done")
+    t = _reply_wait_hand_off(p, d, tmp_path, b, **wait)
     res = json.loads(t["result"])
     assert res["status"] == "done" and "retry_when" not in res and f"#{a}" in res["summary"], res
     assert f"task {b} hand-off: its wait on #{a}'s landing" in (p.state / "logs" / "daemon.log").read_text()
-    t = _reply_wait_hand_off(p, d, tmp_path, c, waiting_for="A's landing", retry_when=f"ttp landed --task {a}")
-    assert json.loads(t["result"])["status"] == "waiting"
+    assert json.loads(_reply_wait_hand_off(p, d, tmp_path, c, **wait)["result"])["status"] == "waiting"
 
 
 def test_a_task_already_waiting_on_a_landing_its_branch_came_to_carry_finishes_model_free(env, tmp_path, monkeypatch):
@@ -259,6 +272,7 @@ def test_a_task_already_waiting_on_a_landing_its_branch_came_to_carry_finishes_m
     assert t["status"] == "queued" and json.loads(t["result"])["status"] == "waiting"
     assert not d._stack_wait_done(t, json.loads(t["result"]))
     git("branch", "-f", "ttp/c", "ttp/b")   # B's branch now holds A's head
-    assert d._stack_wait_done(p.db.task(b), json.loads(p.db.task(b)["result"]))
+    d.probe_waiting()   # its next re-check: no probe run, no model run
+    assert not d._probes
     res = json.loads(p.db.task(b)["result"])
     assert res["status"] == "done" and "retry_when" not in res and f"#{a}" in res["summary"], res

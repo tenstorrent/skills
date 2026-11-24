@@ -22304,6 +22304,21 @@ def test_a_code_hand_off_carrying_a_rejected_task_s_commits_is_sent_back_once_to
     assert s.p.db.q("SELECT id FROM tasks WHERE kind='review' AND labels LIKE ?", (f'%auto_review:{c}"%',))
 
 
+def test_a_wait_on_a_rejected_landing_its_branch_carries_is_taken_as_done_and_never_sent_back(env, monkeypatch):
+    # The send-back's own way out (wait on that landing) can never end for a branch holding those commits:
+    # the daemon takes the hand-off as done, and does not send it back to wait on that landing again.
+    from ttp import carryback
+    from ttp.daemon import Daemon
+    s = _pq(env, monkeypatch)
+    monkeypatch.setattr(Daemon, "_precheck", lambda self, task, head: None)
+    x, xbranch, _, _ = _pq_stacked(s, "rejected", review="failed")
+    c, _, _, _ = _pq_stacked(s, "stacked", on=xbranch)
+    t = _carry_hand_off(env, s, c, status="waiting", waiting_for="needs its code", retry_when=f"ttp landed --task {x}")
+    res = json.loads(t["result"])
+    assert t["status"] == "done" and carryback.KEY not in res and "woke" not in res, dict(t)
+    assert s.p.db.q("SELECT id FROM tasks WHERE kind='review' AND labels LIKE ?", (f'%auto_review:{c}"%',))
+
+
 def test_a_code_hand_off_passes_when_it_declares_the_landing_or_the_carried_commits_landed_or_are_approved(
         env, monkeypatch):
     from ttp import carryback, pushq

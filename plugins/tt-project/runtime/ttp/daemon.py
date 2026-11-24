@@ -8207,6 +8207,7 @@ class Daemon:
                 refusal = ""   # its own detached push is under way: wait on that push's outcome
                 if chaincap.waits_landing(result.get("retry_when"), task["id"]):
                     result = {**result, "retry_when": probe}
+        anc = 0
         if waiting and not refusal and (anc := ownwait.stack_ancestor_wait(self.p, task, result, bool(jobs))):
             # A fix on an unlanded stack: its review queues only once it hands off, and the stack lands
             # through the head's review, so waiting on an ancestor's landing never ends. Done instead.
@@ -8606,7 +8607,8 @@ class Daemon:
             try:   # memoized by _prefetch_git, which reads both this and the full answer the review's queueing reads
                 head = pushq._commit(self.p, task["branch"])
                 own = pushq.carried(self.p, task, head, self.cfg, since_start=True) if head else {}
-                found = carryback.pending(db, task, own, load_result(task["result"]))
+                found = {t: v for t, v in carryback.pending(db, task, own, load_result(task["result"])).items()
+                         if t != anc}   # its wait on that landing was just taken as done: never ordered again
             except Exception:   # never lose a hand-off to the check itself
                 found = {}
                 log(self.p, f"task {task['id']}: checking carried commits failed: "
@@ -18438,9 +18440,8 @@ class Daemon:
         except Exception as e:   # the probe runs as before
             log(self.p, f"task {task['id']}: could not check its stack wait: {type(e).__name__}: {e}")
             return False
-        r = self.p.db.one("SELECT * FROM runs WHERE task=? AND role!='coordinator' ORDER BY id DESC LIMIT 1",
-                          (task["id"],))
-        if not r or r["status"] == "running" or not r["dir"]:
+        r = self._last_worker_run(task["id"])
+        if not r or r["status"] == "running":
             return False
         run_dir = Path(r["dir"])
         full = _read_result(run_dir / RESULT_FILE) or {}

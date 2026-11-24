@@ -95,13 +95,15 @@ def stack_ancestor_wait(p, task: dict, result: dict, job_in_flight: bool = False
 
 def _in_stack(p, task: dict, tid: int) -> bool:
     """Whether `task` re-works task `tid` or its branch contains `tid`'s head commit, even when `tid`'s
-    latest review failed: those commits then reach the push branch only through this branch's review."""
-    from . import carryback
+    latest review failed: those commits then reach the push branch only through this branch's review.
+    Not while a fix chain of that failed review is open: its landing lands `tid` (landed.carriers), so
+    carryback.order's wait on it ends."""
+    from . import carryback, reviewhold
     if carryback.reworks(p.db, task, tid):
         return True
     other = p.db.task(tid) or {}
     mine, theirs = task.get("branch"), other.get("branch")
-    if not (mine and theirs):
+    if not (mine and theirs) or reviewhold.chain_state(p.db, tid, {task["id"]})[0] == "open":
         return False
     import subprocess
     try:
