@@ -32,6 +32,12 @@ if (sys.argv[1:2] in (["setup"], ["upgrade"]) and os.path.isdir(RUNTIME)
 RUNTIME = os.path.join(os.path.dirname(HERE), "runtime")
 try:
     GIT, best = os.path.join(os.path.dirname(HERE), ".git"), (0.0, "")
+    if not os.path.isdir(GIT):     # a linked worktree: its .git file names the git dir
+        with open(GIT) as f:
+            line = f.read().strip()
+        GIT = line[len("gitdir:"):].strip() if line.startswith("gitdir:") else ""
+        if GIT and not os.path.isabs(GIT):
+            GIT = os.path.join(os.path.dirname(HERE), GIT)
     for name in os.listdir(GIT):
         if not name.startswith("ttp-runtime-hold"):
             continue

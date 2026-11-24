@@ -3165,7 +3165,7 @@ def runtime_hold(harness: str | Path) -> Iterator[None]:
     started on it (each noted in its .pids) until a later hold finds nothing running from it. Without
     a copy (no .git directory, or it could not be made) git writes as before."""
     h = Path(harness)
-    git = h / ".git"
+    git = gitlocks.git_dir(h) or h / ".git"   # a linked worktree's .git file points at its git dir
     _drop_dead_holds(git)
     hold = git / f"{RUNTIME_HOLD}.{os.getpid()}.{time.time_ns()}"
     tmp = git / f".{RUNTIME_HOLD}.tmp.{os.getpid()}"

@@ -845,3 +845,36 @@ def test_the_launcher_and_the_runtime_agree_on_the_hold_copy_names():
     for text in (launcher, (RUNTIME / "ttp" / "__init__.py").read_text()):
         assert f'"{project.RUNTIME_HOLD}' in text, "a hold copy's name must stay in step"
         assert f'"{project.HOLD_PIDS}"' in text, "the copy's user list must stay in step"
+
+
+def test_a_harness_that_is_a_linked_worktree_holds_its_runtime_too(tmp_path):
+    """A harness whose .git is a file (a linked worktree) got no hold at all before: runtime_hold
+    skipped the copy and the launcher skipped the scan, both silently. They now follow the .git
+    file to the git dir git keeps for that worktree."""
+    from ttp import project
+    h = tmp_path / "harness"
+    (h / "bin").mkdir(parents=True)
+    gitdir = tmp_path / "main" / ".git" / "worktrees" / "h"   # what a linked worktree's .git names
+    gitdir.mkdir(parents=True)
+    (h / ".git").write_text(f"gitdir: {gitdir}\n")
+    shutil.copy2(RUNTIME.parent / "template" / "bin" / "ttp", h / "bin" / "ttp")
+    pkg = h / "runtime" / "ttp"
+    pkg.mkdir(parents=True)
+    (pkg / "__init__.py").write_text('__version__ = "1"\n')
+    (pkg / "cli.py").write_text("def main():\n    print('old')\n")
+    clean = {k: v for k, v in os.environ.items() if k not in ("PYTHONPATH", "TTP_PYTHON")}
+
+    def holds():
+        return [d for d in gitdir.iterdir() if d.name.startswith(project.RUNTIME_HOLD)]
+
+    def launch():
+        r = subprocess.run([sys.executable, str(h / "bin" / "ttp")], capture_output=True, text=True,
+                           env=clean, timeout=60)
+        return r.stdout.strip() or r.stderr.strip().splitlines()[-1]
+
+    with project.runtime_hold(h):
+        (pkg / "cli.py").write_text("from . import extra\n\ndef main():\n    print(extra.SAY)\n")
+        assert launch() == "old", "the launcher runs the copy the .git file leads to"
+        assert len(holds()) == 1 and (holds()[0] / project.HOLD_PID).exists()
+        assert (holds()[0] / project.HOLD_PIDS).read_text().split(), "the launcher noted its process"
+    assert launch() == "new" and not any((d / project.HOLD_PID).exists() for d in holds())

@@ -9,9 +9,11 @@ def _hold_use() -> None:
     while it still imports from it. A child that gets the copy through PYTHONPATH never sees the
     launcher, which records the processes it starts itself."""
     import os
-    hold = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))   # .git/<hold>/<this package>
-    if (os.path.basename(os.path.dirname(hold)) == ".git"                 # project.RUNTIME_HOLD's shape
-            and os.path.basename(hold).startswith("ttp-runtime-hold")):
+    hold = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))  # <git dir>/<hold>/<this pkg>
+    d = os.path.dirname(hold)   # a hold copy sits in the harness's git dir: .git itself, or a
+    while d and os.path.basename(d) != ".git":   # linked worktree's git dir somewhere under it
+        d = os.path.dirname(d)
+    if os.path.basename(d) == ".git" and os.path.basename(hold).startswith("ttp-runtime-hold"):
         try:
             marks = os.path.join(hold, ".pids")          # project.HOLD_PIDS
             with open(marks, "a") as f:
