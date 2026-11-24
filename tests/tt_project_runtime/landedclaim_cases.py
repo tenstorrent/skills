@@ -83,9 +83,8 @@ def test_a_receipt_holds_a_claim_only_when_it_holds_its_commit(env, monkeypatch)
 def test_a_push_of_something_else_is_no_landing_claim(env, monkeypatch):
     """A push verb whose subject is not the run's own work ("pushed the logs to a folder",
     "pushed everything to a cache", "it was pushed to the cache") is no claim of a landing, and
-    neither is a push or merge to another destination (review #9671): those sentences stay as
-    written, a sha-less claim being checked only against the push branch it names or a plain
-    'landed' naming no other destination."""
+    neither is a push or merge naming another destination: those sentences stay as written, a
+    sha-less claim being checked only against the push branch it names or a plain 'landed'."""
     from ttp import pushclaim
     p, repo, head = _claim_replay_setup(env, monkeypatch, landed=False)
     for text in ("pushed the log files to the results folder.",
