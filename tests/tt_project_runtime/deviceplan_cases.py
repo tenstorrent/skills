@@ -51,7 +51,6 @@ def test_the_seventh_check_allows_power_only_through_the_approved_routes():
     assert deviceplan.risky("broker reset box-a") and not deviceplan.risky("git reset --hard")
 
 
-
 # Replay of a device plan that ran a cluster validator, its all-link traffic pass included, straight on the box's
 # chips (paths, box and checkout made generic): only the box's device broker runs a device tool.
 _DP_VALIDATOR = ("./build/tools/scaleout/cluster_validation/run_cluster_validation --cabling-descriptor-path "
@@ -68,8 +67,8 @@ def _dp_steps_plan(cmds):
 
 
 def test_a_plan_running_a_device_tool_outside_the_boxs_broker_goes_back_to_opus(tmp_path):
-    """cells: plan-10103-traffic-refused: replay: the advisor planned the validator, then its traffic pass, as local
-    steps on the box; nothing stopped them. Each is refused by its step, the read between them and the broker's job pass."""
+    """cells: plan-10103-traffic-refused: a plan step running a device tool outside the broker is refused by its
+    step number; the read between such steps and the same tool as the broker's job pass."""
     from ttp import deviceplan
     run, _ = _dp_run(tmp_path)
     why = deviceplan.store(run, _dp_steps_plan(_DP_DIRECT_STEPS), str(tmp_path), {})
@@ -84,7 +83,7 @@ def test_a_plan_running_a_device_tool_outside_the_boxs_broker_goes_back_to_opus(
     help_step = "cd wt && " + _DP_VALIDATOR.split()[0] + " --help"   # prints usage, opens no device
     assert deviceplan.store(run3, _dp_steps_plan([help_step, _DP_VIA_BROKER, _DP_DIRECT_STEPS[1]]), str(tmp_path),
                             {}) is None
-    assert "device jobs (validation, fabric or link checks, resets, tt-smi) go only through the broker" in \
+    assert "device jobs (validation, fabric or link checks, tt-smi resets) go only through the broker" in \
         deviceplan.DEVICE_PLAN
 
 
@@ -98,13 +97,16 @@ def test_a_device_tool_runs_only_as_the_brokers_job_in_every_form():
               f"timeout 600 {v}", f"env A=1 {v}", f"nohup sh -c '{v}' &", f"echo `{v}`", f"xargs -a list {v}",
               "python3 tools/test_system_health.py", "/opt/x/test_tt_fabric --gtest_filter='*'",
               f"other-cli run-bg box-a '{v}'", f"{tool} --help --send-traffic", f"{tool} -h; {tool}",
-              f"other-cli run-bg box-a '{tool} --help; {tool}'"):
+              f"other-cli run-bg box-a '{tool} --help; {tool}'", f"ssh box-a <<'EOF'\n{v}\nEOF",
+              f"ssh -p 22 box-a bash -s <<'EOF'\ncd wt\n{v} --send-traffic\nEOF"):
         assert "run it through the box's device broker" in deviceplan.direct_tool(c), c
     for c in (f"broker submit box-a -- {v}", _DP_VIA_BROKER, "grep run_cluster_validation /tmp/v.log",
               "ls build/tools/scaleout/cluster_validation/run_cluster_validation", _DP_DIRECT_STEPS[1],
               'git commit -m "add the run_cluster_validation step"', "tt-smi -s", f"{tool} --help 2>&1 | head -50",
               f"cd wt && {tool} -h > /tmp/usage.txt", f"ssh box-a '{tool} --help'",
-              "python3 tools/test_system_health.py -h"):
+              "python3 tools/test_system_health.py -h", f"broker submit box-a -- {v} 2>&1 | tee {tool}.log",
+              f"sed -n '/error/p' /tmp/{tool}.log", f"awk '/FAIL/' {tool}.log", f"sed -n 1,40p src/{tool}.cpp",
+              f"cmake --build build --target {tool}", f"ssh box-a 'cat > notes.txt' <<'EOF'\n{v}\nEOF"):
         assert deviceplan.direct_tool(c) is None, c
     s = deviceplan.settings(_dp_cfg(device_tools=["fabric_check"], power_routes=["./bin/devq"]))
     assert deviceplan.direct_tool("python3 tools/fabric_check.py", s["power_routes"], s["device_tools"])
@@ -126,7 +128,8 @@ def test_a_glm_device_run_never_runs_a_device_tool_outside_the_broker_even_as_a_
         assert "run it through the box's device broker" in deviceplan.refusal(c, ws, e, {}), c
     for c in (_DP_DIRECT_STEPS[1], _DP_VIA_BROKER, "tt-smi -s", _DP_VALIDATOR.split()[0] + " --help"):
         assert deviceplan.refusal(c, ws, e, {}) is None, c
-    for c in ("tt-smi -r 0", "ipmitool chassis power cycle", "tt-flash --fw-tar fw.tar.gz", "sudo reboot"):
+    for c in ("tt-smi -r 0", "ipmitool chassis power cycle", "tt-flash --fw-tar fw.tar.gz", "sudo reboot",
+              "ssh box-a <<'EOF'\ntt-smi -r 0\nEOF"):
         assert deviceplan.refusal(c, ws, e, {}), c
     assert deviceplan.hook_refusal(_DP_DIRECT_STEPS[2], ws, e)
     assert deviceplan.bounce_kind(run) == "guard", "a harmful refusal: the run is handed back to Opus"

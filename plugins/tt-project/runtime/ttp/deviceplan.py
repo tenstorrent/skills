@@ -79,8 +79,8 @@ PLAN_RULES = (
     "holds and pauses, Slurm nodes held by others, protected paths. Power cycles and resets go only through the "
     "project's approved routes (its broker or the scripts its settings name), never raw `ipmitool chassis power`, "
     "raw IPMI bytes or `tt-smi -glx_reset` outside them. On a box with a device broker, device jobs (validation, "
-    "fabric or link checks, resets, tt-smi) go only through the broker. Stop at the first failed check and hand back; post nothing "
-    "to a person.")
+    "fabric or link checks, tt-smi resets) go only through the broker. Stop at the first failed check and hand back; "
+    "post nothing to a person.")
 SOURCE_RULES = (
     "Copy every check and job-submit command verbatim from the commands to copy from (listed with the task) or "
     "from a script they name, changing only the arguments the task names (its box, its task id, its paths) and "
@@ -191,11 +191,29 @@ def ssh_target(w, strict: bool = False):
     return w[i].split("@")[-1].lower(), " ".join(w[i + 1:])   # ssh itself joins its words with spaces
 
 
+def _ssh_shell_bodies(cmd: str) -> list[str]:
+    """Lines of the heredocs `cmd` feeds to a remote shell (`ssh box <<EOF`, `ssh box bash -s <<EOF`): hook._split
+    keeps only a local shell's."""
+    from . import hook
+    lines, bodies = hook._heredocs(cmd)
+    out = []
+    for i, body, pos in bodies:
+        s, e, _ = next(p for p in hook._pieces(lines[i]) if p[0] <= pos <= p[1])
+        got = ssh_target(next(iter(hook._segments(lines[i][s:e])), []))
+        remote = got[1].split() if got else None
+        if got and (not remote or os.path.basename(remote[0]) in hook.SHELLS):
+            out += body
+    return out
+
+
 def _segs(cmd: str):
     """hook's simple commands of `cmd` (wrappers dropped, `bash -c` and `$( )` read, file redirects gone), None
     when it cannot be read: a backquote hides a command from that parser."""
     from . import glmguard, hook
-    cmd = hook._split(cmd)[0]   # heredoc bodies no shell reads: gone, before REDIRECT takes their `<<`
+    try:   # heredoc bodies no shell reads: gone, before REDIRECT takes their `<<`
+        cmd = "\n".join([hook._split(cmd)[0], *_ssh_shell_bodies(cmd)])
+    except Exception:
+        return None
     if "`" in cmd:
         return None
     try:
@@ -311,7 +329,8 @@ def power_refusal(cmd: str, routes=("broker",)) -> str | None:
 
 # a program that only names its words (`grep run_cluster_validation log`, `git commit -m ...`): any other program
 # naming a device tool may run it (`python3 x/fabric_check.py`, `env A=1 ./tool`, `xargs ./tool`)
-NAMERS = LISTERS | {"grep", "egrep", "fgrep", "rg", "cat", "head", "tail", "less", "wc", "file", "which", "type", "git"}
+NAMERS = LISTERS | {"grep", "egrep", "fgrep", "rg", "cat", "head", "tail", "less", "wc", "file", "which", "type", "git",
+                    "cmake", "make", "ninja", "cp", "scp", "chmod"}   # building or copying it runs nothing
 
 
 def direct_tool(cmd: str, routes=("broker",), tools=tuple(DEFAULTS["device_tools"])) -> str | None:
@@ -333,7 +352,8 @@ def direct_tool(cmd: str, routes=("broker",), tools=tuple(DEFAULTS["device_tools
             continue
         words = " ".join(w).split()   # a quoted command line is read word by word too
         at = [i for i, a in enumerate(words)
-              if os.path.basename(a) in names or os.path.splitext(os.path.basename(a))[0] in names]
+              if os.path.basename(a) in names or os.path.splitext(os.path.basename(a)) in
+              {(t, x) for t in names for x in (".py", ".sh")}]   # its log or source names it and runs nothing
         if at and not (len(at) == 1 and words[at[0] + 1:] in (["--help"], ["-h"])):   # only its usage: no device
             return why + " ".join(w)[:120]
     return None
