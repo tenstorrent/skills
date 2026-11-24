@@ -5,7 +5,7 @@ from __future__ import annotations
 
 def _claim_replay_setup(env, monkeypatch, landed):
     """A project whose repo pushes to a bare origin, and a code task whose branch holds one commit
-    (`landed`: that commit is also on the push branch). Returns (p, head, summary words)."""
+    (`landed`: that commit is also on the push branch). Returns (p, repo, head)."""
     p, repo, origin, other = _push_setup(env, monkeypatch, ["true"])
     _commit(repo, "change.txt", "change\n")
     head = _git_out(repo, "rev-parse", "HEAD")
@@ -134,7 +134,6 @@ def test_a_text_claim_the_local_check_cannot_settle_is_corrected_by_the_remote_c
 def _digest_result(p, tid):
     """The task's stored summary as the digest reads it."""
     return json.loads(p.db.task(tid)["result"])["summary"]
-
 
 
 def test_a_landing_the_tracking_ref_lags_is_refreshed_before_not_landed(env, monkeypatch):
