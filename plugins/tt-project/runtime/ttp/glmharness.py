@@ -77,18 +77,22 @@ def install(version: str = "", root: Path | None = None) -> dict:
     return benchrun.harness_ready(HARNESS, version or _installed(base), base)
 
 
+def _glm(cfg: dict) -> dict:
+    """The `route.code_sonnet.glm` settings, {} when unset."""
+    got = ((cfg.get("route") or {}).get("code_sonnet") or {}).get("glm")
+    return got if isinstance(got, dict) else {}
+
+
 def digest_on(cfg: dict) -> bool:
     """`route.code_sonnet.glm.digest`: a command's long output reaches the model as a digest (glmenv.digest).
     Off by default; the dry run's GLM arm turns it on."""
-    got = ((cfg.get("route") or {}).get("code_sonnet") or {}).get("glm")
-    return isinstance(got, dict) and got.get("digest") is True
+    return _glm(cfg).get("digest") is True
 
 
 def batch_on(cfg: dict) -> bool:
     """`route.code_sonnet.glm.batch_steps`: the run's task message is INSTANCE_TEMPLATE (batched reads and
     searches) rather than mini's own step-by-step one. On by default; false keeps mini's template."""
-    got = ((cfg.get("route") or {}).get("code_sonnet") or {}).get("glm")
-    return not (isinstance(got, dict) and got.get("batch_steps") is False)
+    return _glm(cfg).get("batch_steps") is not False
 
 
 def files(run_dir: Path, inst: dict, model: str, runtime_dir: str, digest: bool = False,
@@ -116,8 +120,7 @@ def files(run_dir: Path, inst: dict, model: str, runtime_dir: str, digest: bool 
 
 def wanted(cfg: dict) -> str:
     """The version setting (`route.code_sonnet.glm.harness_version`), '' for the newest installed or current."""
-    got = ((cfg.get("route") or {}).get("code_sonnet") or {}).get("glm")
-    return str(got.get("harness_version") or "") if isinstance(got, dict) else ""
+    return str(_glm(cfg).get("harness_version") or "")
 
 
 def apply(spec: dict, run_dir: Path, cfg: dict, runtime_dir: str, budget_usd=None, install_fn=None) -> str:
