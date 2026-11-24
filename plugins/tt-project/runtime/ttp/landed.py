@@ -393,7 +393,7 @@ def _pushed(db) -> list[dict]:
         return []
 
 
-def _dropped(db, tid: int, carry: dict, rows: "Rows | None") -> set[str]:
+def _gone_shas(db, tid: int, carry: dict, rows: Rows | None) -> set[str]:
     """The shas whose drop verdict still stands for task `tid`: a drop beats every landing record at
     that sha until a supersession is recorded after it, and a drop recorded after the supersession
     wins again (the record times decide)."""
@@ -426,7 +426,7 @@ def recorded(db, tid: int, carry: dict | None = None, rows: Rows | None = None) 
     member = isinstance(res, dict) and isinstance(res.get("batch"), dict) and res["batch"].get("lead") != tid
     if member and res.get("landed"):
         return [str(res["landed"])], "its own commit on the push branch"
-    gone = _dropped(db, tid, carry, rows)
+    gone = _gone_shas(db, tid, carry, rows)
     pushed = _pushed(db) if rows is None else rows.pushed
     hits = [r for r in pushed if (r["landed_sha"] or r["pushed_sha"]) not in gone | {None, ""}
             and (r["task"] in carry or (r["branch"] in branches and not member))]
