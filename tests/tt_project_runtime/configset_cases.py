@@ -604,13 +604,13 @@ def test_config_add_appends_one_item_to_a_list_key_dedupes_and_refuses_other_key
 
 
 def test_a_config_still_setting_the_retired_keys_loads_and_an_upgrade_drops_them(env):
-    """Nine off-by-default extras were deleted. A project.json that still sets them loads without
+    """Off-by-default extras were deleted. A project.json that still sets them loads without
     error, `ttp config` names each as retired, and `ttp upgrade` removes them, keeping the rest."""
     from ttp import cli
     from ttp.project import config_problems, unknown_key_hint
     gone = {"coordinator": {"settle_cmd": "true"}, "budget": {"daily_target_usd": 5, "split_reread_tokens": 9},
             "chains": {"split_lines": 400}, "notify": {"chat_status": True, "chat_cost_alarm": True},
-            "worktree": {"kinds": ["work"]}, "tasks": {"daily_target": 20}, "machine": {"max_workers": 3}}
+            "worktree": {"kinds": ["work"]}, "tasks": {"daily_target": 20}}
     keys = [f"{s}.{k}" for s, sub in gone.items() for k in sub]
     for k in keys:
         assert "retired" in (unknown_key_hint(k) or ""), k
@@ -618,7 +618,7 @@ def test_a_config_still_setting_the_retired_keys_loads_and_an_upgrade_drops_them
     raw = p.raw_config()
     for s, sub in gone.items():
         raw.setdefault(s, {}).update(sub)
-    raw["machine"]["worker_limit"] = "on"
+    raw.setdefault("machine", {})["worker_limit"] = "on"
     p.config_path.write_text(json.dumps(raw))
     cfg = p.config()
     assert cfg["machine"]["worker_limit"] == "on"
@@ -629,7 +629,7 @@ def test_a_config_still_setting_the_retired_keys_loads_and_an_upgrade_drops_them
     notes = cli._drop_retired_keys(p)
     assert sorted(n.split("removed ")[1].split(" ")[0] for n in notes) == sorted(keys), notes
     left = p.raw_config()
-    assert left["machine"].get("worker_limit") == "on" and "max_workers" not in left["machine"]
+    assert left["machine"].get("worker_limit") == "on"
     assert not any(k.split(".")[1] in (left.get(k.split(".")[0]) or {}) for k in keys)
     assert cli._drop_retired_keys(p) == [], "a rerun is a no-op"
 

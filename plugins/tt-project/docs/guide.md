@@ -4295,6 +4295,7 @@ is open raises one `cap_wait` event naming the key.
 | `budget.max_parallel_workers` | 6 | worker runs at once | safety (spend) |
 | `machine.worker_limit` | auto (laptops and workstations): binds only under real pressure (then the cores, 2-32), paced down | worker runs at once across all projects on the machine | safety (host) |
 | `machine.pace_from` | moderate: moderate and heavy readings cut the limit; heavy: only heavy CPU or memory (plus a call or heat) cut it | which readings pace this project's machine-wide limit | safety (host) |
+| `machine.max_workers` | unset: no fixed ceiling | the user's ceiling on worker runs of all projects on the machine together, held with `machine.worker_limit` on or off; account-wide (`ttp config --account machine.max_workers 6`, `''` removes it) | safety (host) |
 
 ### Queue waits over 30 minutes
 

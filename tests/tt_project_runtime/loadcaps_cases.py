@@ -461,3 +461,85 @@ def test_machine_pace_from_is_settable_and_checked(env):
         co.USER_SETTABLE["machine.pace_from"]("light")
     assert not [w for w in pj.config_problems({"machine": {"pace_from": "heavy"}}) if "pace_from" in w]
     assert [w for w in pj.config_problems({"machine": {"pace_from": "light"}}) if "pace_from" in w]
+
+
+def test_machine_max_workers_unset_is_no_ceiling_and_bad_values_are_config_problems(env, monkeypatch, tmp_path):
+    """No shipped default: unset, a server with the paced limit off is never held, however many run.
+    A value that is not a whole number of 1 or more holds nothing and is named as a config problem."""
+    from ttp import machinecap as mc
+    from ttp import project as pj
+    assert "max_workers" not in pj.DEFAULT_CONFIG["machine"]
+    home, off = tmp_path / "mhome", _mcap_cfg("off")
+    mc.publish("other", 50, home=home)
+    assert mc.ceiling(off) is None and mc.check("me", off, 50, claim=True, home=home) is None
+    for bad in (0, -2, 2.5, "4", True):
+        cfg = {"machine": {"worker_limit": "off", "max_workers": bad}}
+        assert mc.ceiling(cfg) is None and mc.check("me", cfg, 99, home=home) is None, bad
+        assert [w for w in pj.config_problems({"machine": {"max_workers": bad}}) if "machine.max_workers" in w], bad
+    assert not [w for w in pj.config_problems({"machine": {"max_workers": 3}}) if "max_workers" in w]
+
+
+def test_machine_max_workers_holds_starts_at_the_ceiling_across_projects_with_its_reason(env, monkeypatch):
+    """Set once for the machine (an account setting), the ceiling counts every live project's running
+    workers, refuses the start that would reach past it with a reason the held task shows, holds with the
+    paced limit off, and frees a place as a worker ends."""
+    from ttp import machinecap as mc
+    from ttp.daemon import Daemon
+    from ttp import cli
+    p = make(env)
+    p.set_config("machine.worker_limit", "off")
+    with pytest.raises(ValueError, match="host-wide"):
+        p.set_config("machine.max_workers", 3)
+    for bad in ("0", "two"):
+        with pytest.raises(SystemExit):
+            cli.main(["config", "--account", "machine.max_workers", bad])
+    cli.main(["config", "--account", "machine.max_workers", "3"])
+    d = Daemon(p.base)
+    assert mc.ceiling(d.cfg) == 3
+    mc.publish("other", 2, pid=os.getpid())   # another live project's two workers
+    core = d.cfg.get("core_provider", "claude")
+    t = p.db.task(p.db.add_task("light work", "s", kind="work", tier="light", origin="user", priority=2))
+
+    def ctx(n):
+        return {"now": time.time(), "paused": {}, "committed": None, "busy": {core: n}, "logged_out": {}}
+    assert d._start_hold(t, core, ctx(0), reserve=True) is None, "2 + 0 < 3: starts and claims"
+    c = ctx(1)
+    assert d._start_hold(t, core, c) == "held"
+    words = d._hold_words(t, "held", c)
+    assert "machine-wide worker limit: 3 of 3" in words and "machine.max_workers" in words, words
+    mc.publish("other", 1, pid=os.getpid())   # one of its workers ended
+    assert Daemon(p.base)._start_hold(t, core, ctx(1)) is None
+    cli.main(["config", "--account", "machine.max_workers", ""])
+    assert mc.ceiling(Daemon(p.base).cfg) is None
+
+
+def test_upgrade_moves_an_old_projects_machine_max_workers_to_the_account_and_honours_it(env, tmp_path):
+    """An older release kept machine.max_workers in project.json (a later one retired and dropped it).
+    The upgrade moves it to the machine's account settings, keeping the lower of two, so the ceiling
+    still holds; a bad value is removed with a note, never silently. A rerun changes nothing."""
+    from ttp import cli
+    from ttp import machinecap as mc
+    from ttp.project import account_value
+    p = make(env)
+    raw = p.raw_config()
+    raw.setdefault("machine", {})["max_workers"] = 4
+    p.config_path.write_text(json.dumps(raw))
+    note = cli._move_max_workers(p)
+    assert "moved machine.max_workers 4" in note and "now 4" in note, note
+    assert account_value("machine.max_workers") == 4 and "max_workers" not in (p.raw_config().get("machine") or {})
+    assert cli._move_max_workers(p) == "", "a rerun is a no-op"
+    home = tmp_path / "mhome"
+    mc.publish("other", 4, home=home)
+    why = mc.check(p.name, p.config(), 0, home=home)
+    assert why and "4 of 4" in why and "machine.max_workers" in why, why
+    q = p   # a second old copy, as another project on the machine would hold
+    raw = q.raw_config()
+    raw.setdefault("machine", {})["max_workers"] = 6
+    q.config_path.write_text(json.dumps(raw))
+    assert "now 4" in cli._move_max_workers(q) and account_value("machine.max_workers") == 4, "the lower one stays"
+    raw = q.raw_config()
+    raw.setdefault("machine", {})["max_workers"] = "lots"
+    q.config_path.write_text(json.dumps(raw))
+    note = cli._move_max_workers(q)
+    assert "removed machine.max_workers" in note and "not a whole number" in note, note
+    assert account_value("machine.max_workers") == 4 and "max_workers" not in (q.raw_config().get("machine") or {})

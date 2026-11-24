@@ -31,7 +31,11 @@ Config (provenance as any key: a value the user or coordinator set is kept acros
     off on lab and build servers), on, off.
   machine.pace_from: moderate (default) or heavy. heavy, for a host whose projects only run agents:
     only heavy CPU or heavy memory cut this project's limit (a call and heat count as before).
-Undo: `ttp config <project> machine.worker_limit off` (each project).
+  machine.max_workers: the user's fixed ceiling on running workers of all projects on the machine
+    together, set once for the machine (`ttp config --account machine.max_workers N`; unset by default:
+    no fixed ceiling). It holds beside the paced limit, worker_limit on or off.
+Undo: `ttp config <project> machine.worker_limit off` (each project); `ttp config --account
+machine.max_workers ''` removes the ceiling.
 
 State: TTP_HOME/machine-workers.json, under an fcntl lock (.lock beside it), shared by all projects:
 each project's daemon pid and running workers, and the last signal reading with the CPU's low-idle
@@ -105,6 +109,13 @@ def pace_from(cfg: dict) -> str:
     """machine.pace_from: 'heavy' when set so, else 'moderate' (the default, also for a bad value)."""
     v = str(((cfg or {}).get("machine") or {}).get("pace_from") or "moderate").strip().lower()
     return "heavy" if v == "heavy" else "moderate"
+
+
+def ceiling(cfg: dict) -> int | None:
+    """machine.max_workers (an account setting, so the same in every project): the user's fixed ceiling,
+    or None when unset or not a whole number of 1 or more (config_problems names a bad one)."""
+    v = ((cfg or {}).get("machine") or {}).get("max_workers")
+    return v if isinstance(v, int) and not isinstance(v, bool) and v >= 1 else None
 
 
 def levels(sig: dict, pace: str = "moderate") -> dict:
@@ -336,29 +347,36 @@ def check(project: str, cfg: dict, running: int, claim: bool = False, now: float
           home: Path | None = None, read=None, pid: int | None = None) -> str | None:
     """None when one more worker may start on the machine with this project's `running` ones, else why
     not. With `claim`, a None also records the start (running + 1) before the lock is released, so
-    another project's check sees it. A project with the limit off is never held."""
-    if not enabled(cfg):
+    another project's check sees it. A project with the limit off and no machine.max_workers is never held."""
+    on, cap = enabled(cfg), ceiling(cfg)
+    if not on and cap is None:
         return None
     now = time.time() if now is None else now
-    with _locked(home) as data:
-        sig = data.get("signals") if isinstance(data.get("signals"), dict) else None
-    fresh = not sig or not 0 <= now - float(sig.get("at") or 0) < SIGNAL_S
-    if fresh:
-        sig = (read or read_signals)()   # outside the lock: the CPU sample may take a second
+    sig, fresh = None, False
+    if on:
+        with _locked(home) as data:
+            sig = data.get("signals") if isinstance(data.get("signals"), dict) else None
+        fresh = not sig or not 0 <= now - float(sig.get("at") or 0) < SIGNAL_S
+        if fresh:
+            sig = (read or read_signals)()   # outside the lock: the CPU sample may take a second
     with _locked(home) as data:
         others = _others(data, project, now)
-        if fresh:
-            prev = data.get("signals")
-            if isinstance(prev, dict) and float(prev.get("at") or 0) >= float(sig.get("at") or 0):
-                sig = prev   # another project stored a newer reading meanwhile
-            else:
-                data["signals"] = sig = advance(prev, sig)
-        pace = pace_from(cfg)
-        top = in_force(sig, pace=pace)
-        if top is not None and others + running >= top:
-            return (f"the machine-wide worker limit: {others + running} of {top} running across all projects "
-                    f"({words(sig, pace)}; machine.worker_limit"
-                    f"{', machine.pace_from heavy' if pace == 'heavy' else ''})")
+        if cap is not None and others + running >= cap:
+            return (f"the machine-wide worker limit: {others + running} of {cap} running across all projects "
+                    f"(machine.max_workers, set for the whole machine)")
+        if on:
+            if fresh:
+                prev = data.get("signals")
+                if isinstance(prev, dict) and float(prev.get("at") or 0) >= float(sig.get("at") or 0):
+                    sig = prev   # another project stored a newer reading meanwhile
+                else:
+                    data["signals"] = sig = advance(prev, sig)
+            pace = pace_from(cfg)
+            top = in_force(sig, pace=pace)
+            if top is not None and others + running >= top:
+                return (f"the machine-wide worker limit: {others + running} of {top} running across all projects "
+                        f"({words(sig, pace)}; machine.worker_limit"
+                        f"{', machine.pace_from heavy' if pace == 'heavy' else ''})")
         if claim:
             data["projects"][project] = {"pid": pid or os.getpid(), "at": now, "running": running + 1}
         return None

@@ -725,6 +725,7 @@ META_KEYS = {"name", "id", "host", "root", "created", "tt_project_version", "pri
 EXTRA_KEYS = {
     "waste": {"moved_at"},
     "chat": {"max_inflight"},   # account-level only (HOST_WIDE_KEYS): the host's chat calls in flight (inflight.py)
+    "machine": {"max_workers"},   # account-level only (HOST_WIDE_KEYS): the machine's worker ceiling (machinecap.ceiling)
     # model_bench.terminalbench: the Terminal-Bench settings (harborslice.settings, tbcycle.settings), set as one object.
     "model_bench": {"terminalbench"},
     # route: run-class routing (runclass.py). code_sonnet: {"share", "kinds", "guard", "guard_pts", "alarm_p"} or false, the code
@@ -1107,7 +1108,6 @@ RETIRED_KEYS = {
     "budget.split_reread_tokens": "removed: off by default and unused",
     "worktree.kinds": "removed: off by default and unused; only code tasks get a worktree of their own",
     "tasks.daily_target": "removed: off by default and unused",
-    "machine.max_workers": "removed: off by default and unused; under pressure the base is the cores",
     "coordinator.session.mode": "the coordinator session is always on, with no off switch",
     "coordinator.session.pause_h": "the session spend guard is gone: the dollar caps are the cost limits",
     "budget.hourly_coordinator_usd": "the coordinator's hourly dollar guard is gone: the dollar caps are the cost limits",
@@ -1570,10 +1570,20 @@ def config_problems(raw: dict, root: Path | None = None, fetch: bool = False) ->
     v = m.get("pace_from")
     if v is not None and str(v).strip().lower() not in ("moderate", "heavy"):
         out.append(f"machine.pace_from: {v!r} is not moderate or heavy; moderate is used")
+    for where, v in (("", m.get("max_workers")), (" (account)", (load_account_settings().get("machine") or {}).get("max_workers"))):
+        if v is not None and (why := max_workers_problem(v)):
+            out.append(f"machine.max_workers{where}: {why}")
     v = (raw.get("runner") or {}).get("pin_verify") if isinstance(raw.get("runner"), dict) else None
     if v is not None and v not in ("strict", "lenient"):
         out.append(f"runner.pin_verify: {v!r} is not strict or lenient")
     return out
+
+def max_workers_problem(v: Any) -> str:
+    """Why `v` is no machine.max_workers (a whole number of 1 or more), else ''."""
+    if isinstance(v, bool) or not isinstance(v, int) or v < 1:
+        return f"{json.dumps(v)[:40]} is not a whole number of 1 or more; no machine-wide worker ceiling is used"
+    return ""
+
 
 def deep_merge(base: dict, over: dict) -> dict:
     """A copy of base with over merged in, dict by dict; over's other values are put in as they are.
@@ -3341,7 +3351,8 @@ ACCOUNT_KEYS = {"budget": {"global_daily_usd", "day_start", "timezone", "push_sp
                 # waves {flag: [[names]]}, wave_at {flag: k} and project_rollback {flag: {name: {ts, why}}} (auto's wave gate)
                 "rollout": {"flags", "rings", "excluded", "thresholds", "scratch_cap_usd", "waves", "wave_at",
                             "project_rollback"},
-                "chat": {"max_inflight"}}   # the host's chat-provider calls in flight at once (inflight.py)
+                "chat": {"max_inflight"},   # the host's chat-provider calls in flight at once (inflight.py)
+                "machine": {"max_workers"}}   # the user's worker ceiling for all projects on the machine (machinecap.ceiling)
 # Account keys a run may only clear (ttp config --account refuses setting them inside a run): remove them
 # ('') or set them to their off value (ACCOUNT_OFF_VALUE), which only reduces their reach.
 # The ranking's source and key file too: the key goes to that source, so only the user names either.
@@ -3362,7 +3373,7 @@ ACCOUNT_OFF_VALUE = {"checks.spill_hosts": [], "rollout.flags": {}}
 ACCOUNT_NESTED_KEYS = {"providers.chat.model_ranking", "providers.chat.rank_exclude", "providers.chat.class_ranking", "providers.chat.class_prefs", "providers.chat.ranking_source", "providers.chat.ranking_every_s",
                        "providers.chat.ranking_key_file", "providers.chat.served_every_s", "providers.chat.served_idle_s"}
 HOST_WIDE_KEYS = {"checks.host_max", "route.host_max", "chat.max_inflight", "checks.spill_hosts", "checks.no_spill_hosts", "checks.dirty_max_mb", "checks.io_full_max",
-                  "checks.push_priority_wait_s"}
+                  "checks.push_priority_wait_s", "machine.max_workers"}
 
 
 WEEKS_OF_DAYS = 7   # an unset budget.weekly_usd: this many days at the daily cap, so it never stops work first

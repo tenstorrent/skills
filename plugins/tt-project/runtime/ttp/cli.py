@@ -42,7 +42,7 @@ from . import schedule as sched
 from .project import here as project_here
 from .project import (NAME_RE, Project, hostname, load_registry, load_secrets, register, save_secret,
                       durable_append, durable_write, write_json, ACCOUNT_KEYS, ACCOUNT_USER_ONLY, account_keys, DEFAULT_CONFIG, deep_merge,
-                      load_account_settings, set_account_setting, zombie, device_timeout_max, command_env,
+                      load_account_settings, set_account_setting, max_workers_problem, zombie, device_timeout_max, command_env,
                       NOTE_RUN_ENV, in_run, replace_copy, sync_all, MEMORY_AUDIENCES, append_text,
                       open_append_or_null, tree_writes)
 from . import gitmemo
@@ -13067,6 +13067,8 @@ def cmd_account_config(key: str, value: str | None) -> None:
             bad = [str(e)]
     if nested and (why := rankfresh.check_setting(key, val)):
         bad = [why]
+    if key == "machine.max_workers" and val not in ("", None) and (why := max_workers_problem(val)):
+        bad = [f"{key}: {why}"]
     if bad:
         die(bad[0])
     from . import accountset
@@ -14634,6 +14636,8 @@ def _upgrade(p: Project, auto: bool = False, explicit: bool = False, took_over: 
         print(ttl_note)
     if caps_note := _migrate_load_caps(p):
         print(caps_note)
+    if mw_note := _move_max_workers(p):
+        print(mw_note)
     for line in _drop_retired_keys(p):
         print(line)
     print("harness up to date with the installed template; restarting the daemon")
@@ -14737,6 +14741,31 @@ def _migrate_load_caps(p: Project) -> str:
     except Exception:
         return ""
     return "upgrade note: defaults now sized to the project's load: " + "; ".join(done)
+
+
+def _move_max_workers(p: Project) -> str:
+    """An older release kept machine.max_workers in project.json; it is now one value for the whole
+    machine in the account settings. A valid one moves there (the lower one, when the account has one
+    already) and leaves project.json; a bad one leaves too, named. Returns the note ('' when none was set)."""
+    from .project import account_value
+    try:
+        raw = p.raw_config()
+        if p.config_status == "unavailable" or not _config_has(raw, "machine.max_workers"):
+            return ""
+        v = (raw.get("machine") or {}).get("max_workers")
+        if why := max_workers_problem(v):
+            note = f"removed machine.max_workers from project.json: {why}"
+        else:
+            have = account_value("machine.max_workers")
+            keep = v if max_workers_problem(have) else min(v, have)
+            if keep != have:
+                set_account_setting("machine.max_workers", keep)
+            note = (f"moved machine.max_workers {v} from project.json to the machine's account settings "
+                    f"(now {keep}, for every project here: ttp config --account machine.max_workers)")
+        p.unset_config("machine.max_workers", by={"by": "default", "via": "upgrade: moved to the account settings"})
+    except Exception:
+        return ""
+    return "upgrade note: " + note
 
 
 def _drop_retired_keys(p: Project) -> list[str]:
