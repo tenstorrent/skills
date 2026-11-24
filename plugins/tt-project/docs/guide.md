@@ -327,7 +327,8 @@ coordinator with that evidence.
   and the error. Only a harness task edits a listed guard file. `ttp doctor` shows each guard and whether it
   loads. See the harness skill's references/local-guards.md.
 - Hand-off checks (`worker.handoff_checks`, unset by default): the project's own model-free commands
-  the daemon runs on each worker's hand-off before it accepts it, posts its `reply_chat` reply or
+  the daemon runs on each worker's hand-off before it accepts it, raises its `reply_chat` task's
+  reply event or
   queues its review or push. Each entry is `{"name", "run", "timeout_s" (60), "kinds"}` (`kinds`: the
   task kinds it applies to, default all), for example
   `{"name": "done says what it verified", "run": "python3 checks/handoff.py {result}", "kinds": ["work"]}`.

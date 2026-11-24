@@ -1,13 +1,14 @@
-"""What a task that answers a chat (`reply_chat`) posts there, and when it posts nothing.
+"""What a task that answers a chat (`reply_chat`) hands the coordinator, and when nothing is handed.
 
-The chat gets the hand-off's `message` verbatim when it is present and non-empty, else its `summary`
-(less a trailing AI-authorship tag, which db.post drops from every message to the user: aitag.for_user).
-The chat sees nothing else of the run: not its tool output, not its final reply. A done hand-off whose
-text is empty, or only describes the run ("returned them as the message for the user") with no content
-of its own, delivers nothing: `undelivered` names why, and the daemon sends the task to review instead
-of posting it, so the coordinator sees that the user got nothing. The check runs on every reply_chat worker's done hand-off, a
-code task's too (it then waits in review for the coordinator); a landed reply from the push queue posts
-the `message` the worker's hand-off already passed it with.
+The hand-off's `message` when present and non-empty, else its `summary`, goes to the coordinator as
+the reply text (less a trailing AI-authorship tag, which db.post drops from every message to the user:
+aitag.for_user); the chat itself never sees the raw hand-off, only the coordinator's plain reply
+(chatdigest.REPLY_DUE). A done hand-off whose text is empty, or only describes the run ("returned
+them as the message for the user") with no content of its own, delivers nothing: `undelivered` names
+why, and the daemon sends the task to review instead of handing it over, so the coordinator sees that
+the user got nothing. The check runs on every reply_chat worker's done hand-off, a code task's too (it
+then waits in review for the coordinator); a landed reply hands the `message` the worker's hand-off
+already passed it with.
 
 A hand-off from a run on the chat provider (GLM) is data: its text posts only as the Opus write-up
 (writeup.py), which stamps it; `guard` refuses any other, on every path that posts it.
