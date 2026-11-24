@@ -1914,8 +1914,7 @@ def _push_handoff_task(p, tmp_path, marker_body, kind="code", **hand):
 
 
 @pytest.mark.parametrize("kind, hand, summary", [
-    # a 'landed' claim nothing can check reads 'landed (unverified)': never a plain 'landed'
-    ("code", {"on_pass": {"status": "done", "summary": "landed the fix"}}, "landed (unverified) the fix"),
+    ("code", {"on_pass": {"status": "done", "summary": "landed the fix"}}, "landed the fix"),
     ("review", {}, "approved; pushing it (Its push landed"),
     ("code", {"resolves": ["n1"]}, "approved; pushing it (Its push landed")])
 @pytest.mark.parametrize("body", [{"status": "pushed", "sha": "a" * 40},

@@ -3164,7 +3164,6 @@ def cmd_note(a) -> None:
         die("ttp note only works inside a tt-project run")
     a.sent_text = a.text   # the leak scan reads what was asked to be sent, before masking (_note_to)
     a.text = redact.scrub(a.text)   # progress.md and a note's recipients keep no key or secret
-    a.text = _landed_claims_checked(a.text)   # a note's landed-claim is checked like a hand-off's
     if getattr(a, "urgent", False):
         if not a.to:
             die("ttp note: --urgent goes with --to", 2)
@@ -3183,24 +3182,6 @@ def cmd_note(a) -> None:
     if not glmguard.active():   # a GLM-arm run's note stays in its own log: it sends nobody's notes on
         upstream.maybe_fallback()   # the daemon cannot reach a forward target: send its notes from this run
     print_update()
-
-
-def _landed_claims_checked(text: str) -> str:
-    """A note's text with its landed-claims checked against the push branch, as a hand-off's
-    (pushclaim.correct_landed_claims): a note saying this run's change landed reads 'not landed'
-    when the commit is not on the branch. A fault or a missing project leaves the text as written."""
-    from . import pushclaim, pushq
-    try:
-        base = os.environ.get("TTP_PROJECT")
-        p = Project(base) if base else None
-        if not p or not p.exists():
-            return text
-        tid = int(os.environ.get("TTP_TASK") or 0)
-        t = p.db.task(tid) if tid else None
-        head = pushq._commit(p, t["branch"]) if t and t["branch"] else ""
-        return pushclaim.correct_landed_claims(p, text, p.root, head, tid)
-    except Exception:
-        return text
 
 
 def print_update() -> bool:
