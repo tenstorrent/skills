@@ -103,6 +103,7 @@ def test_landings_time_a_late_supersession_record_from_the_commit_that_landed(en
     off, gone, old = (p.db.add_task(t, "s", kind="code", status="done") for t in
                       ("its head stayed on its own branch", "dropped after", "the work predates it"))
     p.db.x("UPDATE tasks SET created=? WHERE id IN (?,?)", (now - 4 * 86400, off, gone))
+    p.db.x("UPDATE tasks SET created=? WHERE id=?", (now - 950, old))
     _sp.run(["git", "-C", str(p.root), "checkout", "-q", "-b", "side"], check=True)
     side = _commit_at(p, now - 3 * 86400, "never on the push branch")
     for t, h in ((off, side), (gone, head), (old, head)):
@@ -111,7 +112,7 @@ def test_landings_time_a_late_supersession_record_from_the_commit_that_landed(en
     got = landed.landed_whens(p, [off, gone, old])
     assert got[off] == pytest.approx(now - 1000, abs=5)   # the squash commit, not the side head
     assert got[gone] is None                               # the drop verdict stands
-    assert got[old] == pytest.approx(now - 900, abs=5)     # commits older than the task: the record time
+    assert got[old] == pytest.approx(now - 950, abs=1)     # work older than the task: landed at creation
 
 
 def test_landings_read_the_carrier_links_once_for_all_candidates(env, monkeypatch):

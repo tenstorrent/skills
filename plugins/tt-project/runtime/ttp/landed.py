@@ -485,8 +485,8 @@ def landed_whens(p, tids, rows: Rows | None = None) -> dict[int, float | None]:
     verdict does not stand), the earlier committer date of the superseding commit or of the head it
     names once that head was on the push branch (on_push). A head's date is when it was committed on
     its branch, which a fast-forward carried unchanged. A push queue landing keeps its record time: its
-    commit is dated at the rebase, before its checks ran. A date before the task was created (work
-    that existed already) is not its landing. None while nothing is known. `rows`: read once for all
+    commit is dated at the rebase, before its checks ran. A commit older than the task (work that
+    existed already) lands it when it was created. None while nothing is known. `rows`: read once for all
     of them (Rows), else read here."""
     tids = [int(t) for t in tids]
     rows = Rows(p.db, tids) if rows is None else rows
@@ -505,8 +505,8 @@ def landed_whens(p, tids, rows: Rows | None = None) -> dict[int, float | None]:
         want[tid] = [str(r["sha"]) for r in sup] + [h for h in heads if tip and on_push(p, p.root, [h], tip)]
     dates = commit_dates(p, [s for v in want.values() for s in v])
     made = {tid: float((rows.tasks.get(tid) or {}).get("created") or 0) for tid in tids}
-    return {tid: min([t for t in [at[tid], *(dates.get(s) for s in want[tid])] if t and t >= made[tid]],
-                     default=at[tid]) for tid in tids}
+    return {tid: min([t for t in [at[tid], *(max(dates[s], made[tid]) for s in want[tid] if s in dates)] if t],
+                     default=None) for tid in tids}
 
 
 def commit_dates(p, shas) -> dict[str, float]:
