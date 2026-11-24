@@ -39,7 +39,8 @@ def test_a_summary_claiming_a_landing_the_push_branch_lacks_reads_not_landed(env
     res = json.loads(p.db.task(tid)["result"])
     assert "not landed" in res["summary"] and f"{head[:12]} is not on origin/proj" in res["summary"], res
     assert "landed at" not in res["summary"]
-    assert p.db.task(tid)["status"] not in ("failed", "pushing"), p.db.task(tid)["status"]
+    # the false word costs the run nothing beyond the correction: its work goes on as usual
+    assert p.db.task(tid)["status"] == "done", p.db.task(tid)["status"]
     assert not p.db.q("SELECT id FROM events WHERE kind='task_failed' AND task=?", (tid,))
 
 
@@ -65,6 +66,29 @@ def test_a_claim_this_project_cannot_check_is_marked_unverified(env, monkeypatch
     from ttp import pushclaim
     fixed = pushclaim.correct_landed_claims(p, _claim_text("sha", head), p.root, head)
     assert "(unverified)" in fixed and "not landed" not in fixed, fixed
+
+
+def test_a_receipt_holds_a_claim_only_when_it_holds_its_commit(env, monkeypatch):
+    """A claim naming no sha stands only when a push receipt holds the task head; a receipt for
+    another commit does not make the claim true."""
+    from ttp import landed, pushclaim
+    p, repo, head = _claim_replay_setup(env, monkeypatch, landed=False)
+    monkeypatch.setattr(landed, "recorded", lambda *a: (["f" * 40],))
+    fixed = pushclaim.correct_landed_claims(p, _claim_text("head"), p.root, head, tid=7)
+    assert "not landed" in fixed, fixed
+    monkeypatch.setattr(landed, "recorded", lambda *a: ([head],))
+    assert "not landed" not in pushclaim.correct_landed_claims(p, _claim_text("head"), p.root, head, tid=7)
+
+
+def test_a_push_of_something_else_is_no_landing_claim(env, monkeypatch):
+    """A push verb whose subject is not the run's own work ("pushed the logs to a folder",
+    "pushed everything to a cache", "it was pushed to the cache") is no claim of a landing."""
+    from ttp import pushclaim
+    p, repo, head = _claim_replay_setup(env, monkeypatch, landed=False)
+    for text in ("pushed the log files to the results folder.",
+                 "pushed everything to the results folder.",
+                 "it was pushed to the artifacts cache."):
+        assert pushclaim.correct_landed_claims(p, text, p.root, head) == text, text
 
 
 def test_a_text_claim_the_local_check_cannot_settle_is_corrected_by_the_remote_check(env, monkeypatch, tmp_path):

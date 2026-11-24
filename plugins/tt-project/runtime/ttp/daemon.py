@@ -7517,7 +7517,7 @@ class Daemon:
                 # the text and let the hand-off go to its normal review; only a run that was itself
                 # meant to push (its markers, its pushed list) fails as before.
                 handoff = {**handoff, "summary": pushclaim.correct_landed_claims(
-                    self.p, said, self.p.root, pushq._commit(self.p, db.task(tid)["branch"] or ""),
+                    self.p, said, self.p.root, pushq._commit(self.p, t["branch"] or ""),
                     tid, remote_missing=True)[:1500]}
                 log(self.p, f"task {tid}: claimed push is not on the remote; its text is corrected "
                             f"and it goes to review: {why[:200]}")

@@ -73,9 +73,11 @@ _NOT_REFS = {"the", "a", "an", "it", "its", "origin", "remote", "github", "branc
 # A claim that the run's change landed, naming no commit: "the change landed", "it was pushed".
 _LANDED_VERB = re.compile(r"(?i)\b(landed|pushed|merged)\b")
 # Words saying the verb's subject is the run's own work ("the change landed", "landed the fix"),
-# so a verb about something else ("pushed the data to a folder") is no claim of a landing.
+# so a verb about something else ("pushed the data to a folder") is no claim of a landing. Generic
+# words ("it", "this", "everything") are left out: "pushed everything to the results folder" is
+# about a folder, not a landing.
 _LANDED_SUBJECT = re.compile(r"(?i)\b(?:changes?|works?|fix(es)?|patch(es)?|commits?|head|branch(es)?"
-                             r"|it|this|everything|pr|diffs?)\b")
+                             r"|pr|diffs?)\b")
 UNVERIFIED_CLAIM = "(unverified)"      # a landed-claim this project cannot check, never a plain 'landed'
 NOT_LANDED = "not landed"              # the correction a claim off the push branch reads
 
@@ -134,32 +136,40 @@ def _default(p, repo) -> tuple[str, str] | None:
     return (remote, f"refs/heads/{branch}") if remote in _remotes(repo) else None
 
 
+def _sha_phrases(text: str, repo) -> list[tuple[int, int, str, str, bool]]:
+    """(start, end, sha, ref, is-tag) of each phrase naming a push with a commit: the one parse
+    both readers of these phrases follow — same regexes, same negation and one-claim-a-phrase
+    overlap rules; the sha resolves as a commit of `repo`, or the phrase is no claim."""
+    out, taken = [], []
+    for rx, order in ((_TAG, "ref_sha"), (_REF_SHA, "ref_sha"), (_SHA_REF, "sha_ref")):
+        for m in rx.finditer(text or ""):
+            if _NEGATED.search(text[max(0, m.start() - NEG_WINDOW):m.start()]) \
+                    or any(m.start() < e and s < m.end() for s, e in taken):
+                continue   # one phrase, one claim, hedged or negated ones are none
+            taken.append((m.start(), m.end()))
+            ref, sha = (m.group(1), m.group(2)) if order == "ref_sha" else (m.group(2), m.group(1))
+            full = _commit(repo, sha)
+            if not full or not full.startswith(sha.lower()):
+                continue   # a word or ref name, or another repository's commit
+            out.append((m.start(), m.end(), full, ref or "", rx is _TAG))
+    return out
+
+
 def text_claims(p, text: str, repo=None) -> list[dict]:
     """The pushes a summary claims. Only commits of the project's repository count (a claim about
     another repository's commit cannot be checked here), and only remotes it has."""
     repo = repo or p.root
     out, seen = [], set()
-    found = []
-    for rx, order in ((_TAG, "ref_sha"), (_REF_SHA, "ref_sha"), (_SHA_REF, "sha_ref")):
-        for m in rx.finditer(text or ""):
-            if _NEGATED.search(text[max(0, m.start() - NEG_WINDOW):m.start()]):
-                continue
-            ref, sha = (m.group(1), m.group(2)) if order == "ref_sha" else (m.group(2), m.group(1))
-            if any(m.start() < e and s < m.end() for s, e in found):
-                continue   # one phrase, one claim
-            found.append((m.start(), m.end()))
-            full = _commit(repo, sha)
-            if not full or not full.startswith(sha.lower()):
-                continue
-            target = None
-            if ref and ref.lower() not in _NOT_REFS:
-                target = _ref(repo, ref, tag=rx is _TAG)
-            target = target or _default(p, repo)
-            if not target or (full, target) in seen:
-                continue
-            seen.add((full, target))
-            out.append({"repo": str(repo), "remote": target[0], "ref": target[1], "sha": full,
-                        "source": "its summary", "strict": False})
+    for start, end, full, ref, tag in _sha_phrases(text, repo):
+        target = None
+        if ref and ref.lower() not in _NOT_REFS:
+            target = _ref(repo, ref, tag=tag)
+        target = target or _default(p, repo)
+        if not target or (full, target) in seen:
+            continue
+        seen.add((full, target))
+        out.append({"repo": str(repo), "remote": target[0], "ref": target[1], "sha": full,
+                    "source": "its summary", "strict": False})
     return out
 
 
@@ -170,19 +180,10 @@ def landed_claims(p, text: str, repo) -> list[tuple[int, int, str, tuple]]:
     or run (its sentence names its id) is left out: the check would read this run's head, not that
     task's."""
     target = _default(p, repo)
-    out, taken = [], []
-    for rx, order in ((_TAG, "ref_sha"), (_REF_SHA, "ref_sha"), (_SHA_REF, "sha_ref")):
-        for m in rx.finditer(text or ""):
-            if _NEGATED.search(text[max(0, m.start() - NEG_WINDOW):m.start()]) \
-                    or any(m.start() < e and s < m.end() for s, e in taken):
-                continue   # one phrase, one claim, hedged or negated ones are none
-            ref, sha = (m.group(1), m.group(2)) if order == "ref_sha" else (m.group(2), m.group(1))
-            full = _commit(repo, sha)
-            t = _ref(repo, ref, tag=rx is _TAG) if ref and ref.lower() not in _NOT_REFS else None
-            if not full or not full.startswith(sha.lower()):
-                continue   # a word or ref name, or another repository's commit
-            taken.append((m.start(), m.end()))
-            out.append((m.start(), m.end(), full, t or _default(p, repo)))
+    out = [(start, end, full,
+            (_ref(repo, ref, tag=tag) if ref and ref.lower() not in _NOT_REFS else None) or target)
+           for start, end, full, ref, tag in _sha_phrases(text, repo)]
+    taken = [(start, end) for start, end, *_ in out]
     from . import claimcheck   # its task and run id rules: the claim is about that id, not this run
     for m in _LANDED_VERB.finditer(text or ""):
         lo = max(text.rfind(c, 0, m.start()) for c in ".!?\n") + 1
@@ -227,7 +228,7 @@ def correct_landed_claims(p, text: str, repo, head: str = "", tid: int = 0,
             rc = landed.NOT_YET
         elif claim_target not in (None, target):
             continue   # another ref's claim: the remote checks own it
-        elif sha and sha in receipts or not sha and receipts:
+        elif what in receipts:
             continue   # the push receipts hold this task's landing: the claim stands
         else:
             rc, why = landed.check(p, repo, what, fetch=False) if what else (landed.CANNOT, "no commit named")
