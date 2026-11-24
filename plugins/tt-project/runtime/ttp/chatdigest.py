@@ -386,10 +386,11 @@ def outcome_words(facts: dict) -> str:
     return ", ".join(bits)
 
 
-def outcome_line(task: dict, facts: dict) -> str:
+def outcome_line(item: dict, facts: dict) -> str:
     """The fallback line for a chat the coordinator did not reply to: the task, whether it landed
-    (commit and version), whether it is deployed, and any user step on record. No hand-off prose."""
-    head = f"#{task['id']} " + " ".join(str(task.get("title") or "").split())
+    (commit and version), whether it is deployed, and any user step on record. No hand-off prose.
+    `item` is the armed fallback: {chat, task, title, facts}."""
+    head = f"#{item['task']} " + " ".join(str(item.get("title") or "").split())
     line = f"{head[:200]}: {outcome_words(facts)}"
     if (need := str(facts.get("need") or "").strip()):
         line += "\nNeeds from you: " + need
