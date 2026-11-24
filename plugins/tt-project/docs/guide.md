@@ -4995,8 +4995,8 @@ Workers can read Slack links you paste, using your Slack connector if you have o
     the ledger and announced first. A reset of a held machine still needs no ask. Not seen: programs
     a command calls in turn, a device broker's own recovery, which is no run's command, an ssh chain
     more than 3 hops deep, a heredoc that only holds data (it is refused, never passed) and a `sed`
-    program that writes to sysrq. One decider (`ruleguard._halt`) reads every stop command, the
-    reboot notice's journal lines included.
+    program that writes to sysrq. The rule and the reboot notice's journal lines share one decider
+    (`ruleguard._halt`); the power-cycle shims and the device plan keep their own lists.
   Each refusal is one line naming the rule and its setting. `ttp guards [project]` lists the rules
   and their settings, and `ttp stats --guards` counts fires per rule and model (from each run's
   `ruleguard.jsonl`). `guards.off` (a list of rule names) turns rules off; only the user may set it.

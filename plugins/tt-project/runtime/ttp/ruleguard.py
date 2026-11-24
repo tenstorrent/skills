@@ -28,8 +28,9 @@ alike) and the GLM shell (glmenv.refusal) ask it. RULES, with the setting each r
   machines change add <alias> "<why>" --power-cycle-at <t>`) holds now and was recorded at least
   guards.reboot_lead_s (default REBOOT_LEAD_S, never under REBOOT_LEAD_MIN_S) earlier. The recording
   project's daemon announces each intent in its chat (daemon.announce_power_cycles) within a minute.
-  A ledger that cannot be read refuses. Programs a command calls in turn are not seen; a device
-  broker's own recovery is no run's command and is not checked.
+  A ledger that cannot be read refuses. Not seen: programs a command calls in turn, an ssh chain more
+  than 3 hops deep, and a sed program that writes to sysrq; a data-only heredoc is refused (fails
+  safe). A device broker's own recovery is no run's command and is not checked.
 guards.off, a list of rule names, turns rules off for one project; only the user's own word sets it
 (coordinator.NEEDS_USER). Each refusal is one line naming its rule and setting, and is counted in the
 run folder (FIRES) by rule and model; `ttp stats --guards` sums them and `ttp guards` lists the rules.

@@ -214,7 +214,7 @@ def _rg_power_shims(rule_home):
 REBOOTS = ("sudo reboot", "shutdown -r now", "systemctl reboot", "sudo systemctl --no-pager poweroff",
            "systemctl start reboot.target", "kexec -e", "echo b | sudo tee /proc/sysrq-trigger",
            "echo b > /proc/sysrq-trigger", "sh -c 'sync; reboot'", "init 6", "sudo -n reboot", "sudo -u root -n reboot",
-           "echo b | sudo dd of=/proc/sysrq-trigger", "python3 -c \"open('/proc/sysrq-trigger','w').write('b')\"",
+           "sudo -nu root reboot", "echo b | sudo dd of=/proc/sysrq-trigger", "python3 -c \"open('/proc/sysrq-trigger','w').write('b')\"",
            "busctl call org.freedesktop.login1 /org/freedesktop/login1 org.freedesktop.login1.Manager Reboot b true")
 
 

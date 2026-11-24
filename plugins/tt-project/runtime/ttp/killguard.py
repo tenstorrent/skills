@@ -62,10 +62,6 @@ OWN_WORDS = {"$!", "${!}", "$$", "${$}", "$BASHPID", "${BASHPID}"}
 SUB = "__ttpsub{}__"
 SUB_RE = re.compile(r"__ttpsub(\d+)__")
 VAR_RE = re.compile(r"\$\{?([A-Za-z_]\w*)\}?")
-# sudo's and doas's options that take a value (sudo -u root, -p prompt, -g grp; doas -u, -C)
-SUDO_VALUE_OPTS = set("ugpChDrRtUTa")
-SUDO_LONG_VALUE = {"user", "group", "prompt", "host", "close-from", "chdir", "role", "type", "other-user",
-                   "command-timeout", "chroot"}
 # A file descriptor written against its redirection (`2>/dev/null`, `1>&2`): not a kill target
 FD_RE = re.compile(r"(^|[\s;&|()])(\d+)(?=[<>])")
 PIDFILE_RE = re.compile(r"\s*(?:<\s*(\S+)|cat\s+(\S+)|head\s+(?:-n\s*1|-1)\s+(\S+))\s*")
@@ -505,26 +501,8 @@ def _command(argv: list[str]) -> tuple[list[str], list[str]]:
         if s is None:
             return wrappers + [os.path.basename(w) for w in prefix], stripped
         wrappers += [os.path.basename(w) for w in argv[:s + 1]]
-        argv = argv[s + 1 + _sudo_opts(argv[s + 1:]):]
+        argv = argv[s + 1 + hook._sudo_opts(argv[s + 1:]):]
     return wrappers, argv
-
-
-def _sudo_opts(args: list[str]) -> int:
-    """How many words of `args` (what follows sudo or doas) are its own options."""
-    i = 0
-    while i < len(args) and args[i].startswith("-") and len(args[i]) > 1:
-        a = args[i]
-        if a == "--":
-            return i + 1
-        if a.startswith("--"):
-            i += a[2:] in SUDO_LONG_VALUE
-        else:
-            for j, ch in enumerate(a[1:], 2):
-                if ch in SUDO_VALUE_OPTS:
-                    i += not a[j:]
-                    break
-        i += 1
-    return i
 
 
 def _drop_fds(flat: str) -> str:

@@ -604,10 +604,11 @@ CAT_SUBST_RE = re.compile(r"\$\(\s*(?:cat\s+|<\s*)[\"']?([^\s\"')]+)|`\s*cat\s+[
 # Commands that copy or rename a file: what runs the new name runs the old one's text
 COPIES = {"mv", "cp", "ln", "install"}
 OPTS_WITH_VALUE = {"-u", "--unset", "-C", "--chdir", "-s", "--signal", "-k", "--kill-after", "-n", "--adjustment"}
-# sudo's options that take a value: its -n, -s and -k take none (`sudo -n reboot` runs reboot)
-SUDO_OPTS_WITH_VALUE = {"-u", "--user", "-g", "--group", "-C", "--close-from", "-h", "--host", "-p", "--prompt",
-                        "-r", "--role", "-t", "--type", "-U", "--other-user", "-D", "--chdir", "-R", "--chroot",
-                        "-T", "--command-timeout"}
+# sudo's and doas's options that take a value (sudo -u root, -p prompt, -g grp; doas -u, -C); its -n, -s and -k
+# take none (`sudo -n reboot` runs reboot)
+SUDO_VALUE_OPTS = set("ugpChDrRtUTa")
+SUDO_LONG_VALUE = {"user", "group", "prompt", "host", "close-from", "chdir", "role", "type", "other-user",
+                   "command-timeout", "chroot"}
 # xargs options whose value is the rest of the word or else the next one (`-a FILE`, `-I {}`), and its long
 # ones that take the next word when they carry no `=` (getopt takes an unambiguous prefix too)
 XARGS_VALUE_LETTERS = "adEILnPs"
@@ -1058,21 +1059,41 @@ def _segments(cmd: str, strip: bool = True) -> list[list[str]]:
     return [s for s in out if s]
 
 
+def _sudo_opts(args: list[str]) -> int:
+    """How many words of `args` (what follows sudo or doas) are its own options."""
+    i = 0
+    while i < len(args) and args[i].startswith("-") and len(args[i]) > 1:
+        a = args[i]
+        if a == "--":
+            return i + 1
+        if a.startswith("--"):
+            i += a[2:] in SUDO_LONG_VALUE
+        else:
+            for j, ch in enumerate(a[1:], 2):
+                if ch in SUDO_VALUE_OPTS:
+                    i += not a[j:]
+                    break
+        i += 1
+    return i
+
+
 def _strip_prefix(argv: list[str], ttp_wrappers: list[list[str]] | None = None) -> list[str]:
     """`argv` without its wrappers; each `ttp lock|clip|detach|sandbox|secret env ... --` stripped is added to
     `ttp_wrappers` when given."""
-    i, xargs, sudo = 0, False, False
+    i, xargs = 0, False
     while i < len(argv):
         w = argv[i]
         if xargs and w.startswith("-") and w != "-":   # xargs -a FILE, --arg-file FILE, -0I {} ...
             i += 2 if _xargs_takes_next(w) else 1
-        elif w in (SUDO_OPTS_WITH_VALUE if sudo else OPTS_WITH_VALUE):   # env -u NAME, timeout -s KILL, nice -n 5 ...
+        elif w in OPTS_WITH_VALUE:   # env -u NAME, timeout -s KILL, nice -n 5 ...
             i += 2
         elif re.match(r"^\w+\+?=", w) or w.startswith("-") or re.fullmatch(r"\d+[smhd]?", w) \
                 or os.path.basename(w) in WRAPPERS or w in RESERVED:
             if not w.startswith("-"):
-                xargs, sudo = os.path.basename(w) == "xargs", os.path.basename(w) == "sudo"
+                xargs = os.path.basename(w) == "xargs"
             i += 1
+            if os.path.basename(w) == "sudo":
+                i += _sudo_opts(argv[i:])
         elif w == "ttp" and (argv[i + 1:i + 2] in (["lock"], ["clip"], ["detach"], ["sandbox"])
                              or argv[i + 1:i + 3] == ["secret", "env"]) and "--" in argv[i:]:
             end = argv.index("--", i)
