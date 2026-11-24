@@ -57,6 +57,7 @@ AUDIT_EVERY_S, AUDIT_DAYS, AUDIT_REFS = 3600, 2, 20
 PENDING_EVERY_S = 30             # between the slices of an audit round the per-tick ref cap cut short
 ON_PASS_DIR = "on_pass"          # daemon.ON_PASS_DIR
 
+NEG_WINDOW = 40                # chars before a match the negation look-behind reads
 # A short sha may have no digit (about 1 in 1,000 at 7 characters): a token counts only once it resolves
 # as a commit it prefixes (text_claims), which a word or a ref name does not.
 _SHA = r"`?([0-9a-f]{7,40})`?"
@@ -137,7 +138,7 @@ def text_claims(p, text: str, repo=None) -> list[dict]:
     found = []
     for rx, order in ((_TAG, "ref_sha"), (_REF_SHA, "ref_sha"), (_SHA_REF, "sha_ref")):
         for m in rx.finditer(text or ""):
-            if _NEGATED.search(text[max(0, m.start() - 40):m.start()]):
+            if _NEGATED.search(text[max(0, m.start() - NEG_WINDOW):m.start()]):
                 continue
             ref, sha = (m.group(1), m.group(2)) if order == "ref_sha" else (m.group(2), m.group(1))
             if any(m.start() < e and s < m.end() for s, e in found):
@@ -168,7 +169,7 @@ def landed_claims(p, text: str, repo) -> list[tuple[int, int, str, tuple]]:
     out, taken = [], []
     for rx, order in ((_TAG, "ref_sha"), (_REF_SHA, "ref_sha"), (_SHA_REF, "sha_ref")):
         for m in rx.finditer(text or ""):
-            if _NEGATED.search(text[max(0, m.start() - 40):m.start()]) \
+            if _NEGATED.search(text[max(0, m.start() - NEG_WINDOW):m.start()]) \
                     or any(m.start() < e and s < m.end() for s, e in taken):
                 continue   # one phrase, one claim, hedged or negated ones are none
             ref, sha = (m.group(1), m.group(2)) if order == "ref_sha" else (m.group(2), m.group(1))
@@ -181,7 +182,7 @@ def landed_claims(p, text: str, repo) -> list[tuple[int, int, str, tuple]]:
     from . import claimcheck   # its task and run id rules: the claim is about that id, not this run
     for m in _LANDED_VERB.finditer(text or ""):
         lo = max(text.rfind(c, 0, m.start()) for c in ".!?\n") + 1
-        if _NEGATED.search(text[max(0, m.start() - 40):m.start()]) \
+        if _NEGATED.search(text[max(0, m.start() - NEG_WINDOW):m.start()]) \
                 or claimcheck._TASK.search(text[lo:m.start()]) or claimcheck._RUN.search(text[lo:m.start()]):
             continue   # hedged, negated, or about another task or run
         if any(m.start() < e and s < m.end() for s, e in taken):
