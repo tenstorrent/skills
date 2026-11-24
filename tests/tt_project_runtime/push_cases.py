@@ -168,6 +168,8 @@ def test_a_supersession_recorded_after_a_drop_verdict_wins_the_sha_back_until_a_
     p.db.x("INSERT INTO task_superseded(task, head, sha, ts) VALUES(?,?,?,?)", (gone, "h", late, time.time()))
     landed.drop(p, gone, [late], "the recorded commit does not carry it after all", event=False)
     assert landed.recorded(p.db, gone) == ([], "")
+    landed.drop(p, tid, [sha], "the revived sha was re-judged not to carry it", event=False)
+    assert landed.recorded(p.db, tid) == ([], ""), "a re-drop of the revived sha refreshes its verdict"
 
 
 def test_a_landing_that_lacks_a_tasks_head_is_carried_once_its_commit_is_on_the_push_branch(env, monkeypatch):

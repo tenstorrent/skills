@@ -664,7 +664,7 @@ def rearm_refusal(a) -> tuple[str, dict]:
         return "no project here to read the fix task's landing from", {}
     if a.target and project not in rolled_back(a.target):
         return f"{project} is not rolled back for {a.target}; nothing to re-arm", {}
-    code, why = landed.check(p, p.root, tid=fix, fetch=False)
+    code, why = landed.check(p, p.root, tid=fix)   # `ttp landed --task`: fetch only if the local ref says not yet
     if code != 0:
         return f"fix task #{fix} is not on the push branch ({why})", {}
     target = local_projects().get(project)
