@@ -3108,34 +3108,81 @@ def tree_writes(harness: str | Path) -> Iterator[None]:
                 note_protected(f, after.get(f))
 
 
-RUNTIME_HOLD = "ttp-runtime-hold"   # in a harness's .git: the runtime its launcher (bin/ttp) runs while held
-HOLD_PID = ".pid"                   # in it: the process holding it (the launcher ignores a dead one's)
+RUNTIME_HOLD = "ttp-runtime-hold"   # in a harness's .git: each merge's copy of the runtime its launcher runs
+HOLD_PID = ".pid"                   # in one: the process holding it (the launcher ignores a dead one's)
+HOLD_PIDS = ".pids"                 # in one: each process a launcher started on it (it notes itself there)
+
+
+def _hold_pids(file: Path) -> list[int]:
+    """The process numbers a hold copy's `file` names (.pid: its holder; .pids: what its launcher
+    started on it); text that is no such numbers reads as none."""
+    try:
+        text = file.read_text()
+    except OSError:
+        return []
+    out = []
+    for tok in text.split():
+        try:
+            n = int(tok)
+        except ValueError:
+            continue
+        if n > 0:
+            out.append(n)
+    return out
+
+
+def _drop_dead_holds(git: Path) -> None:
+    """Drop hold copies under `git` that nothing runs from any more: each whose holder died and in
+    which no process a launcher recorded still lives. A copy something still runs from stays whole:
+    its modules load long after the merge ended. A copy still being made dies with its maker."""
+    from .liveness import pid_alive
+    try:
+        names = os.listdir(git)
+    except OSError:
+        return
+    for n in names:
+        d, live = git / n, []
+        if n.startswith(f".{RUNTIME_HOLD}.tmp."):   # not a whole copy: alive only while its maker is
+            try:
+                live = [int(n.rsplit(".", 1)[1])]
+            except ValueError:
+                pass
+        elif n.startswith(RUNTIME_HOLD):
+            live = _hold_pids(d / HOLD_PID) + _hold_pids(d / HOLD_PIDS)
+        else:
+            continue
+        if not any(pid_alive(pid) for pid in live):
+            shutil.rmtree(d, ignore_errors=True)
 
 
 @contextmanager
 def runtime_hold(harness: str | Path) -> Iterator[None]:
-    """While git rewrites a harness checkout's files one by one (the upgrade's merge), its launcher runs a
-    whole copy of the runtime from before (.git/RUNTIME_HOLD, made and renamed into place first): a process
-    starting meanwhile never sees new code beside an old module, nor beside a module git has not written
-    yet or has already removed. Its pid file goes once the merge ends, so the next launch runs the merged
-    runtime whole; the copy itself stays for processes started on it, until the next hold replaces it. Without a copy (no .git directory, or it could not be made) git writes as before."""
+    """While git rewrites a harness checkout's files one by one (a merge), its launcher runs a whole
+    copy of the runtime from before (.git/RUNTIME_HOLD.<pid>, marked live by its .pid only once
+    complete): a process starting meanwhile never sees new code beside an old module, nor beside a
+    module git has not written yet or has already removed. Its pid file goes once the merge ends, so
+    the next launch runs the merged runtime whole; the copy itself stays for the processes that
+    started on it (each noted in its .pids) until a later hold finds nothing running from it. Without
+    a copy (no .git directory, or it could not be made) git writes as before."""
     h = Path(harness)
-    hold, src = h / ".git" / RUNTIME_HOLD, h / "runtime"
-    tmp = hold.with_name(f"{hold.name}.{os.getpid()}")
-    for d in (tmp, hold):   # a crashed upgrade's copy (its holder gone)
-        shutil.rmtree(d, ignore_errors=True)
+    git = h / ".git"
+    _drop_dead_holds(git)
+    hold = git / f"{RUNTIME_HOLD}.{os.getpid()}.{time.time_ns()}"
+    tmp = git / f".{RUNTIME_HOLD}.tmp.{os.getpid()}"
+    shutil.rmtree(tmp, ignore_errors=True)   # a copy this process died half-way through making
+    held = False
     try:
-        shutil.copytree(src, tmp, symlinks=True, ignore=shutil.ignore_patterns("__pycache__"))
-        (tmp / HOLD_PID).write_text(str(os.getpid()))
+        shutil.copytree(h / "runtime", tmp, symlinks=True, ignore=shutil.ignore_patterns("__pycache__"))
         os.rename(tmp, hold)
+        (hold / HOLD_PID).write_text(str(os.getpid()))
         held = True
     except OSError:
         shutil.rmtree(tmp, ignore_errors=True)
-        held = False
+        shutil.rmtree(hold, ignore_errors=True)
     try:
         yield
     finally:
-        if held:   # the copy stays for what started on it and loads modules later; the next hold clears it
+        if held:   # the copy stays for what started on it and loads modules later; a later hold clears it
             (hold / HOLD_PID).unlink(missing_ok=True)
 
 

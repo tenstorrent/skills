@@ -124,10 +124,10 @@ def _differs(h: Path, files: list[str]) -> set[str]:
 
 def _put_back(h: Path, files: list[str]) -> list[str]:
     """Put each file back to HEAD's version (deleting one HEAD lacks); the ones that differed."""
-    from .project import tree_writes
+    from .project import runtime_hold, tree_writes
     changed = _differs(h, files)
     out = []
-    with tree_writes(h):
+    with tree_writes(h), runtime_hold(h):
         for f in sorted(changed):
             if _git(h, "cat-file", "-e", f"HEAD:{f}").returncode == 0:
                 _git(h, "checkout", "HEAD", "--", f)
@@ -163,8 +163,8 @@ def recover(p, daemon_started: float | None = None, restart=None, log=print) -> 
     finished = st in ("merged", "restarting")
     if st == "merging":
         if _git(h, "rev-parse", "-q", "--verify", "MERGE_HEAD").returncode == 0:
-            from .project import tree_writes
-            with tree_writes(h):
+            from .project import runtime_hold, tree_writes
+            with tree_writes(h), runtime_hold(h):
                 _git(h, "merge", "--abort")
         files = _put_back(h, _touched(h, base, merged))
         sync_all()

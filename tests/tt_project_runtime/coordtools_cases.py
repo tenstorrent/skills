@@ -1223,9 +1223,9 @@ _HARNESS_EXPR = {"p.harness", "h", "harness", "self.harness", "self.p.harness", 
 _TREE_GIT_EXEMPT = {("landff.py", "_why_not")}
 
 
-def _harness_git_writers(source: str):
+def _harness_git_writers(source: str, ctx: str = "tree_writes"):
     """(function, line, command) of each git command in `source` that can change tracked files in a
-    harness checkout and runs outside `with tree_writes(...)`."""
+    harness checkout and runs outside `with <ctx>(...)`."""
     import ast
     tree = ast.parse(source)
     parent = {c: n for n in ast.walk(tree) for c in ast.iter_child_nodes(n)}
@@ -1269,7 +1269,7 @@ def _harness_git_writers(source: str):
         while node in parent:
             node = parent[node]
             if isinstance(node, (ast.With, ast.AsyncWith)) and any(
-                    isinstance(i.context_expr, ast.Call) and ast.unparse(i.context_expr.func).endswith("tree_writes")
+                    isinstance(i.context_expr, ast.Call) and ast.unparse(i.context_expr.func).endswith(ctx)
                     for i in node.items):
                 wrapped = True
             if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and not fn:
@@ -1277,6 +1277,16 @@ def _harness_git_writers(source: str):
         if not wrapped:
             out.append((fn, call.lineno, sub))
     return out
+
+
+def test_every_git_writer_on_the_harness_checkout_holds_the_runtime():
+    """A git command that rewrites a harness checkout's tracked files can change the runtime a
+    launcher imports from, one file at a time: it runs under project.runtime_hold, so a process
+    starting meanwhile runs the whole runtime from before, never a half-written mix."""
+    bad = [(f.name, fn, line, sub) for f in sorted((RUNTIME / "ttp").glob("*.py"))
+           for fn, line, sub in _harness_git_writers(f.read_text(), "runtime_hold")
+           if (f.name, fn) not in _TREE_GIT_EXEMPT]
+    assert not bad, f"git writers on the harness checkout outside project.runtime_hold: {bad}"
 
 
 def test_every_git_writer_on_the_harness_checkout_logs_its_protected_writes():

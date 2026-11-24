@@ -26,16 +26,33 @@ if (sys.argv[1:2] in (["setup"], ["upgrade"]) and os.path.isdir(RUNTIME)
                  "`<plugin-root>/bin/ttp %s` from the plugin instead" % (HERE, installed, sys.argv[1]))
     if os.path.realpath(installed) != os.path.realpath(__file__):
         os.execv(sys.executable, [sys.executable, installed] + sys.argv[1:])
-# While `ttp upgrade` rewrites a harness's files one by one, it holds a whole copy of the runtime from
-# before in .git (project.runtime_hold): run that copy, never a half-written mix, while its holder lives
-# (a crashed upgrade's copy an hour old is never run, whoever has its pid by then).
-HOLD = os.path.join(os.path.dirname(HERE), ".git", "ttp-runtime-hold")
+# While a merge rewrites a harness's files one by one, it holds a whole copy of the runtime from
+# before in .git (project.runtime_hold): run the newest such copy whose holder lives, never a
+# half-written mix, and note this process in it, so it stays whole while this runs from it.
+RUNTIME = os.path.join(os.path.dirname(HERE), "runtime")
 try:
-    with open(os.path.join(HOLD, ".pid")) as f:
-        if os.fstat(f.fileno()).st_mtime > time.time() - 3600:
-            os.kill(int(f.read()), 0)
-            RUNTIME = HOLD
-except (OSError, ValueError):
+    GIT, best = os.path.join(os.path.dirname(HERE), ".git"), (0.0, "")
+    for name in os.listdir(GIT):
+        if not name.startswith("ttp-runtime-hold"):
+            continue
+        try:
+            with open(os.path.join(GIT, name, ".pid")) as f:
+                mtime = os.fstat(f.fileno()).st_mtime
+                if mtime <= time.time() - 3600:
+                    continue          # a crashed merge's copy is never run, whoever has its pid by then
+                os.kill(int(f.read()), 0)
+        except (OSError, ValueError):
+            continue
+        if mtime > best[0]:
+            best = (mtime, os.path.join(GIT, name))
+    if best[1]:
+        RUNTIME = best[1]
+        try:
+            with open(os.path.join(RUNTIME, ".pids"), "a") as f:
+                f.write("%d\n" % os.getpid())
+        except OSError:
+            pass
+except OSError:
     pass
 # Only this launcher's own runtime may run: inside a worker PYTHONPATH names the harness's runtime, and
 # `ttp setup` would silently reinstall that one.

@@ -727,10 +727,10 @@ def test_a_finish_task_queued_before_a_hold_cannot_apply_without_override_hold(e
     assert [ln.split(" mode=")[1].split()[0] for ln in _upgrade_log_lines(p)][-2:] == ["apply", "apply+override-hold"]
 
 
-def test_the_harness_launcher_runs_the_held_runtime_while_an_upgrade_rewrites_it_and_the_merged_one_after(tmp_path):
-    """git writes a harness's runtime file by file: while project.runtime_hold holds it, the launcher runs the
-    whole copy from before, never new code beside a package that lacks the module it imports; after the hold,
-    the merged runtime. A held copy whose holder is gone is never run."""
+def test_the_harness_launcher_runs_the_held_runtime_while_a_merge_rewrites_it_and_the_merged_one_after(tmp_path):
+    """git writes a harness's runtime file by file: while project.runtime_hold holds it, the launcher
+    runs the whole copy from before, never new code beside a package that lacks the module it imports;
+    after the hold, the merged runtime. A held copy whose holder is gone is never run."""
     from ttp import project
     h = tmp_path / "harness"
     (h / "bin").mkdir(parents=True)
@@ -742,6 +742,8 @@ def test_the_harness_launcher_runs_the_held_runtime_while_an_upgrade_rewrites_it
     (pkg / "cli.py").write_text("def main():\n    print('old')\n")
     clean = {k: v for k, v in os.environ.items() if k not in ("PYTHONPATH", "TTP_PYTHON")}
 
+    def holds():
+        return [d for d in (h / ".git").iterdir() if d.name.startswith(project.RUNTIME_HOLD)]
     def launch():
         r = subprocess.run([sys.executable, str(h / "bin" / "ttp")], capture_output=True, text=True,
                            env=clean, timeout=60)
@@ -752,9 +754,50 @@ def test_the_harness_launcher_runs_the_held_runtime_while_an_upgrade_rewrites_it
         assert launch() == "old"
         (pkg / "extra.py").write_text("SAY = 'new'\n")
         assert launch() == "old"
-    assert launch() == "new" and not (h / ".git" / project.RUNTIME_HOLD / project.HOLD_PID).exists()
-    # A copy left by an upgrade that died mid-merge: its holder pid is gone, so the launcher runs the tree.
+        assert len(holds()) == 1 and (holds()[0] / project.HOLD_PID).exists()
+    assert launch() == "new" and holds() and not any((d / project.HOLD_PID).exists() for d in holds())
+    # A copy left by a merge that died mid-way: its holder pid is gone, so the launcher runs the tree.
     gone = subprocess.Popen([sys.executable, "-c", "pass"])
     gone.wait()
-    (h / ".git" / project.RUNTIME_HOLD / project.HOLD_PID).write_text(str(gone.pid))
+    stale = holds()[0]
+    (stale / project.HOLD_PID).write_text(str(gone.pid))
     assert launch() == "new"
+    # A copy whose holder is past its hour is never run either, whoever has its pid by then.
+    os.utime(stale / project.HOLD_PID, (time.time() - 7200,) * 2)
+    assert launch() == "new"
+
+
+def test_a_new_hold_keeps_a_copy_a_live_process_still_runs_from(tmp_path):
+    """Each hold copy is its own directory, so the next hold cannot sweep one a process still runs
+    from: the launcher notes the processes it started on a copy (.pids), and a hold drops only
+    copies whose holder is dead and that no live process recorded itself in."""
+    from ttp import project
+    h = tmp_path / "harness"
+    (h / "bin").mkdir(parents=True)
+    (h / ".git").mkdir()
+    shutil.copy2(RUNTIME.parent / "template" / "bin" / "ttp", h / "bin" / "ttp")
+    pkg = h / "runtime" / "ttp"
+    pkg.mkdir(parents=True)
+    (pkg / "__init__.py").write_text('__version__ = "1"\n')
+    (pkg / "cli.py").write_text("import time\n\ndef main():\n    time.sleep(30)\n")
+    clean = {k: v for k, v in os.environ.items() if k not in ("PYTHONPATH", "TTP_PYTHON")}
+
+    def holds():
+        return sorted(d for d in (h / ".git").iterdir() if d.name.startswith(project.RUNTIME_HOLD))
+    with project.runtime_hold(h):          # a listener starts on the held copy and stays running
+        (pkg / "cli.py").write_text("import time\n\ndef main():\n    print('x')\n")
+        proc = subprocess.Popen([sys.executable, str(h / "bin" / "ttp")], stdout=subprocess.PIPE,
+                                stderr=subprocess.PIPE, text=True, env=clean)
+        time.sleep(1.0)
+        first = holds()
+        assert len(first) == 1 and (first[0] / project.HOLD_PID).read_text() == str(os.getpid())
+        assert (first[0] / project.HOLD_PIDS).read_text().split() == [str(proc.pid)]
+    with project.runtime_hold(h):          # the next hold: the copy the listener runs from stays
+        assert holds()[:1] == first and not (first[0] / project.HOLD_PID).exists()
+        second = [d for d in holds() if d not in first]
+        assert len(second) == 1, "the new hold made its own copy"
+    proc.terminate()
+    proc.wait()
+    with project.runtime_hold(h):          # nothing runs from any copy now: all gone but the new one
+        left = holds()
+    assert len(left) == 1 and left[0] != first[0], "only the newest hold's copy is left"

@@ -911,3 +911,48 @@ def test_a_harness_checkout_that_is_a_linked_worktree_still_moves_the_sweep_stam
     time.sleep(0.01)
     _commit_in_harness_tree(linked, "prompts/x.md", "x\n", "moves the linked checkout's HEAD")
     assert harnesstree._stamp(q, b) != before
+
+
+def test_a_land_that_rewrites_the_runtime_holds_it_for_the_launcher(env, monkeypatch):
+    """A land's fast-forward rewrites the checkout's files one by one; while it does, the launcher
+    must run the whole runtime from before the land, never the new code beside a module git has not
+    written yet. The merge runs under project.runtime_hold, like the upgrade's."""
+    p = make(env)
+    from ttp import harnesstree
+
+    def stub(tree, cli, extra=""):
+        pkg = tree / "runtime" / "ttp"
+        for f in pkg.iterdir():
+            if f.is_file():
+                f.unlink()
+        (pkg / "__init__.py").write_text('__version__ = "1"\n')
+        (pkg / "cli.py").write_text(cli)
+        if extra:
+            (pkg / "extra.py").write_text(extra)
+        _hgit(tree, "add", "-A", "runtime")
+        _hgit(tree, "commit", "-q", "-m", "stub runtime")
+
+    stub(p.harness, "def main():\n    print('old')\n")
+    _harness_run(p, _harness_task(p, "other"))   # the checkout is busy: the task gets a worktree
+    tid = _harness_task(p, "runtime land")
+    own = harnesstree.workdir(p, tid)
+    stub(own, "from . import extra\n\ndef main():\n    print(extra.SAY)\n", "SAY = 'new'\n")
+    p.db.update_task(tid, status="done")
+    clean = {k: v for k, v in os.environ.items() if k not in ("PYTHONPATH", "TTP_PYTHON")}
+
+    def launch():
+        r = subprocess.run([sys.executable, str(p.harness / "bin" / "ttp")], capture_output=True,
+                           text=True, env=clean, timeout=60)
+        return r.stdout.strip() or r.stderr.strip().splitlines()[-1]
+    mid = []
+    real_git = harnesstree._git
+
+    def git_loud(cwd, *args, **kw):
+        r = real_git(cwd, *args, **kw)
+        if cwd == p.harness and args[:1] == ("read-tree",) and "-u" in args and "-n" not in args:
+            mid.append(launch())   # a process starts while the merge is writing the tree
+        return r
+    monkeypatch.setattr(harnesstree, "_git", git_loud)
+    assert harnesstree.land(p, tid) == "merged"
+    assert mid == ["old"], "a launcher starting mid-merge ran the runtime from before the land"
+    assert launch() == "new"

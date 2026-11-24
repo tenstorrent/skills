@@ -32,7 +32,7 @@ import subprocess
 import time
 from pathlib import Path
 
-from .project import MEMORY_PATHS, Project, durable_write, git_fsync_args, tree_writes
+from .project import MEMORY_PATHS, Project, durable_write, git_fsync_args, runtime_hold, tree_writes
 from . import gitmemo
 from .gitlocks import git_dir
 
@@ -302,7 +302,7 @@ def _fast_forward(p: Project, tid: int, before: str, merged: str) -> subprocess.
         return subprocess.CompletedProcess([], 1, "", "Your local changes to the following files would be "
                                            "overwritten by merge (land left them as they are):\n\t"
                                            + "\n\t".join(keep or [f for f, _ in stage]))
-    with tree_writes(h):
+    with tree_writes(h), runtime_hold(h):   # the launcher runs the whole runtime from before the merge
         for f, _ in stage:
             _git(h, "update-index", "--add", "--", f)
         r = _git(h, "read-tree", "-m", "-u", "-n", before, merged, timeout=120)   # would git refuse?
@@ -528,7 +528,7 @@ def to_main(p: Project, task: int | str | None = None, env: dict | None = None) 
     if (changed := tracked_changes(h)):
         shown = ", ".join(changed[:5]) + (f" and {len(changed) - 5} more" if len(changed) > 5 else "")
         return "dirty", here, f"{h} is on {where} with uncommitted changes ({shown})"
-    with tree_writes(h):
+    with tree_writes(h), runtime_hold(h):   # the checkout move rewrites files the launcher imports
         r = gitmemo.run(["git", "-C", str(h), *git_fsync_args(), "checkout", "-q", main], capture_output=True,
                         text=True, timeout=120, env=env)
     if r.returncode != 0 or on_branch(h) != main:
@@ -658,7 +658,7 @@ def sweep(p: Project, running: set[int]) -> dict[int, str]:
     # MERGE_HEAD read first: no git a tick while no merge is under way
     if (g := git_dir(p.harness)) and (g / "MERGE_HEAD").exists() and _is_repo(p) and landing_merge(p.harness):
         # a merge of ours a killed daemon left: undo it first
-        with tree_writes(p.harness):
+        with tree_writes(p.harness), runtime_hold(p.harness):
             _git(p.harness, "merge", "--abort")
     out = {}
     settled = _SETTLED.setdefault(str(p.harness), {})

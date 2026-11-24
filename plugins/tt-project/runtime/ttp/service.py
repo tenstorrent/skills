@@ -29,7 +29,7 @@ from datetime import datetime
 from pathlib import Path
 
 from . import poll_s
-from .project import Project, durable_write, open_append_or_null, tree_writes
+from .project import Project, durable_write, open_append_or_null, runtime_hold, tree_writes
 from . import gitmemo, hoststate
 
 
@@ -1308,7 +1308,7 @@ def _roll_back(p: Project, msg: str, judged: float, stopped: float, stop_s: floa
         _git(h, "add", "-A", "--", "runtime")
         _git(h, "commit", "-q", "-m", "runtime edits in place when the daemon failed to start")
         changed = _git(h, "log", "--format=%h %s", f"{good}..HEAD", "--", "runtime").stdout.strip()
-    with tree_writes(h):
+    with tree_writes(h), runtime_hold(h):
         if _git(h, "restore", f"--source={good}", "--staged", "--worktree", "--", "runtime").returncode != 0:
             _git(h, "checkout", good, "--", "runtime")    # git older than 2.23
     _git(h, "commit", "-q", "-m", f"roll back runtime to {good[:10]}: the daemon did not start with it")

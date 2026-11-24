@@ -1750,7 +1750,9 @@ def _listen_loop(p: Project, db, a, after: int, floor: str) -> None:
         if late:
             return
         # Code an upgrade changed on disk under this long-running listener: run it again with that code
-        # (the cursor above is saved first), once the files settled, so a lazy import never meets a mix.
+        # (the cursor above is saved first), once the new tree has settled (checkcap.upgraded), so a
+        # lazy import never meets a mix; after an ImportError it cannot tell settled from changing, so
+        # it waits UPGRADE_SETTLE_S and runs again, settled or not.
         new = checkcap.upgraded()
         if new or (broke and time.time() - broke >= checkcap.UPGRADE_SETTLE_S):
             _listen_reexec(new or "import-failure", read, deadline)
@@ -14601,7 +14603,7 @@ def _upgrade(p: Project, auto: bool = False, explicit: bool = False, took_over: 
     _harness_to_main(p, "upgrade not applied", f"ttp upgrade {p.name}", auto=auto)
     emptied = _emptied(h, None, "HEAD")
     if emptied:      # a crash cut these short: they are damage, not local edits to commit and keep
-        with tree_writes(h):
+        with tree_writes(h), runtime_hold(h):
             _git(h, "checkout", "HEAD", "--", *emptied)
         print("restored files a crash left empty: " + ", ".join(emptied))
     if undone := _undo_template_rollback(h, ident):
@@ -15538,7 +15540,7 @@ def _undo_template_rollback(h: Path, ident: list[str]) -> str:
     mb = git("merge-base", "upstream", before).stdout.strip()
     if not mb or git("merge-base", "--is-ancestor", mb, good).returncode != 1:
         return ""       # it rolled back no template merge (a local runtime edit): kept
-    with tree_writes(h):
+    with tree_writes(h), runtime_hold(h):
         if git("restore", f"--source={before}", "--staged", "--worktree", "--", "runtime").returncode != 0:
             git("checkout", before, "--", "runtime")     # git older than 2.23
         r = git(*ident, "commit", "-q", "-m", f"re-apply runtime rolled back by {sha[:10]}: ttp upgrade retries "
@@ -15559,7 +15561,7 @@ def _restore_cut_runtime(h: Path) -> None:
         return
     for f in cut:
         src = "upstream" if _why_cut(f, _blob(h, "HEAD", f), _blob(h, "upstream", f) or b"") else "HEAD"
-        with tree_writes(h):
+        with tree_writes(h), runtime_hold(h):
             r = subprocess.run(["git", "-C", str(h), "checkout", src, "--", f], capture_output=True, text=True)
         if r.returncode != 0:
             die(f"upgrade refused: {f} is {cut[f]} and could not be restored from {src}: "
