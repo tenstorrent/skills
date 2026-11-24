@@ -140,7 +140,7 @@ def test_a_claim_naming_a_sha_this_repo_does_not_have_stays_as_written(env, monk
 
 
 def test_the_foreign_sha_rule_follows_the_one_sha_phrase_parse(env, monkeypatch):
-    """Review #9726: the sha a sentence names is read by the one sha-phrase parse, so its case,
+    """The sha a sentence names is read by the one sha-phrase parse, so its case,
     negation and word rules hold here too: an uppercase foreign sha leaves the claim as written; a
     negated phrase ('never pushed as <sha>') or an all-hex word ('defaced') names no commit, so the
     sentence's bare claim is still checked against the task head."""
@@ -197,11 +197,11 @@ def test_a_hand_off_with_a_push_still_in_flight_is_not_locally_corrected(env, mo
     assert res["summary"] == f"Hardening landed at {head[:10]}.", res   # as written, not 'not landed'
 
 
-@pytest.mark.parametrize("handoff_status", ["blocked", "failed"])
+@pytest.mark.parametrize("handoff_status", ["blocked", "failed", "needs_review"])
 def test_a_hand_off_not_deferred_to_the_remote_check_is_corrected_despite_a_push_in_flight(
         env, monkeypatch, handoff_status):
-    """Review #9726: only a hand-off the remote check will settle skips the local correction. A
-    blocked or failed one is never deferred, so its false 'landed at <sha>' still reads 'not landed'."""
+    """Only a hand-off the remote check will settle skips the local correction. A
+    blocked, failed or approval-needing one is never deferred, so its false 'landed at <sha>' still reads 'not landed'."""
     task, res, head = _in_flight_finish(env, monkeypatch, handoff_status)
     assert task["status"] != "pushing", task["status"]
     assert "not landed" in res["summary"] and head[:12] in res["summary"], res
