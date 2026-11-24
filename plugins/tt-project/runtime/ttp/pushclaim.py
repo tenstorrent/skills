@@ -27,7 +27,14 @@ null: a reboot, a killed run, a push queued and never started) while its commit 
 Its repo is the one the marker names, else (a task worktree since pruned) the project root.
 Accepted gap: when that fallback root is another repository than the push's, a remote it lacks makes
 the claim UNVERIFIABLE rather than checked on the remote the push used. The audit confirms such a
-claim, or one left UNKNOWN, when its commit is an ancestor of the target's local tracking ref."""
+claim, or one left UNKNOWN, when its commit is an ancestor of the target's local tracking ref.
+
+A hand-off that claims its change landed naming no commit is checked the same way (landed_claims):
+a sentence naming the push branch, or saying 'landed' while naming no other destination, is
+corrected to read 'not landed' when the run's head is not on that branch. Known gap: a sha-less
+claim that names another destination (pushed to its own branch, merged into a PR branch) names no
+ref the checks can read, so it is not checked and stays as written.
+"""
 from __future__ import annotations
 
 import json
@@ -79,9 +86,12 @@ _LANDED_VERB = re.compile(r"(?i)\b(landed|pushed|merged)\b")
 _LANDED_SUBJECT = re.compile(r"(?i)\b(?:changes?|works?|fix(es)?|patch(es)?|commits?|head|branch(es)?"
                              r"|pr|diffs?)\b")
 # A destination a sha-less claim's sentence names for its run's own work: another branch, a PR,
-# a fork, another repository. Naming one keeps the sentence out of the push-branch check.
-_LANDED_DEST = re.compile(r"(?i)\b(?:upstream|forks?|repo(?:sitory)?s?|pull request|pr\b|main|master"
-                           r"|trunk|[a-z0-9_./-]+/[a-z0-9_./-]+|\w+\s+branch)")
+# a fork, another repository. Naming one keeps the sentence out of the push-branch check; "the
+# branch" and "this branch" name no other destination. A slash token is one only as a ref a
+# movement word names, decided by _other_destination.
+_LANDED_DEST = re.compile(r"(?i)\b(?:upstream|forks?|repo(?:sitory)?s?|pull request|pr|main|master"
+                           r"|trunk|(?!(?:the|this)\s+branch)\w+\s+branch(?:es)?)\b")
+_SLASH_DEST = re.compile(r"(?i)\b(?:into|onto|to|on)\s+([a-z0-9_./-]+/[a-z0-9_./-]+)")
 UNVERIFIED_CLAIM = "(unverified)"      # a landed-claim this project cannot check, never a plain 'landed'
 NOT_LANDED = "not landed"              # the correction a claim off the push branch reads
 
@@ -177,14 +187,25 @@ def text_claims(p, text: str, repo=None) -> list[dict]:
     return out
 
 
+def _other_destination(text: str) -> bool:
+    """Whether a sha-less claim's sentence names another destination for its run's own work: one of
+    the destination words, or a slash token a movement word (to, into, onto, on) names as a ref —
+    never a ratio (682/682), "and/or" or a file path."""
+    if _LANDED_DEST.search(text):
+        return True
+    return any(tok.lower() != "and/or" and not re.fullmatch(r"\d+/\d+", tok) and "." not in tok
+               for tok in (m.group(1) for m in _SLASH_DEST.finditer(text)))
+
+
 def _names_push_branch(sentence: str, target) -> bool:
     """Whether a claim's sentence names the project's push branch: the words 'the push branch',
     or its configured name (`origin/proj`, or the branch name alone)."""
     if "push branch" in sentence.lower():
         return True
-    return bool(target) and bool(re.search(
-        rf"\b{re.escape(target[0] + '/' + target[1][len('refs/heads/'):])}\b|"
-        rf"\b{re.escape(target[1][len('refs/heads/'):])}\b", sentence))
+    if not target:
+        return False
+    full, name = re.escape(target[0] + '/' + target[1][len('refs/heads/'):]), re.escape(target[1][len('refs/heads/'):])
+    return bool(re.search(rf"(?<![\w.-]){full}(?![\w/-])|(?<![\w/.-]){name}(?![\w/-])", sentence))
 
 
 def landed_claims(p, text: str, repo) -> list[tuple[int, int, str, tuple]]:
@@ -217,7 +238,7 @@ def landed_claims(p, text: str, repo) -> list[tuple[int, int, str, tuple]]:
         # says 'landed' naming no destination: a push or merge to the run's own branch, a PR
         # branch or a fork is another destination's business and stays as written.
         if not (_names_push_branch(text[lo:hi], target)
-                or (m.group(1).lower() == "landed" and not _LANDED_DEST.search(text[m.end():hi]))):
+                or (m.group(1).lower() == "landed" and not _other_destination(text[m.end():hi]))):
             continue
         out.append((m.start(), m.end(), "", None))
     return out

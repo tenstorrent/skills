@@ -97,6 +97,24 @@ def test_a_push_of_something_else_is_no_landing_claim(env, monkeypatch):
         assert pushclaim.correct_landed_claims(p, text, p.root, head) == text, text
 
 
+def test_a_plain_landed_sentence_that_names_no_destination_is_checked(env, monkeypatch):
+    """A plain 'landed' sentence whose remainder merely mentions a report, a 'main'-prefixed word, a
+    count, a file path, 'and/or', 'forked' or 'the branch' names no other destination, so the claim
+    is checked against the task head and corrected when nothing landed."""
+    from ttp import pushclaim
+    p, repo, head = _claim_replay_setup(env, monkeypatch, landed=False)
+    for text in ("The change landed and the report is attached.",
+                 "The change landed, mainly in the parser.",
+                 "The change landed and maintains the old API.",
+                 "The change landed: smoke 682/682 passed.",
+                 "The change landed in plugins/tt-project/runtime/ttp/pushclaim.py.",
+                 "The fix landed and/or was deployed.",
+                 "The fix landed in the forked worktree.",
+                 "The fix landed on the branch."):
+        fixed = pushclaim.correct_landed_claims(p, text, p.root, head)
+        assert "not landed" in fixed and head[:12] in fixed, (text, fixed)
+
+
 def test_a_sha_less_claim_naming_the_push_branch_is_checked(env, monkeypatch):
     """A sha-less claim whose sentence names the push branch is checked against the task head even
     when its verb is a push or a merge: the correction still reads 'not landed' when the branch
