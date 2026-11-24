@@ -223,7 +223,7 @@ NOT_POST_RE = re.compile(rf"(?:^|_){_READS}(?:_|$)|^{_READS}(?=[A-Z_]|$)")
 # An event or invite others get only when it names guests (an event on one's own calendar is not a post).
 EVENT_TOOL_RE = re.compile(r"(?:create|update|edit|add|schedule|send|quick)[\w-]*?(?:event|invit|meeting)", re.I)
 # The claude.ai Slack connector labels its own posts as written by Claude; its drafts are the user's to send.
-LABELLED_SERVER_RE = re.compile(r"^claude_ai_slack$", re.I)
+LABELLED_SERVER = "claude_ai_slack"
 GUEST_KEY_RE = re.compile(r"attendee|guest|invitee|participant|recipient", re.I)
 # A field of its input that carries the text people read (key words compared without case, `_` or `-`).
 TEXT_KEYS = ("text", "message", "body", "comment", "description", "markdown", "html", "content")
@@ -291,7 +291,7 @@ def posts(tool_name: str, tool_input=None) -> bool:
         return False
     parts = tool_name.split("__", 2)
     server, own = (parts[1] if len(parts) > 2 else ""), parts[-1]
-    if NOT_POST_RE.search(own) or LABELLED_SERVER_RE.match(server) and "draft" not in own.lower():
+    if NOT_POST_RE.search(own) or server.lower() == LABELLED_SERVER and "draft" not in own.lower():
         return False
     return bool(POST_TOOL_RE.search(own)) or bool(EVENT_TOOL_RE.search(own)) and _guests(tool_input)
 
