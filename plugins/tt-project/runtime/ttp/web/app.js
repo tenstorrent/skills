@@ -19,6 +19,15 @@ const showFile = async (path) => {
                        : ("<b>" + esc(r.name) + "</b><pre>" + esc(r.text) + "</pre>");
   v.classList.add("on");
 };
+// A run link's target: the run's own progress, result and stderr tails, in the file view pane.
+async function showRun(id) {
+  const r = await api(`/api/run/${encodeURIComponent(id)}`);
+  const v = $("#fileview");
+  v.innerHTML = r.error ? `<p class="meta">${esc(r.error)}</p>`
+    : `<b>run ${esc(id)}</b>` + [["progress", r.progress], ["result", r.result], ["stderr", r.stderr]]
+      .filter(([, t]) => t).map(([k, t]) => `<p class="meta">${k}</p><pre>${esc(t)}</pre>`).join("");
+  v.classList.add("on");
+}
 const money = (x) => `$${(+x || 0).toFixed(2)}`;
 // Every time is shown in the project's home zone (the daemon sends it), with its abbreviation: never
 // this browser's zone or the zone of the machine the project runs on.
@@ -36,7 +45,9 @@ const zoneFmt = (day) => {
 const at = (ts) => ts ? zoneFmt(Math.abs(ts - Date.now() / 1000) >= 20 * 3600).format(new Date(ts * 1000)) : "—";
 
 let TOKEN = new URLSearchParams(location.hash.slice(1)).get("token") || sessionStorage.getItem("ttp_token") || "";
-const FILE = new URLSearchParams(location.hash.slice(1)).get("file");   // a file link a message carries
+const Q = new URLSearchParams(location.hash.slice(1));
+const FILE = Q.get("file");            // a file link a message carries
+const TASK = Q.get("task"), RUN = Q.get("run"), MSG = Q.get("msg");   // and an id link: its page
 // The token lives only in this tab's sessionStorage and goes out as the X-TTP-Token header, never
 // in a cookie (cookies are not scoped by port). Expire the cookie older versions wrote.
 document.cookie = "ttp_token=; Max-Age=0; SameSite=Strict; path=/";
@@ -123,7 +134,7 @@ function trendHtml(series) {
 function taskRow(t) {
   const label = deferred(t) ? esc(t.starts) : waiting(t) ? esc(t.waiting || "waiting") : held(t) ? heldAs(t) : depWait(t) ? esc(depWait(t)) : t.review_since ? `review ${agoH(t.review_since)}` : t.status === "pushing" ? "approved, pushing" : t.outcome === "changes_needed" ? "changes needed" : esc(t.status);
   const noteLabel = t.status === "blocked" ? "Blocked" : waiting(t) ? "Waiting" : held(t) ? "Held" : "Note";
-  return `<details class="row"><summary><span class="id">#${t.id}</span> <span class="st st-${t.outcome || t.status}">${label}</span>
+  return `<details class="row" id="task-${t.id}"><summary><span class="id">#${t.id}</span> <span class="st st-${t.outcome || t.status}">${label}</span>
     <span class="title">${esc(t.title)}</span> <span class="meta">${esc(t.tier)} · ${money(t.spent_usd)}${t.budget_usd ? " / " + money(t.budget_usd) : ""} · ${agoH(t.updated)} ago${t.pr_url ? ` · ${isHttp(t.pr_url) ? link(t.pr_url, "PR") : "PR " + esc(t.pr_url)}` : ""}</span></summary>
     ${t.wait ? `<p class="meta">${esc(t.wait.text)} (${esc(t.wait.age_text)})</p>` : ""}${t.blocking_step ? `<p class="meta">${esc(t.blocking_step)}</p>` : ""}${t.eta ? `<p class="meta">${esc(t.eta)}</p>` : ""}${topupWords(t.budget_topups) ? `<p class="meta">${esc(topupWords(t.budget_topups))}</p>` : ""}${(t.job_use || []).map((x) => `<p class="meta">${esc(x)}</p>`).join("")}${t.start_when ? `<p class="meta">start check: <code>${esc(t.start_when)}</code></p>` : ""}${t.gate ? `<p class="meta">${t.gate.warn ? "<b>warning:</b> " : ""}${esc(t.gate.text)}</p>` : ""}
     ${t.blocked_reason ? `<p><b>${noteLabel}:</b> ${esc(t.blocked_reason)}</p>` : ""}${t.result ? `<p>${esc(t.result)}</p>` : ""}${trendHtml(t.trend)}
@@ -423,7 +434,7 @@ async function pollChat() {
   let rows; try { rows = await api(`/api/messages?after=${lastMsg}`); } catch (e) { return; }
   const log = $("#log"), atBottom = log.scrollHeight - log.scrollTop - log.clientHeight < 40;
   rows.forEach((m) => { lastMsg = Math.max(lastMsg, m.id);
-    const d = document.createElement("div"); d.className = `msg ${m.direction} sev-${m.severity}`;
+    const d = document.createElement("div"); d.className = `msg ${m.direction} sev-${m.severity}`; d.id = "msg-" + m.id;
     const where = m.chat === null ? (m.direction === "out" ? " · to everyone" : "")
       : m.chat === "web" ? "" : ` · chat ${esc(m.chat_label || m.chat)}`;
     d.innerHTML = `<div class="b">${mdLinks(esc(m.text))}</div><div class="meta">${agoH(m.ts)} ago${where}</div>`;
@@ -435,6 +446,18 @@ $("#say").onsubmit = async (e) => { e.preventDefault(); const t = $("#msg").valu
 
 refresh(); pollChat();
 if (FILE) showFile(FILE).catch(() => {});
+// A message's id links land on the row they name: the tab opens, the row scrolls into view and
+// is highlighted, so the reader never has to find it. A run link opens the run's own page.
+if (TASK || MSG) {
+  document.querySelector(`#tabs button[data-tab="${TASK ? "tasks" : "chat"}"]`).click();
+  const sel = TASK ? "#task-" + TASK : "#msg-" + MSG;
+  const focus = () => { const el = document.querySelector(sel);
+    if (el) { el.scrollIntoView({ block: "center" }); el.classList.add("flash"); }
+    else if (++tries < 40) setTimeout(focus, 250); };   // the row arrives with the next state render
+  let tries = 0;
+  focus();
+}
+if (RUN) showRun(RUN).catch(() => {});
 // A hidden tab still looks once 30 s have passed since its last look (by the clock:
 // browsers slow timers in long-hidden tabs), so its notifications still come; it also looks when shown.
 let lastLook = Date.now();

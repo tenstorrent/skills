@@ -6,7 +6,8 @@ from __future__ import annotations
 CFG = {"jira_base": "https://example.atlassian.net", "jira_keys": ["EX"],
        "repos": {"smi": "example-org/example-smi"}, "single_repo": "",
        "file_url": lambda p: f"http://127.0.0.1:9/#token=ab&file={p}" if p.endswith(".json") else None,
-       "is_file": lambda p: p.endswith(".json")}
+       "is_file": lambda p: p.endswith(".json"),
+       "ref_url": lambda n, kind: f"http://127.0.0.1:9/#token=ab&{kind or 'task'}={n}" if n == 5 else None}
 
 
 def test_linkify_turns_each_reference_shape_into_a_link():
@@ -20,13 +21,26 @@ def test_linkify_turns_each_reference_shape_into_a_link():
     assert "`EX-7`" in out                 # a code span is never linkified
 
 
-def test_linkify_links_pr_words_only_with_one_repo_and_never_a_bare_number():
+def test_linkify_links_pr_words_only_with_one_repo_and_a_number_is_an_id_link():
     from ttp import links
     assert "](https://github.com/example-org/one/issues/9)" in \
         links.linkify("PR #9", {"single_repo": "example-org/one"})
     assert links.linkify("PR #9", {"single_repo": ""}) == "PR #9"          # no single repo: stays
-    assert links.linkify("see #1234", CFG) == "see #1234"                 # a bare '#N' is a task
+    # a '#N' is a tt-project id: it links to its web app page
+    assert links.linkify("see #5", CFG) == "see [#5](http://127.0.0.1:9/#token=ab&task=5)"
+    for text, kind in (("task #5", "task"), ("run #5", "run"), ("review #5", "task"), ("msg #5", "msg"),
+                       ("ask #5", "msg"), ("run 5", "run")):
+        out = links.linkify(text, CFG)
+        assert f"&{kind}=5" in out and f"[{text}]" in out, (text, out)
+    # one that resolves to nothing is labelled, never left bare and never given a guessed repo
+    assert links.linkify("see #1234", CFG) == "see #1234 (unresolved reference)"
+    assert links.linkify("task #4", CFG) == "task #4"      # kinded and unresolved: its kind labels it
     assert links.linkify("plain text with no reference", CFG) == "plain text with no reference"
+    # no resolver: the caller promised nothing about ids, so nothing changes
+    assert links.linkify("see #5", {k: v for k, v in CFG.items() if k != "ref_url"}) == "see #5"
+    # a second pass adds nothing
+    once = links.linkify("task #5 needs a look", CFG)
+    assert links.linkify(once, CFG) == once
 
 
 def test_linkify_never_links_twice_or_inside_protected_spans():
@@ -50,13 +64,14 @@ def test_problems_names_the_three_shapes_and_the_bare_number():
     text = "MINFRA-2596 landed, #288 and #64844 too, plus tt-project/state/runs/20240/result.json"
     none = {"repos": {}, "jira_keys": ["MINFRA"], "file_url": None, "is_file": lambda p: True,
             "single_repo": "", "jira_base": ""}
-    out = " ".join(links.problems(text, none, task_ids=set()))
+    out = " ".join(links.problems(text, none))
     for what in ("MINFRA-2596", "#288", "#64844", "result.json"):
         assert what in out, out
     full = {"jira_base": "https://example.atlassian.net", "jira_keys": ["MINFRA"],
             "repos": {}, "single_repo": "example-org/example-smi",
-            "file_url": lambda p: "http://127.0.0.1:9/#token=ab&file=" + p, "is_file": lambda p: True}
-    assert links.problems(text, full, task_ids={288, 64844}) == []
+            "file_url": lambda p: "http://127.0.0.1:9/#token=ab&file=" + p, "is_file": lambda p: True,
+            "ref_url": lambda n, kind: "x" if n in (288, 64844) else None}
+    assert links.problems(text, full) == []
 
 
 def test_readable_keeps_the_file_view_inside_the_project_tree(tmp_path):
@@ -128,6 +143,25 @@ def test_the_web_app_linkifies_its_messages_and_asks(env):
             urllib.request.urlopen(req, timeout=10)
     finally:
         srv.shutdown()
+
+
+def test_ids_link_to_their_web_app_page_and_unresolved_ones_get_labelled(env):
+    p = make(env)
+    p.db.set_kv("web", {"port": 8123})    # a web app link exists: id references can resolve
+    task = p.db.x("INSERT INTO tasks(created,title,spec) VALUES(?,?,?)", (0, "t", ""))
+    p.db.x("INSERT INTO runs(id,task,role) VALUES(?,?,?)", (777, task, "worker"))
+    msg = p.db.post("out", "task %d is running" % task, kind="reply", severity="normal")
+    from ttp import links
+    out = links.for_user(p, f"#{task} and run 777 and msg #{msg} and #4 and review #{task}")
+    assert f"#{task}" in out and "](" in out and f"&task={task}" in out, out  # a task id resolves
+    assert "run 777" in out and "&run=777" in out, out                   # a run id
+    assert f"msg #{msg}" in out and f"&msg={msg}" in out, out            # a message id
+    assert f"review #{task}" in out and f"&task={task}" in out, out      # a review names its task
+    assert "#4 (unresolved reference)" in out, out                       # an id that matches nothing
+    assert "(unresolved" not in links.for_user(p, f"#{task}")          # resolution is not labelling
+    p.set_config("links.web_base", "https://example.org/app")
+    assert "https://example.org/app/#token=" in links.for_user(p, f"#{task}")
+    assert links.problems("#4 needs a look", links.config(p)) and links.problems(f"#{task} done", links.config(p)) == []
 
 
 def test_the_check_command_names_what_a_message_left_unlinked(env, capsys):

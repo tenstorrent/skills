@@ -2574,10 +2574,9 @@ def cmd_links(a) -> None:
              [r["text"] for r in p.db.q("SELECT text FROM messages WHERE direction='out' AND ts>=? ORDER BY id LIMIT 500",
                                          (links.midnight(p),))])
     cfg = links.config(p)
-    ids = {r["id"] for r in p.db.q("SELECT id FROM tasks")}
     out = []
     for i, text in enumerate(texts):
-        for line in links.problems(text, cfg, ids):
+        for line in links.problems(text, cfg):
             out.append(f"message #{i + 1}: {line}" if not a.file else line)
     if out:
         print("\n".join(out))

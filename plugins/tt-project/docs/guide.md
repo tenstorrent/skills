@@ -4087,7 +4087,10 @@ the pick order, so it takes the first starts. A resumed resource ramps only its 
   linking stays off until `jira_base` is set, and only configured keys link, so look-alikes
   (hashes, model names) never do. A repo file at the pushed commit links to the GitHub blob, a
   file on the project host to the web app's read-only file view (`/api/file`, the project tree and
-  the tt-project home only, secrets refused). `ttp links` reports references today's messages left
+  the tt-project home only, secrets refused). A '#N' names a project id: it links to the web app's
+  page for that task, run or message (`web_base` is the address you open the web app at, when it
+  differs from the address the web app itself reports), and one that matches no task, run or message
+  is labelled, never left bare. `ttp links` reports references today's messages left
   unlinked. Set account-wide (`ttp config --account links.jira_base ...`) so every project on a
   host links the same tickets.
 - `delivery.ai_tag` (default `[Authored by AI]`, matched in any case; `""` turns it off) is the
