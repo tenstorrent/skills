@@ -11,7 +11,8 @@ offline, or the box is down) restarts nothing: it is asked again within BACKOFF_
 change. No pass measures the time since the last one: a sleep longer than BACKOFF_S ends every backoff,
 so the first pass after waking checks every box. A port whose forward's own destination does not answer
 from here (its host is off) is not a stale forward: nothing is ended or restarted for it, and it is logged
-once. A service that keeps failing is restarted at most once per RESTART_GAP_S step.
+once. Nor is a silent port of a bridge session another of whose ports answers: the session is live and its
+target only slow. A service that keeps failing is restarted at most once per RESTART_GAP_S step.
 
 Besides the sessions `ttp bridge` installs, the config's "watch" list names ssh forward services made by
 hand: {"label": the launchd label or systemd unit, "box": its ssh alias, "port": the box port it forwards},
@@ -185,13 +186,19 @@ def run_pass(cfg: dict, platform: str | None = None, now: float | None = None) -
         boxes.pop(box, None)
         down = {int(ln.split()[1]) for ln in r.stdout.splitlines() if ln.startswith("down ")}
         none = {int(ln.split()[1]) for ln in r.stdout.splitlines() if ln.startswith("none ")}
+        up = {int(ln.split()[1]) for ln in r.stdout.splitlines() if ln.startswith("up ")}
+        # a bridge session holds all its forwards or exits (ExitOnForwardFailure): one answering port shows it live,
+        # so a silent one whose target answers is only slow there, and a restart would only drop the others
+        live = {t["service"] for t in mine if t["agent"] and up & set(t["ports"])}
         # a port with no listener is dead whatever its target does; one that connects but sends nothing may be a
         # live forward whose target is off: its targets are asked all at once
         ask = [(t["service"], p, t["dests"][p]) for t in mine if t.get("dests") for p in t["ports"] if p in down]
         with ThreadPoolExecutor(max(1, len(ask))) as ex:
             answers = dict(zip([a[:2] for a in ask], ex.map(dest_answers, [a[2] for a in ask])))
         for t in mine:
-            dead, f = [p for p in t["ports"] if p in down or p in none], fails.get(t["service"])
+            dead = [p for p in t["ports"]
+                    if p in none or p in down and not (t["service"] in live and answers[t["service"], p])]
+            f = fails.get(t["service"])
             bad = [p for p in dead if p in none or answers[t["service"], p]] if t.get("dests") else dead
             gone = [p for p in dead if p not in bad]   # the forward is up; its destination does not answer
             if gone and off.get(t["service"]) != gone:

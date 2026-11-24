@@ -2536,6 +2536,33 @@ def test_bridge_watch_leaves_a_session_alone_when_a_forwards_destination_is_down
     assert len(seen["release"]) == 1 and any("kickstart" in c for c in seen["run"]) and out[0].endswith("restarted")
 
 
+def test_bridge_watch_leaves_a_live_session_alone_when_one_forward_is_slow(tmp_path, monkeypatch):
+    # cells: live-session-slow-port-no-restart, all-silent-restarts, coming-up-not-judged-again, live-target-off-logged
+    from ttp import bridge, bridge_watch
+    cfg, seen = _watch_env(tmp_path, monkeypatch, "darwin", ["up 2301\ndown 2302\nttp-watch-done\n",
+                           "down 2301\ndown 2302\nttp-watch-done\n", "none 2301\nnone 2302\nttp-watch-done\n"])
+    cfg = bridge.parse({"boxes": {"box-1": {"login": {}, "agents": {"auto": {"agent": "env", "forward": [
+        {"name": "build-a", "target": "build-a.example.com", "port": 2301},
+        {"name": "build-b", "target": "build-b.example.com", "port": 2302}]}}}}})
+    asked = []
+    monkeypatch.setattr(bridge_watch, "dest_answers", lambda d: asked.append(d) or True)
+    t0, svc = 1_000_000.0, bridge.label("box-1", "auto")
+    # one forward answers, so the session is live: the other's banner is only slow, and a restart would drop both
+    assert bridge_watch.run_pass(cfg, "darwin", t0) == [] and seen["release"] == []
+    assert [h["target"] for h in asked] == ["build-b.example.com"]
+    assert not any("kickstart" in c for c in seen["run"])
+    out = bridge_watch.run_pass(cfg, "darwin", t0 + 30)   # every forward silent: a stale session
+    assert seen["release"] == [(svc, "auto", [2301, 2302])] and out[0].endswith("restarted")
+    # still coming up after its restart (no listener yet): not judged again before RESTART_GAP_S
+    assert bridge_watch.run_pass(cfg, "darwin", t0 + 60) == [] and len(seen["release"]) == 1
+    # a live session's silent port whose target is off is logged once, as for any session
+    two = cfg
+    cfg, seen = _watch_env(tmp_path / "b", monkeypatch, "darwin", ["up 2301\ndown 2302\nttp-watch-done\n"])
+    monkeypatch.setattr(bridge_watch, "dest_answers", lambda d: False)
+    out = bridge_watch.run_pass(two, "darwin", t0)
+    assert seen["release"] == [] and len(out) == 1 and "port 2302" in out[0] and "destination does not" in out[0]
+
+
 def test_bridge_watch_dest_answers_by_the_route_the_relay_takes(monkeypatch):
     # cells: direct-target, interface-target
     import socket
