@@ -266,10 +266,12 @@ def _github_repo(p, links: dict) -> str:
     """The project's own 'owner/repo' from its remotes, else links.repo (the remote may not be
     GitHub itself, e.g. a relay)."""
     from .push import _git
+    from .watchers import _REPO_RE
     out = _git(Path(p.root), "remote", "-v")   # "<name>\t<url> (push)" per remote
     for line in out.stdout.split("\n"):
-        if m := re.search(r"github\.com[:/]([\w.-]+)/([\w.-]+?)(?:\.git)? \(push\)$", line.strip()):
-            return f"{m.group(1)}/{m.group(2)}"
+        w = line.split()
+        if len(w) == 3 and w[2] == "(push)" and (m := _REPO_RE.search(w[1])):
+            return m.group(1)
     return str(links.get("repo") or "")
 
 
