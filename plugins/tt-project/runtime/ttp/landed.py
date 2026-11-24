@@ -949,15 +949,14 @@ def carried(p, repo: Path, tid: int, tip: str, shas: list[str] | None = None, sr
     """Why task `tid`'s recorded landing (`shas`/`src`, else recorded) does not carry its change: the head
     it handed off (integrate.member_head) is in none of those landed commits (on_branch: an ancestor, or an
     equivalent by patch, author and subject, or replay trailer; each a short range from where it forked),
-    no ancestor of the push branch's `tip` or a retired tip, and none holds most of its lines (_holds_part).
+    not on the push branch's `tip` or a retired tip (on_push), and none holds most of its lines (_holds_part).
     "" when it is, when nothing is recorded, or when no head was recorded to judge by."""
     from . import integrate   # late: integrate loads worktree, whose imports reach this module
     if shas is None:
         shas, src = recorded(p.db, tid, rows=rows)
     head = integrate.member_head(repo, tid) if shas else ""
     if not head or any(_commit(repo, s) and on_branch(repo, head, _commit(repo, s)) for s in shas) \
-            or any(t and _git(repo, "merge-base", "--is-ancestor", head, t).returncode == 0
-                   for t in (tip, *retired_tips(p))) \
+            or on_push(p, repo, [head], tip) \
             or any(_commit(repo, s) and _holds_part(repo, head, _commit(repo, s)) for s in shas):
         return ""
     return (f"{src or 'its landing'} ({', '.join(s[:10] for s in shas)}) does not hold its own head "

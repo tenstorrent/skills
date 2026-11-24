@@ -143,6 +143,32 @@ def test_a_landing_that_left_a_tasks_commits_out_reads_dropped_until_its_change_
     assert landed.landed_at(p.db, lost) is not None
 
 
+def test_a_landing_that_lacks_a_tasks_head_is_carried_once_its_commit_is_on_the_push_branch(env, monkeypatch):
+    """Whether a task's change is on the push branch is one rule (landed.on_push): a recorded landing
+    that lacks the task's head still carries it once another push put the head on the push branch as
+    an equivalent commit (a cherry-pick keeping author, date and subject), not only as an ancestor."""
+    from ttp import integrate, landed
+    p, repo, other, tid, path, branch, head = _landed_setup(env, monkeypatch)
+    late, lpath, lbranch = _code_task(p, "late")
+    _commit(lpath, "late.txt", "the late change\n")
+    lhead = _git_out(lpath, "rev-parse", "HEAD")
+    integrate.record_member_head(repo, late, lhead)
+    batch = _git_out(repo, "rev-parse", "origin/proj")   # a landing that left the late change out
+    now = time.time()
+    p.db.x("INSERT INTO push_queue(task, branch, head, target, status, landed_sha, created, updated) "
+           "VALUES(?, ?, ?, 'origin/proj', 'landed', ?, ?, ?)", (late, lbranch, lhead, batch, now, now))
+    _commit(other, "next.txt", "a later push\n")
+    _git_out(other, "fetch", "-q", str(lpath), lbranch)
+    _git_out(other, "cherry-pick", lhead)
+    _git_out(other, "push", "-q", "origin", "HEAD:proj")
+    _git_out(repo, "fetch", "-q", "origin")
+    tip = _git_out(repo, "rev-parse", "origin/proj")
+    assert subprocess.run(["git", "-C", str(repo), "merge-base", "--is-ancestor", lhead, tip]).returncode == 1, \
+        "on the tip only as a copy"
+    assert landed.drops(p, record=False) == [] and landed.check(p, repo, tid=late)[0] == 0
+    assert not p.db.q("SELECT * FROM events WHERE kind=?", (landed.DROP_EVENT,))
+
+
 def test_local_only_clears_a_branch_recorded_as_superseded_by_a_commit_on_the_push_branch(env, monkeypatch, capsys):
     """A re-land after a push conflict puts a task's work on the push branch as one new commit with
     another patch and subject: the check flags it until a task records the commit that carries it.
