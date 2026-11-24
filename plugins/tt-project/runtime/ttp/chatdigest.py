@@ -467,6 +467,7 @@ def _replied(db, item: dict) -> bool:
     return bool(db.one("SELECT 1 FROM messages WHERE direction='out' AND ts>=? AND (chat=? OR (chat IS NULL "
                        "AND ?='all')) LIMIT 1", (float(item.get("at") or 0), chat, chat)))
 
+
 def counts(db) -> dict:
     """{chat: {"sent", "held", "digests", "deduped", "waiting"}}: posts sent at once, held, digests posted,
     near-repeats not sent, held now."""
