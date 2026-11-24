@@ -442,6 +442,16 @@ def test_a_live_claim_inside_a_landed_fix_span_is_left_to_the_landed_fix(env, mo
     assert "not live yet" not in fixed, fixed   # one fix per span, not two spliced into one
 
 
+def test_two_live_phrases_in_one_sentence_get_one_mark(env, monkeypatch):
+    """"is live" and "in the running version" are one claim, not two: the sentence is marked
+    once, never a duplicated 'not live yet' line."""
+    from ttp import pushclaim
+    p, repo, head = _claim_replay_setup(env, monkeypatch, landed=True)
+    fixed = pushclaim.correct_reply_claims(p, "The fix is now live in the running version.", p.root,
+                                           running=head)
+    assert fixed.count("not live yet") == 1, fixed
+
+
 def test_the_reply_path_marks_a_false_live_line_before_sending(env, monkeypatch):
     """The whole send path: a reply action claiming a landing or liveness the push branch and the
     running version do not hold is posted marked, and the coordinator is told in its notes."""

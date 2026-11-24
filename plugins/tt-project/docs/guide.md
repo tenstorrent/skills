@@ -4407,6 +4407,9 @@ Known gaps of the reply check:
   hold, so it passes as another repository's business;
 - "deployed" also matches distribution prose ("the template is deployed to all workers"),
   which reads as a claim and asks for a commit a distribution step cannot name;
+- the subject list mirrors the landed one, so a sentence whose subject word it lacks
+  ("everything is deployed") passes as written, and a quoted word ("is 'live'") escapes the
+  be-verb pattern;
 - "becomes live" is not parsed ("become live" needs "be", already matched, but the be-verb
   list has no "become"), so it passes as written;
 - a mid-turn `ttp urgent-reply` posts before the turn's checks run.

@@ -268,7 +268,7 @@ def live_claims(text: str, repo) -> list[tuple[int, int, str]]:
     version", under the same sentence splitting, negation/hedge, task/run-id and
     one-claim-a-phrase rules as landed_claims. The sha is the first commit of its sentence the
     repository holds, else "": a live line must name one."""
-    out, taken = [], []
+    out, taken, sents = [], [], []
     from . import claimcheck, landed   # their task/run-id rules and sha scan: one parser, reused
     for m in _LIVE_CLAIM.finditer(text or ""):
         if re.search(r"\b(?:not|never|n't)\b", m.group(0)):
@@ -280,11 +280,14 @@ def live_claims(text: str, repo) -> list[tuple[int, int, str]]:
             continue   # hedged, negated, or about another task or run
         if any(m.start() < e and s < m.end() for s, e in taken) or not _LIVE_SUBJECT.search(text[lo:hi]):
             continue   # a phrase landed_claims owns, or a sentence not about this project's own work
+        if any(lo < h and l < hi for l, h in sents):
+            continue   # one live claim a sentence: a second phrase in it is the same claim
         toks = landed._LITERAL_SHA.findall(text[lo:hi])
         sha = next((w for w in toks if _commit(repo, w)), "")
         if not sha and any(re.search(r"\d", w) for w in toks):
             continue   # names a sha this repository does not hold: another repository's business
         taken.append((m.start(), m.end()))
+        sents.append((lo, hi))
         out.append((m.start(), m.end(), sha))
     return out
 
