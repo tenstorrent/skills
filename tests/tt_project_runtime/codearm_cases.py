@@ -1187,6 +1187,26 @@ def test_glmharness_writes_a_guarded_mini_run_with_the_prompt_on_stdin_and_the_b
     assert "openai/example-org/code-model" in sh and "PYTHONPATH=/opt/rt" in sh and "/opt/harness/bin/mini" in sh
 
 
+def test_a_glm_run_gets_a_batched_task_message_in_place_of_minis_step_by_step_one_unless_turned_off(tmp_path):
+    import json
+    from ttp import glmharness
+
+    def template(rd):
+        lines = [x for x in (rd / "mini.yaml").read_text().splitlines() if x.startswith("  instance_template: ")]
+        return json.loads(lines[0].split(": ", 1)[1]) if lines else None
+    inst = {"kind": "mini-swe-agent", "version": "2.4.6", "bin": "/opt/harness/bin/mini"}
+    rd = tmp_path / "run"
+    rd.mkdir()
+    (rd / "prompt.md").write_text("do the task")
+    glmharness.apply({"model": "m"}, rd, {}, "/opt/rt", install_fn=lambda v: inst)
+    t = template(rd)
+    assert t is not None and t.startswith("{{task}}") and t.count("{{") == 1   # mini renders it with jinja
+    assert "Batch" in t and glmharness.SUBMIT in t and "reproduce script" in t
+    off = {"route": {"code_sonnet": {"glm": {"batch_steps": False}}}}
+    glmharness.apply({"model": "m"}, rd, off, "/opt/rt", install_fn=lambda v: inst)
+    assert template(rd) is None and "step_limit: 0" in (rd / "mini.yaml").read_text()
+
+
 def test_a_harness_that_cannot_be_installed_hands_the_task_back_to_opus_not_a_failed_attempt(tmp_path):
     import json
     from ttp import codearm, glmharness

@@ -26,6 +26,34 @@ HARNESS = "mini-swe-agent"
 COMMAND_TIMEOUT_S = 900   # one command (a build, a test), over mini's 30 s default
 STEP_LIMIT = 0            # no step cap: the run's own timeout, stall and budget end it
 
+# The run's task message, in place of mini's own (`mini.yaml` instance_template: "Please solve this issue",
+# a step-by-step workflow with a reproduce script and an edge-case pass, one short command per example). On
+# that template GLM code runs took a median 94.5 tool calls against Opus's 49 at about the same seconds per call,
+# most of them one search or one short read each. `{{task}}` is the run's prompt (worker rules, hand-off and
+# spec); mini renders the template with jinja, so it holds no other `{{`.
+SUBMIT = "echo COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT"
+INSTANCE_TEMPLATE = """{{task}}
+
+## Working through the bash tool
+
+Every response makes at least one bash tool call. Each call runs in a new subshell: start it with
+`cd <folder> && ...` when it needs a folder. Every model call costs about as long as a short command, so make
+each one count:
+
+- Batch: put independent reads and searches in one command (`grep -n a f1; sed -n 1,200p f2; git log -5
+  --oneline`), or make several bash tool calls in one response. Never spend a call on one `ls` or one short
+  grep when you already know the next ones you need.
+- Read in large pieces: a whole function or 200+ lines at once (`sed -n 'A,Bp' file`), not 20-line slices.
+- Edit in one go: make related edits with one script (a heredoc python or a patch), then check them with one
+  focused test run.
+- Run the narrowest tests that cover the change while you work, and the task's required checks once at the end.
+- Write no separate reproduce script and no extra edge-case pass unless the task asks for one: its own rules
+  say what done means and what to test.
+
+Finish only as the task above says (its hand-off). Then run `%s` as a command of its own, combined with
+nothing else; after it you cannot continue.
+""" % SUBMIT
+
 
 def _installed(root: Path) -> str:
     """The newest mini-swe-agent version already installed under `root`, '' when none is."""
@@ -56,13 +84,23 @@ def digest_on(cfg: dict) -> bool:
     return isinstance(got, dict) and got.get("digest") is True
 
 
-def files(run_dir: Path, inst: dict, model: str, runtime_dir: str, digest: bool = False) -> list[str]:
+def batch_on(cfg: dict) -> bool:
+    """`route.code_sonnet.glm.batch_steps`: the run's task message is INSTANCE_TEMPLATE (batched reads and
+    searches) rather than mini's own step-by-step one. On by default; false keeps mini's template."""
+    got = ((cfg.get("route") or {}).get("code_sonnet") or {}).get("glm")
+    return not (isinstance(got, dict) and got.get("batch_steps") is False)
+
+
+def files(run_dir: Path, inst: dict, model: str, runtime_dir: str, digest: bool = False,
+          batch: bool = True) -> list[str]:
     """Write the launch script and the guarded config into `run_dir`; returns the argv. The prompt is read from
-    stdin (the `-t` task), the trajectory goes to trajectory.json."""
+    stdin (the `-t` task), the trajectory goes to trajectory.json. `batch` sets INSTANCE_TEMPLATE as the run's
+    task message (a JSON string is a YAML double-quoted scalar, so it needs no block indenting)."""
     q = shlex.quote
     from . import glmenv
     conf = ("agent:\n  mode: yolo\n  cost_limit: 0\n"
             f"  step_limit: {STEP_LIMIT}\n"
+            + (f"  instance_template: {json.dumps(INSTANCE_TEMPLATE)}\n" if batch else "") +
             "model:\n  cost_tracking: ignore_errors\n  model_kwargs:\n    drop_params: true\n"
             f"environment:\n  environment_class: {glmenv.CLASS_PATH}\n  timeout: {COMMAND_TIMEOUT_S}\n")
     from .project import durable_write
@@ -104,7 +142,7 @@ def apply(spec: dict, run_dir: Path, cfg: dict, runtime_dir: str, budget_usd=Non
     if lead and lead not in prompt:
         from .project import durable_write
         durable_write(run_dir / "prompt.md", lead + "\n\n" + prompt)
-    spec["argv"] = files(run_dir, inst, str(spec.get("model") or ""), runtime_dir, digest_on(cfg))
+    spec["argv"] = files(run_dir, inst, str(spec.get("model") or ""), runtime_dir, digest_on(cfg), batch_on(cfg))
     spec.pop("stdin", None)   # mini reads plain text, not Claude Code's stream-json
     spec["openai_env"] = True
     spec["harness"] = {"kind": HARNESS, "version": inst.get("version")}

@@ -1307,7 +1307,10 @@ included) is treated as 0 and logged once per setting. A run that handed back ca
 of a code task follows the arm recorded for it, light wakes included. `route.code_sonnet.glm.digest` (off by
 default) gives the model a command's output over about 8 KB as its first lines, every failing line and its tail,
 with the whole output saved in the run folder; it is for server capacity (a long context per call), and each
-run's result line reports the context tokens per call. Each project keeps a list of policy files, the code that
+run's result line reports the context tokens per call. `route.code_sonnet.glm.batch_steps` (on by default; false
+turns it off) replaces mini-swe-agent's step-by-step task message with one that asks for batched reads and
+searches, large reads and one-go edits: on mini's own message GLM code runs made about twice the tool calls of
+Opus runs at about the same time per call. Each project keeps a list of policy files, the code that
 decides what needs an audit record, review, approval, budget or push, in `harness/policy_files.txt` (one glob per
 line relative to the code repo root, `#` starts a comment, `**` crosses directories, a pattern without `/` matches
 that name at any depth; the plugin ships no list). Before the coin, a task whose title, spec or `Where:` line
