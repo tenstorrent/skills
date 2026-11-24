@@ -217,12 +217,13 @@ def _incidents(db, cfg: dict, runs: list[dict], tasks: dict, until: float) -> in
 
 
 def quality(db, cfg: dict, tids, tasks: dict, runs: dict, reviews: dict, fixes: dict, requeued: set,
-            days: float, until: float) -> dict:
-    """One arm's quality over tasks `tids` (the module doc)."""
-    from . import effort
+            days: float, until: float, fixed: dict | None = None) -> dict:
+    """One arm's quality over tasks `tids` (the module doc); a bounce `fixed` (rollout.fixed_stops) lists from
+    before its fix went live is not counted and lands in q["not_counted"]."""
+    from . import effort, rollout
     q = {"tasks": 0, "done": 0, "failed": 0, "reopened": 0, "reviewed": 0, "first_pass": 0, "fix_rounds": 0,
          "bounces": 0, "decided": 0, "glm_runs": 0, "incidents": 0}
-    glm_runs = []
+    glm_runs, q["not_counted"] = [], []
     for tid in tids:
         t = tasks.get(tid)
         if not t:
@@ -237,8 +238,10 @@ def quality(db, cfg: dict, tids, tasks: dict, runs: dict, reviews: dict, fixes: 
             q["first_pass"] += rv["first"] == "done"
             q["fix_rounds"] += fixes.get(tid, 0)
         q["decided"] += _outcome_at(t, rv, rs) is not None
-        q["bounces"] += any(((_note(r["note"]).get(route.KEY) or {}).get("fallback")) == route.BOUNCE for r in rs) \
-            or effort.wants_deep(t.get("result"))
+        bounced = [r for r in rs if (_note(r["note"]).get(route.KEY) or {}).get("fallback") == route.BOUNCE]
+        off = [f for r in bounced if (f := rollout.not_counted(fixed or {}, r["id"], r["ended"] or r["started"]))]
+        q["not_counted"] += off
+        q["bounces"] += len(off) < len(bounced) or effort.wants_deep(t.get("result"))
         glm_runs += [r for r in rs if on_glm(r["provider"], r["model"], r["note"])]
     q["glm_runs"] = len(glm_runs)
     q["incidents"] = _incidents(db, cfg, glm_runs, tasks, until)
@@ -645,7 +648,8 @@ def judge(p, cfg: dict, now: float) -> dict:
     w0 = max(t0, armed)   # the GLM window being judged: the baseline is Claude's outcomes from the same period
     base, lo = base_window(cand, tasks, runs, ctx[0], w0, since, st["min_window"])
     days = max((now - t0) / 86400, 1e-9)
-    g = quality(db, cfg, glm, tasks, runs, *ctx, days, now)
+    fixed = rollout.fixed_stops(getattr(p, "name", ""), "glm_work", "glm_code")
+    g = quality(db, cfg, glm, tasks, runs, *ctx, days, now, fixed)
     g["incidents"] += _incidents(db, cfg, [r for t in dev_glm for r in runs.get(t, [])
                                            if on_glm(r["provider"], r["model"], r["note"])], tasks, now)
     b = quality(db, cfg, base, tasks, runs, *ctx, days, now)
@@ -657,7 +661,8 @@ def judge(p, cfg: dict, now: float) -> dict:
     n = g["decided"]
     frm = datetime.datetime.fromtimestamp(lo, datetime.timezone.utc)
     nums = (f"GLM {n} tasks with an outcome; Claude baseline {b['decided']} with an outcome since "
-            f"{frm:%Y-%m-%d %H:%M} UTC; " + "; ".join(_says(s) for s in _failing_first(sig)))
+            f"{frm:%Y-%m-%d %H:%M} UTC; " + "; ".join(_says(s) for s in _failing_first(sig))
+            + (f"; {rollout.not_counted_line(g['not_counted'], p)}" if g["not_counted"] else ""))
     out = lambda state, why: {"state": state, "why": f"{why}; {nums}", "n": n, "signals": sig,   # noqa: E731
                               "glm_pct": g["first_pass_pct"], "base_pct": b["first_pass_pct"],
                               "base_window": [round(lo, 3), round(now, 3)]}

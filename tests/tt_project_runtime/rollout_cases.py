@@ -1276,3 +1276,110 @@ def test_a_run_re_arms_one_project_on_evidence_and_records_it_in_the_ledger(env,
     assert rec["deployed"] == head and rec["replay"] == "7" and rec["run_project"] == str(p.base)
     code, out = _roll(capsys, "status")
     assert code == 0 and f"last re-armed in {target.name} by a run: fix #{fix}" in out and "replay 7" in out
+
+
+def _land_fix(p, repo, title, path):
+    """Another fix task landed on the push branch the way _rearm_setup's is: (task, landed head)."""
+    fix = p.db.add_task(title, "s", kind="code", status="done", branch=f"ttp/t-{path}")
+    _commit(repo, path, f"{title}\n")
+    _git_out(repo, "push", "-q", "origin", "HEAD:proj")
+    head = _git_out(repo, "rev-parse", "HEAD")
+    now = time.time()
+    p.db.x("INSERT INTO push_queue(task, branch, head, target, status, landed_sha, pushed_sha, created, updated) "
+           "VALUES(?,?,?,?,?,?,?,?,?)", (fix, f"ttp/t-{path}", head, "origin/proj", "landed", head, head, now, now))
+    return fix, head
+
+
+def _daemon_starts(target, starts):
+    """`target`'s daemon log as its daemon writes it: one start line per (time, commit), stamped in local time."""
+    target.logs.mkdir(parents=True, exist_ok=True)
+    (target.logs / "daemon.log").write_text("".join(
+        f"{time.strftime('%Y-%m-%dT%H:%M:%S', time.localtime(ts))} daemon start pid=1 host=h boot=b version=0.0.1 "
+        f"commit={c[:12]} instance=i\n" for ts, c in starts))
+
+
+def _stopped_window(env, monkeypatch, tmp_path):
+    """The rollback replay: 10 GLM device runs of `target`, 6 handed back to Opus. Fix A goes live between the
+    first 3 stops and the next 2, which fix B covers; B goes live before the last stop, a refused push no fix
+    covers. Returns (p, target, cfg, fix A, fix B, {run id: (ts, bounced)})."""
+    from ttp import deviceplan, glmguard
+    p, target, fix_a, head_a, older = _rearm_setup(env, monkeypatch)
+    fix_b, head_b = _land_fix(p, p.root, "fix b", "fixb.txt")
+    cfg = _dp_cfg(device=True, device_audits=2)
+    t = target.db.task(target.db.add_task("soak", "Run the soak on the box.", kind="work"))
+    base = float(int(time.time()) - 7200)
+    _daemon_starts(target, [(base, older), (base + 600, head_a), (base + 1200, head_b)])
+    plan = [(60, "power"), (120, "power"), (180, "out_of_plan"), (240, ""), (700, "gate"), (760, "gate"),
+            (820, ""), (1300, "guard"), (1360, ""), (1420, "")]
+    runs = {}
+    for i, (dt, kind) in enumerate(plan, 1):
+        (tmp_path / f"r{i}").mkdir()
+        run, _ = _dp_run(tmp_path / f"r{i}")
+        if kind:
+            (run / glmguard.HIT).write_text(json.dumps({"kind": kind, "why": "stopped"}))
+        with monkeypatch.context() as m:
+            m.setattr(time, "time", lambda: base + dt)
+            deviceplan.run_end(target.db, cfg, target.name, t, i, run, "")
+        runs[i] = (base + dt, bool(kind))
+    return p, target, cfg, fix_a, fix_b, runs
+
+
+def test_stops_a_live_fix_covers_no_longer_count_toward_the_rollback(env, monkeypatch, capsys, tmp_path):
+    """The replay: 6 of the last 10 runs stopped rolls back; once fixes record the 5 stops from before they went
+    live, 1 stop counts and the verdict names the ones not counted."""
+    from ttp import deviceplan
+    p, target, cfg, fix_a, fix_b, runs = _stopped_window(env, monkeypatch, tmp_path)
+    assert deviceplan.judge(target, cfg, time.time())["state"] == "worse"
+    _roll(capsys, "set", "glm_device", "2")
+    code, out = _roll(capsys, "fixed", "glm_device", target.name, "--fix", str(fix_a), "--runs", "1,2,3")
+    assert code == 0, out
+    code, out = _roll(capsys, "fixed", "glm_device", target.name, "--fix", str(fix_b), "--runs", "5,6")
+    assert code == 0, out
+    v = deviceplan.judge(target, cfg, time.time())
+    assert v["state"] != "worse" and f"3 stops not counted: fixed by task #{fix_a}" in v["why"] \
+        and f"2 stops not counted: fixed by task #{fix_b}" in v["why"], v
+
+
+def test_a_stop_after_its_fix_went_live_still_counts(env, monkeypatch, capsys, tmp_path):
+    """A fix listing a stop that happened once it was live did not prevent it: that stop keeps counting."""
+    from ttp import deviceplan
+    p, target, cfg, fix_a, fix_b, runs = _stopped_window(env, monkeypatch, tmp_path)
+    _roll(capsys, "fixed", "glm_device", target.name, "--fix", str(fix_b), "--runs", "5,6,8")
+    assert f"2 stops not counted: fixed by task #{fix_b}" in deviceplan.judge(target, cfg, time.time())["why"]
+
+
+def test_a_pushed_fix_no_daemon_ran_is_refused_and_excludes_nothing(env, monkeypatch, capsys, tmp_path):
+    """Pushed is not live: a fix no daemon start of the project ran is refused and no stop stops counting."""
+    from ttp import deviceplan, rollout
+    p, target, cfg, fix_a, fix_b, runs = _stopped_window(env, monkeypatch, tmp_path)
+    fix_c, _ = _land_fix(p, p.root, "fix c", "fixc.txt")
+    code, out = _roll(capsys, "fixed", "glm_device", target.name, "--fix", str(fix_c), "--runs", "8")
+    assert code == 2 and "pushed but not live" in out and not rollout.fixed_stops(target.name, "glm_device"), out
+
+
+def test_another_projects_fix_record_excludes_no_stop(env, monkeypatch, capsys, tmp_path):
+    """A fix recorded for one project's runs leaves the same run ids of another project counted."""
+    from ttp import deviceplan
+    p, target, cfg, fix_a, fix_b, runs = _stopped_window(env, monkeypatch, tmp_path)
+    other = _second_project(env, "neighbour")
+    _daemon_starts(other, [(time.time() - 7200, _git_out(p.root, "rev-parse", "HEAD"))])
+    for fix, ids in ((fix_a, "1,2,3"), (fix_b, "5,6")):
+        code, out = _roll(capsys, "fixed", "glm_device", other.name, "--fix", str(fix), "--runs", ids)
+        assert code == 0, out
+    assert deviceplan.judge(target, cfg, time.time())["state"] == "worse"
+
+
+def test_rollout_fixed_refuses_a_fix_that_never_landed(env, monkeypatch, capsys, tmp_path):
+    """`ttp rollout fixed` needs the fix task's change on the push branch, as `ttp landed --task` reads it."""
+    p, target, fix, head, older = _rearm_setup(env, monkeypatch)
+    never = p.db.add_task("a change that never landed", "s", status="done")
+    code, out = _roll(capsys, "fixed", "glm_device", target.name, "--fix", str(never), "--runs", "1")
+    assert code == 2 and "is not on the push branch" in out, out
+
+
+def test_rollout_status_shows_the_stops_a_fix_took_out_of_the_count(env, monkeypatch, capsys, tmp_path):
+    """Stops not counted stay visible: status names how many, the fix task and when it went live."""
+    p, target, cfg, fix_a, fix_b, runs = _stopped_window(env, monkeypatch, tmp_path)
+    _roll(capsys, "fixed", "glm_device", target.name, "--fix", str(fix_a), "--runs", "1,2,3")
+    code, out = _roll(capsys, "status")
+    assert f"in {target.name}: 3 stops not counted: fixed by task #{fix_a} (live " in out, out

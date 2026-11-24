@@ -18038,19 +18038,24 @@ def ttp_parser():
     s.set_defaults(fn=cmd_alerts)
 
     s = sub.add_parser("rollout", help="release rings: show or change which projects a flagged change is on for")
-    s.add_argument("action", choices=["status", "ring", "set", "promote", "rollback", "arm", "waves", "on"],
+    s.add_argument("action", choices=["status", "ring", "set", "promote", "rollback", "arm", "waves", "on",
+                                          "fixed"],
                    help="status; ring PROJECT 0|1|2|exclude|include; set FLAG off|0|1|2|auto; promote FLAG (one ring "
                         "wider); rollback FLAG (off and frozen); arm FLAG [PROJECT] (a fix landed: unfreeze and "
                         "restore the level the flag had before its rollback, or re-arm one project the wave "
                         "gate or health watch switched off; a run re-arms one project only, with --fix and "
                         "--replay evidence, when rollout.run_rearm is on); waves FLAG <p1,p2> <p3> ... | clear "
                         "(auto's waves); on FLAG [PROJECT] (a wait's probe: exit 0 while the flag is on for the "
-                        "project)")
+                        "project); fixed FLAG PROJECT --fix TASK --runs R1,R2 (PROJECT's stops on FLAG from "
+                        "before fix TASK went live there no longer count toward its rollback; TASK must be on the "
+                        "push branch and have run in the project's daemon)")
     s.add_argument("target", nargs="?", help="the project (ring) or the flag")
-    s.add_argument("value", nargs="?", help="the ring (ring), the level (set), the project (arm) or the first wave")
+    s.add_argument("value", nargs="?", help="the ring (ring), the level (set), the project (arm, fixed) or the first "
+                   "wave")
     s.add_argument("more", nargs="*", help="the further waves (waves)")
-    s.add_argument("--fix", type=int, metavar="TASK", help="arm: the task whose fix landed; a run's re-arm "
+    s.add_argument("--fix", type=int, metavar="TASK", help="arm, fixed: the task whose fix landed; a run's re-arm "
                    "checks it is on the push branch and deployed to the project")
+    s.add_argument("--runs", metavar="R1,R2", help="fixed: the project's stopped run ids the fix covers")
     s.add_argument("--replay", metavar="RESULT", help="arm: a passing replay of the rollback's cause, as a "
                    "result.json path or a run id; a run's re-arm needs it")
     s.add_argument("--reason", help="why (kept in the rollout ledger)")

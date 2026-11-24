@@ -5262,6 +5262,12 @@ flag back or, when the account setting `rollout.run_rearm` is on, re-arm one rol
 `ttp rollout arm FLAG PROJECT --fix TASK --replay RUN`: the fix task's change must be on the push branch
 and deployed to that project, and the replay of the rollback's cause must have passed. The command writes only the account settings and the ledger, never a project's charter, memory,
 config or state. The shipped defaults list no project: which projects are in ring 1 is the account's setting.
+A stop (a GLM run a guard or plan check handed back to Opus) whose cause a guard fix covers is that fix's replay
+case: `ttp rollout fixed FLAG PROJECT --fix TASK --runs R1,R2` records which of the project's stopped runs the
+fix covers, once the fix task's change is on the push branch and a daemon start in the project's log ran it.
+From then on the route's rollback count leaves out each listed stop from before that start; a listed stop
+after it still counts, as does any stop no fix lists. The verdict and `ttp rollout status` name what was left
+out ("3 stops not counted: fixed by task #M (live HH:MM)"). A run may record this too.
 
 Health watch. Every 15 minutes the daemon compares each project that has a flag on with its own trailing 7 days
 before the flag reached its ring, with no model call. A failing signal switches the flag off for that project

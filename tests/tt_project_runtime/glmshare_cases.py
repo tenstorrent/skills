@@ -438,3 +438,18 @@ def test_glm_share_held_splits_person_by_how_the_task_reaches_a_person_and_reads
     by = {k: (v["runs"], v["hours"], v["user_rule"]) for k, v in got.items()}
     assert by["person:reply_chat"] == (1, 1.0, True) and by["person:instruction"] == (1, 0.5, True)
     assert by["person:conclusion"] == (1, 0.25, True) and by["person"] == (1, 2.0, True)
+
+
+def test_glm_share_bounces_a_live_fix_covers_no_longer_count_toward_the_rollback(env, monkeypatch, capsys):
+    """The glm_work judge reads `ttp rollout fixed` too: bounces from before a listed fix went live drop out."""
+    from ttp import glmshare, route
+    p, target, fix, head, older = _rearm_setup(env, monkeypatch)
+    now = 1_000_000_000.0 + 60 * 86400
+    t0, glm = _gs_waved(target, now)
+    bounced = [_gs_run(target, tid, t0 + 7200, 1, note={route.KEY: {"to": route.TO, "fallback": route.BOUNCE}})
+               for tid in glm[:2]]
+    assert glmshare.judge(target, _GS_CFG, now)["state"] == "worse"
+    _daemon_starts(target, [(t0 + 86400, head)])
+    code, out = _roll(capsys, "fixed", "glm_work", target.name, "--fix", str(fix), "--runs", ",".join(map(str, bounced)))
+    v = glmshare.judge(target, _GS_CFG, now)
+    assert code == 0 and v["state"] != "worse" and f"2 stops not counted: fixed by task #{fix}" in v["why"], (out, v)
