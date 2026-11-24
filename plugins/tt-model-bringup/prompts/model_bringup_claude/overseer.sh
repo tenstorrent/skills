@@ -9,7 +9,7 @@
 # --at replays a past run: the transcripts are copied cut at that time, and the agent is told to ignore live host
 # state. --since sets the window start instead of the previous report's time (or the run start).
 set -uo pipefail
-SESSION= TT= INPUTS= HOURS=1 MODEL=claude-sonnet-5-5 STARTED= LOG= DRY=no ONCE=no AT= PROJ= SINCE_OPT=
+SESSION= TT= INPUTS= HOURS=1 MODEL=claude-opus-5-5 STARTED= LOG= DRY=no ONCE=no AT= PROJ= SINCE_OPT=
 while [ $# -gt 0 ]; do case $1 in
   --dry-run) DRY=yes; shift; continue;; --once) ONCE=yes; shift; continue;;
   --session) SESSION=$2;; --tt) TT=$2;; --inputs) INPUTS=$2;; --interval) HOURS=$2;; --model) MODEL=$2;;

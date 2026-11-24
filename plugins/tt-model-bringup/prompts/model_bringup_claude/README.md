@@ -28,7 +28,7 @@ tells the session when the budget is reached and starts the overseer. Options:
 | `--no-overseer` | – | do not start the overseer |
 
 The overseer (`overseer.sh`) reports facts; the session diagnoses and decides. Each tick it starts one fresh
-`claude -p` agent (default `claude-sonnet-5-5`, `--model` to change; no saved session, 20 min limit) with a short
+`claude -p` agent (default `claude-opus-5-5`, `--model` to change; no saved session, 20 min limit) with a short
 prompt in the script. The agent gets a time window, from the previous report (its time and text, taken from
 `overseer.log`) or the run start to now, and reads only that window: transcript records newer than the window start
 (`jq` on `.timestamp`), files newer than it (`find -newermt`, `stat`, `tail`). Its sources are the session's
