@@ -37,9 +37,9 @@ def command(cfg: dict) -> str:
 
 def every_s(cfg: dict) -> float:
     try:
-        v = float(_locks(cfg).get("yield_every_s") or EVERY_S)
+        v = float(_locks(cfg).get("yield_every_s"))
     except (TypeError, ValueError):
-        v = EVERY_S
+        return EVERY_S
     return v if v > 0 else EVERY_S
 
 
@@ -96,22 +96,22 @@ class Probe:
         """Stop the command's whole process group: SIGTERM, then SIGKILL after KILL_AFTER_S, and
         return BUSY_RC. A command that ended on its own (its rc, or a signal that is not ours)
         returns that instead: a finished command is never reported as a yield."""
+        sent = False
         for sig, grace in ((signal.SIGTERM, KILL_AFTER_S), (signal.SIGKILL, None)):
-            if popen.poll() is not None:
-                return popen.returncode   # it ended on its own: never report a finished command as yielded
+            if popen.poll() is not None and not sent:
+                return popen.returncode   # it ended on its own: a finished command is never a yield
             try:
                 os.killpg(popen.pid, sig)   # the command runs in a group of its own for this
                 sent = True
             except OSError:
-                sent = False   # it left the group (setsid) or just ended between check and signal
+                pass   # it left the group (setsid) or just ended between check and signal
             try:
                 popen.wait(grace)
             except subprocess.TimeoutExpired:
-                if sent:
-                    continue   # it ignores SIGTERM: the SIGKILL comes next
-                return BUSY_RC   # out of reach; the resource is still yielded
+                continue   # it ignores this signal: the SIGKILL comes next
             # Our signal ended it (or a shell that trapped it ended with 128+sig): a yield.
             return BUSY_RC if sent else (popen.returncode if popen.returncode is not None else BUSY_RC)
+        return BUSY_RC   # out of reach (its group escaped); the resource is still yielded
 
 
 def run_whole(cmd: list, env: dict, probe: "Probe | None") -> int:

@@ -2602,6 +2602,26 @@ def test_a_command_that_ignores_sigterm_is_killed_after_the_grace(env, tmp_path)
             t.kill()
 
 
+def test_a_signal_to_a_probed_ttp_lock_reaches_the_whole_command_group(env, tmp_path):
+    # With the probe armed the command runs in a group of its own, so a signal forwarded by
+    # `ttp lock` (a timeout, a cancel) must still reach the command's children, not only its leader.
+    p = make(env)
+    _yield_probe(p, tmp_path, "exit 1")
+    marks = tmp_path / "marks"
+    t = subprocess.Popen([sys.executable, str(TTP), "lock", "rig", "--", "bash", "-c",
+                          f"echo start >> {shlex.quote(str(marks))}; "
+                          f"(trap 'echo child-term >> {shlex.quote(str(marks))}' TERM; sleep 30) & wait"],
+                         env=_lock_env(env, p), stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    try:
+        _until_or_ended(lambda: marks.exists(), [t])
+        t.send_signal(signal.SIGTERM)
+        t.wait(timeout=30)
+        assert "child-term" in marks.read_text(), "the command's child never got the forwarded signal"
+    finally:
+        if t.poll() is None:
+            t.kill()
+
+
 def test_the_whole_run_path_yields_to_the_probe_too(env, tmp_path):
     p = make(env)
     _yield_probe(p, tmp_path, "echo stream; exit 0")
