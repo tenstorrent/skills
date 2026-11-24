@@ -3117,8 +3117,8 @@ def runtime_hold(harness: str | Path) -> Iterator[None]:
     """While git rewrites a harness checkout's files one by one (the upgrade's merge), its launcher runs a
     whole copy of the runtime from before (.git/RUNTIME_HOLD, made and renamed into place first): a process
     starting meanwhile never sees new code beside an old module, nor beside a module git has not written
-    yet or has already removed. The copy is renamed away once the merge ends, so the next launch runs the
-    merged runtime whole. Without a copy (no .git directory, or it could not be made) git writes as before."""
+    yet or has already removed. Its pid file goes once the merge ends, so the next launch runs the merged
+    runtime whole; the copy itself stays for processes started on it, until the next hold replaces it. Without a copy (no .git directory, or it could not be made) git writes as before."""
     h = Path(harness)
     hold, src = h / ".git" / RUNTIME_HOLD, h / "runtime"
     tmp = hold.with_name(f"{hold.name}.{os.getpid()}")
@@ -3135,13 +3135,8 @@ def runtime_hold(harness: str | Path) -> Iterator[None]:
     try:
         yield
     finally:
-        if held:
-            gone = hold.with_name(f"{hold.name}.gone.{os.getpid()}")
-            try:
-                os.rename(hold, gone)
-            except OSError:
-                pass
-            shutil.rmtree(gone, ignore_errors=True)
+        if held:   # the copy stays for what started on it and loads modules later; the next hold clears it
+            (hold / HOLD_PID).unlink(missing_ok=True)
 
 
 def replace_copy(src: str | Path, dst: str | Path, *, follow_symlinks: bool = True) -> str:

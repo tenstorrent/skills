@@ -101,8 +101,8 @@ def fast_forward(h: Path, merged: str, guard_env: str) -> str:
         return "could not read main's commit"
     touched = _touched(h, base, merged)
     clean = [f for f in touched if f not in _differs(h, touched)]
-    from .project import tree_writes
-    with tree_writes(h):
+    from .project import runtime_hold, tree_writes
+    with tree_writes(h), runtime_hold(h):
         r = _git(h, "merge", "--ff-only", merged, env={**os.environ, guard_env: "1"})
     if r.returncode == 0:
         return ""

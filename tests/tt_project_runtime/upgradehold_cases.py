@@ -752,13 +752,9 @@ def test_the_harness_launcher_runs_the_held_runtime_while_an_upgrade_rewrites_it
         assert launch() == "old"
         (pkg / "extra.py").write_text("SAY = 'new'\n")
         assert launch() == "old"
-    assert launch() == "new" and not list((h / ".git").iterdir())
+    assert launch() == "new" and not (h / ".git" / project.RUNTIME_HOLD / project.HOLD_PID).exists()
     # A copy left by an upgrade that died mid-merge: its holder pid is gone, so the launcher runs the tree.
     gone = subprocess.Popen([sys.executable, "-c", "pass"])
     gone.wait()
-    stale = h / ".git" / project.RUNTIME_HOLD / "ttp"
-    stale.mkdir(parents=True)
-    (stale / "__init__.py").write_text('__version__ = "0"\n')
-    (stale / "cli.py").write_text("def main():\n    print('stale')\n")
-    (stale.parent / project.HOLD_PID).write_text(str(gone.pid))
+    (h / ".git" / project.RUNTIME_HOLD / project.HOLD_PID).write_text(str(gone.pid))
     assert launch() == "new"

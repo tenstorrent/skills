@@ -1704,6 +1704,10 @@ def _listen_loop(p: Project, db, a, after: int, floor: str) -> None:
     from .web import cleared
     from . import checkcap, relayers
     deadline = time.time() + a.timeout if a.timeout else None
+    try:   # a listener that re-executed itself (_listen_reexec) ends when the one before it would have
+        deadline = float(os.environ.pop(LISTEN_DEADLINE_ENV, "") or 0) or deadline
+    except ValueError:
+        pass
     parent = _STARTED_BY[1] if _STARTED_BY[0] == os.getpid() else os.getppid()
     window = relayers.batch_s(p.config(), getattr(a, "batch", None))
     pending: list = []
@@ -1749,7 +1753,7 @@ def _listen_loop(p: Project, db, a, after: int, floor: str) -> None:
         # (the cursor above is saved first), once the files settled, so a lazy import never meets a mix.
         new = checkcap.upgraded()
         if new or (broke and time.time() - broke >= checkcap.UPGRADE_SETTLE_S):
-            _listen_reexec(new or "import-failure", read)
+            _listen_reexec(new or "import-failure", read, deadline)
             broke = 0.0
         if time.time() - beat > 60:
             beat = time.time()
@@ -1770,9 +1774,11 @@ def _listen_line(p: Project, m: dict, plain: bool = False) -> str:
 
 LISTEN_FROM_ENV = "TTP_LISTEN_FROM"     # _listen_reexec: the last message id the listener before the exec printed
 LISTEN_REEXEC_ENV = "TTP_LISTEN_REEXEC"  # ... and when it re-executed after an import failure
+LISTEN_DEADLINE_ENV = "TTP_LISTEN_DEADLINE"  # ... and when its --timeout ends, which a re-execution keeps
+LISTEN_REEXEC_S = 300.0
 
 
-def _listen_reexec(new: str, read: int) -> None:
+def _listen_reexec(new: str, read: int, deadline: float | None = None) -> None:
     """Run this listener again, as the same process (its pid stays in the chat's lock), through the launcher
     that started it with the same arguments and the runtime installed now (`new`: checkcap.upgraded's
     answer, or "import-failure"), going on after message `read`. A version it re-executed for already
@@ -1790,20 +1796,19 @@ def _listen_reexec(new: str, read: int) -> None:
     else:
         os.environ[checkcap.REEXEC_ENV] = new
     os.environ[LISTEN_FROM_ENV] = str(read)
+    if deadline:
+        os.environ[LISTEN_DEADLINE_ENV] = repr(deadline)
     launcher = sys.argv[0]
     cmd = ([sys.executable, launcher] if os.path.isfile(launcher) and not launcher.endswith(".py")
            else [sys.executable, "-m", "ttp"])
     print(f"ttp: runtime {__version__} changed on disk ({new}): listener re-executing with the installed one "
           f"(same pid), going on after #{read}", file=sys.stderr, flush=True)
-    sys.stdout.flush()
     try:
         os.execv(sys.executable, cmd + sys.argv[1:])
     except OSError as e:
         os.environ.pop(LISTEN_FROM_ENV, None)
+        os.environ.pop(LISTEN_DEADLINE_ENV, None)
         print(f"ttp: listener could not re-execute ({e}); listening on with this runtime", file=sys.stderr)
-
-
-LISTEN_REEXEC_S = 300.0
 
 
 def _listen_write(db, sql: str, args: tuple, what: str) -> None:
