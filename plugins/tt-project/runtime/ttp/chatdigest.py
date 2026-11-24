@@ -433,10 +433,10 @@ def handoff(db, cfg: dict | None, task: dict, new: str, text: str, now: float | 
               tid, str(task.get("title") or "")[:80], new, chat, outcome_words(f), tid,
               spans.wrap(body, "hand-off of #%d" % tid, spans.new_tag())),
           "queued", tid, json.dumps({"chat": chat, "task": tid, "facts": f})))
-    st = db.kv(FALLBACK_KV) or []
-    st.append({"chat": chat, "task": tid, "title": str(task.get("title") or ""),
-               "at": now, "due": now + fallback_s(cfg or _cfg(db)), "facts": f})
-    with db.tx():
+    with db.tx():   # the read-modify-write is one pass: a concurrent arm or sweep never loses one
+        st = db.kv(FALLBACK_KV) or []
+        st.append({"chat": chat, "task": tid, "title": str(task.get("title") or ""),
+                   "at": now, "due": now + fallback_s(cfg or _cfg(db)), "facts": f})
         db.set_kv(FALLBACK_KV, st)
     if p is not None and new == "done":
         from . import obligations
