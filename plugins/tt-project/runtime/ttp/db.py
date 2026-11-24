@@ -1404,7 +1404,7 @@ def _planned_by(planned: dict) -> str:
     by = str(planned.get("by") or "")
     if by.startswith(("host-cycle record", "machine change #")) and re.fullmatch(r"[\w.-]+", project):
         return project
-    return re.sub(r"\s*\(.*\)\s*$", "", str(planned.get("by") or ""))[:60].strip()
+    return re.sub(r"\s*\(.*\)\s*$", "", by)[:60].strip()
 
 
 def host_line(boots: list[dict], where=None) -> str:
