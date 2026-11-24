@@ -692,12 +692,15 @@ def rearm_refusal(a) -> tuple[str, dict]:
 
 def rearm_deployed(target) -> tuple[dict | None, str]:
     """(receipt, why not): the running daemon's verified receipt, read the way `ttp deployed` reads a
-    deployment (identity.verified_receipt; identity.probe names the running daemon's pid)."""
+    deployment (a verified receipt and a completed tick; identity.probe names the daemon's pid)."""
     from . import identity, project as project_mod
     s = identity.probe(target.state, target.db.kv("daemon", {}), project_mod.hostname())
     if not s["alive"] or not s["pid"]:
         return None, "its daemon is not running here"
-    return identity.verified_receipt(target.state, s["pid"])
+    receipt, why = identity.verified_receipt(target.state, s["pid"])
+    if receipt and not identity.tick_done(target.state, receipt):
+        return None, "its daemon has not completed a tick on the running code yet"
+    return receipt, why
 
 
 def rearm_replay(ref: str, target, p, not_before: float = 0.0) -> str:

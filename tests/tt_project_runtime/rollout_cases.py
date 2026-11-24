@@ -1170,14 +1170,17 @@ def _rearm_runs(target, status):
     return "7"
 
 
-def _rearm_daemon(target, commit):
-    """The target's daemon runs `commit`: its heartbeat carries a verified receipt naming it, and its
-    daemon record names the live pid identity.probe looks for."""
+def _rearm_daemon(target, commit, ticked=True):
+    """The target's daemon runs `commit`: its heartbeat carries a verified receipt naming it, its
+    daemon record names the live pid identity.probe looks for, and (`ticked`) it completed a tick."""
+    from ttp import identity
     from ttp.project import hostname
     pid = os.getpid()
     (target.state / "heartbeat").write_text(json.dumps({"pid": pid, "receipt": {
-        "pid": pid, "version": "0.0.1", "commit": commit, "provenance": "verified"}}))
+        "pid": pid, "version": "0.0.1", "commit": commit, "provenance": "verified", "instance": "i1"}}))
     target.db.set_kv("daemon", {"pid": pid, "host": hostname()})
+    tick = target.state / identity.TICK_FILE
+    tick.write_text(json.dumps({"instance": "i1"})) if ticked else tick.unlink(missing_ok=True)
 
 
 def test_a_run_rearm_is_refused_without_the_setting_the_evidence_or_a_deployed_fix(env, monkeypatch, capsys):
@@ -1239,6 +1242,10 @@ def test_a_run_rearm_reads_the_running_daemon_not_the_files_on_disk(env, monkeyp
     code, out = _roll(capsys, "arm", "glm_device", target.name, "--fix", str(fix),
                       "--replay", _rearm_runs(target, "done"))
     assert code == 2 and "does not contain fix task" in out, "the files cannot answer for the running daemon"
+    _rearm_daemon(target, head, ticked=False)   # restarted onto the fix, no completed tick yet
+    code, out = _roll(capsys, "arm", "glm_device", target.name, "--fix", str(fix),
+                      "--replay", _rearm_runs(target, "done"))
+    assert code == 2 and "has not completed a tick" in out, "a restart counts once its daemon completed a tick"
 
 
 def test_a_run_re_arms_one_project_on_evidence_and_records_it_in_the_ledger(env, monkeypatch, capsys):
