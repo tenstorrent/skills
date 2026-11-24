@@ -21442,6 +21442,33 @@ def test_push_own_still_refuses_a_test_failing_only_on_its_head(env, monkeypatch
                           capture_output=True).returncode != 0, "nothing pushed"
 
 
+@pytest.mark.parametrize("found_by", ["push_target", "base_ref"])
+@pytest.mark.parametrize("kind", ["pre_existing", "new"])
+def test_a_branch_not_on_the_remote_is_judged_against_its_nearest_base_not_none(
+        env, monkeypatch, tmp_path, found_by, kind):
+    # No base handed to the gate (own_base found none, the branch is not on the remote): the failing tests
+    # rerun on the merge base with the branch's nearest base (real_base: the push target, else
+    # delivery.base_ref), so a failure the base has too does not block; one new on the head still does.
+    from ttp import push
+    head_body = (_GATE_BASE + "\n\ndef helper():\n    return 1\n" if kind == "pre_existing" else
+                 _GATE_BASE.replace("def test_x():\n    pass", "def test_x():\n    assert False"))
+    p, repo, base, head = _gate_push_setup(env, monkeypatch, tmp_path, head_body)
+    if found_by == "base_ref":   # a push target this repo lacks: delivery.base_ref names the base
+        p.set_config("delivery.push_branch", "origin/elsewhere")
+        p.set_config("delivery.base_ref", "origin/proj")
+    said: list[str] = []
+    rc = push.publish(repo, "origin", "own", push.check_list([_GATE_CHECK]), say=said.append, base=None, p=p)
+    text = "\n".join(said)
+    assert f"on the base {base[:10]}" in text and "(none)" not in text, text
+    if kind == "pre_existing":
+        assert rc == 0, text
+        assert "pre-existing on the base" in text and "tests/test_gate.py::test_pre" in text, text
+        assert _git_out(repo, "rev-parse", "origin/own") == head
+    else:
+        assert rc == push.CHECKS_FAILED, text
+        assert "new on" in text and "tests/test_gate.py::test_x" in text, text
+
+
 def test_push_own_quarantines_a_test_that_passes_on_its_rerun_and_pushes(env, monkeypatch, tmp_path):
     # Flaky: fails once, passes on the head rerun. Quarantined as the batch does, and the push goes.
     from ttp import gatejudge, push

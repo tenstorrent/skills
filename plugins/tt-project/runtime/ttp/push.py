@@ -5150,7 +5150,7 @@ def _tests_gate(cmd: Any, repo: Path, env: dict, say: Callable[[str], None], hea
     """The base-vs-head tests gate for a push check that failed (`seen`: _run_one's exit code and output), as
     the push queue's batch and `ttp checks` judge one (gatejudge.judge): its failing pytest ids
     (gatejudge.judgeable) rerun once at `head`, those failing again once at its merge base with `target` (the
-    push target's tip), in a temp checkout on this same host. 0 when none is new on the head (each flaky,
+    push target's tip; when that gives none, with the branch's nearest base, _nearest_base), in a temp checkout on this same host. 0 when none is new on the head (each flaky,
     quarantined, or pre-existing: failing the same way on the base), each named; BUSY when a rerun found no
     slot; else CHECKS_FAILED, the failure as it was. A failing id matching delivery.push_hard_tests (the leak
     scan) is never excused. `p` (else TTP_PROJECT): its settings, base results and quarantine."""
@@ -5163,8 +5163,7 @@ def _tests_gate(cmd: Any, repo: Path, env: dict, say: Callable[[str], None], hea
     if not ids:
         return CHECKS_FAILED
     s, now, host_ = gatejudge.settings(cfg), time.time(), gatejudge.host()
-    r = _git(repo, "merge-base", target, head) if target else None
-    mb = r.stdout.strip() if r is not None and r.returncode == 0 else ""
+    mb = _merge_base(repo, target, head) or _merge_base(repo, _nearest_base(p, repo), head)
     diff = _git(repo, "diff", "--name-only", f"{mb}..{head}") if mb else None
     changed = diff.stdout.split() if diff is not None and diff.returncode == 0 else None
 
@@ -5220,6 +5219,23 @@ def _tests_gate(cmd: Any, repo: Path, env: dict, say: Callable[[str], None], hea
         return BUSY
     say(f"none of the failing tests is new on {head[:10]}: {cmd}{where(cmd)} does not block the push")
     return 0
+
+
+def _merge_base(repo: Path, ref: str, head: str) -> str:
+    """`git merge-base ref head`, "" when `ref` is empty or has none with `head`."""
+    r = _git(repo, "merge-base", ref, head) if ref else None
+    return r.stdout.strip() if r is not None and r.returncode == 0 else ""
+
+
+def _nearest_base(p: Project, repo: Path) -> str:
+    """The checked-out branch's nearest base (real_base: the push target, delivery.base_ref, the remote's
+    default branch), for the tests gate of a branch handed no target, as one not yet on the remote is."""
+    try:
+        remote, push_to = target(p, repo)
+    except ValueError:   # no push_branch: base_ref and the default branch still count
+        remote, push_to = "origin", ""
+    branch = _git(repo, "symbolic-ref", "--quiet", "--short", "HEAD").stdout.strip()
+    return real_base(p, repo, remote, push_to, branch)[0]
 
 
 def _gate_here(cmd: Any, repo: Path, env: dict, say: Callable[[str], None], head: str, target: str, seen: dict,
