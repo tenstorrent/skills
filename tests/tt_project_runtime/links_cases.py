@@ -162,7 +162,7 @@ def test_ids_link_to_their_web_app_page_and_unresolved_ones_get_labelled(env):
     assert f"#{task}" in out and "](" in out and f"&task={task}" in out, out  # a task id resolves
     assert "run 777" in out and "&run=777" in out, out                   # a run id
     assert f"msg #{msg}" in out and f"&msg={msg}" in out, out            # a message id
-    assert f"review #{task}" in out and f"&task={task}" in out, out      # a review names its task
+    assert f"[review #{task}](http://127.0.0.1:8123/#token=" in out, out  # a review names its task
     assert "#4 (unresolved reference)" in out, out                       # an id that matches nothing
     assert "(unresolved" not in links.for_user(p, f"#{task}")          # resolution is not labelling
     p.set_config("links.web_base", "https://example.org/app")

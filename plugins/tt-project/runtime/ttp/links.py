@@ -165,16 +165,16 @@ def config(p, db=None) -> dict:
     return {"jira_base": str(links.get("jira_base") or "").rstrip("/"),
             "jira_keys": [str(k) for k in (links.get("jira_keys") or [])],
             "repos": links.get("repos") or {},
-            "single_repo": (repo or {}).get("single", str(links.get("repo") or "")),
+            "single_repo": (repo or {}).get("single") or str(links.get("repo") or ""),
             "file_url": file_url, "is_file": is_file, "ref_ok": exists, "ref_url": _ref_url(p, web, exists)}
 
 def _exists(p, db):
-    """Whether id `n` names a record of `kind` ('' = the id kinds in turn). `db` is the caller's
-    own connection: p.db belongs to the thread that opened it."""
+    """Whether id `n` names a record of `kind`; a bare '#N' names a task (a run or message id
+    says its kind). `db` is the caller's own connection: p.db belongs to the thread that opened it."""
     def exists(n: int, kind: str) -> bool:
         try:
-            return any((db or p.db).one(f"SELECT 1 FROM {TABLES[k]} WHERE id=?", (n,))
-                       for k in ((kind,) if kind else ("task",)))
+            k = KIND.get(kind, kind) or "task"
+            return bool((db or p.db).one(f"SELECT 1 FROM {TABLES[k]} WHERE id=?", (n,)))
         except Exception:   # a db fault never breaks a message
             return False
     return exists
