@@ -2390,7 +2390,7 @@ class Daemon:
             self._last_cfg = now
             self.jev = babysit.wrap(self.cfg, Jev(self.cfg, db=self.p.db, pause=self._jev_pause), self.p.db,
                                     self._chat_pause, log=lambda m: log(self.p, m))
-        for step in (self.lift_boot_pause, self.reap_runs, self.reap_waiting_checks, self.wake_after_reboot, self.meter_running, self.watch_runs, self.watch_urgent_messages, self.check_steer_reads, self.relay_escalations, self.post_held_notifies, self.reconcile_tasks, self.retry_workspaces, self.tend_pushes,
+        for step in (self.lift_boot_pause, self.reap_runs, self.reap_waiting_checks, self.wake_after_reboot, self.resume_after_reboot, self.meter_running, self.watch_runs, self.watch_urgent_messages, self.check_steer_reads, self.relay_escalations, self.post_held_notifies, self.reconcile_tasks, self.retry_workspaces, self.tend_pushes,
                      self.verify_pushes,
                      self.tick_prune_worktrees, self.prune_leftovers, self.branch_cap, self.rollout_watch, self.land_harness_worktrees, self.backup_branches, self.check_local_only, self.check_disk,
                      self.sweep_alerts, self.check_release, self.sync_shared_pauses, self.check_pause_ends, self.check_move, self.track_outages,
@@ -4454,6 +4454,10 @@ class Daemon:
         except OSError:
             fresh = False
         this_boot = self._this_boot(r["boot_id"])
+        if r["boot_id"] and self.boot != "unknown" and not this_boot:
+            # Started on an earlier boot: its supervisor died with it, however young its lease. Only its
+            # own supervisor still up (pid and start time as recorded) says the boot id was misread instead.
+            return bool(r["pid"]) and _alive(r["pid"]) and self._is_supervisor(r) is True
         if fresh and this_boot and r["pid"] and self._is_supervisor(r) is False:
             return False   # its supervisor is gone though its last lease is young: lost now, not 3 min on (L7)
         return fresh or (this_boot and bool(r["pid"]) and _alive(r["pid"]) and self._is_supervisor(r) is not False)
@@ -12936,7 +12940,8 @@ class Daemon:
         return not any(tid in dependency_ids(t) for t in live)
 
     # workers ----------------------------------------------------------------------------------------
-    def dispatch(self) -> None:
+    def dispatch(self, only: set[int] | None = None) -> None:
+        """Start ready tasks; `only` limits the pass to those tasks (resume_after_reboot)."""
         db, began = self.p.db, time.time()
         running = db.q("SELECT provider, COUNT(*) n FROM runs WHERE role!='coordinator' AND status='running' "
                        "GROUP BY provider")
@@ -12953,8 +12958,9 @@ class Daemon:
             self._slot_resv_pass = {}
         try:
             with gitmemo.dispatch_pass():   # each start's reads of the root's checkout and its fetch: once
-                self._dispatch(busy)
-            self._dispatch_pass_at = began   # check_unstarted: a pass that began after a gate cleared
+                self._dispatch(busy, only)
+            if only is None:
+                self._dispatch_pass_at = began   # check_unstarted: a pass that began after a gate cleared
         finally:
             self._slot_resv_pass = None
 
@@ -13002,7 +13008,7 @@ class Daemon:
         hold = release.upgrade_hold(self.p.name)
         return f"release {release.hold_text(hold, self.p)}" if hold else ""
 
-    def _dispatch(self, busy: dict) -> None:
+    def _dispatch(self, busy: dict, only: set[int] | None = None) -> None:
         db = self.p.db
         if held := projmove.dispatch_hold(db):   # the old copy may still start workers: none here yet
             if held != getattr(self, "_move_said", ""):
@@ -13018,6 +13024,8 @@ class Daemon:
         self._step_over("the ready-task read")
         ready = db.ready_tasks()   # read after _slot_reservations, which may have woken a reserving task
         ready = self._lead_gate(ready)   # lead mode: the coordinator works the rest itself (leadmode.py)
+        if only is not None:
+            ready = [t for t in ready if t["id"] in only]
         reached = set()     # tasks that got past the gates to the resource check
         paused = db.paused_resources()
         now, core = time.time(), self.cfg.get("core_provider", "claude")
@@ -13042,11 +13050,15 @@ class Daemon:
         # a band is reached in turn, and an urgent or better-priority task walked but not started still
         # goes before every task of a later band.
         ids = {t["id"] for t in ready}
-        walked = self._dispatch_walked = [i for i in self.__dict__.get("_dispatch_walked") or () if i in ids]
+        if only is None:
+            walked = self._dispatch_walked = [i for i in self.__dict__.get("_dispatch_walked") or () if i in ids]
+        else:
+            walked = []   # a resume pass leaves the whole walk's rotation as it was
         fresh = [t for t in ready if t["id"] not in walked]
         if walked:
             ready = _rotate_walked(ready, set(walked), _owner_due(db), now)
         ramp = rampup.active(db, self.cfg, now) if ready else None
+        resumes = self._reboot_resumes() if ramp else set()
         batched: set[int] = set()   # tasks a batch run started this tick took along (batchrun.py)
         scratch = rollout.scratch_state(db, self.p.name, self.cfg.get("rollout")) if ready else None
         scratch_owners = _owner_due(db) if scratch else {}
@@ -13168,7 +13180,8 @@ class Daemon:
             if why:
                 continue
             # After an outage new workers ramp up (rampup.py); urgent work is first in the pick order.
-            if ramp and rampup.covers(ramp, coord.task_resources(task)) \
+            # A run the reboot cut resumes at once: it restores what ran, it is not new load.
+            if ramp and task["id"] not in resumes and rampup.covers(ramp, coord.task_resources(task)) \
                     and self._ramp_running(ramp["scope"]) >= rampup.allowed(ramp, self.cfg, now):
                 if not ramp.get("said"):
                     log(self.p, rampup.note(ramp, self.cfg, now))
@@ -13475,7 +13488,7 @@ class Daemon:
             busy[run_prov] = busy.get(run_prov, 0) + 1
             if gate.regime == "caps":
                 ctx["committed"] += cost
-        if all(t["id"] in walked for t in fresh):
+        if only is None and all(t["id"] in walked for t in fresh):
             self._dispatch_walked = []   # every task was reached: next tick goes in plain order again
         if any(f == "full" for f in fate.values()) and preempt.enabled(self.cfg):
             try:
@@ -13486,7 +13499,7 @@ class Daemon:
         for task in ready:
             if task["id"] not in reached:
                 self._unreserve(task)
-        if free:
+        if free and only is None:
             try:
                 self._log_slot_fill(free, ready, fate, ctx, core)
             except Exception:   # the audit log never stops dispatch
@@ -16322,6 +16335,28 @@ class Daemon:
         log(self.p, f"pause lifted: set until reboot at {since}, now on boot {self.boot}")
         db.post("out", f"The project pause set until the host reboots ({since}) was lifted: the host has booted since. "
                        "New runs start again.", kind="info", severity="low", ref=f"pause-lifted:{self.boot}")
+
+    def _reboot_resumes(self) -> set[int]:
+        """Queued tasks whose latest run a host reboot cut short (finish_run's lost_to_reboot, this boot)."""
+        rows = self.p.db.q(
+            "SELECT r.task, r.note FROM runs r JOIN tasks t ON t.id=r.task WHERE r.ended>? AND r.status='lost' "
+            "AND r.role!='coordinator' AND t.status='queued' AND r.note LIKE '%lost_to_reboot%' AND NOT EXISTS "
+            "(SELECT 1 FROM runs n WHERE n.id>r.id AND n.task=r.task AND n.role!='coordinator')",
+            (time.time() - 2 * 86400,))
+        return {r["task"] for r in rows if self._this_boot(json.loads(r["note"] or "{}").get("lost_to_reboot"))}
+
+    def resume_after_reboot(self) -> None:
+        """Right after the reap, start the runs a host reboot cut short, ahead of the tick's other steps
+        (minutes on the first tick after a boot) and the post-outage ramp: a reboot's runs resume within
+        seconds of the daemon starting. The same holds as for dispatch: pause, settle, host cycle, gates."""
+        if self.cfg_status == "unavailable" or self.p.db.kv("paused", False) or self.settling() \
+                or self.host_cycle_held(time.time()):
+            return
+        if not (ids := self._reboot_resumes()):
+            return
+        if not self.gates:
+            self.update_gates()   # the first tick: dispatch reads the budget gates
+        self.dispatch(only=ids)
 
     def wake_after_reboot(self) -> None:
         """Once per daemon start: a waiting task that handed off before this host booted is due now,

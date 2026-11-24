@@ -68,3 +68,70 @@ def test_dispatch_after_an_outage_starts_urgent_work_first_and_widens_step_by_st
     finally:
         drain(d)
         assert reap_tmp_processes(tmp_path) == [], "a stand-in run outlived the test"
+
+
+def _cut_run(p, tmp_path, tid, boot, pid, lease_age=20.0):
+    """A run of task tid recorded running under `boot` with supervisor `pid`, its lease `lease_age` s old."""
+    p.db.update_task(tid, status="running")
+    run_dir = tmp_path / f"run{tid}"
+    run_dir.mkdir()
+    (run_dir / "output.jsonl").write_text("")
+    (run_dir / "lease").touch()
+    os.utime(run_dir / "lease", (time.time() - lease_age, time.time() - lease_age))
+    return p.db.x("INSERT INTO runs(task,role,provider,started,status,dir,boot_id,pid) VALUES(?,?,?,?,?,?,?,?)",
+                  (tid, "worker", "fake", time.time() - 1800, "running", str(run_dir), boot, pid))
+
+
+def test_runs_a_reboot_cut_resume_on_the_first_tick_ahead_of_its_slow_steps_and_the_ramp(
+        env, monkeypatch, tmp_path, reap_tmp_processes):
+    """A fast reboot: runs recorded running on the earlier boot, their pids gone, their leases still
+    young. The first tick reaps them and starts every one before its slow steps run, though the ramp
+    after the reboot allows one start; work that was not running waits for the ramp."""
+    import subprocess
+    from ttp import rampup
+    p, d, drain, settle = _slot_setup(env, monkeypatch, tmp_path, slots=6)
+    try:
+        p.set_config("budget.ramp_start", 1)
+        d.cfg = p.config()
+        gone = subprocess.Popen(["true"])
+        gone.wait()
+        cut = [p.db.add_task(f"cut {i}", "s", kind="work", tier="light", origin="user", priority=3) for i in range(3)]
+        routine = p.db.add_task("routine", "s", kind="work", tier="light", origin="user", priority=1)
+        lost = {_cut_run(p, tmp_path, tid, "an-earlier-boot", gone.pid) for tid in cut}
+        p.db.set_kv(rampup.KEY, {"since": time.time(), "cause": "host reboot", "base": 0, "scope": None})
+        began, seen = time.monotonic(), []
+        fresh = lambda: sorted(r["task"] for r in p.db.q(   # noqa: E731
+            "SELECT task FROM runs WHERE status='running' AND id>?", (max(lost),)))
+        monkeypatch.setattr(d, "tick_prune_worktrees", lambda: seen.append(fresh()))
+        d.tick()
+        assert seen == [sorted(cut)], "the resumes start before the tick's later steps"
+        assert time.monotonic() - began < 120
+        assert {r["id"] for r in p.db.q("SELECT id FROM runs WHERE status='lost'")} == lost, \
+            "a young lease from an earlier boot is no sign of life"
+        assert fresh() == sorted(cut), \
+            "every cut run resumes; new work waits for the ramp"
+        assert all(p.db.task(t)["attempts"] == 0 for t in cut)
+    finally:
+        drain(d)
+        assert reap_tmp_processes(tmp_path) == [], "a stand-in run outlived the test"
+
+
+def test_a_run_alive_on_this_boot_is_never_resumed_twice(env, monkeypatch, tmp_path, reap_tmp_processes):
+    import subprocess
+    p, d, drain, settle = _slot_setup(env, monkeypatch, tmp_path, slots=6)
+    live = subprocess.Popen(["sleep", "60"])
+    try:
+        tid = p.db.add_task("running", "s", kind="work", tier="light", origin="user", priority=1)
+        rid = _cut_run(p, tmp_path, tid, d.boot, live.pid, lease_age=999)
+        for _ in range(2):
+            d.reap_runs()
+            d.resume_after_reboot()
+            d.dispatch()
+        assert [r["id"] for r in p.db.q("SELECT id FROM runs WHERE task=?", (tid,))] == [rid]
+        assert p.db.one("SELECT status FROM runs WHERE id=?", (rid,))["status"] == "running"
+        assert p.db.task(tid)["status"] == "running" and d._reboot_resumes() == set()
+    finally:
+        live.kill()
+        live.wait()
+        drain(d)
+        assert reap_tmp_processes(tmp_path) == [], "a stand-in run outlived the test"

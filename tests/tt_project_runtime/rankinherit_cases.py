@@ -72,14 +72,18 @@ def test_a_run_whose_supervisor_is_gone_is_lost_though_its_lease_is_young(env, t
     (run_dir / "runner.pid").write_text(f"{gone.pid}\n123456\n")
     row = {"id": 1, "dir": str(run_dir), "boot_id": d.boot, "pid": gone.pid}
     assert d._run_alive(row) is False
-    # Bypasses: a live supervisor with a matching start, no runner record, another boot's pid, a finished run.
+    # Bypasses: a live supervisor with a matching start, no runner record, a finished run. A young lease
+    # from another boot is no sign of life; only that run's own supervisor still up is.
     from ttp import runner
     (run_dir / "runner.pid").write_text(f"{os.getpid()}\n{runner.proc_start(os.getpid())}\n")
     assert d._run_alive(dict(row, pid=os.getpid())) is True
     (run_dir / "runner.pid").unlink()
     assert d._run_alive(dict(row, pid=gone.pid)) is True   # nothing recorded: the lease still speaks for it
     (run_dir / "runner.pid").write_text(f"{gone.pid}\n123456\n")
-    assert d._run_alive(dict(row, boot_id="another-boot")) is True
+    assert d._run_alive(dict(row, boot_id="another-boot")) is False
+    (run_dir / "runner.pid").write_text(f"{os.getpid()}\n{runner.proc_start(os.getpid())}\n")
+    assert d._run_alive(dict(row, pid=os.getpid(), boot_id="another-boot")) is True
+    (run_dir / "runner.pid").write_text(f"{gone.pid}\n123456\n")
     (run_dir / "exit.json").write_text("{}")
     assert d._run_alive(row) is False
 
