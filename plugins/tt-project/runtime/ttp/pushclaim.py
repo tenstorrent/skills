@@ -78,6 +78,10 @@ _LANDED_VERB = re.compile(r"(?i)\b(landed|pushed|merged)\b")
 # about a folder, not a landing.
 _LANDED_SUBJECT = re.compile(r"(?i)\b(?:changes?|works?|fix(es)?|patch(es)?|commits?|head|branch(es)?"
                              r"|pr|diffs?)\b")
+# A destination a sha-less claim's sentence names for its run's own work: another branch, a PR,
+# a fork, another repository. Naming one keeps the sentence out of the push-branch check.
+_LANDED_DEST = re.compile(r"(?i)\b(?:upstream|forks?|repo(?:sitory)?s?|pull request|pr\b|main|master"
+                           r"|trunk|[a-z0-9_./-]+/[a-z0-9_./-]+|\w+\s+branch)")
 UNVERIFIED_CLAIM = "(unverified)"      # a landed-claim this project cannot check, never a plain 'landed'
 NOT_LANDED = "not landed"              # the correction a claim off the push branch reads
 
@@ -173,10 +177,22 @@ def text_claims(p, text: str, repo=None) -> list[dict]:
     return out
 
 
+def _names_push_branch(sentence: str, target) -> bool:
+    """Whether a claim's sentence names the project's push branch: the words 'the push branch',
+    or its configured name (`origin/proj`, or the branch name alone)."""
+    if "push branch" in sentence.lower():
+        return True
+    return bool(target) and bool(re.search(
+        rf"\b{re.escape(target[0] + '/' + target[1][len('refs/heads/'):])}\b|"
+        rf"\b{re.escape(target[1][len('refs/heads/'):])}\b", sentence))
+
+
 def landed_claims(p, text: str, repo) -> list[tuple[int, int, str, tuple]]:
     """The (start, end, sha, target) of each phrase in `text` claiming a landing: the push phrases
     text_claims parses (same regexes, negation and overlap rules; the sha resolved in `repo`), then
-    a claim verb naming no commit ("the change landed", target None). A phrase about another task
+    a claim verb naming no commit ("the change landed", target None) whose sentence names the push
+    branch, or says 'landed' while naming no other destination ("pushed the fix to my branch",
+    "merged into the work branch" name one, so they are left out). A phrase about another task
     or run (its sentence names its id) is left out: the check would read this run's head, not that
     task's."""
     target = _default(p, repo)
@@ -197,6 +213,12 @@ def landed_claims(p, text: str, repo) -> list[tuple[int, int, str, tuple]]:
         hi = next((i for i in (text.find(c, m.end()) for c in ".!?\n") if i > m.end()), len(text))
         if not _LANDED_SUBJECT.search(text[lo:hi]) or text[m.end():].startswith(" " + UNVERIFIED_CLAIM):
             continue   # not about this run's work, or the claim is already marked
+        # a sha-less claim is a push-branch claim only when its sentence names that branch, or
+        # says 'landed' naming no destination: a push or merge to the run's own branch, a PR
+        # branch or a fork is another destination's business and stays as written.
+        if not (_names_push_branch(text[lo:hi], target)
+                or (m.group(1).lower() == "landed" and not _LANDED_DEST.search(text[m.end():hi]))):
+            continue
         out.append((m.start(), m.end(), "", None))
     return out
 
@@ -211,7 +233,9 @@ def correct_landed_claims(p, text: str, repo, head: str = "", tid: int = 0,
     (unverified), never a plain 'landed'. A claim the local tracking ref cannot confirm is decided
     again after the push branch is fetched once: a landing another route pushed must not read
     'not landed' because the ref lags behind it. Claims naming another ref are the remote
-    checks' business and are left as written. `remote_missing`: the remote check settled every
+    checks' business and are left as written. Known gap: a sha-less claim naming another
+    destination (pushed to its own branch, merged into a PR branch) names no ref the remote
+    checks can read, so it is not checked either and stays as written. `remote_missing`: the remote check settled every
     claim of this task false, so each is rewritten to read 'not landed', whatever ref it named.
     `fetches`: a cache filled before the write transaction (prefetch), so the one fetch runs
     outside it and this reads the refreshed ref; None makes its own."""

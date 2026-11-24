@@ -82,13 +82,33 @@ def test_a_receipt_holds_a_claim_only_when_it_holds_its_commit(env, monkeypatch)
 
 def test_a_push_of_something_else_is_no_landing_claim(env, monkeypatch):
     """A push verb whose subject is not the run's own work ("pushed the logs to a folder",
-    "pushed everything to a cache", "it was pushed to the cache") is no claim of a landing."""
+    "pushed everything to a cache", "it was pushed to the cache") is no claim of a landing, and
+    neither is a push or merge to another destination (review #9671): those sentences stay as
+    written, a sha-less claim being checked only against the push branch it names or a plain
+    'landed' naming no other destination."""
     from ttp import pushclaim
     p, repo, head = _claim_replay_setup(env, monkeypatch, landed=False)
     for text in ("pushed the log files to the results folder.",
                  "pushed everything to the results folder.",
-                 "it was pushed to the artifacts cache."):
+                 "it was pushed to the artifacts cache.",
+                 "Pushed the fix to my branch for review.",
+                 "Merged main into the work branch and reran the tests.",
+                 "Pushed branch ttp/t12-x and opened a draft PR.",
+                 "The change landed in the upstream repository."):
         assert pushclaim.correct_landed_claims(p, text, p.root, head) == text, text
+
+
+def test_a_sha_less_claim_naming_the_push_branch_is_checked(env, monkeypatch):
+    """A sha-less claim whose sentence names the push branch is checked against the task head even
+    when its verb is a push or a merge: the correction still reads 'not landed' when the branch
+    does not hold the head."""
+    from ttp import pushclaim
+    p, repo, head = _claim_replay_setup(env, monkeypatch, landed=False)
+    for text in ("The change landed on the push branch.",
+                 "Pushed the fix to the push branch.",
+                 "Merged the change into origin/proj."):
+        fixed = pushclaim.correct_landed_claims(p, text, p.root, head)
+        assert "not landed" in fixed and head[:12] in fixed, (text, fixed)
 
 
 def test_a_text_claim_the_local_check_cannot_settle_is_corrected_by_the_remote_check(env, monkeypatch, tmp_path):
