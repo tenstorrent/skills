@@ -223,26 +223,26 @@ def test_eta_factor_is_bounded_needs_samples_and_has_an_off_switch(env):
     p = make(env)
     now = time.time()
     rows = []
-    for i in range(11):   # eleven code deliveries that took 10x the promised ETA
+    for i in range(11):   # eleven code deliveries that took 10x the raw ETA
         rows.append({"ts": now - 5000 - i, "ref": f"t{100 + i}", "kind": "code", "src": "state", "likely": now - 5000 - i + 100,
                      "shown": now - 5000 - i + 100, "conservative": now - 5000 - i + 200})
         rows.append({"ts": now - 10, "ref": f"t{100 + i}", "delivered": now - 5000 - i + 1000})
     etaledger._append(p.db, rows)
     f = etaledger.factors(p.db, p, now)
-    assert f["factors"]["code"] == 2.0                    # clamped to the upper bound
+    assert f["factors"]["code"] == 3.0                    # clamped to the upper bound
     p.db.set_kv("eta_factors", f)
     e = {"end": now + 1000, "path": []}
     got = etaledger.shown(p.db, e, now, "code")
-    assert got["end"] == pytest.approx(now + 2000) and got["raw_end"] == e["end"] and got["factor"] == 2.0
+    assert got["end"] == pytest.approx(now + 3000) and got["raw_end"] == e["end"] and got["factor"] == 3.0
     assert got["conservative"] > got["end"]
-    # A long outside-work leg whose p90 walk ends before the x2 likely time: neither conservative time
+    # A long outside-work leg whose p90 walk ends before the x3 likely time: neither conservative time
     # is earlier than the likely one, in `ttp eta`, its --json, STATE's line or the ledger row.
     leg = {"end": now + 10.4 * 3600, "p90_end": now + 18.8 * 3600, "why": None, "overrun": False,
            "path": [7], "legs": [("outside work", 10.35 * 3600)]}
     got = etaledger.shown(p.db, leg, now, "code")
-    assert got["end"] == pytest.approx(now + 20.8 * 3600) and got["raw_p90_end"] == leg["p90_end"]
+    assert got["end"] == pytest.approx(now + 31.2 * 3600) and got["raw_p90_end"] == leg["p90_end"]
     assert got["conservative"] >= got["end"] and got["p90_end"] >= got["end"]
-    assert "conservative" in eta.field(got, p, now) and "corrected x2" in eta.text(got, p, now)
+    assert "conservative" in eta.field(got, p, now) and "corrected x3" in eta.text(got, p, now)
     etaledger.record(p.db, p, [("t7", "code", got), ("t8", "code", {**got, "conservative": now})], now, src="cli")
     rows = [r for r in etaledger.read(p.db) if r.get("ref") in ("t7", "t8")]
     assert len(rows) == 2 and all(r["conservative"] >= r["shown"] for r in rows), rows
@@ -254,20 +254,30 @@ def test_eta_factor_is_bounded_needs_samples_and_has_an_off_switch(env):
     assert few["factors"] == {}
 
 
-def test_eta_factor_is_the_median_actual_over_promised_per_kind(env):
-    """The factor is measured against the promised (shown) time, per kind: a kind that promises 2x
-    its raw estimate and still takes twice the promised time gets a 2x factor, not 1x."""
+def test_eta_factor_is_per_kind_holds_under_its_own_correction_and_needs_ten(env):
+    """Per kind, from 10 deliveries in the last 7 days: a kind whose ETAs already carry a 0.7 factor and land
+    on the promised time keeps 0.7 (measured against the raw estimate, so a right factor does not undo
+    itself); a kind with 9 deliveries gets none, and an older delivery is out of the window."""
     from ttp import etaledger
     p = make(env)
     now = time.time()
     rows = []
-    for i in range(11):
-        rows.append({"ts": now - 5000 - i, "ref": f"t{100 + i}", "kind": "code", "src": "state",
-                     "likely": now - 5000 - i + 100, "shown": now - 5000 - i + 200,
-                     "conservative": now - 5000 - i + 300})
-        rows.append({"ts": now - 10, "ref": f"t{100 + i}", "delivered": now - 5000 - i + 400})
+    for i in range(10):   # raw 1000 s, promised 700 s (x0.7 in use), delivered at 700 s
+        ts = now - 5000 - i
+        rows += [{"ts": ts, "ref": f"c{i}", "kind": "code", "src": "state", "likely": ts + 1000, "shown": ts + 700,
+                  "conservative": ts + 1400}, {"ts": now - 10, "ref": f"c{i}", "delivered": ts + 700}]
+    for i in range(9):    # review: 3x late, but only 9 deliveries
+        ts = now - 5000 - i
+        rows += [{"ts": ts, "ref": f"r{i}", "kind": "review", "src": "state", "likely": ts + 100, "shown": ts + 100,
+                  "conservative": ts + 200}, {"ts": now - 10, "ref": f"r{i}", "delivered": ts + 300}]
+    old = now - 8 * 86400   # a tenth review delivery, 8 days old
+    rows += [{"ts": old, "ref": "r9", "kind": "review", "src": "state", "likely": old + 100, "shown": old + 100,
+              "conservative": old + 200}, {"ts": old + 300, "ref": "r9", "delivered": old + 300}]
     etaledger._append(p.db, rows)
-    assert etaledger.factors(p.db, p, now)["factors"] == {"code": 2.0}
+    f = etaledger.factors(p.db, p, now)
+    assert f["factors"] == {"code": 0.7}
+    p.db.set_kv("eta_factors", f)
+    assert etaledger.factor(p.db, "code") == 0.7 and etaledger.factor(p.db, "review") == 1.0
 
 
 def test_eta_cli_calibration_and_landings_commands_run(env, capsys):

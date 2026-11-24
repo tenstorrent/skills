@@ -7,8 +7,10 @@ estimate, `shown` the corrected one, `conservative`, `due`), and a settling row 
 delivered (`delivered`) or closed without delivery (`closed`). Obligation promises older than the ledger are
 backfilled once from their due and receipt.
 
-The correction: per task kind, the trailing 7-day median of actual / promised time, bounded (CLAMP)
-and used only from MIN_SAMPLES deliveries on, multiplies the time left in eta.py's estimates. It is
+The correction: per task kind, the trailing 7-day median of actual / raw-estimated time, bounded (CLAMP)
+and used only from MIN_SAMPLES deliveries on, multiplies the time left in eta.py's estimates (measured
+against the raw estimate, not the promised one: the promised time already carries the factor in use, so
+a factor taken from it would undo itself once right). It is
 kept in the project's kv (`eta_factors`) so every estimate reads the same one. Config `eta`: `correction`
 (false: off), `min_samples`, `clamp` [low, high], `conservative_x` (the conservative time's multiple of
 the time left when too few deliveries give a measured one), `ledger` (false: record nothing),
@@ -34,7 +36,7 @@ from pathlib import Path
 
 NAME = "eta-ledger.jsonl"
 KEY = "eta_factors"
-CLAMP = (0.7, 2.0)
+CLAMP = (0.7, 3.0)
 MIN_SAMPLES = 10
 CONSERVATIVE_X = 2.0
 WEEK_S = 7 * 86400
@@ -485,7 +487,7 @@ def _clamp(c: dict) -> tuple[float, float]:
 
 
 def factors(db, where, now: float) -> dict:
-    """The per-kind correction: the trailing 7-day median of actual / promised, bounded, used from
+    """The per-kind correction: the trailing 7-day median of actual / raw estimate, bounded, used from
     `min_samples` deliveries on."""
     c = cfg(where)
     lo, hi = _clamp(c)
@@ -496,7 +498,7 @@ def factors(db, where, now: float) -> dict:
     ps = [p for p in pairs(read(db), now - WEEK_S) if p["kind"] != "promise"]
     by: dict[str, list[float]] = {}
     for p in ps:
-        by.setdefault(p["kind"], []).append(p["actual"] / p["promised"])
+        by.setdefault(p["kind"], []).append(p["actual"] / p["raw"])
     out = {k: round(min(hi, max(lo, statistics.median(v))), 3) for k, v in by.items() if len(v) >= need}
     cons = None
     if len(ps) >= need:
