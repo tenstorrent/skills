@@ -343,11 +343,12 @@ _KEEP_OPEN = (
     "        time.sleep(0.5)\n")
 
 
-def keep_open(held: list, pid: int) -> subprocess.Popen | None:
+def keep_open(held: list, pid: int, own_group: bool = False) -> subprocess.Popen | None:
     """A small process that holds the open files of `held` (hold_fds) until the command `pid` ends, which
     the command itself never gets: the lock then outlives a killed `ttp lock`, never the command.
     It ignores SIGINT, SIGTERM and SIGHUP and waits on a pidfd of the command (a 0.5 s poll where there
-    is none); the `ttp lock` that started it ends it once the command has ended. None if it cannot start."""
+    is none); the `ttp lock` that started it ends it once the command has ended. None if it cannot start.
+    `own_group`: a session of its own, so a kill of `ttp lock`'s group frees the lock only with the command."""
     try:
         pfd = os.pidfd_open(pid)
     except (AttributeError, OSError):
@@ -355,7 +356,8 @@ def keep_open(held: list, pid: int) -> subprocess.Popen | None:
     try:
         return subprocess.Popen([sys.executable, "-I", "-S", "-c", _KEEP_OPEN, str(pid), str(pfd)],
                                 pass_fds=hold_fds(held) + ([pfd] if pfd >= 0 else []), stdin=subprocess.DEVNULL,
-                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                start_new_session=own_group)   # own session: see own_group
     except OSError:
         return None
     finally:

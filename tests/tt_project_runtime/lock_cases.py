@@ -2090,7 +2090,7 @@ def test_a_push_batch_carrying_an_urgent_approval_lands_ahead_of_an_earlier_urge
         _until_or_ended(lambda: "start land" in marks.read_text() or "start hot" in marks.read_text(), procs[1:])
         go_b.touch()
         t.join(60)
-        assert not t.is_lives() and got and got[0][0] == 0, got
+        assert not t.is_alive() and got and got[0][0] == 0, got
         assert _ended(procs) == [0, 0]
     finally:
         go.touch()
@@ -2320,7 +2320,7 @@ def test_a_push_batch_checks_ttp_lock_goes_ahead_of_an_earlier_suite_waiter_only
         assert (seen.find("start late") % 10**6 < seen.find("start suite") % 10**6) == (mode == "target"), seen
         go_b.touch()
         t.join(60)
-        assert not t.is_lives() and got and got[0][0] == 0, got
+        assert not t.is_alive() and got and got[0][0] == 0, got
         assert _ended(procs) == [0, 0]
     finally:
         go.touch()
@@ -2623,13 +2623,6 @@ def test_a_signal_to_a_probed_ttp_lock_reaches_the_whole_command_group(env, tmp_
             t.kill()
 
 
-def _lives(pid):
-    try:
-        return Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[0] != "Z"
-    except (OSError, IndexError):
-        return False
-
-
 def _caller_is_killed_the_command_ends(t, pidfile, sig):
     """The `ttp lock` caller `t` (the leader of its own group) gets `sig` for its whole group: the
     probed command, which runs in a group of its own, must end too."""
@@ -2639,11 +2632,11 @@ def _caller_is_killed_the_command_ends(t, pidfile, sig):
         os.killpg(t.pid, sig)
         t.wait(timeout=30)
         deadline = time.time() + 25   # a watchdog's SIGTERM comes at once; a trapped one dies at its KILL
-        while _lives(pid) and time.time() < deadline:
+        while not _gone(pid) and time.time() < deadline:
             time.sleep(0.2)
-        assert not _lives(pid), f"the command survived {sig.name} to its ttp lock's process group"
+        assert _gone(pid), f"the command survived {sig.name} to its ttp lock's process group"
     finally:
-        if _lives(pid):
+        if not _gone(pid):
             os.kill(pid, signal.SIGKILL)
         if t.poll() is None:
             t.kill()
@@ -2659,6 +2652,32 @@ def test_a_kill_of_a_probed_ttp_locks_group_ends_the_command(env, tmp_path, sig)
                          env=_lock_env(env, p), stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                          start_new_session=True)
     _caller_is_killed_the_command_ends(t, pidfile, sig)
+
+
+def test_the_lock_outlives_a_killed_probed_ttp_lock_until_the_command_is_gone(env, tmp_path):
+    # The watchdog's SIGTERM is ignored for its grace: the keeper must hold the lock all that time.
+    p = make(env)
+    _yield_probe(p, tmp_path, "exit 1")
+    pidfile = tmp_path / "pid"
+    t = subprocess.Popen([sys.executable, str(TTP), "lock", "rig", "--", "bash", "-c",
+                          f"trap '' TERM; echo $$ > {shlex.quote(str(pidfile))}; sleep 60"],
+                         env=_lock_env(env, p), stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                         start_new_session=True)
+    _until_or_ended(lambda: pidfile.exists() and pidfile.read_text().strip(), [t])
+    pid = int(pidfile.read_text())
+    try:
+        os.killpg(t.pid, signal.SIGKILL)
+        t.wait(timeout=30)
+        time.sleep(2)
+        assert not _gone(pid), "the command should still be running: it ignores the watchdog's SIGTERM"
+        busy = _lock_probe(_lock_env(env, p), "rig", extra=("--no-yield",))
+        assert busy.returncode == 75, "the lock was freed while the command still ran"
+    finally:
+        os.killpg(pid, signal.SIGKILL)   # the command is its group's leader
+    until = time.time() + 20
+    while _lock_probe(_lock_env(env, p), "rig", extra=("--no-yield",)).returncode != 0 and time.time() < until:
+        time.sleep(0.5)
+    assert _lock_probe(_lock_env(env, p), "rig", extra=("--no-yield",)).returncode == 0
 
 
 @pytest.mark.parametrize("sig", [signal.SIGTERM, signal.SIGKILL])
@@ -2697,7 +2716,6 @@ def test_the_yield_probe_also_answers_ttp_lock_probe_and_the_take(env, tmp_path)
     assert _lock_probe(run_env, "rig", extra=("--no-yield",)).returncode == 0   # an opt-out call is not held
     p.set_config("locks.yield_exempt", ["ri*"])
     assert _lock_probe(run_env, "rig").returncode == 0
-    assert _lock_probe(run_env, "rig").returncode == 0           # (and the lock was released by the refusal)
 
 
 def test_a_broken_yield_probe_leaves_ttp_lock_probe_and_the_take_alone(env, tmp_path):

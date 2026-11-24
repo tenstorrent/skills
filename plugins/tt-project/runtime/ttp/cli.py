@@ -9228,17 +9228,6 @@ def cmd_lock(a) -> None:
         ordered = userorder.holding(p.db, cfg, p.db.task(int(otask)), [L["name"] for L in todo])
         return (ordered, userorder.line(p, otask, *ordered)) if ordered else None
     yprobe = None if a.no_yield else lockyield.armed(cfg, [L["name"] for L in todo], p.root)
-    yielded: list = []   # the probe is asked once per take, just before the command starts
-
-    def _yield_first(held=()) -> None:
-        # A task that yielded waits on `ttp lock --probe`, and a take right after it is asked too:
-        # the probe saying yield means the command never starts (exit 75, the locks released).
-        if yprobe is not None and not yielded:
-            yielded.append(1)
-            if (why := yprobe.ask()) is not None:
-                for f in held:
-                    f.close()
-                die(yprobe.says(why).removeprefix("ttp lock: "), UPGRADE_BUSY)
     if held_by := _ordered():
         if a.probe:
             print(json.dumps({"name": held_by[0][0], "free": False, "line": held_by[1], "user_order": held_by[0][2]})
@@ -9524,7 +9513,11 @@ def cmd_lock(a) -> None:
                 lk.dequeue(t)
             tickets.clear()
             _wait_occupied()   # a stream that went live while this queued: the slot is kept, the start waits
-            _yield_first(fs)
+            if yprobe is not None and (why := yprobe.ask()) is not None:
+                # a task that yielded waits on `ttp lock --probe`; a take right after is asked too
+                for f in fs:
+                    f.close()   # released: the command never runs
+                die(yprobe.says(why).removeprefix("ttp lock: "), UPGRADE_BUSY)
             for L in todo:   # as the task's run does once it has its slot (runner._take_exclusive)
                 if L["mine"]:
                     lk.unreserve(L["mark"], L["own"])
@@ -9563,7 +9556,7 @@ def cmd_lock(a) -> None:
             started.append(proc)
             if yprobe is not None:
                 yprobe.guard(proc)
-            keeper = lk.keep_open(fs, proc.pid)
+            keeper = lk.keep_open(fs, proc.pid, own_group=yprobe is not None)
             lk.hand_to_command(fs, proc.pid)
             lk.let_go(gate)
             while pending:

@@ -25,6 +25,11 @@ MIN_INTERVAL_S = 0.1   # a smaller configured interval would spin
 BUSY_RC = 75           # the exit of a busy or, now, yielded lock
 
 
+def runner_kill_after() -> float:
+    from .runner import KILL_AFTER_S   # the watchdog's grace before its SIGKILL
+    return KILL_AFTER_S
+
+
 def _locks(cfg: dict) -> dict:
     return cfg.get("locks") if isinstance(cfg.get("locks"), dict) else {}
 
@@ -84,7 +89,7 @@ class Probe:
             pass
         os.close(w)
         try:
-            proc.wait(KILL_AFTER_S + 5)
+            proc.wait(runner_kill_after() + 5)
         except subprocess.TimeoutExpired:
             proc.kill()
 
@@ -156,18 +161,27 @@ def run_whole(cmd: list, env: dict, probe: "Probe | None") -> int:
     of its own watched by it."""
     if probe is None:
         return subprocess.call(cmd, env=env)
-    # a run's kill of this process is passed on to the command's group (signals forwarded, a watchdog)
-    # own session: the probe stops the command's whole process group
-    proc = subprocess.Popen(cmd, env=env, start_new_session=True)
-    probe.guard(proc)
+    # a run's kill of this process is passed on to the command's group (signals forwarded, a watchdog);
+    # one that comes before the command runs is kept and passed on as it starts
+    started: list = []
+    pending: list = []
 
     def _forward(signum, _frame):
+        if not started:
+            pending.append(signum)
+            return
         try:
-            os.killpg(proc.pid, signum)
+            os.killpg(started[0].pid, signum)
         except OSError:
             pass
     old = {s: signal.signal(s, _forward) for s in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP)}
     try:
+        # own session: the probe stops the command's whole process group
+        proc = subprocess.Popen(cmd, env=env, start_new_session=True)
+        started.append(proc)
+        probe.guard(proc)
+        while pending:
+            _forward(pending.pop(0), None)
         return probe.wait(proc)
     finally:
         for s, h in old.items():
