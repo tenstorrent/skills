@@ -68,6 +68,36 @@ def test_landings_name_a_late_supersession_record_after_done_not_unknown(env):
     assert "unknown" not in b["causes"]
 
 
+def _commit_at(p, when: float, msg: str) -> str:
+    """A commit in the project's repo whose committer date is `when`: the time a change reaches the
+    push branch is read from it."""
+    import os as _os
+    import subprocess as _sp
+    env = {**_os.environ, "GIT_COMMITTER_DATE": f"@{int(when)} +0000"}
+    _sp.run(["git", "-C", str(p.root), "-c", "user.name=t", "-c", "user.email=t@t",
+             "commit", "-q", "--allow-empty", "-m", msg], env=env, check=True)
+    return _sp.run(["git", "-C", str(p.root), "rev-parse", "HEAD"],
+                   capture_output=True, text=True).stdout.strip()
+
+
+def test_landings_time_a_late_supersession_record_from_the_commit_that_landed(env):
+    """A task recorded as superseded days after its work reached the branch: its landing time is the
+    landed commit's date, not the record's write time."""
+    from ttp import landings
+    p = make(env)
+    now = time.time()
+    tid = p.db.add_task("landed during a squash", "s", kind="code", status="done")
+    p.db.x("UPDATE tasks SET created=?, updated=? WHERE id=?", (now - 4 * 86400, now - 3.5 * 86400, tid))
+    p.db.x("INSERT INTO runs(task, role, started, ended, status) VALUES(?, 'worker', ?, ?, 'ok')",
+           (tid, now - 3.5 * 86400, now - 3.4 * 86400))
+    head, squashing = _commit_at(p, now - 3 * 86400, "its change"), _commit_at(p, now - 1000, "the squash")
+    p.db.x("INSERT INTO task_superseded(task, head, sha, ts) VALUES(?,?,?,?)",
+           (tid, head, squashing, now - 1000))
+    b = landings.landed(p.db, now - 8 * 86400, now, p=p)[0]
+    assert b["landed"] == pytest.approx(now - 3 * 86400, abs=5)
+    assert b["causes"].get("late landing record", 0) < 2 * 3600
+
+
 def test_landings_read_the_carrier_links_once_for_all_candidates(env, monkeypatch):
     from ttp import landed, landings
     p = make(env)

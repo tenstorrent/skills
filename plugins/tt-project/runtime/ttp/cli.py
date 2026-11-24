@@ -2785,7 +2785,7 @@ def cmd_landings(a) -> None:
             except ValueError:
                 die(f"--from: not a date, time or epoch: {a.since}")
         a.days = (now - since) / DAY_S
-    rows = landings.landed(p.db, since, now)
+    rows = landings.landed(p.db, since, now, p=p)
     sm = landings.summary(rows, top=a.top)
     sm["push_batch_died"] = landings.push_batch_deaths(p.db, since)
     sm["events"] = landings.event_counts(p.db, since)

@@ -272,7 +272,7 @@ def breakdown(ctx: Ctx, t: dict, end: float) -> dict:
             "runs": len(runs), "segments": segs}
 
 
-def landed(db, since: float, now: float | None = None, kinds=("code",)) -> list[dict]:
+def landed(db, since: float, now: float | None = None, kinds=("code",), p=None) -> list[dict]:
     """Breakdowns of the tasks of `kinds` whose change landed at or after `since`, oldest landing first."""
     from . import landed as lm
     now = time.time() if now is None else now
@@ -280,9 +280,10 @@ def landed(db, since: float, now: float | None = None, kinds=("code",)) -> list[
                 (*kinds, since - 30 * DAY_S))
     when = {}
     rows = lm.Rows(db, [t["id"] for t in cand])
+    when0 = lm.landed_whens(p, [t["id"] for t in cand], rows) if p is not None else {}
     for t in cand:
         try:
-            at = lm.landed_at(db, t["id"], rows)
+            at = when0.get(t["id"]) if p is not None else lm.landed_at(db, t["id"], rows)
         except Exception:
             at = None
         if at and since <= at <= now and at >= (_f(t["created"]) or 0):
@@ -424,17 +425,17 @@ def fix_open(db, cause: str) -> bool:
                      (f"{FIX_TITLE}{cause}%",)))
 
 
-def audit_lines(db, now: float, top: int = 5) -> list[str]:
+def audit_lines(db, now: float, top: int = 5, p=None) -> list[str]:
     """The daily review's lines: the slowest landings of 24 h with their dominant cause, and the top
     recurring cause over 7 days with the instruction to queue one fix task for it (never a second while
     one is open)."""
-    day = landed(db, now - DAY_S, now)
+    day = landed(db, now - DAY_S, now, p=p)
     out = []
     if day:
         slow = sorted(day, key=lambda r: -r["total_s"])[:top]
         out.append(f"slowest landings, 24 h ({len(day)} landed): " + "; ".join(
             f"#{r['task']} {dur(r['total_s'])} mostly {dominant(r)}" for r in slow))
-    week = landed(db, now - 7 * DAY_S, now)
+    week = landed(db, now - 7 * DAY_S, now, p=p)
     if week:
         sm = summary(week)
         pool = {c: s for c, s in sm["gaps"]["by_cause"].items() if c not in ("run", "queue")}

@@ -355,7 +355,7 @@ class Rows:
         self.links = _links(db, min(tids, default=0))
         self.pushed = _pushed(db)
         self.landings = db.q("SELECT task, sha FROM task_landings ORDER BY marker")
-        self.superseded = db.q("SELECT task, sha, ts FROM task_superseded ORDER BY ts")
+        self.superseded = db.q("SELECT task, head, sha, ts FROM task_superseded ORDER BY ts")
         self.dropped = db.q("SELECT task, sha, ts FROM task_dropped")
 
 
@@ -437,7 +437,7 @@ def recorded(db, tid: int, carry: dict | None = None, rows: Rows | None = None) 
     if hits:
         return list(dict.fromkeys(r["sha"] for r in hits)), via("its detached push landing", hits[-1]["task"])
     if rows is None:
-        found = db.q("SELECT task, sha FROM task_superseded WHERE task IN (%s) ORDER BY ts"
+        found = db.q("SELECT task, head, sha FROM task_superseded WHERE task IN (%s) ORDER BY ts"
                      % ",".join("?" * len(carry)), list(carry))
     else:
         found = [r for r in rows.superseded if r["task"] in carry]
@@ -447,15 +447,15 @@ def recorded(db, tid: int, carry: dict | None = None, rows: Rows | None = None) 
     return [], ""
 
 
-def landed_at(db, tid: int, rows: Rows | None = None) -> float | None:
+def landed_at(db, tid: int, rows: Rows | None = None, carry: dict | None = None) -> float | None:
     """When task `tid`'s change first landed, from the push records `recorded` judges by (a push queue
     landing of it or a task carrying it on, a detached push, a recorded supersession); None while none
     exists. A task of a kind that is not pushed (harness, work, question) lands when it is done.
-    `rows`: read once for many tasks (Rows), else read here."""
+    `rows`: read once for many tasks (Rows), else read here; `carry`: carriers read by the caller."""
     task = rows.tasks.get(int(tid)) if rows else db.task(int(tid))
     if not task:
         return None
-    carry = carriers(db, int(tid), rows)
+    carry = carriers(db, int(tid), rows) if carry is None else carry
     res = load_result(task.get("result"))
     member = isinstance(res, dict) and isinstance(res.get("batch"), dict) and res["batch"].get("lead") != tid
     branches = {v[0] for v in carry.values() if v[0]} if not member else set()
@@ -477,6 +477,55 @@ def landed_at(db, tid: int, rows: Rows | None = None) -> float | None:
         times.append(task.get("updated"))
     times = [float(t) for t in times if t]
     return min(times) if times else None
+
+
+def landed_when(p, tid: int, rows: Rows | None = None) -> float | None:
+    """When task `tid`'s change first reached the push branch: the committer date of the commit that
+    carried it there (its recorded landing, or the head and the superseding commit a recorded
+    supersession names), never later than the record time `landed_at` judges by. The record time
+    alone when the repository cannot read the commits; None while neither is known."""
+    return landed_whens(p, (tid,), rows).get(int(tid))
+
+
+def landed_whens(p, tids, rows: Rows | None = None) -> dict[int, float | None]:
+    """landed_when's answer for each task in `tids`, their commit dates read in one git call: the
+    per-task carrier chain and record time (landed_at) and recorded commits (recorded) are read from
+    `rows` when given, else read here once for all of them."""
+    tids = [int(t) for t in tids]
+    rows = Rows(p.db, tids) if rows is None else rows
+    at, want = {}, {}
+    for tid in tids:
+        carry = carriers(p.db, tid, rows)
+        at[tid] = landed_at(p.db, tid, rows, carry)
+        sup = [r for r in rows.superseded if r["task"] in carry]
+        want[tid] = [str(s) for s in [*recorded(p.db, tid, carry, rows)[0],
+                                      *(r["head"] for r in sup if r.get("head"))]]
+    dates = commit_dates(p, [s for v in want.values() for s in v])
+    return {tid: min([t for t in [at[tid], *(dates.get(s) for s in want[tid])] if t], default=None)
+            for tid in tids}
+
+
+def commit_dates(p, shas) -> dict[str, float]:
+    """{sha: committer date} of the shas the repository has, in one git call; one call each when a
+    sha is unknown (git show fails on any unknown rev, so they are then read one by one). A commit's
+    committer date is when it was created on its branch: for a landing, when the change reached the
+    push branch."""
+    shas = [s for s in dict.fromkeys(str(s) for s in shas) if s]
+    out: dict[str, float] = {}
+    if not shas:
+        return out
+    r = _git(p.root, "show", "-s", "--format=%H %ct", *shas)
+    if r.returncode == 0:
+        for ln in r.stdout.splitlines():
+            sha, _, ts = ln.partition(" ")
+            out[sha] = float(ts)
+    else:   # one unknown rev fails the whole call: read the revs one at a time
+        for s in shas:
+            one = _git(p.root, "show", "-s", "--format=%ct", s)
+            got = one.stdout.strip()
+            if one.returncode == 0 and got.isdigit():
+                out[s] = float(got)
+    return out
 
 
 def task_shas(p, tid: int) -> tuple[list[str], str]:

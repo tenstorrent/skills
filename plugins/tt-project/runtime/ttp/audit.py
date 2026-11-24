@@ -690,7 +690,7 @@ def lines(db: DB, now: float | None = None, window_s: float = WINDOW_S, blocked_
             out.append(drift)
         try:   # where landing time went and how accurate the ETAs were (landings.py, etaledger.py)
             from . import etaledger, landings
-            out += landings.audit_lines(db, now)
+            out += landings.audit_lines(db, now, p=p)
             etaledger.refresh(db, p, now)
             cal = etaledger.calibration(db, now, etaledger.cfg(p))
             if cal.get("count"):   # no delivered ETA yet is nothing to grade, not a line
@@ -704,7 +704,7 @@ def landing_report(db: DB, p: Project | None, now: float) -> dict:
     """The landing breakdown summary (7 days) and the ETA calibration, for `ttp audit --json`."""
     try:
         from . import etaledger, landings
-        sm = landings.summary(landings.landed(db, now - 7 * 86400, now), 5)
+        sm = landings.summary(landings.landed(db, now - 7 * 86400, now, p=p), 5)
         return {"landing_breakdown": sm, "eta_calibration": etaledger.calibration(db, now, etaledger.cfg(p))}
     except Exception:
         return {}
