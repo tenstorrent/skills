@@ -31,9 +31,11 @@ The overseer (`overseer.sh`) double-checks the run; the session still leads it. 
 agent (default `claude-sonnet-5-5`, `--model` to change; no saved session, 20 min limit) with a short prompt in the
 script. The agent reads the session's transcripts (`$CLAUDE_CONFIG_DIR` or `~/.claude`, `projects/<checkout path,
 / and . as ->`: the main `*.jsonl`, `*/subagents/*.jsonl`, `tool-results/`), the background shell outputs
-under `/tmp/claude-<uid>`, `inputs.json` and the host (`ps`, `fuser` on `/dev/tenstorrent/*`, `free`, `df`), and
-answers with one line per subagent and background job (verdict and evidence: progressing, stuck, waiting on a
-finished job), then devices, CPU and memory, disk and budget, or a single line if all is progressing. The report
+under `/tmp/claude-<uid>`, `inputs.json` and the host (`ps`, `fuser` on `/dev/tenstorrent/*`, `free`, `df`). It
+first runs a fixed `jq` command (given in the prompt) that lists every subagent and background job of the main
+session and its subagents with its owner, start and whether it has finished (task notifications, `TaskStop`), so
+none is skipped; then it answers with exactly one line per unfinished item (verdict and evidence: progressing, slow,
+stuck, waiting on a finished job), then the main session, devices, CPU and memory, disk and budget. The report
 is typed into the session prefixed "Automated overseer report (hourly, not from the operator):" and appended to
 `overseer.log` next to `inputs.json`. When the pane shows a dialog or prompt, nothing is typed (the keys could
 answer it); the next tick tries again. A failed tick is logged and sends nothing.

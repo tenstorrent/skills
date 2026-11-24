@@ -31,6 +31,33 @@ NO=(Edit Write NotebookEdit WebFetch WebSearch "Bash(tmux:*)" "Bash(kill:*)" "Ba
 
 log() { [ "$DRY" = yes ] && { echo "$*" >&2; return; }; printf '%s %s\n' "$(date -u +%FT%TZ)" "$*" >> "$LOG"; }
 
+# Inventory of every subagent and background job (shell or Monitor) in the transcripts, one line each with
+# UNFINISHED/finished: starts from tool results (backgroundTaskId, async_launched agentId, Monitor taskId), ends from
+# the latest <task-notification> (an agent "waiting on its own background work" is unfinished) or a TaskStop result.
+INV=$(sed 's/^ *//' <<'EOF' | tr '\n' ' '
+[inputs | (input_filename | capture("agent-(?<a>[0-9a-f]+)\\.jsonl$").a // "main-" + (input_filename | sub(".*/"; "") | .[:8])) as $o | .timestamp as $t
+| ({k: "seen", o: $o, t: $t},
+   (.message.content? | arrays | .[] | select(.type == "tool_use") | {k: "use", u: .id, c: (.input.command // "")}),
+   ((.message.content? | arrays | .[] | select(.type == "tool_result") | .tool_use_id) as $u | .toolUseResult? | objects
+    | if .backgroundTaskId then {k: "start", id: .backgroundTaskId, kind: "shell", o: $o, t: $t, u: $u}
+      elif .status == "async_launched" then {k: "start", id: .agentId, kind: "agent", o: $o, t: $t, d: .description}
+      elif .taskId and .timeoutMs then {k: "start", id: .taskId, kind: "monitor", o: $o, t: $t, u: $u}
+      elif (.message? | strings | test("^Successfully stopped task")) then {k: "note", id: (.message | capture("task: (?<i>[a-z0-9]+)").i), t: $t, s: "stopped"}
+      else empty end),
+   (tostring | split("<task-notification>")[1:][] | capture("<task-id>(?<i>[a-z0-9]+)</task-id>").i as $i
+    | (if test("waiting on its own background work") then "waiting-on-own-jobs" elif test("<status>") then capture("<status>(?<s>[a-z_]+)</status>").s
+       elif test("Monitor expired|stream ended") then "expired" else empty end) | {k: "note", id: $i, t: $t, s: .}))]
+| (map(select(.k == "use") | {(.u): .c}) | add) as $cmd
+| (map(select(.k == "seen")) | group_by(.o) | map({(.[0].o): (map(.t) | max)}) | add) as $last
+| (map(select(.k == "note")) | group_by(.id) | map({(.[0].id): max_by(.t)}) | add // {}) as $note
+| map(select(.k == "start")) | unique_by(.id) | map(($note[.id] // {s: "none", t: ""}) as $n
+  | (if $n.s == "waiting-on-own-jobs" or $n.s == "none" or ($last[.id] // "") > $n.t then "UNFINISHED" else "finished" end) as $f
+  | [$f, .kind, .id, "by " + .o, "start " + .t[5:16], "notice " + $n.s + " " + $n.t[5:16],
+     if .kind == "agent" then "last-act \($last[.id][5:16] // "-") " + .d else $cmd[.u] // "?" | gsub("\\s+"; " ") | .[:100] end])
+| sort_by(.[0], .[4])[] | join("  ")
+EOF
+)
+
 prompt() {  # $1: transcript dir the agent reads
   cat <<EOF
 You oversee an autonomous Claude Code session that is bringing a model up on Tenstorrent hardware. Now is $NOW.
@@ -40,34 +67,31 @@ Only read; change nothing.
 Where things are:
 - tt-metal checkout (the session's working directory): $TT
 - run settings and budget (budget_hours, started_at): ${INPUTS:-none}${STARTED:+; the run was launched at $(date -u -d "@$STARTED" +%FT%TZ)}
-- transcripts: $1. The main session is the most recently modified *.jsonl there; its subagents are
-  <session-id>/subagents/agent-*.jsonl (task in agent-*.meta.json), large tool outputs in <session-id>/tool-results/.
-  One JSON object per line with .timestamp, .type and .message.content (tool_use blocks with .name and .input,
-  tool_result blocks). A background shell is a Bash tool_use with run_in_background; its result names its ID and
-  output file ("Output is being written to: ..."). A subagent or background shell has finished when its result or a
-  <task-notification> with its status has arrived; anything started and not finished counts, however long idle.
-  The files are large: use tail, grep, jq and wc on them; never read a whole transcript. Bash runs only simple
-  read-only commands (ls, cat, head, tail, grep, jq, wc, find, ps, pgrep, fuser, df, du, free, uptime, date) and
-  pipes between them; loops, \$(...), redirections and other commands are denied.
+- transcripts: $1. The main session is the most recently modified *.jsonl there, its subagents are
+  <session-id>/subagents/agent-<id>.jsonl, large tool outputs are in <session-id>/tool-results/, and background job
+  output is in $TASKS/<project>/<session-id>/tasks/<id>.output. Never read a whole transcript: use tail, grep, jq, wc.
+  Bash runs only simple read-only commands (ls, cat, head, tail, grep, jq, wc, find, ps, pgrep, fuser, df, du, free,
+  uptime, date) and pipes between them; loops, \$(...), redirections and other commands are denied.
 
-Check:
-- every subagent and every background job (of the main session and of subagents) not finished: its task,
-  and whether it is progressing (recent tool calls, growing logs) or stuck, for example waiting (sleep, until, wait,
-  a polling loop) on a job that has already finished or will never finish. Evidence: times, last log lines.
-- the main session: when it last acted and what it is waiting for.
-- who holds /dev/tenstorrent/* (fuser, ps) and whether that process does work.
-- CPU, memory, disk (df on the checkout).
-- budget used and left.
+Step 1. Run this command exactly as written, first. It lists every subagent and background job, unfinished first:
+jq -rn '$INV' $1/*.jsonl $1/*/subagents/*.jsonl
 
-Answer in plain text, no headings or markdown: one line per subagent or job with its name, a verdict (progressing,
-slow, stuck, waiting on a finished job, done) and the evidence in a few words; then one line each for the main
-session, devices, CPU and memory, disk, budget. Name what looks wrong; do not give instructions. If every subagent
-and job is progressing and nothing else looks wrong, answer with one line saying so.
+Step 2. For each UNFINISHED line, and only those, find out what it is doing: for a job, what its command runs or waits
+for (grep its id in the transcript of its owner, the "by" column) and whether that can still happen, its output and
+logs, its process (ps); for a subagent, its last tool calls and text (tail of its transcript) and which job it waits on.
+A wait on a job that already finished, or on a condition that cannot become true (for example pgrep -f matching its
+own command line), never ends.
+
+Answer in plain text, no headings or markdown. First exactly one line per UNFINISHED item, in the list's order: its
+id, owner and task in a few words, a verdict (progressing, slow, stuck, waiting on a finished job; for a subagent also
+name the job it waits on) and the evidence (times, last log lines). Then one line each for the main session (when it
+last acted and what it waits for), devices (who holds /dev/tenstorrent/*: fuser, ps; is it doing work), CPU and
+memory, disk (df on the checkout), budget used and left. Name what looks wrong; do not give instructions.
 EOF
   [ -n "$AT" ] && echo "
 This is a replay of a past run: assume now is $NOW; the transcripts were cut at that time. Ignore live host state
 (processes, devices, CPU, memory, disk), which is unrelated; say it is not available. Files the transcripts name
-outside $1 are gone."
+outside $1, including job outputs, are gone."
 }
 
 tick() {
