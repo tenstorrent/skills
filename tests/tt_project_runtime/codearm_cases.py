@@ -1837,7 +1837,11 @@ _GG_MENTION_REFUSED = [
     "python3 - <<'EOF'\nDB = '/x/state/' + 'project.db'\nprint(open(DB, 'rb').read(16))\nEOF",
     "python3 - <<'EOF'\nimport json\njson.load(open('/h/.tt-project/machine-workers.json'))\nEOF",
     "python3 - <<'EOF'\nx = '''\nproject.db\nEOF",   # a script tokenize cannot read stays whole
-    "python3 - <<EOF\n# project.db\nEOF", "node - <<'EOF'\n// project.db\nEOF"]
+    "python3 - <<EOF\n# project.db\nEOF", "node - <<'EOF'\n// project.db\nEOF",
+    # a multi-line literal the script runs is code
+    "python3 - <<'EOF'\nimport os\nos.system(\'\'\'\nsqlite3 /x/project.db \"select 1\"\n\'\'\')\nEOF",
+    "python3 - <<'EOF'\nexec(\'\'\'\nimport sqlite3\nsqlite3.connect(\"/x/project.db\")\n\'\'\')\nEOF",
+    "python3 - <<'EOF'\nimport subprocess\nsubprocess.run([\"bash\", \"-c\", \"\"\"\ncat project.db\n\"\"\"])\nEOF"]
 # The code a python script writes into a file (a multi-line literal) and its comments are text no call reads as a path
 _GG_PY_TEXT_ALLOWED = [
     "python3 - <<'EOF'\np = 'src/n.py'\ns = open(p).read()\ns = s.replace(\"x = 1\", '''    db = DB(p.state / \"project.db\")\n"

@@ -655,20 +655,25 @@ def code_text(cmd: str, interp: bool = False, py_code: bool = False) -> str:
                               for ln in (_py_code(body) if python(i, pos) else body)])
 
 
+_RUNS_TEXT = re.compile(r"\b(?:exec\w*|eval|compile|system|popen|Popen|subprocess|spawn\w*|check_output|check_call|runpy)\b")
+
+
 def _py_code(body: list[str]) -> list[str]:
     """A python script without its comments and multi-line string literals (docstrings, code it writes into a file):
     text no call reads as a path. Its one-line literals stay (`connect('/x/project.db')` opens that file); a script
-    tokenize cannot read stays whole."""
+    tokenize cannot read stays whole, and so does one that runs text (exec, a shell, a subprocess): a literal may be code."""
     import io
     import tokenize
     src = "\n".join(body) + "\n"
+    if _RUNS_TEXT.search(src):
+        return body
     try:
         toks = list(tokenize.generate_tokens(io.StringIO(src).readline))
     except (tokenize.TokenError, SyntaxError):
         return body
     starts = [0]
-    for ln in src.splitlines(keepends=True):
-        starts.append(starts[-1] + len(ln))
+    for ln in src.split("\n"):   # tokenize's lines: only a newline ends one
+        starts.append(starts[-1] + len(ln) + 1)
     for t in reversed(toks):
         if t.type == tokenize.COMMENT or t.type == tokenize.STRING and "\n" in t.string:
             a, b = starts[t.start[0] - 1] + t.start[1], starts[t.end[0] - 1] + t.end[1]
