@@ -13,7 +13,8 @@ def _hold_use() -> None:
     if (os.path.basename(os.path.dirname(hold)) == ".git"                 # project.RUNTIME_HOLD's shape
             and os.path.basename(hold).startswith("ttp-runtime-hold")):
         try:
-            with open(os.path.join(hold, ".pids"), "a") as f:             # project.HOLD_PIDS
+            marks = os.path.join(hold, ".pids")          # project.HOLD_PIDS
+            with open(marks, "a") as f:
                 f.write("%d\n" % os.getpid())
         except OSError:
             pass
