@@ -47,6 +47,7 @@ import json
 import os
 import re
 import shlex
+import shutil
 
 LABEL = "untrusted_input"   # modelpick.UNTRUSTED
 WRITE_LABEL = "untrusted_write"
@@ -583,9 +584,10 @@ def _unsingle(cmd: str) -> str:
 
 
 MARK_FEEDS = frozenset(("read", "mapfile", "readarray", "xargs", "parallel"))   # turn their input into words or commands
-# Commands that change or create a file named as their argument, or run another command: a word of a prose clause
-# before the mark that is one of these (or a runner or feed) makes it a command line, the same on every host (no
-# PATH lookup). Readers (MARK_READERS) stay prose: naming the file to one has no effect on it.
+# Commands that change or create a file named as their argument, or run another command: a word of a
+# prose clause before the mark that is one of these (or a runner or feed) makes it a command line.
+# The list only adds names to the prose test's PATH lookup, for commands a host may not have installed.
+# Readers (MARK_READERS) stay prose: naming the file to one has no effect on it.
 MARK_FILE_COMMANDS = frozenset((
     "rm", "rmdir", "unlink", "mv", "cp", "ln", "truncate", "shred", "touch", "chmod", "chown", "chattr", "mkdir",
     "mkfifo", "mknod", "tee", "dd", "install", "patch", "nano", "rsync", "scp", "tar", "zip", "unzip", "gzip",
@@ -663,17 +665,19 @@ MARK_CODE_QUOTE_RE = re.compile(r"(?:(?:^|\s)-\w*[ceErRBpP]|--eval|--print|<<<|\
 
 def _mark_prose(clause: str) -> bool:
     """Whether a quoted clause names RUN_MARK only as a word of prose: it has spaces, each mention is a
-    whole word (trailing .,:!), and no word before one is a command (MARK_FILE_COMMANDS, a runner or feed),
-    `.` or an option (a builtin's `history -w`, `enable -f`), so the clause run as a command line could not
-    take the mark as its argument."""
+    whole word (trailing .,:!), and no word before one is a command (on PATH, in MARK_FILE_COMMANDS, a
+    runner or feed), `.` or an option (a builtin's `history -w`, `enable -f`), so the clause run as a
+    command line could not take the mark as its argument."""
     # shortcut: a script that cuts the name out of such text (a split or slice) is not seen, as names built at
-    # run time never are (perl's glob splits its text too)
+    # run time never are (perl's glob splits its text too).
+    # Accepted gap, not patched: a prose word before the mark that names an installed command (a reader
+    # like cat or ls) still refuses the clause, on the hosts that have that command installed.
     words = clause.split()
     at = [i for i, w in enumerate(words) if RUN_MARK in w]
     if len(words) < 2 or not at or any(words[i].rstrip(".,:!") != RUN_MARK for i in at):
         return False
-    return not any(w == "." or w.startswith("-") or w in MARK_FILE_COMMANDS or MARK_RUNNER_RE.fullmatch(w)
-                   or w in MARK_FEEDS for w in words[:at[-1]])
+    return not any(w == "." or w.startswith("-") or w in MARK_FILE_COMMANDS or shutil.which(w)
+                   or MARK_RUNNER_RE.fullmatch(w) or w in MARK_FEEDS for w in words[:at[-1]])
 
 
 def _mark_quiet(cmd: str, words: list[str]) -> tuple[list[str], str] | None:
@@ -743,8 +747,8 @@ def _mark_data_bodies(cmd: str) -> str | None:
         return _mark_uncomment(cmd)
     if re.search(r"#[^\n]*\\\n", cmd) or (bare := _mark_uncomment("\n".join(lines))) is None:
         return None
+    text = bare
     bare = bare.split("\n")
-    text = "\n".join(bare)
 
     def tee(i: int, pos: int) -> bool:
         s, e, sep = next(p for p in _pieces(bare[i]) if p[0] <= pos <= p[1])

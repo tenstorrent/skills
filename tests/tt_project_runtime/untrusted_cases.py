@@ -703,6 +703,9 @@ MARK_CODE_EFFECT = [   # code that reads or changes the record itself, or gets i
     f"cat > x.sh <<'EOF'\nrm {_M}\nEOF\nbash x.sh", f"tee x.sh <<'EOF'\nrm {_M}\nEOF\nbash x.sh",
     f"cat > n.md <<'EOF'\nthe {_M} record\nEOF\nrm {_M}",
     f"cat > l.txt <<'EOF'\n{_M}\nEOF\nxargs rm < l.txt",   # the written file read back into code
+    # a first word found on PATH is never prose (the test installs stubs for these)
+    f"python3 x.py 'gio remove {_M} now'", f"python3 x.py 'chgrp nogroup {_M}'",
+    f"python3 x.py 'rename a {_M}'",
     f"perl <<'EOF'\n$x = q( #); unlink \"{_M}\";\nEOF",   # a `#` in an interpreter's body is no shell comment
     f"ls # cat > a.md <<'EOF'\nrm {_M}\nEOF", f"python3 x.py 'mkdir {_M} now'",
     # a comment ending in a backslash must not swallow the line after it; a `#` inside ${...} is literal
@@ -763,15 +766,25 @@ def test_a_script_writing_receipt_prose_that_names_the_mark_passes(env, tmp_path
     assert _why(tmp_path, "Bash", {"command": cmd}) == "", cmd
 
 
-def test_prose_verdicts_are_the_same_with_no_commands_on_path(tmp_path, monkeypatch):
-    """Whether a word before the mark is a command comes from a fixed list, never a PATH lookup, so the same
-    quoted sentence passes or is refused on every host."""
+def test_a_first_word_found_on_path_is_never_prose(env, tmp_path, monkeypatch):
+    """The prose test's main rule is a PATH lookup: a clause with a word before the mark that names an
+    installed command is never prose, wherever that command is installed, and MARK_FILE_COMMANDS only
+    adds names to that lookup (mkdir is not on this PATH). A plain sentence stays prose and a script
+    given one still passes; a prose word that happens to name an installed command is refused: an
+    accepted gap of the PATH lookup."""
     from ttp import untrusted
-    clauses = [f"ls {_M} now", f"the {_M} record", f"mkdir {_M} here", f"rm {_M} now", f"then shred {_M} too"]
-    seen = [untrusted._mark_prose(c) for c in clauses]
-    (tmp_path / "empty").mkdir()
-    monkeypatch.setenv("PATH", str(tmp_path / "empty"))
-    assert [untrusted._mark_prose(c) for c in clauses] == seen == [True, True, False, False, False]
+    _untrusted_run(env, tmp_path, monkeypatch, [])
+    stubs = tmp_path / "cmds"
+    stubs.mkdir()
+    (stubs / "wordy").write_text("#!/bin/sh\n")
+    (stubs / "wordy").chmod(0o755)
+    real = os.environ["PATH"]
+    monkeypatch.setenv("PATH", str(stubs))
+    assert not untrusted._mark_prose(f"wordy reads the {_M} record"), "a word found on PATH"
+    assert not untrusted._mark_prose(f"mkdir {_M} here"), "a name MARK_FILE_COMMANDS adds"
+    assert untrusted._mark_prose(f"the {_M} record"), "plain prose"
+    monkeypatch.setenv("PATH", real)
+    assert _why(tmp_path, "Bash", {"command": f"python3 x.py 'the {_M} record stands'"}) == ""
 
 
 @pytest.mark.parametrize("cmd", MARK_DATA_HEREDOCS)
@@ -786,6 +799,12 @@ def test_code_that_reads_or_changes_the_mark_is_still_refused(env, tmp_path, mon
     """Prose is only a quoted clause with no path, option or command before the name, given to a script
     interpreter: a shell, eval, xargs, a pipe or a substitution that splits it into words still counts."""
     _untrusted_run(env, tmp_path, monkeypatch, [])
+    stubs = tmp_path / "mark-cmds"   # the prose test's PATH lookup needs the file changers installed
+    stubs.mkdir()
+    for name in ("gio", "chgrp", "rename"):
+        (stubs / name).write_text("#!/bin/sh\n")
+        (stubs / name).chmod(0o755)
+    monkeypatch.setenv("PATH", str(stubs) + os.pathsep + os.environ["PATH"])
     assert "leave it as it is" in _why(tmp_path, "Bash", {"command": cmd}), cmd
 
 
