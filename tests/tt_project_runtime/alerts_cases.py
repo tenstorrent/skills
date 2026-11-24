@@ -3038,6 +3038,47 @@ def test_after_push_deploy_restart_held_by_a_live_stream_pages_only_past_its_gra
         assert sent[0]['severity'] == ('high' if case == 'daemon_dead' else 'normal')
 
 
+@pytest.mark.parametrize('case', ['hold_ends', 'restarted_not_ticked'])
+def test_after_push_deploy_restart_grace_covers_only_a_restart_still_held(env, tmp_path, monkeypatch, case):
+    """Once the stream's hold ends the daemon gets delivery.deploy_restart_wait_s to restart, a newer
+    release meanwhile keeping that deadline; a daemon already on the release that has not ticked on it
+    is no held restart. Either one late pages as a failed deploy, never as a held restart."""
+    from ttp import deploy, occupancy, overview
+    p = make(env)
+    p.set_config('delivery.deploy_restart_wait_s', 600)
+    p.set_config('delivery.deploy_restart_held_s', 3600)
+    stream = {'live': True}
+    monkeypatch.setattr(occupancy, 'blocks', lambda target, step='test', now=None:
+                        'stay off for restart: box: a live realtime stream holds it'
+                        if step == 'restart' and stream['live'] else '')
+    _deploy_lib('0.5.0')
+    if case == 'restarted_not_ticked':
+        base, db = _deploy_project(tmp_path, 'alpha', '0.5.0', tick_age=7200)
+    else:
+        base, db = _deploy_project(tmp_path, 'alpha', '0.5.0', running='0.4.9')
+    now = time.time()
+    deploy.record(p, overview.deployed(names=['alpha']), now)
+    pages, page = _deploy_pager(p)
+    t = now + 1
+    if case == 'hold_ends':
+        while t < now + 1800:
+            deploy.tick(p, page, t)
+            t += deploy.PROBE_S
+        stream['live'] = False
+        deploy.tick(p, page, t)
+        _deploy_lib('0.5.1')
+        (base / 'harness' / 'runtime' / 'ttp' / '__init__.py').write_text('__version__ = "0.5.1"\n')
+        result = deploy.record(p, overview.deployed(names=['alpha']), t + 300)
+        assert result['rc'] == 0 and result['projects'][0]['outcome'] == 'pending', result['text']
+        t += 300
+    end = t + 600 + 3 * deploy.PROBE_S
+    while t < end:
+        deploy.tick(p, page, t)
+        t += deploy.PROBE_S
+    sent = p.db.q("SELECT text FROM messages WHERE direction='out' AND kind='alert' AND ref='deploy-behind:alpha'")
+    assert len(sent) == 1 and sent[0]['text'].startswith('Deploy failed:'), sent
+
+
 def test_deploy_pending_is_one_live_line_per_project_that_a_newer_release_updates_and_catching_up_clears(env, tmp_path):
     """Three releases in a row while a project waits on its merge: one live status line, naming the
     newest release in plain words, never one feed line per release. It clears with a short line once

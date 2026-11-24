@@ -85,7 +85,7 @@ def _restart_held(p, rec: dict, row: dict, now: float) -> None:
     project fell behind, and once the hold ends the daemon gets restart_wait again. Past that grace assess
     pages it as a held restart (kind "held")."""
     from . import occupancy
-    why = (rec.get("restart") and row.get("settling") and row.get("daemon_alive")
+    why = (rec.get("restart") and row.get("restart_owed") and row.get("daemon_alive")
            and occupancy.blocks(project.hostname(), "restart"))
     if why:
         rec["held"] = why
@@ -485,8 +485,9 @@ def record(p, report: dict, now: float | None = None) -> dict:
             if not rec.get("takeover_at") and row.get("settling"):
                 # Its daemon restarts onto the files (or ticks on them) by itself: re-checked after the wait.
                 # A restart still pending (or already failed) for an earlier release keeps that deadline:
-                # a daemon that never restarts cannot push its re-check back with each release.
-                at = min([now + wait] + [float(c["takeover_at"]) for c in checks.values()
+                # a daemon that never restarts cannot push its re-check back with each release (a held
+                # restart's due, moved by _restart_held within its cap, is that deadline).
+                at = min([now + wait] + [float(c.get("due") or c["takeover_at"]) for c in checks.values()
                                          if c.get("name") == row["name"] and not c.get("closed")
                                          and c.get("restart") and c.get("takeover_at")])
                 rec.update(owner=owner, takeover_at=at, due=at, restart=True)

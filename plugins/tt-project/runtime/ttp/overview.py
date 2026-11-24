@@ -515,6 +515,7 @@ def deploy_status(name: str, entry: dict, target: str, commit: str | None, now: 
                 reason, owner, resumes = _behind(name, db, state, files, now, where, target, commit)
                 return done(PENDING, f"{reason}; daemon runs {running}", owner, resumes)
             row["settling"] = True   # its own daemon finishes it: deploy.assess gives it a bounded deadline
+            row["restart_owed"] = True   # still on the old runtime (a hold on restarts may defer it: deploy.py)
             return done(PENDING, f"files at {files}, daemon still runs {running}: restart pending",
                         "this project's daemon", "when it restarts onto the new files")
         tick = identity.tick_done(state, r)
