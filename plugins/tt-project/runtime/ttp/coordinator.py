@@ -2791,6 +2791,14 @@ def untrusted_write_update(task: dict, a: dict, upd: dict) -> str:
     return ""
 
 
+def untrusted_write_event(db, task: int, moved: str) -> None:
+    """The audit trail of the write label moving: `moved` is "set" or "cleared"."""
+    db.x("INSERT INTO events(ts,source,kind,severity,text,data,status,task) VALUES(?,?,?,?,?,?,?,?)",
+         (time.time(), "coordinator", untrusted.WRITE_LABEL, "low",
+          f"#{task}: {untrusted.WRITE_LABEL} {moved}", json.dumps({"to": moved == "set"}),
+          "handled", task))
+
+
 def apply(p: Project, actions: list[dict], default_chat: str | None = None, user_turn: bool = False,
           turn: int | None = None, messages: list[int] | None = None, lean: bool = False,
           applied: list | None = None, skip_actions: frozenset | set = frozenset(),
@@ -2997,6 +3005,7 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                 kind_label = "exclusive" if a.get("exclusive") else "resource"
                 names = _resource_names(a.get("resources") or [], t, problems)
                 labels = [f"{kind_label}:{r}" for r in names] + read_labels(a.get("resources_read"), names, t, problems)
+                write_set = False   # untrusted_write on a task_add: the label moves at birth
                 if a.get("needs_device") or set(names) & locks.device_locks(cfg):
                     labels.append("needs_device")
                 if tier == "deep" and a.get("user_deep"):
@@ -3149,11 +3158,14 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                 labels += _pin_mark(db, a.get("pin_required"), pin, old or followup)
                 if a.get("untrusted_input") is True or untrusted.spec_sources(a.get("spec") or ""):
                     labels.append(untrusted.LABEL)   # untrusted.py: its run's narrowed policy, no routing
+                if (want := a.get("untrusted_write")) is not None and not isinstance(want, bool):
+                    raise ValueError("task_add rejected: untrusted_write is true or false")
                 if a.get("untrusted_write") is True:
                     if _in_task_run():   # a run cannot pre-authorize writes for its successor
                         raise ValueError("task_add rejected: a task run cannot set "
                                          f"{untrusted.WRITE_LABEL}; only the coordinator can")
                     labels.append(untrusted.WRITE_LABEL)   # only the field sets it, never the spec's wording
+                    write_set = True
                 labels = untrusted.inherit(labels, old, followup, carried and carried[0])
                 clash = _file_overlaps(p, kind, a.get("spec") or "", {old["id"]} if old else set())
                 if dropped := _exempt_overlap_deps(p, old or followup, deps):
@@ -3198,6 +3210,8 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                                          parent=followup["id"] if followup else old["id"] if split else None)
                     batch_tasks[new_id] = a.get("reply_chat") or None
                     new_tasks[i] = new_id
+                    if write_set:   # the same audit trail a task_update's move leaves
+                        untrusted_write_event(db, new_id, "set")
                     for r in {r["id"]: r for n, r in autos.items() if n not in under_way}.values():
                         db.update_task(r["id"], status="cancelled", blocked_reason=f"replaced by review #{new_id}")
                         _take_over_dependents(db, r["id"], new_id)
@@ -3417,10 +3431,7 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                 cleared = untrusted_update(task, a, upd)
                 write_moved = untrusted_write_update(task, a, upd)
                 if write_moved:   # the audit trail of a power grant being moved
-                    db.x("INSERT INTO events(ts,source,kind,severity,text,data,status,task) VALUES(?,?,?,?,?,?,?,?)",
-                         (time.time(), "coordinator", untrusted.WRITE_LABEL, "low",
-                          f"#{task['id']}: {untrusted.WRITE_LABEL} {write_moved}",
-                          json.dumps({"to": write_moved == "set"}), "handled", task["id"]))
+                    untrusted_write_event(db, task["id"], write_moved)
                 if a.get("start_after") is not None or a.get("start_when") is not None \
                         or (a.get("why") is not None and deferral(task).get("when")):
                     if task["status"] in ("running", *TERMINAL_TASK_STATES):

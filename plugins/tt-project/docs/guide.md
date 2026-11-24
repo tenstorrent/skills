@@ -4812,10 +4812,10 @@ Workers can read Slack links you paste, using your Slack connector if you have o
   `mergeBranch`, `updatePullRequestBranch` and the branch protection rule and repository ruleset
   mutations), `gh release` create, edit, delete, upload and delete-asset, `gh pr update-branch` and
   `gh repo sync` of a named repo; reads of the same endpoints pass, and the hook refuses the same
-  requests sent by curl and the like. PR merges follow the charter's merge policy. The one exception
-  is the harness's own `ttp push --retire`: its delete passes a one-shot grant file parked under the
-  project's `state/` folder, a folder a run's tools cannot write, so a raw command from the run
-  cannot forge it; everything else a run sends stays refused.
+  requests sent by curl and the like. PR merges follow the charter's merge policy. The one route
+  that writes a ref from inside a run is the harness's own `ttp push --retire`: its delete runs on
+  the host's real gh binary, past the run's gh wrapper, so no file or variable the run can write
+  authorizes it; every raw command a run sends, ref delete included, stays refused.
 - A run whose task carries the `untrusted_input` label (its input, such as a PR comment, an issue body
   or a CI log, may carry planted instructions) gets three more guards, model-free (untrusted.py). The
   label is read from the task's record; `TTP_UNTRUSTED_INPUT=1` also turns them on (a benchmark cell

@@ -1017,7 +1017,7 @@ def check(args: list[str], real: str, db=None, stdin_text: str | None = None, _d
         if not why and cmd == "api":
             endpoint, method = _api_target(rest)
             why = credguard.REF_WHY if credguard.ref_write(endpoint, method, _api_text(rest, stdin_text)) else None
-        if why and not credguard.ref_grant(args):   # the harness's own retire route holds a grant
+        if why:
             return why
     if cmd == "api":
         return (_check_api(rest, real, db, stdin_text, allowed, seen) or _api_form_problem(rest, stdin_text, cfg)

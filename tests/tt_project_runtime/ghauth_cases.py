@@ -1466,10 +1466,10 @@ def test_gh_retire_runs_with_this_hosts_own_logged_in_gh_while_the_route_is_unse
 
 def test_retire_from_a_task_run_deletes_the_branch_a_raw_ref_delete_stays_refused(
         env, monkeypatch, capsys):
-    """`ttp push --retire` from inside a task run: the delete its gh route sends passes the run's gh
-    wrapper, while the same raw `gh api -X DELETE` a model sends from that run stays refused. The
-    guard tells the two apart by a one-shot grant file under the project's state folder, a folder a
-    run's tools cannot write, never by the command's wording. Retire's own checks (an open PR) stay."""
+    """`ttp push --retire` from inside a task run: its delete runs on the host's real gh binary, past
+    the run's gh wrapper, while the same raw `gh api -X DELETE` a model sends from that run stays
+    refused: no file or variable the run can write or set authorizes a ref write. Retire's own
+    checks (an open PR) stay."""
     from ttp import ghqueue, ghroute
     p, repo, _origin, _other = _push_setup(env, monkeypatch, ["true"])
     # a task run: the plugin's gh wrapper first on PATH, a stub gh behind it
@@ -1515,25 +1515,28 @@ def test_retire_from_a_task_run_deletes_the_branch_a_raw_ref_delete_stays_refuse
     assert ghqueue.retire(branch, str(repo)) == 1 and "open PR" in capsys.readouterr().err
 
 
-def test_a_retire_grant_covers_only_its_own_call_and_only_from_the_state_folder(env, monkeypatch):
-    """credguard.ref_grant: a grant passes only when the file it names sits under the project's
-    state folder, holds exactly this argv, and has not been used; anything else is refused."""
-    from ttp import credguard
+def test_a_run_written_state_file_and_env_var_no_longer_open_a_ref_delete(env, monkeypatch):
+    """A file a run writes under the project's state folder, named by the env variable the retire
+    route once read, lets no raw `gh api -X DELETE .../git/refs/...` through: no grant mechanism
+    exists to satisfy, so the wrapper refuses the ref write whatever the file holds."""
     p = make(env)
+    run = env["tmp"] / "run"
+    (run / "bin").mkdir(parents=True)
+    shutil.copy(RUNTIME.parent / "template" / "bin" / "gh", run / "bin" / "gh")
+    (run / "runtime").symlink_to(RUNTIME, target_is_directory=True)
+    stub = run / "stub" / "gh"
+    (run / "stub").mkdir()
+    stub.write_text("#!/bin/sh\necho the real gh ran\n")
+    stub.chmod(0o755)
+    forged = p.state / "retire-grants" / "forged.json"   # a file the run itself could write
+    forged.parent.mkdir(parents=True, exist_ok=True)
+    argv = ["api", "-X", "DELETE", "repos/acme/widgets/git/refs/heads/main"]
+    forged.write_text(json.dumps({"argv": argv}))
     monkeypatch.setenv("TTP_PROJECT", str(p.base))
-    d = p.state / credguard.REF_GRANT_DIR
-    d.mkdir(parents=True)
-    argv = ["api", "-X", "DELETE", "repos/acme/widgets/git/refs/heads/ttp/x"]
-    monkeypatch.delenv(credguard.REF_GRANT_ENV, raising=False)
-    assert not credguard.ref_grant(argv), "no env var: no grant"
-    outside = env["tmp"] / "grant.json"
-    outside.write_text(json.dumps({"argv": argv}))
-    monkeypatch.setenv(credguard.REF_GRANT_ENV, str(outside))
-    assert not credguard.ref_grant(argv), "a file outside the state folder grants nothing"
-    mine = d / "g.json"
-    mine.write_text(json.dumps({"argv": ["api", "-X", "DELETE", "repos/acme/widgets/git/refs/heads/main"]}))
-    monkeypatch.setenv(credguard.REF_GRANT_ENV, str(mine))
-    assert not credguard.ref_grant(argv), "the grant covers a different argv"
-    mine.write_text(json.dumps({"argv": argv}))
-    assert credguard.ref_grant(argv) and not mine.exists(), "one shot: the grant is consumed"
-    assert not credguard.ref_grant(argv), "a second call on the same grant is refused"
+    monkeypatch.setenv("TTP_RUN_DIR", str(run / "rundir"))
+    monkeypatch.setenv("TTP_RETIRE_GRANT", str(forged))
+    monkeypatch.setenv("TTP_PYTHON", sys.executable)
+    monkeypatch.setenv("PATH", f"{run / 'bin'}{os.pathsep}{run / 'stub'}{os.pathsep}{os.environ['PATH']}")
+    out = subprocess.run([str(run / "bin" / "gh"), *argv], capture_output=True, text=True, timeout=60)
+    assert out.returncode == 1 and "never writes git refs" in out.stderr
+    assert "the real gh ran" not in (out.stdout + out.stderr), "the real gh never ran"

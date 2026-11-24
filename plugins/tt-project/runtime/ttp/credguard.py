@@ -53,7 +53,6 @@ launch and on what tool_refusal refuses (coordtools.pre_tool_use).
 """
 from __future__ import annotations
 
-import json
 import os
 import re
 from pathlib import Path
@@ -162,31 +161,6 @@ RELEASE_WRITES = {"create", "edit", "delete", "upload", "delete-asset"}
 REF_WHY = ("refused: a run never writes git refs, tags, releases, file contents or branch rules through the GitHub "
            "API (gh api, gh release, gh pr update-branch, gh repo sync, curl and the like). Commit, and land the "
            "change through `ttp push` and the push queue, which run the checks and review first")
-
-# The harness's own retire route (`ttp push --retire`, ghqueue.retire) is the one gh call that may
-# write a ref from inside a run: it puts a one-shot grant file under the project's state folder (a
-# folder a run's tools cannot write), names its path in this variable, and the gh wrapper consumes it.
-REF_GRANT_ENV = "TTP_RETIRE_GRANT"
-REF_GRANT_DIR = "retire-grants"
-
-
-def ref_grant(args: list[str]) -> bool:
-    """True when this gh call is the harness's own retire route: the grant file REF_GRANT_ENV names
-    lives under the project's state folder and holds exactly this argv. Consumed here, once."""
-    from .project import Project
-    path = os.environ.get(REF_GRANT_ENV)
-    if not path or not (root := os.environ.get("TTP_PROJECT")):
-        return False
-    try:
-        folder = (Project(root).state / REF_GRANT_DIR).resolve()
-        grant = json.loads(Path(path).read_text())
-        ok = Path(path).resolve().is_relative_to(folder) and grant.get("argv") == list(args)
-    except (OSError, ValueError):
-        return False
-    if ok:
-        Path(path).unlink()   # one-shot: the same grant never covers a second call
-    return ok
-
 
 def ssh_public(name: str) -> bool:
     """`name` (a path under ~/.ssh) holds no secret: a public key (a glob of them too), ssh's config or

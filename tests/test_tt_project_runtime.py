@@ -27306,7 +27306,6 @@ DURABLE_EXEMPT = {
     ("project.py", "HOLD_PID).write_text("): "the holder pid in a merge's runtime copy, removed when the merge ends; a cut pid only makes the launcher run the harness tree as before; never state",
     ("__init__.py", 'open(marks, "a")'): "a process noting itself on the runtime hold copy it runs from; a cut line only loses one stale-user note, never state",
     ("ghqueue.py", '(Path(t) / "b.bundle").write_bytes('): "the bundle to publish, in a temporary folder removed when the publish ends; never state",
-    ("ghqueue.py", 'f.write_text(json.dumps({"argv": argv}))'): "a one-shot retire grant consumed by the gh wrapper at once; a cut write only means the delete is refused as before",
     ("ghhold.py", "(d / name).write_text("): "a run's zsh startup file in its own run folder, rewritten at every run start; never state",
     ("ghhold.py", "(run_dir / MARK).write_text("): "a run's gh-unguarded mark in its own run folder: its existence is the signal, so a cut write still marks; never state",
     ("occupancy.py", 'open(f"/proc/{pid}/autogroup", "w")'): "a kernel setting (a session's autogroup nice) written through /proc while a stream holds the box; never state",

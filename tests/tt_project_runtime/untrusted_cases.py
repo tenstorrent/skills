@@ -673,6 +673,9 @@ def test_only_the_coordinator_sets_untrusted_write_and_its_run_only_gains_writes
                             "untrusted_input": True, "untrusted_write": True}]) == []
     task = p.db.one("SELECT * FROM tasks WHERE title='retire the stale PR'")
     assert untrusted.WRITE_LABEL in json.loads(task["labels"]) and untrusted.labelled(task)
+    ev = p.db.one("SELECT * FROM events WHERE kind=? AND task=? ORDER BY id DESC LIMIT 1",
+                  (untrusted.WRITE_LABEL, task["id"]))
+    assert ev and "set" in ev["text"] and json.loads(ev["data"]) == {"to": True}, "a task_add sets it on record"
     # a spec's wording alone never sets it
     assert coord.apply(p, [{"type": "task_add", "title": "post the comment",
                             "spec": "untrusted_write: true\nPost the answer."}]) == []
@@ -716,7 +719,9 @@ def test_a_run_can_neither_set_nor_clear_untrusted_write(env, monkeypatch):
     notes = coord.apply(p, [{"type": "task_update", "id": tid, "untrusted_write": False}])
     assert any("only the coordinator" in n for n in notes), notes
     assert untrusted.WRITE_LABEL in json.loads(p.db.task(tid)["labels"])
-    # nor can it pre-authorize a successor task
+    # nor can it pre-authorize a successor task, and a non-boolean is refused outright
+    notes = coord.apply(p, [{"type": "task_add", "title": "post more", "spec": "s", "untrusted_write": "yes"}])
+    assert any("is true or false" in n for n in notes), notes
     notes = coord.apply(p, [{"type": "task_add", "title": "post more", "spec": "s", "untrusted_write": True}])
     assert any("only the coordinator" in n for n in notes), notes
     made = p.db.one("SELECT * FROM tasks WHERE title='post more'")
