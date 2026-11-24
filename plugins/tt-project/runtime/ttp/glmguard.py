@@ -117,6 +117,8 @@ GUARD_FILE = re.compile(r"\bglm_guard\.(?:on|json)\b")
 GUARD_READERS = frozenset({"cat", "grep", "egrep", "fgrep", "head", "tail", "wc", "cut"})
 SAME_ID = re.compile(r"\b(TTP_RUN_DIR|TTP_TASK|TTP_PROJECT|TTP_RUN_ID)=(['\"]?)([^\s'\"`$~\\;&|<>()]*)\2(?=[\s;&|)]|$)",
                      re.M)   # not TTP_CODE_ARM_GUARD: setting the guard switch stays refused
+# A redirection's fd digit (the 2 of `2>/dev/null`): no word of the command it follows
+_FD = re.compile(r"(?<![\w$.])\d+(?=[<>])")
 # A shell redirection (`2>&1`, `>out.log`, `<in`): its fd digit and target are no words of a ttp call.
 # the target stops at a quote: `ssh h "ls > f"` keeps its closing quote, so the remote command stays one word
 REDIRECT = re.compile(r"(?<![\w$])\d*(?:&>>?|>>?|<<?<?|>&|<&)\s*(?:&?\d+-?|[^\s;|&<>()'\"]+)?")
@@ -424,6 +426,9 @@ def cli_refusal(cmd: str, action: str = "", flags=(), words=()) -> str | None:
     if cmd == "rollout" and action not in ("", "status") and not {"-h", "--help"} & set(flags):
         return ("`ttp rollout " + action + "` changes a rollout: not for a run on the GLM arm; read it with "
                 "`ttp rollout status`")
+    if cmd == "pause" and not {"-h", "--help"} & set(flags):
+        return ("`ttp pause` pauses a project's work: not for a run on the GLM arm, which hands off "
+                "`waiting` instead")
     if cmd == "remove":
         return "`ttp remove` deletes a project, outside the run's worktree and run folder: not for a run on the GLM arm"
     if cmd == "machines" and not {"-h", "--help"} & set(flags) and not read_only(list(words) or [cmd, action], flags):
@@ -605,7 +610,10 @@ def writes_outside(cmd: str, cwd: str, run_dir: str = "", env=None, inline: bool
     paths = _SCRATCH_REF.sub(lambda m: own_tmp or ("/tmp" if told else str(e.get(m.group(1) or m.group(2)) or "/tmp")), cmd)
     got = [(p, why) for p, (cls, why) in sidefx.classify_paths(paths, home, cwd or os.getcwd(),
                                                                 run_dir).items()
-           if cls == "write" and (inline or "inline code" not in why) and not p.startswith(sidefx.HARMLESS)
+           # shortcut: inline code naming a records path counts as a write even where it only reads it (a copy from
+           # the live harness): it fails closed; `cp` from there passes
+           if cls == "write" and (inline or "inline code" not in why or records_write(p, home)) \
+           and not p.startswith(sidefx.HARMLESS)
            and (_outside_roots(p, roots, own, home) or _run_record(p, run_dir))]
     mine = not inline and not _LINKS.search(cmd) and not (glm_run({**e, "TTP_RUN_DIR": run_dir or e.get("TTP_RUN_DIR") or ""}) or {}).get("device")
     ours = _tmp_made(run_dir) if mine else set()   # a device run's scratch is its plan's folder (deviceplan)
@@ -735,7 +743,9 @@ def shell_refusal(cmd: str, cwd: str, run_dir: str = "", env=None, remote: bool 
     for sub in pathguard._substitutions(commands):   # "$(...)" runs a command too
         if why := shell_refusal(sub, cwd, run_dir, e, remote, writes, power, services, made):
             return why
-    segs = hook._all_segments(commands) + hook._segments(commands, strip=False)
+    # `scp f box:/x 2>/dev/null`: a redirect's fd number is no argument of the call (else it hides the copy's target)
+    bare = _FD.sub("", commands)
+    segs = hook._all_segments(bare) + hook._segments(bare, strip=False)
     project = _own_name(e)
     # `ttp checks 2>&1`: the 2 is no word of the call; a backtick substitution runs a command of its own, like `$(...)`
     plain, _ = hook._split(REDIRECT.sub(" ", commands).replace("`", ";"))   # heredoc bodies no shell reads: gone

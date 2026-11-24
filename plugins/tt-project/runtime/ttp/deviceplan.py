@@ -191,18 +191,37 @@ def ssh_target(w, strict: bool = False):
     return w[i].split("@")[-1].lower(), " ".join(w[i + 1:])   # ssh itself joins its words with spaces
 
 
-def _ssh_shell_bodies(cmd: str) -> list[str]:
-    """Lines of the heredocs `cmd` feeds to a remote shell (`ssh box <<EOF`, `ssh box bash -s <<EOF`): hook._split
-    keeps only a local shell's."""
+def ssh_shell(w) -> bool:
+    """The ssh call `w` runs a remote shell that reads its commands from stdin: no remote command, or one
+    there (wrappers such as sudo dropped, `cd d && bash -s` too) is an interpreter with no script of its
+    own (`bash -s`, `python3 -`) that reads what the local side feeds it."""
     from . import hook
-    lines, bodies = hook._heredocs(cmd)
-    out = []
-    for i, body, pos in bodies:
-        s, e, _ = next(p for p in hook._pieces(lines[i]) if p[0] <= pos <= p[1])
-        got = ssh_target(next(iter(hook._segments(lines[i][s:e])), []))
-        remote = got[1].split() if got else None
-        if got and (not remote or os.path.basename(remote[0]) in hook.SHELLS):
-            out += body
+    got = ssh_target(list(w))
+    return bool(got) and (not got[1].strip() or any(
+        hook.INTERPRETER_RE.match(os.path.basename(s[0])) and ("-" in s or "-s" in s or all(a.startswith("-") for a in s[1:]))
+        for s in hook._segments(got[1])))
+
+
+def _ssh_shell_bodies(cmd: str) -> list[str]:
+    return [text for _, text in _ssh_shell_feeds(cmd)]
+
+
+def _ssh_shell_feeds(cmd: str) -> list[tuple[str, str]]:
+    """(host, text) for each text `cmd` feeds to a remote shell over ssh: a heredoc an ssh call reads
+    (`ssh box <<EOF`, `cat <<EOF | ssh box bash`) and what echo or printf pipes into one (`echo cmd | ssh box
+    bash`); hook._split keeps only a local shell's."""
+    from . import hook
+    out = [(ssh_target(list(argv))[0], ln) for argv, body in hook._heredoc_readers(cmd) if ssh_shell(argv)
+           for ln in body]
+    for line in cmd.split("\n"):
+        pieces = hook._pieces(line)
+        for k, (s, e, _) in enumerate(pieces):
+            if hook._first_word(line[s:e]) not in ("echo", "printf"):
+                continue
+            for nxt in hook._chain(line, pieces, k):
+                if os.path.basename(hook._first_word(nxt)) == "ssh" and ssh_shell(hook._first_argv(nxt)):
+                    text = " ".join(w for w in next(iter(hook._segments(line[s:e])), [])[1:] if not w.startswith("-"))
+                    out.append((ssh_target(list(hook._first_argv(nxt)))[0], text.replace("\\n", "\n")))
     return out
 
 
@@ -344,7 +363,11 @@ def direct_tool(cmd: str, routes=("broker",), tools=tuple(DEFAULTS["device_tools
            f"({', '.join(routes) or 'none set'}): run it through the box's device broker: ")
     for x in _words(cmd):
         if x is None:
-            if any(re.search(r"(?<![\w.-])" + re.escape(t) + r"(?![\w-])", hook._split(cmd)[0]) for t in names):
+            try:
+                text = hook._split(cmd)[1]   # what to scan: heredoc bodies a program does not only write
+            except Exception:
+                text = cmd
+            if any(re.search(r"(?<![\w.-])" + re.escape(t) + r"(?![\w-])", text) for t in names):
                 return why + cmd[:120]
             continue
         w = x[0]
@@ -356,6 +379,27 @@ def direct_tool(cmd: str, routes=("broker",), tools=tuple(DEFAULTS["device_tools
               {(t, x) for t in names for x in (".py", ".sh")}]   # its log or source names it and runs nothing
         if at and not (len(at) == 1 and words[at[0] + 1:] in (["--help"], ["-h"])):   # only its usage: no device
             return why + " ".join(w)[:120]
+    return None
+
+
+def fed_script(cmd: str) -> str | None:
+    """Why `cmd` feeds a script to a remote shell over ssh (`ssh box 'bash -s' < s.sh`): the guard cannot
+    read the script, so it cannot check what it writes on that host. A heredoc body it can read is no fed
+    script."""
+    from . import hook
+    for line in hook._split(cmd)[0].split("\n"):   # heredoc bodies gone: a `<` in their text feeds nothing
+        pieces = hook._pieces(line)
+        for k, (s, e, _) in enumerate(pieces):   # `cat s.sh | ssh box bash`; echo, printf and a heredoc are read
+            if (hook._first_word(line[s:e]) not in ("echo", "printf") and "<<" not in line[s:e] and any(
+                    os.path.basename(w[0]) == "ssh" and ssh_shell(w)
+                    for nxt in hook._chain(line, pieces, k) for w in _segs(nxt) or [])):
+                return ("a script piped to a remote shell over ssh is not read by this guard: give each remote "
+                        "command as a step of the plan: " + cmd[:120])
+            bare = re.sub(r"'[^']*'|\"[^\"]*\"", "", line[s:e])   # a remote `< f` reads the box's own file
+            if any(f != "/dev/null" for f in re.findall(r"(?<!<)<(?![<&])\s*(\S*)", bare)) and any(
+                    os.path.basename(w[0]) == "ssh" and ssh_shell(w) for w in _segs(line[s:e]) or []):
+                return ("a script fed to a remote shell over ssh is not read by this guard: give each remote "
+                        "command as a step of the plan: " + cmd[:120])
     return None
 
 
@@ -479,7 +523,8 @@ def _gates(st: dict) -> list[str]:
 
 
 def _static(cmd: str, s: dict, cwd: str, run_dir: str = "") -> str | None:
-    if why := power_refusal(cmd, s["power_routes"]) or direct_tool(cmd, s["power_routes"], s["device_tools"]):
+    if why := power_refusal(cmd, s["power_routes"]) or direct_tool(cmd, s["power_routes"], s["device_tools"]) \
+            or fed_script(cmd):
         return why
     segs = _segs(cmd)
     if any(os.path.basename(w[0]) == "ssh" and not ssh_target(w, strict=True) for w in segs or []) or \
@@ -566,12 +611,17 @@ def refusal(cmd: str, cwd: str = "", env=None, cfg: dict | None = None) -> str |
     if not marked(run_dir):
         return None
     s = settings(cfg if cfg is not None else _cfg())
-    if why := power_refusal(cmd, s["power_routes"]) or direct_tool(cmd, s["power_routes"], s["device_tools"]):
+    if why := power_refusal(cmd, s["power_routes"]) or direct_tool(cmd, s["power_routes"], s["device_tools"]) \
+            or fed_script(cmd):
         return why   # a step of the plan too: the plan check refuses it, and a plan stored before this rule may hold it
     ws = cwd or os.getcwd()
     from . import glmguard
     got = plan(run_dir)
     steps = (got or {}).get("steps") or []
+    if not step_match(cmd, steps):   # a line fed to a remote shell is checked as that line run on the box over ssh
+        for host, text in _ssh_shell_feeds(cmd):
+            if why := refusal(f"ssh {host} {shlex.quote(text)}", cwd, env, cfg):
+                return why
     if device_read(cmd) and not step_match(cmd, steps):   # never a redirect: the read itself is the harm
         return f"out of plan: it reads a device file directly, which runs only as a step of Opus's plan: {cmd[:120]}"
     if why := glmguard.shell_refusal(cmd, ws, run_dir, e, power=False):
