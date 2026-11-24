@@ -734,20 +734,35 @@ def _dropped_told(db, b, m: dict) -> None:
                   f"task that restores it.", "queued"))
 
 
-def _reply(db, task: dict, new: str, text: str, need: str | None = None) -> None:
-    """The answer to the chat that asked for the task, as Daemon._finish_worker gives it."""
+def landing_facts(sha: str | None, version: str | None, branch: str | None) -> dict:
+    """The landing facts a reply_due event carries: what landed where, and whether the installed
+    release runs it. Model-free, from records only; `landed` is false when no commit or version is
+    on record (nothing landed)."""
+    from . import release
+    cur = release.runtime_version(release.installed())
+    return {"landed": bool(sha or version), "sha": sha, "version": version, "branch": branch,
+            "deploy": "deployed" if version and cur == version
+            else ("pending install" if version and release.is_newer(version, cur)
+                  else "not deployed")}
+
+
+def _reply(db, task: dict, new: str, text: str, need: str | None = None, facts: dict | None = None) -> None:
+    """The answer to the chat that asked for the task, as Daemon._finish_worker gives it: never a post,
+    a reply_due event for the coordinator (chatdigest.handoff)."""
     if not task["reply_chat"] or new not in ("done", "failed", "blocked"):
         return
     text = text if new == "done" else f"(task #{task['id']} {new}) {text}"
     if need and need not in text:
         text += f"\nNeeds from you: {need}"
-    chatdigest.handoff(db, None, task, new, msgparts.cut(text, f"task #{task['id']}'s hand-off"))
+    chatdigest.handoff(db, None, task, new, msgparts.cut(text, f"task #{task['id']}'s hand-off"),
+                       facts={**(facts or {}), "need": need})
 
 
-def post_held(db, ids, tail: str) -> list[int]:
-    """Post once, with the landing `tail`, the chat reply each done task in `ids` held at its hand-off
-    (replymsg.HELD, Daemon._hold_reply): its covering review passed and the change was pushed or landed.
-    The held text is cleared in the same transaction, so it never posts twice. The ids posted."""
+def post_held(db, ids, tail: str, facts: dict | None = None) -> list[int]:
+    """Hand once to the coordinator (chatdigest.handoff raises its reply_due event), with the landing
+    `tail`, the chat reply each done task in `ids` held at its hand-off (replymsg.HELD, Daemon
+    _hold_reply): its covering review passed and the change was pushed or landed. The held text is
+    cleared in the same transaction, so it never posts twice. The ids handed over."""
     out = []
     for i in sorted(ids):
         t = db.task(i)
@@ -762,7 +777,7 @@ def post_held(db, ids, tail: str) -> list[int]:
             db.update_task(i, result=dump_result(prev))
             if held.strip():
                 chatdigest.handoff(db, None, t, "done", msgparts.cut(f"{held.rstrip()} ({tail})",
-                                                                     f"task #{i}'s hand-off"))
+                                                                     f"task #{i}'s hand-off"), facts=facts)
                 out.append(i)
     return out
 
@@ -2897,10 +2912,11 @@ def _settle_landed(p: Project, task: dict, b: dict, m: dict, prev: dict, summary
     # Handled: the coordinator sees it in its next turn's task list; no turn is spent on it.
     _event(db, task, "task_done", f"#{tid} {task['title']} → done ({tail}, batch {b['id']}): {summary[:1200]}",
            queued=False)
-    _reply(db, task, "done", _done_text(prev, result["summary"], tail))
+    landing = landing_facts(last.get("pushed_sha"), last.get("version"), last.get("target") or target)
+    _reply(db, task, "done", _done_text(prev, result["summary"], tail), facts=landing)
     covered = _covers(db, task, rows)
     settle_reviewed(db, now, only=covered)
-    post_held(db, covered, f"shipped by review #{tid}: {tail}")
+    post_held(db, covered, f"shipped by review #{tid}: {tail}", facts=landing)
 
 
 def rebase_head(task: dict) -> str:
@@ -3059,6 +3075,7 @@ def settle_reviewed(db, now: float | None = None, only: set[int] | None = None) 
             continue
         last = max(shipped, key=lambda x: x["id"])
         tail = f"shipped by review #{latest['id']}: " + _landing(last, last["target"], _batch_reach(db, last["batch"]), db)
+        landing = landing_facts(last.get("pushed_sha"), last.get("version"), last.get("target"))
         prev = load_result(t["result"])
         summary = str(prev.get("summary") or "")
         result = {**prev, "status": "done", "summary": f"{summary.rstrip()} ({tail})".strip()[:1500],
@@ -3071,7 +3088,7 @@ def settle_reviewed(db, now: float | None = None, only: set[int] | None = None) 
                                    "WHERE id=? AND status='review'", (dump_result(result), now, t["id"])).rowcount:
                 continue
             _event(db, t, "task_done", f"#{t['id']} {t['title']} → done ({tail})", queued=False)
-            _reply(db, t, "done", _done_text(prev, result["summary"], tail))
+            _reply(db, t, "done", _done_text(prev, result["summary"], tail), facts=landing)
         closed.append(t["id"])
     return closed
 

@@ -17,6 +17,13 @@ def _wu_bin(env, monkeypatch, text="Opus wrote this: it works.", rc=0):
     return seen
 
 
+def _wu_due_texts(p, tid):
+    """The hand-off texts the daemon handed the coordinator for `tid` (its reply_due events)."""
+    from ttp import spans
+    return [spans.strip(r["text"].partition("Hand-off: ")[2]).strip()
+            for r in p.db.q("SELECT text FROM events WHERE kind='reply_due' AND task=?", (tid,))]
+
+
 def _wu_finish(env, p, result, *, provider="chat", kind="work", chat="c1", status="ok"):
     from ttp.daemon import Daemon
     from ttp.providers.base import RunUsage as Usage
@@ -31,7 +38,9 @@ def _wu_finish(env, p, result, *, provider="chat", kind="work", chat="c1", statu
     d._prewrite(run, run_dir)   # the daemon does this before its finish rounds
     with d.p.db.tx():
         d._finish_worker(run, Usage(cost_usd=1.0), status, run_dir)
-    replies = [m["text"] for m in p.db.q("SELECT text FROM messages WHERE kind='reply' AND chat=?", (chat,))]
+    from ttp import spans
+    ev = p.db.q("SELECT text FROM events WHERE kind='reply_due' AND task=?", (tid,))
+    replies = [spans.strip(r["text"].partition("Hand-off: ")[2]).strip() for r in ev]
     return p.db.task(tid), replies, run_dir
 
 
@@ -145,10 +154,12 @@ def test_a_code_tasks_done_reply_from_a_glm_run_waits_for_its_landing_as_the_opu
     d._hold_reply(t, got["message"], True)
     held = load_result(p.db.task(task["id"])["result"])[replymsg.HELD]
     assert held.startswith("Landed text from Opus") and "GLM-" not in held
-    n = len(p.db.q("SELECT 1 FROM messages WHERE kind='reply' AND chat='c7'"))
+    n = len(p.db.q("SELECT 1 FROM events WHERE kind='reply_due' AND task=?", (task["id"],)))
     assert pushq.post_held(p.db, [task["id"]], "shipped") == [task["id"]]
-    posted = [m["text"] for m in p.db.q("SELECT text FROM messages WHERE kind='reply' AND chat='c7'")]
-    assert len(posted) == n + 1 and posted[-1].startswith("Landed text from Opus") and "GLM-" not in posted[-1]
+    due = [r["text"] for r in p.db.q("SELECT text FROM events WHERE kind='reply_due' AND task=?",
+                                     (task["id"],))]
+    assert len(due) == n + 1, "one reply_due event per finished task"
+    assert _wu_due_texts(p, task["id"])[-1].startswith("Landed text from Opus"), "Opus's text, never GLM's"
 
 
 def test_a_glm_run_handing_off_for_review_is_flagged_so_a_later_landing_posts_none_of_its_text(env, monkeypatch):
@@ -209,8 +220,7 @@ def test_the_writeup_runs_outside_the_finish_transaction_and_a_replayed_round_do
     monkeypatch.setattr(Daemon, "_finish_worker", finish)
     Daemon(p.base).finish_run(run, {"rc": 0, "started": time.time() - 60, "ended": time.time(), "stopped": None})
     assert len(rounds) == 2, "the finish round was replayed once"
-    assert [m["text"] for m in p.db.q("SELECT text FROM messages WHERE kind='reply' AND chat='c1'")] == [
-        "Opus wrote this: it works."]
+    assert _wu_due_texts(p, tid) == ["Opus wrote this: it works."]
     assert seen == [False], "one Opus call, with no write transaction open"
     assert p.db.task(tid)["status"] == "done"
 
@@ -236,8 +246,7 @@ def test_a_glm_reply_claiming_a_push_pays_for_one_opus_writeup_when_its_push_ver
         **load_result(p.db.task(tid)["result"])[pushclaim.KEY], "next": 0}}))
     d.verify_pushes()
     assert seen == [False] and p.db.task(tid)["status"] == "done"
-    assert [m["text"] for m in p.db.q("SELECT text FROM messages WHERE kind='reply' AND chat='c1'")] == [
-        "Opus wrote this: it works."]
+    assert _wu_due_texts(p, tid) == ["Opus wrote this: it works."]
 
 
 def test_a_writeup_stamp_is_taken_only_for_its_own_run_and_outcome(env, monkeypatch):

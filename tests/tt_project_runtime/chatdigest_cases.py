@@ -322,92 +322,116 @@ def _cd_task(p, title, chat="main"):
     return dict(p.db.task(t))
 
 
-def test_a_routine_hand_off_within_the_hour_is_folded_into_the_next_status(env, monkeypatch):
-    """A finished task's routine hand-off and shipped notice wait as one line each and go out in the next
-    status post, once the chat's status gap allows; nothing is lost."""
-    from ttp import chatdigest, hourly, obligations, pushq
+def _cd_events(p, kind=None):
+    return p.db.q("SELECT * FROM events WHERE kind=?" if kind else "SELECT * FROM events",
+                  (kind,)) if kind else p.db.q("SELECT * FROM events")
+
+
+def _cd_due(p, tid):
+    """The reply_due row a finished reply_chat task raised, or None."""
+    return p.db.one("SELECT * FROM events WHERE kind='reply_due' AND task=? ORDER BY id DESC", (tid,))
+
+
+def test_a_finished_reply_chat_task_raises_reply_due_and_never_posts_its_hand_off(env, monkeypatch):
+    """cells: handoff. the user's chat gets the coordinator's plain outcome
+    summary, never a worker's raw hand-off. The daemon raises one reply_due event naming the chat and
+    the landing facts, with the hand-off enclosed as data, and arms the fallback."""
+    from ttp import chatdigest, coordinator as coord, pushq
     monkeypatch.setenv("TTP_TEST_CHAT_DIGEST", "on")
     p = make(env)
-    p.db.post("in", "hello", chat="main")
-    now = time.time()
-    chatdigest.mark_status(p.db, "main", now - 600)   # a status went out 10 minutes ago
-    a, b = _cd_task(p, "tidy the docs"), _cd_task(p, "speed up a check")
-    pushq._reply(p.db, a, "done", "Docs tidied. Two pages merged.")
-    pushq._reply(p.db, b, "done", "(shipped by review #9) the check runs in 40 s now.")
-    assert not p.db.q("SELECT id FROM messages WHERE direction='out'"), "both held inside the status gap"
-    assert hourly.post(p, now) is None and chatdigest.status_flush(p, p.config(), now) == []
-    held = [i["task"] for i in p.db.kv(chatdigest.KV)["held"]["main"] if i["why"] == chatdigest.HANDOFF]
-    assert held == [a["id"], b["id"]]
-    o = obligations.add(p, "an order", now=now)
-    obligations.record(p, o, "receipt", "commit abc1234", None, now=now + 3100)
-    mid = hourly.post(p, now + 3601)
-    text = p.db.one("SELECT text FROM messages WHERE id=?", (mid,))["text"]
-    assert "Finished since the last status (2):" in text
-    assert f"- #{a['id']} tidy the docs: done: Docs tidied." in text and f"#{b['id']} speed up a check: done" in text
-    assert not [i for i in p.db.kv(chatdigest.KV)["held"]["main"] if i["why"] == chatdigest.HANDOFF]
-    # With no table due, status_flush posts the held lines alone once the gap allows.
-    chatdigest.mark_status(p.db, "main", now + 3650)   # a status reply reached the chat
-    c = _cd_task(p, "one more")
-    pushq._reply(p.db, c, "done", "Done.")
-    assert chatdigest.status_flush(p, p.config(), now + 3700) == []
-    got = chatdigest.status_flush(p, p.config(), now + 7300)
-    assert got and f"#{c['id']} one more: done" in p.db.one("SELECT text FROM messages WHERE id=?", (got[0],))["text"]
+    coord.apply(p, [{"type": "reply", "chat": "c1", "text": "Queued for a worker."},
+                    {"type": "task_add", "title": "tidy the docs", "spec": "tidy", "kind": "work", "tier": "light",
+                     "priority": 3, "reply_chat": "c1"}], turn=1)
+    t = dict(p.db.one("SELECT * FROM tasks WHERE reply_chat='c1' ORDER BY id DESC LIMIT 1"))
+    before = _cd_out(p)
+    pushq._reply(p.db, t, "done", "Docs tidied. Two pages merged.")
+    assert _cd_out(p) == before, "no part of the hand-off reaches the out queue"
+    ev = _cd_due(p, t["id"])
+    assert ev and ev["status"] == "queued" and ev["kind"] == "reply_due"
+    assert json.loads(ev["data"])["chat"] == "c1"          # names the chat
+    assert json.loads(ev["data"])["facts"]["status"] == "done"
+    assert "Docs tidied" in ev["text"]                      # the hand-off goes in as enclosed data
+    armed = p.db.kv(chatdigest.FALLBACK_KV)
+    assert len(armed) == 1 and armed[0]["task"] == t["id"]  # the fallback is armed for that chat
 
 
-def test_held_hand_off_lines_stay_in_the_web_app(env, monkeypatch):
-    """The status post carrying the held hand-off lines is recorded for the web
-    app only (no chat, the quiet channel); nothing is lost and no chat gets it."""
-    from ttp import alerts, chatdigest, pushq
+def test_a_landed_code_change_carries_its_landing_facts_to_the_event(env, monkeypatch):
+    """The reply_due event of a task the push queue settled carries what landed where, and whether the
+    installed release runs it, so the coordinator can say what is live without a hand-off."""
+    from ttp import chatdigest, pushq
+    p = make(env)
+    t = _cd_task(p, "fix the reply path", chat="c1")
+    pushq._reply(p.db, t, "done", "Fixed.", facts=pushq.landing_facts("abcdef1234", "0.2.1520", "relay/x"))
+    ev = _cd_due(p, t["id"])
+    assert ev
+    f = json.loads(ev["data"])["facts"]
+    assert (f["landed"], f["sha"], f["version"], f["branch"]) == (True, "abcdef1234", "0.2.1520", "relay/x")
+    assert f["deploy"] in ("deployed", "pending install", "not deployed")
+    assert "landed as abcdef1" in ev["text"]
+
+
+def test_the_fallback_outcome_line_posts_from_records_only_once_the_bound_passes(env, monkeypatch):
+    """No coordinator reply within `coordinator.reply_fallback_s`: one short model-free outcome line
+    built from records (never hand-off prose) posts to the chat; a reply before the bound posts
+    nothing."""
+    from ttp import chatdigest, pushq
     monkeypatch.setenv("TTP_TEST_CHAT_DIGEST", "on")
     p = make(env)
+    t = _cd_task(p, "Reply path: the user's chat gets the coordinator's plain summary", chat="c1")
+    pushq._reply(p.db, t, "done", _CD_TABLE + " (shipped by review #9674: pushed b40ca78 as 0.2.1519)",
+                 facts=pushq.landing_facts("b40ca7854", "0.2.1519", "relay/smartonTT/tt-project"))
     now = time.time()
-    chatdigest.mark_status(p.db, "main", now - 60)
-    a = _cd_task(p, "tidy the docs")
-    pushq._reply(p.db, a, "done", "Docs tidied.")
-    assert chatdigest.status_flush(p, p.config(), now) == []   # inside the status gap
-    got = chatdigest.status_flush(p, p.config(), now + 3700)
-    assert got
-    row = p.db.one("SELECT chat, channel, text FROM messages WHERE id=?", (got[0],))
-    assert row["chat"] is None and row["channel"] == alerts.QUIET and f"#{a['id']} tidy the docs: done" in row["text"]
-    assert not [i for i in (p.db.kv(chatdigest.KV)["held"].get("main") or []) if i["why"] == chatdigest.HANDOFF]
+    assert chatdigest.fallbacks(p, p.config(), now + 10) == []       # inside the bound: nothing posts
+    got = chatdigest.fallbacks(p, p.config(), now + chatdigest.DEFAULT_FALLBACK_S + 60)
+    assert got and len(got) == 1
+    text = p.db.one("SELECT text FROM messages WHERE id=?", (got[0],))["text"]
+    assert len(text) <= 300 and "landed as b40ca78" in text and "0.2.1519" in text
+    assert "shipped by review" not in text and "Opus" not in text   # no hand-off prose
+    assert p.db.kv(chatdigest.FALLBACK_KV) == []                    # armed once, spent once
+    # A chat the coordinator answered in time gets no fallback.
+    t2 = _cd_task(p, "second task", chat="c2")
+    pushq._reply(p.db, t2, "done", "Rows posted.", facts={"need": "run the Mac upgrade"})
+    p.db.post("out", "The fix is live as 0.2.1519; run the Mac upgrade.", chat="c2", kind="reply")
+    assert chatdigest.fallbacks(p, p.config(), now + chatdigest.DEFAULT_FALLBACK_S + 60) == []
 
 
-def test_an_owed_or_user_blocking_hand_off_posts_at_once(env, monkeypatch):
-    """A hand-off that delivers an open obligation its task owns, or a failure only the user can clear,
-    goes at once inside the status gap; a routine failure waits."""
-    from ttp import chatdigest, obligations, pushq
+def test_the_coordinator_s_reply_closes_the_delivery(env, monkeypatch):
+    """The coordinator's reply to the chat, `delivers` naming the task, is the delivery: the promise
+    the task's hand-off recorded closes on it, and no fallback line follows."""
+    from ttp import chatdigest, coordinator as coord, obligations, pushq
     monkeypatch.setenv("TTP_TEST_CHAT_DIGEST", "on")
     p = make(env)
+    tid = _cd_promised_task(p)
+    pushq._reply(p.db, dict(p.db.task(tid)), "done", _CD_TABLE,
+                 facts=pushq.landing_facts("b40ca7854", "0.2.1519", "relay/x"))
+    assert _cd_due(p, tid)
+    coord.apply(p, [{"type": "reply", "chat": "c1", "text": "The column is in: GLM-5.3 agrees on 9 of 12.",
+                     "delivers": [f"#{tid}"]}], turn=2)
+    owed = next(o for o in obligations.items(p.db) if (o.get("promise") or {}).get("chat") == "c1")
+    assert owed["delivered"], "the reply with `delivers` is the delivery"
     now = time.time()
-    chatdigest.mark_status(p.db, "main", now - 60)
-    a = _cd_task(p, "find the causes")
-    obligations.add(p, "the causes and fixes", owners=[a["id"]], now=now)
-    pushq._reply(p.db, a, "done", "Causes and fixes: the table posted on each batch.")
-    assert _cd_out(p, "main") == ["Causes and fixes: the table posted on each batch."]
-    b = _cd_task(p, "rerun a check")
-    pushq._reply(p.db, b, "failed", "The build host is down.")
-    c = _cd_task(p, "flaky test")
-    pushq._reply(p.db, c, "failed", "A test was flaky; retried by itself.")
-    assert _cd_out(p, "main")[1:] == [f"(task #{b['id']} failed) The build host is down."]
-    assert [i["task"] for i in p.db.kv(chatdigest.KV)["held"]["main"]] == [c["id"]]
+    assert chatdigest.fallbacks(p, p.config(), now + chatdigest.DEFAULT_FALLBACK_S + 60) == []
 
 
-def test_a_hand_off_also_posts_once_in_the_chat_of_an_obligation_it_delivers(env, monkeypatch):
-    """#3399: a task replying to chat A that owns an order from chat B, or names one from chat C by key,
-    posts its hand-off in A, B and C, once each; an order from A itself adds no second post in A."""
-    from ttp import chatdigest, obligations, pushq
+def test_a_promise_in_a_finished_task_s_hand_off_is_owed_until_the_coordinator_replies(env, monkeypatch):
+    """#8608 posted 'I will post the finished rows when they end.'; the promise records from the
+    hand-off (by_task), a later task replying there adopts it, and its own reply delivers it."""
+    from ttp import chatdigest, coordinator as coord, obligations, pushq
     monkeypatch.setenv("TTP_TEST_CHAT_DIGEST", "on")
     p = make(env)
-    now = time.time()
-    a = _cd_task(p, "find the causes", chat="A")
-    for text, owners, chat in (("the causes", [a["id"]], "B"), ("the causes again", [a["id"]], "A"),
-                               ("a related order", [], "C")):
-        mid = p.db.post("in", text, chat=chat)
-        obligations.add_order(p, text, mid, owners=owners, chat=chat, action_class="read", now=now)
-    oc = next(o["id"] for o in obligations.items(p.db) if o["promise"]["chat"] == "C")
-    pushq._reply(p.db, a, "done", f"Causes and fixes (for {oc}).")
-    want = [f"Causes and fixes (for {oc})."]
-    assert (_cd_out(p, "A"), _cd_out(p, "B"), _cd_out(p, "C")) == (want, want, want)
+    first = _cd_task(p, "the reference rows", chat="c1")
+    mid = p.db.post("in", "post the new table with the same columns", chat="c1")
+    obligations.add_order(p, "post the new table", mid, [first["id"]], due=time.time() + 7200, action_class="change")
+    chatdigest.handoff(p.db, p.config(), first, "done",
+                       "Rows so far. The open models are slow; I will post the finished rows when they end.", p=p)
+    owed = [o for o in obligations.items(p.db) if obligations._open(o) and (o.get("promise") or {}).get("chat") == "c1"
+            and (o.get("promise") or {}).get("order") is None]
+    assert owed and not owed[0]["promise"]["tasks"]
+    coord.apply(p, [{"type": "task_add", "title": "finish the open-model rows", "spec": "finish them",
+                     "kind": "work", "tier": "light", "priority": 2, "reply_chat": "c1"}], turn=2)
+    tid = p.db.one("SELECT id FROM tasks WHERE reply_chat='c1' ORDER BY id DESC LIMIT 1")["id"]
+    got = next(o for o in obligations.items(p.db) if o["id"] == owed[0]["id"])
+    assert tid in got["promise"]["tasks"], "the new task adopted the promise"
 
 
 def test_every_daemon_chat_post_of_kind_info_or_reply_keeps_the_chat_pace():
@@ -440,6 +464,9 @@ def test_every_daemon_chat_post_of_kind_info_or_reply_keeps_the_chat_pace():
                 found.append(f"{f.name}:{call.lineno}")
                 if fn.name == "cmd_urgent_reply":
                     continue   # an urgent message's first finding is exempt from the chat's pace on purpose
+                if fn.name == "fallbacks":
+                    continue   # the daemon's one bounded outcome line (chatdigest.fallbacks): at most
+                    # once per finished task, only past the reply bound, built from records only
                 if not names & pace:
                     bad.append(f"{f.name}:{call.lineno} in {fn.name}")
     assert found, "the scan found no posting call: the guard is broken"
@@ -468,110 +495,6 @@ def test_the_promise_detector_reads_the_column_and_rows_promises():
     assert obligations.commitments("The host is slow, so I will post the finished rows when they end.")
     assert not obligations.commitments("I will tighten the filter next.")
     assert not obligations.commitments("If you want, I'll post the rows.")
-
-
-def test_a_promised_result_posts_whole_at_once_from_a_normal_finish(env, monkeypatch):
-    from ttp import chatdigest
-    from ttp.daemon import Daemon
-    from ttp.providers.base import RunUsage as Usage
-    monkeypatch.setenv("TTP_TEST_CHAT_DIGEST", "on")
-    p = make(env)
-    tid = _cd_promised_task(p)
-    chatdigest.mark_status(p.db, "c1", time.time() - 60)   # inside the chat's status gap
-    p.db.update_task(tid, status="running")
-    run_dir = env["tmp"] / f"run-cd-{tid}"
-    run_dir.mkdir()
-    (run_dir / "result.json").write_text(json.dumps({"status": "done", "summary": "scored", "message": _CD_TABLE}))
-    d = Daemon(p.base)
-    with d.p.db.tx():
-        d._finish_worker({"task": tid}, Usage(cost_usd=0.1), "ok", run_dir)
-    assert p.db.task(tid)["status"] == "done"
-    assert _cd_out(p)[-1] == _CD_TABLE, _cd_out(p)
-    assert not (p.db.kv(chatdigest.KV) or {}).get("held", {}).get("c1")
-
-
-def test_a_promised_result_posts_whole_at_once_from_a_model_free_on_pass_finish(env, monkeypatch):
-    from ttp import chatdigest
-    from ttp.daemon import Daemon
-    monkeypatch.setenv("TTP_TEST_CHAT_DIGEST", "on")
-    p = make(env)
-    _sessions(env, monkeypatch, "s1")
-    tid = _cd_promised_task(p)
-    d = Daemon(p.base)
-    cmd = ("""printf '%s' '""" + json.dumps({"status": "done", "summary": "scored", "message": _CD_TABLE})
-           + """' > "$TTP_RESULT\"""")
-    monkeypatch.setenv("TTP_FAKE_SESSION", "s1")
-    monkeypatch.setenv("TTP_FAKE_RESULT", json.dumps({
-        "status": "waiting", "summary": "scoring runs", "waiting_for": "its job", "retry_when": "true",
-        "retry_after_s": 600, "on_pass_cmd": cmd}))
-    d.dispatch()
-    _finish_runs(p, d)
-    assert p.db.task(tid)["status"] == "queued", dict(p.db.task(tid))
-    chatdigest.mark_status(p.db, "c1", time.time() - 60)
-    assert d._start_on_pass(p.db.task(tid), time.time()) is True
-    assert _until_true(lambda: d._poll_on_pass(time.time()) or tid not in d._on_pass)
-    assert p.db.task(tid)["status"] == "done", dict(p.db.task(tid))
-    assert _cd_out(p)[-1] == _CD_TABLE, _cd_out(p)
-
-
-def test_an_order_owned_by_a_reply_chat_task_posts_its_result_whole(env, monkeypatch):
-    """Owned open, or closed by the task's own receipt before it hands off: either way it posts whole."""
-    from ttp import chatdigest, obligations, pushq
-    monkeypatch.setenv("TTP_TEST_CHAT_DIGEST", "on")
-    p = make(env)
-    now = time.time()
-    chatdigest.mark_status(p.db, "c1", now - 60)
-    for receipt in (False, True):
-        mid = p.db.post("in", "post the new table with the same columns", chat="c1")
-        t = _cd_task(p, "the new table", chat="c1")
-        oid = obligations.add_order(p, "post the new table", mid, [t["id"]], due=now + 7200,
-                                    action_class="change", now=now).split()[1]
-        if receipt:   # the run's own `ttp obligation receipt` as a required owner
-            obligations.attach(p, oid, [t["id"]], now=now)
-            obligations.record(p, oid, "receipt", "table in the hand-off", t["id"], now=now + 1)
-            assert not obligations._open(obligations.get(p.db, oid))
-        pushq._reply(p.db, t, "done", _CD_TABLE + f" ({receipt})")
-        assert _cd_out(p)[-1] == _CD_TABLE + f" ({receipt})", _cd_out(p)
-
-
-def test_a_promise_in_a_posted_hand_off_goes_to_the_next_task_replying_there(env, monkeypatch):
-    """#8608 posted 'I will post the finished rows when they end.'; #8639, added later to finish them,
-    owned nothing, so its table was held. The posted promise is recorded and the new task owns it."""
-    from ttp import chatdigest, coordinator as coord, obligations
-    monkeypatch.setenv("TTP_TEST_CHAT_DIGEST", "on")
-    p = make(env)
-    first = _cd_task(p, "the reference rows", chat="c1")
-    mid = p.db.post("in", "post the new table with the same columns", chat="c1")
-    obligations.add_order(p, "post the new table", mid, [first["id"]], due=time.time() + 7200, action_class="change")
-    posted = chatdigest.handoff(p.db, p.config(), first, "done",
-                                "Rows so far. The open models are slow; I will post the finished rows when they end.",
-                                p=p)
-    assert posted
-    owed = [o for o in obligations.items(p.db) if obligations._open(o) and (o.get("promise") or {}).get("chat") == "c1"
-            and (o.get("promise") or {}).get("order") is None]
-    assert owed and not owed[0]["promise"]["tasks"]
-    coord.apply(p, [{"type": "task_add", "title": "finish the open-model rows", "spec": "finish them",
-                     "kind": "work", "tier": "light", "priority": 2, "reply_chat": "c1"}], turn=2)
-    tid = p.db.one("SELECT id FROM tasks WHERE reply_chat='c1' ORDER BY id DESC LIMIT 1")["id"]
-    assert chatdigest.owed(p.db, tid, "c1") == [owed[0]["id"]]
-    chatdigest.mark_status(p.db, "c1", time.time() - 60)
-    assert chatdigest.handoff(p.db, p.config(), dict(p.db.task(tid)), "done", _CD_TABLE)
-    assert _cd_out(p)[-1] == _CD_TABLE
-
-
-def test_a_reply_chat_hand_off_owing_nothing_is_still_one_held_line(env, monkeypatch):
-    from ttp import chatdigest, coordinator as coord, pushq
-    monkeypatch.setenv("TTP_TEST_CHAT_DIGEST", "on")
-    p = make(env)
-    coord.apply(p, [{"type": "reply", "chat": "c1", "text": "Queued for a worker."},
-                    {"type": "task_add", "title": "tidy the docs", "spec": "tidy", "kind": "work", "tier": "light",
-                     "priority": 3, "reply_chat": "c1"}], turn=1)
-    t = dict(p.db.one("SELECT * FROM tasks WHERE reply_chat='c1' ORDER BY id DESC LIMIT 1"))
-    chatdigest.mark_status(p.db, "c1", time.time() - 60)
-    before = _cd_out(p)
-    pushq._reply(p.db, t, "done", "Docs tidied. Two pages merged.")
-    assert _cd_out(p) == before
-    assert [i["task"] for i in p.db.kv(chatdigest.KV)["held"]["c1"] if i["why"] == chatdigest.HANDOFF] == [t["id"]]
 
 
 def test_a_reply_the_user_asked_for_goes_at_once_after_a_status_and_a_late_repeat_waits(env, monkeypatch):

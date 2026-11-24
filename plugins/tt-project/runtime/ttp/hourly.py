@@ -4,8 +4,7 @@
 (Daemon.post_hourly_status) only when something important changed since the last post (important, changes:
 an order or promise closed or went overdue, a blocker or outage appeared or cleared, the spend gate changed
 level). Counts, times, loads or versions moving alone never post it; nor does a batch landing or a deploy by itself.
-The changes since the last post add up, so the next post names them all. The post folds the
-main chat's held hand-off lines (chatdigest.handoff), one per finished task. No model call builds or posts it.
+The changes since the last post add up, so the next post names them all. No model call builds or posts it.
 
 Rows, in order:
 1. Fork rate: of the worker and review runs started in the last hour and today (home zone), the share that
@@ -339,18 +338,17 @@ def corrected(p) -> dict:
 
 
 def post(p, now: float | None = None) -> int | None:
-    """Record the table for the web app when due, the main chat's held hand-off lines folded in; the
-    message id, else None."""
+    """Record the table for the web app when due; the message id, else None."""
     now = time.time() if now is None else now
     if not (p.config().get("notify") or {}).get("hourly_status", True):
         return None
-    from . import alerts, chatdigest
+    from . import alerts
     chat = main_chat(p.db)
     if not (got := due(p, now)):
         return None
     sig = important(p, now)
     with p.db.tx():
-        text = "\n".join([got[0], *chatdigest.handoff_lines(chatdigest.take_handoffs(p.db, chat))])
+        text = got[0]
         mid = p.db.post("out", text, chat=None, channel=alerts.QUIET, kind="info", severity="low", ref=REF)
     try:
         st = json.loads((p.state / STATE_FILE).read_text())

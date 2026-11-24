@@ -51,7 +51,15 @@ def _hc_hand_off(env, p, tid, result, prefetch=True):
 
 
 def _hc_replies(p, chat="c1"):
-    return [m["text"] for m in p.db.q("SELECT text FROM messages WHERE kind='reply' AND chat=?", (chat,))]
+    """The hand-off texts the daemon handed the coordinator for `chat`: a finished task's reply_due
+    event carries its hand-off enclosed; nothing posts to the chat itself."""
+    from ttp import spans
+    out = []
+    for r in p.db.q("SELECT text, data FROM events WHERE kind='reply_due' ORDER BY id"):
+        if chat != "all" and json.loads(r["data"]).get("chat") != chat:
+            continue
+        out.append(spans.strip(r["text"].partition("Hand-off: ")[2]).strip())
+    return out
 
 
 def _hc_runs(log):

@@ -1,4 +1,5 @@
-# What a task that answers a chat posts there (runtime/ttp/replymsg.py, Daemon._finish_worker, pushq._reply).
+# What a task that answers a chat hands the coordinator (runtime/ttp/replymsg.py, Daemon._finish_worker,
+# pushq._reply): the chat gets the coordinator's plain reply, never the raw hand-off.
 # Run from test_tt_project_runtime.py.
 
 # A task's hand-off: the steps it was asked to send were only in its tool output.
@@ -17,11 +18,13 @@ def _reply_hand_off(env, p, result: dict, chat="c1", kind="work"):
     d = Daemon(p.base)
     with d.p.db.tx():
         d._finish_worker({"task": tid}, Usage(cost_usd=1.0), "ok", run_dir)
-    replies = [m["text"] for m in p.db.q("SELECT text FROM messages WHERE kind='reply' AND chat=?", (chat,))]
+    from ttp import spans
+    replies = [spans.strip(r["text"].partition("Hand-off: ")[2]).strip()
+                for r in p.db.q("SELECT text FROM events WHERE kind='reply_due' AND task=?", (tid,))]
     return p.db.task(tid), replies
 
 
-def test_a_reply_posts_the_hand_offs_message_not_its_summary(env):
+def test_a_reply_hands_the_coordinator_its_message_not_the_summary(env):
     from ttp.db import load_result
     p = make(env)
     steps = "1. Run `ttp notifier reset`.\n2. Run `ttp notifier check` and paste back what it prints."
@@ -193,7 +196,7 @@ def test_a_long_worker_reply_is_posted_as_parts_and_cut_only_past_the_cap_saying
     p = make(env)
     long = "\n\n".join("Step. " + "x " * 700 + "end." for _ in range(6))   # ~8.4k chars
     task, replies = _reply_hand_off(env, p, {"status": "done", "summary": "s", "message": long})
-    assert len(replies) == 2 and "".join(_unmarked(replies)) == long
+    assert len(replies) == 1 and long.startswith(replies[0]) and len(replies[0]) <= 3500, replies[0][:80]
     huge = "y " * msgparts.MAX_CHARS
     cut = msgparts.cut(huge, "task #7's hand-off")
     assert len(cut) <= msgparts.MAX_CHARS and huge.startswith(cut[:cut.index("\n\n[")])

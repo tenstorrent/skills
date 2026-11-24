@@ -1627,7 +1627,7 @@ def record_promises(p, sent: list[tuple[int, str | None, str]], tasks: dict[int,
 def adopt(p, tasks: dict[int, str | None], now: float | None = None) -> list[str]:
     """Give each open promise a done hand-off posted in a chat (`by_task`: "I will post the finished rows")
     that no open task owns to the tasks this batch added replying to that chat (`tasks`: id -> reply_chat),
-    so their result is owed there and posts whole (chatdigest.owed). The coordinator's own promises keep
+    so their result is owed there. The coordinator's own promises keep
     the owners its batch gave them. Returns a note per promise adopted."""
     now = time.time() if now is None else now
     chats = {}

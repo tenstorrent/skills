@@ -1120,7 +1120,10 @@ def test_fake_round_trip_reply_task_and_answer(env):
         time.sleep(0.05)
     replies = p.db.unread_for_chat("c1", 0)
     assert any("ack: add a greeting" in r["text"] for r in replies)
-    assert any("fake worker finished" in r["text"] for r in replies)
+    # The worker's raw hand-off never reaches the chat: it goes to the coordinator as a reply_due event.
+    assert not any("fake worker finished" in r["text"] for r in replies)
+    due = p.db.q("SELECT text FROM events WHERE kind='reply_due'")
+    assert any("fake worker finished" in r["text"] for r in due), due
     assert all(r["status"] == "ok" for r in p.db.q("SELECT status FROM runs"))
 
 
@@ -5057,7 +5060,9 @@ def test_blocked_reply_to_a_chat_carries_the_question(env, monkeypatch):
     d = Daemon(p.base)
     assert _run_until(d, p, lambda: p.db.task(tid)["status"] == "blocked")
     replies = [m["text"] for m in p.db.q("SELECT text FROM messages WHERE direction='out' AND chat='laptop'")]
-    assert replies and replies[-1].endswith("\nNeeds from you: which board should I use?"), replies
+    assert not replies, "the raw hand-off never reaches the chat"
+    ev = p.db.one("SELECT data FROM events WHERE kind='reply_due' AND task=?", (tid,))
+    assert ev and json.loads(ev["data"])["facts"]["need"] == "which board should I use?", ev
 
 
 def test_web_payload_carries_coordinator_health_and_why_idle(env):
@@ -31961,10 +31966,10 @@ def test_closing_a_harness_task_from_review_answers_its_chat_once(env, capsys):
     d = Daemon(p.base)
     _sweep(d)
     assert p.db.task(tid)["status"] == "done"
-    (r,) = _replies(p, "c1")
-    assert r["text"].startswith("prompts tuned (") and "merged into the harness" in r["text"]
-    _sweep(d)
-    assert len(_replies(p, "c1")) == 1
+    ev = p.db.one("SELECT text FROM events WHERE kind='reply_due' AND task=? ORDER BY id DESC", (tid,))
+    assert ev and ev["text"].startswith(f"#{tid} ")
+    assert "prompts tuned (" in ev["text"] and "merged into the harness" in ev["text"]
+    assert not _replies(p, "c1"), "the chat never gets the hand-off"
     other = _harness_in_review(p, "landed edit", "ok", time.time())
     p.db.update_task(other, reply_chat="c2")
     try:
@@ -31973,10 +31978,10 @@ def test_closing_a_harness_task_from_review_answers_its_chat_once(env, capsys):
         assert e.code in (0, None)
     capsys.readouterr()
     assert p.db.task(other)["status"] == "done"
-    (r,) = _replies(p, "c2")
-    assert "recorded with `ttp task superseded`" in r["text"]
+    ev = p.db.one("SELECT text FROM events WHERE kind='reply_due' AND task=? ORDER BY id DESC", (other,))
+    assert "recorded with `ttp task superseded`" in ev["text"]
     _sweep(d)
-    assert len(_replies(p, "c2")) == 1 and len(_replies(p, "c1")) == 1
+    assert p.db.one("SELECT COUNT(*) n FROM events WHERE kind='reply_due'", ())["n"] == 2, "raised twice"
 
 
 def test_a_harness_task_whose_review_passed_is_closed_with_no_merged_commit_seen(env):

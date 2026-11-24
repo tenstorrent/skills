@@ -2470,6 +2470,7 @@ class Daemon:
                 self.check_idle_capacity,
                 self.check_obligations,
                 self.check_claims,
+                self.check_reply_fallbacks,
                 self.audit_pushes,
                 self.retire_ended,
                 self.archive_hidden_memory,
@@ -8773,6 +8774,7 @@ class Daemon:
             except Exception as e:   # a miss never stops the hand-off
                 log(self.p, f"review {task['id']}: earlier reviews not marked superseded: {e}")
         reply_text = None   # a code change's done reply, posted or held once its review is known
+        need = db.for_user(upd.get("blocked_reason")) if new == "blocked" else None
         if task["reply_chat"] and new in ("done", "failed", "blocked"):
             if isinstance(result, dict) and result.get(replymsg.CHAT_RUN):   # a chat-provider run: Opus's write-up only
                 text = db.for_user(replymsg.text(result)) if not replymsg.guard(result) else ""
@@ -8781,17 +8783,18 @@ class Daemon:
             else:
                 text = db.for_user(replymsg.text(result) if new == "done"
                                    else f"(task #{task['id']} {outcome}) {summary}")
-                need = db.for_user(upd.get("blocked_reason")) if new == "blocked" else None
                 if need and need not in summary:
                     text += f"\nNeeds from you: {need}"
-            # The chat's status pace (chatdigest.handoff): at once only when owed or the user must act.
-            # A code change's done reply waits for the review decision below (_hold_reply).
+            # The chat never gets the hand-off: chatdigest.handoff raises the reply_due event the
+            # coordinator answers in plain words. A code change's done reply waits for the review
+            # decision below (_hold_reply), so its event carries the landing facts.
             from . import chatdigest
             if new == "done" and self._code_change(task):
                 reply_text = text
             else:
                 chatdigest.handoff(db, self.cfg, task, new, msgparts.cut(
-                    text, f"task #{task['id']}'s hand-off (`ttp task {self.p.name} show {task['id']}`)"), p=self.p)
+                    text, f"task #{task['id']}'s hand-off (`ttp task {self.p.name} show {task['id']}`)"),
+                    p=self.p, facts={"need": need})
         sev = "high" if new == "blocked" else "normal"
         fups = result.get("followups") if isinstance(result, dict) else None
         fups = [f for f in fups if isinstance(f, dict) and f.get("title")] if isinstance(fups, list) else []
@@ -10904,9 +10907,6 @@ class Daemon:
         self._hourly_checked = now
         hourly.sample(self.p.state, now)
         hourly.post(self.p, now)
-        from . import chatdigest   # held hand-off lines the table did not fold, once each chat's gap allows
-        if ids := chatdigest.status_flush(self.p, self.cfg, now):
-            log(self.p, f"held hand-offs posted: messages {', '.join(map(str, ids))}")
 
     def check_host_load(self) -> None:
         """Model-free host-load watch (hostload): this host's runnable CPU demand above the load guard's threshold
@@ -11993,6 +11993,15 @@ class Daemon:
                     obligations.claim_result(self.p, oid, rc, now)
         except Exception:
             log(self.p, "claims: check failed\n" + traceback.format_exc())
+
+    def check_reply_fallbacks(self) -> None:
+        """A reply_chat task's chat no coordinator reply reached (chatdigest.fallbacks): post the
+        model-free outcome line built from records."""
+        from . import chatdigest
+        try:
+            chatdigest.fallbacks(self.p, self.cfg)
+        except Exception:
+            log(self.p, "reply fallbacks: check failed\n" + traceback.format_exc())
 
     def check_unreachable(self, every_s: float = 60) -> None:
         """One alert per network outage (netwait): every task that could start waits on a probe saying

@@ -454,7 +454,7 @@ def test_a_task_superseded_by_an_unlanded_commit_posts_nothing_and_its_heir_carr
     for kw in ({}, {"ref": "origin/proj"}):   # no heir: a landing
         before = len(_c1_replies(p))
         superseded(**kw)
-        assert [r for r in _c1_replies(p)[before:] if f"its work is in {relanded[:10]}" in r], (kw, _c1_replies(p))
+        assert _c1_replies(p)[before:] == [], "the raw hand-off still never posts"
     p.db.x("DELETE FROM task_superseded WHERE task=?", (tid,))
     p.db.update_task(tid, result=json.dumps({"status": "done", replymsg.HELD: "Done."}))
     landed.record_superseded(p, tid, relanded)
@@ -23072,6 +23072,12 @@ def _c1_replies(p):
                                       "AND chat='c1' ORDER BY id")]
 
 
+def _due_facts(p, tid):
+    """The landing facts of a task's reply_due event (chatdigest.REPLY_DUE), or None."""
+    r = p.db.one("SELECT data, text FROM events WHERE kind='reply_due' AND task=? ORDER BY id DESC", (tid,))
+    return ((json.loads(r["data"]) or {}).get("facts"), r["text"]) if r else (None, "")
+
+
 def test_a_code_reply_is_held_until_its_review_passes_and_the_push_queue_ships_it(env, monkeypatch):
     """#8518 told its chat "shipped" before its review ran and before anything landed: the done reply
     of a code task whose review is ahead is held, then posted once with the landing."""
@@ -23089,11 +23095,13 @@ def test_a_code_reply_is_held_until_its_review_passes_and_the_push_queue_ships_i
     d = Daemon(s.p.base)
     assert _run_until(d, s.p, lambda: s.p.db.task(s.review)["status"] == "done" and not s.p.db.one(
         "SELECT id FROM push_batches WHERE after_finalized IS NULL"), timeout=60)
-    assert _c1_replies(s.p) == [f"The relay fix is in. (shipped by review #{s.review}: pushed {sha[:7]} as 0.3.1 "
-                                f"to origin/proj)"]
+    facts, text = _due_facts(s.p, s.code)
+    assert facts and (facts["sha"], facts["version"]) == (sha, "0.3.1"), facts
+    assert "shipped by review" in text and "landed as " + sha[:7] in text
     assert replymsg.HELD not in json.loads(s.p.db.task(s.code)["result"])
     d.tick()
-    assert len(_c1_replies(s.p)) == 1, "posted twice"
+    assert _c1_replies(s.p) == [], "the chat never gets the hand-off"
+    assert len(s.p.db.q("SELECT id FROM events WHERE kind='reply_due' AND task=?", (s.code,))) == 1, "raised twice"
 
 
 def test_a_held_code_reply_posts_nothing_when_its_review_fails(env, monkeypatch):
@@ -23103,12 +23111,14 @@ def test_a_held_code_reply_posts_nothing_when_its_review_fails(env, monkeypatch)
     assert t["status"] == "failed" and _c1_replies(s.p) == []
 
 
-def test_a_code_reply_with_no_review_ahead_posts_at_its_hand_off(env, monkeypatch):
+def test_a_code_reply_with_no_review_ahead_hands_off_at_once(env, monkeypatch):
     from ttp import replymsg
     s = _pq(env, monkeypatch)
     t = _held_reply_code(env, monkeypatch, s, review=False)
-    assert _c1_replies(s.p) == ["The relay fix is in."]
+    facts, text = _due_facts(s.p, s.code)
+    assert facts and not facts.get("landed"), facts        # nothing landed yet
     assert replymsg.HELD not in json.loads(t["result"])
+    assert _c1_replies(s.p) == [], "the chat never gets the hand-off"
 
 
 def test_the_push_queue_does_not_approve_a_head_whose_latest_run_handed_the_task_back(env, monkeypatch):

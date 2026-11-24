@@ -28,17 +28,16 @@ message delivers only what the reply's own `delivers` named (obligations.deliver
 `coordinator.chat_users` {chat: user} tells apart chats of different users; unset, a project's chats are one
 user's. `coordinator.chat_dedupe` false turns the twin check off.
 
-Daemon hand-offs (handoff): a finished task's hand-off or shipped notice to its reply chat goes at once only
-when it delivers an obligation the task owns in that chat (owed: open, or closed by this task's own receipt),
-or reports a failure or block the user must act on (needs_user). A done hand-off posted at once that commits
-to more ("I will post the finished rows") records that promise in its chat (obligations.record_promises), and a
-reply_chat task the coordinator adds there later owns it (obligations.adopt), so its result posts whole too. Any other is held as one short line per task (why HANDOFF) and folded into the
-chat's next status post under its status gap (status_flush); the digest's own flush keeps the same gap. With
-the digest off, each goes at once.
+Daemon hand-offs (handoff): a finished task's hand-off never posts to its chat. The daemon raises one
+REPLY_DUE event per finished reply_chat task, naming its chat and its landing facts with the hand-off
+enclosed as data, and the coordinator replies to the chat in plain words; the task's promises still record
+in its chat (obligations.record_promises, by_task this task). A fallback outcome line (outcome_line) posts
+model-free, from records only, when no reply reaches that chat within coordinator.reply_fallback_s.
 Every daemon path that posts kind info or reply to a chat goes through status_wait, hold or checked (a guard
 test reads the posting code paths)."""
 from __future__ import annotations
 
+import json
 import os
 import re
 import time
@@ -47,8 +46,6 @@ KV = "chat_digest"   # {"held": {chat: [{ts, text, why}]}, "last": {chat: ts}, "
 #                       "counts": {chat: {sent, held, digests, deduped}}}
 DEFAULT_H = 3
 STATUS_GAP_H = 1
-HANDOFF = "hand-off"   # why of a held daemon hand-off line (handoff, status_flush)
-HANDOFF_REF = "held_handoffs"
 TWIN_S = 3600   # a near-repeat within this long of a post to another chat of the same user is not sent
 FOOTER = "\nStatus now: "   # onhost.guard's appended status line
 
@@ -87,14 +84,6 @@ def asks_user(text: str) -> bool:
     credential wording. Such a post is an ask, never routine."""
     body = str(text or "")
     return bool(_USER_STEP.search(body) or ("`" in body and re.search(r"`[^`\n]+`", body) and _YOU.search(body)))
-
-
-_NEEDS_USER = re.compile(r"\bask \d+\b|\bneed (?:you|your)\b|\byour (?:yes|word|answer|call|go|decision)\b", re.I)
-
-
-def needs_user(text: str) -> bool:
-    """A failure or block the user must act on: an outage, a step only they can take, or their answer."""
-    return urgent(text) or bool(_NEEDS_USER.search(str(text or "").replace("Needs from you:", "")))
 
 
 def urgent(text: str) -> bool:
@@ -375,137 +364,107 @@ def flush(p, cfg: dict | None, now: float | None = None) -> list[int]:
     return out
 
 
-def owed(db, tid: int, chat: str | None) -> list[str]:
-    """The obligations task `tid` owns that are owed in `chat`: an order or promise made there (or to every
-    chat), or a plain obligation, which names no chat. Open ones, and one this task's own run closed with its
-    receipt: its hand-off is the deliverable."""
-    from . import obligations
-    here = obligations._chat(chat)
-    out = []
-    for o in obligations.items(db):
-        if o.get("dropped") or int(tid) not in obligations._owner_ids(o):
-            continue
-        if not obligations._open(o) and (o.get("receipt") or {}).get("task") != int(tid):
-            continue
-        where = (o.get("promise") or {}).get("chat")
-        if where is None or here == "all" or obligations._chat(where) in ("all", here):
-            out.append(o["id"])
-    return out
+REPLY_DUE = "reply_due"          # the event a finished reply_chat task raises for the coordinator
+FALLBACK_KV = "reply_fallback"   # kv: the armed fallbacks [{chat, task, title, at, due, facts}]
+DEFAULT_FALLBACK_S = 1200       # coordinator.reply_fallback_s: how long the coordinator has to reply
+LINE_MAX = 300                  # a fallback outcome line stays under this
+HANDOFF_CHARS = 3500            # the enclosed hand-off is cut at this many chars
 
 
-def _line(task: dict, new: str, text: str) -> str:
-    """One short line for a held hand-off: the task, how it ended and its first sentence."""
-    body = re.sub(r"^\(task #\d+ \w+\)\s*", "", " ".join(str(text or "").split()))
-    first = re.split(r"(?<=[.;!])\s", body, 1)[0]
-    first = first if len(first) <= 160 else first[:157].rstrip() + "..."
-    return f"#{task['id']} {' '.join(str(task.get('title') or '').split())[:60]}: {new}" + (f": {first}" if first else "")
+def outcome_words(facts: dict) -> str:
+    """The landing facts of a finished reply_chat task in words, for the reply_due event and the
+    fallback line: how the task ended, what landed where, and whether it is deployed."""
+    bits = [str(facts.get("status") or "done")]
+    if facts.get("landed"):
+        bit = ("landed as " + str(facts.get("sha") or "?")[:7]
+               + f" (version {facts.get('version') or '?'}) on {facts.get('branch') or '?'}")
+        if facts.get("deploy"):
+            bit += ", " + str(facts["deploy"])
+        bits.append(bit)
+    else:
+        bits.append("not landed")
+    return ", ".join(bits)
 
 
-def handoff(db, cfg: dict | None, task: dict, new: str, text: str, now: float | None = None, p=None) -> list[int]:
-    """Post the daemon's hand-off `text` of `task` (ended `new`) to its reply chat at once when the user needs
-    it now (owed, needs_user) or the chat has no status gap; else hold one short line of it for the chat's
-    next status post (module doc). The same goes, once each, to the chat of every obligation the hand-off
-    delivers that came from another chat (obligation_chats). The message ids posted ([] when held). Any fault
-    posts it at once. With the project `p`, a done hand-off posted at once records the promises its text makes
-    in the chat."""
-    chat = None if task.get("reply_chat") in (None, "", "all") else task["reply_chat"]
-    ids = _handoff_to(db, cfg, task, new, text, chat, now, p)
+def outcome_line(task: dict, facts: dict) -> str:
+    """The fallback line for a chat the coordinator did not reply to: the task, whether it landed
+    (commit and version), whether it is deployed, and any user step on record. No hand-off prose."""
+    head = f"#{task['id']} " + " ".join(str(task.get("title") or "").split())
+    line = f"{head[:200]}: {outcome_words(facts)}"
+    if (need := str(facts.get("need") or "").strip()):
+        line += "\nNeeds from you: " + need
+    return line if len(line) <= LINE_MAX else line[:LINE_MAX - 3].rstrip() + "..."
+
+
+def fallback_s(cfg: dict | None) -> float:
+    """`coordinator.reply_fallback_s`: how long the coordinator has to reply before the fallback line."""
     try:
-        extra = obligation_chats(db, task, chat, text) if chat is not None else []
-    except Exception:   # the reply chat already has it
-        extra = []
-    for other in extra:
-        ids += _handoff_to(db, cfg, task, new, text, other, now, p, delivers=True)
-    return ids
+        return max(0.0, float((((cfg or {}).get("coordinator") or {}).get("reply_fallback_s"))
+                              or DEFAULT_FALLBACK_S))
+    except (TypeError, ValueError):
+        return DEFAULT_FALLBACK_S
 
 
-OBLIGATION_KEY = re.compile(r"(?<![\w-])o\d+(?![\w-])")
-
-
-def obligation_chats(db, task: dict, chat: str | None, text: str) -> list[str]:
-    """The chats, other than `chat`, of the obligations a hand-off delivers or reports on: one the task owns
-    (owed's rule: open, or closed by this task's receipt), or one its `text` names by key that is open or this
-    task closed. An obligation of every chat ("all") or of `chat` itself adds none; each chat once."""
-    from . import obligations
+def handoff(db, cfg: dict | None, task: dict, new: str, text: str, now: float | None = None, p=None,
+            facts: dict | None = None) -> list[int]:
+    """A finished reply_chat task's hand-off never posts to its chat; the user gets the coordinator's
+    plain outcome summary instead. This raises one REPLY_DUE event that wakes the coordinator, naming
+    the chat and the landing facts, with the hand-off enclosed as data only, and arms the model-free
+    fallback line for the case no reply reaches the chat in time (fallbacks). The hand-off's promises
+    still record in its chat. The message ids posted (always []: nothing posts here)."""
+    from . import msgparts, spans
+    chat = "all" if task.get("reply_chat") in (None, "", "all") else task["reply_chat"]
+    now = time.time() if now is None else now
+    f = {"status": new, **(facts or {})}
     tid = int(task["id"])
-    named = set(OBLIGATION_KEY.findall(str(text or "")))
-    here = obligations._chat(chat)
-    out: list[str] = []
-    for o in obligations.items(db):
-        if o.get("dropped") or not (tid in obligations._owner_ids(o) or o.get("id") in named):
-            continue
-        if not obligations._open(o) and (o.get("receipt") or {}).get("task") != tid:
-            continue
-        where = (o.get("promise") or {}).get("chat")
-        if where is None or obligations._chat(where) in ("all", here) or where in out:
-            continue
-        out.append(where)
-    return out
-
-
-def _handoff_to(db, cfg: dict | None, task: dict, new: str, text: str, chat: str | None, now: float | None,
-                p, delivers: bool = False) -> list[int]:
-    """Post or hold one chat's copy; `delivers` (an obligation's own chat) always posts at once."""
-    from . import msgparts
-    try:
-        if cfg is None:
-            from pathlib import Path
-            from .project import Project
-            cfg = Project(Path(db.path).parent.parent).config()
-        if (not delivers and status_gap_s(cfg, chat) > 0 and not owed(db, int(task["id"]), chat)
-                and not (new in ("failed", "blocked") and needs_user(text))):
-            hold(db, chat, _line(task, new, text), HANDOFF, now, task=int(task["id"]))
-            return []
-    except Exception:   # a hand-off is never lost to this filter
-        pass
-    ids = msgparts.post(db, text, chat=chat, kind="reply", severity="normal")
-    if p is not None and new == "done" and ids:
+    body = msgparts.cut(text, "the hand-off")[:HANDOFF_CHARS]
+    db.x("INSERT INTO events(ts,source,kind,severity,text,status,task,data) VALUES(?,?,?,?,?,?,?,?)",
+         (now, "task:%d" % tid, REPLY_DUE, "normal",
+          "#%d %s -> %s in chat %s: %s. Reply to that chat in plain words with the outcome (what is "
+          "live, what the user must do), `delivers` naming #%d. Hand-off: %s" % (
+              tid, str(task.get("title") or "")[:80], new, chat, outcome_words(f), tid,
+              spans.wrap(body, "hand-off of #%d" % tid, spans.new_tag())),
+          "queued", tid, json.dumps({"chat": chat, "task": tid, "facts": f})))
+    st = db.kv(FALLBACK_KV) or []
+    st.append({"chat": chat, "task": tid, "title": str(task.get("title") or ""),
+               "at": now, "due": now + fallback_s(cfg), "facts": f})
+    db.set_kv(FALLBACK_KV, st)
+    if p is not None and new == "done":
         from . import obligations
-        try:   # the user read it, so what it promises is owed there; recording it never undoes the post
-            obligations.record_promises(p, [(ids[0], chat, text)], {}, now=now, by_task=int(task["id"]))
+        try:   # the promises its hand-off makes stay owed in that chat, closed by the reply that delivers
+            obligations.record_promises(p, [(0, chat, body)], {}, now=now, by_task=tid)
         except Exception:
             pass
-    return ids
+    return []
 
 
-def take_handoffs(db, chat: str | None) -> list[str]:
-    """Remove and return `chat`'s held hand-off lines, oldest first, for the status post that folds them."""
-    with db.tx():
-        st = db.kv(KV) or {}
-        items = (st.get("held") or {}).get(chat or "all") or []
-        got = [i for i in items if i.get("why") == HANDOFF]
-        if got:
-            st["held"][chat or "all"] = [i for i in items if i.get("why") != HANDOFF]
-            db.set_kv(KV, st)
-    return [str(i["text"]) for i in got]
-
-
-def handoff_lines(lines: list[str]) -> list[str]:
-    return [f"Finished since the last status ({len(lines)}):", *(f"- {x}" for x in lines)] if lines else []
-
-
-def status_flush(p, cfg: dict | None, now: float | None = None) -> list[int]:
-    """Post each chat's held hand-off lines as one short status post once its status gap allows (the hourly
-    table folds the main chat's first, hourly.post). The message ids posted."""
-    from . import msgparts, timefmt
+def fallbacks(p, cfg: dict | None, now: float | None = None) -> list[int]:
+    """Post the fallback outcome line (outcome_line) for each armed chat no reply reached within its
+    bound (a message out to that chat since the hand-off). The message ids."""
+    from . import msgparts
     now = time.time() if now is None else now
+    st = p.db.kv(FALLBACK_KV) or []
     out: list[int] = []
-    for chat, items in list(((p.db.kv(KV) or {}).get("held") or {}).items()):
-        target = None if chat == "all" else chat
-        if not any(i.get("why") == HANDOFF for i in items) or status_wait(p.db, cfg, target, now) > 0:
+    keep = []
+    for item in st:
+        if now < float(item.get("due") or 0):
+            keep.append(item)
             continue
-        with p.db.tx():
-            if not (lines := take_handoffs(p.db, target)):
-                continue
-            text = "\n".join([f"Status at {timefmt.short(now, timefmt.home(p), now)}", *handoff_lines(lines)])
-            from . import alerts   # the web app only: no chat, the quiet channel
-            out += msgparts.post(p.db, text, chat=None, channel=alerts.QUIET, kind="info", severity="low",
-                                 ref=HANDOFF_REF)
-            st = p.db.kv(KV) or {}
-            _count(st, chat, "sent")
-            p.db.set_kv(KV, st)
+        if _replied(p.db, item):
+            continue   # the coordinator's reply reached that chat: no fallback is needed
+        out += msgparts.post(p.db, outcome_line(item, item.get("facts") or {}),
+                             chat=None if item.get("chat") == "all" else item.get("chat"),
+                             kind="reply", severity="normal")
+    if len(keep) != len(st):
+        p.db.set_kv(FALLBACK_KV, keep)
     return out
 
+
+def _replied(db, item: dict) -> bool:
+    """Whether a message reached the chat of `item` since its hand-off armed the fallback."""
+    chat = item.get("chat")
+    return bool(db.one("SELECT 1 FROM messages WHERE direction='out' AND ts>=? AND (chat=? OR (chat IS NULL "
+                       "AND ?='all')) LIMIT 1", (float(item.get("at") or 0), chat, chat)))
 
 def counts(db) -> dict:
     """{chat: {"sent", "held", "digests", "deduped", "waiting"}}: posts sent at once, held, digests posted,
@@ -514,3 +473,4 @@ def counts(db) -> dict:
     chats = set(st.get("counts") or {}) | set(st.get("held") or {})
     return {c: {**{f: int((st.get("counts") or {}).get(c, {}).get(f) or 0) for f in ("sent", "held", "digests", "deduped")},
                 "waiting": len((st.get("held") or {}).get(c) or [])} for c in sorted(chats)}
+
