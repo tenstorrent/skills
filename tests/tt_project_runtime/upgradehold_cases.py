@@ -801,3 +801,35 @@ def test_a_new_hold_keeps_a_copy_a_live_process_still_runs_from(tmp_path):
     with project.runtime_hold(h):          # nothing runs from any copy now: all gone but the new one
         left = holds()
     assert len(left) == 1 and left[0] != first[0], "only the newest hold's copy is left"
+
+
+def test_a_child_that_gets_a_hold_copy_through_pythonpath_is_noted_and_kept(tmp_path):
+    """A child that never sees the launcher gets the hold copy through PYTHONPATH (as ttp's own
+    children do): it notes itself in the copy at import, so a hold after its parent died keeps the
+    copy it still imports from, and drops it once nothing runs from it."""
+    from ttp import project
+    git = tmp_path / "harness" / ".git"
+    copy = git / f"{project.RUNTIME_HOLD}.1.1"   # a copy a finished hold left behind: the runtime
+    shutil.copytree(RUNTIME, copy)               # sits in it, as copytree of runtime/ puts it
+    pkg = copy / "ttp"
+    clean = {k: v for k, v in os.environ.items() if k not in ("PYTHONPATH", "TTP_PYTHON")}
+    child = subprocess.Popen([sys.executable, "-c", "import ttp, time; time.sleep(30)"],
+                            env={**clean, "PYTHONPATH": str(copy)}, stdout=subprocess.DEVNULL)
+    try:
+        for _ in range(200):      # the child notes itself on the copy it imports from
+            noted = (pkg.parent / project.HOLD_PIDS).read_text().split() if (pkg.parent / project.HOLD_PIDS).is_file() else []
+            if str(child.pid) in noted:
+                break
+            time.sleep(0.05)
+        assert str(child.pid) in (pkg.parent / project.HOLD_PIDS).read_text().split()
+        h = tmp_path / "harness"
+        (h / "runtime").mkdir()
+        (h / "runtime" / "ttp").mkdir()
+        (h / "runtime" / "ttp" / "__init__.py").write_text("__version__ = '1'\n")
+        with project.runtime_hold(h):      # nothing else runs from the copy: only the child keeps it
+            assert copy.is_dir(), "the copy the child imports from stays whole"
+    finally:
+        child.terminate()
+        child.wait()
+    with project.runtime_hold(h):
+        assert not copy.exists(), "with the child gone the copy is dropped"
