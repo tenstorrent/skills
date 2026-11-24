@@ -343,7 +343,6 @@ def post(p, now: float | None = None) -> int | None:
     if not (p.config().get("notify") or {}).get("hourly_status", True):
         return None
     from . import alerts
-    chat = main_chat(p.db)
     if not (got := due(p, now)):
         return None
     sig = important(p, now)

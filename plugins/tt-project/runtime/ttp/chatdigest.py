@@ -397,6 +397,13 @@ def outcome_line(item: dict, facts: dict) -> str:
     return line if len(line) <= LINE_MAX else line[:LINE_MAX - 3].rstrip() + "..."
 
 
+def _cfg(db):
+    """The project's config for callers that hold only its db (pushq): the config lives one level up."""
+    from pathlib import Path
+    from .project import Project
+    return Project(Path(db.path).parent.parent).config()
+
+
 def fallback_s(cfg: dict | None) -> float:
     """`coordinator.reply_fallback_s`: how long the coordinator has to reply before the fallback line."""
     try:
@@ -428,8 +435,9 @@ def handoff(db, cfg: dict | None, task: dict, new: str, text: str, now: float | 
           "queued", tid, json.dumps({"chat": chat, "task": tid, "facts": f})))
     st = db.kv(FALLBACK_KV) or []
     st.append({"chat": chat, "task": tid, "title": str(task.get("title") or ""),
-               "at": now, "due": now + fallback_s(cfg), "facts": f})
-    db.set_kv(FALLBACK_KV, st)
+               "at": now, "due": now + fallback_s(cfg or _cfg(db)), "facts": f})
+    with db.tx():
+        db.set_kv(FALLBACK_KV, st)
     if p is not None and new == "done":
         from . import obligations
         try:   # the promises its hand-off makes stay owed in that chat, closed by the reply that delivers
@@ -464,8 +472,9 @@ def fallbacks(p, now: float | None = None) -> list[int]:
 def _replied(db, item: dict) -> bool:
     """Whether a message reached the chat of `item` since its hand-off armed the fallback."""
     chat = item.get("chat")
-    return bool(db.one("SELECT 1 FROM messages WHERE direction='out' AND ts>=? AND (chat=? OR (chat IS NULL "
-                       "AND ?='all')) LIMIT 1", (float(item.get("at") or 0), chat, chat)))
+    return bool(db.one("SELECT 1 FROM messages WHERE direction='out' AND ts>=? AND channel IS NULL "
+                       "AND (chat=? OR (chat IS NULL AND ?='all')) LIMIT 1",
+                       (float(item.get("at") or 0), chat, chat)))
 
 
 def counts(db) -> dict:
@@ -475,4 +484,3 @@ def counts(db) -> dict:
     chats = set(st.get("counts") or {}) | set(st.get("held") or {})
     return {c: {**{f: int((st.get("counts") or {}).get(c, {}).get(f) or 0) for f in ("sent", "held", "digests", "deduped")},
                 "waiting": len((st.get("held") or {}).get(c) or [])} for c in sorted(chats)}
-

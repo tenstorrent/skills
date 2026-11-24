@@ -322,11 +322,6 @@ def _cd_task(p, title, chat="main"):
     return dict(p.db.task(t))
 
 
-def _cd_events(p, kind=None):
-    return p.db.q("SELECT * FROM events WHERE kind=?" if kind else "SELECT * FROM events",
-                  (kind,)) if kind else p.db.q("SELECT * FROM events")
-
-
 def _cd_due(p, tid):
     """The reply_due row a finished reply_chat task raised, or None."""
     return p.db.one("SELECT * FROM events WHERE kind='reply_due' AND task=? ORDER BY id DESC", (tid,))
