@@ -2,10 +2,13 @@
 # Start a Claude bring-up run in tmux from a few inputs. See README.md.
 #   launch.sh --hf-model org/name --tt-metal /path/to/tt-metal [--budget 48] [--scope open|contained]
 #             [--resets yes|no] [--notes file] [--inputs '{"targets": {...}, "evals": [...]}'] [--session name]
+#             [--overseer-interval hours] [--no-overseer]
 set -euo pipefail
 HERE=$(cd "$(dirname "$0")" && pwd); PLUGINS=$(cd "$HERE/../../.." && pwd)
 HF_MODEL= TT= BUDGET=48 SCOPE=open RESETS=no NOTES= EXTRA='{}' SESSION= MODEL=${CLAUDE_MODEL:-claude-opus-5-5}
+OVERSEER=1
 while [ $# -gt 0 ]; do case $1 in
+  --no-overseer) OVERSEER=; shift; continue;; --overseer-interval) OVERSEER=$2;;
   --hf-model) HF_MODEL=$2;; --tt-metal) TT=$(cd "$2" && pwd);; --budget) BUDGET=$2;; --scope) SCOPE=$2;;
   --resets) RESETS=$2;; --notes) NOTES=$2;; --inputs) EXTRA=$2;; --session) SESSION=$2;;
   *) echo "unknown option $1" >&2; exit 2;; esac; shift 2; done
@@ -48,4 +51,7 @@ tmux new-session -d -s "$SESSION" -c "$TT" bash -lc "
   exec bash"
 # Budget watchdog: tell the session when the budget is reached.
 nohup bash -c "sleep \$(python3 -c 'print(int($BUDGET*3600))'); tmux send-keys -t $SESSION -l 'Budget reached: start nothing new; finish and commit REPORT.md.'; tmux send-keys -t $SESSION Enter" >/dev/null 2>&1 &
-echo "started tmux session $SESSION (prompt: $PROMPT)"
+# Overseer: every OVERSEER hours, a report on subagents, jobs, devices, CPU, disk and budget (overseer.sh).
+[ -n "$OVERSEER" ] && nohup "$HERE/overseer.sh" --session "$SESSION" --tt "$TT" --inputs "$RUN/inputs.json" \
+  --interval "$OVERSEER" --model "$MODEL" --started-at "$(date +%s)" >/dev/null 2>&1 &
+echo "started tmux session $SESSION (prompt: $PROMPT)${OVERSEER:+; overseer every $OVERSEER h, log $RUN/overseer.log}"

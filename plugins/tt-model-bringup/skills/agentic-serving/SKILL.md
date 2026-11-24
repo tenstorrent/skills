@@ -280,7 +280,10 @@ Name what each cause would need to fix and whether it is the model, the serving 
 The multigoal runner starts and checks stages; it does not watch eval runs. Start each list run and rerun
 wave so that it survives the tool call (`scripts/eval_runs.py start`, Helpers, does this and records the
 run), and wait without model calls, in waits of tens of minutes with other analysis between them
-([serving and evals](../ttnn-knowledge/topics/serving-evals.md#eval-infrastructure) says why). Score the run from the harness output and mark it `collected` in
+([serving and evals](../ttnn-knowledge/topics/serving-evals.md#eval-infrastructure) says why). Give the
+eval server and the client separate lifetimes, and stop the server when the client exits, whatever its exit
+code. An acceptance FAIL exit is a result, not a crash: read the report before treating a nonzero exit as
+failure. Score the run from the harness output and mark it `collected` in
 `results.json`. Sub-agents run at low effort for
 profiling, log triage and tests; the coordinator decides. Sub-agents share findings within the run through
 its own records (`results.json`, the digests and triage files).

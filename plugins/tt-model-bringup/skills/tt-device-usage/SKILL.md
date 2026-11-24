@@ -20,6 +20,7 @@ Use this skill for the hardware-facing parts of model bringup. It covers only no
 - Run every device job under a bounded timeout that interrupts first and kills late: `timeout -s INT --kill-after=120 <limit> <cmd>`, so the job can close its device. A plain `timeout` sends SIGTERM and `-s KILL` closes nothing; both leave the dispatch path wedged, and a multi-chip open on top of a chip left mid-operation has taken whole hosts down. Start the clock only once the job holds its chips: a limit that also counts the wait for a lock kills jobs while they run. Do not SIGTERM a process with outstanding device work yourself. Let the timeout end the job, record it, and stop device work on that chip when a mesh smoke no longer completes.
 - After any unclean exit (signal, timeout, `TT_THROW`/`TT_FATAL`), the next job on that board waits for a reset and a multi-chip health check. When the set of chips changes between jobs (one chip, then all), pause a few seconds and check health first. Two failed recoveries stop all device work until the operator looks.
 - Launch device jobs detached, with their own lifetime; a job tied to a short-lived remote session dies with it and leaves the device open.
+- Give background work an expected end time and a progress signal (a growing log, device activity) and check it against them, rather than only waiting for it to exit. Never `wait` on a server process: it does not exit, and an idle server holds the devices.
 - Do not reproduce a known hang on a board nobody can power-cycle remotely. Before any reset or health check, copy the debug dumps it may overwrite.
 - Record firmware and driver versions per machine. When results differ between machines, suspect the machine before the model.
 - On QB2 the two dies of a p300c card share a reset: resetting one die alone has broken the Ethernet links to the others. Pause the other die's job and reset the card or the board.
@@ -31,6 +32,7 @@ Use this skill for the hardware-facing parts of model bringup. It covers only no
 - Do not profile live vLLM serving stages. Use serving benchmark JSON and logs instead.
 - Before launching a bringup, keep the workspace, multigoal log directory, and `CODEX_HOME` on storage that survives reboot and, when applicable, container recreation. The runner defaults to `<repo>/bringup/artifacts/multigoal-runs/<timestamp>`; any `--log-dir` or `RUN_MULTIGOAL_LOG_DIR` override must also use persistent storage. Do not put resume state in `/tmp`: recovery needs both the manifest's stage/thread mapping and the Codex session state.
 - Preserve evidence before cleanup: work logs, README files, benchmark JSON, server logs, compact perf summaries, and exact failing commands. Do not delete `CODEX_HOME`, auth/config, completed stage artifacts, or the repo state.
+- When disk runs low, clean only inside the run's own folder (logs of finished servers, profiler/trace/tensor dumps, the run's build leftovers and stopped containers), after keeping the evidence. Never the tt-metal kernel cache, shared weights or HF caches, other runs, CI files, or committed artifacts; if that is not enough, report it.
 
 ## Reset And Health Checks
 
