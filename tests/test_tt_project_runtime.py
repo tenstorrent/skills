@@ -17099,7 +17099,8 @@ def test_a_run_whose_recorded_pid_is_gone_is_lost_at_once_and_replaced(env, tmp_
     from ttp.daemon import Daemon
     d = Daemon(p.base)
     gone = subprocess.Popen(["true"])
-    gone.wait()   # the pid the run row records: its process is gone
+    from ttp.daemon import _alive
+    assert _wait(lambda: not _alive(gone.pid)), "its recorded process has to be gone before the reap"
     tid = p.db.add_task("job", "s", kind="work", tier="light", origin="user")
     p.db.update_task(tid, status="running")
     run_dir = tmp_path / "gone"
