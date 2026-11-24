@@ -1278,7 +1278,7 @@ def test_a_run_re_arms_one_project_on_evidence_and_records_it_in_the_ledger(env,
     assert code == 0 and f"last re-armed in {target.name} by a run: fix #{fix}" in out and "replay 7" in out
 
 
-def _land_fix(p, repo, title, path):
+def _push_landed_fix(p, repo, title, path):
     """Another fix task landed on the push branch the way _rearm_setup's is: (task, landed head)."""
     fix = p.db.add_task(title, "s", kind="code", status="done", branch=f"ttp/t-{path}")
     _commit(repo, path, f"{title}\n")
@@ -1307,7 +1307,7 @@ def _stopped_window(env, monkeypatch, tmp_path):
     covers. Returns (p, target, cfg, fix A, fix B, {run id: (ts, bounced)})."""
     from ttp import deviceplan, glmguard
     p, target, fix_a, head_a, older = _rearm_setup(env, monkeypatch)
-    fix_b, head_b = _land_fix(p, p.root, "fix b", "fixb.txt")
+    fix_b, head_b = _push_landed_fix(p, p.root, "fix b", "fixb.txt")
     cfg = _dp_cfg(device=True, device_audits=2)
     t = target.db.task(target.db.add_task("soak", "Run the soak on the box.", kind="work"))
     base = float(int(time.time()) - 7200)
@@ -1355,7 +1355,7 @@ def test_a_pushed_fix_no_daemon_ran_is_refused_and_excludes_nothing(env, monkeyp
     """Pushed is not live: a fix no daemon start of the project ran is refused and no stop stops counting."""
     from ttp import rollout
     p, target, cfg, fix_a, fix_b, runs = _stopped_window(env, monkeypatch, tmp_path)
-    fix_c, _ = _land_fix(p, p.root, "fix c", "fixc.txt")
+    fix_c, _ = _push_landed_fix(p, p.root, "fix c", "fixc.txt")
     code, out = _roll(capsys, "fixed", "glm_device", target.name, "--fix", str(fix_c), "--runs", "8")
     assert code == 2 and "is not live in" in out and not rollout.fixed_stops(target.name, "glm_device"), out
 
