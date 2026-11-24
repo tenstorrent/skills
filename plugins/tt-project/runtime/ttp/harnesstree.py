@@ -112,13 +112,35 @@ def _checked(p: Project, tid: int, own: Path) -> Path:
     return own
 
 
+def _reclaimed(p: Project, tid: int, own: Path) -> bool:
+    """Remove task `tid`'s worktree left on another branch (or detached), e.g. by a run that bounced
+    mid-write, when nothing would be lost: it is clean, every commit it holds is in the harness HEAD
+    and no detached job of the task runs. Its branch goes too (`branch -d`), never the main line.
+    True once removed; False leaves it for _checked to refuse."""
+    got = on_branch(own)
+    if got == branch(tid) or not _is_repo(p) or dirty(own) or running_in(p, tid):
+        return False
+    head = _git(own, "rev-parse", "HEAD").stdout.strip()
+    ahead = _git(p.harness, "rev-list", "--count", head, "^HEAD") if head else None
+    if not ahead or ahead.returncode != 0 or ahead.stdout.strip() != "0":
+        return False
+    from .worktree import unkeep
+    unkeep(own)
+    if _git(p.harness, "worktree", "remove", str(own), timeout=120).returncode != 0:
+        return False
+    if got and got != main_branch(p):
+        _git(p.harness, "branch", "-d", got)
+    return True
+
+
 def workdir(p: Project, tid: int) -> Path:
     """Where harness task `tid` works: its worktree when it has one, else the harness checkout while
     that is free and on its main line, else a new worktree of its own: branch ttp/harness-t<tid>,
     kept as it is when it exists (a retry), else started from the main line (main_branch), never from
-    whatever the checkout has checked out. A worktree not on that branch is refused (RuntimeError)."""
+    whatever the checkout has checked out. A worktree not on that branch is reclaimed when nothing
+    would be lost (_reclaimed), else refused (RuntimeError)."""
     own = path(p, tid)
-    if own.exists():
+    if own.exists() and not _reclaimed(p, tid, own):
         return _checked(p, tid, own)
     if not _is_repo(p) or not (checkout_busy(p, tid) or TASK_BRANCH_RE.fullmatch(on_branch(p.harness))):
         return p.harness
@@ -144,6 +166,12 @@ def held(p: Project, tid: int) -> str | None:
     task = p.db.task(int(tid))
     if task and task["status"] not in TERMINAL_TASK_STATES:
         return f"task #{tid} ({task['status']}) is still open"
+    return running_in(p, tid)
+
+
+def running_in(p: Project, tid: int) -> str | None:
+    """Why harness task `tid`'s worktree is in use, or None: a detached job, detached checks or a
+    detached `ttp push` of it still runs (in it, for all we know)."""
     from .push import running
     own = path(p, tid).resolve()
     if any(Path(m.get("repo") or "/").resolve() == own for m in running(p)):

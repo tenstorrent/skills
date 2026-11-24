@@ -53,7 +53,7 @@ def test_an_existing_harness_task_branch_is_reused_with_its_commits(env):
     assert _hgit(own, "rev-parse", "HEAD").strip() == head
 
 
-def test_a_harness_worktree_on_the_wrong_branch_is_refused_and_the_task_not_started_there(env):
+def test_a_harness_worktree_on_the_wrong_branch_with_work_in_it_is_refused_and_the_task_not_started_there(env):
     p = make(env)
     from ttp import harnesstree
     from ttp.daemon import Daemon
@@ -61,6 +61,7 @@ def test_a_harness_worktree_on_the_wrong_branch_is_refused_and_the_task_not_star
     _harness_run(p, a)
     own = harnesstree.workdir(p, b)
     _hgit(own, "checkout", "-q", "-b", f"ttp/harness-t{a}-copy")
+    _commit_in_harness_tree(own, "prompts/unique.md", "unique\n", "a commit the harness HEAD lacks")
     with pytest.raises(RuntimeError, match=rf"on ttp/harness-t{a}-copy, not its own branch ttp/harness-t{b}"):
         harnesstree.workdir(p, b)
     with pytest.raises(RuntimeError, match="not its own branch"):
@@ -70,6 +71,44 @@ def test_a_harness_worktree_on_the_wrong_branch_is_refused_and_the_task_not_star
         harnesstree.workdir(p, b)
     _hgit(own, "checkout", "-q", f"ttp/harness-t{b}")
     assert harnesstree.workdir(p, b) == own
+    assert _hgit(p.harness, "branch", "--list", f"ttp/harness-t{a}-copy").strip()   # its commit kept
+
+
+def test_a_dirty_harness_worktree_on_the_wrong_branch_is_refused_and_left_as_it_is(env):
+    p = make(env)
+    from ttp import harnesstree
+    a, b = _harness_task(p, "a"), _harness_task(p, "b")
+    _harness_run(p, a)
+    own = harnesstree.workdir(p, b)
+    _hgit(own, "checkout", "-q", "-b", "leftover")
+    (own / "prompts").mkdir(exist_ok=True)
+    (own / "prompts" / "wip.md").write_text("uncommitted\n")
+    with pytest.raises(RuntimeError, match="on leftover, not its own branch"):
+        harnesstree.workdir(p, b)
+    assert (own / "prompts" / "wip.md").read_text() == "uncommitted\n"
+    assert _hgit(own, "symbolic-ref", "--short", "HEAD").strip() == "leftover"
+
+
+def test_a_clean_leftover_harness_worktree_with_no_unique_commits_is_reclaimed_and_the_task_starts(env, monkeypatch):
+    """Before: a run that bounced mid-write left its worktree on a self-named branch already in the
+    harness HEAD; every later run was refused ('not its own branch') until the task was exhausted."""
+    p = make(env)
+    from ttp import harnesstree
+    from ttp.daemon import Daemon
+    a, b = _harness_task(p, "a"), _harness_task(p, "b")
+    _harness_run(p, a)
+    own = harnesstree.workdir(p, b)
+    _hgit(own, "checkout", "-q", "-b", f"t{b}-slug")
+    with monkeypatch.context() as m:   # a detached job of the task may still run in it: left alone
+        m.setattr(harnesstree, "running_in", lambda p, tid: "a detached job of it still runs")
+        with pytest.raises(RuntimeError, match=f"on t{b}-slug, not its own branch"):
+            harnesstree.workdir(p, b)
+    assert Daemon(p.base)._workdir_for({"id": b, "kind": "harness"})[0] == str(own)
+    assert _hgit(own, "symbolic-ref", "--short", "HEAD").strip() == f"ttp/harness-t{b}"
+    assert not _hgit(p.harness, "branch", "--list", f"t{b}-slug").strip()
+    _hgit(own, "checkout", "-q", "--detach")   # a detached leftover too
+    assert harnesstree.workdir(p, b) == own
+    assert _hgit(own, "symbolic-ref", "--short", "HEAD").strip() == f"ttp/harness-t{b}"
 
 
 def test_a_harness_worktree_made_on_another_branch_is_refused(env, monkeypatch):
