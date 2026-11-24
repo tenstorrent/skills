@@ -632,11 +632,12 @@ OPENER_RE = re.compile(
     r"|socket|http\w*|curl|wget|getline|\w*(?:Stream|Sync))\b|`")
 
 
-def code_text(cmd: str, interp: bool = False) -> str:
+def code_text(cmd: str, interp: bool = False, py_code: bool = False) -> str:
     """`cmd` without the heredoc bodies that are only data: a quoted body (`<<'EOF'`, no expansion) only written to a
     file (`cat > t.py <<'EOF' ... project.db ...`) opens nothing; an unquoted one runs its `$(...)` and backticks,
     and one a shell or interpreter reads runs, so they stay. `interp`: a quoted body that a script interpreter reads
-    (python, node, perl) also goes when it has no call that opens a file (OPENER_RE): a test string naming a key."""
+    (python, node, perl) also goes when it has no call that opens a file (OPENER_RE): a test string naming a key.
+    `py_code`: a quoted body python reads keeps only its code (_py_code)."""
     from . import hook, pathguard
     lines, bodies = hook._heredocs(cmd)
 
@@ -646,7 +647,33 @@ def code_text(cmd: str, interp: bool = False) -> str:
         if not (interp and hook.HEREDOC_RE.match(lines[i], pos)[2]) or OPENER_RE.search("\n".join(body)):
             return False
         return bool(pathguard.INTERPRETER_RE.match(hook._first_word(hook._piece_at(lines[i], pos)[0])))
-    return "\n".join(lines + [ln for i, body, pos in bodies if not data(i, pos, body) for ln in body])
+
+    def python(i: int, pos: int) -> bool:
+        return bool(py_code and hook.HEREDOC_RE.match(lines[i], pos)[2]
+                    and re.fullmatch(r"python[\d.]*", hook._first_word(hook._piece_at(lines[i], pos)[0])))
+    return "\n".join(lines + [ln for i, body, pos in bodies if not data(i, pos, body)
+                              for ln in (_py_code(body) if python(i, pos) else body)])
+
+
+def _py_code(body: list[str]) -> list[str]:
+    """A python script without its comments and multi-line string literals (docstrings, code it writes into a file):
+    text no call reads as a path. Its one-line literals stay (`connect('/x/project.db')` opens that file); a script
+    tokenize cannot read stays whole."""
+    import io
+    import tokenize
+    src = "\n".join(body) + "\n"
+    try:
+        toks = list(tokenize.generate_tokens(io.StringIO(src).readline))
+    except (tokenize.TokenError, SyntaxError):
+        return body
+    starts = [0]
+    for ln in src.splitlines(keepends=True):
+        starts.append(starts[-1] + len(ln))
+    for t in reversed(toks):
+        if t.type == tokenize.COMMENT or t.type == tokenize.STRING and "\n" in t.string:
+            a, b = starts[t.start[0] - 1] + t.start[1], starts[t.end[0] - 1] + t.end[1]
+            src = src[:a] + "''" * (t.type == tokenize.STRING) + src[b:]
+    return src.split("\n")
 
 
 _ARITH = re.compile(r"\$\(\((?=(?:[^()]|\([^()]*\))*\)\))")   # `$((` that closes with `))`: arithmetic, no command
@@ -674,7 +701,7 @@ def shell_refusal(cmd: str, cwd: str, run_dir: str = "", env=None, remote: bool 
     from . import credguard, hook, pathguard
     e = os.environ if env is None else env
     lines, bodies = hook._heredocs(cmd)
-    named = code_text(cmd)
+    named = code_text(cmd, py_code=True)
     # the command words: the quoted text of commands that only print, search for or record it, and their quoted
     # heredoc bodies, gone (a commit message, a grep pattern or an echo naming a command runs none), and so is a
     # quoted body a script interpreter reads (`python3 - <<'EOF'`: its code, not shell); every other body stays

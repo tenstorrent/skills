@@ -1830,11 +1830,34 @@ _GG_MENTION_REFUSED = [
     "cat > t.py <<EOF\n$(sqlite3 $TTP_PROJECT/state/project.db \"delete from tasks\")\nEOF",
     "cat > t.py <<EOF\n$(rm $TTP_RUN_DIR/glm_guard.on)\nEOF", "echo x > t.txt <<EOF\n`unset TTP_RUN_DIR`\nEOF",
     "TTP_CODE_ARM_GUARD=1\"0\" ls", "TTP_CODE_ARM_GUARD=1 ls", "export TTP_CODE_ARM_GUARD=1",
-    "TTP_CODE_ARM_GUARD=1 python3 -m pytest -q tests/x.py", "bash <<'EOF'\nrm $TTP_RUN_DIR/glm_guard.on\nEOF"]
+    "TTP_CODE_ARM_GUARD=1 python3 -m pytest -q tests/x.py", "bash <<'EOF'\nrm $TTP_RUN_DIR/glm_guard.on\nEOF",
+    # a python script's one-line literal names the file it opens, a comment beside it or not
+    "python3 - <<'EOF'\n# read the tasks\nimport sqlite3\nc = sqlite3.connect(\"/x/project.db\")  # by hand\nEOF",
+    "python3 - <<'EOF'\nimport sqlite3\nsqlite3.connect(\"\"\"/x/project.db\"\"\")\nEOF",
+    "python3 - <<'EOF'\nDB = '/x/state/' + 'project.db'\nprint(open(DB, 'rb').read(16))\nEOF",
+    "python3 - <<'EOF'\nimport json\njson.load(open('/h/.tt-project/machine-workers.json'))\nEOF",
+    "python3 - <<'EOF'\nx = '''\nproject.db\nEOF",   # a script tokenize cannot read stays whole
+    "python3 - <<EOF\n# project.db\nEOF", "node - <<'EOF'\n// project.db\nEOF"]
+# The code a python script writes into a file (a multi-line literal) and its comments are text no call reads as a path
+_GG_PY_TEXT_ALLOWED = [
+    "python3 - <<'EOF'\np = 'src/n.py'\ns = open(p).read()\ns = s.replace(\"x = 1\", '''    db = DB(p.state / \"project.db\")\n"
+    "    try:\n        rows = db.q(\"SELECT 1\")''')\nopen(p, \"w\").write(s)\nEOF",
+    "python3 - <<'PYEOF'\np = 'src/r.py'\ns = open(p).read()\nold = '''def f(t):\n    \"\"\"Reads the database.\"\"\"\n"
+    "    conn = connect_ro(t.state / \"project.db\")'''\nassert old in s\nPYEOF",
+    "python3 - <<'EOF'\n# the events table is in project.db, which a run may not open: read the reports\nimport glob\n"
+    "print(glob.glob('reports/*'))\nEOF"]
 
 
 @_pytest.mark.parametrize("cmd", _GG_MENTION_ALLOWED)
 def test_glm_guard_allows_a_protected_name_in_a_heredoc_body_only_written_to_a_file(cmd, tmp_path):
+    from ttp import glmguard
+    wt, rd = _gg_run(tmp_path)
+    e = {"TTP_PROJECT": str(tmp_path / "proj"), "TMPDIR": str(rd / "tmp"), **_GG_RUN_ENV}
+    assert glmguard.shell_refusal(cmd, str(wt), str(rd), e) is None, cmd
+
+
+@_pytest.mark.parametrize("cmd", _GG_PY_TEXT_ALLOWED)
+def test_glm_guard_allows_a_protected_name_in_a_python_scripts_comment_or_multi_line_literal(cmd, tmp_path):
     from ttp import glmguard
     wt, rd = _gg_run(tmp_path)
     e = {"TTP_PROJECT": str(tmp_path / "proj"), "TMPDIR": str(rd / "tmp"), **_GG_RUN_ENV}
