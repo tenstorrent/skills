@@ -889,7 +889,7 @@ def test_a_listener_picks_up_a_link_base_that_answers_after_it_started(env, monk
     try:
         cli.main(["listen", "demo", "--chat", "c1", "--timeout", "70"])
     finally:
-        _stop(srv)
+        _stop_web_apps(srv)
     first_line, second_line = capsys.readouterr().out.strip().splitlines()
     assert "first" in first_line and "http" not in first_line, first_line
     assert "second" in second_line, second_line

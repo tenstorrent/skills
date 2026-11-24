@@ -135,7 +135,7 @@ def _web_app(proj):
     return srv
 
 
-def _stop(*servers):
+def _stop_web_apps(*servers):
     """Stop a test's web apps, so no server thread or port outlives the test."""
     for s in servers:
         s.shutdown()
@@ -184,7 +184,7 @@ def test_the_web_app_linkifies_its_messages_and_asks(env):
         with pytest.raises(urllib.error.HTTPError):
             urllib.request.urlopen(req, timeout=10)
     finally:
-        _stop(srv)
+        _stop_web_apps(srv)
 
 
 def test_ids_link_to_their_web_app_page_and_unresolved_ones_get_labelled(env):
@@ -218,7 +218,7 @@ def test_an_alert_text_reaches_the_user_linkified_from_a_fresh_connection(env):
         assert rows and f"#{task} (" in rows[0]["text"] and f"#task={task}" in rows[0]["text"], rows
         weblink._ANSWERED.clear()
     finally:
-        _stop(srv)
+        _stop_web_apps(srv)
 
 
 def test_the_check_command_names_what_a_message_left_unlinked(env, capsys):
@@ -352,7 +352,7 @@ def test_a_viewer_s_links_open_only_its_own_project_s_web_app(env, monkeypatch):
         assert rows[-1]["chat"] == 7 and rows[-1]["base"] == passed
         assert rows[-1]["project"] == "the name the base answered as" and rows[-1]["ts"] > 0
     finally:
-        _stop(app, mine)
+        _stop_web_apps(app, mine)
 
 
 def test_the_notifier_s_alerts_use_the_viewer_s_checked_base(env, monkeypatch):
@@ -376,7 +376,7 @@ def test_the_notifier_s_alerts_use_the_viewer_s_checked_base(env, monkeypatch):
         rows = [r for r in notifier.alerts_since(p, 0, "high") if not r.get("cleared")]
         assert rows and "#task=" not in rows[0]["text"], rows
     finally:
-        _stop(app, other)
+        _stop_web_apps(app, other)
 
 
 def test_the_web_app_renders_its_message_links_relative_to_itself(env):
@@ -468,4 +468,4 @@ def test_the_forwarded_base_proof_row_records_once_per_change(env):
         assert cli.links_show_base(p, "http://127.0.0.1:9/", 7, "demo", noted=passed)
         assert [r["base"] for r in rows()] == [passed, "http://127.0.0.1:9/"]
     finally:
-        _stop(app)
+        _stop_web_apps(app)
