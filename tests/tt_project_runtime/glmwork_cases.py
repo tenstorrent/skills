@@ -347,7 +347,7 @@ def test_a_glm_hand_off_asking_for_opus_or_deep_bounces_fresh_to_opus_with_its_s
     assert '"glm" in (routed.get(codearm.KEY), routed.get(glmwork.KEY))' in fin
     assert "its hand-off said: " in fin   # the bounced run's own summary reaches the fresh run's prompt
     assert "glmwork.contract()" in inspect.getsource(daemon.Daemon)
-    assert "ttp slop --diff" in glmwork.size_check() and "glmwork.size_check()" in inspect.getsource(daemon.Daemon)
+    assert "ttp slop --diff" in glmwork.size_check() and "glmwork.size_check(" in inspect.getsource(daemon.Daemon)
 
 
 def _gw_run(p, task, status):

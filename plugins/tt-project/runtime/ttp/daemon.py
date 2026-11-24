@@ -13411,8 +13411,6 @@ class Daemon:
                     prompt += glmwork.contract()   # so may a GLM work run (glmwork.bounce_reason)
                 on_glm = on_arm or bool(routed and routed.get(glmwork.KEY) and run_prov == routed.get("to")
                                         and not routed.get("fallback_model"))
-                if on_glm and task.get("kind") == "code":
-                    prompt += glmwork.size_check()
                 assist = glmassist.for_run(self.cfg) if on_glm else None
                 is_device = deviceplan.device(task, self.cfg)
                 if on_glm and is_device and deviceplan.on(self.cfg):   # Opus plans, GLM runs only that plan (#3728)
@@ -13420,6 +13418,8 @@ class Daemon:
                 if assist:   # ask-Opus switches, logged per run
                     note[glmassist.KEY] = assist
                     prompt += glmassist.prompt_lines(assist)
+                if on_glm and task.get("kind") == "code":
+                    prompt += glmwork.size_check(bool(assist and assist.get("advisor")))
                 prompt += deviceplan.glm_lines() if note.get(deviceplan.KEY) else deviceplan.prompt_lines(is_device)
                 if glmguard.run_env(run_prov, note):   # its TMPDIR is a scratch folder of its own (start_run)
                     prompt += f"\n\n{glmguard.deny_list()}\n\n{glmguard.SCRATCH_LINE}\n"

@@ -169,11 +169,23 @@ def contract() -> str:
             "previous attempt; no attempt is spent. On that exit never run `ttp push`, `git push` or publish anything.")
 
 
-def size_check() -> str:
-    """The prompt block a GLM run on a code task gets: the size review its change meets before it can land, run
-    by the run itself first. Reviews of GLM changes fail mostly on that lane (extra copies, dead code, tests that
-    only match text), not on correctness."""
-    return ("\n\n## Before you hand off: the size review (your change is failed on these)\n"
+def size_check(advisor: bool = False) -> str:
+    """The prompt block a GLM run on a code task gets: the correctness and size reviews its change meets before it
+    can land, run by the run itself first. GLM changes fail their first review mostly on correctness (an input the
+    new logic mishandles, a spec step done in a weaker form, a trust hole), so with the Opus advisor on its first
+    question after the last commit is a correctness review of the final diff, never the size lane."""
+    ask = ("Spend your first `ttp advise` after your last commit on it: paste the spec's goal and steps and the "
+           "output of `git diff <base>..HEAD` into the question (the advisor cannot run git) and ask for the 3 "
+           "inputs or cases most likely to make the change wrong or miss a spec step, each with an example. "
+           "Do the size review below yourself, not through `ttp advise`: the reviewer reruns it."
+           if advisor else "Reread your diff as that reviewer and write down the 3 inputs most likely to break it.")
+    return ("\n\n## Before you hand off: the correctness review (most GLM changes fail on it)\n"
+            "The reviewer tries to break your change: an input the new logic mishandles, a spec step done in a "
+            "weaker form (another source, no refresh, no recheck after a failure), a pattern matching more than it "
+            "must, two tasks or callers sharing one record, a stale cache or ref, an older peer rejecting a new "
+            "flag, a file any run can write trusted as a grant, a secret reaching text others read. " + ask +
+            " Add a test that fails before the fix for each real one, fix it and commit."
+            "\n\n## Before you hand off: the size review (your change is failed on these)\n"
             "A separate reviewer asks whether this is the smallest change that solves the task. Reread your own diff "
             "as that reviewer before result.json, and fix what it would flag: a helper, string, rule or table that "
             "exists once already (call it, never copy it); dead code, unused parameters, fields, imports or options; "

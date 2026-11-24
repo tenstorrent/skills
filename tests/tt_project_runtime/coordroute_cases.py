@@ -859,3 +859,22 @@ def test_coordroute_an_escalation_where_the_coordinator_acted_out_of_lane_is_cou
         rec = coordroute.shadow_side(p.state, run, "glm", esc, "ok", 0.1)
         assert not rec["compare"]["agree"] and rec["compare"]["escalated_right"] is right, run
     assert coordroute.report(p.db, p.state)["shadow"]["escalated_right"] == round(2 / 3, 3)
+
+
+def test_a_glm_code_run_spends_an_opus_advisor_call_on_a_correctness_review_of_its_final_diff(env, monkeypatch):
+    from ttp import configwho
+    from ttp import daemon as dmod
+    p = make(env)
+    p.set_config("core_provider", "claude")
+    _route_config(p, route=None)
+    for advisor in (True, False):
+        p.set_config("route.glm_work", {"on": True, "model": _RT_MODEL, "holdout": 0, "advisor": advisor},
+                     by=configwho.by("user", via="cli"))
+        prompts = []
+        prov, _tier, _note = _route_dispatch(p, dmod.Daemon(p.base), monkeypatch, prompts,
+                                             title=f"fix the parser {advisor}", kind="code", tier="standard")
+        step = prompts[-1].split("## Before you hand off: the correctness review", 1)
+        assert prov == "chat" and len(step) == 2
+        # With the advisor on, one of its calls reviews the final diff for correctness, and none is spent on the
+        # size lane; without it the run reviews its diff itself and is never sent to a command it cannot use.
+        assert ("`ttp advise`" in step[1]) is advisor and ("not through `ttp advise`" in prompts[-1]) is advisor
