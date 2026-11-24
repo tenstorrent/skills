@@ -11,8 +11,8 @@ def _hold_use() -> None:
     import os
     hold = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))  # <git dir>/<hold>/<this pkg>
     d = os.path.dirname(hold)   # a hold copy sits in the harness's git dir: .git itself, or a
-    while d and os.path.basename(d) != ".git":   # linked worktree's git dir somewhere under it
-        d = os.path.dirname(d)
+    while d and d != os.path.dirname(d) and os.path.basename(d) != ".git":
+        d = os.path.dirname(d)   # linked worktree's git dir, somewhere under its .git
     if os.path.basename(d) == ".git" and os.path.basename(hold).startswith("ttp-runtime-hold"):
         try:
             marks = os.path.join(hold, ".pids")          # project.HOLD_PIDS

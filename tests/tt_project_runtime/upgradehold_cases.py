@@ -874,6 +874,7 @@ def test_a_harness_that_is_a_linked_worktree_holds_its_runtime_too(tmp_path):
 
     with project.runtime_hold(h):
         (pkg / "cli.py").write_text("from . import extra\n\ndef main():\n    print(extra.SAY)\n")
+        (pkg / "extra.py").write_text("SAY = 'new'\n")
         assert launch() == "old", "the launcher runs the copy the .git file leads to"
         assert len(holds()) == 1 and (holds()[0] / project.HOLD_PID).exists()
         assert (holds()[0] / project.HOLD_PIDS).read_text().split(), "the launcher noted its process"

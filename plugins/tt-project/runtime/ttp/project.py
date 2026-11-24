@@ -3173,8 +3173,8 @@ def runtime_hold(harness: str | Path) -> Iterator[None]:
     held = False
     try:
         shutil.copytree(h / "runtime", tmp, symlinks=True, ignore=shutil.ignore_patterns("__pycache__"))
-        os.rename(tmp, hold)
-        (hold / HOLD_PID).write_text(str(os.getpid()))
+        (tmp / HOLD_PID).write_text(str(os.getpid()))   # lands with the rename: never a live-looking
+        os.rename(tmp, hold)                            # copy without its marker, nor a dead one
         held = True
     except OSError:
         shutil.rmtree(tmp, ignore_errors=True)

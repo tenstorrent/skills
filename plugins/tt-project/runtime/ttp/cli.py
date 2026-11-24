@@ -15559,13 +15559,13 @@ def _restore_cut_runtime(h: Path) -> None:
     cut = _cut_runtime(h, None, "upstream")
     if not cut:
         return
-    for f in cut:
-        src = "upstream" if _why_cut(f, _blob(h, "HEAD", f), _blob(h, "upstream", f) or b"") else "HEAD"
-        with tree_writes(h), runtime_hold(h):
+    with tree_writes(h), runtime_hold(h):
+        for f in cut:
+            src = "upstream" if _why_cut(f, _blob(h, "HEAD", f), _blob(h, "upstream", f) or b"") else "HEAD"
             r = subprocess.run(["git", "-C", str(h), "checkout", src, "--", f], capture_output=True, text=True)
-        if r.returncode != 0:
-            die(f"upgrade refused: {f} is {cut[f]} and could not be restored from {src}: "
-                f"{r.stderr.strip()[-300:]}. Nothing was committed; restore it, then rerun `ttp upgrade`.", 1)
+            if r.returncode != 0:
+                die(f"upgrade refused: {f} is {cut[f]} and could not be restored from {src}: "
+                    f"{r.stderr.strip()[-300:]}. Nothing was committed; restore it, then rerun `ttp upgrade`.", 1)
     left = _cut_runtime(h, None, "upstream")
     if left:
         die("upgrade refused: runtime files upstream ships are still deleted or cut short after restoring "
