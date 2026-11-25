@@ -1454,6 +1454,20 @@ def _refusal_command(payload: dict) -> str:
     return str(args.get("command") or "") if tool == "Bash" else f"{tool} {json.dumps(args, default=str)[:400]}"
 
 
+def _proven(payload: dict) -> dict:
+    """The Bash call the guards judge: each inline Python snippet pyproof proves harmless written as `pass`
+    (the guards read words, and such a snippet's words do nothing); the call as is otherwise."""
+    args = payload.get("tool_input")
+    if payload.get("tool_name") != "Bash" or not isinstance(args, dict) or not isinstance(args.get("command"), str):
+        return payload
+    from . import pyproof
+    try:
+        new = pyproof.rewrite(args["command"], str(payload.get("cwd") or os.getcwd()))
+    except Exception:   # no proof: the call as written
+        return payload
+    return {**payload, "tool_input": {**args, "command": new}} if new else payload
+
+
 def pre_tool_use(payload: dict, stage: str = "before") -> tuple[dict | None, None]:
     """The tool hook's verdict on one call; a refusal no guard logged itself is logged to the run's
     refusals.jsonl as worker_role or provenance, so localfault counts it apart from the resource."""
@@ -1462,7 +1476,7 @@ def pre_tool_use(payload: dict, stage: str = "before") -> tuple[dict | None, Non
     CALL.update(id=str(payload.get("tool_use_id") or payload.get("call_id") or payload.get("id") or ""), stage=stage)
     _refusal.update(logged=False, kind="worker_role")
     made: list[str] = []
-    out, _ = _pre_tool_use(payload, made)
+    out, _ = _pre_tool_use(_proven(payload), made)
     spec = (out or {}).get("hookSpecificOutput") or {}
     if spec.get("permissionDecision") not in ("deny", "ask"):
         from . import glmguard

@@ -85,6 +85,7 @@ CONFIG_OPTIONS = {"kubectl": "--kubeconfig", "helm": "--kubeconfig", "k9s": "--k
 CONFIG_VARS = ("KUBECONFIG=", "DOCKER_CONFIG=", "AWS_SHARED_CREDENTIALS_FILE=", "CLOUDSDK_CONFIG=",
                "AZURE_CONFIG_DIR=", "GOOGLE_APPLICATION_CREDENTIALS=", "GH_CONFIG_DIR=")
 SSH_FAMILY = {"ssh", "scp", "sftp", "autossh", "ssh-copy-id"}
+OPTION_VALUE_RE = re.compile(r"-\w.")   # `-C~`: an option with its value joined on
 # The ssh -o option that names a key ssh reads itself
 SSH_KEY_OPTION_RE = re.compile(r"\s*IdentityFile[\s=]", re.I)
 # the host lists ssh reads (and adds to) itself: one or more files after the option name
@@ -496,9 +497,19 @@ def _resolve(path: str, cwds: list[str], home: str) -> list[str] | None:
     if not re.fullmatch(r"[\w./+@%-]*", path):
         return None
     try:
-        return [os.path.realpath(os.path.join(c, path)) for c in cwds]
+        return [_real(c, path) for c in cwds]
     except (OSError, ValueError):
         return None
+
+
+def _real(folder: str, path: str) -> str:
+    """os.path.realpath(folder/path) for a `folder` realpath already resolved, one lstat when the path's
+    first part is missing there (nothing under it can be a link): a heredoc's many words stay cheap."""
+    joined = os.path.join(folder, path)
+    head = path.split("/", 1)[0]
+    if head in ("", ".", "..") or ".." in path.split("/") or os.path.lexists(os.path.join(folder, head)):
+        return os.path.realpath(joined)
+    return os.path.normpath(joined)
 
 
 def _homeward(prefix: str, cwds: list[str]) -> bool:
@@ -514,20 +525,31 @@ def _cwds(segments: list[list[str]], cwd: str, home: str) -> list[str]:
     another user's shell runs (ssh, su, sudo)."""
     home = os.path.realpath(home)
     cwds = [home, os.path.realpath(cwd)]
+    seen: dict[str, bool] = {}   # word -> it may name HOME, from the folders so far (a heredoc repeats words)
 
     def add(*places):   # each folder once: a long command (a heredoc's many words) never grows the list per word
-        cwds.extend(p for p in dict.fromkeys(places) if p not in cwds[1:])
+        new = [p for p in dict.fromkeys(places) if p not in cwds[1:]]
+        cwds.extend(new)
+        if new:
+            seen.clear()
+    shells = SSH_FAMILY | {"su", "sudo", "doas", "runuser", "popd"}
     for argv in segments:
         name = os.path.basename(argv[0])
         targets = [w for w in argv[1:] if not w.startswith("-")] if name in ("cd", "pushd") else []
-        if name in SSH_FAMILY | {"su", "sudo", "doas", "runuser", "popd"} or name in ("cd", "pushd") and not targets:
+        if name in shells or name in ("cd", "pushd") and not targets:
             add(home)
         for w in argv[1:]:
-            for v in {w.split("=", 1)[-1], w[2:] if re.match(r"-\w.", w) else ""} - {""}:
-                places = _resolve(v, cwds[1:], home)
-                if places is None and v[0] in "$~`" or places and home in places:
+            if home in cwds[1:] and w not in targets:   # HOME is already there: only a cd target adds more
+                continue
+            for v in {w.split("=", 1)[-1], w[2:] if OPTION_VALUE_RE.match(w) else ""} - {""}:
+                if w not in targets and v in seen:
+                    homeward = seen[v]
+                else:
+                    places = _resolve(v, cwds[1:], home)
+                    homeward = seen[v] = places is None and v[0] in "$~`" or bool(places) and home in places
+                if homeward:
                     add(home)
-                elif places and w in targets:
+                elif w in targets and places:
                     add(*places)
     return cwds
 
