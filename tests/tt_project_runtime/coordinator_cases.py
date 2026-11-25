@@ -12747,13 +12747,18 @@ def test_task_specs_that_forbid_leaving_draft_pass_the_gate_and_orders_still_do_
                               # descriptive text names the gate, it orders no one (#9824)
                               "- the review gate on PR state in worker specs (a direct order before the user's yes "
                               "stays refused; descriptive text passes);",
-                              "- a spec that orders a worker to take a PR out of draft")):
+                              "- a spec that orders a worker to take a PR out of draft",
+                              # the user is the subject and the verb no order: it says what they do or did
+                              "The user pushes it from their Mac and marks acme/widgets#7 ready themselves.",
+                              "But the user had marked it ready for review themselves an hour ago.")):
         assert coord.apply(p, [{"type": "task_add", "title": f"ok {n}", "kind": "code", "spec": spec}]) == [], spec
     for spec in ("Run gh pr ready on acme/widgets#7.", "No reviewers, then run gh pr ready on acme/widgets#7.",
                  "Fix the lint, no merge, mark acme/widgets#7 ready.", "No push: gh pr ready 7 in acme/widgets#7.",
                  "After the user marks the docs done, mark acme/widgets#7 ready.",
                  "Then run `gh pr ready https://github.com/acme/widgets/pull/7`.",
-                 "Take PR https://github.com/acme/widgets/pull/7 out of draft once checks pass."):
+                 "Take PR https://github.com/acme/widgets/pull/7 out of draft once checks pass.",
+                 "When the user agrees, it marks acme/widgets#7 ready.",
+                 "Once the owner agrees the worker takes acme/widgets#7 out of draft."):
         out = " ".join(coord.apply(p, [{"type": "task_add", "title": "ready it", "kind": "code", "spec": spec}]))
         assert "approval is not on record" in out, spec
     assert not p.db.q("SELECT id FROM tasks WHERE title='ready it'")
