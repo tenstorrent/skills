@@ -110,7 +110,7 @@ def test_glm_quota_bridge_counts_each_answer_and_syncs_a_quota_429(mock_chat, mo
         # The run's exit record keeps the 429's numbers only.
         assert b.stats()["quota"] == {"limit": 100_000_000, "used": 105_832_148, "reset": _QUOTA_END, "window_s": 3600}
     st = json.loads((tmp_path / "quota" / "cloud.json").read_text())
-    assert (st["size"], st["server_used"], st["size_from"]) == (100_000_000, 105_832_148, "429")
+    assert (st["size"], st["used"], st["size_from"]) == (100_000_000, 105_832_148, "429")
     assert _CB_KEY not in json.dumps(st) and "Quota exceeded" not in json.dumps(st), "numbers only"
 
 

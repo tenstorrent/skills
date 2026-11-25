@@ -182,7 +182,7 @@ def stop_project(flag: str, project: str, why: str, by: str = "daemon") -> bool:
 OUTAGE_RE = re.compile(r"outage|quota|rate.?limit|\b429\b|unreachable|connection (?:refused|reset|error)"
                        r"|overloaded"
                        r"|(?:endpoint|glm|server|api|provider)\b[\w'&.: -]{0,40}\b"
-                       r"(?:down|out|dead|dying|fail(?:ed|ing)|unavailable|timed? ?out|capacity)"
+                       r"(?:down|out|dead|dying|fail(?:ed|ing)|unavailable|timed? ?out|capacity|5\d\d)"
                        r"|(?:http|status)\s+5\d\d\b|\b5\d\d\s+(?:errors?|responses?)\b|error\s+5\d\d\b", re.I)
 
 
@@ -1006,11 +1006,9 @@ def run(a) -> int:
         elif act == "rollback" and in_run:   # one project, never a freeze; the whole flag is the user's
             _check(a.target)
             why = outage_refusal(reason)
-            project = a.value or os.environ.get("TTP_PROJECT") or ""
-            if not project:
-                from . import project as project_mod
-                here = project_mod.here()
-                project = here.name if here is not None else ""
+            from . import project as project_mod
+            here = project_mod.here()   # a run rolls its own project back: its name, never TTP_PROJECT's path
+            project = a.value or (here.name if here is not None else "")
             if why or not project:
                 print(f"ttp rollout rollback: {why or 'name the project to roll the flag back in (PROJECT)'}",
                       flush=True)

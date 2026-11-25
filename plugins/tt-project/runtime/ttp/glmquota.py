@@ -97,7 +97,7 @@ def _roll(st: dict, window_s: float, now: float) -> dict:
         reset += window_s * (math.floor((now - reset) / window_s) + 1)
     else:   # no reset known: windows on the clock's boundaries (the endpoint's are on the hour)
         reset = now - now % window_s + window_s
-    return {**st, "reset": reset, "used": 0, "server_used": 0, "spent": 0}
+    return {**st, "reset": reset, "used": 0, "spent": 0}
 
 
 def add(key: str, tokens: int, window_s: float = 3600, now: float | None = None) -> None:
@@ -108,7 +108,6 @@ def add(key: str, tokens: int, window_s: float = 3600, now: float | None = None)
     with _locked(key) as path:
         st = _roll(_read(path), window_s, now)
         st["used"] = int(st.get("used") or 0) + int(tokens)
-        st["ts"] = now
         _write(path, st)
 
 
@@ -148,14 +147,13 @@ def sync(key: str, got: dict, window_s: float = 3600, now: float | None = None, 
         st = _read(path)
         if float(got.get("reset") or 0) > now:
             if float(st.get("reset") or 0) != float(got["reset"]):
-                st = {**st, "used": 0, "server_used": 0, "spent": 0}
+                st = {**st, "used": 0, "spent": 0}
             st["reset"] = float(got["reset"])
         st = _roll(st, window_s, now)
         ours = int(st.get("used") or 0)
         if int(got.get("limit") or 0) > 0:
             st["size"], st["size_from"] = int(got["limit"]), "429"
         if "used" in got:
-            st["server_used"] = int(got["used"])
             st["used"] = max(ours, int(got["used"]))
         if spent:
             if not int(got.get("limit") or 0) and ours > 0:
@@ -163,7 +161,6 @@ def sync(key: str, got: dict, window_s: float = 3600, now: float | None = None, 
                     [[now, ours]]
             st["spent"] = float(st["reset"])   # this window is used up, whatever our count says
         st["last_429"] = {k: got[k] for k in ("limit", "used", "reset", "window_s") if k in got} | {"at": now}
-        st["synced"] = st["ts"] = now
         _write(path, st)
 
 

@@ -109,6 +109,11 @@ def test_a_runs_rollback_for_an_outage_or_quota_is_refused_and_the_flag_is_uncha
         assert _roll(capsys, "rollback", "glm_code", "projA", "--reason", reason)[0] == 0, reason
     assert rollout.level("glm_code") == 2 and not rollout.frozen("glm_code")
     assert set(rollout.rolled_back("glm_code")) == {"projA"}
+    # A run rolls its own project back under its name, not its TTP_PROJECT base path.
+    p = make(env)
+    monkeypatch.setenv("TTP_PROJECT", str(p.base))
+    assert _roll(capsys, "rollback", "glm_code", "--reason", "its quality fell")[0] == 0
+    assert set(rollout.rolled_back("glm_code")) == {"projA", p.name}
     monkeypatch.delenv("TTP_RUN_DIR")
     assert _roll(capsys, "rollback", "glm_code", "--reason", "quota")[0] == 0, "the user's terminal still may"
     assert rollout.frozen("glm_code")
