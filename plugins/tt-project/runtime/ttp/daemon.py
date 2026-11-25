@@ -37,7 +37,7 @@ import uuid
 from pathlib import Path
 
 from . import runtimeload   # first of its own: its LOADED_AT is when the daemon imported its code
-from . import aitag, blindreview, deviceplan, glmassist
+from . import aitag, blindreview, deviceplan, glmassist, glmquota
 from . import rolerestore
 from . import codearm
 from . import glmwork
@@ -14237,6 +14237,8 @@ class Daemon:
         if core_only:
             return None
         why = "model_missing" if route.held(self.p.db, self.cfg, tier, model) else route.cooling(self.p.db, name, now)
+        if not why and name == route.TO:   # the endpoint's quota is short: this run starts on core (glmquota.py)
+            why = glmquota.paced(self.cfg, task, cls, now)
         where, key = (f"tier {tier}", tier) if rule_i is None else (f"tier {tier} rule {rule_i}", f"{tier}:rule{rule_i}")
         if pick:   # a model pick routes one tier to several models (modelpick.py): one switch per model
             key = f"{tier}:pick:{model}"

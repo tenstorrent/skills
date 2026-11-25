@@ -30,10 +30,10 @@ HOLDOUT = 0.10                      # in its wave
 HOLDOUT_HELD = 0.05                 # once its wave gate says its quality holds
 FALLBACK = {"provider": "claude", "model": "sonnet", "effort": "high"}
 # Reasons a routed run starts on core (the route entry's `fallback`, route.REASONS) that take the fallback model:
-# the endpoint refused or is cooling down after a fault (route.FAULTS), or had no room in time. A rerun after the
-# task's own routed run failed and an escalation keep their core model.
+# the endpoint refused or is cooling down after a fault (route.FAULTS), had no room in time, or its token quota
+# is short (paced, glmquota.py). A rerun after the task's own routed run failed and an escalation keep their core model.
 FALLBACK_ON = ("down", "error", "rate_limit", "quota", "auth", "malformed", "model_missing", "busy", "slots",
-               "busy_wait_expired")
+               "busy_wait_expired", "paced")
 
 # A run told to talk to a person (GLM never does): an instruction to post, comment, reply, send or notify (a
 # sentence or list item that opens with the verb, `then`/`also`/`please` and the like aside) to a person or a channel,

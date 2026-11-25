@@ -2076,6 +2076,20 @@ Messages calls into `<base url>/chat/completions` calls and back, and ends with 
    GLM route that stop is a bounce to Opus (`route.glm_work.bounce`), with no attempt spent. The
    exit record counts nudges and stops under `bridge.loop`, and `ttp stats --glm-share` and the
    daily review show them by day.
+10. Quota pacing, on by default (`providers.chat.quota.on: false` turns it off). Every chat run on
+   this host adds its tokens (prompt, cached prompt and completion) to one shared count per endpoint,
+   `~/.tt-project/quota/<endpoint>.json`. A 429 that says the quota is used up gives its numbers only
+   (limit, used, window, reset) to that count and to the run's exit record (`bridge.quota`), marks the
+   window used up, and `ttp status` shows it. The size is the last such limit, else `quota.size`, else
+   the most tokens counted here in one window when such a 429 came over the last day (`observed`);
+   with none of these, nothing is paced. The window's budget (size less `quota.reserve`, default 10%) spread
+   evenly over the window (`quota.window_s`, default 3600) is the pace line. Once use runs more
+   than 2% of the budget ahead of it, new runs that would start on GLM start on the core provider
+   with the fallback model (route fallback `paced`): priority 5 first, one more level for each
+   further 3%; question, plan and review runs, coordinator runs and specs with a `conclusion:` line
+   all; and every run once the whole quota is spent, until the reset. Runs already going keep
+   running, and no flag is rolled back or frozen. `ttp status` and the web app show the tokens
+   used, the size, the reset and whether pacing acts.
 8. Human interaction stays on Opus. On every run on the chat model, whatever route sent it there
    (the chat provider, a code arm's GLM run, a routine coordinator lane), an outward post (`ttp
    notify`, `say`, `ask`, `ttp note --to` or `--reply`, a `gh` comment or other write, an HTTP

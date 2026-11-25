@@ -129,8 +129,9 @@ OWN_CAUSE_WORDS = ("timed out", "stalled", "exited without", "result.json", "exi
 # busy: the routed-to provider's gate or a pause held new work, no fault; busy_wait_expired: its slots
 # (the project's or the host's) stayed full for the whole wait; rerun: the task fell back on its own before.
 # escalated: an urgent, user-ordered or fix start, or a lineage's, kept on the core provider (escalation).
+# paced: the endpoint's token quota is short (glmquota.py): this start goes to core, no fault, no cool-down.
 ESCALATED = "escalated"
-REASONS = ("none", *FAULTS, *RUN_CAUSES, "busy", "busy_wait_expired", "rerun", ESCALATED)
+REASONS = ("none", *FAULTS, *RUN_CAUSES, "busy", "busy_wait_expired", "rerun", ESCALATED, "paced")
 
 
 def routed_fell(fallback: str) -> bool:

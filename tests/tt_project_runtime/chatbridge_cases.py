@@ -358,7 +358,8 @@ def test_chatbridge_settings_and_config(env, monkeypatch):
     cfg = {"providers": {"chat": {"endpoint": "cloud", "base_url": "https://api.example.com/v1", "max_tokens": 8192,
                                   "tiers": {"light": {"model": "small-model", "max_tokens": 4096}}}}}
     assert chatbridge.settings(cfg, "light", "small-model") == {
-        "endpoint": "cloud", "base_url": "https://api.example.com/v1", "model": "small-model", "max_tokens": 4096}
+        "endpoint": "cloud", "base_url": "https://api.example.com/v1", "model": "small-model", "max_tokens": 4096,
+        "quota": {"key": "cloud", "window_s": 3600, "count_cached": True}}   # the endpoint's shared count (glmquota.py)
     assert chatbridge.settings(cfg, "standard", "m")["max_tokens"] == 8192
     assert chatbridge.config_problems(cfg) == [] and chatbridge.config_problems({}) == []
     bad = chatbridge.config_problems({"providers": {"chat": {"endpoint": "a b", "base_url": "ftp://x",

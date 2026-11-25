@@ -193,7 +193,9 @@ Every project cuts its queue times with the resources its charter allows (the te
 - A run cut off before it reports its cost counts at an estimate, labelled as such.
 - Tier routing (off by default): `providers.chat.tiers.<tier>.route: true` sends that tier's unpinned
   worker runs to the OpenAI-compatible `chat` provider; endpoint faults fall back to the core provider
-  with no attempt spent and a cool-down (`route_cooldown_s`, default 900). A 404 for a model the
+  with no attempt spent and a cool-down (`route_cooldown_s`, default 900). While the endpoint's token
+  quota runs ahead of an even spread over its window (`providers.chat.quota`, glmquota.py), new GLM
+  runs start on core, lowest priority and judgement runs first (fallback `paced`). A 404 for a model the
   endpoint no longer serves (`model_missing`) holds only that tier's route to that model, with one notice naming
   the setting it came from (the tier's model or a `providers.chat.routes` rule's), until that setting changes or the
   model-free /models check lists it again; `ttp status` shows the hold

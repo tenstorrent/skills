@@ -2031,6 +2031,9 @@ def status_text(p: Project, verbose: bool = False) -> str:
         lines.append("routing: " + route_line)
     from . import route
     lines += route.model_lines(db, p.config(), p.state, now, lambda ts: at(ts, now, tz))   # holds, served ids
+    from . import glmquota
+    if quota_line := glmquota.line(p.config(), now, lambda ts: at(ts, now, tz)):   # used, size, reset, pacing
+        lines.append(quota_line)
     from . import loadcaps, pushq
     # Routine diagnostics print only with --verbose; a line that reports an anomaly always prints.
     from . import checkcap, checkjoin, checklane, checkspill, heal, locks, shared, testslots

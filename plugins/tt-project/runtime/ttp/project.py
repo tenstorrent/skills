@@ -919,7 +919,10 @@ PROVIDER_KEYS = {"billing", "tiers", "plugin_dirs", "worker_isolation", "mcp_ser
                  "vendor_defaults", "vendor_values",
                  # providers.chat only: the rules-first model pick (modelpick.py); its keys (enabled, min_p,
                  # options) are checked by modelpick.config_problems.
-                 "dispatch"}
+                 "dispatch",
+                 # quota: the endpoint's token quota count and pacing (glmquota.py: on, size, window_s, reserve,
+                 # rate_window_s, count_cached).
+                 "quota"}
 
 
 def write_dirs(root: Path, guard: Path, value: Any) -> tuple[list[str], list[str], list[str]]:

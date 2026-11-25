@@ -87,7 +87,7 @@ import urllib.request
 import uuid
 from datetime import datetime
 
-from . import endpoint, inflight, redact, serverhealth
+from . import endpoint, glmquota, inflight, redact, serverhealth
 from .providers.base import challenged
 
 UPSTREAM_TIMEOUT_S = 600
@@ -218,6 +218,7 @@ def settings(cfg: dict, tier: str, model: str, effort: str = "", standins=(), se
             **({"effort": effort, "standins": alts, "served": [str(d) for d in served]} if alts and served else {}),
             **({"thinking": think} if think else {}), **({"vendor": levers} if levers else {}), **client, **busy,
             **({k: False for k in ("emission_guard", "loop_guard") if entry.get(k) is False}),
+            **({"quota": {k: q[k] for k in ("key", "window_s", "count_cached")}} if (q := glmquota.conf(cfg)) else {}),
             **({"junk_patterns": dict(entry["junk_patterns"])}
                if isinstance(entry.get("junk_patterns"), dict) and not _junk_problems(entry["junk_patterns"]) else {})}
 
@@ -1072,7 +1073,8 @@ class Bridge:
                  fields: dict | None = None, standins: list | None = None, served: list | None = None,
                  busy_retries: int | None = None, busy_wait_s: float | None = None, thinking: dict | None = None,
                  junk_patterns: dict | None = None, client_timeout_ms: int = 0, attribution_header: bool = True,
-                 vendor: list | None = None, emission_guard: bool = True, loop_guard: bool = True):
+                 vendor: list | None = None, emission_guard: bool = True, loop_guard: bool = True,
+                 quota: dict | None = None):
         self.base_url, self._key, self.model = endpoint.base_url(base_url), key, model
         self.emission_guard = bool(emission_guard)   # mend unparsed tool arguments (repair_args)
         self.loop_guard, self._nudged = bool(loop_guard), {}   # the loop guard; each call it nudged: failures then
@@ -1102,6 +1104,9 @@ class Bridge:
         self.usage = {"calls": 0, "input_tokens": 0, "output_tokens": 0, "cache_read_input_tokens": 0, "scanned": 0}
         self.busy = {"waits": 0, "waited_s": 0.0, "gave_up": 0}   # capacity waits (busy_wait), for stats()
         self.quota_until = None   # the first quota 429's window end (quota_until): the runner stops on it
+        self.quota_hit: dict = {}   # that 429's numbers only (glmquota.parse: limit, used, reset, window_s): stats()["quota"]
+        # The endpoint's shared quota count (glmquota.py: {key, window_s, count_cached}); none: not counted.
+        self.quota = quota if isinstance(quota, dict) and quota.get("key") else None
         # After this many model_missing answers, later calls get the 404 here, never upstream (0: no cap; a
         # bench row sets it so a withdrawn model's agents stop calling the endpoint: tbcycle.MISSING_MAX).
         self.missing_max, self.missing_local = 0, 0
@@ -1146,7 +1151,7 @@ class Bridge:
                       "client_timeout_ms": s.get("client_timeout_ms") or 0, "vendor": s.get("vendor") or [],
                       "attribution_header": s.get("attribution_header", True) is not False,
                       "emission_guard": s.get("emission_guard", True) is not False,
-                      "loop_guard": s.get("loop_guard", True) is not False,
+                      "loop_guard": s.get("loop_guard", True) is not False, "quota": s.get("quota"),
                       **{k: s[k] for k in ("busy_retries", "busy_wait_s") if _count_ok(s.get(k))}, **kw})
 
     @property
@@ -1287,6 +1292,7 @@ class Bridge:
         return {"last_fault": self.last_fault, "faults": dict(self.faults),
                 **({"upstream": dict(self.upstream)} if self.upstream else {}),
                 **({"quota_until": self.quota_until} if self.quota_until else {}),
+                **({"quota": dict(self.quota_hit)} if self.quota_hit else {}),
                 **({"effort": self.effort, "fields": dict(self.fields), "rejected": self.rejected}
                    if self.fields else {}),
                 **({"mid_run": [dict(m) for m in self.mid_run], "model": self.model} if self.mid_run else {}),
@@ -1410,6 +1416,15 @@ class Bridge:
                 quota = quota_until(detail) if e.code == 429 else None
                 if quota and self.quota_until is None:
                     self.quota_until = quota
+                if quota:   # the quota's numbers only (limit, used, window, reset): the run's exit record and the shared count
+                    try:
+                        got = glmquota.parse(detail, e.headers)
+                        self.quota_hit = self.quota_hit or {**got, "reset": got.get("reset") or quota}
+                        if self.quota:
+                            glmquota.sync(self.quota["key"], got, float(self.quota.get("window_s") or 3600),
+                                          spent=True)
+                    except Exception:   # counting must never break a call
+                        pass
                 wait = None if quota else self._busy_wait(e, detail, tries, waited)   # waiting cannot help
                 if wait is not None and wait >= 0:
                     tries, waited = tries + 1, waited + wait
@@ -1503,6 +1518,13 @@ class Bridge:
             self.usage["calls"] += 1
             for k in ("input_tokens", "output_tokens", "cache_read_input_tokens"):
                 self.usage[k] += int(got.get(k) or 0)
+        if self.quota:   # the endpoint's quota, shared by every run on this host (glmquota.py)
+            n = got["input_tokens"] + got["output_tokens"] + \
+                (got["cache_read_input_tokens"] if self.quota.get("count_cached", True) is not False else 0)
+            try:
+                glmquota.add(self.quota["key"], n, float(self.quota.get("window_s") or 3600))
+            except Exception:   # counting must never break a call
+                pass
 
     def _sent_back(self, req: dict) -> None:
         """Count the assistant turns whose reasoning went upstream (preserved thinking, stats())."""

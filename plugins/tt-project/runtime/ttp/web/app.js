@@ -381,7 +381,8 @@ async function refresh() {
     h.spend.top_7d ? `Top spender, 7 days: ${h.spend.top_7d.source} ${money(h.spend.top_7d.usd)}` : "",
     h.spend.caps_line ? `Project caps: ${h.spend.caps_line}` : "",
     h.spend.bases_line ? `Runs by cost basis, 7 days: ${h.spend.bases_line}` : "",
-    h.spend.route_line ? `routing: ${h.spend.route_line}` : ""].filter(Boolean).join(" · "));
+    h.spend.route_line ? `routing: ${h.spend.route_line}` : "",
+    h.spend.quota_line || ""].filter(Boolean).join(" · "));
   put($("#chealth"), healthHtml(h));
   $("#pqcard").hidden = !st.push_queue;
   if (st.push_queue) { text($("#pqline"), st.push_queue.line || ""); put($("#pq"), pushQueueHtml(st.push_queue, st.now || Date.now() / 1000)); }

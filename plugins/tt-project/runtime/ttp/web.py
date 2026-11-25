@@ -522,6 +522,8 @@ def health(p: Project, db: DB, alive: bool = True, now: float | None = None) -> 
     spend["bases_line"] = audit.bases_text(spend["bases_7d"]) if spend["bases_7d"] else ""
     spend["headline"] = budget_line(db, now, core, g, spend["spent_24h"], gates, where=tz)
     spend["route_line"] = route.phrase(db, now)   # routing stats: the Budget tab and ttp status --verbose
+    from . import glmquota   # the chat endpoint's token quota: used, size, reset and whether pacing acts
+    spend["quota_line"] = glmquota.line(cfg, now, lambda ts: at(ts, now, tz))
     # A provider whose budget gate allows fewer worker slots than budget.max_parallel_workers: ttp status
     spend["slot_lines"] = bud.slot_lines(gates, int(cfg["budget"].get("max_parallel_workers", 6) or 0), {
         r["provider"]: r["n"] for r in db.q("SELECT provider, COUNT(*) n FROM runs WHERE status='running' "

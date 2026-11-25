@@ -31,7 +31,7 @@ import re
 import time
 from pathlib import Path
 
-from . import looks
+from . import glmquota, looks
 from .util import num_in, read_dict
 
 KEY = "coord_routine"          # kv: {"last_opus", "turns": [...], "escalate", "suspended", "shadows": [run ids]}
@@ -216,6 +216,8 @@ def classify(db, cfg: dict, *, msgs=(), evs=(), triggers=(), due=None, rerun=Fal
         why.append("lane escalated")
     if (st.get("failed_at") or 0) > now - FAIL_COOL_S:
         why.append("lane failed recently")
+    if glmquota.paced(cfg, {}, "coordinator", now):   # the chat endpoint's quota is short (glmquota.py)
+        why.append("GLM quota short")
     last = float(st.get("last_opus") or 0)
     if not last:
         why.append("no coordinator wake on record")
