@@ -132,7 +132,9 @@ def live_items(alias: str, now: float | None = None, where=None) -> list[dict]:
                 out.append({"kind": "task", "project": name,
                             "text": f"open task #{t['id']} ({t['status']}) on {', '.join(hit)}: "
                                     f"{t['title']}"})
-    held = bool(fleethold.active().get(alias)) or ml.outages().get(alias) is not None
+    o = ml.outages().get(alias)
+    held = bool(fleethold.active().get(alias)) or (o is not None and not o.get("covers"))
+    # a partial outage leaves the machine reachable, so its items stay verifiable
     for c in ml.changes([alias]):   # standing setups not undone
         if c.get("kind") == ml.POWER_CYCLE or ml.noop_undo(c.get("undo")):
             continue   # a power-cycle intent leaves nothing running; a no-op undo is no standing setup

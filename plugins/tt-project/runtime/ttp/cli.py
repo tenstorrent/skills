@@ -12694,7 +12694,7 @@ def _machine_outage(a) -> None:
         if not got:
             print("no known outages")
         return
-    was = (ml.outage_entries().get(a.alias) or {}).get(by)
+    was = ml.outage_entries().get(a.alias)   # any project's entry: the machine was already out
     try:
         rec = ml.set_outage(a.alias, a.why, by, a.expires, owner=a.owner or "", covers=a.covers, where=p,
                             queue=queue)
