@@ -342,7 +342,7 @@ def test_the_digest_shows_each_machines_reach_and_the_daemon_probes_due_machines
 
 @pytest.mark.parametrize("kind", ["hold", "outage"])
 def test_the_reach_probe_makes_no_ssh_to_a_held_or_out_machine_and_shows_it_held(env, monkeypatch, kind):
-    """Upstream notes 0e51acd4fa8107aa, d6740a96b0251cd5: our reach probe ssh'd a lent, held machine. A machine
+    """A machine
     held for every project, or out whole, is never probed and shows held, not probed; a partial outage (its
     covers) is still probed; other machines are untouched; once it ends it is probed again."""
     from ttp import daemon as dm, fleethold, machine_ledger as ml, machines, netwait, reach

@@ -798,7 +798,7 @@ def test_spill_skips_hosts_that_are_not_allowed_busy_or_down_and_keeps_waiting_h
 
 
 def test_spill_makes_no_ssh_to_a_host_out_whole_and_takes_it_back_once_the_outage_ends(env, tmp_path, monkeypatch):
-    """Upstream notes 0e51acd4fa8107aa, d6740a96b0251cd5: a machine out whole (a known outage without covers,
+    """A machine out whole (a known outage without covers,
     as for a lent machine) gets no spill check, probe or remote run: each says held, not probed with the
     outage's reason, and no ssh starts. Another host is untouched; once the outage ends it is allowed again."""
     from ttp import checkspill, machine_ledger as ml, remotecheck

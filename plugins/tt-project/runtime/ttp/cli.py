@@ -3004,10 +3004,13 @@ def cmd_bridge(a) -> None:
         return
     if a.action == "setup":
         try:
-            for line in bridge.setup(cfg, boxes):
+            lines = bridge.setup(cfg, boxes)
+            for line in lines:
                 print(line)
         except (bridge.BadConfig, RuntimeError) as e:
             die(str(e))
+        if any(": refused: " in line for line in lines):
+            sys.exit(1)
         return
     if a.action == "gh-pull":
         _bridge_gh_pull(a, cfg, boxes if a.boxes else [b for b in boxes if cfg["boxes"][b].get("gh_pull")])

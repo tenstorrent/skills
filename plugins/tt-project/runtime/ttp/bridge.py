@@ -560,7 +560,7 @@ def _held_file() -> Path:
 
 def held_boxes(boxes) -> dict[str, str]:
     """{box: why} for the boxes whose machine is held for every project or out whole (machine_ledger.no_ssh):
-    no bridge goes into one while that stands."""
+    no bridge goes into one while that stands. It reads the holds and outages recorded on this computer only."""
     from . import machine_ledger as ml
     return ml.no_ssh(list(boxes)) if boxes else {}
 
@@ -570,7 +570,7 @@ def _services(cfg: dict, box: str) -> list[str]:
     return [*cfg["boxes"][box]["agents"], *([GH_PULL] if cfg["boxes"][box].get("gh_pull") else [])]
 
 
-def _start(cfg: dict, box: str, an: str, platform: str | None) -> str:
+def _start_service(cfg: dict, box: str, an: str, platform: str | None) -> str:
     if an == GH_PULL:
         from .ghqueue import service_argv as gh_argv
         return start(box, an, gh_argv(box), platform)
@@ -590,7 +590,7 @@ def setup(cfg: dict, boxes: list[str], platform: str | None = None) -> list[str]
             continue
         out.append(f"{box}: {write_block(cfg, box)}")
         for an in _services(cfg, box):
-            out.append(f"{box} {an}: {_start(cfg, box, an, platform)}")
+            out.append(f"{box} {an}: {_start_service(cfg, box, an, platform)}")
     from . import bridge_watch
     out.append(f"self-heal watch: {bridge_watch.install(platform)}")
     return out
@@ -612,9 +612,14 @@ def hold_pass(cfg: dict, platform: str | None = None) -> list[str]:
             if got:
                 was[box] = sorted({*was.get(box, []), *got})
         elif box in was:
+            left = []
             for an in was.pop(box):
                 if an in _services(cfg, box):
-                    out.append(f"{box} {an}: {_start(cfg, box, an, platform)} (its hold ended)")
+                    said = _start_service(cfg, box, an, platform)
+                    out.append(f"{box} {an}: {said} (its hold ended)")
+                    left += [] if said.endswith("started") else [an]
+            if left:
+                was[box] = left   # tried again at the next pass
     if out:
         durable_write(_held_file(), json.dumps(was))
     return out

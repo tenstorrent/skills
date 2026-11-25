@@ -341,9 +341,13 @@ def when(t: int) -> str:
 
 def renew(cfg: dict, boxes: list[str], force: bool = False, make: bool = False) -> tuple[list[str], int]:
     """Sign each box's key again once less than half its validity is left (or force). rc 1 on any failure."""
+    from .bridge import held_boxes
     c = cfg["cert"]
-    lines, bad = [], 0
+    lines, bad, closed = [], 0, held_boxes(boxes)
     for box in boxes:
+        if box in closed:
+            lines.append(f"{box}: held, not probed ({closed[box]})")
+            continue
         try:
             pub, cert = read_box(box, c)
             if not pub:
@@ -367,9 +371,13 @@ def renew(cfg: dict, boxes: list[str], force: bool = False, make: bool = False) 
 
 
 def status(cfg: dict, boxes: list[str]) -> tuple[list[str], int]:
+    from .bridge import held_boxes
     c = cfg["cert"]
-    lines, bad = [], 0
+    lines, bad, closed = [], 0, held_boxes(boxes)
     for box in boxes:
+        if box in closed:
+            lines.append(f"{box}: held, not probed ({closed[box]})")
+            continue
         try:
             pub, cert = read_box(box, c)
         except RuntimeError as e:

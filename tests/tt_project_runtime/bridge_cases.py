@@ -3020,10 +3020,9 @@ def test_bridge_watch_release_runs_the_box_cleanup_for_only_the_dead_ports(tmp_p
 
 def test_a_machine_hold_tears_down_refuses_and_hands_back_only_that_boxs_bridge(env, tmp_path, monkeypatch):
     # cells: hold-teardown, hold-refuse, hold-status, hold-handback
-    # Upstream notes 0e51acd4fa8107aa, d6740a96b0251cd5: a box whose machine is held for every project (or out
-    # whole) loses its bridge sessions (agent forwarding and the gh bridge) at the watcher's next pass, gets no
-    # new one and no ssh at all, with the hold's reason; once the hold ends they start again. Other boxes are
-    # untouched.
+    # A box whose machine is held for every project (or out whole) loses its bridge sessions (agent forwarding
+    # and the gh bridge) at the watcher's next pass, gets no new one, no certificate renewal and no ssh at all,
+    # with the hold's reason; once the hold ends they start again. Other boxes are untouched.
     import json
     import subprocess
     from ttp import bridge, bridge_watch, fleethold, hoststate, machines
@@ -3058,6 +3057,11 @@ def test_a_machine_hold_tears_down_refuses_and_hands_back_only_that_boxs_bridge(
     assert any(ln.startswith("box-b auto: ") for ln in got), "box-b is set up as before"
     lines, rc = bridge.status(cfg, ["box-a"], "linux")
     assert lines[0].startswith("box-a: held, not probed (held machine-wide") and "box-a" not in seen["box"]
+    from ttp import bridge_cert
+    for check in (bridge_cert.renew, bridge_cert.status):
+        lines, rc = check({"cert": {}}, ["box-a"])
+        assert (lines, rc) == ([lines[0]], 0) and lines[0].startswith("box-a: held, not probed (held machine-wide")
+    assert "box-a" not in seen["box"], "no certificate ssh either"
     bridge_watch.run_pass(cfg, "linux", 1_000_100.0)
     assert "box-a" not in seen["box"] and "box-b" in seen["box"], "the watcher checks box-b only"
     fleethold.lift("box-a", True, "test")
