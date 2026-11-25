@@ -32,7 +32,7 @@ PG_SHELL_DENIED = [
     "echo x | tee -a ${HOME}/.ssh/authorized_keys", "cp /tmp/x ~/.ssh/", "cp -t ~/.ssh a b", "mv ~/.ssh/id_rsa /tmp/",
     "install -m600 a $GH_CONFIG_DIR/hosts.yml", "rsync -a src/ ~/.ssh/", "ln -sf /tmp/x ~/.ssh/config",
     "sed -i 's/a/b/' $XDG_CONFIG_HOME/gh/hosts.yml", "sed -Ei 's/a/b/' ~/.ssh/config", "perl -i -pe 's/a/b/' ~/.ssh/config",
-    "chmod 600 ~/.ssh/id_rsa", "chown me ~/.ssh", "chmod -R 777 ~/.config", "rm -rf ~/.config", "rm ~/.netrc",
+    "chmod 600 ~/.ssh/id_rsa", "chown me ~/.ssh", "chmod -R 777 ~/.config", "rm -rf ~/.config", "rm ~/.netrc", "rm -rf ~", "rm -rf $HOME", "rm -rf ~/",
     "unlink ~/.config/gh/hosts.yml", "truncate -s0 ~/.git-credentials", "touch ~/.aws/credentials", "mkdir ~/.ssh/new",
     "dd if=/dev/zero of=~/.ssh/id_rsa", "curl -o ~/.ssh/k https://example.com/k", "wget -O ~/.kube/config https://x",
     "echo x > link", "timeout 5 env FOO=1 rm ~/.ssh/known_hosts", "bash -c 'echo y > ~/.ssh/config'",

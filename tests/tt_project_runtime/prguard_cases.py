@@ -692,3 +692,25 @@ def test_literal_argv_splits_like_bash(tmp_path):
         assert words is not None and words == (out.decode().split("\0")[:-1] if words else []), text
     for text in refused:
         assert hook._literal_argv(text) is None, text
+
+
+# GitHub writes whose method, body or config hides behind quoting, a variable, a config read from stdin or another
+# command's output stay refused: none of them is a fully literal read-only curl
+HIDDEN_WRITES = ('curl ">" -XPOST ">" --data=@b ' + API + "pulls",
+                 'curl ">" -XPATCH ">" --data=@b ' + API + "git/refs/heads/main",
+                 "curl '\"'$A-X PATCH " + API + "pulls/1 -H $A'\"' -H '\"'$A-d @b -H $A'\"'",
+                 "wget curl -s " + API + "git/refs/heads/main -H --method=PATCH --body-data='{\"sha\":\"abc\"}'; "
+                 "curl -s " + API + "git/refs/heads/main -H --method; true",
+                 "\"cur\"l 'a;curl -H ' -d @body.json " + API + "pulls ';'",
+                 "printf '%s\\n' -X PATCH -d @b | curl -K - " + API + "pulls/1",
+                 "curl -K - " + API + "pulls/1 <<EOF\n-X PATCH\nEOF",
+                 "printf '%s\\n' -X PATCH -d @b | curl --conf - " + API + "pulls/1",
+                 "curl --conf - " + API + "pulls/1 <<EOF\n-X PATCH\nEOF",
+                 "ARGS='-X POST -d @b.json'; curl $ARGS " + API + "pulls",
+                 "printf '%s\\n' -X POST -d @b.json | xargs curl " + API + "pulls")
+
+
+def test_hidden_github_writes_stay_refused():
+    from ttp import hook
+    for cmd in HIDDEN_WRITES:
+        assert hook.draft_bypass(cmd), cmd

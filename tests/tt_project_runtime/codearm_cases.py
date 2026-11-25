@@ -2624,3 +2624,18 @@ def test_glm_guard_redirect_refusals_never_undo_a_done_hand_off(tmp_path):
     assert not (rd / glmguard.HIT).exists() and len(glmguard.refusals(rd)) == 4
     glmguard.refused(rd, "a run on the GLM arm publishes only with `ttp push` (after its checks), never `git push`", cfg={})
     assert (rd / glmguard.HIT).exists() and json.loads((rd / "result.json").read_text())["status"] == "blocked"
+
+
+def test_a_glm_run_still_refuses_hidden_and_home_wide_writes(monkeypatch, tmp_path):
+    """A default written into $TMPDIR by expansion, a program name hidden behind quoting, and a recursive delete
+    of the home folder stay refused."""
+    from ttp import glmguard
+    wt, rd = _glm_run_env(monkeypatch, tmp_path)
+    glmguard.mark_run(rd, False, cwd=str(wt))
+    home = os.path.expanduser("~")
+    for cmd in ("x=rm; (echo \"$(printf '$(')\"); $x -rf /srv/x; echo \"y\"",
+                "unset TMPDIR; echo > ${TMPDIR:=" + home + "}/.bashrc", "TMPDIR= ; echo > ${TMPDIR:=" + home + "}/.bashrc",
+                "cp a ${TMPDIR:=" + home + "}/.bashrc", "env -u TMPDIR sh -c \"echo > ${TMPDIR:=" + home + "}/.bashrc\"",
+                "unset TM''PDIR; TMPDIR=\"${TMPDIR:-" + home + "}\"; rm -rf \"$TMPDIR\"", "tee ${TMPDIR=/etc}/x",
+                "rm -rf ~", "rm -rf $HOME", "rm -rf " + home, "echo x > ~/.ssh/config"):
+        assert glmguard.shell_refusal(cmd, str(wt), str(rd)), cmd
