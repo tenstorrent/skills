@@ -334,6 +334,22 @@ def test_the_guard_resolves_the_ssh_target_so_another_config_alias_is_refused(en
     fleethold.lift(_HM_BOX, True, "test")
 
 
+def test_an_unread_inventory_item_is_never_a_note_to_its_project(env, monkeypatch):
+    """A project whose database or open tasks cannot be read is listed under every held machine as unverified;
+    a hold's notes name only what is on the machine, so neither read failure asks its project to stop work."""
+    from ttp import heldwork
+    from ttp import upstream as up
+    alpha, beta = _hm_setup(env)
+    sent: list[tuple[str, str]] = []
+    monkeypatch.setattr(up, "send_or_queue", lambda state, source, task, to, text, severity="normal":
+                        sent.append((to, text)) or ("sent", 1))
+    its = heldwork.live_items(_HM_BOX) + [heldwork._unread("gamma", "database", OSError("unable to open")),
+                                          heldwork._unread("beta", "open tasks", RuntimeError("locked"))]
+    mine, failed = heldwork.notes(alpha, its)
+    assert [to for to, _ in sent] == ["beta"] and "run on the box" in sent[0][1], sent
+    assert "could not be read" not in sent[0][1] and mine == [] and not failed, (sent, mine, failed)
+
+
 def test_a_failed_task_read_keeps_the_schedules_and_says_so(env, monkeypatch):
     """cells: heldwork-schedules. Follow-up 42924: a project whose open tasks cannot be read still has its
     schedules listed, and the failed read is an item of its own (unverified), never a silent skip; so is a

@@ -355,6 +355,10 @@ def test_refuse_wait_moves_the_probe_aside_and_records_one_event(env):
     assert got == {"status": "waiting", "on_pass": "x", "retry_when_refused": "true"}, got
     ev = p.db.q("SELECT text, status FROM events WHERE kind='handoff_probe_refused' AND task=?", (tid,))
     assert [e["text"] for e in ev] == [f"#{tid} wait on it: its probe is refused"] and ev[0]["status"] == "queued"
+    task["title"] = "t" * 2000   # a long title: the event text keeps its cap
+    waitheal.refuse_wait(p.db, p, task, {"retry_when": "true"}, "true", "its probe is refused", "x")
+    ev = p.db.q("SELECT text FROM events WHERE kind='handoff_probe_refused' AND task=? ORDER BY id", (tid,))
+    assert len(ev) == 2 and len(ev[1]["text"]) == 1500, len(ev[1]["text"])
 
 
 def test_a_charter_update_with_wrong_typed_resource_settings_neither_crashes_nor_adopts_letters(env):
