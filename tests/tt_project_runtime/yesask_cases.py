@@ -294,7 +294,7 @@ def test_a_refused_rule_change_never_holds_the_ordered_work(env, tmp_path, capsy
     assert t and t["status"] == "queued" and "CHARTER" not in (t["labels"] or ""), t
     assert waitheal.charter_wait("test -e out/job.rc") == ""
     from ttp import cli
-    with pytest.raises(SystemExit) as xc:
+    with pytest.raises(SystemExit):
         cli.main(["task", "demo", "add", "preempt the soak too", "--start-when",
                   "grep -q box-q harness/CHARTER.md || exit 1", "--why", "the exception lands"])
     seen = capsys.readouterr()
