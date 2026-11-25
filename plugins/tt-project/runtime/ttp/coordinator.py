@@ -2760,7 +2760,7 @@ def _deploy_checked(p: Project, text: str, notes: list) -> str:
                      f"the message went unchecked")
     try:
         from . import heldwork
-        fixed = heldwork.mark_nothing_claims(text)
+        fixed = heldwork.mark_nothing_claims(text, where=p)
         if fixed != text:
             notes.append("heldwork: a line in your message claimed nothing of ours runs on or "
                          "uses a held machine the inventory is not empty for; it went marked "
@@ -5681,13 +5681,16 @@ def pause_machine(p: Project, alias: str, paused: bool, reason: str = "", by: st
             raise ValueError(pauseends.NEEDS_END.replace("a resource pause", "a machine hold"))
         hold, new = fleethold.set_hold(alias, reason, by, p.name, end, user_msg=user_msg)
         sync_shared_pauses(p, db)
+        undelivered: list[str] = []
         if new:   # each owner project is told what of its work is still on the machine
             from . import heldwork
-            heldwork.notes(p, heldwork.live_items(alias), why=f"{alias} is held machine-wide")
+            _, undelivered = heldwork.notes(p, heldwork.live_items(alias),
+                                            why=f"{alias} is held machine-wide")
         till = pauseends.describe(fleethold.entry(hold), p)
         return (f"{alias} held machine-wide (hold {hold['id']}" + ("" if new else ", updated") + ")"
                 + (f" ({hold['reason']})" if hold.get("reason") else "")
-                + ": every project's tasks on it wait, and `ttp lock` refuses it" + (f"; {till}" if till else ""))
+                + ": every project's tasks on it wait, and `ttp lock` refuses it" + (f"; {till}" if till else "")
+                + (f". undelivered: {'; '.join(undelivered)}" if undelivered else ""))
     hold = fleethold.lift(alias, users_word, p.name)
     if hold is None:
         return f"{alias} has no machine-wide hold"

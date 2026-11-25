@@ -239,3 +239,20 @@ def test_the_digest_names_what_is_still_on_a_held_machine(env):
         fleethold.lift(_HM_BOX, True, "test")
         parts = dict(coord.digest_parts(alpha, {}, [], [])[0])
         assert not any(f"still on {_HM_BOX}" in ln for ln in parts.get("paused", "").splitlines())
+
+
+def test_a_note_that_cannot_be_sent_names_its_owner_in_the_return(env, monkeypatch):
+    from ttp import heldwork
+    from ttp import upstream as up
+    alpha, beta = _hm_setup(env)
+    def full(state, source, task, to, text, severity="normal"):
+        return ("full", 0)
+    monkeypatch.setattr(up, "send_or_queue", full)
+    monkeypatch.setattr(up, "send", lambda *a, **k: "limited")
+    mine, failed = heldwork.notes(alpha, heldwork.live_items(_HM_BOX))
+    assert mine == [] and failed and f"note to beta failed" in failed[0], failed
+    # the queue result is enough; nothing fails
+    monkeypatch.undo()
+    monkeypatch.setattr(up, "send_or_queue", lambda *a, **k: ("queued", 3))
+    mine, failed = heldwork.notes(alpha, heldwork.live_items(_HM_BOX))
+    assert mine == [] and not failed, failed

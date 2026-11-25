@@ -211,7 +211,7 @@ _NOTHING_RUNS = re.compile(r"(?i)\b(?:nothing|none)\b[^.!?]{0,160}"
                            r"\b(?:runs?|running|use[sd]?|using|installed)\b")
 
 
-def mark_nothing_claims(text: str) -> str:
+def mark_nothing_claims(text: str, where=None) -> str:
     """`text` (a reply or notify) with its 'nothing runs there' claims checked against the
     held-machine inventory: a sentence claiming that nothing (of ours) runs on or uses a machine
     that is held machine-wide or under a whole-machine outage reads ' (unverified: still on
@@ -232,7 +232,7 @@ def mark_nothing_claims(text: str) -> str:
             if (start, end) in fixes or not _text_names(alias, sent):
                 continue
             if alias not in items:
-                items[alias] = live_items(alias)
+                items[alias] = live_items(alias, where=where)
             if items[alias]:
                 mark = f" (unverified: {still_on_line(alias, items[alias])})"
                 body, tail = sent.rstrip(), sent[len(sent.rstrip()):]
@@ -259,15 +259,18 @@ def still_on_line(alias: str, its: list[dict]) -> str:
     return "still on " + alias + ": " + "; ".join(f"{i['project']}: {i['text']}" for i in its)
 
 
-def notes(p, its: list[dict], why: str = "") -> list[str]:
+def notes(p, its: list[dict], why: str = "") -> tuple[list[str], list[str]]:
     """One note per owner project naming its items: `upstream.send_or_queue` in the placing
     project's context, `upstream.send` when none exists (a project-less CLI call). The placing
-    project's own items are returned instead of a note to itself."""
+    project's own items are returned instead of a note to itself. A note that is refused (a full
+    outbox, a raise) gets one retry as a direct high-severity send, and the second failure is
+    returned as a "note to <project> failed" line, so it is never lost silently."""
     from . import upstream
     by: dict[str, list[str]] = {}
     for i in its:
         by.setdefault(i["project"], []).append(i["text"])
     mine: list[str] = []
+    failed: list[str] = []
     for owner, texts in sorted(by.items()):
         if owner == getattr(p, "name", None):
             mine += texts
@@ -276,12 +279,20 @@ def notes(p, its: list[dict], why: str = "") -> list[str]:
                 + "; ".join(texts) + ". Stop what runs or is installed there, or reply why not.")
         try:
             if p is None:
-                upstream.send("user", None, owner, body, "normal")
+                got = upstream.send("user", None, owner, body, "normal")
+                done = got in ("sent", "duplicate")
             else:
-                upstream.send_or_queue(p.state, p.name, None, owner, body, "normal")
-        except Exception:
-            pass   # the status line still shows the item; the owner's own status shows it too
-    return mine
+                got = upstream.send_or_queue(p.state, p.name, None, owner, body, "normal")
+                done = got[0] in ("sent", "duplicate", "queued")
+            if not done:   # a full outbox: a direct high note jumps the queue instead of waiting
+                done = upstream.send(p and p.name or "user", None, owner, body, "high") in ("sent", "duplicate")
+        except Exception as e:
+            done = False
+            got = f"{type(e).__name__}: {e}"
+        if not done:
+            failed.append(f"note to {owner} failed ({got if isinstance(got, str) else got[0]}); "
+                          "the status line still lists its items")
+    return mine, failed
 
 
 def _probe_for(owner: str, alias: str) -> str:

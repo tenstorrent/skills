@@ -12707,7 +12707,9 @@ def _machine_outage(a) -> None:
         return
     if not was:   # a first record: each owner project is told what of its work is on the machine
         from . import heldwork
-        heldwork.notes(p, heldwork.live_items(a.alias), why=f"{a.alias} has a known outage")
+        _, failed = heldwork.notes(p, heldwork.live_items(a.alias), why=f"{a.alias} has a known outage")
+        if failed:
+            print("undelivered: " + "; ".join(failed))
     print(ml.outage_line(a.alias, ml.outages().get(a.alias) or rec, p))
 
 
