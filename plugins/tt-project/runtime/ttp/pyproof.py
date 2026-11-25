@@ -72,10 +72,16 @@ SYSTEM = ("/proc", "/sys", "/dev")
 def harmless(code: str, cwd: str, env=None, bases=None) -> bool:
     """Whether the whole of `code` is proven harmless (module doc); any doubt is False. `bases` are the folders
     a relative path may start from (a `cd` before the snippet), else `cwd`."""
+    return _prove(code, cwd, env, bases) is not None
+
+
+def _prove(code: str, cwd: str, env=None, bases=None) -> "_Proof | None":
+    """The proof of `code` (its `wrote` says whether it opens a file for writing), None unless it is harmless."""
     try:
-        return _Proof(cwd, os.environ if env is None else env, bases).ok(ast.parse(code))
+        proof = _Proof(cwd, os.environ if env is None else env, bases)
+        return proof if proof.ok(ast.parse(code)) else None
     except (SyntaxError, ValueError, RecursionError, OSError):
-        return False
+        return None
 
 
 class _Proof:
@@ -85,6 +91,7 @@ class _Proof:
         self.funcs: dict[str, str] = {}   # name bound by `from m import f` -> `m.f`
         self.lits: dict[str, str] = {}    # name bound once, to a literal path
         self.paths: set[str] = set()      # name bound once, to a pathlib path of literal parts
+        self.wrote = False                # a file is opened for writing
 
     def ok(self, tree: ast.AST) -> bool:
         nodes = list(ast.walk(tree))
@@ -167,8 +174,7 @@ class _Proof:
 
     def _call(self, call: ast.Call) -> bool:
         path = self._path(call.args[0]) if call.args else None
-        mode = call.args[1] if len(call.args) > 1 else next((k.value for k in call.keywords if k.arg == "mode"), None)
-        return len(call.args) <= 2 and self._open(path, mode, call)
+        return len(call.args) <= 2 and self._open(path, call.args[1] if len(call.args) > 1 else None, call)
 
     def _open(self, path: str | None, mode, call: ast.Call) -> bool:
         if path is None or any(k.arg not in ("mode", "encoding", "errors", "newline") for k in call.keywords):
@@ -191,16 +197,18 @@ class _Proof:
         return self._place(os.path.join(folder, arg), False, search=True)
 
     def _place(self, path: str, writes: bool, search: bool = False) -> bool:
-        from . import credguard, pathguard
+        from . import credguard, hook, pathguard
         home = str(self.env.get("HOME") or os.path.expanduser("~"))
         path = os.path.expanduser(path) if path.startswith("~") else path
         tmp = self.env.get("TMPDIR")
         mine = [os.path.realpath(r).rstrip("/") + "/" for r in [self.cwd, *[tmp] * bool(tmp)]]
+        self.wrote |= writes
         for base in self.bases:
             real = os.path.realpath(os.path.join(base, path))
+            # the guards' own reading of the path as a word of a shell command: a store by name anywhere
             if credguard.read_refusal(real, search, home) or pathguard._inside(real, pathguard.roots(self.env)) \
-                    or any(credguard.bash_refusal(f"cat {shlex.quote(p)}", [["cat", p]], home, base) for p in (path, real)):
-                return False   # the shell guard's own reading of the path as a word: a store by name anywhere
+                    or any(hook.store_refusal(f"cat {shlex.quote(p)}", base) for p in (path, real)):
+                return False
             if not any((real + "/").startswith(m) for m in mine) and (
                     writes or any(real == s or real.startswith(s + "/") for s in SYSTEM)):
                 return False
@@ -294,41 +302,44 @@ def rewrite(cmd: str, cwd: str, env=None) -> str | None:
     bases = credguard._cwds(segments, cwd, str(env.get("HOME") or os.path.expanduser("~"))) if moves else None
     if bases and len(bases) >= credguard.CWDS_CAP:   # more folders than the guard follows: no proof
         return None
-    out, changed, pending, shell, hidden = [], False, [], [], False
-    for line in cmd.split("\n"):
-        if pending:
-            delim, dash, body, fed, quoted = pending[0]
-            if (line.lstrip("\t") if dash else line) != delim:
-                body.append(line)
-                continue
-            pending.pop(0)
-            text = "\n".join(b.lstrip("\t") if dash else b for b in body)
-            if fed and text.strip() and (quoted or not re.search(r"[$`\\]", text)) and harmless(text, cwd, env, bases):
-                hidden |= _words_name_store(text, cwd, env)
-                body[:] = ["pass"]
-                changed = True
-            out += [*body, line]
-            continue
+    lines, bodies = hook._heredocs(cmd)
+    if any(b.end is None for b in bodies):   # an unended heredoc: the shell reads it differently than we would
+        return None
+    changed = hidden = False
+    for b in bodies:
+        i, body, pos = b
+        m = hook.HEREDOC_RE.match(lines[i], pos)
+        argv = list(hook._first_argv(hook._piece_at(lines[i], pos)[0]))
+        fed = bool(argv) and bool(PY_RE.match(os.path.basename(argv[0]))) and hook._interpreter_args(argv) == "-"
+        text = "\n".join(l.lstrip("\t") if m[1] == "-" else l for l in body)
+        if fed and text.strip() and (m[2] or not re.search(r"[$`\\]", text)) \
+                and (proof := _prove(text, cwd, env, bases)):
+            named = _words_name_store(text, cwd, env)
+            if named and proof.wrote:   # it could leave a script naming the store for a later call
+                return None
+            hidden |= named
+            body[:] = ["pass"]
+            changed = True
+    ends: dict[int, list[str]] = {}   # the lines each heredoc leaves after its line: its body, then its end
+    for b in bodies:
+        ends.setdefault(b[0], []).extend([*b[1], b.end])
+    out = []
+    for i, line in enumerate(lines):
         flags = hook._quoting(line)
         for m in reversed(list(DASH_C_RE.finditer(line))):
             code = m[1] if m[1] is not None else m[2]
-            if not flags[m.start()][0] and _code_at(line, m.start()) == code and harmless(code, cwd, env, bases):
+            if not flags[m.start()][0] and _code_at(line, m.start()) == code and (proof := _prove(code, cwd, env, bases)):
                 line, changed = f"{line[:m.start()]}-c 'pass'{line[m.end():]}", True
-                hidden |= _words_name_store(code, cwd, env)
-        flags = hook._quoting(line)
-        for m in hook.HEREDOC_RE.finditer(line):
-            if not flags[m.start()][0]:
-                argv = list(hook._first_argv(hook._piece_at(line, m.start())[0]))
-                fed = bool(argv) and bool(PY_RE.match(os.path.basename(argv[0]))) and hook._interpreter_args(argv) == "-"
-                pending.append((m[3], m[1] == "-", [], fed, bool(m[2])))
-        out.append(line)
-        shell.append(line)
+                named = _words_name_store(code, cwd, env)
+                if named and proof.wrote:
+                    return None
+                hidden |= named
+        out += [line, *ends.get(i, [])]
     # A snippet naming a store the guard would have seen in its words is freed only as the whole command: its
     # output piped, captured, redirected or written for a later command could feed that name to the shell.
-    if hidden and (len(shell) > 1 or re.search(r"[|>`;&]|\$\(|<\(", shell[0])):
+    if hidden and (len(lines) > 1 or re.search(r"[|>`;&]|\$\(|<\(", lines[0])):
         return None
-    # an unended heredoc: the shell reads it differently than we would
-    return "\n".join(out) if changed and not pending else None
+    return "\n".join(out) if changed else None
 
 
 def _words_name_store(code: str, cwd: str, env) -> bool:

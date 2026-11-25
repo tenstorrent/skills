@@ -885,6 +885,12 @@ def _blank(piece: str) -> str:
     return "".join(out)
 
 
+class _Body(tuple):
+    """(a heredoc's line index, its body lines, the `<<` column), unpacked as such, and `.end`: the line that
+    closes it as written (tabs included), None while it is unended."""
+    end: str | None = None
+
+
 def _heredocs(text: str) -> tuple[list[str], list[tuple[int, list[str], int]]]:
     """(the lines that are not heredoc bodies, each body as (its line's index, its lines, the `<<` column))."""
     lines, bodies, pending = [], [], []
@@ -893,6 +899,7 @@ def _heredocs(text: str) -> tuple[list[str], list[tuple[int, list[str], int]]]:
             delim, dash, k = pending[0]
             if (line.lstrip("\t") if dash else line) == delim:
                 pending.pop(0)
+                bodies[k].end = line
             else:
                 bodies[k][1].append(line)
             continue
@@ -901,7 +908,7 @@ def _heredocs(text: str) -> tuple[list[str], list[tuple[int, list[str], int]]]:
         for m in HEREDOC_RE.finditer(line):
             if not flags[m.start()][0]:
                 pending.append((m[3], m[1] == "-", len(bodies)))
-                bodies.append((len(lines) - 1, [], m.start()))
+                bodies.append(_Body((len(lines) - 1, [], m.start())))
     return lines, bodies
 
 
@@ -1247,6 +1254,19 @@ SECRET_FILE_RE = re.compile(r"(?:\.tt-project|TTP_HOME\}?)/+secrets\.json\b")
 SECRET_CALL_RE = re.compile(r"(?<!def )\b(?:credentials|load_secrets|env_for)\s*\(|\bendpoint\.saved\s*\(|\bsecrets_path\s*\(|\bsecretstore\.(?:load|BACKENDS|_\w+_load)\b")
 
 
+def store_refusal(cmd: str, cwd: str) -> str | None:
+    """Why a Bash command naming a credential store is refused, else None: the web token's path, the secrets
+    store (secret_read) and the credential folders (credguard). The guards' one reading of the words of a
+    command, which pyproof asks of each path a snippet opens."""
+    from . import credguard
+    commands, _ = _split(cmd)
+    if WEB_TOKEN_RE.search(cmd):
+        # Whoever holds it acts as the user in the web app; the Read deny rule covers the file tools.
+        return ("the web token is the user's credential and a run must not read it; any command naming its "
+                "path is refused, so write a commit message with `git commit -F <file>` or call it 'the web token file'")
+    return secret_read(cmd, _segments(commands), cwd) or credguard.bash_refusal(cmd, _all_segments(commands), cwd=cwd)
+
+
 def secret_read(cmd: str, segments: list[list[str]], cwd: str) -> str | None:
     """Why a Bash call that reads the secrets store is refused, else None: a command naming the store's
     path, or an interpreter (inline code, stdin or a script it runs) calling the runtime's readers."""
@@ -1537,21 +1557,13 @@ def _pre_tool_use(payload: dict, made: list[str] | None = None) -> tuple[dict | 
         why = ("a run must not post messages as the user; report with `ttp note` and the hand-off, "
                    "tell the user with `ttp notify \"<text>\"`, "
                    "and reach another project with `ttp note --to <project> \"<text>\"`")
-    if not why and WEB_TOKEN_RE.search(cmd):
-        # Whoever holds it acts as the user in the web app; the Read deny rule covers the file tools.
-        why = ("the web token is the user's credential and a run must not read it; any command naming its "
-               "path is refused, so write a commit message with `git commit -F <file>` or call it 'the web token file'")
     if not why and (HARNESS_GH_RE.search(cmd) or HARNESS_BIN_RE.search(cmd) and GH_D_RE.search(cmd)) \
             and not _harness_task():
         why = HARNESS_GH_WHY
     if not why and "***" in cmd:   # a patch in the command (`apply_patch <<EOF`), relative paths too
         why = harness_gh_patch(payload)
     if not why:
-        why = secret_read(cmd, segments, str(payload.get("cwd") or os.getcwd()))
-    if not why:
-        from . import credguard
-        why = credguard.bash_refusal(cmd, _all_segments(commands),
-                                     cwd=str(payload.get("cwd") or os.getcwd()))
+        why = store_refusal(cmd, str(payload.get("cwd") or os.getcwd()))
     if not why:   # the run's own credentials and proxy stay in the run (runguard.py)
         from . import runguard
         why = runguard.refusal(cmd, _all_segments(commands) + _segments(commands, strip=False))

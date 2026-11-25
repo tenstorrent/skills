@@ -91,6 +91,51 @@ def test_the_hook_passes_a_proven_snippet_and_still_refuses_the_rest_of_its_call
         assert _bash_why(tmp_path, cmd), cmd                                      # its output may feed the name to the shell
 
 
+def _store_paths(home):
+    """The web token's and the secrets store's paths under a fake HOME, spelled so this file never names them."""
+    return [f"{home}/.tt-project/state/" + "web." + "token", f"{home}/.tt-project/" + "secrets" + ".json"]
+
+
+def test_the_hook_refuses_a_snippet_that_opens_the_web_token_or_the_secrets_store(env, tmp_path, monkeypatch):
+    import os
+    home = _cred_home(tmp_path, monkeypatch)
+    for path in _store_paths(home):
+        for cmd in (f"python3 -c 'print(open(\"{path}\").read())'",
+                    f"python3 -c 'from pathlib import Path\nprint(Path(\"{path}\").read_text())'",
+                    f"python3 - <<'EOF'\nprint(open('{path}').read())\nEOF",
+                    f"python3 - <<'EOF'\nfrom pathlib import Path\nprint(Path('{path}').open().read())\nEOF"):
+            assert _bash_why(tmp_path, cmd), cmd
+        from ttp import pyproof   # a relative name after a cd: the snippet is not freed, the guards read it as written
+        assert pyproof.rewrite(f"cd {os.path.dirname(path)} && python3 -c 'print(open(\"{os.path.basename(path)}\").read())'",
+                               str(tmp_path)) is None
+    assert _bash_why(tmp_path, f"python3 -c 'print(open(\"{home}/notes.txt\").read())'") == ""   # other files stay free
+
+
+def test_the_hook_refuses_a_store_naming_snippet_that_writes_a_file_for_a_later_call(env, tmp_path, monkeypatch):
+    home = _cred_home(tmp_path, monkeypatch)
+    key = home / _SSH / "id_ed25519"
+    for mode in ("w", "a", "x", "w+", "r+"):
+        for cmd in (f"python3 -c 'open(\"s.sh\",\"{mode}\").write(\"cat {key}\")'",
+                    f"python3 -c 'open(\"s.sh\",mode=\"{mode}\").write(\"cat {key}\")'",
+                    f"python3 - <<'EOF'\nopen('s.sh','{mode}').write('cat {key}')\nEOF",
+                    f"python3 - <<-'EOF'\n\topen('s.sh','{mode}').write('cat {key}')\n\tEOF",
+                    f"python3 - <<'EOF'\nfrom pathlib import Path\nPath('s.sh').open('{mode}').write('cat {key}')\nEOF"):
+            assert _bash_why(tmp_path, cmd), cmd
+    assert _bash_why(tmp_path, "python3 -c 'open(\"s.sh\",\"w\").write(\"echo hi\")'") == ""   # no store named
+
+
+def test_pyproof_reads_heredocs_as_the_hook_does(tmp_path, monkeypatch):
+    from ttp import pyproof
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    cwd, code = str(tmp_path), "print(1)"
+    assert pyproof.rewrite(f"python3 - <<'A' && python3 - <<'B'\n{code}\nA\n{code}\nB", cwd) == \
+        "python3 - <<'A' && python3 - <<'B'\npass\nA\npass\nB"                    # two on one line, each its own body
+    assert pyproof.rewrite(f"python3 - <<-'EOF'\n\t{code}\n\t\tEOF\necho x", cwd) == \
+        "python3 - <<-'EOF'\npass\n\t\tEOF\necho x"                               # the end line stays as written
+    assert pyproof.rewrite(f"python3 - <<'EOF'\n{code}\nEOF\npython3 - <<'EOF'\n{code}\n", cwd) is None   # one unended
+    assert pyproof.rewrite(f"python3 - <<'EOF'\n{code}\n EOF\n", cwd) is None   # an indented end line does not end it
+
+
 def test_cwds_reads_a_ten_thousand_line_heredoc_quickly(env, tmp_path):
     import time
     from ttp import credguard, hook
