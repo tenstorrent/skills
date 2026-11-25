@@ -739,7 +739,8 @@ def test_cfgshell_a_key_the_coordinator_sets_in_its_shell_applies_as_ttp_config_
 def test_cfgshell_chat_settable_reports_the_keys_config_set_applies_as_ttp_config(env, capsys, monkeypatch):
     """`ttp config --chat-settable KEY` refused keys that config_set applies through `ttp config`; it now
     reports them accepted (with the value checked as `ttp config` checks it), while push grants,
-    machines.allowed, budget.* and their parents stay refused."""
+    machines.allowed, budget.* and their parents stay refused, and every such key once the coordinator has
+    no shell (read_only), as config_set refuses it."""
     from ttp import cli
     p = make(env)
     monkeypatch.setenv("TTP_PROJECT", str(p.root))
@@ -750,3 +751,9 @@ def test_cfgshell_chat_settable_reports_the_keys_config_set_applies_as_ttp_confi
         with pytest.raises(SystemExit) as e:
             cli.cmd_chat_settable(key, None)
         assert e.value.code == 1 and "refused" in capsys.readouterr().out, key
+    cli.cmd_chat_settable("waiting.poll_s", "")   # '' removes it, as config_set reads it
+    assert capsys.readouterr().out.startswith("waiting.poll_s: accepted"), key
+    p.set_config("coordinator.session.tools", "read_only")
+    with pytest.raises(SystemExit) as e:
+        cli.cmd_chat_settable("waiting.poll_s", "120")
+    assert e.value.code == 1 and "refused" in capsys.readouterr().out

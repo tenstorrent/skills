@@ -72,10 +72,7 @@ def problems(p, actions: list, wakes: list | None = None) -> list[tuple[int, str
         t = a.get("type")
         try:
             if t == "task_update":
-                try:
-                    task = db.task(int(a.get("id")))
-                except (TypeError, ValueError):
-                    raise ValueError("task_update needs the id of a task") from None
+                task = db.task(a["id"])   # a task number: plain_fields checked it
                 if not task:
                     raise ValueError(f"no task #{a.get('id')}")
                 tid, status = task["id"], a.get("status")

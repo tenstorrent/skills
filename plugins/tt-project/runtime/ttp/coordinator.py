@@ -615,12 +615,23 @@ class ShellKey(ValueError):
     """settable's refusal of a known key that is not the user's alone: the coordinator sets it by `ttp config`."""
 
 
-def shell_settable(key: str) -> bool:
-    """Whether a config_set of a ShellKey `key` is applied as `ttp config` applies it: not a spend setting
-    (budget), push permission (grants) or the machine allowlist, nor a parent of one: those are the user's."""
-    from . import grants
-    return key.split(".")[0] != "budget" and not any(
-        k == key or k.startswith(key + ".") for k in (*grants.KEYS, "machines.allowed"))
+def shell_conv(p, cfg: dict, key: str, refusal: ShellKey):
+    """How a config_set of ShellKey `key` converts its value: as `ttp config` applies it (its checks, its JSON
+    reading of a text value). Raises `refusal` when the coordinator has no shell (read_only), or the key is a
+    spend setting (budget), push permission (grants), the machine allowlist or a parent of one: the user's.
+    `ttp config --chat-settable` asks the same, so it reports what config_set does."""
+    from . import cli, grants
+    if coordtools.tools_mode(cfg) != "full" or key.split(".")[0] == "budget" or any(
+            k == key or k.startswith(key + ".") for k in (*grants.KEYS, "machines.allowed")):
+        raise refusal
+
+    def conv(v):
+        try:
+            v = json.loads(v) if isinstance(v, str) else v
+        except ValueError:
+            pass
+        return cli.config_value(p, key, v)
+    return conv
 
 CHARTER_HISTORY = ends.CHARTER_HISTORY   # harness file: charter sections replaced or retired
 # kv: [{"id", "messages", "ask", "section", "quote", "replaces", "candidates", "text", "sha", "ts",
@@ -2888,23 +2899,23 @@ def untrusted_write_event(db, task: int, moved: str) -> None:
 
 def plain_fields(a: dict) -> dict:
     """The action with the field types apply relies on checked first, so a malformed field gets a plain
-    refusal, never an internal error: a task_update's `id` is a task number (`#12` is read as 12), a
-    task_add or task_update's `priority` a whole number and `spec` text, a reply's `text` non-empty text.
+    refusal, never an internal error: a task_update's `id` is a task number, a task_add or task_update's
+    `priority` a small whole number and `spec` text, a reply's `text` non-empty text.
     coordprecheck.problems runs the same check, so the dry run refuses what apply refuses."""
     t = a.get("type")
     if t == "task_update":
-        tid = str(a.get("id") if a.get("id") is not None else "").strip().lstrip("#")
+        tid = str(a.get("id") if a.get("id") is not None else "").strip()
         if not tid.isdigit():
             raise ValueError(f"needs `id`: a task number such as 12, not {clip(str(a.get('id')), 40)!r}")
         a = {**a, "id": int(tid)}
     if t in ("task_add", "task_update"):
         if a.get("priority") is not None:
             try:
-                if int(a["priority"]) != float(a["priority"]):
-                    raise ValueError
+                x = float(a["priority"])
             except (TypeError, ValueError):
-                raise ValueError(f"`priority` must be a whole number 1-5, not "
-                                 f"{clip(str(a['priority']), 40)!r}") from None
+                x = 0.5
+            if not (x.is_integer() and abs(x) < 100):
+                raise ValueError(f"`priority` must be a whole number such as 2, not {clip(str(a['priority']), 40)!r}")
         if a.get("spec") is not None and not isinstance(a["spec"], str):
             raise ValueError(f"`spec` must be text (one string, lines joined with newlines), "
                              f"not a {type(a['spec']).__name__}")
@@ -4376,22 +4387,8 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                 key = ALIASES.get(key, key)
                 try:
                     conv, shell = settable(key), False
-                except ShellKey:
-                    # A key the coordinator would set by `ttp config` in its own shell: applied here as that command
-                    # applies it (its checks, its JSON reading of a text value), unless the coordinator has no shell
-                    # (read_only), or the key is a spend setting (budget), push permission (grants) or the machine
-                    # allowlist, or a parent of one: those are the user's.
-                    from . import cli
-                    if coordtools.tools_mode(cfg) != "full" or not shell_settable(key):
-                        raise
-
-                    def conv(v, key=key):
-                        try:
-                            v = json.loads(v) if isinstance(v, str) else v
-                        except ValueError:
-                            pass
-                        return cli.config_value(p, key, v)
-                    shell = True
+                except ShellKey as e:   # a key the coordinator would set by `ttp config` in its own shell
+                    conv, shell = shell_conv(p, cfg, key, e), True
                 # '' removes a project key so its default applies (as `ttp config NAME KEY ''`), never "" stored
                 # over a list or an object; an account key keeps accountset's own handling of '', and a chat
                 # routing key (chatset) its own check, so no routed tier loses its model or endpoint.
@@ -4450,6 +4447,7 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                     p.set_config(key, value, by=who)
                 cfg = p.config()
                 if shell:   # the command it stands for, and what that command warns of
+                    from . import cli
                     notes.append(f"config_set {key} applied as: ttp config {p.name} {key} "
                                  f"{json.dumps('' if remove else value)[:200]} (was: refused, not settable from chat)"
                                  + "".join(f"; warning: {w}" for w in cli.config_warnings(p, key)))
