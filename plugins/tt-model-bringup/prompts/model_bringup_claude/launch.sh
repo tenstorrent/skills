@@ -7,7 +7,8 @@
 # --dry-run writes inputs.json, prompt.md and the config dir, and prints the commands instead of starting them.
 set -euo pipefail
 PATH="$HOME/.local/bin:$PATH"  # claude installs here; ssh and nohup shells often lack it
-command -v claude >/dev/null || { echo "claude not found on PATH" >&2; exit 2; }
+CLAUDE=${CLAUDE_BIN:-claude}  # CLAUDE_BIN: e.g. a wrapper that runs the session inside a container (README)
+command -v "$CLAUDE" >/dev/null || { echo "$CLAUDE not found on PATH" >&2; exit 2; }
 HERE=$(cd "$(dirname "$0")" && pwd); PLUGINS=$(cd "$HERE/../../.." && pwd)
 HF_MODEL= TT= BUDGET=48 SCOPE=open RESETS=no NOTES= EXTRA='{}' SESSION= MODEL=${CLAUDE_MODEL:-claude-opus-5-5}
 OVERSEER=1 CONFIG_DIR= EFFORT= DRY= RUN_DIR=
@@ -92,7 +93,7 @@ for v in CLAUDE_CONFIG_DIR HF_HOME HF_TOKEN_PATH; do
   if [ -n "${!v:-}" ]; then ENVS+="export $v=$(printf %q "${!v}"); "; fi; done
 ADD=; for d in "${DIRS[@]}"; do ADD+=" --add-dir $(printf %q "$d")"; done
 CMD="${ENVS}[ -f python_env/bin/activate ] && source python_env/bin/activate
-  claude --model $MODEL${EFFORT:+ --effort $EFFORT} --permission-mode auto$ADD --plugin-dir $(printf %q "$PLUGINS/tt-model-bringup") --plugin-dir $(printf %q "$PLUGINS/tt-autodebug") -- \"\$(cat $(printf %q "$PROMPT"))\"
+  $(printf %q "$CLAUDE") --model $MODEL${EFFORT:+ --effort $EFFORT} --permission-mode auto$ADD --plugin-dir $(printf %q "$PLUGINS/tt-model-bringup") --plugin-dir $(printf %q "$PLUGINS/tt-autodebug") -- \"\$(cat $(printf %q "$PROMPT"))\"
   exec bash"
 TMUX_CMD=(tmux new-session -d -s "$SESSION" -c "$TT" bash -lc "$CMD")
 # Budget watchdog: tell the session when the budget is reached.

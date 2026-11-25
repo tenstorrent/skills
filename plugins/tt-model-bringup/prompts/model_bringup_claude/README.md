@@ -107,5 +107,13 @@ tells the agent to ignore live host state; `--since` sets the window start, and 
 from `--log` but does not write it):
 `overseer.sh --dry-run --once --tt <tt-metal> [--inputs <inputs.json>] [--project-dir <claude config>/projects/<dir> --at <UTC time>] [--since <UTC time>] [--log <file>]`.
 
+**Hosts without the build toolchain.** If the host lacks what tt-metal needs to build (clang, cmake, ninja,
+OpenMPI ULFM), run the session inside a container that has it, with the run folder and `/tmp/claude-$(id -u)` mounted
+at the same paths. Run `setup.sh` and `preflight.sh` inside the container, then start `launch.sh` on the host with
+`CLAUDE_BIN=<wrapper>`, a script that runs `docker exec -it <container> claude "$@"` in the current directory and
+passes `CLAUDE_CONFIG_DIR`, `HF_HOME`, `HF_TOKEN_PATH` and the venv's `PATH`. tmux, the budget timer and the overseer
+stay on the host. What then runs only inside the container: the build, device jobs, `tt-smi` and anything the session
+installs. Anything that needs the host itself (its packages, services, or a reboot) is out of the session's reach.
+
 If a host is lost or a session ends, see `RESUME.md`. Running and watching runs from another machine, and what we
 did when hosts failed: `REMOTE.md`.
