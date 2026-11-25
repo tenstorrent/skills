@@ -453,13 +453,13 @@ CRASH_WINDOW_S = 3600   # a gh pull loop that started CRASH_STARTS times within 
 CRASH_STARTS = 5
 
 
-def _starts(box: str) -> Path:
+def _loop_starts(box: str) -> Path:
     return HOME_DIR / f"bridge-{box}-{GH_PULL}.starts"
 
 
 def loop_started(box: str, now: float | None = None) -> None:
     """Record one start of `box`'s gh pull loop (its last few), so status() can tell a crash loop from a running one."""
-    f = _starts(box)
+    f = _loop_starts(box)
     try:
         kept = f.read_text().split()[-(2 * CRASH_STARTS):] if f.is_file() else []
         f.parent.mkdir(parents=True, exist_ok=True)
@@ -472,7 +472,7 @@ def crash_loop(box: str, now: float | None = None) -> int:
     """How often `box`'s gh pull loop started in the last CRASH_WINDOW_S, if CRASH_STARTS or more (else 0)."""
     now = now or time.time()
     try:
-        n = sum(1 for t in _starts(box).read_text().split() if t.isdigit() and now - int(t) < CRASH_WINDOW_S)
+        n = sum(1 for t in _loop_starts(box).read_text().split() if t.isdigit() and now - int(t) < CRASH_WINDOW_S)
     except OSError:
         return 0
     return n if n >= CRASH_STARTS else 0
