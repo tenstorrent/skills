@@ -676,7 +676,6 @@ def _gw9846_task(p, provider, model, branch):
 def test_a_glm_code_runs_hand_off_is_sent_back_for_a_test_on_the_real_tmp(env):
     """A code hand-off meets the built-in check whatever ran it: a GLM run's test lines name real paths, and
     every run's new tests must come with a base-failing run line."""
-    
     from ttp import handoffcheck, route
     p = make(env)
     git = lambda *a: subprocess.run(["git", "-C", str(p.root), *a], check=True, capture_output=True)   # noqa: E731
@@ -719,6 +718,26 @@ def test_the_stop_hook_refuses_a_code_hand_off_adding_a_test_with_no_base_failin
     assert "fail on the base" in out["reason"], out
     assert _hc_stop(monkeypatch, run_dir, {"status": "done", "summary": "fixed",
                                            "self_check": "pytest tests/test_gw9886.py at base 1111111: 1 failed"}) is None
+    monkeypatch.setenv("TTP_ROLE", "reviewer")   # a review of the same task is not the check's to judge
+    assert _hc_stop(monkeypatch, run_dir, {"status": "done", "summary": "verdict: pass"}) is None
+
+
+def test_a_reviewers_hand_off_on_a_test_adding_code_task_is_not_the_built_in_checks_to_judge(env):
+    """The built-in check judges the run that made the change: a reviewer's hand-off on the same branch
+    passes, the worker's is sent back for the missing base-failing run line."""
+    from ttp import handoffcheck, route
+    p = make(env)
+    git = lambda *a: subprocess.run(["git", "-C", str(p.root), *a], check=True, capture_output=True)   # noqa: E731
+    git("checkout", "-q", "-b", "ttp/gw9886")
+    (p.root / "tests").mkdir(exist_ok=True)
+    (p.root / "tests" / "test_gw9886.py").write_text("def test_w():\n    assert calc(2) == 5\n")
+    git("add", "-A")
+    git("commit", "-qm", "a test")
+    git("checkout", "-q", "-")
+    t = _gw9846_task(p, "claude", "opus", "ttp/gw9886")
+    assert handoffcheck.verdict(p, {}, t, {"status": "done", "verdict": "fail"}, None, role="reviewer") == {}
+    assert handoffcheck.verdict(p, {}, t, {"status": "done", "verdict": "fail"}, None)\
+        ["failed"]["name"] == handoffcheck.CODE_CHECK
 
 
 def test_a_glm_hand_off_is_sent_back_for_an_incident_comment_and_passes_once_it_states_the_rule(env):

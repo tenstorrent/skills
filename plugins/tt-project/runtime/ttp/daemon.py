@@ -4347,7 +4347,8 @@ class Daemon:
                 env.pop(handoffcheck.SENDBACKS_ENV, None)   # never an inherited value
                 row = self.p.db.task(task["id"]) or task
                 if (handoffcheck.applies(self.cfg, row, {"status": "done"})
-                        or handoffcheck.builtin_applies(row, {"status": "done"})) and not _push_rechecked(row):
+                        or role == "worker" and handoffcheck.builtin_applies(row, {"status": "done"})) \
+                        and not _push_rechecked(row):
                     used = int(load_result(row.get("result")).get(handoffcheck.KEY) or 0)
                     env[handoffcheck.SENDBACKS_ENV] = f"{used}/{handoffcheck.max_sendbacks(self.cfg)}"
                 # Its hook warns a code hand-off that names no change the daemon could review (hook.handoff_warning).
@@ -6766,7 +6767,7 @@ class Daemon:
             except Exception:
                 log(p, f"run {r['id']}: judging its project root paths failed\n" + traceback.format_exc())
         if r["role"] != "coordinator" and r["task"]:
-            self._prefetch_remote(r["task"], _read_result(run_dir / RESULT_FILE), run_dir)
+            self._prefetch_remote(r["task"], _read_result(run_dir / RESULT_FILE), run_dir, r.get("role") or "worker")
             if status == "ok":
                 self._dry_run_on_pass(r, run_dir, usage.session_id or note.get("session_id") or "")
         # A failed end that made no model call at all counts toward its provider's no-call streak.
@@ -7612,13 +7613,14 @@ class Daemon:
         if not missing:
             scr.close_watcher_issues(db, "daemon:push-audit", why="every claimed push of the last days is on its remote")
 
-    def _prefetch_remote(self, task_id: int, result: dict | None, run_dir: Path | None = None) -> None:
+    def _prefetch_remote(self, task_id: int, result: dict | None, run_dir: Path | None = None,
+                         role: str = "worker") -> None:
         """What finishing a code or review task's hand-off asks the push remote (pushq.prefetch), asked
         now, before the transaction that records it: inside it the answer is read, never fetched, so
         the write lock never waits on the network. Best effort: an unanswered question reads as before."""
         self._rescue_detached(task_id, result, run_dir)
         self._adopt_own_branch(task_id, result)
-        task = self._prefetch_lint(task_id, result, run_dir)
+        task = self._prefetch_lint(task_id, result, run_dir, role)
         if not isinstance(result, dict) or result.get("status") not in ("done", "needs_review"):
             return   # only a finished hand-off approves a push or gets its review
         if not task or task["kind"] not in ("code", "review"):
@@ -7670,7 +7672,8 @@ class Daemon:
             log(self.p, f"task {task_id}: a {task['kind']} task that committed its change on its own branch "
                         f"{branch}; now a code task on it, so its change gets its review")
 
-    def _prefetch_lint(self, task_id: int, result, run_dir: Path | None = None) -> dict | None:
+    def _prefetch_lint(self, task_id: int, result, run_dir: Path | None = None,
+                       role: str = "worker") -> dict | None:
         """What the hand-off lint (handofflint.lint, in _finish_worker) reads from the remote, and the
         project's hand-off checks (handoffcheck), asked before the transaction. Returns the task."""
         task = self.p.db.task(task_id)
@@ -7681,7 +7684,7 @@ class Daemon:
             log(self.p, f"task {task_id}: asking the remote for the hand-off lint failed: {type(e).__name__}: {e}")
         try:
             if task and not _push_rechecked(task):
-                handoffcheck.prefetch(self.p, self.cfg, task, result, run_dir)
+                handoffcheck.prefetch(self.p, self.cfg, task, result, run_dir, role=role)
         except Exception as e:   # verdict runs them again inside the transaction
             log(self.p, f"task {task_id}: the hand-off checks failed to run early: {type(e).__name__}: {e}")
         if task:   # the landed-claim check's one fetch: inside the transaction a git network call is
@@ -8564,7 +8567,8 @@ class Daemon:
         if status == "ok" and not waiting and not refusal and not push_quiet and not _daemon_precheck(r, handoff) \
                 and not _push_rechecked(task):
             try:
-                checked = handoffcheck.verdict(self.p, self.cfg, task, handoff, run_dir)
+                checked = handoffcheck.verdict(self.p, self.cfg, task, handoff, run_dir,
+                                             role=r.get("role") or "worker")
             except Exception:   # never lose a hand-off to the checks themselves
                 log(self.p, "hand-off checks failed: " + traceback.format_exc().replace("\n", " | ")[:1500])
         for b in checked.get("broken") or []:
