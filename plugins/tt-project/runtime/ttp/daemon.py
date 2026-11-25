@@ -46,6 +46,7 @@ from . import (   # one name per line: two changes adding names merge without a 
     handback,
 )
 from . import rolerestore
+from . import stalegates
 from . import codearm
 from . import glmwork
 from . import coordroute
@@ -2463,6 +2464,7 @@ class Daemon:
                 self.check_checks_wait,
                 self.check_urgent_check_wait,
                 self.check_queue_waits,
+                self.check_stale_gates,
                 self.check_chat_digest,
                 self.check_checks_owner,
                 self.reap_leftover_checks,
@@ -11780,6 +11782,8 @@ class Daemon:
         from . import chatdigest
         if ids := chatdigest.flush(self.p, self.cfg, now):
             log(self.p, f"chat digest posted: messages {', '.join(map(str, ids))}")
+
+    check_stale_gates = stalegates.tick   # model-free stale-gate sweep, stalegates.py
 
     def check_queue_waits(self, every_s: float = 60) -> None:
         """Model-free queue-wait escalation (queuewait.py): a task waiting past coordinator.queue_wait_escalate_min

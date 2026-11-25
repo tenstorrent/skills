@@ -5420,3 +5420,18 @@ Scratch projects. A project listed in ring 0 has a soft daily spend cap, $25 by 
 (`rollout.scratch_cap_usd`, the project's own value first, 0 turns it off). Past it, routine tasks wait in the
 queue and start when the day's spend falls under it. Urgent tasks, tasks answering the user's chat and owners of
 an open order are never held by it, and the project's dollar caps are unchanged.
+
+### Stale gates
+
+No task or promise sits behind a gate that no longer truly blocks it. Once a minute, without a model call,
+the daemon walks every queued, blocked and waiting task and every open order and promise
+(`stalegates.py`). A task whose resource is on a machine that is held (a pause, a fleet or lent-out hold),
+in a recorded outage or failing repeatedly moves at once to another machine the project's config allows
+(`machines.allowed`, `resources`, `shared_resources`), unless the task names the machine itself; a hold or
+pause is never lifted. A dependency that is cancelled, failed or gone and that the task never names is
+dropped and the task requeued. A gate older than `coordinator.stale_gate_min` (default 30, 0: off) that
+states no reason (a `why`, a rule id, `needs #id` or `safety:`) is cleared, and so is an open dependency the
+task neither names nor shares a file with. What cannot be fixed safely becomes a must-act item keyed
+`stale_gate-<task>`, and a promise whose live owners all cannot run is given its one clear replacement or
+raised as `stale_gate-<id>`. Each fix leaves an observation on the task. The Course check shows a
+`stale gate:` line for any task or promise held over the threshold.
