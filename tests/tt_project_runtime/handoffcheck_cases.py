@@ -694,9 +694,11 @@ def test_a_glm_hand_off_is_sent_back_for_an_incident_comment_and_passes_once_it_
     src.write_text('def f():\n    """Fixed after the outage on 2026-11-24."""\n    return 1\n')
     git("add", "-A")
     git("commit", "-qm", "an incident docstring")
+    git("checkout", "-q", "-")
     glm = _gw9846_task(p, route.TO, "example-org/glm-x", "ttp/gw9860")
     got = handoffcheck.verdict(p, {}, glm, {"status": "done"}, None)
     assert "gw9860.py:2: Fixed after the outage" in got["failed"]["output"], got
+    git("checkout", "-q", "ttp/gw9860")
     src.write_text('def f():\n    """One per call: a retry never doubles it."""\n    return 1\n')
     git("commit", "-qam", "the rule instead")
     git("checkout", "-q", "-")
