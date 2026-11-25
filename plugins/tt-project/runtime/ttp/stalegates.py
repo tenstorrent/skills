@@ -289,7 +289,6 @@ def sweep(p, cfg: dict, now: float | None = None) -> list[str]:
             except Exception as e:   # a task changed under us: the next pass sees it again
                 from .daemon import log
                 log(p, f"stale gate fix for #{f['task']} failed: {e}")
-                continue
     left = [f for f in found if f["action"] == "raise"]
     prom = promises(db, cfg, found, now)
     live = set()
