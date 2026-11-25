@@ -66,6 +66,17 @@ def guarded(env) -> list[str]:
         return []
 
 
+def first(env) -> None:
+    """Put the judge's zip first on `env`'s PYTHONPATH again, when the judge is on (a launcher set its own)."""
+    try:
+        zp = json.loads(env.get(POLICY_ENV) or "")["zip"]
+    except (ValueError, KeyError, TypeError):
+        return
+    pp = str(env.get("PYTHONPATH") or "")
+    if pp.split(os.pathsep)[0] != zp:
+        env["PYTHONPATH"] = zp + (os.pathsep + pp if pp else "")
+
+
 def child_refusal(cmd: str, cwd: str, env: dict) -> str | None:
     """Why the hook refuses a child command of the judged Python (its argv as shell text), or None."""
     from . import hook

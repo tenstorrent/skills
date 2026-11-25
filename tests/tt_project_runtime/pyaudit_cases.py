@@ -57,6 +57,26 @@ def test_pyaudit_refuses_writes_reads_and_children(env, cred_home):
     assert '"kind": "pyaudit"' in log
 
 
+def test_pyaudit_glm_shell_puts_the_judge_first_again(tmp_path, monkeypatch):
+    """A GLM run's shell command (GuardedEnvironment) puts the judge's zip back first on PYTHONPATH."""
+    from ttp import glmenv, pyaudit
+
+    class Base:
+        def execute(self, action, cwd="", *, timeout=None):
+            return {"output": os.environ["PYTHONPATH"], "returncode": 0}
+    if glmenv.LocalEnvironment is not object:
+        pytest.skip("minisweagent is importable here: its own environment class is the base")
+    zp = str(tmp_path / "pyaudit.zip")
+    monkeypatch.setenv("TTP_RUN_DIR", str(tmp_path))
+    monkeypatch.setenv(pyaudit.POLICY_ENV, json.dumps({"zip": zp}))
+    monkeypatch.setenv("PYTHONPATH", "/elsewhere")
+    env = type("Env", (glmenv.GuardedEnvironment, Base), {})()
+    out = env._guarded({"command": "true"}, str(tmp_path))
+    assert out["returncode"] == 0 and out["output"] == zp + os.pathsep + "/elsewhere"
+    pyaudit.first(os.environ)
+    assert os.environ["PYTHONPATH"] == zp + os.pathsep + "/elsewhere"   # already first: unchanged
+
+
 def test_pyaudit_later_hook_is_not_added(env, cred_home):
     r = _pa_run(_pa_env(cred_home), "import sys; sys.addaudithook(lambda e, a: print('ADDED') if e == 'open' "
                                     "else None); open('/dev/null')", cred_home.work)
