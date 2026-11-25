@@ -30,7 +30,6 @@ from __future__ import annotations
 import fcntl
 import json
 import math
-import os
 import re
 import time
 from contextlib import contextmanager
@@ -87,9 +86,8 @@ def _read(path: Path) -> dict:
 
 
 def _write(path: Path, st: dict) -> None:
-    tmp = path.with_suffix(f".{os.getpid()}.tmp")
-    tmp.write_text(json.dumps(st))
-    os.replace(tmp, path)
+    from .project import durable_write
+    durable_write(path, json.dumps(st))
 
 
 def _roll(st: dict, window_s: float, now: float) -> dict:
