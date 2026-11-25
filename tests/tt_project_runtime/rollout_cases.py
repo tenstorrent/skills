@@ -105,7 +105,8 @@ def test_a_runs_rollback_for_an_outage_or_quota_is_refused_and_the_flag_is_uncha
         assert "per-run fallback" in out or "quality problem" in out
     assert rollout.level("glm_code") == 2 and not rollout.frozen("glm_code") and not rollout.rolled_back("glm_code")
     assert [r["kind"] for r in rollout.ledger("glm_code")] == ["set"], "nothing was recorded"
-    assert _roll(capsys, "rollback", "glm_code", "projA", "--reason", "review pass fell")[0] == 0
+    for reason in ("review pass fell", "pass rate down from 75% to 36%", "review pass fell on 500 tasks"):
+        assert _roll(capsys, "rollback", "glm_code", "projA", "--reason", reason)[0] == 0, reason
     assert rollout.level("glm_code") == 2 and not rollout.frozen("glm_code")
     assert set(rollout.rolled_back("glm_code")) == {"projA"}
     monkeypatch.delenv("TTP_RUN_DIR")

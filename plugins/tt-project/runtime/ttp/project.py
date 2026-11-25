@@ -920,8 +920,8 @@ PROVIDER_KEYS = {"billing", "tiers", "plugin_dirs", "worker_isolation", "mcp_ser
                  # providers.chat only: the rules-first model pick (modelpick.py); its keys (enabled, min_p,
                  # options) are checked by modelpick.config_problems.
                  "dispatch",
-                 # quota: the endpoint's token quota count and pacing (glmquota.py: on, size, window_s, reserve,
-                 # rate_window_s, count_cached).
+                 # quota: the endpoint's token quota count and pacing (glmquota.py: on, size, window_s,
+                 # reserve, count_cached).
                  "quota"}
 
 

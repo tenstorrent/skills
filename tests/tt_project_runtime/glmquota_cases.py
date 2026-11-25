@@ -167,3 +167,15 @@ def test_glm_quota_without_a_limit_paces_on_the_tokens_counted_when_a_quota_429_
     assert glmquota.paced(cfg, {"kind": "review", "priority": 1}, "worker", nxt + 1320) == "paced"
     # A day later the observation has aged out: counted, not paced.
     assert glmquota.view(cfg, _GQ_HOUR + 1500 + glmquota.OBSERVED_KEEP_S + 60)["paced"] is False
+
+
+def test_glm_quota_429_that_names_its_window_rolls_windows_on_it(monkeypatch, tmp_path):
+    from ttp import glmquota
+    _gq_home(monkeypatch, tmp_path)
+    cfg = {"providers": {"chat": {"endpoint": "cloud"}}}
+    got = glmquota.parse('{"error": {"code": "quota_exceeded", "message": "per minute limit exceeded"}}')
+    assert got == {"window_s": 60}
+    glmquota.sync("cloud", got, now=_GQ_HOUR + 120, spent=True)
+    glmquota.add("cloud", 1_000_000, now=_GQ_HOUR + 121)
+    assert glmquota.view(cfg, _GQ_HOUR + 122)["used"] == 1_000_000
+    assert glmquota.view(cfg, _GQ_HOUR + 181)["used"] == 0, "the 429's own minute window rolled"

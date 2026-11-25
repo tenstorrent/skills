@@ -176,9 +176,14 @@ def stop_project(flag: str, project: str, why: str, by: str = "daemon") -> bool:
 
 
 # A run's rollback names an endpoint fault: per-run fallback already moves each run off the endpoint (route.FAULTS,
-# glmwork.FALLBACK_ON), so a flag is never rolled back or frozen for one (outage_refusal).
-OUTAGE_RE = re.compile(r"outage|quota|rate.?limit|\b429\b|unreachable|\bdown\b|endpoint (?:is )?(?:out|dead|failing)"
-                       r"|\b5\d\d\b|timed? ?out|connection (?:refused|reset|error)|overloaded|capacity", re.I)
+# glmwork.FALLBACK_ON), so a flag is never rolled back or frozen for one (outage_refusal). The fault words
+# down/out/dead/failing/capacity/timed out and a bare 5xx also read as quality wording ("pass rate down",
+# "500 tasks"), so they match only next to endpoint words, and a 5xx only as an HTTP status.
+OUTAGE_RE = re.compile(r"outage|quota|rate.?limit|\b429\b|unreachable|connection (?:refused|reset|error)"
+                       r"|overloaded"
+                       r"|(?:endpoint|glm|server|api|provider)\b[\w'&.: -]{0,40}\b"
+                       r"(?:down|out|dead|dying|fail(?:ed|ing)|unavailable|timed? ?out|capacity)"
+                       r"|(?:http|status)\s+5\d\d\b|\b5\d\d\s+(?:errors?|responses?)\b|error\s+5\d\d\b", re.I)
 
 
 def outage_refusal(reason: str) -> str:

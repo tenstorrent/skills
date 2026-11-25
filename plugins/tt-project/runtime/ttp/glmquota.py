@@ -3,8 +3,8 @@ it does not run dry before the reset, and keep judgement runs off it while it is
 
 Counting: every chat bridge run adds each answer's tokens (prompt and completion, cached prompt tokens too
 unless `count_cached` is false) to one file per endpoint alias, ~/.tt-project/quota/<alias>.json, under a
-file lock: every project on this host shares it. The file keeps the window's reset, its tokens used, the
-quota's size and per-minute counts for the burn rate. A 429 quota_exceeded answer (chatbridge.quota_until)
+file lock: every project on this host shares it. The file keeps the window's reset, its tokens used and
+the quota's size. A 429 quota_exceeded answer (chatbridge.quota_until)
 syncs it from the body's numbers only (limit, used, resets_at; numeric x-ratelimit headers on that answer
 too): used becomes the larger of ours and the server's, as other hosts spend the same quota.
 
@@ -20,10 +20,9 @@ or rollback (rollout.outage_refusal):
 - lowest priority first: each STEP of the budget further ahead sheds one more priority level, 5 first;
 - question, plan and review kinds, coordinator runs and specs with a `conclusion:` line, all of them;
 - once the whole quota is spent, every run, until the reset.
-The allowed rate (quota left over the time to reset) and the burn rate (tokens over the last `rate_window_s`)
-are shown beside it. Runs already going keep running: pacing only moves new starts.
+Runs already going keep running: pacing only moves new starts.
 Settings (`providers.chat.quota`, every key optional): on (default true; false: no counting, no pacing),
-size, window_s (3600), reserve (0.1), rate_window_s (600), count_cached (true).
+size, window_s (3600), reserve (0.1), count_cached (true).
 """
 from __future__ import annotations
 
@@ -37,9 +36,7 @@ from datetime import datetime
 from pathlib import Path
 
 DIR = "quota"
-DEFAULTS = {"on": True, "size": 0, "window_s": 3600, "reserve": 0.1, "rate_window_s": 600, "count_cached": True}
-BUCKET_S = 60
-KEEP_S = 3600                       # per-minute counts kept this long
+DEFAULTS = {"on": True, "size": 0, "window_s": 3600, "reserve": 0.1, "count_cached": True}
 REASON = "paced"                    # the route entry's fallback while the quota is short (route.REASONS)
 SHORT_KINDS = ("question", "plan", "review")
 SLACK = 0.02                        # share of the window's budget used ahead of an even spread before pacing acts
@@ -111,10 +108,7 @@ def add(key: str, tokens: int, window_s: float = 3600, now: float | None = None)
     with _locked(key) as path:
         st = _roll(_read(path), window_s, now)
         st["used"] = int(st.get("used") or 0) + int(tokens)
-        b = {k: v for k, v in (st.get("buckets") or {}).items() if float(k) > now - KEEP_S}
-        m = str(int(now - now % BUCKET_S))
-        b[m] = int(b.get(m) or 0) + int(tokens)
-        st["buckets"], st["ts"] = b, now
+        st["ts"] = now
         _write(path, st)
 
 
@@ -148,6 +142,8 @@ def sync(key: str, got: dict, window_s: float = 3600, now: float | None = None, 
     if not key or not (got or spent):
         return
     now = time.time() if now is None else now
+    if got.get("window_s"):
+        window_s = float(got["window_s"])   # the 429 names its own window (minute, hourly): windows roll on it
     with _locked(key) as path:
         st = _read(path)
         if float(got.get("reset") or 0) > now:
@@ -172,8 +168,8 @@ def sync(key: str, got: dict, window_s: float = 3600, now: float | None = None, 
 
 
 def view(cfg: dict | None, now: float | None = None) -> dict:
-    """The quota's state now: {} when off; else {key, used, size, size_from, reset, rate, allowed, short,
-    ahead (the share of the window's budget used ahead of an even spread), exhausted, paced (size known)}."""
+    """The quota's state now: {} when off; else {key, used, size, size_from, reset, short, ahead (the share
+    of the window's budget used ahead of an even spread), exhausted, paced (size known)}."""
     c = conf(cfg)
     if not c:
         return {}
@@ -182,18 +178,15 @@ def view(cfg: dict | None, now: float | None = None) -> dict:
     observed = max([int(o[1]) for o in (st.get("observed") or []) if float(o[0]) > now - OBSERVED_KEEP_S] or [0])
     size = int(st.get("size") or 0) or int(c["size"] or 0) or observed
     used = int(st.get("used") or 0)
-    span = max(float(c["rate_window_s"] or 600), BUCKET_S)
-    rate = sum(int(v) for k, v in (st.get("buckets") or {}).items() if float(k) > now - span) / span
-    out = {"key": c["key"], "used": used, "size": size, "reset": float(st["reset"]), "rate": rate,
+    out = {"key": c["key"], "used": used, "size": size, "reset": float(st["reset"]),
            "size_from": st.get("size_from") if st.get("size") else "setting" if c["size"] else "observed" if size else "",
-           "paced": bool(size), "short": False, "ahead": 0.0, "exhausted": False, "allowed": 0.0,
+           "paced": bool(size), "short": False, "ahead": 0.0, "exhausted": False,
            "last_429": st.get("last_429") or {}}
     if not size:
         return out
     budget = size * (1 - float(c["reserve"] or 0))
     window_s = float(c["window_s"] or 3600)
     gone = min(max((now - (out["reset"] - window_s)) / window_s, 0.0), 1.0)
-    out["allowed"] = max(budget - used, 0) / max(out["reset"] - now, 1)
     out["exhausted"] = used >= size or float(st.get("spent") or 0) == out["reset"]   # the reserve is the margin for runs in flight and the band pacing tracks in
     out["ahead"] = (used - budget * gone) / budget if budget > 0 else 1.0
     out["short"] = out["exhausted"] or out["ahead"] > SLACK

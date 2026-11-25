@@ -229,14 +229,14 @@ def handed_done(run_dir) -> bool:
     return isinstance(got, dict) and got.get("status") == "done"
 
 
-def hit(run_dir, why: str, kind: str = "guard", detail: str = "", soft: bool = False) -> bool:
+def hit(run_dir, why: str, kind: str = "guard", detail: str = "") -> None:
     """End the run as a hand-back to Opus: record the refusal and replace its hand-off with a `needs_opus`
     one (a hand-off it already wrote is kept beside it). The runner stops the agent when HIT exists;
     the daemon requeues the task on Opus. `kind`: "guard" for a refused side effect, GATE for a failed gate
-    command on a device run, whose output tail is `detail`. `soft` (a redirect's refusal): a `done` hand-off stands
-    and nothing is written (False). Never raises: a guard that cannot write still refuses."""
-    if not run_dir or soft and handed_done(run_dir):
-        return False
+    command on a device run, whose output tail is `detail`. Never raises: a guard that cannot write still
+    refuses."""
+    if not run_dir:
+        return
     d = Path(run_dir)
     why = why.strip()[:280]
     try:
@@ -254,7 +254,6 @@ def hit(run_dir, why: str, kind: str = "guard", detail: str = "", soft: bool = F
                                            **({"output": detail[-OUTPUT_TAIL:]} if detail else {})}))
     except OSError:
         pass
-    return True
 
 
 def hit_reason(run_dir) -> str:
@@ -390,7 +389,7 @@ def refused(run_dir, why: str, kind: str = "guard", cfg: dict | None = None) -> 
     s = refusal_settings(cfg)
     n = len(refusals(run_dir)) + 1
     back = cls == HARMFUL or not s["redirect"] or n >= s["hand_back_after"]
-    kept = back and cls != HARMFUL and handed_done(run_dir)   # a redirect never undoes a done hand-off (hit's soft)
+    kept = back and cls != HARMFUL and handed_done(run_dir)   # a redirect never undoes a done hand-off
     back = back and not kept
     if run_dir:
         try:
@@ -401,7 +400,7 @@ def refused(run_dir, why: str, kind: str = "guard", cfg: dict | None = None) -> 
         except OSError:
             pass
     if back:
-        hit(run_dir, why if cls == HARMFUL or n == 1 else f"refusal {n} in one run: {why}", kind, soft=cls != HARMFUL)
+        hit(run_dir, why if cls == HARMFUL or n == 1 else f"refusal {n} in one run: {why}", kind)
         return f"refused: {why}; the run ends and its task goes back to Opus"
     left = s["hand_back_after"] - n
     if kept:
