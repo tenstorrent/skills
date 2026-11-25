@@ -1,5 +1,8 @@
 # Memory and L1
 
+L1 and circular-buffer failures: why a dtype, batch, grid or KV change breaks a working config, modules that collide
+only when combined, collective workspaces and long-context budgets.
+
 **"Static circular-buffer end overlaps live L1."** The most common device failure across bringups. A program's
 static CB region ends above the lowest live L1 tensor. The message gives both addresses to the byte, and the CB
 sizes of the op's factory account for the difference exactly, so arithmetic on the factory finds the cause faster

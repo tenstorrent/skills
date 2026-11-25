@@ -1,5 +1,8 @@
 # Numerics
 
+Accuracy that looks fine by PCC but drifts, loops or depends on batch or slot: gain errors, SDPA statistics at long
+context, recurrent state, fused-path rounding, padding NaNs, and choosing a precision policy.
+
 **PCC cannot see a uniform gain error.** Several real biases passed PCC: BF16 accumulation biasing large-K
 matmuls, LoFi truncating operands, the FPU truncating FP32 operands to fewer mantissa bits, BFP4 packing taking
 the block exponent before rounding (a clamp), and a small gain inside a fused recurrence op. A least-squares gain

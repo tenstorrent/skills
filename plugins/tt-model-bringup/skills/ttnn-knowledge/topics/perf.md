@@ -1,5 +1,8 @@
 # Performance work
 
+Comparing measurements, host time per step, profiler use, kernel edits that do nothing, weight-streaming bounds and
+roofline accounting.
+
 **Comparing measurements.** Numbers drifted about 1% between sessions and 2–3% between machines; a C++ build
 running during a timing run, a variant order inside one process, and a benchmark missing a feature flag each
 produced wrong conclusions. Re-measuring the previous head in the same session before attributing a small

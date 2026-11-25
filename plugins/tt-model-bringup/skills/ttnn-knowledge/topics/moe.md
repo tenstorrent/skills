@@ -1,5 +1,8 @@
 # Mixture of experts
 
+Routed experts: why each batch size is a different problem, routing and batch invariance, expert vs tensor parallel,
+op limits, expert precision and placing experts on a mesh.
+
 **A routed layer is a different problem at every batch.** At batch 1 it is a small dense layer; at large batch it
 touches many experts with few tokens each; prefill touches most experts with many tokens. One port that ran
 experts per user served about 2 tokens/s per user at batch 32; processing all users' selections in one pass made

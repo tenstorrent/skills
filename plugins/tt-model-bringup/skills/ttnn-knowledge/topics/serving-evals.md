@@ -1,5 +1,8 @@
 # Serving and evals
 
+The vLLM plugin and its setup, sampler routing, eval harnesses and their infrastructure, and slow benchmark and eval
+runs.
+
 ## Plugin and vLLM
 
 - **Top-k cap.** The shared device sampler handles top-k up to 32: the model's limit, the plugin's parameter

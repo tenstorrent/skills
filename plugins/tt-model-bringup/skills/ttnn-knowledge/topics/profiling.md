@@ -1,5 +1,7 @@
 # Profiling, tracing for measurement, and watcher
 
+Measuring traced runs, `tt-perf-report`, profiling large models and known tooling failures, and the watcher.
+
 ## Measuring traced runs
 
 - Open the device with `trace_region_size=0` where the revision supports it: traces then go into dynamic DRAM buffers, and capture fails if one could overlap replay memory, in which case reserve a region ([tracing](tracing.md)).

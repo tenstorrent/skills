@@ -1,5 +1,8 @@
 # Prefill, KV and paging
 
+Chunked, resumed and unaligned prefill, paged attention and its misses, program keys from offsets, prefix reuse and
+batched prefill, and long prompts.
+
 **Resumed or unaligned prefill differs from a fresh one.** Continuation at starts that are not chunk-aligned
 failed accuracy while aligned starts passed. Three causes stacked in one model: the legacy rotary-embedding op
 gave one core group a default compute config (use the HF-style rotary op in prefill); SDPA's Q/K chunk partition

@@ -1,5 +1,8 @@
 # Multi-chip and CCL
 
+Sharding over chips: Blackhole grid sizes, fused CCL ops, tensor-parallel patterns and 2D plans, distributed norms,
+and validating and setting up a multi-chip path.
+
 **Blackhole's worker grid is 11 columns wide; many configs assume 8.** This bit three ways:
 - SDPA decode derives reducer coordinates from the compute grid width while query shards sat on the first 8
   columns; an explicit 8-wide SDPA program config then read the wrong users once the batch exceeded 8. Matching

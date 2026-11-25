@@ -1,5 +1,8 @@
 # Environment and small traps
 
+Containers, sandboxes, caches, offline Hugging Face, commit hooks, network storage and small API traps that cost
+runs time.
+
 - **AutoDebug sandbox.** Hosts without unprivileged user namespaces fail the AutoDebug child sandbox preflight
   (bubblewrap) at every stage; `AUTODEBUG_SKIP_CHILD_SANDBOX=1` under an explicitly authorized unrestricted
   policy was used.

@@ -4,7 +4,8 @@ stage reviews, no runner gates: you decide how to check your work and say how yo
 
 Use the skills when the work reaches them: `lean-model` for the model (its outcome and lessons; ignore its
 `stage-review` and goal-gate mentions), `reference-accuracy`, `vllm-integration`, `agentic-serving` for serving
-and evals, `tt-device-usage` for devices, `ttnn-knowledge` by topic.
+and evals, `tt-device-usage` for devices. `ttnn-knowledge/topics/` holds what earlier bringups found
+out about the hardware and the stack, one file per topic, each opening with a line on what it covers.
 
 Settings are in models/autoports/<model>/bringup/agentic_evals/inputs.json. `scope`: `open` lets you change any
 tt-metal code the model needs (the model keeps its own versions); `contained` keeps every change inside the model

@@ -1,5 +1,8 @@
 # Correctness: defaults and the HF reference
 
+TTNN defaults that change results while a module's semantics are being proven, and building and trusting the HF
+reference, including with synthetic weights.
+
 ## TTNN defaults while proving semantics
 
 - Start with `ttnn.bfloat16`, `ttnn.TILE_LAYOUT`, and `ttnn.DRAM_MEMORY_CONFIG` where that simplifies correctness; optimize memory layout after PCC is stable.

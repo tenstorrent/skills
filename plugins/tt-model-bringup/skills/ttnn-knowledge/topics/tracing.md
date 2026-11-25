@@ -1,5 +1,8 @@
 # Tracing and the program cache
 
+Trace capture and warmup, allocations or compiles after capture, program-cache signatures, the generator split,
+multi-chip traces and debugging replay failures.
+
 **Allocation or compilation after capture.** The usual causes, in the order they were found: programs that only
 some prompt lengths or offsets use (see prefill-kv); buffers created lazily on first use of a slot or on the
 first decode step; reset, prefill-chunk and sampling programs never run before the decode trace was recorded. A
