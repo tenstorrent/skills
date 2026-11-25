@@ -290,7 +290,10 @@ def test_a_cant_reach_claim_is_judged_by_each_machines_last_ssh_probe_and_sent_a
     # A setting widens the window; a question, a condition, code and a probe that held stay as written.
     p.set_config("ssh.reach_fresh_min", 60)
     assert claimcheck.check(p, "box-a cannot be reached.", now=now + 40 * 60)[1], "40 min old is fresh under 60"
-    for text in ("Can workers not reach box-a?", "If box-a is unreachable, retry later.", "Ran `ssh box-a || echo unreachable`."):
+    assert claimcheck.check(p, "box-a can't be reached.", now=now)[1]
+    for text in ("Can workers not reach box-a?", "If box-a is unreachable, retry later.", "Ran `ssh box-a || echo unreachable`.",
+                 "While box-a can't be reached, the watcher keeps checking.", "Whenever box-a is unreachable, it retries.",
+                 "During an outage box-a can't be reached.", "If the host is down, the watcher alerts after 5 minutes."):
         assert claimcheck.check(p, text, now=now) == (text, [], 0), text
     claims = [{"text": "box-a is unreachable", "expect": "true", "_rc": 0}]
     assert claimcheck.check(p, "box-a is unreachable.", claims, now=now)[1] == []

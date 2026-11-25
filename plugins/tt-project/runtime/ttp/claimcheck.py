@@ -54,7 +54,7 @@ _VERB = re.compile(rf"(?i)\b(?P<v>{_RUN_V}|started|{_STOP_V}|raised|lowered|incr
                    r"pushed|enabled|(?:(?<=\bis )|(?<=\bare )|(?<=\bwas )|(?<=\bwere )|(?<=\bnow )|(?<=\bbeen ))set|set(?= to\b))\b")
 # Words before the verb (same clause) that make it a plan, condition or negation, not a claim.
 _HEDGE = re.compile(r"(?i)(?:\b(?:will|shall|going to|plan(?:s|ned)? to|about to|want to|needs? to|to be|to get|"
-                    r"not|never|no longer|once|until|when|after|if|before|unless|should|would|could|might|may|can|"
+                    r"not|never|no longer|once|until|when(?:ever)?|while|during|in case|after|if|before|unless|should|would|could|might|may|can|"
                     r"let me|i['’]ll|we['’]ll|it['’]ll|try(?:ing)? to|whether)\b|n['’]t\b)[^.!?;,\n]{0,60}$")
 _CODE = re.compile(r"`[^`\n]*`")
 _TASK = re.compile(r"(?i)(?<!msg )(?<!message )(?<!pr )(?<!issue )(?<!order )(?<!reply )(?<!messages )#(\d{1,9})\b")
