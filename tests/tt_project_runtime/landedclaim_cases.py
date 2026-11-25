@@ -512,6 +512,28 @@ def test_a_later_edit_of_the_same_lines_with_no_revert_keeps_a_commit_landed(env
     assert landed.reverted_by(repo, x, tip) == "" and landed.check(p, repo, x, fetch=False)[0] == 0
 
 
+def test_an_unresolvable_reverts_range_poisons_no_landed_check_at_its_tip(env, monkeypatch):
+    """A "Reverts A..B" whose range this repo cannot resolve (shas a rewrite, another fork or a typo left
+    behind) names no commit we can know: an untouched ancestor stays landed, and a real revert elsewhere in
+    the same history still reads as reverted."""
+    from ttp import landed
+    p, repo, a = _claim_replay_setup(env, monkeypatch, landed=True)
+    _commit(repo, "one.txt", "one\n")
+    one = _git_out(repo, "rev-parse", "HEAD")
+    _commit(repo, "two.txt", "two\n")
+    two = _git_out(repo, "rev-parse", "HEAD")
+    _git_out(repo, "revert", "--no-edit", one)   # a real revert elsewhere in the same history
+    rev = _git_out(repo, "rev-parse", "HEAD")
+    _git_out(repo, "commit", "--allow-empty", "-qm", "Reverts deadbeef1..deadbeef2")
+    _git_out(repo, "push", "-q", "origin", "HEAD:refs/heads/proj")
+    tip = _git_out(repo, "rev-parse", "origin/proj")
+    assert landed.holds(repo, two, tip) is True, "nothing reverts 'two', whatever the tip's other messages"
+    assert landed.reverted_by(repo, two, tip) == ""
+    assert landed.reverted_by(repo, one, tip) == rev
+    assert landed.check(p, repo, two, fetch=False)[0] == 0
+    assert landed.check(p, repo, one, fetch=False)[0] == landed.NOT_YET
+
+
 def test_a_push_queue_range_revert_takes_out_each_commit_of_its_range(env, monkeypatch):
     """The push queue's post-landing revert ('Reverts A..B', A left out): each commit in the range reads
     reverted by it; A and commits before it stay landed."""

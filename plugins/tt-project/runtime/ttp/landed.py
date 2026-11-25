@@ -271,9 +271,9 @@ def _reverted_by(repo: Path, sha: str, tip: str) -> str | None:
                 key = (str(repo), start, end)
                 if key not in _ranges:
                     inside = _git(repo, "rev-list", f"{start}..{end}")
-                    if inside.returncode != 0:
-                        return None
-                    _ranges[key] = frozenset(inside.stdout.split())
+                    # a range that cannot resolve (shas a rewrite, another fork or a typo left behind) names
+                    # no commit we can know: it skips, so one bad record cannot poison every check at this tip
+                    _ranges[key] = frozenset(inside.stdout.split()) if inside.returncode == 0 else frozenset()
                 if sha in _ranges[key]:
                     hits.append(rev)
     if not hits:

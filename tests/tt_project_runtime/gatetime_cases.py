@@ -737,8 +737,9 @@ _PL_BAD = f"sh -c \"grep -qs bad pl*.txt && {{ {_PL_FAIL}; }}; {_PL_PASS}\""
 
 def _pl_rows(env, tmp_path, monkeypatch, rows, check=_PL_BAD, lead=None):
     """Like _pl_land, but each queue row lands several commits: `rows` lists rows, each a list of (file, content,
-    task key) commits whose subject ends "(#<id>)" of that key's code task (made here, branch ttp/t<id>-<key>).
-    A row's own task is a review on branch ch<i>, or on its `lead` key's code branch. Returns
+    task key) commits whose subject ends "(#<id>)" of that key's code task (made here, branch ttp/t<id>-<key>);
+    a 4th element overrides the commit message (a string, or a callable given `tasks`). A row's own task is a
+    review on branch ch<i>, or on its `lead` key's code branch. Returns
     (p, g, pushed, {key: task id}, [[commit sha, ...] per row])."""
     import json as _json
     import subprocess as sp
@@ -751,11 +752,14 @@ def _pl_rows(env, tmp_path, monkeypatch, rows, check=_PL_BAD, lead=None):
     tip, tasks, shas = g("rev-parse", "HEAD"), {}, []
     for row in rows:
         shas.append([])
-        for name, text, key in row:
+        for spec in row:
+            name, text, key = spec[0], spec[1], spec[2]
             if key not in tasks:
                 tasks[key] = p.db.add_task(f"code {key}", kind="code", status="done")
                 p.db.x("UPDATE tasks SET branch=? WHERE id=?", (f"ttp/t{tasks[key]}-{key}", tasks[key]))
-            (p.root / name).write_text(text); g("add", name); g("commit", "-qm", f"{key} {name} (#{tasks[key]})")
+            (p.root / name).write_text(text); g("add", name)
+            msg = spec[3] if len(spec) > 3 else f"{key} {name} (#{tasks[key]})"
+            g("commit", "-qm", msg(tasks) if callable(msg) else msg)
             shas[-1].append(g("rev-parse", "HEAD"))
     (p.root / "PLVERSION").write_text("2\n"); g("add", "PLVERSION")
     g("commit", "-qm", "bump", "-m", "Ttp-Version-Bump: 2")
@@ -854,6 +858,53 @@ def test_post_land_bisect_past_its_time_limit_reverts_the_whole_entry_saying_why
     assert g("diff", "--name-only", pushed, head).split() == ["pl_b1.txt", "pl_c1.txt"]
     assert f"Reverts {shas[0][0][:10]}..{shas[1][1][:10]}" in body and "the bisect of 2 commits passed its" in body
     assert f"Forward revert of {shas[0][0][:10]}..{shas[1][1][:10]} by " in rev["spec"] and "passed its" in rev["spec"]
+
+
+def test_post_land_whole_range_revert_blames_the_entry_s_task_not_the_guilty_commit_s(env, tmp_path, monkeypatch):
+    """A guilty commit naming another task, whose narrowed reverts cannot pass the tests: the entry's whole
+    range is reverted and the entry's task (never the guilty commit's) is dropped and re-landed."""
+    import json as _json
+    from ttp import landed, postland
+    p, g, pushed, tasks, shas = _pl_rows(env, tmp_path, monkeypatch, [
+        [("pl_y1.txt", "bad\n", "y"), ("pl_y2.txt", "bad\n", "y"), ("pl_z.txt", "bad\n", "z")]])
+    postland.tend(p, p.config())
+    assert postland.tend(p, p.config()) == "guilty"
+    x = p.db.one("SELECT id FROM tasks WHERE title='change 0'")["id"]
+    (fix,) = p.db.q("SELECT * FROM tasks WHERE title LIKE 'Fix #%'")
+    assert f"relands:{x}" in _json.loads(fix["labels"]), "the entry's task is re-landed by the fix"
+    assert landed.dropped(p.db, x), "the entry's task no longer reads as landed"
+    assert not landed.dropped(p.db, tasks["y"]), "the guilty commit's task keeps its landing"
+
+
+def test_post_land_ignores_a_guilty_commit_s_task_reference_that_names_no_task(env, tmp_path, monkeypatch):
+    """A guilty commit whose subject's "(#N)" names a task that does not exist: the entry's task owns the
+    revert, never the phantom id."""
+    from ttp import landed, postland
+    p, g, pushed, tasks, shas = _pl_rows(env, tmp_path, monkeypatch, [
+        [("pl_a.txt", "bad\n", "a", "a pl_a.txt (#999999)"), ("pl_b.txt", "ok\n", "b")]])
+    assert postland._task_of(p.root, shas[0][0]) == 999999, "the subject still names its phantom task"
+    postland.tend(p, p.config())
+    assert postland.tend(p, p.config()) == "guilty"
+    x = p.db.one("SELECT id FROM tasks WHERE title='change 0'")["id"]
+    assert landed.dropped(p.db, x), "the entry's task is dropped"
+    assert not p.db.q("SELECT * FROM task_dropped WHERE task NOT IN (SELECT id FROM tasks)"), \
+        "no phantom task is dropped"
+
+
+def test_post_land_ignores_a_task_reference_that_only_a_body_line_names(env, tmp_path, monkeypatch):
+    """A "(#N)" that only ends a body line names no task: the entry's task owns the revert, never the task
+    the body happens to mention."""
+    from ttp import landed, postland
+    p, g, pushed, tasks, shas = _pl_rows(env, tmp_path, monkeypatch, [
+        [("pl_y.txt", "ok\n", "y")],
+        [("pl_a.txt", "bad\n", "a", lambda t: f"a pl_a.txt\n\nfollow-up of an earlier change (#{t['y']})"),
+         ("pl_b.txt", "ok\n", "b")]])
+    assert postland._task_of(p.root, shas[1][0]) is None, "a body line names no task"
+    postland.tend(p, p.config())
+    assert postland.tend(p, p.config()) == "guilty"
+    x = p.db.one("SELECT id FROM tasks WHERE title='change 1'")["id"]
+    assert landed.dropped(p.db, x), "the entry's task is dropped"
+    assert not landed.dropped(p.db, tasks["y"]), "the mentioned task keeps its landing"
 
 
 def test_post_land_failure_that_fails_before_the_landing_too_is_pre_existing_never_reverted(

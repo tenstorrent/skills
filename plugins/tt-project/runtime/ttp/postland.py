@@ -56,7 +56,8 @@ REVERT_TITLE_TAIL = ": post-landing tests fail"
 # Its fix task is "Fix <who>" + the same tail; its spec names the failing tests on one line after this.
 FAILING_TESTS = "Its failing tests, the only ones to rerun: "
 BISECT_S = 900   # a bisect of one entry's commits stops here; past it the entry's whole range is reverted
-_TASK_OF = re.compile(r"\(#(\d+)\)\s*$|^Task: #(\d+)\s*$", re.M)   # a commit's task: its subject's "(#N)" or a Task trailer
+_TASK_OF = re.compile(r"^Task: #(\d+)([^0-9]|$)", re.M)   # a commit's task: its "Task: #N" trailer
+_SUBJECT_ID = re.compile(r"\(#(\d+)\)\s*$")             # ... or its subject's trailing "(#N)"
 
 
 def driver_argv(job: Path) -> list[str]:
@@ -242,13 +243,12 @@ def spawn(p: Project, job: Path) -> int:
 
 
 def _owner(db, e: dict, c: dict) -> int | None:
-    """The task a revert takes off: the guilty commit's own task when it names one that is not the entry's (by
-    id or branch), else the entry's."""
-    gt = c.get("guilty_task") if c.get("revert_head") else None
-    if not gt or gt == e.get("task"):
-        return e.get("task")
-    t = db.task(gt)
-    return e.get("task") if t and e.get("branch") and t.get("branch") == e.get("branch") else gt
+    """The task a revert takes off: the guilty commit's own task when a narrowed revert kept its change (a
+    whole-range revert takes the entry's own) and it exists and is not the entry's (by id or branch), else the
+    entry's."""
+    gt = c.get("guilty_task") if c.get("revert_head") and c.get("narrowed") else None
+    t = db.task(gt) if gt and gt != e.get("task") else None
+    return gt if t and not (e.get("branch") and t.get("branch") == e.get("branch")) else e.get("task")
 
 
 def failing_tests(db, revert_title: str) -> list[str]:
@@ -579,8 +579,11 @@ def _own_commits(repo: Path, start: str, sha: str) -> list[str]:
 def _task_of(repo: Path, sha: str) -> int | None:
     """The task a commit names: its subject's trailing "(#N)" or a "Task: #N" trailer; None when it names none."""
     r = _git(repo, "log", "-1", "--format=%B", sha)
-    m = _TASK_OF.search(r.stdout) if r.returncode == 0 else None
-    return int(m.group(1) or m.group(2)) if m else None
+    if r.returncode != 0:
+        return None
+    subject, _, rest = r.stdout.partition("\n")
+    m = _SUBJECT_ID.search(subject) or _TASK_OF.search(rest)
+    return int(m.group(1)) if m else None
 
 
 def _bisect(commits: list[str], ids: list[str], failed, deadline: float) -> tuple[str, str]:
