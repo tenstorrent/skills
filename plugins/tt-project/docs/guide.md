@@ -2378,13 +2378,14 @@ receiving project at once.
 ### A missed promise changes the plan
 
 A promise, order or claim whose due passes with nothing delivered records a miss (replan.py). Moving
-its due afterwards (`obligation` with `key` and `due`) is refused unless the same batch changes the plan
-on its critical path. Plan changes that count: a `task_add` naming the key or continuing an owner (new
+its due afterwards (`obligation` with `key` and `due`) should come with a plan change on its critical path
+in the same batch; a move with none is applied as sent but never hidden: its chat's digest says the
+promise was missed and moved, and the daily review counts it. Plan changes that count: a `task_add` naming the key or continuing an owner (new
 owner, split, continue), a `task_update` of an owner changing `priority`, `resources`, `depends_on`,
 `status` or `spec`, an `obligation` attaching a new owner, a `config_set` on a key the obligation or its
 owners' block reasons name (the bottleneck), or a `justify` of three words or more naming what changed
 (it may ride on the due move itself). A move the user asked for cites their message (`message`: its
-id) and is never refused. A reply giving a new time in the chat of a missed promise with no plan change
+id). A reply giving a new time in the chat of a missed promise with no plan change
 in its batch raises one `promise_moved_unchanged` event. The second miss of the same item makes its
 must-act line a re-plan: a new split, route or owner, or an honest update in its chat with any time
 from Expected finish (`ttp eta <key>`), never a guess. The daily review's `missed promises` line counts

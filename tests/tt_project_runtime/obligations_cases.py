@@ -1122,8 +1122,8 @@ def test_obligation_actions_that_change_nothing_owed_are_notes_and_kept_gates_st
     new = ob.open_order(p.db, again)
     assert new and new["id"] != oid and new["promise"]["class"] == "change" and new["text"] == "build it"
     assert f"obligation {oid} is closed: the order of message #{again} is recorded as a new one" in notes()
-    # Kept: a missed due with no plan change, an unknown milestone, a Restrictions change without a
-    # source and a task_update replacing a guard line.
+    # Kept: an unknown milestone, a Restrictions change without a source and a task_update replacing a
+    # guard line. A missed due with no plan change is applied and its chat told (replan.bare_move).
     late = p.db.post("in", "and ship it", chat="c1")
     ob.add_order(p, "ship it", late, [code], due=now - 60, action_class="change", now=now - 7200)
     lid = ob.open_order(p.db, late)["id"]
@@ -1135,8 +1135,8 @@ def test_obligation_actions_that_change_nothing_owed_are_notes_and_kept_gates_st
         {"type": "obligation", "key": plain, "evidence": "done", "milestone": "nope"},
         {"type": "charter_update", "section": "Restrictions", "quote": "Never merge.", "text": "Merging is fine."},
         {"type": "task_update", "id": guarded, "replace": {"old": "- never push to main", "new": ""}}])
-    assert len(probs) == 4, probs
-    assert any("a new time alone is refused" in x for x in probs), probs
+    assert len(probs) == 3, probs
+    assert ob.get(p.db, lid)["promise"]["due"] == now + 7200 and f"{lid} missed its due" in notes()
     assert any("no milestone nope" in x and "its milestones: draft" in x for x in probs), probs
     assert any(x.startswith("charter_update") for x in probs) and p.charter_path.read_text() == before
     assert any("touches a safety line" in x for x in probs), probs
@@ -1659,8 +1659,8 @@ def test_a_receipt_on_partial_or_blocked_owner_work_is_kept_as_progress_and_the_
 
 
 def test_obform_kept_forms_are_not_rewritten_and_still_refused(env, monkeypatch):
-    """The keep list, in one batch: a missed due moved with no plan change is refused (a receipt citing a
-    partial hand-off is kept as progress, a note); a review never owns a change order, not even as a done owner's only open successor;
+    """The keep list, in one batch (a receipt citing a partial hand-off is kept as progress and a missed due
+    moved with no plan change is applied and told, both notes): a review never owns a change order, not even as a done owner's only open successor;
     a due move on an open obligation with no due stays a note. None is rewritten (no "applied as" note)."""
     from ttp import coordinator as coord, obligations as ob
     p, d, now, tid, check, mid, raised = _order_setup(env, monkeypatch)
@@ -1683,9 +1683,9 @@ def test_obform_kept_forms_are_not_rewritten_and_still_refused(env, monkeypatch)
          "owners": [made, rev, code]},
         {"type": "obligation", "key": plain, "due": now + 3600}])
     applied, notes = _obform_notes(p, coord)
-    assert len(probs) == 1 and applied == [], (probs, applied)
+    assert len(probs) == 0 and applied == [], (probs, applied)
     assert f"{part}: receipt recorded as progress" in notes and "so the acceptance is not met" in notes, notes
-    assert any("a new time alone is refused" in x for x in probs), probs
+    assert "missed its due" in notes and "with no plan change, as sent" in notes, notes
     assert ob.get(p.db, part)["receipt"] is None and ob.open_order(p.db, mid)["promise"]["tasks"] == [code]
     assert f"#{made} is done, so not attached" in notes and f"#{rev} is a review task" in notes
     assert f"{plain} is open but has no promise or due to move" in notes

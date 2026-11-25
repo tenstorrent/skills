@@ -23,23 +23,23 @@ def _rp_setup(env, monkeypatch, now=None):
     return p, ob, o["id"], tid, other, late
 
 
-def test_replan_missed_due_move_is_refused_without_a_plan_change(env, monkeypatch):
-    """Past its due, `obligation` key+due alone is refused, naming what counts; nothing moves. A batch with
-    a non-owner update, a one-word justify or a refused plan action does not count either."""
-    from ttp import coordinator as coord
+def test_replan_missed_due_move_without_a_plan_change_is_applied_and_never_hidden(env, monkeypatch):
+    """Replayed refusal ('o325 missed its due: a new time alone is refused'): past its due, `obligation`
+    key+due alone (here with a non-owner update, no plan change) is applied as sent, with a note; the chat's
+    digest says it was missed and moved, the move stays a bare one and the daily review counts it."""
+    from ttp import chatdigest, coordinator as coord, replan
     p, ob, oid, tid, other, late = _rp_setup(env, monkeypatch)
-    due = ob.get(p.db, oid)["promise"]["due"]
-    for extra in ([], [{"type": "task_update", "id": other, "priority": 1}],
-                  [{"type": "obligation", "key": oid, "justify": "faster"}]):
-        out = coord.apply(p, [{"type": "obligation", "key": oid, "due": late + 3600}, *extra])
-        assert any("a new time alone is refused" in n for n in out), (extra, out)
-        assert ob.get(p.db, oid)["promise"]["due"] == due
-    out = coord.apply(p, [{"type": "obligation", "key": oid, "due": late + 3600}])
-    msg = next(n for n in out if "refused" in n)
-    for what in ("task_add naming", "priority, resources, depends_on, status or spec", "config_set",
-                 "`justify`", "`message`", f"ttp eta {oid}"):
-        assert what in msg, what
-    assert ob.get(p.db, oid)["promise"]["misses"]   # the miss is on record either way
+    out = coord.apply(p, [{"type": "obligation", "key": oid, "due": late + 3600},
+                          {"type": "task_update", "id": other, "priority": 1}])
+    assert out == [], out
+    pr = ob.get(p.db, oid)["promise"]
+    assert pr["due"] == late + 3600 and pr["moves"][-1]["plan"] is None and pr["misses"], pr
+    notes = " ".join(p.db.kv(coord.NOTES_KEY) or [])
+    assert f"{oid} missed its due" in notes and "with no plan change, as sent" in notes, notes
+    held = [h["text"] for h in ((p.db.kv(chatdigest.KV) or {}).get("held") or {}).get("c1") or []] + [
+        r["text"] for r in p.db.q("SELECT text FROM messages WHERE chat='c1' AND kind='info'")]   # digest off: posted
+    assert any(f"{oid} " in h and "missed its due" in h and "was moved to" in h for h in held), held
+    assert "due moves without a plan change" in replan.audit_line(p.db, late - 60, late + 60)
     # Before its due, a move needs nothing.
     p2, ob2, oid2, *_ = _rp_setup(env, monkeypatch)
     monkeypatch.setattr(time, "time", lambda: ob2.get(p2.db, oid2)["promise"]["due"] - 60)
@@ -172,9 +172,9 @@ def test_replan_prompt_rule_and_docs(env):
     assert "### A missed promise changes the plan" in guide and "`missed promises`" in guide
 
 
-def test_replan_order_resent_with_a_new_due_after_a_miss_needs_a_new_owner(env, monkeypatch):
-    """Re-sending a missed order's `order` action with a later due is the same move: refused alone,
-    kept with a new owner."""
+def test_replan_order_resent_with_a_new_due_after_a_miss_records_a_new_owner_as_its_plan(env, monkeypatch):
+    """Re-sending a missed order's `order` action with a later due is the same move: alone it is a bare
+    move (no plan), with a new owner that owner is its plan."""
     from ttp import coordinator as coord, obligations as ob
     p = make(env)
     now = time.time()
@@ -184,12 +184,13 @@ def test_replan_order_resent_with_a_new_due_after_a_miss_needs_a_new_owner(env, 
     oid = ob.add_order(p, "build it", mid, [tid], due=now + 600, action_class="change", now=now).split()[1]
     monkeypatch.setattr(time, "time", lambda: now + 1200)
     act = {"type": "obligation", "order": mid, "text": "build it", "action_class": "change", "due": now + 7200}
-    out = coord.apply(p, [{**act, "owners": [tid]}])
-    assert any("a new time alone is refused" in n for n in out), out
-    assert ob.get(p.db, oid)["promise"]["due"] == now + 600
-    assert coord.apply(p, [{**act, "owners": [other]}]) == []
+    assert coord.apply(p, [{**act, "owners": [tid]}]) == []
     pr = ob.get(p.db, oid)["promise"]
-    assert pr["due"] == now + 7200 and pr["moves"][-1]["plan"] == f"new owner #{other}"
+    assert pr["due"] == now + 7200 and pr["moves"][-1]["plan"] is None
+    monkeypatch.setattr(time, "time", lambda: now + 7800)
+    assert coord.apply(p, [{**act, "due": now + 14400, "owners": [other]}]) == []
+    pr = ob.get(p.db, oid)["promise"]
+    assert pr["due"] == now + 14400 and pr["moves"][-1]["plan"] == f"new owner #{other}"
 
 
 def test_replan_user_asked_move_needs_a_newer_message_in_its_chat(env, monkeypatch):
@@ -221,24 +222,24 @@ def test_replan_user_asked_move_needs_a_newer_message_in_its_chat(env, monkeypat
 
 def test_replan_same_value_task_update_is_no_plan_change(env, monkeypatch):
     """A task_update setting an owner's field to the value it already has changes no plan: the missed move
-    is refused; a real change in the same field lets it through."""
+    is a bare one (no plan); a real change in the same field is its plan."""
     from ttp import coordinator as coord
     p, ob, oid, tid, other, late = _rp_setup(env, monkeypatch)
-    due = ob.get(p.db, oid)["promise"]["due"]
     spec = p.db.task(tid)["spec"]
-    for same in ({"priority": 2}, {"spec": spec}, {"priority": 2, "spec": spec}):
-        out = coord.apply(p, [{"type": "task_update", "id": tid, **same},
-                              {"type": "obligation", "key": oid, "due": late + 3600}])
-        assert any("a new time alone is refused" in n for n in out), (same, out)
-        assert ob.get(p.db, oid)["promise"]["due"] == due
+    for n, same in enumerate(({"priority": 2}, {"spec": spec}, {"priority": 2, "spec": spec})):
+        monkeypatch.setattr(time, "time", lambda n=n: late + 7200 * n)
+        assert coord.apply(p, [{"type": "task_update", "id": tid, **same},
+                               {"type": "obligation", "key": oid, "due": late + 7200 * n + 3600}]) == []
+        assert ob.get(p.db, oid)["promise"]["moves"][-1]["plan"] is None, same
+    monkeypatch.setattr(time, "time", lambda: late + 7200 * 3)
     assert coord.apply(p, [{"type": "task_update", "id": tid, "priority": 1},
-                           {"type": "obligation", "key": oid, "due": late + 3600}]) == []
+                           {"type": "obligation", "key": oid, "due": late + 7200 * 3 + 3600}]) == []
     assert ob.get(p.db, oid)["promise"]["moves"][-1]["plan"] == f"task_update #{tid} changes priority"
 
 
 def test_replan_order_resent_takes_the_batchs_plan_change(env, monkeypatch):
     """A re-sent missed order's new due follows the key+due rule: an owner's task_update in the same batch
-    (which its refusal names) lets it through; nothing, or a same-value update, is refused."""
+    is its plan; nothing, or a same-value update, makes it a bare move (no plan)."""
     from ttp import coordinator as coord, obligations as ob
     p = make(env)
     now = time.time()
@@ -247,14 +248,16 @@ def test_replan_order_resent_takes_the_batchs_plan_change(env, monkeypatch):
     oid = ob.add_order(p, "build it", mid, [tid], due=now + 600, action_class="change", now=now).split()[1]
     monkeypatch.setattr(time, "time", lambda: now + 1200)
     act = {"type": "obligation", "order": mid, "text": "build it", "action_class": "change", "due": now + 7200}
-    for extra in ([], [{"type": "task_update", "id": tid, "priority": 2}]):
-        out = coord.apply(p, [*extra, act])
-        assert any("a new time alone is refused" in n for n in out), (extra, out)
-        assert ob.get(p.db, oid)["promise"]["due"] == now + 600
-    out = coord.apply(p, [{"type": "task_update", "id": tid, "priority": 1, "spec": "new approach: split it"}, act])
+    for n, extra in enumerate(([], [{"type": "task_update", "id": tid, "priority": 2}])):
+        monkeypatch.setattr(time, "time", lambda n=n: now + 1200 + 7200 * n)
+        assert coord.apply(p, [*extra, {**act, "due": now + 7200 * (n + 1)}]) == [], extra
+        assert ob.get(p.db, oid)["promise"]["moves"][-1]["plan"] is None, extra
+    monkeypatch.setattr(time, "time", lambda: now + 1200 + 7200 * 2)
+    out = coord.apply(p, [{"type": "task_update", "id": tid, "priority": 1, "spec": "new approach: split it"},
+                          {**act, "due": now + 7200 * 3}])
     assert out == [], out
     pr = ob.get(p.db, oid)["promise"]
-    assert pr["due"] == now + 7200 and pr["moves"][-1]["plan"].startswith(f"task_update #{tid} changes")
+    assert pr["due"] == now + 7200 * 3 and pr["moves"][-1]["plan"].startswith(f"task_update #{tid} changes")
 
 
 def test_replan_a_review_task_add_earlier_in_the_batch_keeps_the_batch_start_time(env, monkeypatch):

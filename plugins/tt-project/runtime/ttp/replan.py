@@ -6,7 +6,8 @@ action apply, a due move on an obligation whose current due has passed is refuse
 changes the plan on its critical path (plan_change): a task_add naming it or continuing an owner, a
 task_update of an owner changing priority, resources, depends_on, status or spec, an owner attached, a
 config_set on a key the obligation or its owners name (the bottleneck), or a `justify` naming what
-changed. A move citing the user's own message, sent in its chat after its due was set, is never refused. A reply giving a new time in the chat of
+changed. A move with none is applied as sent but never hidden (bare_move): its chat's digest says the
+promise was missed and moved, and the daily review counts it. A move citing the user's own message, sent in its chat after its due was set, is never refused. A reply giving a new time in the chat of
 a missed promise with no plan change is flagged (flag_reply). A second miss makes the overdue item a
 must-act re-plan (REPLAN_TEXT). audit_line is the daily review's metric. Model-free throughout, and the
 same for session and stateless coordinators on every provider: all of it runs in coordinator.apply and
@@ -28,7 +29,7 @@ JUSTIFY_MIN_WORDS = 3
 KEPT = 20   # misses and moves kept per obligation
 REPLAN_TEXT = ("\nMissed twice: re-plan now (a new split, route or owner: task_add naming it, or task_update of its "
                "owner) or tell its chat honestly what is true, with any time from Expected finish's measured medians "
-               "(`ttp eta {key}`), never a guessed or padded time. A new time alone is refused.")
+               "(`ttp eta {key}`), never a guessed or padded time. A new time alone is told to its chat as missed and moved.")
 
 
 def _names(text, key: str) -> bool:
@@ -65,6 +66,18 @@ def refusal(o: dict, due_text: str) -> str:
             f"with key {o['id']} and new `owners`, a config_set on the bottleneck it waits on, or `justify` naming "
             f"what changed; or cite the user's message asking for the move (`message`). Else tell its chat what is "
             f"true, with a time from Expected finish (`ttp eta {o['id']}`).")
+
+
+def bare_move(p, o: dict, was: str, to: str, now: float) -> str:
+    """A missed promise moved with no plan change and no user's message: applied, never hidden. Its chat's
+    digest gets a line saying it was missed and moved (chatdigest.routine), the move stays on record as
+    one without a plan change (audit_line counts it), and the returned note says so."""
+    from . import chatdigest, obligations
+    chatdigest.routine(p, obligations._chat((o.get("promise") or {}).get("chat")),
+                       f"{o['id']} ({o.get('text') or 'a promise'}) missed its due ({was}) and was moved to {to}.",
+                       "missed promise moved", now)
+    return (f"{o['id']} missed its due ({was}): moved to {to} with no plan change, as sent. Its chat's digest says "
+            f"it was missed and moved, and the daily review counts it as a move without a plan change")
 
 
 def user_asked(db, o: dict, mid: int) -> str | None:

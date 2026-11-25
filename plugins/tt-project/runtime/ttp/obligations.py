@@ -2807,8 +2807,8 @@ def claim_result(p, oid: str, rc, now: float | None = None) -> list[str]:
 
 def set_due(p, oid: str, due, now: float | None = None, plan: str | None = None, user: int | None = None) -> str:
     """Give an open order, promise or claim a new due time: it can fall due once more. Past its due, the
-    move needs `plan` (the batch's plan change, replan.plan_change) or `user` (the user's message asking
-    for it); else it is refused (replan.py)."""
+    move names `plan` (the batch's plan change, replan.plan_change) or `user` (the user's message asking
+    for it); with neither it is applied as a bare move, its chat's digest told (replan.bare_move)."""
     from . import replan, timefmt
     now = time.time() if now is None else now
     at = _when(due, f"{oid} due", p)
@@ -2823,14 +2823,14 @@ def set_due(p, oid: str, due, now: float | None = None, plan: str | None = None,
                           f"its due was not moved, and nothing is owed")
         pr = o["promise"]
         late = replan.missed(pr, now)
-        refused = late and not plan and user is None
+        bare = late and not plan and user is None
+        was = timefmt.long(pr["due"], p)
         if late:
-            replan.note_miss(pr, now)   # kept on a refusal too
-        if not refused:
-            replan.note_move(pr, at, now, plan, user, "due")
-            pr.update(due=at, timed=True, raised=None, set_at=now)
+            replan.note_miss(pr, now)
+        replan.note_move(pr, at, now, plan, user, "due")
+        pr.update(due=at, timed=True, raised=None, set_at=now)
         p.db.set_kv(KV, st)
-    if refused:
-        raise ValueError(replan.refusal(o, timefmt.long(pr["due"], p)))
+    if bare:
+        return replan.bare_move(p, o, was, timefmt.long(at, p), now)
     why = f"plan change: {plan}" if plan else f"the user asked in message #{user}" if user is not None else ""
     return f"{oid} now due {timefmt.long(at, p)}" + (f" ({why})" if late and why else "")

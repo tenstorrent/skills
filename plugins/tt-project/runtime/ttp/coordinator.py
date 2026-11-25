@@ -4531,7 +4531,7 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                     fan_orders.append((oid, int(a["order"]), a.get("supersedes") or []))
                 elif a.get("due") not in (None, "") and oid and not a.get("owners") \
                         and not any(str(a.get(f) or "").strip() for f in ("evidence", "why")):
-                    due_moves.append((i, a, oid, None))   # after the batch: a missed one needs its plan change (replan)
+                    due_moves.append((i, a, oid, None))   # after the batch: a missed one records its plan change (replan)
                 elif not oid:
                     oid = obligations.add(p, str(a.get("text") or ""), owners, by="coordinator",
                                           milestones=a.get("milestones") or [])
@@ -8541,9 +8541,9 @@ def _users_withdrawal(p: Project, name: str, user_turn: bool, why: str | None,
 def _apply_due_moves(p: Project, actions: list, moves: list, failed: set, problems: list, notes: list,
                      since: float, before: dict | None = None) -> dict:
     """Apply the batch's `obligation` due moves (a re-sent order's new due too) once the rest of it went
-    through: one past its due needs a plan change of this batch (or the move's own: a re-sent order's new
-    owner) or the user's message (`message`) in its chat after its due was set, else it is refused
-    (replan.py). Returns the batch's plan changes by obligation id, for the reply check (record_promises).
+    through: one past its due records the plan change of this batch (or the move's own: a re-sent order's new
+    owner) or the user's message (`message`) in its chat after its due was set; with neither it is a bare
+    move, its chat told (replan.bare_move). A `message` that cannot ask for it is refused (replan.py). Returns the batch's plan changes by obligation id, for the reply check (record_promises).
     `since`: when the batch started applying (an owner attached since is a new one); `before`: owners'
     plan fields before it (replan.snapshot)."""
     plans = replan.batch_plans(p.db, actions, failed, since=since, before=before)
