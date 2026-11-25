@@ -99,7 +99,8 @@ def test_a_runs_rollback_for_an_outage_or_quota_is_refused_and_the_flag_is_uncha
     monkeypatch.setenv("TTP_RUN_DIR", "/nonexistent")
     monkeypatch.delenv("TTP_PROJECT", raising=False)
     for reason in ("", "GLM endpoint 429 quota_exceeded until 05:00", "endpoint outage", "rate limited",
-                   "endpoint unreachable", "TT Cloud token quota ran out"):
+                   "endpoint unreachable", "TT Cloud token quota ran out",
+                   "GLM endpoint failing", "GLM endpoint returned a 503", "GLM keeps timing out"):
         code, out = _roll(capsys, "rollback", "glm_code", "projA", *(("--reason", reason) if reason else ()))
         assert code == 2, reason
         assert "per-run fallback" in out or "quality problem" in out

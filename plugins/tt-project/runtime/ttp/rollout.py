@@ -179,6 +179,9 @@ def stop_project(flag: str, project: str, why: str, by: str = "daemon") -> bool:
 # glmwork.FALLBACK_ON), so a flag is never rolled back or frozen for one (outage_refusal). The fault words
 # down/out/dead/failing/capacity/timed out and a bare 5xx also read as quality wording ("pass rate down",
 # "500 tasks"), so they match only next to endpoint words, and a 5xx only as an HTTP status.
+# Some quality reasons that name GLM next to a fault word ("GLM output quality is down") are
+# refused for a run-initiated rollback too: over-refusing is the safe side, and the model-free
+# automatic quality rollback still rolls a flag back on quality.
 OUTAGE_RE = re.compile(r"outage|quota|rate.?limit|\b429\b|unreachable|connection (?:refused|reset|error)"
                        r"|overloaded"
                        r"|(?:endpoint|glm|server|api|provider)\b[\w'&.: -]{0,40}\b"

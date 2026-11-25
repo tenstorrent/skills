@@ -10,7 +10,8 @@ too): used becomes the larger of ours and the server's, as other hosts spend the
 
 Size: the last 429's limit, else the `size` setting, else what we observed: the most tokens we had counted
 in one window when a quota 429 came (the last OBSERVED_KEEP_S); with none of these, nothing is paced
-(counting goes on). A quota 429 also marks its window spent, as the server says it is.
+(counting goes on). A quota 429 also marks its window spent, as the server says it is. A 429 that names its own window
+replaces the `window_s` setting until a later 429 names a different one.
 
 Pacing: the window's budget (size less `reserve` of it) spread evenly over the window is the pace line. The
 quota is short while the tokens used run more than SLACK of the budget ahead of that line (a burn the even
