@@ -313,9 +313,11 @@ def reply_footer(p, text: str, repo, running: dict | None = None, extra=()) -> s
     every commit is held to the running release."""
     from . import landed
     text, items = text or "", list(extra)
-    live = any(not re.search(r"\b(?:not|never|n't)\b", m.group(0)) for m in _LIVE_CLAIM.finditer(text))
-    said = live or any(not _NEGATED.search(text[max(0, m.start() - NEG_WINDOW):m.start()])
-                       for m in _LANDED_VERB.finditer(text))
+    def claimed(m):   # neither negated nor hedged inside the match or just before it
+        return not (re.search(r"\b(?:not|never|n't)\b", m.group(0))
+                    or _NEGATED.search(text[max(0, m.start() - NEG_WINDOW):m.start()]))
+    live = any(map(claimed, _LIVE_CLAIM.finditer(text)))
+    said = live or any(map(claimed, _LANDED_VERB.finditer(text)))
     target = _default(p, repo) if said and not live else None
     version, tip = str((running or {}).get("version") or "?"), str((running or {}).get("commit") or "")
     known = _commit(repo, tip) if live and tip else ""

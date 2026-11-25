@@ -258,3 +258,16 @@ def test_a_writeup_stamp_is_taken_only_for_its_own_run_and_outcome(env, monkeypa
         assert result[replymsg.CHAT_RUN] is True
         assert (result.get(replymsg.BY) == stamp[replymsg.BY]) is taken
         assert (result[replymsg.FIELD] == "Opus wrote this.") is taken
+
+
+def test_a_writeups_false_status_claim_is_posted_as_written_and_raised(env, monkeypatch):
+    """The Opus write-up goes out as written; a status claim the records disprove raises claim_false."""
+    from ttp import claimcheck
+    p = make(env)
+    _wu_on(p)
+    other = p.db.add_task("other", "Goal: other.", kind="work", tier="standard", origin="coordinator")
+    _wu_bin(env, monkeypatch, text=f"Task #{other} is running.")
+    task, replies, _ = _wu_finish(env, p, dict(_WU_GLM))
+    assert replies == [f"Task #{other} is running."], replies
+    (ev,) = p.db.q("SELECT text FROM events WHERE kind=?", (claimcheck.KIND,))
+    assert f"#{other} is queued" in ev["text"] and "write-up" in ev["text"], ev["text"]

@@ -2773,12 +2773,13 @@ def _deploy_checked(p: Project, text: str, notes: list, claims: list | None = No
         notes.append(f"heldwork: the held-machine claim check failed ({type(e).__name__}: {e})")
     try:
         from . import identity, pushclaim
-        running = identity.running(p.state, os.getpid()) or identity.running(p.state, None)
-        fixed = pushclaim.reply_footer(p, text, p.root, running, claimcheck.claims_footer(p, claims))
-        if fixed != text:
+        own = text.partition(claimcheck.STATUS_TAIL)[0]   # the coordinator's words, not the harness's tail
+        footer = pushclaim.reply_footer(p, own, p.root, identity.running(p.state, os.getpid()),
+                                        claimcheck.claims_footer(p, claims))[len(own):]
+        if footer:
             notes.append(f"reply check: your message went out with the footer "
-                         f"'{fixed[len(text):].strip()}'. Name only commits that hold, and back each claim")
-        return fixed
+                         f"'{footer.strip()}'. Name only commits that hold, and back each claim")
+        return text + footer
     except Exception as e:
         notes.append(f"reply check: the live/landed-claim check failed ({type(e).__name__}: {e}); "
                      f"the message went unchecked")
@@ -3830,7 +3831,6 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                     if why:
                         raise ValueError(f"ask_user rejected: {why}")
                 text = _wakemode_checked(p, text, notes)
-                text = _deploy_checked(p, text, notes)   # an ask's commits are checked the same way
                 text, rec = db.for_user(text), db.for_user((a.get("recommendation") or "").strip())   # notes follow them
                 least = db.for_user(least)   # the least-disruptive part is appended mid-message: its tag would stay
                 if a["blocking"] == "restriction":
@@ -3842,6 +3842,7 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                 default = askauto.entry(a["blocking"], rec)   # every ask stores one
                 if auto_at := askauto.due(time.time(), cfg):   # shown in the chat, ttp status, the web app
                     text += f"{_AUTO_NOTE}{askauto.note(default, timefmt.short(auto_at, p))}."
+                text = _deploy_checked(p, text, notes)   # an ask's commits are checked the same way, footer last
                 turn_asks.append((k, db.post("out", text, chat=None, kind="ask",
                                              severity=_norm_severity(a.get("severity") or "high"),
                                              ref=f"{prguard.BLOCKING_REF}{a['blocking']}")))

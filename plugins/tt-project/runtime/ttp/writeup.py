@@ -94,8 +94,10 @@ def write(p, cfg: dict, task: dict, result: dict, run: dict, status: str, need: 
                                         TIMEOUT_S, str(run_dir), model, usage)
         if not got.strip():
             raise RuntimeError("the writer returned no text")
-        checked, _, marked = claimcheck.check(
+        checked, false, marked = claimcheck.check(
             p, got, own={"task": task.get("id"), "run": run.get("id")}) if p is not None else (got, [], 0)
+        if false:   # sent as written: the coordinator hears of each false claim
+            claimcheck.raise_false(p.db, false, f"task #{task.get('id')}'s write-up (run {run.get('id')})")
         result[replymsg.FIELD] = checked.strip()
         result[replymsg.BY] = {"step": replymsg.WRITEUP, "model": model, "run": run.get("id"),
                                "sha": replymsg.digest(result[replymsg.FIELD]), "unverified": marked,

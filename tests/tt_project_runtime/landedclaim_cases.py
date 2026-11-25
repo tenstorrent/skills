@@ -409,6 +409,8 @@ def test_a_message_with_no_live_or_landed_word_is_never_checked(env, monkeypatch
     running = {"version": "0.1.1", "commit": head}
     for text in (f"Commit {side[:10]} waits for its review.",
                  f"The fix ({side[:10]}) is not live yet.",
+                 f"The fix ({side[:10]}) is not deployed yet.",
+                 f"It will be live after the restart ({side[:10]}).",
                  "The project's GLM code route is back on since 10:30 PST."):
         assert _footer(p, text, running) == text, text
 
@@ -441,9 +443,11 @@ def test_a_coordinator_reply_and_ask_carry_the_footer_and_never_an_inline_tag(en
     (sent,) = p.db.q("SELECT text FROM messages WHERE direction='out' AND kind='reply'")
     assert sent["text"] == (f"{text}\n\nUnverified: 1 status claim did not hold, "
                             f"{side[:10]} not in running 0.1.1"), sent["text"]
-    coord.apply(p, [{"type": "ask_user", "text": f"{text} May I close the task?", "blocking": "spend"}])
+    coord.apply(p, [{"type": "ask_user", "text": f"{text} May I close the task?", "blocking": "spend",
+                     "recommendation": "yes"}])
     ask = p.db.one("SELECT text FROM messages WHERE kind='ask'")["text"]
-    assert ask.startswith(f"{text} May I close the task?\n\nUnverified: {side[:10]} not in running 0.1.1"), ask
+    assert ask.startswith(f"{text} May I close the task?"), ask
+    assert ask.endswith(f"\n\nUnverified: {side[:10]} not in running 0.1.1") and ask.count("Unverified:") == 1, ask
     coord.apply(p, [{"type": "reply", "chat": "c1", "text": "I'll tell you when the fix is live here."}])
     last = p.db.q("SELECT text FROM messages WHERE direction='out' AND kind='reply' ORDER BY id DESC LIMIT 1")
     assert last[0]["text"] == "I'll tell you when the fix is live here.", last

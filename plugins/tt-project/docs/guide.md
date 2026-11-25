@@ -4388,14 +4388,15 @@ Known gaps (these claims pass unchecked, as written):
 - wording the parse does not know ("shipped", "made it into main");
 - quoted text written to a script and run later.
 
-The coordinator's own `reply`, `notify` and `ask_user` messages go out exactly as written. When
-one says 'live' (or "deployed", "in the running version") or 'landed', each commit it names is
-checked once, with no fetch: against the running release (an ancestor of the daemon receipt's
+The coordinator's own `reply`, `notify` and `ask_user` messages: the live/landed check leaves
+their text as written. When one says 'live' (or "deployed", "in the running version") or
+'landed', each commit it names is checked once, with no fetch: against the running release (an ancestor of the daemon receipt's
 commit) for a live word, else against the push branch's local ref. Any that fail add one footer
 line at the end, e.g. `Unverified: 26b5acd3a not in running 0.2.1550`; a commit the check cannot
 settle reads `<sha> not checked`, and a `claims` item that did not hold or could not be checked
 adds a count (`1 status claim not checked`). Status sentences are never tagged inline: a false
-one only raises `claim_false` for the coordinator. Known gaps: a message with both words is
+one only raises `claim_false` for the coordinator (a negated or hedged 'live'/'landed' is no
+claim). Known gaps: a message with both words is
 checked against the running release only; a commit this repository does not hold, or a running
 commit it does not hold (another project's runtime), is not checked; a mid-turn `ttp urgent-reply`
 posts before the turn's checks run.
