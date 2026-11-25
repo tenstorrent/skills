@@ -2054,16 +2054,23 @@ def parse_start_after(raw: Any, now: float | None = None, tz: str | None = None)
     return at if at > now else None
 
 
-def _drop_charter_wait(a: dict, who: str) -> str:
+def _drop_charter_wait(a: dict, who: str, charter_refused: bool = False) -> str:
     """A start_when that waits on the charter is dropped and the task queued at once: a refused or pending
-    rule change never holds ordered work. The note saying so ('' when nothing was dropped)."""
+    rule change never holds ordered work. The note saying so ('' when nothing was dropped); it asks for the
+    charter_update to be resent fixed only when the turn sent one that was refused (`charter_refused`)."""
     from .waitheal import charter_wait
     when = a.get("start_when")
     if not isinstance(when, str) or not (word := charter_wait(when)):
         return ""
     a["start_when"] = ""
     return (f"{who}: its start_when {clip(when.strip(), 80)!r} waited on the charter ({word!r}) and was dropped: "
-            f"a refused or pending rule change never holds ordered work; resend the charter_update fixed")
+            f"a refused or pending rule change never holds ordered work"
+            + ("; resend the charter_update fixed" if charter_refused else ""))
+
+
+def _charter_refused(order: list, failed: set) -> bool:
+    """Whether a charter_update of this batch was refused: apply() runs them before task_add and task_update."""
+    return any(i in failed for i, x in order if isinstance(x, dict) and x.get("type") == "charter_update")
 
 
 def _start_args(a: dict, cur: dict, p: Project | None = None) -> tuple[float | None, str | None]:
@@ -2541,15 +2548,15 @@ def _landed_as_deps(p: Project, a: dict, deps: list | None = None) -> tuple[dict
                f"checked here and it starts once {', '.join(f'#{i}' for i in ids)} is done")
 
 
-def deferral_update(db, task: dict, a: dict, p: Project | None, labels: list | None = None
-                    ) -> tuple[dict, float | None, str | None, str]:
+def deferral_update(db, task: dict, a: dict, p: Project | None, labels: list | None = None,
+                    charter_refused: bool = False) -> tuple[dict, float | None, str | None, str]:
     """The one path from a task_update's or `ttp task set-when`'s start_after/start_when/why (`a`) to
     the columns of a task not yet started: ({labels, not_before}, start_after, start_when, note). Each part
     `a` leaves out stays as it was; `now` or "" clears it. `labels` are the ones to build on (the
     task's own when None). A new future start_after drops the progress probe's old answers. An urgent
     task's gate whose why names no safety class is dropped (convgate), `note` saying so ('' else)."""
     cur = deferral(task)
-    dropped = _drop_charter_wait(a, f"task_update: #{task['id']}")
+    dropped = _drop_charter_wait(a, f"task_update: #{task['id']}", charter_refused)
     try:
         after, when = _start_args(a, cur, p)
     except MissingTaskRef as e:
@@ -3193,7 +3200,8 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                 if inherited and (a.get("pr_branch") == "" or unpublished or foreign is not None
                                   or _lands_on_push_branch(cfg, spec_text, inherited)):
                     labels.append(worktree.NO_PR_BRANCH)
-                if dropped := _drop_charter_wait(a, f"task_add {json.dumps(title, ensure_ascii=False)}"):
+                if dropped := _drop_charter_wait(a, f"task_add {json.dumps(title, ensure_ascii=False)}",
+                                                 _charter_refused(order, failed)):
                     notes.append(dropped)
                 try:
                     after, when = _start_args(a, {}, p)
@@ -3508,7 +3516,8 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                         raise InfoRejection(f"task #{task['id']} is {task['status']}: only a task that has not "
                                          f"started can be deferred; add a new one with start_after/start_when")
                     cur = deferral(task)
-                    new, after, when, dropped = deferral_update(db, task, a, p, upd.get("labels"))
+                    new, after, when, dropped = deferral_update(db, task, a, p, upd.get("labels"),
+                                                                _charter_refused(order, failed))
                     upd.update(new)
                     if dropped:
                         notes.append(dropped)
@@ -4068,13 +4077,13 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                             p.charter_path.read_text(), section, text, excepts,
                             "" if verbatim and not unsourced else unsourced or (
                                 "a Brief or harness-gate source is not the user's words" if a.get("source")
-                                else restriction_source.NO_SOURCE), end, said, ordered_scope, _own_resources(cfg))
+                                else restriction_source.NO_SOURCE), end, said, ordered_scope, machine_ledger.configured_names(cfg or {}))
                         notes.append(overlap)
                     elif text and not (replaces or a.get("both_hold") or refused):
                         # the user's verbatim words (or agent-ordered) behind a lift: the harness fixes its form
                         fixed, why_not = (_repair_lift(p, section, text, end,
                                                        _verbatim_said(db, cite, agent, a.get("source")), ordered_scope,
-                                                       _own_resources(cfg))
+                                                       machine_ledger.configured_names(cfg or {}))
                                           if not (quote or unsourced) and re.search(_SAID_CITE, cite) else ("", ""))
                         if fixed:
                             text, overlap = fixed
@@ -7056,7 +7065,7 @@ _SAID_CITE = r"user msg #\d+|relayer-ordered|owner-record"   # cites _verbatim_s
 
 
 def _ordered_work(charter: str, text: str, names: set[str], unsaid: list[str], said: str,
-                  own: tuple = ()) -> str:
+                  own: list | tuple = ()) -> str:
     """Why an exception whose scope names `unsaid` are not in the order's words `said` is not ordered work
     that cannot hurt people, else "". Only steps that could hurt people or speak as the owner need the
     user's own words naming them: relay.HELD's classes (someone else's work or data, a shared service,
@@ -7115,13 +7124,6 @@ def _bans_in_scope(other: str, text: str, names: set[str]) -> bool:
     return not oa and not ta and bool((oo & to) - names - _KINDS)
 
 
-def _own_resources(cfg: dict | None) -> tuple:
-    """The machines and resources this project's own config names (machines.allowed, resources,
-    shared_resources): a step there is the project's own, not someone else's (_ordered_work)."""
-    from .machine_ledger import configured_names
-    return tuple(configured_names(cfg or {}))
-
-
 def _near_scope(word: str, names: set[str], text: str) -> bool:
     """`word` (a general word such as `any`) sits within a few words of one of the scope `names` in
     `text`, in one phrase before it: "any soak on box-a" is scoped; "power cycle box-a, that's all" and
@@ -7135,7 +7137,7 @@ def _near_scope(word: str, names: set[str], text: str) -> bool:
 
 def _scoped_exception(charter: str, section: str, text: str, clause: str, sourced: str,
                       end: dict | None, said: str = "", accepted: dict | None = None,
-                      own: tuple = ()) -> tuple[str, str]:
+                      own: list | tuple = ()) -> tuple[str, str]:
     """Check a Restrictions charter_update sent with `excepts` (the clause of a standing Restrictions
     item it narrows) and return (the text to store, a note) or raise ValueError naming the clause and
     why. It passes when the clause is a standing ban; `sourced` is the user's verbatim words (a
@@ -7267,7 +7269,7 @@ def _verbatim_said(db, cite: str, agent: bool, src=None) -> str:
 
 
 def _repair_lift(p: Project, section: str, text: str, end: dict | None, said: str,
-                 accepted: dict | None = None, own: tuple = ()) -> tuple[tuple[str, str] | str, str]:
+                 accepted: dict | None = None, own: list | tuple = ()) -> tuple[tuple[str, str] | str, str]:
     """A new Restrictions `text` resting on the user's verbatim words (or the owner's agent's order in
     agent mode) that may lift a standing ban (_append_conflicts, lifts_only) goes in as a scoped
     exception to that ban (_scoped_exception, as `excepts` would) instead of being refused for its

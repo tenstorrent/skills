@@ -195,14 +195,22 @@ def refuse_charter_wait(db, p, task: dict, result: dict) -> dict:
     word = charter_wait(probe if isinstance(probe, str) else None)
     if not word:
         return result
-    refused = result["retry_when"][:200]
+    return refuse_wait(db, p, task, result, probe[:200],
+                       f"its waiting hand-off's retry_when waits on the charter ({word!r}), so it was not stored: "
+                       f"a refused or pending rule change never holds ordered work, the coordinator queues it in "
+                       f"the same turn; the task wakes at its retry timer",
+                       f"retry_when refused: waits on the charter: {probe[:200]}")
+
+
+def refuse_wait(db, p, task: dict, result: dict, refused: str, why: str, logged: str) -> dict:
+    """`result` without its retry_when, kept as `retry_when_refused` (`refused`): one handoff_probe_refused
+    event says `why` after the task's name and the daemon log says `logged`; the task wakes at its retry
+    timer. The one path for every waiting hand-off whose probe is not stored."""
     db.x("INSERT INTO events(ts,source,kind,severity,text,status,task) VALUES(?,?,?,?,?,?,?)",
          (time.time(), f"task:{task['id']}", "handoff_probe_refused", "normal",
-          f"#{task['id']} {task['title']}: its waiting hand-off's retry_when waits on the charter ({word!r}), "
-          f"so it was not stored: a refused or pending rule change never holds ordered work, the "
-          f"coordinator queues it in the same turn; the task wakes at its retry timer", "queued", task["id"]))
+          f"#{task['id']} {task['title']}: {why}", "queued", task["id"]))
     from .daemon import log   # daemon imports this module
-    log(p, f"task {task['id']} hand-off: retry_when refused: waits on the charter: {refused}")
+    log(p, f"task {task['id']} hand-off: {logged}")
     return {**{k: v for k, v in result.items() if k != "retry_when"}, "retry_when_refused": refused}
 
 
