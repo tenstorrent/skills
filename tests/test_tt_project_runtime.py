@@ -31441,7 +31441,9 @@ def test_a_re_review_gets_its_checks_started_when_the_fix_finishes(env):
     p.db.update_task(fix["id"], status="running")
     run_dir = env["tmp"] / f"run-{fix['id']}"
     run_dir.mkdir()
-    (run_dir / "result.json").write_text(json.dumps({"status": "done", "summary": "fixed"}))
+    (run_dir / "result.json").write_text(json.dumps(
+        {"status": "done", "summary": "fixed",
+         "self_check": "pytest test_x.py on the base: 1 failed"}))   # the base-fail line a new test owes
     Daemon(p.base)._finish_worker({"task": fix["id"]}, Usage(cost_usd=1.0), "ok", run_dir)
     re_rev = p.db.task(re_rev["id"])
     out = p.state / PRECHECKS_DIR / f"t{fix['id']}-{head[:12]}"
@@ -32298,7 +32300,9 @@ def test_a_failed_review_with_fixes_moves_its_dependents_onto_the_re_review(env)
     p.db.update_task(fix["id"], status="running")
     run_dir = env["tmp"] / f"run-{fix['id']}"
     run_dir.mkdir()
-    (run_dir / "result.json").write_text(json.dumps({"status": "done", "summary": "fixed"}))
+    (run_dir / "result.json").write_text(json.dumps(
+        {"status": "done", "summary": "fixed",
+         "self_check": "pytest test_x.py on the base: 1 failed"}))   # the base-fail line a new test owes
     from ttp.daemon import Daemon
     from ttp.providers.base import RunUsage as Usage
     Daemon(p.base)._finish_worker({"task": fix["id"]}, Usage(cost_usd=1.0), "ok", run_dir)

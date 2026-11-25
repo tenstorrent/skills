@@ -1985,7 +1985,10 @@ def test_g_a_read_that_never_settles_degrades_as_a_git_failure_in_the_final_roun
     s, holds, lines, walls = _finish_holds(env, monkeypatch, True, slice_s=0.0, n=20, warm=False, delay=0.0)
     assert s.p.db.task(s.code)["status"] == "done"
     first = next(i for i, (_, ok) in enumerate(holds) if ok)
-    assert first == gitmemo.MAX_ROUNDS, holds   # the code task's rounds: MAX_ROUNDS rolled back, then the final one
+    # Its rounds end at MAX_ROUNDS and its last one commits: the base-fail hand-off check's git
+    # reads are warmed before the transaction, so one read fewer is learnt inside the rounds.
+    assert f"rounds {gitmemo.MAX_ROUNDS}," in lines[0], lines[0]
+    assert first == gitmemo.MAX_ROUNDS - 1, (holds, lines[0])
     reviews = s.p.db.q("SELECT id FROM tasks WHERE kind='review' AND status='queued' AND title LIKE ?",
                        (f"Review #{s.code}:%",))
     assert not reviews, "the code task's review was queued in the degraded round"

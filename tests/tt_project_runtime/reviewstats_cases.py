@@ -86,7 +86,9 @@ def test_a_re_review_leads_with_the_fix_delta_and_each_review_is_recorded(env):
     p.db.update_task(fix["id"], status="running")
     run_dir = env["tmp"] / f"run-{fix['id']}"
     run_dir.mkdir()
-    (run_dir / "result.json").write_text(json.dumps({"status": "done", "summary": "fixed"}))
+    (run_dir / "result.json").write_text(json.dumps(
+        {"status": "done", "summary": "fixed",
+         "self_check": "pytest test_x.py on the base: 1 failed"}))   # the base-fail line a new test owes
     Daemon(p.base)._finish_worker({"task": fix["id"]}, Usage(cost_usd=1.0), "ok", run_dir)
     # Once the fix is done: the new head and the delta's size, once per head.
     spec = p.db.task(re_rev["id"])["spec"]
