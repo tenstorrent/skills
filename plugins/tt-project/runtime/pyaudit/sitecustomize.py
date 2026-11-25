@@ -170,7 +170,7 @@ def _install(pol: dict) -> None:
                 k := m[1] or m[2]) == os.environ.get(k) else shlex.quote(env.get(k, "")), cmd)
         if env is not None:   # judged where the run's own paths stand; the judge's start as the child gets it
             env = {**{k: v for k, v in os.environ.items() if k not in KEEP}, **env}
-        return ttp().child_refusal(cmd, cwd or os.getcwd(), dict(os.environ) if env is None else env)
+        return ttp().child_refusal(cmd, cwd or os.getcwd())
 
     def judge(ev, args):
         if ev == "open":
@@ -202,7 +202,7 @@ def _install(pol: dict) -> None:
             return next((y for p in spots(args[1], args[2] if len(args) > 2 else None) if (y := write_why(p))), None)
         if ev in CHILD:
             if ev == "os.system":
-                return ttp().child_refusal(fs(args[0]), os.getcwd(), dict(os.environ))
+                return ttp().child_refusal(fs(args[0]), os.getcwd())
             if ev == "subprocess.Popen":   # (executable, args, cwd, env)
                 return child(args[1], args[3], args[2], args[0])
             if ev == "_posixsubprocess.fork_exec":   # (executable, args, env, cwd): the wrapper's own

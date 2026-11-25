@@ -77,7 +77,7 @@ def first(env) -> None:
         env["PYTHONPATH"] = zp + (os.pathsep + pp if pp else "")
 
 
-def child_refusal(cmd: str, cwd: str, env: dict) -> str | None:
+def child_refusal(cmd: str, cwd: str) -> str | None:
     """Why the hook refuses a child command of the judged Python (its argv as shell text), or None."""
     from . import hook
     out, _ = hook.pre_tool_use({"tool_name": "Bash", "tool_input": {"command": cmd}, "cwd": cwd}, stage=FLAG)
