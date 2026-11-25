@@ -39,7 +39,7 @@ from .devq import unmask_devices
 from .detach import VERDICT_SH as _DETACH_VERDICT_SH
 from . import chatgone, checksqueue, checkwait, hoststate, runnerenv, setupfault, sshcmd, syntaxfault, timefmt, workerloss
 from . import schedule as sched
-from .project import here as project_here
+from .project import here
 from .project import (NAME_RE, Project, hostname, load_registry, load_secrets, register, save_secret,
                       durable_append, durable_write, write_json, ACCOUNT_KEYS, ACCOUNT_USER_ONLY, account_keys, DEFAULT_CONFIG, deep_merge,
                       load_account_settings, set_account_setting, max_workers_problem, zombie, device_timeout_max, command_env,
@@ -52,11 +52,15 @@ PLUGIN_ROOT = RUNTIME.parent                                   # plugin root, or
 MARKER = "tt-project://{name}@{host}:{dir}"
 SSH_FAILED = 255      # ssh's own exit code: it could not reach or run on the host
 SIGNAL_RC_BASE = 128  # a shell reports a death by signal N as 128 + N
+MIN_S = 60
 HOUR_S = 3600
 DAY_S = 86400
+EXEC_MODE = 0o755   # an installed script or hook: its owner writes it, everyone runs it
+MB = 1e6
+REFUSED_RC = 2   # the exit code of a refused or malformed command: die's default, as argparse's usage error
 
 
-def die(msg: str, code: int = 2) -> None:
+def die(msg: str, code: int = REFUSED_RC) -> None:
     print(f"ttp: {msg}", file=sys.stderr)
     sys.exit(code)
 
@@ -103,9 +107,9 @@ def ensure_own(p: Project, name: str, what: str) -> None:
     from . import projectremove
     if walked_up(p):
         die(f"ttp {what}: {p.name} at {p.root} was found by walking up from {Path.cwd()}; name it "
-            f"(`ttp {what} {p.name}`) or run it from {p.root}", 2)
+            f"(`ttp {what} {p.name}`) or run it from {p.root}")
     if why := projectremove.identity_refusal(p, name):
-        die(f"ttp {what}: refused: {why}", 2)
+        die(f"ttp {what}: refused: {why}")
 
 
 def remote_entry(name: str) -> dict | None:
@@ -113,13 +117,6 @@ def remote_entry(name: str) -> dict | None:
     if entry and entry.get("host") and entry["host"] != hostname():
         return entry
     return None
-
-
-def remote_hosts() -> list[str]:
-    """The other machines this user's projects run on (projects created with --host)."""
-    here = hostname()
-    return sorted({e.get("ssh") or e["host"] for e in load_registry().get("projects", {}).values()
-                   if isinstance(e, dict) and e.get("host") and e["host"] != here})
 
 
 LISTEN_GAVE_UP = 75   # `ttp listen --timeout` on another machine: still unreachable when the timeout ran out
@@ -335,12 +332,12 @@ def forward(entry: dict, argv: list[str], quiet: bool = False, shown: set[int] |
             _unreachable(entry, r.stderr)
     elif r.stderr:
         err = sshfail.scrub(r.stderr, entry.get("ssh") or entry["host"])
-        if r.returncode == 2 and _USAGE_ERROR.search(err):
+        if r.returncode == REFUSED_RC and _USAGE_ERROR.search(err):
             # The far side's parser rejected it: say where, so it never reads as this machine's ttp.
             where = f"on {entry['host']} (ttp {_remote_ttp_version(entry)}): "
             err = _USAGE_ERROR.sub(lambda m: where + m.group(0), err, count=1)
         sys.stderr.write(err)
-        if r.returncode == 2 and argv and f"invalid choice: '{argv[0]}'" in r.stderr:
+        if r.returncode == REFUSED_RC and argv and f"invalid choice: '{argv[0]}'" in r.stderr:
             # Its parser is fine here: the far side runs an older ttp that lacks the command.
             sys.stderr.write(f"ttp: `ttp {argv[0]}` ran on {entry['host']}, whose ttp is older and lacks it; "
                              f"it works there once a newer tt-project release is deployed on that machine\n")
@@ -357,7 +354,7 @@ def _drop_unrecognized(argv: list[str], r: subprocess.CompletedProcess) -> list[
     option, and is never retried."""
     err = r.stderr or ""
     drop = {f for f in _NEWER_FLAGS if f in err and f in argv}
-    if r.returncode != 2 or "unrecognized arguments" not in err or not drop:
+    if r.returncode != REFUSED_RC or "unrecognized arguments" not in err or not drop:
         return None
     out, i = [], 0
     while i < len(argv):
@@ -372,15 +369,15 @@ def _drop_unrecognized(argv: list[str], r: subprocess.CompletedProcess) -> list[
 def _send_say(entry: dict, argv: list[str], client_id: str, capture: bool = False) -> subprocess.CompletedProcess:
     """`ttp say` on the project's machine, tagged with the client id it deduplicates on."""
     r = _ssh(entry, [argv[0], f"--client-id={client_id}", *argv[1:]], capture)
-    if r.returncode == 2 and "--client-id" in (r.stderr or ""):   # an older runtime there: send it untagged
+    if r.returncode == REFUSED_RC and "--client-id" in (r.stderr or ""):   # an older runtime there: send it untagged
         r = _ssh(entry, argv, capture)
-    if r.returncode == 2 and "--broadcast" in (r.stderr or "") and "--broadcast" in argv:
+    if r.returncode == REFUSED_RC and "--broadcast" in (r.stderr or "") and "--broadcast" in argv:
         return _send_say(entry, _fold_broadcast(argv), client_id, capture)
-    if r.returncode == 2 and "--context" in (r.stderr or "") and "--context" in argv:
+    if r.returncode == REFUSED_RC and "--context" in (r.stderr or "") and "--context" in argv:
         return _send_say(entry, _fold_context(argv), client_id, capture)
-    if r.returncode == 2 and "--wait" in (r.stderr or "") and _drop_wait(argv) != argv:   # older: send, no wait
+    if r.returncode == REFUSED_RC and "--wait" in (r.stderr or "") and _drop_wait(argv) != argv:   # older: send, no wait
         return _send_say(entry, _drop_wait(argv), client_id, capture)
-    if r.returncode == 2 and "--caller" in (r.stderr or "") and "--caller" in argv:   # no reply chats there
+    if r.returncode == REFUSED_RC and "--caller" in (r.stderr or "") and "--caller" in argv:   # no reply chats there
         i = argv.index("--caller")
         return _send_say(entry, argv[:i] + argv[i + 2:], client_id, capture)
     return r
@@ -434,7 +431,7 @@ def flush_outbox(name: str, entry: dict, quiet: bool = False) -> subprocess.Comp
                 sent += 1
                 continue
             why = ((r.stderr or "").strip().splitlines() or [f"exit {r.returncode}"])[-1]
-            if r.returncode == 2:     # the project refused it: set it aside, do not block the rest
+            if r.returncode == REFUSED_RC:     # the project refused it: set it aside, do not block the rest
                 outbox.drop(name, e["id"], rejected=why)
                 print(f"ttp: {name} refused queued message #{e['id']} ({why}); it is kept in "
                       f"{outbox.folder() / (name + '.rejected.jsonl')}", file=sys.stderr)
@@ -791,7 +788,7 @@ def _new_harness(p: Project, template: Path) -> None:
     _copy_tree(template / "prompts", p.harness / "prompts")
     _copy_tree(template / "bin", p.harness / "bin")
     for f in (p.harness / "bin").iterdir():
-        f.chmod(0o755)
+        f.chmod(EXEC_MODE)
     for f in HARNESS_ROOT_FILES:
         replace_copy(template / f, p.harness / f)
     durable_write(p.harness / ".gitignore", "__pycache__/\n*.pyc\n", sync=False)
@@ -933,7 +930,7 @@ def cmd_new(a) -> None:
         return new_remote(a, brief)
     root = Path(a.dir).expanduser().resolve() if a.dir else _default_root()
     if why := new_refusal(a.name, root):
-        die(f"ttp new: refused: {why}", 2)
+        die(f"ttp new: refused: {why}")
     p = bootstrap(root, a.name, brief, a.provider or detect_provider(), a.home_tz, a.home_from or "",
                   relayer=bool(getattr(a, "relayer", False)))
     register(a.name, {"host": hostname(), "dir": str(p.root), **_made_by()})
@@ -1213,7 +1210,7 @@ def connect_remote(name: str, entry: dict, argv: list[str]) -> int:
     # The user's zone only from their workstation: in an ssh login here it is a server's, so none.
     home = [] if timefmt.in_ssh_login() else ["--home-tz", timefmt.detect_local(), "--home-from", hostname()]
     r = _ssh(entry, [*argv, *home], capture=True)
-    while r.returncode == 2:   # an older runtime there: connect without what it lacks (one parse error names all)
+    while r.returncode == REFUSED_RC:   # an older runtime there: connect without what it lacks (one parse error names all)
         old_tz = bool(home) and "--home-tz" in (r.stderr or "")
         dropped = _drop_unrecognized(argv, r)
         if not (old_tz or dropped is not None):
@@ -2006,8 +2003,8 @@ def status_text(p: Project, verbose: bool = False) -> str:
     want = c["route"]
     ran = coordmodel.last_turn(db)
     coord = f"coordinator: {c['route_line'].removeprefix('coordinator: ')}, " + (
-        f"last turn {int((now - c['last_turn']) // 60)} min ago ({c['last_status']})" if c["last_turn"] and c["last_status"]
-        else f"last turn {int((now - c['last_turn']) // 60)} min ago" if c["last_turn"] else "no turn yet")
+        f"last turn {int((now - c['last_turn']) // MIN_S)} min ago ({c['last_status']})" if c["last_turn"] and c["last_status"]
+        else f"last turn {int((now - c['last_turn']) // MIN_S)} min ago" if c["last_turn"] else "no turn yet")
     if ran and (off := coordmodel.mismatch(want, ran)):
         coord += f" · configured {coordmodel._route_text(want)}, ran as {', '.join(off)}"
     if c["failures"]:
@@ -2229,7 +2226,7 @@ def daemon_state(p: Project) -> str:
     if s["state"] == "unknown":
         return "status unknown from this sandbox"
     if s["state"] == "stale":
-        return f"NOT RUNNING (process {s['pid']} is up but stuck: no completed tick for {int(s['age'] // 60)} min)"
+        return f"NOT RUNNING (process {s['pid']} is up but stuck: no completed tick for {int(s['age'] // MIN_S)} min)"
     return "NOT RUNNING"
 
 
@@ -2241,11 +2238,6 @@ def _checks_log_tail(log: Path, n: int = 65536) -> str:
             return f.read().decode("utf-8", errors="replace")
     except OSError:
         return ""
-
-
-def here() -> Project | None:
-    """The project this process runs in (project.here)."""
-    return project_here()
 
 
 # Commands whose first positional is the project: with none given, it is the one here().
@@ -2434,7 +2426,7 @@ def cmd_stats(a) -> None:
         from . import chatdigest
         s = chatdigest.counts(p.db)
         print(json.dumps(s, indent=1) if a.json else "\n".join(
-            [f"{p.name}: coordinator chat posts (digest every {chatdigest.every_s(p.config()) / 3600:g} h; 0: off)"]
+            [f"{p.name}: coordinator chat posts (digest every {chatdigest.every_s(p.config()) / HOUR_S:g} h; 0: off)"]
             + ([f"  {c}: {v['sent']} sent, {v['held']} held, {v['digests']} digests, "
                f"{v['deduped']} not sent as repeats, {v['waiting']} waiting"
                for c, v in s.items()] or ["  none counted yet"])))
@@ -3171,7 +3163,7 @@ def cmd_note(a) -> None:
     if getattr(a, "status", None) is not None:
         return _cmd_note_status(a, run_dir)
     if a.text is None:
-        die("ttp note: the note's text is required", 2)
+        die("ttp note: the note's text is required")
     if not run_dir:
         die("ttp note only works inside a tt-project run")
     a.sent_text = a.text   # the leak scan reads what was asked to be sent, before masking (_note_to)
@@ -3179,12 +3171,12 @@ def cmd_note(a) -> None:
     a.text = _landed_claims_checked(a.text)   # a note's landed-claim is checked like a hand-off's
     if getattr(a, "urgent", False):
         if not a.to:
-            die("ttp note: --urgent goes with --to", 2)
+            die("ttp note: --urgent goes with --to")
         from . import msgurgent
         a.text, _ = msgurgent.mark(a.text, "")
         a.sent_text, a.severity = msgurgent.mark(a.sent_text, "")[0], "high"
     if getattr(a, "reply", None) and a.to:
-        die("ttp note: --reply answers the note's sender by its own route; leave out --to", 2)
+        die("ttp note: --reply answers the note's sender by its own route; leave out --to")
     if getattr(a, "confirms", None):
         if _note_confirms(a, run_dir):   # the ack is the receipt; a note goes only when --to or --reply asks
             _note_to(a, run_dir)
@@ -3315,7 +3307,7 @@ def cmd_notify(a) -> None:
     why = problem("ttp notify", text, getattr(a, "check", None) or "", getattr(a, "do", None) or "")
     if why:
         record("ttp notify", why)
-        die(why, 2)
+        die(why)
     step = {}
     if getattr(a, "step", None):
         # A step only the user can take: one standing item per task and step (userstep.py).
@@ -3323,7 +3315,7 @@ def cmd_notify(a) -> None:
             die("ttp notify --step is for the user (low or normal); a high notify goes to the coordinator")
         step = {"step": a.step, **({"check": a.check.strip()} if (a.check or "").strip() else {}),
                 **({"do": a.do.strip()} if (a.do or "").strip() else {}),
-                **({"deadline": time.time() + 60 * a.expires_in} if a.expires_in and a.expires_in > 0 else {})}
+                **({"deadline": time.time() + MIN_S * a.expires_in} if a.expires_in and a.expires_in > 0 else {})}
     elif getattr(a, "check", None) or getattr(a, "do", None) or getattr(a, "expires_in", None):
         die("ttp notify: --check, --do and --expires-in describe a user step: give its --step too")
     if a.severity == "high":
@@ -3371,7 +3363,7 @@ def _note_confirms(a, run_dir: str) -> bool:
             upstream.queue_ack(Path(run_dir), a.confirms, a.text)
             how = f"queued in this run's directory ({e.strerror or e}); this project's daemon records it when the run ends"
     except ValueError as e:
-        die(f"ttp note --confirms: {e}. Nothing was recorded or sent", 2)
+        die(f"ttp note --confirms: {e}. Nothing was recorded or sent")
     print(f"ack of note {a.confirms} {how}: the fixing project reads it as its receipt, model-free"
           + ("" if a.to or getattr(a, "reply", None) else "; no note to it is needed")
           + ". A new problem goes in its own note, without --confirms")
@@ -3397,7 +3389,7 @@ def _note_to(a, run_dir: str) -> None:
     why = problem("ttp note --to", getattr(a, "sent_text", a.text), p=me)
     if why:
         record("ttp note --to", why, me)
-        die(why, 2)
+        die(why)
     at = back = None
     routed = bool(getattr(a, "reply", None)) or "@" in a.to
     if routed:
@@ -3484,7 +3476,7 @@ def _note_to(a, run_dir: str) -> None:
     if earlier:
         print(f"note for {a.to} not sent: this task already sent it note {earlier} naming the same notes "
               f"({', '.join(sorted(upstream.named_notes(text, getattr(a, 'confirms', None))))}) within "
-              f"{upstream.REPEAT_S // 3600} h, so this one only repeats it. Nothing to wait for: keep working; "
+              f"{upstream.REPEAT_S // HOUR_S} h, so this one only repeats it. Nothing to wait for: keep working; "
               f"`ttp note --status {earlier}` shows whether {a.to} read it")
         return
     print(f"note for {a.to} " + ("already in its inbox" if got == "duplicate" else "filed in its inbox")
@@ -3507,13 +3499,13 @@ def _cmd_note_status(a, run_dir: str | None) -> None:
     the project it is for read it, 1 while it is on its way, 2 when it cannot tell: a retry_when."""
     from . import upstream
     if a.text is not None or a.to or getattr(a, "reply", None):
-        die("ttp note --status takes only the note's id", 2)
+        die("ttp note --status takes only the note's id")
     base = os.environ.get("TTP_PROJECT")
     try:
         rc, line = upstream.note_status(a.status, Project(base).state if base else None,
                                         Path(run_dir) if run_dir else None)
     except ValueError as e:
-        die(str(e), 2)
+        die(str(e))
     print(line)
     raise SystemExit(rc)
 
@@ -3566,7 +3558,7 @@ def cmd_upstream(a) -> None:
         try:
             print(json.dumps(upstream.note_state(a.note_state), sort_keys=True))
         except ValueError as e:
-            die(str(e), 2)
+            die(str(e))
         return
     if a.fp is not None:
         title, spec = a.fp
@@ -3585,10 +3577,10 @@ def cmd_upstream(a) -> None:
     if a.resolve or a.fixed or a.ack or a.regress or a.mine or a.resolved or a.wontfix is not None:
         try:
             if a.wontfix is not None and not a.resolve:
-                die("ttp upstream --wontfix needs --resolve <fp>", 2)
+                die("ttp upstream --wontfix needs --resolve <fp>")
             if a.resolve and a.wontfix is not None:
                 if a.fixed_in or a.task is not None:
-                    die("ttp upstream --wontfix closes a note without a release: drop --fixed-in and --task", 2)
+                    die("ttp upstream --wontfix closes a note without a release: drop --fixed-in and --task")
                 me = here()
                 try:
                     r = upstream.wontfix(a.resolve, a.wontfix, me.name if me else "")
@@ -3610,7 +3602,7 @@ def cmd_upstream(a) -> None:
                 me = here()
                 ok, why = upstream.check_fixed_in(me, a.resolve, a.fixed_in, a.task)
                 if not ok:
-                    die(f"refused: note {a.resolve.strip().lower()} is not fixed in {a.fixed_in.strip().lstrip('v')}: {why}", 2)
+                    die(f"refused: note {a.resolve.strip().lower()} is not fixed in {a.fixed_in.strip().lstrip('v')}: {why}")
                 print(why)
                 try:
                     r = upstream.resolve(a.resolve, a.fixed_in, a.note or "", me.name if me else "")
@@ -3634,7 +3626,7 @@ def cmd_upstream(a) -> None:
                 return
             p = here()
             if not p:
-                die("no tt-project project here", 2)
+                die("no tt-project project here")
             if a.fixed:
                 rc, words = upstream.fixed_status(p, a.fixed)
                 print(words)
@@ -3645,7 +3637,7 @@ def cmd_upstream(a) -> None:
                 # record one for a note no project here filed, so it is never closed as filer unreachable.
                 if (fp.strip().lower() not in upstream.filed(p.name)
                         and not (p.config().get("upstream") or {}).get("ingest")):
-                    die(f"note {fp} was not filed by {p.name}", 2)
+                    die(f"note {fp} was not filed by {p.name}")
                 try:
                     upstream.regress(fp, reason, p.name)
                 except OSError as e:
@@ -3677,7 +3669,7 @@ def cmd_upstream(a) -> None:
                 print(line)
             return
         except ValueError as e:
-            die(str(e), 2)
+            die(str(e))
     if a.receive:
         ack, rc = upstream.receive(sys.stdin.buffer.read(upstream.RECEIVE_BYTES + 1), a.via or "")
         print(json.dumps(ack, sort_keys=True))
@@ -5597,7 +5589,7 @@ def _cmd_checks(a) -> None:
                         + (f": {env_why.partition(';')[0]}, a fault of the spill env, not the change" if env_why else "")
                         + "); running them again on this machine, whose result counts, or on a free spill host "
                         + (("they did not fail on" + (f" (that one again once the checks config changes or in "
-                            f"{checkspill.FAULT_RETRY_S // 60} min: the host's own fault ended them there)"
+                            f"{checkspill.FAULT_RETRY_S // MIN_S} min: the host's own fault ended them there)"
                             if rc == UPGRADE_BUSY and not timed_out and not slow else ""))
                            if spilled.host in checkspill.kept_off(no_spill, p.config())
                            else "(that one again once free: the fault was the host's)" if not env_why
@@ -7882,6 +7874,52 @@ def _checks_place(run_dir: Path, old: dict, env: dict) -> float:
     return min(seen) if seen else now
 
 
+CHECKS_REPLACE_TERM_S = 15   # replaced detached checks get this long after SIGTERM before SIGKILL
+
+
+def _checks_stop_replaced(old: dict, run_dir: Path, env: dict) -> None:
+    """End the earlier detached checks `old` of this run (SIGTERM, then SIGKILL) and log each signal sent."""
+    if not _checks_alive(old):
+        return
+    sent = []
+    try:
+        os.killpg(old["pid"], signal.SIGTERM)
+        sent.append(signal.SIGTERM)
+    except OSError:
+        pass
+    deadline = time.time() + CHECKS_REPLACE_TERM_S
+    while _checks_alive(old) and time.time() < deadline:
+        time.sleep(0.1)
+    if _checks_alive(old):
+        try:
+            os.killpg(old["pid"], signal.SIGKILL)
+            sent.append(signal.SIGKILL)
+        except OSError:
+            pass
+    from . import detach
+    state = Project(env["TTP_PROJECT"]).state if env.get("TTP_PROJECT") else None
+    for sig in sent:   # logged once they ended, into the checks log and the job-signal stream
+        detach.signalled(run_dir / CHECKS_RC, sig, old["pid"], "ttp checks --detach (replaced)",
+                         "newer detached checks of the same run replace these", by="checks", state=state)
+
+
+def _checks_free_previous(old: dict, run_dir: Path, base: str) -> None:
+    """Close out the check output folder of the earlier checks `old` (finished when it is not this run's).
+    OSError when checks.pid names a folder outside the project's (a linked legacy lock) or their commands
+    still own their temporary storage."""
+    from . import checkdirs
+    previous = Path(old["check_run_dir"]) if old.get("check_run_dir") else run_dir
+    if previous != run_dir and previous.parent != Project(base).state / checkdirs.FOLDER:
+        raise OSError("TTP_RUN_DIR in checks.pid is outside the project's check output directory")
+    old_guard = checkdirs.take(previous) if previous.exists() or previous.is_symlink() else False
+    if old_guard is None:
+        raise OSError("earlier check commands still own their temporary storage; not starting replacement checks")
+    if old_guard:
+        old_guard.close()
+        if previous != run_dir:
+            checkdirs.finish(previous)
+
+
 def _checks_start(a, run_dir: Path, top: str, head: str, env: dict, req: str = "",
                   need: int | None = None) -> int:
     """Launch outside the tool sandbox, cancelling the earlier host process before replacing its
@@ -7896,41 +7934,11 @@ def _checks_start(a, run_dir: Path, top: str, head: str, env: dict, req: str = "
     checkdirs.writable(str(run_dir))
     old = _read_checks_pid(run_dir)
     arrived = _checks_place(run_dir, old, env)
-    if _checks_alive(old):
-        sent = []
-        try:
-            os.killpg(old["pid"], signal.SIGTERM)
-            sent.append(signal.SIGTERM)
-        except OSError:
-            pass
-        deadline = time.time() + 15
-        while _checks_alive(old) and time.time() < deadline:
-            time.sleep(0.1)
-        if _checks_alive(old):
-            try:
-                os.killpg(old["pid"], signal.SIGKILL)
-                sent.append(signal.SIGKILL)
-            except OSError:
-                pass
-        from . import detach
-        state = Project(env["TTP_PROJECT"]).state if env.get("TTP_PROJECT") else None
-        for sig in sent:   # logged once they ended, into the checks log and the job-signal stream
-            detach.signalled(run_dir / CHECKS_RC, sig, old["pid"], "ttp checks --detach (replaced)",
-                             "newer detached checks of the same run replace these", by="checks", state=state)
+    _checks_stop_replaced(old, run_dir, env)
     base = env.get("TTP_PROJECT")
     if not base:
         raise OSError("TTP_RUN_DIR for detached checks requires a project state directory (TTP_PROJECT)")
-    # Refuse a linked legacy lock, and preserve the old commands' lifetime on upgrade.
-    previous = Path(old["check_run_dir"]) if old.get("check_run_dir") else run_dir
-    if previous != run_dir and previous.parent != Project(base).state / checkdirs.FOLDER:
-        raise OSError("TTP_RUN_DIR in checks.pid is outside the project's check output directory")
-    old_guard = checkdirs.take(previous) if previous.exists() or previous.is_symlink() else False
-    if old_guard is None:
-        raise OSError("earlier check commands still own their temporary storage; not starting replacement checks")
-    if old_guard:
-        old_guard.close()
-        if previous != run_dir:
-            checkdirs.finish(previous)
+    _checks_free_previous(old, run_dir, base)
     output = checkdirs.new(Project(base).state, run_dir / CHECKS_PID, need)
     guard = checkdirs.take(output)
     launched = False
@@ -8101,9 +8109,9 @@ def _checks_settle(run_dir: Path, head: str | None) -> int:
     from . import checksettle
     out = os.environ.get("TTP_RESULT")
     if not out:
-        die("ttp checks --settle is an on_pass_cmd: it writes the hand-off to $TTP_RESULT, which is not set", 2)
+        die("ttp checks --settle is an on_pass_cmd: it writes the hand-off to $TTP_RESULT, which is not set")
     if not head:
-        die("ttp checks --settle needs --head <sha>: the commit the checks must have passed on", 2)
+        die("ttp checks --settle needs --head <sha>: the commit the checks must have passed on")
     rc, what, handoff = checksettle.settle(run_dir, head)
     if handoff is not None:
         write_json(Path(out), handoff)
@@ -8211,6 +8219,37 @@ def _checks_foreground(run_dir: Path, info: dict) -> int | None:
     return 0
 
 
+def _checks_wait_line(run_dir: Path, info: dict) -> str:
+    """The `ttp checks --result` line of live checks that have not ended: running, or why they wait."""
+    try:
+        wait = json.loads((run_dir / CHECKS_SLOT_WAIT).read_text())
+    except (OSError, ValueError):
+        wait = None
+    if isinstance(wait, dict) and isinstance(wait.get("parked"), dict):   # out of the queue, keeping its place
+        return f"ttp checks: waiting (pid {info['pid']}, not running): {checksqueue.note(wait['parked'])}"
+    if isinstance(wait, dict) and wait.get("follows"):   # joined or superseded (checkjoin): no suite of its own
+        return f"ttp checks: waiting (pid {info['pid']}, not running): {wait['follows']}"
+    if isinstance(wait, dict) and wait.get("suite"):
+        from . import checkcap, locks as lk
+        try:
+            held = checkcap._some(lk.held_labels([Path(wait["suite"])]))
+        except OSError:
+            held = ""
+        n = wait.get("limit") if isinstance(wait.get("limit"), int) else 1
+        n_from = wait.get("limit_from") if isinstance(wait.get("limit_from"), str) else ""
+        return (f"ttp checks: waiting (pid {info['pid']}, not running) for this project's other full checks "
+                f"to end, {'one' if n == 1 else n} at a time per project and repository "
+                f"({n_from or 'checks.slots sets it'}): held by {held or 'a run that just ended'}")
+    if isinstance(wait, dict) and wait.get("spill"):   # a workstation's wait (_spill_wait): no slot here
+        return (f"ttp checks: waiting (pid {info['pid']}, not running, holding no checks slot here) for a busy "
+                f"spill host ({wait['spill']})")
+    if wait is not None or (run_dir / CHECKS_SLOT_WAIT).exists():
+        from . import checkcap
+        return (f"ttp checks: queued for a host-wide checks slot (pid {info['pid']}); "
+                + (checkcap.line() or "they start once one is free"))
+    return f"ttp checks: running (pid {info['pid']})"
+
+
 def _checks_result(run_dir: Path) -> int:
     """`retry_when` probe of the run's checks, detached or foreground: 0 once checks.rc exists or the
     checks died without writing it (it then writes `killed` there), or a foreground run ended
@@ -8249,34 +8288,7 @@ def _checks_result(run_dir: Path) -> int:
         return 1
     alive = _checks_alive(info)
     if not rc_file.exists() and alive:
-        try:
-            wait = json.loads((run_dir / CHECKS_SLOT_WAIT).read_text())
-        except (OSError, ValueError):
-            wait = None
-        if isinstance(wait, dict) and isinstance(wait.get("parked"), dict):   # out of the queue, keeping its place
-            print(f"ttp checks: waiting (pid {info['pid']}, not running): {checksqueue.note(wait['parked'])}")
-        elif isinstance(wait, dict) and wait.get("follows"):   # joined or superseded (checkjoin): no suite of its own
-            print(f"ttp checks: waiting (pid {info['pid']}, not running): {wait['follows']}")
-        elif isinstance(wait, dict) and wait.get("suite"):
-            from . import checkcap, locks as lk
-            try:
-                held = checkcap._some(lk.held_labels([Path(wait["suite"])]))
-            except OSError:
-                held = ""
-            n = wait.get("limit") if isinstance(wait.get("limit"), int) else 1
-            n_from = wait.get("limit_from") if isinstance(wait.get("limit_from"), str) else ""
-            print(f"ttp checks: waiting (pid {info['pid']}, not running) for this project's other full checks "
-                  f"to end, {'one' if n == 1 else n} at a time per project and repository "
-                  f"({n_from or 'checks.slots sets it'}): held by {held or 'a run that just ended'}")
-        elif isinstance(wait, dict) and wait.get("spill"):   # a workstation's wait (_spill_wait): no slot here
-            print(f"ttp checks: waiting (pid {info['pid']}, not running, holding no checks slot here) for a busy "
-                  f"spill host ({wait['spill']})")
-        elif wait is not None or (run_dir / CHECKS_SLOT_WAIT).exists():
-            from . import checkcap
-            print(f"ttp checks: queued for a host-wide checks slot (pid {info['pid']}); "
-                  + (checkcap.line() or "they start once one is free"))
-        else:
-            print(f"ttp checks: running (pid {info['pid']})")
+        print(_checks_wait_line(run_dir, info))
         return 1
     if rc_file.exists() and rc_file.read_text().strip() == "75" and (fault := envfault.marker_open(run_dir)):
         # Stopped at a runner the host lacks: asleep until it is back, then the task runs them again.
@@ -8535,7 +8547,7 @@ def _since_s(v: str) -> float:
     m = re.fullmatch(r"\s*(\d+(?:\.\d+)?)\s*([smhd]?)\s*", str(v))
     if not m or float(m.group(1)) <= 0:
         die(f"--since: give a duration such as 24h, 90m or 2d, not {v!r}")
-    return float(m.group(1)) * {"": 1, "s": 1, "m": 60, "h": HOUR_S, "d": DAY_S}[m.group(2)]
+    return float(m.group(1)) * {"": 1, "s": 1, "m": MIN_S, "h": HOUR_S, "d": DAY_S}[m.group(2)]
 
 
 def cmd_model_trip(a) -> None:
@@ -8547,7 +8559,7 @@ def cmd_model_trip(a) -> None:
         die("ttp model-trip: no project here (run it in a project or its run, or name one)")
     if a.h2h:
         if a.ok == a.worse or not a.ref:
-            die("ttp model-trip --h2h <kind/tier/label>: give exactly one of --ok or --worse, and --ref", 2)
+            die("ttp model-trip --h2h <kind/tier/label>: give exactly one of --ok or --worse, and --ref")
         rec = modeltrip.head_to_head(p.db, a.h2h, a.ok, a.ref)
         print(f"ttp model-trip: head-to-head for {a.h2h} recorded ({'passed' if rec['ok'] else 'worse'})")
         return
@@ -8570,9 +8582,9 @@ def cmd_model(a) -> None:
         die("ttp model: no project here (run it in a project or its run, or --project NAME)")
     if a.action:
         if not a.model:
-            die(f"ttp model {a.action}: name the model", 2)
+            die(f"ttp model {a.action}: name the model")
         if a.action in ("park", "unpark") and a.cls:
-            die(f"ttp model {a.action}: a park holds the model for every class; drop --class", 2)
+            die(f"ttp model {a.action}: a park holds the model for every class; drop --class")
         why = modeldemote.set_state(p.db, a.model, a.cls or modeldemote.ANY, a.action, configwho.from_env(),
                                     time.time(), a.why or "")
         if why:
@@ -8844,7 +8856,7 @@ def _leftover_stop(a) -> int:
     if not leftoverstop.PROC.is_dir():
         print("ttp leftover-procs --stop: no /proc on this host: no process can be attributed; nothing stopped",
               file=sys.stderr)
-        return 2
+        return REFUSED_RC
     if _boxed() and not a.dry_run:
         leftoverstop.request(p, a.stop, a.pid, os.environ.get("TTP_TASK") or "")
         print(f"task #{a.stop}: queued; the daemon checks again and stops them within seconds; its receipt "
@@ -8853,7 +8865,7 @@ def _leftover_stop(a) -> int:
     r = leftoverstop.stop(p, a.stop, a.pid, dry=a.dry_run)
     if r.get("error"):
         print(f"ttp leftover-procs --stop: refused: {r['error']}", file=sys.stderr)
-        return 2
+        return REFUSED_RC
     for t in r["stopped"]:
         print(f"{'would stop' if a.dry_run else 'stopped'} pid {t['pid']}: {t['cmd'] or '?'}")
     for t in r["refused"]:
@@ -8863,7 +8875,7 @@ def _leftover_stop(a) -> int:
     if not a.dry_run:
         print(f"task #{a.stop}: stopped {len(r['stopped'])}; locks freed: {', '.join(r.get('freed') or []) or 'none'}"
               + (f"; still held: {', '.join(r['held'])}" if r.get("held") else ""))
-    return 2 if r["refused"] or r.get("group_refused") else 0
+    return REFUSED_RC if r["refused"] or r.get("group_refused") else 0
 
 
 def cmd_svcscan(a) -> None:
@@ -9011,7 +9023,7 @@ def _lock_alternative(p, cfg: dict, names: list[str], a) -> str:
     each, so the caller tells a pause from a busy lock. Alternatives mix with no other names (exit 2)."""
     from . import lockprobe
     if len(names) != 1:
-        die("ttp lock: alternatives (A|B) are one word of their own, never mixed with A,B", 2)
+        die("ttp lock: alternatives (A|B) are one word of their own, never mixed with A,B")
     alts = list(dict.fromkeys(x for x in names[0].split("|") if x))
     paused = {x: h for x in alts if (h := lockprobe.pause(p, cfg, x)) is not None}
     live = [x for x in alts if x not in paused]
@@ -9035,14 +9047,14 @@ def cmd_host_run(a) -> None:
         cmd = cmd[1:]
     look = a.status or a.result
     if look and cmd:
-        die("ttp host-run: --status and --result take an id, not a command", 2)
+        die("ttp host-run: --status and --result take an id, not a command")
     if not cmd and not look:
-        die("usage: ttp host-run [--detach] [--timeout S] -- <command...> | --status <id> | --result <id>", 2)
+        die("usage: ttp host-run [--detach] [--timeout S] -- <command...> | --status <id> | --result <id>")
     if a.timeout is not None and not (a.timeout > 0 and a.timeout == a.timeout):
-        die("ttp host-run: --timeout takes a number of seconds above 0", 2)
+        die("ttp host-run: --timeout takes a number of seconds above 0")
     p = here()
     if p is None:
-        die("ttp host-run only works inside a tt-project run or project folder", 2)
+        die("ttp host-run only works inside a tt-project run or project folder")
     if look:
         sys.exit(hostrun.status(p, look, result=bool(a.result)))
     sys.exit(hostrun.request(p, cmd, timeout=a.timeout, detach=a.detach))
@@ -9177,13 +9189,13 @@ def cmd_lock(a) -> None:
     if cmd and cmd[0] == "--":
         cmd = cmd[1:]
     if a.json and cmd:
-        die("ttp lock --json lists the locks and runs nothing: drop the command or --json", 2)
+        die("ttp lock --json lists the locks and runs nothing: drop the command or --json")
     a.probe = a.probe or a.json
     if not cmd and not a.probe:
         die("usage: ttp lock [--disruptive] <resource> -- <command...>  |  ttp lock --probe <resource>")
     names = list(dict.fromkeys(n for n in a.resource.split(",") if n))
     if not names:
-        die("usage: ttp lock [--disruptive] <resource>[,<resource>...] -- <command...>", 2)
+        die("usage: ttp lock [--disruptive] <resource>[,<resource>...] -- <command...>")
     base = os.environ.get("TTP_PROJECT")
     if not base and a.probe:
         base = next((str(d) for d in [Path.cwd(), *Path.cwd().parents] if Project(d).exists()), None)
@@ -9260,7 +9272,7 @@ def cmd_lock(a) -> None:
     dev = next((L for L in todo if L["device"]), None)
     if a.shared and dev and not a.probe:   # a probe answers for the plain lock: a retry_when keeps working
         die(f"{dev['name']} is a device lock: one command at a time may use the device, so it cannot be "
-            f"held shared. Use a plain `ttp lock {dev['name']} -- <command>`", 2)
+            f"held shared. Use a plain `ttp lock {dev['name']} -- <command>`")
 
     # A newer user order on one of them holds a task created or last re-specified before it (userorder.py):
     # its take (before each try, as a pause) and its probe say busy, so the task waits until it is
@@ -9357,7 +9369,7 @@ def cmd_lock(a) -> None:
         sys.exit(subprocess.call(cmd))
     if bad := next((L for L in todo if L["res"] in shared_locks), None):
         die(f"cannot lock {bad['name']} exclusively inside a shared `ttp lock` of it: it would wait for itself. "
-            f"Take the exclusive lock around the whole command instead", 2)
+            f"Take the exclusive lock around the whole command instead")
     mine = [L["res"] for L in todo]
     child_env = {**os.environ, **({"TTP_LOCKS_SHARED": ",".join(shared_locks + mine)} if a.shared
                                   else {"TTP_LOCKS_HELD": ",".join(held_locks + mine)})}
@@ -9569,7 +9581,7 @@ def cmd_lock(a) -> None:
                     lk.unreserve(L["mark"], L["own"])
             waited = time.time() - started
             if waited > 5:
-                print(f"ttp lock: got {what}{' (shared)' if a.shared else ''} after {waited / 60:.1f} min",
+                print(f"ttp lock: got {what}{' (shared)' if a.shared else ''} after {waited / MIN_S:.1f} min",
                       file=sys.stderr, flush=True)
             # The lock is held until the command itself has ended. A signal to this process (a
             # timeout, a cancel) is passed on to the command, and the lock is released only once
@@ -10007,7 +10019,7 @@ def _bench_reach(targets: list[str]) -> int:
         rows, problems = benchrun.reach_probe(targets)
     except benchrun.BenchError as e:
         print(f"bench reach: {e}", file=sys.stderr)
-        return 2
+        return REFUSED_RC
     for cell, target, verdict in rows:
         print(f"{cell}: {target} {verdict}")
     for p in problems:
@@ -10343,7 +10355,7 @@ def cmd_quarantine(a) -> None:
     now = time.time()
     if a.action == "still":
         if not (a.test_id or "").isdigit():
-            die("ttp quarantine still: give the deflake task's id", 2)
+            die("ttp quarantine still: give the deflake task's id")
         rc, why = gatejudge.deflake_due(p, int(a.test_id), now)
         print(f"task {a.test_id}: {why}")
         sys.exit(rc)
@@ -10427,12 +10439,12 @@ def cmd_progress(a) -> None:
     a = ap.parse_intermixed_args(a.words or [])
     p = here()
     if not p:
-        die("ttp progress report: no project here (run it in a project or with TTP_PROJECT set)", 2)
+        die("ttp progress report: no project here (run it in a project or with TTP_PROJECT set)")
     key = a.key
     if not key and (job := os.environ.get(progress.JOB_ENV)):
         key = f"{os.environ.get('TTP_TASK') or 'job'}/{Path(job).stem}"
     if not (key or "").strip():
-        die("ttp progress report: --key is required outside a `ttp detach` job", 2)
+        die("ttp progress report: --key is required outside a `ttp detach` job")
     holder = a.holder
     if not holder.strip() and a.kind == "refusal" and a.resource.strip():
         holder = progress.holder_text(p, a.resource.strip())
@@ -10694,7 +10706,7 @@ def cmd_detach(a) -> None:
     how = (f"(pid {pid})" if pid else
            "(queued: " + ("the check's end" if check is not None else "this command's sandbox")
            + " would end it, so the daemon starts it within seconds"
-           + (f"; it ends after {detach.CHECK_JOB_S // 3600} h or once the push or checks run that ran this "
+           + (f"; it ends after {detach.CHECK_JOB_S // HOUR_S} h or once the push or checks run that ran this "
               "check is gone, whichever comes first)" if check is not None else ")"))
     print(f"detached {a.name} {how}\nlog: {logf}\nrc:  {rc}\n"
           + (f"locks: {','.join(job_locks)} (taken all or nothing before the command starts, held until it "
@@ -10736,7 +10748,7 @@ def _detach_reap(what: str) -> int:
     rc = rc.resolve()
     if not detach._entry(rc):
         print(f"ttp detach --reap: no detached job is recorded at {rc}", file=sys.stderr)
-        return 2
+        return REFUSED_RC
     e = detach.close(rc)
     if e is None:
         st, _ = detach.state(rc)
@@ -10762,7 +10774,7 @@ def _detach_idle_ok(what: str, why: str) -> int:
     rc = rc.resolve()
     if not detach._entry(rc):
         print(f"ttp detach --idle-ok: no detached job is recorded at {rc}", file=sys.stderr)
-        return 2
+        return REFUSED_RC
     if detach.state(rc)[0] in ("ended", "lost"):
         print(f"ttp detach --idle-ok: {rc.stem} is over; nothing samples it now", file=sys.stderr)
         return 1
@@ -10850,7 +10862,7 @@ def _detach_list() -> int:
     if not me and not coord:
         print("ttp detach --list: only works inside a tt-project task or coordinator run (TTP_PROJECT and "
               "TTP_RUN_ID set, plus TTP_TASK in a task run)", file=sys.stderr)
-        return 2
+        return REFUSED_RC
     jobs = jobstop.task_jobs(*me) if me else jobstop.coord_jobs(coord)
     for run, j in jobs:
         st, why = detach.state(Path(j["rc"]))
@@ -10891,7 +10903,7 @@ def _detach_stop(what: str, given: str | None = None) -> int:
     base = rc.parent.parent.parent.parent if rc.parent.parent.name == "runs" else None
     if base is None or not (base / "state").is_dir():
         print(f"ttp detach --stop: {rc} is not a job of a tt-project run", file=sys.stderr)
-        return 2
+        return REFUSED_RC
     p = Project(base)
     if not jobstop.running(rc):
         print(f"{rc.stem}: not running; nothing to stop")
@@ -10927,7 +10939,7 @@ def _detach_stop_checks(rc: Path, given: str | None) -> int:
     base = run_dir.parent.parent.parent if run_dir.parent.name in ("runs", "prechecks") else None
     if base is None or not (base / "state").is_dir():
         print(f"ttp detach --stop: {rc} is not the checks of a tt-project run", file=sys.stderr)
-        return 2
+        return REFUSED_RC
     p = Project(base)
     caller, run = os.environ.get("TTP_TASK") or "", os.environ.get("TTP_RUN_ID") or ""
     if _boxed():
@@ -10981,7 +10993,7 @@ def _detach_stop_push(marker: Path, given: str | None) -> int:
     if marker.parent.name != push.DETACHED or not (p := Project(marker.parent.parent.parent)).exists() \
             or p.state.resolve() != marker.parent.parent:
         print(f"ttp detach: {marker} is not a detached push marker of a tt-project project", file=sys.stderr)
-        return 2
+        return REFUSED_RC
     return push.stop_own(p, marker, given or "")
 
 
@@ -11018,7 +11030,7 @@ def _launcher_stop(what: str, rc: Path) -> int:
               f"{where}, and no stop command registered for its folder in {launcherstop.CONFIG_KEY} "
               f"(project.json: {{glob of job folders: stop command}}); register the launcher's stop there, "
               f"then rerun `ttp detach --stop <job folder>`", file=sys.stderr)
-        return 2
+        return REFUSED_RC
     if _boxed():
         print(f"ttp detach --stop: {f} names a launcher's driver, but its process cannot be seen from inside a "
               "sandbox; run it outside this command's sandbox", file=sys.stderr)
@@ -11077,7 +11089,7 @@ def _detach_stop_pids(what: str) -> int:
     if not base or not caller:
         print("ttp detach --stop-pids: only works inside a tt-project task run (TTP_PROJECT and TTP_TASK set)",
               file=sys.stderr)
-        return 2
+        return REFUSED_RC
     p, f = Project(base), Path(what).expanduser().absolute()
     boxed = _boxed()
     targets, gone, why = jobstop.plan_pids(p, f, caller, procs=not boxed)
@@ -11417,12 +11429,12 @@ def _detach_check_remote(host: str, prefixes: list, rows: str | None = None, aft
             got = (lines[0] if lines else "").split(" ", 1)
             if got[0] != "rows" or len(got) < 2:
                 print(f"{name}: unreadable answer from {host} (exit {r.returncode}): {(r.stdout + r.stderr).strip()[-200:]}")
-                return 2
+                return REFUSED_RC
             n = None if got[1].strip() == "none" else int(got[1]) if got[1].strip().isdigit() else 0
         out = (lines or [""])[-1].split(" ", 1)
         if r.returncode or out[0] not in ("rc", "none", "boot", "running", "gone", "series"):
             print(f"{name}: unreadable answer from {host} (exit {r.returncode}): {(r.stdout + r.stderr).strip()[-200:]}")
-            return 2
+            return REFUSED_RC
         if mirror and (end := mirror_end(lines[-1])):
             try:
                 mirror_save(mirror, name, host, pre, end=end)
@@ -11494,56 +11506,7 @@ def cmd_devq(a) -> None:
     cfg_json = json.dumps(devq.settings(rc))
     rest = list(a.rest or [])
     if a.op == "submit":
-        usage = ("usage: ttp devq submit <runner> --id <id> [--config <key>] [--timeout <s>] [--workdir <dir>] "
-                 "[--input <path>]... [--cold-start <s>] [--artifact <path>] [--wedge-pattern <regex>]... "
-                 "[--no-wedge-check] "
-                 "[--no-lint] -- <command...>")
-        opts, rest = (rest[:rest.index("--")], rest[rest.index("--") + 1:]) if "--" in rest else (rest, [])
-        sp = argparse.ArgumentParser(prog="ttp devq submit", add_help=False)
-        for flag in ("--id", "--config", "--workdir", "--artifact"):
-            sp.add_argument(flag, default="")
-        sp.add_argument("--timeout", type=int, default=0)
-        sp.add_argument("--input", action="append", default=[])
-        sp.add_argument("--cold-start", type=int, default=0)
-        sp.add_argument("--no-lint", action="store_true")
-        sp.add_argument("--wedge-pattern", action="append", default=[])
-        sp.add_argument("--no-wedge-check", action="store_true")
-        try:
-            o, extra = sp.parse_known_args(opts)
-        except SystemExit:
-            die(usage)
-        if not o.id or not rest or extra:
-            die(usage)
-        a.id = o.id
-        timeout = o.timeout
-        ceiling = device_timeout_max(p.config())[0]
-        if ceiling and timeout > ceiling:
-            die(f"devq submit: --timeout {timeout} is above the project's device-job ceiling of {ceiling} s "
-                f"(runner.device_timeout_max_s); split the run into shorter jobs")
-        if ceiling and not timeout and not 0 < float(devq.settings(rc)["job_timeout_s"] or 0) <= ceiling:
-            timeout = ceiling
-            print(f"devq submit: no --timeout; the job gets the project's device-job ceiling of {ceiling} s")
-        spec = {"id": o.id, "config": o.config or o.id, "cmd": rest[0] if len(rest) == 1 else shlex.join(rest),
-                "task": os.environ.get("TTP_TASK", ""), "project": p.name, "workdir": o.workdir, "timeout_s": timeout,
-                "inputs": o.input, "cold_start_s": o.cold_start}
-        if o.artifact:
-            spec["artifact"] = o.artifact
-        if _urgent_priority(p, spec["task"]) is not None:
-            spec["urgent"] = True   # the runner takes it before routine queued jobs (devq.Runner.next_job)
-        if o.wedge_pattern and o.no_wedge_check:
-            die("devq submit: --wedge-pattern and --no-wedge-check exclude each other")
-        if o.wedge_pattern or o.no_wedge_check:
-            spec["wedge_patterns"] = o.wedge_pattern
-            bad = devq.pattern_problems(o.wedge_pattern)
-            if bad:
-                die("devq submit: --wedge-pattern: " + "; ".join(bad))
-        if not o.no_lint:
-            errors, warnings = devq.lint(spec["cmd"], rc, o.id, o.workdir, spec["task"])
-            for w in warnings:
-                print(f"devq submit: warning: {w}", file=sys.stderr)
-            if errors:
-                die("devq submit: refused, the job would fail at once: " + "; ".join(errors)
-                    + " (fix the command, or pass --no-lint if this check is wrong)")
+        spec = _devq_submit_spec(a, p, rc, rest)
         args, install, limit = [cfg_json, json.dumps(spec)], True, 120
     elif a.op == "start":
         args, install, limit = [cfg_json], True, 120
@@ -11573,6 +11536,63 @@ def cmd_devq(a) -> None:
         print(f"hand off: status waiting, retry_when \"{_own_ttp_word(p)} devq probe {a.runner} {a.id}\", "
               f"wake_tier light{', survives_reboot true' if remote else ''}")
     sys.exit(r.returncode)
+
+
+def _devq_submit_spec(a, p: Project, rc: dict, rest: list) -> dict:
+    """Parse `ttp devq submit`'s options into the job spec the runner queues, refusing a job over the
+    project's device-job ceiling, bad wedge patterns or a command its lint says fails at once."""
+    from . import devq
+    usage = ("usage: ttp devq submit <runner> --id <id> [--config <key>] [--timeout <s>] [--workdir <dir>] "
+             "[--input <path>]... [--cold-start <s>] [--artifact <path>] [--wedge-pattern <regex>]... "
+             "[--no-wedge-check] "
+             "[--no-lint] -- <command...>")
+    opts, rest = (rest[:rest.index("--")], rest[rest.index("--") + 1:]) if "--" in rest else (rest, [])
+    sp = argparse.ArgumentParser(prog="ttp devq submit", add_help=False)
+    for flag in ("--id", "--config", "--workdir", "--artifact"):
+        sp.add_argument(flag, default="")
+    sp.add_argument("--timeout", type=int, default=0)
+    sp.add_argument("--input", action="append", default=[])
+    sp.add_argument("--cold-start", type=int, default=0)
+    sp.add_argument("--no-lint", action="store_true")
+    sp.add_argument("--wedge-pattern", action="append", default=[])
+    sp.add_argument("--no-wedge-check", action="store_true")
+    try:
+        o, extra = sp.parse_known_args(opts)
+    except SystemExit:
+        die(usage)
+    if not o.id or not rest or extra:
+        die(usage)
+    a.id = o.id
+    timeout = o.timeout
+    ceiling = device_timeout_max(p.config())[0]
+    if ceiling and timeout > ceiling:
+        die(f"devq submit: --timeout {timeout} is above the project's device-job ceiling of {ceiling} s "
+            f"(runner.device_timeout_max_s); split the run into shorter jobs")
+    if ceiling and not timeout and not 0 < float(devq.settings(rc)["job_timeout_s"] or 0) <= ceiling:
+        timeout = ceiling
+        print(f"devq submit: no --timeout; the job gets the project's device-job ceiling of {ceiling} s")
+    spec = {"id": o.id, "config": o.config or o.id, "cmd": rest[0] if len(rest) == 1 else shlex.join(rest),
+            "task": os.environ.get("TTP_TASK", ""), "project": p.name, "workdir": o.workdir, "timeout_s": timeout,
+            "inputs": o.input, "cold_start_s": o.cold_start}
+    if o.artifact:
+        spec["artifact"] = o.artifact
+    if _urgent_priority(p, spec["task"]) is not None:
+        spec["urgent"] = True   # the runner takes it before routine queued jobs (devq.Runner.next_job)
+    if o.wedge_pattern and o.no_wedge_check:
+        die("devq submit: --wedge-pattern and --no-wedge-check exclude each other")
+    if o.wedge_pattern or o.no_wedge_check:
+        spec["wedge_patterns"] = o.wedge_pattern
+        bad = devq.pattern_problems(o.wedge_pattern)
+        if bad:
+            die("devq submit: --wedge-pattern: " + "; ".join(bad))
+    if not o.no_lint:
+        errors, warnings = devq.lint(spec["cmd"], rc, o.id, o.workdir, spec["task"])
+        for w in warnings:
+            print(f"devq submit: warning: {w}", file=sys.stderr)
+        if errors:
+            die("devq submit: refused, the job would fail at once: " + "; ".join(errors)
+                + " (fix the command, or pass --no-lint if this check is wrong)")
+    return spec
 
 
 def _own_ttp_word(p: Project | None) -> str:
@@ -11665,7 +11685,7 @@ def cmd_adopt(a) -> None:
     # Another name for this machine (an alias, its FQDN) is stored as its own short name.
     host = a.host if a.host and not machines.names_here(a.host) else hostname()
     if host == hostname() and (why := adopt_refusal(a.name, a.dir)):
-        die(f"ttp adopt: refused: {why}", 2)
+        die(f"ttp adopt: refused: {why}")
     register(a.name, {"host": host, "dir": a.dir})
     print(MARKER.format(name=a.name, host=host, dir=a.dir))
 
@@ -12094,7 +12114,7 @@ def cmd_prune(a) -> None:
               f"archive {archive.task_dir(p, a.archived)}")
         for e in m.get("files") or []:
             where = archive.where(p, a.archived, e)
-            print(f"  {e['path']}  {e['size'] / 1e6:.1f} MB  {e['stored']}"
+            print(f"  {e['path']}  {e['size'] / MB:.1f} MB  {e['stored']}"
                   + ("  (hand-off artifact)" if e.get("named") else "")
                   + (f"  {where}" if where else ""))
         for e in m.get("patches") or []:
@@ -12115,13 +12135,13 @@ def cmd_prune(a) -> None:
     for r in res:
         cleared = f"; cleared {', '.join(r['cleared'][:5])}" if r["cleared"] else ""
         mv, ar = r.get("moved"), r.get("archived")
-        moved = (f"{'would move' if dry else 'moved'} {mv['files']} untracked file(s) ({mv['bytes'] / 1e6:.1f} MB) "
+        moved = (f"{'would move' if dry else 'moved'} {mv['files']} untracked file(s) ({mv['bytes'] / MB:.1f} MB) "
                  f"to {mv['to']}; " if mv else "")
         if ar:
-            moved += (f"{'would archive' if dry else 'archived'} {ar['files']} file(s) ({ar['bytes'] / 1e6:.1f} MB)"
+            moved += (f"{'would archive' if dry else 'archived'} {ar['files']} file(s) ({ar['bytes'] / MB:.1f} MB)"
                       + (f" to {ar['dir']}" if ar.get("dir") else "")
                       + (f", {'would drop' if dry else 'dropped'} {ar['dropped']} over the cap "
-                         f"({ar['dropped_bytes'] / 1e6:.1f} MB, listed in the manifest)" if ar["dropped"] else "")
+                         f"({ar['dropped_bytes'] / MB:.1f} MB, listed in the manifest)" if ar["dropped"] else "")
                       + "; ")
         if r.get("patched"):
             moved += f"{'would save' if dry else 'saved'} its {len(r['patched'])} changed tracked file(s) as a verified patch; "
@@ -12266,7 +12286,7 @@ def _schedule_run(p, name: str | None) -> int:
         die("usage: ttp schedules <name> run <schedule>")
     if why := schednow.refusal(p.db.one("SELECT * FROM schedules WHERE name=?", (name,)), name):
         print(f"ttp schedules run: {why}", file=sys.stderr)
-        return 2
+        return REFUSED_RC
     res = schednow.wait(p, schednow.request(p, name, os.environ.get("TTP_TASK")))
     if res.get("error"):
         print(f"ttp schedules run: {res['error']}", file=sys.stderr)
@@ -12274,7 +12294,7 @@ def _schedule_run(p, name: str | None) -> int:
     status = str(res.get("status") or "")
     if status.startswith("refused: "):
         print(f"ttp schedules run: {status[9:]}", file=sys.stderr)
-        return 2
+        return REFUSED_RC
     if res.get("stdout"):
         print(res["stdout"])
     rc = res.get("rc")
@@ -12319,7 +12339,7 @@ def cmd_schedules(a) -> None:
         grace = watchgrace.grace_s(json.loads(r["payload"] or "{}"))
         lines = watchgrace.status(dict(p.db.kv(watchgrace.KV + a.schedule) or {}), grace, a.obs_key)
         print("\n".join(lines) if lines else f"{a.schedule}: ok (no key reported"
-              + (f"; grace {grace / 60:g} min)" if grace else "; no grace_min set)"))
+              + (f"; grace {grace / MIN_S:g} min)" if grace else "; no grace_min set)"))
         return
     if a.action == "show":
         if not a.schedule:
@@ -12360,7 +12380,7 @@ def cmd_schedules(a) -> None:
               f"{f' (runs at the cap: {sched.over_cap_text(over)})' if over else ''}"
               f"{f' precheck: {pre[:60]}' if pre else ''}"
               f"{'' if e['enabled'] else ' (off)'}  {r['last_status'] or ''}"
-              f"{f' ({n} skip(s) in 24 h)' if (n := len(sched.skips(p.db, r['name'], sched.SKIP_KEEP, time.time() - 86400))) else ''}")
+              f"{f' ({n} skip(s) in 24 h)' if (n := len(sched.skips(p.db, r['name'], sched.SKIP_KEEP, time.time() - DAY_S))) else ''}")
 
 
 def cmd_mute(a) -> None:
@@ -12489,7 +12509,7 @@ def cmd_obligation(a) -> None:
             die(f"usage: ttp obligation {a.action} <id> \"<evidence>\"")
         ob.append_run(Path(run_dir), a.args[0], a.action, a.args[1], task, milestone=a.milestone)
         print(f"{a.action} on {a.args[0]} recorded for task #{task}; the daemon files it within "
-              f"{ob.CHECK_EVERY_S // 60} min (only if this task owns {a.args[0]})")
+              f"{ob.CHECK_EVERY_S // MIN_S} min (only if this task owns {a.args[0]})")
         return
     if in_run():
         die(f"ttp obligation {a.action} is for the user or the coordinator, not inside a run; an owner "
@@ -12601,49 +12621,60 @@ def cmd_machines(a) -> None:
             die(str(e))
         print(f"removed {a.alias}")
     if a.action in ("add", "remove", "push", "set"):
-        named = getattr(a, "to", None) or ([a.host] if getattr(a, "host", None) else [])
-        hosts = named or remote_hosts()
-        if a.action == "push" and not hosts:
-            print("no projects on other machines; nothing to copy")
-        if not named:   # a host named on purpose is tried whatever its state
-            skips = mm.push_skips(hosts)
-            for host in hosts:
-                if host in skips:
-                    print(f"skipped {host}: {skips[host]}")
-            hosts = [h for h in hosts if h not in skips]
-        if a.action == "push":
-            for host in hosts:
-                print(mm.push(host), flush=True)
-            if getattr(a, "log", False):
-                print(mm.PUSH_DONE, flush=True)
-        else:
-            # A change never waits for hosts that are down: the copy runs on in the background.
-            for line in mm.push_failures(mark=True):
-                print(f"last background copy: {line}")
-            if hosts:
-                try:
-                    log = mm.push_background(hosts)
-                except OSError as e:     # the local change is saved; only the copy did not start
-                    print(f"could not start copying the machines list to {', '.join(hosts)}: {e}")
-                    return
-                print(f"copying the machines list to {', '.join(hosts)} in the background (results: {log}; "
-                      f"`ttp machines push` copies in the foreground)")
+        _machines_copy(a, mm)
     else:
-        known, notes = mm.load(), mm.tag_notes()
-        if a.json:   # "_tag_notes" can never be an alias (machines.ALIAS_RE starts with a letter or digit)
-            print(json.dumps({**known, **({mm.TAG_NOTES_KEY: notes} if notes else {})}, indent=2, sort_keys=True))
-            return
-        if not known:
-            print("no machines yet: ttp machines add <alias> --tags device,... [--note TEXT]")
-        from . import fleethold
-        holds = fleethold.active()
-        for alias in sorted(known):
-            print(mm.line(alias, known[alias]))
-            if alias in holds:
-                print("  " + fleethold.line(holds[alias]))
-        carried = {t for m in known.values() for t in mm._tags_of(m)}
-        for tag, n in sorted(notes.items()):   # a note for a tag no machine has yet still shows
-            print(mm.tag_note_line(tag, n) + ("" if tag in carried else " (no listed machine has this tag)"))
+        _machines_list(a, mm)
+
+def _machines_copy(a, mm) -> None:
+    """Copy the machines list to the other hosts after a change, or in the foreground for `push`:
+    the hosts named, else every remote project host not skipped."""
+    named = getattr(a, "to", None) or ([a.host] if getattr(a, "host", None) else [])
+    from .upstream import remote_hosts
+    hosts = named or remote_hosts()
+    if a.action == "push" and not hosts:
+        print("no projects on other machines; nothing to copy")
+    if not named:   # a host named on purpose is tried whatever its state
+        skips = mm.push_skips(hosts)
+        for host in hosts:
+            if host in skips:
+                print(f"skipped {host}: {skips[host]}")
+        hosts = [h for h in hosts if h not in skips]
+    if a.action == "push":
+        for host in hosts:
+            print(mm.push(host), flush=True)
+        if getattr(a, "log", False):
+            print(mm.PUSH_DONE, flush=True)
+    else:
+        # A change never waits for hosts that are down: the copy runs on in the background.
+        for line in mm.push_failures(mark=True):
+            print(f"last background copy: {line}")
+        if hosts:
+            try:
+                log = mm.push_background(hosts)
+            except OSError as e:     # the local change is saved; only the copy did not start
+                print(f"could not start copying the machines list to {', '.join(hosts)}: {e}")
+                return
+            print(f"copying the machines list to {', '.join(hosts)} in the background (results: {log}; "
+                  f"`ttp machines push` copies in the foreground)")
+
+
+def _machines_list(a, mm) -> None:
+    """`ttp machines` with no action: every machine with its hold and the tag notes, or --json."""
+    known, notes = mm.load(), mm.tag_notes()
+    if a.json:   # "_tag_notes" can never be an alias (machines.ALIAS_RE starts with a letter or digit)
+        print(json.dumps({**known, **({mm.TAG_NOTES_KEY: notes} if notes else {})}, indent=2, sort_keys=True))
+        return
+    if not known:
+        print("no machines yet: ttp machines add <alias> --tags device,... [--note TEXT]")
+    from . import fleethold
+    holds = fleethold.active()
+    for alias in sorted(known):
+        print(mm.line(alias, known[alias]))
+        if alias in holds:
+            print("  " + fleethold.line(holds[alias]))
+    carried = {t for m in known.values() for t in mm._tags_of(m)}
+    for tag, n in sorted(notes.items()):   # a note for a tag no machine has yet still shows
+        print(mm.tag_note_line(tag, n) + ("" if tag in carried else " (no listed machine has this tag)"))
 
 
 def _machine_activity(a) -> None:
@@ -12724,26 +12755,7 @@ def _machine_change(a) -> None:
     """`ttp machines change add|list|close|edit`: the ledger of live changes to shared machines (machine_ledger.py)."""
     from . import machine_ledger as ml
     if a.change == "list":
-        got = ml.changes([a.alias] if a.alias else None, open_only=not a.all)
-        if a.json:
-            print(json.dumps(got, indent=2, sort_keys=True))
-            return
-        if not got:
-            print("no open machine changes")
-        p = here()
-        for c in got:
-            print(ml.change_line(c, where=p) + (f" (closed {ml.ends.shown(c['closed'], p)}: {c.get('closed_why')})"
-                                                if c.get("closed") else ""))
-            for r in c.get("auto_undo_runs") or []:
-                tail = " ".join(str(r.get("tail") or "").split())[-200:]
-                print(f"  auto-undo try {r.get('try')} at {ml.ends.shown(float(r.get('at') or 0), p)}: "
-                      f"{r.get('outcome')}" + (f"; output: {tail}" if tail else ""))
-        for r in ml.pending(p.state) if p else []:
-            print(f"queued for this project's daemon (request {r['queued']}): {r['op']} "
-                  + (f"#{r['fields'].get('id')}" if r["op"] in ("close", "edit", "test") else
-                     f"{r['fields'].get('alias')}" if r["op"] in ("outage", "outage_clear", "machine") else
-                     f"{r['fields'].get('alias')}: {r['fields'].get('what')}"))
-        return
+        return _machine_change_list(a, ml)
     p = here()
     by = a.by or (p.name if p else "")
     queue = p.state if p else None   # a sandbox that keeps the shared ledger read-only: queued for the daemon
@@ -12761,37 +12773,7 @@ def _machine_change(a) -> None:
                 print(f"answered page note {fp}: the close is its reply, no other reply is needed")
         return
     if a.change == "edit":
-        flag_only = a.test is not None and not any((a.what, a.undo, a.expires, a.until_probe, a.until_task)) \
-            and a.auto_undo is None
-        if a.allow_met_probe and not a.until_probe:
-            die("--allow-met-probe goes with --until-probe")
-        try:
-            if a.test is not None:
-                c = ml.set_test(a.id, by, a.test, queue=queue)
-                if c.get("queued"):
-                    print(f"queued the test flag of machine change #{a.id} (request {c['queued']}): the shared "
-                          f"machine ledger is read-only here, so this project's daemon sets it on its next tick")
-                else:
-                    print(f"machine change #{a.id} is {'now' if a.test else 'no longer'} flagged as a test: "
-                          f"`ttp ttr` labels the incidents inside its window afresh")
-            if flag_only:
-                return
-            owner = None
-            if a.until_task or a.until_probe:
-                c = next((c for c in ml.changes() if c.get("id") == a.id), None)
-                owner = c.get("by") if c else by
-            if a.until_task:
-                _until_task_ok(p, owner, a.until_task)
-            c = ml.edit_change(a.id, by or "user", a.what, a.undo, a.expires, a.until_probe, until_task=a.until_task,
-                               where=p, auto_undo=a.auto_undo, allow_met_probe=a.allow_met_probe,
-                               project=(p if p and p.name == owner else local_project(owner) or p)
-                               if a.until_probe else None, queue=queue, expires_only=a.expires_only)
-        except ValueError as e:
-            die(str(e))
-        except OSError as e:
-            die(_unwritable(e))
-        print(_queued_line(c, p) if c.get("queued") else f"edited {ml.change_line(c, where=p)}")
-        return
+        return _machine_change_edit(a, ml, p, by, queue)
     if not by:
         die("run it inside a project, or say whose change it is: --by <project>")
     task = os.environ.get("TTP_TASK")
@@ -12825,6 +12807,64 @@ def _machine_change(a) -> None:
     except OSError as e:
         die(_unwritable(e))
     print(_queued_line(c, p) if c.get("queued") else f"recorded {ml.change_line(c, where=p)}")
+
+
+def _machine_change_list(a, ml) -> None:
+    """`ttp machines change list`: the open (or --all) changes with their auto-undo tries, then the
+    requests still queued for this project's daemon."""
+    got = ml.changes([a.alias] if a.alias else None, open_only=not a.all)
+    if a.json:
+        print(json.dumps(got, indent=2, sort_keys=True))
+        return
+    if not got:
+        print("no open machine changes")
+    p = here()
+    for c in got:
+        print(ml.change_line(c, where=p) + (f" (closed {ml.ends.shown(c['closed'], p)}: {c.get('closed_why')})"
+                                            if c.get("closed") else ""))
+        for r in c.get("auto_undo_runs") or []:
+            tail = " ".join(str(r.get("tail") or "").split())[-200:]
+            print(f"  auto-undo try {r.get('try')} at {ml.ends.shown(float(r.get('at') or 0), p)}: "
+                  f"{r.get('outcome')}" + (f"; output: {tail}" if tail else ""))
+    for r in ml.pending(p.state) if p else []:
+        print(f"queued for this project's daemon (request {r['queued']}): {r['op']} "
+              + (f"#{r['fields'].get('id')}" if r["op"] in ("close", "edit", "test") else
+                 f"{r['fields'].get('alias')}" if r["op"] in ("outage", "outage_clear", "machine") else
+                 f"{r['fields'].get('alias')}: {r['fields'].get('what')}"))
+
+
+def _machine_change_edit(a, ml, p, by: str, queue) -> None:
+    """`ttp machines change edit <id>`: set its test flag, or change its text, undo or end."""
+    flag_only = a.test is not None and not any((a.what, a.undo, a.expires, a.until_probe, a.until_task)) \
+        and a.auto_undo is None
+    if a.allow_met_probe and not a.until_probe:
+        die("--allow-met-probe goes with --until-probe")
+    try:
+        if a.test is not None:
+            c = ml.set_test(a.id, by, a.test, queue=queue)
+            if c.get("queued"):
+                print(f"queued the test flag of machine change #{a.id} (request {c['queued']}): the shared "
+                      f"machine ledger is read-only here, so this project's daemon sets it on its next tick")
+            else:
+                print(f"machine change #{a.id} is {'now' if a.test else 'no longer'} flagged as a test: "
+                      f"`ttp ttr` labels the incidents inside its window afresh")
+        if flag_only:
+            return
+        owner = None
+        if a.until_task or a.until_probe:
+            c = next((c for c in ml.changes() if c.get("id") == a.id), None)
+            owner = c.get("by") if c else by
+        if a.until_task:
+            _until_task_ok(p, owner, a.until_task)
+        c = ml.edit_change(a.id, by or "user", a.what, a.undo, a.expires, a.until_probe, until_task=a.until_task,
+                           where=p, auto_undo=a.auto_undo, allow_met_probe=a.allow_met_probe,
+                           project=(p if p and p.name == owner else local_project(owner) or p)
+                           if a.until_probe else None, queue=queue, expires_only=a.expires_only)
+    except ValueError as e:
+        die(str(e))
+    except OSError as e:
+        die(_unwritable(e))
+    print(_queued_line(c, p) if c.get("queued") else f"edited {ml.change_line(c, where=p)}")
 
 
 def _unwritable(e: OSError, what: Path | None = None) -> str:
@@ -13161,7 +13201,7 @@ def cmd_service(a) -> None:
     p = need(a.name, sys.argv[1:])
     from . import service
     if a.cmd in ("start", "restart") and (why := service.foreign_refusal(p, a.cmd)):
-        die(why, 2)
+        die(why)
     if a.cmd == "start":
         print(service.install(p))
     elif a.cmd == "stop":
@@ -13190,11 +13230,11 @@ def cmd_remove(a) -> None:
     p = need(a.name, sys.argv[1:])
     own = os.environ.get("TTP_PROJECT")
     if os.environ.get("TTP_RUN_DIR") and own and Path(own).resolve() in (Path(p.base).resolve(), Path(p.root).resolve()):
-        die("ttp remove: a run cannot remove its own project (its daemon is running it); a scratch project it made is fine", 2)
+        die("ttp remove: a run cannot remove its own project (its daemon is running it); a scratch project it made is fine")
     from . import projectremove
     ensure_own(p, a.name, "remove")
     if a.delete_files and (why := projectremove.delete_refusal(p)):
-        die(f"ttp remove: {why}", 2)
+        die(f"ttp remove: {why}")
     for ln in projectremove.remove(p, lambda: stop_project(p, True), delete=a.delete_files):
         print(ln)
 
@@ -13561,7 +13601,7 @@ def cmd_config(a) -> None:
             elif err := hostrun.entry(val)[2]:
                 raise ValueError(f"{a.key} {json.dumps(val)[:160]}: {err}")
         except ValueError as e:
-            die(str(e), 2)
+            die(str(e))
     from . import configwho
     setter, grant = configwho.from_env(), None
     if run and (k := _user_only_change(p.raw_config(), a.key, val)):
@@ -14133,7 +14173,7 @@ def cmd_setup(a) -> None:
     bindir.mkdir(parents=True, exist_ok=True)
     shim = bindir / "ttp"
     durable_write(shim, shim_text(sys.executable, cur / "bin" / "ttp", sys.version_info[:2] >= SHIM_MIN_PYTHON),
-                  mode=0o755)
+                  mode=EXEC_MODE)
     on_path = str(bindir) in os.environ.get("PATH", "").split(":")
     print(f"ttp {__version__} ({commit}) installed: {shim}" + ("" if on_path else f" (add {bindir} to PATH)"))
     from .service import plan
@@ -14148,7 +14188,7 @@ def cmd_setup(a) -> None:
 def cmd_uninstall(a) -> None:
     """Remove ttp's services, crontab lines, shortcut, shim and lib for this user (uninstall.py); keep projects."""
     if os.environ.get("TTP_RUN_DIR"):
-        die("ttp uninstall: refused inside a run; the user runs it", 2)
+        die("ttp uninstall: refused inside a run; the user runs it")
     from . import uninstall
     bin_dir = Path(a.bin_dir).expanduser()
     acts = uninstall.plan(bin_dir)
@@ -14395,7 +14435,7 @@ def _install_parts(src_root: Path, lib: Path) -> None:
         if src.exists():
             _copy_tree(src, lib / part)
     for f in (lib / "bin").iterdir():
-        f.chmod(0o755)
+        f.chmod(EXEC_MODE)
     _write_markets(lib)
 
 
@@ -14655,7 +14695,7 @@ def cmd_upgrade(a) -> None:
                 f"nothing was changed ({release.holder_line(p, holder)}).", UPGRADE_BUSY)
         if a.apply is None and mine:
             die(f"task #{tid} finishes the merge in its own worktree and applies it with "
-                f"`ttp upgrade {p.name} --apply <commit>`", 2)
+                f"`ttp upgrade {p.name} --apply <commit>`")
         release.guard_harness(p.harness)
         if a.apply is not None:
             _apply_upgrade(p, a.apply)
@@ -15389,7 +15429,7 @@ def _apply_upgrade(p: Project, commit: str) -> None:
     r = subprocess.run(["git", "-C", str(h), "rev-parse", "-q", "--verify", commit + "^{commit}"],
                        capture_output=True, text=True)
     if r.returncode != 0:
-        die(f"--apply: {commit} is not a commit of {h}", 2)
+        die(f"--apply: {commit} is not a commit of {h}")
     merged = r.stdout.strip()
     if subprocess.run(["git", "-C", str(h), "merge-base", "--is-ancestor", "upstream", merged]).returncode != 0:
         die(f"--apply refused: {commit} does not contain the current template (upstream); merge it again", 1)
@@ -15828,18 +15868,10 @@ def _keep_local_imports(ours: str, base: str, theirs: str) -> str | None:
     return out + "".join(tail) + ("" if tail[-1].endswith("\n") else "\n")
 
 
-def _keep_local_blocks(ours: str, base: str, theirs: str) -> str | None:
-    """A template prompt merged as upstream's text (`theirs`) plus this project's own blocks, when the
-    project only added to it: its text outside `<!-- ttp:local -->` fences is `base` with lines inserted.
-    Each block goes back after the base line it followed (after upstream's rewrite of that spot, if
-    any); added lines not yet fenced get the fence lines, so the next upgrade finds them as the
-    project's (the prompts leave the fence lines out). None when the project changed or removed
-    template text, a fence is not closed, or a line the project added nearly repeats one upstream
-    added or changed at the same spot (batch._near: two versions of one line): that needs judgment."""
-    import difflib
-
-    from .batch import _near
-    items: list[tuple[str, object]] = []       # ("t", template line) or ("b", fenced block lines)
+def _local_items(ours: str) -> list[tuple[str, object]] | None:
+    """`ours` as ("t", template line) and ("b", fenced block lines) items, in order; None when a
+    `<!-- ttp:local -->` fence is not closed or a close has no open."""
+    items: list[tuple[str, object]] = []
     block = None
     for line in ours.splitlines(keepends=True):
         s = line.strip()
@@ -15855,7 +15887,21 @@ def _keep_local_blocks(ours: str, base: str, theirs: str) -> str | None:
             return None
         else:
             items.append(("t", line))
-    if block is not None:
+    return None if block is not None else items
+
+
+def _keep_local_blocks(ours: str, base: str, theirs: str) -> str | None:
+    """A template prompt merged as upstream's text (`theirs`) plus this project's own blocks, when the
+    project only added to it: its text outside `<!-- ttp:local -->` fences is `base` with lines inserted.
+    Each block goes back after the base line it followed (after upstream's rewrite of that spot, if
+    any); added lines not yet fenced get the fence lines, so the next upgrade finds them as the
+    project's (the prompts leave the fence lines out). None when the project changed or removed
+    template text, a fence is not closed, or a line the project added nearly repeats one upstream
+    added or changed at the same spot (batch._near: two versions of one line): that needs judgment."""
+    import difflib
+
+    from .batch import _near
+    if (items := _local_items(ours)) is None:
         return None
     old = base.splitlines(keepends=True)
     tmpl = [x for kind, x in items if kind == "t"]
@@ -16187,7 +16233,7 @@ def cmd_doctor(a) -> None:
     g = mcpgap.gap(claude_cfg, mcpgap.read(p.state))
     if g["state"] == "unknown":
         print(f"mcp servers on this host: unknown ({g['error']}); the daemon runs `claude mcp list` again within "
-              f"{mcpgap.RETRY_S // 60} min")
+              f"{mcpgap.RETRY_S // MIN_S} min")
     names = name_list(claude_cfg.get("mcp_servers") or [])
     if names:
         from .providers import get_provider
@@ -18202,7 +18248,7 @@ def blind_gate(a) -> None:
     if blindreview.caller_blind():
         why = blindreview.refusal(fn, str(getattr(a, "action", "") or ""))
         if why:
-            die(f"refused: {why}", 2)
+            die(f"refused: {why}")
 
 
 def glm_gate(a, name: str | None = None) -> None:
@@ -18218,7 +18264,7 @@ def glm_gate(a, name: str | None = None) -> None:
     cmd = cmd if isinstance(cmd, str) else ""
     if d := glmguard.outward_cli(cmd, str(getattr(a, "text", "") or ""), str(getattr(a, "to", "") or ""),
                                  str(getattr(a, "reply", "") or ""), str(getattr(a, "chat", "") or "")):
-        die(glmguard.drafted(os.environ.get("TTP_RUN_DIR"), d), 2)   # a draft for Opus; the run goes on
+        die(glmguard.drafted(os.environ.get("TTP_RUN_DIR"), d))   # a draft for Opus; the run goes on
     if not glmguard.active():
         return
     action = str(getattr(a, "action", "") or getattr(a, "op", "") or "")
@@ -18233,7 +18279,7 @@ def glm_gate(a, name: str | None = None) -> None:
         flags += [f"--{k}" for k in ("owner", "expires", "by", "covers", "clear") if getattr(a, k, None)]
     why = glmguard.cli_refusal(cmd, action, flags, words)
     if why:
-        die(glmguard.refused(os.environ.get("TTP_RUN_DIR"), why), 2)
+        die(glmguard.refused(os.environ.get("TTP_RUN_DIR"), why))
 
 
 def dry_run_stub(a, name: str | None = None) -> None:
