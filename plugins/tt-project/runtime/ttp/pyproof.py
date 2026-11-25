@@ -19,6 +19,7 @@ import importlib.machinery
 import os
 import re
 import shlex
+import shutil
 import sys
 import types
 
@@ -314,7 +315,7 @@ def rewrite(cmd: str, cwd: str, env=None) -> str | None:
     if _may_shadow("\n".join(lines), bases[1:] if bases else [cwd], env):
         return None
     changed = hidden = False
-    proven = 0
+    proven = set()   # the python commands proven, by line and command start
     for b in bodies:
         i, body, pos = b
         m = hook.HEREDOC_RE.match(lines[i], pos)
@@ -328,7 +329,8 @@ def rewrite(cmd: str, cwd: str, env=None) -> str | None:
                 return None
             hidden |= named
             body[:] = ["pass"]
-            changed, proven = True, proven + 1
+            changed = True
+            proven.add((i, _start(lines[i], pos)))
     ends: dict[int, list[str]] = {}   # the lines each heredoc leaves after its line: its body, then its end
     for b in bodies:
         ends.setdefault(b[0], []).extend([*b[1], b.end])
@@ -338,7 +340,8 @@ def rewrite(cmd: str, cwd: str, env=None) -> str | None:
         for m in reversed(list(DASH_C_RE.finditer(line))):
             code = m[1] if m[1] is not None else m[2]
             if not flags[m.start()][0] and _code_at(line, m.start()) == code and (proof := _prove(code, cwd, env, bases)):
-                line, changed, proven = f"{line[:m.start()]}-c 'pass'{line[m.end():]}", True, proven + 1
+                proven.add((i, _start(line, m.start())))
+                line, changed = f"{line[:m.start()]}-c 'pass'{line[m.end():]}", True
                 named = _words_name_store(code, cwd, env)
                 if named and proof.wrote:
                     return None
@@ -347,7 +350,7 @@ def rewrite(cmd: str, cwd: str, env=None) -> str | None:
     # A snippet naming a store the guard would have seen in its words is freed only as the whole command: its
     # output piped, captured, redirected or written for a later command could feed that name to the shell.
     # Another python of the command (one not proven) could write a module a proven one then imports.
-    if proven < sum(any(PY_RE.match(os.path.basename(w)) for w in argv) for argv in segments):
+    if len(proven) < sum(any(PY_RE.match(os.path.basename(w)) for w in argv) for argv in segments):
         return None
     if hidden and (len(lines) > 1 or re.search(r"[|>`;&]|\$\(|<\(", lines[0])):
         return None
@@ -375,16 +378,17 @@ def _may_shadow(shell: str, cwds: list[str], env) -> bool:
     from . import hook, pyaudit
     expanded = UNQUOTED_RE.sub(lambda m: re.sub(r"\\.", "", m[1] or ""), shell)   # what the shell may expand
     if re.search(r"[$`]|\(\(", expanded) or re.search(r"PYTHON|CDPATH", re.sub(r"['\"\\{},]", "", shell)) \
-            or env.get("CDPATH"):
+            or env.get("CDPATH") or not all(map(os.path.isabs, str(env.get("PATH") or os.defpath).split(os.pathsep))):
         return True
     for argv in hook._segments(shell, strip=False):
-        while argv and ASSIGN_RE.match(argv[0]):
-            argv = argv[1:]
+        if argv and ASSIGN_RE.match(argv[0]):   # an exported variable (PATH, LD_PRELOAD) python could read
+            return True
         py = next((i for i, w in enumerate(argv) if PY_RE.match(os.path.basename(w))), None)
         head = argv[:py] if py else argv[:2] if argv[:1] in (["cd"], ["pushd"]) else argv[:1]
         if any(re.search(r"[*?\[{~]", w) for w in head) or argv[:1] in (["cd"], ["pushd"]) and (
                 len(argv) != 2 or argv[1].startswith("-")) or head and head[0] in SHELL_WORDS - {"cd", "pushd"} \
-                or py and (head[0] not in WRAPPERS or any(w.startswith("-") for w in head)):
+                or py and any(w not in WRAPPERS and not w.isdigit() for w in head) \
+                or py is not None and not _interpreter(argv[py], env):
             return True
     if _plants(shell):
         return True
@@ -393,7 +397,8 @@ def _may_shadow(shell: str, cwds: list[str], env) -> bool:
     entries = [""] + [e for e in (path.split(os.pathsep) if path else []) if e not in judge]
     user = env.get("PYTHONUSERBASE") or os.path.join(str(env.get("HOME") or os.path.expanduser("~")), ".local")
     site = os.path.join(user, "lib", f"python{sys.version_info[0]}.{sys.version_info[1]}", "site-packages")
-    return _holds_module(site) or any(_holds_module(os.path.join(c, e)) for c in cwds for e in entries)
+    return _holds_module(site) or _runs_at_start(site) \
+        or any(_holds_module(os.path.join(c, e)) for c in cwds for e in entries)
 
 
 def _plants(shell: str) -> bool:
@@ -405,7 +410,6 @@ def _plants(shell: str) -> bool:
         words = list(lex)
     except ValueError:
         return True
-    from . import sidefx
     ran = writes = py = False   # ran: a writer ran before this pipeline; writes, py: one is in it
     start, target = True, ""
     for w in words + [";"]:
@@ -419,7 +423,7 @@ def _plants(shell: str) -> bool:
                     return True
                 ran, writes, py, start = ran or writes, False, False, True
         elif target:
-            writes |= ">" in target and not (w.isdigit() or w == "-" or w.startswith(sidefx.HARMLESS))
+            writes |= ">" in target and not (w.isdigit() or w in ("-", "/dev/null", "/dev/stdout", "/dev/stderr", "/dev/tty"))
             target = False
         elif start:
             name = os.path.basename(w)
@@ -427,10 +431,39 @@ def _plants(shell: str) -> bool:
                 if ran:
                     return True
                 py, start = True, False
-            elif not (ASSIGN_RE.match(w) or w.isdigit() or name in WRAPPERS):
+            elif not (w.isdigit() or name in WRAPPERS):
                 writes |= name not in READERS | {"cd", "pushd"}
                 start = False
     return False
+
+
+def _start(line: str, pos: int) -> int:
+    from . import hook
+    return next(s for s, e, _ in hook._pieces(line) if s <= pos <= e)
+
+
+def _interpreter(word: str, env) -> bool:
+    """`word` runs a python this check reads for: of the checker's own version (its standard names and user site
+    folder), in a folder this user cannot change: no python an earlier call planted, no venv whose site folder
+    could hold a .pth python runs at start."""
+    exe = shutil.which(word, path=str(env.get("PATH") or os.defpath))
+    real = exe and os.path.realpath(exe)
+    return bool(real) and os.path.basename(real) == "python{}.{}".format(*sys.version_info[:2]) \
+        and not any(os.access(p, os.W_OK) for f in (exe, real) for p in (f, os.path.dirname(f)))
+
+
+def _runs_at_start(folder: str) -> bool:
+    """`folder` (the user's site folder) holds a .pth file with a line python runs at start (`import ...`)."""
+    try:
+        pths = [os.path.join(folder, e) for e in os.listdir(folder) if e.endswith(".pth")]
+    except FileNotFoundError:
+        return False
+    except OSError:
+        return True
+    try:
+        return any(line.startswith(("import ", "import\t")) for p in pths for line in open(p, errors="replace"))
+    except OSError:
+        return True
 
 
 def _holds_module(folder: str) -> bool:

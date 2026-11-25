@@ -202,19 +202,35 @@ def test_pyproof_proves_nothing_when_python_may_import_a_module_from_its_folder_
                 f". ./env.sh && python3 -c '{code}'", f"export \"$V\"; python3 -c '{code}'",
                 f"cd \"$D\" && python3 -c '{code}'", f"cd - && python3 -c '{code}'", f"cd ~root && python3 -c '{code}'",
                 f"set -a; read X < f; python3 -c '{code}'", f"export PYT{{H,}}ONPATH=x; python3 -c '{code}'",
-                f"ttp lock r -- python3 -c '{code}'", f"find . -exec python3 -c '{code}' ';'"):
+                f"ttp lock r -- python3 -c '{code}'", f"find . -exec python3 -c '{code}' ';'",
+                f"LD_PRELOAD=x python3 -c '{code}'", f"A=1; python3 -c '{code}'", f"env A=1 python3 -c '{code}'"):
         assert pyproof.rewrite(cmd, str(work)) is None, cmd   # it may set Python's environment or folder
+    for cmd in (f"./python3 -c '{code}'", f"python2.7 -c '{code}'", f"PATH=. python3 -c '{code}'"):
+        assert pyproof.rewrite(cmd, str(work)) is None, cmd   # or run another python than the checker's own
+    (tmp_path / "bin").mkdir()
+    (tmp_path / "bin" / "python3").symlink_to(os.path.realpath(sys.executable))
+    path = os.environ["PATH"]
+    for planted in (f"{tmp_path / 'bin'}:{path}", f".:{path}"):
+        monkeypatch.setenv("PATH", planted)
+        assert not proven(work), planted                    # one in a folder a call could plant it in
+    monkeypatch.setenv("PATH", path)
     plant = "open('json.py', 'w').write('x')"
     for cmd in (f"echo x > json.py; python3 -c '{code}'", f"cp a.py json.py && python3 -c '{code}'",
                 f"python3 -c '{code}' | tee json.py", f"python3 -c '{code}' > json.py",
                 f"python3 -c \"{plant}\"; python3 -c '{code}'", f"python3 -m pip -q x; python3 -c '{code}'",
-                f"python3 - <<'EOF'\n{plant}\n{code}\nEOF"):
+                f"python3 - <<'EOF'\n{plant}\n{code}\nEOF", f"echo x > /proc/self/cwd/json.py; python3 -c '{code}'",
+                f"python3 -c \"{plant}\"; python3 -c '{code}' -c '{code}'"):
         assert pyproof.rewrite(cmd, str(work)) is None, cmd   # or it writes one first, beside python or in it
     for cmd in (f"cat a.json | python3 -c '{code}' 2>&1 | tail -3", f"timeout 60 python3 -c '{code}' 2>/dev/null"):
         assert pyproof.rewrite(cmd, str(work)) is not None, cmd   # readers and output to the terminal write none
     monkeypatch.delenv("PYTHONUSERBASE", raising=False)
     site = tmp_path / "home" / ".local" / "lib" / "python{}.{}".format(*sys.version_info[:2]) / "site-packages"
     site.mkdir(parents=True)
+    (site / "paths.pth").write_text("/opt/x\n")
+    assert proven(work)                                     # a .pth naming folders only runs nothing
+    (site / "run.pth").write_text("import os\n")
+    assert not proven(work)                                 # one with an import line does, at python's start
+    (site / "run.pth").unlink()
     (site / "usercustomize.py").write_text("x")
     assert not proven(work)                                 # nor when the user's site folder holds one
 
