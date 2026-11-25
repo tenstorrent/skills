@@ -730,3 +730,137 @@ def test_a_push_check_slow_only_from_waiting_queues_no_speed_up_task(env, tmp_pa
     for i in range(10):
         push.record_check_s(p, 700 + i, wait_s=30)   # slow from its tests: flagged
     assert "Queued test speed-up task" in gatetime.flag(p.db, p.state, {}, None, time.time())
+
+
+_PL_BAD = f"sh -c \"grep -qs bad pl*.txt && {{ {_PL_FAIL}; }}; {_PL_PASS}\""
+
+
+def _pl_rows(env, tmp_path, monkeypatch, rows, check=_PL_BAD, lead=None):
+    """Like _pl_land, but each queue row lands several commits: `rows` lists rows, each a list of (file, content,
+    task key) commits whose subject ends "(#<id>)" of that key's code task (made here, branch ttp/t<id>-<key>).
+    A row's own task is a review on branch ch<i>, or on its `lead` key's code branch. Returns
+    (p, g, pushed, {key: task id}, [[commit sha, ...] per row])."""
+    import json as _json
+    import subprocess as sp
+    from ttp import postland
+    p = make(env)
+    g = lambda *a: sp.run(["git", "-C", str(p.root), "-c", "user.name=t", "-c", "user.email=t@t", *a],
+                          check=True, capture_output=True, text=True).stdout.strip()
+    sp.run(["git", "init", "-q", "--bare", str(tmp_path / "up.git")], check=True)
+    g("remote", "add", "up", str(tmp_path / "up.git"))
+    tip, tasks, shas = g("rev-parse", "HEAD"), {}, []
+    for row in rows:
+        shas.append([])
+        for name, text, key in row:
+            if key not in tasks:
+                tasks[key] = p.db.add_task(f"code {key}", kind="code", status="done")
+                p.db.x("UPDATE tasks SET branch=? WHERE id=?", (f"ttp/t{tasks[key]}-{key}", tasks[key]))
+            (p.root / name).write_text(text); g("add", name); g("commit", "-qm", f"{key} {name} (#{tasks[key]})")
+            shas[-1].append(g("rev-parse", "HEAD"))
+    (p.root / "PLVERSION").write_text("2\n"); g("add", "PLVERSION")
+    g("commit", "-qm", "bump", "-m", "Ttp-Version-Bump: 2")
+    pushed = g("rev-parse", "HEAD")
+    g("push", "-q", "up", "HEAD:refs/heads/main")
+    now = time.time()
+    p.db.x("INSERT INTO push_batches(id,marker,target,started,ended,outcome,pushed_sha,tip,finalized) "
+           "VALUES(?,?,?,?,?,?,?,?,?)", ("b1", "m", "up/main", now - 60, now - 30, "pushed", pushed, tip, now - 30))
+    for i, row in enumerate(shas):
+        branch = f"ttp/t{tasks[lead]}-{lead}" if lead else f"ch{i}"
+        t = p.db.add_task(f"change {i}", kind="review", status="done")
+        p.db.x("INSERT INTO push_queue(task,branch,head,target,status,batch,created,updated,pushed_sha,landed_sha) "
+               "VALUES(?,?,?,?,?,?,?,?,?,?)", (t, branch, row[-1], "up/main", "landed", "b1", now, now, pushed, row[-1]))
+    p.set_config("delivery.post_land_checks", [check])
+
+    def inline(p_, job):
+        job.with_suffix(".result.json").write_text(_json.dumps(postland.drive(p_, _json.loads(job.read_text()))))
+        return 0
+    monkeypatch.setattr(postland, "spawn", inline)
+    return p, g, pushed, tasks, shas
+
+
+def _pl_revert(p, g):
+    """(the revert task, its push queue head, its commit message, the fix task) of one forward revert."""
+    (rev,) = p.db.q("SELECT * FROM tasks WHERE title LIKE 'Revert #%'")
+    (row,) = p.db.q("SELECT * FROM push_queue WHERE task=?", (rev["id"],))
+    (fix,) = p.db.q("SELECT * FROM tasks WHERE title LIKE 'Fix #%'")
+    return rev, row["head"], g("log", "-1", "--format=%B", row["head"]), fix
+
+
+def test_post_land_bisects_inside_the_guilty_entry_and_reverts_only_the_commit_that_broke_the_test(
+        env, tmp_path, monkeypatch):
+    """Three tasks, five commits, the third breaks: only it is reverted; the other commits of its entry stay."""
+    from ttp import landed, postland
+    p, g, pushed, tasks, shas = _pl_rows(env, tmp_path, monkeypatch, [
+        [("pl_a1.txt", "ok\n", "a"), ("pl_a2.txt", "ok\n", "a")],
+        [("pl_b1.txt", "bad\n", "b"), ("pl_c1.txt", "ok\n", "c")],
+        [("pl_c2.txt", "ok\n", "c")]])
+    bad, other = shas[1]
+    postland.tend(p, p.config())
+    assert postland.tend(p, p.config()) == "guilty"
+    rev, head, body, fix = _pl_revert(p, g)
+    assert g("diff", "--name-only", pushed, head) == "pl_b1.txt", "only the guilty commit comes out"
+    assert g("rev-parse", f"{head}^") == pushed and f"This reverts commit {bad}." in body and other not in body
+    assert "failing: tests/t.py::test_x" in body
+    assert landed.reverted_by(p.root, bad, head) and not landed.reverted_by(p.root, other, head)
+    assert f"#{tasks['b']} ttp/t{tasks['b']}-b" in rev["title"] and f"#{tasks['b']}" in fix["title"]
+    assert f"Forward revert of ..{bad} by " in rev["spec"], "rollout_health reads the guilty commit's own files"
+    assert f"Re-apply only {bad[:10]} on top" in fix["spec"] and f"task #{tasks['b']}" in fix["spec"]
+    assert f"{postland.FAILING_TESTS}tests/t.py::test_x\n" in fix["spec"], "the fix reruns only the failing test"
+    assert f"relands:{tasks['b']}" in fix["labels"]
+    assert landed.dropped(p.db, tasks["b"]) and not landed.dropped(p.db, tasks["c"])
+
+
+def test_post_land_reverts_only_the_entry_tasks_own_commit_not_another_tasks_commit_in_its_range(
+        env, tmp_path, monkeypatch):
+    """The real shape: an entry's range holds another task's earlier commit (the batch tip was its base); the
+    entry's own breaking commit goes, the other task's commit stays."""
+    from ttp import postland
+    p, g, pushed, tasks, shas = _pl_rows(env, tmp_path, monkeypatch, [
+        [("pl_fallback.txt", "ok\n", "fallback"), ("pl_forms.txt", "bad\n", "forms")]], lead="forms")
+    kept, bad = shas[0]
+    postland.tend(p, p.config())
+    assert postland.tend(p, p.config()) == "guilty"
+    rev, head, body, fix = _pl_revert(p, g)
+    assert g("diff", "--name-only", pushed, head) == "pl_forms.txt"
+    assert f"This reverts commit {bad}." in body and kept not in body
+    assert f"ttp/t{tasks['forms']}-forms" in rev["title"] and "fallback" not in rev["title"] + fix["title"]
+
+
+def test_post_land_guilty_commit_whose_revert_conflicts_widens_to_its_tasks_commits_only(env, tmp_path, monkeypatch):
+    from ttp import postland
+    p, g, pushed, tasks, shas = _pl_rows(env, tmp_path, monkeypatch, [
+        [("pl_a1.txt", "ok\n", "a")],
+        [("pl_b1.txt", "bad\n", "b"), ("pl_b1.txt", "bad again\n", "b"), ("pl_c1.txt", "ok\n", "c")]])
+    first, second, other = shas[1]
+    postland.tend(p, p.config())
+    assert postland.tend(p, p.config()) == "guilty"
+    rev, head, body, fix = _pl_revert(p, g)
+    assert g("diff", "--name-only", pushed, head) == "pl_b1.txt", "its task's commits come out, the other's stays"
+    assert f"This reverts commit {first}." in body and f"This reverts commit {second}." in body and other not in body
+    assert "Not narrower: the revert of " in body and "does not apply" in body
+    assert "Not narrower: the revert of " in rev["spec"]
+    assert f"Re-apply only {first[:10]}, {second[:10]} on top" in fix["spec"]
+
+
+def test_post_land_bisect_past_its_time_limit_reverts_the_whole_entry_saying_why(env, tmp_path, monkeypatch):
+    from ttp import postland
+    monkeypatch.setattr(postland, "BISECT_S", -1)
+    p, g, pushed, tasks, shas = _pl_rows(env, tmp_path, monkeypatch, [
+        [("pl_a1.txt", "ok\n", "a")],
+        [("pl_b1.txt", "bad\n", "b"), ("pl_c1.txt", "ok\n", "c")]])
+    postland.tend(p, p.config())
+    assert postland.tend(p, p.config()) == "guilty"
+    rev, head, body, fix = _pl_revert(p, g)
+    assert g("diff", "--name-only", pushed, head).split() == ["pl_b1.txt", "pl_c1.txt"]
+    assert f"Reverts {shas[0][0][:10]}..{shas[1][1][:10]}" in body and "the bisect of 2 commits passed its" in body
+    assert f"Forward revert of {shas[0][0][:10]}..{shas[1][1][:10]} by " in rev["spec"] and "passed its" in rev["spec"]
+
+
+def test_post_land_failure_that_fails_before_the_landing_too_is_pre_existing_never_reverted(
+        env, tmp_path, monkeypatch):
+    from ttp import postland
+    p, g, pushed, tasks, shas = _pl_rows(env, tmp_path, monkeypatch, [
+        [("pl_a1.txt", "ok\n", "a"), ("pl_b1.txt", "ok\n", "b")]], check=f"sh -c \"{_PL_FAIL}\"")
+    postland.tend(p, p.config())
+    assert postland.tend(p, p.config()) == "pre_existing"
+    assert not p.db.q("SELECT id FROM tasks WHERE title LIKE 'Revert%' OR title LIKE 'Fix%'")

@@ -20,8 +20,12 @@ holding the queue. Each daemon pass (tend()):
   The rest rerun at the range's start: failing there too, they were not this landing's. Of the others, those that
   pass at the target's current tip were fixed since (recorded, never reverted); each of the rest bisects over
   the entries' landed shas to the first that fails it: the guilty change of that test.
-- Guilty: for each guilty change, a revert of its commits on the current tip (never a force push), checked to
-  pass the ids it broke, goes in as ttp/postland-revert-<sha>. The daemon approves it into the push queue (it
+- Guilty: for each guilty change, a revert on the current tip (never a force push), checked to pass the ids it
+  broke, goes in as ttp/postland-revert-<sha>. It is the narrowest that passes: when the entry's range holds
+  more than one commit (a batch entry can carry other tasks' commits), a bisect of those commits on the ids
+  alone (version bumps skipped, at most BISECT_S) finds the guilty commit and only it is reverted; if that
+  revert conflicts or still fails, the guilty commit's task's commits; then the entry's whole range, the reason
+  in the revert's message. The daemon approves it into the push queue (it
   lands with the next batch, after the smoke checks) and queues one code task to fix the change on its own
   failing tests alone. Anything it cannot tell or attribute goes to the coordinator as one observation.
 - An express landing (pushq.py's express path, batch id express-*) checked only its smoke and touched tests: its job
@@ -31,6 +35,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import subprocess
 import sys
 import time
@@ -50,6 +55,8 @@ DEAD_RETRIES = 2  # reruns of a landing whose driver died without a result (a re
 REVERT_TITLE_TAIL = ": post-landing tests fail"
 # Its fix task is "Fix <who>" + the same tail; its spec names the failing tests on one line after this.
 FAILING_TESTS = "Its failing tests, the only ones to rerun: "
+BISECT_S = 900   # a bisect of one entry's commits stops here; past it the entry's whole range is reverted
+_TASK_OF = re.compile(r"\(#(\d+)\)\s*$|^Task: #(\d+)\s*$", re.M)   # a commit's task: its subject's "(#N)" or a Task trailer
 
 
 def driver_argv(job: Path) -> list[str]:
@@ -234,6 +241,16 @@ def spawn(p: Project, job: Path) -> int:
     return child.pid
 
 
+def _owner(db, e: dict, c: dict) -> int | None:
+    """The task a revert takes off: the guilty commit's own task when it names one that is not the entry's (by
+    id or branch), else the entry's."""
+    gt = c.get("guilty_task") if c.get("revert_head") else None
+    if not gt or gt == e.get("task"):
+        return e.get("task")
+    t = db.task(gt)
+    return e.get("task") if t and e.get("branch") and t.get("branch") == e.get("branch") else gt
+
+
 def failing_tests(db, revert_title: str) -> list[str]:
     """The failing test ids the fix task of a forward revert (by the revert task's title) names (apply)."""
     fix = db.q("SELECT spec FROM tasks WHERE title=? ORDER BY id DESC LIMIT 1",
@@ -275,25 +292,36 @@ def apply(p: Project, job: dict, got: dict) -> str:
         e, ids = c["entry"], " ".join(c["ids"])
         who = f"#{e['task']} {e.get('branch') or '?'}" if e.get("task") else f"commit {e['sha'][:10]}"
         span = f"{str(e.get('base') or '')[:10]}..{e['sha'][:10]}"
+        owner, only = _owner(db, e, c), ""   # the task whose landing the revert takes off: the guilty commit's
+        if owner != e.get("task"):
+            who = f"#{owner} {(db.task(owner) or {}).get('branch') or '?'}"
+        if c.get("revert_head") and c.get("narrowed"):
+            rev = c["reverted"]
+            only = (f"only {', '.join(s[:10] for s in rev)} (guilty commit {c['guilty'][:10]}"
+                    + (f", task #{c['guilty_task']}" if c.get("guilty_task") else "") + f") of {span}; the rest stays")
+            span = ", ".join(s[:10] for s in rev)
         tail = (f"{FAILING_TESTS}{ids}\nCommand: {got.get('cmd')}\n"
                 + (f"Also failing, quarantined and their deflake task's, not this task's: {named}\n" if owned else "") +
                 f"Output tail:\n{str(got.get('tail') or '')[-2000:]}")
         if c.get("revert_head"):   # the revert first; the fix starts once it has landed, on top of it
             with db.tx():
                 tid = db.add_task(f"Revert {who}{REVERT_TITLE_TAIL}", kind="review", status="pushing",
-                                  spec=f"Forward revert of {span} by the post-landing checks.")
+                                  spec=(f"Forward revert of ..{c['guilty']} by the post-landing checks: {only}."
+                                        if only else f"Forward revert of {span} by the post-landing checks.")
+                                  + (f" Not narrower: {c['narrow_why']}" if c.get("narrow_why") else ""))
                 pushq.approve(p, tid, None, {"entries": [{"branch": c["revert_branch"], "head": c["revert_head"]}],
                                              "target": job["target"]})
-                if e.get("task"):   # no longer landed: landed:#<task> and the ledgers wait for its fix's landing
-                    landed.drop(p, e["task"], list(dict.fromkeys([*landed.recorded(db, e["task"])[0], e["sha"]])),
+                if owner:   # no longer landed: landed:#<task> and the ledgers wait for its fix's landing
+                    landed.drop(p, owner, list(dict.fromkeys([*landed.recorded(db, owner)[0],
+                                                              *(c.get("reverted") if only else [e["sha"]])])),
                                 f"forward revert #{tid} of {span} after post-landing tests failed", event=False)
             fix = db.add_task(f"Fix {who}{REVERT_TITLE_TAIL}", kind="code", labels=[
                 f"start_when:landed:#{tid}", f"start_why:revert #{tid} lands", f"deferred_since:{time.time():.0f}",
-                *([f"relands:{e['task']}"] if e.get("task") else [])],
+                *([f"relands:{owner}"] if owner else [])],
                 spec=(f"Post-landing checks (delivery.post_land_checks) failed after {who} landed as {e['sha'][:10]}. "
-                      f"Revert #{tid} (commit {c['revert_head'][:10]}, branch {c['revert_branch']}) takes {span} "
-                      f"off {job['target']}; this starts once it has landed. Re-apply {span} on top of the revert "
-                      f"with its fix. {tail}"))
+                      f"Revert #{tid} (commit {c['revert_head'][:10]}, branch {c['revert_branch']}) takes "
+                      f"{only or span} off {job['target']}; this starts once it has landed. Re-apply only {span} on "
+                      f"top of the revert with its fix. {tail}"))
             texts.append(f"Post-landing checks on {sha}: {who} fails {ids}; revert #{tid} ({c['revert_head'][:10]}) "
                          f"approved for {job['target']}; fix task #{fix} starts once it lands")
         else:
@@ -498,8 +526,12 @@ def _blame(points: list, ids: list[str], failed) -> dict[int, list[str]]:
 
 
 def revert(p: Project, repo: Path, job: dict, e: dict, cmd, ids: list[str], run) -> dict:
-    """A commit reverting the entry's own commits (e['base']..e['sha']) on the target's current tip, as a local branch, once it passes `ids`."""
-    from . import cleantree, push
+    """The narrowest forward revert of the entry's change on the target's current tip that passes `ids`, as a local
+    branch: its guilty commit alone when a bisect of the entry's commits (e['base']..e['sha'], bumps skipped, on `ids`
+    alone, within BISECT_S) finds one, else that commit's task's commits, else the whole range, each wider try naming
+    why the narrower one did not do. Adds `reverted` (its commits), `narrowed` (fewer than the range's), and
+    `guilty` and `guilty_task` when known."""
+    from . import gatejudge, push
     remote, _, branch = str(job["target"]).partition("/")
     try:
         tip = push._fetch(repo, remote, branch)
@@ -510,24 +542,94 @@ def revert(p: Project, repo: Path, job: dict, e: dict, cmd, ids: list[str], run)
     start = e.get("base") or ""
     if not start or start == e["sha"]:
         return {"why": f"no commits of its own to revert ({start[:10] or 'no base'}..{e['sha'][:10]})"}
+    failed = lambda at, sel: gatejudge.failed_of(*run(at, cmd, sel), sel)
+    commits = _own_commits(repo, start, e["sha"])
+    tries, why, found = [], [], {}
+    if len(commits) > 1:
+        guilty, note = _bisect(commits, ids, failed, time.monotonic() + BISECT_S)
+        if guilty:
+            task = _task_of(repo, guilty)
+            found = {"guilty": guilty} | ({"guilty_task": task} if task else {})
+            tries.append([guilty])
+            mates = [c for c in commits if task and _task_of(repo, c) == task]
+            if len(mates) > 1:
+                tries.append(mates)
+        else:
+            why.append(note)
+    tries.append(None)   # the whole range
+    for shas in tries:
+        got = _revert_at(p, repo, job, e, tip, shas, ids, why, found, failed)
+        if "revert_head" in got:
+            return found | got | {"reverted": shas or commits or [e["sha"]], "narrowed": bool(shas)} \
+                | ({"narrow_why": "; ".join(why)} if why else {})
+        why.append(got["why"])
+    return found | {"why": "; ".join(why)}
+
+
+def _own_commits(repo: Path, start: str, sha: str) -> list[str]:
+    """The non-merge commits of start..sha, oldest first, without a push's version bump ([] when git cannot tell)."""
+    from .push import BUMP_TRAILER
+    r = _git(repo, "log", "--reverse", "--no-merges", "--format=%H%x00%B%x01", f"{start}..{sha}")
+    if r.returncode:
+        return []
+    rows = [c.strip().split("\0", 1) for c in r.stdout.split("\x01") if c.strip()]
+    return [c[0] for c in rows if f"{BUMP_TRAILER}:" not in (c[1] if len(c) > 1 else "")]
+
+
+def _task_of(repo: Path, sha: str) -> int | None:
+    """The task a commit names: its subject's trailing "(#N)" or a "Task: #N" trailer; None when it names none."""
+    r = _git(repo, "log", "-1", "--format=%B", sha)
+    m = _TASK_OF.search(r.stdout) if r.returncode == 0 else None
+    return int(m.group(1) or m.group(2)) if m else None
+
+
+def _bisect(commits: list[str], ids: list[str], failed, deadline: float) -> tuple[str, str]:
+    """(the first of `commits` at which any of `ids` fails, "") given they pass before the first and fail at the
+    last; ("", why) when a run could not tell or the bisect passed `deadline`."""
+    lo, hi = -1, len(commits) - 1
+    while hi - lo > 1:
+        if time.monotonic() > deadline:
+            return "", f"the bisect of {len(commits)} commits passed its {BISECT_S} s limit"
+        mid = (lo + hi) // 2
+        bad = failed(commits[mid], ids)
+        if bad is None:
+            return "", f"the rerun at {commits[mid][:10]} could not tell"
+        lo, hi = (lo, mid) if bad else (mid, hi)
+    return commits[hi], ""
+
+
+def _revert_at(p: Project, repo: Path, job: dict, e: dict, tip: str, shas: list[str] | None, ids: list[str],
+               why: list[str], found: dict, failed) -> dict:
+    """One try of revert(): `shas` (None: the entry's whole range) reverted on `tip`, committed, fetched as
+    ttp/postland-revert-<sha>, then checked to pass `ids`."""
+    from . import cleantree
+    start = e["base"]
     tree = cleantree.Checkout(repo, tip, str(Path(job["path"]).parent))
     try:
         g = lambda *a: _git(tree.path, "-c", "user.name=ttp", "-c", "user.email=ttp@localhost", *a)
-        r = g("revert", "--no-edit", "--no-commit", f"{start}..{e['sha']}")
+        r = g("revert", "--no-edit", "--no-commit", *(reversed(shas) if shas else [f"{start}..{e['sha']}"]))
+        what = (f"{', '.join(s[:10] for s in shas)} of {start[:10]}..{e['sha'][:10]}" if shas
+                else f"{start[:10]}..{e['sha'][:10]}")
         if r.returncode != 0:
-            return {"why": f"the revert does not apply on {tip[:10]}: {(r.stderr or r.stdout).strip()[:300]}"}
-        r = g("commit", "-q", "-m", f"Revert {e.get('branch') or e['sha'][:10]}: post-landing tests fail\n\n"
-                                    f"Reverts {start[:10]}..{e['sha'][:10]}; failing: {' '.join(ids)}")
+            return {"why": f"the revert of {what} does not apply on {tip[:10]}: {(r.stderr or r.stdout).strip()[:300]}"}
+        if shas:   # git revert's own line per commit, so the landed and live checks see each one taken out
+            gt = f" (task #{found['guilty_task']})" if found.get("guilty_task") else ""
+            body = ("".join(f"This reverts commit {s}.\n" for s in shas) +
+                    f"\nOnly {what}: the guilty commit {found['guilty'][:10]}{gt}"
+                    + (" and its task's other commits" if len(shas) > 1 else "") + "; the rest stays")
+        else:
+            body = f"Reverts {start[:10]}..{e['sha'][:10]}"
+        body += f"; failing: {' '.join(ids)}" + (f"\n\nNot narrower: {'; '.join(why)}" if why else "")
+        r = g("commit", "-q", "-m", f"Revert {e.get('branch') or e['sha'][:10]}: post-landing tests fail\n\n{body}")
         head = _git(tree.path, "rev-parse", "HEAD").stdout.strip()
         name = f"ttp/postland-revert-{e['sha'][:10]}"
         if r.returncode or _git(repo, "fetch", "-q", str(tree.path), f"+HEAD:refs/heads/{name}").returncode:
-            return {"why": "the revert commit could not be made"}
+            return {"why": f"the revert commit of {what} could not be made"}
     finally:
         tree.close()
-    from . import gatejudge
-    still = gatejudge.failed_of(*run(head, cmd, ids), ids)
+    still = failed(head, ids)
     if still is None or still:
-        return {"why": f"the revert {head[:10]} does not pass {' '.join(sorted(still or ids))}"}
+        return {"why": f"the revert {head[:10]} of {what} does not pass {' '.join(sorted(still or ids))}"}
     return {"revert_branch": name, "revert_head": head}
 
 
