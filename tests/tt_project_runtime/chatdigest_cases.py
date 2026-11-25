@@ -663,6 +663,47 @@ def test_a_held_reply_answers_no_order_and_its_note_says_the_chat_never_got_it(e
     assert turnrules.order_gap(p.db, set(), actions, set(), [m]) is None   # sent: its no_order covers it
 
 
+def test_a_reply_held_after_a_charter_update_in_one_batch_is_held_never_a_tuple_crash(env, monkeypatch):
+    """cells: held_after_charter. Upstream note 2c792038ccca2c77: a charter_update earlier in the batch once
+    rebound apply()'s `held` list to a tuple, so a later reply the digest held crashed on `held.append`
+    (AttributeError), was reported as not applied and asked to be resent, and order_gap never saw it held."""
+    from ttp import coordinator as coord
+    monkeypatch.setenv("TTP_TEST_CHAT_DIGEST", "on")
+    p = make(env)
+    coord.apply(p, [{"type": "reply", "chat": "c1", "text": "Backlog: 12 tasks open, 3 queued; #40 done."}], turn=1)
+    actions = [{"type": "charter_update", "section": "Goals", "text": "Keep the docs short."},
+               {"type": "reply", "chat": "c1", "text": "Backlog: 11 tasks open, 4 queued; #41 done."}]
+    held: list = []
+    problems = coord.apply(p, actions, turn=2, held=held)
+    assert not any(pr.startswith("reply:") for pr in problems), problems
+    assert held == [1] and len(_cd_out(p)) == 1
+    assert not p.db.q("SELECT id FROM events WHERE kind='action_fault'")
+
+
+def test_a_reply_fault_after_its_post_is_not_resent_and_one_before_it_is(env, monkeypatch):
+    """cells: fault_after_post, fault_before_post. A reply that reached the chat and then hit an internal
+    error is recorded as sent (a note, a harness fault event), never asked to be resent; one that failed
+    before its post is rejected for a resend with a harness fault event: no message is lost or doubled."""
+    from ttp import coordinator as coord
+    p = make(env)
+
+    def boom(*a, **k):
+        raise AttributeError("'tuple' object has no attribute 'append'")
+    monkeypatch.setattr(coord.turnrules, "record_cites", boom)
+    problems = coord.apply(p, [{"type": "reply", "chat": "c1", "text": "Thanks, noted."}], turn=1)
+    assert problems == [] and _cd_out(p) == ["Thanks, noted."], (problems, _cd_out(p))
+    note = [n for n in p.db.kv(coord.NOTES_KEY, []) if n.startswith("reply:")][-1]
+    assert "posted as message #" in note and "not resent" in note and "Resend" not in note, note
+    ev = p.db.q("SELECT text FROM events WHERE kind='action_fault'")
+    assert len(ev) == 1 and "not resent" in ev[0]["text"], ev
+    monkeypatch.undo()
+    monkeypatch.setattr(coord, "_deploy_checked", boom)
+    (got,) = coord.apply(p, [{"type": "reply", "chat": "c1", "text": "Thanks, noted again."}], turn=2)
+    assert got.startswith("reply: not applied: an internal harness error") and "Resend" in got, got
+    assert _cd_out(p) == ["Thanks, noted."]
+    assert len(p.db.q("SELECT id FROM events WHERE kind='action_fault'")) == 2
+
+
 def test_a_web_app_only_digest_does_not_start_the_chats_status_gap(env, monkeypatch):
     """Upstream note d12a28e292fd1e82: a digest the chat never got (the web app only) leaves its status
     gap alone."""

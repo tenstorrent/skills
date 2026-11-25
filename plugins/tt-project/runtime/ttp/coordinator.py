@@ -2645,12 +2645,13 @@ _RAW_ERROR = re.compile(r"(?:not enough|too many) values to unpack|invalid liter
                         r"index out of range|takes \d+ positional|unsupported operand|got an unexpected keyword")
 
 
-def _internal_fault(p: Project, t: str | None, a: Any, e: Exception) -> str:
+def _internal_fault(p: Project, t: str | None, a: Any, e: Exception, applied: str = "") -> str:
     """The rejection of an action that failed on an internal error, not on a value the coordinator wrote
     (`_RAW_ERROR`, or a KeyError, IndexError or AttributeError): it names the error, where it was raised and
     the action's fields, and records a harness event (action_fault; the rejection itself reaches the next turn,
     so the record wakes no turn), so the coordinator never reads a bare Python error as its own mistake.
-    "" for a refusal that names its field."""
+    "" for a refusal that names its field. `applied`: where the action already went (a posted reply), so
+    the text records it as done and never asks for a resend."""
     try:
         if not (isinstance(e, (KeyError, IndexError, AttributeError)) or _RAW_ERROR.search(str(e))):
             return ""
@@ -2658,9 +2659,11 @@ def _internal_fault(p: Project, t: str | None, a: Any, e: Exception) -> str:
         frames = [f for f in traceback.extract_tb(e.__traceback__) if "/ttp/" in f.filename.replace(os.sep, "/")]
         where = f" at {Path(frames[-1].filename).name}:{frames[-1].lineno}" if frames else ""
         fields = ", ".join(sorted(str(k) for k in a)) if isinstance(a, dict) else type(a).__name__
-        why = (f"not applied: an internal harness error ({type(e).__name__}: {clip(str(e), 160)}{where}), not a "
-               f"refusal of a field you wrote (fields: {clip(fields, 200)}); it is reported as a harness fault. "
-               f"Resend it unchanged once that is fixed, or apply the change another way")
+        err = f"an internal harness error ({type(e).__name__}: {clip(str(e), 160)}{where})"
+        why = (f"{applied}, but a later step hit {err}; it is reported as a harness fault and is not resent"
+               if applied else
+               f"not applied: {err}, not a refusal of a field you wrote (fields: {clip(fields, 200)}); it is "
+               f"reported as a harness fault. Resend it unchanged once that is fixed, or apply the change another way")
         p.db.x("INSERT INTO events(ts,source,kind,severity,text,status) VALUES(?,?,?,?,?,?)",
                (time.time(), "harness", "action_fault", "normal", f"{t or 'action'} {why}", "handled"))
         return why
@@ -2902,6 +2905,7 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
         if on_action is not None:
             on_action(i)
         wrote_before = getattr(getattr(db, "conn", None), "total_changes", None)
+        out = ""   # where a reply went once it left: a later fault then never asks for it again
         try:
             a = normalize_action(a)
             if t == "reply":
@@ -2924,6 +2928,7 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                 a["text"], false = _claims_checked(p, a, notes)
                 a["text"] = _deploy_checked(p, a["text"], notes)
                 if (text := chatdigest.checked(db, cfg, a["text"], a, chat, notes, twins=(dup := []))) is None:
+                    out = f"a near-repeat of #{dup[0][0]}, not posted" if dup else "held for the chat's digest"
                     twins += [(m, c, list(a.get("delivers") or []), authored) for m, c in dup]
                     if not dup and held is not None:   # held for the digest: it answers no order (order_gap)
                         held.append(i)
@@ -2932,6 +2937,7 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                 a["text"] = text
                 replies.append(msgparts.post(db, a["text"], chat=None if chat in (None, "all") else chat, kind="reply",
                                              severity=_norm_severity(a.get("severity") or "normal"))[0])
+                out = f"posted as message #{replies[-1]}"
                 claimcheck.raise_false(db, false, f"your reply #{replies[-1]} (chat {chat or 'all'})")
                 turnrules.record_cites(db, chat, cites, replies[-1])
                 sent.append((replies[-1], chat, authored))
@@ -4076,12 +4082,12 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                         and a.get("source") and restriction_source.turn_quote(db, a.get("source"), messages, False))
                     restr = _DATED.sub("", section.lstrip("# ")).lower().startswith("restriction") or (
                         _restriction_edit(p, section, quote, str(a.get("replaces") or "")))
-                    held = _held_lift(section, text, quote, replaced, gone) if (
+                    lift = _held_lift(section, text, quote, replaced, gone) if (   # never `held`: apply()'s list
                         by_agent and restr) else ("", "", "")
-                    if held[0]:
-                        note = held[0] == "people" and relay.agent_orders(cfg) and all(
+                    if lift[0]:
+                        note = lift[0] == "people" and relay.agent_orders(cfg) and all(
                             new for (c, _), _, new in _held_hits(text, quote, replaced, gone) if c)
-                        raise ValueError(relay.held_refusal("charter_update", *held) + "; a new ban the agent "
+                        raise ValueError(relay.held_refusal("charter_update", *lift) + "; a new ban the agent "
                                          "orders may still be added as its own item" + (_SAFETY_NOTE_FIX if note else ""))
                     try:
                         target, extra, retired = _charter_update(p, section, text, quote, replaces, key,
@@ -4483,6 +4489,9 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                     deferred_new_asks.append((k, item, act.get("id")))
                 notes.append(note)
                 continue   # a spent time budget says nothing about the action: the next tick applies it
+            if out:   # the reply went out or waits in the digest: a resend would post it twice
+                notes.append(f"reply: {_internal_fault(p, t, a, e, applied=out) or f'{out}; a later step failed ({e}); it is not resent'}")
+                continue
             failed.add(i)
             sent_as = f"; {GATE_MARK}: {json.dumps(order[k][1], ensure_ascii=False, default=str)}" \
                 if isinstance(e, DraftGateRejection) else ""
