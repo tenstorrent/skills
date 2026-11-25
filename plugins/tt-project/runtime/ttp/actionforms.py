@@ -24,7 +24,7 @@ log = logging.getLogger(__name__)
 # returns (rewritten action, note) or None. A form lives beside the check it satisfies.
 FORMS = {"sweep": ("sweep",), "obligation": ("obligations", "coordsession"), "memory_add": ("coordsession",),
          "observation_mute": ("throughmute",), "reply": ("turnrules",), "task_add": ("taskforms",),
-         "task_update": ("taskforms",), "config_set": ("configwho",)}
+         "task_update": ("taskforms",), "config_set": ("configwho",), "resource_pause": ("pauseends",)}
 
 
 def normalise(p, actions: list, *, home: str, now: float) -> tuple[list, list[str]]:

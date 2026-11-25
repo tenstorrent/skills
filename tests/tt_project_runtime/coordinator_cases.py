@@ -9233,11 +9233,15 @@ def test_resource_pause_actions_are_validated_and_a_user_pause_needs_the_user(en
     assert coord.apply(p, [{"type": "resource_pause", "resource": "board", "paused": False}]) == []
 
 
-def test_a_resource_pause_without_an_end_is_refused(env, capsys):
+def test_a_resource_pause_without_an_end_gets_the_default_end_and_bad_ends_are_refused(env, capsys):
     p = make(env)
     from ttp import cli, coordinator as coord
-    problems = coord.apply(p, [{"type": "resource_pause", "resource": "board", "paused": True, "reason": "x"}])
-    assert problems and "needs an end" in problems[0], problems
+    # A coordinator's pause with no end gets the default one, noted (#9824); `ttp pause` still needs one.
+    assert coord.apply(p, [{"type": "resource_pause", "resource": "board", "paused": True, "reason": "x"}]) == []
+    until = p.db.paused_resources()["board"]["until"]
+    assert abs(until - (time.time() + 7 * 86400)) < 120, until
+    assert any("until=7d, the default end (was: no end)" in n for n in p.db.kv(coord.NOTES_KEY, []))
+    assert coord.apply(p, [{"type": "resource_pause", "resource": "board", "paused": False}]) == []
     for bad, why in (({"until": "9d"}, "more than 7 days"), ({"until": "2001-01-01"}, "already past"),
                      ({"until": "soon"}, "use a delay"), ({"end_when": "a\nb"}, "one line"),
                      ({"until": "1d", "report_from": "../x"}, "not a project name")):
