@@ -525,3 +525,20 @@ def test_a_task_the_opus_arm_finished_counts_only_its_bounce_not_its_review_outc
     _gs_run(p, retry, t0 + 5400, 2, provider="claude", model="opus")
     _gs_review(p, retry, "failed")
     assert glmshare.judge(p, _GS_CFG, now)["glm_pct"] < 100.0, "the retry's failed review counts against GLM"
+
+
+def test_a_task_that_bounced_after_its_first_review_keeps_that_review_as_glms(env):
+    """The first review judged GLM's work when the bounce came after it (a reopened task): Opus finishing it
+    later does not take that review out of the GLM arm's numbers."""
+    from ttp import glmshare, route
+    p = make(env)
+    now = 1_000_000_000.0 + 60 * 86400
+    t0, glm = _gs_waved(p, now)
+    tid = _gs_task(p, status="done")
+    p.db.set_kv(f"glm_work_arm:{tid}", {"arm": "glm", "why": "x", "ts": t0})
+    _gs_run(p, tid, t0 + 1800, 1)
+    rid = _gs_review(p, tid, "failed")   # GLM's own work, judged first
+    p.db.x("UPDATE tasks SET created=? WHERE id=?", (t0 + 3600, rid))
+    _gs_run(p, tid, t0 + 90000, 2, note={route.KEY: {"to": route.TO, "fallback": route.BOUNCE}})
+    _gs_run(p, tid, t0 + 95000, 3, provider="claude", model="opus")
+    assert glmshare.judge(p, _GS_CFG, now)["glm_pct"] < 100.0, "the review before the bounce is GLM's"

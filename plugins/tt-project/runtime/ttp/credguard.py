@@ -268,19 +268,22 @@ def ssh_walk(argv: list[str]):
     return out, dest
 
 
-def ssh_own_file(value: str, kind: str = "config") -> bool:
+def ssh_own_file(value: str, kind: str = "config", roots=None, cwd: str = "") -> bool:
     """`value` names one of ssh's own settings files in ~/.ssh, as ~/, $HOME/ or an absolute path, shaped like
     the option it is given to (fail closed): for `kind` "config" (-F) every line that is not blank or a comment
     starts with an ssh_config keyword, for "hosts" (UserKnownHostsFile, GlobalKnownHostsFile) every such line is
     a known_hosts entry. Any other file, a token or age key too, is refused: ssh prints the first word of each
     config line it cannot parse, and it adds host lines to a host list. The file is no private key either,
-    neither by its name (id_*, *.pem, *.key, ...) nor by its content."""
+    neither by its name (id_*, *.pem, *.key, ...) nor by its content. With `roots` (folders) the file is one
+    inside them instead, named relative to `cwd` or as ~/ or an absolute path, and shaped the same way."""
     home = os.path.expanduser("~")
     path = re.sub(r"^\$(?:HOME|\{HOME\})(?=/)", lambda _: home, value)
-    if not path.startswith(("~/", "/")) or re.search(r"[*?\[%$`]", path):
+    if re.search(r"[*?\[%$`]", path) or not (roots or path.startswith(("~/", "/"))):
         return False
-    ssh, real = os.path.realpath(os.path.join(home, ".ssh")), os.path.realpath(os.path.expanduser(path))
-    if not real.startswith(ssh + os.sep) or SSH_KEY_NAME_RE.search(os.path.basename(real)) or os.path.isdir(real):
+    real = os.path.realpath(os.path.join(cwd or home, os.path.expanduser(path)))
+    folders = roots or [os.path.join(home, ".ssh")]
+    if not any(real.startswith(os.path.realpath(r) + os.sep) for r in folders) \
+            or SSH_KEY_NAME_RE.search(os.path.basename(real)) or os.path.isdir(real):
         return False
     try:
         with open(real, "rb") as f:
@@ -295,7 +298,8 @@ def ssh_own_file(value: str, kind: str = "config") -> bool:
     lines = [ln for ln in lines if ln and not ln.startswith("#")]
     if kind == "hosts":
         return all(SSH_HOSTS_LINE_RE.fullmatch(ln) for ln in lines)
-    return all(re.split(r"[\s=]", ln, maxsplit=1)[0].lower() in SSH_CONFIG_WORDS for ln in lines)
+    return all(re.split(r"[\s=]", ln, maxsplit=1)[0].lower() in SSH_CONFIG_WORDS
+               and not (roots and SSH_RUNS_RE.match(ln.lstrip("\"'"))) for ln in lines)
 
 
 def ssh_host_list(value: str) -> bool:

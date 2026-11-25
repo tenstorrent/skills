@@ -238,7 +238,8 @@ def quality(db, cfg: dict, tids, tasks: dict, runs: dict, reviews: dict, fixes: 
             continue
         rs, rv = runs.get(tid) or [], reviews.get(tid) or {}
         bounced = [r for r in rs if (_note(r["note"]).get(route.KEY) or {}).get("fallback") == route.BOUNCE]
-        finished_off = arm == "glm" and bounced and not on_glm(rs[-1]["provider"], rs[-1]["model"], rs[-1]["note"])
+        finished_off = (arm == "glm" and bounced and not on_glm(rs[-1]["provider"], rs[-1]["model"], rs[-1]["note"])
+                        and (not rv.get("at") or float(bounced[0]["started"] or 0) < rv["at"]))   # Opus finished it before its first review
         q["tasks"] += 1
         if not finished_off:
             q["done"] += t["status"] == "done"

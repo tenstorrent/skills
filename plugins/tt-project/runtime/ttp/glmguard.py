@@ -891,18 +891,12 @@ def shell_refusal(cmd: str, cwd: str, run_dir: str = "", env=None, remote: bool 
 
 def _own_ssh_config(value: str, cmd: str, cwd: str, run_dir: str, e) -> bool:
     """`ssh -F value` names a settings file of the run's own: inside its worktree or run folder (by its real
-    path), with no line that runs a local program or reads another file (credguard.SSH_RUNS_RE), in a command that
-    is one plain call (no separator, pipe, redirection or substitution), so no step of it writes the file or moves
-    the folder first (fail closed)."""
-    from . import credguard, sidefx
-    path = os.path.realpath(os.path.join(cwd, os.path.expanduser(value)))
-    if credguard.SHELL_META_RE.search(cmd) or not sidefx._inside(path, _own_roots(cwd, run_dir, e)):
-        return False
-    try:
-        with open(path, encoding="utf-8", errors="replace") as f:
-            return not any(credguard.SSH_RUNS_RE.match(line) for line in f.read(1 << 20).splitlines())
-    except OSError:
-        return False
+    path) and shaped as ssh's own (credguard.ssh_own_file: known keywords only, so no ProxyCommand or Include),
+    in a command that is one plain call (no separator, pipe, redirection or substitution), so no step of it
+    writes the file or moves the folder first (fail closed)."""
+    from . import credguard
+    return not credguard.SHELL_META_RE.search(cmd) and credguard.ssh_own_file(
+        value, roots=_own_roots(cwd, run_dir, e), cwd=cwd)
 
 
 def tool_refusal(payload: dict, env=None, made: list[str] | None = None) -> str | None:

@@ -2677,8 +2677,12 @@ def test_glm_guard_refuses_a_config_in_its_own_folders_that_runs_a_program_or_th
     (wt / "conf" / "bad").write_text("Host box-a\n  ProxyCommand nc %h %p\n")
     (wt / "conf" / "inc").write_text("Include /etc/ssh/ssh_config.d/*\n")
     (wt / "conf" / "ok").write_text("Host box-a\n  User user\n")
+    (wt / "conf" / "quoted").write_text('Host box-a\n  "ProxyCommand" nc %h %p\n')
+    (wt / "conf" / "big").write_text("#" * (1 << 20) + "\n  ProxyCommand nc %h %p\n")   # the program past ssh_own_file's read
     e = {**_GG_RUN_ENV, "TMPDIR": str(rd / "tmp")}
     for cmd in ("ssh -F conf/bad box-a ls", "ssh -F conf/inc box-a ls", "ssh -F conf/missing box-a ls",
+                "ssh -F conf/[b]ad box-a ls", f"ssh -F {wt}/conf/$USER box-a ls", f"ssh -F {wt}/conf/%h box-a ls",
+                "ssh -F conf/quoted box-a ls", "ssh -F conf/big box-a ls",
                 "printf 'ProxyCommand x\\n' >> conf/ok && ssh -F conf/ok box-a ls",
                 "ssh -F conf/ok box-a ls; cp conf/bad conf/ok; ssh -F conf/ok box-a ls",
                 "ssh -Fx>conf/ok box-a cat; ssh -F conf/ok box-a ls",
