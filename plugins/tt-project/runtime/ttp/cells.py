@@ -40,9 +40,6 @@ NAME_CHARS = 40     # a cell name's most characters
 TOKEN_COLON = re.compile(r"[^\s:]+(?::[^\s:]+)+")   # a ':' only inside one token: 81:00.0, 0000:81:00.0
 END = ".!?,;"   # sentence punctuation a cell name never ends in: `cells: a, b.` names `b`
 TAIL = re.compile(r"[.!?,;]+(?=[`'\"]*$)")   # that punctuation at a name's end, inside closing quotes too
-# One trailing remark on a line: `a, b (8 tasks each)`. A remark that adds cells (`a, b (plus one per
-# other project)`) is part of the list, so the line stays a description.
-REMARK = re.compile(r"\s*\((?!\s*(?:plus|and|also)\b|\s*\+)[^()]*\)[\s.!?]*$")
 
 
 def norm(cell) -> str:
@@ -75,16 +72,9 @@ def is_name(cell: str) -> bool:
     return ":" not in cell or bool(TOKEN_COLON.fullmatch(cell))
 
 
-def listed(text: str) -> str:
-    """One `cells:` line's text (after the key) without one trailing parenthetical remark: `a, b (8 tasks
-    each)` lists a and b."""
-    return REMARK.sub("", text or "", count=1)
-
-
 def enumerable(text: str) -> bool:
-    """Whether one `cells:` line's text (after the key) lists cell names only (is_name for every part),
-    a trailing parenthetical remark aside (listed)."""
-    parts = [p for p in SEP.split(listed(text)) if p.strip()]
+    """Whether one `cells:` line's text (after the key) lists cell names only (is_name for every part)."""
+    parts = [p for p in SEP.split(text or "") if p.strip()]
     return bool(parts) and all(is_name(p) for p in parts)
 
 
@@ -107,7 +97,7 @@ def problem(spec) -> str | None:
 def requested(spec) -> list[str]:
     """The cells `spec`'s enumerable `cells:` lines request, in order, each once; [] without such a line
     (a descriptive line, ignored(), requests none)."""
-    return split(",".join(listed(t) for t in LINE.findall(str(spec or "")) if enumerable(t)))
+    return split(",".join(t for t in LINE.findall(str(spec or "")) if enumerable(t)))
 
 
 def _valid(value) -> bool:

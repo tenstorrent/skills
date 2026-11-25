@@ -1087,10 +1087,9 @@ def test_obligation_actions_that_change_nothing_owed_are_notes_and_kept_gates_st
     """#2116 part 2: an obligation action whose wording was off but whose meaning is clear goes through
     or is noted, never rejected: a due move on a closed obligation or one with no due, an order linked to
     a closed key (recorded as a new order), and finished or unfit owners (left out, the rest attached).
-    Still refused in the same batch: a missed due with no plan change, an unknown milestone on one that
-    has milestones, a Restrictions change without the user's word and a task_update touching a guard line.
-    coordprecheck refuses none of the noted ones either."""
-    from ttp import coordinator as coord, coordprecheck, obligations as ob
+    Still refused in the same batch: a missed due with no plan change, an unknown milestone, a
+    Restrictions change without the user's word and a task_update touching a guard line."""
+    from ttp import coordinator as coord, obligations as ob
     p, d, now, tid, check, mid, raised = _order_setup(env, monkeypatch)
     p.charter_path.write_text("# demo\n\n## Restrictions\n- Never merge. (user msg #1)\n")
 
@@ -1111,14 +1110,12 @@ def test_obligation_actions_that_change_nothing_owed_are_notes_and_kept_gates_st
     gone = ob.add(p, "dropped one", [tid], now=now)
     ob.drop(p, gone, "by mistake", by="coordinator")
     for key, why in ((plain, "is open but has no promise"), (gone, "is already closed (dropped)")):
-        act = {"type": "obligation", "key": key, "due": now + 3 * 3600}
-        assert coordprecheck.problems(p, [dict(act)]) == [] and coord.apply(p, [act]) == [], key
+        assert coord.apply(p, [{"type": "obligation", "key": key, "due": now + 3 * 3600}]) == [], key
         assert f"{key} {why}" in notes()
     # An order linked to a closed key is recorded as a new order, its text and class carried over.
     ob.record(p, oid, "receipt", "commit abc", None)
     again = p.db.post("in", "build it again", chat="c1")
-    act = {"type": "obligation", "key": oid, "order": again, "owners": [code]}
-    assert coordprecheck.problems(p, [dict(act)]) == [] and coord.apply(p, [act]) == []
+    assert coord.apply(p, [{"type": "obligation", "key": oid, "order": again, "owners": [code]}]) == []
     new = ob.open_order(p.db, again)
     assert new and new["id"] != oid and new["promise"]["class"] == "change" and new["text"] == "build it"
     assert f"obligation {oid} is closed: the order of message #{again} is recorded as a new one" in notes()
@@ -1129,7 +1126,6 @@ def test_obligation_actions_that_change_nothing_owed_are_notes_and_kept_gates_st
     lid = ob.open_order(p.db, late)["id"]
     guarded = p.db.add_task("loader", "1. load\n\nRestrictions:\n- never push to main\n", kind="work")
     before = p.charter_path.read_text()
-    ob.add_milestones(p, plain, [{"key": "draft", "due": now + 3600, "evidence_required": "a draft"}])
     probs = coord.apply(p, [
         {"type": "obligation", "key": lid, "due": now + 7200},
         {"type": "obligation", "key": plain, "evidence": "done", "milestone": "nope"},
@@ -1137,7 +1133,7 @@ def test_obligation_actions_that_change_nothing_owed_are_notes_and_kept_gates_st
         {"type": "task_update", "id": guarded, "replace": {"old": "- never push to main", "new": ""}}])
     assert len(probs) == 4, probs
     assert any("a new time alone is refused" in x for x in probs), probs
-    assert any("no milestone nope" in x and "its milestones: draft" in x for x in probs), probs
+    assert any("no milestone nope" in x and "its milestones: none" in x for x in probs), probs
     assert any(x.startswith("charter_update") for x in probs) and p.charter_path.read_text() == before
     assert any("touches a safety line" in x for x in probs), probs
 
@@ -1465,178 +1461,3 @@ def test_the_daemon_files_a_change_order_receipt_as_progress_until_it_lands(env,
     assert o["receipt"] is None and o["owners"][str(tid)]["evidence"], "filed as progress, still owed"
     assert "not landed" in (run_dir / "progress.md").read_text(), "the run is told why"
     assert "receipt" not in o["owners"][str(tid)]
-
-
-# Action forms: an `obligation` action or run record whose meaning is clear is applied as meant.
-
-def _obform_run(p, task, oid, kind, evidence, milestone=None):
-    """A running run of task `task` that wrote a `kind` record for `oid` (RUN_FILE); its directory."""
-    from ttp import obligations as ob
-    run_dir = p.runs / f"r-obform-{task}"
-    run_dir.mkdir(parents=True, exist_ok=True)
-    p.db.x("INSERT INTO runs(task,role,started,status,dir) VALUES(?,?,?,?,?)",
-           (task, "worker", time.time(), "running", str(run_dir)))
-    ob.append_run(run_dir, oid, kind, evidence, str(task), milestone=milestone)
-    return run_dir
-
-
-def _obform_notes(p, coord):
-    return [n for n in p.db.kv(coord.NOTES_KEY) or [] if "applied as" in n], " ".join(p.db.kv(coord.NOTES_KEY) or [])
-
-
-def test_obform_a_finished_owner_is_replaced_by_its_one_open_heir(env, monkeypatch):
-    """Item 5 (sample: owner done #A, open "Fix review #A"): the fix is attached instead, with one note, and
-    coordprecheck refuses nothing. A finished owner with no open successor, or two, is left out with
-    fit_owners' note and the rest attached."""
-    from ttp import coordinator as coord, coordprecheck, obligations as ob
-    p, d, now, tid, check, mid, raised = _order_setup(env, monkeypatch)
-
-    def task(title, **kw):
-        return p.db.add_task(title, "s", kind="code", tier="light", origin="coordinator", **kw)
-    done, lone, twice = task("build part a"), task("build part b"), task("build part c")
-    for t in (done, lone, twice):
-        p.db.update_task(t, status="done")
-    fix = task(f"Fix review #{done}: build part a")
-    task(f"Fix review #{twice}: build part c")
-    task("continue: build part c", parent=twice)
-    oid = ob.add(p, "the benchmark table", [tid], now=now)
-    act = {"type": "obligation", "key": oid, "owners": [done, lone, twice]}
-    assert coordprecheck.problems(p, [dict(act)]) == []
-    assert coord.apply(p, [act]) == []
-    applied, notes = _obform_notes(p, coord)
-    assert applied == [f"actions[0] (obligation) applied as: owners=[{fix}, {lone}, {twice}] "
-                       f"(was: [{done}, {lone}, {twice}])"], applied
-    assert sorted(ob.get(p.db, oid)["owners"]) == sorted([str(tid), str(fix)])
-    assert f"#{lone} is done, so not attached" in notes and f"#{twice} is done, so not attached" in notes
-
-
-def test_obform_owner_0_is_left_out_and_the_rest_recorded(env, monkeypatch):
-    """Item 8 (an owner sent as 0, refused as no such task): owner 0 is a placeholder, left out with one note;
-    the order is recorded with the other owner and coordprecheck refuses nothing."""
-    from ttp import coordinator as coord, coordprecheck, obligations as ob
-    p, d, now, tid, check, mid, raised = _order_setup(env, monkeypatch)
-    act = {"type": "obligation", "order": mid, "text": "build the deliverable", "action_class": "change",
-           "owners": [0, tid]}
-    assert coordprecheck.problems(p, [dict(act)]) == []
-    assert coord.apply(p, [act]) == []
-    assert _obform_notes(p, coord)[0] == [f"actions[0] (obligation) applied as: owners=[{tid}] (was: [0, {tid}])"]
-    assert ob.open_order(p.db, mid)["promise"]["tasks"] == [tid]
-
-
-def test_obform_a_milestone_on_an_obligation_with_none_is_progress_never_a_receipt(env, monkeypatch):
-    """Item 9 (sample "no milestone watcher_live on oN; its milestones: none"), from both paths: the
-    coordinator's action and a run's record the daemon files. Each is kept as progress under the
-    milestone's name, the order stays owed, and coordprecheck refuses nothing."""
-    from ttp import coordinator as coord, coordprecheck, obligations as ob
-    p, d, now, tid, check, mid, raised = _order_setup(env, monkeypatch)
-    oid = ob.add_order(p, "build the deliverable", mid, [tid], action_class="change", now=now).split()[1]
-    ob.attach(p, oid, [tid], now=now)
-    act = {"type": "obligation", "key": oid, "evidence": "the watcher is live", "milestone": "watcher_live"}
-    assert coordprecheck.problems(p, [dict(act)]) == []
-    assert coord.apply(p, [act]) == []
-    assert f"{oid} has no milestones: 'watcher_live: the watcher is live' recorded as progress, not a receipt" \
-        in _obform_notes(p, coord)[1]
-    _obform_run(p, tid, oid, "receipt", "reset answered", milestone="reset-answer")
-    assert ob.file_runs(p, now + 60) == []
-    o = ob.get(p.db, oid)
-    assert o["receipt"] is None and "receipt" not in o["owners"][str(tid)]
-    assert [e["text"] for e in o["owners"][str(tid)]["evidence"]] == ["reset-answer: reset answered"]
-    assert [h["evidence"] for h in o["history"] if h["event"] == "progress"] == ["watcher_live: the watcher is live"]
-
-
-def test_obform_a_run_s_record_from_a_task_carrying_an_owner_on_makes_it_an_owner(env, monkeypatch):
-    """Item 10, the owner rule's samples: a run's record for an obligation its task does not own is filed
-    when the task carries an owner's work on ("Fix review #<owner>", a "Review #" of that fix, a "continue:"
-    of an owner, a parent_copy of a continuation, a task delivering onto an owner's branch) or its spec
-    names the key: it is made an owner first, with a history entry and a daemon.log line. An unrelated
-    task's record stays refused, and so does a review's on a change order (keep list)."""
-    from ttp import obligations as ob
-    p, d, now, tid, check, mid, raised = _order_setup(env, monkeypatch)
-
-    def task(title, spec="s", kind="code", **kw):
-        return p.db.add_task(title, spec, kind=kind, tier="light", origin="coordinator", **kw)
-    p.db.update_task(tid, branch=f"ttp/t{tid}-build")
-    oid = ob.add(p, "the benchmark table", [tid], now=now)
-    p.db.update_task(tid, status="done")
-    fix = task(f"Fix review #{tid}: build the deliverable")
-    rev = task(f"Review #{fix}: build the deliverable", kind="review")
-    cont = task(f"continue: missing cells of #{tid}", parent=tid)
-    hop = task("build the deliverable again", labels=[f"continues:{tid}"])
-    copy = task("build the deliverable, part 2", parent=hop, tier_source="parent_copy")
-    onto = task("land the table", labels=[f"pr_branch:ttp/t{tid}-build"])
-    says = task("write the summary", spec=f"Owns obligation {oid}: the benchmark table.", kind="work")
-    other = task("something else", kind="work")
-    code = task("make the change")
-    order = ob.add_order(p, "make the change", mid, [code], action_class="change", now=now).split()[1]
-    ob.attach(p, order, [code], now=now)
-    review = task(f"Review #{code}: make the change", kind="review", labels=[f"auto_review:{code}"])
-    for t in (fix, rev, cont, copy, onto, says, other):
-        _obform_run(p, t, oid, "progress", f"step of #{t}")
-    _obform_run(p, review, order, "progress", "reviewed")
-    p.db.update_task(fix, status="done")   # its run's records are filed after it ended
-    refused = ob.file_runs(p, now + 60)
-    assert sorted(refused) == sorted(x for x in refused if "not a required owner" in x) and len(refused) == 2
-    assert any(f"#{other} is not" in x for x in refused) and any(f"#{review} is not" in x for x in refused)
-    o = ob.get(p.db, oid)
-    for t in (fix, rev, cont, copy, onto, says):
-        assert [e["text"] for e in o["owners"][str(t)]["evidence"]] == [f"step of #{t}"], t
-    assert str(other) not in o["owners"] and str(review) not in ob.get(p.db, order)["owners"]
-    want = {fix: f"descends from #{tid}", rev: f"descends from #{fix}", cont: f"descends from #{tid}",
-            copy: f"descends from #{tid}", onto: f"descends from #{tid}", says: f"its spec names {oid}"}
-    assert {h["task"]: h["why"] for h in _ob_history(p, oid)} == \
-        {t: f"#{t} {why}: its run's record is filed" for t, why in want.items()}
-    log = (p.logs / "daemon.log").read_text()
-    assert all(f"obligation owner added: #{t} ({why}) for {oid}" in log for t, why in want.items()), log
-
-
-def test_obform_an_adopted_fix_s_receipt_still_waits_for_its_change_to_land(env, monkeypatch):
-    """sa109 unchanged: a "Fix review #<owner>" run on the owner's branch files the change order's receipt
-    through the daemon (under the transaction guard). It is made an owner, then judged as any owner's
-    receipt: its commit is not landed, so the receipt is kept as progress and the order stays open, though
-    its text names that commit."""
-    from ttp import obligations as ob
-    monkeypatch.setenv("TTP_TX_GUARD", "1")     # a fetch inside the write transaction is refused
-    p, repo, tid, oid = _receipt_order_setup(env, monkeypatch, status="done")
-    head = _git_out(repo, "rev-parse", "HEAD")
-    fix = p.db.add_task(f"Fix review #{tid}: build the deliverable", "fix", kind="code", tier="standard",
-                        origin="coordinator", branch=f"ttp/t{tid}-build")
-    run_dir = _obform_run(p, fix, oid, "receipt", f"landed as {head}")
-    p.db.update_task(fix, status="done")
-    assert ob.file_runs(p) == []
-    o = ob.get(p.db, oid)
-    assert o["receipt"] is None and o.get("unverified") is None and "receipt" not in o["owners"][str(fix)]
-    assert [e["text"] for e in o["owners"][str(fix)]["evidence"]] == [f"landed as {head}"], "kept as progress"
-    assert "not landed" in (run_dir / "progress.md").read_text(), "the run is told why"
-
-
-def test_obform_kept_forms_are_not_rewritten_and_still_refused(env, monkeypatch):
-    """The keep list, in one batch: a receipt citing a partial hand-off and a missed due moved with no plan
-    change are refused; a review never owns a change order, not even as a done owner's only open successor;
-    a due move on an open obligation with no due stays a note. None is rewritten (no "applied as" note)."""
-    from ttp import coordinator as coord, obligations as ob
-    p, d, now, tid, check, mid, raised = _order_setup(env, monkeypatch)
-
-    def task(title, kind="code", **kw):
-        return p.db.add_task(title, "s", kind=kind, tier="light", origin="coordinator", **kw)
-    part = ob.add(p, "the cell table", [tid], now=now)
-    _ob_handoff(p, tid, "partial: 8 of 9 cells (missing: live)")
-    plain = ob.add(p, "a plain one", [], now=now)
-    late = p.db.post("in", "and ship it", chat="c1")
-    code = task("ship it")
-    ob.add_order(p, "ship it", late, [code], due=now - 60, action_class="change", now=now - 7200)
-    made = task("make the change")
-    p.db.update_task(made, status="done")
-    rev = task(f"Review #{made}: make the change", kind="review", labels=[f"auto_review:{made}"])
-    probs = coord.apply(p, [
-        {"type": "obligation", "key": part, "evidence": f"#{tid} finished"},
-        {"type": "obligation", "key": ob.open_order(p.db, late)["id"], "due": now + 7200},
-        {"type": "obligation", "order": mid, "text": "build it", "action_class": "change",
-         "owners": [made, rev, code]},
-        {"type": "obligation", "key": plain, "due": now + 3600}])
-    applied, notes = _obform_notes(p, coord)
-    assert len(probs) == 2 and applied == [], (probs, applied)
-    assert any("receipt refused" in x and "so the acceptance is not met" in x for x in probs), probs
-    assert any("a new time alone is refused" in x for x in probs), probs
-    assert ob.get(p.db, part)["receipt"] is None and ob.open_order(p.db, mid)["promise"]["tasks"] == [code]
-    assert f"#{made} is done, so not attached" in notes and f"#{rev} is a review task" in notes
-    assert f"{plain} is open but has no promise or due to move" in notes

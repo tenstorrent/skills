@@ -13557,10 +13557,64 @@ def cmd_config(a) -> None:
         die(hint)   # an unknown key present in project.json (one a plugin retired) can still be removed
     if a.value == "":
         return _config_remove(p, a.key, run)
-    try:
-        val = config_value(p, a.key, val)
-    except ValueError as e:
-        die(str(e))
+    if a.key == "runner.pin_verify":
+        from .project import pin_verify_mode
+        try:
+            val = pin_verify_mode(val)
+        except ValueError as e:
+            die(str(e))
+    if a.key in ("coordinator.provider_failover_after_h", "coordinator.provider_failover_to",
+                 "coordinator.provider_logout_failover_s"):
+        from . import failover
+        try:
+            val = (failover.after_h_of(val) if a.key.endswith("_after_h")
+                   else failover.logout_s_of(val) if a.key.endswith("_logout_failover_s")
+                   else failover.to_of(val, p.config().get("providers")))
+        except ValueError as e:
+            die(str(e))
+    if a.key == "providers_allowed":
+        from . import provallow
+        try:
+            val = provallow.of(val, p.config().get("providers"))
+        except ValueError as e:
+            die(str(e))
+    if a.key == "coordinator.conclusion_floor":
+        from . import tierfloor
+        try:
+            val = tierfloor.floor_of(val)
+        except ValueError as e:
+            die(str(e))
+    if a.key.startswith("heal.outage_") and a.key.endswith("_min"):
+        from .outagetask import minutes
+        try:
+            minutes(a.key.split(".", 1)[1], val)
+        except ValueError as e:
+            die(str(e).replace("; the default is used", ""))
+    if a.key == "delivery.checks_spill_hosts" or a.key == "delivery" and isinstance(val, dict):
+        from . import checkspill
+        if why := checkspill.ban_refusal(f"delivery.{checkspill.KEY}", val.get(checkspill.KEY) if a.key == "delivery"
+                                         else val):
+            die(why)
+    if a.key in ("delivery.push_checks", "delivery.push_checks_by_repo"):
+        from .push import checks_by_repo_of, checks_of
+        try:
+            val = checks_of(val) if a.key == "delivery.push_checks" else checks_by_repo_of(val)
+        except ValueError as e:
+            die(str(e) if a.key == "delivery.push_checks" else f"{a.key}: {e}")
+    if a.key.split(".")[:2] == ["runner", "host_commands"] or a.key == "runner" and isinstance(val, dict) \
+            and "host_commands" in val:
+        from . import configwho
+        if configwho.from_env()["by"] == "worker":
+            die("runner.host_commands (the commands `ttp host-run` may run outside the sandbox) is set only by "
+                "the user or the coordinator, never by a worker: name the exact command in your hand-off")
+        from . import hostrun
+        try:   # the list itself (a JSON list of valid entries, as config_set takes it), or one entry under it
+            if a.key == "runner" or a.key == hostrun.KEY:
+                hostrun.check_list(val.get("host_commands") if a.key == "runner" else val)
+            elif err := hostrun.entry(val)[2]:
+                raise ValueError(f"{a.key} {json.dumps(val)[:160]}: {err}")
+        except ValueError as e:
+            die(str(e))
     from . import configwho
     setter, grant = configwho.from_env(), None
     if run and (k := _user_only_change(p.raw_config(), a.key, val)):
@@ -13586,72 +13640,14 @@ def cmd_config(a) -> None:
                (time.time(), "cli", "config_grant", "low", f"ttp config {a.key} {json.dumps(val)} on the user's word "
                 f"in message #{grant}", json.dumps({"key": a.key, "value": val, "messages": [grant]}), "handled"))
     print(f"{a.key} = {json.dumps(val)}")
-    for warn in config_warnings(p, a.key):
-        print(f"warning: {warn}", file=sys.stderr)
-
-
-def config_value(p, key: str, val):
-    """`val` as `ttp config` stores it at `key`, after that key's own checks; ValueError saying why not. A
-    coordinator config_set of a key the coordinator sets in its own shell (coordinator.ShellKey) runs them too."""
-    if key == "runner.pin_verify":
-        from .project import pin_verify_mode
-        val = pin_verify_mode(val)
-    if key in ("coordinator.provider_failover_after_h", "coordinator.provider_failover_to",
-               "coordinator.provider_logout_failover_s"):
-        from . import failover
-        val = (failover.after_h_of(val) if key.endswith("_after_h")
-               else failover.logout_s_of(val) if key.endswith("_logout_failover_s")
-               else failover.to_of(val, p.config().get("providers")))
-    if key == "providers_allowed":
-        from . import provallow
-        val = provallow.of(val, p.config().get("providers"))
-    if key == "coordinator.conclusion_floor":
-        from . import tierfloor
-        val = tierfloor.floor_of(val)
-    if key.startswith("heal.outage_") and key.endswith("_min"):
-        from .outagetask import minutes
-        try:
-            minutes(key.split(".", 1)[1], val)
-        except ValueError as e:
-            raise ValueError(str(e).replace("; the default is used", "")) from None
-    if key == "delivery.checks_spill_hosts" or key == "delivery" and isinstance(val, dict):
-        from . import checkspill
-        if why := checkspill.ban_refusal(f"delivery.{checkspill.KEY}", val.get(checkspill.KEY) if key == "delivery"
-                                         else val):
-            raise ValueError(why)
-    if key in ("delivery.push_checks", "delivery.push_checks_by_repo"):
-        from .push import checks_by_repo_of, checks_of
-        try:
-            val = checks_of(val) if key == "delivery.push_checks" else checks_by_repo_of(val)
-        except ValueError as e:
-            raise ValueError(str(e) if key == "delivery.push_checks" else f"{key}: {e}") from None
-    if key.split(".")[:2] == ["runner", "host_commands"] or key == "runner" and isinstance(val, dict) \
-            and "host_commands" in val:
-        from . import configwho
-        if configwho.from_env()["by"] == "worker":
-            raise ValueError("runner.host_commands (the commands `ttp host-run` may run outside the sandbox) is set "
-                             "only by the user or the coordinator, never by a worker: name the exact command in your "
-                             "hand-off")
-        from . import hostrun
-        # the list itself (a JSON list of valid entries, as config_set takes it), or one entry under it
-        if key == "runner" or key == hostrun.KEY:
-            hostrun.check_list(val.get("host_commands") if key == "runner" else val)
-        elif err := hostrun.entry(val)[2]:
-            raise ValueError(f"{key} {json.dumps(val)[:160]}: {err}")
-    return val
-
-
-def config_warnings(p, key: str) -> list[str]:
-    """What `ttp config` warns of once `key` is set (the change stands): a weekly cap under the daily one,
-    a code route no run takes."""
-    out = []
-    if key in ("budget", "budget.daily_usd", "budget.weekly_usd"):
+    if a.key in ("budget", "budget.daily_usd", "budget.weekly_usd"):
         from .project import weekly_below_daily
-        out.append(weekly_below_daily(p.config().get("budget")))
-    if key == "route" or key.startswith("route."):
+        if warn := weekly_below_daily(p.config().get("budget")):
+            print(f"warning: {warn}", file=sys.stderr)
+    if a.key == "route" or a.key.startswith("route."):
         from . import codearm, policyfiles
-        out.append(codearm.refusal(p.config(), policyfiles.load(p.harness)))
-    return [w for w in out if w]
+        if why := codearm.refusal(p.config(), policyfiles.load(p.harness)):
+            print(f"warning: {why}", file=sys.stderr)
 
 
 def _config_remove(p, key: str, run) -> None:

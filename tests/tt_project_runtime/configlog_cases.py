@@ -427,15 +427,14 @@ def test_a_worker_runs_config_of_a_coordinator_set_spill_wrap_cmd_is_refused_and
 def test_config_set_refusing_a_key_a_coordinator_sets_by_cli_names_that_route_and_a_users_key_does_not(env):
     """A known key config_set refuses (not chat-settable) but a coordinator may set by `ttp config`: the
     rejection names that route, so a worker told to hand it to the coordinator never loops. A key that is
-    the user's alone (NEEDS_USER) and an unknown key get no such route. (Most such keys config_set now
-    applies as that command would: configset_cases; a spend setting stays refused.)"""
+    the user's alone (NEEDS_USER) and an unknown key get no such route."""
     from ttp.coordinator import apply
     p = make(env)
-    probs = apply(p, [{"type": "config_set", "key": "budget.task_default_usd", "value": 2}])
-    assert any("budget.task_default_usd is not user-settable from chat" in x
-               and "`ttp config <project> budget.task_default_usd <value>` in its own shell after `ttp audit "
+    probs = apply(p, [{"type": "config_set", "key": "checks.spill_wrap_cmd", "value": "/opt/example/wrap.sh"}])
+    assert any("checks.spill_wrap_cmd is not user-settable from chat" in x
+               and "`ttp config <project> checks.spill_wrap_cmd <value>` in its own shell after `ttp audit "
                    "why`" in x for x in probs), probs
-    assert "task_default_usd" not in (p.raw_config().get("budget") or {})
+    assert "spill_wrap_cmd" not in (p.raw_config().get("checks") or {})
     for key in ("delivery.backup_remote", "checks.no_such_key"):
         probs = apply(p, [{"type": "config_set", "key": key, "value": "x"}])
         assert probs and not any("ttp audit why" in x for x in probs), (key, probs)

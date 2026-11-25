@@ -10,7 +10,7 @@ def test_coordinator_actions_are_validated(env):
     probs = apply(p, [{"type": "task_add", "title": "t1", "spec": "s"},
                       {"type": "task_add", "title": "t1", "spec": "s"},
                       {"type": "config_set", "key": "budget.reserve_pct", "value": "0"},
-                      {"type": "config_set", "key": "delivery.push_allowed", "value": "x"},
+                      {"type": "config_set", "key": "providers.claude.tiers", "value": "x"},
                       {"type": "bogus"}])
     assert len(p.db.q("SELECT id FROM tasks WHERE title='t1'")) == 1
     assert any("duplicate" in x for x in probs)
@@ -14655,7 +14655,7 @@ def test_sweep_action_records_one_validated_outcome_per_item(env):
     probs = coord.apply(p, [
         {"type": "sweep", "id": t, "outcome": "still_blocked", "until": "Accepted-evidence addendum only; retain blocked status",
          "start_after": "6h"},
-        {"type": "sweep", "id": t, "outcome": "still_blocked", "until_probe": "test -e /tmp/x", "start_after": "soon"},
+        {"type": "sweep", "id": t, "outcome": "still_blocked", "until_probe": "test -e /tmp/x"},
         {"type": "sweep", "id": t, "outcome": "human_indispensable"},
         {"type": "sweep", "id": t, "outcome": "maybe"},
         {"type": "sweep", "outcome": "retired"},
@@ -14713,12 +14713,10 @@ def test_sweep_unblocked_keeps_a_pending_deferral_unless_the_turn_clears_it(env)
     db.update_task(held, status="blocked", blocked_reason="x", not_before=now + 3600)
     db.set_kv(sweep.STATE_KEY, {"n": 1, "items": {f"task:{gated}": {"status": "queued"},
                                                   f"task:{held}": {"status": "blocked"}}})
-    # Recorded as still_blocked instead, next checked at the deferral's start (actionforms).
-    assert coord.apply(p, [{"type": "sweep", "id": later, "outcome": "unblocked"},
-                           {"type": "sweep", "id": gated, "outcome": "unblocked"}]) == []
-    outs = db.kv(sweep.OUTCOMES_KEY)
-    assert outs[f"task:{later}"]["outcome"] == outs[f"task:{gated}"]["outcome"] == "still_blocked"
-    assert int(outs[f"task:{later}"]["next"]) == int(now + 8 * 3600) and outs[f"task:{gated}"]["probe"] == "test -e out/ready"
+    probs = coord.apply(p, [{"type": "sweep", "id": later, "outcome": "unblocked"},
+                            {"type": "sweep", "id": gated, "outcome": "unblocked"}])
+    assert len(probs) == 2 and "still deferred (start_after" in probs[0] and "start_when `test -e out/ready`" in probs[1]
+    assert db.kv(sweep.OUTCOMES_KEY) is None
     assert deferral(db.task(later))["after"] == now + 8 * 3600 and db.task(later)["not_before"] == now + 8 * 3600
     assert deferral(db.task(gated))["when"] == "test -e out/ready"
     # A requeue from blocked keeps the planned start; clearing the deferral first makes `unblocked` hold.
@@ -14733,102 +14731,6 @@ def test_sweep_unblocked_keeps_a_pending_deferral_unless_the_turn_clears_it(env)
     assert deferral(db.task(gated)) == {} and not db.task(gated)["not_before"]
     assert {k: v["outcome"] for k, v in db.kv(sweep.OUTCOMES_KEY).items()} == {
         f"task:{held}": "unblocked", f"task:{gated}": "unblocked", f"task:{later}": "still_blocked"}
-
-
-def test_sweep_form_still_blocked_without_start_after_is_checked_next_at_the_items_own_wake(env):
-    """'task:N still_blocked needs `start_after`: when to check it next' (and, for the short '#M lands', the
-    re-checkable condition): applied with the task's own wake, else now + the sweep period, and the landing
-    its hold waits on (actionforms), in the dry run as in apply. The note says what was applied."""
-    p = make(env)
-    from ttp import coordinator as coord, coordprecheck, sweep
-    db, now = p.db, time.time()
-    m, wake = db.add_task("producer"), int(now) + 2 * 3600
-    own, bare = db.add_task("own wake", labels=[f"start_after:{wake}"]), db.add_task("no wake")
-    for t in (own, bare):
-        db.update_task(t, status="blocked", blocked_reason=f"waits for #{m} to land", not_before=wake if t == own else None,
-                       labels=[f"waits:when:landed:#{m}"] + ([f"start_after:{wake}"] if t == own else []))
-    sent = [{"type": "sweep", "id": t, "outcome": "still_blocked", "until": f"#{m} lands"} for t in (own, bare)]
-    assert coordprecheck.problems(p, sent) == []
-    assert coord.apply(p, sent) == []
-    outs = db.kv(sweep.OUTCOMES_KEY)
-    assert outs[f"task:{own}"]["next"] == wake and abs(outs[f"task:{bare}"]["next"] - (now + 6 * 3600)) < 60
-    assert outs[f"task:{own}"]["probe"] == outs[f"task:{bare}"]["probe"] == f"landed:#{m}"
-    notes = [n for n in db.kv(coord.NOTES_KEY) if "applied as" in n]
-    assert len(notes) == 2 and notes[0].startswith(f"actions[0] (sweep) applied as: until_probe=landed:#{m} (was: none); "
-                                                   f"start_after=") and notes[0].endswith("(was: none)"), notes
-
-
-def test_sweep_form_still_blocked_without_until_takes_the_tasks_start_when_probe(env):
-    """'task:N still_blocked needs a re-checkable condition': on a task deferred with start_when
-    `landed:#M`, that probe is its until_probe."""
-    p = make(env)
-    from ttp import coordinator as coord, coordprecheck, sweep
-    db = p.db
-    m = db.add_task("producer")
-    t = db.add_task("consumer", labels=[f"start_when:landed:#{m}", f"deferred_since:{time.time() - 600}"])
-    sent = [{"type": "sweep", "id": t, "outcome": "still_blocked", "start_after": "6h"}]
-    assert coordprecheck.problems(p, sent) == []
-    assert coord.apply(p, sent) == []
-    assert db.kv(sweep.OUTCOMES_KEY)[f"task:{t}"]["probe"] == f"landed:#{m}"
-    assert f"actions[0] (sweep) applied as: until_probe=landed:#{m} (was: none)" in db.kv(coord.NOTES_KEY)
-
-
-def test_sweep_form_unblocked_on_a_still_deferred_task_is_recorded_still_blocked(env):
-    """'#N is still deferred (start_when `landed:#M`): `unblocked` keeps that deferral, so it would not
-    start': recorded as still_blocked on that probe, next checked at the sweep period; the deferral stays."""
-    p = make(env)
-    from ttp import coordinator as coord, coordprecheck, sweep
-    from ttp.db import deferral
-    db, now = p.db, time.time()
-    m = db.add_task("producer")
-    t = db.add_task("consumer", labels=[f"start_when:landed:#{m}", f"deferred_since:{now - 600}"])
-    sent = [{"type": "sweep", "id": t, "outcome": "unblocked", "why": f"#{m} is approved"}]
-    assert coordprecheck.problems(p, sent) == []
-    assert coord.apply(p, sent) == []
-    o = db.kv(sweep.OUTCOMES_KEY)[f"task:{t}"]
-    assert (o["outcome"], o["probe"]) == ("still_blocked", f"landed:#{m}") and abs(o["next"] - (now + 6 * 3600)) < 60
-    assert deferral(db.task(t))["when"] == f"landed:#{m}" and db.task(t)["status"] == "queued"
-    assert any(f"outcome=still_blocked (was: 'unblocked' while still deferred: start_when `landed:#{m}`)" in n
-               for n in db.kv(coord.NOTES_KEY)), db.kv(coord.NOTES_KEY)
-
-
-def test_sweep_form_item_key_sent_in_another_field_is_moved_to_its_own(env):
-    """'promise:oN still_blocked needs `start_after`' with the key sent as `id` ('promise:o1374'), and
-    'task:N' as `id`, 'resource:X' as `resource`: each is recorded on its item."""
-    p = make(env)
-    from ttp import coordinator as coord, coordprecheck, obligations, sweep
-    db, now = p.db, time.time()
-    db.set_kv(obligations.KV, {"next": 1375, "runs": {}, "items": {"o1374": {
-        "id": "o1374", "text": "send the bench table", "by": "coordinator", "created": now - 7200, "owners": {},
-        "receipt": None, "dropped": None, "episode": 0, "raised": None, "covered": [],
-        "promise": {"chat": "c", "message": 1, "due": now - 3600, "timed": True, "tasks": []}}}})
-    t = db.add_task("blocked")
-    db.update_task(t, status="blocked", blocked_reason="x")
-    sent = [{"type": "sweep", "id": "promise:o1374", "outcome": "still_blocked", "until": "the vendor sends the signed key"},
-            {"type": "sweep", "id": f"task:{t}", "outcome": "still_blocked", "until": "the vendor sends the signed key",
-             "start_after": "6h"},
-            {"type": "sweep", "resource": "resource:box-a", "outcome": "human_indispensable",
-             "why": "only the owner can reseat the card"}]
-    assert coordprecheck.problems(p, sent) == []
-    assert coord.apply(p, sent) == []
-    outs = db.kv(sweep.OUTCOMES_KEY)
-    assert set(outs) == {"promise:o1374", f"task:{t}", "resource:box-a"}
-    assert abs(outs["promise:o1374"]["next"] - (now + 6 * 3600)) < 60   # overdue: no own wake ahead
-    assert any("promise=o1374 (was: id 'promise:o1374'); start_after=" in n for n in db.kv(coord.NOTES_KEY))
-
-
-def test_sweep_form_still_blocked_with_no_wait_on_record_and_a_vague_until_stays_refused(env):
-    p = make(env)
-    from ttp import coordinator as coord, coordprecheck, sweep
-    db = p.db
-    t = db.add_task("blocked")
-    db.update_task(t, status="blocked", blocked_reason="x")
-    sent = [{"type": "sweep", "id": t, "outcome": "still_blocked", "until": "keep it blocked"}]
-    [(i, why)] = coordprecheck.problems(p, sent)
-    assert i == 0 and "re-checkable condition" in why
-    [why] = coord.apply(p, sent)
-    assert "re-checkable condition" in why and db.kv(sweep.OUTCOMES_KEY) is None
-    assert not any("applied as" in n for n in db.kv(coord.NOTES_KEY) or [])
 
 
 def test_blocker_sweep_carries_and_flags_items_left_without_an_outcome(env):

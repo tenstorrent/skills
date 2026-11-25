@@ -167,33 +167,6 @@ def vet(db: Any, source: Any, match: Any, why: Any, end_when: Any, cfg: dict | N
     return {"owner": owner, "max_h": max_h(cfg)}
 
 
-def normal_form(p, a: dict, batch: list, _home: str, now: float):
-    """actionforms: a mute `vet` refuses for want of an owner, whose `why` names no task, gets the one open
-    task whose title or spec names its `match` as the owner (`#<id>` in `why`); None when several tasks do,
-    or a task_add of this batch does too (a task the batch adds has no id to name yet), or nothing is wrong."""
-    from .db import TERMINAL_TASK_STATES
-    why = str(a.get("why") or a.get("reason") or a.get("text") or "").strip()
-    match = str(a.get("match") or "").strip()
-    if not match or named_tasks(why):
-        return None
-    try:
-        vet(p.db, a.get("source"), match, why, a.get("end_when"), p.config(), now)
-        return None
-    except ValueError as e:
-        if not str(e).startswith("observation_mute needs an owner"):
-            return None
-    ids = [r["id"] for r in p.db.q(
-        f"SELECT id FROM tasks WHERE status NOT IN ({','.join('?' * len(TERMINAL_TASK_STATES))}) AND "
-        "instr(lower(coalesce(title, '') || char(10) || coalesce(spec, '')), ?) > 0 LIMIT 2",
-        (*TERMINAL_TASK_STATES, match.lower()))]
-    added = [x for x in batch if isinstance(x, dict) and x.get("type") == "task_add"
-             and match.lower() in f"{x.get('title') or ''}\n{x.get('spec') or ''}".lower()]
-    if len(ids) != 1 or added:
-        return None
-    new = f"{why + ' ' if why else ''}(owner #{ids[0]}: the one open task naming {match!r})"
-    return {**a, "why": new}, f"why={new!r} (was: {why!r})"
-
-
 def cap_note(m: dict, hours: Any) -> str:
     """The ack of a throughput-class mute whose `hours` were cut to its max, else ''."""
     t = m.get("throughput") or {}

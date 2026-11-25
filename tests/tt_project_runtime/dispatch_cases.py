@@ -1193,7 +1193,7 @@ def test_a_scalar_config_section_is_refused_never_kept_as_last_good_and_a_missin
             p.set_config(key, val)
         assert p.raw_config() == raw
     probs = apply(p, [{"type": "config_set", "key": "core_provider.x", "value": 1}])
-    assert any(x.startswith("config_set: core_provider") for x in probs), probs
+    assert any(x.startswith("config_set: core_provider.x") for x in probs), probs
     assert p.raw_config() == raw
     p.set_config("checks.test_pool", 4)
     assert p.raw_config()["checks"] == {"test_pool": 4}

@@ -698,39 +698,3 @@ def test_upgrade_drops_the_retired_effort_ab_keys_and_keeps_jev_pick(env):
     notes = cli._drop_retired_keys(p)
     assert len(notes) == 3 and not any("removed effort_ab.jev_pick" in n for n in notes), notes
     assert p.raw_config()["effort_ab"] == {"jev_pick": True}
-
-
-def test_cfgshell_a_key_the_coordinator_sets_in_its_shell_applies_as_ttp_config_and_user_keys_stay_refused(env):
-    """Refused: `config_set: route.code_sonnet is not user-settable from chat; the
-    coordinator runs `ttp config <project> route.code_sonnet <value>` in its own shell after `ttp audit why``.
-    Such a key now applies through that command's checks (a text value read as JSON, as it reads one), as the
-    coordinator's setting, with an 'applied as' note; a chat routing key applies as before. Push permission,
-    a spend setting, an unknown key (with its did-you-mean) and any such key without a shell (read_only) stay
-    refused."""
-    from ttp import configwho, coordinator as coord
-    p = make(env)
-    assert coord.apply(p, [{"type": "config_set", "key": "route.code_sonnet", "value": '{"share": 0.25}'},
-                           {"type": "config_set", "key": "providers.chat.tiers.light.route", "value": False}]) == []
-    raw = p.raw_config()
-    assert raw["route"]["code_sonnet"] == {"share": 0.25} and raw["providers"]["chat"]["tiers"]["light"]["route"] is False
-    assert configwho.role(configwho.lookup(p.db, "route.code_sonnet", raw)) == "coordinator"
-    notes = p.db.kv(coord.NOTES_KEY, [])
-    assert any(n.startswith('config_set route.code_sonnet applied as: ttp config demo route.code_sonnet {"share": 0.25}')
-               for n in notes), notes
-    probs = coord.apply(p, [{"type": "config_set", "key": "providers_allowed", "value": ["nope"]}])   # its own check
-    assert len(probs) == 1 and "not a configured provider: nope" in probs[0], probs
-    before = p.raw_config()
-    for key, value, why in (("delivery.push_allowed", False, "delivery.push_allowed is not user-settable from chat"),
-                            ("budget.daily_usd", 5, "budget.daily_usd needs the user's approval"),
-                            ("budget.task_default_usd", 2, "budget.task_default_usd is not user-settable from chat"),
-                            ("checks.spill_hosts", "box-a", "did you mean checks.spill_runs_per_host?"),
-                            ("machines.allowed", ["box-a"], "machines.allowed is not user-settable from chat"),
-                            ("machines", {"allowed": ["box-a"]}, "machines is not user-settable from chat")):
-        probs = coord.apply(p, [{"type": "config_set", "key": key, "value": value}])
-        assert len(probs) == 1 and why in probs[0], (key, probs)
-    assert p.raw_config() == before
-    p.set_config("coordinator.session.tools", "read_only")
-    before = p.raw_config()
-    probs = coord.apply(p, [{"type": "config_set", "key": "route.code_sonnet", "value": False}])
-    assert len(probs) == 1 and "in its own shell" in probs[0], probs
-    assert p.raw_config() == before
