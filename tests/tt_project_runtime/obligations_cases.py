@@ -884,18 +884,18 @@ def test_a_delivered_obligation_is_not_closed_when_its_owner_hand_off_leaves_acc
     assert ob.get(p.db, oid)["receipt"] is not None
 
 
-def test_a_receipt_citing_only_an_owner_hand_off_that_leaves_acceptance_unmet_is_refused(env, monkeypatch):
+def test_a_receipt_citing_only_an_owner_hand_off_that_leaves_acceptance_unmet_is_kept_as_progress(env, monkeypatch):
     """record(): a receipt whose evidence names only owners whose hand-off is partial, or filed by an owner
-    task that ended so, is refused naming why; evidence naming a met owner or no owner is taken."""
-    import pytest
+    task that ended so, is kept as progress naming why, the obligation still owed; evidence naming a met
+    owner or no owner is taken."""
     from ttp import obligations as ob
     p, d, now, tid, check = _ob_setup(env, monkeypatch)
     oid = ob.add(p, "build the deliverable", [tid], now=now)
     _ob_handoff(p, tid, "partial: 0 cases qualify")
-    with pytest.raises(ValueError, match=f"receipt refused: #{tid}'s hand-off is marked"):
-        ob.record(p, oid, "receipt", f"#{tid} finished", None, now=now)
-    with pytest.raises(ValueError, match="acceptance is not met"):
-        ob.record(p, oid, "receipt", "done", tid, now=now)
+    assert f"receipt recorded as progress, not a receipt: #{tid}'s hand-off is marked" in ob.record(
+        p, oid, "receipt", f"#{tid} finished", None, now=now)
+    assert "acceptance is not met" in ob.record(p, oid, "receipt", "done", tid, now=now)
+    assert ob.get(p.db, oid)["owners"][str(tid)]["evidence"][-1]["text"] == "done"
     assert ob.get(p.db, oid)["receipt"] is None
     other = p.db.add_task("build it again", "s", kind="work", tier="light")
     oid2 = ob.add(p, "build it again", [other], now=now)
@@ -1634,9 +1634,33 @@ def test_obform_an_adopted_fix_s_receipt_still_waits_for_its_change_to_land(env,
     assert "not landed" in (run_dir / "progress.md").read_text(), "the run is told why"
 
 
+def test_a_receipt_on_partial_or_blocked_owner_work_is_kept_as_progress_and_the_obligation_stays_owed(
+        env, monkeypatch):
+    """Replayed refusals: a coordinator receipt citing an owner whose hand-off is 'partial: 4 of 11 cells',
+    'partial: 8 of 9 cells' or blocked waiting (its urgent part landed) is applied as progress with a note:
+    no problem, no receipt, the obligation still owed."""
+    from ttp import coordinator as coord, obligations as ob
+    p, d, now, tid, check = _ob_setup(env, monkeypatch)
+    cases = [("partial: 4 of 11 cells (missing: a-rerun, b-rerun)", "done", "done"),
+             ("partial: 8 of 9 cells (missing: live). Cost dropped about 20x", "done", "done"),
+             ("Urgent part (user msg #3399) landed as 989ee0b79, before the due. 1) the rest waits", "blocked",
+              "waiting")]
+    for summary, status, handoff in cases:
+        t = p.db.add_task("build the cells", "s", kind="work", tier="light")
+        oid = ob.add(p, "the cell table", [t], now=now)
+        _ob_handoff(p, t, summary, status=status, handoff=handoff)
+        probs = coord.apply(p, [{"type": "obligation", "key": oid, "evidence": f"#{t} {summary[:40]}"}])
+        notes = " ".join(p.db.kv(coord.NOTES_KEY) or [])
+        o = ob.get(p.db, oid)
+        assert probs == [], probs
+        assert o["receipt"] is None and ob._open(o), o
+        assert f"{oid}: receipt recorded as progress" in notes and f"{oid} stays owed" in notes, notes
+        assert any(h["event"] == "progress" and f"#{t}" in h["evidence"] for h in o["history"]), o
+
+
 def test_obform_kept_forms_are_not_rewritten_and_still_refused(env, monkeypatch):
-    """The keep list, in one batch: a receipt citing a partial hand-off and a missed due moved with no plan
-    change are refused; a review never owns a change order, not even as a done owner's only open successor;
+    """The keep list, in one batch: a missed due moved with no plan change is refused (a receipt citing a
+    partial hand-off is kept as progress, a note); a review never owns a change order, not even as a done owner's only open successor;
     a due move on an open obligation with no due stays a note. None is rewritten (no "applied as" note)."""
     from ttp import coordinator as coord, obligations as ob
     p, d, now, tid, check, mid, raised = _order_setup(env, monkeypatch)
@@ -1659,8 +1683,8 @@ def test_obform_kept_forms_are_not_rewritten_and_still_refused(env, monkeypatch)
          "owners": [made, rev, code]},
         {"type": "obligation", "key": plain, "due": now + 3600}])
     applied, notes = _obform_notes(p, coord)
-    assert len(probs) == 2 and applied == [], (probs, applied)
-    assert any("receipt refused" in x and "so the acceptance is not met" in x for x in probs), probs
+    assert len(probs) == 1 and applied == [], (probs, applied)
+    assert f"{part}: receipt recorded as progress" in notes and "so the acceptance is not met" in notes, notes
     assert any("a new time alone is refused" in x for x in probs), probs
     assert ob.get(p.db, part)["receipt"] is None and ob.open_order(p.db, mid)["promise"]["tasks"] == [code]
     assert f"#{made} is done, so not attached" in notes and f"#{rev} is a review task" in notes

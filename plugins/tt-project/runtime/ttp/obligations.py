@@ -588,7 +588,9 @@ def record(p, oid: str, kind: str, evidence: str, task: int | None, now: float |
     that owner's clock. Returns what was done, in a few words. A receipt on a change order closes it
     only once its change is on the push branch (the landed check decides; see _receipt_landing): one
     that is not is kept as progress, and one this project cannot check leaves the order open, marked
-    unverified. `run_dir`: the run whose record this is, told the reason a receipt was not filed. A task
+    unverified. A receipt citing owner work that leaves the acceptance unmet (_receipt_unmet: a partial
+    or blocked hand-off) is kept as progress too, the order still owed, and the note says so.
+    `run_dir`: the run whose record this is, told the reason a receipt was not filed. A task
     carrying an owner's work on is made an owner first (_adopt). A milestone named on an obligation
     that has none is filed as progress under that name, never a receipt."""
     if kind not in ("progress", "receipt"):
@@ -644,9 +646,16 @@ def record(p, oid: str, kind: str, evidence: str, task: int | None, now: float |
             msg = f"progress on {oid} recorded for #{task}"
         else:
             if _accepts(o) and (why := _receipt_unmet(p.db, o, evidence, task)):
-                raise ValueError(f"{oid}: receipt refused: {why}, so the acceptance is not met. Record it once an "
-                                 f"owner meets it, or give evidence that does (a commit, a file, a met hand-off)")
-            if landing:
+                # Partial work is kept as progress; the obligation stays owed, never closed on work short of it.
+                if own is not None:
+                    _record_progress(own, evidence, now)
+                else:   # the coordinator's (no task): no owner clock to reset
+                    o.setdefault("history", []).append({"at": now, "event": "progress", "evidence": evidence})
+                msg = (f"{oid}: receipt recorded as progress, not a receipt: {why}, so the acceptance is not met; "
+                       f"{oid} stays owed. Record the receipt once an owner meets it, or give evidence that does "
+                       f"(a commit, a file, a met hand-off)")
+                run_note = f"obligation receipt on {oid}: {msg}"
+            elif landing:
                 if own is not None:
                     _record_progress(own, evidence, now)   # the receipt text is kept as progress
                 if landing[0] == "unverified":
