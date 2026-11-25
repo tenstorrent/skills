@@ -109,6 +109,14 @@ def _reasoned(t: dict, d: dict) -> bool:
                 or str(d.get("when") or "").lstrip().startswith(("ttp landed", "landed:")))
 
 
+def _rehome_clash(old: str, new: str, res, known: dict) -> bool:
+    """Whether a resource of `old` renames onto `new` (new alias + the old suffix) to a name another
+    machine owns: the re-home onto `new` is invalid then."""
+    from . import responsibilities as rs
+    return any(any(a != new and rs._names(a, new + r[len(old):]) for a in known)
+               for r in res if rs._names(old, r))
+
+
 def _swap(labels: list, old: str, new: str) -> list:
     return [f"{lb.split(':', 1)[0]}:{new}" if isinstance(lb, str) and lb.split(":", 1)[0] in GATE_KEYS
             and lb.split(":", 1)[-1] == old else lb for lb in labels]
@@ -135,17 +143,19 @@ def findings(db, cfg: dict, now: float | None = None) -> list[dict]:
         old = now - since >= limit
         base = {"task": tid, "since": since}
         # A machine the task is queued on or its probes name.
-        hit = [(r, b) for r in sorted(task_resources(t)) for b in bad if b["match"](r)]
+        res = task_resources(t)
+        hit = [(r, b) for r in sorted(res) for b in bad if b["match"](r)]
         probes = " ".join(str(x) for x in (d.get("when"), waiting_handoff(t).get("retry_when")) if x)
         if hit:
             r, b = hit[0]
             alias = b["alias"]
             alts = [a for a in machines.alternatives(alias, known, avoid) if a in allowed] if alias else []
             named = alias and _word(alias, f"{text}\n{probes}")
-            if alts and rs._names(alias, r) and not named and all(
+            new = next((a for a in alts if not _rehome_clash(alias, a, res, known)), None)
+            if new and rs._names(alias, r) and not named and all(
                     h[1]["alias"] and rs._names(h[1]["alias"], h[0]) for h in hit):
                 out.append({**base, "ident": f"{b['cause']}:{r}", "cause": b["cause"], "gate": b["why"], "action": "rehome",
-                            "old": alias, "res": r, "new": alts[0], "fix": f"moved from {alias} to {alts[0]}"})
+                            "old": alias, "res": r, "new": new, "fix": f"moved from {alias} to {new}"})
             elif old:
                 why = "it names the machine itself" if named else "no other machine the config allows"
                 out.append({**base, "ident": f"{b['cause']}:{r}", "cause": b["cause"], "gate": b["why"], "action": "raise",
@@ -236,7 +246,7 @@ def _fixed_gate_was_block(t: dict, f: dict) -> bool:
     if not text:
         return False
     if f["action"] == "drop_dep":
-        return bool(re.search(rf"(?:#|task ){f['dep']}\b", text))
+        return bool(re.search(rf"(?:dependency #|landed:?#|--task ){f['dep']}\b", text))
     if f["action"] == "rehome":
         return _word(f["old"], text) or _word(str(f.get("res") or ""), text)
     return text.strip() == str(deferral(t).get("when") or "").strip()   # clear: the probe itself
@@ -254,11 +264,10 @@ def _apply(db, f: dict, now: float) -> None:
         from . import responsibilities as rs
         known = machines.load()
         for r in sorted(n for n in names if rs._names(f["old"], n)):
-            new = f["new"] + r[len(f["old"]):]
-            if not rs._names(f["new"], new) or any(a != f["new"] and rs._names(a, new)
-                                                   for a in known):
-                raise ValueError(f"cannot re-home {r} onto {f['new']}: {new} is not its resource")
-            kw["labels"] = _swap(kw["labels"], r, new)
+            if _rehome_clash(f["old"], f["new"], {r}, known):
+                raise ValueError(f"cannot re-home {r} onto {f['new']}: "
+                                 f"{f['new'] + r[len(f['old']):]} is not its resource")
+            kw["labels"] = _swap(kw["labels"], r, f["new"] + r[len(f["old"]):])
     elif f["action"] == "drop_dep":
         kw["depends_on"] = [x for x in dependency_ids(t) if x != f["dep"]]
     elif f["action"] == "clear":
@@ -266,12 +275,14 @@ def _apply(db, f: dict, now: float) -> None:
         if deferral(t).get("after"):   # the deferral's own timer; another source's hold stays
             kw["not_before"] = None
     # A task held by something else (a user ask, a hold, a budget cap) is never started past it.
-    if t["status"] in ("queued", "blocked", "waiting") and _fixed_gate_was_block(t, f):
+    requeued = t["status"] in ("queued", "blocked", "waiting") and _fixed_gate_was_block(t, f)
+    if requeued:
         kw.update(status="queued", blocked_reason=None, not_before=None)
     with db.tx():
         db.update_task(f["task"], **kw)
         _observe(db, now, f"stale_gate_cleared:{f['task']}:{f['ident']}:{now:.0f}",
-                 f"#{f['task']} {t['title'][:80]}: {f['gate']}; {f['fix']} and requeued (stale-gate sweep).", f["task"])
+                 f"#{f['task']} {t['title'][:80]}: {f['gate']}; {f['fix']}"
+                 + (" and requeued" if requeued else "") + " (stale-gate sweep).", f["task"])
     startgate.forget(db, tid=f["task"])
 
 

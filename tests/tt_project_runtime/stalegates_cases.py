@@ -51,6 +51,7 @@ def test_stalegate_held_machine_rehomes_the_task_and_keeps_the_hold(env, monkeyp
     assert p.db.task(tid)["status"] == "queued" and p.db.kv(PAUSED_RESOURCES_KEY, {}) == held
     obs = p.db.q("SELECT text FROM events WHERE fingerprint LIKE ?", (f"stale_gate_cleared:{tid}:%",))
     assert obs and "box-a-dev is held (the user's pause" in obs[0]["text"] and "box-b" in obs[0]["text"]
+    assert "and requeued" not in obs[0]["text"]   # a queued task is not requeued, only moved
     assert stalegates.sweep(p, _SG_CFG, time.time()) == []   # nothing left to fix
 
 
@@ -66,6 +67,8 @@ def test_stalegate_lent_machine_rehomes_a_blocked_task(env, monkeypatch):
     stalegates.sweep(p, _SG_CFG, time.time())
     t = p.db.task(tid)
     assert t["status"] == "queued" and t["blocked_reason"] is None and _sg_labels(p, tid) == ["resource:box-b"]
+    obs = p.db.q("SELECT text FROM events WHERE fingerprint LIKE ?", (f"stale_gate_cleared:{tid}:%",))
+    assert obs and "and requeued" in obs[0]["text"]
 
 
 def test_stalegate_outage_rehomes_and_machine_specific_or_no_alternative_raises(env, monkeypatch):
@@ -245,11 +248,13 @@ def test_stalegate_a_task_blocked_on_a_user_ask_stays_blocked(env, monkeypatch):
     p = make(env)
     dead = _sg_task(p, status="failed")
     ask = _sg_task(p, deps=[dead], status="blocked")
-    p.db.update_task(ask, blocked_reason="ask #42: waiting on the user's word")
+    p.db.update_task(ask, blocked_reason=f"ask #{dead}: waiting on the user's word")
     stalegates.sweep(p, _SG_CFG, time.time())
     t = p.db.task(ask)
     assert json.loads(t["depends_on"]) == [] and t["status"] == "blocked"
-    assert t["blocked_reason"] == "ask #42: waiting on the user's word"
+    assert t["blocked_reason"] == f"ask #{dead}: waiting on the user's word"
+    obs = p.db.q("SELECT text FROM events WHERE fingerprint LIKE ?", (f"stale_gate_cleared:{ask}:dep:%",))
+    assert obs and "and requeued" not in obs[0]["text"]
 
 
 def test_stalegate_a_wait_whose_retry_when_is_the_dead_dependency_is_released(env, monkeypatch):
@@ -281,9 +286,17 @@ def test_stalegate_rehomes_only_onto_a_resource_the_target_machine_has(env, monk
     _sg_hold(p, "box-a")
     clash = _sg_task(p, labels=["resource:box-a-dev"])
     plain = _sg_task(p, labels=["resource:box-a"])
-    stalegates.sweep(p, _SG_CFG, time.time())
+    now = time.time()
+    stalegates.sweep(p, _SG_CFG, now)
     assert _sg_labels(p, clash) == ["resource:box-a-dev"]      # box-b-dev is another machine
     assert _sg_labels(p, plain) == ["resource:box-b"]
+    assert _sg_events(p) == []   # too young to raise yet
+    stalegates.sweep(p, _SG_CFG, now + _SG_OLD)
+    assert _sg_labels(p, clash) == ["resource:box-a-dev"]      # never silently retried forever
+    assert {json.loads(e["data"])["must_act"]["key"] for e in _sg_events(p)} == {f"stale_gate-{clash}"}
+    lines = [x for x, _ in stalegates.course_lines(p.db, _SG_CFG, now + _SG_OLD)]
+    assert any(f"#{clash}" in x and "held" in x for x in lines), lines
+    assert not any("moved" in x for x in lines if f"#{clash}" in x), lines   # it was not moved
 
 
 def test_stalegate_a_block_naming_the_resource_is_released_by_the_rehome(env, monkeypatch):
