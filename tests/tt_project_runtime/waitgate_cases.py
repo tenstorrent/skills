@@ -903,15 +903,13 @@ def test_at_the_hard_ceiling_a_broken_probe_a_pass_or_no_answer_still_wakes(env,
     """The hard ceiling keeps its wake for everything but a "not yet": a broken probe, a pass (its task
     starts), a timeout and no answer seen."""
     p = make(env)
-    tid = _gate_task(p, tmp_path, ended_ago=30 * 3600)
-    for probe in ((2, "bad args"), ("timeout", ""), None):
+    for probe in ((2, "bad args"), ("timeout", ""), None):   # a fresh task each: no cached wake
+        d = _gate_decide(p, _gate_task(p, tmp_path, ended_ago=30 * 3600), probe=probe)
+        assert d.wake and d.by == "cap" and "hard ceiling" in d.reason, (probe, d)
+    for probe in ((0, "done"), (1, "pending")):   # its pass starts it, even with a stale "not yet" answer
+        tid = _gate_task(p, tmp_path, ended_ago=30 * 3600, woke="probe passed")
         d = _gate_decide(p, tid, probe=probe)
         assert d.wake and d.by == "cap", (probe, d)
-    _gate_set(p, tid, woke="probe broken: exit 2")
-    assert _gate_decide(p, tid, probe=(2, "bad args")).wake
-    _gate_set(p, tid, woke="probe passed")
-    d = _gate_decide(p, tid, probe=(0, "done"))
-    assert d.wake and d.by == "cap", d
 
 
 @pytest.mark.parametrize("by", ["plain", "jev"])
@@ -930,7 +928,7 @@ def test_a_planned_check_past_the_cap_on_an_unchanged_not_yet_probe_starts_no_tu
     _gate_set(p, tid, **plan)
     d = _gate_decide(p, tid, jev=None, probe=(1, "pending: no terminal reply yet"))
     assert not d.wake and d.by == "rule", d
-    assert d.delay_s >= 60, d
+    assert d.delay_s >= (600 if ended_h >= 24 else 60), d   # past the ceiling: its backoff, not each minute
     # the other side: a new answer, a pass or a failure wakes it
     assert _gate_decide(p, tid, jev=None, probe=(1, "pending: 1 reply, not terminal")).wake
     assert _gate_decide(p, tid, jev=None, probe=(0, "terminal reply")).wake

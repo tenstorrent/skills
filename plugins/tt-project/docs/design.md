@@ -160,7 +160,8 @@ disk untouched, with no migration; nothing else is reclaimed by check recovery.
    Before a due wait starts a model turn, the wait-wake gate (`waitgate.py`) decides whether one
    is needed. Must-wake events always wake: an escalation, any wake reason but a timer or "probe
    passed", a changed spec, a probe answer that changed since the last skip, and the hard ceiling
-   (`waiting.wake_gate.cap_hard_h`, 24 h since the last turn). At the cap (`max_skips`, 4, or
+   (`waiting.wake_gate.cap_hard_h`, 24 h since the last turn) unless its probe still says not yet:
+   that sleeps on its backoff with one model-free skip line naming its wait age. At the cap (`max_skips`, 4, or
    `max_skip_h`, 4 h) the watcher is asked again with no model-free rule first: it may skip with a
    next look (at least `backoff_s`, never past the ceiling); no answer, or a probe that answered,
    wakes. A wake the daemon cannot start yet (slots full, a hold) is the same wake when re-gated
