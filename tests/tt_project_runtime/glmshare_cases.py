@@ -490,11 +490,14 @@ def test_the_glm_code_judge_keeps_a_code_arm_that_matches_its_claude_baseline(en
     p = make(env)
     now = 1_000_000_000.0 + 60 * 86400
     t0 = now - 5 * 86400
-    for _ in range(4):
-        _gs_code_arm(p, t0 - 3 * 86400, 1, arm="sonnet")
-    for _ in range(4):
-        _gs_code_arm(p, t0 + 3600, 1, arm="glm")
+    for ok in (1, 1, 0, 0):   # each arm passes half its code tasks
+        _gs_code_arm(p, t0 - 3 * 86400, ok, arm="sonnet")
+        _gs_code_arm(p, t0 + 3600, ok, arm="glm")
+    for _ in range(8):   # passing Claude work tasks: not code, so outside the code arm's baseline
+        tid = _gs_task(p, kind="work")
+        _gs_run(p, tid, t0 + 3600, 1, provider="claude", model="claude-sonnet")
+        _gs_review(p, tid, "done")
     v = glmshare.judge_code(p, _GS_CFG, now)
     assert v["state"] == "ok", v
     assert v["why"].startswith("within every advance margin of the Claude baseline")
-    assert "first review pass rate GLM 100 vs Claude 100, level, within the margins" in v["why"]
+    assert "first review pass rate GLM 50 vs Claude 50, level, within the margins" in v["why"]

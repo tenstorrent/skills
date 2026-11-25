@@ -882,36 +882,39 @@ def test_a_worse_project_is_rolled_back_alone_and_the_terminal_rearms_it(env, ca
 
 
 def test_a_worse_glm_code_project_is_rolled_back_alone_at_its_ring_level_with_its_rearm_line(env, capsys):
-    """glm_code at a ring level (no waves): the wave gate judges the ring's projects on their code-arm records, rolls
-    back only the worse one and only that flag, and opens no wave."""
+    """glm_code at a ring level: the wave gate judges the ring's projects on their code-arm records, rolls back
+    only the worse one and only that flag, and opens no wave; a project glm_work covers or whose own setting wins
+    is left alone."""
     from ttp import rollout
-    projs = {"alpha": make(env, "alpha"), **{n: _second_project(env, n) for n in ("beta", "gamma")}}
-    for n in ("alpha", "beta"):
+    projs = {"alpha": make(env, "alpha"), **{n: _second_project(env, n) for n in ("beta", "gamma", "delta", "eps")}}
+    for n in ("alpha", "beta", "delta", "eps"):
         _roll(capsys, "ring", n, "1")   # gamma stays in ring 2, which level 1 does not cover
     _roll(capsys, "set", "glm_code", "1")
-    _roll(capsys, "waves", "glm_work", "alpha")
-    _roll(capsys, "set", "glm_work", "auto")
+    _roll(capsys, "waves", "glm_code", "beta", "gamma")
+    _roll(capsys, "waves", "glm_work", "delta")
+    _roll(capsys, "set", "glm_work", "auto")   # delta's code tasks are glm_work's
     now = time.time()
     t0 = now - 5 * 86400
     for n, p in projs.items():
         p.set_config("route.glm_work", {"min_tasks": 4, "min_base": 4})
         for _ in range(4):
             _gs_code_arm(p, t0 - 3 * 86400, 1, arm="sonnet")
-        for _ in range(4):   # beta's GLM code passes like its baseline; alpha's and gamma's fail
+        for _ in range(4):   # beta's GLM code passes like its baseline; the others' fails
             _gs_code_arm(p, t0 + 3600, n == "beta", arm="glm")
+    projs["eps"].set_config("route.code_sonnet.glm_share", 0.5)   # its own value wins over the flag
     recs = rollout.wave_tick(now, None, projs)
     assert [(r["op"], r["flag"], r["project"]) for r in recs] == [("project_rollback", "glm_code", "alpha")], recs
     raw = {n: p.raw_config() for n, p in projs.items()}
     assert not rollout.on("glm_code", "alpha", raw["alpha"]) and rollout.on("glm_code", "beta", raw["beta"])
     assert rollout.level("glm_code") == 1 and rollout.wave_at("glm_code") == 0
-    assert rollout.on("glm_work", "alpha") and rollout.rolled_back("glm_work") == {}, "glm_work is not moved"
+    assert rollout.on("glm_work", "delta") and rollout.rolled_back("glm_work") == {}, "glm_work is not moved"
     out = _roll(capsys, "status")[1]
     assert ("rolled back in alpha alone: worse than the Claude baseline past the rollback margin: "
             "first review pass rate") in out
     assert "`ttp rollout arm glm_code alpha`" in out
     assert "re-armed in alpha" in _roll(capsys, "arm", "glm_code", "alpha")[1]
     assert rollout.on("glm_code", "alpha", raw["alpha"])
-    assert rollout.wave_tick(now + 3600, None, projs) == [], "the re-armed project waits for new outcomes"
+    assert rollout.wave_tick(now + 3600, None, projs) == [], "alpha waits for new outcomes; beta's ok opens no wave"
 
 
 def test_a_rollback_record_carries_both_pass_rates_and_the_baseline_window(env, capsys, tmp_path):

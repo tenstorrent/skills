@@ -15518,7 +15518,8 @@ class Daemon:
         with the project's own trailing 7 days (rollout_health). A failing signal switches the flag off for this
         project alone (rollout.stop_project: until `ttp rollout arm FLAG PROJECT`; the other projects keep it), alerts
         this project's coordinator and tells the user; a clean window with enough samples votes for promotion, and the
-        vote that completes a ring's list promotes the flag one ring. A flag at auto is the wave gate's (rollout.wave_tick)."""
+        vote that completes a ring's list promotes the flag one ring. A flag at auto is the wave gate's (rollout.wave_tick),
+        which also judges a wave-gated flag's quality at a ring level."""
         now = time.time()
         if now - self._last_rolloutwatch < every_s:
             return []

@@ -5383,7 +5383,11 @@ noise holds a wave but only a clear gap rolls a project back: first review pass 
 `rollback_rounds`) and bounce rate (10 / 25 points, `advance_bounce_pts` / `rollback_bounce_pts`). Two only hold
 the next wave, because they are project-wide and not tied to the GLM arm alone: tasks done per day down more than
 25% from the 14 days before GLM (`hold_done_pct`) and more than 3 user corrections in 7 days
-(`hold_corrections`). Claude $/day and bad output are reported, never gating. Each verdict lists every signal
+(`hold_corrections`). Claude $/day and bad output are reported, never gating. `glm_code` is judged the same way on
+its code-arm records against the project's Claude code tasks, on first review pass rate, bounce rate and tasks
+done per day alone, and waits where `glm_work` is on (that route decides the code tasks there). At a ring level
+instead of auto the gate judges this host's projects in the covered rings (not one whose own setting wins) and
+only rolls back; waves open only at auto. Each verdict lists every signal
 with both arms, the gap and the margins. A `worse` project is rolled back
 for that flag alone, the others keep it; it stays off until `ttp rollout arm <flag> <project>`. When every project
 left in the current wave is `ok`, and none went worse in that pass, the next wave opens; `wait` holds it. Each

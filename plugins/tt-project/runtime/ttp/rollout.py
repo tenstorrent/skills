@@ -630,7 +630,8 @@ def wave_tick(now: float | None = None, judge=None, projects: dict | None = None
             continue
         rings, excl = cfg.get("rings"), set(cfg.get("excluded") or [])
         names = ([n for w in ws[:k + 1] for n in w] if lv == AUTO
-                 else [n for n in projs if (r := ring_of(n, cfg)) is not None and r <= lv])
+                 else [n for n, p in projs.items() if (r := ring_of(n, cfg)) is not None and r <= lv
+                       and not own_setting(_raw(p), FLAGS[flag]["key"])])   # the project's own value wins
         verdicts: dict[str, dict] = {}
         try:
             from . import deviceplan, glmshare
