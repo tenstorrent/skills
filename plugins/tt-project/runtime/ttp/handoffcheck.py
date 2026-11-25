@@ -23,12 +23,17 @@ passes each task run its send-backs so far and the cap (SENDBACKS_ENV, "used/cap
 refuses the stop with its output while used + the run's own refusals (STOP_FILE) stay under the cap,
 and the daemon counts those refusals as send-backs. A broken check, a timeout (the checks get
 STOP_BUDGET_S in all) or any fault of the hook lets the run end: the daemon's check stays the final
-gate. A check sees AT_ENV=stop there, with the run's own variables (RUN_VARS) left out."""
+gate. A check sees AT_ENV=stop there, with the run's own variables (RUN_VARS) left out.
+
+A code task's hand-off from a run on the GLM model also meets one built-in check (glm_check, no setting): its
+branch's added test lines must not name the real /tmp, /home, ~ or Path.home() (glm_test_hygiene). It fails and
+sends back like a project check, under the same cap."""
 from __future__ import annotations
 
 import hashlib
 import json
 import os
+import re
 import shlex
 import subprocess
 import tempfile
@@ -54,6 +59,10 @@ RUN_VARS = ("TTP_RUN_DIR", "TTP_TASK", "TTP_TASK_ID", "TTP_RUN_ID", "TTP_PROJECT
 SEEN_TTL_S = 300
 KILL_WAIT_S = 5                   # the wait for a killed check's output; an escaped child is not waited for
 _seen: dict[tuple[str, int, str], tuple[float, dict]] = {}
+GLM_CHECK = "glm test hygiene"
+# The real machine's paths in a test (a temp dir or the user's home); tmp_path or monkeypatch on the line clears it.
+REAL_PATH = re.compile(r"(?<![\w./~-])(?:/tmp\b|/home/)|(?<![\w/])~/|\bPath\.home\(\)")
+TEST_FILE = re.compile(r"(?:^|/)(?:tests?/|test_[^/]*\.py$|[^/]*_test\.py$)")
 
 
 def rules(cfg: dict) -> tuple[list[dict], list[str]]:
@@ -106,6 +115,55 @@ def applies(cfg: dict, task: dict, handoff) -> list[dict]:
         return []
     kind = task.get("kind") or "work"
     return [c for c in rules(cfg)[0] if c["kinds"] is None or kind in c["kinds"]]
+
+
+def glm_test_hygiene(diff_text: str) -> list[str]:
+    """One line per added test-file line of the unified diff `diff_text` that names a real path (REAL_PATH),
+    comments and lines using tmp_path or monkeypatch aside."""
+    out, path = [], ""
+    for line in (diff_text or "").splitlines():
+        if line.startswith(("diff --git", "+++ ")):
+            path = line[4:].strip().removeprefix("b/") if line.startswith("+++ ") else ""
+            continue
+        code = line[1:]
+        if not line.startswith("+") or not TEST_FILE.search(path) or code.lstrip().startswith("#") \
+                or "tmp_path" in code or "monkeypatch" in code:
+            continue
+        if m := REAL_PATH.search(code):
+            out.append(f"{path}: `{code.strip()[:160]}` uses the real {m.group(0)}: use tmp_path or monkeypatch")
+    return out
+
+
+def _glm_run(p: Project, task: dict) -> bool:
+    """Whether `task` is a code task whose last worker run ran on the GLM model (glmshare.on_glm)."""
+    if task.get("kind") != "code" or not task.get("id"):
+        return False
+    from . import glmshare
+    r = p.db.one("SELECT provider, model, note FROM runs WHERE task=? AND role='worker' ORDER BY id DESC LIMIT 1",
+                 (task["id"],))
+    return bool(r) and glmshare.on_glm(r["provider"], r["model"], r["note"])
+
+
+def glm_check(p: Project, task: dict, handoff) -> dict | None:
+    """The built-in check's failure ({name, output}) on a GLM run's hand-off: glm_test_hygiene over its branch's
+    diff from its fork point (else the base). None when it passes, does not apply or git cannot tell."""
+    if not isinstance(handoff, dict) or handoff.get("status") not in STATUSES or not _glm_run(p, task):
+        return None
+    from . import worktree
+    try:
+        wt = Path(p.worktrees) / f"t{task['id']}"
+        root = wt if worktree.is_git(wt) else Path(p.root)
+        head = task.get("branch") or ("HEAD" if root == wt else "")
+        base = worktree.fork_point(root, task["id"]) or worktree.resolve_base(p)
+        if not head or not base:
+            return None
+        got = subprocess.run(["git", "-C", str(root), "diff", "--no-color", "--no-ext-diff", "-U0", f"{base}...{head}"],
+                             capture_output=True, text=True, timeout=DEFAULT_TIMEOUT_S)
+    except (OSError, RuntimeError, subprocess.SubprocessError):   # git cannot tell: the hand-off stands
+        return None
+    bad = glm_test_hygiene(got.stdout) if got.returncode == 0 else []
+    return {"name": GLM_CHECK, "output": "Tests must not touch the real machine's paths:\n" + "\n".join(bad[:20])} \
+        if bad else None
 
 
 def _digest(handoff: dict) -> str:
@@ -164,9 +222,11 @@ def _run_one(p: Project, check: dict, task: dict, path: Path,
 
 def run(p: Project, cfg: dict, task: dict, handoff, run_dir: Path | None, deadline: float | None = None,
         base_env: dict | None = None) -> dict:
-    """Runs the checks that apply, in order, up to the first that fails. {"failed": {name, output} or
+    """Runs glm_check, then the checks that apply, in order, up to the first that fails. {"failed": {name, output} or
     None, "broken": [{name, run, why, output}]}; {} when none apply. By `deadline` (time.monotonic)
     each check's timeout is cut to the time left, and none starts after it."""
+    if glm := glm_check(p, task, handoff):
+        return {"failed": glm, "broken": []}
     checks = applies(cfg, task, handoff)
     if not checks:
         return {}
@@ -192,7 +252,7 @@ def run(p: Project, cfg: dict, task: dict, handoff, run_dir: Path | None, deadli
 
 def prefetch(p: Project, cfg: dict, task: dict, handoff, run_dir: Path | None) -> None:
     """Runs the checks before the transaction that records `task`'s hand-off; verdict reads it."""
-    if not applies(cfg, task, handoff):
+    if not applies(cfg, task, handoff) and not _glm_run(p, task):
         return
     now = time.time()
     for k in [k for k, (until, _) in _seen.items() if until <= now]:
@@ -203,7 +263,7 @@ def prefetch(p: Project, cfg: dict, task: dict, handoff, run_dir: Path | None) -
 
 def verdict(p: Project, cfg: dict, task: dict, handoff, run_dir: Path | None) -> dict:
     """prefetch's answer for this hand-off, else the checks run now; {} when none apply."""
-    if not applies(cfg, task, handoff):
+    if not applies(cfg, task, handoff) and not _glm_run(p, task):
         return {}
     hit = _seen.pop((str(p.root), int(task["id"]), _digest(handoff)), None)
     if hit and hit[0] > time.time():

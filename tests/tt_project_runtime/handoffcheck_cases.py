@@ -613,3 +613,57 @@ def test_leftover_procs_at_the_stop_hook_skips_the_sessions_own_children_only(tm
     monkeypatch.setenv("TTP_HANDOFF_CHECK_AT", "stop")
     rc, msg = leftoverprocs.check({"status": "done"}, wt, procs)
     assert rc == 1 and "pid 101 " not in msg and "pid 102 " in msg and "pid 103 " in msg
+
+
+_GW9846_DIFF = """\
+diff --git a/tests/test_x.py b/tests/test_x.py
+--- a/tests/test_x.py
++++ b/tests/test_x.py
+@@ -1,0 +2,6 @@
++    out = Path("/tmp/ttp-x.json")
++    cfg = Path.home() / ".ttp"
++    log = tmp_path / "tmp" / "x.log"
++    monkeypatch.setenv("HOME", "/home/someone")
++    # writes /tmp/ttp-x.json in the real run
++    keep = Path("/var/tmp/y")
+diff --git a/src/app.py b/src/app.py
+--- a/src/app.py
++++ b/src/app.py
+@@ -1,0 +2 @@
++CACHE = "/tmp/app-cache"
+"""
+
+
+def test_glm_test_hygiene_flags_added_test_lines_naming_real_paths_only():
+    from ttp import handoffcheck
+    got = handoffcheck.glm_test_hygiene(_GW9846_DIFF)
+    assert len(got) == 2 and all(g.startswith("tests/test_x.py: ") for g in got), got
+    assert "/tmp" in got[0] and "Path.home()" in got[1]
+    assert handoffcheck.glm_test_hygiene(_GW9846_DIFF.replace("+    out", "     out")) == got[1:]   # context line
+
+
+def _gw9846_task(p, provider, model, branch):
+    tid = p.db.add_task("fix the helper", "spec", kind="code", tier="standard", origin="coordinator")
+    p.db.update_task(tid, branch=branch)
+    p.db.x("INSERT INTO runs(task, role, provider, model, status) VALUES(?, 'worker', ?, ?, 'done')",
+           (tid, provider, model))
+    return p.db.task(tid)
+
+
+def test_a_glm_code_runs_hand_off_is_sent_back_for_a_test_on_the_real_tmp(env):
+    """Only a GLM run's code hand-off meets the built-in check, on its branch's added test lines."""
+    from ttp import handoffcheck, route
+    p = make(env)
+    git = lambda *a: subprocess.run(["git", "-C", str(p.root), *a], check=True, capture_output=True)   # noqa: E731
+    git("checkout", "-q", "-b", "ttp/gw9846")
+    (p.root / "tests").mkdir(exist_ok=True)
+    (p.root / "tests" / "test_gw9846.py").write_text('def test_x():\n    out = Path("/tmp/ttp-x.json")\n')
+    git("add", "-A")
+    git("commit", "-qm", "a test on the real tmp")
+    git("checkout", "-q", "-")
+    glm = _gw9846_task(p, route.TO, "example-org/glm-x", "ttp/gw9846")
+    got = handoffcheck.verdict(p, {}, glm, {"status": "done"}, None)
+    assert got["failed"]["name"] == handoffcheck.GLM_CHECK and "test_gw9846.py" in got["failed"]["output"], got
+    assert handoffcheck.verdict(p, {}, glm, {"status": "waiting"}, None) == {}
+    claude = _gw9846_task(p, "claude", "opus", "ttp/gw9846")
+    assert handoffcheck.verdict(p, {}, claude, {"status": "done"}, None) == {}

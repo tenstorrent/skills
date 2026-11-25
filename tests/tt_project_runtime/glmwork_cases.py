@@ -471,3 +471,43 @@ def test_a_glm_code_run_spends_an_opus_advisor_call_on_a_correctness_review_of_i
         assert ("| ttp advise -`" in step[1]) is advisor and ("not through `ttp advise`" in step[1]) is advisor
         # The self-review is there with the advisor on too, so a run whose advisor calls are used up still has it.
         assert "Reread your diff as that reviewer" in step[1] and "most likely to break it in your self_check" in step[1]
+
+
+def _gw9846_kc(p, spec, kind="code", title=None):
+    from ttp import glmwork
+    t = p.db.add_task(title or f"{kind} task", spec, kind=kind, tier="standard", priority=3, budget_usd=1.0)
+    return glmwork.keeps_core(p.db, _gw_cfg(), p.db.task(t), "standard")
+
+
+def test_glm_work_keeps_a_broker_job_or_a_smoke_on_a_named_host_on_core(env):
+    """A goal that runs a broker job or a smoke on a named host keeps core (the GLM guard refuses the job); a spec
+    about the broker's code does not."""
+    p = make(env)
+    for goal in ("Fix the timeout, then run the smoke through box06 broker.", "Run a broker smoke on box-a.",
+                 "Submit a broker job on host box-a with the new build.", "Then run a smoke on box06 at the head."):
+        assert _gw9846_kc(p, goal) == "device", goal
+    for goal in ("Fix broker.py so a job with no owner is refused.", "Refactor the broker job queue parser.",
+                 "Add tests for the broker smoke command.", "Pass the request through broker.py's client.",
+                 "Fix the flaky test.\nContext:\n- earlier runs ran a broker smoke on box-a"):
+        assert _gw9846_kc(p, goal) == "", goal
+
+
+def test_glm_work_keeps_a_publish_to_an_outside_branch_on_core_from_the_goal_only(env):
+    """`git push`, a push to the PR's branch and the review-fix spec's publish keep core; the same words in Context,
+    a negated push or a spec about push code do not."""
+    p = make(env)
+    for goal in ("Fix the findings, then publish the fix to the same branch feat/x of org/repo (a fast-forward).",
+                 "Commit the fix, then `git push origin HEAD:feat/x`.", "Push the commit to the PR branch."):
+        assert _gw9846_kc(p, goal).startswith("publish"), goal
+    for goal in ("Fix the flaky test.\nContext:\n- the last run had to git push to the PR branch",
+                 "Fix it; never run git push.", "Fix git push error handling in the push queue.",
+                 "Fix it. Push nothing to this project's push branch."):
+        assert _gw9846_kc(p, goal) == "", goal
+
+
+def test_glm_size_check_names_the_test_hygiene_and_spec_step_rules():
+    from ttp import glmwork
+    text = glmwork.size_check()
+    for line in ("tmp_path and monkeypatch, never the real /tmp, /home or ~", "must fail on the base",
+                 "grep every reader", "self_check names each numbered spec step"):
+        assert line in text, line

@@ -2542,3 +2542,82 @@ def test_audit4291_c2_deploy_a_worktree_run_never_writes_into_the_live_harness_c
         "a copy inside the run's own worktree runs"
     assert not deny("ttp push --own --detach") and not deny("git commit -am fix"), "it commits and publishes as usual"
     assert not deny("ttp pause --help"), "a usage read pauses nothing"
+
+
+def _gg9846_hook(monkeypatch, tmp_path):
+    """A GLM-arm run in its worktree under a project in HOME, its system temp dir in tmp_path: the live hook's verdict
+    (temp dir entries kept as a run's are)."""
+    from ttp import glmguard, hook
+    home = tmp_path / "home"
+    wt = home / "proj/tt-project/worktrees/t1"
+    for d in (wt, home / "proj/tt-project/state", tmp_path / "systmp"):
+        d.mkdir(parents=True)
+    rd = tmp_path / "run"
+    (rd / "tmp").mkdir(parents=True)
+    for k, v in {"HOME": str(home), "TTP_RUN_DIR": str(rd), "TMPDIR": str(rd / "tmp"),
+                 "TTP_PROJECT": str(home / "proj"), **_GG_RUN_ENV}.items():
+        monkeypatch.setenv(k, v)
+    monkeypatch.setattr(glmguard, "_TMP", (str(tmp_path / "systmp"),))
+    glmguard.mark_run(rd, False, cwd=str(wt))
+
+    def deny(cmd):
+        out = (hook.pre_tool_use({"tool_name": "Bash", "tool_input": {"command": cmd}, "cwd": str(wt)})[0] or {})
+        return (out.get("hookSpecificOutput") or {}).get("permissionDecision") == "deny"
+    return deny, wt, rd
+
+
+def test_glm_guard_runs_dev_redirects_dry_pushes_reader_expansions_and_env_i_of_a_plain_program(monkeypatch, tmp_path):
+    """Replayed bounces: a redirect to /dev, `git push --dry-run`, an expansion in a line of readers and `env -i make`
+    write and publish nothing; the forms that can are still refused."""
+    deny, _, _ = _gg9846_hook(monkeypatch, tmp_path)
+    for cmd in ("ls x 2>/dev", "ls x 2>/dev/null >/dev/stderr", "git push --dry-run origin ttp/t1-x", "git push -n",
+                "env -i make test", "env -i PATH=/usr/bin git status", "for f in a b; do cat ${!f}; done",
+                "while read f; do ls ${!f} | head; done < list"):
+        assert not deny(cmd), cmd
+    for cmd in ("git push origin ttp/t1-x", "env -i bash -c 'ttp say hi'", "env -i FOO=1 /usr/bin/python3 x.py",
+                "env -i ttp checks", "env TTP_TASK=9 make", "for f in a; do \"$f\" x; done", "rm -rf /dev"):
+        assert deny(cmd), cmd
+
+
+def test_glm_guard_counts_a_mktemp_entry_as_the_runs_own_and_not_its_neighbours(monkeypatch, tmp_path):
+    deny, _, rd = _gg9846_hook(monkeypatch, tmp_path)
+    tmp = tmp_path / "systmp"
+    assert not deny(f"d=$(mktemp -d {tmp}/gg.XXXXXX) && echo $d")
+    made, other = tmp / "gg.a1B2c3", tmp / "gg.a1B2c3d4"   # what mktemp made, and an entry the run did not make
+    made.mkdir(), other.mkdir()
+    assert not deny(f"echo a > {made}/f && rm -rf {made}")
+    assert deny(f"echo a > {other}/f") and deny(f"rm -rf {other}")
+    from ttp import glmguard
+    assert glmguard.mktemp_templates(f"mktemp -p {tmp}", {}) == [f"{tmp}/tmp.XXXXXXXXXX"]
+    assert glmguard.mktemp_templates(f"mktemp -d -p {rd / 'tmp'}", {}) == [], "its own TMPDIR is its own already"
+
+
+def test_glm_guard_rm_of_nothing_or_an_unread_glob_is_a_redirect_and_a_real_delete_harmful(tmp_path):
+    from ttp import glmguard
+    real = tmp_path / "f.txt"
+    real.write_text("x")
+    why = "it writes outside its worktree: {} (rm target)"
+    assert glmguard.classify(why.format(tmp_path / "nothing"))[:2] == ("scratch", glmguard.REDIRECTED)
+    assert glmguard.classify(why.format(tmp_path / "*.nothing"))[:2] == ("expansion", glmguard.REDIRECTED)
+    assert glmguard.classify(why.format(real))[:2] == ("delete", glmguard.HARMFUL)
+    assert glmguard.classify(why.format(tmp_path / "*.txt"))[:2] == ("delete", glmguard.HARMFUL), "a glob that matches"
+
+
+def test_glm_guard_lets_a_run_write_its_own_worktree_by_a_linked_spelling(monkeypatch, tmp_path):
+    deny, wt, _ = _gg9846_hook(monkeypatch, tmp_path)
+    (tmp_path / "alias").symlink_to(tmp_path / "home/proj")
+    assert not deny(f"echo x > {tmp_path}/alias/tt-project/worktrees/t1/a.txt")
+    assert deny(f"echo x > {tmp_path}/alias/tt-project/state/a.txt"), "the project's records by the same link"
+
+
+def test_glm_guard_redirect_refusals_never_undo_a_done_hand_off(tmp_path):
+    from ttp import glmguard
+    _, rd = _gg_run(tmp_path)
+    done = {"status": "done", "summary": "fixed"}
+    (rd / "result.json").write_text(json.dumps(done))
+    for _ in range(4):
+        text = glmguard.refused(rd, glmguard.HIDDEN_WHY + ": $X", cfg={})
+    assert "hand-off stands" in text and json.loads((rd / "result.json").read_text()) == done
+    assert not (rd / glmguard.HIT).exists() and len(glmguard.refusals(rd)) == 4
+    glmguard.refused(rd, "a run on the GLM arm publishes only with `ttp push` (after its checks), never `git push`", cfg={})
+    assert (rd / glmguard.HIT).exists() and json.loads((rd / "result.json").read_text())["status"] == "blocked"

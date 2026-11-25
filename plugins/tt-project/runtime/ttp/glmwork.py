@@ -54,8 +54,30 @@ DESIGN = re.compile(
     r"|\brace\s+condition")
 # A question or work task that reviews another task (Opus reviews), not a fix of one.
 REVIEW_TITLE = re.compile(r"(?i)^(?!\s*fix\b).*?(?:\breview\s+(?:of\s+)?#\d+|\bsecond\s+reviewer\b)")
-# A job the goal runs through a box's device broker (tierfloor.DEVICE_SPEC names resets, soaks and device tests).
-BROKER_JOB = re.compile(r"(?i)\bthrough\s+(?:its|the|a|each|every|[\w.-]+'s)\s+(?:[\w-]+\s+){0,2}broker\b")
+# A job the goal runs through a box's device broker (tierfloor.DEVICE_SPEC names resets, soaks and device tests),
+# submits as a broker job or smoke, or runs as a smoke on a named host (an alias with a digit, or `host <name>`).
+# A spec about the broker's code (broker.py, its job parser) is no job: only a run, submit or through.
+BROKER_JOB = re.compile(
+    r"(?i)\bthrough\s+(?:(?:its|the|a|each|every)\s+)?(?:[\w.'-]+\s+){0,2}broker\b(?!\.\w)"
+    r"|\b(?:run|submit|queue|launch|start)\s+(?:(?:a|an|the|one|its)\s+)?(?:[\w-]+\s+)?broker\s+(?:smoke|job)s?\b"
+    r"|\b(?:run|submit|launch|start)\s+(?:(?:a|an|the|one|its)\s+)?(?:[\w-]+\s+)?smoke(?:\s+tests?)?s?\s+on\s+"
+    r"(?:host\s+[\w.-]+|[a-z][a-z-]*\d[\w.-]*\b)")
+# A publish to an outside branch (the GLM guard refuses it, so such a run always bounces): an instruction to `git
+# push` (not a spec about push code), a push to the PR's or the same branch, or the review-fix spec's "publish the
+# fix to the same branch"; not after a never, no or not (NEGATED).
+PUBLISH = re.compile(
+    r"(?im)(?:^|[.;:!?]\s+|\b(?:run|then|and|use|via)\s+)[ \t>*\d.)-]*`?git\s+push\b"
+    r"|\bpublish\s+(?:the\s+|your\s+|this\s+)?(?:fix|change|commit)e?s?\s+(?:to|onto)\s+the\s+same\s+branch\b"
+    r"|\bpush\s+(?:[\w-]+\s+){0,3}?(?:to|onto)\s+(?:the\s+)?(?:same|pr|pull\s+request|contributor'?s|fork'?s?|"
+    r"external|upstream|their)\b[^\n.]{0,20}?\bbranch\b")
+NEGATED = re.compile(r"(?i)\b(?:never|not|no|nothing|without|don't|avoid)\b[^\n.;]{0,25}$")
+
+
+def publishes(text: str) -> bool:
+    """Whether `text` tells the run to publish to an outside branch (PUBLISH, not after a never/no/not)."""
+    return any(not NEGATED.search(text[max(0, m.start() - 40):m.start()]) for m in PUBLISH.finditer(text or ""))
+
+
 # Where a spec's own goal ends: its first `Context:` or `Restrictions:` line (`Restrictions (binding):` too).
 GOAL_END = re.compile(r"(?im)^[ \t#>*-]*(?:context|restrictions)\b(?:\s*\([^)\n]*\))?\**\s*:")
 
@@ -194,7 +216,11 @@ def size_check(advisor: bool = False) -> str:
             "only that some text is present, or repeats a rule another test asserts. Run `ttp slop --diff "
             "<base>..HEAD` and clear what it lists. Keep every fact and behaviour the task needs: cut size, not "
             "correctness. Never widen what a change reads or runs on a device or live service beyond what the spec "
-            "names, and bound any new read of one in time.")
+            "names, and bound any new read of one in time."
+            "\n\n## Before you hand off: tests and spec steps\n"
+            "Tests use tmp_path and monkeypatch, never the real /tmp, /home or ~. Each new test must fail on the "
+            "base commit: run it there or reason it through. When you change a field or function, grep every reader "
+            "and update it. Your self_check names each numbered spec step and what does it.")
 
 
 def ring_gate(cfg: dict, project: str, raw: dict | None) -> dict:
@@ -298,10 +324,11 @@ def keeps_core(db, cfg: dict, task: dict, tier: str, cls: str | None = None, pic
     retries on GLM), a GLM bounce (needs Opus or deep), a run that talks to a person (`reply_chat` with
     person_writeup off, or an instruction to post, comment or notify with the outward-drafts redirect off: with
     them on, Opus writes the words and GLM does the work), a task titled as a review of another, optimization or
-    design work, device work (a job through a device broker too; with
-    glm_device on it runs on GLM under an Opus plan, deviceplan.py), urgent (only with keep_urgent), a kind off
-    the list. The design and judgment keepers read the title and own_spec; the device keepers the title and
-    own_spec with quoted words kept (a quoted command is the task's own), besides its resources."""
+    design work, a publish to an outside branch (publishes), device work (a broker job or a smoke on a named
+    host too; with glm_device on it runs on GLM under an Opus plan, deviceplan.py), urgent (only with
+    keep_urgent), a kind off the list. The design and judgment keepers read the title and own_spec; the publish
+    and device keepers the title and own_spec with quoted words kept (a quoted command is the task's own),
+    besides its resources."""
     from . import codearm, deviceplan, effort, modelpick, untrusted, urgent
     kind = str(task.get("kind") or "")
     text = f"{task.get('title') or ''}\n{task.get('spec') or ''}"
@@ -331,6 +358,8 @@ def keeps_core(db, cfg: dict, task: dict, tier: str, cls: str | None = None, pic
     if DESIGN.search(goal) or codearm.JUDGMENT.search(goal):
         return "design"
     own = {**task, "spec": own_spec(task.get("spec"), words=True)}
+    if publishes(f"{task.get('title') or ''}\n{own['spec']}"):
+        return "publish: pushes to an outside branch (GLM never publishes)"
     if (deviceplan.device(own, cfg) or BROKER_JOB.search(f"{task.get('title') or ''}\n{own['spec']}")) \
             and not deviceplan.on(cfg):
         return "device"   # with glm_device on, a device task runs on GLM under an Opus plan (deviceplan.py)
