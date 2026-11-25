@@ -147,8 +147,15 @@ def on_branch(repo: Path, sha: str, tip: str) -> bool:
     has an equivalent there (git cherry's patch-id, the same author, date and subject, or a replay
     trailer naming it). Version-bump commits on its top are left out, as the push queue drops them.
     Commits never change under their ids, so the answer for two full ids is read once (gitcache.fixed).
+    An ancestor whose change a later revert took out of `tip` (reverted_by) is not on it.
     A git read that failed answers False and keeps nothing: the next call asks again."""
-    return bool(gitcache.fixed(repo, "on_branch", sha, tip, lambda: _on_branch(repo, sha, tip)))
+    return bool(holds(repo, sha, tip))
+
+
+def holds(repo: Path, sha: str, tip: str) -> bool | None:
+    """on_branch's answer, None when a git read failed (cannot tell): for a caller that marks a claim
+    unverified rather than false."""
+    return gitcache.fixed(repo, "on_branch", sha, tip, lambda: _on_branch(repo, sha, tip))
 
 
 def _on_branch(repo: Path, sha: str, tip: str) -> bool | None:
@@ -159,8 +166,9 @@ def _on_branch(repo: Path, sha: str, tip: str) -> bool | None:
         return r.stdout if r.returncode in ok else None
 
     anc = _git(repo, "merge-base", "--is-ancestor", sha, tip).returncode
-    if anc == 0:
-        return True
+    if anc == 0:   # an ancestor counts while a later revert has not taken its change out of `tip`
+        gone = reverted_by(repo, sha, tip)
+        return None if gone is None else not gone
     if anc != 1:
         return None
     base = out("merge-base", tip, sha, ok=(0, 1))     # 1: no common ancestor
@@ -199,6 +207,86 @@ def _on_branch(repo: Path, sha: str, tip: str) -> bool | None:
     theirs = {k[1] for ln in logs[1].splitlines() if (k := _key(ln))}
     replayed = set(re.findall(rf"^{REPLAYED}: ([0-9a-f]{{40,64}})[ \t]*$", logs[2], re.M))
     return all(c in replayed or mine.get(c) in theirs for c in left)
+
+
+# A revert's message: git revert's own line, or the push queue's range revert (postland.revert)
+_REVERTS = re.compile(r"^(?:This reverts commit ([0-9a-f]{7,64})|Reverts ([0-9a-f]{7,64})\.\.([0-9a-f]{7,64}))", re.M)
+_reverted: dict[tuple[str, str, str], str] = {}
+
+
+def reverted_by(repo: Path, sha: str, tip: str) -> str | None:
+    """The commit on `tip` that took ancestor `sha`'s change out of it, or "": a later commit (sha..tip) says
+    it reverts `sha` (git revert's "This reverts commit <sha>", or the push queue's "Reverts A..B" range
+    holding it) and `sha`'s diff no longer reverse-applies to `tip`'s tree (a re-applied change does). A
+    later edit with no revert naming it, a merge, an empty diff or a non-ancestor reads "". None when a git
+    read failed. Kept per (commit, tip): commits never change under their ids."""
+    full, top = _commit(repo, sha), _commit(repo, tip)
+    if not full or not top:
+        return None
+    key = (str(repo), full, top)
+    if key not in _reverted:
+        got = _reverted_by(repo, full, top)
+        if got is None:
+            return None
+        if len(_reverted) >= 4096:
+            _reverted.clear()
+        _reverted[key] = got
+    return _reverted[key]
+
+
+def _reverted_by(repo: Path, sha: str, tip: str) -> str | None:
+    if sha == tip:
+        return ""
+    log = _git(repo, "log", "-E", "--grep=^(This reverts commit|Reverts [0-9a-f]+\\.\\.)", "--format=%H%x00%B%x01",
+               f"{sha}..{tip}", timeout=60)
+    if log.returncode != 0:
+        return None
+    hits = []
+    for rec in log.stdout.split("\x01"):
+        rev, _, body = rec.strip("\n").partition("\0")
+        for one, start, end in _REVERTS.findall(body):
+            if one and sha.startswith(one):
+                hits.append(rev)
+            elif start and end:
+                inside = _git(repo, "rev-list", f"{start}..{end}")
+                if inside.returncode != 0:
+                    return None
+                if sha in inside.stdout.split():
+                    hits.append(rev)
+    if not hits:
+        return ""
+    return None if (present := _present(repo, sha, tip)) is None else ("" if present else hits[0])
+
+
+def _present(repo: Path, sha: str, tip: str) -> bool | None:
+    """Whether `sha`'s change is still in `tip`'s tree: its diff reverse-applies there (git apply --check -R
+    on a scratch index, no checkout). True for a merge or an empty diff (ancestry decides those); None when
+    git failed."""
+    import tempfile
+    parents = _git(repo, "rev-list", "--parents", "-n", "1", sha)
+    if parents.returncode != 0:
+        return None
+    if len(parents.stdout.split()) > 2:
+        return True
+    env = {**os.environ, "GIT_TERMINAL_PROMPT": "0"}
+    try:
+        diff = subprocess.run(["git", "-C", str(repo), "diff-tree", "-p", "--binary", "--no-color", "--no-renames",
+                               "--no-ext-diff", "--root", sha], capture_output=True, timeout=60, env=env,
+                              stdin=subprocess.DEVNULL)
+        if diff.returncode != 0:
+            return None
+        patch = diff.stdout.split(b"\n", 1)[1] if diff.stdout.startswith(sha.encode()) else diff.stdout
+        if not patch.strip():
+            return True
+        with tempfile.TemporaryDirectory(prefix="ttp-landed-") as d:
+            env["GIT_INDEX_FILE"] = str(Path(d) / "index")
+            if subprocess.run(["git", "-C", str(repo), "read-tree", tip], capture_output=True, timeout=60,
+                              env=env, stdin=subprocess.DEVNULL).returncode != 0:
+                return None
+            return subprocess.run(["git", "-C", str(repo), "apply", "--cached", "--check", "-R"], input=patch,
+                                  capture_output=True, timeout=60, env=env).returncode == 0
+    except (OSError, subprocess.SubprocessError):
+        return None
 
 
 def _tip(repo: Path, onto: str, fetch: bool) -> tuple[str, str]:
@@ -1292,6 +1380,11 @@ def check(p, repo: Path, sha: str | None = None, tid: int | None = None, onto: s
             continue
         if any(_commit(repo, s) and on_branch(repo, s, tip) for s in shas):
             return _not_dropped(p, repo, tid, tip, shas, src, onto) or (0, f"{what} is on {ref}")
+        gone = [reverted_by(repo, s, tip) for s in shas if _commit(repo, s)]
+        if r := next((g for g in gone if g), ""):
+            return NOT_YET, f"{what} reverted by {r[:10]} on {ref}"
+        if None in gone:   # the revert test could not run: unverified, never "not landed"
+            return CANNOT, f"cannot tell whether {what} was reverted on {ref}"
     if p is not None and has_push_branch(p) and onto == _push_ref(p, repo) and (found := on_push(p, repo, shas, "")):
         return _not_dropped(p, repo, tid, tip, shas, src, onto) or (0, f"{what} is on {onto}, at its retired tip {found[:10]}")
     return NOT_YET, f"{what} is not on {onto} yet"

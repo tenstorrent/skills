@@ -451,3 +451,105 @@ def test_a_coordinator_reply_and_ask_carry_the_footer_and_never_an_inline_tag(en
     coord.apply(p, [{"type": "reply", "chat": "c1", "text": "I'll tell you when the fix is live here."}])
     last = p.db.q("SELECT text FROM messages WHERE direction='out' AND kind='reply' ORDER BY id DESC LIMIT 1")
     assert last[0]["text"] == "I'll tell you when the fix is live here.", last
+
+
+def _reverted_setup(env, monkeypatch):
+    """A push branch holding X (lines a file did not have) and then R, git's revert of X.
+    Returns (p, repo, x, r)."""
+    p, repo, head = _claim_replay_setup(env, monkeypatch, landed=True)
+    _commit(repo, "fix.txt", "".join(f"the fix, line {i}\n" for i in range(4)))
+    x = _git_out(repo, "rev-parse", "HEAD")
+    _commit(repo, "other.txt", "unrelated\n")
+    _git_out(repo, "revert", "--no-edit", x)
+    r = _git_out(repo, "rev-parse", "HEAD")
+    _git_out(repo, "push", "-q", "origin", "HEAD:refs/heads/proj")
+    return p, repo, x, r
+
+
+def test_a_commit_a_later_revert_took_out_is_neither_landed_nor_live(env, monkeypatch):
+    """An ancestor whose change a later revert took out reads not landed, naming the revert,
+    and a live line naming it gets one footer item 'reverted by <R>, not in running'; a plain ancestor
+    stays landed and a commit off the branch is not."""
+    from ttp import landed
+    p, repo, x, r = _reverted_setup(env, monkeypatch)
+    tip = _git_out(repo, "rev-parse", "origin/proj")
+    assert landed.reverted_by(repo, x, tip) == r
+    assert not landed.on_branch(repo, x, tip)
+    assert landed.check(p, repo, x, fetch=False) == (landed.NOT_YET, f"{x[:10]} reverted by {r[:10]} on origin/proj")
+    other = _git_out(repo, "rev-parse", "HEAD~1")
+    assert landed.check(p, repo, other, fetch=False)[0] == 0, "a plain ancestor is landed"
+    off = _side(repo, tip, "off")
+    assert landed.check(p, repo, off, fetch=False)[0] == landed.NOT_YET, "a non-ancestor is not"
+    text = f"The fix is live in 0.2.9 (commit {x[:10]})."
+    assert _footer(p, text, {"version": "0.2.9", "commit": tip}) == \
+        f"{text}\n\nUnverified: {x[:10]} reverted by {r[:10]}, not in running 0.2.9"
+    text = f"The fix landed at {x[:10]}."
+    assert _footer(p, text, None) == f"{text}\n\nUnverified: {x[:10]} reverted by {r[:10]}, not on origin/proj"
+
+
+def test_a_reverted_change_applied_again_reads_landed_again(env, monkeypatch):
+    """Reverting the revert puts X's change back: X is landed and live again."""
+    from ttp import landed
+    p, repo, x, r = _reverted_setup(env, monkeypatch)
+    _git_out(repo, "revert", "--no-edit", r)
+    _git_out(repo, "push", "-q", "origin", "HEAD:refs/heads/proj")
+    tip = _git_out(repo, "rev-parse", "origin/proj")
+    assert landed.reverted_by(repo, x, tip) == "" and landed.on_branch(repo, x, tip)
+    assert landed.check(p, repo, x, fetch=False)[0] == 0
+    text = f"The fix is live (commit {x[:10]})."
+    assert _footer(p, text, {"version": "0.2.9", "commit": tip}) == text
+
+
+def test_a_later_edit_of_the_same_lines_with_no_revert_keeps_a_commit_landed(env, monkeypatch):
+    """A later commit rewrote X's lines but no revert names X: ancestry's answer stands."""
+    from ttp import landed
+    p, repo, head = _claim_replay_setup(env, monkeypatch, landed=True)
+    _commit(repo, "fix.txt", "first\n")
+    x = _git_out(repo, "rev-parse", "HEAD")
+    _commit(repo, "fix.txt", "rewritten\n")
+    _git_out(repo, "push", "-q", "origin", "HEAD:refs/heads/proj")
+    tip = _git_out(repo, "rev-parse", "origin/proj")
+    assert landed.reverted_by(repo, x, tip) == "" and landed.check(p, repo, x, fetch=False)[0] == 0
+
+
+def test_a_push_queue_range_revert_takes_out_each_commit_of_its_range(env, monkeypatch):
+    """The push queue's post-landing revert ('Reverts A..B', A left out): each commit in the range reads
+    reverted by it; A and commits before it stay landed."""
+    from ttp import landed
+    p, repo, a = _claim_replay_setup(env, monkeypatch, landed=True)
+    _commit(repo, "one.txt", "one\n")
+    one = _git_out(repo, "rev-parse", "HEAD")
+    _commit(repo, "two.txt", "two\n")
+    two = _git_out(repo, "rev-parse", "HEAD")
+    _git_out(repo, "revert", "--no-commit", f"{a}..{two}")
+    _git_out(repo, "commit", "-qm", f"Revert b: post-landing tests fail\n\nReverts {a[:10]}..{two[:10]}; failing: t")
+    rev = _git_out(repo, "rev-parse", "HEAD")
+    _git_out(repo, "push", "-q", "origin", "HEAD:refs/heads/proj")
+    tip = _git_out(repo, "rev-parse", "origin/proj")
+    assert landed.reverted_by(repo, one, tip) == rev == landed.reverted_by(repo, two, tip)
+    assert landed.reverted_by(repo, a, tip) == "" and landed.check(p, repo, a, fetch=False)[0] == 0
+
+
+def test_a_landed_wait_on_a_task_whose_landing_was_reverted_does_not_pass(env, monkeypatch):
+    """start_when landed:#<id> runs `ttp landed --task <id>`: a task whose recorded landing a later revert
+    took out is not landed, and the words name the revert."""
+    from ttp import landed
+    p, repo, x, r = _reverted_setup(env, monkeypatch)
+    tid = p.db.add_task("the fix", "spec", kind="code")
+    now = time.time()
+    p.db.x("INSERT INTO push_queue(task, branch, head, target, status, landed_sha, created, updated) "
+           "VALUES(?, 'b', ?, 'origin/proj', 'landed', ?, ?, ?)", (tid, x, x, now, now))
+    assert landed.probe_command(f"landed:#{tid}") == f"ttp landed --task {tid}"
+    rc, why = landed.check(p, repo, tid=tid, fetch=False)
+    assert rc == landed.NOT_YET and f"reverted by {r[:10]}" in why, why
+
+
+def test_a_revert_test_that_cannot_run_reads_cannot_tell_never_not_landed(env, monkeypatch):
+    """A git failure inside the revert test leaves the claim unverified (CANNOT), never 'not landed'."""
+    from ttp import landed
+    p, repo, x, r = _reverted_setup(env, monkeypatch)
+    monkeypatch.setattr(landed, "_present", lambda *a: None)
+    landed._reverted.clear()
+    rc, why = landed.check(p, repo, x, fetch=False)
+    assert rc == landed.CANNOT and "cannot tell whether" in why, why
+    landed._reverted.clear()

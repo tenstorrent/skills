@@ -257,10 +257,15 @@ def landed_claims(p, text: str, repo) -> list[tuple[int, int, str, tuple]]:
     return out
 
 
-def _in_running(repo, sha: str, running: str) -> bool | None:
-    """Whether `sha` is an ancestor of (or equals) `running`, the commit the daemon's own receipt
-    names; None when that cannot be told (git failed)."""
-    return {0: True, 1: False}.get(_git(Path(repo), "merge-base", "--is-ancestor", sha, running).returncode)
+def _in_running(repo, sha: str, running: str) -> bool | str | None:
+    """Whether `sha`'s change is in `running`, the commit the daemon's own receipt names, by the push
+    branch's membership rule (landed.holds): True, False, the revert's sha when a later revert took it
+    out (landed.reverted_by), or None when that cannot be told (git failed)."""
+    from . import landed
+    held = landed.holds(Path(repo), sha, running)
+    if held is False and (gone := landed.reverted_by(Path(repo), sha, running)):
+        return gone
+    return held
 
 
 def _landed_fixes(p, text: str, repo, target, fetches: dict, head: str = "",
@@ -304,7 +309,8 @@ def reply_footer(p, text: str, repo, running: dict | None = None, extra=()) -> s
     live or landed (any _LIVE_CLAIM or landed word, not negated), each commit it names that this
     repository holds is checked once, model-free and with no fetch. With a live word the check is
     the running release (`running`: identity.running's receipt): a commit it lacks reads
-    "<sha> not in running <version>". With only a landed word it is the push branch's local
+    "<sha> not in running <version>" ("<sha> reverted by <revert>, not in running <version>" when a
+    later revert took it out). With only a landed word it is the push branch's local
     tracking ref (landed.check): "<sha> not on <ref>". A check that cannot run reads
     "<sha> not checked". `extra`: further items for the same line (claimcheck's count). The
     footer is "\n\nUnverified: " and the items comma-joined; no failure, no footer. Not checked
@@ -333,11 +339,15 @@ def reply_footer(p, text: str, repo, running: dict | None = None, extra=()) -> s
             where = _in_running(repo, full, known) if known else None
             if where is None:
                 items.append(f"{tok} not checked")
+            elif isinstance(where, str):
+                items.append(f"{tok} reverted by {where[:10]}, not in running {version}")
             elif not where:
                 items.append(f"{tok} not in running {version}")
         elif target:
-            rc, _why = landed.check(p, repo, full, fetch=False)
-            if rc == landed.NOT_YET:
+            rc, why = landed.check(p, repo, full, fetch=False)
+            if rc == landed.NOT_YET and (gone := re.search(r" reverted by ([0-9a-f]+) on ", why)):
+                items.append(f"{tok} reverted by {gone.group(1)}, not on {short_ref(*target)}")
+            elif rc == landed.NOT_YET:
                 items.append(f"{tok} not on {short_ref(*target)}")
             elif rc == landed.CANNOT:
                 items.append(f"{tok} not checked")
