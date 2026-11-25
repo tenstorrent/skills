@@ -676,7 +676,6 @@ def _gw9846_task(p, provider, model, branch):
 def test_a_glm_code_runs_hand_off_is_sent_back_for_a_test_on_the_real_tmp(env):
     """A code hand-off meets the built-in check whatever ran it: a GLM run's test lines name real paths, and
     every run's new tests must come with a base-failing run line."""
-    
     from ttp import handoffcheck, route
     p = make(env)
     git = lambda *a: subprocess.run(["git", "-C", str(p.root), *a], check=True, capture_output=True)   # noqa: E731
@@ -691,6 +690,7 @@ def test_a_glm_code_runs_hand_off_is_sent_back_for_a_test_on_the_real_tmp(env):
     assert got["failed"]["name"] == handoffcheck.GLM_CHECK and "test_gw9846.py" in got["failed"]["output"], got
     assert handoffcheck.verdict(p, {}, glm, {"status": "waiting"}, None) == {}
     claude = _gw9846_task(p, "claude", "opus", "ttp/gw9846")
+    assert handoffcheck.verdict(p, {}, claude, {"status": "blocked"}, None) == {}   # a test it could not run on the base
     got = handoffcheck.verdict(p, {}, claude, {"status": "done"}, None)
     assert got["failed"]["name"] == handoffcheck.CODE_CHECK, got
     assert "no line showing them fail on the base" in got["failed"]["output"], got

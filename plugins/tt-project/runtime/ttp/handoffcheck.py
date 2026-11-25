@@ -234,8 +234,8 @@ def builtin_check(p: Project, task: dict, handoff) -> dict | None:
     if got is None:
         return None
     root, head, diff, fork = got
-    if not _glm_run(p, task):
-        gap = new_test_gap(diff, handoff)
+    if not _glm_run(p, task):   # a blocked or failed hand-off may owe no run: it could not run the test
+        gap = new_test_gap(diff, handoff) if handoff.get("status") in ("done", "needs_review") else None
         return {"name": CODE_CHECK, "output": gap} if gap else None
     from . import slop
     try:
