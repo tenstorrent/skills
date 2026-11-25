@@ -553,3 +553,32 @@ def test_a_revert_test_that_cannot_run_reads_cannot_tell_never_not_landed(env, m
     rc, why = landed.check(p, repo, x, fetch=False)
     assert rc == landed.CANNOT and "cannot tell whether" in why, why
     landed._reverted.clear()
+
+
+def test_a_revert_the_local_ref_still_shows_is_rechecked_on_the_remote_that_landed_the_change_again(env, monkeypatch):
+    """The local tracking ref still ends at the revert while the remote already put X's change back: the
+    fetched tip decides, so X reads landed, not 'reverted'."""
+    from ttp import landed
+    p, repo, x, r = _reverted_setup(env, monkeypatch)
+    _git_out(repo, "revert", "--no-edit", r)
+    _git_out(repo, "push", "-q", "origin", "HEAD:refs/heads/proj")
+    _git_out(repo, "update-ref", "refs/remotes/origin/proj", r)   # the tracking ref lags the re-landing
+    assert landed.check(p, repo, x, fetch=False)[0] == landed.NOT_YET
+    assert landed.check(p, repo, x)[0] == 0
+
+
+def test_a_task_whose_recorded_landing_a_later_revert_took_out_reads_dropped(env, monkeypatch):
+    """The daemon's dropped-landing sweep (drops/carried) names a done task whose landed commit a later
+    revert took off the push branch, naming the revert; with the change applied again it is carried."""
+    from ttp import landed
+    p, repo, x, r = _reverted_setup(env, monkeypatch)
+    tid = p.db.add_task("the fix", "spec", kind="code")
+    p.db.update_task(tid, status="done")
+    now = time.time()
+    p.db.x("INSERT INTO push_queue(task, branch, head, target, status, landed_sha, created, updated) "
+           "VALUES(?, 'b', ?, 'origin/proj', 'landed', ?, ?, ?)", (tid, x, x, now, now))
+    ((got, why),) = landed.drops(p, record=False)
+    assert got == tid and f"reverted by {r[:10]}" in why, why
+    _git_out(repo, "revert", "--no-edit", r)
+    _git_out(repo, "push", "-q", "origin", "HEAD:refs/heads/proj")
+    assert landed.drops(p, record=False) == []

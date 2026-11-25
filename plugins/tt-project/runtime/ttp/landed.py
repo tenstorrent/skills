@@ -249,6 +249,7 @@ def _revert_log(repo: Path, tip: str) -> list[tuple[str, list]] | None:
             return None
         if len(_revert_logs) >= 64:
             _revert_logs.clear()
+            _ranges.clear()
         _revert_logs[key] = [(rev, found) for rec in log.stdout.split("\x01")
                              for rev, _, body in [rec.strip("\n").partition("\0")]
                              if rev and (found := _REVERTS.findall(body))]
@@ -1127,7 +1128,8 @@ def drop(p, tid: int, shas: list[str], why: str, event: bool = True, recheck: bo
 
 def carried(p, repo: Path, tid: int, tip: str, shas: list[str] | None = None, src: str = "",
             rows: Rows | None = None) -> str:
-    """Why task `tid`'s recorded landing (`shas`/`src`, else recorded) does not carry its change: the head
+    """Why task `tid`'s recorded landing (`shas`/`src`, else recorded) does not carry its change: a later
+    revert on `tip` took a landed commit's change out (reverted_by), or the head
     it handed off (integrate.member_head) is in none of those landed commits (on_branch: an ancestor, or an
     equivalent by patch, author and subject, or replay trailer; each a short range from where it forked),
     not on the push branch's `tip` or a retired tip (on_push), and none holds most of its lines (_holds_part).
@@ -1135,6 +1137,8 @@ def carried(p, repo: Path, tid: int, tip: str, shas: list[str] | None = None, sr
     from . import integrate   # late: integrate loads worktree, whose imports reach this module
     if shas is None:
         shas, src = recorded(p.db, tid, rows=rows)
+    if tip and (r := next((g for x in shas if (c := _commit(repo, x)) and (g := reverted_by(repo, c, tip))), "")):
+        return f"{src or 'its landing'} was reverted by {r[:10]}, which took its change off the push branch"
     head = integrate.member_head(repo, tid) if shas else ""
     if not head or any(_commit(repo, s) and on_branch(repo, head, _commit(repo, s)) for s in shas) \
             or on_push(p, repo, [head], tip) \
@@ -1402,11 +1406,12 @@ def check(p, repo: Path, sha: str | None = None, tid: int | None = None, onto: s
             continue
         if any(_commit(repo, s) and on_branch(repo, s, tip) for s in shas):
             return _not_dropped(p, repo, tid, tip, shas, src, onto) or (0, f"{what} is on {ref}")
-        gone = [reverted_by(repo, s, tip) for s in shas if _commit(repo, s)]
-        if r := next((g for g in gone if g), ""):
-            return NOT_YET, f"{what} reverted by {r[:10]} on {ref}"
-        if None in gone:   # the revert test could not run: unverified, never "not landed"
-            return CANNOT, f"cannot tell whether {what} was reverted on {ref}"
+        if fetching or not fetch:   # a local ref behind the remote may miss a re-landing: the fetched tip decides
+            gone = [reverted_by(repo, s, tip) for s in shas if _commit(repo, s)]
+            if r := next((g for g in gone if g), ""):
+                return NOT_YET, f"{what} reverted by {r[:10]} on {ref}"
+            if None in gone:   # the revert test could not run: unverified, never "not landed"
+                return CANNOT, f"cannot tell whether {what} was reverted on {ref}"
     if p is not None and has_push_branch(p) and onto == _push_ref(p, repo) and (found := on_push(p, repo, shas, "")):
         return _not_dropped(p, repo, tid, tip, shas, src, onto) or (0, f"{what} is on {onto}, at its retired tip {found[:10]}")
     return NOT_YET, f"{what} is not on {onto} yet"
