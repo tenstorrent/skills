@@ -2,11 +2,10 @@
 "tt-project": minor
 ---
 
-Check a coordinator reply or notify's own 'landed'/'live' lines before it is sent, tagging only:
-a line whose named commit the push branch or the running version definitely does not hold gets
-one ' (unverified)' appended right after its claim phrase. Nothing is ever rewritten or negated;
-a passing line, a line naming no commit, a check that cannot run and every other sentence go out
-exactly as written. The daemon's running commit is read from its heartbeat so a session
-coordinator can check live lines too, and a decimal version number no longer ends the sentence
-before the commit it names. The landed/live parse extends pushclaim's single parser (fail-open),
-and the hedges cover "should/may/might/could have".
+A coordinator reply, notify or ask goes out exactly as written. When it says 'live' or 'landed',
+each commit it names is checked once (running release for 'live', the push branch's local ref
+for 'landed', no fetch), and any that fail add one footer line at the end, e.g.
+`Unverified: 26b5acd3a not in running 0.2.1550`; an uncheckable commit reads `not checked`.
+Status sentences are no longer tagged inline: a `claims` item that did not hold or could not be
+checked is counted in the same footer, and a false status sentence only raises `claim_false`.
+The sentence-level live/landed rewriting and tagging on the send path is gone.

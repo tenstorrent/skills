@@ -24,10 +24,9 @@ hedged before the phrase) is judged apart, by a matching `claims` probe that exi
 machines' reach record (reach.judge): false when a machine it names answered ssh within
 ssh.reach_fresh_min, unverified when no probe of it is that fresh or the claim is seen from another
 host ('From X, ...': the record holds this host's probes only). With a status verb too, any false wins.
-A claim that does not hold goes prefixed with what is true (FALSE_MARK) and wakes the coordinator
-with a high `claim_false` event; a claim nothing could check gets UNVERIFIED after it. Callers the
-user reads pass mark=False, so their text goes out as written and only the record and event carry
-it: coordinator.apply (replies and notifies, turn and session mode) and
+Every message goes out as written: a claim that does not hold wakes the coordinator with a high
+`claim_false` event, and a `claims` item that did not hold or could not be checked is counted in the
+message's one footer line (footer, pushclaim.reply_footer). Callers: coordinator.apply (replies and notifies, turn and session mode) and
 daemon.relay_worker_notifies (worker `ttp notify`, record and config checks only). handoff_mark() marks a
 worker hand-off that claims a live state and cites no evidence (an artifact or a command-output path) in
 the digest and its hand-off event. Any fault leaves the text as written: a message is never lost to this."""
@@ -181,23 +180,41 @@ def _same(live, said: str) -> bool:
         return str(live).strip().lower() == said.rstrip(".").lower()
 
 
+def _item(p, c: dict, now: float) -> tuple[str, str]:
+    """A `claims` item's own verdict: ('ok' | 'false' | 'unverified', why)."""
+    if c.get("task") not in (None, "") or c.get("action") not in (None, ""):
+        return "ok", "tracked by its task"
+    if c.get("due") not in (None, ""):
+        from .obligations import _when
+        if _when(c["due"], "claim due") > now:
+            return "ok", "tracked until its due"
+    if "_rc" not in c and str(c.get("expect") or "").strip() and not p.db.conn.in_transaction:
+        c["_rc"] = _probe(p, str(c["expect"]))   # prerun did not run it (a replay, a worker notify): now
+    rc = c.get("_rc")
+    if rc == 0:
+        return "ok", "its check exited 0"
+    if rc not in (None, 75, 255, "timeout", "could not start"):
+        return "false", f"its check `{str(c.get('expect'))[:120]}` exited {rc}"
+    return "unverified", "its check could not run"
+
+
+def footer(p, claims: list | None, now: float | None = None) -> list[str]:
+    """The footer items (pushclaim.reply_footer) counting `claims` entries that did not hold or could
+    not be checked, e.g. '1 status claim not checked'; [] when all held. Any fault: []."""
+    now = time.time() if now is None else now
+    try:
+        got = [_item(p, c, now)[0] for c in claims or [] if isinstance(c, dict)]
+    except Exception:
+        return []
+    return [f"{n} status claim{'s' * (n != 1)} {what}"
+            for n, what in ((got.count("false"), "did not hold"), (got.count("unverified"), "not checked")) if n]
+
+
 def _judge(p, sentence: str, verb: str, claims: list, now: float, own: dict | None = None) -> tuple[str, str]:
     """('ok' | 'false' | 'unverified', what is true or why)."""
     cls = _cls(verb)
-    if c := _entry(sentence, claims):
-        if c.get("task") not in (None, "") or c.get("action") not in (None, ""):
-            return "ok", "tracked by its task"
-        if c.get("due") not in (None, ""):
-            from .obligations import _when
-            if _when(c["due"], "claim due") > now:
-                return "ok", "tracked until its due"
-        if "_rc" not in c and str(c.get("expect") or "").strip() and not p.db.conn.in_transaction:
-            c["_rc"] = _probe(p, str(c["expect"]))   # prerun did not run it (a replay, a worker notify): now
-        rc = c.get("_rc")
-        if rc == 0:
-            return "ok", "its check exited 0"
-        if rc not in (None, 75, 255, "timeout", "could not start"):
-            return "false", f"its check `{str(c.get('expect'))[:120]}` exited {rc}"
+    if (c := _entry(sentence, claims)) and (got := _item(p, c, now))[0] != "unverified":
+        return got
     low = sentence.lower()
     keys = [k for k in _KEY.findall(sentence)] + [v for a, v in ALIASES.items() if a in low]
     cfg = p.config()
@@ -244,25 +261,17 @@ def _judge(p, sentence: str, verb: str, claims: list, now: float, own: dict | No
     return "unverified", "nothing could check it"
 
 
-def _mark(sentence: str) -> str:
-    m = re.search(r"[.!;:]+\s*$", sentence)
-    return (sentence[:m.start()] + f" {UNVERIFIED}" + sentence[m.start():]) if m else f"{sentence} {UNVERIFIED}"
-
-
 def check(p, text: str, claims: list | None = None, now: float | None = None,
-          own: dict | None = None, mark: bool = True) -> tuple[str, list[tuple[str, str]], int]:
-    """(text to send, [(false sentence, what is true)], count that could not be checked). `own`
-    ({'task': id, 'run': id}): the writer's own task and run, whose state at the end of its run
-    is not what its notify claimed. A sentence in a block meant to be posted as written
-    (onhost.segments) is never changed: its mark goes on its own line after the block, quoting it.
-    `mark` False (the user-facing reply path) leaves the text as written: a false or unchecked
-    claim is only recorded and raised, never marked in what the user reads."""
+          own: dict | None = None) -> tuple[str, list[tuple[str, str]], int]:
+    """(text, exactly as given, [(false sentence, what is true)], count nothing could check). `own`
+    ({'task': id, 'run': id}): the writer's own task and run, whose state at the end of its run is not
+    what its notify claimed."""
     now = time.time() if now is None else now
     try:
-        head, cut, tail = (text or "").partition(STATUS_TAIL)   # onhost's honest status lines: the harness's own
-        false, unverified, out = [], 0, []
-        for chunk, block in onhost.segments(head):
-            parts, after = _SPLIT.split(chunk), []
+        head = (text or "").partition(STATUS_TAIL)[0]   # onhost's honest status lines: the harness's own
+        false, unverified = [], 0
+        for chunk, _block in onhost.segments(head):
+            parts = _SPLIT.split(chunk)
             for k in range(0, len(parts), 2):
                 verb, cut_off = _verb(parts[k]), _reach(parts[k])
                 if not verb and not cut_off:
@@ -270,25 +279,11 @@ def check(p, text: str, claims: list | None = None, now: float | None = None,
                 got = [_judge(p, parts[k], verb, claims or [], now, own)] if verb else []
                 got += [_judge_reach(p, parts[k], claims or [], now)] if cut_off else []
                 bad = [w for g, w in got if g == "false"]
-                got, why = ("false", "; ".join(bad)) if bad else ("ok", "") if all(g == "ok" for g, _ in got) \
-                    else ("unverified", "")
-                if got == "false":
-                    false.append((parts[k].strip(), why))
-                    if mark:
-                        lead = parts[k][:len(parts[k]) - len(parts[k].lstrip())]
-                        if block:
-                            after.append(f"\n{FALSE_MARK} ({why}): {onhost.quoted(parts[k])}")
-                        else:
-                            parts[k] = f"{lead}{FALSE_MARK} ({why}): {parts[k].strip()}"
-                elif got == "unverified":
+                if bad:
+                    false.append((parts[k].strip(), "; ".join(bad)))
+                elif not all(g == "ok" for g, _ in got):
                     unverified += 1
-                    if mark:
-                        if block:
-                            after.append(f"\n{UNVERIFIED}: {onhost.quoted(parts[k])}")
-                        else:
-                            parts[k] = _mark(parts[k].rstrip()) + parts[k][len(parts[k].rstrip()):]
-            out.append("".join(parts) + "".join(after))
-        return "".join(out) + cut + tail, false, unverified
+        return text, false, unverified
     except Exception:
         return text, [], 0
 
@@ -303,8 +298,8 @@ def raise_false(db, false: list, where: str, now: float | None = None) -> None:
         return   # the same batch or run end applied again
     db.x("INSERT INTO events(ts,source,kind,fingerprint,severity,text,status) VALUES(?,?,?,?,?,?,?)",
          (time.time() if now is None else now, "daemon", KIND, fp, "high",
-          f"{where} claimed what did not hold when checked before sending: {lines}. It was sent as written; "
-          f"tell that chat what is true now and fix or re-order the work; check live state before "
+          f"{where} claimed what did not hold when checked before sending: {lines}. It was sent as written. "
+          f"Tell that chat what is true now and fix or re-order the work; check live state before "
           f"you claim one"[:4000], "queued"))
 
 

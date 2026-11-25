@@ -328,206 +328,11 @@ def test_the_daemon_s_finish_transaction_marks_a_claim_it_cannot_check(env, monk
     assert "(unverified)" in res["summary"] and "not landed" not in res["summary"], res["summary"]
 
 
-# The reply-path check: a coordinator reply or notify's own 'landed'/'live' lines are checked
-# against the push branch and the daemon's running commit before the message is sent.
+# The reply footer: a coordinator reply, notify or ask goes out exactly as written;
+# when it says 'live' or 'landed', each commit it names is checked once, and those that fail add
+# one 'Unverified: ...' footer line at the end. No inline tags, no sentence parsing.
 
-_REPLY_4303 = (
-    "The 'landed' check is live on every project (tt-project 0.2.1525). When a run says it "
-    "landed something, the harness now checks the push branch without a model, and the message "
-    "reads 'not landed' if the commit isn't there.\n\n"
-    "The rollback-count fix is live too. another project's GLM device stops that already-live fixes "
-    "covered no longer count, so only 1 of its 6 counts (the refused git push). GLM device work "
-    "in tt-buddy stays off until the broker-only check (task #9695) is live. I'll turn it back "
-    "on then and tell you.")
-
-_REPLY_4310 = (
-    "The project's GLM code route is back on since 10:30 PST. Both failed runs behind its 05:47 PST "
-    "switch-off were cut by the dev box's reboots; without them it's 0 of 22 "
-    "failed. Runs a host reboot or crash kills no longer count toward any switch-off, on every "
-    "flag and project (task #9712).\n\n"
-    "another project's GLM device route: its fix is in a second review, so it's later than the 10:05 "
-    "PST I gave. Likely live about 12:30 PST; I turn the route on then and tell you.\n\n"
-    "Daily GLM code report: GLM landed 38 code tasks since 11-18, at about Opus's rate and a bit "
-    "cheaper ($3.66 vs $4.26 per landing). But fewer pass review first time (55% vs 62%) and they "
-    "take twice as long to land (102 vs 50 min median). GLM did 45% of model-hours here in the "
-    "last 24 h. All 10 bounces to Opus were guard stops; none got through.")
-
-
-def test_a_reply_s_claims_are_tagged_only_when_they_definitely_fail(env, monkeypatch):
-    """Replay of the 09:41 reply: its live and landed lines name no commit, so nothing can be
-    checked and the reply posts exactly as written - a line naming no commit is never marked."""
-    from ttp import pushclaim
-    p, repo, head = _claim_replay_setup(env, monkeypatch, landed=True)
-    assert pushclaim.correct_reply_claims(p, _REPLY_4303, p.root, running=head) == _REPLY_4303
-    # a true live line: the named commit is an ancestor of the running one, unmarked
-    text = f"The fix is live (commit {head})."
-    assert pushclaim.correct_reply_claims(p, text, p.root, running=head) == text
-    # a landed line naming a commit on the push branch passes
-    assert pushclaim.correct_reply_claims(p, f"Hardening landed at {head[:10]}.", p.root) == \
-        f"Hardening landed at {head[:10]}."
-    # a landed line naming a commit the push branch does not hold: one tag, no word changed
-    _commit(repo, "off-branch.txt", "off\n")            # a commit the push branch does not hold
-    off = _git_out(repo, "rev-parse", "HEAD")
-    _git_out(repo, "reset", "-q", "--hard", head)
-    fixed = pushclaim.correct_reply_claims(p, f"Hardening landed at {off[:10]}.", p.root)
-    assert fixed == f"Hardening landed at {off[:10]} (unverified).", fixed
-
-
-def test_a_reply_with_no_landed_or_live_claim_goes_unchanged(env, monkeypatch):
-    """Replay of the GLM report reply: its 'landed'/'live' words are about other tasks and
-    other projects, so none is a claim and the reply posts exactly as written."""
-    from ttp import pushclaim
-    p, repo, head = _claim_replay_setup(env, monkeypatch, landed=True)
-    assert pushclaim.correct_reply_claims(p, _REPLY_4310, p.root, running=head) == _REPLY_4310
-
-
-def test_a_live_claim_naming_a_commit_the_running_version_lacks_is_tagged(env, monkeypatch):
-    """A 'live' line naming a commit the daemon's running version does not contain gets one
-    '(unverified)' tag after its claim phrase; a version number instead of a commit, a sha this
-    repository does not hold, or a check that cannot run leaves the line as written."""
-    from ttp import pushclaim
-    p, repo, head = _claim_replay_setup(env, monkeypatch, landed=True)
-    _commit(repo, "side.txt", "side\n")
-    side = _git_out(repo, "rev-parse", "HEAD")   # a commit the running version does not hold
-    _git_out(repo, "reset", "-q", "--hard", head)
-    fixed = pushclaim.correct_reply_claims(p, f"The fix is live (commit {side[:10]}).", p.root, running=head)
-    assert fixed == f"The fix is live (unverified) (commit {side[:10]}).", fixed
-    # a version number instead of a commit, or a sha this repository does not hold: as written
-    for text in ("The fix is live (0.2.1525).", "The fix is live (commit 9aa4c1f88ea7).",
-                 "The fix is live.", "The fix is live (commit 9aa4c1f88ea7) and nothing else."):
-        assert pushclaim.correct_reply_claims(p, text, p.root, running=head) == text, text
-    # the running version unknown: the check cannot run, so the line stands as written
-    fixed = pushclaim.correct_reply_claims(p, f"The fix is live (commit {head[:10]}).", p.root)
-    assert fixed == f"The fix is live (commit {head[:10]}).", fixed
-
-
-def test_a_live_claim_with_a_running_commit_the_repo_lacks_stands_as_written(env, monkeypatch):
-    """A project whose repo does not hold the daemon's running commit (any project but the
-    plugin's own) cannot check a live claim at all: sha-less or not, the line stands as
-    written, never a false mark in the user's chat."""
-    from ttp import pushclaim
-    p, repo, head = _claim_replay_setup(env, monkeypatch, landed=True)
-    outside = "f1d0" * 10   # a running commit this repository does not hold
-    for text in ("The fix is live.", f"The fix is live (commit {head[:10]})."):
-        fixed = pushclaim.correct_reply_claims(p, text, p.root, running=outside)
-        assert fixed == text, (fixed, text)
-
-
-def test_hedged_landed_and_live_claims_are_not_claims(env, monkeypatch):
-    """'should have landed' and its hedge kin hedge a landed claim out of existence (the
-    ponytail-lane follow-up); an unhedged sha-less landed claim names no commit, so it is
-    never marked either."""
-    from ttp import pushclaim
-    p, repo, head = _claim_replay_setup(env, monkeypatch, landed=False)
-    for text in ("The fix should have landed.", "The fix may have landed.",
-                 "The fix might have landed.", "The fix could have landed.",
-                 "The fix should have gone live.", "The fix landed.", "The fix landed.",
-                 "The fix is live here."):
-        assert pushclaim.correct_reply_claims(p, text, p.root, running=head) == text, text
-
-
-def test_a_live_claim_inside_a_landed_fix_span_is_left_to_the_landed_fix(env, monkeypatch):
-    """A sentence both parses catch ("was pushed <sha> live"): the landed fix owns the span and
-    the live fix never splices into the same text twice, which corrupts the message."""
-    from ttp import pushclaim
-    p, repo, head = _claim_replay_setup(env, monkeypatch, landed=False)
-    base = _git_out(repo, "rev-parse", "HEAD~1")
-    fixed = pushclaim.correct_reply_claims(p, f"The fix was pushed {head[:10]} live.", p.root,
-                                           running=base)
-    assert fixed == f"The fix was pushed {head[:10]} (unverified) live.", fixed
-    assert fixed.count("(unverified)") == 1, fixed   # one fix per span, not two spliced into one
-
-
-def test_two_live_phrases_in_one_sentence_get_one_tag(env, monkeypatch):
-    """"is live" and "in the running version" are one claim, not two: a failing sentence gets
-    one '(unverified)' tag, never a duplicated mark."""
-    from ttp import pushclaim
-    p, repo, head = _claim_replay_setup(env, monkeypatch, landed=True)
-    _commit(repo, "side.txt", "side\n")
-    side = _git_out(repo, "rev-parse", "HEAD")
-    _git_out(repo, "reset", "-q", "--hard", head)
-    fixed = pushclaim.correct_reply_claims(
-        p, f"The fix is now live in the running version (commit {side[:10]}).", p.root,
-        running=head)
-    assert fixed.count("(unverified)") == 1, fixed
-    # the sha-less shape of the same sentence names no commit: as written
-    fixed = pushclaim.correct_reply_claims(p, "The fix is now live in the running version.",
-                                           p.root, running=head)
-    assert fixed == "The fix is now live in the running version.", fixed
-
-
-def test_the_reply_path_never_rewrites_and_tags_only_a_failing_live_or_landed_line(env, monkeypatch):
-    """The send path never rewrites or negates a reply's 'landed'/'live' lines: the texts the
-    old check corrupted reach the chat as written, and only a line whose named commit the push
-    branch or the running version definitely does not hold goes out tagged '(unverified)'."""
-    from ttp import coordinator as coord
-    p, repo, head = _claim_replay_setup(env, monkeypatch, landed=True)
-    for text in ("I'll tell you when the fix is live here",
-                 "2bf5c16bce is live in 0.2.1547",
-                 "Commit X has landed on the branch"):
-        assert coord._deploy_checked(p, text, []) == text, text
-    coord.apply(p, [{"type": "reply", "chat": "c1",
-                     "text": "I'll tell you when the fix is live here"}])
-    (sent,) = p.db.q("SELECT text FROM messages WHERE direction='out' AND kind='reply'")
-    assert sent["text"] == "I'll tell you when the fix is live here", sent["text"]
-    assert not [n for n in p.db.kv(coord.NOTES_KEY, []) if "pushclaim" in n], p.db.kv(coord.NOTES_KEY)
-    # only a line whose named commit definitely fails the check gets the tag, through the whole
-    # send path; the running commit is read from the daemon's heartbeat, whatever process sends
-    _commit(repo, "side.txt", "side\n")
-    side = _git_out(repo, "rev-parse", "HEAD")   # a commit the running version does not hold
-    _git_out(repo, "reset", "-q", "--hard", head)
-    # the heartbeat names a daemon pid that is not this process: a session coordinator still
-    # reads its receipt (the 17:22 reply's true live line was wrongly marked (unverified))
-    (p.state / "heartbeat").write_text(json.dumps(
-        {"pid": 999999, "receipt": {"pid": 999999, "commit": head}}))
-    coord.apply(p, [{"type": "reply", "chat": "c1",
-                     "text": f"The fix is live (commit {side[:10]})."}])
-    (sent,) = p.db.q("SELECT text FROM messages WHERE direction='out' AND kind='reply' "
-                      "ORDER BY id DESC LIMIT 1")
-    assert sent["text"] == f"The fix is live (unverified) (commit {side[:10]}).", sent["text"]
-    assert any("names its commit" in n for n in p.db.kv(coord.NOTES_KEY) or []), p.db.kv(coord.NOTES_KEY)
-    # an ordinary answer with no claim posts as written
-    notes = coord.apply(p, [{"type": "reply", "chat": "c1", "text": "On it. I'll report by 14:00."}])
-    sent = p.db.q("SELECT text FROM messages WHERE direction='out' AND kind='reply' ORDER BY id DESC LIMIT 1")
-    assert sent[0]["text"] == "On it. I'll report by 14:00." and not notes, (sent, notes)
-
-
-def test_an_ask_with_a_failing_live_line_is_tagged_like_a_reply(env, monkeypatch):
-    """The ask path gets the same tag-only check: a live line whose named commit the running
-    version definitely does not hold goes out with one ' (unverified)' tag, and an ask with no
-    claim goes out as written."""
-    from ttp import coordinator as coord
-    p, repo, head = _claim_replay_setup(env, monkeypatch, landed=True)
-    _commit(repo, "side.txt", "side\n")
-    side = _git_out(repo, "rev-parse", "HEAD")   # a commit the running version does not hold
-    _git_out(repo, "reset", "-q", "--hard", head)
-    (p.state / "heartbeat").write_text(json.dumps(
-        {"pid": 999999, "receipt": {"pid": 999999, "commit": head}}))
-    coord.apply(p, [{"type": "ask_user", "text": f"The fix is live (commit {side[:10]}). May I close the task?",
-                     "blocking": "spend"}])
-    ask = p.db.one("SELECT text FROM messages WHERE kind='ask'")["text"]
-    assert f"The fix is live (unverified) (commit {side[:10]})." in ask, ask   # tagged, never rewritten
-    coord.apply(p, [{"type": "ask_user", "text": "May I spend $40 on the long run?", "blocking": "spend"}])
-    ask = p.db.q("SELECT text FROM messages WHERE kind='ask' ORDER BY id DESC LIMIT 1")[0]["text"]
-    assert ask.startswith("May I spend $40 on the long run?"), ask
-
-
-def test_a_reply_s_tagged_landed_claim_is_never_tagged_twice(env, monkeypatch):
-    """A reply's landed line naming a commit the push branch does not hold gets one
-    '(unverified)' tag; a second pass over the tagged text adds no second tag."""
-    from ttp import pushclaim
-    p, repo, head = _claim_replay_setup(env, monkeypatch, landed=True)
-    _commit(repo, "off.txt", "off\n")
-    off = _git_out(repo, "rev-parse", "HEAD")
-    _git_out(repo, "reset", "-q", "--hard", head)
-    once = pushclaim.correct_reply_claims(p, f"Hardening landed at {off[:10]}.", p.root)
-    assert once.count("(unverified)") == 1, once
-    assert pushclaim.correct_reply_claims(p, once, p.root) == once
-    # a reply's sha-less landed claim, and a project with no push branch: as written
-    assert pushclaim.correct_reply_claims(p, "The change landed.", p.root) == "The change landed."
-
-
-_REPLY_4365 = (
+_REPLY_4368 = (
     "The check you asked for is live: commit {sha}, running here in ttp 0.1.1. "
     "Every 'live' or 'landed' line, mine included, must now name its commit. Before a "
     "message goes out, the reply path checks that the commit is in the running version. "
@@ -537,52 +342,108 @@ _REPLY_4365 = (
     "Nothing for you to do.")
 
 
-def test_a_true_live_line_and_the_rule_sentences_around_it_stay_untouched(env, monkeypatch):
-    """Replay of the 17:22 reply: the live line's named commit is an ancestor of the running
-    one, and the sentences around it (a quoted 'landed', a sentence describing the check
-    itself, a live line naming no commit) are not claims about any commit: the whole reply
-    posts byte-identical to what was written."""
+def _footer(p, text, running):
+    """reply_footer of `text`, asserting the message itself comes back byte-exact."""
     from ttp import pushclaim
-    p, repo, head = _claim_replay_setup(env, monkeypatch, landed=True)
-    text = _REPLY_4365.format(sha=head)
-    fixed = pushclaim.correct_reply_claims(p, text, p.root, running=head)
-    assert fixed == text, (fixed, text)
+    out = pushclaim.reply_footer(p, text, p.root, running)
+    assert out.startswith(text), (out, text)
+    return out
 
 
-def test_a_live_line_naming_its_commit_in_a_running_release_stays_byte_identical(env, monkeypatch):
-    """Replay of the two 18:49 replies: a line naming the running release sha in parentheses
-    and then its own commit ('commit 2bf5c16bce') stays byte-identical when the named commits
-    are ancestors of the running sha; the checker never negates a true 'live' claim."""
-    from ttp import pushclaim
+def _side(repo, head, name="side"):
+    """A commit off `head` that neither the running release nor the push branch holds."""
+    _commit(repo, f"{name}.txt", f"{name}\n")
+    side = _git_out(repo, "rev-parse", "HEAD")
+    _git_out(repo, "reset", "-q", "--hard", head)
+    return side
+
+
+def test_true_live_replies_go_out_byte_identical(env, monkeypatch):
+    """Replays of the 17:22 reply and the two 18:49 replies: every commit they name is in the
+    running release, so each goes out exactly as written, with no footer."""
     p, repo, head = _claim_replay_setup(env, monkeypatch, landed=True)
+    text = _REPLY_4368.format(sha=head)
+    assert _footer(p, text, {"version": "0.1.1", "commit": head}) == text
     shas = []
     for name in ("box-order", "reply-crash", "held-machine"):
         _commit(repo, f"{name}.txt", f"{name}\n")
         shas.append(_git_out(repo, "rev-parse", "HEAD"))
-    running = shas[-1]   # the running release: each named commit is its ancestor
+    running = {"version": "0.1.1", "commit": shas[-1]}
     for sha, name in zip(shas, ("box-order", "reply-crash", "held-machine")):
-        text = (f"The {name} fix is live in the running release 0.1.1 ({running}), "
-                f"commit {sha[:10]}.")
-        fixed = pushclaim.correct_reply_claims(p, text, p.root, running=running)
-        assert fixed == text, (fixed, text)
-    # the sentence's commit named after 'commit' is the claim's own: a side commit there is
-    # checked, never the release sha the sentence also quotes
-    _commit(repo, "side.txt", "side\n")
-    side = _git_out(repo, "rev-parse", "HEAD")
-    _git_out(repo, "reset", "-q", "--hard", head)
-    text = f"The fix is live in the running release 0.1.1 ({running}), commit {side[:10]}."
-    fixed = pushclaim.correct_reply_claims(p, text, p.root, running=running)
-    assert fixed == f"The fix is live (unverified) in the running release 0.1.1 ({running}), " \
-                    f"commit {side[:10]}.", fixed
+        text = f"The {name} fix is live in the running release 0.1.1 ({shas[-1]}), commit {sha[:10]}."
+        assert _footer(p, text, running) == text
 
 
-def test_a_live_line_pledging_a_future_landing_is_never_rewritten(env, monkeypatch):
-    """A live line pledging a future landing ("I'll tell you when the fix is live here") names
-    no commit and claims nothing checkable: it stays exactly as written, never a negation."""
-    from ttp import pushclaim
+def test_a_live_reply_naming_a_commit_the_running_release_lacks_gets_one_footer(env, monkeypatch):
+    """Review #9808's case: the body stays byte-identical and one footer names the side commit;
+    two failing commits share that one line."""
     p, repo, head = _claim_replay_setup(env, monkeypatch, landed=True)
-    for text in ("I'll tell you when the fix is live here.",
-                 "The fix is not live yet: nothing named.",
-                 "The fix went live in the running release 0.1.1 (29dc168987af), commit 0123456789.",
-                 "Every 'live' or 'landed' line, mine included, must now name its commit."):
-        assert pushclaim.correct_reply_claims(p, text, p.root, running=head) == text, text
+    side, other = _side(repo, head), _side(repo, head, "other")
+    running = {"version": "0.2.1550", "commit": head}
+    text = f"The fix is live in 0.2.1550 ({head[:12]}). Next: commit {side[:10]} waits for its review."
+    assert _footer(p, text, running) == f"{text}\n\nUnverified: {side[:10]} not in running 0.2.1550"
+    text = f"Both are live: {side[:10]} and {other[:10]} (and {side[:10]} again)."
+    out = _footer(p, text, running)
+    assert out == (f"{text}\n\nUnverified: {side[:10]} not in running 0.2.1550, "
+                   f"{other[:10]} not in running 0.2.1550"), out
+    assert out.count("Unverified:") == 1
+
+
+def test_a_commit_the_check_cannot_run_on_reads_not_checked(env, monkeypatch):
+    """A named commit the running-release check cannot settle reads 'not checked'; a running
+    commit this repository does not hold (another project's) checks nothing."""
+    p, repo, head = _claim_replay_setup(env, monkeypatch, landed=True)
+    text = f"The fix is live (commit {head[:10]})."
+    assert _footer(p, text, None) == f"{text}\n\nUnverified: {head[:10]} not checked"
+    assert _footer(p, text, {"version": "0.1.1", "commit": "f1d0" * 10}) == text
+    # a sha this repository does not hold is another repository's commit: not checked here
+    assert _footer(p, "The fix is live (commit 9aa4c1f88ea7).", {"commit": head}) == \
+        "The fix is live (commit 9aa4c1f88ea7)."
+
+
+def test_a_message_with_no_live_or_landed_word_is_never_checked(env, monkeypatch):
+    """No live/landed word: nothing is checked, even a commit the running release lacks; a
+    negated word is no claim either."""
+    p, repo, head = _claim_replay_setup(env, monkeypatch, landed=True)
+    side = _side(repo, head)
+    running = {"version": "0.1.1", "commit": head}
+    for text in (f"Commit {side[:10]} waits for its review.",
+                 f"The fix ({side[:10]}) is not live yet.",
+                 "The project's GLM code route is back on since 10:30 PST."):
+        assert _footer(p, text, running) == text, text
+
+
+def test_a_landed_reply_is_checked_against_the_push_branch(env, monkeypatch):
+    """With only a 'landed' word, each named commit is checked on the push branch's local ref (no
+    fetch); a project with no push branch checks nothing."""
+    p, repo, head = _claim_replay_setup(env, monkeypatch, landed=True)
+    off = _side(repo, head, "off")
+    assert _footer(p, f"Hardening landed at {head[:10]}.", None) == f"Hardening landed at {head[:10]}."
+    text = f"Hardening landed at {off[:10]}."
+    assert _footer(p, text, None) == f"{text}\n\nUnverified: {off[:10]} not on origin/proj"
+    q = make(env)
+    assert _footer(q, "The change landed.", None) == "The change landed."
+
+
+def test_a_coordinator_reply_and_ask_carry_the_footer_and_never_an_inline_tag(env, monkeypatch):
+    """The send path: a reply and an ask go out as written plus at most one footer line, which
+    also counts a failed `claims` item; a reply with nothing to flag goes out unchanged."""
+    from ttp import claimcheck, coordinator as coord
+    p, repo, head = _claim_replay_setup(env, monkeypatch, landed=True)
+    side = _side(repo, head)
+    receipt = {"pid": os.getpid(), "commit": head, "version": "0.1.1"}
+    (p.state / "heartbeat").write_text(json.dumps({"pid": os.getpid(), "receipt": receipt}))
+    text = f"The fix is live (commit {side[:10]})."
+    acts = [{"type": "reply", "chat": "c1", "text": text,
+             "claims": [{"text": "the fix is live", "expect": "false"}]}]
+    claimcheck.prerun(p, acts)   # the daemon runs the probes before the batch
+    coord.apply(p, acts)
+    (sent,) = p.db.q("SELECT text FROM messages WHERE direction='out' AND kind='reply'")
+    assert sent["text"] == (f"{text}\n\nUnverified: 1 status claim did not hold, "
+                            f"{side[:10]} not in running 0.1.1"), sent["text"]
+    coord.apply(p, [{"type": "ask_user", "text": f"{text} May I close the task?", "blocking": "spend"}])
+    ask = p.db.one("SELECT text FROM messages WHERE kind='ask'")["text"]
+    assert ask.startswith(f"{text} May I close the task?\n\nUnverified: {side[:10]} not in running 0.1.1"), ask
+    coord.apply(p, [{"type": "reply", "chat": "c1", "text": "I'll tell you when the fix is live here."}])
+    last = p.db.q("SELECT text FROM messages WHERE direction='out' AND kind='reply' ORDER BY id DESC LIMIT 1")
+    assert last[0]["text"] == "I'll tell you when the fix is live here.", last

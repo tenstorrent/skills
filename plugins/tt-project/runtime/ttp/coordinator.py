@@ -2755,31 +2755,12 @@ def _pending_checked(p: Project, text: str, notes: list, what: str) -> str:
     return text
 
 
-def _running_commit(p: Project) -> str:
-    """The commit of the runtime the project's daemon runs: its receipt, read from the heartbeat
-    or start marker, whether the coordinator runs in the daemon or beside it."""
-    from . import identity
-    r = identity.running(p.state, os.getpid()) or identity.running(p.state, None)
-    return str((r or {}).get("commit") or "")
-
-
-def _deploy_checked(p: Project, text: str, notes: list) -> str:
-    """A reply or notify as pushclaim.correct_reply_claims posts it: a 'landed'/'live' line whose
-    named commit the push branch or the running version definitely does not hold goes out tagged
-    '(unverified)'; no word is ever changed. heldwork.mark_nothing_claims then marks a
-    'nothing runs there' line that names a held machine the inventory is not empty for. Any fault
-    posts the text unchanged: a message is never lost to this check."""
-    try:
-        from . import pushclaim
-        fixed = pushclaim.correct_reply_claims(p, text, p.root, _running_commit(p))
-        if fixed != text:
-            notes.append("pushclaim: a 'landed'/'live' line in your message named a commit the "
-                         "push branch / the running version does not hold; it went out tagged "
-                         "'(unverified)'. A line claiming a landing or liveness names its commit")
-        text = fixed
-    except Exception as e:
-        notes.append(f"pushclaim: the landed/live-claim check failed ({type(e).__name__}: {e}); "
-                     f"the message went unchecked")
+def _deploy_checked(p: Project, text: str, notes: list, claims: list | None = None) -> str:
+    """A reply, notify or ask with its words as written: heldwork.mark_nothing_claims marks a
+    'nothing runs there' line that names a held machine the inventory is not empty for, then
+    pushclaim.reply_footer appends one 'Unverified: ...' line when a commit a live/landed message
+    names fails its check, or a `claims` item did not hold or could not be checked
+    (claimcheck.footer). Any fault posts the text unchanged: a message is never lost to this check."""
     try:
         from . import heldwork
         fixed = heldwork.mark_nothing_claims(text, where=p)
@@ -2787,20 +2768,31 @@ def _deploy_checked(p: Project, text: str, notes: list) -> str:
             notes.append("heldwork: a line in your message claimed nothing of ours runs on or "
                          "uses a held machine the inventory is not empty for; it went marked "
                          "'unverified' with what the inventory lists")
-        return fixed
+        text = fixed
     except Exception as e:
         notes.append(f"heldwork: the held-machine claim check failed ({type(e).__name__}: {e})")
+    try:
+        from . import identity, pushclaim
+        running = identity.running(p.state, os.getpid()) or identity.running(p.state, None)
+        fixed = pushclaim.reply_footer(p, text, p.root, running, claimcheck.footer(p, claims))
+        if fixed != text:
+            notes.append(f"reply check: your message went out with the footer "
+                         f"'{fixed[len(text):].strip()}'. Name only commits that hold, and back each claim")
+        return fixed
+    except Exception as e:
+        notes.append(f"reply check: the live/landed-claim check failed ({type(e).__name__}: {e}); "
+                     f"the message went unchecked")
         return text
 
 
 def _claims_checked(p: Project, a: dict, notes: list) -> tuple[str, list]:
-    """A reply or notify as claimcheck.check judges it: a status claim that did not hold, or one
-    nothing could check, keeps its record and event so the coordinator corrects it in a follow-up
-    message; the user-facing text is never marked. Returns (text, the false claims)."""
-    text, false, unverified = claimcheck.check(p, a["text"], a.get("claims"), mark=False)
+    """A reply or notify as written, its status claims judged by claimcheck.check: one that did not
+    hold raises claim_false; a failing `claims` item is counted in _deploy_checked's footer.
+    Returns (text, the false claims)."""
+    text, false, unverified = claimcheck.check(p, a["text"], a.get("claims"))
     if false or unverified:
         notes.append(f"claimcheck: {len(false)} claim(s) did not hold and {unverified} could not be checked when "
-                     f"sent; the message went unmarked. Check live state first and back each status claim with `claims`")
+                     f"sent; the message went as written. Check live state first and back each status claim with `claims`")
     return text, false
 
 
@@ -2965,7 +2957,7 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                 a["text"] = _wakemode_checked(p, a["text"], notes)
                 a["text"] = _pending_checked(p, a["text"], notes, "reply")
                 a["text"], false = _claims_checked(p, a, notes)
-                a["text"] = _deploy_checked(p, a["text"], notes)
+                a["text"] = _deploy_checked(p, a["text"], notes, a.get("claims"))
                 if (text := chatdigest.checked(db, cfg, a["text"], a, chat, notes, twins=(dup := []))) is None:
                     out = f"a near-repeat of #{dup[0][0]}, not posted" if dup else "held for the chat's digest"
                     twins += [(m, c, list(a.get("delivers") or []), authored) for m, c in dup]
@@ -3838,7 +3830,7 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                     if why:
                         raise ValueError(f"ask_user rejected: {why}")
                 text = _wakemode_checked(p, text, notes)
-                text = _deploy_checked(p, text, notes)   # a claim in an ask is tagged the same way
+                text = _deploy_checked(p, text, notes)   # an ask's commits are checked the same way
                 text, rec = db.for_user(text), db.for_user((a.get("recommendation") or "").strip())   # notes follow them
                 least = db.for_user(least)   # the least-disruptive part is appended mid-message: its tag would stay
                 if a["blocking"] == "restriction":
@@ -3897,7 +3889,7 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                 a["text"] = _wakemode_checked(p, a["text"], notes)
                 a["text"] = _pending_checked(p, a["text"], notes, "notify")
                 a["text"], false = _claims_checked(p, a, notes)
-                a["text"] = _deploy_checked(p, a["text"], notes)
+                a["text"] = _deploy_checked(p, a["text"], notes, a.get("claims"))
                 if (text := chatdigest.checked(db, cfg, a["text"], a, None, notes)) is None:
                     workernotify.handled(db, said)
                     continue

@@ -1339,7 +1339,7 @@ Person-facing tasks (`route.glm_work.person_writeup`, default on where `route.gl
 chat (`reply_chat`), holds a `conclusion:` line or tells the worker to post no longer stays on Opus whole: GLM does the
 work and Opus writes every word a person reads. For a `reply_chat` task whose run was on the chat provider the daemon
 never posts GLM's `message` or `summary`. It makes one small Opus call (no tools, no session) that reads the hand-off as
-data and writes the chat message; claimcheck marks the claims the records do not show, and the result carries
+data and writes the chat message; claimcheck counts the claims the records do not show, and the result carries
 `message_by` = `{step: opus-writeup, model, run, sha}`. A post guard refuses chat-provider text without that stamp on every
 path (the reply block, the push queue's landed reply, a held reply). A failed write-up or a held core provider posts
 nothing: the task goes to review with `Not posted to the chat`. A code task's done reply still waits for its landing.
@@ -4381,14 +4381,6 @@ names the push branch, or says "landed" while naming no other destination. A don
 on its own push still in flight is left to the remote check; a blocked, failed or approval-needing
 one is corrected here.
 
-The coordinator's own `reply` and `notify` messages get the same check on their send path, but
-it only ever tags: a 'landed' line's commit the push branch definitely does not hold, or a
-'live' line's commit the running version definitely does not contain, gets " (unverified)"
-appended right after its claim phrase. No word is ever replaced or negated. A line naming no
-commit, a check that cannot run (an unknown running commit, a fetch that fails, git failing), a
-passing line and every other sentence stay exactly as written. The coordinator hears of each
-tag in its next digest.
-
 Known gaps (these claims pass unchecked, as written):
 - a sha-less push claim naming another destination (the run's own branch, a PR branch, a fork);
 - any claim in a sentence that also names a sha, with a digit, this repository does not hold;
@@ -4396,25 +4388,17 @@ Known gaps (these claims pass unchecked, as written):
 - wording the parse does not know ("shipped", "made it into main");
 - quoted text written to a script and run later.
 
-Known gaps of the reply check:
-- the running commit is read from the daemon's heartbeat as it stands: a stale heartbeat names an
-  older runtime, and a landed line is judged on local refs only, so a landing the local ref has
-  not picked up yet can read '(unverified)';
-- the hedges cover "should/may/might/could have" (perfect), not "should be live" (the hedge
-  window sits before the matched be-verb, so "should be" cannot hedge it); a forecast naming
-  no commit passes unchecked;
-- "live" is checked by ancestry against the daemon receipt's commit, which only a project whose
-  own repository holds the runtime's commits can read; elsewhere the line passes as written;
-- a 'landed'/'live' line about another project's repo names a commit this repository does not
-  hold, so it passes as another repository's business;
-- "deployed" also matches distribution prose ("the template is deployed to all workers"),
-  which reads as a claim and asks for a commit a distribution step cannot name;
-- the subject list mirrors the landed one, so a sentence whose subject word it lacks
-  ("everything is deployed") passes as written, and a quoted word ("is 'live'") escapes the
-  be-verb pattern;
-- "becomes live" is not parsed ("become live" needs "be", already matched, but the be-verb
-  list has no "become"), so it passes as written;
-- a mid-turn `ttp urgent-reply` posts before the turn's checks run.
+The coordinator's own `reply`, `notify` and `ask_user` messages go out exactly as written. When
+one says 'live' (or "deployed", "in the running version") or 'landed', each commit it names is
+checked once, with no fetch: against the running release (an ancestor of the daemon receipt's
+commit) for a live word, else against the push branch's local ref. Any that fail add one footer
+line at the end, e.g. `Unverified: 26b5acd3a not in running 0.2.1550`; a commit the check cannot
+settle reads `<sha> not checked`, and a `claims` item that did not hold or could not be checked
+adds a count (`1 status claim not checked`). Status sentences are never tagged inline: a false
+one only raises `claim_false` for the coordinator. Known gaps: a message with both words is
+checked against the running release only; a commit this repository does not hold, or a running
+commit it does not hold (another project's runtime), is not checked; a mid-turn `ttp urgent-reply`
+posts before the turn's checks run.
 
 ## A report-only next step settles a wait without a model
 
