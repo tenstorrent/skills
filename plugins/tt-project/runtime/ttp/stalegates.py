@@ -23,7 +23,8 @@ import re
 import time
 
 from . import machine_ledger, machines, obligations
-from .db import _first_dead, deferral, dependency_ids, review_subject, waiting_handoff, without_deferral
+from .db import _first_dead, deferral, dependency_ids, load_result, review_subject, waiting_handoff, \
+    without_deferral
 
 KIND = "stale_gate"
 DEFAULT_MIN = 30.0
@@ -144,7 +145,7 @@ def findings(db, cfg: dict, now: float | None = None) -> list[dict]:
             if alts and rs._names(alias, r) and not named and all(
                     h[1]["alias"] and rs._names(h[1]["alias"], h[0]) for h in hit):
                 out.append({**base, "ident": f"{b['cause']}:{r}", "cause": b["cause"], "gate": b["why"], "action": "rehome",
-                            "old": alias, "new": alts[0], "fix": f"moved from {alias} to {alts[0]}"})
+                            "old": alias, "res": r, "new": alts[0], "fix": f"moved from {alias} to {alts[0]}"})
             elif old:
                 why = "it names the machine itself" if named else "no other machine the config allows"
                 out.append({**base, "ident": f"{b['cause']}:{r}", "cause": b["cause"], "gate": b["why"], "action": "raise",
@@ -219,17 +220,25 @@ def _observe(db, now: float, fp: str, text: str, tid: int | None) -> None:
          (now, "daemon", "observation", fp, "low", text[:600], "handled", tid))
 
 
+def _block_text(t: dict) -> str:
+    """What the task itself says holds it: its blocked reason, or the retry probe of its waiting
+    hand-off (a task left in a literal waiting status keeps its hand-off in its result)."""
+    if t["status"] == "blocked":
+        return str(t.get("blocked_reason") or "")
+    w = waiting_handoff(t) or (load_result(t.get("result")) if t["status"] == "waiting" else {})
+    return str((w or {}).get("retry_when") or "")
+
+
 def _fixed_gate_was_block(t: dict, f: dict) -> bool:
     """Whether the fixed gate `f` was the task's own block: its blocked reason, or its waiting
-    hand-off's retry probe, names that dependency, machine, or the cleared probe itself."""
-    text = str(t.get("blocked_reason") or "") if t["status"] == "blocked" \
-        else str(waiting_handoff(t).get("retry_when") or "")
+    hand-off's retry probe, names that dependency, machine or resource, or the cleared probe."""
+    text = _block_text(t)
     if not text:
         return False
     if f["action"] == "drop_dep":
-        return bool(re.search(rf"#{f['dep']}\b", text))
+        return bool(re.search(rf"(?:#|task ){f['dep']}\b", text))
     if f["action"] == "rehome":
-        return _word(f["old"], text)
+        return _word(f["old"], text) or _word(str(f.get("res") or ""), text)
     return text.strip() == str(deferral(t).get("when") or "").strip()   # clear: the probe itself
 
 
@@ -253,7 +262,9 @@ def _apply(db, f: dict, now: float) -> None:
     elif f["action"] == "drop_dep":
         kw["depends_on"] = [x for x in dependency_ids(t) if x != f["dep"]]
     elif f["action"] == "clear":
-        kw.update(labels=without_deferral(labels), not_before=None)
+        kw["labels"] = without_deferral(labels)
+        if deferral(t).get("after"):   # the deferral's own timer; another source's hold stays
+            kw["not_before"] = None
     # A task held by something else (a user ask, a hold, a budget cap) is never started past it.
     if t["status"] in ("queued", "blocked", "waiting") and _fixed_gate_was_block(t, f):
         kw.update(status="queued", blocked_reason=None, not_before=None)

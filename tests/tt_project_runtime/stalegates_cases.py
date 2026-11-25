@@ -284,3 +284,55 @@ def test_stalegate_rehomes_only_onto_a_resource_the_target_machine_has(env, monk
     stalegates.sweep(p, _SG_CFG, time.time())
     assert _sg_labels(p, clash) == ["resource:box-a-dev"]      # box-b-dev is another machine
     assert _sg_labels(p, plain) == ["resource:box-b"]
+
+
+def test_stalegate_a_block_naming_the_resource_is_released_by_the_rehome(env, monkeypatch):
+    """A task blocked by a paused *resource* (its reason names the resource, not the machine alias)
+    is requeued too when the re-home moves it: the sweep looks at the resource it moved, not only
+    the alias."""
+    from ttp import stalegates
+    _sg_env(monkeypatch)
+    p = make(env)
+    _sg_hold(p, "box-a")
+    tid = _sg_task(p, labels=["resource:box-a-dev"], status="blocked")
+    p.db.update_task(tid, blocked_reason="waits for a paused resource: box-a-dev (ttp resume)")
+    stalegates.sweep(p, _SG_CFG, time.time())
+    t = p.db.task(tid)
+    assert t["status"] == "queued" and t["blocked_reason"] is None
+    assert _sg_labels(p, tid) == ["resource:box-b-dev"]
+
+
+def test_stalegate_releases_a_wait_naming_the_dep_without_a_hash(env, monkeypatch):
+    """A retry probe that names the dependency as `ttp landed --task N`, and a task left in a
+    literal waiting status, are released when the dead dependency is dropped."""
+    from ttp import stalegates
+    from ttp.db import dump_result
+    _sg_env(monkeypatch)
+    p = make(env)
+    dead = _sg_task(p, status="failed")
+    landed = _sg_task(p, deps=[dead])
+    p.db.update_task(landed, not_before=time.time() + 1800,
+                     result=dump_result({"status": "waiting", "summary": "waits",
+                                         "retry_when": f"ttp landed --task {dead}"}))
+    literal = _sg_task(p, deps=[dead], status="waiting")
+    p.db.update_task(literal, not_before=time.time() + 1800,
+                     result=dump_result({"status": "waiting", "summary": "waits",
+                                         "retry_when": f"landed:#{dead}"}))
+    stalegates.sweep(p, _SG_CFG, time.time())
+    for tid in (landed, literal):
+        t = p.db.task(tid)
+        assert json.loads(t["depends_on"]) == [] and t["status"] == "queued" and t["not_before"] is None
+
+
+def test_stalegate_clearing_a_gate_keeps_a_timer_from_another_source(env, monkeypatch):
+    """Clearing an unreasoned start_when gate never wipes a not_before another hold set (a retry
+    timer): only the deferral's own labels go."""
+    from ttp import stalegates
+    _sg_env(monkeypatch)
+    p = make(env)
+    now = time.time()
+    tid = _sg_task(p, labels=["start_when:test -e /nowhere", f"deferred_since:{now - 4000:.0f}"])
+    p.db.update_task(tid, not_before=now + 3600)
+    stalegates.sweep(p, _SG_CFG, now)
+    t = p.db.task(tid)
+    assert _sg_labels(p, tid) == [] and t["not_before"] == now + 3600
