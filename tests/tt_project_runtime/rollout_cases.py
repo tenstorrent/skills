@@ -99,13 +99,16 @@ def test_a_runs_rollback_for_an_outage_or_quota_is_refused_and_the_flag_is_uncha
     monkeypatch.setenv("TTP_RUN_DIR", "/nonexistent")
     monkeypatch.delenv("TTP_PROJECT", raising=False)
     for reason in ("", "GLM endpoint 429 quota_exceeded until 05:00", "endpoint outage", "rate limited",
-                   "endpoint unreachable", "TT Cloud token quota ran out"):
+                   "endpoint unreachable", "TT Cloud token quota ran out",
+                   "GLM endpoint down", "server returned 503", "GLM unavailable"):
         code, out = _roll(capsys, "rollback", "glm_code", "projA", *(("--reason", reason) if reason else ()))
         assert code == 2, reason
         assert "per-run fallback" in out or "quality problem" in out
     assert rollout.level("glm_code") == 2 and not rollout.frozen("glm_code") and not rollout.rolled_back("glm_code")
     assert [r["kind"] for r in rollout.ledger("glm_code")] == ["set"], "nothing was recorded"
-    for reason in ("review pass fell", "pass rate down from 75% to 36%", "review pass fell on 500 tasks"):
+    for reason in ("review pass fell", "pass rate down from 75% to 36%", "review pass fell on 500 tasks",
+                   "GLM first-review pass rate down to 36%", "GLM code failed review on 5 of 8 tasks",
+                   "GLM output quality is down", "glm patches dead wrong"):
         assert _roll(capsys, "rollback", "glm_code", "projA", "--reason", reason)[0] == 0, reason
     assert rollout.level("glm_code") == 2 and not rollout.frozen("glm_code")
     assert set(rollout.rolled_back("glm_code")) == {"projA"}

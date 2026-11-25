@@ -89,7 +89,7 @@ def _write(path: Path, st: dict) -> None:
 
 def _roll(st: dict, window_s: float, now: float) -> dict:
     """The state in the window holding `now`: a passed reset starts a new window, used 0."""
-    window_s = float(window_s or 3600)
+    window_s = float(st.get("window_s") or window_s or 3600)   # a 429's own window, when it named one
     reset = float(st.get("reset") or 0)
     if reset > now:
         return st
@@ -141,10 +141,10 @@ def sync(key: str, got: dict, window_s: float = 3600, now: float | None = None, 
     if not key or not (got or spent):
         return
     now = time.time() if now is None else now
-    if got.get("window_s"):
-        window_s = float(got["window_s"])   # the 429 names its own window (minute, hourly): windows roll on it
     with _locked(key) as path:
         st = _read(path)
+        if got.get("window_s"):
+            st["window_s"] = float(got["window_s"])   # the 429 names its own window (minute, hourly)
         if float(got.get("reset") or 0) > now:
             if float(st.get("reset") or 0) != float(got["reset"]):
                 st = {**st, "used": 0, "spent": 0}
@@ -182,7 +182,7 @@ def view(cfg: dict | None, now: float | None = None) -> dict:
     if not size:
         return out
     budget = size * (1 - float(c["reserve"] or 0))
-    window_s = float(c["window_s"] or 3600)
+    window_s = float(st.get("window_s") or c["window_s"] or 3600)
     gone = min(max((now - (out["reset"] - window_s)) / window_s, 0.0), 1.0)
     out["exhausted"] = used >= size or float(st.get("spent") or 0) == out["reset"]   # the reserve is the margin for runs in flight and the band pacing tracks in
     out["ahead"] = (used - budget * gone) / budget if budget > 0 else 1.0

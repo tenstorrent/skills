@@ -172,10 +172,14 @@ def test_glm_quota_without_a_limit_paces_on_the_tokens_counted_when_a_quota_429_
 def test_glm_quota_429_that_names_its_window_rolls_windows_on_it(monkeypatch, tmp_path):
     from ttp import glmquota
     _gq_home(monkeypatch, tmp_path)
-    cfg = {"providers": {"chat": {"endpoint": "cloud"}}}
+    cfg = {"providers": {"chat": {"endpoint": "cloud", "quota": {"size": 60_000_000}}}}
     got = glmquota.parse('{"error": {"code": "quota_exceeded", "message": "per minute limit exceeded"}}')
     assert got == {"window_s": 60}
     glmquota.sync("cloud", got, now=_GQ_HOUR + 120, spent=True)
     glmquota.add("cloud", 1_000_000, now=_GQ_HOUR + 121)
     assert glmquota.view(cfg, _GQ_HOUR + 122)["used"] == 1_000_000
     assert glmquota.view(cfg, _GQ_HOUR + 181)["used"] == 0, "the 429's own minute window rolled"
+    glmquota.add("cloud", 1_000_000, now=_GQ_HOUR + 240)   # minute 4: its own fresh window
+    v = glmquota.view(cfg, _GQ_HOUR + 250)
+    assert v["used"] == 1_000_000 and -0.16 < v["ahead"] < -0.13, (v, "ahead on the 429's minute window")
+    assert glmquota.view(cfg, _GQ_HOUR + 301)["used"] == 0, "the second rollover on the 429's window"
