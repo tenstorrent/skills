@@ -11212,11 +11212,10 @@ class Daemon:
     def _lock_holders(self, res: str, tid: int) -> list[dict]:
         """The holders of `res`'s `ttp lock` slots other than task `tid`'s own hold (check_lock_yield's
         form)."""
-        out = []
+        base, out = os.path.realpath(self.p.base), []
         for h in self._other_holder_records(res, tid):
             root = h.get("project_root")
-            own = os.path.realpath(root) == os.path.realpath(self.p.base) if root \
-                else str(h.get("project") or "") == self.p.name
+            own = os.path.realpath(root) == base if root else str(h.get("project") or "") == self.p.name
             task = int(h["task_id"]) if own and str(h.get("task_id") or "").isdigit() else None
             run = int(h["run_id"]) if task and str(h.get("run_id") or "").isdigit() else None
             label = f"#{task}" if task else str(h.get("holder") or "a holder")
