@@ -616,22 +616,106 @@ XARGS_LONG_WITH_VALUE = ("--arg-file", "--delimiter", "--max-args", "--max-procs
 SCRIPT_MAX_BYTES = 1 << 20
 
 
-def _api_draft_change(text: str, full: str = "") -> bool:
+# Fully literal shell text: bare words from a fixed safe set, single-quoted spans (any content) and double-quoted
+# spans with nothing the shell expands; no expansion, redirect, pipe, glob, comment, tilde or escape is possible
+LITERAL_RE = re.compile(r"""(?:[A-Za-z0-9 _./:=@,+%^-]|'[^']*'|"[^"$`\\!]*")*""")
+
+
+def _literal_argv(core: str) -> list[str] | None:
+    """The words of `core` when the whole text is literal (LITERAL_RE) and no leading word is a NAME=value
+    assignment, as bash would split it; else None, and the caller judges the command as if unread."""
+    if not LITERAL_RE.fullmatch(core):
+        return None
+    words = shlex.split(core)
+    if words and re.match(r"[A-Za-z_]\w*=", words[0]):
+        return None
+    return words
+
+
+# curl options that only shape a read: flags, and options whose value is the next word (or the rest of a short one)
+CURL_READ_FLAGS = {"-s", "-S", "-L", "-f", "-i", "-k", "-v", "-I", "--compressed", "--fail", "--silent",
+                   "--show-error", "--location", "--include", "--head"}
+CURL_READ_VALUED = {"-m", "--max-time", "--connect-timeout", "--retry", "-o", "--output", "-D", "--dump-header",
+                    "-H", "--header", "-w", "--write-out", "-A", "--user-agent", "-X", "--request"}
+
+
+def _curl_read(argv: list[str]) -> bool:
+    """A literal `curl` argv that can only read: every option is a read-only one (no body, form, upload or config
+    file), a method is GET or HEAD, no header is read from a file or overrides the method, and no URL is GraphQL."""
+    if not argv or argv[0] != "curl":
+        return False
+    words, i = argv[1:], 0
+    while i < len(words):
+        w = words[i]
+        i += 1
+        if not w.startswith("-") or w == "-":
+            if "graphql" in w.lower():
+                return False
+            continue
+        if w.startswith("--"):
+            name, eq, value = w.partition("=")
+            if name in CURL_READ_FLAGS and not eq:
+                continue
+            if name not in CURL_READ_VALUED:
+                return False
+            if not eq:
+                if i >= len(words):
+                    return False
+                value, i = words[i], i + 1
+            opts = [(name, value)]
+        else:
+            opts, j = [], 1
+            while j < len(w):
+                o = "-" + w[j]
+                if o in CURL_READ_FLAGS:
+                    j += 1
+                    continue
+                if o not in CURL_READ_VALUED:
+                    return False
+                value = w[j + 1:]
+                if not value:
+                    if i >= len(words):
+                        return False
+                    value, i = words[i], i + 1
+                opts.append((o, value))
+                break
+        for name, value in opts:
+            if name in ("-X", "--request") and value not in ("GET", "HEAD"):
+                return False
+            if name in ("-H", "--header") and (value.startswith("@") or "override" in value.lower()):
+                return False
+    return True
+
+
+def _write_match(text: str, reads: list[tuple[int, int]] = ()) -> bool:
+    """A WRITE_RE match in `text` that does not lie wholly inside one of the `reads` spans (_read_spans)."""
+    return any(not any(a <= m.start() and m.end() <= b for a, b in reads) for m in WRITE_RE.finditer(text))
+
+
+def _read_spans(text: str) -> list[tuple[int, int]]:
+    """The spans of `text`'s top-level commands that are a fully literal read-only curl (_curl_read): a write
+    match inside one (`-D headers.txt`, a dump-header file) is no write; one that runs across them still is."""
+    return [(a, b) for a, b, _ in _pieces(text) if _curl_read(_literal_argv(text[a:b].strip()) or [])]
+
+
+def _api_draft_change(text: str, full: str = "", reads: list[tuple[int, int]] = ()) -> bool:
     """An HTTP client sending a request to the GitHub API that creates a PR or takes one out of draft.
     The client and the API are looked for in `text` (what runs); the draft change may also sit in a
-    body the same command writes (`full`) when the request sends data: `curl ... -d @q.json`."""
+    body the same command writes (`full`) when the request sends data: `curl ... -d @q.json`. A write
+    form inside a literal read-only curl (`reads`, _read_spans) is no write."""
     api = GITHUB_API_RE.search(text) or (TOKEN_API_RE.search(text) and API_PATH_RE.search(text))
-    write = WRITE_RE.search(text)
+    write = _write_match(text, reads)
     change = DRAFT_CHANGE_RE.search(text) or (write and (PULLS_RE.search(text) or DRAFT_CHANGE_RE.search(full)))
     return bool(api and change and HTTP_CLIENT_RE.search(text))
 
 
-def api_ref_write(text: str) -> bool:
+def api_ref_write(text: str, reads: list[tuple[int, int]] = ()) -> bool:
     """An HTTP client sending a write to a GitHub API route that moves refs, tags, releases or file
-    contents (credguard), or a GraphQL ref mutation."""
+    contents (credguard), or a GraphQL ref mutation. A write form inside a literal read-only curl
+    (`reads`, _read_spans) is no write."""
     from .credguard import REF_MUTATION_RE, REF_URL_RE
     api = GITHUB_API_RE.search(text) or (TOKEN_API_RE.search(text) and API_PATH_RE.search(text))
-    write = WRITE_RE.search(text) or re.search(r"(?:-X\s*|--request[\s=]+|--method[\s=]+|method\s*[=:]\s*)[\"']?"
+    write = _write_match(text, reads) or re.search(r"(?:-X\s*|--request[\s=]+|--method[\s=]+|method\s*[=:]\s*)[\"']?"
                                                r"DELETE\b|\.delete\s*\(", text, re.I)
     change = (write and REF_URL_RE.search(text)) or REF_MUTATION_RE.search(text)
     return bool(api and change and HTTP_CLIENT_RE.search(text))
@@ -1057,10 +1141,11 @@ def draft_bypass(text: str, path_changed: bool = False, trusted: bool = True) ->
             and (GH_ARGV_RE.search(text) or _gh_writes(commands, text))):
         return ("call gh by its name, with PATH as the run set it: the harness's gh comes first and checks "
                 "that a PR leaves draft only with the user's recorded approval")
-    if _api_draft_change(text, full):
+    reads = _read_spans(text)
+    if _api_draft_change(text, full, reads):
         return ("create or update PRs with gh, not a direct GitHub API call: a PR leaves draft only with "
                 "the user's recorded approval")
-    if api_ref_write(text):
+    if api_ref_write(text, reads):
         from .credguard import REF_WHY
         return REF_WHY.removeprefix("refused: ")
     return None

@@ -635,3 +635,60 @@ def test_worker_agent_env_holds_the_gh_token_behind_the_wrapper(env, monkeypatch
     seen = dict(line.split("=", 1) for line in (run / "agent-env.txt").read_text().splitlines() if "=" in line)
     assert "GH_TOKEN" not in seen and seen.get("GH_CONFIG_DIR") == str(run / "gh-empty"), seen.get("GH_CONFIG_DIR")
     assert seen.get("TTP_RUN_BIN") == str(p.harness / "bin") and seen.get("ZDOTDIR") == str(run / "zdotdir")
+
+
+# A write form that runs across two commands (a header option whose value is the next line's write) is still a
+# write: only a match wholly inside one literal read-only curl is excused
+API = "https://api." + "github.com/repos/o/r/"
+SPLIT_REPROS = ("curl -s " + API + "pulls/1 -H -X\nPUT -c application/json " + API + "pulls/1/merge",
+                "curl -s " + API + "git/refs/heads/main -H --request\nPOST -c application/json " + API + "git/refs")
+
+
+def test_split_write_forms_stay_refused_through_the_hook(tmp_path, monkeypatch):
+    from ttp import hook
+    monkeypatch.setenv("TTP_RUN_DIR", str(tmp_path))
+    for cmd in SPLIT_REPROS:
+        out = hook._pre_tool_use({"tool_name": "Bash", "tool_input": {"command": cmd}, "cwd": str(tmp_path)})[0]
+        assert out and out["hookSpecificOutput"]["permissionDecision"] == "deny", cmd
+
+
+def test_draft_guard_passes_a_literal_read_only_curl():
+    from ttp import hook
+    reads = ("curl -sS -m 30 -D /tmp/d/pr.hdr -o /tmp/d/pr.json -H 'Accept: application/vnd.github+json' "
+             + API + "pulls/1",
+             "mkdir -p /tmp/d && curl -fsSL -X GET -D- " + API + "pulls/1; grep -c x /tmp/d/pr.hdr")
+    for cmd in reads:
+        assert hook.draft_bypass(cmd) is None, cmd
+    writes = ("curl -s -D h -X POST " + API + "pulls",
+              "curl -s -D h -d @b.json " + API + "pulls/1",
+              "curl -s -D h -XPATCH " + API + "pulls/1",
+              "curl -s -D h --request=PUT " + API + "pulls/1/merge",
+              "curl -s -D h -H 'X-HTTP-Method-Override: PATCH' " + API + "pulls/1",
+              "curl -s -D h -H @hdrs " + API + "pulls/1",
+              "curl -s -D h -K cfg " + API + "pulls/1",
+              "curl -s -D h -F draft=false " + API + "pulls/1",
+              "curl -s -D \"$H\" -X PATCH " + API + "pulls/1",
+              "curl -s -D h " + API + "pulls/1; curl -X PATCH " + API + "pulls/1")
+    for cmd in writes:
+        assert hook.draft_bypass(cmd), cmd
+    assert hook.api_ref_write("curl -s -D h -X PATCH " + API + "git/refs/heads/main")
+    assert not hook.api_ref_write("curl -s -D h " + API + "git/refs/heads/main", hook._read_spans(
+        "curl -s -D h " + API + "git/refs/heads/main"))
+
+
+def test_literal_argv_splits_like_bash(tmp_path):
+    """Every text the literal test accepts splits into the words bash itself passes; the rest are refused."""
+    import subprocess
+    from ttp import hook
+    accepted = ["curl -s https://api.github.com/repos/o/r/pulls/1", "a  b", "", "x", "-w '%{http_code}' -H 'A: $B `c` \\'",
+                "'a'\"b\"c", "\"\" ''", "\"a b\"'c d'e", "a,b+c%d^e@f:g/h.i_j-k=l", "'#' \"x'y\" 'p\"q' \"#\"'!'",
+                "'*' '?' '~' '[a]' '{a,b}' '$(x)' '<' '|' ';' '&'", "-x=y"]
+    refused = ["$A", "a\\ b", "a>b", "a|b", "a;b", "a&b", "(a)", "{a,b}", "a*", "a?", "~", "[a]", "!a", "a #b", "a\tb",
+               "a\nb", "a\rb", "\"$A\"", "\"`a`\"", "\"a\\b\"", "\"!a\"", "'a", "\"a", "é", "A=1 b", "a<b", "`a`"]
+    for text in accepted:
+        words = hook._literal_argv(text)
+        out = subprocess.run(["bash", "--noprofile", "--norc", "-c", "printf '%s\\0' " + text], env={}, cwd=tmp_path,
+                             capture_output=True, check=True).stdout
+        assert words is not None and words == (out.decode().split("\0")[:-1] if words else []), text
+    for text in refused:
+        assert hook._literal_argv(text) is None, text
