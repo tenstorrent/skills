@@ -84,6 +84,7 @@ CONFIG_OPTIONS = {"kubectl": "--kubeconfig", "helm": "--kubeconfig", "k9s": "--k
                   "docker": "--config"}
 CONFIG_VARS = ("KUBECONFIG=", "DOCKER_CONFIG=", "AWS_SHARED_CREDENTIALS_FILE=", "CLOUDSDK_CONFIG=",
                "AZURE_CONFIG_DIR=", "GOOGLE_APPLICATION_CREDENTIALS=", "GH_CONFIG_DIR=")
+CWDS_CAP = 64   # the folders _cwds follows; a command reaching more is read from HOME too (a full list)
 SSH_FAMILY = {"ssh", "scp", "sftp", "autossh", "ssh-copy-id"}
 OPTION_VALUE_RE = re.compile(r"-\w.")   # `-C~`: an option with its value joined on
 # The ssh -o option that names a key ssh reads itself
@@ -529,6 +530,8 @@ def _cwds(segments: list[list[str]], cwd: str, home: str) -> list[str]:
 
     def add(*places):   # each folder once: a long command (a heredoc's many words) never grows the list per word
         new = [p for p in dict.fromkeys(places) if p not in cwds[1:]]
+        if len(cwds) + len(new) > CWDS_CAP:   # alternating relative cds double the list: at the cap, the rest is
+            new = new[:CWDS_CAP - len(cwds)] + [home] * (home not in cwds[1:])   # read from HOME, as for `cd $D`
         cwds.extend(new)
         if new:
             seen.clear()

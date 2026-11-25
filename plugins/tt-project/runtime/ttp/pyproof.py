@@ -292,6 +292,8 @@ def rewrite(cmd: str, cwd: str, env=None) -> str | None:
     moves = any(argv and (os.path.basename(argv[0]) in ("cd", "pushd", "popd")
                           or any(w.startswith(("-C", "--chdir")) for w in argv)) for argv in segments)
     bases = credguard._cwds(segments, cwd, str(env.get("HOME") or os.path.expanduser("~"))) if moves else None
+    if bases and len(bases) >= credguard.CWDS_CAP:   # more folders than the guard follows: no proof
+        return None
     out, changed, pending, shell, hidden = [], False, [], [], False
     for line in cmd.split("\n"):
         if pending:
