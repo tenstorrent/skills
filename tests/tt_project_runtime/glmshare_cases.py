@@ -143,6 +143,17 @@ def _gs_waved(p, now, glm_passed=(1, 1, 1, 1)):
     return t0, [_gs_decided(p, t0 + 3600 * (i + 1), ok, arm="glm") for i, ok in enumerate(glm_passed)]
 
 
+def _gs_code_arm(p, start, passed, arm="glm", ts=None):
+    """A decided code-arm task: a code_arm record, one worker run and its first review."""
+    from ttp import codearm
+    tid = _gs_task(p)
+    p.db.set_kv(f"{codearm.ARM_KV}{tid}", {"arm": arm, "why": "coin at share 0.5", "ts": ts or start})
+    _gs_run(p, tid, start, 1, provider="chat" if arm == "glm" else "claude",
+            model=_GS_GLM if arm == "glm" else "claude-sonnet")
+    _gs_review(p, tid, "done" if passed else "failed")
+    return tid
+
+
 def _gs_verdict(v, name):
     return next(s["verdict"] for s in v["signals"] if s["signal"] == name)
 
@@ -453,3 +464,37 @@ def test_glm_share_bounces_a_live_fix_covers_no_longer_count_toward_the_rollback
     code, out = _roll(capsys, "fixed", "glm_work", target.name, "--fix", str(fix), "--runs", ",".join(map(str, bounced)))
     v = glmshare.judge(target, _GS_CFG, now)
     assert code == 0 and v["state"] != "worse" and f"2 stops not counted: fixed by task #{fix}" in v["why"], (out, v)
+
+
+def test_the_glm_code_judge_rolls_back_a_clearly_worse_code_arm_and_leaves_the_work_judge_alone(env):
+    from ttp import glmshare
+    p = make(env)
+    now = 1_000_000_000.0 + 60 * 86400
+    t0 = now - 5 * 86400
+    for _ in range(4):     # the Claude baseline: sonnet-arm code tasks, all passing
+        _gs_code_arm(p, t0 - 3 * 86400, 1, arm="sonnet")
+    for _ in range(4):     # the GLM arm: every task failing its first review
+        _gs_code_arm(p, t0 + 3600, 0, arm="glm")
+    v = glmshare.judge_code(p, _GS_CFG, now)
+    assert v["state"] == "worse", v
+    assert "worse than the Claude baseline past the rollback margin: first review pass rate" in v["why"]
+    assert {s["signal"] for s in v["signals"]} == {"first review pass rate", "bounce rate", "tasks done per day"}
+    assert _gs_verdict(v, "first review pass rate") == "worse"
+    # glm_work's own judge is untouched: it still waits on the work arms, not the code arms
+    w = glmshare.judge(p, _GS_CFG, now)
+    assert (w["state"], w["why"]) == ("wait", "not enough data: no glm_work arm records yet")
+
+
+def test_the_glm_code_judge_keeps_a_code_arm_that_matches_its_claude_baseline(env):
+    from ttp import glmshare
+    p = make(env)
+    now = 1_000_000_000.0 + 60 * 86400
+    t0 = now - 5 * 86400
+    for _ in range(4):
+        _gs_code_arm(p, t0 - 3 * 86400, 1, arm="sonnet")
+    for _ in range(4):
+        _gs_code_arm(p, t0 + 3600, 1, arm="glm")
+    v = glmshare.judge_code(p, _GS_CFG, now)
+    assert v["state"] == "ok", v
+    assert v["why"].startswith("within every advance margin of the Claude baseline")
+    assert "first review pass rate GLM 100 vs Claude 100, level, within the margins" in v["why"]

@@ -881,6 +881,32 @@ def test_a_worse_project_is_rolled_back_alone_and_the_terminal_rearms_it(env, ca
     assert rollout.frozen("glm_work") is None
 
 
+def test_a_worse_glm_code_project_is_rolled_back_alone_with_its_rearm_line(env, capsys):
+    """The glm_code flag's own rollback: its judge reads the code-arm records, and only its own flag moves."""
+    from ttp import rollout
+    p = make(env, "alpha")
+    _roll(capsys, "waves", "glm_code", "alpha")
+    _roll(capsys, "set", "glm_code", "auto")
+    p.set_config("route.glm_work", {"min_tasks": 4, "min_base": 4})
+    now = time.time()
+    t0 = now - 5 * 86400
+    for _ in range(4):
+        _gs_code_arm(p, t0 - 3 * 86400, 1, arm="sonnet")
+    for _ in range(4):
+        _gs_code_arm(p, t0 + 3600, 0, arm="glm")
+    projs = {"alpha": p}
+    recs = rollout.wave_tick(now, None, projs)
+    assert [(r["op"], r["flag"], r["project"]) for r in recs] == [("project_rollback", "glm_code", "alpha")], recs
+    assert not rollout.on("glm_code", "alpha", p.raw_config()) and rollout.level("glm_code") == "auto"
+    out = _roll(capsys, "status")[1]
+    assert "rolled back in alpha alone: worse than the Claude baseline past the rollback margin" in out
+    assert "`ttp rollout arm glm_code alpha`" in out
+    assert "re-armed in alpha" in _roll(capsys, "arm", "glm_code", "alpha")[1]
+    assert rollout.on("glm_code", "alpha", p.raw_config())
+    recs = rollout.wave_tick(now + 3600, None, projs)   # the re-armed project is judged again, on a new window
+    assert recs == [] or all(r["op"] != "project_rollback" for r in recs)
+
+
 def test_a_rollback_record_carries_both_pass_rates_and_the_baseline_window(env, capsys, tmp_path):
     from ttp import rollout
     _roll(capsys, "waves", "glm_work", "alpha")

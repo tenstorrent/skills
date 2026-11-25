@@ -53,8 +53,10 @@ def _code(*names: str) -> tuple[str, ...]:
 
 
 FLAGS: dict[str, dict[str, Any]] = {
+    # `judge`: the wave gate judges the flag with the named judge (wave_tick). glm_code's code-arm records
+    # (codearm.ARM_KV) are judged by glmshare.judge_code: the code route's own rollback metrics.
     "glm_code": {"key": "route.code_sonnet.glm_share", "area": "route", "code": _code("codearm.py"), "waves": True,
-                 "arm": "glm"},
+                 "judge": "codearm", "arm": "glm"},
     # The project's routed work on GLM (glmwork.py); `waves`: it may run at auto, judged by glmshare.judge.
     "glm_work": {"key": "route.glm_work.on", "area": "route", "code": _code("glmwork.py", "codearm.py", "daemon.py"),
                  "waves": True, "arm": "glm"},
@@ -600,7 +602,7 @@ def _wave_state() -> dict:
 
 def wave_tick(now: float | None = None, judge=None, projects: dict | None = None, by: str = "daemon") -> list[dict]:
     """The wave gate, model-free: for each flag at auto not judged in the last hour, judge each project of its
-    covered waves (`judge(p, cfg, now)`: glmshare.judge, ok | worse | wait). A worse one is rolled back for that
+    covered waves (`judge(p, cfg, now)`: the flag's own judge, ok | worse | wait). A worse one is rolled back for that
     flag alone (the others stay); when every project left in the current wave is ok (and none went worse), the
     next wave opens. The ledger records each move; returns those records. The hour limit and the lock make a
     call from every project's daemon safe; judging runs outside the lock."""
@@ -625,7 +627,8 @@ def wave_tick(now: float | None = None, judge=None, projects: dict | None = None
         verdicts: dict[str, dict] = {}
         try:
             from . import deviceplan, glmshare
-            fj = judge or (deviceplan.judge if FLAGS.get(flag, {}).get("judge") == "deviceplan" else glmshare.judge)
+            judges = {"deviceplan": deviceplan.judge, "codearm": glmshare.judge_code}
+            fj = judge or judges.get(FLAGS.get(flag, {}).get("judge"), glmshare.judge)
         except ImportError:
             continue
         for name in (n for w in ws[:k + 1] for n in w if n not in excl and n not in back):

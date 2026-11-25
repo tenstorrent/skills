@@ -49,6 +49,8 @@ setting is under `route.glm_work` (settings()); a signal is "worse by" the gap i
   before it (a percent drop, `hold_done_pct` HOLD_DONE_PCT; needs `min_base` tasks before) and user corrections
   in the last CORR_DAYS days (more than `hold_corrections` HOLD_CORRECTIONS). Both are per project and move with
   the user's own workload, so they hold a wave but never roll one back.
+- glm_code (judge_code): the same judge over the code arm's own records (codearm.ARM_KV), on its three
+  metrics alone: first review pass rate, bounce rate and tasks done per day.
 - Reported only: Claude $/day and bad output by day (report()).
 The verdict lists each signal ("signals": glm, base, worse_by, verdict ok | hold | worse | unmeasured).
 
@@ -84,6 +86,9 @@ GATED = (("first review pass rate", "first_pass_pct", False, "advance_pts", "rol
          ("failed or reopened rate", "bad_pct", True, "advance_pts", "rollback_pts"),
          ("fix rounds per reviewed task", "fix_rounds_per_reviewed", True, "advance_rounds", "rollback_rounds"),
          ("bounce rate", "bounce_pct", True, "advance_bounce_pts", "rollback_bounce_pts"))
+CODE_METRICS = frozenset(("first review pass rate", "bounce rate", "tasks done per day"))
+   # the glm_code flag gates on these alone (glmshare.judge_code): the code route's own quality, not the
+   # work route's bad-output or fix-round signals
 REVIEW_KEYS = ("first_pass_pct", "fix_rounds_per_reviewed")   # need min_base reviewed tasks in each arm
 CHUNK = 500
 BAD_KEYS = ("tool_input_errors", "args_unparsed", "args_repaired", "empty_content", "junk_responses")
@@ -626,30 +631,44 @@ def _failing_first(sig: list[dict]) -> list[dict]:
 def judge(p, cfg: dict, now: float) -> dict:
     """{"state": "ok" | "worse" | "wait", "why", "n", "signals"}: the project's GLM arm against its own Claude
     baseline (the module doc); n is the GLM tasks with an outcome."""
+    return _judge_arms(p, cfg, now, arm_records(p.db), ("glm_work", "glm_code"), None,
+                       "no glm_work arm records yet")
+
+
+def judge_code(p, cfg: dict, now: float) -> dict:
+    """The glm_code flag's judge: the project's code-arm tasks (codearm's records) against its own Claude
+    baseline on the metrics the flag owns: first review pass rate, bounce rate and tasks done per day."""
+    return _judge_arms(p, cfg, now, arm_records(p.db, CODE_ARM_KV), ("glm_code",), CODE_METRICS,
+                       "no glm_code arm records yet")
+
+
+def _judge_arms(p, cfg: dict, now: float, recs: dict, flags: tuple, metrics, none_why: str) -> dict:
+    """The wave gate judges shared by glm_work and glm_code: `recs` are the arm records judged, `flags` the
+    rollout flags whose re-arms and fixed stops reset the window, `metrics` (None: every signal) the signals
+    that gate, `none_why` the wait reason without records."""
     from . import correction, deviceplan, rollout
     db, st = p.db, settings(cfg)
-    recs = arm_records(db)
     if not recs:
-        return {"state": "wait", "why": "not enough data: no glm_work arm records yet", "n": 0, "signals": []}
+        return {"state": "wait", "why": f"not enough data: {none_why}", "n": 0, "signals": []}
     t0 = min(float(r.get("ts") or now) for r in recs.values())
     since = t0 - BASE_DAYS * 86400
     pre, post = _first_runs(db, since, t0), _first_runs(db, t0, now)
     ids = set(recs) | pre | post
     tasks, runs = _tasks(db, ids), _worker_runs(db, ids)
     work = lambda ts: [t for t in ts if (tasks.get(t) or {}).get("kind") != "review"]   # noqa: E731
-    armed = rollout.armed_at(getattr(p, "name", ""), "glm_work", "glm_code")   # a re-arm starts a new window
+    armed = rollout.armed_at(getattr(p, "name", ""), *flags)   # a re-arm starts a new window
     device = lambda t: deviceplan.device(tasks.get(t) or {}, cfg)   # noqa: E731
     glm = [t for t, r in recs.items() if r.get("arm") == "glm" and float(r.get("ts") or now) >= armed]
     dev_glm = [t for t in glm if device(t)]   # device runs are judged by glm_device's own judge: only incidents count here
     glm = [t for t in glm if t not in dev_glm]
-    cand = [t for t, r in recs.items() if r.get("arm") == "holdout" and not device(t)] + [
+    cand = [t for t, r in recs.items() if r.get("arm") != "glm" and not device(t)] + [
         t for t in work(pre | post) if t not in recs and runs.get(t) and not device(t)
         and not on_glm(runs[t][0]["provider"], runs[t][0]["model"], runs[t][0]["note"])]
     ctx = (_reviews(db, since), _fix_rounds(db, since), _requeued(db, since))
     w0 = max(t0, armed)   # the GLM window being judged: the baseline is Claude's outcomes from the same period
     base, lo = base_window(cand, tasks, runs, ctx[0], w0, since, st["min_window"])
     days = max((now - t0) / 86400, 1e-9)
-    fixed = rollout.fixed_stops(getattr(p, "name", ""), "glm_work", "glm_code")
+    fixed = rollout.fixed_stops(getattr(p, "name", ""), *flags)
     g = quality(db, cfg, glm, tasks, runs, *ctx, days, now, fixed)
     g["incidents"] += _incidents(db, cfg, [r for t in dev_glm for r in runs.get(t, [])
                                            if on_glm(r["provider"], r["model"], r["note"])], tasks, now)
@@ -659,6 +678,8 @@ def judge(p, cfg: dict, now: float) -> dict:
     corr = sum(1 for c in (db.kv(correction.KEY, []) or [])
                if isinstance(c, dict) and now - CORR_DAYS * 86400 <= float(c.get("ts") or 0) < now)
     sig = signals(g, b, before, after, corr, st)
+    if metrics is not None:
+        sig = [s for s in sig if s["signal"] in metrics]
     n = g["decided"]
     frm = datetime.datetime.fromtimestamp(lo, datetime.timezone.utc)
     nums = (f"GLM {n} tasks with an outcome; Claude baseline {b['decided']} with an outcome since "
