@@ -211,15 +211,18 @@ def _on_branch(repo: Path, sha: str, tip: str) -> bool | None:
 
 # A revert's message: git revert's own line, or the push queue's range revert (postland.revert)
 _REVERTS = re.compile(r"^(?:This reverts commit ([0-9a-f]{7,64})|Reverts ([0-9a-f]{7,64})\.\.([0-9a-f]{7,64}))", re.M)
+# A commit that puts a reverted change back by name: "Re-apply A..B (...)" or "Re-apply <sha>"
+_REAPPLIES = re.compile(r"^Re-apply ([0-9a-f]{7,64})(?:\.\.([0-9a-f]{7,64}))?", re.M)
 _reverted: dict[tuple[str, str, str], str] = {}
 
 
 def reverted_by(repo: Path, sha: str, tip: str) -> str | None:
     """The commit on `tip` that took ancestor `sha`'s change out of it, or "": a later commit (sha..tip) says
     it reverts `sha` (git revert's "This reverts commit <sha>", or the push queue's "Reverts A..B" range
-    holding it) and `sha`'s diff no longer reverse-applies to `tip`'s tree (a re-applied change does). A
-    later edit with no revert naming it, a merge, an empty diff or a non-ancestor reads "". None when a git
-    read failed. Kept per (commit, tip): commits never change under their ids."""
+    holding it), that revert still stands (_undone: no later commit put the change back) and `sha`'s diff
+    no longer reverse-applies to `tip`'s tree (a re-applied change does). A later edit with no revert naming
+    it, a merge, an empty diff or a non-ancestor reads "". None when a git read failed. Kept per (commit, tip):
+    commits never change under their ids."""
     full, top = _commit(repo, sha), _commit(repo, tip)
     if not full or not top:
         return None
@@ -234,26 +237,83 @@ def reverted_by(repo: Path, sha: str, tip: str) -> str | None:
     return _reverted[key]
 
 
-_revert_logs: dict[tuple[str, str], list[tuple[str, list]]] = {}
+_revert_logs: dict[tuple[str, str], list[tuple[str, list, list]]] = {}
 _ranges: dict[tuple[str, str, str], frozenset] = {}
 
 
-def _revert_log(repo: Path, tip: str) -> list[tuple[str, list]] | None:
-    """[(revert commit, its _REVERTS matches)] for every revert in `tip`'s history: one git log per tip,
-    shared by every commit checked against it. None when git failed."""
+def _revert_log(repo: Path, tip: str) -> list[tuple[str, list, list]] | None:
+    """[(commit, its _REVERTS matches, its _REAPPLIES matches as (sha, start, end))] for every revert or
+    re-apply in `tip`'s history, newest first: one git log per tip, shared by every commit checked against
+    it. None when git failed."""
     key = (str(repo), tip)
     if key not in _revert_logs:
-        log = _git(repo, "log", "-E", "--grep=^(This reverts commit|Reverts [0-9a-f]+\\.\\.)",
+        log = _git(repo, "log", "-E", "--grep=^(This reverts commit|Reverts [0-9a-f]+\\.\\.|Re-apply [0-9a-f])",
                    "--format=%H%x00%B%x01", tip, timeout=60)
         if log.returncode != 0:
             return None
         if len(_revert_logs) >= 64:
             _revert_logs.clear()
             _ranges.clear()
-        _revert_logs[key] = [(rev, found) for rec in log.stdout.split("\x01")
+        _revert_logs[key] = [(rev, found, back) for rec in log.stdout.split("\x01")
                              for rev, _, body in [rec.strip("\n").partition("\0")]
-                             if rev and (found := _REVERTS.findall(body))]
+                             if rev and ((found := _REVERTS.findall(body)) +
+                                         (back := [("", a, b) if b else (a, "", "")
+                                                   for a, b in _REAPPLIES.findall(body)]))]
     return _revert_logs[key]
+
+
+def _names(repo: Path, found: list, sha: str) -> bool:
+    """Whether `found` ((sha, start, end) matches of a revert or re-apply message) names commit `sha`: by its
+    id, or a range A..B holding it. A range that cannot resolve (shas a rewrite, another fork or a typo left
+    behind) names no commit we can know, so one bad record cannot poison every check at a tip."""
+    for one, start, end in found:
+        if one and sha.startswith(one):
+            return True
+        if start and end:
+            key = (str(repo), start, end)
+            if key not in _ranges:
+                inside = _git(repo, "rev-list", f"{start}..{end}")
+                _ranges[key] = frozenset(inside.stdout.split()) if inside.returncode == 0 else frozenset()
+            if sha in _ranges[key]:
+                return True
+    return False
+
+
+def _stands(repo: Path, log: list, rev: str) -> bool:
+    """Whether revert or re-apply `rev` still holds on the tip `log` was read from: no later revert naming
+    it (git's "This reverts commit <rev>", or a push queue range holding it) still holds itself."""
+    return not any(c != rev and _names(repo, found, rev) and _stands(repo, log, c) for c, found, _ in log)
+
+
+def _undone(repo: Path, log: list, rev: str, sha: str, tip: str) -> bool:
+    """Whether a commit after revert `rev` on `tip` put `sha`'s change back, and still holds: a revert of
+    `rev`, a "Re-apply" naming `sha` or its range, or a commit with `sha`'s patch-id (a cherry-picked
+    re-land). A git read that fails finds none: the revert stands and _present decides."""
+    if not _stands(repo, log, rev):
+        return True
+    if any(_names(repo, back, sha) and _stands(repo, log, c)
+           and _git(repo, "merge-base", "--is-ancestor", rev, c).returncode == 0 for c, _, back in log):
+        return True
+    paths = [f":(literal){f}" for f in _git(repo, "diff-tree", "-z", "--no-commit-id", "--name-only", "-r",
+                                            "--root", sha).stdout.split("\0") if f]
+    if not paths:
+        return False
+    own = _patch_ids(repo, "-1", sha).get(sha)
+    twins = _patch_ids(repo, "--no-merges", "--full-diff", f"{rev}..{tip}", "--", *paths) if own else {}
+    return any(pid == own and c != sha and _stands(repo, log, c) for c, pid in twins.items())
+
+
+def _patch_ids(repo: Path, *args: str) -> dict[str, str]:
+    """{commit: stable patch-id} of the commits `git log <args>` lists; {} when git failed."""
+    log = _git(repo, "log", "-p", "--no-color", "--no-ext-diff", "--format=commit %H", *args, timeout=60)
+    if log.returncode != 0 or not log.stdout:
+        return {}
+    try:
+        r = subprocess.run(["git", "-C", str(repo), "patch-id", "--stable"], input=log.stdout, text=True,
+                           capture_output=True, timeout=60, env={**os.environ, "GIT_TERMINAL_PROMPT": "0"})
+    except (OSError, subprocess.SubprocessError):
+        return {}
+    return {c: pid for ln in r.stdout.splitlines() if len(parts := ln.split()) == 2 for pid, c in [parts]}
 
 
 def _reverted_by(repo: Path, sha: str, tip: str) -> str | None:
@@ -262,20 +322,8 @@ def _reverted_by(repo: Path, sha: str, tip: str) -> str | None:
     log = _revert_log(repo, tip)
     if log is None:
         return None
-    hits = []
-    for rev, found in log:
-        for one, start, end in found:
-            if one and sha.startswith(one):
-                hits.append(rev)
-            elif start and end:
-                key = (str(repo), start, end)
-                if key not in _ranges:
-                    inside = _git(repo, "rev-list", f"{start}..{end}")
-                    # a range that cannot resolve (shas a rewrite, another fork or a typo left behind) names
-                    # no commit we can know: it skips, so one bad record cannot poison every check at this tip
-                    _ranges[key] = frozenset(inside.stdout.split()) if inside.returncode == 0 else frozenset()
-                if sha in _ranges[key]:
-                    hits.append(rev)
+    # only a revert that still stands (no later commit put the change back) reaches the reverse-apply check
+    hits = [rev for rev, found, _ in log if _names(repo, found, sha) and not _undone(repo, log, rev, sha, tip)]
     if not hits:
         return ""
     return None if (present := _present(repo, sha, tip)) is None else ("" if present else hits[0])
@@ -547,15 +595,30 @@ def recorded(db, tid: int, carry: dict | None = None, rows: Rows | None = None) 
     hits = [r for r in landings if r["task"] in carry and r["sha"] not in gone]
     if hits:
         return list(dict.fromkeys(r["sha"] for r in hits)), via("its detached push landing", hits[-1]["task"])
+    if found := _superseding(db, carry, gone, rows):
+        return [r["sha"] for r in found], via(SUPERSEDING, found[-1]["task"])
+    return [], ""
+
+
+SUPERSEDING = "the commit recorded as superseding it"
+
+
+def _superseding(db, carry: dict, gone: set[str], rows: Rows | None) -> list[dict]:
+    """The `ttp task superseded` records (task, head, sha) of the tasks in `carry`, oldest first, whose drop
+    verdict does not stand (`gone`)."""
     if rows is None:
         found = db.q("SELECT task, head, sha FROM task_superseded WHERE task IN (%s) ORDER BY ts"
                      % ",".join("?" * len(carry)), list(carry))
     else:
         found = [r for r in rows.superseded if r["task"] in carry]
-    found = [r for r in found if r["sha"] not in gone]
-    if found:
-        return [r["sha"] for r in found], via("the commit recorded as superseding it", found[-1]["task"])
-    return [], ""
+    return [r for r in found if r["sha"] not in gone]
+
+
+def superseding_on(p, repo: Path, tid: int, tip: str, rows: Rows | None = None) -> list[str]:
+    """The commits recorded as superseding task `tid` (or a task carrying it on) that are on `tip`."""
+    carry = carriers(p.db, tid, rows)
+    found = _superseding(p.db, carry, _gone_shas(p.db, tid, carry, rows), rows) if tip else []
+    return [s for s in dict.fromkeys(r["sha"] for r in found) if (c := _commit(repo, s)) and on_branch(repo, c, tip)]
 
 
 def landed_at(db, tid: int, rows: Rows | None = None, carry: dict | None = None) -> float | None:
@@ -1133,10 +1196,21 @@ def carried(p, repo: Path, tid: int, tip: str, shas: list[str] | None = None, sr
     it handed off (integrate.member_head) is in none of those landed commits (on_branch: an ancestor, or an
     equivalent by patch, author and subject, or replay trailer; each a short range from where it forked),
     not on the push branch's `tip` or a retired tip (on_push), and none holds most of its lines (_holds_part).
-    "" when it is, when nothing is recorded, or when no head was recorded to judge by."""
-    from . import integrate   # late: integrate loads worktree, whose imports reach this module
+    "" when it is, when nothing is recorded, or when no head was recorded to judge by. A recorded
+    supersession on `tip` (superseding_on) that carries it is judged as well: either one carrying it is enough,
+    as `ttp landed --task` reads it once the other is dropped."""
     if shas is None:
         shas, src = recorded(p.db, tid, rows=rows)
+    why = _carried(p, repo, tid, tip, shas, src)
+    if why and (sup := superseding_on(p, repo, tid, tip, rows)) and sup != shas \
+            and not _carried(p, repo, tid, tip, sup, SUPERSEDING):
+        return ""
+    return why
+
+
+def _carried(p, repo: Path, tid: int, tip: str, shas: list[str], src: str) -> str:
+    """carried's answer for the landed commits `shas` alone."""
+    from . import integrate   # late: integrate loads worktree, whose imports reach this module
     if tip and (r := next((g for x in shas if (c := _commit(repo, x)) and (g := reverted_by(repo, c, tip))), "")):
         return f"{src or 'its landing'} was reverted by {r[:10]}, which took its change off the push branch"
     head = integrate.member_head(repo, tid) if shas else ""
@@ -1404,7 +1478,8 @@ def check(p, repo: Path, sha: str | None = None, tid: int | None = None, onto: s
             if fetching:
                 return CANNOT, ref
             continue
-        if any(_commit(repo, s) and on_branch(repo, s, tip) for s in shas):
+        if any(_commit(repo, s) and on_branch(repo, s, tip) for s in shas) \
+                or (tid is not None and p is not None and superseding_on(p, repo, tid, tip)):   # carried's rule
             return _not_dropped(p, repo, tid, tip, shas, src, onto) or (0, f"{what} is on {ref}")
         if fetching or not fetch:   # a local ref behind the remote may miss a re-landing: the fetched tip decides
             gone = [reverted_by(repo, s, tip) for s in shas if _commit(repo, s)]

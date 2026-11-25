@@ -604,3 +604,68 @@ def test_a_task_whose_recorded_landing_a_later_revert_took_out_reads_dropped(env
     _git_out(repo, "revert", "--no-edit", r)
     _git_out(repo, "push", "-q", "origin", "HEAD:refs/heads/proj")
     assert landed.drops(p, record=False) == []
+
+
+def _edit_fix(repo):
+    """A later batch commit that rewrites the first line X added: X's own diff no longer reverse-applies."""
+    f = repo / "fix.txt"
+    f.write_text(f.read_text().replace("the fix, line 0\n", "the fix, line 0, edited later\n"))
+    _git_out(repo, "commit", "-qam", "a later batch edits the fix")
+
+
+@pytest.mark.parametrize("how", ["revert", "reapply", "pick"])
+def test_a_revert_a_later_commit_undid_no_longer_takes_a_commit_off_the_branch(env, monkeypatch, how):
+    """X was reverted (R), then put back by a revert of R, a 'Re-apply A..B' naming X's range, or a
+    cherry-pick with X's patch-id; a later batch edited X's lines. X is landed: R no longer stands."""
+    from ttp import landed
+    p, repo, x, r = _reverted_setup(env, monkeypatch)
+    if how == "revert":
+        _git_out(repo, "revert", "--no-edit", r)
+    elif how == "pick":
+        _git_out(repo, "cherry-pick", x)
+    else:   # the change and an extra file in one commit: no patch-id twin, only the message names X
+        _git_out(repo, "cherry-pick", "--no-commit", x)
+        _commit(repo, "extra.txt", "extra\n")
+        base = _git_out(repo, "rev-parse", f"{x}~1")
+        _git_out(repo, "commit", "--amend", "-qm", f"Re-apply {base[:10]}..{x[:10]} (the fix)")
+    _edit_fix(repo)
+    _git_out(repo, "push", "-q", "origin", "HEAD:refs/heads/proj")
+    tip = _git_out(repo, "rev-parse", "origin/proj")
+    assert landed.reverted_by(repo, x, tip) == "" and landed.on_branch(repo, x, tip)
+    assert landed.check(p, repo, x, fetch=False)[0] == 0
+
+
+def test_a_revert_that_still_stands_keeps_a_commit_off_the_branch(env, monkeypatch):
+    """A revert alone takes X out; so does reverting X's revert and then reverting that again."""
+    from ttp import landed
+    p, repo, x, r = _reverted_setup(env, monkeypatch)
+    tip = _git_out(repo, "rev-parse", "origin/proj")
+    assert landed.reverted_by(repo, x, tip) == r and not landed.on_branch(repo, x, tip)
+    _git_out(repo, "revert", "--no-edit", r)
+    _git_out(repo, "revert", "--no-edit", "HEAD")   # the revert of the revert, reverted again
+    _git_out(repo, "push", "-q", "origin", "HEAD:refs/heads/proj")
+    tip = _git_out(repo, "rev-parse", "origin/proj")
+    assert landed.reverted_by(repo, x, tip) == r and not landed.on_branch(repo, x, tip)
+    assert landed.check(p, repo, x, fetch=False)[0] == landed.NOT_YET
+
+
+def test_a_task_whose_superseding_commit_is_on_the_branch_raises_no_landing_dropped(env, monkeypatch):
+    """The push queue landed X, a revert took it out, and the change landed again as S (recorded with
+    `ttp task superseded`): the dropped-landing sweep raises no landing_dropped and `ttp landed --task`
+    reads it landed, both by the same rule."""
+    from ttp import landed
+    p, repo, x, r = _reverted_setup(env, monkeypatch)
+    _git_out(repo, "cherry-pick", "--no-commit", x)
+    _commit(repo, "extra.txt", "extra\n")
+    s = _git_out(repo, "rev-parse", "HEAD")
+    _edit_fix(repo)
+    _git_out(repo, "push", "-q", "origin", "HEAD:refs/heads/proj")
+    tid = p.db.add_task("the fix", "spec", kind="code")
+    p.db.update_task(tid, status="done")
+    now = time.time()
+    p.db.x("INSERT INTO push_queue(task, branch, head, target, status, landed_sha, created, updated) "
+           "VALUES(?, 'b', ?, 'origin/proj', 'landed', ?, ?, ?)", (tid, x, x, now, now))
+    p.db.x("INSERT INTO task_superseded(task, head, sha, ts) VALUES(?,?,?,?)", (tid, x, s, now))
+    assert landed.drops(p) == []
+    assert not p.db.q("SELECT id FROM events WHERE kind=?", (landed.DROP_EVENT,))
+    assert landed.check(p, repo, tid=tid, fetch=False)[0] == 0
