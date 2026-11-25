@@ -25,10 +25,11 @@ and the daemon counts those refusals as send-backs. A broken check, a timeout (t
 STOP_BUDGET_S in all) or any fault of the hook lets the run end: the daemon's check stays the final
 gate. A check sees AT_ENV=stop there, with the run's own variables (RUN_VARS) left out.
 
-A code task's hand-off from a run on the GLM model also meets one built-in check (glm_check, no setting): its
-branch's added test lines must not name the real /tmp, /home, ~ or Path.home() (glm_test_hygiene), its added
-comments and docstrings must not tell an incident (slop.new_noisy), and its hand-off must show its new tests failing
-on the base and name each numbered spec step (handoff_gaps). It fails and sends back like a project check, under
+A code task's hand-off also meets one built-in check (builtin_check, no setting): it must show a run line
+of its new tests failing on the base commit (new_test_gap), whatever ran it; a run on the GLM model is checked
+further: its branch's added test lines must not name the real /tmp, /home, ~ or Path.home()
+(glm_test_hygiene), its added comments and docstrings must not tell an incident (slop.new_noisy), and its
+hand-off must name each numbered spec step (handoff_gaps). A failure sends back like a project check, under
 the same cap."""
 from __future__ import annotations
 
@@ -61,7 +62,8 @@ RUN_VARS = ("TTP_RUN_DIR", "TTP_TASK", "TTP_TASK_ID", "TTP_RUN_ID", "TTP_PROJECT
 SEEN_TTL_S = 300
 KILL_WAIT_S = 5                   # the wait for a killed check's output; an escaped child is not waited for
 _seen: dict[tuple[str, int, str], tuple[float, dict]] = {}
-GLM_CHECK = "glm hand-off check"
+GLM_CHECK = "glm hand-off check"   # a GLM run's full built-in check
+CODE_CHECK = "new-test check"        # any other run's: a new test must be shown failing on the base
 # The real machine's paths in a test (a temp dir or the user's home): a string literal that opens with one, or
 # Path.home(); tmp_path or monkeypatch on the line clears it. Paths in docstrings, comments, the middle of a string
 # (fixture data) and an endswith/startswith comparison are text, not files the test touches.
@@ -153,16 +155,24 @@ def glm_test_hygiene(diff_text: str) -> list[str]:
     return out
 
 
-def handoff_gaps(diff_text: str, spec: str, handoff: dict) -> list[str]:
-    """What a hand-off leaves out: a run line showing the tests the diff adds fail on the base commit, and a
-    self_check naming each numbered step of the spec (its own steps, glmwork.goal_spec, two or more)."""
-    out = []
+def new_test_gap(diff_text: str, handoff: dict) -> str | None:
+    """The one line a hand-off adding tests owes: a run of them failing on the base commit, which stops a test
+    that cannot fail (it already passed there, or its stub records too little)."""
     tests = [m.group(1) or m.group(2) for path, line in _added(diff_text) if TEST_FILE.search(path)
              for m in [NEW_TEST.match(line)] if m]
     told = json.dumps({k: v for k, v in handoff.items() if k != "commits"})   # its own commit ids run nothing
     if tests and not BASE_FAILS.search(told):
-        out.append(f"New tests ({', '.join(tests[:5])}) with no line showing them fail on the base commit: run them "
-                   "there and put the command and its failing result in your self_check.")
+        return ("New tests (" + ", ".join(tests[:5]) + ") with no line showing them fail on the base commit: "
+                "run them there and put the command and its failing result in your self_check.")
+    return None
+
+
+def handoff_gaps(diff_text: str, spec: str, handoff: dict) -> list[str]:
+    """What a hand-off leaves out: a run line showing the tests the diff adds fail on the base commit, and a
+    self_check naming each numbered step of the spec (its own steps, glmwork.goal_spec, two or more)."""
+    out = []
+    if gap := new_test_gap(diff_text, handoff):
+        out.append(gap)
     from .glmwork import goal_spec
     steps = list(dict.fromkeys(m.group(1) or m.group(2) for line in goal_spec(spec).splitlines()
                                for m in [STEP.match(line)] if m))
@@ -188,12 +198,13 @@ def _glm_run(p: Project, task: dict) -> bool:
     return bool(r) and glmshare.on_glm(r["provider"], r["model"], r["note"])
 
 
-def glm_check(p: Project, task: dict, handoff) -> dict | None:
-    """The built-in check's failure ({name, output}) on a GLM run's hand-off: glm_test_hygiene, slop.new_noisy and
-    handoff_gaps over its branch's diff from its fork point (else the base). None when it passes, does not apply or
-    git cannot tell."""
-    if not isinstance(handoff, dict) or handoff.get("status") not in STATUSES or not _glm_run(p, task):
-        return None
+def builtin_applies(task: dict, handoff) -> bool:
+    """Whether the built-in check looks at this hand-off: a finished one (STATUSES) of a code task."""
+    return task.get("kind") == "code" and isinstance(handoff, dict) and handoff.get("status") in STATUSES
+
+
+def _branch_diff(p: Project, task: dict):
+    """A code task's branch diff: (repo root, head, diff text, fork point), or None when git cannot tell."""
     from . import worktree
     try:
         wt = Path(p.worktrees) / f"t{task['id']}"
@@ -206,17 +217,36 @@ def glm_check(p: Project, task: dict, handoff) -> dict | None:
                              capture_output=True, text=True, timeout=DEFAULT_TIMEOUT_S)
         if got.returncode != 0:
             return None
-        from . import slop
         fork = subprocess.run(["git", "-C", str(root), "merge-base", base, head], capture_output=True, text=True,
                               timeout=DEFAULT_TIMEOUT_S).stdout.strip()
-        noisy = slop.new_noisy(root, fork or base, head)
+        return root, head, got.stdout, fork or base
     except (OSError, RuntimeError, subprocess.SubprocessError):   # git cannot tell: the hand-off stands
         return None
-    bad = glm_test_hygiene(got.stdout)
+
+
+def builtin_check(p: Project, task: dict, handoff) -> dict | None:
+    """The built-in check's failure ({name, output}) on a code task's hand-off: glm_test_hygiene, slop.new_noisy
+    and handoff_gaps on a GLM run's branch diff, else only its new tests' base-failing run line (new_test_gap).
+    None when it passes, does not apply or git cannot tell."""
+    if not builtin_applies(task, handoff):
+        return None
+    got = _branch_diff(p, task)
+    if got is None:
+        return None
+    root, head, diff, fork = got
+    if not _glm_run(p, task):
+        gap = new_test_gap(diff, handoff)
+        return {"name": CODE_CHECK, "output": gap} if gap else None
+    from . import slop
+    try:
+        noisy = slop.new_noisy(root, fork, head)
+    except (OSError, subprocess.SubprocessError):   # git cannot tell: the rest of the check still stands
+        noisy = []
+    bad = glm_test_hygiene(diff)
     out = (["Tests must not touch the real machine's paths:", *bad[:20]] if bad else []) \
         + (["Comments and docstrings state the rule, never an incident (a date, id or host):",
             *(f"{n['at']}: {n['text']}" for n in noisy[:20])] if noisy else []) \
-        + handoff_gaps(got.stdout, task.get("spec") or "", handoff)
+        + handoff_gaps(diff, task.get("spec") or "", handoff)
     return {"name": GLM_CHECK, "output": "\n".join(out)} if out else None
 
 
@@ -276,11 +306,11 @@ def _run_one(p: Project, check: dict, task: dict, path: Path,
 
 def run(p: Project, cfg: dict, task: dict, handoff, run_dir: Path | None, deadline: float | None = None,
         base_env: dict | None = None) -> dict:
-    """Runs glm_check, then the checks that apply, in order, up to the first that fails. {"failed": {name, output} or
+    """Runs builtin_check, then the checks that apply, in order, up to the first that fails. {"failed": {name, output} or
     None, "broken": [{name, run, why, output}]}; {} when none apply. By `deadline` (time.monotonic)
     each check's timeout is cut to the time left, and none starts after it."""
-    if glm := glm_check(p, task, handoff):
-        return {"failed": glm, "broken": []}
+    if bad := builtin_check(p, task, handoff):
+        return {"failed": bad, "broken": []}
     checks = applies(cfg, task, handoff)
     if not checks:
         return {}
@@ -306,7 +336,7 @@ def run(p: Project, cfg: dict, task: dict, handoff, run_dir: Path | None, deadli
 
 def prefetch(p: Project, cfg: dict, task: dict, handoff, run_dir: Path | None) -> None:
     """Runs the checks before the transaction that records `task`'s hand-off; verdict reads it."""
-    if not applies(cfg, task, handoff) and not _glm_run(p, task):
+    if not applies(cfg, task, handoff) and not builtin_applies(task, handoff):
         return
     now = time.time()
     for k in [k for k, (until, _) in _seen.items() if until <= now]:
@@ -317,7 +347,7 @@ def prefetch(p: Project, cfg: dict, task: dict, handoff, run_dir: Path | None) -
 
 def verdict(p: Project, cfg: dict, task: dict, handoff, run_dir: Path | None) -> dict:
     """prefetch's answer for this hand-off, else the checks run now; {} when none apply."""
-    if not applies(cfg, task, handoff) and not _glm_run(p, task):
+    if not applies(cfg, task, handoff) and not builtin_applies(task, handoff):
         return {}
     hit = _seen.pop((str(p.root), int(task["id"]), _digest(handoff)), None)
     if hit and hit[0] > time.time():
@@ -352,7 +382,7 @@ def at_stop(run_dir: Path) -> str | None:
         return None
     cfg = p.config()
     task = p.db.task(int(os.environ["TTP_TASK"]))
-    if not task or not applies(cfg, task, handoff):
+    if not task or not (applies(cfg, task, handoff) or builtin_applies(task, handoff)):
         return None
     env = {k: v for k, v in os.environ.items() if k not in RUN_VARS}
     env[AT_ENV] = "stop"

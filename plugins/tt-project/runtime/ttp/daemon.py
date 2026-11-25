@@ -4346,7 +4346,8 @@ class Daemon:
                 # (handoffcheck.at_stop); none apply, or a hand-off a push already checked: no variable.
                 env.pop(handoffcheck.SENDBACKS_ENV, None)   # never an inherited value
                 row = self.p.db.task(task["id"]) or task
-                if handoffcheck.applies(self.cfg, row, {"status": "done"}) and not _push_rechecked(row):
+                if (handoffcheck.applies(self.cfg, row, {"status": "done"})
+                        or handoffcheck.builtin_applies(row, {"status": "done"})) and not _push_rechecked(row):
                     used = int(load_result(row.get("result")).get(handoffcheck.KEY) or 0)
                     env[handoffcheck.SENDBACKS_ENV] = f"{used}/{handoffcheck.max_sendbacks(self.cfg)}"
                 # Its hook warns a code hand-off that names no change the daemon could review (hook.handoff_warning).

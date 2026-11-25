@@ -8,7 +8,9 @@
 - Ponytail mode (skill `tt-ponytail`): the smallest change that fully solves the task. No code it does not
   need (speculative options, layers, fallbacks, copied trees); reuse what exists; delete before you add.
 - Reproduce first, then fix. Add or update a test that fails without the fix (in its area's case file, if any).
-  Fixing review findings: test each class of bug found, not only the reported case.
+  Run each new test on the base commit too and put the command and its failing result in your self_check: the
+  hand-off check refuses a hand-off whose new test shows no run failing on the base. Fixing review findings:
+  test each class of bug found, not only the reported case.
 - Run the full checks before handing off, committed, through `ttp checks`: the project's checks,
   plus after `--` only the repository's test and lint commands they do not already run, each
   command quoted as one word (`-- 'pytest -q tests/a.py' 'ruff check .'`). It reuses

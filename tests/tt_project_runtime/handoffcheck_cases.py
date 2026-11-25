@@ -584,12 +584,14 @@ def test_task_runs_get_their_hand_off_check_send_backs_only_when_checks_apply(en
     monkeypatch.setenv(handoffcheck.SENDBACKS_ENV, "9/9")   # never inherited
     tid = _hc_task(p)
 
-    def run():
+    def run(t=None):
         d = Daemon(p.base)
-        rid = d.start_run("worker", "go", "claude", "light", str(p.root), task=p.db.task(tid))
+        rid = d.start_run("worker", "go", "claude", "light", str(p.root), task=p.db.task(t or tid))
         return json.loads((p.runs / str(rid) / "run.json").read_text())["env"]
 
     assert handoffcheck.SENDBACKS_ENV not in run(), "no checks configured"
+    ctid = _hc_task(p, kind="code")   # the built-in base-failing-run check applies with none configured
+    assert run(ctid)[handoffcheck.SENDBACKS_ENV] == "0/2"
     _hc_setup(env, p, [{"name": "c", "run": "true"}], handoff_check_max_sendbacks=3)
     p.db.update_task(tid, result=json.dumps({handoffcheck.KEY: 2}))
     assert run()[handoffcheck.SENDBACKS_ENV] == "2/3"
@@ -672,7 +674,9 @@ def _gw9846_task(p, provider, model, branch):
 
 
 def test_a_glm_code_runs_hand_off_is_sent_back_for_a_test_on_the_real_tmp(env):
-    """Only a GLM run's code hand-off meets the built-in check, on its branch's added test lines."""
+    """A code hand-off meets the built-in check whatever ran it: a GLM run's test lines name real paths, and
+    every run's new tests must come with a base-failing run line."""
+    
     from ttp import handoffcheck, route
     p = make(env)
     git = lambda *a: subprocess.run(["git", "-C", str(p.root), *a], check=True, capture_output=True)   # noqa: E731
@@ -687,7 +691,34 @@ def test_a_glm_code_runs_hand_off_is_sent_back_for_a_test_on_the_real_tmp(env):
     assert got["failed"]["name"] == handoffcheck.GLM_CHECK and "test_gw9846.py" in got["failed"]["output"], got
     assert handoffcheck.verdict(p, {}, glm, {"status": "waiting"}, None) == {}
     claude = _gw9846_task(p, "claude", "opus", "ttp/gw9846")
-    assert handoffcheck.verdict(p, {}, claude, {"status": "done"}, None) == {}
+    got = handoffcheck.verdict(p, {}, claude, {"status": "done"}, None)
+    assert got["failed"]["name"] == handoffcheck.CODE_CHECK, got
+    assert "no line showing them fail on the base" in got["failed"]["output"], got
+    assert "put the command and its failing result in your self_check" in got["failed"]["output"], got
+    ran = "pytest tests/test_gw9846.py at base 1111111: 1 failed"
+    assert handoffcheck.verdict(p, {}, claude, {"status": "done", "self_check": ran}, None) == {}
+
+
+def test_the_stop_hook_refuses_a_code_hand_off_adding_a_test_with_no_base_failing_run(env, monkeypatch):
+    """With no project checks configured at all, the Stop hook still refuses a code hand-off whose new
+    test shows no run failing on the base, and lets it through once the run line is in self_check."""
+    from ttp import handoffcheck
+    p = make(env)
+    git = lambda *a: subprocess.run(["git", "-C", str(p.root), *a], check=True, capture_output=True)   # noqa: E731
+    git("checkout", "-q", "-b", "ttp/gw9886")
+    (p.root / "tests").mkdir(exist_ok=True)
+    (p.root / "tests" / "test_gw9886.py").write_text("def test_z():\n    assert calc(1) == 2\n")
+    git("add", "-A")
+    git("commit", "-qm", "a test")
+    git("checkout", "-q", "-")
+    tid = p.db.add_task("fix the helper", "spec", kind="code", tier="light", origin="coordinator")
+    p.db.update_task(tid, branch="ttp/gw9886")
+    run_dir = _hc_session(env, p, tid, monkeypatch)
+    out = _hc_stop(monkeypatch, run_dir, {"status": "done", "summary": "fixed"})
+    assert out["decision"] == "block" and handoffcheck.CODE_CHECK in out["reason"], out
+    assert "fail on the base" in out["reason"], out
+    assert _hc_stop(monkeypatch, run_dir, {"status": "done", "summary": "fixed",
+                                           "self_check": "pytest tests/test_gw9886.py at base 1111111: 1 failed"}) is None
 
 
 def test_a_glm_hand_off_is_sent_back_for_an_incident_comment_and_passes_once_it_states_the_rule(env):
