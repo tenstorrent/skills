@@ -197,7 +197,7 @@ class _Proof:
         return self._place(os.path.join(folder, arg), False, search=True)
 
     def _place(self, path: str, writes: bool, search: bool = False) -> bool:
-        from . import credguard, hook, pathguard
+        from . import credguard, hook, pathguard, untrusted
         home = str(self.env.get("HOME") or os.path.expanduser("~"))
         path = os.path.expanduser(path) if path.startswith("~") else path
         tmp = self.env.get("TMPDIR")
@@ -205,6 +205,8 @@ class _Proof:
         self.wrote |= writes
         for base in self.bases:
             real = os.path.realpath(os.path.join(base, path))
+            if os.path.basename(real) == untrusted.RUN_MARK:   # the run's mark of untrusted input: the guards judge it
+                return False
             # the guards' own reading of the path as a word of a shell command: a store by name anywhere
             if credguard.read_refusal(real, search, home) or pathguard._inside(real, pathguard.roots(self.env)) \
                     or any(hook.store_refusal(f"cat {shlex.quote(p)}", base) for p in (path, real)):
@@ -344,10 +346,9 @@ def rewrite(cmd: str, cwd: str, env=None) -> str | None:
 
 def _words_name_store(code: str, cwd: str, env) -> bool:
     """`code`'s words name a credential store or a protected path, as the shell guards read a command's words."""
-    from . import credguard, pathguard
-    home = str(env.get("HOME") or os.path.expanduser("~"))
+    from . import hook, pathguard, untrusted
     words = re.findall(r"[^\s'\"(),\[\]{}]+", code)
-    return bool(credguard.bash_refusal(code, [["cat", *words]], home, cwd)) or any(
+    return untrusted.RUN_MARK in code or bool(hook.store_refusal(f"cat {shlex.join(words)}", cwd)) or any(
         pathguard._inside(os.path.realpath(os.path.join(cwd, os.path.expanduser(w))), pathguard.roots(env))
         for w in words if "/" in w)
 

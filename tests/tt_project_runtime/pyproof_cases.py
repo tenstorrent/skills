@@ -122,6 +122,10 @@ def test_the_hook_refuses_a_store_naming_snippet_that_writes_a_file_for_a_later_
                     f"python3 - <<'EOF'\nfrom pathlib import Path\nPath('s.sh').open('{mode}').write('cat {key}')\nEOF"):
             assert _bash_why(tmp_path, cmd), cmd
     assert _bash_why(tmp_path, "python3 -c 'open(\"s.sh\",\"w\").write(\"echo hi\")'") == ""   # no store named
+    for path in _store_paths(home):   # the web token and the secrets store, named only: the same three routes
+        for cmd in (f"python3 -c 'print(\"cat {path}\")' | sh", f"python3 -c 'open(\"s.sh\",\"w\").write(\"cat {path}\")'",
+                    f"K=$(python3 -c 'print(\"{path}\")'); cat \"$K\""):
+            assert _bash_why(tmp_path, cmd), cmd
 
 
 def test_pyproof_reads_heredocs_as_the_hook_does(tmp_path, monkeypatch):
