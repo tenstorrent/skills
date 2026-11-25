@@ -12743,14 +12743,7 @@ def test_task_specs_that_forbid_leaving_draft_pass_the_gate_and_orders_still_do_
                               "Request no reviewers and no gh pr ready on acme/widgets#7.",
                               "Push fixes without marking it ready.",
                               "Leave acme/widgets#7 as is: the user takes it out of draft.",
-                              "Once green, the user will mark acme/widgets#7 ready.",
-                              # descriptive text names the gate, it orders no one (#9824)
-                              "- the review gate on PR state in worker specs (a direct order before the user's yes "
-                              "stays refused; descriptive text passes);",
-                              "- a spec that orders a worker to take a PR out of draft",
-                              # the user is the subject and the verb no order: it says what they do or did
-                              "The user pushes it from their Mac and marks acme/widgets#7 ready themselves.",
-                              "But the user had marked it ready for review themselves an hour ago.")):
+                              "Once green, the user will mark acme/widgets#7 ready.")):
         assert coord.apply(p, [{"type": "task_add", "title": f"ok {n}", "kind": "code", "spec": spec}]) == [], spec
     for spec in ("Run gh pr ready on acme/widgets#7.", "No reviewers, then run gh pr ready on acme/widgets#7.",
                  "Fix the lint, no merge, mark acme/widgets#7 ready.", "No push: gh pr ready 7 in acme/widgets#7.",
@@ -12759,9 +12752,19 @@ def test_task_specs_that_forbid_leaving_draft_pass_the_gate_and_orders_still_do_
                  "Take PR https://github.com/acme/widgets/pull/7 out of draft once checks pass.",
                  "When the user agrees, it marks acme/widgets#7 ready.",
                  "Once the owner agrees the worker takes acme/widgets#7 out of draft.",
-                 # a verb aimed at you or the worker gives the order itself (ponytail review, #9824)
+                 # an order relayed through a verb, to any addressee, or a wish for the PR to be marked ready
                  "This step tells you to mark acme/widgets#7 ready for review once CI is green.",
-                 "The coordinator tells the worker to mark acme/widgets#7 ready."):
+                 "The coordinator tells the worker to mark acme/widgets#7 ready.",
+                 "This step tells the agent to mark PR 5 ready.",
+                 "The coordinator instructs Codex to take PR 5 out of draft.",
+                 "The spec tells the coder to mark PR 5 ready",
+                 "the owner orders the coder to mark PR 5 ready",
+                 "Per the owner orders mark PR 5 ready",
+                 "The spec instructs marking PR 5 ready",
+                 "The user wants PR 5 marked ready now",
+                 "The user asked that PR 5 be marked ready",
+                 "The user requests that PR 5 gets marked ready",
+                 "The owner expects PR 5 marked ready by the end"):
         out = " ".join(coord.apply(p, [{"type": "task_add", "title": "ready it", "kind": "code", "spec": spec}]))
         assert "approval is not on record" in out, spec
     assert not p.db.q("SELECT id FROM tasks WHERE title='ready it'")

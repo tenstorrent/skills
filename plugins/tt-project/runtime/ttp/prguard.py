@@ -472,14 +472,6 @@ CLAUSE_END_RE = re.compile(r"[,:;()\n]|\bthen\b", re.I)
 FORBIDS_RE = re.compile(r"\b(?:no|never|not|without)\b|n't\b|\bkeep\w*\b[^.;\n]*\bdraft\b", re.I)
 # The user (or owner) is the one who does it, right before the mention: "the user takes it out of draft".
 USER_ACTS_RE = re.compile(r"\b(?:user|owner)\s+(?:will\s+|then\s+|later\s+|alone\s+)?$", re.I)
-# It describes such an order rather than giving one: "a spec that orders a worker to take a PR out of draft".
-# A verb aimed at "you" or "the worker" gives the order itself: "This step tells you to mark PR 5 ready".
-DESCRIBES_RE = re.compile(r"\b(?:orders|ordering|tells|telling|instructs|instructing)\b"
-                          r"(?!\s+(?:you|the\s+workers?)\b)", re.I)
-# The user (or owner) is the sentence's subject and the verb is not an order ("the user pushes it and marks
-# PR 5 ready themselves", "the user had marked it ready"): a worker is told nothing.
-USER_SUBJECT_RE = re.compile(r"\b(?:user|owner)\b(?![^.;,\n]*\b(?:workers?|you|agent)\b)[^.;,\n]*$", re.I)
-NOT_IMPERATIVE_RE = re.compile(r"(?:mark|take|move|get|bring)(?:s|ed)\b|took\b|moved\b", re.I)
 
 
 def _orders_ready(sentence: str) -> bool:
@@ -493,8 +485,7 @@ def _orders_ready(sentence: str) -> bool:
         before = sentence[:m.start()]
         ends = [e.end() for e in CLAUSE_END_RE.finditer(before)]
         clause = before[ends[-1] if ends else 0:]
-        if not FORBIDS_RE.search(clause) and not USER_ACTS_RE.search(clause) and not DESCRIBES_RE.search(clause) \
-                and not (NOT_IMPERATIVE_RE.match(m.group(0)) and USER_SUBJECT_RE.search(before)):
+        if not FORBIDS_RE.search(clause) and not USER_ACTS_RE.search(clause):
             return True
     return False
 

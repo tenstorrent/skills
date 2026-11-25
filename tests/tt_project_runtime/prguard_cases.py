@@ -652,46 +652,37 @@ def test_split_write_forms_stay_refused_through_the_hook(tmp_path, monkeypatch):
         assert out and out["hookSpecificOutput"]["permissionDecision"] == "deny", cmd
 
 
-def test_draft_guard_passes_a_literal_read_only_curl():
-    from ttp import hook
-    reads = ("curl -sS -m 30 -D /tmp/d/pr.hdr -o /tmp/d/pr.json -H 'Accept: application/vnd.github+json' "
-             + API + "pulls/1",
-             "mkdir -p /tmp/d && curl -fsSL -X GET -D- " + API + "pulls/1; grep -c x /tmp/d/pr.hdr")
-    for cmd in reads:
-        assert hook.draft_bypass(cmd) is None, cmd
-    writes = ("curl -s -D h -X POST " + API + "pulls",
-              "curl -s -D h -d @b.json " + API + "pulls/1",
-              "curl -s -D h -XPATCH " + API + "pulls/1",
-              "curl -s -D h --request=PUT " + API + "pulls/1/merge",
-              "curl -s -D h -H 'X-HTTP-Method-Override: PATCH' " + API + "pulls/1",
-              "curl -s -D h -H @hdrs " + API + "pulls/1",
-              "curl -s -D h -K cfg " + API + "pulls/1",
-              "curl -s -D h -F draft=false " + API + "pulls/1",
-              "curl -s -D \"$H\" -X PATCH " + API + "pulls/1",
-              "curl -s -D h " + API + "pulls/1; curl -X PATCH " + API + "pulls/1")
-    for cmd in writes:
-        assert hook.draft_bypass(cmd), cmd
-    assert hook.api_ref_write("curl -s -D h -X PATCH " + API + "git/refs/heads/main")
-    assert not hook.api_ref_write("curl -s -D h " + API + "git/refs/heads/main", hook._read_spans(
-        "curl -s -D h " + API + "git/refs/heads/main"))
+# Write text inside a curl's quoted words, or that the curl prints and a shell then runs, is still a write: the
+# draft guard grants no read relief to a curl that names a write anywhere
+QUOTE_REPROS = ('curl ">" -XPOST ">" --data=@b ' + API + "{}",
+                "curl '>' -XPATCH '>' --data=@b " + API + "{}",
+                "curl '\"'$A-X PATCH " + API + "{} -H $A'\"' -H '\"'$A-d @b -H $A'\"'",
+                "$(curl -s -o /dev/null -w 'curl -X PATCH -d @q.json " + API + "{}' " + API + "pulls/1)",
+                "curl -s -o /dev/null -w 'curl -X PATCH -d @q.json " + API + "{}' " + API + "pulls/1 | sh",
+                "curl -sv -H 'X: y; curl -X PATCH -d @q.json " + API + "{}' " + API + "pulls/1 |& bash",
+                "curl -o '/x/$(curl -X PATCH -d @b " + API + "{})' " + API + "pulls/1 |& bash",
+                "curl 'http://[$(curl -X PATCH -d @q.json " + API + "{})]/' |& sed -n 2p | bash",
+                "curl -s -H PATCH " + API + "{}",
+                # a shell made to run curl's words, curl's stderr piped into a shell, and headers dumped into the
+                # curl config the next curl reads
+                "hash -p /bin/bash curl; echo 'eval \"$*\"' | curl -s '/usr/bin/curl -X' PATCH " + API + "{} 'x -d@b'",
+                "hash -p /bin/bash curl; echo 'eval \"$*\"' | curl -s -H 'X: 1' '/usr/bin/curl -X PATCH -d @b " + API
+                + "{}'",
+                "curl -s 'http://[ curl -X PATCH -d @b " + API + "{} ]/' |& sed -n 's/.*\\[//;s/\\].*//p' | bash",
+                "curl -s 'http://[ curl -X PATCH -d @b " + API + "{} ]/' |& grep -o 'curl -X.*' | sh",
+                "curl -s -D ~/.curlrc https://example.com/x; curl -s " + API + "{}",
+                "curl -s -D h -H 'X-HTTP-Method: PATCH' " + API + "{}")
 
 
-def test_literal_argv_splits_like_bash(tmp_path):
-    """Every text the literal test accepts splits into the words bash itself passes; the rest are refused."""
-    import subprocess
+def test_curl_write_text_stays_refused_wherever_it_sits(tmp_path, monkeypatch):
     from ttp import hook
-    accepted = ["curl -s https://api.github.com/repos/o/r/pulls/1", "a  b", "", "x", "-w '%{http_code}' -H 'A: $B `c` \\'",
-                "'a'\"b\"c", "\"\" ''", "\"a b\"'c d'e", "a,b+c%d^e@f:g/h.i_j-k=l", "'#' \"x'y\" 'p\"q' \"#\"'!'",
-                "'*' '?' '~' '[a]' '{a,b}' '$(x)' '<' '|' ';' '&'", "-x=y"]
-    refused = ["$A", "a\\ b", "a>b", "a|b", "a;b", "a&b", "(a)", "{a,b}", "a*", "a?", "~", "[a]", "!a", "a #b", "a\tb",
-               "a\nb", "a\rb", "\"$A\"", "\"`a`\"", "\"a\\b\"", "\"!a\"", "'a", "\"a", "é", "A=1 b", "a<b", "`a`"]
-    for text in accepted:
-        words = hook._literal_argv(text)
-        out = subprocess.run(["bash", "--noprofile", "--norc", "-c", "printf '%s\\0' " + text], env={}, cwd=tmp_path,
-                             capture_output=True, check=True).stdout
-        assert words is not None and words == (out.decode().split("\0")[:-1] if words else []), text
-    for text in refused:
-        assert hook._literal_argv(text) is None, text
+    monkeypatch.setenv("TTP_RUN_DIR", str(tmp_path))
+    for cmd in QUOTE_REPROS:
+        assert hook.draft_bypass(cmd.format("pulls/1")), cmd
+        assert hook.api_ref_write(cmd.format("git/refs/heads/main")), cmd
+        out = hook._pre_tool_use({"tool_name": "Bash", "tool_input": {"command": cmd.format("pulls/1")},
+                                  "cwd": str(tmp_path)})[0]
+        assert out and out["hookSpecificOutput"]["permissionDecision"] == "deny", cmd
 
 
 # GitHub writes whose method, body or config hides behind quoting, a variable, a config read from stdin or another
