@@ -326,6 +326,10 @@ def test_selfimprove_a_self_change_sent_without_an_undo_gets_its_kinds_own_inver
     assert coord.apply(p, [mem, cfg]) == []
     undos = [r["undo"] for r in selfimprove.items(p.db)]
     assert undos[1:] == ["ttp memory --forget fact-stale", f"ttp config {p.name} coordinator.effort high"], undos
+    # the usual batch sets the key first: its undo restores the value from before the batch
+    assert coord.apply(p, [{"type": "config_set", "key": "coordinator.effort", "value": "medium"}, cfg]) == []
+    assert p.config()["coordinator"]["effort"] == "medium"
+    assert selfimprove.items(p.db)[-1]["undo"] == f"ttp config {p.name} coordinator.effort high"
     probs = coord.apply(p, [{**cfg, "name": "coordinator.no_such_key"}, {**mem, "kind": "script"},
                             {**cfg, "name": "budget.daily_usd"}])
     assert len(probs) == 3 and "needs an undo" in probs[0] and "needs an undo" in probs[1], probs

@@ -2968,6 +2968,7 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
     timeouts)."""
     db, problems, notes = p.db, [], []
     cfg = p.config()
+    cfg_before = json.loads(json.dumps(cfg))   # a self_change's filled config undo restores the value before this batch
     as_sent = actions
     try:   # a form with one clear meaning is applied as meant, not refused (actionforms)
         actions, notes = actionforms.normalise(p, actions, home=timefmt.home(p), now=time.time())
@@ -4621,7 +4622,8 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                               if (db.task(tid) or {}).get("kind") in selfimprove.TASK_KINDS]
                     bound = makers[0] if len(makers) == 1 else None
                 notes.append(selfimprove.add(p, a, parse_start_after(a.get("start_after") or selfimprove.DEFAULT_CHECK,
-                                                                     tz=timefmt.home(p)), settable=settable, task=bound))
+                                                                     tz=timefmt.home(p)), settable=settable, task=bound,
+                                             config=cfg_before))
             elif t == "look":
                 from . import looks
                 if a.get("enabled") is False:   # clears every pending look: back to the idle wake

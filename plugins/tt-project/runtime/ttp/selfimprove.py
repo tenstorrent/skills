@@ -216,9 +216,10 @@ def _upstream(name: str, title: str, spec: str) -> int:
 
 
 def add(p, a: dict, check_at: float | None, settable=None, now: float | None = None,
-        task: int | None = None) -> str:
+        task: int | None = None, config: dict | None = None) -> str:
     """The `self_change` action: file a general fix upstream, or record a local one (module doc). `task`:
-    the task making a TASK_UNDO change, which gates its measurement on that task's receipt."""
+    the task making a TASK_UNDO change, which gates its measurement on that task's receipt; `config`: the
+    project's config before the batch, so a filled config undo never restores the batch's own new value."""
     now = time.time() if now is None else now
     kind, target = str(a.get("kind") or "").strip(), str(a.get("name") or "").strip()
     change, miss = " ".join(str(a.get("text") or "").split()), " ".join(str(a.get("evidence") or "").split())
@@ -234,7 +235,7 @@ def add(p, a: dict, check_at: float | None, settable=None, now: float | None = N
                       f"Files: {', '.join(map(str, files)) or 'none named'}\nGeneral because {why}.")
         return f"self_change {cls}: general ({why}): filed upstream ({'new note' if n else 'already filed'}), " \
                "not recorded as a local change"
-    filled = "" if undo else _own_undo(p, kind, target, task)
+    filled = "" if undo else _own_undo(p, kind, target, task, config)
     if filled:
         undo, filled = filled, f"; undo filled in as its kind's own inverse: {filled}"
     guard(kind, target, undo, settable, p.name)
@@ -265,15 +266,15 @@ def add(p, a: dict, check_at: float | None, settable=None, now: float | None = N
         (f"; measured once task #{task} lands its commit" if task is not None else "") + filled
 
 
-def _own_undo(p, kind: str, target: str, task: int | None) -> str:
+def _own_undo(p, kind: str, target: str, task: int | None, config: dict | None = None) -> str:
     """The undo a self-change sent without one has by its kind alone, '' when none: a memory entry's
-    forget (UNDO_FORM), a config key's current scalar value set back (UNDO_FORM; an unset key has no
+    forget (UNDO_FORM), a config key's scalar value before the batch (`config`, else current) set back (UNDO_FORM; an unset key has no
     value to restore), a bound task's change reverted from its applied-change receipt (TASK_UNDO).
     guard() then judges it as if sent."""
     if kind == "memory" and target:
         return f"ttp memory --forget {target}"
     if kind == "config" and target:
-        val = p.config()
+        val = p.config() if config is None else config
         for part in target.split("."):
             val = val.get(part) if isinstance(val, dict) else None
         if isinstance(val, (str, int, float)) and not isinstance(val, bool) and str(val).strip():
