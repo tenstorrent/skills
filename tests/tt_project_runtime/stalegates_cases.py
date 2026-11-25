@@ -69,7 +69,7 @@ def test_stalegate_lent_machine_rehomes_a_blocked_task(env, monkeypatch):
 
 
 def test_stalegate_outage_rehomes_and_machine_specific_or_no_alternative_raises(env, monkeypatch):
-    """A recorded outage moves a task off the machine; a task naming the machine itself, or one whose machine
+    """A machine marked out of service moves a task off it; a task naming the machine itself, or one whose machine
     has no allowed alternative, is raised as stale_gate-<task> once it is over 30 min old, never moved."""
     from ttp import machine_ledger, stalegates
     _sg_env(monkeypatch)

@@ -5,7 +5,7 @@ in the Course check. A gate is a start_after or start_when deferral, an unmet de
 probe or a resource the task is queued on. Each finding is fixed here when that is safe, else raised
 once as a must-act item `stale_gate-<task>` (mustact.STALE_GATE_KIND):
 
-- a resource on a machine that is held (a pause, a fleet or lent-out hold), in a recorded outage or in
+- a resource on a machine that is held (a pause, a fleet or lent-out hold), marked out of service or in
   repeated trouble: the task moves to another machine the project's config allows when the task does
   not name the machine itself, else it is raised. A hold is never lifted or bypassed;
 - a dependency that is cancelled, failed or gone, which the dependent never names: dropped, requeued;
