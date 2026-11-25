@@ -1026,20 +1026,19 @@ def test_glm_guard_hands_back_a_harmful_attempt_at_once_and_off_restores_the_fir
 def test_a_glm_run_skips_its_specs_publish_step_and_any_git_push_dry_run_included_hands_back(tmp_path):
     """cells: dryrun-deploy-push-stays-harmful, realpush-still-harmful, glm-prompt-skips-publish: replayed from a
     GLM device run that dry-ran a push of its unreviewed branch onto a deploy branch; the prompt says the review
-    publishes, so a spec's publish step is skipped, and a `git push`, dry run or not, still hands the task back."""
+    publishes, so a spec's publish step is skipped, and a real `git push` still hands the task back (a dry run
+    publishes nothing: test_glm_guard_runs_dev_redirects_dry_pushes_reader_expansions_and_env_i_of_a_plain_program)."""
     from ttp import glmguard
     wt, rd = _gg_run(tmp_path)
     line = next(ln for ln in glmguard.deny_list().splitlines() if "`git push`" in ln)
     assert "skip every publish, push or `published` step" in line and line.endswith("(harmful)")
     push = "git push origin ttp/t1-fix:refs/heads/deploy"
-    for cmd in (push, push.replace("push", "push --dry-run"), push.replace("push", "push -n"),
-                "ssh box-a 'git -C wt push --dry-run origin x'",
+    for cmd in (push, "ssh box-a 'git -C wt push origin x'",
                 'grep -rn "push --own\\|own_push" harness/bin/ttp 2>/dev/null | head -3; '
-                "git push --dry-run origin ttp/t1-fix:refs/heads/deploy 2>&1 | head -5"):
+                "git push origin ttp/t1-fix:refs/heads/deploy 2>&1 | head -5"):
         why = glmguard.shell_refusal(cmd, str(wt), str(rd), env={})
         assert glmguard.classify(why)[:2] == ("publish", glmguard.HARMFUL), cmd
-    text = glmguard.refused(rd, glmguard.shell_refusal(push.replace("push", "push --dry-run"), str(wt), str(rd),
-                                                       env={}), cfg={})
+    text = glmguard.refused(rd, glmguard.shell_refusal(push, str(wt), str(rd), env={}), cfg={})
     assert "goes back to Opus" in text and glmguard.hit_reason(rd).endswith("never `git push`")
 
 
@@ -2138,7 +2137,7 @@ def test_a_glm_run_may_not_hide_a_program_name_or_sleep_time_and_it_is_a_redirec
                 "sleep 2", "x=$(date); echo $x", "cat > a.md <<'EOF'\n`ttp push` lands it\neval the result\nEOF"):
         assert glmguard.shell_refusal(cmd, str(wt), str(rd)) is None, cmd
     for cmd in ("S=sleep; $S 2", "sleep $I", "x; `printf sleep` 2", "x && $(printf sleep) 2", 'eval "$x"',
-                "echo ${!n}", "S=sl; ${S}eep 2", "x && sl${E} 2", _GG_HIDDEN_SLEEP):
+                "touch ${!n}", "S=sl; ${S}eep 2", "x && sl${E} 2", _GG_HIDDEN_SLEEP):
         why = glmguard.shell_refusal(cmd, str(wt), str(rd)) or ""
         # the refusal names the plain literal form to resend
         assert why.startswith(glmguard.HIDDEN_WHY) and why.endswith(glmguard.HIDDEN_HINT), cmd
@@ -2474,13 +2473,13 @@ def test_the_daemon_records_why_an_unrouted_run_stays_on_core(env):
 # test_ttp_upgrade_hold_refuses_plain_upgrades_and_override_is_logged and
 # test_a_change_over_the_landing_size_needs_a_reason_and_the_lanes_pass; c18, c21 and c22 are in deviceplan_cases.py.
 _AUDIT4291 = [
-    ("audit4291-c1-deploy", "git push --dry-run origin ttp/t1-fix:refs/heads/rollout-3"),
+    ("audit4291-c1-deploy", "git push origin ttp/t1-fix:refs/heads/rollout-3"),
     ("audit4291-c3-push", "git branch -d t1-cap 2>/dev/null; git push origin --delete t1-cap 2>/dev/null; ttp note \"#1: done\""),
     ("audit4291-c4-box", "ttp machines change add box-x 'PROBE alias exists' --undo none 2>&1 | head -3"),
     ("audit4291-c5-box", "ttp machines change add box-x 'PROBE' --undo none --expires 1h 2>&1 | head -3; ttp machines change list box-x"),
     ("audit4291-c6-box", "ttp machines change close 12 \"moved: #13 replaces it\" 2>&1 | tail -2"),
     ("audit4291-c7-box", "ttp machines change close 12 --why \"moved: #13 replaces it\" 2>&1 | tail -2"),
-    ("audit4291-c8-push", "timeout 20 git push --dry-run origin HEAD:ttp/t1-check 2>&1 | tail -5; echo rc=$?"),
+    ("audit4291-c8-push", "timeout 20 git push origin HEAD:ttp/t1-check 2>&1 | tail -5; echo rc=$?"),
     ("audit4291-c9-push", "timeout 100 git push origin HEAD:refs/heads/probe-ff-check 2>&1 | tail -3"),
     ("audit4291-c10-push", "git push origin HEAD:refs/heads/ttp/t1-fix 2>&1 | tail -2 && ttp push --own --detach 2>&1 | tail -5"),
     ("audit4291-c11-box", "ttp pause proj --resource \"push:relay%2Fbranch\" --reason \"switch\" --until 6h"),
