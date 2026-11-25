@@ -29,11 +29,14 @@ def key(tid: int) -> str:
 
 
 def raise_(db, tid: int, got: dict, now: float | None = None) -> bool:
-    """One must-act event for task `tid`'s missing entry `got` (parse), once per rule and entry."""
+    """One must-act event for task `tid`'s missing entry `got` (parse), once per rule and entry; none when its
+    order id names no message from the user (a note cannot invent an order to widen its own guard)."""
     from . import obligations
     now = time.time() if now is None else now
-    m = db.one("SELECT chat FROM messages WHERE id=?", (got["order"],))
-    chat = obligations._chat(m["chat"] if m else None)
+    m = db.one("SELECT chat FROM messages WHERE id=? AND direction='in' AND kind='user'", (got["order"],))
+    if not m:
+        return False
+    chat = obligations._chat(m["chat"])
     text = (f"Task #{tid}: a guard or allowlist refused a step the user ordered (user msg #{got['order']}). "
             f"Missing entry: `{got['entry']}` in {got['rule']}. Add it now, then wake or requeue #{tid}, "
             f"unless a Restriction, a user hold or a user-only setting forbids it (then a noop naming the key "

@@ -1758,8 +1758,8 @@ SLACK_MOVES = 2      # as does a due moved this often before its work starts
 
 def _slack(p, o: dict, now: float) -> tuple[str, str] | None:
     """(fingerprint, text) when open promise or order `o` sits far beyond its work before any owner starts:
-    due over SLACK_S after it was made for work under SHORT_WORK_S, or its due moved SLACK_MOVES times;
-    None once an owner started, the due passed or `justify` recorded the rule that holds it."""
+    due over SLACK_S after it was made for work under SHORT_WORK_S, or its due moved SLACK_MOVES times (not at
+    the user's word); None once an owner started, the due passed or `justify` recorded the rule that holds it."""
     from . import eta, timefmt
     pr = o["promise"]
     due, made = float(pr["due"]), float(pr.get("set_at") or o["created"])
@@ -1769,8 +1769,9 @@ def _slack(p, o: dict, now: float) -> tuple[str, str] | None:
             or first_run(p.db, ids, made) is not None:
         return None
     owners = ", ".join(f"#{t}" for t in ids)
-    if len(pr.get("moves") or []) >= SLACK_MOVES:
-        why = f"its due moved {len(pr['moves'])} times before {owners} started"
+    moves = sum(1 for m in pr.get("moves") or [] if m.get("user") is None)   # the user's own moves never count
+    if moves >= SLACK_MOVES:
+        why = f"its due moved {moves} times before {owners} started"
     elif due - made > SLACK_S and (work := eta.work_s(p.db, ids, now)) is not None and work < SHORT_WORK_S:
         why = (f"it is due {int((due - made) // 60)} min after it was made for about {max(1, round(work / 60))} "
                f"min of work, and {owners} has not started")

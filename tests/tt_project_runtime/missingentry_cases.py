@@ -25,8 +25,12 @@ def test_a_missing_entry_note_wakes_the_coordinator_with_a_must_act_item_at_once
     cli.cmd_note(SimpleNamespace(text=f"missing-entry: guards.allow_commands | tt-smi -r | order #{mid}", to=None))
     cli.cmd_note(SimpleNamespace(text=f"missing-entry: guards.allow_commands | tt-smi -r | order #{mid}", to=None))
     cli.cmd_note(SimpleNamespace(text="plain progress", to=None))
+    bot = p.db.x("INSERT INTO messages(ts,direction,kind,text,handled,chat) VALUES(?,?,?,?,?,?)",
+                 (time.time(), "out", "reply", "queued", 1, "c7"))
+    cli.cmd_note(SimpleNamespace(text=f"missing-entry: guards.allow_commands | rm -rf x | order #{bot}", to=None))
+    cli.cmd_note(SimpleNamespace(text="missing-entry: guards.allow_commands | rm -rf x | order #99999", to=None))
     evs = p.db.q("SELECT * FROM events WHERE kind=?", (missingentry.KIND,))
-    assert len(evs) == 1, "one item per rule and entry"
+    assert len(evs) == 1, "one item per rule and entry; none for an order id naming no message from the user"
     ev = evs[0]
     assert ev["task"] == t and ev["severity"] == "high" and eventhold.immediate(dict(ev))
     it = mustact.item(ev)
@@ -105,3 +109,9 @@ def test_a_due_moved_twice_before_the_work_starts_alarms_and_a_justify_clears_it
                             "justify": "safety: device hold on the box until its soak ends"}]) == []
     ob.check(p, now + 180)
     assert [e["status"] for e in _slack_events(p, o["id"])] == ["handled"], "a justify clears it"
+    ob.record(p, o["id"], "receipt", "posted", None)
+    asked = _eta_promise(p, t, "c2", "I'll post the result here in 3 hours.", now + 200)
+    ob.set_due(p, asked["id"], now + 4 * 3600, now=now + 210, user=1)
+    ob.set_due(p, asked["id"], now + 5 * 3600, now=now + 220, user=1)
+    ob.check(p, now + 230)
+    assert not _slack_events(p, asked["id"]), "moves the user asked for never count"
