@@ -22,7 +22,8 @@ log = logging.getLogger(__name__)
 
 # action type -> the modules whose `normal_form(p, a, batch, home, now)` rewrite it, in order; each
 # returns (rewritten action, note) or None. A form lives beside the check it satisfies.
-FORMS = {"sweep": ("sweep",), "obligation": ("obligations", "coordsession"), "memory_add": ("coordsession",),
+FORMS = {"sweep": ("sweep",), "obligation": ("obligations", "coordsession"),
+         "memory_add": ("coordsession", "memforms"), "memory_forget": ("memforms",),
          "observation_mute": ("throughmute",), "reply": ("turnrules",), "task_add": ("taskforms",),
          "task_update": ("taskforms",), "config_set": ("configwho",), "resource_pause": ("pauseends",)}
 

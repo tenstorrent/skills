@@ -1510,6 +1510,31 @@ def test_obform_a_finished_owner_is_replaced_by_its_open_heirs(env, monkeypatch)
     assert f"#{lone} is done, so not attached" in notes and f"#{twice} is done" not in notes
 
 
+def test_obform_a_review_or_plan_owner_of_a_change_order_is_replaced_by_the_task_making_the_change(env, monkeypatch):
+    """#9824 (sample "order oN: #N is a review task, which cannot carry a change order"): a review owner is
+    replaced by the code task it reviews, a plan owner by its open code child, each with a note; a plan with
+    no such child is still left out with fit_owners' note."""
+    from ttp import coordinator as coord, coordprecheck, obligations as ob
+    p, d, now, tid, check, mid, raised = _order_setup(env, monkeypatch)
+
+    def task(title, kind, **kw):
+        return p.db.add_task(title, "s", kind=kind, tier="light", origin="coordinator", **kw)
+    code = task("build part a", "code")
+    review = task(f"review #{code}", "review", labels=[f"auto_review:{code}"])
+    plan, lone = task("plan part b", "plan"), task("plan part c", "plan")
+    child = task("build part b", "code", parent=plan)
+    oid = ob.add_order(p, "change it", mid, [tid], action_class="change").split()[1]
+    act = {"type": "obligation", "key": oid, "owners": [review, plan, lone]}
+    assert coordprecheck.problems(p, [dict(act)]) == []
+    assert coord.apply(p, [act]) == []
+    applied, notes = _obform_notes(p, coord)
+    assert applied == [f"actions[0] (obligation) applied as: owners=[{code}, {child}, {lone}] "
+                       f"(was: [{review}, {plan}, {lone}])"], applied
+    owners = ob.get(p.db, oid)["owners"]
+    assert {str(code), str(child)} <= set(owners) and not {str(review), str(plan), str(lone)} & set(owners)
+    assert f"#{lone} is a plan task, which cannot carry a change order" in notes
+
+
 def test_obform_owner_0_is_left_out_and_the_rest_recorded(env, monkeypatch):
     """Item 8 (an owner sent as 0, refused as no such task): owner 0 is a placeholder, left out with one note;
     the order is recorded with the other owner and coordprecheck refuses nothing."""

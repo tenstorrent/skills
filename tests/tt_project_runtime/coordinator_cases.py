@@ -8534,10 +8534,11 @@ def test_a_standing_entry_is_refused_retirement_without_a_why(env):
     assert f"[{duty.stem}] Whenever a box is down, repower it. (standing)" in p.memory_text()
     errors = coord.apply(p, [{"type": "memory_forget", "name": duty.stem}], turn=2)
     assert errors and "standing instruction" in errors[0] and duty.exists()
-    # A supersedes by an entry that is not standing is a retirement too.
-    errors = coord.apply(p, [{"type": "memory_add", "text": "Box A was repowered.", "supersedes": [duty.stem]}],
-                         turn=3)
-    assert errors and "standing instruction" in errors[0] and duty.exists()
+    # A supersedes by an entry that is not standing would be a retirement too: the entry is added and the
+    # standing one stays, with a note (#9824).
+    assert coord.apply(p, [{"type": "memory_add", "text": "Box A was repowered.", "supersedes": [duty.stem]}],
+                       turn=3) == []
+    assert "a shorter-lived one never retires" in " ".join(p.db.kv(coord.NOTES_KEY, [])) and duty.exists()
     with pytest.raises(SystemExit, match="standing instruction"), contextlib.redirect_stdout(io.StringIO()):
         cli.main(["memory", "demo", "--forget", duty.stem])
     assert duty.exists() and "repower it" in p.memory_text()

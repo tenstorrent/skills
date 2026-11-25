@@ -1,4 +1,4 @@
-# Coordinator action forms applied as meant (#9824: taskforms.py, configwho.normal_form) of
+# Coordinator action forms applied as meant (#9824: taskforms.py, memforms.py, configwho.normal_form) of
 # tests/test_tt_project_runtime.py, which runs this file in its own namespace (see _include_cases there):
 # helpers, fixtures and imports come from that file. Add new task_add/task_update form tests here.
 from __future__ import annotations
@@ -76,3 +76,28 @@ def test_tform_config_set_maps_a_moved_key_and_overrides_an_ordinary_user_value_
     probs = coord.apply(p, [{"type": "config_set", "key": "checks.spill_hosts", "value": ["box-a"]}])
     assert probs and "checks.spill_hosts" in probs[0], probs
     assert "checks_spill_hosts" not in (p.raw_config().get("delivery") or {}), p.raw_config()
+
+
+def test_tform_memory_names_resolve_to_the_one_entry_meant_and_a_standing_entry_is_kept_beside_the_add(env):
+    """Refused before: memory_forget of 'sa85' (a part of one entry's name), a supersedes of a near spelling,
+    and a non-standing memory_add superseding a standing entry. Each applies with a note: the standing entry
+    stays beside the added one. A name matching two entries, or none closely, is still refused."""
+    from ttp import coordinator as coord
+    p = make(env)
+    a = p.add_memory("settled rule sa85: keep the probe read-only", kind="decision", title="rule sa85 probe").stem
+    p.add_memory("settled rule sa86: one", kind="decision", title="rule sa86 one")
+    old = p.add_memory("settled rule sa86: two", kind="decision", title="rule sa86 two").stem
+    duty = p.add_memory("review open branches every morning", kind="preference", title="morning branch review",
+                        standing=True).stem
+    assert coord.apply(p, [{"type": "memory_forget", "name": "sa85", "why": "obsolete"}]) == []
+    assert f"name: {a!r} (was: 'sa85', no such entry)" in " ".join(_tf_notes(p))
+    assert a not in {e["name"] for e in p._memory_entries()}
+    for name in ("sa86", "nothing-like-it"):
+        (problem,) = coord.apply(p, [{"type": "memory_forget", "name": name, "why": "obsolete"}])
+        assert "no memory entry" in problem, problem
+    assert coord.apply(p, [{"type": "memory_add", "text": "branch review found two stale branches",
+                            "title": "stale branches found", "supersedes": [old[:-1] + "x", duty]}]) == []
+    notes = " ".join(_tf_notes(p))
+    assert f"supersedes: {old!r}" in notes and "a shorter-lived one never retires" in notes, notes
+    live = {e["name"] for e in p._memory_entries()}
+    assert old not in live and duty in live
