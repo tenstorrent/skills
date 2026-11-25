@@ -69,7 +69,10 @@ REAL_PATH = re.compile(r"(?<!endswith\()(?<!startswith\()(?<![\w\"'])[rfbRFB]{0,
                        r"|\bPath\.home\(\)")
 TEST_FILE = re.compile(r"(?:^|/)(?:tests?/|test_[^/]*\.py$|[^/]*_test\.py$)")
 NEW_TEST = re.compile(r"^\+\s*(?:async\s+)?def (test_\w+)|^\+\s*(?:it|test)\(\s*[\"'`]([^\"'`]+)")
-BASE_FAILS = re.compile(r"(?i)\bbase\b.{0,120}\bfail|\bfail.{0,120}\bbase\b")   # a run line: the new test fails on base
+# A run line: the new tests fail on the base, however it is named (main, the old code, a revert, a sha).
+_BEFORE = r"\b(?:base|main|master|old|before|parent|revert\w*|[0-9a-f]{7,40})\b"
+BASE_FAILS = re.compile(rf"(?i){_BEFORE}.{{0,120}}\bfail|\bfail.{{0,120}}{_BEFORE}")
+RANGE = re.compile(r"\(?\b([a-z]|\d{1,2})\)?\s*(?:-|–|to)\s*\(?([a-z]|\d{1,2})\)")
 STEP = re.compile(r"^\s*(?:\(([a-z]|\d{1,2})\)|(\d{1,2})[.)])\s+\S")   # a spec's numbered step: (a), (1), 1. or 1)
 
 
@@ -163,6 +166,9 @@ def handoff_gaps(diff_text: str, spec: str, handoff: dict) -> list[str]:
                                .splitlines() for m in [STEP.match(line)] if m))
     check = handoff.get("self_check")
     check = check if isinstance(check, str) else json.dumps(check or "")
+    for a, b in RANGE.findall(check.lower()):   # "(a)-(f)" names each step between
+        check += "".join(f" ({x})" for x in steps if x.isdigit() == a.isdigit() == b.isdigit()
+                         and (int(a) <= int(x) <= int(b) if x.isdigit() else a <= x <= b))
     missed = [s for s in steps if not re.search(rf"(?i)(?<![\w.#])(?:\({s}\)|{s}[.):]|(?:step|part|item)\s+{s}\b)", check)]
     if len(steps) > 1 and missed:
         out.append(f"Your self_check names no spec step {', '.join(missed)}: list each numbered step with done, or "
@@ -202,7 +208,9 @@ def glm_check(p: Project, task: dict, handoff) -> dict | None:
         return None
     from . import slop
     bad = glm_test_hygiene(got.stdout)
-    noisy = slop.new_noisy(root, base, head)
+    fork = subprocess.run(["git", "-C", str(root), "merge-base", base, head], capture_output=True, text=True,
+                          timeout=DEFAULT_TIMEOUT_S).stdout.strip()
+    noisy = slop.new_noisy(root, fork or base, head)
     out = (["Tests must not touch the real machine's paths:", *bad[:20]] if bad else []) \
         + (["Comments and docstrings state the rule, never an incident (a date, id or host):",
             *(f"{n['at']}: {n['text']}" for n in noisy[:20])] if noisy else []) \

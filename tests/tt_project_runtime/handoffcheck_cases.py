@@ -654,6 +654,7 @@ def test_handoff_gaps_want_a_base_failing_run_and_each_numbered_spec_step():
     gaps = handoffcheck.handoff_gaps(diff, spec, {"self_check": "(a) done"})
     assert len(gaps) == 2 and "test_y" in gaps[0] and "test_helper" not in gaps[0] and "step b:" in gaps[1], gaps
     assert handoffcheck.handoff_gaps(diff, spec, {"self_check": f"{ran}. (a) done; (b) not done: no device"}) == []
+    assert handoffcheck.handoff_gaps(diff, spec, {"self_check": "test_y fails on main 571cc6c8. (a)-(b) done"}) == []
     assert handoffcheck.handoff_gaps("+++ b/src/x.py\n+x = 1\n", "1. one step\n", {}) == []
 
 
