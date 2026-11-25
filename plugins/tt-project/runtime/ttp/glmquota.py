@@ -161,13 +161,13 @@ def sync(key: str, got: dict, window_s: float = 3600, now: float | None = None, 
                 st["observed"] = [o for o in (st.get("observed") or []) if float(o[0]) > now - OBSERVED_KEEP_S] + \
                     [[now, ours]]
             st["spent"] = float(st["reset"])   # this window is used up, whatever our count says
-        st["last_429"] = {k: got[k] for k in ("limit", "used", "reset", "window_s") if k in got} | {"at": now}
+        st["last_429"] = {k: got[k] for k in ("limit", "used") if k in got} | {"at": now}
         _write(path, st)
 
 
 def view(cfg: dict | None, now: float | None = None) -> dict:
     """The quota's state now: {} when off; else {key, used, size, size_from, reset, short, ahead (the share
-    of the window's budget used ahead of an even spread), exhausted, paced (size known)}."""
+    of the window's budget used ahead of an even spread), exhausted, last_429}."""
     c = conf(cfg)
     if not c:
         return {}
@@ -178,7 +178,7 @@ def view(cfg: dict | None, now: float | None = None) -> dict:
     used = int(st.get("used") or 0)
     out = {"key": c["key"], "used": used, "size": size, "reset": float(st["reset"]),
            "size_from": st.get("size_from") if st.get("size") else "setting" if c["size"] else "observed" if size else "",
-           "paced": bool(size), "short": False, "ahead": 0.0, "exhausted": False,
+           "short": False, "ahead": 0.0, "exhausted": False,
            "last_429": st.get("last_429") or {}}
     if not size:
         return out

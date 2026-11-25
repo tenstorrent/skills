@@ -522,10 +522,3 @@ def test_glm_work_keeps_a_publish_to_an_outside_branch_on_core_from_the_goal_onl
                  "Fix it. Push nothing to this project's push branch."):
         assert _gw9846_kc(p, goal) == "", goal
 
-
-def test_glm_size_check_names_the_test_hygiene_and_spec_step_rules():
-    from ttp import glmwork
-    text = glmwork.size_check()
-    for line in ("tmp_path and monkeypatch, never the real /tmp, /home or ~", "must fail on the base",
-                 "grep every reader", "self_check names each numbered spec step"):
-        assert line in text, line

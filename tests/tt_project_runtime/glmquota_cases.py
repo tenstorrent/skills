@@ -82,7 +82,7 @@ def test_glm_quota_429_numbers_set_size_used_and_reset_and_the_off_switch_turns_
     now = _QUOTA_END - 1200
     glmquota.add("cloud", 1_000_000, now=now - 60)
     v = glmquota.view(cfg, now)
-    assert v["size"] == 0 and not v["paced"] and glmquota.paced(cfg, {"kind": "review"}, "worker", now) == ""
+    assert v["size"] == 0 and glmquota.paced(cfg, {"kind": "review"}, "worker", now) == ""
     assert "size unknown" in glmquota.line(cfg, now)
     glmquota.sync("cloud", got, now=now)   # the server's count is larger: it wins; its reset and size are taken
     v = glmquota.view(cfg, now)
@@ -166,7 +166,7 @@ def test_glm_quota_without_a_limit_paces_on_the_tokens_counted_when_a_quota_429_
     glmquota.add("cloud", 6_000_000, now=nxt + 1300)   # 15M by minute 22: well ahead, judgement runs leave GLM
     assert glmquota.paced(cfg, {"kind": "review", "priority": 1}, "worker", nxt + 1320) == "paced"
     # A day later the observation has aged out: counted, not paced.
-    assert glmquota.view(cfg, _GQ_HOUR + 1500 + glmquota.OBSERVED_KEEP_S + 60)["paced"] is False
+    assert glmquota.view(cfg, _GQ_HOUR + 1500 + glmquota.OBSERVED_KEEP_S + 60)["size"] == 0
 
 
 def test_glm_quota_429_that_names_its_window_rolls_windows_on_it(monkeypatch, tmp_path):
