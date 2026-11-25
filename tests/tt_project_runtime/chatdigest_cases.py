@@ -707,6 +707,24 @@ def test_a_reply_fault_after_its_post_is_not_resent_and_one_before_it_is(env, mo
     assert len(p.db.q("SELECT id FROM events WHERE kind='action_fault'")) == 2
 
 
+def test_a_reply_plain_error_after_its_post_is_not_resent_and_leaves_a_fault_event(env, monkeypatch):
+    """cells: plain_error_after_post. A later step of a posted reply failing on a plain error (no internal
+    harness error) is not resent either, and still leaves one harness fault event: never a silent note."""
+    from ttp import coordinator as coord
+    p = make(env)
+
+    def locked(*a, **k):
+        raise ValueError("database is locked")
+    monkeypatch.setattr(coord.turnrules, "record_cites", locked)
+    problems = coord.apply(p, [{"type": "reply", "chat": "c1", "text": "Thanks, noted."}], turn=1)
+    assert problems == [] and _cd_out(p) == ["Thanks, noted."], (problems, _cd_out(p))
+    note = [n for n in p.db.kv(coord.NOTES_KEY, []) if n.startswith("reply:")][-1]
+    assert "posted as message #" in note and "database is locked" in note and "not resent" in note, note
+    ev = p.db.q("SELECT text FROM events WHERE kind='action_fault'")
+    assert len(ev) == 1 and "database is locked" in ev[0]["text"] and "not resent" in ev[0]["text"], ev
+    assert "internal" not in ev[0]["text"], ev
+
+
 def test_a_web_app_only_digest_does_not_start_the_chats_status_gap(env, monkeypatch):
     """Upstream note d12a28e292fd1e82: a digest the chat never got (the web app only) leaves its status
     gap alone."""

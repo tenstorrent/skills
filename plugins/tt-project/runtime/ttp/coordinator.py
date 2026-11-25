@@ -2651,15 +2651,17 @@ def _internal_fault(p: Project, t: str | None, a: Any, e: Exception, applied: st
     the action's fields, and records a harness event (action_fault; the rejection itself reaches the next turn,
     so the record wakes no turn), so the coordinator never reads a bare Python error as its own mistake.
     "" for a refusal that names its field. `applied`: where the action already went (a posted reply), so
-    the text records it as done and never asks for a resend."""
+    the text records it as done and never asks for a resend; any error after it is recorded, internal or not."""
     try:
-        if not (isinstance(e, (KeyError, IndexError, AttributeError)) or _RAW_ERROR.search(str(e))):
+        internal = isinstance(e, (KeyError, IndexError, AttributeError)) or bool(_RAW_ERROR.search(str(e)))
+        if not (internal or applied):
             return ""
         import traceback
         frames = [f for f in traceback.extract_tb(e.__traceback__) if "/ttp/" in f.filename.replace(os.sep, "/")]
         where = f" at {Path(frames[-1].filename).name}:{frames[-1].lineno}" if frames else ""
         fields = ", ".join(sorted(str(k) for k in a)) if isinstance(a, dict) else type(a).__name__
-        err = f"an internal harness error ({type(e).__name__}: {clip(str(e), 160)}{where})"
+        err = (f"{'an internal harness error' if internal else 'an error'} "
+               f"({type(e).__name__}: {clip(str(e), 160)}{where})")
         why = (f"{applied}, but a later step hit {err}; it is reported as a harness fault and is not resent"
                if applied else
                f"not applied: {err}, not a refusal of a field you wrote (fields: {clip(fields, 200)}); it is "
