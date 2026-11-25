@@ -24,9 +24,10 @@ hedged before the phrase) is judged apart, by a matching `claims` probe that exi
 machines' reach record (reach.judge): false when a machine it names answered ssh within
 ssh.reach_fresh_min, unverified when no probe of it is that fresh or the claim is seen from another
 host ('From X, ...': the record holds this host's probes only). With a status verb too, any false wins.
-A claim that does not hold is not sent as written: it goes prefixed with what is true (FALSE_MARK), and
-the caller wakes the coordinator with a high `claim_false` event. A claim nothing could check goes with
-UNVERIFIED after it. Callers: coordinator.apply (replies and notifies, turn and session mode) and
+A claim that does not hold goes prefixed with what is true (FALSE_MARK) and wakes the coordinator
+with a high `claim_false` event; a claim nothing could check gets UNVERIFIED after it. Callers the
+user reads pass mark=False, so their text goes out as written and only the record and event carry
+it: coordinator.apply (replies and notifies, turn and session mode) and
 daemon.relay_worker_notifies (worker `ttp notify`, record and config checks only). handoff_mark() marks a
 worker hand-off that claims a live state and cites no evidence (an artifact or a command-output path) in
 the digest and its hand-off event. Any fault leaves the text as written: a message is never lost to this."""
