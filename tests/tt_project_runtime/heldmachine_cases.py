@@ -332,3 +332,24 @@ def test_the_guard_resolves_the_ssh_target_so_another_config_alias_is_refused(en
     for other in ("gw-2222", "via-jump"):   # the same HostName on another port, or behind a jump host
         assert heldwork.ssh_refusal(f"ssh {other} true") is None, other
     fleethold.lift(_HM_BOX, True, "test")
+
+
+def test_a_failed_task_read_keeps_the_schedules_and_says_so(env, monkeypatch):
+    """cells: heldwork-schedules. Follow-up 42924: a project whose open tasks cannot be read still has its
+    schedules listed, and the failed read is an item of its own (unverified), never a silent skip; so is a
+    project database that cannot be opened."""
+    from ttp import heldwork, machine_ledger as ml, schedule as sched
+    alpha, beta = _hm_setup(env)
+    sched.upsert(beta.db, "watch-box", "command", "10m", payload={"command": f"ssh {_HM_BOX} true"})
+
+    def locked(db, on):
+        raise RuntimeError("database is locked")
+    monkeypatch.setattr(ml, "tasks_on", locked)
+    its = heldwork.live_items(_HM_BOX)
+    assert any(i["kind"] == "schedule" and i["project"] == "beta" for i in its), its
+    [unread] = [i for i in its if i["kind"] == "unread" and i["project"] == "beta"]
+    assert "open tasks could not be read" in unread["text"] and "unverified" in unread["text"], unread
+    assert not any(i["kind"] == "task" for i in its), its
+    monkeypatch.setattr(ml, "project_dbs", lambda: iter([("gamma", None, OSError("unable to open database file"))]))
+    [gone] = [i for i in heldwork.live_items(_HM_BOX) if i["project"] == "gamma"]
+    assert gone["kind"] == "unread" and "database could not be read" in gone["text"], gone

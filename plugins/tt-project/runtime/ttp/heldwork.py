@@ -138,6 +138,8 @@ def live_items(alias: str, now: float | None = None, where=None) -> list[dict]:
                                 f"{timefmt.short(float(rec.get('since') or 0), where)}"})
     scheds: list[dict] = []
     for name, base, db in ml.project_dbs():   # open tasks and schedules that name it, every project
+        if isinstance(db, Exception):
+            out.append(_unread(name, "database", db))
         if db is None or isinstance(db, Exception):
             continue
         try:
@@ -145,9 +147,12 @@ def live_items(alias: str, now: float | None = None, where=None) -> list[dict]:
                 out.append({"kind": "task", "project": name,
                             "text": f"open task #{t['id']} ({t['status']}) on {', '.join(hit)}: "
                                     f"{t['title']}"})
+        except Exception as e:   # each section on its own: a failed read is reported, never skips the next
+            out.append(_unread(name, "open tasks", e))
+        try:
             scheds += _schedules(alias, name, base, db)
-        except Exception:
-            continue
+        except Exception as e:
+            scheds.append(_unread(name, "schedules", e))
     o = ml.outages().get(alias)
     held = bool(fleethold.active().get(alias)) or (o is not None and not o.get("covers"))
     # a partial outage leaves the machine reachable, so its items stay verifiable
@@ -340,3 +345,9 @@ def _config(owner: str) -> dict:
 
 def _unverified(owner) -> str:
     return UNVERIFIED.format(owner=owner or "?")
+
+
+def _unread(name: str, what: str, e: Exception) -> dict:
+    """The item for project `name`'s `what` that could not be read: the inventory says it is incomplete."""
+    return {"kind": "unread", "project": name,
+            "text": f"its {what} could not be read ({type(e).__name__}: {str(e)[:120]}) — {_unverified(name)}"}

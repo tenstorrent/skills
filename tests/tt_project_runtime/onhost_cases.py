@@ -371,7 +371,9 @@ def test_the_batch_loop_never_rebinds_its_action_list_or_position():
     """`order` (the batch's (index, action) pairs), `k` and `i` are read by later actions of the batch
     (order[k + 1:], failed.add(i)): rebinding one inside the loop corrupts every action after it. So are
     the batch's lists (upstream note 2c792038ccca2c77: a charter_update rebound `held` to a tuple and a
-    later held reply crashed on held.append); `+=` on them stays in place."""
+    later held reply crashed on held.append); `+=` on them stays in place. cells: internal-errors. They are
+    every name apply() takes or binds before the loop that the loop grows, read from its code, never a hand
+    list a new one is missing from (the refusal audit's internal errors were this class, twice)."""
     import ast
     import inspect
     import textwrap
@@ -380,7 +382,18 @@ def test_the_batch_loop_never_rebinds_its_action_list_or_position():
     loop = next(n for n in ast.walk(fn) if isinstance(n, ast.For) and isinstance(n.iter, ast.Call)
                 and getattr(n.iter.func, "id", "") == "enumerate" and getattr(n.iter.args[0], "id", "") == "order")
     scopes = (ast.FunctionDef, ast.Lambda, ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp)
-    batch = ("held", "failed", "problems", "notes", "replies", "sent", "claimed", "delivered", "explicit", "twins")
+    apply_fn = fn.body[0]
+    kept = {x.arg for x in (*apply_fn.args.args, *apply_fn.args.kwonlyargs)}
+    for s in apply_fn.body:
+        if s.lineno < loop.lineno and isinstance(s, (ast.Assign, ast.AnnAssign)):
+            for tg in (s.targets if isinstance(s, ast.Assign) else [s.target]):
+                kept |= {x.id for x in ast.walk(tg) if isinstance(x, ast.Name)}
+    batch = {c.func.value.id for c in ast.walk(loop) if isinstance(c, ast.Call) and isinstance(c.func, ast.Attribute)
+             and isinstance(c.func.value, ast.Name) and c.func.value.id in kept
+             and c.func.attr in ("append", "extend", "insert", "add", "update")}
+    batch |= {n.target.id for n in ast.walk(loop) if isinstance(n, ast.AugAssign) and isinstance(n.target, ast.Name)
+              and n.target.id in kept and isinstance(n.value, (ast.List, ast.ListComp))}   # twins += [...]
+    assert {"held", "failed", "problems", "notes", "replies", "explicit", "twins"} <= batch, sorted(batch)
     bad = []
 
     def walk(node):

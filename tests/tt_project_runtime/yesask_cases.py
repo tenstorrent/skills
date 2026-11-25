@@ -317,16 +317,56 @@ def test_a_refused_rule_change_never_holds_the_ordered_work(env, tmp_path, capsy
     assert "queue the work that order covers now" in msg and "never to re-ask an order" in msg, msg
 
 
+def test_a_dropped_charter_wait_names_the_charter_update_only_when_the_turn_sent_a_refused_one(env):
+    """cells: charter-wait-note. A start_when on the charter is dropped either way; its note asks for the
+    charter_update to be resent fixed only in a turn whose charter_update was refused, never in a turn that
+    sent none or one that applied."""
+    from ttp import coordinator as coord
+    p = make(env)
+    probe = "grep -q 'box-q' tt-project/harness/CHARTER.md || exit 1"
+
+    def note(actions):
+        coord.apply(p, actions)
+        return [n for n in p.db.kv(coord.NOTES_KEY, []) if "waited on the charter" in n][-1]
+    alone = note([{"type": "task_add", "title": "soak a", "spec": "s", "why": "w", "start_when": probe}])
+    assert "was dropped" in alone and "charter_update" not in alone, alone
+    applied = note([{"type": "charter_update", "section": "Goals", "text": "Keep the docs short."},
+                    {"type": "task_add", "title": "soak b", "spec": "s", "why": "w", "start_when": probe}])
+    assert "charter_update" not in applied, applied
+    refused = note([{"type": "charter_update", "section": "Goals", "text": ""},   # no text: refused
+                    {"type": "task_add", "title": "soak d", "spec": "s", "why": "w", "start_when": probe}])
+    assert "resend the charter_update fixed" in refused, refused
+    tid = p.db.add_task("soak c", "s", kind="work", tier="standard")
+    upd = note([{"type": "task_update", "id": tid, "start_when": probe, "why": "w"}])
+    assert f"#{tid}" in upd and "charter_update" not in upd, upd
+
+
+def test_refuse_wait_moves_the_probe_aside_and_records_one_event(env):
+    """cells: retry-when-helper. waitheal.refuse_wait, the one path of every refused hand-off wait (no shell
+    command, the checks.running marker, the charter, an unfiled upstream note, an unset run variable): the
+    probe moves to retry_when_refused, one handoff_probe_refused event names the task and why, and the rest
+    of the hand-off is kept. Each daemon path's own text is checked by its own end-to-end test."""
+    from ttp import waitheal
+    p = make(env)
+    tid = p.db.add_task("wait on it", "s", kind="work", tier="standard")
+    task = p.db.one("SELECT * FROM tasks WHERE id=?", (tid,))
+    got = waitheal.refuse_wait(p.db, p, task, {"status": "waiting", "retry_when": "true", "on_pass": "x"},
+                               "true", "its probe is refused", "retry_when refused: test")
+    assert got == {"status": "waiting", "on_pass": "x", "retry_when_refused": "true"}, got
+    ev = p.db.q("SELECT text, status FROM events WHERE kind='handoff_probe_refused' AND task=?", (tid,))
+    assert [e["text"] for e in ev] == [f"#{tid} wait on it: its probe is refused"] and ev[0]["status"] == "queued"
+
+
 def test_a_charter_update_with_wrong_typed_resource_settings_neither_crashes_nor_adopts_letters(env):
     """A hand-edited config whose `machines` or `shared_resources` is a plain string (or whose
     machines.allowed is one) neither crashes the charter check nor turns the string's letters into
-    own resource names: _own_resources shares machine_ledger's guarded lookup (configured_names)."""
+    own resource names: the charter check reads machine_ledger's guarded lookup (configured_names)."""
     import json
-    from ttp import coordinator as coord
+    from ttp import coordinator as coord, machine_ledger
     p = make(env)
     # direct: the guards hold for every wrong-typed shape
-    assert coord._own_resources({"machines": "box-q", "shared_resources": "abc", "resources": "xyz"}) == ()
-    assert coord._own_resources({"machines": {"allowed": "b-x"}}) == ()
+    assert machine_ledger.configured_names({"machines": "box-q", "shared_resources": "abc", "resources": "xyz"}) == []
+    assert machine_ledger.configured_names({"machines": {"allowed": "b-x"}}) == []
     # through a charter_update: a scoped exception on the order's own words still runs to its end
     cfg = json.loads(p.config_path.read_text()) if p.config_path.exists() else {}
     cfg["machines"] = "box-q"          # wrong type: a hand edit
