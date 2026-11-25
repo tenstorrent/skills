@@ -822,6 +822,19 @@ def _urgent_owner(db, o: dict) -> bool:
     return any(urgent.is_urgent(db.task(t)) for t in live_owner_ids(db, o))
 
 
+def due_made(o: dict, what: str, item: dict, now: float) -> tuple[float, float] | None:
+    """(due, made) for open obligation `o`'s promise or milestone `item` (named `what` in
+    `eta_justified`) while its due is still ahead of `now` and no justification entry matches that due;
+    None once it is due or justified for its current due. The caller keeps the claim/receipt check: an
+    item reaching this helper is one that is open."""
+    due = float(item["due"])
+    made = float(item.get("set_at") or o["created"]) if what == "promise" else float(item.get("added") or o["created"])
+    j = (o.get("eta_justified") or {}).get(what) or {}
+    if now >= due or float(j.get("due") or 0) == due:
+        return None
+    return due, made
+
+
 def long_promises(db, cfg: dict | None, now: float | None = None) -> list[dict]:
     """The open promises and milestones on urgent goals due more than the threshold after they were made,
     not shortened, met or justified for that due: {"id", "what", "due", "made", "o"}."""
@@ -837,17 +850,13 @@ def long_promises(db, cfg: dict | None, now: float | None = None) -> list[dict]:
             continue
         cands = []
         if (pr := o.get("promise")) and not pr.get("claim"):   # a claim's due is its check time, no ETA
-            cands.append(("promise", float(pr["due"]), float(pr.get("set_at") or o["created"])))
-        for m in (o.get("milestones") or {}).values():
-            if not m.get("receipt"):
-                cands.append((f"milestone {m['key']}", float(m["due"]), float(m.get("added") or o["created"])))
-        cands = [c for c in cands if c[1] - c[2] > h * 3600 and c[1] > now]
+            cands.append(("promise", pr))
+        cands += [(f"milestone {m['key']}", m) for m in (o.get("milestones") or {}).values()
+                  if not m.get("receipt")]
+        cands = [(w, *dm) for w, item in cands if (dm := due_made(o, w, item, now)) and dm[0] - dm[1] > h * 3600]
         if not cands or not _urgent_owner(db, o):
             continue
         for what, due, made in cands:
-            j = (o.get("eta_justified") or {}).get(what)
-            if j and float(j.get("due") or 0) == due:
-                continue
             if what == "promise" and any(
                     q["id"] != o["id"] and q["promise"]["chat"] == o["promise"]["chat"]
                     and float(q["promise"].get("set_at") or q["created"]) > made and float(q["promise"]["due"]) < due

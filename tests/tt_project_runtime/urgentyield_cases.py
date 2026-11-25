@@ -185,3 +185,62 @@ def test_a_detached_soak_holding_the_lock_is_ended_after_the_grace_and_its_task_
         assert p.db.task(soak)["status"] == "waiting", "its own wait wakes it"
     finally:
         f.close()
+
+
+def test_lock_yield_and_urgent_start_agree_on_own_versus_other_holds(env, tmp_path):
+    """The two holder walks use one own-hold rule: a holder record naming this project *and* this task
+    is the task's own hold and is named by neither, whatever root it records; this project's other
+    tasks, another project's record (even one rooted at this project's own folder) and a person's hold
+    are holders for both check_lock_yield's yield request and check_urgent_start's lock-wait event."""
+    import fcntl
+    from ttp import locks, preempt
+    from ttp.daemon import Daemon
+    p = make(env)
+    _no_events(p)
+    p.db.x("UPDATE tasks SET status='done'")
+    p.set_config("resources.box", 5)
+    d = Daemon(p.base)
+    d.cfg = p.config()
+    d.cfg.setdefault("budget", {})["urgent_yield_grace_s"] = 0
+    d.cfg.setdefault("coordinator", {})["urgent_start_wait_min"] = 1
+    d.update_gates()
+    hot = p.db.add_task("reset the box", "s\nurgent: the user ordered it", kind="work", tier="light",
+                        origin="user", labels=["resource:box"])
+    p.db.update_task(hot, status="running")
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    rid = p.db.x("INSERT INTO runs(task, role, provider, status, started, dir) VALUES(?,?,?,?,?,?)",
+                 (hot, "worker", "claude", "running", time.time(), str(run_dir)))
+    locks.record_wait(run_dir, "w1", time.time() - 120, None, ["box"])
+    recs = [
+        {"project": p.name, "task_id": str(hot), "run_id": str(rid)},   # its own hold, no root recorded
+        {"project": p.name, "task_id": str(hot), "run_id": "5",        # own hold: a foreign root never
+         "project_root": str(tmp_path / "elsewhere")},                   # makes it another holder's
+        {"project": p.name, "task_id": "77", "run_id": "88", "project_root": str(p.base)},
+        {"project": "other", "task_id": "7", "run_id": "9", "project_root": str(p.base)},
+        {"holder": "someone at a shell"},
+    ]
+    slots = d._slot_paths("box")
+    assert len(slots) == len(recs)
+    fds = []
+    try:
+        for slot, rec in zip(slots, recs):
+            slot.parent.mkdir(parents=True, exist_ok=True)
+            slot.write_text(json.dumps(rec))
+            fd = os.open(slot, os.O_RDWR)
+            fcntl.flock(fd, fcntl.LOCK_EX)
+            fds.append(fd)
+        d.check_lock_yield()
+        ask = json.loads(preempt.yield_path(d._slot_paths("box")[0].parent, "box").read_text())
+        assert ask["for_task"] == hot
+        assert sorted(ask["holders"]) == ["#7", "#77", "someone at a shell"], ask["holders"]
+        d._urgent_start_checked = time.time() - 120
+        d.check_urgent_start()
+        ev = p.db.one("SELECT * FROM events WHERE fingerprint=?", (f"urgent_lock:{hot}:{rid}",))
+        assert ev is not None and "in `ttp lock`" in ev["text"]
+        assert "box: other #7 run 9" in ev["text"] and "box: ? #? run ?" in ev["text"]
+        assert f"box: {p.name} #77 run 88" in ev["text"]
+        assert f"box: {p.name} #{hot} run" not in ev["text"], "its own hold is no other holder"
+    finally:
+        for fd in fds:
+            os.close(fd)

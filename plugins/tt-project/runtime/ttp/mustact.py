@@ -105,9 +105,6 @@ def block(db, ids, now: float | None = None) -> str:
         if ev["kind"] == URGENT_MSG_KIND:
             again = (" (urgent message with no finding yet: post the first finding in its chat now, with times, "
                      "before anything else; `ttp urgent-reply <chat> <text>` posts it mid-turn)")
-        if ev["kind"] == MISSING_KIND:
-            again = (" (missing entry: add it in this turn, then wake or requeue its task, unless a Restriction, "
-                     "a user hold or a user-only setting such as machines.allowed or push permission forbids it)")
         owners = f"; owners #{', #'.join(map(str, it.get('tasks') or []))}" if it.get("tasks") else "; no owner task"
         out.append(f"- {it['key']} in chat {it['chat']}{owners}{again}: {first}")
     out += [x for x in unowned(db, now) if x.split(":", 1)[0] not in {y.split(" in chat", 1)[0] for y in out}]

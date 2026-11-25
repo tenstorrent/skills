@@ -11107,8 +11107,8 @@ class Daemon:
         want: dict[str, tuple[dict, str, list[dict]]] = {}
         if preempt.enabled(self.cfg) and self.cfg_status != "unavailable":
             ready = None
-            for t in db.q("SELECT * FROM tasks WHERE status IN ('queued','running') AND spec LIKE '%urgent:%'"):
-                if not urgent.extra_ok(t, now) or not coord.task_resources(t):
+            for t in self._urgent_tasks(now):
+                if not coord.task_resources(t):
                     continue
                 if t["status"] == "queued":
                     ready = {r["id"] for r in db.ready_tasks()} if ready is None else ready
@@ -11210,25 +11210,47 @@ class Daemon:
         return [(r, w) for r, w in out if w]
 
     def _lock_holders(self, res: str, tid: int) -> list[dict]:
-        """The holders of `res`'s `ttp lock` slots other than task `tid` (check_lock_yield's form)."""
+        """The holders of `res`'s `ttp lock` slots other than task `tid`'s own hold (check_lock_yield's
+        form)."""
+        out = []
+        for h in self._other_holder_records(res, tid):
+            root = h.get("project_root")
+            own = os.path.realpath(root) == os.path.realpath(self.p.base) if root \
+                else str(h.get("project") or "") == self.p.name
+            task = int(h["task_id"]) if own and str(h.get("task_id") or "").isdigit() else None
+            run = int(h["run_id"]) if task and str(h.get("run_id") or "").isdigit() else None
+            label = f"#{task}" if task else str(h.get("holder") or "a holder")
+            if h.get("project_root") and not own:
+                label = f"{locks.project_of(h)}: {label}"
+            out.append({"label": label, "task": task, "run": run, "job_rc": h.get("job_rc") if task else None})
+        return out
+
+    def _other_holder_records(self, res: str, tid: int) -> list[dict]:
+        """The holder records of `res`'s `ttp lock` slots other than task `tid`'s own hold: the one
+        holder walk check_lock_yield and check_urgent_start's lock-wait naming share."""
         try:
             recs = locks.holder_records(self._slot_paths(res))
         except Exception:
             return []
-        mine = os.path.realpath(self.p.base)
-        out = []
-        for h in recs:
-            root = h.get("project_root")
-            own = os.path.realpath(root) == mine if root else h.get("project") == self.p.name
-            task = int(h["task_id"]) if own and str(h.get("task_id") or "").isdigit() else None
-            if task == tid:
-                continue
-            run = int(h["run_id"]) if task and str(h.get("run_id") or "").isdigit() else None
-            label = f"#{task}" if task else str(h.get("holder") or "a holder")
-            if root and not own:
-                label = f"{locks.project_of(h)}: {label}"
-            out.append({"label": label, "task": task, "run": run, "job_rc": h.get("job_rc") if task else None})
-        return out
+        return [h for h in recs if not self._own_hold(h, tid)]
+
+    def _own_hold(self, h: dict, tid) -> bool:
+        """Whether holder record `h` is task `tid`'s own hold: the record is this project's (by its
+        recorded name, or by its root when the registry named no project for it) and names the same
+        task. The one own-hold rule check_lock_yield and check_urgent_start's lock-wait naming share."""
+        if str(h.get("task_id") or "") != str(tid):
+            return False
+        name = str(h.get("project") or "")
+        if name:
+            return name == self.p.name
+        root = h.get("project_root")
+        return bool(root) and os.path.realpath(root) == os.path.realpath(self.p.base)
+
+    def _urgent_tasks(self, now: float) -> list[dict]:
+        """The queued or running tasks with a fresh `urgent:` line: the rows check_urgent_start and
+        check_lock_yield both watch."""
+        return [t for t in self.p.db.q("SELECT * FROM tasks WHERE status IN ('queued','running') AND spec LIKE '%urgent:%'")
+                if urgent.extra_ok(t, now)]
 
     def check_urgent_start(self, every_s: float = 60) -> None:
         """Model-free start watch for user-ordered urgent machine or device work: a task with a fresh
@@ -11253,8 +11275,7 @@ class Daemon:
         if mins <= 0 or self.cfg_status == "unavailable" or self.settling():
             return
         db = self.p.db
-        rows = [t for t in db.q("SELECT * FROM tasks WHERE status IN ('queued','running') AND spec LIKE '%urgent:%'")
-                if urgent.extra_ok(t, now) and (coord.task_resources(t) or holds_device(t, self.cfg))]
+        rows = [t for t in self._urgent_tasks(now) if coord.task_resources(t) or holds_device(t, self.cfg)]
         for seen in (self._urgent_own_logged, self._urgent_woke_from):   # only tasks still watched
             for tid in set(seen) - {t["id"] for t in rows}:
                 del seen[tid]
@@ -11318,9 +11339,7 @@ class Daemon:
                 who, since = {}, []
                 for s, on in waits:   # only the locks each wait is on; one naming none (checks, a push): their own events
                     for r in on:
-                        for h in locks.holder_records(self._slot_paths(r)):
-                            if str(h.get("project") or "") == self.p.name and str(h.get("task_id") or "") == str(tid):
-                                continue   # its own hold
+                        for h in self._other_holder_records(r, tid):
                             who[f"{r}: {h.get('project') or '?'} #{h.get('task_id') or '?'} run {h.get('run_id') or '?'}"
                                 + (f" ({h['note']})" if h.get("note") else "")] = None
                             since.append(s)

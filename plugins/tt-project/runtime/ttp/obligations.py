@@ -1762,12 +1762,12 @@ def _slack(p, o: dict, now: float) -> tuple[str, str] | None:
     the user's word); None once an owner started, the due passed or `justify` recorded the rule that holds it."""
     from . import eta, timefmt
     pr = o["promise"]
-    due, made = float(pr["due"]), float(pr.get("set_at") or o["created"])
+    got = eta.due_made(o, "promise", pr, now)
     ids = live_owner_ids(p.db, o)
-    j = (o.get("eta_justified") or {}).get("promise") or {}
-    if not ids or now >= due or pr.get("started") is not None or float(j.get("due") or 0) == due \
-            or first_run(p.db, ids, made) is not None:
+    if got is None or not ids or pr.get("started") is not None \
+            or first_run(p.db, ids, got[1]) is not None:
         return None
+    due, made = got
     owners = ", ".join(f"#{t}" for t in ids)
     moves = sum(1 for m in pr.get("moves") or [] if m.get("user") is None)   # the user's own moves never count
     if moves >= SLACK_MOVES:

@@ -37,7 +37,7 @@ def test_a_missing_entry_note_wakes_the_coordinator_with_a_must_act_item_at_once
     assert it["key"] == f"missing-entry-{t}" and it["chat"] == "c7" and it["tasks"] == [t]
     block = mustact.block(p.db, [ev["id"]])
     assert "## Must act now" in block and "tt-smi -r" in block and "guards.allow_commands" in block
-    assert "add it in this turn" in block and "machines.allowed" in block
+    assert "Add it now" in block, "the event's own first line still carries the rule"
     assert mustact.acted(it, [{"type": "config_set", "key": "guards.allow_commands"}], {0})
     assert mustact.acted(it, [{"type": "task_update", "id": t, "status": "queued"}], {0})
     assert not mustact.acted(it, [{"type": "reply", "chat": "c7", "text": "on it"}], {0})

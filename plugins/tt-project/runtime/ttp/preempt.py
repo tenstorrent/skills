@@ -6,10 +6,11 @@ nothing else holds gets the slot of the lowest-priority routine run, stopped at 
 `ttp stop --kill` path (runner.request_stop with STOP_TEXT: its supervisor ends the agent, the task goes back
 to the queue at its place, its worktree, branch and attempts kept, and resumes on its next start).
 
-Never preempted (victims): urgent work or a review of it (urgent.covers_urgent), any review, a harness task,
-a task pushing or not running, an open obligation's required owner, a run whose stop is already asked, and
-a run holding a `ttp lock` (a device lock or any other: it may be mid-command on the device). Dispatch calls
-pick once per held urgent task per tick; budget.urgent_preempt false turns it off.
+Slot preemption never takes (victims): urgent work or a review of it (urgent.covers_urgent), any review, a
+harness task, a task pushing or not running, an open obligation's required owner, a run whose stop is already
+asked, and a run holding a `ttp lock` (a device lock or any other: it may be mid-command on the device; the
+Lock yield paragraph below is the one path that stops a lock holder). Dispatch calls pick once per held
+urgent task per tick; budget.urgent_preempt false turns it off.
 
 A coordinator restart takes the same path (request_restart): a task_update on a running task whose spec has a
 `restart: <why>` line, or `ttp task <project> restart <id> "<why>"`. The run gets a RESTART file and is stopped
