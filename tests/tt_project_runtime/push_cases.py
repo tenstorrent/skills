@@ -20768,12 +20768,15 @@ def test_push_queue_batch_checks_run_at_nice_19_and_idle_io_like_ttp_checks(env,
     src = inspect.getsource(batch)
     calls = [n for n in ast.walk(ast.parse(src)) if isinstance(n, ast.Call) and getattr(n.func, "attr", "") == "check_argv"]
     assert len(calls) == 1, "every batch check argv comes from batch._check_argv"
-    streamed = [n.args[0] for n in ast.walk(ast.parse(src))
+    streamed = [n for n in ast.walk(ast.parse(src))
                 if isinstance(n, ast.Call) and getattr(n.func, "id", "") == "_stream" and n.args]
-    checks = [a for a in streamed if isinstance(a, ast.Call)]
-    assert len(checks) >= 3 and all(getattr(a.func, "id", "") == "_check_argv" for a in checks), \
+    checks = [n for n in streamed if isinstance(n.args[0], ast.Call)]
+    assert len(checks) >= 3 and all(getattr(n.args[0].func, "id", "") == "_check_argv" for n in checks), \
         "every batch stream (entry checks, run, rerun, cap probe, split probe) is a _check_argv"
-    argv = batch._check_argv("x", tmp_path)
+    for n in checks:   # its argv is built from the env it runs with
+        given = {k.arg: ast.dump(k.value) for k in n.keywords}.get("env")
+        assert given and ast.dump(n.args[0].args[2]) == given, ast.unparse(n)
+    argv = batch._check_argv("x", tmp_path, dict(os.environ))
     assert argv[len(argv) - len(push.check_argv("x", tmp_path)):] == push.check_argv("x", tmp_path)
     if not (shutil.which("nice") and shutil.which("ionice")):
         return   # the live check needs both tools (`nice -n 19` reaches 19 from any lower level)
@@ -20783,7 +20786,7 @@ def test_push_queue_batch_checks_run_at_nice_19_and_idle_io_like_ttp_checks(env,
         print("nice", os.nice(0))
         print("io", subprocess.run(["ionice", "-p", str(os.getpid())], capture_output=True, text=True).stdout.strip())
     """))
-    rc, tail, _ = batch._stream(batch._check_argv(f"{shlex.quote(sys.executable)} {probe}", tmp_path), tmp_path)
+    rc, tail, _ = batch._stream(batch._check_argv(f"{shlex.quote(sys.executable)} {probe}", tmp_path, dict(os.environ)), tmp_path)
     assert rc == 0, tail
     assert "nice 19" in tail and "io idle" in tail, tail
 
@@ -23307,3 +23310,23 @@ def test_a_local_select_rerun_of_a_check_that_sets_its_own_pythonpath_loads_the_
     r = subprocess.run(argv, cwd=tmp_path, env=env, capture_output=True, text=True, timeout=120)
     assert "ImportError" not in r.stdout + r.stderr, r.stdout + r.stderr
     assert "1 failed" in r.stdout and "test_fails" not in r.stdout, r.stdout
+
+
+def test_a_batch_rerun_of_a_check_that_sets_its_own_pythonpath_loads_the_select_plugin(tmp_path, monkeypatch):
+    """The push queue's rerun of failing tests (Batch._run_ids) builds the check's argv from the env it
+    runs with, so a check that sets PYTHONPATH itself still imports `-p ttp_pytest_select` and runs only
+    the selected test; an empty `PYTHONPATH=` gets the plugin folder alone, no empty (cwd) entry."""
+    from ttp import batch, gatejudge, push
+    (tmp_path / "pytest.ini").write_text("[pytest]\n")
+    (tmp_path / "test_x.py").write_text("def test_fails():\n    assert 0\n\ndef test_other():\n    assert 0\n")
+    clean = {k: v for k, v in os.environ.items() if not k.startswith(("PYTEST_", "TTP_PYTEST_"))}
+    monkeypatch.setattr(batch.Batch, "_checkout", lambda self, head: None)
+    monkeypatch.setattr(batch.Batch, "_urgent_mark", lambda self: False)
+    b = batch.Batch.__new__(batch.Batch)
+    b.wt, b.d, b.checks, b.reran = tmp_path, {}, {}, {"head": set(), "tip": set()}
+    for own in ("PYTHONPATH=.", "PYTHONPATH="):
+        rc, tail = b._run_ids("h" * 40, f"{own} {sys.executable} -m pytest -q -p no:cacheprovider test_x.py",
+                              ["test_x.py::test_other"], "head", clean, {})
+        assert "ImportError" not in tail and rc == 1 and _passed_failed(tail) == (0, 1), tail
+    sel = gatejudge.select_env(["test_x.py::test_other"], clean)
+    assert push.check_argv("PYTHONPATH= pytest", None, sel)[-1].split()[0].endswith(os.sep + "pytest_resume")

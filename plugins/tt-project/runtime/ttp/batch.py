@@ -371,10 +371,10 @@ def _here(cmd):
     return getattr(cmd, "was", cmd) if getattr(cmd, "spilled", False) else cmd
 
 
-def _check_argv(cmd, wt: Path) -> list[str]:
-    """How a batch check runs: push.check_argv at a low CPU and IO priority (testslots.low_priority),
-    as `ttp push` (push._run_one) and `ttp checks` run theirs."""
-    return testslots.low_priority(push.check_argv(cmd, wt))
+def _check_argv(cmd, wt: Path, env: dict) -> list[str]:
+    """How a batch check runs with `env`, the environment it is given: push.check_argv on that env at a
+    low CPU and IO priority (testslots.low_priority), as `ttp push` (push._run_one) and `ttp checks` run theirs."""
+    return testslots.low_priority(push.check_argv(cmd, wt, env))
 
 
 def _stream(cmd: str | list[str], cwd: Path, env: dict | None = None, timeout: float | None = None,
@@ -2231,14 +2231,14 @@ class Batch:
             key = str(cmd)
             if key not in bad:   # once per tip: a command the tip itself fails blames no entry
                 self._checkout(tip)
-                rc, _, over = _stream(_check_argv(cmd, self.wt), self.wt, env=env, timeout=ENTRY_CHECK_S, group=True)
+                rc, _, over = _stream(_check_argv(cmd, self.wt, env), self.wt, env=env, timeout=ENTRY_CHECK_S, group=True)
                 bad[key] = rc != 0 or over
                 if bad[key]:
                     say(f"entry check `{key}` fails on {tip[:10]} alone; the batch's checks decide instead")
             if bad[key]:
                 continue
             self._checkout(head)
-            rc, tail, over = _stream(_check_argv(cmd, self.wt), self.wt, env=env, timeout=ENTRY_CHECK_S, group=True)
+            rc, tail, over = _stream(_check_argv(cmd, self.wt, env), self.wt, env=env, timeout=ENTRY_CHECK_S, group=True)
             if rc != 0 and not over:
                 return key, tail
         self._checkout(head)
@@ -2822,7 +2822,7 @@ class Batch:
 
         def once():
             collect.reset()
-            return _stream(_check_argv(cmd, self.wt), self.wt, env=run_env, pass_fds=checkdirs.inherited(),
+            return _stream(_check_argv(cmd, self.wt, run_env), self.wt, env=run_env, pass_fds=checkdirs.inherited(),
                            collect=collect, urgent_mark=self._urgent_mark())
         reruns = torn = setup = 0
         while True:
@@ -2935,8 +2935,8 @@ class Batch:
         self.reran.setdefault(where, set()).update(ids)
         self._checkout(at)
         self.checks["reruns"] = self.checks.get("reruns", 0) + 1
-        rc, tail, late = _stream(_check_argv(cmd, self.wt), self.wt,
-                                 env={**env, **gatejudge.select_env(ids, env), **slot_env},
+        run_env = {**env, **gatejudge.select_env(ids, env), **slot_env}
+        rc, tail, late = _stream(_check_argv(cmd, self.wt, run_env), self.wt, env=run_env,
                                  timeout=_seconds(self.d.get("push_rerun_s"), RERUN_S), group=True,
                                  pass_fds=checkdirs.inherited(), urgent_mark=self._urgent_mark())
         gone = gatejudge.not_collected(tail)
@@ -3198,8 +3198,8 @@ class Batch:
                         slot = self._slot(head)
                         started, cpu0 = time.time(), checkcap.child_cpu_s()
                     say(f"cap probe of {head[:10]}: {cmd}")
-                    rc, tail, _ = _stream(_check_argv(cmd, self.wt), self.wt,
-                                          env={**env, **pushpass.select_env(rx, env), **slot.env()},
+                    run_env = {**env, **pushpass.select_env(rx, env), **slot.env()}
+                    rc, tail, _ = _stream(_check_argv(cmd, self.wt, run_env), self.wt, env=run_env,
                                           pass_fds=checkdirs.inherited(), urgent_mark=self._urgent_mark())
                     if fault := push.remote_fault(cmd, rc, self.wt, str(tail or "")):
                         raise envfault.Fault(fault)

@@ -641,7 +641,8 @@ def check_argv(cmd: str, top: str | Path | None = None, env: dict | None = None,
     return [*wrap, *lane, *argv]
 
 
-_SETS_PYTHONPATH = re.compile(r"(?<![\w$])PYTHONPATH=")
+# A PYTHONPATH= word; group 1 is the first character of its value, empty when none follows.
+_SETS_PYTHONPATH = re.compile(r"(?<![\w$])PYTHONPATH=(?=([^\s;&|)]?))")
 
 
 def _keep_select_path(cmd: str, env: dict | None) -> str:
@@ -650,7 +651,8 @@ def _keep_select_path(cmd: str, env: dict | None) -> str:
     drop the folder select_env put on PYTHONPATH, and pytest could not import `-p ttp_pytest_select`."""
     if pushpass.SELECT_PLUGIN not in (env or {}).get("PYTEST_ADDOPTS", ""):
         return cmd
-    return _SETS_PYTHONPATH.sub(lambda m: m.group(0) + shlex.quote(str(pushpass.PLUGIN_DIR)) + os.pathsep, cmd)
+    return _SETS_PYTHONPATH.sub(
+        lambda m: m.group(0) + shlex.quote(str(pushpass.PLUGIN_DIR)) + (os.pathsep if m.group(1) else ""), cmd)
 
 
 VENV_DIRS = (".venv", "venv")
