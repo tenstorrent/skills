@@ -249,6 +249,11 @@ def test_pyproof_proves_nothing_when_python_may_import_a_module_from_its_folder_
     (tmp_path / "extra" / "usercustomize.py").write_text("x")
     (site / "paths.pth").write_text(f"/opt/x\n{tmp_path / 'extra'}\n")
     assert not proven(work)                                 # nor one naming a folder that holds a module it runs
+    (site / "evil").mkdir()
+    (site / "evil" / "usercustomize.py").write_text("x")
+    (site / "link").symlink_to(tmp_path / "home")
+    (site / "paths.pth").write_text("link/../evil\n")
+    assert not proven(work)                                 # by python's reading of the line, not the filesystem's
     (site / "paths.pth").unlink()
     (site / "usercustomize.py").write_text("x")
     assert not proven(work)                                 # nor when the user's site folder holds one

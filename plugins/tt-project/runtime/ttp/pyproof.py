@@ -475,8 +475,8 @@ def _runs_at_start(folder: str) -> bool:
         lines = [line.rstrip() for p in pths for line in open(p, errors="replace") if not line.startswith("#")]
     except OSError:
         return True
-    return any(line.startswith(("import ", "import\t")) or line and _holds_module(os.path.join(folder, line))
-               for line in lines)
+    return any(line.startswith(("import ", "import\t"))   # a path line: the folder site.makepath adds
+               or line and _holds_module(os.path.abspath(os.path.join(folder, line))) for line in lines)
 
 
 def _holds_module(folder: str) -> bool:
