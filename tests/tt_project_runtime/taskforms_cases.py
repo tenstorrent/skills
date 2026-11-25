@@ -147,3 +147,12 @@ def test_tform_memory_names_resolve_to_the_one_entry_meant_and_a_standing_entry_
     assert f"supersedes: {old!r}" in notes and "a shorter-lived one never retires" in notes, notes
     live = {e["name"] for e in p._memory_entries()}
     assert old not in live and duty in live
+
+
+def test_tform_config_set_maps_a_bare_key_only_onto_its_one_ordinary_home():
+    """A bare key maps onto the one section holding that leaf; a leaf in two sections, or whose only home needs
+    the user's word, stays unmapped so the normal refusal applies."""
+    from ttp import configwho
+    form = lambda k: configwho.normal_form(None, {"type": "config_set", "key": k, "value": 1}, [], "UTC", 0.0)
+    assert form("spill_beside_device")[0]["key"] == "checks.spill_beside_device"
+    assert form("timeout_s") is None and form("max_hops") is None

@@ -564,7 +564,7 @@ def normal_form(_p, a: dict, _batch: list, _home: str, _now: float):
         return None   # an account key means itself, never a project key
     *head, leaf = key.split(".")
     tops = sorted(_known_keys([]) or ())
-    both = [f"{s}.{x}" for s in tops for x in (leaf, "_".join([*head[-1:], leaf]))
+    both = [f"{s}.{x}" for s in tops for x in {leaf, "_".join([*head[-1:], leaf])}
             if s != (head or [""])[0] and x in (_known_keys([s]) or ())]
     near = difflib.get_close_matches(leaf, sorted(_known_keys(head) or ()), n=2, cutoff=0.85) if head else []
     to = both[0] if len(both) == 1 else ".".join([*head, near[0]]) if len(near) == 1 else None
