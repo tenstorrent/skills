@@ -23292,3 +23292,18 @@ def test_a_push_refused_before_any_remote_write_is_not_a_claim(env):
     assert [c["marker"] for c in pushclaim.marker_claims(p, tid, 7)] == [f"t{tid}-c.json"]
     marker("d", status="pushed", exit=0, sha="ab" * 20)
     assert [c["marker"] for c in pushclaim.marker_claims(p, tid, 7)] == [f"t{tid}-d.json"]
+
+
+def test_a_local_select_rerun_of_a_check_that_sets_its_own_pythonpath_loads_the_select_plugin(tmp_path):
+    """A local rerun of failing tests (gatejudge.select_env) of a check that sets PYTHONPATH itself, as
+    `PYTHONPATH=$PWD python3 -m pytest ...` does, still imports `-p ttp_pytest_select` and runs only the
+    selected test: check_argv puts the plugin's folder first in the PYTHONPATH the command sets."""
+    from ttp import gatejudge, push
+    (tmp_path / "pytest.ini").write_text("[pytest]\n")
+    (tmp_path / "test_x.py").write_text("def test_fails():\n    assert 0\n\ndef test_other():\n    assert 0\n")
+    clean = {k: v for k, v in os.environ.items() if not k.startswith(("PYTEST_", "TTP_PYTEST_"))}
+    env = {**clean, "PWD": str(tmp_path), **gatejudge.select_env(["test_x.py::test_other"], clean)}
+    argv = push.check_argv("PYTHONPATH=$PWD python3 -m pytest -q -p no:cacheprovider test_x.py", None, env)
+    r = subprocess.run(argv, cwd=tmp_path, env=env, capture_output=True, text=True, timeout=120)
+    assert "ImportError" not in r.stdout + r.stderr, r.stdout + r.stderr
+    assert "1 failed" in r.stdout and "test_fails" not in r.stdout, r.stdout
