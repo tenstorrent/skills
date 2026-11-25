@@ -28,8 +28,8 @@ gate. A check sees AT_ENV=stop there, with the run's own variables (RUN_VARS) le
 A code task's hand-off also meets one built-in check (builtin_check, no setting): it must show a run line
 of its new tests failing on the base commit (new_test_gap), whatever ran it; a run on the GLM model is checked
 further: its branch's added test lines must not name the real /tmp, /home, ~ or Path.home()
-(glm_test_hygiene), its added comments and docstrings must not tell an incident (slop.new_noisy), and its
-hand-off must name each numbered spec step (handoff_gaps). A failure sends back like a project check, under
+(glm_test_hygiene), its added comments and docstrings must state the rule and never tell what happened
+(slop.new_noisy), and its hand-off must name each numbered spec step (handoff_gaps). A failure sends back like a project check, under
 the same cap."""
 from __future__ import annotations
 
