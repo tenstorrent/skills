@@ -417,6 +417,20 @@ def test_a_live_claim_naming_a_commit_the_running_version_lacks_is_marked(env, m
     assert "(unverified)" in fixed and "not live yet" not in fixed, fixed
 
 
+def test_a_live_claim_with_a_running_commit_the_repo_lacks_reads_unverified(env, monkeypatch):
+    """A project whose repo does not hold the daemon's running commit (any project but the
+    plugin's own) cannot check a live claim at all: sha-less or not, it reads (unverified),
+    never a false 'not live yet' mark in the user's chat."""
+    from ttp import pushclaim
+    p, repo, head = _claim_replay_setup(env, monkeypatch, landed=True)
+    outside = "f1d0" * 10   # a running commit this repository does not hold
+    fixed = pushclaim.correct_reply_claims(p, "The fix is live.", p.root, running=outside)
+    assert "(unverified)" in fixed and "not live yet" not in fixed, fixed
+    fixed = pushclaim.correct_reply_claims(p, f"The fix is live (commit {head[:10]}).", p.root,
+                                           running=outside)
+    assert "(unverified)" in fixed and "not live yet" not in fixed, fixed
+
+
 def test_hedged_landed_and_live_claims_are_not_claims(env, monkeypatch):
     """'should have landed' and its hedge kin hedge a landed claim out of existence (the
     ponytail-lane follow-up); the unhedged sha-less landed claim is still corrected."""
