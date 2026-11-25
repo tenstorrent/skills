@@ -236,8 +236,6 @@ def run_pass(cfg: dict, platform: str | None = None, now: float | None = None) -
             continue
         mine = [t for t in ts if t["box"] == box]
         bs = boxes.get(box, {})
-        if bs and (line := _down_alert(box, bs, now)):
-            out.append(line)
         if bs.get("next", 0) > now and not fast:
             continue
         ports = sorted({p for t in mine for p in t["ports"]})
@@ -250,7 +248,7 @@ def run_pass(cfg: dict, platform: str | None = None, now: float | None = None) -
                 continue
             # offline or the box is down: keep checking, keep restarting its bridges (never only a
             # network change): each restart re-reads the ssh route and jump hosts and resolves the
-            # name again, paced like any other failing service; _down_alert tells the user once
+            # name again, paced like any other failing service; the user is told once
             n = bs.get("n", 0) + 1
             wait = BACKOFF_S[min(n, len(BACKOFF_S)) - 1]
             live = [t for t in mine if loaded(t, platform)]
@@ -262,6 +260,8 @@ def run_pass(cfg: dict, platform: str | None = None, now: float | None = None) -
                        if acts else f"next check in {wait}s or on a network change"))
             if refused := [a for a in acts if not a.endswith(": restarted")]:
                 out.append(f"{box}: some restarts refused: {'; '.join(refused)}")
+            if line := _down_alert(box, boxes[box], now):   # only after a check that failed: a sleep never alerts
+                out.append(line)
             continue
         boxes.pop(box, None)
         if (rec := _recovered(box, bs, now)):
@@ -341,19 +341,13 @@ def run_pass(cfg: dict, platform: str | None = None, now: float | None = None) -
     return out
 
 
-def run_window(cfg: dict, platform: str | None = None, clock=time.time, sleep=time.sleep, reload=None):
+def run_window(cfg: dict, platform: str | None = None, clock=time.time, sleep=time.sleep):
     """`ttp bridge watch`: a pass, then one every FAST_STEP_S while a network change's fast window stays open;
-    yields each pass's lines as it ends. `reload` re-reads the bridge config between passes, so a route
-    or jump host fixed mid-outage is picked up without waiting for the next run of the service."""
+    yields each pass's lines as it ends."""
     while True:
         yield from run_pass(cfg, platform, clock())
         if _load().get("fast_until", 0) <= clock() + FAST_STEP_S:
             return
-        if reload:
-            try:
-                cfg = reload()
-            except Exception:   # a half-edited config keeps the last good one
-                pass
         sleep(FAST_STEP_S)
 
 

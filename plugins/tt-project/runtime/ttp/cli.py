@@ -2991,7 +2991,7 @@ def cmd_bridge(a) -> None:
         return
     if a.action == "watch":   # the self-heal check: one pass, more during a fast window (its service runs this)
         from . import bridge_watch
-        for line in bridge_watch.run_window(cfg, reload=lambda: bridge.load(a.config)):
+        for line in bridge_watch.run_window(cfg):
             print(f"{time.strftime('%Y-%m-%d %H:%M:%S')} {line}", flush=True)
         return
     boxes = a.boxes or list(cfg["boxes"])

@@ -2485,7 +2485,7 @@ def test_bridge_watch_offline_keeps_retrying_and_restarts_its_bridges_on_a_pace(
     for i in range(12):   # an hour down: a check each minute, every one logged, never a silent stretch
         assert any(ln.startswith("box-1: not reachable") for ln in bridge_watch.run_pass(cfg, "linux", t0 + 61 * i))
     assert len(seen["box"]) == 12
-    assert 1 < sum("systemctl --user restart" in c for c in seen["run"]) < 12   # restarts keep coming, on the pace
+    assert sum("systemctl --user restart" in c for c in seen["run"]) == 4   # on the 0/60/120/300 s pace, never every check
 
 
 def test_bridge_watch_alerts_once_after_five_minutes_down_and_once_when_back(tmp_path, monkeypatch):
@@ -2513,10 +2513,12 @@ def test_bridge_watch_alerts_once_after_five_minutes_down_and_once_when_back(tmp
     for i in range(10):   # a pass every 30 s: down from t0 to t0 + 270
         lines += pass_at(cfg, 30 * i)
     assert shown == [] and not any("alerted" in ln for ln in lines)
-    out = pass_at(cfg, 300)
-    assert len(shown) == 1 and "unreachable" in shown[0][0] and any("user alerted" in ln for ln in out)
-    for i in range(11, 24):   # more minutes down: no second alert
-        pass_at(cfg, 30 * i)
+    alerted = []
+    for i in range(10, 24):   # the first failed check at or after 5 min alerts (within a backoff step), once
+        if any("user alerted" in ln for ln in pass_at(cfg, 30 * i)):
+            alerted.append(30 * i)
+    assert len(alerted) == 1 and 300 <= alerted[0] <= 300 + max(bridge_watch.BACKOFF_S) and len(shown) == 1
+    assert "unreachable" in shown[0][0]
     assert len(shown) == 1
     out = pass_at(cfg, 750)   # the box answers
     assert len(shown) == 2 and "again" in shown[1][0] and "750s" in shown[1][1]
@@ -2524,6 +2526,14 @@ def test_bridge_watch_alerts_once_after_five_minutes_down_and_once_when_back(tmp
     assert "box-1" not in bridge_watch._load()["boxes"]
     pass_at(cfg, 780)
     assert len(shown) == 2   # one note only
+    # a box that went down just before a long sleep, and answers on waking, alerts nothing
+    clock[0], up_at[0] = t0, t0 + 100_000
+    (tmp_path / "ttp" / "bridge-watch.json").unlink()
+    pass_at(cfg, 0)
+    shown.clear()
+    up_at[0] = t0 + 28_000
+    pass_at(cfg, 28_800)
+    assert shown == []
     # a short outage never alerts, so its recovery says nothing either
     shown.clear()
     clock[0], up_at[0] = t0, t0 + 100
@@ -2537,29 +2547,6 @@ def test_bridge_watch_alerts_once_after_five_minutes_down_and_once_when_back(tmp
     (tmp_path / "ttp" / "bridge-watch.json").unlink()
     pass_at(cfg, 0)
     assert any("user alerted" in ln for ln in pass_at(cfg, 400))
-
-
-def test_bridge_watch_window_rereads_the_route_between_passes(tmp_path, monkeypatch):
-    # cells: reload-each-pass, half-edited-config-keeps-last-good
-    import os
-    from ttp import bridge_watch
-    cfg, seen = _watch_env(tmp_path, monkeypatch, "darwin", [None] * 60)
-    stamp = tmp_path / "netconf"
-    stamp.write_text("x")
-    t0 = 1_000_000.0
-    os.utime(stamp, (t0 - 1000, t0 - 1000))
-    list(bridge_watch.run_window(cfg, "darwin", *_watch_clock(t0)[1:]))
-    os.utime(stamp, (t0 + 1, t0 + 1))   # a network change opens the fast window
-    loads = []
-
-    def reload():
-        loads.append(1)
-        if len(loads) == 2:
-            raise ValueError("half-edited")
-        return cfg
-    now, clock, sleep = _watch_clock(t0 + 2)
-    list(bridge_watch.run_window(cfg, "darwin", clock, sleep, reload=reload))
-    assert len(loads) >= 3 and len(seen["box"]) == len(loads) + 2   # one pass per reload, the failed reload did not stop it
 
 
 def _watch_clock(t):
