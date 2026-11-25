@@ -51,6 +51,7 @@ NET_PATHS = {"darwin": ["/Library/Preferences/SystemConfiguration"]}   # launchd
 BACKOFF_S = (30, 60)                  # the next check of a box that could not be reached: never over a minute
 RESTART_GAP_S = (0, 60, 120, 300)   # the least time between restarts of one service that keeps failing
 ALERT_AFTER_S = 300                  # a box unreachable this long gets one desktop alert, one more when back
+STALE_S = 3 * max(BACKOFF_S)         # a failed check this long after the last one (a sleep between) starts a new outage
 #                                     (a restarted session needs some seconds to log in and forward its ports)
 LOGIN_S = INTERVAL_S                # a session's login younger than this may not have set up its forwards yet
 FAST_S, FAST_STEP_S = 120, 5        # after a network change: a check every FAST_STEP_S until all answer, at most FAST_S
@@ -132,6 +133,11 @@ def _alert(title: str, body: str) -> None:
         show(f"tt-project: {title}", body)
     except Exception as e:   # the watch pass must survive a failed alert
         print(f"alert failed: {e}", file=sys.stderr)
+
+
+def _gap(restarts: int) -> float:
+    """The least time before the next restart of something restarted `restarts` times already."""
+    return RESTART_GAP_S[min(restarts, len(RESTART_GAP_S) - 1)]
 
 
 def _down_alert(box: str, bs: dict, now: float) -> str | None:
@@ -249,13 +255,16 @@ def run_pass(cfg: dict, platform: str | None = None, now: float | None = None) -
             # offline or the box is down: keep checking, keep restarting its bridges (never only a
             # network change): each restart re-reads the ssh route and jump hosts and resolves the
             # name again, paced like any other failing service; the user is told once
+            if not bs.get("alert") and now - bs.get("at", now) > STALE_S:
+                bs = {}   # its last failed check was before a sleep: the outage is counted from this check
             n = bs.get("n", 0) + 1
             wait = BACKOFF_S[min(n, len(BACKOFF_S)) - 1]
-            live = [t for t in mine if loaded(t, platform)]
-            gap = RESTART_GAP_S[min(bs.get("restarts", 0), len(RESTART_GAP_S) - 1)]
-            acts = [f"{t['service']}: {restart(t, platform)}" for t in live] if live and now - bs.get("last", 0) >= gap else []
-            boxes[box] = {"n": n, "next": now + wait, "since": bs.get("since") or now, "alert": bs.get("alert", 0),
-                          "restarts": bs.get("restarts", 0) + bool(acts), "last": now if acts else bs.get("last", 0)}
+            due = now - bs.get("last", 0) >= _gap(bs.get("restarts", 0))
+            live = [t for t in mine if loaded(t, platform)] if due else []
+            acts = [f"{t['service']}: {restart(t, platform)}" for t in live]
+            boxes[box] = {"n": n, "at": now, "next": now + wait, "since": bs.get("since") or now,
+                          "alert": bs.get("alert", 0), "restarts": bs.get("restarts", 0) + bool(acts),
+                          "last": now if acts else bs.get("last", 0)}
             out.append(f"{box}: not reachable; " + ("restarted its bridges to retry the route"
                        if acts else f"next check in {wait}s or on a network change"))
             if refused := [a for a in acts if not a.endswith(": restarted")]:
@@ -314,7 +323,7 @@ def run_pass(cfg: dict, platform: str | None = None, now: float | None = None) -
                                "until its check changes")
                     f["said"] = True
                 continue
-            if f and now - f["last"] < RESTART_GAP_S[min(f["restarts"], len(RESTART_GAP_S) - 1)]:
+            if f and now - f["last"] < _gap(f["restarts"]):
                 continue
             # a login under way is no failure yet: a spared session that comes up records no heal
             if t["agent"] and none >= set(t["ports"]) and (age := login_age(t, platform)) is not None and age < LOGIN_S:

@@ -2534,6 +2534,16 @@ def test_bridge_watch_alerts_once_after_five_minutes_down_and_once_when_back(tmp
     up_at[0] = t0 + 28_000
     pass_at(cfg, 28_800)
     assert shown == []
+    # one that is still down on waking (the network not back yet) counts its outage from waking, not from
+    # before the sleep: no alert at once, one after 5 min of failed checks
+    up_at[0] = t0 + 100_000
+    (tmp_path / "ttp" / "bridge-watch.json").unlink()
+    pass_at(cfg, 0)
+    shown.clear()
+    assert not any("alerted" in ln for ln in pass_at(cfg, 28_800)) and shown == []
+    assert bridge_watch._load()["boxes"]["box-1"]["since"] == t0 + 28_800
+    woke = [ln for i in range(1, 13) for ln in pass_at(cfg, 28_800 + 30 * i)]
+    assert len(shown) == 1 and any("unreachable for 3" in ln and "user alerted" in ln for ln in woke), woke
     # a short outage never alerts, so its recovery says nothing either
     shown.clear()
     clock[0], up_at[0] = t0, t0 + 100
@@ -2545,8 +2555,7 @@ def test_bridge_watch_alerts_once_after_five_minutes_down_and_once_when_back(tmp
     monkeypatch.setattr(notifier, "show", lambda *a, **k: 1 / 0)
     up_at[0] = t0 + 10_000
     (tmp_path / "ttp" / "bridge-watch.json").unlink()
-    pass_at(cfg, 0)
-    assert any("user alerted" in ln for ln in pass_at(cfg, 400))
+    assert any("user alerted" in ln for i in range(15) for ln in pass_at(cfg, 30 * i))
 
 
 def test_bridge_watch_project_host_reboot_every_box_down_retries_paced_and_alerts_once_each(tmp_path, monkeypatch):
@@ -2648,7 +2657,6 @@ def test_bridge_watch_heals_within_a_minute_of_the_network_back_after_a_wake(tmp
     t0 = 1_000_000.0   # the computer sleeps; it wakes at +21, the network changes at +22 and is back at +30
     wake_change, net_back = t0 + 22, t0 + 30
     now, clock, sleep = _watch_clock(t0 - 30)
-    restarted = []
 
     stamped = []   # when each restart ran (seen at the next check)
 
