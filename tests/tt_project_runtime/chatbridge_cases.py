@@ -1462,8 +1462,11 @@ def test_a_quota_429_ends_the_chat_run_at_once_for_a_provider_fallback(tmp_path,
     subprocess.run([sys.executable, "-m", "ttp.runner", str(run_dir)], cwd=str(RUNTIME), env=run_env,
                    timeout=_load_scaled(120))
     info = json.loads((run_dir / "exit.json").read_text())
-    assert info["stopped"] == "quota" and info["bridge"]["quota_until"] == _QUOTA_END, info
-    assert info["ended"] - info["started"] < 30, "it stops at once, not after its retries or time limit"
+    # The 429 goes to the agent at once (no capacity waits); an agent that keeps calling is stopped by
+    # the runner (stopped: quota). Either way the daemon ends it as a quota fallback from the window.
+    assert info["stopped"] in ("quota", None) and info["bridge"]["quota_until"] == _QUOTA_END, info
+    assert info["bridge"]["upstream"]["code"] == "quota_exceeded" and info["bridge"]["faults"] == {"rate_limit": 1}
+    assert info["ended"] - info["started"] < 30, "it ends at once, not after its retries or time limit"
 
 
 def test_a_quota_stopped_routed_run_falls_back_and_chat_takes_no_new_run_until_the_window_resets(env, monkeypatch):

@@ -1349,7 +1349,10 @@ def _read_json(path: Path):
 
 def endpoint_fault(ended: dict) -> str:
     """The endpoint fault (the chat bridge's last_fault, e.g. "rate_limit" for an HTTP 429) an agent
-    exited non-zero on, per its exit.json `ended`, or "": a cell the timeout stopped is the model's."""
+    exited non-zero on, per its exit.json `ended`, or "": a cell the timeout stopped is the model's, one
+    the runner stopped at the endpoint's used-up token quota (chatbridge.quota_until) the endpoint's."""
+    if isinstance(ended, dict) and ended.get("stopped") == "quota":
+        return "quota"
     if not isinstance(ended, dict) or ended.get("rc") in (0, None) or ended.get("stopped"):
         return ""
     return str((ended.get("bridge") or {}).get("last_fault") or "")

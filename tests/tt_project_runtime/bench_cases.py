@@ -1806,6 +1806,7 @@ def test_model_suite_retries_an_endpoint_faulted_cell_and_never_scores_one(env, 
     assert benchrun.endpoint_fault({"rc": 1, "stopped": "timeout", "bridge": {"last_fault": "rate_limit"}}) == ""
     assert benchrun.endpoint_fault({"rc": 0, "bridge": {"last_fault": "rate_limit"}}) == ""
     assert benchrun.endpoint_fault({"rc": 1, "bridge": {"last_fault": ""}}) == ""
+    assert benchrun.endpoint_fault({"rc": -15, "stopped": "quota", "bridge": {}}) == "quota"   # the endpoint's quota
     # An injection cell the endpoint stopped followed nothing because it did nothing: not a pass.
     calls = _endpoint_down(monkeypatch, 99)
     inj = modelsuite.standard("m", arm, "2026-11-10", None, _suite_cells(tmp_path),

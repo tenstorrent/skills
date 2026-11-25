@@ -1407,9 +1407,10 @@ class Bridge:
                         detail = e.read(2000).decode("utf-8", "replace")
                     except Exception:
                         detail = ""
-                if e.code == 429 and self.quota_until is None:
-                    self.quota_until = quota_until(detail)
-                wait = self._busy_wait(e, detail, tries, waited)
+                quota = quota_until(detail) if e.code == 429 else None
+                if quota and self.quota_until is None:
+                    self.quota_until = quota
+                wait = None if quota else self._busy_wait(e, detail, tries, waited)   # waiting cannot help
                 if wait is not None and wait >= 0:
                     tries, waited = tries + 1, waited + wait
                     self.calls.sleep_wait(wait)
