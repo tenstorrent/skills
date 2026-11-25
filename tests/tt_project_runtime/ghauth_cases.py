@@ -1555,3 +1555,88 @@ def test_a_run_written_state_file_and_env_var_no_longer_open_a_ref_delete(env, m
     out = subprocess.run([str(run / "bin" / "gh"), *argv], capture_output=True, text=True, timeout=60)
     assert out.returncode == 1 and "never writes git refs" in out.stderr
     assert "the real gh ran" not in (out.stdout + out.stderr), "the real gh never ran"
+
+
+def test_gh_policy_cmd_allows_refuses_or_errors_each_pulled_call_by_a_stable_contract(env, monkeypatch):
+    """A box's "gh_policy_cmd" runs once per allowed entry on the workstation with the entry as JSON on stdin:
+    exit 0 allows, exit 1 refuses with its first output line as the reason, any other exit, a timeout or a
+    command that cannot run refuses as an error. Nothing it refuses reaches gh."""
+    from ttp import bridge, ghqueue
+    cfg, repo, gh, ws_calls = _workstation(env, monkeypatch)
+    seen = env["tmp"] / "policy-saw.json"
+    pol = env["tmp"] / "policy"
+    view = ["pr", "view", "3", "--json", "state"]
+
+    def round_with(body: str) -> dict:
+        pol.write_text(f"#!/bin/sh\n{body}\n")
+        pol.chmod(0o755)
+        assert ghqueue.enqueue(view, cwd=str(repo)) == ghqueue.HELD_RC
+        key = json.loads(next(ghqueue.outbox().glob("*.q")).read_text())["key"]
+        ghqueue.pull("lab-box", gh, policy_cmd=f"{pol} --strict")
+        done = ghqueue.outbox() / f"{key}.done"
+        got = json.loads(done.read_text())
+        done.unlink()   # the next round asks the same call again
+        return got
+
+    got = round_with(f'cat > "{seen}"; exit 0')
+    assert got["rc"] == 0 and ws_calls.read_text().splitlines() == ["pr view 3 --json state -R acme/widgets"]
+    sent = json.loads(seen.read_text())
+    assert set(sent) == set(ghqueue.POLICY_FIELDS) and sent["argv"] == [*view, "-R", "acme/widgets"]
+    assert sent["repo"] == "acme/widgets" and sent["task"] == "42"
+    ws_calls.unlink()
+    got = round_with('echo "drafts only here"; echo more; exit 1')
+    assert got["rc"] == 1 and got["stderr"] == "refused on the workstation: the gh policy command refused it: drafts only here"
+    got = round_with('echo boom >&2; exit 3')
+    assert got["rc"] == 1 and got["stderr"].endswith("error: the gh policy command failed (exit 3): boom"), got
+    monkeypatch.setattr(ghqueue, "POLICY_TIMEOUT_S", 1)
+    got = round_with("sleep 5")
+    assert got["rc"] == 1 and "error: the gh policy command timed out after 1s" in got["stderr"]
+    assert "could not run" in ghqueue.policy(str(env["tmp"] / "no-such-policy"), {"key": "k"})
+    assert not ws_calls.exists(), "gh ran a call its policy did not allow"
+    agents = {"a": {"agent": "env", "direct": [{"name": "h"}]}}
+    assert bridge.parse({"boxes": {"b": {"agents": agents}}})["boxes"]["b"]["gh_policy_cmd"] == ""
+    assert bridge.parse({"boxes": {"b": {"agents": agents, "gh_policy_cmd": "/opt/p --x"}}}
+                        )["boxes"]["b"]["gh_policy_cmd"] == "/opt/p --x"
+    for bad in (["/opt/p"], "   ", "'unclosed", 3):
+        with pytest.raises(bridge.BadConfig):
+            bridge.parse({"boxes": {"b": {"agents": agents, "gh_policy_cmd": bad}}})
+
+
+def test_gh_pull_answers_a_raising_entry_with_an_error_and_the_loop_goes_on(env, monkeypatch):
+    """An answer path that raises (a patched answer() with an old signature, a bad entry) answers that entry
+    with an error and the others as usual; the looping service survives a failed round."""
+    import argparse
+    from ttp import bridge, cli, ghqueue
+    cfg, repo, gh, ws_calls = _workstation(env, monkeypatch)
+    for n in ("3", "4"):
+        assert ghqueue.enqueue(["pr", "view", n], cwd=str(repo)) == ghqueue.HELD_RC
+    real = ghqueue.answer
+
+    def flaky(entry, gh=None, prefixes=(), where="on the workstation", policy_cmd=""):
+        if "3" in entry["argv"]:
+            raise TypeError("answer() takes 2 positional arguments but 3 were given")
+        return real(entry, gh, prefixes, where, policy_cmd)
+    monkeypatch.setattr(ghqueue, "answer", flaky)
+    assert ghqueue.pull("lab-box", gh) == "lab-box: answered 2 gh call(s), 1 failed here"
+    done = [json.loads(f.read_text()) for f in ghqueue.outbox().glob("*.done")]
+    assert sorted(d["rc"] for d in done) == [0, 1]
+    assert any(d["stderr"].startswith("error on the workstation: TypeError") for d in done)
+    assert ws_calls.read_text().splitlines() == ["pr view 4 -R acme/widgets"]
+
+    monkeypatch.setattr(bridge, "HOME_DIR", env["tmp"] / "bridgehome")
+    rounds = []
+
+    def pull(box, gh=None, prefixes=(), policy_cmd=""):
+        rounds.append(box)
+        raise RuntimeError("ssh went away")
+
+    def sleep(s):
+        if len(rounds) >= 2:
+            raise KeyboardInterrupt
+    monkeypatch.setattr(ghqueue, "pull", pull)
+    monkeypatch.setattr(cli.time, "sleep", sleep)
+    with pytest.raises(KeyboardInterrupt):
+        cli._bridge_gh_pull(argparse.Namespace(loop=True, every=5), {"boxes": {"lab-box": {}}}, ["lab-box"])
+    assert rounds == ["lab-box", "lab-box"], "the loop kept pulling after a failed round"
+    with pytest.raises(RuntimeError):   # a one-off pull still says it failed
+        cli._bridge_gh_pull(argparse.Namespace(loop=False, every=5), {"boxes": {"lab-box": {}}}, ["lab-box"])

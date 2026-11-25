@@ -201,9 +201,17 @@ def parse(data: dict) -> dict:
                                                    and x.rstrip("/") not in ("main", "master") for x in grants):
             raise BadConfig(f"box {box}: gh_branch_prefixes is a list of branch prefixes ending in '/' (beyond ttp/, "
                             "the box's branches this computer publishes or deletes)")
+        policy = b.get("gh_policy_cmd", "")
+        try:
+            policy_ok = isinstance(policy, str) and (not policy or bool(shlex.split(policy)))
+        except ValueError:
+            policy_ok = False
+        if not policy_ok:
+            raise BadConfig(f"box {box}: gh_policy_cmd is a command on this computer (one string, split like a shell "
+                            "line, never run by one) that gets each queued gh call as JSON and exits 0 to allow it")
         out["boxes"][box] = {"login": {"agent": login.get("agent", ""), "identity": login.get("identity", "")},
                              "agents": parsed, "hold_check": hold, "gh_pull": b.get("gh_pull", False),
-                             "gh_branch_prefixes": grants}
+                             "gh_branch_prefixes": grants, "gh_policy_cmd": policy}
     watch = data.get("watch", [])
     if not isinstance(watch, list) or not all(isinstance(w, dict) and {"label", "box", "port"} <= set(w)
                                               <= {"label", "box", "port", "target", "interface"} for w in watch):
@@ -439,6 +447,35 @@ def service_file(box: str, agent: str, platform: str | None = None) -> Path:
 
 def bridge_marker(box: str, agent: str) -> Path:
     return HOME_DIR / f"bridge-{box}-{agent}.start"
+
+
+CRASH_WINDOW_S = 3600   # a gh pull loop that started CRASH_STARTS times within this keeps crashing
+CRASH_STARTS = 5
+
+
+def _starts(box: str) -> Path:
+    return HOME_DIR / f"bridge-{box}-{GH_PULL}.starts"
+
+
+def loop_started(box: str, now: float | None = None) -> None:
+    """Record one start of `box`'s gh pull loop (its last few), so status() can tell a crash loop from a running one."""
+    f = _starts(box)
+    try:
+        kept = f.read_text().split()[-(2 * CRASH_STARTS):] if f.is_file() else []
+        f.parent.mkdir(parents=True, exist_ok=True)
+        durable_write(f, "\n".join([*kept, f"{now or time.time():.0f}"]) + "\n", sync=False)
+    except OSError:
+        pass   # a start record is diagnosis only: the loop runs without it
+
+
+def crash_loop(box: str, now: float | None = None) -> int:
+    """How often `box`'s gh pull loop started in the last CRASH_WINDOW_S, if CRASH_STARTS or more (else 0)."""
+    now = now or time.time()
+    try:
+        n = sum(1 for t in _starts(box).read_text().split() if t.isdigit() and now - int(t) < CRASH_WINDOW_S)
+    except OSError:
+        return 0
+    return n if n >= CRASH_STARTS else 0
 
 
 def launchd_plist(box: str, agent: str, argv: list[str]) -> dict:
@@ -756,6 +793,12 @@ def status(cfg: dict, boxes: list[str], platform: str | None = None, deep: bool 
         if box in closed:
             lines.append(f"{box}: held, not probed ({closed[box]}); its sessions stay down while that stands")
             continue
+        if b.get("gh_pull") and (n := crash_loop(box)):
+            bad += 1
+            log = HOME_DIR / f"bridge-{box}-{GH_PULL}.log"
+            tail = log.read_text(errors="replace").strip().splitlines()[-1:] if log.is_file() else []
+            lines.append(f"{box} {GH_PULL}: CRASH LOOP (started {n} times in the last {CRASH_WINDOW_S // 60} min; "
+                         f"its queued gh calls are not answered{'; log: ' + tail[0][:200] if tail else ''})")
         r = _box(box, probe_script(cfg, box))
         if r.returncode == 255:
             lines.append(f"{box}: unreachable from here ({r.stderr.strip()[-160:]})")

@@ -21,6 +21,7 @@ import hashlib
 import json
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -620,10 +621,36 @@ def publish_here(gh: str, argv: list[str], bundle: bytes) -> tuple[int, str]:
     return 0, f"pushed {sha} to {repo} branch {branch}"
 
 
-def answer(entry: dict, gh: str | None = None, prefixes=(), where: str = "on the workstation") -> dict | None:
+POLICY_TIMEOUT_S = 30   # a gh policy command's time per entry
+POLICY_FIELDS = ("key", "argv", "repo", "project", "task", "stdin")   # its stdin JSON (stdin: base64), a stable contract
+
+
+def policy(cmd: str, entry: dict) -> str:
+    """The workstation's own gh policy (a box's "gh_policy_cmd" in the bridge config), run once per allowed entry
+    as an argument list with the entry's POLICY_FIELDS as JSON on stdin: exit 0 allows (""); exit 1 refuses, its
+    first output line the reason; any other exit, a timeout or a command that cannot run refuses as an error."""
+    if not cmd:
+        return ""
+    try:
+        p = subprocess.run(shlex.split(cmd), input=json.dumps({k: entry.get(k) for k in POLICY_FIELDS}),
+                           capture_output=True, text=True, timeout=POLICY_TIMEOUT_S)
+    except subprocess.TimeoutExpired:
+        return f"error: the gh policy command timed out after {POLICY_TIMEOUT_S}s"
+    except (OSError, ValueError) as e:
+        return f"error: the gh policy command could not run: {e}"
+    if p.returncode == 0:
+        return ""
+    first = next((ln.strip() for ln in f"{p.stdout}\n{p.stderr}".splitlines() if ln.strip()), "")[:300]
+    if p.returncode == 1:
+        return f"the gh policy command refused it: {first or 'no reason given'}"
+    return f"error: the gh policy command failed (exit {p.returncode}){': ' + first if first else ''}"
+
+
+def answer(entry: dict, gh: str | None = None, prefixes=(), where: str = "on the workstation",
+           policy_cmd: str = "") -> dict | None:
     """Run one taken call with this computer's gh, if allowed() here (`prefixes`: the branch prefixes this
-    computer's bridge config grants beyond ttp/; `where`: how its refusals and faults say where they happened); its
-    answer."""
+    computer's bridge config grants beyond ttp/; `where`: how its refusals and faults say where they happened;
+    `policy_cmd`: the workstation's own policy(), which may refuse more); its answer."""
     key = entry.get("key")
     if not isinstance(key, str) or not _KEY.fullmatch(key):
         return None
@@ -632,7 +659,7 @@ def answer(entry: dict, gh: str | None = None, prefixes=(), where: str = "on the
     except (ValueError, TypeError):
         return {"key": key, "rc": 1, "stdout": "", "stderr": f"refused {where}: stdin is not base64"}
     argv = entry.get("argv")
-    if why := allowed(argv, stdin, prefixes):
+    if (why := allowed(argv, stdin, prefixes)) or (why := policy(policy_cmd, entry)):
         return {"key": key, "rc": 1, "stdout": "", "stderr": f"refused {where}: {why}"}
     gh = gh or shutil.which("gh", path=os.environ.get("PATH", "") + ":/opt/homebrew/bin:/usr/local/bin") or "gh"
     if argv[0] == PUBLISH:
@@ -665,7 +692,18 @@ def answer(entry: dict, gh: str | None = None, prefixes=(), where: str = "on the
     return out
 
 
-def pull(box: str, gh: str | None = None, prefixes=()) -> str:
+def _answer_or_error(entry: dict, gh: str | None, prefixes, policy_cmd: str) -> dict | None:
+    """answer(), or an error answer for an entry whose answering raised: one bad entry never stops the pull loop."""
+    try:
+        return answer(entry, gh, prefixes, policy_cmd=policy_cmd)
+    except Exception as e:   # noqa: BLE001 - any fault answers this entry and the loop goes on
+        key = entry.get("key")
+        if not isinstance(key, str) or not _KEY.fullmatch(key):
+            return None
+        return {"key": key, "rc": 1, "stdout": "", "stderr": f"error on the workstation: {type(e).__name__}: {e}"[:600]}
+
+
+def pull(box: str, gh: str | None = None, prefixes=(), policy_cmd: str = "") -> str:
     """One round on `box`: take its queue, answer each call here, put the answers back."""
     from .bridge import _box
     r = _box(box, f"{REMOTE} take", timeout=60)
@@ -675,14 +713,17 @@ def pull(box: str, gh: str | None = None, prefixes=()) -> str:
         entries = json.loads(r.stdout or "[]")
     except ValueError:
         return f"{box}: the gh queue's answer is not JSON"
-    results = [a for e in entries if isinstance(e, dict) and (a := answer(e, gh, prefixes))] if isinstance(entries, list) else []
+    results = [a for e in (entries if isinstance(entries, list) else [])
+               if isinstance(e, dict) and (a := _answer_or_error(e, gh, prefixes, policy_cmd))]
     if not results:
         return f"{box}: no gh calls queued"
     p = _box(box, f"{REMOTE} put", timeout=60, inp=json.dumps(results))
     if p.returncode != 0:
         return f"{box}: ran {len(results)} gh call(s) but could not put the answers back: {p.stderr.strip()[:200]}"
-    refused = sum(1 for a in results if a["stderr"].startswith("refused on the workstation"))
-    return f"{box}: answered {len(results)} gh call(s)" + (f", {refused} refused" if refused else "")
+    refused = sum(1 for a in results if str(a.get("stderr", "")).startswith("refused on the workstation"))
+    failed = sum(1 for a in results if str(a.get("stderr", "")).startswith("error on the workstation"))
+    return (f"{box}: answered {len(results)} gh call(s)" + (f", {refused} refused" if refused else "")
+            + (f", {failed} failed here" if failed else ""))
 
 
 def service_argv(box: str) -> list[str]:

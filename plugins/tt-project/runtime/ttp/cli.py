@@ -3030,12 +3030,22 @@ def cmd_bridge(a) -> None:
 
 def _bridge_gh_pull(a, cfg: dict, boxes: list[str]) -> None:
     """`ttp bridge gh-pull [boxes] [--loop]`: run the boxes' queued gh calls with this computer's gh."""
-    from . import ghqueue
+    from . import bridge, ghqueue
     if not boxes:
         die("no box to pull: name one, or set \"gh_pull\": true on it in the bridge config")
+    if a.loop:
+        for box in boxes:
+            bridge.loop_started(box)
     while True:
         for box in boxes:
-            print(ghqueue.pull(box, prefixes=cfg["boxes"][box].get("gh_branch_prefixes") or []), flush=True)
+            b = cfg["boxes"][box]
+            try:
+                said = ghqueue.pull(box, prefixes=b.get("gh_branch_prefixes") or [], policy_cmd=b.get("gh_policy_cmd", ""))
+            except Exception as e:   # noqa: BLE001 - a looping service reports a fault and pulls again
+                if not a.loop:
+                    raise
+                said = f"{box}: the gh pull failed here ({type(e).__name__}: {e}); trying again"
+            print(said, flush=True)
         if not a.loop:
             return
         time.sleep(max(5, a.every))

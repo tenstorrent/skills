@@ -3071,3 +3071,30 @@ def test_a_machine_hold_tears_down_refuses_and_hands_back_only_that_boxs_bridge(
     assert "box-a" in seen["box"], "and it is checked again"
     assert all(bridge.service_file(b, an, "linux").is_file() for b, an in sessions)
     assert bridge.hold_pass(cfg, "linux") == [], "handed back once"
+
+
+def test_bridge_status_flags_a_gh_pull_loop_that_keeps_restarting(tmp_path, monkeypatch):
+    """Each start of `ttp bridge gh-pull --loop` is recorded; status (the bridge heal check) fails with a
+    CRASH LOOP line once it started CRASH_STARTS times within CRASH_WINDOW_S, though its service file is there."""
+    import subprocess
+    from ttp import bridge
+    monkeypatch.setattr(bridge, "HOME_DIR", tmp_path)
+    monkeypatch.setattr(bridge, "_box", lambda *a, **k: subprocess.CompletedProcess([], 255, "", "no route"))
+    agents = {"a": {"agent": "env", "direct": [{"name": "h"}]}}
+    cfg = bridge.parse({"boxes": {"box-1": {"agents": agents, "gh_pull": True}}})
+    now = time.time()
+    for i in range(bridge.CRASH_STARTS - 1):
+        bridge.loop_started("box-1", now - 60 * i)
+    bridge.loop_started("box-1", now - bridge.CRASH_WINDOW_S - 5)   # an old start does not count
+    assert bridge.crash_loop("box-1", now) == 0
+    lines, _ = bridge.status(cfg, ["box-1"], "linux")
+    assert not any("CRASH LOOP" in ln for ln in lines)
+    (tmp_path / f"bridge-box-1-{bridge.GH_PULL}.log").write_text("Traceback ...\nTypeError: answer() got 3 args\n")
+    bridge.loop_started("box-1", now)
+    assert bridge.crash_loop("box-1", now) == bridge.CRASH_STARTS
+    lines, rc = bridge.status(cfg, ["box-1"], "linux")
+    assert rc == 1 and lines[0] == (f"box-1 gh-pull: CRASH LOOP (started {bridge.CRASH_STARTS} times in the last 60 min; "
+                                    "its queued gh calls are not answered; log: TypeError: answer() got 3 args)"), lines
+    for _ in range(30):
+        bridge.loop_started("box-1", now)
+    assert len((tmp_path / f"bridge-box-1-{bridge.GH_PULL}.starts").read_text().split()) <= 2 * bridge.CRASH_STARTS + 1
