@@ -2736,31 +2736,11 @@ def _pending_checked(p: Project, text: str, notes: list, what: str) -> str:
     return text
 
 
-def _running_commit(p: Project) -> str:
-    """The commit of the runtime this daemon runs, from its own receipt; "" when this process is
-    not the daemon that holds it (a worker applying actions, a test)."""
-    from . import identity
-    return str((identity.running(p.state, os.getpid()) or {}).get("commit") or "")
-
-
 def _deploy_checked(p: Project, text: str, notes: list) -> str:
-    """A reply or notify as pushclaim.correct_reply_claims posts it: a 'landed' line names a commit
-    the push branch holds and a 'live' one a commit the running version contains; any other is
-    marked in place ('not landed'/'not live yet'). heldwork.mark_nothing_claims then marks a
-    'nothing runs there' line that names a held machine the inventory is not empty for. Any fault
-    posts the text unchanged: a message is never lost to this check."""
-    try:
-        from . import pushclaim
-        fixed = pushclaim.correct_reply_claims(p, text, p.root, _running_commit(p))
-        if fixed != text:
-            notes.append("pushclaim: a 'landed'/'live' line in your message named no commit, or a "
-                         "commit the push branch / the running version does not hold; it went "
-                         "marked 'not landed'/'not live yet' or '(unverified)'. A line claiming a "
-                         "landing or liveness names its commit")
-        text = fixed
-    except Exception as e:
-        notes.append(f"pushclaim: the landed/live-claim check failed ({type(e).__name__}: {e}); "
-                     f"the message went unchecked")
+    """A reply or notify goes out as written: its 'landed'/'live' lines are never marked,
+    rewritten or negated (the reply-claim check is off). heldwork.mark_nothing_claims marks a
+    'nothing runs there' line that names a held machine the inventory is not empty for. Any
+    fault posts the text unchanged: a message is never lost to this check."""
     try:
         from . import heldwork
         fixed = heldwork.mark_nothing_claims(text, where=p)

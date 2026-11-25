@@ -466,23 +466,20 @@ def test_two_live_phrases_in_one_sentence_get_one_mark(env, monkeypatch):
     assert fixed.count("not live yet") == 1, fixed
 
 
-def test_the_reply_path_marks_a_false_live_line_before_sending(env, monkeypatch):
-    """The whole send path: a reply action claiming a landing or liveness the push branch and the
-    running version do not hold is posted marked, and the coordinator is told in its notes."""
+def test_the_reply_path_never_marks_or_rewrites_a_live_or_landed_line(env, monkeypatch):
+    """The send path never marks, rewrites or negates a reply's 'landed'/'live' lines: the
+    reply-claim check is off, so the texts it corrupted reach the chat as written."""
     from ttp import coordinator as coord
-    p, repo, head = _claim_replay_setup(env, monkeypatch, landed=True)
-    (p.state / "heartbeat").write_text(json.dumps(
-        {"pid": os.getpid(), "receipt": {"pid": os.getpid(), "commit": head}}))
-    coord.apply(p, [{"type": "reply", "chat": "c1", "text": _REPLY_4303}])
-    sent = p.db.q("SELECT text FROM messages WHERE direction='out' AND kind='reply'")
-    assert len(sent) == 1, sent
-    assert "not live yet: no commit named" in sent[0]["text"], sent[0]["text"]
-    # the rejection note reaches the coordinator in its next digest (NOTES_KEY)
-    assert any("names its commit" in n for n in p.db.kv(coord.NOTES_KEY) or []), p.db.kv(coord.NOTES_KEY)
-    # an ordinary answer with no claim posts as written
-    notes = coord.apply(p, [{"type": "reply", "chat": "c1", "text": "On it. I'll report by 14:00."}])
-    sent = p.db.q("SELECT text FROM messages WHERE direction='out' AND kind='reply' ORDER BY id DESC LIMIT 1")
-    assert sent[0]["text"] == "On it. I'll report by 14:00." and not notes, (sent, notes)
+    p = make(env)
+    for text in ("I'll tell you when the fix is live here",
+                 "2bf5c16bce is live in 0.2.1547",
+                 "Commit X has landed on the branch"):
+        assert coord._deploy_checked(p, text, []) == text, text
+    coord.apply(p, [{"type": "reply", "chat": "c1",
+                     "text": "I'll tell you when the fix is live here"}])
+    (sent,) = p.db.q("SELECT text FROM messages WHERE direction='out' AND kind='reply'")
+    assert sent["text"] == "I'll tell you when the fix is live here", sent["text"]
+    assert not [n for n in p.db.kv(coord.NOTES_KEY, []) if "pushclaim" in n], p.db.kv(coord.NOTES_KEY)
 
 
 def test_a_reply_s_unverified_landed_claim_is_never_marked_twice(env):
