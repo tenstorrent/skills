@@ -114,6 +114,40 @@ def test_a_bounce_keeps_the_task_on_opus_after(env):
     assert runclass.code_route(cfg, t, None, codearm.code_state({}, got)) == (None, "needs_opus")
 
 
+
+def test_a_glm_guarded_run_that_fell_back_to_core_and_asks_for_opus_bounces_once_to_opus(env, tmp_path):
+    """A run routed to GLM whose endpoint fell back to a cheaper core model before it started still runs under
+    the GLM guard; its guard's `needs_opus` hand-back is a bounce (requeued on the core provider at Opus), not a
+    blocked task, and only once."""
+    import inspect
+    from ttp import codearm, daemon, glmguard, handback, route, runclass
+    p = make(env)
+    cfg = _ca_cfg()
+    t = _ca_task(p)
+    routed = {"tier": "standard", "to": "chat", "model": _CA_GLM["model"], codearm.KEY: "glm", "glm_work": "glm",
+              "fallback": "quota", "fallback_model": "sonnet"}
+    run = {"id": 7, "task": t["id"], "role": "worker", "provider": "claude"}
+    res = {"status": "blocked", "needs_opus": "guard: refusal 4 in one run: write the path literally",
+           "summary": "needs Opus: guard: refusal 4 in one run: write the path literally"}
+    assert handback.offroute_bounce(p.db, cfg, run, routed, tmp_path, res) == ""   # no GLM guard on the run
+    (tmp_path / glmguard.RUN_MARK).write_text("{}")
+    why = handback.offroute_bounce(p.db, cfg, run, routed, tmp_path, res)
+    assert why == "guard: refusal 4 in one run: write the path literally"
+    assert handback.offroute_bounce(p.db, cfg, {**run, "provider": "chat"}, routed, tmp_path, res) == ""   # on route: the daemon's own check
+    assert handback.offroute_bounce(p.db, cfg, run, {**routed, codearm.KEY: "", "glm_work": ""}, tmp_path, res) == ""
+    assert handback.offroute_bounce(p.db, cfg, run, routed, tmp_path, {"status": "blocked", "summary": "a lock"}) == ""
+    assert handback.offroute_bounce(p.db, cfg, {**run, "role": "coordinator"}, routed, tmp_path, res) == ""
+    src = inspect.getsource(daemon.Daemon.finish_run)
+    assert "handback.offroute_bounce(db, self.cfg, r, routed, run_dir," in src
+    # the daemon records it as it records an on-route bounce: the next run is Opus on the core provider
+    note = {route.KEY: {**routed, "fallback": route.BOUNCE, "bounce": why}}
+    p.db.x("INSERT INTO runs(task,role,provider,model,started,ended,status,cost_usd,note) VALUES(?,?,?,?,?,?,?,?,?)",
+           (t["id"], "worker", "claude", "sonnet", time.time() - 60, time.time(), "fallback", 0.0, json.dumps(note)))
+    assert codearm.bounced(p.db, t["id"]) == why
+    got = codearm.choose(p.db, cfg, t, "standard")
+    assert got["run"] == "opus" and runclass.code_route(cfg, t, None, codearm.code_state({}, got)) == (None, "needs_opus")
+    assert handback.offroute_bounce(p.db, cfg, run, routed, tmp_path, res) == ""   # once: its hand-off then stands
+
 def test_code_arm_day_table_guard_and_review_lines(env):
     from ttp import codearm
     p = make(env)

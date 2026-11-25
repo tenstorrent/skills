@@ -43,6 +43,7 @@ from . import (   # one name per line: two changes adding names merge without a 
     deviceplan,
     glmassist,
     glmquota,
+    handback,
 )
 from . import rolerestore
 from . import codearm
@@ -6525,6 +6526,8 @@ class Daemon:
             # a run on the glm_work route has its policy files checked by review; the run's own note says which route
             # it took, also after a rollback took the route away mid-run
             bounce = self._policy_bounce(r)   # a run on the arm that changed a policy file hands nothing off
+        if not bounce and refused != "instructions_missing":   # a GLM-guarded run that fell back to core before it ran
+            bounce = handback.offroute_bounce(db, self.cfg, r, routed, run_dir, _read_result(run_dir / RESULT_FILE))
         handed_off = r["role"] != "coordinator" and refused != "instructions_missing" and not bounce and \
             (_read_result(run_dir / RESULT_FILE) or {}).get("status") in HANDOFF_STATES
         if r["role"] != "coordinator" and r["task"] and not handed_off:
