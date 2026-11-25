@@ -18,13 +18,13 @@ def test_a_false_running_claim_is_held_back_with_what_is_true_and_wakes_the_coor
     tid = p.db.add_task("smoke the model", "s", kind="work", status="queued")
     coord.apply(p, [{"type": "reply", "text": f"Task #{tid} is running since 07:09.", "chat": "c1"}], turn=1)
     (got,) = _cc_sent(p)
-    assert got.startswith(f"{claimcheck.FALSE_MARK} (#{tid} is queued): Task #{tid} is running"), got
+    assert got == f"Task #{tid} is running since 07:09.", got   # no inline mark in user-facing text
     (ev,) = _cc_false_events(p)
     assert ev["severity"] == "high" and f"#{tid} is queued" in ev["text"] and "chat c1" in ev["text"]
     assert any("claimcheck:" in n for n in p.db.kv(coord.NOTES_KEY, []))
     # 'started' with no run at all, in a notify, is false the same way; the same false claims raise one event.
     coord.apply(p, [{"type": "notify", "text": f"Long runs started on #{tid}."}], turn=2)
-    assert _cc_sent(p, "alert")[-1].startswith(f"{claimcheck.FALSE_MARK} (#{tid} is queued)")
+    assert _cc_sent(p, "alert")[-1] == f"Long runs started on #{tid}."
     assert len(_cc_false_events(p)) == 2
     for _ in range(2):
         claimcheck.raise_false(p.db, [(f"Long runs started on #{tid}.", f"#{tid} is queued")], "your notify #9")
@@ -47,10 +47,10 @@ def test_a_probe_backed_claim_is_sent_as_written_and_a_failing_probe_holds_it_ba
         return _cc_sent(p)[-1]
 
     assert send("true", 1) == "The smoke test is running on the box."
-    assert send("false", 2).startswith(f"{claimcheck.FALSE_MARK} (its check `false` exited 1)")
+    assert send("false", 2) == "The smoke test is running on the box."   # the event, not the text, carries it
     assert len(_cc_false_events(p)) == 1
-    # A probe that cannot answer (75: busy) or outlasts its time is no verdict: marked unverified.
-    assert send("exit 75", 3) == "The smoke test is running on the box (unverified)."
+    # A probe that cannot answer (75: busy) or outlasts its time is no verdict: as written.
+    assert send("exit 75", 3) == "The smoke test is running on the box."
     # Inside a database transaction no probe runs: a probe never holds the write lock.
     acts = [{"type": "reply", "text": "x is running.", "claims": [{"text": "x running", "expect": "true"}]}]
     with p.db.tx():
@@ -58,14 +58,16 @@ def test_a_probe_backed_claim_is_sent_as_written_and_a_failing_probe_holds_it_ba
     assert "_rc" not in acts[0]["claims"][0]
 
 
-def test_an_unbacked_claim_is_marked_unverified_and_the_rest_kept(env):
+def test_an_unbacked_status_claim_keeps_the_message_as_written(env):
+    """A status claim nothing could check: the sentence is never marked in what the user reads;
+    the count reaches the coordinator in its notes and the record keeps the claim."""
     from ttp import coordinator as coord
     p = make(env)
     text = "Hi. The model is running since 07:09. Smoke deployed to the box!\nNext I'll look at the logs."
     coord.apply(p, [{"type": "reply", "text": text, "chat": "c1"}], turn=1)
-    assert _cc_sent(p)[-1] == ("Hi. The model is running since 07:09 (unverified). Smoke deployed to the box "
-                               "(unverified)!\nNext I'll look at the logs.")
+    assert _cc_sent(p)[-1] == text
     assert not _cc_false_events(p)
+    assert any("could not be checked" in n for n in p.db.kv(coord.NOTES_KEY, []))
 
 
 def test_a_cap_raised_claim_is_checked_against_the_live_config(env):
@@ -74,7 +76,8 @@ def test_a_cap_raised_claim_is_checked_against_the_live_config(env):
     p.set_config("budget.daily_usd", 100)
     for turn, text in enumerate(("Raised the daily cap to $500.", "budget.daily_usd is set to 500 now."), 1):
         coord.apply(p, [{"type": "reply", "text": text, "chat": "c1"}], turn=turn)
-        assert _cc_sent(p)[-1] == f"{claimcheck.FALSE_MARK} (budget.daily_usd is 100): {text}", _cc_sent(p)[-1]
+        assert _cc_sent(p)[-1] == text   # false, but the message goes out as written
+        assert len(_cc_false_events(p)) == turn
     p.set_config("budget.daily_usd", 500)
     coord.apply(p, [{"type": "reply", "text": "Raised the daily cap to $500.", "chat": "c1"}], turn=3)
     assert _cc_sent(p)[-1] == "Raised the daily cap to $500."
@@ -107,8 +110,8 @@ def test_a_worker_notify_claim_is_checked_against_the_records(env):
     with p.db.tx():
         daemon.relay_worker_notifies(p, p.db.task(tid), run_dir, {"status": "done"})
     got = _cc_sent(p, "alert")
-    assert got[0].startswith(f"#{tid} smoke: {claimcheck.FALSE_MARK} (#{other} is queued)"), got
-    assert got[1].endswith("Smoke running on the box (unverified)."), got
+    assert got[0] == f"#{tid} smoke: #{other} is running too.", got   # as written, never marked
+    assert got[1] == f"#{tid} Smoke running on the box.", got
     (ev,) = _cc_false_events(p)
     assert f"#{tid}'s `ttp notify`" in ev["text"]
 
@@ -144,12 +147,12 @@ def test_each_task_and_run_is_judged_by_the_claim_of_its_own_clause(env):
     # One false part: only its task is named.
     text = f"#{done} landed and #{queued} is running."
     coord.apply(p, [{"type": "reply", "text": text, "chat": "c1"}], turn=9)
-    assert _cc_sent(p)[-1] == f"{claimcheck.FALSE_MARK} (#{queued} is queued): {text}", _cc_sent(p)[-1]
+    assert _cc_sent(p)[-1] == text, _cc_sent(p)[-1]
+    assert len(_cc_false_events(p)) == 1
     # Bound to no one claim (a verbless clause with other words, two claims): unverified, never false.
     text = f"#{queued} on the box, #{run} is running and #{done} landed."
     coord.apply(p, [{"type": "reply", "text": text, "chat": "c1"}], turn=10)
-    assert _cc_sent(p)[-1] == f"#{queued} on the box, #{run} is running and #{done} landed (unverified).", _cc_sent(p)
-    assert len(_cc_false_events(p)) == 1
+    assert _cc_sent(p)[-1] == text, _cc_sent(p)
 
 
 def test_an_ended_run_started_and_a_worker_notify_on_its_own_run_are_not_false(env):
@@ -161,7 +164,7 @@ def test_an_ended_run_started_and_a_worker_notify_on_its_own_run_are_not_false(e
     coord.apply(p, [{"type": "reply", "text": text, "chat": "c1"}], turn=1)
     assert _cc_sent(p)[-1] == text, _cc_sent(p)
     coord.apply(p, [{"type": "reply", "text": "Run 4321 is running.", "chat": "c1"}], turn=2)
-    assert _cc_sent(p)[-1].startswith(f"{claimcheck.FALSE_MARK} (run 4321 is done)"), _cc_sent(p)
+    assert _cc_sent(p)[-1] == "Run 4321 is running.", _cc_sent(p)[-1]
     # Relayed when the run has ended: the worker's own task and run were running when it wrote this.
     run_dir = env["tmp"] / "4321"
     run_dir.mkdir()
@@ -188,7 +191,7 @@ def test_an_id_after_the_claim_verb_or_a_hedge_in_its_clause_is_not_judged_as_it
     assert not _cc_false_events(p)
     text = f"#{run} is running and #{done} is running."
     coord.apply(p, [{"type": "reply", "text": text, "chat": "c1"}], turn=9)
-    assert _cc_sent(p)[-1] == f"{claimcheck.FALSE_MARK} (#{done} is done): {text}", _cc_sent(p)[-1]
+    assert _cc_sent(p)[-1] == text, _cc_sent(p)[-1]
     assert len(_cc_false_events(p)) == 1
 
 
@@ -206,7 +209,7 @@ def test_an_id_after_the_verb_with_a_noun_subject_is_never_false_but_a_start_on_
     # The one exception: a start on a task that never ran stays false.
     never = p.db.add_task("b", "s", kind="work", status="queued")
     coord.apply(p, [{"type": "reply", "text": f"Long runs started on #{never}.", "chat": "c1"}], turn=9)
-    assert _cc_sent(p)[-1].startswith(f"{claimcheck.FALSE_MARK} (#{never} is queued)"), _cc_sent(p)[-1]
+    assert _cc_sent(p)[-1] == f"Long runs started on #{never}.", _cc_sent(p)[-1]
     assert len(_cc_false_events(p)) == 1
 
 
@@ -286,9 +289,9 @@ def test_a_cant_reach_claim_is_judged_by_each_machines_last_ssh_probe(env):
     tid = p.db.add_task("t", "s", kind="work", status="running")
     got, false, _ = claimcheck.check(p, f"Task #{tid} is running but box-a is unreachable.", now=now)
     assert got.startswith(claimcheck.FALSE_MARK) and "box-a answered ssh" in false[0][1]
-    # Through apply: the reply goes marked and the coordinator gets the high claim_false event.
+    # Through apply: the reply goes as written and the coordinator gets the high claim_false event.
     coord.apply(p, [{"type": "reply", "text": "Workers can't reach box-a.", "chat": "c1"}], turn=1)
-    assert _cc_sent(p)[-1].startswith(claimcheck.FALSE_MARK) and _cc_false_events(p)
+    assert _cc_sent(p)[-1] == "Workers can't reach box-a." and _cc_false_events(p)
 
 
 def test_a_reach_claim_seen_from_another_host_never_tests_that_host_as_a_target(env):

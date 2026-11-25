@@ -4381,12 +4381,13 @@ names the push branch, or says "landed" while naming no other destination. A don
 on its own push still in flight is left to the remote check; a blocked, failed or approval-needing
 one is corrected here.
 
-The coordinator's own `reply` and `notify` messages get the same check on their send path: a
-'landed' line names a commit the push branch holds, a 'live' one (or "deployed", "in the running
-version") names a commit the running version contains — an ancestor of the commit the daemon's
-receipt names — and a line naming none, or one that fails, is marked "not landed"/"not live yet"
-in place; the coordinator hears of each mark in its next digest. A claim this project cannot
-check (no push branch, an unknown running commit, git failing) is marked "(unverified)".
+The coordinator's own `reply` and `notify` messages get the same check on their send path, but
+it only ever tags: a 'landed' line's commit the push branch definitely does not hold, or a
+'live' line's commit the running version definitely does not contain, gets " (unverified)"
+appended right after its claim phrase. No word is ever replaced or negated. A line naming no
+commit, a check that cannot run (an unknown running commit, a fetch that fails, git failing), a
+passing line and every other sentence stay exactly as written. The coordinator hears of each
+tag in its next digest.
 
 Known gaps (these claims pass unchecked, as written):
 - a sha-less push claim naming another destination (the run's own branch, a PR branch, a fork);
@@ -4396,13 +4397,14 @@ Known gaps (these claims pass unchecked, as written):
 - quoted text written to a script and run later.
 
 Known gaps of the reply check:
-- the hedges cover "should/may/might/could have" (perfect), not "should be live": a forecast
-  naming no commit is marked "not live yet" like a claim (the hedge window sits before the
-  matched be-verb, so "should be" cannot hedge it);
-- the settled sha-less landed parse marks a sentence that only describes the check itself (it
-  says "landed" and "the push branch"): a reply explaining the rule can be marked as a claim;
+- the running commit is read from the daemon's heartbeat as it stands: a stale heartbeat names an
+  older runtime, and a landed line is judged on local refs only, so a landing the local ref has
+  not picked up yet can read '(unverified)';
+- the hedges cover "should/may/might/could have" (perfect), not "should be live" (the hedge
+  window sits before the matched be-verb, so "should be" cannot hedge it); a forecast naming
+  no commit passes unchecked;
 - "live" is checked by ancestry against the daemon receipt's commit, which only a project whose
-  own repository holds the runtime's commits can read; elsewhere the line reads "(unverified)";
+  own repository holds the runtime's commits can read; elsewhere the line passes as written;
 - a 'landed'/'live' line about another project's repo names a commit this repository does not
   hold, so it passes as another repository's business;
 - "deployed" also matches distribution prose ("the template is deployed to all workers"),

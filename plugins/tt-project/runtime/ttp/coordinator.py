@@ -2755,11 +2755,42 @@ def _pending_checked(p: Project, text: str, notes: list, what: str) -> str:
     return text
 
 
+def _running_commit(p: Project) -> str:
+    """The commit of the runtime the project's daemon runs. The daemon reads its own receipt;
+    a session's coordinator (another process) reads the daemon's heartbeat, which names the
+    daemon and its receipt. "" when neither names one."""
+    from . import identity
+    r = identity.running(p.state, os.getpid())
+    if r is None:
+        for name in ("heartbeat", "daemon.start"):
+            try:
+                d = json.loads((p.state / name).read_text())
+            except (OSError, ValueError):
+                continue
+            rc = d.get("receipt") if isinstance(d, dict) else None
+            if isinstance(rc, dict) and int(d.get("pid") or 0) == int(rc.get("pid") or 0):
+                r = rc   # the record's own receipt: the pid pair still has to agree
+                break
+    return str((r or {}).get("commit") or "")
+
+
 def _deploy_checked(p: Project, text: str, notes: list) -> str:
-    """A reply or notify goes out as written: its 'landed'/'live' lines are never marked,
-    rewritten or negated (the reply-claim check is off). heldwork.mark_nothing_claims marks a
-    'nothing runs there' line that names a held machine the inventory is not empty for. Any
-    fault posts the text unchanged: a message is never lost to this check."""
+    """A reply or notify as pushclaim.correct_reply_claims posts it: a 'landed'/'live' line whose
+    named commit the push branch or the running version definitely does not hold goes out tagged
+    '(unverified)'; no word is ever changed. heldwork.mark_nothing_claims then marks a
+    'nothing runs there' line that names a held machine the inventory is not empty for. Any fault
+    posts the text unchanged: a message is never lost to this check."""
+    try:
+        from . import pushclaim
+        fixed = pushclaim.correct_reply_claims(p, text, p.root, _running_commit(p))
+        if fixed != text:
+            notes.append("pushclaim: a 'landed'/'live' line in your message named a commit the "
+                         "push branch / the running version does not hold; it went out tagged "
+                         "'(unverified)'. A line claiming a landing or liveness names its commit")
+        text = fixed
+    except Exception as e:
+        notes.append(f"pushclaim: the landed/live-claim check failed ({type(e).__name__}: {e}); "
+                     f"the message went unchecked")
     try:
         from . import heldwork
         fixed = heldwork.mark_nothing_claims(text, where=p)
@@ -2774,12 +2805,13 @@ def _deploy_checked(p: Project, text: str, notes: list) -> str:
 
 
 def _claims_checked(p: Project, a: dict, notes: list) -> tuple[str, list]:
-    """A reply or notify as claimcheck.check sends it: a status claim that did not hold goes prefixed with what is
-    true, one nothing could check with '(unverified)' after it. Returns (text, the false claims)."""
-    text, false, unverified = claimcheck.check(p, a["text"], a.get("claims"))
+    """A reply or notify as claimcheck.check judges it: a status claim that did not hold, or one
+    nothing could check, keeps its record and event so the coordinator corrects it in a follow-up
+    message; the user-facing text is never marked. Returns (text, the false claims)."""
+    text, false, unverified = claimcheck.check(p, a["text"], a.get("claims"), mark=False)
     if false or unverified:
         notes.append(f"claimcheck: {len(false)} claim(s) did not hold and {unverified} could not be checked when "
-                     f"sent; they went marked. Check live state first and back each status claim with `claims`")
+                     f"sent; the message went unmarked. Check live state first and back each status claim with `claims`")
     return text, false
 
 

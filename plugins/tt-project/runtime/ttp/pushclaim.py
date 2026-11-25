@@ -103,7 +103,9 @@ _LIVE_SUBJECT = re.compile(r"(?i)\b(?:changes?|works?|fix(es)?|patch(es)?|commit
                            r"versions?)\b")
 UNVERIFIED_CLAIM = "(unverified)"      # a landed-claim this project cannot check, never a plain 'landed'
 NOT_LANDED = "not landed"              # the correction a claim off the push branch reads
-NOT_LIVE = "not live yet"            # the correction a claim the running version lacks reads
+# The sha a live line names as its commit: "commit <sha>" beats a version or release sha the
+# sentence also quotes ("live in the running release 0.1 (tipsha), commit abc1234").
+_COMMIT_SHA = re.compile(r"(?i)\bcommit\s+(`?[0-9a-f]{7,40}`?)")
 
 
 def _git(repo, *args: str, timeout: float = 30) -> subprocess.CompletedProcess:
@@ -201,6 +203,18 @@ def text_claims(p, text: str, repo=None) -> list[dict]:
     return out
 
 
+def _sentence(text: str, at: int) -> tuple[int, int]:
+    """The (start, end) of the sentence around `at`. A '.' between digits (the decimal point
+    of a version number, "release 0.2.1547, commit abc") is no stop: the sentence runs on, so
+    a commit named after a version number is still inside it."""
+    def stop(i: int) -> bool:
+        return not (0 < i < len(text) - 1 and text[i] == "." and text[i - 1].isdigit() and text[i + 1].isdigit())
+    lo = max(i + 1 for i in (text.rfind(c, 0, at) for c in ".!?\n") if stop(i))
+    hi = next((i for i in sorted({text.find(c, at) for c in ".!?\n"} | {len(text)})
+               if i >= at and stop(i)), len(text))
+    return lo, min(hi, len(text))
+
+
 def _other_destination(text: str) -> bool:
     """Whether a sha-less claim's sentence names another destination for its run's own work: one of
     the destination words, or a slash token a movement word (to, into, onto, on) names as a ref —
@@ -239,7 +253,7 @@ def landed_claims(p, text: str, repo) -> list[tuple[int, int, str, tuple]]:
     taken = [(start, end) for start, end, *_ in out]
     from . import claimcheck   # its task and run id rules: the claim is about that id, not this run
     for m in _LANDED_VERB.finditer(text or ""):
-        lo = max(text.rfind(c, 0, m.start()) for c in ".!?\n") + 1
+        lo, hi = _sentence(text, m.start())
         if _NEGATED.search(text[max(0, m.start() - NEG_WINDOW):m.start()]) \
                 or claimcheck._TASK.search(text[lo:m.start()]) or claimcheck._RUN.search(text[lo:m.start()]):
             continue   # hedged, negated, or about another task or run
@@ -247,7 +261,6 @@ def landed_claims(p, text: str, repo) -> list[tuple[int, int, str, tuple]]:
             continue
         # the sentence must name the run's own work as what landed ("the change landed", "landed
         # the fix"), so a verb about something else ("pushed the data to a folder") is no claim
-        hi = min((i for i in (text.find(c, m.end()) for c in ".!?\n") if i >= m.end()), default=len(text))
         if not _LANDED_SUBJECT.search(text[lo:hi]) or text[m.end():].startswith(" " + UNVERIFIED_CLAIM):
             continue   # not about this run's work, or the claim is already marked
         if any(lo <= s < hi for s, _ in foreign):
@@ -273,8 +286,7 @@ def live_claims(text: str, repo) -> list[tuple[int, int, str]]:
     for m in _LIVE_CLAIM.finditer(text or ""):
         if re.search(r"\b(?:not|never|n't)\b", m.group(0)):
             continue   # "is not live (yet)" claims nothing
-        lo = max(text.rfind(c, 0, m.start()) for c in ".!?\n") + 1
-        hi = min((i for i in (text.find(c, m.end()) for c in ".!?\n") if i >= m.end()), default=len(text))
+        lo, hi = _sentence(text, m.start())
         if _NEGATED.search(text[max(0, m.start() - NEG_WINDOW):m.start()]) \
                 or claimcheck._TASK.search(text[lo:m.start()]) or claimcheck._RUN.search(text[lo:m.start()]):
             continue   # hedged, negated, or about another task or run
@@ -283,7 +295,9 @@ def live_claims(text: str, repo) -> list[tuple[int, int, str]]:
         if any(lo < h and l < hi for l, h in sents):
             continue   # one live claim a sentence: a second phrase in it is the same claim
         toks = landed._LITERAL_SHA.findall(text[lo:hi])
-        sha = next((w for w in toks if _commit(repo, w)), "")
+        named = [m.group(1) for m in _COMMIT_SHA.finditer(text[lo:hi])]
+        sha = next((w for w in named if _commit(repo, w)), "") or \
+            next((w for w in toks if _commit(repo, w)), "")
         if not sha and any(re.search(r"\d", w) for w in toks):
             continue   # names a sha this repository does not hold: another repository's business
         sents.append((lo, hi))
@@ -305,8 +319,8 @@ def _landed_fixes(p, text: str, repo, target, fetches: dict, head: str = "",
     the push branch and a re-check when the local tracking ref cannot confirm it, a claim the
     branch disproves reads "not landed: <sha> is not on <ref>", one this project cannot check
     "(unverified)". `receipts` and `remote_missing` are the hand-off path's (its landing
-    receipts; the remote check settled every claim false). `reply`: a line naming no commit is
-    itself a failed claim ("not landed: no commit named"), while a hand-off falls back to its
+    receipts; the remote check settled every claim false). `reply`: only a named commit the
+    push branch does not hold gets one ' (unverified)' tag; a hand-off falls back to its
     task's `head`."""
     from . import landed
     fixes = []
@@ -318,12 +332,16 @@ def _landed_fixes(p, text: str, repo, target, fetches: dict, head: str = "",
             continue   # another ref's claim: the remote checks own it
         elif what in receipts:
             continue   # the push receipts hold this task's landing: the claim stands
-        elif reply and (not sha or not target):
-            # a reply's landed line names its commit; none is a failed claim
-            if target and not sha:
-                fixes.append((start, end, f"{NOT_LANDED}: no commit named"))
-            elif not text[end:].startswith(" " + UNVERIFIED_CLAIM):
-                fixes.append((start, end, text[start:end] + " " + UNVERIFIED_CLAIM))  # never marked twice
+        elif reply:
+            # a reply's line is tagged, never rewritten: only a named commit the push branch
+            # definitely does not hold reads ' (unverified)' after its phrase; a line naming
+            # no commit, or a check that cannot run, stays exactly as written. Local refs only:
+            # no fetch runs on the chat send path (sa105: a fetch stays outside a send).
+            if not sha:
+                continue
+            rc, why = landed.check(p, repo, sha, fetch=False)
+            if rc == landed.NOT_YET and not text[end:].startswith(" " + UNVERIFIED_CLAIM):
+                fixes.append((start, end, text[start:end] + " " + UNVERIFIED_CLAIM))  # never twice
             continue
         else:
             rc, why = landed.check(p, repo, what, fetch=False) if what else (landed.CANNOT, "no commit named")
@@ -343,12 +361,12 @@ def _landed_fixes(p, text: str, repo, target, fetches: dict, head: str = "",
 
 
 def correct_reply_claims(p, text: str, repo, running: str = "") -> str:
-    """A coordinator reply or notify `text` with its landed/live claims checked model-free, the
-    way a hand-off's are (correct_landed_claims): a 'landed'/'pushed' line must name a commit the
-    push branch holds, a 'live' one a commit the running version contains; a line that names none,
-    or whose commit fails the check, is rewritten in place to read "not landed"/"not live yet"
-    with why. A claim this project cannot check keeps its words marked (unverified), never a false
-    'not landed'. `running`: the commit of the runtime the project's daemon is running."""
+    """A coordinator reply or notify `text` with its landed/live claims tagged, never rewritten:
+    a 'landed' line's commit the push branch definitely does not hold, or a 'live' line's commit
+    the running version definitely does not contain, gets " (unverified)" appended right after
+    its claim phrase. A passing line, a line naming no commit, a check that cannot run and every
+    other sentence stay exactly as written. `running`: the commit of the runtime the project's
+    daemon is running."""
     if not text:
         return text
     target, fetches = _default(p, repo), {}
@@ -362,16 +380,10 @@ def correct_reply_claims(p, text: str, repo, running: str = "") -> str:
             continue
         if any(s < end and start < e for s, e in landed_fixes):
             continue   # the landed fix already owns this span: one fix per span, never two splices
-        if not known:   # the running commit is unknown here: the claim cannot be checked
+        if not known or not sha:
+            continue   # no named commit to check, or the running one is unknown here: as written
+        if _in_running(repo, sha, known) is False:   # None: git failed, fail open
             fixes.append((start, end, text[start:end] + " " + UNVERIFIED_CLAIM))
-        elif not sha:     # a live line names its commit, and the check is possible
-            fixes.append((start, end, f"{NOT_LIVE}: no commit named"))
-        else:
-            where = _in_running(repo, sha, known)
-            if where is None:   # git failed: fail open
-                fixes.append((start, end, text[start:end] + " " + UNVERIFIED_CLAIM))
-            elif not where:
-                fixes.append((start, end, f"{NOT_LIVE}: {sha[:12]} is not in the running version"))
     for start, end, fix in sorted(fixes, reverse=True):
         text = text[:start] + fix + text[end:]
     return text

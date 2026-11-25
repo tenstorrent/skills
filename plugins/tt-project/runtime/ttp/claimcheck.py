@@ -249,11 +249,13 @@ def _mark(sentence: str) -> str:
 
 
 def check(p, text: str, claims: list | None = None, now: float | None = None,
-          own: dict | None = None) -> tuple[str, list[tuple[str, str]], int]:
-    """(text to send, [(false sentence, what is true)], count marked unverified). `own` ({'task': id, 'run': id}):
-    the writer's own task and run, whose state at the end of its run is not what its notify claimed. A
-    sentence in a block meant to be posted as written (onhost.segments) is never changed: its mark goes on
-    its own line after the block, quoting it."""
+          own: dict | None = None, mark: bool = True) -> tuple[str, list[tuple[str, str]], int]:
+    """(text to send, [(false sentence, what is true)], count that could not be checked). `own`
+    ({'task': id, 'run': id}): the writer's own task and run, whose state at the end of its run
+    is not what its notify claimed. A sentence in a block meant to be posted as written
+    (onhost.segments) is never changed: its mark goes on its own line after the block, quoting it.
+    `mark` False (the user-facing reply path) leaves the text as written: a false or unchecked
+    claim is only recorded and raised, never marked in what the user reads."""
     now = time.time() if now is None else now
     try:
         head, cut, tail = (text or "").partition(STATUS_TAIL)   # onhost's honest status lines: the harness's own
@@ -269,19 +271,21 @@ def check(p, text: str, claims: list | None = None, now: float | None = None,
                 bad = [w for g, w in got if g == "false"]
                 got, why = ("false", "; ".join(bad)) if bad else ("ok", "") if all(g == "ok" for g, _ in got) \
                     else ("unverified", "")
-                lead = parts[k][:len(parts[k]) - len(parts[k].lstrip())]
                 if got == "false":
                     false.append((parts[k].strip(), why))
-                    if block:
-                        after.append(f"\n{FALSE_MARK} ({why}): {onhost.quoted(parts[k])}")
-                    else:
-                        parts[k] = f"{lead}{FALSE_MARK} ({why}): {parts[k].strip()}"
+                    if mark:
+                        lead = parts[k][:len(parts[k]) - len(parts[k].lstrip())]
+                        if block:
+                            after.append(f"\n{FALSE_MARK} ({why}): {onhost.quoted(parts[k])}")
+                        else:
+                            parts[k] = f"{lead}{FALSE_MARK} ({why}): {parts[k].strip()}"
                 elif got == "unverified":
                     unverified += 1
-                    if block:
-                        after.append(f"\n{UNVERIFIED}: {onhost.quoted(parts[k])}")
-                    else:
-                        parts[k] = _mark(parts[k].rstrip()) + parts[k][len(parts[k].rstrip()):]
+                    if mark:
+                        if block:
+                            after.append(f"\n{UNVERIFIED}: {onhost.quoted(parts[k])}")
+                        else:
+                            parts[k] = _mark(parts[k].rstrip()) + parts[k][len(parts[k].rstrip()):]
             out.append("".join(parts) + "".join(after))
         return "".join(out) + cut + tail, false, unverified
     except Exception:
@@ -298,8 +302,8 @@ def raise_false(db, false: list, where: str, now: float | None = None) -> None:
         return   # the same batch or run end applied again
     db.x("INSERT INTO events(ts,source,kind,fingerprint,severity,text,status) VALUES(?,?,?,?,?,?,?)",
          (time.time() if now is None else now, "daemon", KIND, fp, "high",
-          f"{where} claimed what did not hold when checked before sending: {lines}. It was sent marked with what "
-          f"is true. Tell that chat what is true now and fix or re-order the work; check live state before "
+          f"{where} claimed what did not hold when checked before sending: {lines}. It was sent as written; "
+          f"tell that chat what is true now and fix or re-order the work; check live state before "
           f"you claim one"[:4000], "queued"))
 
 

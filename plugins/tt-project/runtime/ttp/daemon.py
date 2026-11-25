@@ -24145,8 +24145,9 @@ def relay_worker_notifies(p: Project, task: dict, run_dir: Path, handoff: dict |
         if step:
             sent += userstep.relay(db, task, step, n, userstep.item_text(db.for_user(text), n, timefmt.zone(p)))
             continue
-        checked, false, _ = claimcheck.check(   # status claims: checked against the records, else marked
-            p, body, own={"task": task["id"], "run": int(run_dir.name) if run_dir.name.isdigit() else None})
+        checked, false, _ = claimcheck.check(   # status claims: checked against the records, never marked
+            p, body, own={"task": task["id"], "run": int(run_dir.name) if run_dir.name.isdigit() else None},
+            mark=False)   # the alert reads as the worker wrote it; a false claim keeps its record and event
         text = headline.join(task['title'], checked, 80, f"#{task['id']} ") if checked != body else text
         if db.one("SELECT id FROM messages WHERE direction='out' AND kind='alert' AND text=? AND ts>?",
                   (text, time.time() - 86400)):
