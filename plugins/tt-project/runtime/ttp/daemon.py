@@ -37,7 +37,13 @@ import uuid
 from pathlib import Path
 
 from . import runtimeload   # first of its own: its LOADED_AT is when the daemon imported its code
-from . import aitag, blindreview, deviceplan, glmassist, glmquota
+from . import (   # one name per line: two changes adding names merge without a conflict
+    aitag,
+    blindreview,
+    deviceplan,
+    glmassist,
+    glmquota,
+)
 from . import rolerestore
 from . import codearm
 from . import glmwork
