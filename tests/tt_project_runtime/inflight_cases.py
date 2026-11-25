@@ -113,6 +113,13 @@ def test_inflight_cap_is_raised_or_removed_only_by_the_user(env, tmp_path):
         with pytest.raises(ValueError, match="set by the user|user's word"):
             accountset.apply(key, v, by)
     assert accountset.current("checks.host_max") == 2 and inflight.cap() == 8
+    accountset.apply("checks.host_max", 8, {"by": "user"})
+    accountset.apply("checks.host_max", 7, by)   # lowered, it stays the user's value: no raise past it after
+    for v in (8, 4096, 0):
+        with pytest.raises(ValueError, match="set by the user"):
+            accountset.apply("checks.host_max", v, by)
+    accountset.apply("checks.host_max", 6, by)
+    assert accountset.current("checks.host_max") == 6 and accountset.last("checks.host_max")["user_value"] == 8
     assert not accountset.raises("chat.max_inflight", 8, 4) and accountset.raises("chat.max_inflight", 8, 9)
     assert not accountset.raises("chat.max_inflight", None, 8), "setting one where none was lowers it"
 

@@ -786,7 +786,8 @@ def test_a_continue_over_a_soft_cap_with_a_reason_passes_in_the_same_action_and_
     assert "new evidence, a different approach or a narrower scope" in bare and "identical retry" in bare
     # The same spec once a hop's stored copy gained an update and an obligation block is still a retry.
     for hop in chaincap.chain(p.db, tip2):
-        p.db.update_task(hop["id"], spec="s\n\n## Update\nrestart: host lost\n\n## Obligation o1 (urgent, owed to the user)\nx")
+        p.db.update_task(hop["id"], spec="s\n\n### Obligation o1 milestone m1\nx\n\n## Update\nrestart: host lost\n\n"
+                                                "## Obligation o1 (urgent, owed to the user)\nx")
     (again,) = coord.apply(p, [dict(act, title="continue: lexer", continues=tip2)])
     assert "refused" in again and "identical retry" in again, again
     # A changed spec passes the soft cap with no reason, noted and recorded as an override.

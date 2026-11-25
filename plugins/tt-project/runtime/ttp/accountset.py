@@ -82,12 +82,13 @@ def last(key: str) -> dict | None:
 
 def user_set(key: str, value: Any = None) -> bool:
     """Whether `key`'s account value (`value`: the one read now) is the user's: set, and either its last
-    logged change is the user's or the log does not explain it (set outside this module)."""
+    logged change is the user's or a coordinator's lowering of the user's value, or the log does not explain
+    it (set outside this module)."""
     value = current(key) if value is None else value
     if value is None:
         return False
     rec = last(key)
-    return rec is None or rec.get("by") == "user" or rec.get("new") != value
+    return rec is None or rec.get("by") == "user" or "user_value" in rec or rec.get("new") != value
 
 
 def raises(key: str, old: Any, new: Any) -> bool:
@@ -110,7 +111,7 @@ def apply(key: str, value: Any, by: dict) -> str:
     old = current(key)
     who = str((by or {}).get("by") or "unknown")
     was_user = who != "user" and user_set(key, old)
-    if was_user and not (who == "coordinator" and isinstance(value, int) and 0 < value < (old or 0)):
+    if was_user and not (who == "coordinator" and isinstance(old, int) and isinstance(value, int) and 0 < value < old):
         raise ValueError(f"{key} is {json.dumps(old)}, set by the user: only the user changes it "
                          f"(ask them, with the value and why)")
     if who != "user" and raises(key, old, value):
@@ -119,6 +120,8 @@ def apply(key: str, value: Any, by: dict) -> str:
         return f"{key} is {json.dumps(value)} already (account-level); nothing changed"
     set_account_setting(key, value)
     rec = {"ts": round(time.time(), 3), "key": key, "old": old, "new": value, "undo": undo_cmd(key, old), **(by or {})}
+    if was_user:
+        rec["user_value"] = (last(key) or {}).get("user_value", old)   # still the user's: only lowered further
     durable_append(log_path(), json.dumps(rec, sort_keys=True) + "\n")
     return (f"{key} = {json.dumps(value)} (account-level, every project on this host; was {json.dumps(old)}"
             + (", the user's value" if was_user else "") + "); "

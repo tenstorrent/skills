@@ -419,16 +419,13 @@ def reason_ok(reason) -> bool:
     return len(r) >= MIN_REASON and bool(REASON_RE.search(r))
 
 
-_ADDED_RE = re.compile(r"^## (?:Update\b|Obligation )", re.M)   # blocks the harness appends to a stored spec
-
-
 def _same_spec(new, stored) -> bool:
     """Whether `new` repeats a hop's `stored` spec word for word, as stored or as first sent (without the
-    update and obligation blocks added to it later)."""
-    stored = str(stored or "")
-    m = _ADDED_RE.search(stored)
+    obligation blocks (prompts.spec_base) and `## Update` blocks added to it later)."""
+    from .prompts import spec_base
+    sent = spec_base({"spec": stored}).split("\n## Update", 1)[0]
     words = " ".join(str(new or "").split())
-    return words in (" ".join(stored.split()), " ".join(stored[:m.start() if m else len(stored)].split()))
+    return words in (" ".join(str(stored or "").split()), " ".join(sent.split()))
 
 
 def check_add(p, cfg: dict, prev: int, reason, spec=None) -> str:
