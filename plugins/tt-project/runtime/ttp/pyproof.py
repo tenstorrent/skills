@@ -348,36 +348,55 @@ def rewrite(cmd: str, cwd: str, env=None) -> str | None:
     return "\n".join(out) if changed else None
 
 
+# bash's builtins and keywords (compgen -b -k): those but the few here may change the shell's folder or variables
+SHELL_WORDS = frozenset(""". : [ alias bg bind break builtin caller cd command compgen complete compopt continue declare
+    dirs disown echo enable eval exec exit export false fc fg getopts hash help history jobs kill let local logout mapfile
+    popd printf pushd pwd read readarray readonly return set shift shopt source suspend test times trap true type typeset
+    ulimit umask unalias unset wait if then else elif fi case esac for select while until do done in function time { }
+    ! [[ ]] coproc""".split()) - {":", "[", "echo", "false", "pwd", "test", "true"}
+WRAPPERS = {"env", "nohup", "timeout", "nice", "stdbuf"}   # run python in the shell's folder and environment
+ASSIGN_RE = re.compile(r"[A-Za-z_]\w*=")
+UNQUOTED_RE = re.compile(r"\\.|'[^']*'|\"((?:\\.|[^\"\\])*)\"")
+
+
 def _may_shadow(shell: str, cwds: list[str], env) -> bool:
     """Whether python may import something other than the standard module a snippet (or a module it imports)
     names: it searches its working folder and each PYTHONPATH entry first, so a module named like a standard
-    one there (one an earlier call wrote) runs instead. Also when the command may set Python's environment or
-    move to a folder not known here. `shell` is the command without its heredoc bodies."""
-    from . import hook
-    if "PYTHON" in re.sub(r"['\"\\]", "", shell):   # PYTHONPATH, PYTHONHOME ..., however quoted
+    one there (one an earlier call wrote) runs instead. So also whenever the command may give python another
+    environment or folder than the ones read here: an expansion, a builtin that sets variables or moves, a
+    wrapper with options. `shell` is the command without its heredoc bodies."""
+    from . import hook, pyaudit
+    expanded = UNQUOTED_RE.sub(lambda m: re.sub(r"\\.", "", m[1] or ""), shell)   # what the shell may expand
+    if re.search(r"[$`]|\(\(", expanded) or re.search(r"PYTHON|CDPATH", re.sub(r"['\"\\{},]", "", shell)) \
+            or env.get("CDPATH"):
         return True
     for argv in hook._segments(shell, strip=False):
-        words = argv[1:2] if argv and argv[0] in ("command", "builtin", "exec") else argv[:1]
-        if any(w in ("source", ".", "eval", "popd") for w in words) or argv and argv[0] in (
-                "cd", "pushd", "export", "declare", "typeset", "readonly", "local", "env", "set") \
-                and any(w == "-" or re.search(r"[$`*?\[]", w) for w in argv[1:]):
+        while argv and ASSIGN_RE.match(argv[0]):
+            argv = argv[1:]
+        py = next((i for i, w in enumerate(argv) if PY_RE.match(os.path.basename(w))), None)
+        head = argv[:py] if py else argv[:2] if argv[:1] in (["cd"], ["pushd"]) else argv[:1]
+        if any(re.search(r"[*?\[{~]", w) for w in head) or argv[:1] in (["cd"], ["pushd"]) and (
+                len(argv) != 2 or argv[1].startswith("-")) or head and head[0] in SHELL_WORDS - {"cd", "pushd"} \
+                or py and (head[0] not in WRAPPERS or any(w.startswith("-") for w in head)):
             return True
     path = str(env.get("PYTHONPATH") or "")
-    entries = [""] + (path.split(os.pathsep) if path else [])
+    judge = [os.path.join(d, "pyaudit.zip") for d in pyaudit.guarded(env)]   # the run-time judge's own, protected
+    entries = [""] + [e for e in (path.split(os.pathsep) if path else []) if e not in judge]
     return any(_holds_module(os.path.join(c, e)) for c in cwds for e in entries)
 
 
 def _holds_module(folder: str) -> bool:
-    """`folder` holds a module or regular package named like a standard module; True when it cannot be read."""
+    """`folder` holds a module or regular package named like a standard module, or one python runs at start;
+    True when it is not a folder it can list (a zip file on PYTHONPATH is searched too)."""
     try:
         entries = os.listdir(folder)
-    except (FileNotFoundError, NotADirectoryError):
+    except FileNotFoundError:
         return False
     except OSError:
         return True
     names = getattr(sys, "stdlib_module_names", None)   # None (before 3.10): any module may shadow one
+    std = lambda n: names is None or n in names or n in ("sitecustomize", "usercustomize")
     suffixes = importlib.machinery.all_suffixes()
-    std = lambda n: names is None or n in names or n in PURE or n in LISTED
     return any(any(e.endswith(s) and std(e[:-len(s)]) for s in suffixes)
                or std(e) and any(os.path.exists(os.path.join(folder, e, "__init__" + s)) for s in suffixes)
                for e in entries)

@@ -60,6 +60,7 @@ def test_pyproof_proves_plain_reads_and_worktree_writes_and_nothing_else(tmp_pat
 def test_pyproof_rewrites_only_the_proven_snippet_and_keeps_the_rest_of_the_line(tmp_path, monkeypatch):
     from ttp import pyproof
     monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    monkeypatch.delenv("PYTHONPATH", raising=False)   # a run's own would hold its judge's zip
     cwd = str(tmp_path)
     proven = "import json,sys; print(json.load(sys.stdin))"
     assert pyproof.rewrite(f"cat a.json | python3 -c '{proven}' && rm -rf x", cwd) == \
@@ -80,6 +81,7 @@ def test_pyproof_rewrites_only_the_proven_snippet_and_keeps_the_rest_of_the_line
 
 def test_the_hook_passes_a_proven_snippet_and_still_refuses_the_rest_of_its_call(env, tmp_path, monkeypatch):
     home = _cred_home(tmp_path, monkeypatch)
+    monkeypatch.delenv("PYTHONPATH", raising=False)   # a run's own would hold its judge's zip
     key = home / _SSH / "id_ed25519"
     named = f"python3 - <<'EOF'\nprint('{key}'.split('/')[-1])\nEOF"
     assert _bash_why(tmp_path, named) == ""                                     # names a store, reads nothing
@@ -131,6 +133,7 @@ def test_the_hook_refuses_a_store_naming_snippet_that_writes_a_file_for_a_later_
 def test_pyproof_reads_heredocs_as_the_hook_does(tmp_path, monkeypatch):
     from ttp import pyproof
     monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    monkeypatch.delenv("PYTHONPATH", raising=False)   # a run's own would hold its judge's zip
     cwd, code = str(tmp_path), "print(1)"
     assert pyproof.rewrite(f"python3 - <<'A' && python3 - <<'B'\n{code}\nA\n{code}\nB", cwd) == \
         "python3 - <<'A' && python3 - <<'B'\npass\nA\npass\nB"                    # two on one line, each its own body
@@ -168,8 +171,9 @@ def test_pyproof_proves_nothing_when_python_may_import_a_module_from_its_folder_
 
     def proven(where):
         return {cmd: pyproof.rewrite(cmd, str(where)) for cmd in cmds} == cmds
+    # the module, one it imports, each form python loads it in, one python runs at start
     for n, planted in enumerate(("json.py", "re.py", "json.pyc", "json" + importlib.machinery.EXTENSION_SUFFIXES[0],
-                                 "json/__init__.py")):   # the module, one it imports, each form python loads
+                                 "json/__init__.py", "sitecustomize.py")):
         work, lib = tmp_path / f"w{n}", tmp_path / f"lib{n}"
         (work / "json").mkdir(parents=True)              # a folder alone is a namespace part: the standard json wins
         (work / "notes.txt").write_text("x")
@@ -182,11 +186,23 @@ def test_pyproof_proves_nothing_when_python_may_import_a_module_from_its_folder_
         monkeypatch.setenv("PYTHONPATH", f"{tmp_path / 'none'}:{lib.name}")
         assert not proven(tmp_path), planted             # a relative one too
         monkeypatch.delenv("PYTHONPATH")
-        assert pyproof.rewrite(f"cd {lib} && python3 -c '{code}'", str(work)) is None, planted   # or where a cd goes
+        for cmd in (f"cd {lib} && python3 -c '{code}'", f"env -C {lib} python3 -c '{code}'",
+                    f"{{ cd {lib}; }} && python3 -c '{code}'"):
+            assert pyproof.rewrite(cmd, str(work)) is None, (planted, cmd)   # or where the command moves
     work = tmp_path / "w0"
+    (tmp_path / "lib.zip").write_text("x")
+    monkeypatch.setenv("PYTHONPATH", str(tmp_path / "lib.zip"))
+    assert not proven(work)                                 # a zip file on PYTHONPATH is searched as well
+    monkeypatch.setenv("TTP_PYAUDIT_POLICY", '{"zip": "%s"}' % (tmp_path / "pyaudit.zip"))
+    (tmp_path / "pyaudit.zip").write_text("x")
+    monkeypatch.setenv("PYTHONPATH", str(tmp_path / "pyaudit.zip"))
+    assert proven(work)                                     # but the run-time judge's own zip is the harness's
+    monkeypatch.delenv("PYTHONPATH")
     for cmd in (f"PYTHONPATH=x python3 -c '{code}'", f"export PYTH\"\"ONPATH=x; python3 -c '{code}'",
                 f". ./env.sh && python3 -c '{code}'", f"export \"$V\"; python3 -c '{code}'",
-                f"cd \"$D\" && python3 -c '{code}'", f"cd - && python3 -c '{code}'"):
+                f"cd \"$D\" && python3 -c '{code}'", f"cd - && python3 -c '{code}'", f"cd ~root && python3 -c '{code}'",
+                f"set -a; read X < f; python3 -c '{code}'", f"export PYT{{H,}}ONPATH=x; python3 -c '{code}'",
+                f"ttp lock r -- python3 -c '{code}'", f"find . -exec python3 -c '{code}' ';'"):
         assert pyproof.rewrite(cmd, str(work)) is None, cmd   # it may set Python's environment or folder
 
 
