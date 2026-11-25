@@ -463,7 +463,8 @@ def _interpreter(word: str, env) -> bool:
 
 
 def _runs_at_start(folder: str) -> bool:
-    """`folder` (the user's site folder) holds a .pth file with a line python runs at start (`import ...`)."""
+    """`folder` (the user's site folder) holds a .pth file with a line python runs at start (`import ...`), or one
+    naming a folder that holds a module python runs at start or imports (_holds_module), as site.addpackage reads it."""
     try:
         pths = [os.path.join(folder, e) for e in os.listdir(folder) if e.endswith(".pth")]
     except FileNotFoundError:
@@ -471,9 +472,11 @@ def _runs_at_start(folder: str) -> bool:
     except OSError:
         return True
     try:
-        return any(line.startswith(("import ", "import\t")) for p in pths for line in open(p, errors="replace"))
+        lines = [line.rstrip() for p in pths for line in open(p, errors="replace") if not line.startswith("#")]
     except OSError:
         return True
+    return any(line.startswith(("import ", "import\t")) or line and _holds_module(os.path.join(folder, line))
+               for line in lines)
 
 
 def _holds_module(folder: str) -> bool:

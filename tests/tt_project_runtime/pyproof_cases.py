@@ -245,6 +245,11 @@ def test_pyproof_proves_nothing_when_python_may_import_a_module_from_its_folder_
     (site / "run.pth").write_text("import os\n")
     assert not proven(work)                                 # one with an import line does, at python's start
     (site / "run.pth").unlink()
+    (tmp_path / "extra").mkdir()
+    (tmp_path / "extra" / "usercustomize.py").write_text("x")
+    (site / "paths.pth").write_text(f"/opt/x\n{tmp_path / 'extra'}\n")
+    assert not proven(work)                                 # nor one naming a folder that holds a module it runs
+    (site / "paths.pth").unlink()
     (site / "usercustomize.py").write_text("x")
     assert not proven(work)                                 # nor when the user's site folder holds one
 
