@@ -308,8 +308,6 @@ def test_a_second_project_s_outage_still_notes_the_owners(env):
     assert not any(n.get("to") == "beta" for n in new), new
 
 
-
-
 def test_a_path_after_a_machine_name_still_names_that_machine_only(env):
     from ttp import heldwork, machines
     machines.add(_HM_BOX, tags="device")
@@ -322,10 +320,15 @@ def test_a_path_after_a_machine_name_still_names_that_machine_only(env):
 def test_the_guard_resolves_the_ssh_target_so_another_config_alias_is_refused(env, monkeypatch):
     from ttp import fleethold, heldwork, machines
     machines.add(_HM_BOX, tags="device", hostname="hm-box.example")
-    resolved = {"hm-box-alt": {"hm-box.example"}, "other-alt": {"other.example"}}
-    monkeypatch.setattr(heldwork, "_ssh_g_hostname", lambda a: resolved.get(a, set()))
+    box = {"hostname": "hm-box.example", "port": "22"}
+    routes = {"hm-box-alt": box, "hm-box.example": box, "other-alt": {"hostname": "other.example", "port": "22"},
+              "gw-2222": {"hostname": "hm-box.example", "port": "2222"},
+              "via-jump": {"hostname": "hm-box.example", "port": "22", "proxyjump": "jump-host"}}
+    monkeypatch.setattr(heldwork, "_ssh_g", lambda n: routes.get(n, {}))
     _hm_hold()
     why = heldwork.ssh_refusal("ssh hm-box-alt true")
     assert why and "`hm-box` is held machine-wide" in why, why
     assert heldwork.ssh_refusal("scp f other-alt:/tmp") is None, "a config alias of another host"
+    for other in ("gw-2222", "via-jump"):   # the same HostName on another port, or behind a jump host
+        assert heldwork.ssh_refusal(f"ssh {other} true") is None, other
     fleethold.lift(_HM_BOX, True, "test")

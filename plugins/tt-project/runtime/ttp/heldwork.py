@@ -42,29 +42,51 @@ def names_of(alias: str) -> set[str]:
     return (out | _ssh_g_hostname(alias)) - {""}
 
 
-_SSH_G: dict[str, set[str]] = {}   # alias -> names its `ssh -G` gave (cached per process)
+_SSH_G: dict[str, dict[str, str]] = {}   # name -> the route fields its `ssh -G` gave (cached per process)
+SSH_G_FIELDS = ("hostname", "port", "proxyjump")   # where `ssh <name>` really goes
+
+
+def _ssh_g(name: str) -> dict[str, str]:
+    """The HostName, Port and ProxyJump `ssh -G <name>` resolves ({} when ssh or the config
+    cannot say). Read-only: ssh -G prints the config and never connects."""
+    if os.environ.get("TTP_TEST_NO_SSH_CHECK") == "1":   # the test suite: no ssh reads
+        return {}
+    if name not in _SSH_G:
+        try:
+            r = subprocess.run(["ssh", "-G", name], capture_output=True, text=True,
+                                timeout=SSH_G_S, stdin=subprocess.DEVNULL)
+            pairs = (ln.split(" ", 1) for ln in r.stdout.splitlines() if " " in ln)
+            _SSH_G[name] = ({k.lower(): v.strip() for k, v in pairs if k.lower() in SSH_G_FIELDS}
+                            if r.returncode == 0 else {})
+        except (OSError, subprocess.SubprocessError):
+            _SSH_G[name] = {}
+    return _SSH_G[name]
 
 
 def _ssh_g_hostname(alias: str) -> set[str]:
     """The HostName `ssh -G <alias>` resolves to ({} when ssh or the config cannot say)."""
-    if os.environ.get("TTP_TEST_NO_SSH_CHECK") == "1":   # the test suite: no ssh reads
-        return set()
-    if alias not in _SSH_G:
-        try:
-            r = subprocess.run(["ssh", "-G", alias], capture_output=True, text=True,
-                                timeout=SSH_G_S, stdin=subprocess.DEVNULL)
-            _SSH_G[alias] = ({ln.split(" ", 1)[1].strip() for ln in r.stdout.splitlines()
-                              if ln.lower().startswith("hostname ")} if r.returncode == 0 else set())
-        except (OSError, subprocess.SubprocessError):
-            _SSH_G[alias] = set()
-    return _SSH_G[alias]
+    return {_ssh_g(alias).get("hostname", "")} - {""}
+
+
+def _route(name: str) -> tuple[str, str, str] | None:
+    """(HostName, Port, ProxyJump) `ssh -G <name>` resolves, None when it cannot say."""
+    g = _ssh_g(name)
+    return (g["hostname"], g.get("port", ""), g.get("proxyjump", "")) if g.get("hostname") else None
 
 
 def alias_for_host(host: str, candidates: Iterable[str]) -> str | None:
-    """The machine alias `host` names (an alias, its host name, its ssh-resolved HostName), `host`
-    itself resolved by `ssh -G` first: another ssh config alias of the same host names it too."""
-    asked = {host} | _ssh_g_hostname(host)
-    return next((a for a in candidates if asked & names_of(a)), None)
+    """The machine alias `host` names: one of its names, or another ssh config alias whose
+    `ssh -G` route (HostName, Port and ProxyJump, not the HostName alone: two machines behind one
+    gateway share it) is the alias's or its record host name's route."""
+    from . import machines
+    route = _route(host)
+    for a in candidates:
+        if host in names_of(a):
+            return a
+        rec_host = str((machines.load().get(a) or {}).get("hostname") or "").strip()
+        if route and route in {_route(n) for n in (a, rec_host) if n}:
+            return a
+    return None
 
 
 def ssh_refusal(cmd: str) -> str | None:
