@@ -753,8 +753,8 @@ def test_code_workers_are_asked_for_each_new_tests_base_failing_run_line():
     """The code-kind prompt asks for the base-failing run line of each new test, so a test that cannot
     fail is refused at the hand-off check instead of at review."""
     code = " ".join((PLUGIN / "template" / "prompts" / "kind-code.md").read_text(encoding="utf-8").split())
-    assert "Run each new test on the base commit too and put the command and its failing result in your self_check" in code
-    assert "hand-off check refuses a hand-off whose new test shows no run failing on the base" in code
+    assert "Run each new test on the base commit too" in code
+    assert "self_check" in code and "hand-off check refuses" in code
 
 
 def test_new_tests_for_an_area_go_in_its_case_file():

@@ -240,7 +240,7 @@ def builtin_check(p: Project, task: dict, handoff) -> dict | None:
     from . import slop
     try:
         noisy = slop.new_noisy(root, fork, head)
-    except (OSError, subprocess.SubprocessError):   # git cannot tell: the rest of the check still stands
+    except (OSError, RuntimeError, subprocess.SubprocessError):   # git cannot tell: the rest of the check still stands
         noisy = []
     bad = glm_test_hygiene(diff)
     out = (["Tests must not touch the real machine's paths:", *bad[:20]] if bad else []) \
