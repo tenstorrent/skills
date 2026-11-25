@@ -13414,11 +13414,11 @@ def _log_account_change(key: str, old, new) -> None:
 
 
 def _user_only_change(raw: dict, key: str, val) -> str | None:
-    """The user-only setting (coordinator.NEEDS_USER) that writing `val` at `key` into the project.json
+    """The user-only setting (coordinator.user_word) that writing `val` at `key` into the project.json
     `raw` would change, or None. A parent key (`budget`, `delivery`) counts through what it holds, and
     turning a SAFE_WHEN_OFF switch off is the safe direction, as in the coordinator's own gate."""
     import copy
-    from .coordinator import NEEDS_USER, SAFE_WHEN_OFF
+    from .coordinator import NEEDS_USER, SAFE_WHEN_OFF, user_word
 
     def at(node, dotted):
         for part in dotted.split("."):
@@ -13435,11 +13435,15 @@ def _user_only_change(raw: dict, key: str, val) -> str | None:
         if node is None:   # set_config fails on a scalar parent; nothing user-only changes here
             return None
     node[key.split(".")[-1]] = val
-    for k in NEEDS_USER:
-        if k != key and not k.startswith(key + ".") and not key.startswith(k + "."):
-            continue
+
+    def leaves(node, dotted):
+        if not isinstance(node, dict) or not node:
+            return {dotted}
+        return set().union(*(leaves(v, f"{dotted}.{k}") for k, v in node.items()))
+    for k in sorted(leaves(at(raw, key), key) | leaves(at(after, key), key), key=lambda k: (-k.count("."), k)):
+        k = next((n for n in NEEDS_USER if k.startswith(n + ".")), k)
         new = at(after, k)
-        if new != at(raw, k) and not (k in SAFE_WHEN_OFF and new in (False, "", [])):
+        if new != at(raw, k) and user_word(k) and not (k in SAFE_WHEN_OFF and new in (False, "", [])):
             return k
     return None
 

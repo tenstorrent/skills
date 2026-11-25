@@ -992,12 +992,17 @@ def test_config_refuses_user_only_keys_inside_a_run(env, capsys, monkeypatch, va
     cli.main(["config", "demo", "budget.daily_usd"])                     # reading works
     cli.main(["config", "--account", "budget.global_daily_usd"])
     capsys.readouterr()
-    cli.main(["config", "demo", "budget.max_pace_hold_s", "60"])         # not user-only
-    cli.main(["config", "demo", "budget", json.dumps({**before.get("budget", {}), "max_pace_hold_s": 90})])
+    cli.main(["config", "demo", "waiting.poll_s", "60"])                 # not user-only
+    cli.main(["config", "demo", "waiting", json.dumps({**before.get("waiting", {}), "poll_s": 90})])
+    for argv in (["config", "demo", "budget.max_pace_hold_s", "60"], ["config", "demo", "chains.max_usd", "60"],
+                 ["config", "demo", "budget", json.dumps({**before.get("budget", {}), "max_pace_hold_s": 90})]):
+        with pytest.raises(SystemExit) as e:   # a spend setting, by its own key or its parent's
+            cli.main(argv)
+        assert e.value.code == 2 and "only the user may change" in capsys.readouterr().err, argv
     for k in SAFE_WHEN_OFF:                                              # the safe direction
         cli.main(["config", "demo", k, json.dumps(False if k == "delivery.code_tasks_may_push" else [])])
     cfg = p.raw_config()
-    assert cfg["budget"]["max_pace_hold_s"] == 90 and cfg["delivery"]["code_tasks_may_push"] is False
+    assert cfg["waiting"]["poll_s"] == 90 and cfg["delivery"]["code_tasks_may_push"] is False
     assert cfg["delivery"]["mirror_remotes"] == []
     monkeypatch.delenv(var)
     cli.main(["config", "demo", "budget.daily_usd", "12"])               # outside a run: the user's own

@@ -1,4 +1,4 @@
-# Coordinator action forms applied as meant (#9824: taskforms.py, memforms.py, configwho.normal_form) of
+# Coordinator action forms applied as meant (taskforms.py, memforms.py, configwho.normal_form) of
 # tests/test_tt_project_runtime.py, which runs this file in its own namespace (see _include_cases there):
 # helpers, fixtures and imports come from that file. Add new task_add/task_update form tests here.
 from __future__ import annotations
@@ -74,29 +74,33 @@ def test_tform_a_branch_change_on_a_done_task_is_a_task_add_continuing_it(env):
     assert any(f"a task_add of #{tid}'s work continuing it with pr_branch" in n for n in _tf_notes(p)), _tf_notes(p)
 
 
-def test_tform_config_set_maps_a_moved_key_and_overrides_an_ordinary_user_value_with_a_note(env, monkeypatch):
-    """Refused before: an unknown key that means one current key, and a change of an ordinary value the
-    user set. The first applies to the current key; the second applies naming the user's value. Still
-    refused: spend caps, push permission, credentials and the machine allowlist the user set, and an
-    account key (never mapped to another key)."""
-    from ttp import cli, coordinator as coord
+def test_tform_config_set_maps_a_moved_key_and_never_changes_a_user_value_or_a_user_word_key(env, monkeypatch):
+    """Refused before: an unknown key that means one current key; it applies to the current key. Still refused:
+    any change of a value the user set, any key only the user's word changes (spend caps, the chain caps, the run
+    stop, push permission, the machine allowlist), a near spelling of one, and an account key (never mapped)."""
+    from ttp import cli, configwho, coordinator as coord
     p = make(env)
     _config_clear_run_env(monkeypatch)
     assert coord.apply(p, [{"type": "config_set", "key": "delivery.spill_beside_device", "value": ["box-a"]}]) == []
     assert p.raw_config()["checks"]["spill_beside_device"] == ["box-a"]
     assert any("key='checks.spill_beside_device' (was: 'delivery.spill_beside_device', no such key)" in n
                for n in _tf_notes(p)), _tf_notes(p)
-    cli.main(["config", "demo", "checks.spill_beside_device", '["box-b"]'])
-    assert coord.apply(p, [{"type": "config_set", "key": "checks.spill_beside_device", "value": ["box-c"]}]) == []
-    assert p.raw_config()["checks"]["spill_beside_device"] == ["box-c"]
-    assert any("over the user's value" in n and "ttp config" in n for n in _tf_notes(p)), _tf_notes(p)
-    for key, value in (("budget.max_parallel_workers", 3), ("delivery.code_tasks_may_push", False),
-                       ("machines.allowed", ["box-a"]), ("chains.max_usd", 20), ("waste.max_runs", 4)):
+    user = (("checks.spill_beside_device", ["box-b"], ["box-c"]), ("delivery.draft_prs", True, False),
+            ("delivery.push_branch", "dev", "main"), ("delivery.review_before_pr", True, False),
+            ("guards.protected_paths", ["a/"], []), ("delivery.push_upstream", "origin", "other"),
+            ("budget.max_parallel_workers", 3, 5), ("delivery.code_tasks_may_push", False, True),
+            ("machines.allowed", ["box-a"], ["box-z"]))
+    for key, value, _ in user:
         cli.main(["config", "demo", key, json.dumps(value)])
-    for key, value in (("budget.max_parallel_workers", 5), ("delivery.code_tasks_may_push", True),
-                       ("machines.allowed", ["box-z"]), ("chains.max_usd", 200), ("waste.max_runs", 9)):
-        probs = coord.apply(p, [{"type": "config_set", "key": key, "value": value}])
+    for key, value, new in user:
+        probs = coord.apply(p, [{"type": "config_set", "key": key, "value": new}])
         assert probs and ("user" in probs[0] or "not user-settable from chat" in probs[0]), (key, probs)
+        assert configwho.at(p.raw_config(), key) == value, key
+    for key, meant in (("chains.max_usd", "chains.max_usd"), ("chains.max_hops", "chains.max_hops"),
+                       ("waste.max_runs", "waste.max_runs"), ("chains.max_usdd", "chains.max_usd"),
+                       ("waste.max_run", "waste.max_runs"), ("coordinator.turn_budget_usd", "coordinator.turn_budget_usd")):
+        probs = coord.apply(p, [{"type": "config_set", "key": key, "value": 99}])
+        assert probs and configwho.at(p.raw_config(), meant) is configwho._ABSENT, (key, probs)
     probs = coord.apply(p, [{"type": "config_set", "key": "checks.spill_hosts", "value": ["box-a"]}])
     assert probs and "checks.spill_hosts" in probs[0], probs
     assert "checks_spill_hosts" not in (p.raw_config().get("delivery") or {}), p.raw_config()

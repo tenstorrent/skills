@@ -595,7 +595,7 @@ def _forbidden_body(section: str, text: str) -> str:
 def settable(key: str):
     """The validator config_set applies to `key` (USER_SETTABLE, else a provider key chatset.py accepts:
     per-tier routing, the saved endpoint's alias); ValueError saying why when chat may not set it, and
-    for a known key that is not the user's alone (NEEDS_USER), how the coordinator sets it (cli_route)."""
+    for a known key that is not the user's alone (user_word), how the coordinator sets it (cli_route)."""
     if (canonical := ALIASES.get(key, key)) in USER_SETTABLE:
         return USER_SETTABLE[canonical]
     if key in accountset.KEYS:   # the account's host checks caps: applied in the daemon (accountset.apply)
@@ -606,7 +606,7 @@ def settable(key: str):
     from .project import unknown_key_hint
     if why := chatset.refusal(key) or unknown_key_hint(key):
         raise ValueError(why)
-    if any(k == key or k.startswith(key + ".") or key.startswith(k + ".") for k in NEEDS_USER):
+    if user_word(key):
         raise ValueError(f"{key} is not user-settable from chat")
     raise ShellKey(f"{key} is not user-settable from chat; {cli_route(key)}")
 
@@ -617,12 +617,11 @@ class ShellKey(ValueError):
 
 def shell_conv(p, cfg: dict, key: str, refusal: ShellKey):
     """How a config_set of ShellKey `key` converts its value: as `ttp config` applies it (its checks, its JSON
-    reading of a text value). Raises `refusal` when the coordinator has no shell (read_only), or the key is a
-    spend setting (budget), push permission (grants), the machine allowlist or a parent of one: the user's.
-    `ttp config --chat-settable` asks the same, so it reports what config_set does."""
-    from . import cli, grants
-    if coordtools.tools_mode(cfg) != "full" or key.split(".")[0] == "budget" or any(
-            k == key or k.startswith(key + ".") for k in (*grants.KEYS, "machines.allowed")):
+    reading of a text value). Raises `refusal` when the coordinator has no shell (read_only); settable already
+    refused a key only the user's word changes (user_word). `ttp config --chat-settable` asks the same, so it
+    reports what config_set does."""
+    from . import cli
+    if coordtools.tools_mode(cfg) != "full":
         raise refusal
 
     def conv(v):
@@ -1940,6 +1939,21 @@ NEEDS_USER["guards.off"] = "restriction"
 
 
 NEEDS_USER["coordinator.session.tools"] = "restriction"   # read_only, its safe side, needs no word
+# The chain caps and the run stop limit spend as the budget keys do.
+NEEDS_USER.update(dict.fromkeys(("chains.max_usd", "chains.max_hops", "waste.max_runs"), "spend"))
+
+
+def user_word(key: str) -> str | None:
+    """The ask_user blocking reason when only the user's word changes `key`, a setting under it or one it sits
+    under: a NEEDS_USER key, push permission (grants), the machine allowlist, or a spend setting (a key naming usd,
+    a budget.* key chat may not set). None when the coordinator may change it. Every config gate asks this one list."""
+    from . import grants
+    for k in (*NEEDS_USER, *grants.KEYS, "machines.allowed"):
+        if k == key or k.startswith(key + ".") or key.startswith(k + "."):
+            return NEEDS_USER.get(k, "access")
+    if re.search(r"(^|[._])usd([._]|$)", key) or key.split(".")[0] == "budget" and key not in USER_SETTABLE:
+        return "spend"
+    return None
 SAFE_WHEN_OFF = {"coordinator.session.tools", relay.AGENT_KEY, "delivery.code_tasks_may_push", "budget.reset_credits_auto", "delivery.backup_remote", "delivery.fast_forward_also",
                  "delivery.mirror_remotes",
                  "delivery.allow_protected_push_branch", "delivery.own_push", "delivery.rebase_replace",
@@ -4428,20 +4442,20 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                 # Removing a user-only key is safe only where its default is off (none of OFF_VALUE's keys).
                 off = (key not in OFF_VALUE and _default_of(key) in (None, False, "", [])) if remove else (
                     (value == OFF_VALUE[key]) if key in OFF_VALUE else value in (False, "", []))
-                if key in NEEDS_USER and not by_user and not (key in SAFE_WHEN_OFF and off):
+                if (why_user := user_word(key)) and not by_user and not (key in SAFE_WHEN_OFF and off):
                     if key in HELD_SETTING and relay.agent_orders(cfg) and messages and relay.recent(db, messages):
                         raise ValueError(relay.held_refusal(f"config_set {key}", HELD_SETTING[key], key,
                                                             "the setting name (HELD_SETTING)"))
                     open_ask = settinghold.asked(db, key)
                     raise ValueError(f"{key} needs the user's approval: "
                                      + (f"open ask #{open_ask} already asks; " if open_ask else
-                                        f"ask_user (blocking {NEEDS_USER[key]}) with the exact value, and ")
+                                        f"ask_user (blocking {why_user}) with the exact value, and ")
                                      + "set it in the turn that carries their yes"
                                      + ("; only their word in chat grants it, never a charter line or a quote"
                                         if key == MERGE_KEY else ""))
                 before = _only_adds_repos(cfg, [] if remove else value) if key == MERGE_KEY else []
                 own = _granted_by(db, a, key, _users_own(db, messages or []) if user_turn else [],
-                                  key in NEEDS_USER and by_user or bool(said))
+                                  bool(user_word(key)) and by_user or bool(said))
                 if key in accountset.KEYS:   # account-level: logged with its setter and undo, a user's value kept
                     notes.append(accountset.apply(key, value, configwho.by("user", msgs=own, via="chat") if own
                                                   else configwho.by("coordinator", via="config_set")))
