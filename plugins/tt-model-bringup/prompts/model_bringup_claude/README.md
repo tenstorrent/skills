@@ -107,4 +107,5 @@ tells the agent to ignore live host state; `--since` sets the window start, and 
 from `--log` but does not write it):
 `overseer.sh --dry-run --once --tt <tt-metal> [--inputs <inputs.json>] [--project-dir <claude config>/projects/<dir> --at <UTC time>] [--since <UTC time>] [--log <file>]`.
 
-If a host is lost or a session ends, see `RESUME.md`.
+If a host is lost or a session ends, see `RESUME.md`. Running and watching runs from another machine, and what we
+did when hosts failed: `REMOTE.md`.
