@@ -1591,13 +1591,13 @@ def test_gh_policy_cmd_allows_refuses_or_errors_each_pulled_call_by_a_stable_con
     monkeypatch.setattr(ghqueue, "POLICY_TIMEOUT_S", 1)
     got = round_with("sleep 5")
     assert got["rc"] == 1 and "error: the gh policy command timed out after 1s" in got["stderr"]
-    assert "could not run" in ghqueue.policy(str(env["tmp"] / "no-such-policy"), {"key": "k"})
+    assert "error: the gh policy command could not start" in ghqueue.policy(str(env["tmp"] / "no-such-policy"), {"key": "k"})
     assert not ws_calls.exists(), "gh ran a call its policy did not allow"
     agents = {"a": {"agent": "env", "direct": [{"name": "h"}]}}
     assert bridge.parse({"boxes": {"b": {"agents": agents}}})["boxes"]["b"]["gh_policy_cmd"] == ""
     assert bridge.parse({"boxes": {"b": {"agents": agents, "gh_policy_cmd": "/opt/p --x"}}}
                         )["boxes"]["b"]["gh_policy_cmd"] == "/opt/p --x"
-    for bad in (["/opt/p"], "   ", "'unclosed", 3):
+    for bad in (["/opt/p"], "   ", "'unclosed", 3, "~/bin/policy", "policy --x"):
         with pytest.raises(bridge.BadConfig):
             bridge.parse({"boxes": {"b": {"agents": agents, "gh_policy_cmd": bad}}})
 
@@ -1638,5 +1638,6 @@ def test_gh_pull_answers_a_raising_entry_with_an_error_and_the_loop_goes_on(env,
     with pytest.raises(KeyboardInterrupt):
         cli._bridge_gh_pull(argparse.Namespace(loop=True, every=5), {"boxes": {"lab-box": {}}}, ["lab-box"])
     assert rounds == ["lab-box", "lab-box"], "the loop kept pulling after a failed round"
+    assert bridge.crash_loop("lab-box") == 0 and not list(bridge.HOME_DIR.glob("*.starts")), "a round finished"
     with pytest.raises(RuntimeError):   # a one-off pull still says it failed
         cli._bridge_gh_pull(argparse.Namespace(loop=False, every=5), {"boxes": {"lab-box": {}}}, ["lab-box"])

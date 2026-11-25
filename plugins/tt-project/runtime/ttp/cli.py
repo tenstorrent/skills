@@ -3048,6 +3048,8 @@ def _bridge_gh_pull(a, cfg: dict, boxes: list[str]) -> None:
             print(said, flush=True)
         if not a.loop:
             return
+        for box in boxes:
+            bridge.loop_ok(box)   # a round finished: these starts were no crash loop
         time.sleep(max(5, a.every))
 
 

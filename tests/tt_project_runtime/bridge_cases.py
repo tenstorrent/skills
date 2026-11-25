@@ -3075,7 +3075,7 @@ def test_a_machine_hold_tears_down_refuses_and_hands_back_only_that_boxs_bridge(
 
 def test_bridge_status_flags_a_gh_pull_loop_that_keeps_restarting(tmp_path, monkeypatch):
     """Each start of `ttp bridge gh-pull --loop` is recorded; status (the bridge heal check) fails with a
-    CRASH LOOP line once it started CRASH_STARTS times within CRASH_WINDOW_S, though its service file is there."""
+    CRASH LOOP line once it started CRASH_STARTS times within CRASH_WINDOW_S with no round finished, though its service file is there."""
     import subprocess
     from ttp import bridge
     monkeypatch.setattr(bridge, "HOME_DIR", tmp_path)
@@ -3095,6 +3095,9 @@ def test_bridge_status_flags_a_gh_pull_loop_that_keeps_restarting(tmp_path, monk
     lines, rc = bridge.status(cfg, ["box-1"], "linux")
     assert rc == 1 and lines[0] == (f"box-1 gh-pull: CRASH LOOP (started {bridge.CRASH_STARTS} times in the last 60 min; "
                                     "its queued gh calls are not answered; log: TypeError: answer() got 3 args)"), lines
+    bridge.loop_ok("box-1")   # once a round finishes the loop is no crash loop, at once
+    lines, rc = bridge.status(cfg, ["box-1"], "linux")
+    assert not any("CRASH LOOP" in ln for ln in lines)
     for _ in range(30):
         bridge.loop_started("box-1", now)
     assert len((tmp_path / f"bridge-box-1-{bridge.GH_PULL}.starts").read_text().split()) <= 2 * bridge.CRASH_STARTS + 1

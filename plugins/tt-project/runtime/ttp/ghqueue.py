@@ -631,19 +631,22 @@ def policy(cmd: str, entry: dict) -> str:
     first output line the reason; any other exit, a timeout or a command that cannot run refuses as an error."""
     if not cmd:
         return ""
+    from . import boundedchild
     try:
-        p = subprocess.run(shlex.split(cmd), input=json.dumps({k: entry.get(k) for k in POLICY_FIELDS}),
-                           capture_output=True, text=True, timeout=POLICY_TIMEOUT_S)
-    except subprocess.TimeoutExpired:
-        return f"error: the gh policy command timed out after {POLICY_TIMEOUT_S}s"
-    except (OSError, ValueError) as e:
+        argv = shlex.split(cmd)
+    except ValueError as e:
         return f"error: the gh policy command could not run: {e}"
-    if p.returncode == 0:
+    p = boundedchild.run(argv, POLICY_TIMEOUT_S, input=json.dumps({k: entry.get(k) for k in POLICY_FIELDS}))
+    if p.timed_out:   # its whole process group is gone: nothing it started acts later
+        return f"error: the gh policy command timed out after {POLICY_TIMEOUT_S}s"
+    if p.rc is None:
+        return f"error: the gh policy command {p.error}"
+    if p.rc == 0:
         return ""
-    first = next((ln.strip() for ln in f"{p.stdout}\n{p.stderr}".splitlines() if ln.strip()), "")[:300]
-    if p.returncode == 1:
+    first = next((ln.strip() for ln in f"{p.out}\n{p.err}".splitlines() if ln.strip()), "")[:300]
+    if p.rc == 1:
         return f"the gh policy command refused it: {first or 'no reason given'}"
-    return f"error: the gh policy command failed (exit {p.returncode}){': ' + first if first else ''}"
+    return f"error: the gh policy command failed (exit {p.rc}){': ' + first if first else ''}"
 
 
 def answer(entry: dict, gh: str | None = None, prefixes=(), where: str = "on the workstation",
@@ -694,12 +697,12 @@ def answer(entry: dict, gh: str | None = None, prefixes=(), where: str = "on the
 
 def _answer_or_error(entry: dict, gh: str | None, prefixes, policy_cmd: str) -> dict | None:
     """answer(), or an error answer for an entry whose answering raised: one bad entry never stops the pull loop."""
+    key = entry.get("key")
+    if not isinstance(key, str) or not _KEY.fullmatch(key):
+        return None
     try:
         return answer(entry, gh, prefixes, policy_cmd=policy_cmd)
     except Exception as e:   # noqa: BLE001 - any fault answers this entry and the loop goes on
-        key = entry.get("key")
-        if not isinstance(key, str) or not _KEY.fullmatch(key):
-            return None
         return {"key": key, "rc": 1, "stdout": "", "stderr": f"error on the workstation: {type(e).__name__}: {e}"[:600]}
 
 

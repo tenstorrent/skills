@@ -203,12 +203,13 @@ def parse(data: dict) -> dict:
                             "the box's branches this computer publishes or deletes)")
         policy = b.get("gh_policy_cmd", "")
         try:
-            policy_ok = isinstance(policy, str) and (not policy or bool(shlex.split(policy)))
-        except ValueError:
+            policy_ok = isinstance(policy, str) and (not policy or shlex.split(policy)[0].startswith("/"))
+        except (ValueError, IndexError):
             policy_ok = False
         if not policy_ok:
-            raise BadConfig(f"box {box}: gh_policy_cmd is a command on this computer (one string, split like a shell "
-                            "line, never run by one) that gets each queued gh call as JSON and exits 0 to allow it")
+            raise BadConfig(f"box {box}: gh_policy_cmd is a command on this computer starting with an absolute path "
+                            "(one string, split like a shell line, never run by one) that gets each queued gh call "
+                            "as JSON and exits 0 to allow it")
         out["boxes"][box] = {"login": {"agent": login.get("agent", ""), "identity": login.get("identity", "")},
                              "agents": parsed, "hold_check": hold, "gh_pull": b.get("gh_pull", False),
                              "gh_branch_prefixes": grants, "gh_policy_cmd": policy}
@@ -458,7 +459,8 @@ def _loop_starts(box: str) -> Path:
 
 
 def loop_started(box: str, now: float | None = None) -> None:
-    """Record one start of `box`'s gh pull loop (its last few), so status() can tell a crash loop from a running one."""
+    """Record one start of `box`'s gh pull loop (its last few; loop_ok() clears them), so status() can tell a crash
+    loop from a running one."""
     f = _loop_starts(box)
     try:
         kept = f.read_text().split()[-(2 * CRASH_STARTS):] if f.is_file() else []
@@ -468,8 +470,14 @@ def loop_started(box: str, now: float | None = None) -> None:
         pass   # a start record is diagnosis only: the loop runs without it
 
 
+def loop_ok(box: str) -> None:
+    """`box`'s gh pull loop finished a round: its earlier starts were no crash loop, or one that is over."""
+    _loop_starts(box).unlink(missing_ok=True)
+
+
 def crash_loop(box: str, now: float | None = None) -> int:
-    """How often `box`'s gh pull loop started in the last CRASH_WINDOW_S, if CRASH_STARTS or more (else 0)."""
+    """How often `box`'s gh pull loop started in the last CRASH_WINDOW_S with no round finished since, if CRASH_STARTS
+    or more (else 0)."""
     now = now or time.time()
     try:
         n = sum(1 for t in _loop_starts(box).read_text().split() if t.isdigit() and now - int(t) < CRASH_WINDOW_S)
