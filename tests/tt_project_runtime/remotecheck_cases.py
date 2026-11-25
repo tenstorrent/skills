@@ -797,6 +797,26 @@ def test_spill_skips_hosts_that_are_not_allowed_busy_or_down_and_keeps_waiting_h
     assert checkspill.allowed(p, p.config(), "check-host-a") == ""
 
 
+def test_spill_makes_no_ssh_to_a_host_out_whole_and_takes_it_back_once_the_outage_ends(env, tmp_path, monkeypatch):
+    """Upstream notes 0e51acd4fa8107aa, d6740a96b0251cd5: a machine out whole (a known outage without covers,
+    as for a lent machine) gets no spill check, probe or remote run: each says held, not probed with the
+    outage's reason, and no ssh starts. Another host is untouched; once the outage ends it is allowed again."""
+    from ttp import checkspill, machine_ledger as ml, remotecheck
+    p, repo, run, remote = _spill_setup(env, tmp_path, monkeypatch, ["check-host-a", "check-host-b"])
+    ssh = []
+    monkeypatch.setattr(checkspill.subprocess, "run", lambda *a, **k: ssh.append(a) or (_ for _ in ()).throw(OSError("x")))
+    ml.set_outage("check-host-a", "lent to another team", p.name, "10d")
+    why = checkspill.allowed(p, p.config(), "check-host-a")
+    assert why.startswith("held, not probed (known outage until ") and "lent to another team" in why, why
+    rc, why, _ = checkspill.probe("check-host-a")
+    assert rc == 0 and why.startswith("held, not probed (") and why.startswith(checkspill._OUT_OF_REACH)
+    assert remotecheck.paused_in(p, p.config(), "check-host-a").startswith("held, not probed (")
+    assert ssh == [], "no ssh to the held host"
+    assert checkspill.allowed(p, p.config(), "check-host-b") == "" and remotecheck.paused_in(p, p.config(), "check-host-b") == ""
+    ml.clear_outage("check-host-a")
+    assert checkspill.allowed(p, p.config(), "check-host-a") == "" and remotecheck.paused_in(p, p.config(), "check-host-a") == ""
+
+
 def test_spill_skips_a_host_another_project_paused_by_alias_or_host_name_until_the_pause_lifts(env, tmp_path,
                                                                                                     monkeypatch):
     """A pause this project's own lookup does not see still keeps the spill picker off the host: another

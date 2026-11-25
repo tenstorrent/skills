@@ -554,20 +554,69 @@ def replace_config_script(stamp: str) -> str:
             'cp "$t" "$c.ttp-bridge.tmp"; chmod 600 "$c.ttp-bridge.tmp"; mv "$c.ttp-bridge.tmp" "$c"; echo written')
 
 
+def _held_file() -> Path:
+    return HOME_DIR / "bridge-held.json"   # {box: [services]} hold_pass stopped, started again once the hold ends
+
+
+def held_boxes(boxes) -> dict[str, str]:
+    """{box: why} for the boxes whose machine is held for every project or out whole (machine_ledger.no_ssh):
+    no bridge goes into one while that stands."""
+    from . import machine_ledger as ml
+    return ml.no_ssh(list(boxes)) if boxes else {}
+
+
+def _services(cfg: dict, box: str) -> list[str]:
+    """A box's sessions: one per agent, and GH_PULL for its delivery.gh_route "workstation" calls (ghqueue)."""
+    return [*cfg["boxes"][box]["agents"], *([GH_PULL] if cfg["boxes"][box].get("gh_pull") else [])]
+
+
+def _start(cfg: dict, box: str, an: str, platform: str | None) -> str:
+    if an == GH_PULL:
+        from .ghqueue import service_argv as gh_argv
+        return start(box, an, gh_argv(box), platform)
+    argv = service_argv(cfg, box, an, platform=platform)
+    if str(RELAY) in argv:
+        install_relay()
+    return start(box, an, argv, platform)
+
+
 def setup(cfg: dict, boxes: list[str], platform: str | None = None) -> list[str]:
-    out = []
+    """Write each box's block and start its sessions; a held box (held_boxes()) is refused, with why."""
+    out, closed = [], held_boxes(boxes)
     for box in boxes:
+        if box in closed:
+            out.append(f"{box}: refused: {closed[box]}; no bridge into it while that stands "
+                       f"(`ttp bridge setup {box}` works again once it ends)")
+            continue
         out.append(f"{box}: {write_block(cfg, box)}")
-        for an in cfg["boxes"][box]["agents"]:
-            argv = service_argv(cfg, box, an, platform=platform)
-            if str(RELAY) in argv:
-                install_relay()
-            out.append(f"{box} {an}: {start(box, an, argv, platform)}")
-        if cfg["boxes"][box].get("gh_pull"):   # its delivery.gh_route "workstation" calls (ghqueue)
-            from .ghqueue import service_argv as gh_argv
-            out.append(f"{box} {GH_PULL}: {start(box, GH_PULL, gh_argv(box), platform)}")
+        for an in _services(cfg, box):
+            out.append(f"{box} {an}: {_start(cfg, box, an, platform)}")
     from . import bridge_watch
     out.append(f"self-heal watch: {bridge_watch.install(platform)}")
+    return out
+
+
+def hold_pass(cfg: dict, platform: str | None = None) -> list[str]:
+    """Tear down the sessions into each box held (held_boxes()): stopped and removed, so no login starts them again,
+    and remembered (_held_file); once the hold ends they start again. One line per session it stopped or started."""
+    try:
+        was = json.loads(_held_file().read_text())
+    except (OSError, ValueError):
+        was = {}
+    closed, out = held_boxes(cfg["boxes"]), []
+    for box in cfg["boxes"]:
+        if box in closed:
+            got = [an for an in _services(cfg, box) if service_file(box, an, platform).is_file()]
+            for an in got:
+                out.append(f"{box} {an}: {stop(box, an, platform, remove=True)} ({closed[box]})")
+            if got:
+                was[box] = sorted({*was.get(box, []), *got})
+        elif box in was:
+            for an in was.pop(box):
+                if an in _services(cfg, box):
+                    out.append(f"{box} {an}: {_start(cfg, box, an, platform)} (its hold ended)")
+    if out:
+        durable_write(_held_file(), json.dumps(was))
     return out
 
 
@@ -696,8 +745,12 @@ def keep_awake_line(cfg: dict, boxes: list[str], platform: str | None = None) ->
 def status(cfg: dict, boxes: list[str], platform: str | None = None, deep: bool = False) -> tuple[list[str], int]:
     """One line per box and agent; deep (doctor): also what each problem means. rc 1 when any is down."""
     lines, bad = [], 0
+    closed = held_boxes(boxes)
     for box in boxes:
         b = cfg["boxes"][box]
+        if box in closed:
+            lines.append(f"{box}: held, not probed ({closed[box]}); its sessions stay down while that stands")
+            continue
         r = _box(box, probe_script(cfg, box))
         if r.returncode == 255:
             lines.append(f"{box}: unreachable from here ({r.stderr.strip()[-160:]})")

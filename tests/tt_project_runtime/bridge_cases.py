@@ -3016,3 +3016,54 @@ def test_bridge_watch_release_runs_the_box_cleanup_for_only_the_dead_ports(tmp_p
     cid = bridge_relay.computer_id(str(bridge.relay_dir("box-1", "auto")))
     assert p1 == f"{cid}/box-1/auto/" and ports1 == [2301] and "-R" in ssh1   # the session's own login options
     assert p2 == f"{cid}/watch/" and ports2 == [2400] and ssh2[-2:] == ["box-2", "true"] and "-R" not in ssh2
+
+
+def test_a_machine_hold_tears_down_refuses_and_hands_back_only_that_boxs_bridge(env, tmp_path, monkeypatch):
+    # cells: hold-teardown, hold-refuse, hold-status, hold-handback
+    # Upstream notes 0e51acd4fa8107aa, d6740a96b0251cd5: a box whose machine is held for every project (or out
+    # whole) loses its bridge sessions (agent forwarding and the gh bridge) at the watcher's next pass, gets no
+    # new one and no ssh at all, with the hold's reason; once the hold ends they start again. Other boxes are
+    # untouched.
+    import json
+    import subprocess
+    from ttp import bridge, bridge_watch, fleethold, hoststate, machines
+    monkeypatch.setattr(bridge, "HOME_DIR", tmp_path / "ttp")
+    monkeypatch.setattr(hoststate, "unit_dir", lambda: tmp_path / "units")
+    monkeypatch.setattr(bridge_watch, "install", lambda platform=None: "installed")
+    seen = {"box": [], "run": []}
+    monkeypatch.setattr(bridge, "_box", lambda b, script, timeout=40, inp=None: seen["box"].append(b)
+                        or subprocess.CompletedProcess([], 0, "", ""))
+    monkeypatch.setattr(bridge, "_run", lambda argv, timeout=60, inp=None: seen["run"].append(" ".join(argv))
+                        or subprocess.CompletedProcess(argv, 0, "", ""))
+    box = {"login": {}, "gh_pull": True, "agents": {"auto": {"agent": "env", "forward": [
+        {"name": "build-a", "target": "build-a.example.com", "port": 2301}]}}}
+    cfg = bridge.parse(json.loads(json.dumps({"boxes": {"box-a": box, "box-b": box}})))
+    for h in ("box-a", "box-b"):
+        machines.add(h)
+    bridge.setup(cfg, ["box-a", "box-b"], "linux")
+    sessions = [(b, an) for b in ("box-a", "box-b") for an in ("auto", bridge.GH_PULL)]
+    assert all(bridge.service_file(b, an, "linux").is_file() for b, an in sessions)
+    fleethold.set_hold("box-a", "lent to another team", "user", "beta")
+    seen["box"].clear(), seen["run"].clear()
+    out = bridge_watch.run_pass(cfg, "linux", 1_000_000.0)
+    assert [ln for ln in out if ln.startswith("box-a")] == [
+        f"box-a {an}: stopped and removed (held machine-wide (hold 1) by beta for the user: lent to another team)"
+        for an in ("auto", bridge.GH_PULL)], out
+    assert not any(ln.startswith("box-b") and "stopped" in ln for ln in out)
+    assert [s for s in sessions if bridge.service_file(*s, "linux").is_file()] == sessions[2:], "only box-a's go"
+    assert all("box-a" in c for c in seen["run"] if "disable" in c) and "box-a" not in seen["box"], "no ssh to box-a"
+    got = bridge.setup(cfg, ["box-a", "box-b"], "linux")
+    assert got[0].startswith("box-a: refused: held machine-wide (hold 1)") and "lent to another team" in got[0]
+    assert "box-a" not in seen["box"] and not bridge.service_file("box-a", "auto", "linux").is_file()
+    assert any(ln.startswith("box-b auto: ") for ln in got), "box-b is set up as before"
+    lines, rc = bridge.status(cfg, ["box-a"], "linux")
+    assert lines[0].startswith("box-a: held, not probed (held machine-wide") and "box-a" not in seen["box"]
+    bridge_watch.run_pass(cfg, "linux", 1_000_100.0)
+    assert "box-a" not in seen["box"] and "box-b" in seen["box"], "the watcher checks box-b only"
+    fleethold.lift("box-a", True, "test")
+    out = bridge_watch.run_pass(cfg, "linux", 1_000_200.0)
+    assert [ln for ln in out if ln.startswith("box-a ")] == [
+        f"box-a {an}: systemd user unit started (its hold ended)" for an in ("auto", bridge.GH_PULL)], out
+    assert "box-a" in seen["box"], "and it is checked again"
+    assert all(bridge.service_file(b, an, "linux").is_file() for b, an in sessions)
+    assert bridge.hold_pass(cfg, "linux") == [], "handed back once"

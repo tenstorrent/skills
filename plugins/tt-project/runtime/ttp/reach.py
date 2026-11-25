@@ -19,7 +19,7 @@ import os
 import re
 import time
 
-from . import machines, netwait, project, timefmt
+from . import machine_ledger as ml, machines, netwait, project, timefmt
 
 STATE = "machine-reach.json"
 LOCK = "machine-reach.lock"
@@ -62,9 +62,12 @@ def _live() -> dict[str, dict]:
 
 
 def due(now: float, every_s: float = PROBE_S) -> list[str]:
-    """The listed machines whose last probe is older than `every_s` (or that were never probed)."""
+    """The listed machines whose last probe is older than `every_s` (or that were never probed), less those held
+    or out whole (machine_ledger.no_ssh): no ssh at all goes to them."""
     st = read()
-    return [a for a in _live() if now - float(st.get(a, {}).get("ts") or 0) >= every_s]
+    stale = [a for a in _live() if now - float(st.get(a, {}).get("ts") or 0) >= every_s]
+    held = ml.no_ssh(stale, now) if stale else {}
+    return [a for a in stale if a not in held]
 
 
 def probe(aliases: list[str], env: dict | None = None) -> None:
@@ -84,13 +87,15 @@ def probe_every(p) -> float:
 
 
 def digest_lines(p, now: float | None = None) -> list[str]:
-    """One line per listed machine: its last ssh probe's answer and time (home zone), or never probed."""
+    """One line per listed machine: its last ssh probe's answer and time (home zone), never probed, or held,
+    not probed (machine_ledger.no_ssh)."""
     now = time.time() if now is None else now
-    st, live = read(), _live()
+    st, live = read(), sorted(_live())[:machines.DIGEST_MACHINES]
+    held = ml.no_ssh(live, now) if live else {}
     out = []
-    for a in sorted(live)[:machines.DIGEST_MACHINES]:
+    for a in live:
         r = st.get(a)
-        out.append(f"- {a}: never probed" if not r else
+        out.append(f"- {a}: held, not probed ({held[a]})" if a in held else f"- {a}: never probed" if not r else
                    f"- {a}: {'answered' if r.get('ok') else 'no answer to'} ssh at {timefmt.short(float(r['ts']), p, now)}")
     return out
 

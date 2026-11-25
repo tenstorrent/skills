@@ -340,6 +340,36 @@ def test_the_digest_shows_each_machines_reach_and_the_daemon_probes_due_machines
     assert reach.read()["box-b"]["ok"] is True
 
 
+@pytest.mark.parametrize("kind", ["hold", "outage"])
+def test_the_reach_probe_makes_no_ssh_to_a_held_or_out_machine_and_shows_it_held(env, monkeypatch, kind):
+    """Upstream notes 0e51acd4fa8107aa, d6740a96b0251cd5: our reach probe ssh'd a lent, held machine. A machine
+    held for every project, or out whole, is never probed and shows held, not probed; a partial outage (its
+    covers) is still probed; other machines are untouched; once it ends it is probed again."""
+    from ttp import daemon as dm, fleethold, machine_ledger as ml, machines, netwait, reach
+    p = make(env)
+    now = time.time()
+    for h in ("box-a", "box-b"):
+        machines.add(h)
+    if kind == "hold":
+        fleethold.set_hold("box-a", "lent to another team", "user", p.name, now=now)
+    else:
+        ml.set_outage("box-b", "fan swap", p.name, "10d", covers="device", now=now)   # partial: still probed
+        ml.set_outage("box-a", "lent to another team", p.name, "10d", now=now)
+    assert reach.due(now) == ["box-b"]
+    lines = reach.digest_lines(p, now)
+    assert lines[0].startswith("- box-a: held, not probed (") and "lent to another team" in lines[0]
+    assert lines[1] == "- box-b: never probed"
+    asked = []
+    monkeypatch.setattr(netwait, "reach", lambda names, env=None: asked.append(list(names)) or {n: True for n in names})
+    monkeypatch.setenv("TTP_TEST_REACH", "1")
+    d = dm.Daemon(p.base)
+    d.check_reach()
+    d._reach.join(5)
+    assert asked == [["box-b"]], "no ssh goes to the held machine"
+    fleethold.lift("box-a", True, "test") if kind == "hold" else ml.clear_outage("box-a")
+    assert reach.due(now) == ["box-a"] and reach.digest_lines(p, now)[0] == "- box-a: never probed"
+
+
 
 
 @pytest.mark.parametrize("block", [

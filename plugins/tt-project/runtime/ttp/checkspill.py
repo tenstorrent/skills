@@ -1064,7 +1064,7 @@ def allowed(p, cfg: dict, alias: str) -> str:
     allowed, and neither the machine nor its host paused. Only structured settings list a host (the
     project's own list, the account's pool), never charter wording or a machines-list tag; the user's
     pauses and holds still keep a listed host off."""
-    from . import lockprobe, machines
+    from . import lockprobe, machine_ledger as ml, machines
     known = machines.load()
     machine, host = target(alias, known)
     if machine not in known:
@@ -1085,6 +1085,8 @@ def allowed(p, cfg: dict, alias: str) -> str:
         if got := paused_elsewhere(p, n, known.get(n)):
             who, held = got
             return f"paused by {who}{': ' + str(held.get('reason')) if held.get('reason') else ''}"
+    if closed := ml.no_ssh([machine, host]):
+        return f"held, not probed ({next(iter(closed.values()))})"
     return ""
 
 
@@ -1130,7 +1132,9 @@ def probe(alias: str, beside_device: bool = False) -> tuple[int, str, str]:
     """(free slots, "", note) on `alias`, or (0, why it cannot take a check now, note): why names a device
     holder the probe's scan found (_device_holders); note says why that scan did not read, else "". With
     `beside_device` a holder found keeps no run off: it is the note instead (starting DEVICE_WHY)."""
-    from . import checklane
+    from . import checklane, machine_ledger as ml
+    if closed := ml.no_ssh([alias]):   # held or out whole: no ssh at all
+        return 0, f"held, not probed ({closed[alias]})", ""
     try:
         r = subprocess.run(remotecheck._ssh(alias, _probe_script()), stdin=subprocess.DEVNULL, capture_output=True,
                            text=True, timeout=PROBE_TIMEOUT_S)
@@ -1188,7 +1192,8 @@ def _failed(alias: str, why: str) -> tuple[int, str, str]:
     return 0, why, ""
 
 
-_OUT_OF_REACH = ("ssh ", "cannot run ssh", "it lacks", "its probe failed", "its pre-run hook error")   # probe and hook
+_OUT_OF_REACH = ("ssh ", "cannot run ssh", "it lacks", "its probe failed", "its pre-run hook error",
+                 "held, not probed")   # probe and hook
 LAST_BUSY: list[str] = []   # the hosts the last pick skipped only as busy (remote_only waits for them)
 _READ: dict[str, tuple[int, float | None]] = {}   # the last probe's (cores, load) per host: pick sizes a run's workers from it
 _CHECKS_RUNNING: dict[str, int] = {}   # the last probe's running checks per host: _claim counts in-flight claims beyond them

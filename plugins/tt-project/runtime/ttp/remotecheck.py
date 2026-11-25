@@ -185,14 +185,15 @@ def paused(host: str, where: str | Path | None = None) -> str:
 def paused_in(p, cfg: dict, host: str, machine: dict | None = None) -> str:
     """"paused by <who>: <reason>" when `host` is paused for project `p`, else "": a pause of this project or
     a shared one (lockprobe.pause), or one another project set on its alias or host name
-    (checkspill.paused_elsewhere; `machine` its machines record, else read). Errors propagate."""
-    from . import checkspill, lockprobe, machines
+    (checkspill.paused_elsewhere; `machine` its machines record, else read); "held, not probed (<why>)" when
+    its machine is out whole (machine_ledger.no_ssh). Errors propagate."""
+    from . import checkspill, lockprobe, machine_ledger as ml, machines
     held = lockprobe.pause(p, cfg, host)
     who = (held.get("project") if isinstance(held, dict) else "") or p.name
     if held is None and (got := checkspill.paused_elsewhere(p, host, machine or machines.load().get(host))):
         who, held = got
     if held is None:
-        return ""
+        return f"held, not probed ({closed[host]})" if (closed := ml.no_ssh([host])) else ""
     reason = held.get("reason") if isinstance(held, dict) else ""
     return f"paused by {who}{f': {reason}' if reason else ''}"
 

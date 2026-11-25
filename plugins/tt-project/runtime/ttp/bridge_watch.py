@@ -187,7 +187,7 @@ def run_pass(cfg: dict, platform: str | None = None, now: float | None = None) -
     """One pass: what it did, one line per action (nothing when all answer)."""
     from . import bridge
     platform, now = platform or sys.platform, time.time() if now is None else now
-    st, out = _load(), []
+    st, out = _load(), bridge.hold_pass(cfg, platform)   # first: a held box's sessions go, and targets() with them
     boxes, fails, off = st.setdefault("boxes", {}), st.setdefault("fail", {}), st.setdefault("unreachable", {})
     net = _net_stamp(platform)
     event = "network change" if net and st.get("net") and net > st["net"] else ""
@@ -198,7 +198,10 @@ def run_pass(cfg: dict, platform: str | None = None, now: float | None = None) -
             f.pop("down", None)
     fast, waiting = st.get("fast_until", 0) > now, False
     ts = targets(cfg, platform)
+    closed = bridge.held_boxes({t["box"] for t in ts})   # a hand-made watch entry into a held box: no ssh to it either
     for box in dict.fromkeys(t["box"] for t in ts):
+        if box in closed:
+            continue
         mine = [t for t in ts if t["box"] == box]
         bs = boxes.get(box, {})
         if bs.get("next", 0) > now and not fast:

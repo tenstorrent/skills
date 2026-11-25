@@ -1332,6 +1332,18 @@ def _hold_why(hold: dict) -> str:
             + (f": {hold['reason']}" if hold.get("reason") else ""))
 
 
+def no_ssh(names, now: float | None = None) -> dict[str, str]:
+    """{name: why} for each of `names` (a machine alias, host name or resource on one) the harness makes no ssh
+    to at all: its machine is held for every project (a fleet hold, as `ttp lock` reads it) or out whole (a
+    known outage without covers). Reach probes, spill checks and access bridges skip it; it shows as held,
+    not probed."""
+    from . import fleethold
+    closed = [(a, _hold_why(h)) for a, h in sorted(fleethold.active().items())]
+    closed += [(a, _outage_why(o)) for a, o in sorted(outages(now).items()) if not o.get("covers")]
+    ons = [(on_machine(a), why) for a, why in closed]
+    return {n: why for n in names for why in [next((w for on, w in ons if on(n)), "")] if why}
+
+
 def _paused_why(d: dict[str, list[str]]) -> str:
     """A user pause, or a shared pause for every project, from _demand; "" when neither."""
     if d["user"]:

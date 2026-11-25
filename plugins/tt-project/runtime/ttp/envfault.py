@@ -298,7 +298,7 @@ def line(f: dict) -> str:
             if f.get("version") else
             f"{f['python']} cannot import {f['runner']}" if f.get("kind") == "module" and f.get("python")
             else f"check host {f.get('host')} is {f['why']}" if f.get("kind") == "host"
-            and str(f.get("why") or "").startswith("paused by ")
+            and str(f.get("why") or "").startswith(("paused by ", "held, not probed"))
             else f"check host {f.get('host')} cannot run checks over ssh"
             + (f" ({f['why']})" if f.get("why") else "") if f.get("kind") == "host"
             else f"{f.get('runner')} is not on PATH or not executable")
