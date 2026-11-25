@@ -139,7 +139,7 @@ def live_items(alias: str, now: float | None = None, where=None) -> list[dict]:
         text = "open change " + ml.change_line(c, now, where, clip=ml.DIGEST_LINE_CHARS)
         if probe := _probe_for(str(c.get("by")), alias):
             text += " — " + (_unverified(c.get("by")) if held
-                              else "live probe: " + _run_probe(c.get("by"), alias, probe))
+                              else "live probe: " + _run_probe(c.get("by"), probe))
         out.append({"kind": "change", "project": str(c.get("by") or "?"), "text": text})
     out += _schedules(alias)
     return out
@@ -242,7 +242,7 @@ def _probe_for(owner: str, alias: str) -> str:
     return probe.strip() if isinstance(probe, str) and probe.strip() else ""
 
 
-def _run_probe(owner: str, alias: str, probe: str) -> str:
+def _run_probe(owner: str, probe: str) -> str:
     """One run of `probe` in the owner project's root, bounded by PROBE_TIMEOUT_S: its one-line
     output, or the unverified mark when it cannot tell."""
     from . import ends, responsibilities as rs
