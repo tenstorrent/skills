@@ -531,7 +531,7 @@ def _cwds(segments: list[list[str]], cwd: str, home: str) -> list[str]:
     def add(*places):   # each folder once: a long command (a heredoc's many words) never grows the list per word
         new = [p for p in dict.fromkeys(places) if p not in cwds[1:]]
         if len(cwds) + len(new) > CWDS_CAP:   # alternating relative cds double the list: at the cap, the rest is
-            new = new[:CWDS_CAP - len(cwds)] + [home] * (home not in cwds[1:])   # read from HOME, as for `cd $D`
+            new = new[:max(0, CWDS_CAP - len(cwds))] + [home] * (home not in cwds[1:])   # read from HOME, as for `cd $D`
         cwds.extend(new)
         if new:
             seen.clear()
