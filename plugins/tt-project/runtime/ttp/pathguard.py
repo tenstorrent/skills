@@ -203,7 +203,8 @@ def roots(env=None, cfg: dict | None = None, defaults: bool = False) -> list[str
     environment moves it (GH_CONFIG_DIR, XDG_CONFIG_HOME) too. `defaults`: DEFAULT_PATHS' only."""
     env = os.environ if env is None else env
     out = []
-    for p in (list(DEFAULT_PATHS) if defaults else paths(cfg)) + ["$GH_CONFIG_DIR"]:
+    from . import pyaudit
+    for p in (list(DEFAULT_PATHS) if defaults else paths(cfg)) + ["$GH_CONFIG_DIR"] + pyaudit.guarded(env):
         for home in _homes(env):
             for e in (env, {}):
                 out += [expand(p, e, "/", home), expand(p, e, "/", home, real=False)]
@@ -1011,6 +1012,7 @@ def refusal(payload: dict, env=None, cfg: dict | None = None) -> str | None:
         hit = next((p for p in DEFAULT_PATHS + tuple(rts) if p.lstrip("~/") in text), None)
     if not hit:
         return None
+    from . import pyaudit
     if isinstance(hit, KeyHit):   # a key named outside the plain ssh use: a credential-store read
         from . import credguard
         return (f"{credguard.WHY}, and never writes under the account's credential folders ({hit} is named "
@@ -1018,6 +1020,9 @@ def refusal(payload: dict, env=None, cfg: dict | None = None) -> str | None:
     if isinstance(hit, _Leak):
         return LEAK_WHY.format(hit=hit)
     plain = str(hit).removesuffix(" on the remote host")
+    if plain in pyaudit.guarded(env):
+        from . import glmguard
+        return glmguard.GUARD_WHY
     if plain in _REMOTE_EXTRA or plain in set(rts) - set(roots(env, {})):
         return PROJECT_WHY.format(hit=hit)
     # A key used as an ssh or git identity: name the route that passes
@@ -1026,6 +1031,7 @@ def refusal(payload: dict, env=None, cfg: dict | None = None) -> str | None:
 
 
 def _refusal(payload: dict, env, rts: list[str]) -> str | None:
+    from . import pyaudit
     tool = str(payload.get("tool_name") or "")
     inp = payload.get("tool_input") or {}
     inp = inp if isinstance(inp, dict) else {"input": inp}
@@ -1035,6 +1041,7 @@ def _refusal(payload: dict, env, rts: list[str]) -> str | None:
     if tool in ("Bash", "shell", "local_shell", "exec_command"):
         cmd = inp.get("command") or inp.get("cmd") or ""
         cmd = shlex.join(map(str, cmd)) if isinstance(cmd, list) else str(cmd)   # an argv: keep `-c` text one word
+        cmd = pyaudit.relieve(cmd, env)   # inline Python the run-time judge judges as it runs
         return shell_refusal(cmd, env, ctx[1], rts)
     if tool == "apply_patch" or "*** Begin Patch" in json.dumps(inp):
         return next((h for s in _strings(inp) if (h := patch_refusal(s, ctx))), None)

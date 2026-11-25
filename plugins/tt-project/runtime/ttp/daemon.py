@@ -135,7 +135,7 @@ from . import urgent
 from . import eventhold
 from . import msgwake
 from . import waketriage
-from . import costlevers, wakesettle
+from . import costlevers, pyaudit, wakesettle
 from . import convgate
 from . import readywait, unstarted
 from . import boundedchild
@@ -4355,6 +4355,8 @@ class Daemon:
                 masked = machines.mask_devices({**os.environ, **env})
                 env.update({k: masked[k] for k in (*machines.DEVICE_MASK, machines.MASK_RECORD)})
             env.update(git_fsync_env({**os.environ, **env}))   # a power cut must not corrupt workers' commits
+            if costlevers.lever_on(self.p, pyaudit.FLAG):   # the run-time Python judge (pyaudit.py)
+                argv = pyaudit.wire(env, argv, runtime_dir, str(cwd), str(run_dir), self.cfg)
             tout = timeout_s or self.cfg["budget"]["run_timeout_s"].get(tier, 3600)
             stall = self.cfg["budget"].get("stall_s", {}).get(tier) if role != "coordinator" else None
             spec = {"argv": argv, "env": env, "cwd": cwd, "timeout_s": tout, "provider": provider, "stall_s": stall,

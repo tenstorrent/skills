@@ -77,6 +77,11 @@ FLAGS: dict[str, dict[str, Any]] = {
     # A cost lever (costlevers.py): off until a ring turns it on.
     "coord_wake_settle": {"key": "coordinator.wake_settle", "area": "coordinator",
                           "code": _code("costlevers.py", "wakesettle.py", "daemon.py")},
+    # The run-time Python judge (pyaudit.py): a run's inline Python judges its own writes, reads and children,
+    # and the shell guards stop reading its code. It changes every run's Python start-up, so a ring goes first.
+    "pyaudit": {"key": "guards.pyaudit", "area": "worker",
+                "code": _code("pyaudit.py", "daemon.py", "pathguard.py", "glmguard.py", "glmenv.py")
+                + ("plugins/tt-project/runtime/pyaudit/sitecustomize.py",)},
 }
 
 

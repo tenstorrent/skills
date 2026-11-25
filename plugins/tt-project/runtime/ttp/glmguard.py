@@ -130,6 +130,7 @@ HIDDEN = re.compile(rf"""(?m)(?:^\s*|{_CMD_AT})(?:["']?\\?\$(?:\{{\w+\}}|[A-Za-z
                     rf"""|(?:^\s*|{_CMD_AT})["']?(?:[\w-]+\\?\$[{{A-Za-z_]|\\?\$\{{\w+\}}[\w-])"""
                     rf"""|{_CMD_AT}`|(?:^\s*|{_CMD_AT})eval\s+["'$\\]|\$\{{(?:\\?\$|!\w+\}})|(?<![\w.-])sleep\s+["']?\\?\$""")
 HIDDEN_WHY = "a program name or a checked operand comes from an expansion the guard cannot read"
+STATE_DB_WHY = "a run on the GLM arm may not read or write the project's database or machine records by hand"
 STATE_DB = re.compile(r"\bproject\.db\b|\bmachine-workers\.json\b|\b\.tt-project/(?:locks|machines)\b")
 # Every run on the chat model (the code arm, a GLM work route, a routine coordinator lane, a bench run as a task):
 # human interaction stays on Opus, so its outward posts become drafts an Opus step reviews and sends.
@@ -715,9 +716,10 @@ def shell_refusal(cmd: str, cwd: str, run_dir: str = "", env=None, remote: bool 
     power cycles and flashes outside the approved routes; the hook adds protected paths, held Slurm nodes and
     replayed undos (pathguard, ruleguard). Everything else runs. `remote`: the command an ssh call runs on another
     host. `writes` and `services`: False skips those checks (a step of Opus's plan, deviceplan._static). `made`
-    gets the system temp dir entries an allowed command makes (writes_outside); nothing is written here."""
-    from . import credguard, hook, pathguard
+    gets the system temp dir entries an allowed command makes (writes_outside); nothing is written here but the judge's record of relieved code (pyaudit._expects)."""
+    from . import credguard, hook, pathguard, pyaudit
     e = os.environ if env is None else env
+    cmd = cmd if remote else pyaudit.relieve(cmd, e)   # inline Python the run-time judge judges as it runs
     lines, bodies = hook._heredocs(cmd)
     named = code_text(cmd, py_code=True)
     # the command words: the quoted text of commands that only print, search for or record it, and their quoted
@@ -734,7 +736,7 @@ def shell_refusal(cmd: str, cwd: str, run_dir: str = "", env=None, remote: bool 
             os.path.basename(w[0]) in GUARD_READERS | {"echo", "printf", "for"} for w in hook._all_segments(hook._split(same)[0]) if w):
         return GUARD_WHY
     if STATE_DB.search(named):
-        return "a run on the GLM arm may not read or write the project's database or machine records by hand"
+        return STATE_DB_WHY
     if services and (svc := SERVICE_RE.search(view)):
         return f"{SERVICE_WHY}: {svc.group(0)[:120]}"
     if writes and (m := HIDDEN.search(_inert(view))):

@@ -1112,12 +1112,12 @@ def test_a_stuck_task_counts_against_a_glm_flag_only_when_its_own_glm_run_stalle
 
 
 @pytest.mark.parametrize("flag", ["glm_code", "glm_work", "glm_device", "glm_coord", "eta_history", "deslop",
-                                  "coord_wake_settle"])
+                                  "coord_wake_settle", "pyaudit"])
 def test_every_flag_s_health_watch_switches_off_only_its_own_project(env, flag):
-    # cells: glm_code, glm_work, glm_device, glm_coord, eta_history, deslop, coord_wake_settle
+    # cells: glm_code, glm_work, glm_device, glm_coord, eta_history, deslop, coord_wake_settle, pyaudit
     from ttp import rollout
     assert set(rollout.FLAGS) == {"glm_code", "glm_work", "glm_device", "glm_coord", "eta_history", "deslop",
-                                  "coord_wake_settle"}, "a new flag gets a cell here"
+                                  "coord_wake_settle", "pyaudit"}, "a new flag gets a cell here"
     p, d = _watch(env)
     rollout.set_ring(p.name, "1")
     rollout.set_ring("other", "1")

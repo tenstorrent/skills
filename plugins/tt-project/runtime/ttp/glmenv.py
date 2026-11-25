@@ -45,7 +45,7 @@ except ImportError:   # tests and the daemon: the refusal logic below needs neit
             super().__init__()
             self.messages = messages
 
-from . import deviceplan, glmguard
+from . import deviceplan, glmguard, pyaudit
 
 CLASS_PATH = "ttp.glmenv.GuardedEnvironment"
 DIGEST_ENV = "TTP_GLM_DIGEST"   # the harness script sets it to 1 when the digest is on
@@ -146,6 +146,7 @@ class GuardedEnvironment(LocalEnvironment):
     def _guarded(self, action: dict, cwd: str = "", *, timeout: int | None = None):
         command = str(action.get("command") or "")
         run_dir = os.environ.get("TTP_RUN_DIR", "")
+        pyaudit.first(os.environ)   # harness.sh set its own PYTHONPATH: the run-time judge goes first again
         if draft := glmguard.outward_shell(command):   # an outward post: a draft for Opus, the run goes on
             return {"output": glmguard.drafted(run_dir, draft), "returncode": 2, "exception_info": ""}
         here = cwd or getattr(getattr(self, "config", None), "cwd", "") or os.getcwd()
