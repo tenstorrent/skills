@@ -205,6 +205,8 @@ class _Proof:
         tmp = self.env.get("TMPDIR")
         mine = [os.path.realpath(r).rstrip("/") + "/" for r in [self.cwd, *[tmp] * bool(tmp)]]
         self.wrote |= writes
+        if writes and path.endswith((*importlib.machinery.all_suffixes(), ".pth")):   # a module python may import
+            return False
         for base in self.bases:
             real = os.path.realpath(os.path.join(base, path))
             if os.path.basename(real) == untrusted.RUN_MARK:   # the run's mark of untrusted input: the guards judge it
@@ -312,6 +314,7 @@ def rewrite(cmd: str, cwd: str, env=None) -> str | None:
     if _may_shadow("\n".join(lines), bases[1:] if bases else [cwd], env):
         return None
     changed = hidden = False
+    proven = 0
     for b in bodies:
         i, body, pos = b
         m = hook.HEREDOC_RE.match(lines[i], pos)
@@ -325,7 +328,7 @@ def rewrite(cmd: str, cwd: str, env=None) -> str | None:
                 return None
             hidden |= named
             body[:] = ["pass"]
-            changed = True
+            changed, proven = True, proven + 1
     ends: dict[int, list[str]] = {}   # the lines each heredoc leaves after its line: its body, then its end
     for b in bodies:
         ends.setdefault(b[0], []).extend([*b[1], b.end])
@@ -335,7 +338,7 @@ def rewrite(cmd: str, cwd: str, env=None) -> str | None:
         for m in reversed(list(DASH_C_RE.finditer(line))):
             code = m[1] if m[1] is not None else m[2]
             if not flags[m.start()][0] and _code_at(line, m.start()) == code and (proof := _prove(code, cwd, env, bases)):
-                line, changed = f"{line[:m.start()]}-c 'pass'{line[m.end():]}", True
+                line, changed, proven = f"{line[:m.start()]}-c 'pass'{line[m.end():]}", True, proven + 1
                 named = _words_name_store(code, cwd, env)
                 if named and proof.wrote:
                     return None
@@ -343,6 +346,9 @@ def rewrite(cmd: str, cwd: str, env=None) -> str | None:
         out += [line, *ends.get(i, [])]
     # A snippet naming a store the guard would have seen in its words is freed only as the whole command: its
     # output piped, captured, redirected or written for a later command could feed that name to the shell.
+    # Another python of the command (one not proven) could write a module a proven one then imports.
+    if proven < sum(any(PY_RE.match(os.path.basename(w)) for w in argv) for argv in segments):
+        return None
     if hidden and (len(lines) > 1 or re.search(r"[|>`;&]|\$\(|<\(", lines[0])):
         return None
     return "\n".join(out) if changed else None
@@ -357,6 +363,7 @@ SHELL_WORDS = frozenset(""". : [ alias bg bind break builtin caller cd command c
 WRAPPERS = {"env", "nohup", "timeout", "nice", "stdbuf"}   # run python in the shell's folder and environment
 ASSIGN_RE = re.compile(r"[A-Za-z_]\w*=")
 UNQUOTED_RE = re.compile(r"\\.|'[^']*'|\"((?:\\.|[^\"\\])*)\"")
+READERS = {"cat", "echo", "ls", "head", "tail", "grep", "wc", "true", "pwd"}   # write no file without a redirect
 
 
 def _may_shadow(shell: str, cwds: list[str], env) -> bool:
@@ -379,10 +386,51 @@ def _may_shadow(shell: str, cwds: list[str], env) -> bool:
                 len(argv) != 2 or argv[1].startswith("-")) or head and head[0] in SHELL_WORDS - {"cd", "pushd"} \
                 or py and (head[0] not in WRAPPERS or any(w.startswith("-") for w in head)):
             return True
+    if _plants(shell):
+        return True
     path = str(env.get("PYTHONPATH") or "")
     judge = [os.path.join(d, "pyaudit.zip") for d in pyaudit.guarded(env)]   # the run-time judge's own, protected
     entries = [""] + [e for e in (path.split(os.pathsep) if path else []) if e not in judge]
-    return any(_holds_module(os.path.join(c, e)) for c in cwds for e in entries)
+    user = env.get("PYTHONUSERBASE") or os.path.join(str(env.get("HOME") or os.path.expanduser("~")), ".local")
+    site = os.path.join(user, "lib", f"python{sys.version_info[0]}.{sys.version_info[1]}", "site-packages")
+    return _holds_module(site) or any(_holds_module(os.path.join(c, e)) for c in cwds for e in entries)
+
+
+def _plants(shell: str) -> bool:
+    """Whether a command that may write a file (anything but a reader, or a redirect into a file) runs before
+    a python of the command, or beside it in its pipeline: what it writes is not in the folders read here."""
+    lex = shlex.shlex(shell.replace("\n", " ; "), posix=True, punctuation_chars=True)
+    lex.whitespace_split = True
+    try:
+        words = list(lex)
+    except ValueError:
+        return True
+    from . import sidefx
+    ran = writes = py = False   # ran: a writer ran before this pipeline; writes, py: one is in it
+    start, target = True, ""
+    for w in words + [";"]:
+        if set(w) <= set("();<>|&"):
+            if ">" in w or "<" in w:
+                target = w
+            elif w in ("|", "|&"):
+                start = True
+            else:
+                if writes and py:
+                    return True
+                ran, writes, py, start = ran or writes, False, False, True
+        elif target:
+            writes |= ">" in target and not (w.isdigit() or w == "-" or w.startswith(sidefx.HARMLESS))
+            target = False
+        elif start:
+            name = os.path.basename(w)
+            if PY_RE.match(name):
+                if ran:
+                    return True
+                py, start = True, False
+            elif not (ASSIGN_RE.match(w) or w.isdigit() or name in WRAPPERS):
+                writes |= name not in READERS | {"cd", "pushd"}
+                start = False
+    return False
 
 
 def _holds_module(folder: str) -> bool:

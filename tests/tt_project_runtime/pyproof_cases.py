@@ -204,6 +204,19 @@ def test_pyproof_proves_nothing_when_python_may_import_a_module_from_its_folder_
                 f"set -a; read X < f; python3 -c '{code}'", f"export PYT{{H,}}ONPATH=x; python3 -c '{code}'",
                 f"ttp lock r -- python3 -c '{code}'", f"find . -exec python3 -c '{code}' ';'"):
         assert pyproof.rewrite(cmd, str(work)) is None, cmd   # it may set Python's environment or folder
+    plant = "open('json.py', 'w').write('x')"
+    for cmd in (f"echo x > json.py; python3 -c '{code}'", f"cp a.py json.py && python3 -c '{code}'",
+                f"python3 -c '{code}' | tee json.py", f"python3 -c '{code}' > json.py",
+                f"python3 -c \"{plant}\"; python3 -c '{code}'", f"python3 -m pip -q x; python3 -c '{code}'",
+                f"python3 - <<'EOF'\n{plant}\n{code}\nEOF"):
+        assert pyproof.rewrite(cmd, str(work)) is None, cmd   # or it writes one first, beside python or in it
+    for cmd in (f"cat a.json | python3 -c '{code}' 2>&1 | tail -3", f"timeout 60 python3 -c '{code}' 2>/dev/null"):
+        assert pyproof.rewrite(cmd, str(work)) is not None, cmd   # readers and output to the terminal write none
+    monkeypatch.delenv("PYTHONUSERBASE", raising=False)
+    site = tmp_path / "home" / ".local" / "lib" / "python{}.{}".format(*sys.version_info[:2]) / "site-packages"
+    site.mkdir(parents=True)
+    (site / "usercustomize.py").write_text("x")
+    assert not proven(work)                                 # nor when the user's site folder holds one
 
 
 def test_the_hook_refuses_a_store_naming_snippet_beside_a_module_named_like_one_it_imports(env, tmp_path, monkeypatch):
