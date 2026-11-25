@@ -172,6 +172,17 @@ def always_passes(probe: str | None) -> bool:
     return bool(str(probe or "").strip()) and all(not x or _ALWAYS_RE.fullmatch(x) for x in parts) and any(parts)
 
 
+CHARTER_WAIT_RE = re.compile(r"CHARTER\.md|\bcharter_(?:update|retry)\b|\bttp\s+(?:charter|memory)\b", re.I)
+
+
+def charter_wait(probe: str | None) -> str:
+    """The charter word a wait probe names (it greps the charter, or waits on a charter_update or a
+    memory entry landing), or "": a refused rule change never holds ordered work, so approved work is
+    queued in the same turn, never parked on its paperwork."""
+    m = CHARTER_WAIT_RE.search(probe or "")
+    return m.group(0) if m else ""
+
+
 def probe_flag(probe: str | None) -> str:
     """The first flag for a wait probe that may wait wrongly (end_marker_only, header_grep), else ""."""
     return end_marker_only(probe) or header_grep(probe)

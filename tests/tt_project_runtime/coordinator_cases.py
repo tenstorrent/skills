@@ -11020,7 +11020,7 @@ def test_a_broken_waits_on_when_probe_raises_one_event_and_a_log_line(env, monke
 
 
 @pytest.mark.parametrize("probe, flagged", [
-    ("grep -q 'Device broker' harness/CHARTER.md || exit 1", True),   # the path is not under the project root
+    ("grep -q 'Device broker' harness/NOTES.md || exit 1", True),     # the path is not under the project root
     ("cat out/a/state.json | grep -q done", True),
     ("! grep -q done logs/run.log && exit 1", True),
     ("grep -q tt-project tt-project/harness/CHARTER.md || exit 1", False),   # there
@@ -22665,9 +22665,6 @@ def test_a_general_or_too_wide_exception_is_refused_naming_each_clause(env):
             ("Workers may power cycle a serving host.", "it names no host, resource, action or time window"),
             ("Workers may power cycle any serving host, host-a included.", "\"any\" lifts it in general"),
             ("Power cycling a serving host is no longer banned.", "\"no longer\" lifts it in general"),
-            ("Workers may power cycle host-a and host-c.",
-             "it is wider than a ban another item keeps: \"Never power cycle host-c or host-d while they serve "
-             "jobs.\" (section 'Restrictions'): it still bans host-c, which the exception covers"),
             ("Never power cycle host-a on weekends.", "the text permits nothing"),
             ("Workers may open pull requests on host-a.", "the text is not about what that clause bans"),
             ("Workers may power cycle host-a and host-b.", "the user's words in `source` do not name host-b"))):
@@ -22678,6 +22675,11 @@ def test_a_general_or_too_wide_exception_is_refused_naming_each_clause(env):
         if "wider" not in want:
             assert "refused: \"Never power cycle a serving host.\" (section 'Restrictions'): " in err[0], err
         assert p.charter_path.read_text() == _SCOPED_BANS
+    # another ban on host-c that guards no person gets the ordered exception beside it
+    mids, src = _turn_said(p, "you may power cycle host-a and host-c")
+    assert coord.apply(p, [{**base, "text": "Workers may power cycle host-a and host-c.", "source": src}], turn=20,
+                       user_turn=True, messages=mids) == []
+    assert "Exception to \"Never power cycle host-c or host-d while they serve jobs.\"" in p.charter_path.read_text()
     mids, src = _turn_said(p, "you may power cycle host-a")
     err = coord.apply(p, [{**base, "excepts": "Never reboot anything.", "text": "Workers may reboot host-a.",
                            "source": src}], turn=9, user_turn=True, messages=mids)
@@ -22743,44 +22745,42 @@ def test_an_ordered_exception_with_no_new_risk_class_passes_on_the_agents_order_
     assert db.one("SELECT COUNT(*) n FROM messages WHERE kind='ask'")["n"] == asks   # no new ask
 
 
-def test_an_ordered_exception_is_refused_for_a_new_risk_class_or_a_scope_nobody_named(env):
-    """Ordered work covers only what the order or the charter's Goals, Resources and Policies name and adds
-    no new risk class: an exception that disturbs a machine, destroys data or speaks as the owner, or names
-    a script only a Restrictions item (the excepted ban or another) names, is still refused without the
-    user's own words naming it; the ask stays (sa46)."""
+def test_an_ordered_exception_is_refused_only_where_it_could_hurt_people(env):
+    """Ordered work that cannot hurt people goes in, even where it names a step or a script
+    the order did not (a reset on the project's own test box, a new probe script). Still refused without the
+    user's own words naming it: a HELD class (deleting data, speaking as the owner) and a step disturbing a
+    machine or job on a name neither the order, the charter's Goals, Resources and Policies nor the project's
+    own resources name, which may be someone else's; the ask then stays (sa46)."""
     p = make(env)
     from ttp import coordinator as coord
     db = p.db
-    p.charter_path.write_text(_ONLY_WRITE)
     _agent_on(p)
     ask = _gate_ask(db)
     found = db.post("in", f"please {_MUX_ORDER}", chat=None, kind="finding")
     src = {"origin": "relayer", "msg": found, "quote": _MUX_ORDER, "ask": ask}
     for text, why in (
-            ("Workers may make a BMC write that resets the i2c mux in `run.sh` for power reads.", "new risk class"),
-            ("Workers may make a BMC write that power cycles the i2c mux in `run.sh`.", "new risk class"),
-            ("Workers may make a BMC write that deletes the i2c mux logs in `run.sh`.", "new risk class"),
-            ("Workers may make a BMC write that selects the i2c mux channel in `mux_probe.py`.",
-             "Policies name none of mux_probe.py")):
+            ("Workers may make a BMC write that deletes the i2c mux logs in `run.sh`.", "\"delete"),
+            ("Workers may make a BMC write that resets the i2c mux on host-z.",
+             "\"resets\" on host-z, which neither the order"),
+            ("Workers may make a BMC write that resets the i2c mux in `run.sh` for power reads.", ""),
+            ("Workers may make a BMC write that selects the i2c mux channel in `mux_probe.py`.", "")):
+        p.charter_path.write_text(_ONLY_WRITE)
         err = coord.apply(p, [{"type": "charter_update", "section": "Restrictions", "excepts": _ONLY_CLAUSE,
                                "text": text, "source": src}], turn=2, messages=[])
+        if not why:
+            assert err == [] and text in p.charter_path.read_text(), (text, err)
+            continue
         assert len(err) == 1 and "the user's words in `source` do not name" in err[0] and why in err[0], (text, err)
         assert p.charter_path.read_text() == _ONLY_WRITE
-    # a name only a Restrictions item carries is not one the charter allows (it passed on the whole charter)
-    hosts = ("# demo\n\n## Goals\n- Run tests on box-a.\n\n## Restrictions\n"
-             "- Never write to `/etc/hosts` on any box. (user msg #1)\n"
-             "- Never open pull requests from `release.sh`. (user msg #1)\n")
-    p.charter_path.write_text(hosts)
-    found = db.post("in", "please run the tests on box-a", chat=None, kind="finding")
-    err = coord.apply(p, [{"type": "charter_update", "section": "Restrictions", "excepts":
-                           "Never write to `/etc/hosts` on any box", "text":
-                           "Workers may write to `/etc/hosts` on box-a with `release.sh`.",
-                           "source": {"origin": "relayer", "msg": found, "quote": "run the tests on box-a"}}],
+    # the project's own resources (its config) count like the charter's Goals: a reset there passes
+    cfg = json.loads(p.config_path.read_text()) if p.config_path.exists() else {}
+    cfg.setdefault("machines", {})["allowed"] = ["host-z"]
+    p.config_path.write_text(json.dumps(cfg))
+    p.charter_path.write_text(_ONLY_WRITE)
+    err = coord.apply(p, [{"type": "charter_update", "section": "Restrictions", "excepts": _ONLY_CLAUSE,
+                           "text": "Workers may make a BMC write that resets the i2c mux on host-z.", "source": src}],
                       turn=3, messages=[])
-    assert len(err) == 1 and "Policies name none of release.sh" in err[0], err
-    assert p.charter_path.read_text() == hosts
-    assert db.one("SELECT handled FROM messages WHERE id=?", (ask,))["handled"] == 0
-    assert not db.one("SELECT 1 FROM events WHERE kind='restriction_exception'")
+    assert err == [], err
 
 
 def _record_post(db, author, kind="user"):

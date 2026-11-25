@@ -2381,6 +2381,11 @@ def check_probe(probe, what: str = "start_when") -> None:
     if what in ("start_when", "retry_when", "waits_on when"):
         from . import userstep
         userstep.check_wait_text(probe, what)   # prose for the user's next message: no probe sees it
+        from .waitheal import charter_wait
+        if word := charter_wait(probe):
+            raise ValueError(f"{what} {probe.strip()[:80]!r} waits on the charter ({word!r}): a refused or pending "
+                             f"rule change never holds ordered work; queue the work now, and resend the "
+                             f"charter_update fixed in the same turn")
     if re.match(r"\s*landed:", probe, re.I) and not re.fullmatch(r"\s*landed:\s*#?\d+\s*", probe):
         raise ValueError(f"{what} {probe.strip()[:60]!r} is not a landed probe: write it as landed:#<task id> "
                          f"(exactly `landed:#<id>`, one task id); to combine it with another check, use "
@@ -4032,12 +4037,13 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                             p.charter_path.read_text(), section, text, excepts,
                             "" if verbatim and not unsourced else unsourced or (
                                 "a Brief or harness-gate source is not the user's words" if a.get("source")
-                                else restriction_source.NO_SOURCE), end, said, ordered_scope)
+                                else restriction_source.NO_SOURCE), end, said, ordered_scope, _own_resources(cfg))
                         notes.append(overlap)
                     elif text and not (replaces or a.get("both_hold") or refused):
                         # the user's verbatim words (or agent-ordered) behind a lift: the harness fixes its form
                         fixed, why_not = (_repair_lift(p, section, text, end,
-                                                       _verbatim_said(db, cite, agent, a.get("source")), ordered_scope)
+                                                       _verbatim_said(db, cite, agent, a.get("source")), ordered_scope,
+                                                       _own_resources(cfg))
                                           if not (quote or unsourced) and re.search(_SAID_CITE, cite) else ("", ""))
                         if fixed:
                             text, overlap = fixed
@@ -7018,28 +7024,34 @@ _DISTURB_RE = re.compile(r"\b(?:power[- ]?cycl\w*|reboot\w*|restart\w*|shut ?dow
 _SAID_CITE = r"user msg #\d+|relayer-ordered|owner-record"   # cites _verbatim_said reads words from
 
 
-def _ordered_work(charter: str, text: str, names: set[str], unsaid: list[str], said: str) -> str:
+def _ordered_work(charter: str, text: str, names: set[str], unsaid: list[str], said: str,
+                  own: tuple = ()) -> str:
     """Why an exception whose scope names `unsaid` are not in the order's words `said` is not ordered work
-    with no new risk class, else "". It is when the order names part of its scope, its text has no
-    new-risk-class words (_DISTURB_RE, relay.HELD) and the charter's Goals, Resources or Policies name the
-    rest of its scope (an action or resource the project already works with); no Restrictions item counts,
-    the excepted ban or any other. Then the order needs no new words of the user naming each part. A scope
-    the order names in other words than the exception text is refused: resend it in the order's words."""
-    if not said or not names - set(unsaid):
-        return "and the order in `source` names none of its scope"
+    that cannot hurt people, else "". Only steps that could hurt people or speak as the owner need the
+    user's own words naming them: relay.HELD's classes (someone else's work or data, a shared service,
+    speaking as the owner, a PR leaving draft, a merge, money or a credential) in its text, or a step that
+    disturbs a whole machine or job (_DISTURB_RE) on a name that neither the order, the charter's Goals,
+    Resources or Policies nor the project's own resources (`own`: machines.allowed, resources,
+    shared_resources) name, so it may be someone else's. A scope name the order and those leave out is
+    refused only when the order names none of the scope either."""
+    if not said:
+        return "and no order is cited in `source`"
     bare = restriction_source.bare(text)
     cls, words = relay.held_match(bare)
-    risk = words if cls else (m[0] if (m := _DISTURB_RE.search(bare)) else "")
-    if risk:
-        return (f"and \"{risk}\" makes it a new risk class (someone's work or data, a machine or service others "
-                f"use, speaking as the owner, money or a credential), which needs the user's own words naming it")
+    if cls:
+        return (f"and \"{words}\" is a step only the user's own words naming it allow (someone else's work or data, "
+                f"a shared service, speaking as the owner, money or a credential)")
     from .prompts import charter_sections
-    known = _loose("\n".join("\n".join([h, *b]) for h, b in charter_sections(charter)
-                             if _DATED.sub("", h[3:]).strip().lower().startswith(("goal", "resource", "polic"))))
-    unknown = [n for n in unsaid if _loose(n) not in known]
-    if unknown:
-        return (f"and the charter's Goals, Resources and Policies name none of {', '.join(unknown)}: ordered work "
-                f"covers only what the order or those sections name")
+    known = _loose("\n".join(["\n".join([h, *b]) for h, b in charter_sections(charter)
+                              if _DATED.sub("", h[3:]).strip().lower().startswith(("goal", "resource", "polic"))]
+                             + [str(x) for x in own]))
+    unknown = [n for n in unsaid if re.search(r"[a-z]", n) and _loose(n) not in known]
+    if unknown and (m := _DISTURB_RE.search(bare)):
+        return (f"and \"{m[0]}\" on {', '.join(unknown)}, which neither the order, the charter's Goals, Resources "
+                f"and Policies nor the project's own resources name, may disturb someone else's machine or job")
+    if unknown and not names - set(unsaid):
+        return (f"and the order names none of its scope, nor do the charter's Goals, Resources and Policies or the "
+                f"project's own resources name {', '.join(unknown)}")
     return ""
 
 
@@ -7072,19 +7084,34 @@ def _bans_in_scope(other: str, text: str, names: set[str]) -> bool:
     return not oa and not ta and bool((oo & to) - names - _KINDS)
 
 
+def _own_resources(cfg: dict | None) -> tuple:
+    """The machines and resources this project's own config names (machines.allowed, resources,
+    shared_resources): a step there is the project's own, not someone else's (_ordered_work)."""
+    cfg = cfg or {}
+    out = [x for x in (cfg.get("machines") or {}).get("allowed") or [] if isinstance(x, str)]
+    out += [x for x in cfg.get("resources") or {} if isinstance(x, str)]
+    out += [x for x in cfg.get("shared_resources") or [] if isinstance(x, str)]
+    return tuple(out)
+
+
 def _scoped_exception(charter: str, section: str, text: str, clause: str, sourced: str,
-                      end: dict | None, said: str = "", accepted: dict | None = None) -> tuple[str, str]:
+                      end: dict | None, said: str = "", accepted: dict | None = None,
+                      own: tuple = ()) -> tuple[str, str]:
     """Check a Restrictions charter_update sent with `excepts` (the clause of a standing Restrictions
     item it narrows) and return (the text to store, a note) or raise ValueError naming the clause and
     why. It passes when the clause is a standing ban; `sourced` is the user's verbatim words (a
     `source` cite to a user message, or relayer-ordered with agent mode on), else `sourced` is the
     reason it is not; the text may permit what the clause bans; it names a scope the clause does not
     (_scope_names: hosts, resources, actions, a time window, or an end) and no general word
-    (_GENERAL_RE); and no other standing ban it may lift bans the same action on a thing in that
-    scope (_bans_in_scope: an exception wider than a ban another item keeps; a shared name alone is not); every name of that scope is in the user's words `said`, or it is
-    ordered work with no new risk class (_ordered_work). `accepted`, when given, receives its scope.
-    Other bans it may lift that name none of its scope hold
-    alongside (the note lists them). The stored text names the clause and its precedence
+    (_GENERAL_RE; one the cited order says itself is allowed inside a named scope: "any soak on
+    box-a"); every name of
+    that scope is in the user's words `said`, or it is ordered work that cannot hurt people
+    (_ordered_work, `own` the project's own resources). Another standing ban it may lift that bans the
+    same action on a thing in that scope (_bans_in_scope; a shared name alone is not) gets the same
+    exception beside it when an order is cited and that ban guards no user-only class (relay.HELD);
+    else the exception is refused as wider than a ban another item keeps. `accepted`, when given,
+    receives its scope. Other bans it may lift that name none of its scope hold alongside (the note
+    lists them). The stored text names the clause and its precedence
     (SCOPED_EXCEPTION); the clause's own item is never edited."""
     found = _excepted_item(charter, clause)
     head = f"scoped exception {clip(text, 160)!r} refused: "
@@ -7107,28 +7134,35 @@ def _scoped_exception(charter: str, section: str, text: str, clause: str, source
         raise ValueError(head + f"{named}: the text is not about what that clause bans")
     names = _scope_names(text) - _scope_names(item)
     general = _GENERAL_RE.search(restriction_source.bare(text))
-    if general or not (names or end):
+    if general and not (said and names and re.search(rf"\b{re.escape(general[0])}\b", said, re.I)) \
+            or not (names or end):
         why = (f"\"{general[0]}\" lifts it in general" if general
                else "it names no host, resource, action or time window the clause does not")
         raise ValueError(head + f"{named}: {why}; an exception names the scope it covers, and lifting a ban "
                          "everywhere replaces the item (`quote` it)")
     unsaid = sorted(n for n in names if _loose(n) not in _loose(said))
-    if unsaid and (why := _ordered_work(charter, text, names, unsaid, said)):
+    if unsaid and (why := _ordered_work(charter, text, names, unsaid, said, own)):
         raise ValueError(head + f"{named}: the user's words in `source` do not name {', '.join(unsaid)}; an "
                          f"exception covers only what they named, {why}")
     wider = [(s, sc, sorted(_scope_names(s) & names)) for s, sc in _append_conflicts(charter, section, text,
                                                                                   lifts_only=True)
              if s != item and _bans_in_scope(s, text, names)]
+    also = [w for w in wider if said and not relay.held_class(restriction_source.bare(_ban_part(w[0])))]
+    wider = [w for w in wider if w not in also]   # the newest ordered word wins over a ban that guards no person
     if wider:
         raise ValueError(head + "it is wider than a ban another item keeps: " + "; ".join(
             f"\"{clip(restriction_source.bare(s).strip(), 200)}\" (section {sc!r}): it still bans "
             f"{', '.join(n)}, which the exception covers" for s, sc, n in wider)
             + f". Narrow it to what only {named} bans, or the user changes those items too")
-    rest = [s for s, _ in _append_conflicts(charter, section, text, lifts_only=True) if s != item]
-    stored = (bullet[0] if bullet else "- ") + SCOPED_EXCEPTION.format(clause=restriction_source.bare(item).strip(), section=sec) + text
+    rest = [s for s, _ in _append_conflicts(charter, section, text, lifts_only=True)
+            if s != item and all(s != w[0] for w in also)]
+    stored = "\n".join((bullet[0] if bullet else "- ") + SCOPED_EXCEPTION.format(
+        clause=restriction_source.bare(i).strip(), section=c) + text for i, c in [(item, sec), *[w[:2] for w in also]])
     note = (f"charter_update: scoped exception to {named} went in" + (
         f" as ordered work with no new risk class (the order names {', '.join(sorted(names - set(unsaid)))}; the "
-        f"charter's Goals, Resources or Policies name {', '.join(unsaid)})" if unsaid else "") + (
+        f"charter or the project's own resources name the rest, or it names no one's machine)" if unsaid else "") + (
+        "; the same exception went in beside the other bans on its scope the order lifts: " + "; ".join(
+            f"\"{clip(restriction_source.bare(w[0]).strip(), 120)}\"" for w in also) if also else "") + (
         "; these items name none of its scope and still hold: " + "; ".join(f"\"{clip(s, 120)}\"" for s in rest)
         if rest else ""))
     if accepted is not None:
@@ -7175,7 +7209,8 @@ def _parse_origin(src) -> str:
 def _verbatim_said(db, cite: str, agent: bool, src=None) -> str:
     """The words a checked Restrictions `cite` ("(user msg #N)", or relayer-ordered) rests on: that
     message's own words, the owner's agent's too in agent mode, and for a plain yes the question of the
-    ask it answers (yesask.scope), whose scope the yes approves. An owner-record cite rests on the record's
+    ask it answers (yesask.scope; in agent mode the agent's yes, or an ask it names by id), whose scope the
+    yes approves. An owner-record cite rests on the record's
     quoted words in `src`."""
     if "owner-record" in cite:
         try:
@@ -7187,11 +7222,12 @@ def _verbatim_said(db, cite: str, agent: bool, src=None) -> str:
     if not row:
         return ""
     own, ctx = relay.split(row["text"] or "", row["context"])
-    return "\n".join(x for x in (own, ctx if agent else "", yesask.scope(db, row["id"], own)) if x)
+    return "\n".join(x for x in (own, ctx if agent else "", yesask.scope(db, row["id"], own, ctx if agent else ""))
+                     if x)
 
 
 def _repair_lift(p: Project, section: str, text: str, end: dict | None, said: str,
-                 accepted: dict | None = None) -> tuple[tuple[str, str] | str, str]:
+                 accepted: dict | None = None, own: tuple = ()) -> tuple[tuple[str, str] | str, str]:
     """A new Restrictions `text` resting on the user's verbatim words (or the owner's agent's order in
     agent mode) that may lift a standing ban (_append_conflicts, lifts_only) goes in as a scoped
     exception to that ban (_scoped_exception, as `excepts` would) instead of being refused for its
@@ -7206,7 +7242,7 @@ def _repair_lift(p: Project, section: str, text: str, end: dict | None, said: st
         return "", ""
     clause = restriction_source.bare(lifts[0][0]).strip()
     try:
-        stored, note = _scoped_exception(charter, section, text, clause, "", end, said, accepted)
+        stored, note = _scoped_exception(charter, section, text, clause, "", end, said, accepted, own)
     except ValueError as e:
         return "", str(e)
     return (stored, f"charter_update repaired: the source's words allow it within its scope, so it went in as a "
@@ -8742,7 +8778,10 @@ def _charter_retry_now(p: Project, a: dict, err: str, key: str | None,
                f"A charter_update was refused ({sent}): "
                f"{clip(err, RESEND_CHARS if RESEND_MARK in err else 1200)}. Apply the fix that error names "
                f"now, in this turn (immediate retry {mine['n']} of {CHARTER_RETRY_NOW_MAX}); "
-               + ("it carries a cited order: if the fix needs the user's word, ask_user now with the exact change; "
+               + ("it carries a cited order: queue the work that order covers now, in this turn, if it is not "
+                  "queued yet (a refused rule change never holds ordered work, and no start_when or retry_when "
+                  "waits on the charter); ask_user only when the fix needs words that only the user can give "
+                  "(harm to other people, speaking as the owner, money or a credential), never to re-ask an order; "
                   if ordered else "")
                + "if the user has since said otherwise, leave it.") + charterpromise.quote_lines(announced or [])
         db.x("INSERT INTO events(ts,source,kind,severity,text,status) VALUES(?,?,?,?,?,?)",

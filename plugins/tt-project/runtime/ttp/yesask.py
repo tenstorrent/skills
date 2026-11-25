@@ -44,12 +44,26 @@ def answered_ask(db, mid: int) -> dict | None:
     return dict(row) if row else None
 
 
-def scope(db, mid: int, own: str) -> str:
-    """The question of the ask user message `mid` answers, when its own words `own` are a plain yes;
-    else "". Those are the words the yes approves."""
-    if not is_yes(own):
-        return ""
-    ask = answered_ask(db, mid)
+# In agent mode the owner's agent relays a yes in its own words ("the owner approved ask 12"): an ask
+# it names by id, with assent and no refusal word, is the ask that yes answers.
+_ASK_ID_RE = re.compile(r"\bask\W{0,4}#?(\d+)", re.I)
+_ASSENT_RE = re.compile(r"\b(?:yes|approv\w*|go(?:es)? ahead|agree\w*|ok(?:ay)?|do it|confirm\w*)\b", re.I)
+_REFUSE_RE = re.compile(r"\b(?:no|not|don'?t|never|declin\w*|reject\w*|den(?:y|ied|ies)|refus\w*|hold off)\b", re.I)
+
+
+def scope(db, mid: int, own: str, agent_words: str = "") -> str:
+    """The question of the ask user message `mid` answers, when its own words `own` are a plain yes,
+    or (agent mode: `agent_words`, the owner's agent's relayed words) when those are a plain yes or
+    assent to an ask they name by id; else "". Those are the words the yes approves."""
+    ask = None
+    if agent_words and _ASSENT_RE.search(agent_words) and not _REFUSE_RE.search(agent_words):
+        for n in _ASK_ID_RE.findall(agent_words):
+            row = db.one("SELECT id, text FROM messages WHERE id=? AND kind='ask' AND direction='out'", (int(n),))
+            if row:
+                ask = dict(row)
+                break
+    if ask is None and (is_yes(own) or is_yes(agent_words)):
+        ask = answered_ask(db, mid)
     if not ask:
         return ""
     from .coordinator import _ask_question

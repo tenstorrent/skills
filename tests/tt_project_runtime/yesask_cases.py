@@ -63,16 +63,15 @@ def test_agent_mode_the_owners_agent_order_lands_the_same_change(env):
 
 def test_a_lift_the_users_words_do_not_cover_is_still_refused_naming_the_fix(env):
     """(c) is above; (d) a real conflict outside the user's words stays refused, and the refusal names the
-    fix and why the harness could not repair it: a host the yes's ask never named, a host another item
-    still bans, a general lift, and a hedged yes ("yes, but not today") or no ask at all."""
+    fix and why the harness could not repair it: a host the yes's ask never named that a power cycle may
+    disturb, a general lift, and a hedged yes ("yes, but not today") or no ask at all. (A host another item
+    bans with no person to guard gets the exception beside that ban too: chartercontra_cases.)"""
     import json
     p = make(env)
     from ttp import coordinator as coord
     for k, (text, yes, ask, why) in enumerate((
             ("Workers may power cycle host-a and host-b with `cycle_test.sh`.", None, True,
              "do not name host-b"),
-            ("Workers may power cycle host-a and host-c with `cycle_test.sh`.", None, True,
-             "wider than a ban another item keeps"),
             ("Workers may power cycle any serving host.", None, True, "lifts it in general"),
             (_YES_EXC, "yes, but not today", True, "contradicts the Restrictions item"),
             (_YES_EXC, None, False, "contradicts the Restrictions item"))):
@@ -199,3 +198,119 @@ def test_a_kept_text_cite_is_not_the_users_word_for_a_loosening(env):
     err = coord.apply(p, [act], turn=3)
     assert len(err) == 1 and "contradicts the Restrictions item" in err[0], err
     assert p.charter_path.read_text() == _SCOPED_BANS
+
+
+_PREEMPT_BANS = ("# demo\n\n## Restrictions\n"
+              "- Never preempt a running soak. (user msg #1)\n"
+              "- Never open pull requests. (user msg #1)\n")
+
+
+def _agent_order(p, words: str) -> int:
+    """The owner's agent's order, relayed as a findings-only message with agent mode on: its id."""
+    from ttp import relay
+    p.set_config(relay.AGENT_KEY, True)
+    return p.db.post("in", "", chat="cli", kind="finding", provenance="cli-legacy", context=f"Order: {words}")
+
+
+def test_agent_mode_a_relayed_yes_naming_an_ask_lands_its_scoped_exception_on_the_first_try(env):
+    """(a) Agent mode: the owner's agent relays only 'yes to ask N'. The ask it names by id supplies the
+    scope the yes approves, so the lift on the project's own box goes in as a scoped exception at once,
+    with no re-ask and no `excepts` form fix needed."""
+    import json
+    from ttp import coordinator as coord
+    p = make(env)
+    p.charter_path.write_text(_SCOPED_BANS)
+    aid = p.db.post("out", _YES_ASK, chat="web", kind="ask")
+    fid = _agent_order(p, f"yes to ask {aid}, go ahead")
+    act = {"type": "charter_update", "section": "Restrictions", "text": _YES_EXC,
+           "source": json.dumps({"msg": fid, "origin": "relayer", "quote": f"yes to ask {aid}"})}
+    assert coord.apply(p, [act], turn=1, user_turn=False) == []
+    charter = p.charter_path.read_text()
+    assert "Exception to \"Never power cycle a serving host.\"" in charter and _YES_EXC in charter, charter
+    # A refusal in the same words is no yes: nothing lands.
+    p.charter_path.write_text(_SCOPED_BANS)
+    fid = _agent_order(p, f"no, not ask {aid}")
+    act["source"] = json.dumps({"msg": fid, "origin": "relayer", "quote": f"no, not ask {aid}"})
+    assert coord.apply(p, [act], turn=2, user_turn=False)
+    assert _YES_EXC not in p.charter_path.read_text()
+
+
+def test_agent_mode_preempting_the_soak_on_our_own_box_passes(env):
+    """(b) The owner's agent orders a soak preempted on a box the project's own config allows: the ban
+    on preempting a running soak gets a scoped exception there, first try."""
+    import json
+    from ttp import coordinator as coord
+    p = make(env)
+    p.charter_path.write_text(_PREEMPT_BANS)
+    cfg = json.loads(p.config_path.read_text()) if p.config_path.exists() else {}
+    cfg.setdefault("machines", {})["allowed"] = ["box-q"]
+    p.config_path.write_text(json.dumps(cfg))
+    order = "preempt the soak on our own box box-q"
+    fid = _agent_order(p, order)
+    act = {"type": "charter_update", "section": "Restrictions", "excepts": "Never preempt a running soak.",
+           "text": "Workers may preempt the soak on box-q.",
+           "source": json.dumps({"msg": fid, "origin": "relayer", "quote": order})}
+    assert coord.apply(p, [act], turn=1, user_turn=False) == []
+    assert "Exception to \"Never preempt a running soak.\"" in p.charter_path.read_text()
+
+
+def test_agent_mode_the_same_order_aimed_at_another_persons_machine_or_job_is_still_refused(env):
+    """(c) The same words aimed at another user's job or another team's box still refuse on the agent's
+    word: harm to other people needs the user's own words."""
+    import json
+    from ttp import coordinator as coord
+    p = make(env)
+    for order in ("preempt another user's soak on box-q", "preempt the soak on another team's box box-z"):
+        p.charter_path.write_text(_PREEMPT_BANS)
+        fid = _agent_order(p, order)
+        text = "Workers may " + order.replace("preempt", "preempt", 1) + "."
+        act = {"type": "charter_update", "section": "Restrictions", "excepts": "Never preempt a running soak.",
+               "text": text, "source": json.dumps({"msg": fid, "origin": "relayer", "quote": order})}
+        err = coord.apply(p, [act], turn=1, user_turn=False)
+        assert err, order
+        assert text not in p.charter_path.read_text(), order
+
+
+def test_a_refused_rule_change_never_holds_the_ordered_work(env, tmp_path):
+    """(d) A wait on the charter is refused everywhere work could park on it: a task_add start_when, a
+    waiting hand-off's retry_when (dropped with a handoff_probe_refused event), and the charter_retry
+    the coordinator gets tells it to queue the ordered work now and never re-ask the order."""
+    import json
+    from ttp import coordinator as coord, waitheal
+    from ttp.daemon import Daemon
+    p = make(env)
+    for probe in ("grep -q 'box-q' tt-project/harness/CHARTER.md || exit 1", "ttp charter | grep -q box-q",
+                  "test -n \"$(ttp memory | grep box-q)\""):
+        assert waitheal.charter_wait(probe), probe
+        err = coord.apply(p, [{"type": "task_add", "title": "preempt soak", "spec": "s", "start_when": probe,
+                               "why": "the exception lands"}])
+        assert err and "waits on the charter" in err[0] and "never holds ordered work" in err[0], err
+    assert waitheal.charter_wait("test -e out/job.rc") == ""
+    d = Daemon(p.base)
+    tid = p.db.add_task("preempt the soak", "s", kind="work", tier="standard", origin="user")
+    t = _reply_wait_hand_off(p, d, tmp_path, tid, waiting_for="the charter exception",
+                             retry_when="grep -q box-q tt-project/harness/CHARTER.md || exit 1")
+    res = json.loads(t["result"])
+    assert "retry_when" not in res and "CHARTER.md" in res["retry_when_refused"], res
+    ev = p.db.one("SELECT text FROM events WHERE kind='handoff_probe_refused' AND task=?", (tid,))
+    assert ev and "waits on the charter" in ev["text"], ev
+    p.charter_path.write_text(_PREEMPT_BANS)
+    mid = p.db.post("in", "preempt the soak on box-q", chat="web", channel="web", kind="user",
+                    provenance="web-session")
+    act = {"type": "charter_update", "section": "Restrictions", "replaces": "Restrictions",
+           "text": f"- Preempt soaks on box-q freely. (user msg #{mid})"}
+    msg = coord._charter_retry_now(p, act, "needs the user's word", "t1")
+    assert "queue the work that order covers now" in msg and "never to re-ask an order" in msg, msg
+
+
+def test_agent_mode_a_pr_leaving_draft_still_needs_the_users_own_yes(env):
+    """(e) The owner's agent's yes is the user's word for charter changes, never for a PR leaving draft:
+    pr_approve on its relayed words is refused and records no approval."""
+    from ttp import coordinator as coord, prguard
+    p = make(env)
+    url = "https://github.com/acme/widgets/pull/7"
+    _heads_seen(p, "acme/widgets#7")
+    fid = _agent_order(p, f"yes, mark {url} ready")
+    out = " ".join(coord.apply(p, [{"type": "pr_approve", "id": fid, "text": url, "quote": "ready"}]))
+    assert "not a message from the user" in out or "does not count as the user's approval" in out, out
+    assert not prguard.approved(p.db, "acme/widgets#7")

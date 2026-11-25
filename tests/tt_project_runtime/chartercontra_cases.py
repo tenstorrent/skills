@@ -28,9 +28,10 @@ def test_a_scoped_exception_naming_an_alias_other_items_share_passes(env):
     assert "No device test runs on node-7 outside the shared lock" in charter
 
 
-def test_a_scoped_exception_is_still_refused_where_another_item_bans_the_same_action_on_its_scope(env):
-    """A real contradiction stays refused: another item bans the exception's own action (power cycling, or
-    any action at all) on a name in its scope."""
+def test_an_ordered_exception_goes_in_beside_another_ban_on_its_scope_unless_that_ban_guards_people(env):
+    """Another item banning the exception's own action (or any action) on a name in its
+    scope no longer refuses an ordered exception: the newest ordered word wins, so the same exception goes
+    in beside that ban too. A ban that guards other people's machines or jobs (relay.HELD) still refuses."""
     p = make(env)
     from ttp import coordinator as coord
     for k, other in enumerate(("Never power cycle node-7 during a soak.", "Never touch node-7.")):
@@ -41,9 +42,19 @@ def test_a_scoped_exception_is_still_refused_where_another_item_bans_the_same_ac
                                "excepts": "Never power cycle a serving host.",
                                "text": "Workers may power cycle node-7 with `cycle_test.sh`.", "source": src}],
                           turn=1 + k, user_turn=True, messages=mids)
-        assert len(err) == 1 and "it is wider than a ban another item keeps" in err[0], (other, err)
-        assert f"\"{other}\"" in err[0] and "node-7" in err[0] and "device test" not in err[0], err
-        assert p.charter_path.read_text() == charter
+        assert err == [], (other, err)
+        got = [ln for ln in p.charter_path.read_text().splitlines() if "cycle_test.sh`." in ln]
+        assert len(got) == 2 and any(f"Exception to \"{other}\"" in ln for ln in got), got
+        assert f"- {other} (user msg #1)" in p.charter_path.read_text()   # the ban itself is never edited
+    other = "Never power cycle node-7 during another user's job."
+    charter = _ALIAS_BANS.replace("- Never open", f"- {other} (user msg #1)\n- Never open")
+    p.charter_path.write_text(charter)
+    mids, src = _turn_said(p, "you may power cycle node-7 with cycle_test.sh")
+    err = coord.apply(p, [{"type": "charter_update", "section": "Restrictions", "excepts": "Never power cycle a serving host.",
+                           "text": "Workers may power cycle node-7 with `cycle_test.sh`.", "source": src}],
+                      turn=9, user_turn=True, messages=mids)
+    assert len(err) == 1 and "it is wider than a ban another item keeps" in err[0] and other in err[0], err
+    assert p.charter_path.read_text() == charter
 
 
 _COMMON_WORDS = ("# demo\n\n## Restrictions\n"
@@ -120,8 +131,15 @@ def test_charter_gate_power_limit_exception_ignores_items_that_only_name_the_hos
     # an apostrophe inside a word (user's) stays inside the quote it sits in: no ban word leaks out of it
     assert coord._ban_part("- Exception to 'Never reboot the user's box or never touch its power': box-a may run "
                            "CPU checks, never device work.").strip() == "never device work"
+    # a ban on power changes on box-a itself gets the same ordered exception beside it;
+    # one guarding another user's job there still blocks
     p.charter_path.write_text(_BOX_A_ITEMS + "- Never change the power limit of box-a. (user msg #1)\n")
     mids, src = _turn_said(p, "change the power limit of box-a from 170 to 160 W")
-    err = coord.apply(p, [{**act, "source": src}], turn=2, user_turn=True, messages=mids)
+    assert coord.apply(p, [{**act, "source": src}], turn=2, user_turn=True, messages=mids) == []
+    assert "Exception to \"Never change the power limit of box-a.\"" in p.charter_path.read_text()
+    p.charter_path.write_text(_BOX_A_ITEMS + "- Never change the power limit of box-a during another user's job. "
+                                             "(user msg #1)\n")
+    mids, src = _turn_said(p, "change the power limit of box-a from 170 to 160 W")
+    err = coord.apply(p, [{**act, "source": src}], turn=3, user_turn=True, messages=mids)
     assert err and "wider than a ban another item keeps" in err[0] and "Never change the power limit of box-a" in err[0]
     assert "160 W" not in p.charter_path.read_text()
