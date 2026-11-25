@@ -213,6 +213,13 @@ def test_pyproof_proves_nothing_when_python_may_import_a_module_from_its_folder_
     for planted in (f"{tmp_path / 'bin'}:{path}", f".:{path}"):
         monkeypatch.setenv("PATH", planted)
         assert not proven(work), planted                    # one in a folder a call could plant it in
+    (tmp_path / "tools").mkdir()
+    for name in ("env", "cat"):
+        (tmp_path / "tools" / name).write_text("#!/bin/sh\n")
+        (tmp_path / "tools" / name).chmod(0o755)
+    monkeypatch.setenv("PATH", f"{tmp_path / 'tools'}:{path}")
+    for cmd in (f"env python3 -c '{code}'", f"cat a; python3 -c '{code}'"):
+        assert pyproof.rewrite(cmd, str(work)) is None, cmd   # nor a wrapper or reader planted there
     monkeypatch.setenv("PATH", path)
     plant = "open('json.py', 'w').write('x')"
     for cmd in (f"echo x > json.py; python3 -c '{code}'", f"cp a.py json.py && python3 -c '{code}'",

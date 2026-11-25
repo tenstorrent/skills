@@ -366,6 +366,8 @@ SHELL_WORDS = frozenset(""". : [ alias bg bind break builtin caller cd command c
 WRAPPERS = {"env", "nohup", "timeout", "nice", "stdbuf"}   # run python in the shell's folder and environment
 ASSIGN_RE = re.compile(r"[A-Za-z_]\w*=")
 UNQUOTED_RE = re.compile(r"\\.|'[^']*'|\"((?:\\.|[^\"\\])*)\"")
+TERMINAL = ("-", "/dev/null", "/dev/stdout", "/dev/stderr", "/dev/tty")   # redirect targets that write no file
+SHELL_BUILTINS = {"cd", "pushd", "echo", "true", "false", "pwd", "test", "[", ":"}   # the shell runs these itself
 READERS = {"cat", "echo", "ls", "head", "tail", "grep", "wc", "true", "pwd"}   # write no file without a redirect
 
 
@@ -388,7 +390,9 @@ def _may_shadow(shell: str, cwds: list[str], env) -> bool:
         if any(re.search(r"[*?\[{~]", w) for w in head) or argv[:1] in (["cd"], ["pushd"]) and (
                 len(argv) != 2 or argv[1].startswith("-")) or head and head[0] in SHELL_WORDS - {"cd", "pushd"} \
                 or py and any(w not in WRAPPERS and not w.isdigit() for w in head) \
-                or py is not None and not _interpreter(argv[py], env):
+                or py is not None and not _interpreter(argv[py], env) \
+                or any(w not in SHELL_BUILTINS and not w.isdigit() and not _trusted(w, env)
+                       for w in argv[:1 if py is None else py]):
             return True
     if _plants(shell):
         return True
@@ -423,7 +427,7 @@ def _plants(shell: str) -> bool:
                     return True
                 ran, writes, py, start = ran or writes, False, False, True
         elif target:
-            writes |= ">" in target and not (w.isdigit() or w in ("-", "/dev/null", "/dev/stdout", "/dev/stderr", "/dev/tty"))
+            writes |= ">" in target and not (w.isdigit() or w in TERMINAL)
             target = False
         elif start:
             name = os.path.basename(w)
@@ -442,14 +446,20 @@ def _start(line: str, pos: int) -> int:
     return next(s for s, e, _ in hook._pieces(line) if s <= pos <= e)
 
 
-def _interpreter(word: str, env) -> bool:
-    """`word` runs a python this check reads for: of the checker's own version (its standard names and user site
-    folder), in a folder this user cannot change: no python an earlier call planted, no venv whose site folder
-    could hold a .pth python runs at start."""
+def _trusted(word: str, env) -> bool:
+    """`word` runs a program from a folder this user cannot change: none an earlier call planted (a python, an
+    `env` or `cat` that writes a module first), no venv whose site folder could hold a .pth python runs at start."""
     exe = shutil.which(word, path=str(env.get("PATH") or os.defpath))
     real = exe and os.path.realpath(exe)
-    return bool(real) and os.path.basename(real) == "python{}.{}".format(*sys.version_info[:2]) \
-        and not any(os.access(p, os.W_OK) for f in (exe, real) for p in (f, os.path.dirname(f)))
+    return bool(real) and not any(os.access(p, os.W_OK) for f in (exe, real) for p in (f, os.path.dirname(f)))
+
+
+def _interpreter(word: str, env) -> bool:
+    """`word` runs a python this check reads for: the checker's own version (its standard names and user site
+    folder), from a folder this user cannot change."""
+    exe = shutil.which(word, path=str(env.get("PATH") or os.defpath))
+    return bool(exe) and os.path.basename(os.path.realpath(exe)) == "python{}.{}".format(*sys.version_info[:2]) \
+        and _trusted(word, env)
 
 
 def _runs_at_start(folder: str) -> bool:
