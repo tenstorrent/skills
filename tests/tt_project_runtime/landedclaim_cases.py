@@ -669,3 +669,18 @@ def test_a_task_whose_superseding_commit_is_on_the_branch_raises_no_landing_drop
     assert landed.drops(p) == []
     assert not p.db.q("SELECT id FROM events WHERE kind=?", (landed.DROP_EVENT,))
     assert landed.check(p, repo, tid=tid, fetch=False)[0] == 0
+
+
+def test_a_revert_checked_again_on_the_same_tip_reads_no_patch_ids_again(env, monkeypatch):
+    """The cherry-pick check of a revert runs git patch-id once per revert and tip; a second check answers
+    the same from what it read."""
+    import subprocess
+    from ttp import landed
+    p, repo, x, r = _reverted_setup(env, monkeypatch)
+    tip = _git_out(repo, "rev-parse", "origin/proj")
+    log, calls, run = landed._revert_log(repo, tip), [], subprocess.run
+    monkeypatch.setattr(subprocess, "run", lambda cmd, *a, **k: (calls.append(cmd), run(cmd, *a, **k))[1])
+    first = landed._undone(repo, log, r, x, tip)
+    n = sum("patch-id" in c for c in calls)
+    assert n and landed._undone(repo, log, r, x, tip) == first is False
+    assert sum("patch-id" in c for c in calls) == n

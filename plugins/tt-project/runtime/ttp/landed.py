@@ -239,6 +239,7 @@ def reverted_by(repo: Path, sha: str, tip: str) -> str | None:
 
 _revert_logs: dict[tuple[str, str], list[tuple[str, list, list]]] = {}
 _ranges: dict[tuple[str, str, str], frozenset] = {}
+_twins: dict[tuple[str, str, str, str], tuple[str | None, dict[str, str]]] = {}
 
 
 def _revert_log(repo: Path, tip: str) -> list[tuple[str, list, list]] | None:
@@ -254,6 +255,7 @@ def _revert_log(repo: Path, tip: str) -> list[tuple[str, list, list]] | None:
         if len(_revert_logs) >= 64:
             _revert_logs.clear()
             _ranges.clear()
+            _twins.clear()
         _revert_logs[key] = [(rev, found, back) for rec in log.stdout.split("\x01")
                              for rev, _, body in [rec.strip("\n").partition("\0")]
                              if rev and ((found := _REVERTS.findall(body)) +
@@ -294,12 +296,13 @@ def _undone(repo: Path, log: list, rev: str, sha: str, tip: str) -> bool:
     if any(_names(repo, back, sha) and _stands(repo, log, c)
            and _git(repo, "merge-base", "--is-ancestor", rev, c).returncode == 0 for c, _, back in log):
         return True
-    paths = [f":(literal){f}" for f in _git(repo, "diff-tree", "-z", "--no-commit-id", "--name-only", "-r",
-                                            "--root", sha).stdout.split("\0") if f]
-    if not paths:
-        return False
-    own = _patch_ids(repo, "-1", sha).get(sha)
-    twins = _patch_ids(repo, "--no-merges", "--full-diff", f"{rev}..{tip}", "--", *paths) if own else {}
+    key = (str(repo), rev, sha, tip)
+    if key not in _twins:   # one patch-id read per revert, commit and tip
+        paths = [f":(literal){f}" for f in _git(repo, "diff-tree", "-z", "--no-commit-id", "--name-only", "-r",
+                                                "--root", sha).stdout.split("\0") if f]
+        own = _patch_ids(repo, "-1", sha).get(sha) if paths else None
+        _twins[key] = own, _patch_ids(repo, "--no-merges", "--full-diff", f"{rev}..{tip}", "--", *paths) if own else {}
+    own, twins = _twins[key]
     return any(pid == own and c != sha and _stands(repo, log, c) for c, pid in twins.items())
 
 
