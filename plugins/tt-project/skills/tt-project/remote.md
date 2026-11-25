@@ -55,8 +55,11 @@
   answer from this computer is left alone (logged once; nothing ended or restarted); once it
   answers again, a port that still fails gets one restart, even while the session's other ports
   answer (a session rebuilt while the target was off can stay broken for it). An
-  unreachable box restarts nothing and is checked again within 30-60 s, at once after a network
-  change. A stopped service is left alone. Hand-made ssh forward services join with a
+  unreachable box is never left to a network change alone: it is checked again within 30-60 s, each
+  attempt is logged, and its bridge services are restarted at most once per the same 0/60/120/300 s
+  pace (each restart re-reads the ssh route and jump hosts and resolves the name again). A box
+  down 5 minutes gets one desktop alert, and one more note with the outage length once it answers
+  again. A stopped service is left alone. Hand-made ssh forward services join with a
   `"watch"` list in the local bridge config, never shipped with entries:
   `"watch": [{"label": "<launchd label or systemd unit>", "box": "<ssh alias>", "port": <box port>}]`,
   optionally with `"target": "<host>:<port>"` (what the forward reaches) and `"interface": "<name>"`

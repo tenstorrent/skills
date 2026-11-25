@@ -2457,31 +2457,109 @@ def _watch_env(tmp_path, monkeypatch, platform, answers, loaded=True, watch=None
     return cfg, seen
 
 
-def test_bridge_watch_offline_restarts_nothing_and_backs_off(tmp_path, monkeypatch):
-    # cells: offline-no-restart, backoff, network-change
+def test_bridge_watch_offline_keeps_retrying_and_restarts_its_bridges_on_a_pace(tmp_path, monkeypatch):
+    # cells: offline-retries, restart-paced, backoff, network-change, never-silent
     import os
     from ttp import bridge_watch
-    cfg, seen = _watch_env(tmp_path, monkeypatch, "darwin", [None, None, None])
+    cfg, seen = _watch_env(tmp_path, monkeypatch, "darwin", [None] * 12)
+    kicks = lambda: sum("kickstart" in c for c in seen["run"])   # noqa: E731
     t0 = 1_000_000.0
     out = bridge_watch.run_pass(cfg, "darwin", t0)
-    assert seen["release"] == [] and not any("kickstart" in c for c in seen["run"])
-    assert out == ["box-1: not reachable; no restart, next check in 30s or on a network change"]
+    assert seen["release"] == [] and kicks() == 1   # the first miss restarts the bridge service (its ssh resolves the route again)
+    assert out == ["box-1: not reachable; restarted its bridges to retry the route"]
     assert bridge_watch.run_pass(cfg, "darwin", t0 + 20) == [] and len(seen["box"]) == 1   # backing off
-    bridge_watch.run_pass(cfg, "darwin", t0 + 31)
-    assert len(seen["box"]) == 2 and bridge_watch.run_pass(cfg, "darwin", t0 + 61) == []
-    assert len(seen["box"]) == 2   # the second miss waits 60s
+    out = bridge_watch.run_pass(cfg, "darwin", t0 + 31)
+    assert len(seen["box"]) == 2 and kicks() == 1   # the restart pace: not again within a minute
+    assert out == ["box-1: not reachable; next check in 60s or on a network change"]   # every attempt is logged
+    assert bridge_watch.run_pass(cfg, "darwin", t0 + 61) == [] and len(seen["box"]) == 2   # the second miss waits 60s
+    bridge_watch.run_pass(cfg, "darwin", t0 + 92)
+    assert len(seen["box"]) == 3 and kicks() == 2   # a minute after the first restart: restarted again
     (tmp_path / "netconf").write_text("x")   # a network change checks at once
     os.utime(tmp_path / "netconf", (t0, t0))
-    bridge_watch.run_pass(cfg, "darwin", t0 + 62)
-    os.utime(tmp_path / "netconf", (t0 + 63, t0 + 63))
-    bridge_watch.run_pass(cfg, "darwin", t0 + 63)
-    assert len(seen["box"]) == 3 and seen["release"] == []
-    assert not any("kickstart" in c or "restart" in c for c in seen["run"])
+    bridge_watch.run_pass(cfg, "darwin", t0 + 93)
+    os.utime(tmp_path / "netconf", (t0 + 94, t0 + 94))
+    assert bridge_watch.run_pass(cfg, "darwin", t0 + 94)
+    assert len(seen["box"]) == 4
     assert max(bridge_watch.BACKOFF_S) <= 60   # the pause never passes a minute
-    cfg, seen = _watch_env(tmp_path / "c", monkeypatch, "linux", [None] * 6)
-    for i in range(6):
-        bridge_watch.run_pass(cfg, "linux", t0 + 61 * i)   # every pass lands just after the allowed wait
-    assert len(seen["box"]) == 6
+    cfg, seen = _watch_env(tmp_path / "c", monkeypatch, "linux", [None] * 12)
+    for i in range(12):   # an hour down: a check each minute, every one logged, never a silent stretch
+        assert any(ln.startswith("box-1: not reachable") for ln in bridge_watch.run_pass(cfg, "linux", t0 + 61 * i))
+    assert len(seen["box"]) == 12
+    assert 1 < sum("systemctl --user restart" in c for c in seen["run"]) < 12   # restarts keep coming, on the pace
+
+
+def test_bridge_watch_alerts_once_after_five_minutes_down_and_once_when_back(tmp_path, monkeypatch):
+    # cells: no-alert-before-5min, one-alert-at-5min, no-repeat, recovery-note-with-length, short-outage-no-note, alert-failure-survives
+    import subprocess
+    from ttp import bridge, bridge_watch, notifier
+    shown = []
+    monkeypatch.setattr(notifier, "show", lambda title, body, *a, **k: shown.append((title, body)))
+    t0 = 1_000_000.0
+    clock = [t0]
+    up_at = [t0 + 725]   # the box answers from here on
+
+    def pass_at(cfg, dt):
+        clock[0] = t0 + dt
+        return bridge_watch.run_pass(cfg, "darwin", clock[0])
+    cfg, seen = _watch_env(tmp_path, monkeypatch, "darwin", [])
+
+    def box(b, script, timeout=40, inp=None):
+        seen["box"].append(b)
+        if clock[0] < up_at[0]:
+            return subprocess.CompletedProcess([], 255, "", "no route to host")
+        return subprocess.CompletedProcess([], 0, "up 2301\nttp-watch-done\n", "")
+    monkeypatch.setattr(bridge, "_box", box)
+    lines = []
+    for i in range(10):   # a pass every 30 s: down from t0 to t0 + 270
+        lines += pass_at(cfg, 30 * i)
+    assert shown == [] and not any("alerted" in ln for ln in lines)
+    out = pass_at(cfg, 300)
+    assert len(shown) == 1 and "unreachable" in shown[0][0] and any("user alerted" in ln for ln in out)
+    for i in range(11, 24):   # more minutes down: no second alert
+        pass_at(cfg, 30 * i)
+    assert len(shown) == 1
+    out = pass_at(cfg, 750)   # the box answers
+    assert len(shown) == 2 and "again" in shown[1][0] and "750s" in shown[1][1]
+    assert any("reachable again after 750s" in ln for ln in out)
+    assert "box-1" not in bridge_watch._load()["boxes"]
+    pass_at(cfg, 780)
+    assert len(shown) == 2   # one note only
+    # a short outage never alerts, so its recovery says nothing either
+    shown.clear()
+    clock[0], up_at[0] = t0, t0 + 100
+    (tmp_path / "ttp" / "bridge-watch.json").unlink()
+    pass_at(cfg, 0)
+    pass_at(cfg, 31)
+    assert pass_at(cfg, 100) == [] and shown == []
+    # a notifier that raises never breaks the pass
+    monkeypatch.setattr(notifier, "show", lambda *a, **k: 1 / 0)
+    up_at[0] = t0 + 10_000
+    (tmp_path / "ttp" / "bridge-watch.json").unlink()
+    pass_at(cfg, 0)
+    assert any("user alerted" in ln for ln in pass_at(cfg, 400))
+
+
+def test_bridge_watch_window_rereads_the_route_between_passes(tmp_path, monkeypatch):
+    # cells: reload-each-pass, half-edited-config-keeps-last-good
+    import os
+    from ttp import bridge_watch
+    cfg, seen = _watch_env(tmp_path, monkeypatch, "darwin", [None] * 60)
+    stamp = tmp_path / "netconf"
+    stamp.write_text("x")
+    t0 = 1_000_000.0
+    os.utime(stamp, (t0 - 1000, t0 - 1000))
+    list(bridge_watch.run_window(cfg, "darwin", *_watch_clock(t0)[1:]))
+    os.utime(stamp, (t0 + 1, t0 + 1))   # a network change opens the fast window
+    loads = []
+
+    def reload():
+        loads.append(1)
+        if len(loads) == 2:
+            raise ValueError("half-edited")
+        return cfg
+    now, clock, sleep = _watch_clock(t0 + 2)
+    list(bridge_watch.run_window(cfg, "darwin", clock, sleep, reload=reload))
+    assert len(loads) >= 3 and len(seen["box"]) == len(loads) + 2   # one pass per reload, the failed reload did not stop it
 
 
 def _watch_clock(t):
@@ -2503,7 +2581,7 @@ def test_bridge_watch_rechecks_fast_after_a_network_change_then_steady(tmp_path,
     os.utime(stamp, (t0 - 1000, t0 - 1000))
     now, clock, sleep = _watch_clock(t0)
     out = list(bridge_watch.run_window(cfg, "darwin", clock, sleep))   # no network change: one pass, as before
-    assert out == ["box-1: not reachable; no restart, next check in 30s or on a network change"]
+    assert out == ["box-1: not reachable; restarted its bridges to retry the route"]
     assert len(seen["box"]) == 1 and now[0] == t0
     now[0] = t0 + 20
     assert list(bridge_watch.run_window(cfg, "darwin", clock, sleep)) == [] and len(seen["box"]) == 1   # backing off
@@ -2511,7 +2589,7 @@ def test_bridge_watch_rechecks_fast_after_a_network_change_then_steady(tmp_path,
     list(bridge_watch.run_window(cfg, "darwin", clock, sleep))
     fast = len(seen["box"]) - 1
     assert fast == bridge_watch.FAST_S // bridge_watch.FAST_STEP_S and now[0] - (t0 + 20) < bridge_watch.FAST_S
-    assert seen["release"] == [] and not any("kickstart" in c for c in seen["run"])
+    assert seen["release"] == [] and sum("kickstart" in c for c in seen["run"]) == 2   # paced: now, then a minute on, not on every fast check
     end = now[0]
     now[0] = end + 30   # the window is over: the backoff holds again, capped at a minute
     assert list(bridge_watch.run_window(cfg, "darwin", clock, sleep)) == [] and len(seen["box"]) == 1 + fast
@@ -2543,19 +2621,19 @@ def test_bridge_watch_heals_within_a_minute_of_the_network_back_after_a_wake(tmp
     now, clock, sleep = _watch_clock(t0 - 30)
     restarted = []
 
+    stamped = []   # when each restart ran (seen at the next check)
+
     def box(b, script, timeout=40, inp=None):   # each check takes a second; a restarted session logs in for 8s
         seen["box"].append(b)
         at = now[0]
         now[0] += 1
+        stamped.extend([at] * (sum("kickstart" in c for c in seen["run"]) - len(stamped)))
         if t0 <= at < net_back:
             return subprocess.CompletedProcess([], 255, "", "no route to host")
-        if not restarted:
-            restarted.extend(c for c in seen["run"] if "kickstart" in c)
-        state = "up" if at < t0 or restarted and at >= restart_at() + 8 else "none" if restarted else "down"
+        good = [k for k in stamped if k >= net_back]   # a restart while the network is down cannot log in
+        state = "up" if at < t0 or good and at >= good[0] + 8 else "none" if stamped else "down"
         return subprocess.CompletedProcess([], 0, f"{state} 2301\nttp-watch-done\n", "")
 
-    def restart_at():
-        return json.loads((tmp_path / "ttp" / "bridge-watch.json").read_text())["fail"][svc]["last"]
     monkeypatch.setattr(bridge, "_box", box)
     svc = bridge.label("box-1", "auto")
     stamp = tmp_path / "netconf"
@@ -2565,11 +2643,13 @@ def test_bridge_watch_heals_within_a_minute_of_the_network_back_after_a_wake(tmp
     os.utime(stamp, (wake_change, wake_change))
     now[0] = wake_change   # launchd runs the watch on the network change
     out = list(bridge_watch.run_window(cfg, "darwin", clock, sleep))
-    assert out[0].startswith("box-1: not reachable") and out[1].endswith("did not answer; restarted")
+    assert out[0].startswith("box-1: not reachable") and any(ln.endswith("did not answer; restarted") for ln in out)
+    assert sum("not reachable" in ln for ln in out) >= 2   # every failed attempt in the window is logged
     assert out[-1].startswith(f"{svc}: answers again after")
     rec = json.loads((tmp_path / "ttp" / "bridge-heal.log").read_text())
     assert rec["restarts"] == 1 and rec["event"] == "network change"
     assert rec["healed_at"] - net_back <= 60 and len(seen["release"]) == 1
+    assert stamped[0] < net_back <= stamped[-1]   # bridges were restarted during the outage and again once it was back
     assert now[0] - wake_change < bridge_watch.FAST_S and "fast_until" not in bridge_watch._load()
 
 

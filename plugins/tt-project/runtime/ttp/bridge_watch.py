@@ -7,8 +7,11 @@ box, in one login, whether each forwarded port answers end to end (a connection 
 bytes of the host's ssh banner). A port that does not answer gets the box cleanup (bridge_relay.CLEANUP:
 it ends only this account's sshd session holding exactly that port, SIGTERM then SIGKILL) and its service
 is restarted at once, skipping the random start delay. A box that cannot be reached (this computer is
-offline, or the box is down) restarts nothing: it is asked again within BACKOFF_S, or at once on a network
-change. No pass measures the time since the last one: a sleep longer than BACKOFF_S ends every backoff,
+offline, or the box is down) is never left to a network change alone: it is asked again within BACKOFF_S,
+each attempt is logged, and its bridge services are restarted at most once per RESTART_GAP_S step — each
+restart re-reads the ssh route and jump hosts and resolves the name again. Once it has stayed unreachable
+ALERT_AFTER_S the user gets one desktop alert through the notifier, and one more note with the length of
+the outage when the box answers again. No pass measures the time since the last one: a sleep longer than BACKOFF_S ends every backoff,
 so the first pass after waking checks every box. A network change also opens a fast window: `ttp bridge
 watch` checks again every FAST_STEP_S, ignoring the backoff, until every box answers and no service still
 fails, for at most FAST_S; the steady interval and the backoff then apply again. A port whose forward's
@@ -47,6 +50,7 @@ INTERVAL_S = 30
 NET_PATHS = {"darwin": ["/Library/Preferences/SystemConfiguration"]}   # launchd runs the pass when it changes
 BACKOFF_S = (30, 60)                  # the next check of a box that could not be reached: never over a minute
 RESTART_GAP_S = (0, 60, 120, 300)   # the least time between restarts of one service that keeps failing
+ALERT_AFTER_S = 300                  # a box unreachable this long gets one desktop alert, one more when back
 #                                     (a restarted session needs some seconds to log in and forward its ports)
 LOGIN_S = INTERVAL_S                # a session's login younger than this may not have set up its forwards yet
 FAST_S, FAST_STEP_S = 120, 5        # after a network change: a check every FAST_STEP_S until all answer, at most FAST_S
@@ -119,6 +123,34 @@ def dest_answers(h: dict) -> bool:
         return True
     except (OSError, ValueError):
         return False
+
+
+def _alert(title: str, body: str) -> None:
+    """One desktop notification through the existing notifier route; a failure never breaks a pass."""
+    try:
+        from .notifier import show
+        show(f"tt-project: {title}", body)
+    except Exception as e:   # the watch pass must survive a failed alert
+        print(f"alert failed: {e}", file=sys.stderr)
+
+
+def _down_alert(box: str, bs: dict, now: float) -> str | None:
+    """One desktop alert for a box that has stayed unreachable ALERT_AFTER_S; the state marks it sent."""
+    if bs.get("alert") or not bs.get("since") or now - bs["since"] < ALERT_AFTER_S:
+        return None
+    bs["alert"] = now
+    _alert(f"{box} unreachable", f"{box} has been unreachable for {int(now - bs['since'])}s; "
+                                 "its bridges are retried all the while.")
+    return f"{box}: unreachable for {int(now - bs['since'])}s; user alerted"
+
+
+def _recovered(box: str, bs: dict, now: float) -> str | None:
+    """The recovery note for an outage that was long enough to alert: one desktop note with its length."""
+    if not bs.get("alert"):
+        return None
+    secs = int(now - bs.get("since", now))
+    _alert(f"{box} reachable again", f"{box} answers again after {secs}s unreachable.")
+    return f"{box}: reachable again after {secs}s"
 
 
 def release(cfg: dict, t: dict, ports: list[int]) -> bool:
@@ -204,20 +236,36 @@ def run_pass(cfg: dict, platform: str | None = None, now: float | None = None) -
             continue
         mine = [t for t in ts if t["box"] == box]
         bs = boxes.get(box, {})
+        if bs and (line := _down_alert(box, bs, now)):
+            out.append(line)
         if bs.get("next", 0) > now and not fast:
             continue
         ports = sorted({p for t in mine for p in t["ports"]})
         r = bridge._box(box, "sh -c " + shlex.quote(CHECK) + " ttp-watch " + " ".join(map(str, ports)), timeout=40)
-        if "ttp-watch-nocheck" in r.stdout:
-            boxes.pop(box, None)
-            continue
-        if "ttp-watch-done" not in r.stdout:   # offline or the box is down: no restart, ask again later
+        if "ttp-watch-done" not in r.stdout:
+            if "ttp-watch-nocheck" in r.stdout:   # it answered; it only lacks the tools, nothing is restarted
+                boxes.pop(box, None)
+                if (rec := _recovered(box, bs, now)):
+                    out.append(rec)
+                continue
+            # offline or the box is down: keep checking, keep restarting its bridges (never only a
+            # network change): each restart re-reads the ssh route and jump hosts and resolves the
+            # name again, paced like any other failing service; _down_alert tells the user once
             n = bs.get("n", 0) + 1
-            boxes[box] = {"n": n, "next": now + BACKOFF_S[min(n, len(BACKOFF_S)) - 1]}
-            if n == 1:
-                out.append(f"{box}: not reachable; no restart, next check in {BACKOFF_S[0]}s or on a network change")
+            wait = BACKOFF_S[min(n, len(BACKOFF_S)) - 1]
+            live = [t for t in mine if loaded(t, platform)]
+            gap = RESTART_GAP_S[min(bs.get("restarts", 0), len(RESTART_GAP_S) - 1)]
+            acts = [f"{t['service']}: {restart(t, platform)}" for t in live] if live and now - bs.get("last", 0) >= gap else []
+            boxes[box] = {"n": n, "next": now + wait, "since": bs.get("since") or now, "alert": bs.get("alert", 0),
+                          "restarts": bs.get("restarts", 0) + bool(acts), "last": now if acts else bs.get("last", 0)}
+            out.append(f"{box}: not reachable; " + ("restarted its bridges to retry the route"
+                       if acts else f"next check in {wait}s or on a network change"))
+            if refused := [a for a in acts if not a.endswith(": restarted")]:
+                out.append(f"{box}: some restarts refused: {'; '.join(refused)}")
             continue
         boxes.pop(box, None)
+        if (rec := _recovered(box, bs, now)):
+            out.append(rec)
         down = {int(ln.split()[1]) for ln in r.stdout.splitlines() if ln.startswith("down ")}
         none = {int(ln.split()[1]) for ln in r.stdout.splitlines() if ln.startswith("none ")}
         up = {int(ln.split()[1]) for ln in r.stdout.splitlines() if ln.startswith("up ")}
@@ -293,13 +341,19 @@ def run_pass(cfg: dict, platform: str | None = None, now: float | None = None) -
     return out
 
 
-def run_window(cfg: dict, platform: str | None = None, clock=time.time, sleep=time.sleep):
+def run_window(cfg: dict, platform: str | None = None, clock=time.time, sleep=time.sleep, reload=None):
     """`ttp bridge watch`: a pass, then one every FAST_STEP_S while a network change's fast window stays open;
-    yields each pass's lines as it ends."""
+    yields each pass's lines as it ends. `reload` re-reads the bridge config between passes, so a route
+    or jump host fixed mid-outage is picked up without waiting for the next run of the service."""
     while True:
         yield from run_pass(cfg, platform, clock())
         if _load().get("fast_until", 0) <= clock() + FAST_STEP_S:
             return
+        if reload:
+            try:
+                cfg = reload()
+            except Exception:   # a half-edited config keeps the last good one
+                pass
         sleep(FAST_STEP_S)
 
 
