@@ -59,7 +59,7 @@ def _ssh_g_hostname(alias: str) -> set[str]:
     return _SSH_G[alias]
 
 
-def machine_of(host: str, candidates: Iterable[str]) -> str | None:
+def alias_for_host(host: str, candidates: Iterable[str]) -> str | None:
     """The machine alias `host` names (an alias, its host name, its ssh-resolved HostName)."""
     return next((a for a in candidates if host in names_of(a)), None)
 
@@ -73,7 +73,7 @@ def ssh_refusal(cmd: str) -> str | None:
     if not holds and not outs:
         return None
     for host in hook.ssh_targets(cmd):
-        if not (alias := machine_of(host, list(holds) + sorted(outs))):
+        if not (alias := alias_for_host(host, list(holds) + sorted(outs))):
             continue
         if hold := holds.get(alias):
             end = pauseends.describe(fleethold.entry(hold))
