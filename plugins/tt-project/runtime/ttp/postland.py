@@ -558,7 +558,7 @@ def revert(p: Project, repo: Path, job: dict, e: dict, cmd, ids: list[str], run)
             why.append(note)
     tries.append(None)   # the whole range
     for shas in tries:
-        got = _revert_at(p, repo, job, e, tip, shas, ids, why, found, failed)
+        got = _revert_at(repo, job, e, tip, shas, ids, why, found, failed)
         if "revert_head" in got:
             return found | got | {"reverted": shas or commits or [e["sha"]], "narrowed": bool(shas)} \
                 | ({"narrow_why": "; ".join(why)} if why else {})
@@ -598,7 +598,7 @@ def _bisect(commits: list[str], ids: list[str], failed, deadline: float) -> tupl
     return commits[hi], ""
 
 
-def _revert_at(p: Project, repo: Path, job: dict, e: dict, tip: str, shas: list[str] | None, ids: list[str],
+def _revert_at(repo: Path, job: dict, e: dict, tip: str, shas: list[str] | None, ids: list[str],
                why: list[str], found: dict, failed) -> dict:
     """One try of revert(): `shas` (None: the entry's whole range) reverted on `tip`, committed, fetched as
     ttp/postland-revert-<sha>, then checked to pass `ids`."""
