@@ -22819,6 +22819,40 @@ def test_a_scoped_exception_without_the_users_verbatim_words_is_refused_naming_t
         assert p.charter_path.read_text() == _SCOPED_BANS
 
 
+def test_a_scoped_exception_whose_clause_spans_two_sentences_of_one_ban_goes_in(env):
+    """A real refusal replayed: `excepts` quoted a tag rule across its `;` break, cites and all, and was
+    refused as "no clause ... word for word". Matched to the one item by its words (case, spaces and
+    punctuation aside), it goes in naming both sentences, with a note; with no named scope, or no user
+    word in `source`, it is refused as before."""
+    p = make(env)
+    from ttp import coordinator as coord
+    rule = ("- Push only to branch team/proj, plus two tags: proj-cut-1 at the verified cut commit (user msg #1), "
+            "pushed once and never moved; and proj-cut, the single release channel (user msgs #1, #1), moved only "
+            "forward to a commit on team/proj. Never push to main. (user msg #1)\n")
+    charter = "# demo\n\n## Restrictions\n" + rule
+    clause = ("proj-cut-1 at the verified cut commit (user msg #1), pushed once and never moved; and proj-cut, "
+              "the single release channel (user msgs #1, #1), moved only forward to a commit on team/proj.")
+    text = ("Exception: at the `switch` of the branch squash, proj-cut-1 may be deleted, and proj-cut may be "
+            "moved once onto the squashed commit; after that it moves only forward, as before.")
+    words = "yes: at the switch delete proj-cut-1 and move proj-cut once onto the squashed commit"
+    act = {"type": "charter_update", "section": "Restrictions", "excepts": clause, "text": text}
+    for k, (tweak, want) in enumerate((({"text": text.replace("`switch`", "switch")}, "it names no host"),
+                                       ({"source": None}, "no verbatim user source"))):
+        p.charter_path.write_text(charter)
+        mids, src = _turn_said(p, words)
+        err = coord.apply(p, [{**act, "source": src, **tweak}], turn=1 + k, user_turn=True, messages=mids)
+        assert len(err) == 1 and want in err[0], err
+        assert p.charter_path.read_text() == charter
+    p.charter_path.write_text(charter)
+    mids, src = _turn_said(p, words)
+    assert coord.apply(p, [{**act, "source": src}], turn=5, user_turn=True, messages=mids) == []
+    got = p.charter_path.read_text()
+    assert rule.strip() in got and ("- Exception to \"Push only to branch team/proj, plus two tags: proj-cut-1 at the "
+                                    "verified cut commit, pushed once and never moved; and proj-cut, the single "
+                                    "release channel, moved only forward") in got, got
+    assert "`excepts` spans sentences of that item" in str(p.db.kv(coord.NOTES_KEY, "")), p.db.kv(coord.NOTES_KEY, "")
+
+
 def test_a_general_or_too_wide_exception_is_refused_naming_each_clause(env):
     """`excepts` never lifts a ban in general: no scope the clause lacks, or a general word, is refused;
     so is an exception covering a host another item still bans (each such item named with its clause) or

@@ -7172,8 +7172,25 @@ def _excepted_item(charter: str, clause: str) -> tuple[str, str] | None:
     found = [(s, sec) for s, sec, _ in _restriction_items(charter) if want and want in _loose(restriction_source.bare(s))
              and _BAN_RE.search(s) and not _loose(s).startswith(mark)]
     # The ban itself before an item that only quotes it (an older exception "to 'Never ...': box-a may ...")
-    return min(found, key=lambda f: (_loose(restriction_source.bare(f[0])).strip(" .") != want.strip(" ."),
-                                     not _loose(restriction_source.bare(f[0])).startswith(want)), default=None)
+    if found or not want:
+        return min(found, key=lambda f: (_loose(restriction_source.bare(f[0])).strip(" .") != want.strip(" ."),
+                                         not _loose(restriction_source.bare(f[0])).startswith(want)), default=None)
+    # A clause across sentences of one item, word for word but for case, spaces and punctuation: those
+    # sentences, joined, when exactly one item has it and a sentence it covers bans something.
+    words = lambda x: " ".join(re.sub(r"\W+", " ", _loose(restriction_source.bare(x))).split())
+    want, items, hits = words(clause), {}, []
+    for s, sec, n in _restriction_items(charter):
+        if not _loose(s).startswith(mark):
+            items.setdefault((n, sec), []).append(s)
+    for (_, sec), sents in items.items():
+        at, pos, cover = f" {' '.join(words(s) for s in sents)} ".find(f" {want} "), 0, []
+        for s in sents if at >= 0 else ():
+            if pos < at + len(want) and pos + len(words(s)) > at:
+                cover.append(s)
+            pos += len(words(s)) + 1
+        if any(_BAN_RE.search(s) for s in cover):
+            hits.append((" ".join(cover), sec))
+    return hits[0] if len(hits) == 1 else None
 
 
 # What makes an exception a new risk class, so only the user's own words naming its whole scope allow it
@@ -7307,9 +7324,10 @@ def _scoped_exception(charter: str, section: str, text: str, clause: str, source
     if unsaid and (why := _ordered_work(charter, text, names, unsaid, said, own)):
         raise ValueError(head + f"{named}: the user's words in `source` do not name {', '.join(unsaid)}; an "
                          f"exception covers only what they named, {why}")
+    parts = {item, *_sentences([item])}   # the clause's own sentences, when it spans several of one item
     wider = [(s, sc, sorted(_scope_names(s) & names)) for s, sc in _append_conflicts(charter, section, text,
                                                                                   lifts_only=True)
-             if s != item and _bans_in_scope(s, text, names)]
+             if s not in parts and _bans_in_scope(s, text, names)]
     also = [w for w in wider if said and not relay.held_class(restriction_source.bare(_ban_part(w[0])))]
     wider = [w for w in wider if w not in also]   # the newest ordered word wins over a ban that guards no person
     if wider:
@@ -7318,7 +7336,7 @@ def _scoped_exception(charter: str, section: str, text: str, clause: str, source
             f"{', '.join(n)}, which the exception covers" for s, sc, n in wider)
             + f". Narrow it to what only {named} bans, or the user changes those items too")
     rest = [s for s, _ in _append_conflicts(charter, section, text, lifts_only=True)
-            if s != item and all(s != w[0] for w in also)]
+            if s not in parts and all(s != w[0] for w in also)]
     stored = "\n".join((bullet[0] if bullet else "- ") + SCOPED_EXCEPTION.format(
         clause=restriction_source.bare(i).strip(), section=c) + text for i, c in [(item, sec), *[w[:2] for w in also]])
     note = (f"charter_update: scoped exception to {named} went in" + (
@@ -7327,7 +7345,8 @@ def _scoped_exception(charter: str, section: str, text: str, clause: str, source
         "; the same exception went in beside the other bans on its scope the order lifts: " + "; ".join(
             f"\"{clip(restriction_source.bare(w[0]).strip(), 120)}\"" for w in also) if also else "") + (
         "; these items name none of its scope and still hold: " + "; ".join(f"\"{clip(s, 120)}\"" for s in rest)
-        if rest else ""))
+        if rest else "") + ("; `excepts` spans sentences of that item, read word for word but for case, spaces and "
+                            "punctuation" if len(parts) > 2 else ""))
     if accepted is not None:
         accepted.update(clause=restriction_source.bare(item).strip(), scope=sorted(names),
                         by_order=sorted(names - set(unsaid)), by_charter=unsaid)
