@@ -16,7 +16,16 @@ A coordinator restart takes the same path (request_restart): a task_update on a 
 with RESTART_TEXT, at once or, while it holds a `ttp lock`, once it releases it (release_pending, each reap pass).
 It is requeued with its updated spec and work kept, spends no attempt, and its next run's prompt starts with the
 why (prompts.restart_block). At most budget.restart_max (3) per budget.restart_window_h (6) per task. A run
-that ends on its own before the stop (say, still holding its lock) keeps its outcome."""
+that ends on its own before the stop (say, still holding its lock) keeps its outcome.
+
+Lock yield (Daemon.check_lock_yield, each tick): a user-ordered urgent task kept off a resource by its
+`ttp lock` slots or its task cap (queued), or waiting in `ttp lock` on it (running), asks each holder to yield.
+The resource is reserved for the urgent task, so the holder's next `ttp lock` batch and every older waiter
+wait while it takes the lock first, and `<lock>.yield` (yield_path) names the request for a driver that holds
+one long lock. A holder that is a run of this project still in its way after budget.urgent_yield_grace_s
+(YIELD_GRACE_S) is stopped as above, lock and all, if eligible() spares it nothing else. A person's hold,
+another project's run, urgent work, reviews and obligation owners get the request only. Nothing is asked on a
+resource the user paused or a user order holds."""
 from __future__ import annotations
 
 import fcntl
@@ -34,6 +43,22 @@ RESTART_FILE = "RESTART"   # in the run dir: the restart's why and new instructi
 RESTART_KEY = "restart"    # in the task's result: the why its next run's prompt starts with
 RESTART_EVENT = "task_restart"
 _RESTART_LINE = re.compile(r"(?im)^[ \t>*-]*restart:[ \t]*(\S.*)$")
+
+
+YIELD_GRACE_S = 180.0   # budget.urgent_yield_grace_s: how long a holder may keep the lock once asked
+
+
+def yield_grace_s(cfg: dict) -> float:
+    """budget.urgent_yield_grace_s (default YIELD_GRACE_S)."""
+    try:
+        return max(float(((cfg or {}).get("budget") or {}).get("urgent_yield_grace_s", YIELD_GRACE_S)), 0.0)
+    except (TypeError, ValueError):
+        return YIELD_GRACE_S
+
+
+def yield_path(locks_dir: Path, lock: str) -> Path:
+    """The yield request on `lock`: JSON {for_task, project, since, ts, grace_s, holders}."""
+    return Path(locks_dir) / f"{lock}.yield"
 
 
 def enabled(cfg: dict) -> bool:

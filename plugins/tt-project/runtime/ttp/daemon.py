@@ -2450,6 +2450,7 @@ class Daemon:
                 self.check_stall,
                 self.check_slot_wait,
                 self.check_urgent_start,
+                self.check_lock_yield,
                 self.check_unstarted,
                 self.check_resume_wait,
                 self.check_checks_wait,
@@ -11090,6 +11091,127 @@ class Daemon:
             return f"`{probe[:100]}`"
         return ""
 
+    def check_lock_yield(self) -> None:
+        """Lock yield for user-ordered urgent work, each tick and model-free (preempt.py): an urgent.extra_ok
+        task that is ready but kept off a resource by its `ttp lock` slots or its task cap, or whose run waits
+        in `ttp lock` on one, reserves the resource and writes its yield request (preempt.yield_path); each
+        holder is logged once (lock_yield_asked: who, to whom, which resource, since when). A holder that is a
+        run of this project still in the way after preempt.yield_grace_s is stopped (STOP_TEXT) if
+        preempt.eligible spares it nothing else. Nothing is asked on a resource the user paused or a user order
+        holds. A request no longer wanted is taken back, its reservation with it."""
+        now, db = time.time(), self.p.db
+        want: dict[str, tuple[dict, str, list[dict]]] = {}
+        if preempt.enabled(self.cfg) and self.cfg_status != "unavailable":
+            ready = None
+            for t in db.q("SELECT * FROM tasks WHERE status IN ('queued','running') AND spec LIKE '%urgent:%'"):
+                if not urgent.extra_ok(t, now) or not coord.task_resources(t):
+                    continue
+                if t["status"] == "queued":
+                    ready = {r["id"] for r in db.ready_tasks()} if ready is None else ready
+                    if t["id"] not in ready:
+                        continue
+                for res, in_way in self._yield_needs(t):
+                    want.setdefault(locks.canonical(self.cfg, res), (t, res, in_way))
+        for d in preempt.lock_dirs(self.p, self.cfg):
+            for y in d.glob("*.yield"):
+                try:
+                    rec = json.loads(y.read_text() or "{}")
+                except (OSError, ValueError):
+                    rec = {}
+                lock = y.name[:-len(".yield")]
+                if rec.get("project") == self.p.name and (want.get(lock) or ({},))[0].get("id") != rec.get("for_task"):
+                    locks.unreserve(locks.reserve_path(d, lock), str(rec.get("reserved_for") or ""))
+                    y.unlink(missing_ok=True)
+        owners = None
+        for lock, (t, res, in_way) in want.items():
+            y = preempt.yield_path(self._slot_paths(res)[0].parent, lock)
+            mine = shared.holder(self.p, res, hold.who(t["id"]), self.cfg)
+            locks.reserve(self._reserve_path(res), mine, force=True)
+            try:
+                prev = json.loads(y.read_text() or "{}")
+            except (OSError, ValueError):
+                prev = {}
+            since = float(prev["since"]) if prev.get("for_task") == t["id"] and prev.get("project") == self.p.name \
+                and prev.get("since") else now
+            grace = preempt.yield_grace_s(self.cfg)
+            durable_write(y, json.dumps({"for_task": t["id"], "project": self.p.name, "since": since, "ts": now,
+                                         "grace_s": grace, "reserved_for": mine,
+                                         "holders": [w["label"] for w in in_way]}))
+            for w in in_way:
+                fp = f"lock_yield:{t['id']}:{lock}:{w['label']}"
+                if not db.one("SELECT 1 FROM events WHERE fingerprint=?", (fp,)):
+                    db.x("INSERT INTO events(ts,source,kind,fingerprint,severity,text,status,task) "
+                         "VALUES(?,?,?,?,?,?,?,?)",
+                         (now, "daemon", "lock_yield_asked", fp, "low",
+                          f"{w['label']} asked at {timefmt.short(since, self.p, now)} to yield {res} to user-ordered "
+                          f"urgent task #{t['id']}; stopped if it still holds it after {int(grace)}s",
+                          "handled", w["task"] or t["id"]))
+                if now - since < grace or not w["run"]:
+                    continue
+                run = db.one("SELECT * FROM runs WHERE id=? AND task=? AND role='worker' AND status='running'",
+                             (w["run"], w["task"]))
+                owners = self._owner_due() if owners is None else owners
+                victim = db.task(w["task"])
+                if run and preempt.eligible(db, run, victim, owners, set()):
+                    runner.request_stop(Path(run["dir"]), preempt.STOP_TEXT)
+                    db.x("INSERT INTO events(ts,source,kind,severity,text,status,task) VALUES(?,?,?,?,?,?,?)",
+                         (now, "daemon", "task_preempted", "low",
+                          f"#{w['task']} (run {run['id']}) did not yield {res} within {int(grace)}s of "
+                          f"{timefmt.short(since, self.p, now)}: stopped for user-ordered urgent task #{t['id']}; "
+                          "its work is kept, no attempt spent, and it resumes afterwards", "handled", w["task"]))
+                    log(self.p, f"task {w['task']}: stopped to yield {res} to urgent task {t['id']}")
+
+    def _yield_needs(self, t: dict) -> list[tuple[str, list[dict]]]:
+        """(resource, holders in the way) for each resource urgent task `t` is kept off (check_lock_yield);
+        none on a paused one or one a user order holds. A holder: {label, task, run}, task and run set only
+        for a run of this project."""
+        names = sorted(coord.task_resources(t))
+        try:
+            if userorder.holding(self.p.db, self.cfg, t, names):
+                return []
+        except Exception:   # unread user orders: ask nobody to yield
+            return []
+        paused = {locks.canonical(self.cfg, r) for r in self.p.db.paused_resources()}
+        names = [r for r in names if locks.canonical(self.cfg, r) not in paused]
+        out = []
+        if t["status"] == "queued":
+            h = self._resource_hold(t) if names else None
+            if h and h["kind"] == "busy" and h["resource"] in names:
+                out.append((h["resource"], [{"label": f"#{x}", "task": x, "run": (self.p.db.one(
+                    "SELECT id FROM runs WHERE task=? AND role='worker' AND status='running'", (x,)) or {}).get("id")}
+                    for x in h["tasks"] if x != t["id"]]))
+            elif h and h["kind"] == "lock" and h["resource"] in names:
+                out.append((h["resource"], self._lock_holders(h["resource"], t["id"])))
+            return [(r, w) for r, w in out if w]
+        run = self.p.db.one("SELECT dir FROM runs WHERE task=? AND role='worker' AND status='running'", (t["id"],))
+        on = {x for _s, end, ls in (locks.wait_rows(Path(run["dir"])) if run and run["dir"] else []) if end is None
+              for x in ls}
+        for res in names:
+            if locks.canonical(self.cfg, res) in on:
+                out.append((res, self._lock_holders(res, t["id"])))
+        return [(r, w) for r, w in out if w]
+
+    def _lock_holders(self, res: str, tid: int) -> list[dict]:
+        """The holders of `res`'s `ttp lock` slots other than task `tid` (check_lock_yield's form)."""
+        try:
+            recs = locks.holder_records(self._slot_paths(res))
+        except Exception:
+            return []
+        mine = os.path.realpath(self.p.base)
+        out = []
+        for h in recs:
+            root = h.get("project_root")
+            own = os.path.realpath(root) == mine if root else h.get("project") == self.p.name
+            task = int(h["task_id"]) if own and str(h.get("task_id") or "").isdigit() else None
+            if task == tid:
+                continue
+            run = int(h["run_id"]) if task and str(h.get("run_id") or "").isdigit() else None
+            label = f"#{task}" if task else str(h.get("holder") or "a holder")
+            if root and not own:
+                label = f"{locks.project_of(h)}: {label}"
+            out.append({"label": label, "task": task, "run": run})
+        return out
+
     def check_urgent_start(self, every_s: float = 60) -> None:
         """Model-free start watch for user-ordered urgent machine or device work: a task with a fresh
         `urgent:` line (urgent.extra_ok) that names a resource (coord.task_resources) or holds a device
@@ -13550,6 +13672,10 @@ class Daemon:
                 log(self.p, f"run-start breaker closed: task {task['id']}'s run started")
                 probing, probe_tried = None, False
             fate[task["id"]] = "picked"
+            if urgent.extra_ok(task, now):   # its start wakes the coordinator at once (eventhold.hot)
+                db.x("INSERT INTO events(ts,source,kind,severity,text,status,task) VALUES(?,?,?,?,?,?,?)",
+                     (time.time(), "daemon", "urgent_started", "normal",
+                      f"user-ordered urgent task #{task['id']} started (run {run_id})", "queued", task["id"]))
             live[task["id"]] = worktree.claims(self.p, dict(task, branch=branch))   # held from others this tick
             if logged_out[provider] if run_prov == provider else self._logged_out(run_prov):
                 db.set_kv(f"auth_probe:{run_prov}", now)   # the one check of the login until the next

@@ -1133,13 +1133,14 @@ def reserve_path(locks_dir: Path, resource: str) -> Path:
     return Path(locks_dir) / f"{resource}.reserved"
 
 
-def reserve(path: Path, holder: str) -> None:
-    """Reserve for holder, or refresh its reservation. A fresh one by another holder stays."""
+def reserve(path: Path, holder: str, force: bool = False) -> None:
+    """Reserve for holder, or refresh its reservation. A fresh one by another holder stays, unless force
+    (a user-ordered urgent task's lock yield: preempt.py)."""
     other = reserved_by(path)
-    if other and other != holder:
+    if other and other != holder and not force:
         return
     try:
-        since = json.loads(path.read_text()).get("since") if other else None
+        since = json.loads(path.read_text()).get("since") if other == holder else None
     except (OSError, ValueError):
         since = None
     path.parent.mkdir(parents=True, exist_ok=True)

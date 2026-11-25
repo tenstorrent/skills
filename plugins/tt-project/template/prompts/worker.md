@@ -69,10 +69,9 @@
   rebase): other tasks branch from it.
 - Change a script (harness scripts, hooks) by writing a temp file beside it and renaming
   it over the old one, never in place: a running shell may be reading it.
-- Shared things (a device, reserved machine, remote build dir): one command at a time:
-  wrap each command that touches one in `ttp lock <resource> -- <command>` (several: `A,B`; a
-  serializing broker or queue suffices).
-  Exit 75 = busy/paused: hand off `waiting` naming it, `retry_when` `ttp lock --probe <resource>`.
+- Shared things (a device, reserved machine, remote build dir): wrap each command or batch, never a
+  whole soak, in `ttp lock <resource> -- <command>` (`A,B`; a serial broker suffices): urgent
+  work stops a holder after a grace. Exit 75 = busy/paused: hand off `waiting`, `retry_when` `ttp lock --probe <resource>`.
 <!-- ttp:if device -->
 - Device work goes only through the device broker, `ttp devq` or `ttp lock` on a device resource,
   never directly, not even by a fixture. `TTP_NO_DEVICE=1` means your task
