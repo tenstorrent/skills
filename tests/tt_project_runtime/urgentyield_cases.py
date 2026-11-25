@@ -233,7 +233,10 @@ def test_lock_yield_and_urgent_start_agree_on_own_versus_other_holds(env, tmp_pa
         d.check_lock_yield()
         ask = json.loads(preempt.yield_path(d._slot_paths("box")[0].parent, "box").read_text())
         assert ask["for_task"] == hot
-        assert sorted(ask["holders"]) == ["#7", "#77", "someone at a shell"], ask["holders"]
+        # One project-ownership rule: a record naming another project is another project's hold even
+        # when its root is ours, so lock_yield asks it to yield by its project label (its recorded
+        # root names it; locks.project_of) and never stops this project's task 7 / run 9 for it.
+        assert sorted(ask["holders"]) == ["#77", f"{p.name}: a holder", "someone at a shell"], ask["holders"]
         d._urgent_start_checked = time.time() - 120
         d.check_urgent_start()
         ev = p.db.one("SELECT * FROM events WHERE fingerprint=?", (f"urgent_lock:{hot}:{rid}",))
