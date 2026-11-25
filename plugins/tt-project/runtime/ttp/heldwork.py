@@ -61,8 +61,10 @@ def _ssh_g_hostname(alias: str) -> set[str]:
 
 
 def alias_for_host(host: str, candidates: Iterable[str]) -> str | None:
-    """The machine alias `host` names (an alias, its host name, its ssh-resolved HostName)."""
-    return next((a for a in candidates if host in names_of(a)), None)
+    """The machine alias `host` names (an alias, its host name, its ssh-resolved HostName), `host`
+    itself resolved by `ssh -G` first: another ssh config alias of the same host names it too."""
+    asked = {host} | _ssh_g_hostname(host)
+    return next((a for a in candidates if asked & names_of(a)), None)
 
 
 def ssh_refusal(cmd: str) -> str | None:
@@ -94,10 +96,7 @@ def live_items(alias: str, now: float | None = None, where=None) -> list[dict]:
     entries that leave a standing setup. A probe the owner project's config gives
     (`machines.live_probe`) runs read-only under a short timeout; under a machine-wide hold or
     known outage it never runs, and the item reads 'unverified: owner <project> must confirm'."""
-    from . import fleethold, globalcap, locks, machine_ledger as ml, responsibilities as rs, timefmt
-    from .coordinator import task_resources
-    from .db import OPEN_TASKS
-    from . import shared
+    from . import fleethold, locks, machine_ledger as ml, shared, timefmt
     now = time.time() if now is None else now
     on = ml.on_machine(alias)
     out: list[dict] = []
@@ -115,24 +114,18 @@ def live_items(alias: str, now: float | None = None, where=None) -> list[dict]:
                             or str(rec.get("holder") or "?").split(" ", 1)[0]),
                         "text": f"lock {d.name}: {rec['holder']} since "
                                 f"{timefmt.short(float(rec.get('since') or 0), where)}"})
-    for name, base in rs._projects(project.hostname()):   # open tasks that name it, every project
-        db_path = base / "state" / "project.db"
-        if not db_path.is_file():
+    scheds: list[dict] = []
+    for name, base, db in ml.project_dbs():   # open tasks and schedules that name it, every project
+        if db is None or isinstance(db, Exception):
             continue
-        db = None
         try:
-            db = rs.ReadOnly(globalcap.connect_ro(db_path))
-            rows = db.q(f"SELECT id, title, status, labels FROM tasks WHERE {OPEN_TASKS}")
-        except Exception:
-            continue
-        finally:
-            if db is not None:
-                db.close()
-        for t in rows:
-            if hit := sorted(r for r in task_resources(t) if on(r)):
+            for t, hit in ml.tasks_on(db, on):
                 out.append({"kind": "task", "project": name,
                             "text": f"open task #{t['id']} ({t['status']}) on {', '.join(hit)}: "
                                     f"{t['title']}"})
+            scheds += _schedules(alias, name, base, db)
+        except Exception:
+            continue
     o = ml.outages().get(alias)
     held = bool(fleethold.active().get(alias)) or (o is not None and not o.get("covers"))
     # a partial outage leaves the machine reachable, so its items stay verifiable
@@ -144,39 +137,28 @@ def live_items(alias: str, now: float | None = None, where=None) -> list[dict]:
             text += " — " + (_unverified(c.get("by")) if held
                               else "live probe: " + _run_probe(c.get("by"), probe))
         out.append({"kind": "change", "project": str(c.get("by") or "?"), "text": text})
-    out += _schedules(alias)
-    return out
+    return out + scheds
 
 
 SCRIPT_MAX_BYTES = 256 * 1024   # a script a schedule runs is read at most this big
 
 
-def _schedules(alias: str) -> list[dict]:
-    """Every project's enabled command schedules and watcher probes whose text, or the script one
+def _schedules(alias: str, name: str, base, db) -> list[dict]:
+    """Project `name`'s enabled command schedules and watcher probes whose text, or the script one
     runs, names the machine: a schedule that names it will reach for it again."""
-    from . import globalcap, responsibilities as rs
     out = []
-    for name, base in rs._projects(project.hostname()):
-        db = None
+    rows = db.q("SELECT name, kind, payload FROM schedules WHERE enabled=1")
+    for r in rows:
         try:
-            db = rs.ReadOnly(globalcap.connect_ro(base / "state" / "project.db"))
-            rows = db.q("SELECT name, kind, payload FROM schedules WHERE enabled=1")
-        except Exception:
-            continue
-        finally:
-            if db is not None:
-                db.close()
-        for r in rows:
-            try:
-                payload = json.loads(r.get("payload") or "{}")
-            except ValueError:
-                payload = {}
-            payload = payload if isinstance(payload, dict) else {}
-            texts = [r.get("name") or "", json.dumps(payload)]
-            texts += _script_texts(base.parent, str(payload.get("command") or ""))
-            if any(_text_names(alias, t) for t in texts):
-                out.append({"kind": "schedule", "project": name,
-                            "text": f"{r.get('kind')} schedule {r.get('name')!r} names this machine"})
+            payload = json.loads(r.get("payload") or "{}")
+        except ValueError:
+            payload = {}
+        payload = payload if isinstance(payload, dict) else {}
+        texts = [r.get("name") or "", json.dumps(payload)]
+        texts += _script_texts(base.parent, str(payload.get("command") or ""))
+        if any(_text_names(alias, t) for t in texts):
+            out.append({"kind": "schedule", "project": name,
+                        "text": f"{r.get('kind')} schedule {r.get('name')!r} names this machine"})
     return out
 
 
@@ -210,7 +192,7 @@ def _text_names(alias: str, text: str) -> bool:
     for a, m in machines.load().items():
         if a != alias:
             others |= {a, str(m.get("hostname") or "")} - {""}
-    return any((tok := t.split(":", 1)[0]).startswith(alias + "-") and tok not in others
+    return any((tok := re.split(r"[:/]", t, maxsplit=1)[0]).startswith(alias + "-") and tok not in others
                for t in re.split(r"\s", text))
 
 
@@ -283,7 +265,8 @@ def notes(p, its: list[dict], why: str = "") -> tuple[list[str], list[str]]:
             mine += texts
             continue
         body = (f"{why or 'A machine is held machine-wide'}; still on it from your project: "
-                + "; ".join(texts) + ". Stop what runs or is installed there, or reply why not.")
+                + "; ".join(texts) + ". Your runs cannot reach it while it is held: ask the user or the "
+                  "machine's owner to stop what runs or is installed there, or reply why not.")
         try:
             if p is None:
                 got = upstream.send("user", None, owner, body, "normal")

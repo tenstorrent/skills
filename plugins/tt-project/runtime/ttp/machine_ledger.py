@@ -1279,24 +1279,54 @@ def on_machine(alias: str) -> Callable[[str], bool]:
     return lambda res: any(rs._names(n, res) for n in needles)
 
 
+def project_dbs():
+    """(name, base, db) for each project on this host, its database opened read-only and closed
+    once the caller moves on: db is None when the project has none, the error when it cannot be
+    opened. Every reader of all projects' tasks or schedules (`_demand`, heldwork) walks this."""
+    from . import globalcap
+    from . import responsibilities as rs
+    for name, base in rs._projects(project.hostname()):
+        path = base / "state" / "project.db"
+        if not path.is_file():
+            yield name, base, None
+            continue
+        try:
+            db = rs.ReadOnly(globalcap.connect_ro(path))
+        except Exception as e:
+            yield name, base, e
+            continue
+        try:
+            yield name, base, db
+        finally:
+            db.close()
+
+
+def tasks_on(db, on: Callable[[str], bool]) -> list[tuple[dict, list[str]]]:
+    """Each open task in `db` with the resources it uses that `on` (on_machine) puts on the machine."""
+    from .coordinator import task_resources
+    from .db import OPEN_TASKS
+    out = []
+    for t in db.q(f"SELECT id, title, status, labels FROM tasks WHERE {OPEN_TASKS}"):
+        if hit := sorted(r for r in task_resources(t) if on(r)):
+            out.append((t, hit))
+    return out
+
+
 def _demand(alias: str, reporters: list[str]) -> dict[str, list[str]]:
     """Read-only, from every project on this machine: the open tasks that use a resource on `alias`
     ("need"), and the pauses of resources on it ("paused", "user": set by the user). A reporter that
     cannot be read from here counts as needing it."""
-    from . import globalcap, shared
+    from . import shared
     from . import responsibilities as rs
-    from .coordinator import task_resources
     from .db import PAUSED_RESOURCES_KEY
     on = on_machine(alias)
     out: dict[str, list[str]] = {"need": [], "paused": [], "user": [], "shared": []}
     seen = set()
-    for name, base in rs._projects(project.hostname()):
+    for name, _base, db in project_dbs():
         seen.add(name)
-        if not (base / "state" / "project.db").is_file():
+        if db is None:
             continue
-        try:
-            db = rs.ReadOnly(globalcap.connect_ro(base / "state" / "project.db"))
-        except Exception:
+        if isinstance(db, Exception):
             out["need"].append(f"{name} (its state cannot be read)")
             continue
         try:
@@ -1305,14 +1335,12 @@ def _demand(alias: str, reporters: list[str]) -> dict[str, list[str]]:
             for res, v in sorted(pz.items()):
                 if on(res):
                     out["user" if isinstance(v, dict) and v.get("by") == "user" else "paused"].append(f"{name} {res}")
-            for t in db.q("SELECT id, labels FROM tasks WHERE status NOT IN ('done','failed','cancelled')"):
-                for res in sorted(task_resources(t)):
-                    if on(res) and res not in pz and not shared.read_pause(res):
+            for t, hit in tasks_on(db, on):
+                for res in hit:
+                    if res not in pz and not shared.read_pause(res):
                         out["need"].append(f"{name} #{t['id']} ({res})")
         except Exception as e:
             out["need"].append(f"{name} (its state cannot be read: {type(e).__name__})")
-        finally:
-            db.close()
     for alias_res in sorted({r for r in rs._shared_resources(alias)}):
         sp = shared.read_pause(alias_res)
         if sp:

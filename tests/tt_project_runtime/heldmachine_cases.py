@@ -102,7 +102,7 @@ def test_a_new_hold_notes_each_owner_project_and_status_shows_still_on(env):
     assert "held machine-wide" in line
     after = inbox.read_text() if inbox.exists() else ""
     notes = [json.loads(ln) for ln in after[len(before):].strip().splitlines()] if after[len(before):] else []
-    assert any(n.get("to") == "beta" and _HM_BOX in n.get("spec", "") and "Stop" in n["spec"] for n in notes), notes
+    assert any(n.get("to") == "beta" and _HM_BOX in n.get("spec", "") and "ask the user or the machine's owner to stop" in n["spec"] for n in notes), notes
     # re-holding the same machine notes nobody again
     before2 = inbox.read_text()
     coord.pause_machine(alpha, _HM_BOX, True, reason="lent out", by="user", users_word=True,
@@ -308,3 +308,24 @@ def test_a_second_project_s_outage_still_notes_the_owners(env):
     assert not any(n.get("to") == "beta" for n in new), new
 
 
+
+
+def test_a_path_after_a_machine_name_still_names_that_machine_only(env):
+    from ttp import heldwork, machines
+    machines.add(_HM_BOX, tags="device")
+    machines.add("hm-box-2", tags="device")
+    assert heldwork._text_names(_HM_BOX, "rsync out hm-box/some/path")
+    assert heldwork._text_names(_HM_BOX, "logs at hm-box-dev/tt0/run.log"), "a resource on it, then a path"
+    assert not heldwork._text_names(_HM_BOX, "logs at hm-box-2/tt0"), "another machine's alias, then a path"
+
+
+def test_the_guard_resolves_the_ssh_target_so_another_config_alias_is_refused(env, monkeypatch):
+    from ttp import fleethold, heldwork, machines
+    machines.add(_HM_BOX, tags="device", hostname="hm-box.example")
+    resolved = {"hm-box-alt": {"hm-box.example"}, "other-alt": {"other.example"}}
+    monkeypatch.setattr(heldwork, "_ssh_g_hostname", lambda a: resolved.get(a, set()))
+    _hm_hold()
+    why = heldwork.ssh_refusal("ssh hm-box-alt true")
+    assert why and "`hm-box` is held machine-wide" in why, why
+    assert heldwork.ssh_refusal("scp f other-alt:/tmp") is None, "a config alias of another host"
+    fleethold.lift(_HM_BOX, True, "test")
