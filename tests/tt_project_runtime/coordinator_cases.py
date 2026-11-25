@@ -980,7 +980,8 @@ def test_config_refuses_user_only_keys_inside_a_run(env, capsys, monkeypatch, va
                 ["config", "demo", MERGE_KEY, "o/r"],                                   # plain string
                 ["config", "demo", "delivery.mirror_remotes", json.dumps(["other"])],  # not the off direction
                 ["config", "--account", "budget.global_daily_usd", "5000"],
-                ["config", "--account", "budget.global_daily_usd", ""]]               # removes the cap
+                ["config", "--account", "budget.global_daily_usd", ""],                # removes the cap
+                ["config", "--account", "budget.push_spend_to", "none"]]                # a spend key outside NEEDS_USER
     for argv in refused:
         with pytest.raises(SystemExit) as e:
             cli.main(argv)

@@ -13513,8 +13513,8 @@ def cmd_config(a) -> None:
     if a.account:
         if a.value is not None or a.add is not None:
             die("usage: ttp config --account KEY [VALUE]")
-        from .coordinator import NEEDS_USER
-        if run and a.key is not None and a.name in NEEDS_USER:
+        from .coordinator import needs_users_word
+        if run and a.key is not None and needs_users_word(a.name):
             # A run can be steered by text it reads; spend caps change only on the user's word.
             _refuse_user_only_in_run(a.name)
         if run and a.key not in (None, "") and a.name in ACCOUNT_USER_ONLY and not _account_off(a.name, a.key):
