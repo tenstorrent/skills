@@ -82,9 +82,9 @@ def test_turnrules_a_held_reply_answers_nothing_even_beside_a_task_replying_ther
 
 def test_turnrules_a_reply_repeating_a_cited_run_sends_only_its_new_part(env):
     """Replayed refusal 'reply not sent: run N's result went to this chat in message #M; say only what is
-    new': the reply goes out without its sentences naming run N or repeating message #M word for word,
-    run N dropped from its cites, with a note. With nothing left, or no sentence of it told apart as the
-    repeat, the refusal stays."""
+    new': the reply goes out without its sentences repeating message #M word for word, run N dropped from
+    its cites, with a note. With nothing left, no sentence of it told apart as the repeat, or a sentence
+    left still naming run N (it may carry new facts), the refusal stays."""
     from ttp import coordinator as coord
     p = make(env)
     r1, r2 = (p.db.x("INSERT INTO runs(task, role, status, started) VALUES(NULL, 'worker', 'ok', ?)", (time.time(),))
@@ -96,7 +96,8 @@ def test_turnrules_a_reply_repeating_a_cited_run_sends_only_its_new_part(env):
     assert coord.apply(p, [{"type": "reply", "chat": "c1", "cites": [r1],
                             "text": f"Run {r1} passed. The bench is 12 ms."}]) == []
     first = p.db.one("SELECT MAX(id) id FROM messages WHERE kind='reply'")["id"]
-    for text in (f"The bench is 12 ms. Run {r1} passed.", "Again: the bench stays at 12 ms."):
+    for text in (f"The bench is 12 ms. Run {r1} passed.", "Again: the bench stays at 12 ms.",
+                 f"Run {r1} passed. Run {r1} failed again after the fix. I'm rolling back."):
         probs = coord.apply(p, [{"type": "reply", "chat": "c1", "cites": [r1], "text": text}])
         assert len(probs) == 1 and f"run {r1}'s result went to this chat in message #{first}" in probs[0], probs
     assert len(replies()) == 1

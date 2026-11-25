@@ -151,8 +151,8 @@ def check_cites(db, a: dict, chat, notes: list | None = None) -> list[int]:
     if (again := [r for r in runs if str(r) in seen]) and notes is not None \
             and (rest := _new_part(db, a["text"], {r: seen[str(r)] for r in again})):
         a["text"] = rest
-        notes.append("reply: sent only its new part: the sentences naming " + ", ".join(
-            f"run {r} or repeating message #{seen[str(r)]}" for r in again) + " were dropped, and the run(s) "
+        notes.append("reply: sent only its new part: the sentences " + ", ".join(
+            f"repeating message #{seen[str(r)]} (run {r})" for r in again) + " were dropped, and the run(s) "
             "from its cites (already in this chat)")
         return [r for r in runs if r not in again]
     if again:
@@ -163,9 +163,9 @@ def check_cites(db, a: dict, chat, notes: list | None = None) -> list[int]:
 
 
 def _new_part(db, text: str, again: dict[int, int]) -> str:
-    """`text` without its sentences that name a run of `again` (run id -> the message that already
-    reported it) as 'run N' or repeat a sentence of that message word for word; '' when none is dropped
-    (what is new cannot be told apart) or nothing is left."""
+    """`text` without its sentences that repeat a sentence of the message that already reported a run of
+    `again` (run id -> that message) word for word; '' (refused as sent) when none is dropped, nothing is
+    left, or a sentence left still names such a run as 'run N' (it may carry new facts about it)."""
     import re
     said = set()
     for m in set(again.values()):
@@ -176,12 +176,12 @@ def _new_part(db, text: str, again: dict[int, int]) -> str:
     keep, dropped = [], False
     for i in range(0, len(parts), 2):
         s = parts[i]
-        if s.strip() and (named.search(s) or " ".join(s.split()).lower() in said):
+        if s.strip() and " ".join(s.split()).lower() in said:
             dropped = True
             continue
         keep += [s, parts[i + 1] if i + 1 < len(parts) else ""]
     rest = "".join(keep).strip()
-    return rest if dropped and re.search(r"\w", rest) else ""
+    return rest if dropped and re.search(r"\w", rest) and not named.search(rest) else ""
 
 
 def record_cites(db, chat, runs: list[int], message: int) -> None:

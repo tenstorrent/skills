@@ -2,12 +2,12 @@
 
 Each open promise, order or claim (obligations.py) keeps its `misses` (a due that passed with nothing
 delivered) and `moves` (each later due, with the plan change or the user's message behind it). At
-action apply, a due move on an obligation whose current due has passed is refused unless the same batch
-changes the plan on its critical path (plan_change): a task_add naming it or continuing an owner, a
+action apply, a due move on an obligation whose current due has passed counts as re-planned when the
+same batch changes the plan on its critical path (plan_change): a task_add naming it or continuing an owner, a
 task_update of an owner changing priority, resources, depends_on, status or spec, an owner attached, a
 config_set on a key the obligation or its owners name (the bottleneck), or a `justify` naming what
 changed. A move with none is applied as sent but never hidden (bare_move): its chat's digest says the
-promise was missed and moved, and the daily review counts it. A move citing the user's own message, sent in its chat after its due was set, is never refused. A reply giving a new time in the chat of
+promise was missed and moved, and the daily review counts it. A move citing the user's own message, sent in its chat after its due was set, is the user's move. A reply giving a new time in the chat of
 a missed promise with no plan change is flagged (flag_reply). A second miss makes the overdue item a
 must-act re-plan (REPLAN_TEXT). audit_line is the daily review's metric. Model-free throughout, and the
 same for session and stateless coordinators on every provider: all of it runs in coordinator.apply and
