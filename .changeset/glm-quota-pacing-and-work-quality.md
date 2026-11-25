@@ -1,0 +1,5 @@
+---
+"tt-project": patch
+---
+
+`tt-project`: a run or coordinator rollback of a release flag rolls back only its own project and never freezes the flag; one whose reason is an endpoint outage, quota, rate limit or unreachable endpoint is refused, since per-run fallback already covers it. GLM use is quota-aware (`providers.chat.quota`): the bridge counts the endpoint's tokens per window and syncs a quota 429's numbers (kept in the run's exit record and shown in `ttp status` and the web app), and while use runs ahead of an even spread over the window, low-priority, review, plan, question, coordinator and `conclusion:` runs start on the core provider with the fallback model. GLM code runs bounce less: the guard no longer refuses a bare `/dev` redirect, a `mktemp` entry, `env -i` before a plain program, `rm` of nothing, `git push --dry-run`, the run's own worktree by a linked path or an expansion in a reader-only line, and a soft refusal never replaces a done hand-off; broker and host smoke jobs and specs that push to an outside branch stay on core; a GLM code hand-off whose added tests touch the real `/tmp` or home folder is sent back.
