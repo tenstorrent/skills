@@ -3,6 +3,7 @@
 The coordinator's `config_set` writes only the keys below; any other key is refused with a reason.
 Check a key, and a value, without setting it: `ttp config --chat-settable KEY [VALUE]` (exit 0 accepted, 1 refused, the reason printed).
 `ttp config --chat-settable list` prints every accepted key.
+Any other known key is applied as `ttp config` applies it (with its checks) by a coordinator with full tools, and `--chat-settable` reports it accepted; `budget.*`, the push grants and `machines.allowed` stay the user's own.
 Check each key this way before telling the user a setting is being applied: a key the runtime reads may still be refused from chat.
 
 Besides the fixed list (budget, notify, delivery, review, coordinator and a few provider switches), these provider keys are accepted on the user's word:

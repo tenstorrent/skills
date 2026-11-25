@@ -59,3 +59,69 @@ def test_actionforms_clock_times_and_local_dates_apply_and_pass_the_dry_run(env)
     day = datetime.fromtimestamp(now + 3 * 86400, ZoneInfo("America/Los_Angeles")).strftime("%Y-%m-%d")
     assert obligations._when(f"{day} 13:00", "o755 due", p) == \
         datetime.fromisoformat(f"{day}T13:00").replace(tzinfo=ZoneInfo("America/Los_Angeles")).timestamp()
+
+
+def test_actionforms_malformed_fields_get_a_plain_reason_in_apply_and_the_dry_run(env):
+    """Regression for 'task_update: not enough values to unpack (expected 2, got 1)' and 'reply: KeyError: text':
+    a field with no clear meaning is refused with a plain reason by apply and by the dry run alike, never with
+    exception text; an id written '#12' applies as meant."""
+    from ttp import coordinator as coord, coordprecheck
+    p = make(env)
+    t = p.db.add_task("queued one")
+    for bad, why in (({"type": "task_update", "id": "x", "priority": 2}, "needs `id`: a task number"),
+                     ({"type": "task_update", "id": t, "priority": "high"}, "`priority` must be a whole number"),
+                     ({"type": "task_add", "title": "t", "kind": "work", "spec": ["a", "b"]}, "`spec` must be text"),
+                     ({"type": "reply", "chat": "c1"}, "needs `text`"),
+                     ({"type": "reply", "chat": "c1", "text": ""}, "needs `text`")):
+        probs = coordprecheck.problems(p, [bad])
+        assert len(probs) == 1 and why in probs[0][1], (bad, probs)
+        out = coord.apply(p, [bad])
+        assert len(out) == 1 and why in out[0] and "internal harness error" not in out[0], (bad, out)
+    assert coord.apply(p, [{"type": "task_update", "id": f"#{t}", "priority": 2}]) == []
+    assert p.db.task(t)["priority"] == 2
+
+
+def test_actionforms_start_after_in_a_foreign_zone_is_refused_alike_by_apply_and_the_dry_run(env):
+    """Regression: the dry run passed a start_after of '19:20 PST' under a UTC home zone that apply refused
+    ('zone PST is not the home zone's'); both now read it with the home zone, on task_add and task_update."""
+    from ttp import coordinator as coord, coordprecheck
+    p = make(env)
+    p.set_config("home_timezone", "UTC")
+    t = p.db.add_task("queued one")
+    for a in ({"type": "task_add", "title": "later run", "kind": "work", "spec": "run it",
+               "start_after": "19:20 PST", "why": "after the window"},
+              {"type": "task_update", "id": t, "start_after": "19:20 PST", "why": "after the window"}):
+        probs = coordprecheck.problems(p, [a])
+        out = coord.apply(p, [a])
+        assert len(probs) == 1 and len(out) == 1 and "PST" in probs[0][1] and "PST" in out[0], (a, probs, out)
+        assert probs[0][1].split(": ", 1)[-1] in out[0], (probs, out)
+    assert not p.db.one("SELECT id FROM tasks WHERE title='later run'") and not p.db.task(t)["not_before"]
+
+
+def test_actionforms_a_type_that_is_not_text_is_refused_plainly(env):
+    """Regression for a TypeError in normalise on `type: ["x"]`: the forms skip it, the dry run does not
+    raise, and apply refuses it with a plain reason."""
+    from ttp import actionforms, coordinator as coord, coordprecheck
+    p = make(env)
+    sent = [{"type": ["task_update"], "id": 1}]
+    assert actionforms.normalise(p, sent, home="UTC", now=time.time()) == (sent, [])
+    coordprecheck.problems(p, sent)
+    out = coord.apply(p, sent)
+    assert len(out) == 1 and "internal harness error" not in out[0], out
+
+
+def test_actionforms_rewrites_are_tallied_once_per_applied_batch(env):
+    """A batch cut off before it finished and applied again is tallied once, not twice; a rewritten action
+    that is then refused is not counted as normalised."""
+    from ttp import coordinator as coord, rejtally
+    p = make(env)
+    sent = _af_blocked(p)
+
+    def cut(i):
+        raise KeyboardInterrupt
+    with pytest.raises(KeyboardInterrupt):
+        coord.apply(p, sent, on_action=cut)
+    assert not p.db.kv(rejtally.KEY)
+    assert coord.apply(p, sent) == []
+    (day,) = p.db.kv(rejtally.KEY).values()
+    assert day == {rejtally.NORMALISED: [0, 1]}

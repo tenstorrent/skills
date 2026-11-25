@@ -35,7 +35,8 @@ def normalise(p, actions: list, *, home: str, now: float) -> tuple[list, list[st
         return actions, []
     out, notes = [], []
     for i, a in enumerate(actions):
-        for mod in FORMS.get(a.get("type"), ()) if isinstance(a, dict) else ():
+        # a type that is not text (a list, say) has no form: apply refuses it with its own reason
+        for mod in FORMS.get(a.get("type"), ()) if isinstance(a, dict) and isinstance(a.get("type"), str) else ():
             try:
                 got = importlib.import_module(f".{mod}", __package__).normal_form(p, dict(a), actions, home, now)
             except Exception:

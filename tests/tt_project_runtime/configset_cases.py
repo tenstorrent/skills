@@ -734,3 +734,19 @@ def test_cfgshell_a_key_the_coordinator_sets_in_its_shell_applies_as_ttp_config_
     probs = coord.apply(p, [{"type": "config_set", "key": "route.code_sonnet", "value": False}])
     assert len(probs) == 1 and "in its own shell" in probs[0], probs
     assert p.raw_config() == before
+
+
+def test_cfgshell_chat_settable_reports_the_keys_config_set_applies_as_ttp_config(env, capsys, monkeypatch):
+    """`ttp config --chat-settable KEY` refused keys that config_set applies through `ttp config`; it now
+    reports them accepted (with the value checked as `ttp config` checks it), while push grants,
+    machines.allowed, budget.* and their parents stay refused."""
+    from ttp import cli
+    p = make(env)
+    monkeypatch.setenv("TTP_PROJECT", str(p.root))
+    cli.cmd_chat_settable("waiting.poll_s", "120")
+    out = capsys.readouterr().out
+    assert out.startswith("waiting.poll_s: accepted as 120") and "applied as `ttp config`" in out, out
+    for key in ("machines.allowed", "machines", "delivery.push_allowed", "budget.hourly_alarm_x"):
+        with pytest.raises(SystemExit) as e:
+            cli.cmd_chat_settable(key, None)
+        assert e.value.code == 1 and "refused" in capsys.readouterr().out, key

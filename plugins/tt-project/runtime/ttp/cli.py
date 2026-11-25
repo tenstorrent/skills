@@ -13477,13 +13477,20 @@ def cmd_chat_settable(key: str, value: str | None) -> None:
     value, checked as config_set checks it), without setting anything; `list` prints every accepted key.
     Exit 0 when accepted, 1 when refused."""
     from . import chatset
-    from .coordinator import USER_SETTABLE, settable
+    from .coordinator import ALIASES, USER_SETTABLE, ShellKey, settable, shell_settable
     if key == "list":
         from . import accountset
         print("\n".join([*sorted([*USER_SETTABLE, *accountset.KEYS]), *chatset.PATTERNS]))
         return
+    shell = ""
     try:
-        conv = settable(key)
+        try:
+            conv = settable(key)
+        except ShellKey:   # config_set applies it as `ttp config` does (coordinator.apply), with its checks
+            if not shell_settable(ALIASES.get(key, key)):
+                raise
+            p, shell = here(), " (applied as `ttp config` applies it, by a coordinator with full tools)"
+            conv = (lambda v: config_value(p, ALIASES.get(key, key), v)) if p else (lambda v: v)
         if value is not None:
             try:
                 val = json.loads(value)
@@ -13493,7 +13500,7 @@ def cmd_chat_settable(key: str, value: str | None) -> None:
     except (ValueError, TypeError) as e:
         print(f"refused: {e}" if str(e).startswith(key) else f"{key}: refused: {e}")
         sys.exit(1)
-    print(f"{key}: accepted" + (f" as {json.dumps(val)}" if value is not None else ""))
+    print(f"{key}: accepted" + (f" as {json.dumps(val)}" if value is not None else "") + shell)
 
 
 def cmd_config(a) -> None:

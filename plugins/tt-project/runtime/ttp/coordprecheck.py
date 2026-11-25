@@ -65,7 +65,7 @@ def problems(p, actions: list, wakes: list | None = None) -> list[tuple[int, str
         if not isinstance(raw, dict):
             continue
         try:
-            a = normalize_action(raw)
+            a = coord.plain_fields(normalize_action(raw))
         except ValueError as e:
             out.append((i, str(e)))
             continue
@@ -95,6 +95,8 @@ def problems(p, actions: list, wakes: list | None = None) -> list[tuple[int, str
                     if a.get("start_after") is not None or a.get("start_when") is not None:
                         raise ValueError(f"task #{tid} is {task['status']}: only a task that has not started "
                                          f"can be deferred; add a new one with start_after/start_when")
+                if a.get("start_after") is not None:   # as apply parses it (_start_args)
+                    coord.parse_start_after(a["start_after"], tz=home)
                 deps = dependency_ids(task)
                 new_status = status if status in REQUEUE else task["status"]
                 if a.get("depends_on") is not None:
@@ -122,6 +124,8 @@ def problems(p, actions: list, wakes: list | None = None) -> list[tuple[int, str
                        if states.get(r["id"]) not in TERMINAL_TASK_STATES]
                 if dup and str(dup[0]) != str(a.get("continues")):
                     raise ValueError(f"duplicate of open task #{dup[0]}")
+                if a.get("start_after") is not None:   # as apply parses it (_start_args)
+                    coord.parse_start_after(a["start_after"], tz=home)
                 deps = coord._new_dependencies(db, None, a.get("depends_on") or [])
                 if a.get("continues") is not None:
                     try:

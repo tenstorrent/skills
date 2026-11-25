@@ -614,6 +614,14 @@ def settable(key: str):
 class ShellKey(ValueError):
     """settable's refusal of a known key that is not the user's alone: the coordinator sets it by `ttp config`."""
 
+
+def shell_settable(key: str) -> bool:
+    """Whether a config_set of a ShellKey `key` is applied as `ttp config` applies it: not a spend setting
+    (budget), push permission (grants) or the machine allowlist, nor a parent of one: those are the user's."""
+    from . import grants
+    return key.split(".")[0] != "budget" and not any(
+        k == key or k.startswith(key + ".") for k in (*grants.KEYS, "machines.allowed"))
+
 CHARTER_HISTORY = ends.CHARTER_HISTORY   # harness file: charter sections replaced or retired
 # kv: [{"id", "messages", "ask", "section", "quote", "replaces", "candidates", "text", "sha", "ts",
 #       "failed", "used"}]: charter changes made in the user's turn that failed to apply. A later
@@ -2878,6 +2886,33 @@ def untrusted_write_event(db, task: int, moved: str) -> None:
           "handled", task))
 
 
+def plain_fields(a: dict) -> dict:
+    """The action with the field types apply relies on checked first, so a malformed field gets a plain
+    refusal, never an internal error: a task_update's `id` is a task number (`#12` is read as 12), a
+    task_add or task_update's `priority` a whole number and `spec` text, a reply's `text` non-empty text.
+    coordprecheck.problems runs the same check, so the dry run refuses what apply refuses."""
+    t = a.get("type")
+    if t == "task_update":
+        tid = str(a.get("id") if a.get("id") is not None else "").strip().lstrip("#")
+        if not tid.isdigit():
+            raise ValueError(f"needs `id`: a task number such as 12, not {clip(str(a.get('id')), 40)!r}")
+        a = {**a, "id": int(tid)}
+    if t in ("task_add", "task_update"):
+        if a.get("priority") is not None:
+            try:
+                if int(a["priority"]) != float(a["priority"]):
+                    raise ValueError
+            except (TypeError, ValueError):
+                raise ValueError(f"`priority` must be a whole number 1-5, not "
+                                 f"{clip(str(a['priority']), 40)!r}") from None
+        if a.get("spec") is not None and not isinstance(a["spec"], str):
+            raise ValueError(f"`spec` must be text (one string, lines joined with newlines), "
+                             f"not a {type(a['spec']).__name__}")
+    if t == "reply" and not (isinstance(a.get("text"), str) and a["text"].strip()):
+        raise ValueError("needs `text`: the words to post, as non-empty text")
+    return a
+
+
 def apply(p: Project, actions: list[dict], default_chat: str | None = None, user_turn: bool = False,
           turn: int | None = None, messages: list[int] | None = None, lean: bool = False,
           applied: list | None = None, skip_actions: frozenset | set = frozenset(),
@@ -2900,9 +2935,9 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
     timeouts)."""
     db, problems, notes = p.db, [], []
     cfg = p.config()
+    as_sent = actions
     try:   # a form with one clear meaning is applied as meant, not refused (actionforms)
         actions, notes = actionforms.normalise(p, actions, home=timefmt.home(p), now=time.time())
-        rejtally.record(db, [], [], normalised=notes)
     except Exception as e:
         notes = [f"action forms not checked: {type(e).__name__}: {str(e)[:200]}"]
     # For the stale-restriction check (_restriction_conflicts): the restrictions before this turn's
@@ -2928,7 +2963,7 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
     # charter_update so a task added or updated in this turn reads the new charter.
     # The index stays the original one so replay keys do not change.
     first = {"config_set": 0, "charter_update": 1}
-    order = sorted(enumerate(actions), key=lambda ia: first.get((ia[1] or {}).get("type"), 2))
+    order = sorted(enumerate(actions), key=lambda ia: first.get(str((ia[1] or {}).get("type")), 2))
     announced = charterpromise.announcing(actions)   # named in a refused charter_update's charter_retry
     turn_asks: list[tuple[int, int]] = []   # (position in order, ask id) of this turn's asks, for `waits_on ask:new`
     new_ask_holds: list[tuple[int, dict, dict]] = []   # (position, task before, update) waiting for a later ask
@@ -2959,7 +2994,7 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
         wrote_before = getattr(getattr(db, "conn", None), "total_changes", None)
         out = ""   # where a reply went once it left: a later fault then never asks for it again
         try:
-            a = normalize_action(a)
+            a = plain_fields(normalize_action(a))
             if t == "reply":
                 if why := msgparts.too_long(a["text"], "reply"):
                     raise ValueError(why)
@@ -4346,9 +4381,8 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                     # applies it (its checks, its JSON reading of a text value), unless the coordinator has no shell
                     # (read_only), or the key is a spend setting (budget), push permission (grants) or the machine
                     # allowlist, or a parent of one: those are the user's.
-                    from . import cli, grants
-                    if coordtools.tools_mode(cfg) != "full" or key.split(".")[0] == "budget" or any(
-                            k == key or k.startswith(key + ".") for k in (*grants.KEYS, "machines.allowed")):
+                    from . import cli
+                    if coordtools.tools_mode(cfg) != "full" or not shell_settable(key):
                         raise
 
                     def conv(v, key=key):
@@ -4694,6 +4728,12 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                          p.config(), turn=turn)
     except Exception as e:
         notes.append(f"plain-reply check not recorded: {type(e).__name__}: {str(e)[:200]}")
+    try:   # tallied once the batch has applied, its rewrites that went through only: a batch applied
+        # again after a cut-off is not counted twice
+        rejtally.record(db, [], [], normalised=[i for i, (x, y) in enumerate(zip(as_sent, actions))
+                                                if x is not y and i not in failed])
+    except Exception as e:
+        notes.append(f"normalised forms not tallied: {type(e).__name__}: {str(e)[:200]}")
     db.set_kv(NOTES_KEY, notes)
     # Rejections go back to the coordinator in its next digest, never into the user's chat: a reply
     # already sent is corrected there by the coordinator itself, only when it told the user otherwise.
