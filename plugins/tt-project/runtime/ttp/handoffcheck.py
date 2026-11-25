@@ -198,11 +198,9 @@ def _glm_run(p: Project, task: dict) -> bool:
     return bool(r) and glmshare.on_glm(r["provider"], r["model"], r["note"])
 
 
-def builtin_applies(task: dict, handoff, role: str = "worker") -> bool:
-    """Whether the built-in check looks at this hand-off: a finished one (STATUSES) of a code task, made
-    by the run whose change it reports (a worker's, never the review that judges it)."""
-    return role == "worker" and task.get("kind") == "code" and isinstance(handoff, dict) \
-        and handoff.get("status") in STATUSES
+def builtin_applies(task: dict, handoff) -> bool:
+    """Whether the built-in check looks at this hand-off: a finished one (STATUSES) of a code task."""
+    return task.get("kind") == "code" and isinstance(handoff, dict) and handoff.get("status") in STATUSES
 
 
 def _branch_diff(p: Project, task: dict):
@@ -226,11 +224,11 @@ def _branch_diff(p: Project, task: dict):
         return None
 
 
-def builtin_check(p: Project, task: dict, handoff, role: str = "worker") -> dict | None:
+def builtin_check(p: Project, task: dict, handoff) -> dict | None:
     """The built-in check's failure ({name, output}) on a code task's hand-off: glm_test_hygiene, slop.new_noisy
     and handoff_gaps on a GLM run's branch diff, else only its new tests' base-failing run line (new_test_gap).
     None when it passes, does not apply or git cannot tell."""
-    if not builtin_applies(task, handoff, role):
+    if not builtin_applies(task, handoff):
         return None
     got = _branch_diff(p, task)
     if got is None:
@@ -307,11 +305,11 @@ def _run_one(p: Project, check: dict, task: dict, path: Path,
 
 
 def run(p: Project, cfg: dict, task: dict, handoff, run_dir: Path | None, deadline: float | None = None,
-        base_env: dict | None = None, role: str = "worker") -> dict:
+        base_env: dict | None = None) -> dict:
     """Runs builtin_check, then the checks that apply, in order, up to the first that fails. {"failed": {name, output} or
     None, "broken": [{name, run, why, output}]}; {} when none apply. By `deadline` (time.monotonic)
     each check's timeout is cut to the time left, and none starts after it."""
-    if bad := builtin_check(p, task, handoff, role):
+    if bad := builtin_check(p, task, handoff):
         return {"failed": bad, "broken": []}
     checks = applies(cfg, task, handoff)
     if not checks:
@@ -336,25 +334,25 @@ def run(p: Project, cfg: dict, task: dict, handoff, run_dir: Path | None, deadli
     return got
 
 
-def prefetch(p: Project, cfg: dict, task: dict, handoff, run_dir: Path | None, role: str = "worker") -> None:
+def prefetch(p: Project, cfg: dict, task: dict, handoff, run_dir: Path | None) -> None:
     """Runs the checks before the transaction that records `task`'s hand-off; verdict reads it."""
-    if not applies(cfg, task, handoff) and not builtin_applies(task, handoff, role):
+    if not applies(cfg, task, handoff) and not builtin_applies(task, handoff):
         return
     now = time.time()
     for k in [k for k, (until, _) in _seen.items() if until <= now]:
         _seen.pop(k, None)
-    got = run(p, cfg, task, handoff, run_dir, role=role)   # expiry counts from the answer, however long
+    got = run(p, cfg, task, handoff, run_dir)   # its expiry counts from the answer, however long the checks took
     _seen[(str(p.root), int(task["id"]), _digest(handoff))] = (time.time() + SEEN_TTL_S, got)
 
 
-def verdict(p: Project, cfg: dict, task: dict, handoff, run_dir: Path | None, role: str = "worker") -> dict:
+def verdict(p: Project, cfg: dict, task: dict, handoff, run_dir: Path | None) -> dict:
     """prefetch's answer for this hand-off, else the checks run now; {} when none apply."""
-    if not applies(cfg, task, handoff) and not builtin_applies(task, handoff, role):
+    if not applies(cfg, task, handoff) and not builtin_applies(task, handoff):
         return {}
     hit = _seen.pop((str(p.root), int(task["id"]), _digest(handoff)), None)
     if hit and hit[0] > time.time():
         return hit[1]
-    return run(p, cfg, task, handoff, run_dir, role=role)
+    return run(p, cfg, task, handoff, run_dir)
 
 
 def stop_sendbacks(run_dir: Path | None) -> int:
@@ -384,12 +382,11 @@ def at_stop(run_dir: Path) -> str | None:
         return None
     cfg = p.config()
     task = p.db.task(int(os.environ["TTP_TASK"]))
-    role = os.environ.get("TTP_ROLE", "worker")
-    if not task or not (applies(cfg, task, handoff) or builtin_applies(task, handoff, role)):
+    if not task or not (applies(cfg, task, handoff) or builtin_applies(task, handoff)):
         return None
     env = {k: v for k, v in os.environ.items() if k not in RUN_VARS}
     env[AT_ENV] = "stop"
-    bad = run(p, cfg, task, handoff, run_dir, time.monotonic() + STOP_BUDGET_S, env, role=role).get("failed")
+    bad = run(p, cfg, task, handoff, run_dir, time.monotonic() + STOP_BUDGET_S, env).get("failed")
     if not bad:
         return None
     durable_write(run_dir / STOP_FILE, str(stops + 1))
