@@ -1173,7 +1173,8 @@ def test_glmharness_writes_a_guarded_mini_run_with_the_prompt_on_stdin_and_the_b
     rd.mkdir()
     (rd / "prompt.md").write_text("do the task")
     (rd / "system.md").write_text("You are a worker.")
-    spec = {"argv": ["claude"], "stdin": "{json}", "model": "example-org/code-model", "budget_usd": None}
+    spec = {"argv": ["claude"], "stdin": "{json}", "model": "example-org/code-model", "budget_usd": None,
+            "bridge": {"endpoint": "placeholder"}}
     inst = {"kind": "mini-swe-agent", "version": "2.4.6", "bin": "/opt/harness/bin/mini"}
     got = glmharness.apply(spec, rd, {}, "/opt/rt", budget_usd=3.0, install_fn=lambda v: inst)
     assert got == "" and spec["argv"][0] == "/bin/sh" and "stdin" not in spec
@@ -1198,12 +1199,12 @@ def test_a_glm_run_gets_a_batched_task_message_in_place_of_minis_step_by_step_on
     rd = tmp_path / "run"
     rd.mkdir()
     (rd / "prompt.md").write_text("do the task")
-    glmharness.apply({"model": "m"}, rd, {}, "/opt/rt", install_fn=lambda v: inst)
+    glmharness.apply({"model": "m", "bridge": {"endpoint": "e"}}, rd, {}, "/opt/rt", install_fn=lambda v: inst)
     t = template(rd)
     assert t is not None and t.startswith("{{task}}") and t.count("{{") == 1   # mini renders it with jinja
     assert "Batch" in t and glmharness.SUBMIT in t and "reproduce script" in t
     off = {"route": {"code_sonnet": {"glm": {"batch_steps": False}}}}
-    glmharness.apply({"model": "m"}, rd, off, "/opt/rt", install_fn=lambda v: inst)
+    glmharness.apply({"model": "m", "bridge": {"endpoint": "e"}}, rd, off, "/opt/rt", install_fn=lambda v: inst)
     assert template(rd) is None and "step_limit: 0" in (rd / "mini.yaml").read_text()
 
 
@@ -1213,7 +1214,7 @@ def test_a_harness_that_cannot_be_installed_hands_the_task_back_to_opus_not_a_fa
     rd = tmp_path / "run"
     rd.mkdir()
     (rd / "prompt.md").write_text("x")
-    spec = {"argv": ["claude"], "model": "m"}
+    spec = {"argv": ["claude"], "model": "m", "bridge": {"endpoint": "e"}}
 
     def boom(v):
         raise RuntimeError("pip is not available")
@@ -1255,6 +1256,107 @@ def test_the_daemon_wires_the_live_harness_in_and_the_runner_costs_it():
     assert "glmharness.apply(spec" in src and "codearm.harness(self.cfg) == glmharness.HARNESS" in src
     rsrc = inspect.getsource(runner)
     assert "glmharness.cost_so_far" in rsrc and "glmharness.write_result" in rsrc
+
+
+def test_glmfb_a_spec_with_no_bridge_endpoint_keeps_its_own_harness(tmp_path):
+    from ttp import glmharness
+    rd = tmp_path / "run"
+    rd.mkdir()
+    (rd / "prompt.md").write_text("do the task")
+    for spec in ({"argv": ["claude", "-p"], "stdin": "input.jsonl", "model": "sonnet"},   # fell back to core
+                 {"argv": ["claude", "-p"], "model": "m", "bridge": {"endpoint": ""}}):   # no endpoint set
+        was = json.loads(json.dumps(spec))
+        assert glmharness.apply(spec, rd, {}, "/opt/rt", install_fn=lambda v: 1 / 0) == "" and spec == was
+    assert sorted(x.name for x in rd.iterdir()) == ["prompt.md"]
+
+
+def _glmfb_project(env, chat=None):
+    """A project whose glm_code arm runs every code task on mini-swe-agent; `chat`: its providers.chat."""
+    from ttp import configwho, policyfiles
+    p = make(env)
+    (p.harness / policyfiles.FILE).write_text("src/policy_module.py\n")   # a live arm needs the project's policy list
+    p.set_config("core_provider", "claude")
+    cfg, user = _ca_cfg(glm={**_CA_GLM, "harness": "mini-swe-agent"}), configwho.by("user", via="cli")
+    p.set_config("providers.chat", cfg["providers"]["chat"] if chat is None else chat, by=user)
+    p.set_config("route.code_sonnet", cfg["route"]["code_sonnet"], by=user)
+    return p
+
+
+def _glmfb_launch(env, monkeypatch, chat=None, cool=""):
+    """Dispatch one arm task through the real start_run, no runner started (`cool`: the chat endpoint's
+    cool-down); returns (its run row, its run.json)."""
+    from ttp import budget as bud
+    from ttp import daemon as dmod
+    from ttp import glmharness
+    p = _glmfb_project(env, chat)
+    if cool:
+        monkeypatch.setattr(dmod.route, "cooling", lambda db, name, now: cool)
+
+    class Proc:   # never a real runner
+        pid = 4242
+    real = subprocess.Popen
+    monkeypatch.setattr(dmod.subprocess, "Popen",
+                        lambda argv, *a, **k: Proc() if "ttp.runner" in argv else real(argv, *a, **k))
+    monkeypatch.setattr(glmharness, "install", lambda version="", root=None: {
+        "kind": "mini-swe-agent", "version": "2.4.6", "bin": "/opt/harness/bin/mini"})
+    d = dmod.Daemon(p.base)
+    monkeypatch.setattr(d, "_workdir_for", lambda t: (str(p.root), None))
+    for prov in ("claude", "chat"):
+        d.gates[prov] = bud.Gate(prov, regime="windows", max_parallel=6)
+    tid = _ca_task(p)["id"]
+    d.dispatch()
+    run = p.db.one("SELECT * FROM runs WHERE task=? AND role='worker'", (tid,))
+    return run, json.loads((p.runs / str(run["id"]) / "run.json").read_text())
+
+
+@_pytest.mark.parametrize("case", ["rate_limit", "quota", "no endpoint"])
+def test_glmfb_a_glm_code_run_the_endpoint_cannot_take_starts_on_the_claude_cli_not_mini(env, monkeypatch, case):
+    """The arm (on mini-swe-agent) takes a code task while the chat endpoint is limited, out of quota or has no
+    endpoint set: its run starts on the claude CLI, never on mini with no model to call (litellm's
+    "Missing credentials", or exec failing on a prompt past the argument limit)."""
+    from ttp import codearm
+    run, spec = _glmfb_launch(env, monkeypatch, cool="" if case == "no endpoint" else case,
+                              chat={"base_url": "https://chat.example.invalid/v1"} if case == "no endpoint" else None)
+    assert json.loads(run["note"])[codearm.KEY]["run"] == "glm", "the arm took it"
+    assert pathlib.Path(spec["argv"][0]).name == "claude" and "harness" not in spec and not spec.get("openai_env")
+    assert not (pathlib.Path(run["dir"]) / "harness.sh").exists()
+    if case != "no endpoint":
+        assert run["provider"] == spec["provider"] == "claude" and "sonnet" in spec["model"] and "bridge" not in spec
+    else:   # the CLI on the chat bridge, which refuses to start: a free fallback (the test below)
+        assert run["provider"] == "chat" and spec["bridge"]["endpoint"] == ""
+
+
+def test_glmfb_a_glm_code_run_the_endpoint_can_take_still_starts_on_mini_over_the_bridge(env, monkeypatch):
+    run, spec = _glmfb_launch(env, monkeypatch)
+    assert run["provider"] == spec["provider"] == "chat" and spec["bridge"]["endpoint"] == "placeholder"
+    assert spec["argv"] == ["/bin/sh", str(pathlib.Path(run["dir"]) / "harness.sh")] and spec["openai_env"] is True
+    assert spec["harness"] == {"kind": "mini-swe-agent", "version": "2.4.6"}
+
+
+@_pytest.mark.parametrize("exit_info,cause", [
+    ({"rc": 1}, "failed"),   # mini exits before its first step (litellm: "Missing credentials"), handing off nothing
+    ({"rc": None, "launched": False,
+      "launch_error": "could not start the agent: chat bridge: providers.chat.endpoint is not set"}, "error"),
+])
+def test_glmfb_a_mini_run_that_fails_at_start_without_endpoint_credentials_is_a_free_route_fallback(
+        env, monkeypatch, exit_info, cause):
+    """Such a start failure is the route's existing fallback end (daemon.FREE_ENDS): requeued at its tier with no
+    attempt spent, and its next run starts on the core provider."""
+    from ttp import codearm, daemon, policyfiles, route
+    p = _glmfb_project(env)
+    (p.harness / policyfiles.FILE).unlink()   # no policy check: it would bounce this task, which has no branch here
+    d = daemon.Daemon(p.base)
+    monkeypatch.setattr(d, "observe", lambda *a, **k: None)
+    tid = _ca_task(p)["id"]
+    routed = {"tier": "standard", "to": "chat", "model": _CA_GLM["model"], "fallback": "none", codearm.KEY: "glm"}
+    run, task = _route_finish(p, d, tid, {**exit_info, "bridge": {"last_fault": "", "faults": {}}}, routed=routed)
+    assert run["status"] == "fallback" and run["status"] in daemon.FREE_ENDS
+    assert task["status"] == "queued" and int(task["attempts"] or 0) == 0 and task["tier"] == "standard"
+    assert route.of(run["note"])["fallback"] == cause
+    if cause == "error":   # the endpoint cools: other tasks start on core too
+        assert route.cooling(p.db, "chat", time.time()) == "error"
+    else:
+        assert route.fell_back_before(p.db, tid) == run["id"]
 
 
 def test_config_and_doctor_say_why_a_live_share_on_claude_code_is_zero():

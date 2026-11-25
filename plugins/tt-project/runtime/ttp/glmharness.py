@@ -125,8 +125,12 @@ def wanted(cfg: dict) -> str:
 
 def apply(spec: dict, run_dir: Path, cfg: dict, runtime_dir: str, budget_usd=None, install_fn=None) -> str:
     """Make `spec` (a GLM-arm worker's run spec, already written as prompt.md) a mini-swe-agent run; '' on
-    success, else why the harness is unavailable (the run is then ended as a hand-back to Opus)."""
+    success, else why the harness is unavailable (the run is then ended as a hand-back to Opus). mini's only
+    model is the chat bridge's endpoint: a spec without one (its route fell back to the core provider on a
+    limit, quota or hold, or no endpoint is set) keeps its provider's own harness, also ''."""
     from . import glmguard
+    if not (spec.get("bridge") or {}).get("endpoint"):
+        return ""
     run_dir = Path(run_dir)
     try:
         inst = (install_fn or install)(wanted(cfg))
