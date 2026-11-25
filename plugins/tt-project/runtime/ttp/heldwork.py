@@ -28,6 +28,7 @@ from typing import Iterable
 from . import project
 
 PROBE_TIMEOUT_S = 10.0    # a live probe runs at most this long (ends.probe_once)
+PROBE_TEXT_CHARS = 200    # the probe output kept, one line
 SSH_G_S = 5.0              # `ssh -G <alias>` (read-only) is bounded by this
 UNVERIFIED = "unverified: owner {owner} must confirm"
 
@@ -301,7 +302,7 @@ def _run_probe(owner: str, probe: str) -> str:
     rc, out = ends.probe_once(project.Project(base), probe, PROBE_TIMEOUT_S)
     if isinstance(rc, str):   # cannot run or timed out: never a confirmation either way
         return _unverified(owner)
-    return " ".join(out.split())[:200] or f"exit {rc}"
+    return " ".join(out.split())[:PROBE_TEXT_CHARS] or f"exit {rc}"
 
 
 def _config(owner: str) -> dict:
