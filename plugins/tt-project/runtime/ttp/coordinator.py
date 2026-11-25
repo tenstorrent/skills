@@ -4077,13 +4077,14 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                             p.charter_path.read_text(), section, text, excepts,
                             "" if verbatim and not unsourced else unsourced or (
                                 "a Brief or harness-gate source is not the user's words" if a.get("source")
-                                else restriction_source.NO_SOURCE), end, said, ordered_scope, machine_ledger.configured_names(cfg or {}))
+                                else restriction_source.NO_SOURCE), end, said, ordered_scope,
+                            tuple(machine_ledger.configured_names(cfg or {})))
                         notes.append(overlap)
                     elif text and not (replaces or a.get("both_hold") or refused):
                         # the user's verbatim words (or agent-ordered) behind a lift: the harness fixes its form
                         fixed, why_not = (_repair_lift(p, section, text, end,
                                                        _verbatim_said(db, cite, agent, a.get("source")), ordered_scope,
-                                                       machine_ledger.configured_names(cfg or {}))
+                                                       tuple(machine_ledger.configured_names(cfg or {})))
                                           if not (quote or unsourced) and re.search(_SAID_CITE, cite) else ("", ""))
                         if fixed:
                             text, overlap = fixed
@@ -7065,7 +7066,7 @@ _SAID_CITE = r"user msg #\d+|relayer-ordered|owner-record"   # cites _verbatim_s
 
 
 def _ordered_work(charter: str, text: str, names: set[str], unsaid: list[str], said: str,
-                  own: list | tuple = ()) -> str:
+                  own: tuple = ()) -> str:
     """Why an exception whose scope names `unsaid` are not in the order's words `said` is not ordered work
     that cannot hurt people, else "". Only steps that could hurt people or speak as the owner need the
     user's own words naming them: relay.HELD's classes (someone else's work or data, a shared service,
@@ -7137,7 +7138,7 @@ def _near_scope(word: str, names: set[str], text: str) -> bool:
 
 def _scoped_exception(charter: str, section: str, text: str, clause: str, sourced: str,
                       end: dict | None, said: str = "", accepted: dict | None = None,
-                      own: list | tuple = ()) -> tuple[str, str]:
+                      own: tuple = ()) -> tuple[str, str]:
     """Check a Restrictions charter_update sent with `excepts` (the clause of a standing Restrictions
     item it narrows) and return (the text to store, a note) or raise ValueError naming the clause and
     why. It passes when the clause is a standing ban; `sourced` is the user's verbatim words (a
@@ -7269,7 +7270,7 @@ def _verbatim_said(db, cite: str, agent: bool, src=None) -> str:
 
 
 def _repair_lift(p: Project, section: str, text: str, end: dict | None, said: str,
-                 accepted: dict | None = None, own: list | tuple = ()) -> tuple[tuple[str, str] | str, str]:
+                 accepted: dict | None = None, own: tuple = ()) -> tuple[tuple[str, str] | str, str]:
     """A new Restrictions `text` resting on the user's verbatim words (or the owner's agent's order in
     agent mode) that may lift a standing ban (_append_conflicts, lifts_only) goes in as a scoped
     exception to that ban (_scoped_exception, as `excepts` would) instead of being refused for its
