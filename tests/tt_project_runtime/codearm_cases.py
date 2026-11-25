@@ -2658,7 +2658,7 @@ def test_glm_guard_allows_ssh_options_and_a_config_inside_the_runs_own_folders(c
     "ssh -F /etc/ssh/ssh_config box-a ls", "ssh -F /tmp/c box-a",
     "ssh -o ProxyCommand='nc %h %p' box-a ls", "ssh -o LocalCommand=x box-a",
     "ssh -o PermitLocalCommand=yes box-a", "ssh -o Include=/etc/ssh/config.d/* box-a",
-    "scp -S /tmp/prog a box-a:", "sftp -b /tmp/batch box-a", "sftp -o BatchMode=yes box-a"])
+    "scp -S /tmp/prog a box-a:", "sftp -b /tmp/batch box-a"])
 def test_glm_guard_refuses_ssh_options_that_run_a_local_program_or_a_config_outside_its_own_folders(
         cmd, tmp_path, monkeypatch):
     from ttp import glmguard

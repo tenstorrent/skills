@@ -155,15 +155,17 @@ def glm_test_hygiene(diff_text: str) -> list[str]:
 
 def handoff_gaps(diff_text: str, spec: str, handoff: dict) -> list[str]:
     """What a hand-off leaves out: a run line showing the tests the diff adds fail on the base commit, and a
-    self_check naming each numbered step of the spec (the steps above its Context: block, two or more)."""
+    self_check naming each numbered step of the spec (its own steps, glmwork.goal_spec, two or more)."""
     out = []
     tests = [m.group(1) or m.group(2) for path, line in _added(diff_text) if TEST_FILE.search(path)
              for m in [NEW_TEST.match(line)] if m]
-    if tests and not BASE_FAILS.search(json.dumps(handoff)):
+    told = json.dumps({k: v for k, v in handoff.items() if k != "commits"})   # its own commit ids run nothing
+    if tests and not BASE_FAILS.search(told):
         out.append(f"New tests ({', '.join(tests[:5])}) with no line showing them fail on the base commit: run them "
                    "there and put the command and its failing result in your self_check.")
-    steps = list(dict.fromkeys(m.group(1) or m.group(2) for line in re.split(r"(?mi)^\s*Context:", spec or "")[0]
-                               .splitlines() for m in [STEP.match(line)] if m))
+    from .glmwork import goal_spec
+    steps = list(dict.fromkeys(m.group(1) or m.group(2) for line in goal_spec(spec).splitlines()
+                               for m in [STEP.match(line)] if m))
     check = handoff.get("self_check")
     check = check if isinstance(check, str) else json.dumps(check or "")
     for a, b in RANGE.findall(check.lower()):   # "(a)-(f)" names each step between
@@ -202,15 +204,15 @@ def glm_check(p: Project, task: dict, handoff) -> dict | None:
             return None
         got = subprocess.run(["git", "-C", str(root), "diff", "--no-color", "--no-ext-diff", "-U0", f"{base}...{head}"],
                              capture_output=True, text=True, timeout=DEFAULT_TIMEOUT_S)
+        if got.returncode != 0:
+            return None
+        from . import slop
+        fork = subprocess.run(["git", "-C", str(root), "merge-base", base, head], capture_output=True, text=True,
+                              timeout=DEFAULT_TIMEOUT_S).stdout.strip()
+        noisy = slop.new_noisy(root, fork or base, head)
     except (OSError, RuntimeError, subprocess.SubprocessError):   # git cannot tell: the hand-off stands
         return None
-    if got.returncode != 0:
-        return None
-    from . import slop
     bad = glm_test_hygiene(got.stdout)
-    fork = subprocess.run(["git", "-C", str(root), "merge-base", base, head], capture_output=True, text=True,
-                          timeout=DEFAULT_TIMEOUT_S).stdout.strip()
-    noisy = slop.new_noisy(root, fork or base, head)
     out = (["Tests must not touch the real machine's paths:", *bad[:20]] if bad else []) \
         + (["Comments and docstrings state the rule, never an incident (a date, id or host):",
             *(f"{n['at']}: {n['text']}" for n in noisy[:20])] if noisy else []) \

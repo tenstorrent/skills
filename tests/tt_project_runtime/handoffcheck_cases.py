@@ -656,6 +656,11 @@ def test_handoff_gaps_want_a_base_failing_run_and_each_numbered_spec_step():
     assert handoffcheck.handoff_gaps(diff, spec, {"self_check": f"{ran}. (a) done; (b) not done: no device"}) == []
     assert handoffcheck.handoff_gaps(diff, spec, {"self_check": "test_y fails on main 571cc6c8. (a)-(b) done"}) == []
     assert handoffcheck.handoff_gaps("+++ b/src/x.py\n+x = 1\n", "1. one step\n", {}) == []
+    # the spec's own steps end at a Restrictions or markdown Context heading; a commit id alone shows no run
+    for end in ("Restrictions (binding):", "**Context:**"):
+        assert handoffcheck.handoff_gaps("", f"(a) fix x\n(b) test it\n{end}\n1. never push\n2. no secrets\n",
+                                         {"self_check": "(a) done; (b) done"}) == [], end
+    assert handoffcheck.handoff_gaps(diff, "", {"commits": ["1a2b3c4d"], "summary": "no test fails"})
 
 
 def _gw9846_task(p, provider, model, branch):
