@@ -1700,6 +1700,8 @@ def _glm_run_env(monkeypatch, tmp_path, flag="1"):
     monkeypatch.setenv("TTP_RUN_DIR", str(rd))
     monkeypatch.setenv("TTP_PROJECT", str(tmp_path / "proj"))
     monkeypatch.delenv("TTP_CODE_ARM_GUARD", raising=False)
+    for var in glmguard.SCRATCH_VARS:   # a checks run's own short TMPDIR holds the test HOME: not this run's scratch
+        monkeypatch.delenv(var, raising=False)
     if flag:
         monkeypatch.setenv(glmguard.RUN_ENV, flag)
     else:
