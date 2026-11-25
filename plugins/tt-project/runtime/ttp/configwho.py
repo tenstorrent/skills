@@ -552,7 +552,7 @@ def review_lines(p, now: float | None = None) -> list[str]:
     return [line(r, p) for r in history(p, since=now - 86400) if role(r) != "user"]
 
 
-def normal_form(p, a: dict, _batch: list, _home: str, _now: float):
+def normal_form(_p, a: dict, _batch: list, _home: str, _now: float):
     """actionforms: a config_set of an unknown key that means one current key (its last part, or its section and
     last part joined by '_', under one other section; or a near spelling) is applied to that key, unless either
     key needs the user's word (coordinator.needs_users_word). None otherwise."""
