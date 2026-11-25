@@ -42,8 +42,7 @@ if [ -n "$WAIT" ]; then
 fi
 
 RO=(Read Grep Glob Agent)
-for c in ps tail head grep jq ls du stat cat find wc date sort uniq cut tr diff "git log" "git show" "git diff" \
-  "git -C * log" "git -C * show" "git -C * diff" "git blame" "git -C * blame"; do RO+=("Bash($c:*)"); done
+for c in ps tail head grep jq ls du stat cat find wc date sort uniq cut tr diff; do RO+=("Bash($c:*)"); done
 NO=(Edit Write NotebookEdit WebFetch WebSearch "Bash(tmux:*)" "Bash(kill:*)" "Bash(pkill:*)" "Bash(rm:*)"
     "Bash(mv:*)" "Bash(cp:*)" "Bash(tt-smi:*)" "Bash(find * -delete*)" "Bash(find * -exec*)" "Bash(find * -ok*)"
     "Bash(find * -fprint*)" "Bash(find * -fls*)")
@@ -56,8 +55,8 @@ should gain, change or lose. Only read; change nothing. A person reviews your an
 
 Where things are:
 - the run's notes: $BRINGUP/lessons.md (the brief asked: "When something took long to understand and is solved,
-  add a few lines to bringup/lessons.md"), its REPORT.md and doc/, and its commits (git -C $TT log; the base is
-  base_commit in $BRINGUP/agentic_evals/inputs.json when present, else the merge base with origin/main).
+  add a few lines to bringup/lessons.md"), its REPORT.md and doc/, and its commits since the base $BASE with their
+  times and files: $OUT/commits.txt (git is not available to you).
 - the transcripts: $TR. Claude Code: <session>.jsonl (records with .timestamp, .message.content), subagents in
   <session>/subagents/*.jsonl, large outputs in <session>/tool-results/. Codex: sessions/YYYY/MM/DD/rollout-*.jsonl
   (records with .timestamp, .type, .payload); keep only rollouts whose session_meta cwd is in $RUN_DIR. They are
@@ -110,9 +109,12 @@ One or two lines.
 EOF
 }
 
+BASE=$(jq -r '.base_commit // empty' "$BRINGUP/agentic_evals/inputs.json" 2>/dev/null)
+BASE=${BASE:-$(git -C "$TT" merge-base HEAD origin/main 2>/dev/null)}
 if [ -n "$DRY" ]; then prompt; echo "---"; echo "transcripts $TR; knowledge $KB; run knowledge $RKB; out $OUT"; exit 0; fi
 mkdir -p "$OUT"; err=$(mktemp)
-dirs=("$TT" "$RUN_DIR" "$TR" "$KB" "$RKB")
+git -C "$TT" log --reverse --date=format:'%F %H:%M' --format='%h %ad %s' --stat=120 "${BASE:+$BASE..}HEAD" > "$OUT/commits.txt" 2>&1
+dirs=("$TT" "$RUN_DIR" "$TR" "$KB" "$RKB" "$OUT")
 out=$(cd "$RUN_DIR" && timeout 7200 claude -p --model "$MODEL" --no-session-persistence --output-format json \
     --restricted --strict-mcp-config --disable-slash-commands --permission-mode dontAsk --permission-prompts none \
     --tools "Read,Grep,Glob,Bash,Agent" --add-dir "${dirs[@]}" --allowedTools "${RO[@]}" --disallowedTools "${NO[@]}" \
