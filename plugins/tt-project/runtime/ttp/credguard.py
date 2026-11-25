@@ -497,12 +497,12 @@ def _resolve(path: str, cwds: list[str], home: str) -> list[str] | None:
     if not re.fullmatch(r"[\w./+@%-]*", path):
         return None
     try:
-        return [_real(c, path) for c in cwds]
+        return [_realpath_in(c, path) for c in cwds]
     except (OSError, ValueError):
         return None
 
 
-def _real(folder: str, path: str) -> str:
+def _realpath_in(folder: str, path: str) -> str:
     """os.path.realpath(folder/path) for a `folder` realpath already resolved, one lstat when the path's
     first part is missing there (nothing under it can be a link): a heredoc's many words stay cheap."""
     joined = os.path.join(folder, path)

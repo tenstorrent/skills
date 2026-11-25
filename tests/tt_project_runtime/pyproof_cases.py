@@ -21,7 +21,7 @@ _PROVEN = [
 _UNPROVEN = [
     "import os; os.system('id')", "import subprocess", "__import__('os')", "eval('1')", "exec('x')",
     "import ast; ast.sys.modules", "import shlex\nprint(shlex.os)",              # a module reached through another
-    "open('/etc/passwd','w')", "open('/proc/self/environ').read()",
+    "open('/etc/passwd','w')", f"open('/x/{_SSH}/id_rsa').read()", "open('/proc/self/environ').read()",
     f"import os\nopen(os.path.expanduser('~/{_SSH}/id_rsa'))", f"open('~/{_SSH}/id_rsa').read()",
     f"from pathlib import Path\np=Path.home()/'{_SSH}'/'id_rsa'\nprint(p.read_text())",
     "p='x'+'y'\nopen(p)", "import sys\nopen(sys.argv[1])",                     # computed paths

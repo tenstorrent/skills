@@ -14,6 +14,7 @@ from __future__ import annotations
 import ast
 import os
 import re
+import shlex
 import sys
 import types
 
@@ -74,7 +75,7 @@ class _Proof:
                     if n.level or a.name == "*":
                         return False
                     full, name = f"{n.module}.{a.name}", a.asname or a.name
-                    if isinstance(_load(full), types.ModuleType):
+                    if isinstance(_stdlib_module(full), types.ModuleType):
                         self.mods[name] = full
                     elif a.name.startswith("_") or not self._attr(str(n.module), a.name):
                         return False
@@ -133,7 +134,7 @@ class _Proof:
             return self.mods.get(node.id)
         if isinstance(node, ast.Attribute) and (b := self._dotted(node.value)):
             full = f"{b}.{node.attr}"
-            return full if isinstance(_load(full), types.ModuleType) else None
+            return full if isinstance(_stdlib_module(full), types.ModuleType) else None
         return None
 
     def _attr(self, mod: str, attr: str) -> bool:
@@ -143,7 +144,7 @@ class _Proof:
             return attr in LISTED[mod]
         if mod.split(".")[0] in LISTED:
             return False
-        value = getattr(_load(mod), attr, None)
+        value = getattr(_stdlib_module(mod), attr, None)
         return value is not None and not isinstance(value, types.ModuleType)
 
     def _call(self, call: ast.Call) -> bool:
@@ -171,8 +172,9 @@ class _Proof:
         real = os.path.realpath(os.path.join(self.cwd, os.path.expanduser(path) if path.startswith("~") else path))
         tmp = self.env.get("TMPDIR")
         ours = any(real.startswith(os.path.realpath(r).rstrip("/") + "/") for r in [self.cwd, *[tmp] * bool(tmp)])
-        if credguard.read_refusal(real, home=home) or pathguard._inside(real, pathguard.roots(self.env)):
-            return False
+        if credguard.read_refusal(real, home=home) or pathguard._inside(real, pathguard.roots(self.env)) \
+                or any(credguard.bash_refusal(f"cat {shlex.quote(p)}", [["cat", p]], home, self.cwd) for p in (path, real)):
+            return False   # the shell guard's own reading of the path as a word: a store by name anywhere
         return ours or not writes and not any(real == s or real.startswith(s + "/") for s in SYSTEM)
 
     def _path(self, node) -> str | None:
@@ -214,7 +216,7 @@ def _string_annotation(n) -> bool:
     return any(isinstance(c, ast.Constant) and isinstance(c.value, str) for a in notes if a for c in ast.walk(a))
 
 
-def _load(name: str):
+def _stdlib_module(name: str):
     """The stdlib module or attribute `name` names, imported here (PURE and LISTED modules only), else None."""
     root, *rest = name.split(".")
     if root not in PURE | set(LISTED):
