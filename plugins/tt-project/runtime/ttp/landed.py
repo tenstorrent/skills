@@ -234,24 +234,46 @@ def reverted_by(repo: Path, sha: str, tip: str) -> str | None:
     return _reverted[key]
 
 
+_revert_logs: dict[tuple[str, str], list[tuple[str, list]]] = {}
+_ranges: dict[tuple[str, str, str], frozenset] = {}
+
+
+def _revert_log(repo: Path, tip: str) -> list[tuple[str, list]] | None:
+    """[(revert commit, its _REVERTS matches)] for every revert in `tip`'s history: one git log per tip,
+    shared by every commit checked against it. None when git failed."""
+    key = (str(repo), tip)
+    if key not in _revert_logs:
+        log = _git(repo, "log", "-E", "--grep=^(This reverts commit|Reverts [0-9a-f]+\\.\\.)",
+                   "--format=%H%x00%B%x01", tip, timeout=60)
+        if log.returncode != 0:
+            return None
+        if len(_revert_logs) >= 64:
+            _revert_logs.clear()
+        _revert_logs[key] = [(rev, found) for rec in log.stdout.split("\x01")
+                             for rev, _, body in [rec.strip("\n").partition("\0")]
+                             if rev and (found := _REVERTS.findall(body))]
+    return _revert_logs[key]
+
+
 def _reverted_by(repo: Path, sha: str, tip: str) -> str | None:
     if sha == tip:
         return ""
-    log = _git(repo, "log", "-E", "--grep=^(This reverts commit|Reverts [0-9a-f]+\\.\\.)", "--format=%H%x00%B%x01",
-               f"{sha}..{tip}", timeout=60)
-    if log.returncode != 0:
+    log = _revert_log(repo, tip)
+    if log is None:
         return None
     hits = []
-    for rec in log.stdout.split("\x01"):
-        rev, _, body = rec.strip("\n").partition("\0")
-        for one, start, end in _REVERTS.findall(body):
+    for rev, found in log:
+        for one, start, end in found:
             if one and sha.startswith(one):
                 hits.append(rev)
             elif start and end:
-                inside = _git(repo, "rev-list", f"{start}..{end}")
-                if inside.returncode != 0:
-                    return None
-                if sha in inside.stdout.split():
+                key = (str(repo), start, end)
+                if key not in _ranges:
+                    inside = _git(repo, "rev-list", f"{start}..{end}")
+                    if inside.returncode != 0:
+                        return None
+                    _ranges[key] = frozenset(inside.stdout.split())
+                if sha in _ranges[key]:
                     hits.append(rev)
     if not hits:
         return ""

@@ -37,10 +37,13 @@ def test_landed_ancestry_of_several_shas_against_one_tip_costs_one_git_call_then
     assert gitcache.ancestors(repo, [*shas, side], tip) == {**{s: True for s in shas}, side: False}
     assert sum(seen.values()) == 1 and seen["rev-list --max-count=100000"] == 1
     seen.clear()
-    # The same shas again, as landed's own is-ancestor reads and whole on_branch answers: no git at all.
+    # The same shas again, as landed's own is-ancestor reads: no git at all.
     assert [landed._git(repo, "merge-base", "--is-ancestor", s, tip).returncode for s in (*shas, side)] == [0] * 5 + [1]
-    assert landed.on_branch(repo, shas[2], tip) and landed.on_branch(repo, shas[2], tip)
     assert sum(seen.values()) == 0, seen
+    # Whole on_branch answers add one read of the tip's reverts, shared by every sha; asked again, no git.
+    assert landed.on_branch(repo, shas[2], tip) and landed.on_branch(repo, shas[1], tip)
+    assert landed.on_branch(repo, shas[2], tip) and landed.on_branch(repo, shas[1], tip)
+    assert sum(seen.values()) == 1 and seen["log -E"] == 1, seen
     # The tip moves: a fresh answer, read with one rev-list from the old tip's set.
     _git_out(repo, "merge", "-q", "--no-edit", "--no-ff", "side")
     new = _git_out(repo, "rev-parse", "HEAD")
