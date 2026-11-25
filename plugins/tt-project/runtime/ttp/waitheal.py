@@ -206,9 +206,10 @@ def refuse_wait(db, p, task: dict, result: dict, refused: str, why: str, logged:
     """`result` without its retry_when, kept as `retry_when_refused` (`refused`): one handoff_probe_refused
     event says `why` after the task's name and the daemon log says `logged`; the task wakes at its retry
     timer. The one path for every waiting hand-off whose probe is not stored."""
+    from .coordinator import EVENT_CHARS
     db.x("INSERT INTO events(ts,source,kind,severity,text,status,task) VALUES(?,?,?,?,?,?,?)",
          (time.time(), f"task:{task['id']}", "handoff_probe_refused", "normal",
-          f"#{task['id']} {task['title']}: {why}"[:1500], "queued", task["id"]))
+          f"#{task['id']} {task['title']}: {why}"[:EVENT_CHARS], "queued", task["id"]))
     from .daemon import log   # daemon imports this module
     log(p, f"task {task['id']} hand-off: {logged}")
     return {**{k: v for k, v in result.items() if k != "retry_when"}, "retry_when_refused": refused}
