@@ -29,6 +29,7 @@ from . import (   # one name per line: two changes adding names merge without a 
     coordinator as coord,
     cyclenotice,
     envfault,
+    handback,
     lanewait,
     locks,
     msgparts,
@@ -748,7 +749,7 @@ def _reply(db, task: dict, new: str, text: str, need: str | None = None, facts: 
         return
     text = text if new == "done" else f"(task #{task['id']} {new}) {text}"
     if need and need not in text:
-        text += f"\nNeeds from you: {need}"
+        text += handback.need_line(task["id"], need)
     chatdigest.handoff(db, None, task, new, msgparts.cut(text, f"task #{task['id']}'s hand-off"),
                        facts={**(facts or {}), "need": need})
 

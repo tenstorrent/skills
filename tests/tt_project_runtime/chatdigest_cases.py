@@ -736,3 +736,30 @@ def test_a_web_app_only_digest_does_not_start_the_chats_status_gap(env, monkeypa
     chatdigest.hold(p.db, "c1", "#12 is queued for a worker.", "progress", t0)
     assert chatdigest.flush(p, p.config(), t0 + 2 * 3600)
     assert chatdigest.status_wait(p.db, p.config(), "c1", t0 + 2 * 3600 + 1) == 0
+
+
+def test_a_hand_back_to_opus_never_reaches_the_chat_as_a_user_step(env, monkeypatch):
+    """A run's own hand-back ('needs Opus: guard: refusal 4') is no step for the user. The
+    fallback line says in plain words that the task needs another run and nothing is needed from the user,
+    and a coordinator reply quoting a hand-off's 'Needs from you:' line with such a reason is refused. A real
+    user step still reads 'Needs from you:'."""
+    from ttp import chatdigest, coordinator as coord, handback
+    machine, tid = "needs Opus: guard: refusal 4", 7
+    assert handback.need_line(7, "") == ""
+    assert handback.need_line(tid, machine) == f"\nTask #{tid} needs another run; nothing is needed from you."
+    assert handback.need_line(7, "run the Mac upgrade") == "\nNeeds from you: run the Mac upgrade"
+    line = chatdigest.outcome_line({"task": 7, "title": "x"}, {"need": machine})
+    assert "Needs from you" not in line and "refusal" not in line and "nothing is needed from you" in line
+    assert "Needs from you: run the Mac upgrade" in chatdigest.outcome_line({"task": 7, "title": "x"},
+                                                                             {"need": "run the Mac upgrade"})
+    assert handback.refused(f"Task #{tid} is blocked. Needs from you: needs Opus: guard: refusal 4")
+    assert handback.refused("Needs from you: guard: 4 refusals")
+    assert handback.refused("Needs from you: run the Mac upgrade") == ""
+    assert handback.refused(f"Task #{tid} needs another run; nothing is needed from you.") == ""
+    p = make(env)
+    probs = coord.apply(p, [{"type": "reply", "chat": "c1", "text": f"Task #{tid} stopped. Needs from you: {machine}"}])
+    assert len(probs) == 1 and "reply rejected" in probs[0] and "Needs from you" in probs[0], probs
+    assert not p.db.q("SELECT id FROM messages WHERE direction='out'"), "the hand-back line was not posted"
+    assert coord.apply(p, [{"type": "reply", "chat": "c1",
+                            "text": f"Task #{tid} needs another run; nothing is needed from you."}]) == []
+    assert p.db.q("SELECT id FROM messages WHERE direction='out'")

@@ -43,6 +43,7 @@ from . import (   # one name per line: two changes adding names merge without a 
     chaincap,
     channeltag,
     chatdigest,
+    handback,
     charterpromise,
     ghroute,
     chartertemplate,
@@ -3036,6 +3037,8 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                 if why := pointers.refused(a["text"], "reply", pointers.later_parts(a["text"], [
                         str(b.get("text") or "") for _, b in order[k + 1:]
                         if (b or {}).get("type") == "reply" and (b.get("chat") or default_chat) == chat])):
+                    raise ValueError(why)
+                if why := handback.refused(a["text"], "reply"):
                     raise ValueError(why)
                 if a.get("claims"):
                     notes += obligations.check_claims(a["claims"], p)

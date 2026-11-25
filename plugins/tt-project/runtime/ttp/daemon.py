@@ -8804,7 +8804,7 @@ class Daemon:
                 text = db.for_user(replymsg.text(result) if new == "done"
                                    else f"(task #{task['id']} {outcome}) {summary}")
                 if need and need not in summary:
-                    text += f"\nNeeds from you: {need}"
+                    text += handback.need_line(task["id"], need)
             # The chat never gets the hand-off: chatdigest.handoff raises the reply_due event the
             # coordinator answers in plain words. A code change's done reply waits for the review
             # decision below (_hold_reply), so its event carries the landing facts.

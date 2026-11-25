@@ -393,8 +393,8 @@ def outcome_line(item: dict, facts: dict) -> str:
     `item` is the armed fallback: {chat, task, title, facts}."""
     head = f"#{item['task']} " + " ".join(str(item.get("title") or "").split())
     line = f"{head[:200]}: {outcome_words(facts)}"
-    if (need := str(facts.get("need") or "").strip()):
-        line += "\nNeeds from you: " + need
+    from . import handback
+    line += handback.need_line(item["task"], facts.get("need"))
     return line if len(line) <= LINE_MAX else line[:LINE_MAX - 3].rstrip() + "..."
 
 
