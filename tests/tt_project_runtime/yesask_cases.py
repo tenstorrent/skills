@@ -272,19 +272,26 @@ def test_agent_mode_the_same_order_aimed_at_another_persons_machine_or_job_is_st
 
 
 def test_a_refused_rule_change_never_holds_the_ordered_work(env, tmp_path):
-    """(d) A wait on the charter is refused everywhere work could park on it: a task_add start_when, a
-    waiting hand-off's retry_when (dropped with a handoff_probe_refused event), and the charter_retry
-    the coordinator gets tells it to queue the ordered work now and never re-ask the order."""
+    """(d) Work never parks on the charter: a task_add start_when that waits on it is dropped and the task
+    queued now, a block on it is refused, a waiting hand-off's retry_when is dropped with a
+    handoff_probe_refused event, and the charter_retry the coordinator gets tells it to queue the
+    ordered work now and never re-ask the order."""
     import json
+    import pytest
     from ttp import coordinator as coord, waitheal
     from ttp.daemon import Daemon
     p = make(env)
     for probe in ("grep -q 'box-q' tt-project/harness/CHARTER.md || exit 1", "ttp charter | grep -q box-q",
                   "test -n \"$(ttp memory | grep box-q)\""):
         assert waitheal.charter_wait(probe), probe
-        err = coord.apply(p, [{"type": "task_add", "title": "preempt soak", "spec": "s", "start_when": probe,
-                               "why": "the exception lands"}])
-        assert err and "waits on the charter" in err[0] and "never holds ordered work" in err[0], err
+        with pytest.raises(ValueError, match="never holds ordered work"):
+            coord.check_probe(probe, "waits_on when")
+    out = coord.apply(p, [{"type": "task_add", "title": "preempt soak", "spec": "s", "why": "the exception lands",
+                           "start_when": "grep -q 'box-q' tt-project/harness/CHARTER.md || exit 1"}])
+    notes = p.db.kv(coord.NOTES_KEY, [])
+    assert out == [] and any("waited on the charter" in n and "was dropped" in n for n in notes), (out, notes)
+    t = p.db.one("SELECT status, labels FROM tasks WHERE title='preempt soak'")
+    assert t and t["status"] == "queued" and "CHARTER" not in (t["labels"] or ""), t
     assert waitheal.charter_wait("test -e out/job.rc") == ""
     d = Daemon(p.base)
     tid = p.db.add_task("preempt the soak", "s", kind="work", tier="standard", origin="user")

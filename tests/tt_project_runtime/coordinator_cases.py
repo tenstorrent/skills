@@ -22689,6 +22689,11 @@ def test_a_general_or_too_wide_exception_is_refused_naming_each_clause(env):
         if "wider" not in want:
             assert "refused: \"Never power cycle a serving host.\" (section 'Restrictions'): " in err[0], err
         assert p.charter_path.read_text() == _SCOPED_BANS
+    # a general word counts only inside a named scope, in the order and in the text alike
+    mids, src = _turn_said(p, "you may power cycle host-a, that's all")
+    err = coord.apply(p, [{**base, "text": "Workers may power cycle all serving hosts, host-a included.",
+                           "source": src}], turn=8, user_turn=True, messages=mids)
+    assert len(err) == 1 and "\"all\" lifts it in general" in err[0], err
     # another ban on host-c that guards no person gets the ordered exception beside it
     mids, src = _turn_said(p, "you may power cycle host-a and host-c")
     assert coord.apply(p, [{**base, "text": "Workers may power cycle host-a and host-c.", "source": src}], turn=20,

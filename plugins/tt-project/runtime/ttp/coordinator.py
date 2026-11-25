@@ -2054,6 +2054,18 @@ def parse_start_after(raw: Any, now: float | None = None, tz: str | None = None)
     return at if at > now else None
 
 
+def _drop_charter_wait(a: dict, who: str) -> str:
+    """A start_when that waits on the charter is dropped and the task queued at once: a refused or pending
+    rule change never holds ordered work. The note saying so ('' when nothing was dropped)."""
+    from .waitheal import charter_wait
+    when = a.get("start_when")
+    if not isinstance(when, str) or not (word := charter_wait(when)):
+        return ""
+    a["start_when"] = ""
+    return (f"{who}: its start_when {clip(when.strip(), 80)!r} waited on the charter ({word!r}) and was dropped: "
+            f"a refused or pending rule change never holds ordered work; resend the charter_update fixed")
+
+
 def _start_args(a: dict, cur: dict, p: Project | None = None) -> tuple[float | None, str | None]:
     """A task_add/task_update's deferral: (start_after, start_when), each kept from `cur` (the
     task's current deferral) when the action leaves it out. `now` and an empty probe clear them.
@@ -2382,7 +2394,7 @@ def check_probe(probe, what: str = "start_when") -> None:
         from . import userstep
         userstep.check_wait_text(probe, what)   # prose for the user's next message: no probe sees it
         from .waitheal import charter_wait
-        if word := charter_wait(probe):
+        if what != "start_when" and (word := charter_wait(probe)):   # start_when: dropped (_drop_charter_wait)
             raise ValueError(f"{what} {probe.strip()[:80]!r} waits on the charter ({word!r}): a refused or pending "
                              f"rule change never holds ordered work; queue the work now, and resend the "
                              f"charter_update fixed in the same turn")
@@ -2537,6 +2549,7 @@ def deferral_update(db, task: dict, a: dict, p: Project | None, labels: list | N
     task's own when None). A new future start_after drops the progress probe's old answers. An urgent
     task's gate whose why names no safety class is dropped (convgate), `note` saying so ('' else)."""
     cur = deferral(task)
+    dropped = _drop_charter_wait(a, f"task_update: #{task['id']}")
     try:
         after, when = _start_args(a, cur, p)
     except MissingTaskRef as e:
@@ -2569,7 +2582,8 @@ def deferral_update(db, task: dict, a: dict, p: Project | None, labels: list | N
         from .daemon import _retry_s   # daemon imports this module
         nb = task["not_before"] if task["not_before"] and not cur.get("after") else time.time() + _retry_s(prev)
     return {"labels": without_deferral(labels) + defer_labels(after, when, start_why(a, cur, when))
-            + convgate.labels_for(safe, after, when), "not_before": nb}, after, when, note
+            + convgate.labels_for(safe, after, when), "not_before": nb}, after, when, \
+        "\n".join(x for x in (dropped, note) if x)
 
 
 def defer_labels(after: float | None, when: str | None, why: str | None = None) -> list[str]:
@@ -3165,6 +3179,8 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                 if inherited and (a.get("pr_branch") == "" or unpublished or foreign is not None
                                   or _lands_on_push_branch(cfg, spec_text, inherited)):
                     labels.append(worktree.NO_PR_BRANCH)
+                if dropped := _drop_charter_wait(a, f"task_add {json.dumps(title, ensure_ascii=False)}"):
+                    notes.append(dropped)
                 try:
                     after, when = _start_args(a, {}, p)
                 except MissingTaskRef as e:
@@ -7094,6 +7110,17 @@ def _own_resources(cfg: dict | None) -> tuple:
     return tuple(out)
 
 
+def _near_scope(word: str, names: set[str], text: str) -> bool:
+    """`word` (a general word such as `any`) sits within a few words of one of the scope `names` in
+    `text`, in one phrase before it: "any soak on box-a" is scoped; "power cycle box-a, that's all" and
+    "all serving hosts, box-a included" are not."""
+    for n in names:
+        w, nm = re.escape(word), re.escape(n)
+        if re.search(rf"\b{w}(?:\s+[\w'-]+){{0,4}}?\s+{nm}\b", text, re.I):   # one phrase: no comma between
+            return True
+    return False
+
+
 def _scoped_exception(charter: str, section: str, text: str, clause: str, sourced: str,
                       end: dict | None, said: str = "", accepted: dict | None = None,
                       own: tuple = ()) -> tuple[str, str]:
@@ -7134,7 +7161,8 @@ def _scoped_exception(charter: str, section: str, text: str, clause: str, source
         raise ValueError(head + f"{named}: the text is not about what that clause bans")
     names = _scope_names(text) - _scope_names(item)
     general = _GENERAL_RE.search(restriction_source.bare(text))
-    if general and not (said and names and re.search(rf"\b{re.escape(general[0])}\b", said, re.I)) \
+    if general and not (said and names and _near_scope(general[0], names, said)
+                        and _near_scope(general[0], names, restriction_source.bare(text))) \
             or not (names or end):
         why = (f"\"{general[0]}\" lifts it in general" if general
                else "it names no host, resource, action or time window the clause does not")
@@ -8710,8 +8738,8 @@ CHARTER_GUARD_FUNCS = ("_reject_contradicting_append", "_append_conflicts", "_ov
                        "_ref_ids", "_companion_exception", "_changed_sentences", "_quoted_news",
                        "_charter_approval", "_ask_charter_approval", "_conflict_reason", "_scope_names",
                        "_scoped_exception", "_excepted_item", "_orders_banned",
-                       "_same_target", "_delivery_names", "_undelivered", "_edit_overlaps", "_bans_in_scope")
-CHARTER_GUARD_PIN = (24, "68b6cebeb0db0c199b24225f36a56a55acb148e22ae981ac7e49a54bcf79d266")
+                       "_same_target", "_delivery_names", "_undelivered", "_edit_overlaps", "_bans_in_scope", "_near_scope")
+CHARTER_GUARD_PIN = (24, "76d83662f01514fb86adec772301e1013c8ca48e97dab7e8243004cc9a7d33bf")
 CHARTER_RERAISE_KEY = "charter_reraise"   # kv: {"version", "ts"} of the last re-raise pass
 
 
