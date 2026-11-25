@@ -6414,6 +6414,10 @@ class Daemon:
                 log(p, f"run {r['id']}: credential change observation failed\n" + traceback.format_exc())
         prov = get_provider(r["provider"]).use(r["model"] or "", (self.cfg.get("pricing") or {}).get(r["provider"]))
         usage = prov.parse(run_dir / "output.jsonl", run_dir / "stderr.log")
+        if quota := float((exit_info.get("bridge") or {}).get("quota_until") or 0):
+            # The endpoint's token quota is used up (chatbridge.quota_until): the provider's limit pause
+            # holds new runs off it to the window's end (below), and the route entry and alert say so.
+            usage.limit_note = f"token quota used up until {timefmt.long(quota, p)}"
         if exit_info.get("launch_auth"):
             # The chat bridge had no usable key (none saved, or saved for another URL): the provider's
             # auth gate holds it like a logout, never a launch failure that costs attempts.
@@ -6473,7 +6477,7 @@ class Daemon:
         priced = route.price(self.cfg, r["provider"], r["model"] or "", usage) if on_route else None
         basis = "tokens" if on_route else basis   # its pricing rows, or $0 and unpriced (audit.unpriced_runs)
         status = "ok" if exit_info.get("rc") == 0 and not usage.error else "failed"
-        if stopped in ("timeout", "budget", "stopped", "lost", "stalled", "shutdown", "resource_busy"):
+        if stopped in ("timeout", "budget", "stopped", "lost", "stalled", "shutdown", "resource_busy", "quota"):
             status = stopped if stopped != "stopped" else "killed"
         elif stopped in HUNG_STOPS:
             status = "stalled"   # its supervisor broke: an attempt like a stall, retried without a turn
@@ -6519,7 +6523,7 @@ class Daemon:
             self._outside_writes(r, run_dir)
         if r["role"] != "coordinator" and r["task"]:
             self._effect_claims(r, run_dir)
-        if status == "timeout" and handed_off:
+        if status in ("timeout", "quota") and handed_off:
             cut_off, status = status, "ok"   # it handed off before the clock ran out: the work is done, not wasted
         if usage.auth_failed and not slept_auth and not exit_info.get("launch_auth") and not handed_off \
                 and self._login_says_in(r["provider"]):
@@ -6529,6 +6533,8 @@ class Daemon:
             usage.auth_failed, usage.challenged = False, True
         elif usage.challenged and not handed_off and self._login_state(r["provider"]) is False:
             usage.auth_failed, usage.challenged = True, False   # behind the challenge, its CLI is logged out
+        if quota and not handed_off:
+            usage.limited = True   # a limit end (FREE_ENDS): requeued, no attempt spent, its worktree kept
         if usage.limited:
             status = "limit"
         if usage.auth_failed and not slept_auth:
@@ -6591,7 +6597,8 @@ class Daemon:
             swapped = self._rank_mid_run(r, note, mid, str((exit_info.get("bridge") or {}).get("model") or ""))
         if routed:
             note[route.KEY] = {**routed, **({"fallback": fell} if fell else {}), **({"salvaged": True} if salvaged else {}),
-                               **({"cause": _route_cause(stopped or status, exit_info, usage, run_dir)} if own else {}),
+                               **({"cause": _route_cause(stopped or status, exit_info, usage, run_dir)} if own else
+                                  {"cause": usage.limit_note} if fell == "quota" else {}),
                                **({"priced": priced} if priced is not None else {}),
                                **({"bounce": bounce} if bounce else {}),
                                "wall_s": round(float(exit_info.get("ended") or time.time()) - float(r["started"] or 0), 1)}
@@ -6786,8 +6793,8 @@ class Daemon:
                     batchrun.book(db, r["task"], usage.cost_usd)   # a batch run's members get their share
                     runtimeload.clear(p, r["id"])   # finished once: a restart after this never finishes it again
                 self._record_readings(db, r["provider"], read_as, usage, ended)
-                if usage.limited:
-                    until = time.time() + 3600
+                if usage.limited or quota:   # a quota's pause ends at its window's end, also after a hand-off
+                    until = quota or time.time() + 3600
                     db.set_kv(f"limited:{r['provider']}", {"until": until, "note": usage.limit_note})
                     # Only an account out of funds needs the user; a usage or rate limit lifts by itself,
                     # so it is a self-clearing status line (alerts.STATUS_CONDITIONS), not "needs you".

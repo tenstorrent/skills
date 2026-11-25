@@ -796,6 +796,12 @@ def supervise(run_dir: Path) -> int:
                 if (up - st["active"]) - max(wait - st.get("wait0", 0.0), 0.0) > progress.limit(stall_s) or (
                         waits_idle and progress.waited(up, stall_s) >= WAIT_SHARE * stall_s):
                     threading.Thread(target=stop, args=("stalled",), daemon=True).start()
+            if not reason and (until := getattr(bridge, "quota_until", None)):
+                # The endpoint's token quota is used up (chatbridge.quota_until): the run ends now, its
+                # work kept, and the daemon falls it back to the core provider, not at its time limit.
+                print(f"runner: the endpoint's token quota is used up until "
+                      f"{time.strftime('%Y-%m-%d %H:%M UTC', time.gmtime(until))}; stopping the run", flush=True)
+                threading.Thread(target=stop, args=("quota",), daemon=True).start()
             if budget is not None and now - st["budget"] >= BUDGET_EVERY_S:
                 st["budget"] = now
                 try:

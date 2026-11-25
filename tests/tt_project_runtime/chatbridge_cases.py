@@ -1443,6 +1443,100 @@ def test_a_routed_run_on_an_endpoint_fault_falls_back_to_the_core_provider(env, 
     assert route.phrase(p.db) == f"routed 24h: 1 run to chat, 1 fell back ({fault} 1)"
 
 
+# The endpoint's 429 once its hourly token quota is used up (code quota_exceeded, resets_at its window's end).
+_QUOTA_BODY = {"error": {"code": "quota_exceeded", "message": "Quota exceeded for llm_tokens (hourly limit: 100000000)",
+                         "quota": {"limit": 100000000, "resets_at": "2026-11-25T09:00:00Z", "resource_type": "llm_tokens",
+                                   "used": 105832148}}}
+_QUOTA_END = 1795597200.0   # its resets_at
+
+
+def test_a_quota_429_ends_the_chat_run_at_once_for_a_provider_fallback(tmp_path, mock_chat):
+    from ttp.chatbridge import quota_until
+    body = json.dumps(_QUOTA_BODY)
+    # Its window's end is the body's resets_at, also in a cut-off body; the next full hour when it names
+    # none; a capacity 429 is no quota.
+    assert quota_until(body) == quota_until(body[:body.index("resets_at") + 40]) == _QUOTA_END
+    assert quota_until('{"error": {"code": "quota_exceeded"}}', now=7200.5) == 10800
+    assert quota_until('{"error": {"code": "rate_limit_exceeded", "message": "at capacity"}}') is None
+    run_dir, _, run_env = _chat_run(tmp_path, mock_chat(*[(429, _QUOTA_BODY)] * 6))
+    subprocess.run([sys.executable, "-m", "ttp.runner", str(run_dir)], cwd=str(RUNTIME), env=run_env,
+                   timeout=_load_scaled(120))
+    info = json.loads((run_dir / "exit.json").read_text())
+    assert info["stopped"] == "quota" and info["bridge"]["quota_until"] == _QUOTA_END, info
+    assert info["ended"] - info["started"] < 30, "it stops at once, not after its retries or time limit"
+
+
+def test_a_quota_stopped_routed_run_falls_back_and_chat_takes_no_new_run_until_the_window_resets(env, monkeypatch):
+    from ttp import route
+    from ttp.daemon import Daemon
+    p = make(env)
+    _route_config(p)
+    d = Daemon(p.base)
+    monkeypatch.setattr(d, "observe", lambda *a, **k: None)
+    core = d.cfg.get("core_provider", "claude")
+    tid = p.db.add_task("build", "", kind="work", tier="light", priority=3, budget_usd=8.0, labels=[])
+    end = time.time() + 2400
+    run, task = _route_finish(p, d, tid, {"stopped": "quota", "bridge": {
+        "last_fault": "rate_limit", "faults": {"rate_limit": 3}, "quota_until": end,
+        "upstream": {"status": 429, "code": "quota_exceeded"}}})
+    # A free end: requeued at its tier with no attempt spent; its line names the quota and its end.
+    assert run["status"] == "limit" and task["status"] == "queued" and int(task["attempts"] or 0) == 0
+    e = route.of(run["note"])
+    assert e["fallback"] == "quota" and e["cause"].startswith("token quota used up until "), e
+    line = route.fallback_line(run["id"], e)
+    assert f"fell back: quota (HTTP 429 quota_exceeded; {e['cause']})" in line, line
+    assert json.loads(task["result"])["summary"] == line
+    # The provider's limit pause holds chat to the window's end: status and the web app show it.
+    assert p.db.kv("limited:chat") == {"until": end, "note": e["cause"]}
+    d.update_gates()
+    assert not d.gates["chat"].allow_new_work and f"provider limit: {e['cause']}" in d.gates["chat"].reasons
+    # While it holds, the routed tier starts on the core provider: its cool-down first, then the pause...
+    p.db.update_task(tid, status="done")
+    prov, tier, note = _route_dispatch(p, d, monkeypatch, title="held")
+    assert (prov, tier, note[route.KEY]["fallback"]) == (core, "light", "quota")
+    p.db.set_kv(route.COOL + "chat", {"until": time.time() - 1, "reason": "quota"})
+    prov, _, note = _route_dispatch(p, d, monkeypatch, title="still held")
+    assert (prov, note[route.KEY]["fallback"]) == (core, "busy")
+    # ... and the tier routes to chat again once the window resets.
+    p.db.set_kv("limited:chat", {"until": time.time() - 1, "note": e["cause"]})
+    prov, _, note = _route_dispatch(p, d, monkeypatch, title="after")
+    assert prov == "chat" and note[route.KEY]["fallback"] == "none"
+
+
+def test_a_run_that_handed_off_before_the_quota_stop_keeps_its_work_and_still_pauses_chat(env, monkeypatch):
+    from ttp import route
+    from ttp.daemon import Daemon
+    p = make(env)
+    _route_config(p)
+    d = Daemon(p.base)
+    monkeypatch.setattr(d, "observe", lambda *a, **k: None)
+    tid = p.db.add_task("build", "", kind="work", tier="light", priority=3, budget_usd=8.0, labels=[])
+    end = time.time() + 600
+    run, task = _route_finish(p, d, tid, {"stopped": "quota", "bridge": {"last_fault": "rate_limit", "quota_until": end}},
+                              result={"status": "done", "summary": "built"})
+    assert run["status"] == "ok" and task["status"] == "done" and route.of(run["note"])["fallback"] == "none"
+    assert p.db.kv("limited:chat")["until"] == end
+
+
+def test_a_chat_quota_pause_moves_a_preference_pin_at_once_and_a_required_pin_waits_for_the_reset(env):
+    from ttp.daemon import Daemon
+    p = make(env)
+    _chat_config(p)
+    d = Daemon(p.base)
+    pref = p.db.add_task("preferred", "x", kind="work", tier="standard", provider="chat", model=CHAT_MODELS[0])
+    req = p.db.add_task("required", "y", kind="work", tier="standard", provider="chat", model=CHAT_MODELS[1],
+                        labels=["pin:required"])
+    p.db.set_kv("limited:chat", {"until": time.time() + 1800, "note": "token quota used up until 01:00"})
+    d.update_gates()
+    d.failover_pinned()
+    assert p.db.task(pref)["provider"] == d.cfg.get("core_provider", "claude")
+    assert (p.db.task(req)["provider"], p.db.task(req)["status"]) == ("chat", "queued")
+    assert not d.gates["chat"].allow_new_work, "it starts nothing on chat until the window resets"
+    p.db.set_kv("limited:chat", {"until": time.time() - 1, "note": "token quota used up until 01:00"})
+    d.update_gates()
+    assert d.gates["chat"].allow_new_work and p.db.task(req)["provider"] == "chat"
+
+
 def test_chatbridge_stats_keep_the_scrubbed_upstream_status_and_error_code(mock_chat):
     from ttp.chatbridge import Bridge, upstream_of
     hi = {"max_tokens": 5, "messages": [{"role": "user", "content": "hi"}]}

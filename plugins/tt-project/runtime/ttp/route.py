@@ -122,7 +122,7 @@ NOTICE = "route_model_notice:"   # kv per model the user was told is not served 
 LISTED = "the endpoint lists it again"   # release's why once a check that left a held model out is followed by one listing it
 RETRY_QUIET_S = 86400       # a quiet retry no routed run took ends after this
 MISSING_TASK_S = 3600        # a task refused its routed model stays on the core provider this long
-FAULTS = ("down", "error", "rate_limit", "auth", "malformed", "model_missing")
+FAULTS = ("down", "error", "rate_limit", "quota", "auth", "malformed", "model_missing")   # quota: its token quota window
 BOUNCE = "needs_opus"   # a code arm run handed the task back to Opus (codearm.BOUNCE)
 RUN_CAUSES = ("timeout", "failed", "no_handoff")   # a routed run's own end without a hand-off (own_cause)
 OWN_CAUSE_WORDS = ("timed out", "stalled", "exited without", "result.json", "exit ")   # fallback_line shows these
@@ -580,8 +580,8 @@ def fell_back(status: str, exit_info: dict, error: str = "") -> str:
     the run's own error text (a refused model there makes a bridge `error` or no fault model_missing)."""
     if status == "auth":
         return "auth"
-    if status == "limit":
-        return "rate_limit"
+    if status == "limit":   # the endpoint's token quota window (chatbridge.quota_until), or a rate limit
+        return "quota" if (exit_info.get("bridge") or {}).get("quota_until") else "rate_limit"
     if status not in FAULT_ENDS:
         return ""
     fault = str((exit_info.get("bridge") or {}).get("last_fault") or "")
@@ -764,6 +764,8 @@ def fallback_line(run_id, e: dict) -> str:
     detail = " ".join(str(x) for x in (f"HTTP {u['status']}" if u.get("status") else "", u.get("code") or "") if x)
     cause = str(e.get("cause") or "")   # the daemon's own words only (_route_cause), never the run's error text
     detail = detail or (cause[:120] if why in RUN_CAUSES and cause.startswith(OWN_CAUSE_WORDS) else "")
+    if why == "quota":   # the daemon's own words: when the window resets
+        detail = "; ".join(x for x in (detail, cause[:120]) if x)
     model = f" ({e['model']})" if e.get("model") else ""
     if why == BOUNCE:   # the run asked for Opus (codearm.py): its own words, cut, never its error text
         return (f"routed run {run_id} on {e.get('to') or TO}{model} bounced: needs Opus: "

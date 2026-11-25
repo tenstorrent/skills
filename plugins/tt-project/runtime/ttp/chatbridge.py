@@ -85,6 +85,7 @@ import time
 import urllib.error
 import urllib.request
 import uuid
+from datetime import datetime
 
 from . import endpoint, inflight, redact, serverhealth
 from .providers.base import challenged
@@ -118,6 +119,24 @@ SWAP_ERRORS = 3   # 5xx or no-answer calls in a row that swap a model the served
 BUSY_RETRIES, BUSY_WAIT_S, BUSY_WAIT_MAX_S, BUSY_WAIT_MIN_S, BUSY_JITTER = 4, 180.0, 60.0, 1.0, 0.25
 RETRY_AFTER_RE = re.compile(r"retry\s+(?:after|in)\s+(\d+(?:\.\d+)?)\s*s", re.I)
 NEVER_FITS_RE = re.compile(r"request too large|insufficient.{0,20}(?:credit|quota|balance)", re.I)   # waiting cannot help
+# A 429 whose body says code quota_exceeded: the endpoint's token quota is used up until its resets_at
+# (an hourly window). Waiting inside the run cannot help: the runner ends the run for a provider fallback.
+QUOTA_RE = re.compile(r'"code"\s*:\s*"quota_exceeded"')
+RESETS_RE = re.compile(r'"resets_at"\s*:\s*"([^"\s]+)"')   # read with a pattern: a cut-off body keeps it
+
+
+def quota_until(detail: str, now: float | None = None) -> float | None:
+    """When the token quota a 429 body names (QUOTA_RE) resets, in epoch seconds: its resets_at, else
+    the next full hour; None for any other body."""
+    if not QUOTA_RE.search(detail or ""):
+        return None
+    now = time.time() if now is None else now
+    try:
+        return datetime.fromisoformat(RESETS_RE.search(detail).group(1).replace("Z", "+00:00")).timestamp()
+    except (AttributeError, ValueError):   # no resets_at, or one that does not parse
+        return now + 3600 - now % 3600
+
+
 REASONING_FIELDS = ("reasoning", "reasoning_content")   # where Chat Completions servers put a turn's reasoning
 # (vLLM 0.20 and later reads only `reasoning` on input, vllm issue 38488: the default field sent back)
 THINKING_ENV = "TTP_CHAT_PRESERVE_THINKING"   # 1 or 0: preserved thinking on or off for one run (settings)
@@ -1082,6 +1101,7 @@ class Bridge:
         # `scanned`: answers _scan read for bad output, so a run's zero counts are told from a run never measured.
         self.usage = {"calls": 0, "input_tokens": 0, "output_tokens": 0, "cache_read_input_tokens": 0, "scanned": 0}
         self.busy = {"waits": 0, "waited_s": 0.0, "gave_up": 0}   # capacity waits (busy_wait), for stats()
+        self.quota_until = None   # the first quota 429's window end (quota_until): the runner stops on it
         # After this many model_missing answers, later calls get the 404 here, never upstream (0: no cap; a
         # bench row sets it so a withdrawn model's agents stop calling the endpoint: tbcycle.MISSING_MAX).
         self.missing_max, self.missing_local = 0, 0
@@ -1266,6 +1286,7 @@ class Bridge:
         and whether the endpoint rejected them, when the run had any."""
         return {"last_fault": self.last_fault, "faults": dict(self.faults),
                 **({"upstream": dict(self.upstream)} if self.upstream else {}),
+                **({"quota_until": self.quota_until} if self.quota_until else {}),
                 **({"effort": self.effort, "fields": dict(self.fields), "rejected": self.rejected}
                    if self.fields else {}),
                 **({"mid_run": [dict(m) for m in self.mid_run], "model": self.model} if self.mid_run else {}),
@@ -1386,6 +1407,8 @@ class Bridge:
                         detail = e.read(2000).decode("utf-8", "replace")
                     except Exception:
                         detail = ""
+                if e.code == 429 and self.quota_until is None:
+                    self.quota_until = quota_until(detail)
                 wait = self._busy_wait(e, detail, tries, waited)
                 if wait is not None and wait >= 0:
                     tries, waited = tries + 1, waited + wait
