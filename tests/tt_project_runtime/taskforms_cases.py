@@ -91,10 +91,10 @@ def test_tform_config_set_maps_a_moved_key_and_overrides_an_ordinary_user_value_
     assert p.raw_config()["checks"]["spill_beside_device"] == ["box-c"]
     assert any("over the user's value" in n and "ttp config" in n for n in _tf_notes(p)), _tf_notes(p)
     for key, value in (("budget.max_parallel_workers", 3), ("delivery.code_tasks_may_push", False),
-                       ("machines.allowed", ["box-a"])):
+                       ("machines.allowed", ["box-a"]), ("chains.max_usd", 20), ("waste.max_runs", 4)):
         cli.main(["config", "demo", key, json.dumps(value)])
     for key, value in (("budget.max_parallel_workers", 5), ("delivery.code_tasks_may_push", True),
-                       ("machines.allowed", ["box-z"])):
+                       ("machines.allowed", ["box-z"]), ("chains.max_usd", 200), ("waste.max_runs", 9)):
         probs = coord.apply(p, [{"type": "config_set", "key": key, "value": value}])
         assert probs and ("user" in probs[0] or "not user-settable from chat" in probs[0]), (key, probs)
     probs = coord.apply(p, [{"type": "config_set", "key": "checks.spill_hosts", "value": ["box-a"]}])

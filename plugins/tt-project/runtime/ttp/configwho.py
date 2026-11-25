@@ -36,8 +36,9 @@ from .util import read_dict
 KEY = "config_provenance"
 # A value the user set that only their (or the owner's agent's) word changes (#9824): spend caps, credentials,
 # push permission and the machine allowlist. Any other user-set value a coordinator may change, with a note.
+# Spend caps outside budget.* count too: any *_usd key, the chain caps and the run stop (waste.max_runs).
 USERS_WORD = re.compile(r"^(budget(\.|$)|delivery\.(push_allowed|code_tasks_may_push)$|machines(\.allowed)?$)|token|secret|password|credential"
-                        r"|api_?key|mcp_", re.I)
+                        r"|api_?key|mcp_|usd|^chains\.max_|^waste\.max_runs$", re.I)
 ROLES = ("user", "coordinator", "worker", "harness", "default", "upgrade", "migration", "unknown")
 
 

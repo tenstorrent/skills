@@ -12758,7 +12758,10 @@ def test_task_specs_that_forbid_leaving_draft_pass_the_gate_and_orders_still_do_
                  "Then run `gh pr ready https://github.com/acme/widgets/pull/7`.",
                  "Take PR https://github.com/acme/widgets/pull/7 out of draft once checks pass.",
                  "When the user agrees, it marks acme/widgets#7 ready.",
-                 "Once the owner agrees the worker takes acme/widgets#7 out of draft."):
+                 "Once the owner agrees the worker takes acme/widgets#7 out of draft.",
+                 # a verb aimed at you or the worker gives the order itself (ponytail review, #9824)
+                 "This step tells you to mark acme/widgets#7 ready for review once CI is green.",
+                 "The coordinator tells the worker to mark acme/widgets#7 ready."):
         out = " ".join(coord.apply(p, [{"type": "task_add", "title": "ready it", "kind": "code", "spec": spec}]))
         assert "approval is not on record" in out, spec
     assert not p.db.q("SELECT id FROM tasks WHERE title='ready it'")
