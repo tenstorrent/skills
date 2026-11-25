@@ -2549,6 +2549,48 @@ def test_bridge_watch_alerts_once_after_five_minutes_down_and_once_when_back(tmp
     assert any("user alerted" in ln for ln in pass_at(cfg, 400))
 
 
+def test_bridge_watch_project_host_reboot_every_box_down_retries_paced_and_alerts_once_each(tmp_path, monkeypatch):
+    # cells: reboot-all-down, retried-each-minute, no-restart-stampede, one-alert-per-box, recovery-per-box
+    import json
+    import plistlib
+    import subprocess
+    from ttp import bridge, bridge_watch, notifier
+    cfg, seen = _watch_env(tmp_path, monkeypatch, "darwin", [])
+    names = ["box-1", "box-2", "box-3"]
+    data = {"boxes": {b: {"login": {}, "agents": {"auto": {"agent": "env", "forward": [
+        {"name": "build-a", "target": "build-a.example.com", "port": 2301}]}}} for b in names}}
+    cfg = bridge.parse(json.loads(json.dumps(data)))
+    for b in names:
+        f = bridge.service_file(b, "auto", "darwin")
+        f.parent.mkdir(parents=True, exist_ok=True)
+        f.write_bytes(plistlib.dumps({"Label": "x"}))
+    shown = []
+    monkeypatch.setattr(notifier, "show", lambda title, body, *a, **k: shown.append(title))
+    t0, back = 1_000_000.0, 1_000_000.0 + 450   # the host reboots: every box is down 7.5 minutes
+    clock = [t0]
+
+    def box(b, script, timeout=40, inp=None):
+        seen["box"].append(b)
+        if clock[0] < back:
+            return subprocess.CompletedProcess([], 255, "", "no route to host")
+        return subprocess.CompletedProcess([], 0, "up 2301\nttp-watch-done\n", "")
+    monkeypatch.setattr(bridge, "_box", box)
+    logged = {b: 0 for b in names}
+    for i in range(0, 15):   # launchd runs a pass every 30 s while the host is down
+        clock[0] = t0 + 30 * i
+        for ln in bridge_watch.run_pass(cfg, "darwin", clock[0]):
+            logged[ln.split(":")[0]] += ln.split(": ", 1)[1].startswith("not reachable")
+    kicks = {b: sum("kickstart" in c and bridge.label(b, "auto") in c for c in seen["run"]) for b in names}
+    assert all(seen["box"].count(b) >= 7 for b in names)   # each box asked again at least once a minute
+    assert all(logged[b] == seen["box"].count(b) for b in names)   # every attempt is logged
+    assert all(kicks[b] == 3 for b in names)   # restarted at 0, 60 and 180 s: never on every check
+    assert sorted(shown) == sorted(f"tt-project: {b} unreachable" for b in names)   # one alert per box
+    clock[0] = back + 30
+    out = bridge_watch.run_pass(cfg, "darwin", clock[0])
+    assert sum("reachable again" in ln for ln in out) == 3 and len(shown) == 6
+    assert bridge_watch.run_pass(cfg, "darwin", back + 60) == [] and len(shown) == 6
+
+
 def _watch_clock(t):
     now = [t]
 
