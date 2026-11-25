@@ -881,30 +881,37 @@ def test_a_worse_project_is_rolled_back_alone_and_the_terminal_rearms_it(env, ca
     assert rollout.frozen("glm_work") is None
 
 
-def test_a_worse_glm_code_project_is_rolled_back_alone_with_its_rearm_line(env, capsys):
-    """The glm_code flag's own rollback: its judge reads the code-arm records, and only its own flag moves."""
+def test_a_worse_glm_code_project_is_rolled_back_alone_at_its_ring_level_with_its_rearm_line(env, capsys):
+    """glm_code at a ring level (no waves): the wave gate judges the ring's projects on their code-arm records, rolls
+    back only the worse one and only that flag, and opens no wave."""
     from ttp import rollout
-    p = make(env, "alpha")
-    _roll(capsys, "waves", "glm_code", "alpha")
-    _roll(capsys, "set", "glm_code", "auto")
-    p.set_config("route.glm_work", {"min_tasks": 4, "min_base": 4})
+    projs = {"alpha": make(env, "alpha"), **{n: _second_project(env, n) for n in ("beta", "gamma")}}
+    for n in ("alpha", "beta"):
+        _roll(capsys, "ring", n, "1")   # gamma stays in ring 2, which level 1 does not cover
+    _roll(capsys, "set", "glm_code", "1")
+    _roll(capsys, "waves", "glm_work", "alpha")
+    _roll(capsys, "set", "glm_work", "auto")
     now = time.time()
     t0 = now - 5 * 86400
-    for _ in range(4):
-        _gs_code_arm(p, t0 - 3 * 86400, 1, arm="sonnet")
-    for _ in range(4):
-        _gs_code_arm(p, t0 + 3600, 0, arm="glm")
-    projs = {"alpha": p}
+    for n, p in projs.items():
+        p.set_config("route.glm_work", {"min_tasks": 4, "min_base": 4})
+        for _ in range(4):
+            _gs_code_arm(p, t0 - 3 * 86400, 1, arm="sonnet")
+        for _ in range(4):   # beta's GLM code passes like its baseline; alpha's and gamma's fail
+            _gs_code_arm(p, t0 + 3600, n == "beta", arm="glm")
     recs = rollout.wave_tick(now, None, projs)
     assert [(r["op"], r["flag"], r["project"]) for r in recs] == [("project_rollback", "glm_code", "alpha")], recs
-    assert not rollout.on("glm_code", "alpha", p.raw_config()) and rollout.level("glm_code") == "auto"
+    raw = {n: p.raw_config() for n, p in projs.items()}
+    assert not rollout.on("glm_code", "alpha", raw["alpha"]) and rollout.on("glm_code", "beta", raw["beta"])
+    assert rollout.level("glm_code") == 1 and rollout.wave_at("glm_code") == 0
+    assert rollout.on("glm_work", "alpha") and rollout.rolled_back("glm_work") == {}, "glm_work is not moved"
     out = _roll(capsys, "status")[1]
-    assert "rolled back in alpha alone: worse than the Claude baseline past the rollback margin" in out
+    assert ("rolled back in alpha alone: worse than the Claude baseline past the rollback margin: "
+            "first review pass rate") in out
     assert "`ttp rollout arm glm_code alpha`" in out
     assert "re-armed in alpha" in _roll(capsys, "arm", "glm_code", "alpha")[1]
-    assert rollout.on("glm_code", "alpha", p.raw_config())
-    recs = rollout.wave_tick(now + 3600, None, projs)   # the re-armed project is judged again, on a new window
-    assert recs == [] or all(r["op"] != "project_rollback" for r in recs)
+    assert rollout.on("glm_code", "alpha", raw["alpha"])
+    assert rollout.wave_tick(now + 3600, None, projs) == [], "the re-armed project waits for new outcomes"
 
 
 def test_a_rollback_record_carries_both_pass_rates_and_the_baseline_window(env, capsys, tmp_path):

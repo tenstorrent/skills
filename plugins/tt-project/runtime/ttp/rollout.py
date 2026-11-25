@@ -17,6 +17,7 @@ config or state.
   level `auto`: a project is on when it is in waves 0..k (rollout.wave_at {flag: k}, from 0) and not rolled back
   for that flag alone (rollout.project_rollback {flag: {name: {ts, why}}}). wave_tick, model-free and hourly,
   judges the covered projects: a worse one is rolled back alone, a wave whose projects are all ok opens the next.
+  At a ring level it judges the projects on this host that the rings cover, and only rolls back.
 """
 from __future__ import annotations
 
@@ -601,14 +602,16 @@ def _wave_state() -> dict:
 
 
 def wave_tick(now: float | None = None, judge=None, projects: dict | None = None, by: str = "daemon") -> list[dict]:
-    """The wave gate, model-free: for each flag at auto not judged in the last hour, judge each project of its
-    covered waves (`judge(p, cfg, now)`: the flag's own judge, ok | worse | wait). A worse one is rolled back for that
-    flag alone (the others stay); when every project left in the current wave is ok (and none went worse), the
+    """The wave gate, model-free: for each `waves` flag that is on and not judged in the last hour, judge each
+    project it covers (`judge(p, cfg, now)`: the flag's own judge, ok | worse | wait): at auto the projects of its
+    covered waves, at a ring level this host's projects in those rings. A worse one is rolled back for that flag
+    alone (the others stay); at auto, when every project left in the current wave is ok (and none went worse), the
     next wave opens. The ledger records each move; returns those records. The hour limit and the lock make a
     call from every project's daemon safe; judging runs outside the lock."""
     from .project import write_json
     now = time.time() if now is None else now
-    flags = [f for f in FLAGS if level(f) == AUTO]
+    cfg = settings()
+    flags = [f for f in FLAGS if FLAGS[f].get("waves") and level(f, cfg) != OFF]
     if not flags:
         return []
     with _locked():
@@ -622,8 +625,12 @@ def wave_tick(now: float | None = None, judge=None, projects: dict | None = None
     out: list[dict] = []
     for flag in due:
         cfg = settings()
-        ws, k, back = waves(flag, cfg), wave_at(flag, cfg), rolled_back(flag, cfg)
-        excl = set(cfg.get("excluded") or [])
+        lv, ws, k, back = level(flag, cfg), waves(flag, cfg), wave_at(flag, cfg), rolled_back(flag, cfg)
+        if lv == OFF:
+            continue
+        rings, excl = cfg.get("rings"), set(cfg.get("excluded") or [])
+        names = ([n for w in ws[:k + 1] for n in w] if lv == AUTO
+                 else [n for n in projs if (r := ring_of(n, cfg)) is not None and r <= lv])
         verdicts: dict[str, dict] = {}
         try:
             from . import deviceplan, glmshare
@@ -631,7 +638,7 @@ def wave_tick(now: float | None = None, judge=None, projects: dict | None = None
             fj = judge or judges.get(FLAGS.get(flag, {}).get("judge"), glmshare.judge)
         except ImportError:
             continue
-        for name in (n for w in ws[:k + 1] for n in w if n not in excl and n not in back):
+        for name in (n for n in names if n not in excl and n not in back):
             p = projs.get(name)
             if p is None:
                 verdicts[name] = {"state": "wait", "why": "not a project on this host", "n": 0}
@@ -644,7 +651,7 @@ def wave_tick(now: float | None = None, judge=None, projects: dict | None = None
             verdicts[name] = v if isinstance(v, dict) else {"state": "wait", "why": "no verdict", "n": 0}
         with _locked():
             cfg = settings()
-            if level(flag, cfg) != AUTO or waves(flag, cfg) != ws or wave_at(flag, cfg) != k:
+            if (level(flag, cfg), waves(flag, cfg), wave_at(flag, cfg), cfg.get("rings")) != (lv, ws, k, rings):
                 continue   # the user changed it meanwhile: the next hour judges the new state
             back, worse = rolled_back(flag, cfg), []
             for name, v in verdicts.items():
@@ -657,7 +664,7 @@ def wave_tick(now: float | None = None, judge=None, projects: dict | None = None
                                    **{k: v[k] for k in ("glm_pct", "base_pct", "base_window") if k in v}))
             if worse:
                 _put("project_rollback", flag, back)
-            left = [n for n in ws[k] if n not in excl and n not in back]
+            left = [n for n in ws[k] if n not in excl and n not in back] if lv == AUTO else []
             if not worse and k + 1 < len(ws) and left and all(verdicts.get(n, {}).get("state") == "ok" for n in left):
                 _put("wave_at", flag, k + 1)
                 why = f"wave {k} no worse: " + "; ".join(f"{n}: {verdicts[n].get('why') or 'ok'}" for n in left)
