@@ -7,13 +7,15 @@ snippet this module proves harmless is judged as `pass` instead (hook.pre_tool_u
 judged as written. Proven means, from the code alone: it imports only modules without process, network or
 import machinery, calls nothing that runs code it builds, touches no dunder or private name, and opens files
 only at literal paths, reading none that is a credential store, a protected path or the system's live state,
-and writing only under the working folder or the run's TMPDIR. Anything else is not proven: today's guards
-decide it, and the run-time judge (pyaudit) stays the net under both."""
+and writing only under the working folder or the run's TMPDIR; and no folder python searches before the
+standard library (the working folder, PYTHONPATH) holds a module named like a standard one. Anything else is
+not proven: today's guards decide it, and the run-time judge (pyaudit) stays the net under both."""
 from __future__ import annotations
 
 import ast
 import builtins
 import importlib
+import importlib.machinery
 import os
 import re
 import shlex
@@ -307,6 +309,8 @@ def rewrite(cmd: str, cwd: str, env=None) -> str | None:
     lines, bodies = hook._heredocs(cmd)
     if any(b.end is None for b in bodies):   # an unended heredoc: the shell reads it differently than we would
         return None
+    if _may_shadow("\n".join(lines), bases[1:] if bases else [cwd], env):
+        return None
     changed = hidden = False
     for b in bodies:
         i, body, pos = b
@@ -342,6 +346,41 @@ def rewrite(cmd: str, cwd: str, env=None) -> str | None:
     if hidden and (len(lines) > 1 or re.search(r"[|>`;&]|\$\(|<\(", lines[0])):
         return None
     return "\n".join(out) if changed else None
+
+
+def _may_shadow(shell: str, cwds: list[str], env) -> bool:
+    """Whether python may import something other than the standard module a snippet (or a module it imports)
+    names: it searches its working folder and each PYTHONPATH entry first, so a module named like a standard
+    one there (one an earlier call wrote) runs instead. Also when the command may set Python's environment or
+    move to a folder not known here. `shell` is the command without its heredoc bodies."""
+    from . import hook
+    if "PYTHON" in re.sub(r"['\"\\]", "", shell):   # PYTHONPATH, PYTHONHOME ..., however quoted
+        return True
+    for argv in hook._segments(shell, strip=False):
+        words = argv[1:2] if argv and argv[0] in ("command", "builtin", "exec") else argv[:1]
+        if any(w in ("source", ".", "eval", "popd") for w in words) or argv and argv[0] in (
+                "cd", "pushd", "export", "declare", "typeset", "readonly", "local", "env", "set") \
+                and any(w == "-" or re.search(r"[$`*?\[]", w) for w in argv[1:]):
+            return True
+    path = str(env.get("PYTHONPATH") or "")
+    entries = [""] + (path.split(os.pathsep) if path else [])
+    return any(_holds_module(os.path.join(c, e)) for c in cwds for e in entries)
+
+
+def _holds_module(folder: str) -> bool:
+    """`folder` holds a module or regular package named like a standard module; True when it cannot be read."""
+    try:
+        entries = os.listdir(folder)
+    except (FileNotFoundError, NotADirectoryError):
+        return False
+    except OSError:
+        return True
+    names = getattr(sys, "stdlib_module_names", None)   # None (before 3.10): any module may shadow one
+    suffixes = importlib.machinery.all_suffixes()
+    std = lambda n: names is None or n in names or n in PURE or n in LISTED
+    return any(any(e.endswith(s) and std(e[:-len(s)]) for s in suffixes)
+               or std(e) and any(os.path.exists(os.path.join(folder, e, "__init__" + s)) for s in suffixes)
+               for e in entries)
 
 
 def _words_name_store(code: str, cwd: str, env) -> bool:

@@ -35,7 +35,7 @@ _UNPROVEN = [
     "from pathlib import Path\nPath('x').write_text('y')", "from pathlib import Path\nPath('a').replace('b')",
     "import time; time.sleep(100)", "import socket", "import ctypes", "import importlib", "import os; os.environ['A']",
     "not python (",
-    # found in review: modules under other names, frame objects, rebound literal names, keyword modes, listings
+    # modules under other names, frame objects, rebound literal names, keyword modes, listings
     "from shlex import os\nos.system('id')", "import os\nos.path.os.system('id')", "import base64; base64.main()",
     "def g(): yield\nprint(g().gi_frame.f_builtins)", "p='a.txt'\nf=lambda p: open(p,'w')\nf('/etc/x')",
     "p='a.txt'\ndef w(p): open(p,'w')\nw('/etc/x')", "p='a.txt'\nmatch '/etc/x':\n    case p: open(p,'w')",
@@ -156,3 +156,47 @@ def test_cwds_reads_a_ten_thousand_line_heredoc_quickly(env, tmp_path):
     cwds = credguard._cwds(hook._segments(f"{hops}; cat x", strip=False), str(tmp_path), str(tmp_path / "home"))
     assert time.perf_counter() - t < 0.2 and len(cwds) <= credguard.CWDS_CAP + 1 and str(tmp_path / "home") in cwds[1:]  # past the cap, read from HOME too
     assert pyproof.rewrite(f"{hops}; python3 -c 'print(1)'", str(tmp_path)) is None
+
+
+def test_pyproof_proves_nothing_when_python_may_import_a_module_from_its_folder_or_pythonpath(tmp_path, monkeypatch):
+    import importlib.machinery
+    from ttp import pyproof
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    monkeypatch.delenv("PYTHONPATH", raising=False)
+    code = "import json; print(json.dumps(1))"
+    cmds = {f"python3 -c '{code}'": "python3 -c 'pass'", f"python3 - <<'EOF'\n{code}\nEOF": "python3 - <<'EOF'\npass\nEOF"}
+
+    def proven(where):
+        return {cmd: pyproof.rewrite(cmd, str(where)) for cmd in cmds} == cmds
+    for n, planted in enumerate(("json.py", "re.py", "json.pyc", "json" + importlib.machinery.EXTENSION_SUFFIXES[0],
+                                 "json/__init__.py")):   # the module, one it imports, each form python loads
+        work, lib = tmp_path / f"w{n}", tmp_path / f"lib{n}"
+        (work / "json").mkdir(parents=True)              # a folder alone is a namespace part: the standard json wins
+        (work / "notes.txt").write_text("x")
+        assert proven(work), planted                     # a clean folder
+        (lib / planted).parent.mkdir(parents=True, exist_ok=True)
+        (lib / planted).write_text("x")
+        assert not proven(lib), planted                  # planted in the working folder
+        monkeypatch.setenv("PYTHONPATH", str(lib))
+        assert not proven(work), planted                 # or in a PYTHONPATH entry
+        monkeypatch.setenv("PYTHONPATH", f"{tmp_path / 'none'}:{lib.name}")
+        assert not proven(tmp_path), planted             # a relative one too
+        monkeypatch.delenv("PYTHONPATH")
+        assert pyproof.rewrite(f"cd {lib} && python3 -c '{code}'", str(work)) is None, planted   # or where a cd goes
+    work = tmp_path / "w0"
+    for cmd in (f"PYTHONPATH=x python3 -c '{code}'", f"export PYTH\"\"ONPATH=x; python3 -c '{code}'",
+                f". ./env.sh && python3 -c '{code}'", f"export \"$V\"; python3 -c '{code}'",
+                f"cd \"$D\" && python3 -c '{code}'", f"cd - && python3 -c '{code}'"):
+        assert pyproof.rewrite(cmd, str(work)) is None, cmd   # it may set Python's environment or folder
+
+
+def test_the_hook_refuses_a_store_naming_snippet_beside_a_module_named_like_one_it_imports(env, tmp_path, monkeypatch):
+    home = _cred_home(tmp_path, monkeypatch)
+    monkeypatch.delenv("PYTHONPATH", raising=False)
+    key = home / _SSH / "id_ed25519"
+    cmd = f"python3 - <<'EOF'\nimport difflib\nprint(difflib.get_close_matches('{key}', []))\nEOF"
+    assert _bash_why(tmp_path, cmd) == ""                                       # the standard difflib: it names only
+    for planted in ("difflib.py", "heapq.py"):                                  # it, or one it imports, left by a call
+        (tmp_path / planted).write_text("x")
+        assert _bash_why(tmp_path, cmd), planted
+        (tmp_path / planted).unlink()
