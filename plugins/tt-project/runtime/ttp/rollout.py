@@ -182,6 +182,8 @@ def stop_project(flag: str, project: str, why: str, by: str = "daemon") -> bool:
 # Some quality reasons that name GLM next to a fault word ("GLM output quality is down") are
 # refused for a run-initiated rollback too: over-refusing is the safe side, and the model-free
 # automatic quality rollback still rolls a flag back on quality.
+# A plural subject ("endpoints are down") escapes the \b-anchored subject words and is
+# accepted: a known gap, kept while the regex stays at its reviewed form.
 OUTAGE_RE = re.compile(r"outage|quota|rate.?limit|\b429\b|unreachable|connection (?:refused|reset|error)"
                        r"|overloaded"
                        r"|(?:endpoint|glm|server|api|provider)\b[\w'&.: -]{0,40}\b"
