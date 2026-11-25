@@ -917,6 +917,20 @@ def test_a_worse_glm_code_project_is_rolled_back_alone_at_its_ring_level_with_it
     assert rollout.wave_tick(now + 3600, None, projs) == [], "alpha waits for new outcomes; beta's ok opens no wave"
 
 
+
+def test_only_a_ring_judge_flag_is_judged_at_a_ring_level(env, capsys):
+    """At a ring level the wave gate judges only a flag marked `ring_judge` (glm_code); glm_work and glm_device
+    there are left to the health watch, even for a worse project."""
+    from ttp import rollout
+    assert [f for f in rollout.FLAGS if rollout.FLAGS[f].get("ring_judge")] == ["glm_code"]
+    projs = {"alpha": make(env, "alpha")}
+    _roll(capsys, "ring", "alpha", "1")
+    for flag in ("glm_work", "glm_device", "glm_code"):
+        _roll(capsys, "set", flag, "1")
+    recs = rollout.wave_tick(time.time(), _judge({"alpha": "worse"}), projs)
+    assert [(r["op"], r["flag"], r["project"]) for r in recs] == [("project_rollback", "glm_code", "alpha")], recs
+    assert rollout.rolled_back("glm_work") == rollout.rolled_back("glm_device") == {}
+
 def test_a_rollback_record_carries_both_pass_rates_and_the_baseline_window(env, capsys, tmp_path):
     from ttp import rollout
     _roll(capsys, "waves", "glm_work", "alpha")

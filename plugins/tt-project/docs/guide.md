@@ -5386,8 +5386,8 @@ the next wave, because they are project-wide and not tied to the GLM arm alone: 
 (`hold_corrections`). Claude $/day and bad output are reported, never gating. `glm_code` is judged the same way on
 its code-arm records against the project's Claude code tasks, on first review pass rate, bounce rate and tasks
 done per day alone, and waits where `glm_work` is on (that route decides the code tasks there). At a ring level
-instead of auto the gate judges this host's projects in the covered rings (not one whose own setting wins) and
-only rolls back; waves open only at auto. Each verdict lists every signal
+instead of auto the gate judges `glm_code` alone (the one flag marked `ring_judge`), for this host's projects in
+the covered rings (not one whose own setting wins), and only rolls back; waves open only at auto. Each verdict lists every signal
 with both arms, the gap and the margins. A `worse` project is rolled back
 for that flag alone, the others keep it; it stays off until `ttp rollout arm <flag> <project>`. When every project
 left in the current wave is `ok`, and none went worse in that pass, the next wave opens; `wait` holds it. Each

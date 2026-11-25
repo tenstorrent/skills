@@ -17,7 +17,8 @@ config or state.
   level `auto`: a project is on when it is in waves 0..k (rollout.wave_at {flag: k}, from 0) and not rolled back
   for that flag alone (rollout.project_rollback {flag: {name: {ts, why}}}). wave_tick, model-free and hourly,
   judges the covered projects: a worse one is rolled back alone, a wave whose projects are all ok opens the next.
-  At a ring level it judges the projects on this host that the rings cover, and only rolls back.
+  A flag marked `ring_judge` (glm_code) is also judged at a ring level: the projects on this host that the rings
+  cover, rollback only.
 """
 from __future__ import annotations
 
@@ -55,9 +56,10 @@ def _code(*names: str) -> tuple[str, ...]:
 
 FLAGS: dict[str, dict[str, Any]] = {
     # `judge`: the wave gate judges the flag with the named judge (wave_tick). glm_code's code-arm records
-    # (codearm.ARM_KV) are judged by glmshare.judge_code: the code route's own rollback metrics.
+    # (codearm.ARM_KV) are judged by glmshare.judge_code: the code route's own rollback metrics. `ring_judge`: the
+    # gate judges it at a ring level too (rollback only); any other flag only at auto.
     "glm_code": {"key": "route.code_sonnet.glm_share", "area": "route", "code": _code("codearm.py"), "waves": True,
-                 "judge": "codearm", "arm": "glm"},
+                 "judge": "codearm", "ring_judge": True, "arm": "glm"},
     # The project's routed work on GLM (glmwork.py); `waves`: it may run at auto, judged by glmshare.judge.
     "glm_work": {"key": "route.glm_work.on", "area": "route", "code": _code("glmwork.py", "codearm.py", "daemon.py"),
                  "waves": True, "arm": "glm"},
@@ -602,16 +604,17 @@ def _wave_state() -> dict:
 
 
 def wave_tick(now: float | None = None, judge=None, projects: dict | None = None, by: str = "daemon") -> list[dict]:
-    """The wave gate, model-free: for each `waves` flag that is on and not judged in the last hour, judge each
-    project it covers (`judge(p, cfg, now)`: the flag's own judge, ok | worse | wait): at auto the projects of its
-    covered waves, at a ring level this host's projects in those rings. A worse one is rolled back for that flag
-    alone (the others stay); at auto, when every project left in the current wave is ok (and none went worse), the
-    next wave opens. The ledger records each move; returns those records. The hour limit and the lock make a
-    call from every project's daemon safe; judging runs outside the lock."""
+    """The wave gate, model-free: for each flag at auto, or at a ring level when marked `ring_judge`, not judged in
+    the last hour, judge each project it covers (`judge(p, cfg, now)`: the flag's own judge, ok | worse | wait): at
+    auto the projects of its covered waves, at a ring level this host's projects in those rings. A worse one is
+    rolled back for that flag alone (the others stay); at auto, when every project left in the current wave is ok
+    (and none went worse), the next wave opens. The ledger records each move; returns those records. The hour limit
+    and the lock make a call from every project's daemon safe; judging runs outside the lock."""
     from .project import write_json
     now = time.time() if now is None else now
     cfg = settings()
-    flags = [f for f in FLAGS if FLAGS[f].get("waves") and level(f, cfg) != OFF]
+    at = {f: lv for f in FLAGS if (lv := level(f, cfg)) == AUTO or lv != OFF and FLAGS[f].get("ring_judge")}
+    flags = list(at)
     if not flags:
         return []
     with _locked():
@@ -626,8 +629,8 @@ def wave_tick(now: float | None = None, judge=None, projects: dict | None = None
     for flag in due:
         cfg = settings()
         lv, ws, k, back = level(flag, cfg), waves(flag, cfg), wave_at(flag, cfg), rolled_back(flag, cfg)
-        if lv == OFF:
-            continue
+        if lv != at[flag]:
+            continue   # the user changed it meanwhile: the next hour judges the new state
         rings, excl = cfg.get("rings"), set(cfg.get("excluded") or [])
         names = ([n for w in ws[:k + 1] for n in w] if lv == AUTO
                  else [n for n, p in projs.items() if (r := ring_of(n, cfg)) is not None and r <= lv
