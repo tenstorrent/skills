@@ -16,7 +16,8 @@ write fence may keep read-only, so a run never writes it itself:
 Each change appends one synced line to LOG in the account home: when, the key, the old and new values,
 who made it (configwho's role with its project, task and run) and the command that undoes it. A value
 the user set (the log's last line for the key is the user's, or the log does not explain the value: it
-was set at a terminal before this log or by hand) is refused for anyone else: only the user changes it.
+was set at a terminal before this log or by hand) is refused for anyone else: only the user changes it,
+except that a coordinator may lower it to a smaller nonzero number (noted as the user's value).
 A RAISE_USER_ONLY key's cap is only lowered by anyone else: raising it, or removing or zeroing a set
 cap, is the user's (setting one where none was set lowers it from no cap).
 """
@@ -109,7 +110,7 @@ def apply(key: str, value: Any, by: dict) -> str:
     old = current(key)
     who = str((by or {}).get("by") or "unknown")
     was_user = who != "user" and user_set(key, old)
-    if was_user and who != "coordinator":   # a coordinator lowers it, noted (#9824)
+    if was_user and not (who == "coordinator" and isinstance(value, int) and 0 < value < (old or 0)):
         raise ValueError(f"{key} is {json.dumps(old)}, set by the user: only the user changes it "
                          f"(ask them, with the value and why)")
     if who != "user" and raises(key, old, value):

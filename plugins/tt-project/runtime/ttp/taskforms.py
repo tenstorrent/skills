@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: © 2026 Tenstorrent USA, Inc.
 # SPDX-License-Identifier: Apache-2.0
 """task_add and task_update forms with one clear reading (actionforms), applied as meant instead of
-refused (#9824): each returns (rewritten action, note) or None.
+refused: each returns (rewritten action, note) or None.
 
 task_add: a missing title is the spec's first line; a depends_on id below 1 is dropped; a resource
 name is sanitised to the allowed characters; a continue of a running or queued task is a spec update
@@ -13,17 +13,11 @@ from __future__ import annotations
 
 import re
 
+from .coordinator import task_id
 from .db import TERMINAL_TASK_STATES
 
 STEER = ("running", "queued")   # a task_add continuing one is a spec update of it
 DEFER = ("start_after", "start_when")
-
-
-def _int(v):
-    try:
-        return None if isinstance(v, bool) else int(v)
-    except (TypeError, ValueError):
-        return None
 
 
 def _resources(a: dict) -> tuple[dict, str] | None:
@@ -49,14 +43,14 @@ def _add(p, a: dict) -> tuple[dict, list[str]] | tuple[dict, str]:
         a["title"] = next(x for x in spec.splitlines() if x.strip()).strip().lstrip("#-* ").strip()[:120]
         was.append(f"title={a['title']!r}, the spec's first line (was: no title)")
     if isinstance(a.get("depends_on"), list):
-        keep = [d for d in a["depends_on"] if (_int(d) or 0) > 0 or _int(d) is None]
+        keep = [d for d in a["depends_on"] if (task_id(d) or 0) > 0 or task_id(str(d).lstrip("-")) is None]
         if keep != a["depends_on"]:
             was.append(f"depends_on={keep} (was: {a['depends_on']}: no task id is below 1)")
             a["depends_on"] = keep
     if got := _resources(a):
         a = got[0]
         was.append(got[1])
-    prev = _int(a.get("continues"))
+    prev = task_id(a.get("continues"))
     old = db.task(prev) if prev is not None else None
     if old and old["status"] in STEER and spec:
         return {"type": "task_update", "id": old["id"], "spec": spec}, \
@@ -96,7 +90,7 @@ def _update(p, a: dict, batch: list) -> tuple[dict, list[str]]:
         drop = {"waits_on"} | ({"status"} if a.get("status") == "blocked" else set())
         a = {k: v for k, v in a.items() if k not in drop}
         was.append(f"without {' and '.join(sorted(drop))} (was: waits_on ask:new, but the batch sends no ask_user)")
-    t = db.task(_int(a.get("id"))) if _int(a.get("id")) is not None else None
+    t = db.task(task_id(a.get("id"))) if task_id(a.get("id")) is not None else None
     if t and t["status"] not in ("running", *TERMINAL_TASK_STATES):
         from . import chaincap
         a = _self_wait(p, a, [x["id"] for x in chaincap.chain(db, t["id"])[:-1]], was)

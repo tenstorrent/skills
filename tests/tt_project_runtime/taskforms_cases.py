@@ -74,6 +74,24 @@ def test_tform_a_branch_change_on_a_done_task_is_a_task_add_continuing_it(env):
     assert any(f"a task_add of #{tid}'s work continuing it with pr_branch" in n for n in _tf_notes(p)), _tf_notes(p)
 
 
+def test_tform_a_task_id_written_with_a_hash_reads_as_that_task(env):
+    """A task id sent as '#12' is task 12 in every form: a deferral on a running task becomes a task after it
+    ends, and a continue of a running task is a spec update of it."""
+    import json
+    from ttp import coordinator as coord
+    p = make(env)
+    tid = p.db.add_task("Fix the parser", "Fix it.", kind="code")
+    p.db.update_task(tid, status="running")
+    assert coord.apply(p, [{"type": "task_update", "id": f"#{tid}", "start_after": "2h"}]) == []
+    new = p.db.one("SELECT * FROM tasks WHERE id > ? ORDER BY id DESC", (tid,))
+    assert new and new["title"] == f"continue #{tid}: Fix the parser", _tf_notes(p)
+    assert json.loads(new["depends_on"]) == [tid], dict(new)
+    assert coord.apply(p, [{"type": "task_add", "kind": "code", "title": "parser fix, part two",
+                            "spec": "Also cover the empty file.", "continues": f"#{tid}"}]) == []
+    assert p.db.task(tid)["spec"].endswith("Also cover the empty file."), dict(p.db.task(tid))
+    assert not p.db.one("SELECT id FROM tasks WHERE title='parser fix, part two'")
+
+
 def test_tform_config_set_maps_a_moved_key_and_never_changes_a_user_value_or_a_user_word_key(env, monkeypatch):
     """Refused before: an unknown key that means one current key; it applies to the current key. Still refused:
     any change of a value the user set, any key only the user's word changes (spend caps, the chain caps, the run
