@@ -13414,11 +13414,11 @@ def _log_account_change(key: str, old, new) -> None:
 
 
 def _user_only_change(raw: dict, key: str, val) -> str | None:
-    """The user-only setting (coordinator.user_word) that writing `val` at `key` into the project.json
+    """The user-only setting (coordinator.needs_users_word) that writing `val` at `key` into the project.json
     `raw` would change, or None. A parent key (`budget`, `delivery`) counts through what it holds, and
     turning a SAFE_WHEN_OFF switch off is the safe direction, as in the coordinator's own gate."""
     import copy
-    from .coordinator import NEEDS_USER, SAFE_WHEN_OFF, user_word
+    from .coordinator import NEEDS_USER, SAFE_WHEN_OFF, needs_users_word
 
     def at(node, dotted):
         for part in dotted.split("."):
@@ -13443,7 +13443,7 @@ def _user_only_change(raw: dict, key: str, val) -> str | None:
     for k in sorted(leaves(at(raw, key), key) | leaves(at(after, key), key), key=lambda k: (-k.count("."), k)):
         k = next((n for n in NEEDS_USER if k.startswith(n + ".")), k)
         new = at(after, k)
-        if new != at(raw, k) and user_word(k) and not (k in SAFE_WHEN_OFF and new in (False, "", [])):
+        if new != at(raw, k) and needs_users_word(k) and not (k in SAFE_WHEN_OFF and new in (False, "", [])):
             return k
     return None
 

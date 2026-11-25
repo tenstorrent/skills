@@ -83,7 +83,7 @@ def test_actionforms_malformed_fields_get_a_plain_reason_in_apply_and_the_dry_ru
         assert len(out) == 1 and why in out[0] and "internal harness error" not in out[0], (bad, out)
     assert coord.apply(p, [{"type": "task_update", "id": str(t), "priority": 2.0}]) == []
     assert p.db.task(t)["priority"] == 2
-    # '#12' is task 12, for the id and for depends_on alike (one id reading)
+    # an id written with a hash sign is that task, for the id and for depends_on alike (one id reading)
     assert coord.apply(p, [{"type": "task_update", "id": f" #{t} ", "priority": 3}]) == []
     assert p.db.task(t)["priority"] == 3
     assert coord.apply(p, [{"type": "task_add", "title": "after it", "kind": "work", "spec": "s",

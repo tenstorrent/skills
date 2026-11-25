@@ -427,7 +427,7 @@ def test_a_worker_runs_config_of_a_coordinator_set_spill_wrap_cmd_is_refused_and
 def test_config_set_refusing_a_key_a_coordinator_sets_by_cli_names_that_route_and_a_users_key_does_not(env):
     """A known key config_set refuses (not chat-settable) but a coordinator may set by `ttp config`: the
     rejection names that route, so a worker told to hand it to the coordinator never loops. A key that is
-    the user's alone (coordinator.user_word: a spend setting here) and an unknown key get no such route. (Most such
+    the user's alone (coordinator.needs_users_word: a spend setting here) and an unknown key get no such route. (Most such
     keys config_set now applies as that command would: configset_cases.)"""
     from ttp.coordinator import apply
     p = make(env)

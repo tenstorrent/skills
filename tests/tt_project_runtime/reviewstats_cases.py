@@ -828,7 +828,7 @@ def test_task_add_returns_the_verdict_only_for_a_review_of_the_exact_accepted_ta
         assert coord.apply(p, [dict(add, title=f"Review target {n}", spec=spec)]) == [], spec
     problems = coord.apply(p, [dict(add, title="Review the packet once more",
                                     spec=f"Review the detached packet reviews/p.md sha256 {_SUM_A}.")])
-    notes = p.db.kv(coord.NOTES_KEY, [])   # not queued: the earlier verdict comes back, noted (#9824)
+    notes = p.db.kv(coord.NOTES_KEY, [])   # not queued: the earlier verdict comes back, noted
     assert problems == [] and any(f"review #{first}" in n and "the earlier verdict returned" in n for n in notes), notes
     assert not p.db.q("SELECT id FROM tasks WHERE title='Review the packet once more'")
 
@@ -849,7 +849,7 @@ def test_task_add_is_not_refused_by_a_failed_review_of_another_target(env, monke
                               f"Review repo other/b, branch x, head {_OTHER_HEAD}.")):
         assert coord.apply(p, [dict(add, title=f"Review target {n}", spec=spec)]) == [], spec
     problems = coord.apply(p, [dict(add, title="Review the change once more", spec="Review the change.")])
-    notes = p.db.kv(coord.NOTES_KEY, [])   # not queued: the earlier verdict comes back, noted (#9824)
+    notes = p.db.kv(coord.NOTES_KEY, [])   # not queued: the earlier verdict comes back, noted
     assert problems == [] and any(f"review #{plain}" in n and "the earlier verdict returned" in n for n in notes), notes
 
 

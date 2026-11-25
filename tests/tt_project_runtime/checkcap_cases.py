@@ -9911,7 +9911,7 @@ def test_coordinator_sets_the_account_checks_host_cap_logged_with_its_setter_and
     # The user sets it at a terminal: theirs from then on.
     cli.main(["config", "--account", "checks.host_max", "5"])
     assert _json.loads(accountset.log_path().read_text().splitlines()[-1])["by"] == "user"
-    # The coordinator lowering the user's value applies, noted as the user's (#9824); a worker's queue is refused.
+    # The coordinator lowering the user's value applies, noted as the user's; a worker's queue is refused.
     assert coordinator.apply(p, [{"type": "config_set", "key": "checks.host_max", "value": "1"}]) == []
     assert project.load_account_settings()["checks"]["host_max"] == 1
     notes = p.db.kv(coordinator.NOTES_KEY, [])

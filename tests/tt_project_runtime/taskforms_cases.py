@@ -75,7 +75,7 @@ def test_tform_a_branch_change_on_a_done_task_is_a_task_add_continuing_it(env):
 
 
 def test_tform_a_task_id_written_with_a_hash_reads_as_that_task(env):
-    """A task id sent as '#12' is task 12 in every form: a deferral on a running task becomes a task after it
+    """A task id sent with a leading hash sign is that task in every form: a deferral on a running task becomes a task after it
     ends, and a continue of a running task is a spec update of it."""
     import json
     from ttp import coordinator as coord

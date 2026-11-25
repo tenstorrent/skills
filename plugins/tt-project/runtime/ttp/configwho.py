@@ -555,12 +555,12 @@ def review_lines(p, now: float | None = None) -> list[str]:
 def normal_form(p, a: dict, _batch: list, _home: str, _now: float):
     """actionforms: a config_set of an unknown key that means one current key (its last part, or its section and
     last part joined by '_', under one other section; or a near spelling) is applied to that key, unless either
-    key needs the user's word (coordinator.user_word). None otherwise."""
+    key needs the user's word (coordinator.needs_users_word). None otherwise."""
     import difflib
-    from .coordinator import user_word
+    from .coordinator import needs_users_word
     from .project import _known_keys, account_keys, unknown_key_hint
     key = str(a.get("key") or "").strip()
-    if not key or key in account_keys() or user_word(key) or not unknown_key_hint(key):
+    if not key or key in account_keys() or needs_users_word(key) or not unknown_key_hint(key):
         return None   # an account key means itself, never a project key
     *head, leaf = key.split(".")
     tops = sorted(_known_keys([]) or ())
@@ -568,6 +568,6 @@ def normal_form(p, a: dict, _batch: list, _home: str, _now: float):
             if s != (head or [""])[0] and x in (_known_keys([s]) or ())]
     near = difflib.get_close_matches(leaf, sorted(_known_keys(head) or ()), n=2, cutoff=0.85) if head else []
     to = both[0] if len(both) == 1 else ".".join([*head, near[0]]) if len(near) == 1 else None
-    if to and not unknown_key_hint(to) and not user_word(to):
+    if to and not unknown_key_hint(to) and not needs_users_word(to):
         return {**a, "key": to}, f"key={to!r} (was: {key!r}, no such key)"
     return None

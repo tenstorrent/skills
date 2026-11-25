@@ -102,7 +102,7 @@ def from_action(a: dict, now: float | None = None, p: Project | None = None, by:
 
 
 def normal_form(p, a: dict, _batch: list, _home: str, _now: float):
-    """actionforms (#9824): a coordinator's resource pause with no end (and no health end) gets the
+    """actionforms: a coordinator's resource pause with no end (and no health end) gets the
     default one, DEFAULT_S from now; a machine hold, which reaches every project, still needs its own."""
     if a.get("paused") is not True or a.get("machine") or a.get("until") or a.get("end_when") \
             or health_end(p, a.get("resource")):

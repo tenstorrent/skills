@@ -770,7 +770,7 @@ def test_a_continue_over_a_soft_cap_with_a_reason_passes_in_the_same_action_and_
     from ttp import coordinator as coord
     why = "new evidence: the header parser was the slow step, a different approach caches it"
     _, _, tip = _chain(p, 2)   # two done hops with no progress: the stall cap
-    # the hops' spec is "s": the same spec again is an identical retry, the only one a soft cap refuses (#9824)
+    # the hops' spec is "s": the same spec again is an identical retry, the only one a soft cap refuses
     act = {"type": "task_add", "title": "continue: parser, next", "spec": "s", "kind": "code", "continues": tip}
     assert "chains.max_stalls is 2" in chaincap.refusal(p, p.config(), chaincap.chain(p.db, tip))
     assert coord.apply(p, [dict(act, reason=why)]) == []
@@ -784,7 +784,7 @@ def test_a_continue_over_a_soft_cap_with_a_reason_passes_in_the_same_action_and_
     (bare,) = coord.apply(p, [dict(act, title="continue: lexer", continues=tip2)])
     assert "refused" in bare and "it has no `reason`" in bare and "add a `reason` field" in bare, bare
     assert "new evidence, a different approach or a narrower scope" in bare and "identical retry" in bare
-    # A changed spec passes the soft cap with no reason, noted and recorded as an override (#9824).
+    # A changed spec passes the soft cap with no reason, noted and recorded as an override.
     assert coord.apply(p, [dict(act, title="continue: lexer", continues=tip2, spec="cache the header parse")]) == []
     assert p.db.q("SELECT 1 FROM tasks WHERE parent=?", (tip2,))
     assert any("past its cap" in n and "spec differs" in n for n in p.db.kv(coord.NOTES_KEY, []))

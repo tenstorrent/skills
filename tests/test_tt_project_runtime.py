@@ -33002,7 +33002,7 @@ def test_a_split_hop_starts_at_once_and_never_waits_on_its_own_chains_landing(en
     assert "land on the push branch" not in done["text"] and done["status"] == "handled"
     _settle_deferred(dmod.Daemon(p.base), hop["id"])
     assert _ready(p, hop["id"]) and not _events(p, hop["id"], "deferral_probe_broken")
-    # #9824: the wait that could never pass is dropped with a note, and the rest applies
+    # the wait that could never pass is dropped with a note, and the rest applies
     assert coord.apply(p, [{"type": "task_update", "id": hop["id"], "start_when": f"landed:#{root}"}]) == []
     assert not any(x.startswith("start_when:") for x in _labels(p, hop["id"]))
     assert any("a wait on its own continue chain that could never pass" in n for n in p.db.kv(coord.NOTES_KEY, []))
@@ -33081,7 +33081,7 @@ def test_a_continue_chain_over_its_cap_is_refused_unless_its_reason_names_what_c
     from ttp.db import continues_id
     p.set_config("chains.max_hops", 2)
     root, _, tip = _chain(p, 2)
-    # #9824: the soft caps refuse only an identical retry (the tip's spec word for word)
+    # the soft caps refuse only an identical retry (the tip's spec word for word)
     act = {"type": "task_add", "title": "continue: parser, next", "spec": p.db.task(tip)["spec"], "kind": "code",
            "continues": tip}
     problems = coord.apply(p, [act])

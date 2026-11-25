@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: © 2026 Tenstorrent USA, Inc.
 # SPDX-License-Identifier: Apache-2.0
-"""memory_add `supersedes` and memory_forget `name` forms with one clear reading (actionforms, #9824),
+"""memory_add `supersedes` and memory_forget `name` forms with one clear reading (actionforms),
 applied as meant instead of refused: a name matching no entry (project._resolve_memory_name) that is a
 '-'-bounded part of, or a near spelling (difflib >= 0.9) of, exactly one live entry's name is that entry;
 a standing entry named in the `supersedes` of a memory_add that is not standing and gives no `why` is left

@@ -1486,7 +1486,7 @@ def _obform_notes(p, coord):
 
 def test_obform_a_finished_owner_is_replaced_by_its_open_heirs(env, monkeypatch):
     """Item 5 (sample: owner done #A, open "Fix review #A"): the fix is attached instead, with one note, and
-    coordprecheck refuses nothing. A finished owner with two open successors gets both (#9824); one with
+    coordprecheck refuses nothing. A finished owner with two open successors gets both; one with
     none is left out with fit_owners' note and the rest attached."""
     from ttp import coordinator as coord, coordprecheck, obligations as ob
     p, d, now, tid, check, mid, raised = _order_setup(env, monkeypatch)
@@ -1511,7 +1511,7 @@ def test_obform_a_finished_owner_is_replaced_by_its_open_heirs(env, monkeypatch)
 
 
 def test_obform_a_review_or_plan_owner_of_a_change_order_is_replaced_by_the_task_making_the_change(env, monkeypatch):
-    """#9824 (sample "order oN: #N is a review task, which cannot carry a change order"): a review owner is
+    """Was refused (sample "order oN: #N is a review task, which cannot carry a change order"): a review owner is
     replaced by the code task it reviews, a plan owner by its open code child, each with a note; a plan with
     no such child is still left out with fit_owners' note."""
     from ttp import coordinator as coord, coordprecheck, obligations as ob

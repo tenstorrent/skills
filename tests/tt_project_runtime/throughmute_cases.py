@@ -30,7 +30,7 @@ def test_tmute_the_one_open_task_naming_what_it_mutes_owns_an_ownerless_mute(env
 
 def test_tmute_two_candidate_owners_or_one_this_batch_adds_leave_the_coordinator_owning_it(env):
     """A second open task, or a task_add of the same batch, naming what it mutes: no single owner, so the
-    coordinator owns the mute (#9824: was refused as needing an owner), with a note."""
+    coordinator owns the mute (was refused as needing an owner), with a note."""
     from ttp import coordinator as coord, screen as scr
     p, mute = _tmute_rig(env)
     p.db.add_task("Repair the check host", "Make env:check-host:box-a pass again.")

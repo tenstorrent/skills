@@ -155,7 +155,7 @@ def vet(db: Any, source: Any, match: Any, why: Any, end_when: Any, cfg: dict | N
         owner = {"probe": probe}
     elif OUTSIDE_RE.search(why):
         owner = {"outside": why[:200]}
-    else:   # no owner named: the coordinator owns it (#9824), and its review lines show that
+    else:   # no owner named: the coordinator owns it, and its review lines show that
         named = ", ".join(f"#{t}" for t in dict.fromkeys(TASK_RE.findall(why)))
         owner = {"coordinator": (f"{named} is not an open task; " if named else "") + (why[:200] or "no why given")}
     if old and old.get("throughput") and " ".join(why.lower().split()) == " ".join(str(old.get("why") or "").lower().split()):
