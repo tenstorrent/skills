@@ -90,19 +90,19 @@ class _Proof:
         nodes = list(ast.walk(tree))
         binds: dict[str, int] = {}        # every way a name is bound: a literal or an import must be bound once
         for n in nodes:
-            for name in _bound(n):
+            for name in _names_bound(n):
                 binds[name] = binds.get(name, 0) + 1
             if isinstance(n, ast.Import):
                 for a in n.names:
-                    mod = _module(a.name if a.asname else a.name.split(".")[0])
+                    mod = _own_module(a.name if a.asname else a.name.split(".")[0])
                     if mod is None:
                         return False
                     self.mods[a.asname or a.name.split(".")[0]] = mod
             elif isinstance(n, ast.ImportFrom):
                 for a in n.names:
-                    if n.level or a.name == "*" or (base := _module(str(n.module))) is None:
+                    if n.level or a.name == "*" or (base := _own_module(str(n.module))) is None:
                         return False
-                    if (mod := _module(f"{n.module}.{a.name}")) is not None:
+                    if (mod := _own_module(f"{n.module}.{a.name}")) is not None:
                         self.mods[a.asname or a.name] = mod
                     elif not self._attr(base, a.name):
                         return False
@@ -155,7 +155,7 @@ class _Proof:
         if isinstance(node, ast.Name):
             return self.mods.get(node.id)
         if isinstance(node, ast.Attribute) and (b := self._dotted(node.value)):
-            return _module(f"{b}.{node.attr}")
+            return _own_module(f"{b}.{node.attr}")
         return None
 
     def _attr(self, mod: str, attr: str) -> bool:
@@ -238,7 +238,7 @@ class _Proof:
         return isinstance(node, ast.Name) and node.id in self.paths
 
 
-def _bound(n) -> list[str]:
+def _names_bound(n) -> list[str]:
     """The names node `n` binds, in any of Python's ways (parameters, except-as, match captures, defs)."""
     if isinstance(n, ast.Name) and not isinstance(n.ctx, ast.Load):
         return [n.id]
@@ -260,7 +260,7 @@ def _string_annotation(n) -> bool:
     return any(isinstance(c, ast.Constant) and isinstance(c.value, str) for a in notes if a for c in ast.walk(a))
 
 
-def _module(name: str) -> str | None:
+def _own_module(name: str) -> str | None:
     """The own name of the module `name` reaches, when it is one a snippet may use (PURE, LISTED), else None."""
     root, *rest = name.split(".")
     if root not in PURE | set(LISTED):
