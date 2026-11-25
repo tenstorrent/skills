@@ -330,7 +330,7 @@ def rewrite(cmd: str, cwd: str, env=None) -> str | None:
             hidden |= named
             body[:] = ["pass"]
             changed = True
-            proven.add((i, _start(lines[i], pos)))
+            proven.add((i, _piece_start(lines[i], pos)))
     ends: dict[int, list[str]] = {}   # the lines each heredoc leaves after its line: its body, then its end
     for b in bodies:
         ends.setdefault(b[0], []).extend([*b[1], b.end])
@@ -340,7 +340,7 @@ def rewrite(cmd: str, cwd: str, env=None) -> str | None:
         for m in reversed(list(DASH_C_RE.finditer(line))):
             code = m[1] if m[1] is not None else m[2]
             if not flags[m.start()][0] and _code_at(line, m.start()) == code and (proof := _prove(code, cwd, env, bases)):
-                proven.add((i, _start(line, m.start())))
+                proven.add((i, _piece_start(line, m.start())))
                 line, changed = f"{line[:m.start()]}-c 'pass'{line[m.end():]}", True
                 named = _words_name_store(code, cwd, env)
                 if named and proof.wrote:
@@ -441,7 +441,7 @@ def _plants(shell: str) -> bool:
     return False
 
 
-def _start(line: str, pos: int) -> int:
+def _piece_start(line: str, pos: int) -> int:
     from . import hook
     return next(s for s, e, _ in hook._pieces(line) if s <= pos <= e)
 

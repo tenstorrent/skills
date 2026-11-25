@@ -48,6 +48,13 @@ _UNPROVEN = [
 ]
 
 
+def _plain_python(monkeypatch):
+    """The system python, as a run finds it: no PYTHONPATH (a run's own holds its judge's zip), no venv or wrapper
+    in a folder the suite's user can write first on PATH (pyproof proves nothing for those)."""
+    monkeypatch.delenv("PYTHONPATH", raising=False)
+    monkeypatch.setenv("PATH", f"{os.path.dirname(os.path.realpath(sys.executable))}:/usr/bin:/bin")
+
+
 def test_pyproof_proves_plain_reads_and_worktree_writes_and_nothing_else(tmp_path, monkeypatch):
     from ttp import pyproof
     monkeypatch.setenv("HOME", str(tmp_path / "home"))
@@ -60,7 +67,7 @@ def test_pyproof_proves_plain_reads_and_worktree_writes_and_nothing_else(tmp_pat
 def test_pyproof_rewrites_only_the_proven_snippet_and_keeps_the_rest_of_the_line(tmp_path, monkeypatch):
     from ttp import pyproof
     monkeypatch.setenv("HOME", str(tmp_path / "home"))
-    monkeypatch.delenv("PYTHONPATH", raising=False)   # a run's own would hold its judge's zip
+    _plain_python(monkeypatch)
     cwd = str(tmp_path)
     proven = "import json,sys; print(json.load(sys.stdin))"
     assert pyproof.rewrite(f"cat a.json | python3 -c '{proven}' && rm -rf x", cwd) == \
@@ -81,7 +88,7 @@ def test_pyproof_rewrites_only_the_proven_snippet_and_keeps_the_rest_of_the_line
 
 def test_the_hook_passes_a_proven_snippet_and_still_refuses_the_rest_of_its_call(env, tmp_path, monkeypatch):
     home = _cred_home(tmp_path, monkeypatch)
-    monkeypatch.delenv("PYTHONPATH", raising=False)   # a run's own would hold its judge's zip
+    _plain_python(monkeypatch)
     key = home / _SSH / "id_ed25519"
     named = f"python3 - <<'EOF'\nprint('{key}'.split('/')[-1])\nEOF"
     assert _bash_why(tmp_path, named) == ""                                     # names a store, reads nothing
@@ -133,7 +140,7 @@ def test_the_hook_refuses_a_store_naming_snippet_that_writes_a_file_for_a_later_
 def test_pyproof_reads_heredocs_as_the_hook_does(tmp_path, monkeypatch):
     from ttp import pyproof
     monkeypatch.setenv("HOME", str(tmp_path / "home"))
-    monkeypatch.delenv("PYTHONPATH", raising=False)   # a run's own would hold its judge's zip
+    _plain_python(monkeypatch)
     cwd, code = str(tmp_path), "print(1)"
     assert pyproof.rewrite(f"python3 - <<'A' && python3 - <<'B'\n{code}\nA\n{code}\nB", cwd) == \
         "python3 - <<'A' && python3 - <<'B'\npass\nA\npass\nB"                    # two on one line, each its own body
@@ -165,7 +172,7 @@ def test_pyproof_proves_nothing_when_python_may_import_a_module_from_its_folder_
     import importlib.machinery
     from ttp import pyproof
     monkeypatch.setenv("HOME", str(tmp_path / "home"))
-    monkeypatch.delenv("PYTHONPATH", raising=False)
+    _plain_python(monkeypatch)
     code = "import json; print(json.dumps(1))"
     cmds = {f"python3 -c '{code}'": "python3 -c 'pass'", f"python3 - <<'EOF'\n{code}\nEOF": "python3 - <<'EOF'\npass\nEOF"}
 
@@ -244,7 +251,7 @@ def test_pyproof_proves_nothing_when_python_may_import_a_module_from_its_folder_
 
 def test_the_hook_refuses_a_store_naming_snippet_beside_a_module_named_like_one_it_imports(env, tmp_path, monkeypatch):
     home = _cred_home(tmp_path, monkeypatch)
-    monkeypatch.delenv("PYTHONPATH", raising=False)
+    _plain_python(monkeypatch)
     key = home / _SSH / "id_ed25519"
     cmd = f"python3 - <<'EOF'\nimport difflib\nprint(difflib.get_close_matches('{key}', []))\nEOF"
     assert _bash_why(tmp_path, cmd) == ""                                       # the standard difflib: it names only
