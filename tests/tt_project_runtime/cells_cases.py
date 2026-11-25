@@ -254,7 +254,7 @@ def test_only_an_enumerable_cells_line_requests_cells():
     assert cells.requested("cells: 81:00.0, 0000:82:00.0; c1") == ["81:00.0", "0000:82:00.0", "c1"]
     assert cells.requested("cells: a, b, c") == ["a", "b", "c"]
     for bad in ("cells: per chip: a, b", "cells: chip 81:00.0, b", "cells: a:, b", "cells: :a",
-                "cells: a, b (one per chip)", "cells: a, [b]", "cells: the full sweep at each level, then a summary",
+                "cells: a (one per chip), b", "cells: a, [b]", "cells: the full sweep at each level, then a summary",
                 "cells: a, run every test on every chip.", "cells: " + "x" * 41):
         assert cells.requested(bad) == [] and cells.ignored(bad) and cells.problem(bad), bad
     # One descriptive line does not void an enumerable one beside it; a spec without lines has no problem.
@@ -706,3 +706,26 @@ def test_a_run_of_another_project_reads_tasks_here_but_never_changes_them(env, m
     monkeypatch.setenv("TTP_PROJECT", str(p.base))   # its own project: unchanged
     code, out = task("cancel", tid)
     assert "another project is refused" not in out.out + out.err, out
+
+
+def test_cells_one_trailing_parenthetical_remark_is_dropped_and_the_names_are_the_cells(env):
+    """Refused: `task_add rejected: its `cells: glm-codex, sonnet-codex, sonnet-mini, glm-mini-anchor (8 tasks
+    each)` line is a description, not a list of cells`. One trailing parenthetical is a remark on the list: the
+    four names are the cells, the spec stays as sent. A line still a description without it stays refused."""
+    from ttp import cells, coordinator as coord
+    p = make(env)
+    spec = ("Run the four arms on the same tasks.\n"
+            "cells: glm-codex, sonnet-codex, sonnet-mini, glm-mini-anchor (8 tasks each)\nReport each arm's pass rate.")
+    assert coord.apply(p, [{"type": "task_add", "title": "arm bench", "kind": "work", "spec": spec}]) == []
+    stored = p.db.one("SELECT spec FROM tasks WHERE title='arm bench'")["spec"]
+    assert "glm-mini-anchor (8 tasks each)" in stored
+    assert cells.requested(stored) == ["glm-codex", "sonnet-codex", "sonnet-mini", "glm-mini-anchor"]
+    assert cells.ignored(stored) == []
+    bad = "Run each chip.\ncells: one cell per chip id on the board (8 tasks each)"
+    out = coord.apply(p, [{"type": "task_add", "title": "chip bench", "kind": "work", "spec": bad}])
+    assert len(out) == 1 and "is a description, not a list of cells" in out[0], out
+    assert cells.requested(bad) == [] and p.db.one("SELECT id FROM tasks WHERE title='chip bench'") is None
+    more = "Check each project.\ncells: restore, ledger (plus one per other project the list shows)"
+    out = coord.apply(p, [{"type": "task_add", "title": "project sweep", "kind": "work", "spec": more}])
+    assert len(out) == 1 and "is a description, not a list of cells" in out[0], out   # the remark adds cells
+    assert cells.requested(more) == [] and not cells.enumerable("a, b (+ one per box)")

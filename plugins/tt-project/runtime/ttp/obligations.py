@@ -32,7 +32,8 @@ naming a missing, failed or cancelled task, and a wait older than coordinator.de
 raise whatever the owners do. The harness records the evidence as given: checking it stays with the owner.
 
 Inside a run the CLI cannot write the project's database, so `progress` and `receipt` append to the
-run's RUN_FILE, and the daemon files them (only for an obligation that run's task owns). Outside a run
+run's RUN_FILE, and the daemon files them (only for an obligation that run's task owns; one carrying an
+owner's work on, or whose spec names the obligation, is made an owner first: _adopt). Outside a run
 (the user, the relay) they are filed at once.
 
 Daemon.check_obligations looks every CHECK_EVERY_S, model-free: it files new run records, and for each
@@ -392,6 +393,35 @@ def _carried(t) -> dict[str, str]:
     return out
 
 
+def _descends(db, t: dict, owners: dict) -> str | None:
+    """The task of `owners` (id -> its row) whose work task row `t` carries on, hop by hop: a hop
+    _carried names, a parent_copy hop of its parent, or a task on that task's branch (its own or its
+    `pr_branch:`). None when it carries none of them on."""
+    from .worktree import recorded_pr_branch
+    branches = {r["branch"]: i for i, r in owners.items() if r and r.get("branch")}
+    seen, todo = {str(t["id"])}, [t]
+    while todo and len(seen) <= CLAIM_HOPS_MAX:
+        t = todo.pop(0)
+        up = set(_carried(t)) | {branches[b] for b in (t.get("branch"), recorded_pr_branch(t)) if b in branches}
+        if t.get("tier_source") == "parent_copy" and t.get("parent"):
+            up.add(str(t["parent"]))
+        if hit := sorted(up & set(owners), key=int):
+            return hit[0]
+        for u in sorted(up - seen, key=int):
+            seen.add(u)
+            if row := db.task(int(u)):
+                todo.append(row)
+    return None
+
+
+def _heir(db, t: dict) -> int | None:
+    """The one open task (NAMED_OPEN) carrying finished task `t`'s work on (_descends); None when none or
+    several do."""
+    rows = db.q(f"SELECT * FROM tasks WHERE status IN ({','.join('?' * len(NAMED_OPEN))})", NAMED_OPEN)
+    heirs = [r["id"] for r in rows if _descends(db, r, {str(t["id"]): t})]
+    return heirs[0] if len(heirs) == 1 else None
+
+
 def _attach_carriers(p, st: dict, now: float, tids=None) -> list[tuple[str, int]]:
     """Attach the open tasks (or only `tids`) that carry an owner's work on (_carried) to each open
     obligation it owns, inside the caller's transaction, and note each in the obligation's history. A
@@ -509,13 +539,42 @@ def _receipt_landing(p, oid: str, kind: str, milestone: str | None,
     return ("not-landed", outs[0][1])
 
 
+def _adopt(p, oid: str, task: int, now: float) -> None:
+    """Make task `task` an owner of open obligation `oid` when it carries an owner's work on (_descends)
+    or its spec names `oid`, so the record its run wrote is filed, not refused by record()'s owner rule.
+    A kind that cannot carry the order (unfit_owner) and a task with no such link are left out."""
+    db = p.db
+    o, t = get(db, oid), db.task(task)
+    if not o or not t or not _open(o) or str(task) in o["owners"] \
+            or unfit_owner(db, (o.get("promise") or {}).get("class"), [task]):
+        return
+    via = _descends(db, t, {i: db.task(int(i)) for i in o["owners"]})
+    why = f"descends from #{via}" if via else f"its spec names {oid}" if oid in named(t["spec"]) else None
+    if not why:
+        return
+    with db.tx():
+        st = _load(db)
+        o = _need(st, oid)
+        if t["status"] in CLOSED:   # its run's records are filed after it ended: nothing to tell it
+            o["owners"].setdefault(str(task), {"since": now, "progress": None, "evidence": []})
+        else:
+            _attach(p, o, [task], now)
+        o.setdefault("history", []).append({"at": now, "event": "attached", "task": task,
+                                            "why": f"#{task} {why}: its run's record is filed"})
+        db.set_kv(KV, st)
+    from .daemon import log   # daemon imports this module
+    log(p, f"obligation owner added: #{task} ({why}) for {oid}")
+
+
 def record(p, oid: str, kind: str, evidence: str, task: int | None, now: float | None = None,
            milestone: str | None = None, run_dir: str | None = None) -> str:
     """File durable progress or a receipt. Progress counts only from a required owner, and resets only
     that owner's clock. Returns what was done, in a few words. A receipt on a change order closes it
     only once its change is on the push branch (the landed check decides; see _receipt_landing): one
     that is not is kept as progress, and one this project cannot check leaves the order open, marked
-    unverified. `run_dir`: the run whose record this is, told the reason a receipt was not filed."""
+    unverified. `run_dir`: the run whose record this is, told the reason a receipt was not filed. A task
+    carrying an owner's work on is made an owner first (_adopt). A milestone named on an obligation
+    that has none is filed as progress under that name, never a receipt."""
     if kind not in ("progress", "receipt"):
         raise ValueError(f"unknown record kind {kind!r}")
     evidence = " ".join(str(evidence or "").split())[:EVIDENCE_MAX]
@@ -523,6 +582,8 @@ def record(p, oid: str, kind: str, evidence: str, task: int | None, now: float |
         raise ValueError(f"{kind} needs evidence: a commit, a file or a URL")
     now = time.time() if now is None else now
     run_note = ""
+    if task is not None:
+        _adopt(p, oid, int(task), now)   # first: the landing check then judges its receipt as any owner's
     landing = _receipt_landing(p, oid, kind, milestone, task)   # before the transaction: its fetch is a network call
     with p.db.tx():
         st = _load(p.db)
@@ -540,6 +601,14 @@ def record(p, oid: str, kind: str, evidence: str, task: int | None, now: float |
             if kind != "receipt":
                 raise ValueError("a milestone requires a receipt, not general progress")
             m = (o.get("milestones") or {}).get(milestone)
+            if not o.get("milestones"):   # none to satisfy: the name labels progress, never a receipt
+                evidence = f"{milestone}: {evidence}"[:EVIDENCE_MAX]
+                if own is not None:
+                    _record_progress(own, evidence, now)
+                else:   # the coordinator's (no task): no owner clock to reset
+                    o.setdefault("history", []).append({"at": now, "event": "progress", "evidence": evidence})
+                p.db.set_kv(KV, st)
+                return f"{oid} has no milestones: '{evidence}' recorded as progress, not a receipt; {oid} stays owed"
             if not m:
                 raise ValueError(f"no milestone {milestone} on {oid}; its milestones: "
                                  f"{', '.join(sorted(o.get('milestones') or {})) or 'none'}")
@@ -2213,6 +2282,34 @@ def _hours(p) -> float:
 class DueNote(ValueError):
     """A due move that changes nothing owed (the obligation is closed, or has no due to move): the
     coordinator records it as a note, never a rejection; the CLI still refuses it."""
+
+
+def normal_form(p, a: dict, _batch: list, _home: str, _now: float):
+    """An `obligation` action's `owners` as meant (actionforms.normalise): a placeholder owner 0 left out,
+    and a finished owner not attached yet replaced by its one open heir (_heir) that can carry it
+    (unfit_owner). One with none or several is left to fit_owners, which notes it and attaches the rest.
+    None when nothing changes."""
+    sent = a.get("owners")
+    if not isinstance(sent, list):
+        return None
+    db, key = p.db, str(a.get("key") or "").strip()
+    o = get(db, key) if key else None
+    if a.get("order") is not None and not (o and _open(o)):   # the order's own record, as coordinator.apply reads it
+        o = open_order(db, int(a["order"]))
+    owned, owners = (o or {}).get("owners") or {}, []
+    cls = ((o or {}).get("promise") or {}).get("class") or a.get("action_class")
+    for x in sent:
+        if x in (0, "0"):
+            continue   # a placeholder, not a task
+        t = db.task(int(x))
+        if t and t["status"] in CLOSED and str(t["id"]) not in owned and (heir := _heir(db, t)) \
+                and not unfit_owner(db, cls, [heir]):
+            x = heir
+        owners.append(x)
+    if owners == sent:
+        return None
+    a["owners"] = owners
+    return a, f"owners={owners} (was: {sent})"
 
 
 def fit_owners(db, tids, cls: str | None, owned=()) -> tuple[list[int], list[str]]:

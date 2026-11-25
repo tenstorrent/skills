@@ -1,7 +1,8 @@
 """Per-project tally of coordinator action refusals by reason class, for `ttp stats`.
 
 `caught`: what the in-turn dry run (coordprecheck) denied and had the session resend; `rejected`: what
-apply refused after the turn. Kept per UTC day in kv, 14 days; a statistic only."""
+apply refused after the turn; `normalised`: what apply took in a clear-meaning form it rewrote (actionforms),
+one class 'normalised'. Kept per UTC day in kv, 14 days; a statistic only."""
 from __future__ import annotations
 
 import re
@@ -21,8 +22,11 @@ def reason_class(text: str) -> str:
     return " ".join(words[:7]).strip()[:80] or "?"
 
 
-def record(db, caught: list, rejected: list, now: float | None = None) -> None:
-    if not caught and not rejected:
+NORMALISED = "normalised"
+
+
+def record(db, caught: list, rejected: list, now: float | None = None, normalised: list = ()) -> None:
+    if not caught and not rejected and not normalised:
         return
     day = time.strftime("%Y-%m-%d", time.gmtime(now or time.time()))
     tally = db.kv(KEY, {}) or {}
@@ -31,6 +35,9 @@ def record(db, caught: list, rejected: list, now: float | None = None) -> None:
         for x in items or []:
             row = today.setdefault(reason_class(x), [0, 0])
             row[i] += 1
+    if normalised:
+        row = today.setdefault(NORMALISED, [0, 0])
+        row[1] += len(normalised)
     for d in sorted(tally)[:-DAYS]:
         tally.pop(d, None)
     db.set_kv(KEY, tally)
@@ -47,8 +54,10 @@ def lines(db, days: int = 1, top: int = 8) -> list[str]:
             row[1] += int(r)
     if not sums:
         return []
+    applied = sums.pop(NORMALISED, [0, 0])[1]   # not refusals: apply took them as meant
     total = [sum(v[0] for v in sums.values()), sum(v[1] for v in sums.values())]
-    out = [f"action refusals ({days}d): {total[0]} caught in turn, {total[1]} refused after the turn"]
+    out = [f"action refusals ({days}d): {total[0]} caught in turn, {total[1]} refused after the turn"
+           + (f"; {applied} applied as a clear-meaning form ({NORMALISED})" if applied else "")]
     for cls, (c, r) in sorted(sums.items(), key=lambda kv: -(kv[1][0] + kv[1][1]))[:top]:
         out.append(f"  {c} caught, {r} refused: {cls}")
     return out
