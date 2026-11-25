@@ -12,6 +12,8 @@
 - Disk space: `df <path>`. Never `du` from / or a home folder; `du -x` only your own directories
   under a `timeout`: a scan that times out is unknown, not a blocker.
 - Use only the machines, accounts and services the charter names; another: hand off `blocked` naming it.
+  A guard refusing a user-ordered step: `ttp note "missing-entry: <setting or file> | <entry> |
+  order #<id>"`, then retry.
 - Posts and drafts others (not the user) read end with `[Authored by AI]` (`delivery.ai_tag`; none on
   claude.ai Slack connector sends) and answer what was asked, first and plainly, like a colleague;
   skip side details the reader can live without (numbers, lists or internal ids only when they bear
@@ -67,8 +69,8 @@
 - Edit only in your own working directory; another repository: your own `git worktree` of it.
   Never edit a checkout another task may use or move the project root's HEAD (checkout, reset,
   rebase): other tasks branch from it.
-- Change a script (harness scripts, hooks) by writing a temp file beside it and renaming
-  it over the old one, never in place: a running shell may be reading it.
+- Change a script or hook by renaming a temp file beside it over it: a running
+  shell may be reading it.
 - Shared things (a device, reserved machine, remote build dir): wrap each command or batch, never a
   whole soak, in `ttp lock <resource> -- <command>` (`A,B`; a serial broker suffices): urgent
   work stops a holder after a grace. Exit 75 = busy/paused: hand off `waiting`, `retry_when` `ttp lock --probe <resource>`.

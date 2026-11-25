@@ -2411,7 +2411,7 @@ def test_runs_without_a_device_never_open_one_through_tests():
             "not even by a fixture") in worker
     # The `ttp lock` bullet stays whole: its exit-75 guidance is not split off by another bullet.
     raw = (prompts / "worker.md").read_text(encoding="utf-8")
-    start = raw.index("wrap each command that touches one in `ttp lock")
+    start = raw.index("in `ttp lock <resource> -- <command>`")
     end = raw.index("`ttp lock --probe <resource>`", start)
     assert "\n- " not in raw[start:end]
     skill = " ".join((SKILLS / "tt-project-harness" / "SKILL.md").read_text(encoding="utf-8").split())

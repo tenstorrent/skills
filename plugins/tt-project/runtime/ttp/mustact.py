@@ -25,14 +25,17 @@ from .util import as_int
 REWAKE_KIND = "must_act_rewake"
 QUEUE_KIND = "queue_wait"   # queuewait.KIND: a wait on a queue or cap past its threshold, re-raised on a new cause or a doubled wait
 URGENT_MSG_KIND = "urgent_msg_late"   # msgurgent.EVENT_KIND: an urgent message with no finding by its deadline
-KINDS = (*obligations.MUST_ACT_KINDS, REWAKE_KIND, QUEUE_KIND, URGENT_MSG_KIND)
+MISSING_KIND = "missing_entry"   # missingentry.KIND: a guard or allowlist refused a step the user ordered
+KINDS = (*obligations.MUST_ACT_KINDS, REWAKE_KIND, QUEUE_KIND, URGENT_MSG_KIND, MISSING_KIND)
 KV = "must_act"                 # {"told": {fingerprint: at}}: the model-free updates already posted
 TOLD_KEPT = 200
 SECTION = "Must act now"
 LATE = {obligations.PROMISE_KIND: "promise overdue", obligations.ORDER_KIND: "order overdue",
         obligations.ORDER_LATE_KIND: "order not started", obligations.CLAIM_KIND: "claim does not hold",
         obligations.LANDING_STUCK_KIND: "stuck behind a landing nothing can make",
-        QUEUE_KIND: "queue wait", URGENT_MSG_KIND: "urgent message unanswered"}
+        obligations.PROMISE_SLACK_KIND: "promise far beyond its work",
+        QUEUE_KIND: "queue wait", URGENT_MSG_KIND: "urgent message unanswered",
+        MISSING_KIND: "guard refused a user-ordered step"}
 
 
 def item(ev) -> dict | None:
@@ -102,6 +105,9 @@ def block(db, ids, now: float | None = None) -> str:
         if ev["kind"] == URGENT_MSG_KIND:
             again = (" (urgent message with no finding yet: post the first finding in its chat now, with times, "
                      "before anything else; `ttp urgent-reply <chat> <text>` posts it mid-turn)")
+        if ev["kind"] == MISSING_KIND:
+            again = (" (missing entry: add it in this turn, then wake or requeue its task, unless a Restriction, "
+                     "a user hold or a user-only setting such as machines.allowed or push permission forbids it)")
         owners = f"; owners #{', #'.join(map(str, it.get('tasks') or []))}" if it.get("tasks") else "; no owner task"
         out.append(f"- {it['key']} in chat {it['chat']}{owners}{again}: {first}")
     out += [x for x in unowned(db, now) if x.split(":", 1)[0] not in {y.split(" in chat", 1)[0] for y in out}]
@@ -122,7 +128,7 @@ def _names(text, key: str) -> bool:
 def acted(it: dict, actions: list, applied) -> str | None:
     """How an applied action of the turn acted on must-act item `it`; None when none did."""
     key, chat, owners = it["key"], obligations._chat(it.get("chat")), set(it.get("tasks") or [])
-    queue = it.get("kind") == QUEUE_KIND
+    queue = it.get("kind") in (QUEUE_KIND, MISSING_KIND)   # the fix is a setting change or naming the rule
     for i in sorted(applied or ()):
         a = actions[i] if 0 <= i < len(actions) else None
         if not isinstance(a, dict):

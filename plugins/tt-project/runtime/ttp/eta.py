@@ -711,6 +711,19 @@ def estimate(db, tid: int, now: float | None = None, hist: dict | None = None, c
     return corrected(db, with_p90(est, est.task(int(tid)), int(tid)), now)
 
 
+def work_s(db, tids, now: float | None = None) -> float | None:
+    """The expected run time of the slowest of tasks `tids` (the median of its measured runs); None when
+    one has no measured run."""
+    est = _Est(db, time.time() if now is None else now, load=None, depth=None)
+    out = []
+    for tid in tids:
+        t = db.task(int(tid))
+        if not t or (m := pct(est.run_samples(t), 0.5)) is None:
+            return None
+        out.append(m)
+    return max(out) if out else None
+
+
 def core_of(where) -> str | None:
     """The core provider of a project or its config (a task with no provider runs there)."""
     try:

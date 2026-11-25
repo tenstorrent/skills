@@ -3182,10 +3182,25 @@ def cmd_note(a) -> None:
     elif a.to or getattr(a, "reply", None):
         _note_to(a, run_dir)
     durable_append(Path(run_dir) / "progress.md", f"{timefmt.clock()} {a.text}\n")
+    _note_missing_entry(a.text)
     from . import glmguard, upstream
     if not glmguard.active():   # a GLM-arm run's note stays in its own log: it sends nobody's notes on
         upstream.maybe_fallback()   # the daemon cannot reach a forward target: send its notes from this run
     print_update()
+
+
+def _note_missing_entry(text: str) -> None:
+    """A `missing-entry:` note wakes the coordinator at once (missingentry). A fault leaves the note as written."""
+    from . import missingentry
+    if not missingentry.parse(text):
+        return
+    try:
+        base, tid = os.environ.get("TTP_PROJECT"), int(os.environ.get("TTP_TASK") or 0)
+        p = Project(base) if base else None
+        if p and p.exists() and tid:
+            missingentry.from_note(p, tid, text)
+    except Exception:
+        pass
 
 
 def _landed_claims_checked(text: str) -> str:

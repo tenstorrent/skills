@@ -68,3 +68,6 @@ code +32: drafts written for others carry the AI tag too, and direct claude.ai S
 question +32: drafts written for others carry the AI tag too, and direct claude.ai Slack connector sends need none (the line counts in the question prompt too)
 every +32: drafts written for others carry the AI tag too, and direct claude.ai Slack connector sends need none (the line counts in every prompt)
 system +32: drafts written for others carry the AI tag too, and direct claude.ai Slack connector sends need none (the line counts in the system prompt too)
+code +65: a guard refusing a user-ordered step: the structured `missing-entry:` note, then retry (missingentry.py, #9767)
+question +62: the same `missing-entry:` note line, which every task kind that runs machine steps gets (missingentry.py, #9767)
+every +63: the same `missing-entry:` note line (the line counts in every prompt)

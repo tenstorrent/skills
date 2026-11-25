@@ -1729,7 +1729,7 @@ def _check_promise(p, o: dict, st: dict, now: float, raised: list[str]) -> bool:
         o["receipt"] = {"at": now, "task": None, "evidence": kept}
         _retire(p.db, now, "promise kept", prefix=fp)
         return True
-    stuck_changed = _check_landing_stuck(p, o, now, raised)
+    stuck_changed = _check_promise_slack(p, o, now, raised) | _check_landing_stuck(p, o, now, raised)
     if pr.get("order") is not None:
         return _check_order(p, o, now, raised) or stuck_changed
     if now < pr["due"] or pr.get("raised") is not None:
@@ -1748,6 +1748,52 @@ def _check_promise(p, o: dict, st: dict, now: float, raised: list[str]) -> bool:
     fp += f":{int(pr['due'])}"   # a promise given a new due time can fall due once more
     if _raise(p.db, now, fp, PROMISE_KIND, text, pr["tasks"][0] if pr["tasks"] else None, _must(o, twice)):
         raised.append(fp)
+    return True
+
+
+SLACK_S = 900        # a promise due this long after it was made ...
+SHORT_WORK_S = 600   # ... for work expected to run less than this alarms (PROMISE_SLACK_KIND)
+SLACK_MOVES = 2      # as does a due moved this often before its work starts
+
+
+def _slack(p, o: dict, now: float) -> tuple[str, str] | None:
+    """(fingerprint, text) when open promise or order `o` sits far beyond its work before any owner starts:
+    due over SLACK_S after it was made for work under SHORT_WORK_S, or its due moved SLACK_MOVES times;
+    None once an owner started, the due passed or `justify` recorded the rule that holds it."""
+    from . import eta, timefmt
+    pr = o["promise"]
+    due, made = float(pr["due"]), float(pr.get("set_at") or o["created"])
+    ids = live_owner_ids(p.db, o)
+    j = (o.get("eta_justified") or {}).get("promise") or {}
+    if not ids or now >= due or pr.get("started") is not None or float(j.get("due") or 0) == due \
+            or first_run(p.db, ids, made) is not None:
+        return None
+    owners = ", ".join(f"#{t}" for t in ids)
+    if len(pr.get("moves") or []) >= SLACK_MOVES:
+        why = f"its due moved {len(pr['moves'])} times before {owners} started"
+    elif due - made > SLACK_S and (work := eta.work_s(p.db, ids, now)) is not None and work < SHORT_WORK_S:
+        why = (f"it is due {int((due - made) // 60)} min after it was made for about {max(1, round(work / 60))} "
+               f"min of work, and {owners} has not started")
+    else:
+        return None
+    text = (f"Promise {o['id']} (due {timefmt.long(due, p)}) sits far beyond its work: {why}. Start it now "
+            f"(task_update {owners}: priority, resources, wake), give the real time in its chat, or `obligation` "
+            f"with key {o['id']} and `justify` naming the safety rule that holds it.")
+    return f"obligation:{o['id']}:promise:slack:{int(due)}", text
+
+
+def _check_promise_slack(p, o: dict, now: float, raised: list[str]) -> bool:
+    """One must-act event per due for an open promise or order far beyond its work (_slack), retired once an
+    owner starts or it is justified. Returns whether `o` changed."""
+    got = _slack(p, o, now)
+    was = o.get("slack")
+    if (got[0] if got else None) == was:
+        return False
+    if was:
+        _retire(p.db, now, "started or justified", was)
+    o["slack"] = got[0] if got else None
+    if got and _raise(p.db, now, got[0], PROMISE_SLACK_KIND, got[1], _owner_ids(o)[0], _must(o)):
+        raised.append(got[0])
     return True
 
 
@@ -2091,7 +2137,8 @@ CLAIM_KIND = "claim_failed"
 # deadwait.stuck_by) and no open task carries it on (deadwait.path). One high event per episode (the
 # gate and the failed review or row), after waiting.landed_wait_dead_s; it is retired once a path appears.
 LANDING_STUCK_KIND = "order_landing_stuck"
-MUST_ACT_KINDS = (PROMISE_KIND, ORDER_LATE_KIND, ORDER_KIND, CLAIM_KIND, LANDING_STUCK_KIND)
+PROMISE_SLACK_KIND = "promise_slack"   # a promise far beyond its work, before its owner starts (_check_promise_slack)
+MUST_ACT_KINDS = (PROMISE_KIND, ORDER_LATE_KIND, ORDER_KIND, CLAIM_KIND, LANDING_STUCK_KIND, PROMISE_SLACK_KIND)
 ORDER_CLASSES = ("read", "change", "device")
 ORDER_START_S = 1800          # an order with no start_by: its owner's run starts within this after the message
 # Words asking for it the same day: an order given no due is due by the end of the message's home-zone day
