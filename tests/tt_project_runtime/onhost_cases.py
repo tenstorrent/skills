@@ -369,7 +369,9 @@ def test_an_internal_error_applying_an_action_is_named_a_harness_fault_never_a_b
 
 def test_the_batch_loop_never_rebinds_its_action_list_or_position():
     """`order` (the batch's (index, action) pairs), `k` and `i` are read by later actions of the batch
-    (order[k + 1:], failed.add(i)): rebinding one inside the loop corrupts every action after it."""
+    (order[k + 1:], failed.add(i)): rebinding one inside the loop corrupts every action after it. So are
+    the batch's lists (upstream note 2c792038ccca2c77: a charter_update rebound `held` to a tuple and a
+    later held reply crashed on held.append); `+=` on them stays in place."""
     import ast
     import inspect
     import textwrap
@@ -378,6 +380,7 @@ def test_the_batch_loop_never_rebinds_its_action_list_or_position():
     loop = next(n for n in ast.walk(fn) if isinstance(n, ast.For) and isinstance(n.iter, ast.Call)
                 and getattr(n.iter.func, "id", "") == "enumerate" and getattr(n.iter.args[0], "id", "") == "order")
     scopes = (ast.FunctionDef, ast.Lambda, ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp)
+    batch = ("held", "failed", "problems", "notes", "replies", "sent", "claimed", "delivered", "explicit", "twins")
     bad = []
 
     def walk(node):
@@ -390,7 +393,8 @@ def test_the_batch_loop_never_rebinds_its_action_list_or_position():
                     names += [x.id for x in ast.walk(tg) if isinstance(x, ast.Name) and isinstance(x.ctx, ast.Store)]
             elif isinstance(ch, ast.NamedExpr):
                 names.append(ch.target.id)
-            bad.extend((n, ch.lineno) for n in names if n in ("order", "k", "i"))
+            bad.extend((n, ch.lineno) for n in names if n in ("order", "k", "i") or n in batch and not isinstance(
+                ch, ast.AugAssign))
             walk(ch)
     for stmt in loop.body:
         walk(stmt)

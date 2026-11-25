@@ -690,8 +690,11 @@ def test_a_reply_fault_after_its_post_is_not_resent_and_one_before_it_is(env, mo
     def boom(*a, **k):
         raise AttributeError("'tuple' object has no attribute 'append'")
     monkeypatch.setattr(coord.turnrules, "record_cites", boom)
-    problems = coord.apply(p, [{"type": "reply", "chat": "c1", "text": "Thanks, noted."}], turn=1)
+    tid = p.db.add_task("send the summary", "s", kind="work", reply_chat="c1")
+    problems = coord.apply(p, [{"type": "reply", "chat": "c1", "text": "Thanks, noted.", "delivers": [f"#{tid}"]}],
+                           turn=1)
     assert problems == [] and _cd_out(p) == ["Thanks, noted."], (problems, _cd_out(p))
+    assert [d["tasks"] for d in coord.obligations.delivered_since(p.db, 0)] == [[tid]]   # its delivery is kept
     note = [n for n in p.db.kv(coord.NOTES_KEY, []) if n.startswith("reply:")][-1]
     assert "posted as message #" in note and "not resent" in note and "Resend" not in note, note
     ev = p.db.q("SELECT text FROM events WHERE kind='action_fault'")

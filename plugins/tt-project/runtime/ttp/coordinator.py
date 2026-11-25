@@ -2937,9 +2937,7 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                 a["text"] = text
                 replies.append(msgparts.post(db, a["text"], chat=None if chat in (None, "all") else chat, kind="reply",
                                              severity=_norm_severity(a.get("severity") or "normal"))[0])
-                out = f"posted as message #{replies[-1]}"
-                claimcheck.raise_false(db, false, f"your reply #{replies[-1]} (chat {chat or 'all'})")
-                turnrules.record_cites(db, chat, cites, replies[-1])
+                out = f"posted as message #{replies[-1]}"   # recorded as sent before any step that may fail
                 sent.append((replies[-1], chat, authored))
                 if a.get("claims"):
                     claimed.append((replies[-1], chat, a["claims"]))
@@ -2948,6 +2946,8 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                     delivered.append((replies[-1], chat, list(a["delivers"])))
                 if a.get("delivers") or a.get("owners"):
                     explicit.add(replies[-1])
+                claimcheck.raise_false(db, false, f"your reply #{replies[-1]} (chat {chat or 'all'})")
+                turnrules.record_cites(db, chat, cites, replies[-1])
             elif t == "task_add":
                 title = str(a.get("title") or "").strip()
                 missing = [f for f, v in (("title", title), ("spec", str(a.get("spec") or "").strip())) if not v]
@@ -4082,7 +4082,7 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                         and a.get("source") and restriction_source.turn_quote(db, a.get("source"), messages, False))
                     restr = _DATED.sub("", section.lstrip("# ")).lower().startswith("restriction") or (
                         _restriction_edit(p, section, quote, str(a.get("replaces") or "")))
-                    lift = _held_lift(section, text, quote, replaced, gone) if (   # never `held`: apply()'s list
+                    lift = _held_lift(section, text, quote, replaced, gone) if (
                         by_agent and restr) else ("", "", "")
                     if lift[0]:
                         note = lift[0] == "people" and relay.agent_orders(cfg) and all(
@@ -4420,8 +4420,8 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                 name = str(a.get("resource") or "").strip()
                 if not RESOURCE_RE.fullmatch(name):
                     raise ValueError(f"not a resource name: {name!r}")
-                held = db.paused_resources().get(name)
-                if not a["paused"] and held and held.get("by") == "user" and not user_turn:
+                was = db.paused_resources().get(name)
+                if not a["paused"] and was and was.get("by") == "user" and not user_turn:
                     # A pause the user set is lifted on their word only, never by text from outside.
                     raise ValueError(f"{name} was paused by the user; lift it only in the turn that carries "
                                      f"their go-ahead")
@@ -4433,7 +4433,7 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                     if refusal:
                         raise ValueError(refusal)
                 # A re-pause keeps the user's pause theirs (pause_resource), so its end is chosen as theirs.
-                owner = "user" if "user" in (by, (held or {}).get("by")) else by
+                owner = "user" if "user" in (by, (was or {}).get("by")) else by
                 line = pause_resource(p, name, a["paused"], reason=a.get("reason") or a.get("text") or "", by=by, key=key,
                                       via="coordinator resource_pause",
                                       end=_own_end(pauseends.from_action(a, p=p, by=owner), by == "user")
@@ -4490,7 +4490,8 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                 notes.append(note)
                 continue   # a spent time budget says nothing about the action: the next tick applies it
             if out:   # the reply went out or waits in the digest: a resend would post it twice
-                notes.append(f"reply: {_internal_fault(p, t, a, e, applied=out) or f'{out}; a later step failed ({e}); it is not resent'}")
+                why = _internal_fault(p, t, a, e, applied=out) or f"{out}; a later step failed ({e}); it is not resent"
+                notes.append(f"reply: {why}")
                 continue
             failed.add(i)
             sent_as = f"; {GATE_MARK}: {json.dumps(order[k][1], ensure_ascii=False, default=str)}" \
