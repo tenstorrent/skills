@@ -648,7 +648,6 @@ def _keep_select_path(cmd: str, env: dict | None) -> str:
     """`cmd` with the select plugin's folder first in each PYTHONPATH it sets itself, when `env` loads
     that plugin (pushpass.select_env): a check such as `PYTHONPATH=$PWD pytest ...` would otherwise
     drop the folder select_env put on PYTHONPATH, and pytest could not import `-p ttp_pytest_select`."""
-    from . import pushpass
     if pushpass.SELECT_PLUGIN not in (env or {}).get("PYTEST_ADDOPTS", ""):
         return cmd
     return _SETS_PYTHONPATH.sub(lambda m: m.group(0) + shlex.quote(str(pushpass.PLUGIN_DIR)) + os.pathsep, cmd)
