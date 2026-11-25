@@ -116,7 +116,9 @@ def test_stalegate_unneeded_dependency_dropped_after_30_min_only(env, monkeypatc
     from ttp import stalegates
     _sg_env(monkeypatch)
     p = make(env)
-    dep = _sg_task(p, title="edit lib/core.py", spec="change lib/core.py", status="running")
+    dep = _sg_task(p, title="edit lib/core.py", spec="change lib/core.py", status="queued")
+    running = _sg_task(p, title="build the image", spec="build", status="running")
+    ahead = _sg_task(p, title="write notes", spec="notes", deps=[running])
     loose = _sg_task(p, title="write the docs", spec="docs/guide.md", deps=[dep])
     shared = _sg_task(p, title="test lib/core.py", spec="run lib/core.py tests", deps=[dep])
     review = _sg_task(p, title="review the change", spec="s", deps=[dep], kind="review")
@@ -127,6 +129,7 @@ def test_stalegate_unneeded_dependency_dropped_after_30_min_only(env, monkeypatc
     assert json.loads(p.db.task(loose)["depends_on"]) == []
     assert json.loads(p.db.task(shared)["depends_on"]) == [dep]
     assert json.loads(p.db.task(review)["depends_on"]) == [dep]
+    assert json.loads(p.db.task(ahead)["depends_on"]) == [running]   # a running dependency is making progress
 
 
 def test_stalegate_unreasoned_gate_cleared_after_30_min_and_cited_one_kept(env, monkeypatch):
@@ -151,7 +154,7 @@ def test_stalegate_unreasoned_gate_cleared_after_30_min_and_cited_one_kept(env, 
 
 def test_stalegate_promise_whose_only_owner_is_stuck_is_repointed_or_raised(env, monkeypatch):
     """A promise whose every live owner sits behind a stale gate gets its one clear replacement; with none,
-    it is raised as stale_gate-<id>, and the event settles once an owner can run."""
+    it is raised as stale_gate-<id>; a later open task naming the owner becomes its owner."""
     from ttp import obligations, stalegates
     _sg_env(monkeypatch)
     p = make(env)
@@ -182,3 +185,37 @@ def test_stalegate_detector_fires_in_the_course_check_and_off_switch(env, monkey
     assert f"stale_gate:{tid}" in ident
     off = {**_SG_CFG, "coordinator": {"stale_gate_min": 0}}
     assert stalegates.findings(p.db, off, now + _SG_OLD) == [] and stalegates.sweep(p, off, now + _SG_OLD) == []
+
+
+def test_stalegate_a_machine_name_sharing_a_prefix_is_not_renamed_and_a_probe_naming_it_is_raised(env, monkeypatch):
+    """Only resources on the held machine move: `box-ab` is another machine than `box-a`; a task whose probe
+    waits on the held machine is not moved but raised; a dead dependency whose files the task shares is raised."""
+    from ttp import stalegates
+    _sg_env(monkeypatch)
+    p = make(env)
+    _sg_hold(p, "box-a")
+    two = _sg_task(p, labels=["resource:box-a", "read:box-ab"])
+    probe = _sg_task(p, labels=["resource:box-a", "start_when:ssh box-a true", f"deferred_since:{time.time() - _SG_OLD}"])
+    dead = _sg_task(p, title="fix lib/core.py", spec="lib/core.py", status="failed")
+    shared = _sg_task(p, title="test lib/core.py", spec="run lib/core.py", deps=[dead], status="blocked")
+    now = time.time()
+    stalegates.sweep(p, _SG_CFG, now)
+    assert _sg_labels(p, two) == ["resource:box-b", "read:box-ab"]
+    assert "resource:box-a" in _sg_labels(p, probe) and p.db.task(shared)["status"] == "blocked"
+    stalegates.sweep(p, _SG_CFG, now + _SG_OLD)
+    keys = {json.loads(e["data"])["must_act"]["key"] for e in _sg_events(p, "queued")}
+    assert keys == {f"stale_gate-{probe}", f"stale_gate-{shared}"}
+
+
+def test_stalegate_a_busy_lock_in_trouble_is_not_a_down_machine(env, monkeypatch):
+    """Resources the trouble report lists that are no known machine (a lock, a pool) never move or raise a task."""
+    from ttp import machines, stalegates
+    _sg_env(monkeypatch)
+    monkeypatch.setattr(machines, "trouble", lambda db, now=None, seen=None: {"device": {}, "box-c": {}})
+    p = make(env)
+    pooled = _sg_task(p, labels=["resource:device"])
+    gone = _sg_task(p, labels=["resource:box-c"])
+    now = time.time() + _SG_OLD
+    stalegates.sweep(p, _SG_CFG, now)
+    assert _sg_labels(p, pooled) == ["resource:device"] and _sg_events(p) != []
+    assert {json.loads(e["data"])["must_act"]["key"] for e in _sg_events(p)} == {f"stale_gate-{gone}"}

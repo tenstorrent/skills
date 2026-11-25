@@ -29,7 +29,8 @@ KIND = "stale_gate"
 DEFAULT_MIN = 30.0
 GATE_KEYS = ("resource", "exclusive", "read")
 # What states why a gate holds: a rule or order id, a needed task's output, or a safety class.
-CITE = re.compile(r"(?<![\w-])(?:[RPMH]-[\w.-]+|o\d+)(?![\w-])|needs #\d+|safety:|user msg #\d+")
+CITE = re.compile(r"(?<![\w-])(?:[RPMH]-[\w.-]+|o\d+)(?![\w-])|needs #\d+|safety:")
+IDENT = re.compile(r"\b[a-z]+(?:_[a-z0-9]+)+\b|\b[A-Z][a-z0-9]+(?:[A-Z][a-z0-9]*)+\b")
 PATH = re.compile(r"[\w.-]+(?:/[\w.-]+)+|[\w-]+\.(?:py|md|json|sh|js|ts|c|cc|cpp|h|yml|yaml|toml)\b")
 
 
@@ -71,8 +72,9 @@ def _bad(db, now: float) -> list[dict]:
                     "why": f"{alias} is in a recorded outage ({str((rec.get('entries') or [rec])[0].get('why') or '')[:80]})",
                     "match": machine_ledger.on_machine(alias)})
     for name in machines.trouble(db, now):
-        out.append({"name": name, "alias": alias_of(name), "cause": "down", "why": f"{name} keeps failing its tasks",
-                    "match": lambda r, n=name: r == n})
+        if alias_of(name):   # a lock or pool that is merely busy is no machine to move off
+            out.append({"name": name, "alias": alias_of(name), "cause": "down", "why": f"{name} keeps failing its tasks",
+                        "match": lambda r, n=name: r == n})
     return out
 
 
@@ -81,7 +83,13 @@ def _word(alias: str, text: str) -> bool:
 
 
 def _paths(text: str) -> set[str]:
-    return set(PATH.findall(text or ""))
+    """What a spec points at: file paths and code identifiers (snake_case, CamelCase)."""
+    return set(PATH.findall(text or "")) | set(IDENT.findall(text or ""))
+
+
+def _shares(db, text: str, dep: int) -> bool:
+    dt = db.task(dep) or {}
+    return bool(_paths(text) & _paths(f"{dt.get('title')}\n{dt.get('spec')}"))
 
 
 def _since(db, t: dict, now: float) -> float:
@@ -114,6 +122,7 @@ def findings(db, cfg: dict, now: float | None = None) -> list[dict]:
     if limit <= 0:
         return []
     from .coordinator import task_resources
+    from . import responsibilities as rs
     bad, known = _bad(db, now), machines.load()
     allowed = set(machine_ledger.project_machines(cfg or {}, known))
     avoid = {b["alias"] for b in bad if b["alias"]}
@@ -130,13 +139,13 @@ def findings(db, cfg: dict, now: float | None = None) -> list[dict]:
             r, b = hit[0]
             alias = b["alias"]
             alts = [a for a in machines.alternatives(alias, known, avoid) if a in allowed] if alias else []
-            moved = r.startswith(alias) if alias else False
-            if alts and moved and not _word(alias, text) and all(
-                    h[1]["alias"] and h[0].startswith(h[1]["alias"]) for h in hit):
+            named = alias and _word(alias, f"{text}\n{probes}")
+            if alts and rs._names(alias, r) and not named and all(
+                    h[1]["alias"] and rs._names(h[1]["alias"], h[0]) for h in hit):
                 out.append({**base, "ident": f"{b['cause']}:{r}", "cause": b["cause"], "gate": b["why"], "action": "rehome",
                             "old": alias, "new": alts[0], "fix": f"moved from {alias} to {alts[0]}"})
             elif old:
-                why = "it names the machine itself" if alias and _word(alias, text) else "no other machine the config allows"
+                why = "it names the machine itself" if named else "no other machine the config allows"
                 out.append({**base, "ident": f"{b['cause']}:{r}", "cause": b["cause"], "gate": b["why"], "action": "raise",
                             "fix": f"{why}: re-home it by hand, wait for the machine or cancel"})
             continue
@@ -152,17 +161,16 @@ def findings(db, cfg: dict, now: float | None = None) -> list[dict]:
         for dep in deps:
             dead = db.dead_dependency([dep])
             named = bool(re.search(rf"#{dep}\b", text)) or str(dep) in cont or dep in keep
-            if dead and not named:
+            if dead and not named and not _shares(db, text, dep):
                 out.append({**base, "ident": f"dep:{dep}", "cause": "dead_dep", "action": "drop_dep", "dep": dep,
                             "gate": f"depends on #{dep}, which {dead[1]}", "fix": f"dropped #{dep}"})
-            elif dead and old:
+            elif dead and old:   # named or sharing a file with it: its output may still be needed
                 out.append({**base, "ident": f"dep:{dep}", "cause": "dead_dep", "action": "raise",
                             "gate": f"depends on #{dep}, which {dead[1]}",
-                            "fix": f"its spec names #{dep}: re-point it with depends_on or cancel it"})
+                            "fix": f"its spec names or shares files with #{dep}: re-point it with depends_on or cancel it"})
             elif (not dead and old and not named and not CITE.search(text) and t["status"] == "queued"
                   and t["kind"] != "review"):   # a review always waits on its subject
-                dt = db.task(dep) or {}
-                if dt.get("status") != "done" and not _paths(text) & _paths(f"{dt.get('title')}\n{dt.get('spec')}"):
+                if (db.task(dep) or {}).get("status") in ("queued", "blocked", "waiting") and not _shares(db, text, dep):
                     out.append({**base, "ident": f"dep:{dep}", "cause": "unneeded_dep", "action": "drop_dep", "dep": dep,
                                 "gate": f"waits on #{dep}, which its spec neither names nor shares a file with",
                                 "fix": f"dropped #{dep}"})
@@ -217,7 +225,8 @@ def _apply(db, f: dict, now: float) -> None:
         names = {lb.split(":", 1)[1] for lb in labels if isinstance(lb, str) and ":" in lb
                  and lb.split(":", 1)[0] in GATE_KEYS}
         kw["labels"] = labels
-        for r in sorted(n for n in names if n.startswith(f["old"])):
+        from . import responsibilities as rs
+        for r in sorted(n for n in names if rs._names(f["old"], n)):
             kw["labels"] = _swap(kw["labels"], r, f["new"] + r[len(f["old"]):])
     elif f["action"] == "drop_dep":
         kw["depends_on"] = [x for x in dependency_ids(t) if x != f["dep"]]
