@@ -86,8 +86,31 @@ def test_a_run_may_read_or_roll_back_but_never_widen_the_rollout(env, capsys, mo
     assert code == 2 and "unfreezing a flag stays with the user" in out, "a run never unfreezes a flag"
     assert rollout.level("deslop") == 1 and rollout.settings().get("rings") is None
     assert _roll(capsys, "status")[0] == 0
-    assert _roll(capsys, "rollback", "deslop", "--reason", "bad")[0] == 0
-    assert rollout.level("deslop") == rollout.OFF and rollout.ledger("deslop")[-1]["by"] == "run"
+    assert _roll(capsys, "rollback", "deslop", "demo", "--reason", "bad work")[0] == 0
+    assert rollout.level("deslop") == 1 and not rollout.frozen("deslop"), "a run never rolls the whole flag back"
+    assert set(rollout.rolled_back("deslop")) == {"demo"} and rollout.ledger("deslop")[-1]["by"] == "run"
+
+
+def test_a_runs_rollback_for_an_outage_or_quota_is_refused_and_the_flag_is_unchanged(env, capsys, monkeypatch):
+    """The 03:16 replay: a run (the coordinator's) ran `ttp rollout rollback glm_code projA` while the GLM
+    endpoint answered 429 quota_exceeded; it froze glm_code for every project. Now it is refused or one project's."""
+    from ttp import rollout
+    _roll(capsys, "set", "glm_code", "2")
+    monkeypatch.setenv("TTP_RUN_DIR", "/nonexistent")
+    monkeypatch.delenv("TTP_PROJECT", raising=False)
+    for reason in ("", "GLM endpoint 429 quota_exceeded until 05:00", "endpoint outage", "rate limited",
+                   "endpoint unreachable", "TT Cloud token quota ran out"):
+        code, out = _roll(capsys, "rollback", "glm_code", "projA", *(("--reason", reason) if reason else ()))
+        assert code == 2, reason
+        assert "per-run fallback" in out or "quality problem" in out
+    assert rollout.level("glm_code") == 2 and not rollout.frozen("glm_code") and not rollout.rolled_back("glm_code")
+    assert [r["kind"] for r in rollout.ledger("glm_code")] == ["set"], "nothing was recorded"
+    assert _roll(capsys, "rollback", "glm_code", "projA", "--reason", "review pass fell")[0] == 0
+    assert rollout.level("glm_code") == 2 and not rollout.frozen("glm_code")
+    assert set(rollout.rolled_back("glm_code")) == {"projA"}
+    monkeypatch.delenv("TTP_RUN_DIR")
+    assert _roll(capsys, "rollback", "glm_code", "--reason", "quota")[0] == 0, "the user's terminal still may"
+    assert rollout.frozen("glm_code")
 
 
 def test_rollout_state_is_account_wide_and_touches_no_project_file(env, capsys):

@@ -11,6 +11,9 @@ config or state.
 - rollout.rings: {"0": [names], "1": [names]}: a project listed in neither is ring 2. rollout.excluded: [names].
 - Precedence (on): a project's own explicit value for the flag's config key (the user's word) wins, else the
   account's ring rule, else off. A feature calls on() at its entry point and then reads its normal config.
+- Only the user's terminal (and the daemon's checks) roll a whole flag back; a run's rollback (a worker's or the
+  coordinator's) is one project's (stop_project), never a freeze, and is refused for an endpoint outage, quota or
+  rate limit (outage_refusal): per-run fallback handles those.
 - A rolled-back flag stays off and frozen until `ttp rollout arm`, which puts it back at the level it
   had before the rollback (a level set by hand after the rollback wins; a fix landed).
 - Waves (a flag marked `waves`): rollout.waves {flag: [[names], ...]}, the user's ordered project lists, and the
@@ -25,6 +28,7 @@ from __future__ import annotations
 import fcntl
 import json
 import os
+import re
 import time
 from contextlib import contextmanager
 from typing import Any, Iterator
@@ -169,6 +173,25 @@ def stop_project(flag: str, project: str, why: str, by: str = "daemon") -> bool:
         _put("project_rollback", flag, back)
         _op("project_rollback", flag, str(why)[:300], by, project=project)
     return True
+
+
+# A run's rollback names an endpoint fault: per-run fallback already moves each run off the endpoint (route.FAULTS,
+# glmwork.FALLBACK_ON), so a flag is never rolled back or frozen for one (outage_refusal).
+OUTAGE_RE = re.compile(r"outage|quota|rate.?limit|\b429\b|unreachable|\bdown\b|endpoint (?:is )?(?:out|dead|failing)"
+                       r"|\b5\d\d\b|timed? ?out|connection (?:refused|reset|error)|overloaded|capacity", re.I)
+
+
+def outage_refusal(reason: str) -> str:
+    """Why a run may not roll a flag back for `reason`, or "": no reason given, or one naming an endpoint outage,
+    quota, rate limit or unreachable endpoint (OUTAGE_RE), which per-run fallback handles."""
+    if not (reason or "").strip():
+        return ("a run's rollback needs --reason naming the quality problem it saw; an endpoint outage, quota or "
+                "rate limit is never one")
+    if OUTAGE_RE.search(reason):
+        return ("an endpoint outage, quota, rate limit or unreachable endpoint is never a reason to roll a flag "
+                "back: per-run fallback already starts each affected run on the core provider and the flag "
+                "resumes by itself once the endpoint answers; roll back only for bad work (a quality regression)")
+    return ""
 
 
 WHO = {"user": "the user", "run": "a run"}   # the ledger's `by` values, as the digest words them
@@ -886,7 +909,8 @@ def rearm_replay(ref: str, target, p, not_before: float = 0.0) -> str:
 
 def run(a) -> int:
     """`ttp rollout ACTION ...`: the terminal's (the user's) edit of the rollout state. A run's own call may
-    only read it (`status`, or `on`, a wait's probe), roll a flag back (that only reduces a flag's reach)
+    only read it (`status`, or `on`, a wait's probe), roll a flag back in one project for a quality reason
+    (stop_project: never the whole flag, never a freeze; an outage or quota reason is refused: outage_refusal)
     or re-arm one project (rearm_refusal: on the evidence its fix landed, deployed and its replay passed),
     and record the stops a live fix covers (`fixed`, fixed_refusal: on the evidence it landed and ran);
     promotion is the watcher's, the wave moves the gate's, and the ring and wave lists are the user's."""
@@ -974,8 +998,23 @@ def run(a) -> int:
             print(set_level(a.target, a.value, reason or "set by hand"))
         elif act == "promote":
             print(promote(a.target, reason))
+        elif act == "rollback" and in_run:   # one project, never a freeze; the whole flag is the user's
+            _check(a.target)
+            why = outage_refusal(reason)
+            project = a.value or os.environ.get("TTP_PROJECT") or ""
+            if not project:
+                from . import project as project_mod
+                here = project_mod.here()
+                project = here.name if here is not None else ""
+            if why or not project:
+                print(f"ttp rollout rollback: {why or 'name the project to roll the flag back in (PROJECT)'}",
+                      flush=True)
+                return 2
+            done = stop_project(a.target, project, reason, "run")
+            print(f"{a.target} rolled back in {project} alone (`ttp rollout arm {a.target} {project}`); "
+                  "the other projects keep it" if done else f"{a.target} is rolled back in {project} already")
         elif act == "rollback":
-            print(rollback(a.target, reason or "rolled back by hand", "run" if in_run else "user"))
+            print(rollback(a.target, reason or "rolled back by hand", "user"))
         elif act == "arm":
             print(arm(a.target, reason, "run" if in_run else "user", project=a.value or "", evidence=evidence))
         elif act == "waves":
