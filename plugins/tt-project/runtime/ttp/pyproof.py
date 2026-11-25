@@ -292,7 +292,7 @@ def rewrite(cmd: str, cwd: str, env=None) -> str | None:
     moves = any(argv and (os.path.basename(argv[0]) in ("cd", "pushd", "popd")
                           or any(w.startswith(("-C", "--chdir")) for w in argv)) for argv in segments)
     bases = credguard._cwds(segments, cwd, str(env.get("HOME") or os.path.expanduser("~"))) if moves else None
-    out, changed, pending = [], False, []
+    out, changed, pending, shell, hidden = [], False, [], [], False
     for line in cmd.split("\n"):
         if pending:
             delim, dash, body, fed, quoted = pending[0]
@@ -302,6 +302,7 @@ def rewrite(cmd: str, cwd: str, env=None) -> str | None:
             pending.pop(0)
             text = "\n".join(b.lstrip("\t") if dash else b for b in body)
             if fed and text.strip() and (quoted or not re.search(r"[$`\\]", text)) and harmless(text, cwd, env, bases):
+                hidden |= _names_store(text, cwd, env)
                 body[:] = ["pass"]
                 changed = True
             out += [*body, line]
@@ -311,6 +312,7 @@ def rewrite(cmd: str, cwd: str, env=None) -> str | None:
             code = m[1] if m[1] is not None else m[2]
             if not flags[m.start()][0] and _code_at(line, m.start()) == code and harmless(code, cwd, env, bases):
                 line, changed = f"{line[:m.start()]}-c 'pass'{line[m.end():]}", True
+                hidden |= _names_store(code, cwd, env)
         flags = hook._quoting(line)
         for m in hook.HEREDOC_RE.finditer(line):
             if not flags[m.start()][0]:
@@ -318,8 +320,23 @@ def rewrite(cmd: str, cwd: str, env=None) -> str | None:
                 fed = bool(argv) and bool(PY_RE.match(os.path.basename(argv[0]))) and hook._interpreter_args(argv) == "-"
                 pending.append((m[3], m[1] == "-", [], fed, bool(m[2])))
         out.append(line)
+        shell.append(line)
+    # A snippet naming a store the guard would have seen in its words is freed only as the whole command: its
+    # output piped, captured, redirected or written for a later command could feed that name to the shell.
+    if hidden and (len(shell) > 1 or re.search(r"[|>`;&]|\$\(|<\(", shell[0])):
+        return None
     # an unended heredoc: the shell reads it differently than we would
     return "\n".join(out) if changed and not pending else None
+
+
+def _names_store(code: str, cwd: str, env) -> bool:
+    """`code`'s words name a credential store or a protected path, as the shell guards read a command's words."""
+    from . import credguard, pathguard
+    home = str(env.get("HOME") or os.path.expanduser("~"))
+    words = re.findall(r"[^\s'\"(),\[\]{}]+", code)
+    return bool(credguard.bash_refusal(code, [["cat", *words]], home, cwd)) or any(
+        pathguard._inside(os.path.realpath(os.path.join(cwd, os.path.expanduser(w))), pathguard.roots(env))
+        for w in words if "/" in w)
 
 
 def _code_at(line: str, pos: int) -> str | None:

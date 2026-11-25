@@ -85,6 +85,10 @@ def test_the_hook_passes_a_proven_snippet_and_still_refuses_the_rest_of_its_call
     assert _bash_why(tmp_path, named) == ""                                     # names a store, reads nothing
     assert "credential" in _bash_why(tmp_path, f"python3 - <<'EOF'\nprint(open('{key}').read())\nEOF")
     assert _bash_why(tmp_path, f"python3 -c \"print(1)\"; cat {key}")           # the rest of the line is judged
+    for cmd in (f"python3 -c 'print(\"cat {key}\")' | sh", f"K=$(python3 -c 'print(\"{key}\")'); cat \"$K\"",
+                f"python3 -c 'print(\"{key}\")' | xargs cat", f"python3 -c 'open(\"s.sh\",\"w\").write(\"cat {key}\")' && sh s.sh",
+                f"python3 - <<'EOF' | bash\nprint('cat {key}')\nEOF"):
+        assert _bash_why(tmp_path, cmd), cmd                                      # its output may feed the name to the shell
 
 
 def test_cwds_reads_a_ten_thousand_line_heredoc_quickly(env, tmp_path):
