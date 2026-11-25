@@ -892,8 +892,9 @@ def shell_refusal(cmd: str, cwd: str, run_dir: str = "", env=None, remote: bool 
 def _own_ssh_config(value: str, cmd: str, cwd: str, run_dir: str, e) -> bool:
     """`ssh -F value` names a settings file of the run's own: inside its worktree or run folder (by its real
     path) and shaped as ssh's own (credguard.ssh_own_file: known keywords only, so no ProxyCommand or Include),
-    in a command that is one plain call (no separator, pipe, redirection or substitution), so no step of it
-    writes the file or moves the folder first (fail closed)."""
+    in a command that is one plain call (no separator, pipe, redirection or substitution), so no step of that
+    command writes the file or moves the folder first (fail closed). Known gap, as for any script in its own
+    worktree: a background job an earlier command started can still swap the file in."""
     from . import credguard
     return not credguard.SHELL_META_RE.search(cmd) and credguard.ssh_own_file(
         value, roots=_own_roots(cwd, run_dir, e), cwd=cwd)
