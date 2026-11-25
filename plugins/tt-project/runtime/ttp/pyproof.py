@@ -304,7 +304,7 @@ def rewrite(cmd: str, cwd: str, env=None) -> str | None:
             pending.pop(0)
             text = "\n".join(b.lstrip("\t") if dash else b for b in body)
             if fed and text.strip() and (quoted or not re.search(r"[$`\\]", text)) and harmless(text, cwd, env, bases):
-                hidden |= _names_store(text, cwd, env)
+                hidden |= _words_name_store(text, cwd, env)
                 body[:] = ["pass"]
                 changed = True
             out += [*body, line]
@@ -314,7 +314,7 @@ def rewrite(cmd: str, cwd: str, env=None) -> str | None:
             code = m[1] if m[1] is not None else m[2]
             if not flags[m.start()][0] and _code_at(line, m.start()) == code and harmless(code, cwd, env, bases):
                 line, changed = f"{line[:m.start()]}-c 'pass'{line[m.end():]}", True
-                hidden |= _names_store(code, cwd, env)
+                hidden |= _words_name_store(code, cwd, env)
         flags = hook._quoting(line)
         for m in hook.HEREDOC_RE.finditer(line):
             if not flags[m.start()][0]:
@@ -331,7 +331,7 @@ def rewrite(cmd: str, cwd: str, env=None) -> str | None:
     return "\n".join(out) if changed and not pending else None
 
 
-def _names_store(code: str, cwd: str, env) -> bool:
+def _words_name_store(code: str, cwd: str, env) -> bool:
     """`code`'s words name a credential store or a protected path, as the shell guards read a command's words."""
     from . import credguard, pathguard
     home = str(env.get("HOME") or os.path.expanduser("~"))
