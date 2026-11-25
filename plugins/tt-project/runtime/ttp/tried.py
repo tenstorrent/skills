@@ -127,7 +127,7 @@ def params(text: str) -> frozenset[str]:
     return frozenset(out)
 
 
-def targets(text: str) -> frozenset[str]:
+def release_targets(text: str) -> frozenset[str]:
     """The commits (7+ hex digits) and releases (0.2.300) a title or spec acts on: a rollout or check of
     another commit is new work under the same title."""
     text = text or ""
@@ -156,7 +156,7 @@ def similar(title1: str, spec1: str, title2: str, spec2: str, usual: frozenset =
     """Whether new work (title1, spec1) repeats earlier work (title2, spec2): never when both name the
     commits or releases they act on (targets) and share none. `usual` (see common) is left out of the shared parameters and title subject that the parameters rule needs."""
     spec1, spec2 = content(spec1), content(spec2)
-    t1, t2 = targets(f"{title1} {spec1}"), targets(f"{title2} {spec2}")
+    t1, t2 = release_targets(f"{title1} {spec1}"), release_targets(f"{title2} {spec2}")
     if t1 and t2 and not t1 & t2:
         return False   # the same step on another commit or release ("Rollout box-a" of a newer head)
     p1, p2 = params(f"{title1} {spec1}"), params(f"{title2} {spec2}")

@@ -8704,14 +8704,14 @@ def _use_charter_approval(p: Project, rid: str, key: str | None) -> None:
 # with it: a test fails when the source of CHARTER_GUARD_FUNCS no longer has CHARTER_GUARD_PIN's
 # sha256. A user's change that failed under an older guard for another reason than the guard
 # (reraise_charter_changes) is then raised at once.
-CHARTER_GUARD_VERSION = 23
+CHARTER_GUARD_VERSION = 24
 CHARTER_GUARD_FUNCS = ("_reject_contradicting_append", "_append_conflicts", "_overlaps", "_on_object", "_quote_hits",
                        "_item_quote_hits", "_items", "_norm", "_may_lift", "_lifts_item", "_companion_clause",
                        "_ref_ids", "_companion_exception", "_changed_sentences", "_quoted_news",
                        "_charter_approval", "_ask_charter_approval", "_conflict_reason", "_scope_names",
                        "_scoped_exception", "_excepted_item", "_orders_banned",
                        "_same_target", "_delivery_names", "_undelivered", "_edit_overlaps", "_bans_in_scope")
-CHARTER_GUARD_PIN = (23, "27ba06ea21a4129e2b7b61ce6bc219198858d321171c78cfa6e7ab0fd0ad5ee1")
+CHARTER_GUARD_PIN = (24, "68b6cebeb0db0c199b24225f36a56a55acb148e22ae981ac7e49a54bcf79d266")
 CHARTER_RERAISE_KEY = "charter_reraise"   # kv: {"version", "ts"} of the last re-raise pass
 
 

@@ -5303,7 +5303,7 @@ def test_the_same_step_on_another_commit_or_release_is_not_already_tried():
     assert not tried.similar("Rollout box-a", "Deploy 0.2.1544 (commit 9f8e7d6c) on box-a and run the smoke check.", *old)
     assert tried.similar("Rollout box-a", "Deploy 0.2.1540 (commit 1a2b3c4d5e) on box-a and run the smoke check.", *old)
     assert tried.similar("Rollout box-a", "Deploy it on box-a and run the smoke check.", *old)
-    assert tried.targets("fix ea2d6eeacee60e19 in 0.2.300, task #12, 2026-11-25") == {"ea2d6ee", "0.2.300"}
+    assert tried.release_targets("fix ea2d6eeacee60e19 in 0.2.300, task #12, 2026-11-25") == {"ea2d6ee", "0.2.300"}
 
 
 def test_actions_schema_lists_every_action_key_apply_reads():
