@@ -1105,10 +1105,7 @@ def test_a_task_held_only_for_a_release_flag_wakes_when_the_flag_is_armed(env, m
     p.db.update_task(tid, status="queued", not_before=time.time() + 3600, result=json.dumps(hand))
 
     def cycle():
-        d.probe_waiting()
-        for proc, *_ in list(d._probes.values()):
-            proc.wait(30)
-        d.probe_waiting()
+        _settle_deferred(d, tid)
         return p.db.task(tid)
 
     d = Daemon(p.base)

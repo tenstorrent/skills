@@ -22662,10 +22662,12 @@ def test_a_malformed_checks_pid_does_not_stop_other_tasks_waking(env, tmp_path):
 
 
 def _job_lock_free(rc, timeout):
-    from ttp import locks
-    deadline = time.time() + _load_scaled(timeout)
-    while not locks.any_free([locks.job_lock(rc)]) and time.time() < deadline:
-        time.sleep(0.05)
+    """Whether the ended job of `rc` let go of its lock, once its wrapper (the .started pid) exited. Not
+    on the lock alone: the cleanup the wrapper execs drops the wrapper's hold, then takes the lock again
+    to remove the job's dirs, so one probe can see it free and the next one taken."""
+    from ttp import detach, locks
+    pid = int(detach.started(rc).read_text())
+    _wait_for(lambda: _pid_gone(pid), _load_scaled(timeout))
     return locks.any_free([locks.job_lock(rc)])
 
 
