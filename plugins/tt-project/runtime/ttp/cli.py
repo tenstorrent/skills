@@ -12625,6 +12625,7 @@ def cmd_machines(a) -> None:
     else:
         _machines_list(a, mm)
 
+
 def _machines_copy(a, mm) -> None:
     """Copy the machines list to the other hosts after a change, or in the foreground for `push`:
     the hosts named, else every remote project host not skipped."""
