@@ -1362,7 +1362,8 @@ def test_glmfb_a_mini_run_that_fails_at_start_without_endpoint_credentials_is_a_
 def test_config_and_doctor_say_why_a_live_share_on_claude_code_is_zero():
     import inspect
     from ttp import cli
-    assert "codearm.refusal(p.config()" in inspect.getsource(cli.cmd_config)
+    assert "config_warnings(p, a.key)" in inspect.getsource(cli.cmd_config)
+    assert "codearm.refusal(p.config()" in inspect.getsource(cli.config_warnings)
     assert "codearm.refusal(p.config()" in inspect.getsource(cli.cmd_doctor)
 
 
