@@ -54,7 +54,7 @@ _VERB = re.compile(rf"(?i)\b(?P<v>{_RUN_V}|started|{_STOP_V}|raised|lowered|incr
                    r"pushed|enabled|(?:(?<=\bis )|(?<=\bare )|(?<=\bwas )|(?<=\bwere )|(?<=\bnow )|(?<=\bbeen ))set|set(?= to\b))\b")
 # Words before the verb (same clause) that make it a plan, condition or negation, not a claim.
 _HEDGE = re.compile(r"(?i)(?:\b(?:will|shall|going to|plan(?:s|ned)? to|about to|want to|needs? to|to be|to get|"
-                    r"not|never|no longer|once|until|when(?:ever)?|while|during|in case|after|if|before|unless|should|would|could|might|may|can|"
+                    r"not|never|no longer|once|until|when|after|if|before|unless|should|would|could|might|may|can|"
                     r"let me|i['’]ll|we['’]ll|it['’]ll|try(?:ing)? to|whether)\b|n['’]t\b)[^.!?;,\n]{0,60}$")
 _CODE = re.compile(r"`[^`\n]*`")
 _TASK = re.compile(r"(?i)(?<!msg )(?<!message )(?<!pr )(?<!issue )(?<!order )(?<!reply )(?<!messages )#(\d{1,9})\b")
@@ -83,12 +83,16 @@ def _verb(sentence: str) -> str | None:
     return None
 
 
+# A reach phrase after these describes what happens during an outage, not the current state.
+_REACH_COND = re.compile(r"(?i)\b(?:whenever|while|during|in case)\b[^.!?;,\n]{0,60}$")
+
+
 def _reach(sentence: str) -> bool:
     """`sentence` says a machine cannot be reached, as a claim (not a question, plan or condition)."""
     s = _CODE.sub(" ", sentence)
     if not s.strip() or s.rstrip().endswith("?") or onhost.MARK in s or s.lstrip().startswith(FALSE_MARK):
         return False
-    return any(not _HEDGE.search(s[:m.start()]) for m in _REACH.finditer(s))
+    return any(not (_HEDGE.search(s[:m.start()]) or _REACH_COND.search(s[:m.start()])) for m in _REACH.finditer(s))
 
 
 def _judge_reach(p, sentence: str, claims: list, now: float) -> tuple[str, str]:

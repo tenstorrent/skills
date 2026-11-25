@@ -295,6 +295,8 @@ def test_a_cant_reach_claim_is_judged_by_each_machines_last_ssh_probe_and_sent_a
                  "While box-a can't be reached, the watcher keeps checking.", "Whenever box-a is unreachable, it retries.",
                  "During an outage box-a can't be reached.", "If the host is down, the watcher alerts after 5 minutes."):
         assert claimcheck.check(p, text, now=now) == (text, [], 0), text
+    # The new words are scoped to the reach check: other claims after them stay checked.
+    assert claimcheck._verbs("While you slept I restarted the daemon.")
     claims = [{"text": "box-a is unreachable", "expect": "true", "_rc": 0}]
     assert claimcheck.check(p, "box-a is unreachable.", claims, now=now)[1] == []
     # A status verb and a reach phrase in one sentence: the false one wins.
