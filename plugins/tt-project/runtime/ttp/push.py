@@ -632,26 +632,13 @@ def check_argv(cmd: str, top: str | Path | None = None, env: dict | None = None,
             if getattr(cmd, "spill_host", "") == host else ""
         return remotecheck.argv(str(cmd), host, there, commit, tuple(getattr(cmd, "remote_wrap", ()) or ()), py,
                                 dict(getattr(cmd, "literal_env", ()) or ()), spill)
-    cmd = _keep_select_path(venv_cmd(cmd, top, env) if top else cmd, env)
+    cmd = venv_cmd(cmd, top, env) if top else cmd
     cmd = remotecheck.exports(exports) + testslots.clamp_for(cmd, env)
     bash = shutil.which("bash")
     argv = [bash, "-e", "-o", "pipefail", "-c", cmd] if bash else ["sh", "-e", "-c", cmd]
     # checks.wrap_cmd: a lock or queue script sees the host as it does elsewhere.
     # With checks.wrap_lane "after", the lane step runs inside the wrapper, before the command.
     return [*wrap, *lane, *argv]
-
-
-_SETS_PYTHONPATH = re.compile(r"(?<![\w$])PYTHONPATH=")
-
-
-def _keep_select_path(cmd: str, env: dict | None) -> str:
-    """`cmd` with the select plugin's folder first in each PYTHONPATH it sets itself, when `env` loads
-    that plugin (pushpass.select_env): a check such as `PYTHONPATH=$PWD pytest ...` would otherwise
-    drop the folder select_env put on PYTHONPATH, and pytest could not import `-p ttp_pytest_select`."""
-    from . import pushpass
-    if pushpass.SELECT_PLUGIN not in (env or {}).get("PYTEST_ADDOPTS", ""):
-        return cmd
-    return _SETS_PYTHONPATH.sub(lambda m: m.group(0) + shlex.quote(str(pushpass.PLUGIN_DIR)) + os.pathsep, cmd)
 
 
 VENV_DIRS = (".venv", "venv")
