@@ -2394,7 +2394,7 @@ def check_probe(probe, what: str = "start_when") -> None:
         from . import userstep
         userstep.check_wait_text(probe, what)   # prose for the user's next message: no probe sees it
         from .waitheal import charter_wait
-        if what != "start_when" and (word := charter_wait(probe)):   # start_when: dropped (_drop_charter_wait)
+        if word := charter_wait(probe):   # start_when reaches here only when _drop_charter_wait missed it
             raise ValueError(f"{what} {probe.strip()[:80]!r} waits on the charter ({word!r}): a refused or pending "
                              f"rule change never holds ordered work; queue the work now, and resend the "
                              f"charter_update fixed in the same turn")
@@ -7103,11 +7103,8 @@ def _bans_in_scope(other: str, text: str, names: set[str]) -> bool:
 def _own_resources(cfg: dict | None) -> tuple:
     """The machines and resources this project's own config names (machines.allowed, resources,
     shared_resources): a step there is the project's own, not someone else's (_ordered_work)."""
-    cfg = cfg or {}
-    out = [x for x in (cfg.get("machines") or {}).get("allowed") or [] if isinstance(x, str)]
-    out += [x for x in cfg.get("resources") or {} if isinstance(x, str)]
-    out += [x for x in cfg.get("shared_resources") or [] if isinstance(x, str)]
-    return tuple(out)
+    from .machine_ledger import configured_names
+    return tuple(configured_names(cfg or {}))
 
 
 def _near_scope(word: str, names: set[str], text: str) -> bool:

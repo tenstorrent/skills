@@ -37,6 +37,10 @@ def test_plan_gate_parsing_takes_ids_and_a_probe_and_reports_bad_parts():
         assert gate is None and probs and "start_when" in probs[0], (bad, probs)
     assert plangate.parse({"start_when": "now"})[0] is None
     assert plangate.parse("after #4")[0] is None and plangate.parse("after #4")[1]
+    # A gate that waits on the charter is refused, not stored: a refused rule change never holds
+    # the plan's tasks (check_probe covers start_when for every caller).
+    gate, probs = plangate.parse({"start_when": "grep -q box-q harness/CHARTER.md || exit 1"})
+    assert gate is None and any("waits on the charter" in x for x in probs), probs
 
 
 def test_a_done_plan_stores_its_gate_and_its_event_names_it(env):

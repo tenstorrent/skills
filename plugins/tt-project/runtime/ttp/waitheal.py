@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import re
 import shlex
+import time
 from pathlib import Path
 
 from .devq import RUNNER_DOWN_RC as DEVQ_RUNNER_DOWN_RC   # pending, no runner alive
@@ -176,11 +177,33 @@ CHARTER_WAIT_RE = re.compile(r"CHARTER\.md|\bcharter_(?:update|retry)\b|\bttp\s+
 
 
 def charter_wait(probe: str | None) -> str:
-    """The charter word a wait probe names (it greps the charter, or waits on a charter_update or a
-    memory entry landing), or "": a refused rule change never holds ordered work, so approved work is
-    queued in the same turn, never parked on its paperwork."""
+    """The charter word a wait probe names, or "": it greps the charter, waits on a charter_update or
+    charter_retry, or on `ttp memory` — memory entries carry user rules and standing orders too, so a
+    wait on one is the same parking on project paperwork. A refused or pending rule change never
+    holds ordered work, so approved work is queued in the same turn, never parked on its paperwork."""
     m = CHARTER_WAIT_RE.search(probe or "")
     return m.group(0) if m else ""
+
+
+def refuse_charter_wait(db, p, task: dict, result: dict) -> dict:
+    """A waiting hand-off's retry_when that waits on the charter is not stored: it moves to
+    `retry_when_refused`, one handoff_probe_refused event says why, and the task wakes at its
+    retry timer. A refused or pending rule change never holds ordered work: the coordinator queues
+    it in the same turn, so this wait never ends. Returns `result` unchanged when its probe waits
+    on nothing of the charter (charter_wait)."""
+    probe = result.get("retry_when")
+    word = charter_wait(probe if isinstance(probe, str) else None)
+    if not word:
+        return result
+    refused = result["retry_when"][:200]
+    db.x("INSERT INTO events(ts,source,kind,severity,text,status,task) VALUES(?,?,?,?,?,?,?)",
+         (time.time(), f"task:{task['id']}", "handoff_probe_refused", "normal",
+          f"#{task['id']} {task['title']}: its waiting hand-off's retry_when waits on the charter ({word!r}), "
+          f"so it was not stored: a refused or pending rule change never holds ordered work, the "
+          f"coordinator queues it in the same turn; the task wakes at its retry timer", "queued", task["id"]))
+    from .daemon import log   # daemon imports this module
+    log(p, f"task {task['id']} hand-off: retry_when refused: waits on the charter: {refused}")
+    return {**{k: v for k, v in result.items() if k != "retry_when"}, "retry_when_refused": refused}
 
 
 def probe_flag(probe: str | None) -> str:

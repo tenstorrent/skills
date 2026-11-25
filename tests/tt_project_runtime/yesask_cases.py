@@ -271,7 +271,7 @@ def test_agent_mode_the_same_order_aimed_at_another_persons_machine_or_job_is_st
         assert text not in p.charter_path.read_text(), order
 
 
-def test_a_refused_rule_change_never_holds_the_ordered_work(env, tmp_path):
+def test_a_refused_rule_change_never_holds_the_ordered_work(env, tmp_path, capsys):
     """(d) Work never parks on the charter: a task_add start_when that waits on it is dropped and the task
     queued now, a block on it is refused, a waiting hand-off's retry_when is dropped with a
     handoff_probe_refused event, and the charter_retry the coordinator gets tells it to queue the
@@ -293,6 +293,13 @@ def test_a_refused_rule_change_never_holds_the_ordered_work(env, tmp_path):
     t = p.db.one("SELECT status, labels FROM tasks WHERE title='preempt soak'")
     assert t and t["status"] == "queued" and "CHARTER" not in (t["labels"] or ""), t
     assert waitheal.charter_wait("test -e out/job.rc") == ""
+    from ttp import cli
+    with pytest.raises(SystemExit) as xc:
+        cli.main(["task", "demo", "add", "preempt the soak too", "--start-when",
+                  "grep -q box-q harness/CHARTER.md || exit 1", "--why", "the exception lands"])
+    seen = capsys.readouterr()
+    assert "never holds ordered work" in seen.out + seen.err, (seen.out, seen.err)
+    assert not p.db.one("SELECT id FROM tasks WHERE title='preempt the soak too'")
     d = Daemon(p.base)
     tid = p.db.add_task("preempt the soak", "s", kind="work", tier="standard", origin="user")
     t = _reply_wait_hand_off(p, d, tmp_path, tid, waiting_for="the charter exception",
@@ -308,6 +315,32 @@ def test_a_refused_rule_change_never_holds_the_ordered_work(env, tmp_path):
            "text": f"- Preempt soaks on box-q freely. (user msg #{mid})"}
     msg = coord._charter_retry_now(p, act, "needs the user's word", "t1")
     assert "queue the work that order covers now" in msg and "never to re-ask an order" in msg, msg
+
+
+def test_a_charter_update_with_wrong_typed_resource_settings_neither_crashes_nor_adopts_letters(env):
+    """A hand-edited config whose `machines` or `shared_resources` is a plain string (or whose
+    machines.allowed is one) neither crashes the charter check nor turns the string's letters into
+    own resource names: _own_resources shares machine_ledger's guarded lookup (configured_names)."""
+    import json
+    from ttp import coordinator as coord
+    p = make(env)
+    # direct: the guards hold for every wrong-typed shape
+    assert coord._own_resources({"machines": "box-q", "shared_resources": "abc", "resources": "xyz"}) == ()
+    assert coord._own_resources({"machines": {"allowed": "b-x"}}) == ()
+    # through a charter_update: a scoped exception on the order's own words still runs to its end
+    cfg = json.loads(p.config_path.read_text()) if p.config_path.exists() else {}
+    cfg["machines"] = "box-q"          # wrong type: a hand edit
+    cfg["shared_resources"] = "box-r-device"
+    p.config_path.write_text(json.dumps(cfg))
+    p.charter_path.write_text(_PREEMPT_BANS)
+    order = "preempt the soak on our own box box-q"
+    fid = _agent_order(p, order)
+    act = {"type": "charter_update", "section": "Restrictions", "excepts": "Never preempt a running soak.",
+           "text": "Workers may preempt the soak on box-q.",
+           "source": json.dumps({"msg": fid, "origin": "relayer", "quote": order})}
+    err = coord.apply(p, [act], turn=1, user_turn=False)   # a wrong-typed config never crashes it
+    assert err == [], err
+    assert "Exception to \"Never preempt a running soak.\"" in p.charter_path.read_text()
 
 
 def test_agent_mode_a_pr_leaving_draft_still_needs_the_users_own_yes(env):

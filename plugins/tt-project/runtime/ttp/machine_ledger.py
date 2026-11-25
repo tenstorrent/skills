@@ -2461,16 +2461,26 @@ def charter_machines(charter: str, known) -> list[str]:
                                                             for c in clauses for m in pat[a].finditer(c)))
 
 
+def configured_names(cfg: dict) -> list[str]:
+    """The project's own machine and resource names its config names (each a string): `machines.allowed`,
+    `resources` keys and `shared_resources` entries. Wrong-typed values name nothing, so a hand-edited
+    config (machines a string, shared_resources a string) neither crashes a reader nor turns the
+    string's letters into names."""
+    res = cfg.get("resources")
+    shared = cfg.get("shared_resources")
+    machines = cfg.get("machines")
+    allowed = (machines or {}).get("allowed") if isinstance(machines, dict) else None
+    names = [str(x) for x in (res if isinstance(res, dict) else {})]
+    names += [x for x in (shared if isinstance(shared, list) else []) if isinstance(x, str)]
+    names += [x for x in (allowed if isinstance(allowed, list) else []) if isinstance(x, str)]
+    return names
+
+
 def configured_machines(cfg: dict, known) -> list[str]:
     """The machines in `known` the project's config authorizes explicitly: `machines.allowed`, a
     `resources` limit or a `shared_resources` entry that is the alias or a resource on it
     (`<alias>-device`)."""
-    res = cfg.get("resources")
-    shared = cfg.get("shared_resources")
-    allowed = (cfg.get("machines") or {}).get("allowed") if isinstance(cfg.get("machines"), dict) else None
-    names = [str(x) for x in (res if isinstance(res, dict) else {})]
-    names += [x for x in (shared if isinstance(shared, list) else []) if isinstance(x, str)]
-    names += [x for x in (allowed if isinstance(allowed, list) else []) if isinstance(x, str)]
+    names = configured_names(cfg)
     return sorted(a for a in known if any(n == a or n.startswith((a + "-", a + ":")) for n in names))
 
 

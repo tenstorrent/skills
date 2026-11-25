@@ -8099,17 +8099,8 @@ class Daemon:
                 rstatus = "waiting"
                 log(self.p, f"task {task['id']} hand-off: blocked with {len(live)} live detached job(s); "
                             f"recorded as waiting on {probe[:300]}")
-        if rstatus == "waiting" and isinstance(result.get("retry_when"), str) \
-                and (word := waitheal.charter_wait(result["retry_when"])):
-            # A refused rule change never holds ordered work: the coordinator queues it, so this wait never ends.
-            refused = result["retry_when"][:200]
-            result = {**{k: v for k, v in result.items() if k != "retry_when"}, "retry_when_refused": refused}
-            db.x("INSERT INTO events(ts,source,kind,severity,text,status,task) VALUES(?,?,?,?,?,?,?)",
-                 (time.time(), f"task:{task['id']}", "handoff_probe_refused", "normal",
-                  f"#{task['id']} {task['title']}: its waiting hand-off's retry_when waits on the charter ({word!r}), "
-                  f"so it was not stored: a refused or pending rule change never holds ordered work, the "
-                  f"coordinator queues it in the same turn; the task wakes at its retry timer", "queued", task["id"]))
-            log(self.p, f"task {task['id']} hand-off: retry_when refused: waits on the charter: {refused}")
+        if rstatus == "waiting":   # a wait on the charter is dropped, never stored (waitheal)
+            result = waitheal.refuse_charter_wait(db, self.p, task, result)
         if rstatus == "waiting" and result.get("retry_when") is not None and not isinstance(result["retry_when"], str):
             # No shell command (JSON true, a number, a list): never run, nor read as passed through its
             # truthiness. It is dropped, said loudly, and the task wakes at its timer (or on its jobs' probe).

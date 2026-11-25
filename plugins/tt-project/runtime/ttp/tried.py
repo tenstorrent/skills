@@ -154,7 +154,8 @@ def common(ledger: list[dict]) -> frozenset:
 
 def similar(title1: str, spec1: str, title2: str, spec2: str, usual: frozenset = frozenset()) -> bool:
     """Whether new work (title1, spec1) repeats earlier work (title2, spec2): never when both name the
-    commits or releases they act on (targets) and share none. `usual` (see common) is left out of the shared parameters and title subject that the parameters rule needs."""
+    commits or releases they act on (targets) and share none. `usual` (see common) is left out of the
+    shared parameters and title subject that the parameters rule needs."""
     spec1, spec2 = content(spec1), content(spec2)
     t1, t2 = release_targets(f"{title1} {spec1}"), release_targets(f"{title2} {spec2}")
     if t1 and t2 and not t1 & t2:
