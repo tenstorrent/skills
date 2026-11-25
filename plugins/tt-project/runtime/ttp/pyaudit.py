@@ -13,7 +13,6 @@ from __future__ import annotations
 import json
 import os
 import re
-import time
 import zipfile
 from pathlib import Path
 
@@ -34,7 +33,7 @@ def policy(env, cwd: str, run_dir: str, cfg: dict | None, zp: str) -> dict:
     secrets = {p: credguard.WHY for f in [*credguard.credential_files(home), str(project.secrets_path())]
                for p in (str(f), os.path.realpath(f))}
     pol = {"runtime": str(DIR.parent), "zip": zp,
-           "t": time.time(), "tamper": TAMPER, "roots": roots, "secrets": secrets}
+           "tamper": TAMPER, "roots": roots, "secrets": secrets}
     if glmguard.glm_run(env) is not None:
         pol["glm"] = {"run_dir": run_dir, "roots": glmguard._roots(cwd, run_dir, glmguard._scratch(run_dir, env), env),
                       "own": glmguard._own_roots(cwd, run_dir, env), "home": home,

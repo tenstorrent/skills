@@ -150,8 +150,8 @@ def test_pyaudit_closes_the_reviewed_bypasses(env, cred_home):
     # a path type of the code's own runs no code inside the judge: refused closed
     r = _pa_run(e, f"class P:\n    def __fspath__(self): return {str(ssh / 'n')!r}\nopen(P(), 'w')", cred_home.work)
     assert r.returncode != 0 and "tt-project guard" in r.stderr
-    r = _pa_run(e, f"import os, pathlib; pathlib.PurePath.__str__ = lambda s: {str(ssh / 'd')!r}; os.mkdir(pathlib.Path('d'))",
-                cred_home.work)   # os calls pass the judge the path object itself
+    r = _pa_run(e, f"import os, pathlib; pathlib.PurePath.__str__ = lambda s: {str(ssh / 'd')!r}; "
+                   "os.mkdir(pathlib.Path('d'))", cred_home.work)   # os calls pass the judge the path object itself
     assert r.returncode != 0 and "tt-project guard" in r.stderr
     assert not (ssh / "d").exists(), r.stderr
     assert key.read_text() == "secret" and cred_home.home.is_dir() and not (ssh / "d").exists()

@@ -23,8 +23,7 @@ SITE = ("sitecustomize.py", "usercustomize.py", "pyvenv.cfg")   # with *.pth: co
 
 
 def _inline(argv):
-    """Whether the Python runs inline code (`-c`, `-` or no script and no module): False, True, or the code of
-    a `-c`."""
+    """Whether the Python runs inline code (`-c`, `-` or no script and no module)."""
     i = 1
     while i < len(argv):
         a = argv[i]
@@ -33,7 +32,7 @@ def _inline(argv):
         if not a.startswith("--"):
             for k, ch in enumerate(a[1:]):
                 if ch in "cm":
-                    return (a[k + 2:] or (argv[i + 1] if i + 1 < len(argv) else "") or True) if ch == "c" else False
+                    return ch == "c"
                 if ch in "WX":
                     i += k + 2 == len(a)   # its value is the next word
                     break
@@ -168,8 +167,6 @@ def _install(pol: dict) -> None:
         if env is not None:   # a variable the child's environment changes: its value in the text the guards read
             cmd = re.sub(r"\$(?:\{([A-Za-z_]\w*)\}|([A-Za-z_]\w*))", lambda m: m[0] if env.get(
                 k := m[1] or m[2]) == os.environ.get(k) else shlex.quote(env.get(k, "")), cmd)
-        if env is not None:   # judged where the run's own paths stand; the judge's start as the child gets it
-            env = {**{k: v for k, v in os.environ.items() if k not in KEEP}, **env}
         return ttp().child_refusal(cmd, cwd or os.getcwd())
 
     def judge(ev, args):
@@ -178,7 +175,8 @@ def _install(pol: dict) -> None:
             if path is None or isinstance(path, int):   # an open file descriptor: opened before
                 return None
             raw, r = fs(path), real(path)
-            if (raw in ("/dev/null", "/dev/stdout", "/dev/stderr", "/dev/tty") or raw.startswith(("/dev/fd/", "/proc/self/fd/"))) \
+            if (raw in ("/dev/null", "/dev/stdout", "/dev/stderr", "/dev/tty")
+                    or raw.startswith(("/dev/fd/", "/proc/self/fd/"))) \
                     and (r == "/dev/null" or r.startswith(("/dev/pts/", "/dev/tty", "/proc/"))):
                 return None   # the terminal, a pipe
             w = writing(mode, flags)
@@ -305,8 +303,8 @@ def _chain() -> None:
 def _main() -> None:
     raw = os.environ.get(POLICY_ENV)
     argv = getattr(sys, "orig_argv", None)   # 3.10+; before, sys.argv[0] tells only -c, - or stdin from a script
-    code = (_inline(argv) if argv else sys.argv[0] in ("-c", "-", "")) if raw else False
-    if code and hasattr(sys, "addaudithook"):
+    inline = (_inline(argv) if argv else sys.argv[0] in ("-c", "-", "")) if raw else False
+    if inline and hasattr(sys, "addaudithook"):
         import json
         _install(json.loads(raw))
 
