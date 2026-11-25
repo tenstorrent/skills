@@ -60,8 +60,11 @@ SEEN_TTL_S = 300
 KILL_WAIT_S = 5                   # the wait for a killed check's output; an escaped child is not waited for
 _seen: dict[tuple[str, int, str], tuple[float, dict]] = {}
 GLM_CHECK = "glm test hygiene"
-# The real machine's paths in a test (a temp dir or the user's home); tmp_path or monkeypatch on the line clears it.
-REAL_PATH = re.compile(r"(?<![\w./~-])(?:/tmp\b|/home/)|(?<![\w/])~/|\bPath\.home\(\)")
+# The real machine's paths in a test (a temp dir or the user's home): a string literal that opens with one, or
+# Path.home(); tmp_path or monkeypatch on the line clears it. Paths in docstrings, comments, the middle of a string
+# (fixture data) and an endswith/startswith comparison are text, not files the test touches.
+REAL_PATH = re.compile(r"(?<!endswith\()(?<!startswith\()(?<![\w\"'])[rfbRFB]{0,2}[\"'](?:/tmp\b|/home/|~/)"
+                       r"|\bPath\.home\(\)")
 TEST_FILE = re.compile(r"(?:^|/)(?:tests?/|test_[^/]*\.py$|[^/]*_test\.py$)")
 
 
@@ -125,12 +128,13 @@ def glm_test_hygiene(diff_text: str) -> list[str]:
         if line.startswith(("diff --git", "+++ ")):
             path = line[4:].strip().removeprefix("b/") if line.startswith("+++ ") else ""
             continue
-        code = line[1:]
-        if not line.startswith("+") or not TEST_FILE.search(path) or code.lstrip().startswith("#") \
+        code = line[1:].split(" #")[0]
+        if not line.startswith("+") or not TEST_FILE.search(path) or code.lstrip().startswith(("#", '"""', "'''")) \
                 or "tmp_path" in code or "monkeypatch" in code:
             continue
         if m := REAL_PATH.search(code):
-            out.append(f"{path}: `{code.strip()[:160]}` uses the real {m.group(0)}: use tmp_path or monkeypatch")
+            real = m.group(0).lstrip("rfbRFB\"'")
+            out.append(f"{path}: `{code.strip()[:160]}` uses the real {real}: use tmp_path or monkeypatch")
     return out
 
 

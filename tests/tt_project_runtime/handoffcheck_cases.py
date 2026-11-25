@@ -619,13 +619,17 @@ _GW9846_DIFF = """\
 diff --git a/tests/test_x.py b/tests/test_x.py
 --- a/tests/test_x.py
 +++ b/tests/test_x.py
-@@ -1,0 +2,6 @@
+@@ -1,0 +2,10 @@
 +    out = Path("/tmp/ttp-x.json")
 +    cfg = Path.home() / ".ttp"
 +    log = tmp_path / "tmp" / "x.log"
 +    monkeypatch.setenv("HOME", "/home/someone")
 +    # writes /tmp/ttp-x.json in the real run
 +    keep = Path("/var/tmp/y")
++    '''Scratch under /tmp goes, ~/models stays.'''
++    assert any(x.endswith("/home/someone") for x in gone)
++    passwd = "app:x:1001:1001::/home/app:/bin/bash"
++    home = fake / "home/deployer"  # ours by its ~/app
 diff --git a/src/app.py b/src/app.py
 --- a/src/app.py
 +++ b/src/app.py
