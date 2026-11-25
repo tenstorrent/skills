@@ -100,6 +100,7 @@ def test_stalegate_dead_dependency_dropped_unless_the_spec_names_it(env, monkeyp
     dead = _sg_task(p, status="cancelled")
     other = _sg_task(p, status="done")
     free = _sg_task(p, deps=[dead, other], status="blocked")
+    p.db.update_task(free, blocked_reason=f"dependency #{dead} failed")
     named = _sg_task(p, spec=f"continue the work of #{dead}", deps=[dead], status="blocked")
     now = time.time()
     stalegates.sweep(p, _SG_CFG, now)
@@ -219,3 +220,67 @@ def test_stalegate_a_busy_lock_in_trouble_is_not_a_down_machine(env, monkeypatch
     stalegates.sweep(p, _SG_CFG, now)
     assert _sg_labels(p, pooled) == ["resource:device"] and _sg_events(p) != []
     assert {json.loads(e["data"])["must_act"]["key"] for e in _sg_events(p)} == {f"stale_gate-{gone}"}
+
+
+def test_stalegate_a_planned_future_start_after_is_never_cleared(env, monkeypatch):
+    """A start_after still in the future is a planned time deferral, never an unreasoned gate: it is
+    kept with no why and no cited id, however old the deferral; a past one is still cleared."""
+    from ttp import stalegates
+    _sg_env(monkeypatch)
+    p = make(env)
+    now = time.time()
+    planned = _sg_task(p, labels=[f"start_after:{now + 2 * 3600:.0f}",
+                                  f"deferred_since:{now - 3600:.0f}"])
+    past = _sg_task(p, labels=[f"start_after:{now - 60:.0f}", f"deferred_since:{now - 3600:.0f}"])
+    stalegates.sweep(p, _SG_CFG, now)
+    assert _sg_labels(p, planned) == [f"start_after:{now + 2 * 3600:.0f}", f"deferred_since:{now - 3600:.0f}"]
+    assert _sg_labels(p, past) == []
+
+
+def test_stalegate_a_task_blocked_on_a_user_ask_stays_blocked(env, monkeypatch):
+    """Dropping a dead dependency never starts a task held for another reason: one blocked on a user
+    ask keeps its status and blocked reason, only the dependency is dropped."""
+    from ttp import stalegates
+    _sg_env(monkeypatch)
+    p = make(env)
+    dead = _sg_task(p, status="failed")
+    ask = _sg_task(p, deps=[dead], status="blocked")
+    p.db.update_task(ask, blocked_reason="ask #42: waiting on the user's word")
+    stalegates.sweep(p, _SG_CFG, time.time())
+    t = p.db.task(ask)
+    assert json.loads(t["depends_on"]) == [] and t["status"] == "blocked"
+    assert t["blocked_reason"] == "ask #42: waiting on the user's word"
+
+
+def test_stalegate_a_wait_whose_retry_when_is_the_dead_dependency_is_released(env, monkeypatch):
+    """A waiting task whose retry probe waits on the dead dependency is released once the sweep
+    drops it: requeued at once, its retry timer cleared."""
+    from ttp import stalegates
+    from ttp.db import dump_result
+    _sg_env(monkeypatch)
+    p = make(env)
+    dead = _sg_task(p, status="cancelled")
+    waiting = _sg_task(p, deps=[dead])
+    p.db.update_task(waiting, not_before=time.time() + 1800,
+                     result=dump_result({"status": "waiting", "summary": "waits",
+                                         "retry_when": f"landed:#{dead}"}))
+    stalegates.sweep(p, _SG_CFG, time.time())
+    t = p.db.task(waiting)
+    assert json.loads(t["depends_on"]) == [] and t["status"] == "queued" and t["not_before"] is None
+
+
+def test_stalegate_rehomes_only_onto_a_resource_the_target_machine_has(env, monkeypatch):
+    """A resource is re-homed only when the swapped name lands on the target machine: when the new
+    name is another machine's, the task is left where it was instead of re-pointed wrong."""
+    from ttp import machines, stalegates
+    _sg_env(monkeypatch)
+    monkeypatch.setattr(machines, "load", lambda: {"box-a": {"tags": ["cpu"]},
+                                                   "box-b": {"tags": ["cpu"]},
+                                                   "box-b-dev": {"tags": ["cpu"]}})
+    p = make(env)
+    _sg_hold(p, "box-a")
+    clash = _sg_task(p, labels=["resource:box-a-dev"])
+    plain = _sg_task(p, labels=["resource:box-a"])
+    stalegates.sweep(p, _SG_CFG, time.time())
+    assert _sg_labels(p, clash) == ["resource:box-a-dev"]      # box-b-dev is another machine
+    assert _sg_labels(p, plain) == ["resource:box-b"]

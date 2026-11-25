@@ -23,7 +23,7 @@ import re
 import time
 
 from . import machine_ledger, machines, obligations
-from .db import deferral, dependency_ids, review_subject, waiting_handoff, without_deferral
+from .db import _first_dead, deferral, dependency_ids, review_subject, waiting_handoff, without_deferral
 
 KIND = "stale_gate"
 DEFAULT_MIN = 30.0
@@ -124,6 +124,7 @@ def findings(db, cfg: dict, now: float | None = None) -> list[dict]:
     from .coordinator import task_resources
     from . import responsibilities as rs
     bad, known = _bad(db, now), machines.load()
+    states = {r["id"]: r["status"] for r in db.q("SELECT id, status FROM tasks")}
     allowed = set(machine_ledger.project_machines(cfg or {}, known))
     avoid = {b["alias"] for b in bad if b["alias"]}
     out = []
@@ -159,7 +160,7 @@ def findings(db, cfg: dict, now: float | None = None) -> list[dict]:
         cont = {lb[10:] for lb in _labels(t) if isinstance(lb, str) and lb.startswith("continues:")}
         keep = {review_subject(t)} if t["kind"] == "review" else set()
         for dep in deps:
-            dead = db.dead_dependency([dep])
+            dead = _first_dead([dep], states)
             named = bool(re.search(rf"#{dep}\b", text)) or str(dep) in cont or dep in keep
             if dead and not named and not _shares(db, text, dep):
                 out.append({**base, "ident": f"dep:{dep}", "cause": "dead_dep", "action": "drop_dep", "dep": dep,
@@ -170,11 +171,13 @@ def findings(db, cfg: dict, now: float | None = None) -> list[dict]:
                             "fix": f"its spec names or shares files with #{dep}: re-point it with depends_on or cancel it"})
             elif (not dead and old and not named and not CITE.search(text) and t["status"] == "queued"
                   and t["kind"] != "review"):   # a review always waits on its subject
-                if (db.task(dep) or {}).get("status") in ("queued", "blocked", "waiting") and not _shares(db, text, dep):
+                if states.get(dep) in ("queued", "blocked", "waiting") and not _shares(db, text, dep):
                     out.append({**base, "ident": f"dep:{dep}", "cause": "unneeded_dep", "action": "drop_dep", "dep": dep,
                                 "gate": f"waits on #{dep}, which its spec neither names nor shares a file with",
                                 "fix": f"dropped #{dep}"})
-        if old and (d.get("after") or d.get("when")) and not _reasoned(t, d):
+        # A start_after still in the future is a planned time deferral, never an unreasoned gate.
+        if old and not (d.get("after") and d["after"] > now) and (d.get("after") or d.get("when")) \
+                and not _reasoned(t, d):
             out.append({**base, "ident": "gate", "cause": "unreasoned", "action": "clear",
                         "gate": "its start_after/start_when states no reason (a why, rule id, needs #id or safety:)",
                         "fix": "gate cleared"})
@@ -216,6 +219,20 @@ def _observe(db, now: float, fp: str, text: str, tid: int | None) -> None:
          (now, "daemon", "observation", fp, "low", text[:600], "handled", tid))
 
 
+def _fixed_gate_was_block(t: dict, f: dict) -> bool:
+    """Whether the fixed gate `f` was the task's own block: its blocked reason, or its waiting
+    hand-off's retry probe, names that dependency, machine, or the cleared probe itself."""
+    text = str(t.get("blocked_reason") or "") if t["status"] == "blocked" \
+        else str(waiting_handoff(t).get("retry_when") or "")
+    if not text:
+        return False
+    if f["action"] == "drop_dep":
+        return bool(re.search(rf"#{f['dep']}\b", text))
+    if f["action"] == "rehome":
+        return _word(f["old"], text)
+    return text.strip() == str(deferral(t).get("when") or "").strip()   # clear: the probe itself
+
+
 def _apply(db, f: dict, now: float) -> None:
     from . import startgate
     t = db.task(f["task"])
@@ -226,14 +243,20 @@ def _apply(db, f: dict, now: float) -> None:
                  and lb.split(":", 1)[0] in GATE_KEYS}
         kw["labels"] = labels
         from . import responsibilities as rs
+        known = machines.load()
         for r in sorted(n for n in names if rs._names(f["old"], n)):
-            kw["labels"] = _swap(kw["labels"], r, f["new"] + r[len(f["old"]):])
+            new = f["new"] + r[len(f["old"]):]
+            if not rs._names(f["new"], new) or any(a != f["new"] and rs._names(a, new)
+                                                   for a in known):
+                raise ValueError(f"cannot re-home {r} onto {f['new']}: {new} is not its resource")
+            kw["labels"] = _swap(kw["labels"], r, new)
     elif f["action"] == "drop_dep":
         kw["depends_on"] = [x for x in dependency_ids(t) if x != f["dep"]]
     elif f["action"] == "clear":
         kw.update(labels=without_deferral(labels), not_before=None)
-    if t["status"] in ("blocked", "waiting"):
-        kw.update(status="queued", blocked_reason=None)
+    # A task held by something else (a user ask, a hold, a budget cap) is never started past it.
+    if t["status"] in ("queued", "blocked", "waiting") and _fixed_gate_was_block(t, f):
+        kw.update(status="queued", blocked_reason=None, not_before=None)
     with db.tx():
         db.update_task(f["task"], **kw)
         _observe(db, now, f"stale_gate_cleared:{f['task']}:{f['ident']}:{now:.0f}",
@@ -263,7 +286,9 @@ def sweep(p, cfg: dict, now: float | None = None) -> list[str]:
             try:
                 _apply(db, f, now)
                 done.append(f"{f['task']}:{f['ident']}")
-            except Exception:   # a task changed under us: the next pass sees it again
+            except Exception as e:   # a task changed under us: the next pass sees it again
+                from .daemon import log
+                log(p, f"stale gate fix for #{f['task']} failed: {e}")
                 continue
     left = [f for f in found if f["action"] == "raise"]
     prom = promises(db, cfg, found, now)
