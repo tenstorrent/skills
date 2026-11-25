@@ -45,11 +45,12 @@ def problems(p, actions: list, wakes: list | None = None) -> list[tuple[int, str
     """(action index, why) of each action coord.apply would refuse, by the checks it can make without
     a side effect; [] when it finds none. Reads the project's tasks and config only. `wakes` (a list):
     gets (free_at, review, why) of each task_add refused on a full cap, for refusal to ask the retry wake."""
-    from . import coordinator as coord, obligations, timefmt
+    from . import actionforms, coordinator as coord, obligations, timefmt
     from .db import TERMINAL_TASK_STATES, _first_dead, dependency_ids
     from .providers.base import normalize_action
     db, cfg, out = p.db, p.config(), []
     home = timefmt.home(p)
+    actions = actionforms.normalise(p, actions, home=home, now=time.time())[0]   # as apply takes them
     # A config_set in the batch is applied first and may change a cap: the caps are left to apply then.
     caps = not any(isinstance(a, dict) and a.get("type") == "config_set"
                    and "tasks_per_day" in str(a.get("key") or "") for a in actions)

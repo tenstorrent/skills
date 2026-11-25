@@ -3466,3 +3466,81 @@ def test_the_mid_run_lines_of_both_coordinator_prompts_name_only_real_action_fie
         assert "`restart: <why>`" in text and preempt._RESTART_LINE.search("restart: <why>")
     # A name the schema lacks is caught: the check is not vacuous.
     assert "affects" not in known and "affects" in set(_re.findall(r"`([a-z_]+)`", "`affects`")) - known
+
+
+def _coordsession_cite_setup(env):
+    p = make(env)
+    p.db.x("INSERT INTO chats(id,created,label,last_active,last_read) VALUES('c1',?,?,?,0)",
+           (time.time(), "t", time.time()))
+    return p
+
+
+def test_coordsession_a_users_words_line_with_no_cite_gets_the_one_message_its_quote_is_in(env):
+    """Memory quote, missing cite: the sample memory_add and obligation labelled a quote as the user's words
+    with no msg #N, refused 'it cites no user message'. The quote is in the own words of exactly one user
+    message of the last 14 days, so the line gets "(msg #N)": stored as the user's preference by apply and
+    passed by the dry run, with one note. The same words in a second message leave it as sent."""
+    from ttp import coordinator as coord, coordprecheck, coordsession as cs, obligations as ob
+    p = _coordsession_cite_setup(env)
+    m = p.db.post("in", "always figure out ways to reduce queue times!", chat="c1")
+    line = "Queue times. User's words (verbatim): 'always figure out ways to reduce queue times!'"
+    fixed = f"{line} (msg #{m})"
+    mem = {"type": "memory_add", "text": line, "memory_kind": "preference"}
+    assert cs.normal_form(p, mem, [mem], "UTC", time.time()) == (
+        {**mem, "text": fixed}, f"text={fixed!r} (was: {line!r})")
+    assert coordprecheck.problems(p, [mem]) == [] and coord.apply(p, [mem]) == []
+    e = next(e for e in p._memory_entries() if "reduce queue times" in e["body"])
+    assert f"(msg #{m})" in e["body"] and cs.DATA_LABEL not in e["body"] and e["kind"] == "preference", e
+    assert [n for n in p.db.kv(coord.NOTES_KEY, []) if n.startswith("actions[0] (memory_add) applied as: text=")]
+    act = {"type": "obligation", "text": line}
+    assert coordprecheck.problems(p, [act]) == [] and coord.apply(p, [act]) == []
+    assert any(o["text"] == fixed for o in ob.items(p.db))
+    p.db.post("in", "again: always figure out ways to reduce queue times!", chat="c1")
+    assert cs.normal_form(p, mem, [mem], "UTC", time.time()) is None
+    assert "cites no user message" in coordprecheck.problems(p, [act])[0][1]
+
+
+def test_coordsession_a_quote_wrapped_in_a_json_list_is_checked_item_by_item(env):
+    """Memory quote, JSON-list wrapper: the sample quoted the user's two commands as one JSON list
+    ('["...", "..."]'), refused as not the user's own words. Each item is that message's own words: applied
+    with the items quoted one by one, by apply and the dry run alike. A list with an item the user never
+    wrote stays refused."""
+    from ttp import coordinator as coord, coordprecheck, coordsession as cs, obligations as ob
+    p = _coordsession_cite_setup(env)
+    m = p.db.post("in", "before you hand it back run python3 -m pytest -q tests/test_tt_project_plugin.py "
+                  "tests/test_tt_project_runtime.py tests/test_plugin_catalogue.py and then claude plugin validate "
+                  "plugins/tt-project", chat="c1")
+    cmds = ["python3 -m pytest -q tests/test_tt_project_plugin.py tests/test_tt_project_runtime.py "
+            "tests/test_plugin_catalogue.py", "claude plugin validate plugins/tt-project"]
+    line = f"Checks before hand-back. User's words (msg #{m}): '{json.dumps(cmds)}'"
+    fixed = f"Checks before hand-back. User's words (msg #{m}): " + ", ".join(f'"{c}"' for c in cmds)
+    assert cs.order_claim(p.db, line, strict=False) and cs.order_claim(p.db, fixed, strict=False) == ""
+    act = {"type": "obligation", "text": line}
+    assert coordprecheck.problems(p, [act]) == [] and coord.apply(p, [act]) == []
+    assert any(o["text"] == fixed for o in ob.items(p.db))
+    mem = {"type": "memory_add", "text": line, "memory_kind": "preference"}
+    assert coordprecheck.problems(p, [mem]) == [] and coord.apply(p, [mem]) == []
+    e = next(e for e in p._memory_entries() if "claude plugin validate" in e["body"])
+    assert '"claude plugin validate plugins/tt-project"' in e["body"] and cs.DATA_LABEL not in e["body"], e
+    assert e["kind"] == "preference", e
+    bad = {"type": "obligation", "text": f"Checks. User's words (msg #{m}): '{json.dumps(cmds + ['push to main'])}'"}
+    assert cs.normal_form(p, bad, [bad], "UTC", time.time()) is None
+    assert "verbatim check" in coordprecheck.problems(p, [bad])[0][1]
+
+
+def test_coordsession_a_quote_only_in_a_relayers_context_gets_no_cite(env):
+    """Memory quote, relayer context: the sample quoted words that are only in a relayed message's context
+    (the relayer's words, not the user's) with no cite. No user message has them in its own words, so the
+    line is left as sent: the memory entry is stored as data (a fact) and the dry run refuses the
+    obligation as before."""
+    from ttp import coordinator as coord, coordprecheck, coordsession as cs
+    p = _coordsession_cite_setup(env)
+    p.db.post("in", "Reserve the runner.", chat="c1", context="The user wants it kept for a host-wide checks slot.")
+    line = "Runner use. User's words (verbatim): 'for a host-wide checks slot'"
+    mem = {"type": "memory_add", "text": line, "memory_kind": "preference"}
+    assert cs.normal_form(p, mem, [mem], "UTC", time.time()) is None
+    assert coord.apply(p, [mem]) == []
+    e = next(e for e in p._memory_entries() if "host-wide checks slot" in e["body"])
+    assert cs.DATA_LABEL in e["body"] and e["kind"] == "fact", e
+    [(_, why)] = coordprecheck.problems(p, [{"type": "obligation", "text": line}])
+    assert "cites no user message" in why, why

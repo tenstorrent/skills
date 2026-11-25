@@ -1,0 +1,61 @@
+# Coordinator action form tests (actionforms.py) of tests/test_tt_project_runtime.py, which runs this file in its
+# own namespace (see _include_cases there): helpers, fixtures and imports come from that file. Each form's own
+# tests live in its area's case file (sweep: coordinator_cases, obligations, cells, configset, throughmute,
+# turnrules, coordsession); add tests of the shared frame here.
+from __future__ import annotations
+
+
+def _af_blocked(p):
+    t = p.db.add_task("blocked")
+    p.db.update_task(t, status="blocked", blocked_reason="x")
+    return [{"type": "sweep", "id": t, "outcome": "still_blocked", "until": "the vendor sends the signed key"}]
+
+
+def test_actionforms_a_form_that_raises_leaves_the_action_as_sent(env, monkeypatch):
+    """A fault in one form never stops the turn: that action meets its usual check exactly as sent."""
+    from ttp import actionforms, coordinator as coord, sweep
+    p = make(env)
+    sent = _af_blocked(p)
+
+    def boom(*a, **k):
+        raise RuntimeError("form fault")
+    monkeypatch.setattr(sweep, "normal_form", boom)
+    assert actionforms.normalise(p, sent, home="UTC", now=time.time()) == (sent, [])
+    out = coord.apply(p, sent)   # refused as before: no start_after, and the form that adds it failed
+    assert len(out) == 1 and "needs `start_after`" in out[0], out
+
+
+def test_actionforms_a_rewrite_is_tallied_as_normalised_never_as_a_refusal(env):
+    """apply's rewrite is counted once, as 'normalised', apart from the refusals; the dry run counts nothing."""
+    from ttp import coordinator as coord, coordprecheck, rejtally
+    p = make(env)
+    sent = _af_blocked(p)
+    assert coordprecheck.problems(p, sent) == [] and not p.db.kv(rejtally.KEY)
+    assert coord.apply(p, sent) == []
+    (day,) = p.db.kv(rejtally.KEY).values()
+    assert day == {rejtally.NORMALISED: [0, 1]}
+    assert rejtally.lines(p.db) == ["action refusals (1d): 0 caught in turn, 0 refused after the turn; "
+                                    "1 applied as a clear-meaning form (normalised)"]
+    assert any("applied as: " in n for n in p.db.kv(coord.NOTES_KEY))
+
+
+def test_actionforms_clock_times_and_local_dates_apply_and_pass_the_dry_run(env):
+    """Regression for time forms once refused ("look: start_after '23:50': use a delay such as ...", "o755 due:
+    a time needs an absolute timestamp with a time zone offset"): a clock time, one with a zone abbreviation
+    and a local date and time are read in the home zone."""
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+    from ttp import coordinator as coord, coordprecheck, obligations
+    p = make(env)
+    p.set_config("home_timezone", "America/Los_Angeles")
+    now = time.time()
+    sent = [{"type": "look", "at": "23:50", "text": "check the bench"},
+            {"type": "task_add", "title": "later run", "kind": "work", "spec": "run it", "start_after": "19:20 PST",
+             "why": "after the window"}]
+    assert coordprecheck.problems(p, sent) == []
+    assert coord.apply(p, sent) == []
+    at = p.db.task(p.db.one("SELECT id FROM tasks WHERE title='later run'")["id"])["not_before"]
+    assert now < at <= now + 86400 and datetime.fromtimestamp(at, ZoneInfo("America/Los_Angeles")).strftime("%H:%M") == "19:20"
+    day = datetime.fromtimestamp(now + 3 * 86400, ZoneInfo("America/Los_Angeles")).strftime("%Y-%m-%d")
+    assert obligations._when(f"{day} 13:00", "o755 due", p) == \
+        datetime.fromisoformat(f"{day}T13:00").replace(tzinfo=ZoneInfo("America/Los_Angeles")).timestamp()

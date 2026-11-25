@@ -1446,7 +1446,7 @@ def test_the_in_turn_dry_run_catches_sweeps_claims_and_naive_dues_and_fills_the_
     tid = p.db.add_task("stuck", "s", origin="user")
     p.db.update_task(tid, status="blocked")
     bad = [{"type": "sweep", "outcome": "still_blocked"},
-           {"type": "sweep", "id": tid, "outcome": "still_blocked", "until": "the box is back"},
+           {"type": "sweep", "id": tid, "outcome": "still_blocked", "until": "the box is back", "start_after": "soon"},
            {"type": "sweep", "id": tid, "outcome": "nope"},
            {"type": "reply", "chat": "c", "text": "t", "claims": [{"text": "x", "task": tid, "state": "bogus"}]}]
     got = dict(coordprecheck.problems(p, bad))

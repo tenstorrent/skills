@@ -69,10 +69,11 @@ import hashlib
 import json
 import re
 import time
+from datetime import datetime
 from typing import Any, Callable
 
-from . import askrethink, credits, failover, holdloops, mitigate, obligations, outagetask, prguard, reviewsup, settinghold, timefmt, unblock, userpause
-from .db import DB, TERMINAL_TASK_STATES, deferral, dependency_ids, load_result
+from . import anchors, askrethink, credits, failover, holdloops, mitigate, obligations, outagetask, prguard, reviewsup, settinghold, timefmt, unblock, userpause
+from .db import DB, TERMINAL_TASK_STATES, deferral, dependency_ids, load_result, waiting_handoff
 from .coordlimits import positive
 
 SWEEP_KIND = "blocker_sweep"
@@ -189,6 +190,10 @@ def _user_paused(rows: dict[str, dict]) -> dict[str, dict]:
 def _task_resources(t: dict) -> set[str]:
     from .coordinator import task_resources
     return task_resources(t)
+
+
+def _open_deps(db: DB, t: dict) -> list[int]:
+    return sorted(d for d in dependency_ids(t) if isinstance(d, int) and (db.task(d) or {}).get("status") != "done")
 
 
 def pause_covers(db: DB, paused: dict[str, dict] | None = None) -> dict[str, float]:
@@ -433,7 +438,7 @@ def _watch(db: DB, live: list[dict], paused: dict[str, dict], now: float) -> Non
         if i["kind"] == "deferred":
             t = db.task(i["task"]) or {}
             probe, until, v, names = deferral(t).get("when"), None, gates.get(str(i["task"])) or {}, _task_resources(t)
-            deps = sorted(d for d in dependency_ids(t) if isinstance(d, int) and (db.task(d) or {}).get("status") != "done")
+            deps = _open_deps(db, t)
             said = v.get("when")
         else:
             row = paused.get(i["resource"]) or {}
@@ -859,6 +864,86 @@ def record(db: DB, a: dict, next_at: float | None, now: float | None = None, whe
     outs[key] = o
     db.set_kv(OUTCOMES_KEY, {k: v for k, v in outs.items() if now - _num(v.get("ts")) < KEPT_DAYS * 86400})
     return key
+
+
+_KEY_FIELD = {"task": "id", "promise": "promise", "resource": "resource"}   # an item key's kind -> its field
+
+
+def _own_wait(db: DB, key: str, now: float, where) -> tuple[list[float], dict]:
+    """What item `key`'s own record says it waits on (normal_form): its wake times, and the wait as sweep
+    fields ({} when none is on record). A task: its start_when or retry_when probe, else its unfinished
+    dependencies, its hold (waits_on) or its planned start; a resource pause: its end_when."""
+    kind, _, ident = key.partition(":")
+    if kind == "promise":
+        return [_num(((obligations.get(db, ident) or {}).get("promise") or {}).get("due"))], {}
+    if kind == "resource":
+        row = db.paused_resources().get(ident) or {}
+        probe = str(row.get("end_when") or "").strip()
+        return [_num(row.get("until"))], {"until_probe": probe} if probe else {}
+    t = db.task(int(ident)) or {}
+    d, (hold, value) = deferral(t), anchors.anchor(t) or ("", "")
+    after = _num(d.get("after"))
+    wakes = [_num(t.get("not_before")), after, _num(value) if hold == "until" else 0.0]
+    probe = str(d.get("when") or waiting_handoff(t).get("retry_when") or (value if hold == "when" else "")).strip()
+    if probe:
+        return wakes, {"until_probe": probe}
+    if deps := _open_deps(db, t):
+        return wakes, {"until": " and ".join(f"task #{x} finishes" for x in deps)}
+    if hold or after > now:
+        return wakes, {"until": anchors.describe(hold or "until", value or str(after), where)}
+    return wakes, {}
+
+
+def normal_form(p, a: dict, batch: list, home: str, now: float) -> tuple[dict, str] | None:
+    """A `sweep` whose meaning is clear, in the form record() takes (actionforms): an item key sent in another
+    field ('task:12' as `id`) moved to its own; on a task no task_update in the batch changes, `unblocked`
+    while still deferred recorded as still_blocked, and a still_blocked without a re-checkable condition or
+    a future `start_after` given the item's own wait and next wake (else now + the sweep period). None when
+    nothing needs it; a record naming no wait leaves a vague 'keep it blocked' to its refusal."""
+    from .coordinator import parse_start_after
+    db, notes = p.db, []
+    was = lambda v: repr(_clip(v, 80)) if v not in (None, "") else "none"   # noqa: E731
+    done = lambda: (a, "; ".join(notes)) if notes else None   # noqa: E731
+    for f in ("id", "promise", "resource"):
+        kind, _, val = a[f].partition(":") if isinstance(a.get(f), str) else ("", "", "")
+        to, val = _KEY_FIELD.get(kind.strip().lower()), val.strip().lstrip("#")
+        if not to or not val or (to == "id" and not val.isdigit()):
+            continue
+        if to != f and a.get(to) not in (None, ""):   # two items named: no one reading
+            return None
+        notes.append(f"{to}={val} (was: {f} {was(a.pop(f))})")
+        a[to] = int(val) if to == "id" else val
+    try:
+        key = _item_key(a)
+    except (TypeError, ValueError):   # no item named: that refusal stays
+        return None
+    tid = int(key[5:]) if key.startswith("task:") else 0
+    updated = {str(x.get("id")) for x in batch if isinstance(x, dict) and x.get("type") == "task_update"}
+    if (tid and (not db.task(tid) or str(tid) in updated)) or _finished(db, key):
+        return done()   # a turn that updates the task sets its hold itself
+    if a.get("outcome") == "unblocked" and tid and (held := still_deferred(db, tid, now, home)):
+        a["outcome"] = "still_blocked"
+        notes.append(f"outcome=still_blocked (was: 'unblocked' while still deferred: {held})")
+    if a.get("outcome") == "still_blocked":
+        wakes, wait = _own_wait(db, key, now, home)
+        sent = a.get("until") or a.get("reason")
+        if not recheckable({"until": sent, "probe": a.get("until_probe")}):
+            if not wait:
+                return done()
+            for f, v in wait.items():
+                notes.append(f"{f}={_clip(v, 160)} (was: {was(a.get(f) if f == 'until_probe' else sent)})")
+                a[f] = v
+        try:
+            at = parse_start_after(a.get("start_after") or "now", now, tz=home)
+        except ValueError:   # not a time: its own refusal stays
+            return done()
+        if not at:
+            at = min((w for w in wakes if w > now), default=0.0) or now + (
+                _cfg(p.config(), "blocker_sweep_h", EVERY_H) or EVERY_H) * 3600
+            iso = datetime.fromtimestamp(at, timefmt.tzinfo(home)).isoformat(timespec="seconds")
+            notes.append(f"start_after={iso} (was: {was(a.get('start_after'))})")
+            a["start_after"] = iso
+    return done()
 
 
 # The read-only exports (`ttp task show`, `ttp status --json`, the web API state): every field always

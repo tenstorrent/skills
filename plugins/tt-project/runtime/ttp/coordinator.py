@@ -30,6 +30,7 @@ from . import budget as bud, locks
 from . import (   # one name per line: two changes adding names merge without a conflict
     accountset,
     actdefer,
+    actionforms,
     anchors,
     askauto,
     askrethink,
@@ -94,6 +95,7 @@ from . import (   # one name per line: two changes adding names merge without a 
     reask,
     rejcool,
     queuetrim,
+    rejtally,
     relay,
     responsibilities,
     restriction_audit,
@@ -602,9 +604,15 @@ def settable(key: str):
         return conv
     from .configwho import cli_route
     from .project import unknown_key_hint
-    user = any(k == key or k.startswith(key + ".") or key.startswith(k + ".") for k in NEEDS_USER)
-    raise ValueError(chatset.refusal(key) or unknown_key_hint(key) or f"{key} is not user-settable from chat"
-                     + ("" if user else f"; {cli_route(key)}"))
+    if why := chatset.refusal(key) or unknown_key_hint(key):
+        raise ValueError(why)
+    if any(k == key or k.startswith(key + ".") or key.startswith(k + ".") for k in NEEDS_USER):
+        raise ValueError(f"{key} is not user-settable from chat")
+    raise ShellKey(f"{key} is not user-settable from chat; {cli_route(key)}")
+
+
+class ShellKey(ValueError):
+    """settable's refusal of a known key that is not the user's alone: the coordinator sets it by `ttp config`."""
 
 CHARTER_HISTORY = ends.CHARTER_HISTORY   # harness file: charter sections replaced or retired
 # kv: [{"id", "messages", "ask", "section", "quote", "replaces", "candidates", "text", "sha", "ts",
@@ -2892,6 +2900,11 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
     timeouts)."""
     db, problems, notes = p.db, [], []
     cfg = p.config()
+    try:   # a form with one clear meaning is applied as meant, not refused (actionforms)
+        actions, notes = actionforms.normalise(p, actions, home=timefmt.home(p), now=time.time())
+        rejtally.record(db, [], [], normalised=notes)
+    except Exception as e:
+        notes = [f"action forms not checked: {type(e).__name__}: {str(e)[:200]}"]
     # For the stale-restriction check (_restriction_conflicts): the restrictions before this turn's
     # first charter_update, the text it added, and whether it edited a restriction in place.
     restr_before: str | None = None
@@ -4309,11 +4322,29 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
             elif t == "config_set":
                 key = a.get("key", "")
                 key = ALIASES.get(key, key)
-                conv = settable(key)
+                try:
+                    conv, shell = settable(key), False
+                except ShellKey:
+                    # A key the coordinator would set by `ttp config` in its own shell: applied here as that command
+                    # applies it (its checks, its JSON reading of a text value), unless the coordinator has no shell
+                    # (read_only), or the key is a spend setting (budget), push permission (grants) or the machine
+                    # allowlist, or a parent of one: those are the user's.
+                    from . import cli, grants
+                    if coordtools.tools_mode(cfg) != "full" or key.split(".")[0] == "budget" or any(
+                            k == key or k.startswith(key + ".") for k in (*grants.KEYS, "machines.allowed")):
+                        raise
+
+                    def conv(v, key=key):
+                        try:
+                            v = json.loads(v) if isinstance(v, str) else v
+                        except ValueError:
+                            pass
+                        return cli.config_value(p, key, v)
+                    shell = True
                 # '' removes a project key so its default applies (as `ttp config NAME KEY ''`), never "" stored
                 # over a list or an object; an account key keeps accountset's own handling of '', and a chat
                 # routing key (chatset) its own check, so no routed tier loses its model or endpoint.
-                remove = a.get("value") == "" and key in USER_SETTABLE and key not in accountset.KEYS
+                remove = a.get("value") == "" and (key in USER_SETTABLE or shell) and key not in accountset.KEYS
                 value = None if remove else conv(a.get("value"))
                 chatset.route_ready(cfg, key, value)
                 if key == "delivery.backup_remote" and (why := push.backup_problem({**(cfg.get("delivery") or {}),
@@ -4367,6 +4398,10 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                 else:
                     p.set_config(key, value, by=who)
                 cfg = p.config()
+                if shell:   # the command it stands for, and what that command warns of
+                    notes.append(f"config_set {key} applied as: ttp config {p.name} {key} "
+                                 f"{json.dumps('' if remove else value)[:200]} (was: refused, not settable from chat)"
+                                 + "".join(f"; warning: {w}" for w in cli.config_warnings(p, key)))
                 if key in (MERGE_KEY, relay.AGENT_KEY) and said:   # the audit trail: the messages that let it
                     db.x("INSERT INTO events(ts,source,kind,severity,text,data,status) VALUES(?,?,?,?,?,?,?)",
                          (time.time(), "coordinator", "config_grant", "low",
@@ -4584,6 +4619,10 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
             restriction_audit.restriction_tools(p, loosened, list(batch_tasks), notes)
         except Exception as e:
             notes.append(f"restriction tools not checked: {type(e).__name__}: {str(e)[:200]}")
+    try:   # a user message with no order whose chat one task_add replies to: its order, owned by that task
+        notes += turnrules.task_orders(p, messages, actions, new_tasks, failed, held)
+    except Exception as e:   # bookkeeping: the batch is applied either way
+        notes.append(f"order from a task_add not recorded: {type(e).__name__}: {str(e)[:200]}")
     for oid, msg, steps in fan_orders:   # an order recorded here gets this batch's tasks naming it as owners
         if oid is None:
             try:

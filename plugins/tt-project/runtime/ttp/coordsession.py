@@ -160,6 +160,7 @@ DROPPED = "order_claim_dropped"   # the event kind of a claimed user order that 
 # What replaces the user's-words label of a line that failed the verbatim check and is kept (as_data): it
 # names no user or owner, so no reader (CLAIM_RE, a handover, the memory loader) takes it for their words.
 DATA_LABEL = "[unverified quote, kept as data]"
+CITE_WINDOW_S = 14 * 86400   # normal_form: how far back the user message an uncited quote is in is looked up
 _PUNCT_RE = re.compile(r"[^\w\s]+")
 
 
@@ -747,7 +748,7 @@ def order_claim(db, line: str, agent: bool = False, strict: bool = True) -> str:
     from . import relay
     if not CLAIM_RE.search(line or ""):
         return ""
-    quotes = [" ".join(next(g for g in m.groups() if g).split()) for m in _QUOTE_RE.finditer(line)]
+    quotes = _quotes(line)
     if not quotes:
         return "it quotes none of the user's words" if strict else ""
     ids = sorted({int(x) for m in _MSG_RE.finditer(line) for x in re.findall(r"\d+", m.group(0))})
@@ -771,6 +772,57 @@ def _plain(text: str) -> str:
     """`text` compared for the verbatim check: case, whitespace, quote style and punctuation aside."""
     from .restriction_source import _loose
     return " ".join(_PUNCT_RE.sub(" ", _loose(text)).split())
+
+
+def _quotes(line: str) -> list[str]:
+    return [" ".join(next(g for g in m.groups() if g).split()) for m in _QUOTE_RE.finditer(line)]
+
+
+def normal_form(p, a: dict, _batch: list, _home: str, now: float):
+    """actionforms, for a memory_add or obligation: a line of its text fields labelled as the user's words
+    that fails order_claim is rewritten when that makes it pass, else left as sent. A quote that is a JSON
+    list of strings ('["a", "b"]') becomes its items, each checked alone; a line citing no message gets
+    '(msg #N)' of the one user message of the last CITE_WINDOW_S whose own words (relay.split) hold all its
+    quotes. A quote only in relayer context, or in several messages, still fails."""
+    from . import relay
+    agent, out, notes = relay.agent_orders(p.config()), dict(a), []
+    for f, v in a.items():
+        lines = v.split("\n") if isinstance(v, str) and CLAIM_RE.search(v) else []
+        for i, line in enumerate(lines):
+            if order_claim(p.db, line, agent, strict=False) \
+                    and not order_claim(p.db, fixed := _cited(p.db, _unlisted(line), now), agent, strict=False):
+                lines[i] = fixed
+                notes.append(f"{f}={fixed.strip()[:200]!r} (was: {line.strip()[:200]!r})")
+        if lines:
+            out[f] = "\n".join(lines)
+    return (out, "; ".join(notes)) if notes else None
+
+
+def _unlisted(line: str) -> str:
+    """`line` with each quote that is a JSON list of strings written as its items, each quoted alone."""
+    def items(m):
+        try:
+            got = json.loads(next(g for g in m.groups() if g))
+        except ValueError:
+            return m.group(0)
+        if not (isinstance(got, list) and got and all(isinstance(x, str) and len(x.strip()) >= 3
+                                                      and '"' not in x and "\n" not in x for x in got)):
+            return m.group(0)
+        return ", ".join(f'"{x}"' for x in got)
+    return _QUOTE_RE.sub(items, line)
+
+
+def _cited(db, line: str, now: float) -> str:
+    """`line` with '(msg #N)' added when it cites no message and the own words of exactly one user message
+    of the last CITE_WINDOW_S hold each of its quotes."""
+    from . import relay
+    quotes = [_plain(q) for q in _quotes(line)]
+    if _MSG_RE.search(line) or not quotes or not all(quotes):
+        return line
+    hits = [r["id"] for r in db.q("SELECT id, text, context FROM messages WHERE direction='in' AND kind='user' "
+                                  "AND COALESCE(provenance,'')!='system' AND ts>=? ORDER BY id", (now - CITE_WINDOW_S,))
+            if all(q in _plain(relay.split(r["text"] or "", r["context"])[0]) for q in quotes)]
+    return f"{line.rstrip()} (msg #{hits[0]})" if len(hits) == 1 else line
 
 
 def relabel(line: str) -> str:
