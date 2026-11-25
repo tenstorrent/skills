@@ -1031,7 +1031,6 @@ def refusal(payload: dict, env=None, cfg: dict | None = None) -> str | None:
 
 
 def _refusal(payload: dict, env, rts: list[str]) -> str | None:
-    from . import pyaudit
     tool = str(payload.get("tool_name") or "")
     inp = payload.get("tool_input") or {}
     inp = inp if isinstance(inp, dict) else {"input": inp}
@@ -1041,7 +1040,6 @@ def _refusal(payload: dict, env, rts: list[str]) -> str | None:
     if tool in ("Bash", "shell", "local_shell", "exec_command"):
         cmd = inp.get("command") or inp.get("cmd") or ""
         cmd = shlex.join(map(str, cmd)) if isinstance(cmd, list) else str(cmd)   # an argv: keep `-c` text one word
-        cmd = pyaudit.relieve(cmd, env)   # inline Python the run-time judge judges as it runs
         return shell_refusal(cmd, env, ctx[1], rts)
     if tool == "apply_patch" or "*** Begin Patch" in json.dumps(inp):
         return next((h for s in _strings(inp) if (h := patch_refusal(s, ctx))), None)

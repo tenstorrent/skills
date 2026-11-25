@@ -716,10 +716,9 @@ def shell_refusal(cmd: str, cwd: str, run_dir: str = "", env=None, remote: bool 
     power cycles and flashes outside the approved routes; the hook adds protected paths, held Slurm nodes and
     replayed undos (pathguard, ruleguard). Everything else runs. `remote`: the command an ssh call runs on another
     host. `writes` and `services`: False skips those checks (a step of Opus's plan, deviceplan._static). `made`
-    gets the system temp dir entries an allowed command makes (writes_outside); nothing is written here but the judge's record of relieved code (pyaudit._expects)."""
-    from . import credguard, hook, pathguard, pyaudit
+    gets the system temp dir entries an allowed command makes (writes_outside); nothing is written here."""
+    from . import credguard, hook, pathguard
     e = os.environ if env is None else env
-    cmd = cmd if remote else pyaudit.relieve(cmd, e)   # inline Python the run-time judge judges as it runs
     lines, bodies = hook._heredocs(cmd)
     named = code_text(cmd, py_code=True)
     # the command words: the quoted text of commands that only print, search for or record it, and their quoted

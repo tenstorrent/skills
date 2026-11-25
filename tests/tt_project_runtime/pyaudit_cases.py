@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: © 2026 Tenstorrent USA, Inc.
 # SPDX-License-Identifier: Apache-2.0
 # The run-time Python judge (pyaudit.py, pyaudit/sitecustomize.py): a real `python -c` child with the judge's
-# PYTHONPATH and policy, and the static relief the shell guards give the code such a child runs.
+# PYTHONPATH and policy, judging what the code does as it runs.
 
 
 def _pa_env(cred_home, glm=False):
@@ -24,14 +24,10 @@ def test_pyaudit_wire_puts_the_judge_first(env, cred_home):
     from ttp import pyaudit
     e = _pa_env(cred_home)
     zp = str(cred_home.run / "pyaudit" / "pyaudit.zip")
-    assert e["PYTHONPATH"] == f"{zp}{os.pathsep}{RUNTIME}" and pyaudit.loaded(e)
+    assert e["PYTHONPATH"] == f"{zp}{os.pathsep}{RUNTIME}"
     assert f"{zp}{os.pathsep}{RUNTIME}" in json.loads(e["_argv"])[2]   # the hook sees what the run's commands see
     pol = json.loads(e[pyaudit.POLICY_ENV])
     assert any(r.endswith("/.ssh") for r in pol["roots"]) and "glm" not in pol
-    # a changed zip, or the zip not first, loads no judge the static relief can count on
-    assert not pyaudit.loaded({**e, "PYTHONPATH": str(RUNTIME)})
-    Path(zp).write_bytes(Path(zp).read_bytes() + b"x")
-    assert not pyaudit.loaded(e)
 
 
 def test_pyaudit_refuses_writes_reads_and_children(env, cred_home):
@@ -92,79 +88,9 @@ def test_pyaudit_glm_run_writes_only_in_its_roots(env, cred_home):
     assert "guard's own files" in r.stderr and (cred_home.work / "ok.txt").exists()
 
 
-def test_pyaudit_relief_only_when_every_condition_holds(env, cred_home):
-    from ttp import glmguard, pathguard, pyaudit
-    e = _pa_env(cred_home)
-    target = cred_home.home / ".ssh" / "x"
-    code = f"open({str(target)!r}, 'w')".replace("'", '"')
-
-    def refused(cmd, env_=e):
-        return pathguard.refusal({"tool_name": "Bash", "tool_input": {"command": cmd},
-                                  "cwd": str(cred_home.work)}, env_)
-    plain = f"python3 -c '{code}'"
-    assert refused(plain, dict(os.environ, PATH="/usr/bin:/bin"))   # no judge: the shell guard reads the code
-    assert refused(plain) is None and pyaudit.relieve(plain, e) == "python3 -c 'pass'"
-    assert refused(f"cd /x && timeout 20 python3 -u - <<'EOF'\n{code}\nEOF") is None
-    for cmd in (f"python3 -I -c '{code}'", f"python3 -E -c '{code}'", f"python3 -S -c '{code}'",
-                f"env -i python3 -c '{code}'", f"PYTHONPATH= python3 -c '{code}'",
-                f"python3 -c 'import ctypes; {code}'", f"python3 -c 'exec(\"{code}\")'",
-                f"/usr/bin/python3 -c '{code}'", f"perl -e 'open(F, \">{target}\")'",
-                f"node -e 'require(\"fs\").writeFileSync(\"{target}\", \"\")'",
-                f"echo \"x; python3 -c 'a\" > {target}; echo \"'\"",   # the code a quoted string only seems to hold
-                "python3 -c \"$(echo x); open(" + repr(str(target)) + ", 'w')\"",   # a command the shell runs
-                f"python3 - <<EOF\n{code}; $X\nEOF"):   # a heredoc body the shell expands
-        assert refused(cmd), cmd
-    for cmd in ('python3 -c "$X"', "python3 - <<EOF\nprint(1); $X\nEOF"):   # code all expansion; a heredoc's
-        assert pyaudit.relieve(cmd, e) == cmd, cmd
-    assert refused(plain, {**e, "PATH": "bin:/usr/bin"})   # a relative PATH entry
-    # a .pth newer than the judge's policy runs before it: no relief
-    site = cred_home.home / ".local" / "lib" / f"python3.{sys.version_info[1]}" / "site-packages"
-    site.mkdir(parents=True)
-    (site / "x.pth").write_text("")
-    if os.path.realpath(shutil.which("python3", path="/usr/bin")).endswith(f"python3.{sys.version_info[1]}"):
-        assert refused(plain)
-    # the GLM arm's shell guard gives the same relief
-    g = _pa_env(cred_home, glm=True)
-    db = f"python3 -c 'import sqlite3; sqlite3.connect(\"{cred_home.home}/project.db\")'"
-    assert glmguard.shell_refusal(db, str(cred_home.work), str(cred_home.run), {**g, "PATH": "/usr/bin:/bin"},
-                                  made=[]) is None
-
-
-def test_pyaudit_screens_code_shell_expansions_give_as_it_starts(env, cred_home):
-    from ttp import glmguard, pathguard, pyaudit
-    if sys.version_info < (3, 10) or not os.path.realpath(shutil.which("python3", path="/usr/bin") or "").endswith(
-            f"python3.{sys.version_info[1]}"):
-        pytest.skip("needs the system python3 3.10+ as the test's interpreter")
-    e = _pa_env(cred_home)
-    cmd = ("for d in 1 2; do f=runs/$d/result.json; if [ -f \"$f\" ]; then python3 -c "
-           "\"import json; print(json.load(open('$f')))\"; fi; done")
-    bare = dict(os.environ, PATH="/usr/bin:/bin", TTP_GLM_RUN="1")
-    assert glmguard.shell_refusal(cmd, str(cred_home.work), str(cred_home.run), bare, made=[])
-    assert glmguard.shell_refusal(cmd, str(cred_home.work), str(cred_home.run), {**e, "TTP_GLM_RUN": "1"},
-                                  made=[]) is None
-    assert pyaudit.relieve(cmd, e).count("-c 'pass'") == 1
-    shapes = cred_home.run / "pyaudit" / "expanded.jsonl"
-    assert [json.loads(x) for x in shapes.read_text().splitlines()] == [["import json; print(json.load(open('",
-                                                                         "')))"]]
-    pyaudit.relieve(cmd, e)
-    assert len(shapes.read_text().splitlines()) == 1   # recorded once
-    # what the expansion gives is screened as the Python starts: a word that reaches past the judge stops it
-    (cred_home.work / "runs" / "1").mkdir(parents=True)
-    (cred_home.work / "runs" / "1" / "result.json").write_text("{}")
-    for val, ok in (("runs/1/result.json", True), ("x')); import ctypes; print(('", False),
-                    ("x')).__class__.__subclasses__(); print(('", False)):
-        r = _pa_run(e, f"import json; print(json.load(open('{val}')))", cred_home.work)
-        assert (r.returncode == 0) == ok and ("tt-project guard" in r.stderr) != ok, (val, r.stderr[-300:])
-    # the same words in code of another shape, which the shell guards read in full: the judge lets it start
-    r = _pa_run(e, "import ctypes; print('x')", cred_home.work)
-    assert r.returncode == 0 and r.stdout.strip() == "x"
-    assert pathguard.refusal({"tool_name": "Bash", "tool_input": {"command": cmd}, "cwd": str(cred_home.work)},
-                             e) is None
-
-
 def test_pyaudit_real_harm_stays_refused(env, cred_home):
     """Deleting the home folder or reading a credential through inline Python: refused as it runs, and by the
-    shell guards (deletes and moves) whether the static relief is on or off."""
+    shell guards (deletes and moves) whether the judge is wired or not."""
     from ttp import pathguard
     key = cred_home.home / ".ssh" / "id_ed25519"
     key.write_text("secret")
@@ -213,7 +139,3 @@ def test_pyaudit_closes_the_reviewed_bypasses(env, cred_home):
                 " os.link('e/f', 'g'); pathlib.Path('h').write_text('y'); subprocess.run(['ls'], cwd='e', check=True)",
                 cred_home.work)
     assert r.returncode == 0, r.stderr[-400:]
-    # what the static relief leaves to the shell guards: a dir_fd, inspect, a changed HOME, a word that goes on
-    for cmd in ("python3 -c 'import os; os.open(\"k\", os.O_WRONLY, dir_fd=3)'", "python3 -c 'import inspect'",
-                "HOME=/tmp python3 -c 'print(1)'", "python3 -c 'print(1)'x"):
-        assert pyaudit.relieve(cmd, e) == cmd, cmd

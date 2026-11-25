@@ -41,7 +41,7 @@ def _inline(argv):
     return True
 
 
-def _install(pol: dict, code) -> None:
+def _install(pol: dict) -> None:
     import _thread
     import fnmatch
     busy = set()   # threads inside the judge: its own events pass the inner check only
@@ -132,6 +132,11 @@ def _install(pol: dict, code) -> None:
             return ttp().glm_write(path, glm)
         return None
 
+    def writing(mode, flags):
+        """Whether an open with this mode and flags opens the path for writing (judge and inner check alike)."""
+        return (mode is not None and any(c in str(mode) for c in "wax+")) or bool(
+            (flags or 0) & (os.O_WRONLY | os.O_RDWR | os.O_CREAT | os.O_TRUNC | os.O_APPEND))
+
     def read_why(path):
         if hit := inside(path, list(secrets)):
             return secrets[hit]
@@ -176,8 +181,7 @@ def _install(pol: dict, code) -> None:
             if (raw in ("/dev/null", "/dev/stdout", "/dev/stderr", "/dev/tty") or raw.startswith(("/dev/fd/", "/proc/self/fd/"))) \
                     and (r == "/dev/null" or r.startswith(("/dev/pts/", "/dev/tty", "/proc/"))):
                 return None   # the terminal, a pipe
-            w = (mode is not None and any(c in str(mode) for c in "wax+")) or (flags or 0) & (
-                os.O_WRONLY | os.O_RDWR | os.O_CREAT | os.O_TRUNC | os.O_APPEND)
+            w = writing(mode, flags)
             return next((y for p in spots(path) if (y := (write_why(p) if w else read_why(p)))), None)
         if ev == "sqlite3.connect":
             return read_why(real(args[0])) if glm and isinstance(args[0], (str, bytes, os.PathLike)) else None
@@ -230,8 +234,7 @@ def _install(pol: dict, code) -> None:
             f = f.f_back
         try:
             if ev == "open" and isinstance(args[0], (str, bytes)):
-                w = any(c in str(args[1]) for c in "wax+") if args[1] is not None else (args[2] or 0) & (
-                    os.O_WRONLY | os.O_RDWR | os.O_CREAT | os.O_TRUNC | os.O_APPEND)
+                w = writing(args[1], args[2])
                 r = os.path.realpath(args[0])
                 return bool(write_why(r, plain=True) if w else inside(r, list(secrets)))
             if ev in ONE or ev in TWO or ev == "os.symlink":
@@ -281,15 +284,6 @@ def _install(pol: dict, code) -> None:
     _posixsubprocess.fork_exec = fork_exec
     hc = [hook.__code__]
     sys.addaudithook(hook)
-    if isinstance(code, str) and os.path.exists(os.path.join(os.path.dirname(pol["zip"]), "expanded.jsonl")):
-        why = ttp().screen(code, pol)   # code shell expansions finished, which the shell guards relieved
-        if why:
-            try:
-                ttp().logged("compile", (code[:200],), why)
-            except Exception:
-                pass
-            sys.stderr.write(f"tt-project guard: {why}\n")
-            os._exit(1)
 
 
 class _Refused(RuntimeError):
@@ -314,7 +308,7 @@ def _main() -> None:
     code = (_inline(argv) if argv else sys.argv[0] in ("-c", "-", "")) if raw else False
     if code and hasattr(sys, "addaudithook"):
         import json
-        _install(json.loads(raw), code)
+        _install(json.loads(raw))
 
 
 _main()
