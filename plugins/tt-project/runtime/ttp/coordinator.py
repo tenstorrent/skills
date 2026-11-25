@@ -2760,7 +2760,7 @@ def _deploy_checked(p: Project, text: str, notes: list, claims: list | None = No
     'nothing runs there' line that names a held machine the inventory is not empty for, then
     pushclaim.reply_footer appends one 'Unverified: ...' line when a commit a live/landed message
     names fails its check, or a `claims` item did not hold or could not be checked
-    (claimcheck.footer). Any fault posts the text unchanged: a message is never lost to this check."""
+    (claimcheck.claims_footer). Any fault posts the text unchanged: a message is never lost to this check."""
     try:
         from . import heldwork
         fixed = heldwork.mark_nothing_claims(text, where=p)
@@ -2774,7 +2774,7 @@ def _deploy_checked(p: Project, text: str, notes: list, claims: list | None = No
     try:
         from . import identity, pushclaim
         running = identity.running(p.state, os.getpid()) or identity.running(p.state, None)
-        fixed = pushclaim.reply_footer(p, text, p.root, running, claimcheck.footer(p, claims))
+        fixed = pushclaim.reply_footer(p, text, p.root, running, claimcheck.claims_footer(p, claims))
         if fixed != text:
             notes.append(f"reply check: your message went out with the footer "
                          f"'{fixed[len(text):].strip()}'. Name only commits that hold, and back each claim")

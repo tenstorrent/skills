@@ -359,7 +359,7 @@ def _side(repo, head, name="side"):
 
 
 def test_true_live_replies_go_out_byte_identical(env, monkeypatch):
-    """Replays of the 17:22 reply and the two 18:49 replies: every commit they name is in the
+    """Replayed replies: every commit they name is in the
     running release, so each goes out exactly as written, with no footer."""
     p, repo, head = _claim_replay_setup(env, monkeypatch, landed=True)
     text = _REPLY_4368.format(sha=head)
@@ -375,7 +375,7 @@ def test_true_live_replies_go_out_byte_identical(env, monkeypatch):
 
 
 def test_a_live_reply_naming_a_commit_the_running_release_lacks_gets_one_footer(env, monkeypatch):
-    """Review #9808's case: the body stays byte-identical and one footer names the side commit;
+    """A live line naming a side commit: the body stays byte-identical and one footer names the side commit;
     two failing commits share that one line."""
     p, repo, head = _claim_replay_setup(env, monkeypatch, landed=True)
     side, other = _side(repo, head), _side(repo, head, "other")

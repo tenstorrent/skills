@@ -198,7 +198,7 @@ def _item(p, c: dict, now: float) -> tuple[str, str]:
     return "unverified", "its check could not run"
 
 
-def footer(p, claims: list | None, now: float | None = None) -> list[str]:
+def claims_footer(p, claims: list | None, now: float | None = None) -> list[str]:
     """The footer items (pushclaim.reply_footer) counting `claims` entries that did not hold or could
     not be checked, e.g. '1 status claim not checked'; [] when all held. Any fault: []."""
     now = time.time() if now is None else now
