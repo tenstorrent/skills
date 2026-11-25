@@ -11097,8 +11097,10 @@ class Daemon:
         in `ttp lock` on one, reserves the resource and writes its yield request (preempt.yield_path); each
         holder is logged once (lock_yield_asked: who, to whom, which resource, since when). A holder that is a
         run of this project still in the way after preempt.yield_grace_s is stopped (STOP_TEXT) if
-        preempt.eligible spares it nothing else. Nothing is asked on a resource the user paused or a user order
+        preempt.eligible spares it nothing else; a detached job of this project's task holding it is ended
+        (jobstop.end) unless preempt.spared spares its task, whose own wait then wakes it. Nothing is asked on a resource the user paused or a user order
         holds. A request no longer wanted is taken back, its reservation with it."""
+        from . import jobstop
         now, db = time.time(), self.p.db
         want: dict[str, tuple[dict, str, list[dict]]] = {}
         if preempt.enabled(self.cfg) and self.cfg_status != "unavailable":
@@ -11146,11 +11148,25 @@ class Daemon:
                           f"{w['label']} asked at {timefmt.short(since, self.p, now)} to yield {res} to user-ordered "
                           f"urgent task #{t['id']}; stopped if it still holds it after {int(grace)}s",
                           "handled", w["task"] or t["id"]))
-                if now - since < grace or not w["run"]:
+                if now - since < grace or not w["task"]:
+                    continue
+                owners = self._owner_due() if owners is None else owners
+                if w.get("job_rc"):   # a detached job holds it: stop the job, its task's wait then wakes it
+                    victim = db.task(w["task"])
+                    if victim and not preempt.spared(db, victim, owners) and jobstop.end(
+                            self.p, Path(w["job_rc"]), f"yields {res} to user-ordered urgent task #{t['id']}",
+                            w["task"], "check_lock_yield"):
+                        db.x("INSERT INTO events(ts,source,kind,severity,text,status,task) VALUES(?,?,?,?,?,?,?)",
+                             (now, "daemon", "task_preempted", "low",
+                              f"#{w['task']} (detached job {Path(w['job_rc']).stem}) did not yield {res} within "
+                              f"{int(grace)}s of {timefmt.short(since, self.p, now)}: stopped for user-ordered "
+                              f"urgent task #{t['id']}; its task's wait wakes it to resume", "handled", w["task"]))
+                        log(self.p, f"task {w['task']}: detached job stopped to yield {res} to urgent task {t['id']}")
+                    continue
+                if not w["run"]:
                     continue
                 run = db.one("SELECT * FROM runs WHERE id=? AND task=? AND role='worker' AND status='running'",
                              (w["run"], w["task"]))
-                owners = self._owner_due() if owners is None else owners
                 victim = db.task(w["task"])
                 if run and preempt.eligible(db, run, victim, owners, set()):
                     runner.request_stop(Path(run["dir"]), preempt.STOP_TEXT)
@@ -11209,7 +11225,7 @@ class Daemon:
             label = f"#{task}" if task else str(h.get("holder") or "a holder")
             if root and not own:
                 label = f"{locks.project_of(h)}: {label}"
-            out.append({"label": label, "task": task, "run": run})
+            out.append({"label": label, "task": task, "run": run, "job_rc": h.get("job_rc") if task else None})
         return out
 
     def check_urgent_start(self, every_s: float = 60) -> None:

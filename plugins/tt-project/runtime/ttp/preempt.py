@@ -104,11 +104,15 @@ def lock_holders(dirs: list[Path]) -> set[tuple[str, str]]:
     return {(str(h.get("run_id") or ""), str(h.get("task_id") or "")) for d in dirs for h in _taken_labels(d)}
 
 
+def spared(db, task: dict, owners) -> bool:
+    """A task no preemption stops: a review or harness task, urgent work or what it leads, an owner of a due."""
+    return task["kind"] in ("review", "harness") or urgent.covers_urgent(db, task) or urgent.leads(task) \
+        or task["id"] in owners
+
+
 def eligible(db, run: dict, task: dict | None, owners, held: set[tuple[str, str]]) -> bool:
     """Whether running worker run `run` of `task` may be preempted (see the module docstring)."""
-    if not task or task["status"] != "running" or task["kind"] in ("review", "harness"):
-        return False
-    if urgent.covers_urgent(db, task) or urgent.leads(task) or task["id"] in owners:
+    if not task or task["status"] != "running" or spared(db, task, owners):
         return False
     if run.get("dir") and (Path(run["dir"]) / "STOP").exists():
         return False

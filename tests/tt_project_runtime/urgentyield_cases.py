@@ -5,7 +5,7 @@
 from __future__ import annotations
 
 
-def _hold_lock(p, d, monkeypatch, res, task, run, project_root=None):
+def _hold_lock(p, d, monkeypatch, res, task, run, project_root=None, job_rc=None):
     """Take a `ttp lock` slot of `res` as task `task`'s run `run` would (its label names both), or as a
     person at a shell when task is None. Returns the open slot file: close it to release."""
     from ttp import hold, locks, shared
@@ -13,7 +13,8 @@ def _hold_lock(p, d, monkeypatch, res, task, run, project_root=None):
         monkeypatch.delenv(k, raising=False)
     extra = {}
     if task is not None:
-        extra = {"run_id": str(run), "task_id": str(task), "project_root": str(project_root or p.base)}
+        extra = {"run_id": str(run), "task_id": str(task), "project_root": str(project_root or p.base),
+                 **({"job_rc": str(job_rc)} if job_rc else {})}
     who = hold.who(task) if task is not None else "someone at a shell"
     f = locks.try_take(d._slot_paths(res), shared.holder(p, res, who, d.cfg), "soak", extra=extra)
     assert f is not None
@@ -149,5 +150,38 @@ def test_no_yield_on_a_paused_resource_or_for_routine_priority_one_work(env, mon
                       origin="user", labels=["exclusive:box"])
         d.check_lock_yield()
         assert not _yield_events(p) and locks.reserved_by(d._reserve_path("box")) is None
+    finally:
+        f.close()
+
+
+def test_a_detached_soak_holding_the_lock_is_ended_after_the_grace_and_its_task_left_to_its_wait(
+        env, monkeypatch, tmp_path):
+    """The usual soak runs as `ttp detach --lock`: its run handed off `waiting`, so the lock's holder is the job,
+    not a running run. After the grace the job is ended (jobstop.end) and logged; its task keeps its wait."""
+    from ttp import jobstop
+    from ttp.daemon import Daemon
+    p = make(env)
+    _no_events(p)
+    p.db.x("UPDATE tasks SET status='done'")
+    d = Daemon(p.base)
+    d.cfg = p.config()
+    d.cfg.setdefault("budget", {})["urgent_yield_grace_s"] = 0
+    soak = p.db.add_task("soak on the box", "s", kind="work", tier="light", origin="coordinator", priority=3)
+    p.db.x("UPDATE tasks SET status='waiting' WHERE id=?", (soak,))
+    run = p.db.x("INSERT INTO runs(task, role, provider, status, started, dir) VALUES(?,?,?,?,?,?)",
+                 (soak, "worker", "claude", "done", time.time(), str(tmp_path / "soak-run")))
+    rc = tmp_path / "soak-run" / "soak.rc"
+    ended = []
+    monkeypatch.setattr(jobstop, "end", lambda p_, rc_, why, task=None, reason="", fields=None: ended.append(
+        (str(rc_), task, why)) or {"text": "stopped"})
+    f = _hold_lock(p, d, monkeypatch, "box", soak, run, job_rc=rc)
+    try:
+        hot = p.db.add_task("reset the box", "s\nurgent: the user ordered it now", kind="work", tier="light",
+                            origin="user", labels=["exclusive:box"])
+        d.check_lock_yield()
+        assert ended == [(str(rc), soak, f"yields box to user-ordered urgent task #{hot}")]
+        stop = p.db.q("SELECT * FROM events WHERE kind='task_preempted' AND task=?", (soak,))
+        assert len(stop) == 1 and "detached job soak" in stop[0]["text"] and f"#{hot}" in stop[0]["text"]
+        assert p.db.task(soak)["status"] == "waiting", "its own wait wakes it"
     finally:
         f.close()
