@@ -16,6 +16,8 @@ _PROVEN = [
     "from os.path import join\nprint(join('a','b'))",
     "import os\nprint(os.listdir('.'))",
     "print('{} {}'.format(1,2))",
+    "import glob\nprint(glob.glob('src/*.py'))", "from pathlib import Path\nprint(sorted(Path('.').glob('*.md')))",
+    "for _ in range(3):\n    print(dict(a=1).get('a'))",
 ]
 
 _UNPROVEN = [
@@ -33,6 +35,16 @@ _UNPROVEN = [
     "from pathlib import Path\nPath('x').write_text('y')", "from pathlib import Path\nPath('a').replace('b')",
     "import time; time.sleep(100)", "import socket", "import ctypes", "import importlib", "import os; os.environ['A']",
     "not python (",
+    # found in review: modules under other names, frame objects, rebound literal names, keyword modes, listings
+    "from shlex import os\nos.system('id')", "import os\nos.path.os.system('id')", "import base64; base64.main()",
+    "def g(): yield\nprint(g().gi_frame.f_builtins)", "p='a.txt'\nf=lambda p: open(p,'w')\nf('/etc/x')",
+    "p='a.txt'\ndef w(p): open(p,'w')\nw('/etc/x')", "p='a.txt'\nmatch '/etc/x':\n    case p: open(p,'w')",
+    "p='a.txt'\ntry: pass\nexcept Exception as p: pass\nopen(p,'w')",
+    "from pathlib import Path\nPath('/etc/x').open(mode='a')", "from pathlib import Path\nPath('a').replace(target='/etc/x')",
+    "import shlex\nshlex.shlex('').sourcehook('/etc/shadow')", f"import os\nos.listdir('/x/{_SSH}')",
+    f"import glob\nglob.glob('/x/{_SSH}/*')", "import os\nos.listdir(input())", "x=print\nx.__self__",
+    "import json\njson.JSONDecoder.decode.__globals__", "def f(): eval('1')\neval = print",
+    "class A: pass\nA.x = 1",
 ]
 
 
@@ -54,12 +66,14 @@ def test_pyproof_rewrites_only_the_proven_snippet_and_keeps_the_rest_of_the_line
         "cat a.json | python3 -c 'pass' && rm -rf x"
     assert pyproof.rewrite(f"python3 - <<'EOF'\n{proven}\nEOF\necho done", cwd) == "python3 - <<'EOF'\npass\nEOF\necho done"
     assert pyproof.rewrite(f"python3 - <<EOF\n{proven}\nEOF", cwd) == "python3 - <<EOF\npass\nEOF"
+    assert pyproof.rewrite(f"python3 - <<-'EOF'\n\t{proven}\n\tEOF", cwd) == "python3 - <<-'EOF'\npass\n\tEOF"
     for cmd in (f"python3 - <<EOF\nprint('$(cat x)')\nEOF",                    # the shell expands an unquoted heredoc
                 'python3 -c "print(\'$HOME\')"',                                 # and a double-quoted -c
                 f"python3 -c 'import os; os.system(\"id\")'",
                 f"cat <<'EOF'\n{proven}\nEOF",                                   # not fed to python
                 f"python3 x.py -c '{proven}'",                                   # the script's -c, not python's
                 f"python3 - <<'EOF'\n{proven}\n",                                # never ended
+                "cd /etc && python3 -c 'open(\"hosts\",\"w\").write(\"x\")'",          # a relative write after a cd
                 "echo hi"):
         assert pyproof.rewrite(cmd, cwd) is None, cmd
 

@@ -12,15 +12,17 @@ decide it, and the run-time judge (pyaudit) stays the net under both."""
 from __future__ import annotations
 
 import ast
+import builtins
+import importlib
 import os
 import re
 import shlex
 import sys
 import types
 
-# Modules a snippet may import. The pure ones may be used through any public attribute that is not itself a
-# module (`ast.sys` would reach sys's own); the ones that reach files, the process or time only through the
-# attributes listed.
+# Modules a snippet may import, by their own name (`from shlex import os` is os). The pure ones may be used
+# through any public attribute that is not a module or a command-line entry point (`base64.main` reads files);
+# the ones that reach files, the process or time only through the attributes listed.
 PURE = {"json", "re", "collections", "itertools", "functools", "math", "statistics", "datetime", "textwrap",
         "difflib", "hashlib", "base64", "binascii", "csv", "fnmatch", "enum",
         "heapq", "bisect", "decimal", "fractions", "pprint", "shlex", "ast", "tomllib", "html", "struct",
@@ -34,126 +36,136 @@ LISTED = {"os": {"path", "getcwd", "listdir", "scandir", "walk", "stat", "lstat"
           "glob": {"glob", "iglob", "escape"},
           "pathlib": {"Path", "PurePath", "PurePosixPath", "PosixPath"},
           "operator": {"itemgetter", "add", "sub", "mul", "truediv", "floordiv", "mod", "neg", "eq", "ne", "lt",
-                       "le", "gt", "ge", "contains", "getitem"}}
-LISTED["os.path"] = set(dir(os.path)) - {n for n in dir(os.path) if n.startswith("_")}
-# Builtins that run code, reach any module or name, or open a pager; open and getattr only as below
-BANNED = {"eval", "exec", "compile", "__import__", "globals", "locals", "vars", "breakpoint", "help", "setattr",
-          "delattr"}
-# Path methods that change the file system; `replace` with one argument is Path.replace, not str.replace
-PATH_CHANGES = {"write_text", "write_bytes", "unlink", "rename", "mkdir", "touch", "chmod", "lchmod", "rmdir",
-                "symlink_to", "hardlink_to", "link_to", "chown"}
+                       "le", "gt", "ge", "contains", "getitem"},
+          os.path.__name__: {n for n, v in vars(os.path).items() if not n.startswith("_")
+                             and not isinstance(v, types.ModuleType)}}
+LISTING = {"os.listdir", "os.scandir", "os.walk", "glob.glob", "glob.iglob"}   # take a literal folder or pattern
+# The builtins a snippet may name; open only as a call this checks. Every other builtin (eval, getattr, vars...)
+# is refused, also where the snippet binds the name, since another scope may still mean the builtin.
+BUILTINS = {"print", "len", "sorted", "min", "max", "sum", "range", "enumerate", "zip", "list", "dict", "set",
+            "frozenset", "tuple", "str", "int", "float", "bool", "bytes", "abs", "round", "any", "all", "map",
+            "filter", "reversed", "isinstance", "repr", "ord", "chr", "divmod", "hex", "oct", "bin", "iter", "next",
+            "pow", "input", "exit", "Exception", "ValueError", "KeyError", "TypeError",
+            "IndexError", "OSError", "FileNotFoundError", "StopIteration", "SystemExit", "RuntimeError", "open"}
+ALL_BUILTINS = frozenset(dir(builtins))
+# The attributes a snippet may use on a value that is not a module: str, bytes, list, dict, set, numbers, files
+# it opened, re matches, Counter, deque, dates, hashes, csv, pure paths. Path reads and listings, `format` and
+# a pathlib `replace` only as checked below.
+METHODS = set("""split rsplit strip lstrip rstrip splitlines join startswith endswith lower upper title capitalize
+casefold find rfind index rindex count replace partition rpartition isdigit isalpha isalnum isspace isupper islower
+isnumeric isdecimal zfill ljust rjust center encode decode expandtabs removeprefix removesuffix hex fromhex append
+extend insert pop remove sort reverse copy clear get items keys values setdefault update popitem fromkeys add discard
+union intersection difference symmetric_difference issubset issuperset isdisjoint read readline readlines write
+writelines close flush seek tell buffer match search fullmatch findall finditer sub subn group groups groupdict start
+end span pattern most_common elements total subtract appendleft popleft rotate extendleft now utcnow today
+fromtimestamp fromisoformat isoformat strftime strptime timestamp date year month day hour minute second
+microsecond total_seconds days seconds utc hexdigest digest writerow writerows writeheader fieldnames real imag
+bit_length is_integer major minor micro name suffix suffixes stem parent parents parts exists is_file is_dir
+with_name with_suffix joinpath relative_to as_posix st_size st_mtime st_mode""".split())
 PATH_READS = {"read_text", "read_bytes", "open"}
+PATH_LISTS = {"iterdir", "glob", "rglob", "walk"}
 FORMAT_FIELD_RE = re.compile(r"\{[^{}]*[.\[]")   # '{0.attr}', '{0[key]}': format() walks into its arguments
+GLOB_RE = re.compile(r"[*?\[{]")
 SYSTEM = ("/proc", "/sys", "/dev")
 
 
-def harmless(code: str, cwd: str, env=None) -> bool:
-    """Whether the whole of `code` is proven harmless (module doc); any doubt is False."""
+def harmless(code: str, cwd: str, env=None, bases=None) -> bool:
+    """Whether the whole of `code` is proven harmless (module doc); any doubt is False. `bases` are the folders
+    a relative path may start from (a `cd` before the snippet), else `cwd`."""
     try:
-        return _Proof(cwd, os.environ if env is None else env).ok(ast.parse(code))
+        return _Proof(cwd, os.environ if env is None else env, bases).ok(ast.parse(code))
     except (SyntaxError, ValueError, RecursionError, OSError):
         return False
 
 
 class _Proof:
-    def __init__(self, cwd: str, env):
-        self.cwd, self.env = os.path.realpath(cwd), env
-        self.mods: dict[str, str] = {}    # name bound by an import -> its module
+    def __init__(self, cwd: str, env, bases):
+        self.cwd, self.env, self.bases = os.path.realpath(cwd), env, bases or [cwd]
+        self.mods: dict[str, str] = {}    # name bound by an import -> its module's own name
         self.funcs: dict[str, str] = {}   # name bound by `from m import f` -> `m.f`
-        self.lits: dict[str, str] = {}    # name assigned once, to a literal path
-        self.paths: set[str] = set()      # name assigned once, to a pathlib path of literal parts
+        self.lits: dict[str, str] = {}    # name bound once, to a literal path
+        self.paths: set[str] = set()      # name bound once, to a pathlib path of literal parts
 
     def ok(self, tree: ast.AST) -> bool:
         nodes = list(ast.walk(tree))
-        stores: dict[str, list] = {}
+        binds: dict[str, int] = {}        # every way a name is bound: a literal or an import must be bound once
         for n in nodes:
+            for name in _bound(n):
+                binds[name] = binds.get(name, 0) + 1
             if isinstance(n, ast.Import):
                 for a in n.names:
-                    self.mods[a.asname or a.name.split(".")[0]] = a.name if a.asname else a.name.split(".")[0]
+                    mod = _module(a.name if a.asname else a.name.split(".")[0])
+                    if mod is None:
+                        return False
+                    self.mods[a.asname or a.name.split(".")[0]] = mod
             elif isinstance(n, ast.ImportFrom):
                 for a in n.names:
-                    if n.level or a.name == "*":
+                    if n.level or a.name == "*" or (base := _module(str(n.module))) is None:
                         return False
-                    full, name = f"{n.module}.{a.name}", a.asname or a.name
-                    if isinstance(_stdlib_module(full), types.ModuleType):
-                        self.mods[name] = full
-                    elif a.name.startswith("_") or not self._attr(str(n.module), a.name):
+                    if (mod := _module(f"{n.module}.{a.name}")) is not None:
+                        self.mods[a.asname or a.name] = mod
+                    elif not self._attr(base, a.name):
                         return False
                     else:
-                        self.funcs[name] = full
-            elif isinstance(n, ast.Name) and isinstance(n.ctx, ast.Store):
-                stores.setdefault(n.id, []).append(n)
-            elif isinstance(n, (ast.Global, ast.Nonlocal)) or _string_annotation(n):
+                        self.funcs[a.asname or a.name] = f"{base}.{a.name}"
+            elif isinstance(n, (ast.Global, ast.Nonlocal)) or _string_annotation(n) \
+                    or isinstance(n, ast.Attribute) and not isinstance(n.ctx, ast.Load):
                 return False
+        if any(binds[m] != 1 for m in [*self.mods, *self.funcs]):
+            return False
         for n in nodes:
             if isinstance(n, ast.Assign) and len(n.targets) == 1 and isinstance(n.targets[0], ast.Name) \
-                    and len(stores.get(n.targets[0].id, ())) == 1 and (v := self._path(n.value)) is not None:
+                    and binds[n.targets[0].id] == 1 and (v := self._path(n.value)) is not None:
                 self.lits[n.targets[0].id] = v
                 if self._pathish(n.value):
                     self.paths.add(n.targets[0].id)
-        if any(m.split(".")[0] not in PURE | set(LISTED) for m in self.mods.values()) \
-                or (set(self.mods) | set(self.funcs)) & set(stores):   # an imported name bound again
-            return False
         parents = {c: p for p in nodes for c in ast.iter_child_nodes(p)}
-        return all(self._node(n, parents) for n in nodes)
+        return all(self._node(n, parents.get(n)) for n in nodes)
 
-    def _node(self, n, parents) -> bool:
+    def _node(self, n, p) -> bool:
+        call = p if isinstance(p, ast.Call) and p.func is n else None
         if isinstance(n, ast.Name):
-            if n.id.startswith("_") or n.id in BANNED:
-                return False
-            p = parents.get(n)
             if n.id in self.mods:   # a module only as `mod.attr`
                 return isinstance(p, ast.Attribute) and p.value is n
-            if n.id in ("open", "getattr"):   # only as a call this checks
-                return isinstance(p, ast.Call) and p.func is n and self._call(p)
+            if n.id in self.funcs:
+                return self.funcs[n.id] not in LISTING or call is not None and self._list(call, self.funcs[n.id])
+            if n.id == "open":
+                return call is not None and self._call(call)
+            return n.id == "_" or not n.id.startswith("_") and (n.id in BUILTINS or n.id not in ALL_BUILTINS)
+        if not isinstance(n, ast.Attribute):
             return True
-        if isinstance(n, ast.Attribute):
-            if n.attr.startswith("_"):
+        if (base := self._dotted(n.value)) is not None:
+            full = f"{base}.{n.attr}"
+            return self._attr(base, n.attr) and (full not in LISTING or call is not None and self._list(call, full))
+        if n.attr in PATH_READS | PATH_LISTS:   # on a pathlib path of literal parts only
+            path = self._path(n.value) if self._pathish(n.value) else None
+            if call is None or path is None:
                 return False
-            base = self._dotted(n.value)
-            if base is not None:
-                return self._attr(base, n.attr)
-            p = parents.get(n)
-            pathlib = "pathlib" in {m.split(".")[0] for m in [*self.mods.values(), *self.funcs.values()]}
-            if pathlib and (n.attr in PATH_CHANGES or n.attr == "replace" and isinstance(p, ast.Call)
-                            and len(p.args) == 1 and not p.keywords):
-                return False
-            if n.attr in PATH_READS and isinstance(p, ast.Call) and p.func is n and self._pathish(n.value) \
-                    and (path := self._path(n.value)) is not None:
-                return self._open(path, p.args[0] if n.attr == "open" and p.args else None, p)
-            if n.attr in ("read_text", "read_bytes") or n.attr == "open" and pathlib:
-                return False   # a path read at a place the code computes
-            if n.attr in ("format", "format_map"):
-                return isinstance(n.value, ast.Constant) and not FORMAT_FIELD_RE.search(str(n.value.value))
-            return True
-        return True
+            if n.attr in PATH_LISTS:
+                return self._list(call, n.attr, path)
+            return self._open(path, (call.args or [None])[0] if n.attr == "open" else None, call)
+        if n.attr in ("format", "format_map"):
+            return isinstance(n.value, ast.Constant) and not FORMAT_FIELD_RE.search(str(n.value.value))
+        if n.attr == "replace" and "pathlib" in {*self.mods.values(), *(f.split(".")[0] for f in self.funcs.values())}:
+            return call is not None and len(call.args) >= 2 and not call.keywords   # str's, never Path.replace
+        return n.attr in METHODS
 
     def _dotted(self, node) -> str | None:
-        """The module an attribute chain starts from, as `os.path`, when its root is an imported name."""
+        """The module an expression is (`os.path` as posixpath), when it is one."""
         if isinstance(node, ast.Name):
             return self.mods.get(node.id)
         if isinstance(node, ast.Attribute) and (b := self._dotted(node.value)):
-            full = f"{b}.{node.attr}"
-            return full if isinstance(_stdlib_module(full), types.ModuleType) else None
+            return _module(f"{b}.{node.attr}")
         return None
 
     def _attr(self, mod: str, attr: str) -> bool:
-        if mod == "":
-            return False   # a name from `from m import x` that is not a module has no attributes we vouch for
         if mod in LISTED:
             return attr in LISTED[mod]
-        if mod.split(".")[0] in LISTED:
-            return False
-        value = getattr(_stdlib_module(mod), attr, None)
-        return value is not None and not isinstance(value, types.ModuleType)
+        value = getattr(sys.modules.get(mod), attr, None)
+        return not attr.startswith("_") and attr not in ("main", "test") and value is not None \
+            and not isinstance(value, types.ModuleType)
 
     def _call(self, call: ast.Call) -> bool:
-        if call.func.id == "getattr":
-            return (len(call.args) in (2, 3) and isinstance(call.args[1], ast.Constant)
-                    and isinstance(call.args[1].value, str) and not call.args[1].value.startswith("_")
-                    and call.args[1].value not in PATH_CHANGES | PATH_READS
-                    and self._dotted(call.args[0]) is None and not (
-                        isinstance(call.args[0], ast.Name) and call.args[0].id in self.mods))
         path = self._path(call.args[0]) if call.args else None
         mode = call.args[1] if len(call.args) > 1 else next((k.value for k in call.keywords if k.arg == "mode"), None)
         return len(call.args) <= 2 and self._open(path, mode, call)
@@ -161,25 +173,42 @@ class _Proof:
     def _open(self, path: str | None, mode, call: ast.Call) -> bool:
         if path is None or any(k.arg not in ("mode", "encoding", "errors", "newline") for k in call.keywords):
             return False
+        mode = mode or next((k.value for k in call.keywords if k.arg == "mode"), None)
         if mode is not None and not (isinstance(mode, ast.Constant) and isinstance(mode.value, str)):
             return False
-        writes = bool(mode is not None and set(mode.value) & set("wax+"))
-        return self._place(path, writes)
+        return self._place(path, bool(mode is not None and set(mode.value) & set("wax+")))
 
-    def _place(self, path: str, writes: bool) -> bool:
+    def _list(self, call: ast.Call, func: str, folder: str = ".") -> bool:
+        """A listing of a literal folder or pattern (none: the working folder), checked like a Glob tool call."""
+        if any(k.arg not in ("recursive", "topdown", "include_hidden") for k in call.keywords) or len(call.args) > 1:
+            return False
+        arg = self._path(call.args[0]) if call.args else "."
+        if arg is None:
+            return False
+        if func in ("glob.glob", "glob.iglob", "glob", "rglob"):
+            fixed = GLOB_RE.split(arg, maxsplit=1)[0]
+            arg = fixed.rsplit("/", 1)[0] if "/" in fixed else "."
+        return self._place(os.path.join(folder, arg), False, search=True)
+
+    def _place(self, path: str, writes: bool, search: bool = False) -> bool:
         from . import credguard, pathguard
         home = str(self.env.get("HOME") or os.path.expanduser("~"))
-        real = os.path.realpath(os.path.join(self.cwd, os.path.expanduser(path) if path.startswith("~") else path))
+        path = os.path.expanduser(path) if path.startswith("~") else path
         tmp = self.env.get("TMPDIR")
-        ours = any(real.startswith(os.path.realpath(r).rstrip("/") + "/") for r in [self.cwd, *[tmp] * bool(tmp)])
-        if credguard.read_refusal(real, home=home) or pathguard._inside(real, pathguard.roots(self.env)) \
-                or any(credguard.bash_refusal(f"cat {shlex.quote(p)}", [["cat", p]], home, self.cwd) for p in (path, real)):
-            return False   # the shell guard's own reading of the path as a word: a store by name anywhere
-        return ours or not writes and not any(real == s or real.startswith(s + "/") for s in SYSTEM)
+        mine = [os.path.realpath(r).rstrip("/") + "/" for r in [self.cwd, *[tmp] * bool(tmp)]]
+        for base in self.bases:
+            real = os.path.realpath(os.path.join(base, path))
+            if credguard.read_refusal(real, search, home) or pathguard._inside(real, pathguard.roots(self.env)) \
+                    or any(credguard.bash_refusal(f"cat {shlex.quote(p)}", [["cat", p]], home, base) for p in (path, real)):
+                return False   # the shell guard's own reading of the path as a word: a store by name anywhere
+            if not any((real + "/").startswith(m) for m in mine) and (
+                    writes or any(real == s or real.startswith(s + "/") for s in SYSTEM)):
+                return False
+        return True
 
     def _path(self, node) -> str | None:
         """The literal path an expression names (a string, Path('a', 'b'), Path(x) / 'y', os.path.join of
-        literals, a name assigned once to one), else None."""
+        literals, a name bound once to one), else None."""
         if isinstance(node, ast.Constant) and isinstance(node.value, str) and node.value:
             return node.value
         if isinstance(node, ast.Name):
@@ -188,7 +217,7 @@ class _Proof:
             a, b = self._path(node.left), self._path(node.right)
             return os.path.join(a, b) if a is not None and b is not None and self._pathish(node.left) else None
         if isinstance(node, ast.Call) and not node.keywords and node.args and (
-                self._pathish(node) or self._func(node) == "os.path.join"):
+                self._pathish(node) or self._func(node) == f"{os.path.__name__}.join"):
             parts = [self._path(a) for a in node.args]
             return os.path.join(*parts) if None not in parts else None
         return None
@@ -209,6 +238,21 @@ class _Proof:
         return isinstance(node, ast.Name) and node.id in self.paths
 
 
+def _bound(n) -> list[str]:
+    """The names node `n` binds, in any of Python's ways (parameters, except-as, match captures, defs)."""
+    if isinstance(n, ast.Name) and not isinstance(n.ctx, ast.Load):
+        return [n.id]
+    if isinstance(n, ast.arg):
+        return [n.arg]
+    if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+        return [n.name]
+    if isinstance(n, (ast.Import, ast.ImportFrom)):
+        return [a.asname or a.name.split(".")[0] for a in n.names]
+    name = getattr(n, "rest" if isinstance(n, ast.MatchMapping) else "name", None)
+    return [name] if isinstance(name, str) and isinstance(n, (ast.ExceptHandler, ast.MatchAs, ast.MatchStar,
+                                                              ast.MatchMapping)) else []
+
+
 def _string_annotation(n) -> bool:
     """An annotation written as a string: typing and functools evaluate those as code at run time."""
     notes = [n.annotation] if isinstance(n, (ast.arg, ast.AnnAssign)) else [n.returns] if isinstance(
@@ -216,18 +260,19 @@ def _string_annotation(n) -> bool:
     return any(isinstance(c, ast.Constant) and isinstance(c.value, str) for a in notes if a for c in ast.walk(a))
 
 
-def _stdlib_module(name: str):
-    """The stdlib module or attribute `name` names, imported here (PURE and LISTED modules only), else None."""
+def _module(name: str) -> str | None:
+    """The own name of the module `name` reaches, when it is one a snippet may use (PURE, LISTED), else None."""
     root, *rest = name.split(".")
     if root not in PURE | set(LISTED):
         return None
     try:
-        obj = sys.modules.get(root) or __import__(root)
+        obj = sys.modules.get(root) or importlib.import_module(root)
     except ImportError:
         return None
     for part in rest:
         obj = getattr(obj, part, None)
-    return obj
+    own = getattr(obj, "__name__", None) if isinstance(obj, types.ModuleType) else None
+    return own if own in PURE | set(LISTED) else None
 
 
 PY_RE = re.compile(r"python[\d.]*$")
@@ -239,9 +284,14 @@ def rewrite(cmd: str, cwd: str, env=None) -> str | None:
     when none is. Only text the shell passes as is: a heredoc with a quoted delimiter (or a body with no `$`,
     backtick or backslash) that python reads as its script, and the code of python's own `-c` in single quotes
     (or double quotes with none of those). Every other byte of the line stays."""
-    from . import hook
+    from . import credguard, hook
     if "\\\n" in cmd or "python" not in cmd:
         return None
+    env = os.environ if env is None else env
+    segments = hook._segments(cmd, strip=False)   # a cd before the snippet: its relative paths start anywhere it may go
+    moves = any(argv and (os.path.basename(argv[0]) in ("cd", "pushd", "popd")
+                          or any(w.startswith(("-C", "--chdir")) for w in argv)) for argv in segments)
+    bases = credguard._cwds(segments, cwd, str(env.get("HOME") or os.path.expanduser("~"))) if moves else None
     out, changed, pending = [], False, []
     for line in cmd.split("\n"):
         if pending:
@@ -250,8 +300,8 @@ def rewrite(cmd: str, cwd: str, env=None) -> str | None:
                 body.append(line)
                 continue
             pending.pop(0)
-            text = "\n".join(body)
-            if fed and text.strip() and (quoted or not re.search(r"[$`\\]", text)) and harmless(text, cwd, env):
+            text = "\n".join(b.lstrip("\t") if dash else b for b in body)
+            if fed and text.strip() and (quoted or not re.search(r"[$`\\]", text)) and harmless(text, cwd, env, bases):
                 body[:] = ["pass"]
                 changed = True
             out += [*body, line]
@@ -259,7 +309,7 @@ def rewrite(cmd: str, cwd: str, env=None) -> str | None:
         flags = hook._quoting(line)
         for m in reversed(list(DASH_C_RE.finditer(line))):
             code = m[1] if m[1] is not None else m[2]
-            if not flags[m.start()][0] and _code_at(line, m.start()) == code and harmless(code, cwd, env):
+            if not flags[m.start()][0] and _code_at(line, m.start()) == code and harmless(code, cwd, env, bases):
                 line, changed = f"{line[:m.start()]}-c 'pass'{line[m.end():]}", True
         flags = hook._quoting(line)
         for m in hook.HEREDOC_RE.finditer(line):
