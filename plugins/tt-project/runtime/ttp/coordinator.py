@@ -2897,6 +2897,13 @@ def untrusted_write_event(db, task: int, moved: str) -> None:
           "handled", task))
 
 
+def task_id(v) -> int | None:
+    """A task id as sent (12, '12', ' #12 '): its number, or None for anything else (text, '', None, a list)."""
+    v = str(v).strip() if isinstance(v, (int, str)) and not isinstance(v, bool) else ""
+    v = v[1:] if v.startswith("#") else v
+    return int(v) if v.isascii() and v.isdigit() else None
+
+
 def plain_fields(a: dict) -> dict:
     """The action with the field types apply relies on checked first, so a malformed field gets a plain
     refusal, never an internal error: a task_update's `id` is a task number, a task_add or task_update's
@@ -2904,10 +2911,10 @@ def plain_fields(a: dict) -> dict:
     coordprecheck.problems runs the same check, so the dry run refuses what apply refuses."""
     t = a.get("type")
     if t == "task_update":
-        tid = str(a.get("id") if a.get("id") is not None else "").strip()
-        if not tid.isdigit():
-            raise ValueError(f"needs `id`: a task number such as 12, not {clip(str(a.get('id')), 40)!r}")
-        a = {**a, "id": int(tid)}
+        if (tid := task_id(a.get("id"))) is None:
+            raise ValueError(f"task_update needs the id of a task (a number such as 12), not "
+                             f"{clip(str(a.get('id')), 40)!r}")
+        a = {**a, "id": tid}
     if t in ("task_add", "task_update"):
         if a.get("priority") is not None:
             try:
@@ -4902,10 +4909,9 @@ def _new_dependencies(db, task: dict | None, raw: Any) -> list[int]:
     who = f"#{task['id']}" if task else "task_add"
     if not isinstance(raw, list):
         raise ValueError(f"{who} depends_on must be a list of task ids")
-    try:
-        deps = list(dict.fromkeys(int(d) for d in raw))
-    except (TypeError, ValueError):
-        raise ValueError(f"{who} depends_on must be a list of task ids") from None
+    deps = list(dict.fromkeys(task_id(d) for d in raw))
+    if None in deps:
+        raise ValueError(f"{who} depends_on must be a list of task ids")
     for d in deps:
         if task and d == task["id"]:
             raise ValueError(f"{who} cannot depend on itself")

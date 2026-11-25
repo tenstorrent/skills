@@ -68,8 +68,10 @@ def test_actionforms_malformed_fields_get_a_plain_reason_in_apply_and_the_dry_ru
     from ttp import coordinator as coord, coordprecheck
     p = make(env)
     t = p.db.add_task("queued one")
-    for bad, why in (({"type": "task_update", "id": "x", "priority": 2}, "needs `id`: a task number"),
-                     ({"type": "task_update", "id": f"#{t}", "priority": 2}, "needs `id`: a task number"),
+    for bad, why in (*(({"type": "task_update", "id": x, "priority": 2}, "needs the id of a task")
+                       for x in ("abc", "", None, [t], f"##{t}")),
+                     ({"type": "task_add", "title": "t", "kind": "work", "spec": "s", "depends_on": ["abc"]},
+                      "depends_on must be a list of task ids"),
                      ({"type": "task_update", "id": t, "priority": 1e999}, "`priority` must be a whole number"),
                      ({"type": "task_update", "id": t, "priority": "high"}, "`priority` must be a whole number"),
                      ({"type": "task_add", "title": "t", "kind": "work", "spec": ["a", "b"]}, "`spec` must be text"),
@@ -81,6 +83,12 @@ def test_actionforms_malformed_fields_get_a_plain_reason_in_apply_and_the_dry_ru
         assert len(out) == 1 and why in out[0] and "internal harness error" not in out[0], (bad, out)
     assert coord.apply(p, [{"type": "task_update", "id": str(t), "priority": 2.0}]) == []
     assert p.db.task(t)["priority"] == 2
+    # '#12' is task 12, for the id and for depends_on alike (one id reading)
+    assert coord.apply(p, [{"type": "task_update", "id": f" #{t} ", "priority": 3}]) == []
+    assert p.db.task(t)["priority"] == 3
+    assert coord.apply(p, [{"type": "task_add", "title": "after it", "kind": "work", "spec": "s",
+                            "depends_on": [f"#{t}"]}]) == []
+    assert p.db.one("SELECT depends_on FROM tasks WHERE title='after it'")["depends_on"] == f"[{t}]"
 
 
 def test_actionforms_start_after_in_a_foreign_zone_is_refused_alike_by_apply_and_the_dry_run(env):
