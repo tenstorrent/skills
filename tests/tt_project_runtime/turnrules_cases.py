@@ -78,3 +78,58 @@ def test_turnrules_a_held_reply_answers_nothing_even_beside_a_task_replying_ther
     gap = _tr_refused(p)
     assert len(gap) == 1 and f"#{m}: your reply answering it was held" in gap[0] and "NOT delivered" in gap[0], gap
     assert ob.open_order(p.db, m) is None and _tr_handled(p, m) == 0
+
+
+def test_turnrules_a_reply_repeating_a_cited_run_sends_only_its_new_part(env):
+    """Replayed refusal 'reply not sent: run N's result went to this chat in message #M; say only what is
+    new': the reply goes out without its sentences naming run N or repeating message #M word for word,
+    run N dropped from its cites, with a note. With nothing left, or no sentence of it told apart as the
+    repeat, the refusal stays."""
+    from ttp import coordinator as coord
+    p = make(env)
+    r1, r2 = (p.db.x("INSERT INTO runs(task, role, status, started) VALUES(NULL, 'worker', 'ok', ?)", (time.time(),))
+              for _ in range(2))
+
+    def replies():
+        return [m["text"] for m in p.db.q("SELECT text FROM messages WHERE direction='out' AND kind='reply' "
+                                          "AND chat='c1' ORDER BY id")]
+    assert coord.apply(p, [{"type": "reply", "chat": "c1", "cites": [r1],
+                            "text": f"Run {r1} passed. The bench is 12 ms."}]) == []
+    first = p.db.one("SELECT MAX(id) id FROM messages WHERE kind='reply'")["id"]
+    for text in (f"The bench is 12 ms. Run {r1} passed.", "Again: the bench stays at 12 ms."):
+        probs = coord.apply(p, [{"type": "reply", "chat": "c1", "cites": [r1], "text": text}])
+        assert len(probs) == 1 and f"run {r1}'s result went to this chat in message #{first}" in probs[0], probs
+    assert len(replies()) == 1
+    assert coord.apply(p, [{"type": "reply", "chat": "c1", "cites": [r1, r2],
+                            "text": f"Run {r1} passed.\nThe bench is 12 ms. Run {r2} found the cache fix "
+                                    f"cuts it to 9 ms."}]) == []
+    assert replies()[-1] == f"Run {r2} found the cache fix cuts it to 9 ms.", replies()
+    assert any("sent only its new part" in n and f"run {r1}" in n for n in p.db.kv(coord.NOTES_KEY, []))
+    probs = coord.apply(p, [{"type": "reply", "chat": "c1", "cites": [r2], "text": f"Run {r2}: 9 ms."}])
+    assert probs and f"run {r2}'s result went to this chat" in probs[0], probs
+
+
+def test_turnrules_a_claim_state_differing_only_in_case_is_read_as_the_allowed_one(env):
+    """Replayed refusal "claim `state` is one of queued, running, waiting, started": a state that is an
+    allowed one but for case or spaces is read as it, with a note, and still checked against the task's
+    record (a false status stays refused). Another word stays refused. Replayed 'claim due: a time needs
+    an absolute timestamp with a time zone offset': a due with no zone, as an ISO time or a clock time, is
+    already read in the home zone; a date alone stays refused."""
+    from ttp import coordinator as coord
+    p = make(env)
+    tid = p.db.add_task("soak the cache", "s", origin="user")
+
+    def send(claim):
+        return coord.apply(p, [{"type": "reply", "chat": "c1", "text": "The soak is queued.",
+                                "claims": [{"text": "the soak is queued", "task": tid, **claim}]}])
+    assert send({"state": " Queued "}) == []
+    assert any("`state` ' Queued ' read as 'queued'" in n for n in p.db.kv(coord.NOTES_KEY, []))
+    p.db.x("UPDATE tasks SET status='done' WHERE id=?", (tid,))
+    probs = send({"state": "QUEUED"})
+    assert probs and f"#{tid} is done in its record, not queued" in probs[0], probs
+    probs = send({"state": "pending"})
+    assert probs and "claim `state` is one of" in probs[0], probs
+    for due in ("2030-01-02T09:00", "09:00"):
+        assert send({"due": due}) == [], due
+    probs = send({"due": "2030-01-02"})
+    assert probs and "claim due" in probs[0], probs

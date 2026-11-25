@@ -3037,8 +3037,8 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                         if (b or {}).get("type") == "reply" and (b.get("chat") or default_chat) == chat])):
                     raise ValueError(why)
                 if a.get("claims"):
-                    obligations.check_claims(a["claims"], p)
-                cites = turnrules.check_cites(db, a, chat)
+                    notes += obligations.check_claims(a["claims"], p)
+                cites = turnrules.check_cites(db, a, chat, notes)
                 said = workernotify.named(a["text"])   # the ids the coordinator named, before onhost's status line
                 authored = a["text"]   # promises come only from what the coordinator wrote, never the checks' footers
                 a["text"] = _onhost_checked(p, a["text"], None if chat in (None, "all") else chat, a, order[k + 1:],
@@ -3990,7 +3990,7 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                         str(b.get("text") or "") for _, b in order[k + 1:] if (b or {}).get("type") == "notify"])):
                     raise ValueError(why)
                 if a.get("claims"):
-                    obligations.check_claims(a["claims"], p)
+                    notes += obligations.check_claims(a["claims"], p)
                 said = workernotify.named(a["text"])   # the ids the coordinator named, before onhost's status line
                 authored = a["text"]   # promises come only from what the coordinator wrote, never the checks' footers
                 a["text"] = _onhost_checked(p, a["text"], None, a, order[k + 1:], batch_tasks, notes)

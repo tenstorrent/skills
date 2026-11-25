@@ -132,9 +132,10 @@ def task_orders(p, messages, actions: list, tasks: dict, failed, held=()) -> lis
     return notes
 
 
-def check_cites(db, a: dict, chat) -> list[int]:
+def check_cites(db, a: dict, chat, notes: list | None = None) -> list[int]:
     """A reply's `cites` as run ids, before it is sent: each a known run, and none cited by an earlier
-    reply to `chat` unless `repeat` is true. Raises ValueError naming the refused runs."""
+    reply to `chat` unless `repeat` is true. Raises ValueError naming the refused runs. With `notes`, a
+    reply repeating a run goes out with only its new part (_new_part), the run dropped from its cites."""
     raw = a.get("cites")
     if raw in (None, []):
         return []
@@ -147,11 +148,40 @@ def check_cites(db, a: dict, chat) -> list[int]:
     if a.get("repeat") is True:
         return runs
     seen = (db.kv(CITES_KEY, {}) or {}).get(_chat(chat)) or {}
-    if again := [r for r in runs if str(r) in seen]:
+    if (again := [r for r in runs if str(r) in seen]) and notes is not None \
+            and (rest := _new_part(db, a["text"], {r: seen[str(r)] for r in again})):
+        a["text"] = rest
+        notes.append("reply: sent only its new part: the sentences naming " + ", ".join(
+            f"run {r} or repeating message #{seen[str(r)]}" for r in again) + " were dropped, and the run(s) "
+            "from its cites (already in this chat)")
+        return [r for r in runs if r not in again]
+    if again:
         raise ValueError("reply not sent: " + ", ".join(f"run {r}'s result went to this chat in message #{seen[str(r)]}"
                                                         for r in again)
                          + "; say only what is new, or set `repeat` true when the user asked for it again")
     return runs
+
+
+def _new_part(db, text: str, again: dict[int, int]) -> str:
+    """`text` without its sentences that name a run of `again` (run id -> the message that already
+    reported it) as 'run N' or repeat a sentence of that message word for word; '' when none is dropped
+    (what is new cannot be told apart) or nothing is left."""
+    import re
+    said = set()
+    for m in set(again.values()):
+        row = db.one("SELECT text FROM messages WHERE id=?", (m,))
+        said |= {" ".join(x.split()).lower() for x in re.split(r"(?<=[.!?])\s+|\n+", (row or {"text": ""})["text"] or "")}
+    named = re.compile(r"\brun #?(?:" + "|".join(str(r) for r in again) + r")\b", re.I)
+    parts = re.split(r"((?<=[.!?])\s+|\n+)", text or "")
+    keep, dropped = [], False
+    for i in range(0, len(parts), 2):
+        s = parts[i]
+        if s.strip() and (named.search(s) or " ".join(s.split()).lower() in said):
+            dropped = True
+            continue
+        keep += [s, parts[i + 1] if i + 1 < len(parts) else ""]
+    rest = "".join(keep).strip()
+    return rest if dropped and re.search(r"\w", rest) else ""
 
 
 def record_cites(db, chat, runs: list[int], message: int) -> None:

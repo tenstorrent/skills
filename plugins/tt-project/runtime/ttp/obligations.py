@@ -2596,9 +2596,11 @@ def claim_state(c: dict) -> str | None:
     return seen.pop() if len(seen) == 1 else None
 
 
-def check_claims(claims, p, new_tasks=None) -> None:
+def check_claims(claims, p, new_tasks=None) -> list[str]:
     """Static checks of a reply's or notify's `claims` before it is sent; raises on the first bad one.
-    `new_tasks`: the action indexes of this batch's task_add actions, when known."""
+    `new_tasks`: the action indexes of this batch's task_add actions, when known. A `state` that is an
+    allowed one but for case or spaces is set to it, with a note (returned)."""
+    notes = []
     from .coordinator import check_start_when
     if not isinstance(claims, list):
         raise ValueError("`claims` is a list of {text, task | action | expect, due}")
@@ -2613,6 +2615,10 @@ def check_claims(claims, p, new_tasks=None) -> None:
             raise ValueError(f"claim: no task #{c['task']}")
         if c.get("action") not in (None, "") and new_tasks is not None and int(c["action"]) not in new_tasks:
             raise ValueError(f"claim: action {c['action']} is not a task_add of this batch")
+        if isinstance(c.get("state"), str) and c["state"] not in CLAIM_STATES \
+                and (low := c["state"].strip().lower()) in CLAIM_STATES:
+            notes.append(f"claim: `state` {c['state']!r} read as {low!r}")
+            c["state"] = low
         if c.get("state") not in (None, "") and (c["state"] not in CLAIM_STATES or c.get("task") in (None, "")):
             raise ValueError(f"claim `state` is one of {', '.join(CLAIM_STATES)}, with `task`: what its record "
                              f"shows now")
@@ -2625,6 +2631,7 @@ def check_claims(claims, p, new_tasks=None) -> None:
             check_start_when(str(c["expect"]), p)
         if c.get("due") not in (None, ""):
             _when(c["due"], "claim due", p)
+    return notes
 
 
 def record_claims(p, sent: list[tuple[int, str | None, list]], new_tasks: dict[int, int],
