@@ -1955,6 +1955,13 @@ def status_text(p: Project, verbose: bool = False) -> str:
         lines.append(fleethold.line(hold, p))
         if its := heldwork.live_items(hold.get("alias"), where=p):
             lines.append(heldwork.still_on_line(hold.get("alias"), its))
+    from . import machine_ledger as ml
+    for alias, o in ml.outages().items():
+        if o.get("covers") or fleethold.active().get(alias):
+            continue   # partial, or its hold shows the line above
+        if its := heldwork.live_items(alias, where=p):
+            lines.append(f"{ml.outage_line(alias, o, p)}\n"
+                         + heldwork.still_on_line(alias, its))
     try:   # the occupancy watchdog's flags: jobs of this project that ran under a live realtime stream
         from . import occupancy
         occupancy.WHERE = p
@@ -12694,7 +12701,7 @@ def _machine_outage(a) -> None:
         if not got:
             print("no known outages")
         return
-    was = ml.outage_entries().get(a.alias)   # any project's entry: the machine was already out
+    was = by in (ml.outage_entries().get(a.alias) or {})   # this project's own earlier record
     try:
         rec = ml.set_outage(a.alias, a.why, by, a.expires, owner=a.owner or "", covers=a.covers, where=p,
                             queue=queue)

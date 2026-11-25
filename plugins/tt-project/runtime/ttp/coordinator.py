@@ -1479,15 +1479,18 @@ def digest_parts(p: Project, gates: dict, event_ids: list[int], msg_ids: list[in
         lines.append(f"## {hostcycle.hold_line(cyc, p, now)}: no worker or reviewer runs, checks or pushes start "
                      "until it is over; runs in flight are told to hand off")
     paused = db.paused_resources()
-    if paused:
+    from . import fleethold, heldwork, machine_ledger as ml
+    held = sorted(set(fleethold.active())
+                   | {v["machine"] for v in paused.values() if v.get("fleet")}
+                   | {a for a, o in ml.outages(now).items() if not o.get("covers")})
+    items = {a: its for a in held if (its := heldwork.live_items(a, where=p))}
+    if paused or items:
         lines.append("## Paused resources (tasks using one are not dispatched; `ttp lock` refuses it)")
-        from . import fleethold, heldwork
-        for hold in sorted({v["machine"] for v in paused.values() if v.get("fleet")}
-                           | set(fleethold.active())):
+        for hold in held:
             if h := fleethold.active().get(hold):
                 lines.append("- " + fleethold.line(h, p))
-                if its := heldwork.live_items(hold, where=p):
-                    lines.append("  " + heldwork.still_on_line(hold, its))
+            if its := items.get(hold):
+                lines.append("  " + heldwork.still_on_line(hold, its))
         known = machines.load()
         for name, v in sorted(paused.items()):
             if v.get("fleet"):

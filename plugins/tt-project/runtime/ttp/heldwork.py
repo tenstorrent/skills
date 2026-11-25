@@ -198,13 +198,20 @@ def _script_texts(root, command: str) -> list[str]:
 
 def _text_names(alias: str, text: str) -> bool:
     """Whether `text` names the machine: its alias or another of its names as a whole word, or a
-    resource named after it (`<alias>-...`)."""
-    from . import responsibilities as rs
+    resource named after it (`<alias>-...` that is no other machine's name: another machine
+    whose alias is also `<alias>-something` stays that machine's, never this one's)."""
+    from . import machines, responsibilities as rs
     names = names_of(alias) - {alias}
     if any(rs._word(n, text) for n in names):
         return True
-    return rs._word(alias, text) or any(tok.split(":", 1)[0].startswith(alias + "-")
-                                       for tok in re.split(r"\s", text))
+    if rs._word(alias, text):
+        return True
+    others = set()
+    for a, m in machines.load().items():
+        if a != alias:
+            others |= {a, str(m.get("hostname") or "")} - {""}
+    return any((tok := t.split(":", 1)[0]).startswith(alias + "-") and tok not in others
+               for t in re.split(r"\s", text))
 
 
 _NOTHING_RUNS = re.compile(r"(?i)\b(?:nothing|none)\b[^.!?]{0,160}"

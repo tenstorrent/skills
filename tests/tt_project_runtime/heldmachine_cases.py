@@ -256,3 +256,55 @@ def test_a_note_that_cannot_be_sent_names_its_owner_in_the_return(env, monkeypat
     monkeypatch.setattr(up, "send_or_queue", lambda *a, **k: ("queued", 3))
     mine, failed = heldwork.notes(alpha, heldwork.live_items(_HM_BOX))
     assert mine == [] and not failed, failed
+
+
+def test_a_machine_named_by_prefix_of_another_one_is_not_this_machine_s(env):
+    from ttp import heldwork, machines
+    alpha, beta = _hm_setup(env)
+    machines.add("hm-box-2", tags="device")
+    from ttp import heldwork
+    assert heldwork._text_names(_HM_BOX, "check hm-box")
+    assert not heldwork._text_names(_HM_BOX, "check hm-box-2 and hm-other"), "another machine's alias"
+    assert heldwork._text_names(_HM_BOX, "lock hm-box-dev")
+
+
+def test_an_outage_only_machine_gets_the_still_on_line_too(env):
+    from ttp import coordinator as coord, machines
+    from ttp import machine_ledger as ml
+    from ttp.cli import status_text
+    alpha, beta = _hm_setup(env)
+    ml.set_outage(_HM_BOX, "board repair", "alpha", "1h")
+    from ttp import heldwork
+    out = status_text(alpha)
+    assert f"still on {_HM_BOX}:" in out, out
+    parts = dict(coord.digest_parts(alpha, {}, [], [])[0])
+    assert any(ln.strip().startswith(f"still on {_HM_BOX}:")
+               for ln in parts["paused"].splitlines()), parts["paused"]
+    ml.clear_outage(_HM_BOX)
+    assert f"still on {_HM_BOX}:" not in status_text(alpha)
+
+
+def test_a_second_project_s_outage_still_notes_the_owners(env):
+    """A record by one project must not mute the notes when another project records its own
+    outage entry for the same machine (the old check treated any project's entry as 'already
+    told')."""
+    import argparse
+    from ttp import machine_ledger as ml
+    from ttp.cli import _machine_outage
+    from ttp import upstream as up
+    alpha, beta = _hm_setup(env)   # beta owns the machine's one open task
+    _machine_outage(argparse.Namespace(alias=_HM_BOX, why="board repair", by="alpha", expires="1h",
+                                       owner="", covers=None, json=False, clear=False))
+    ml.add_change(_HM_BOX, "edge VM service", "systemctl disable --now svc", by="alpha", expires="1h")
+    inbox = pathlib.Path(up.path())
+    before = inbox.read_text() if inbox.exists() else ""
+    _machine_outage(argparse.Namespace(alias=_HM_BOX, why="second view", by="beta",
+                                       expires="1h", owner="", covers=None, json=False, clear=False))
+    after = inbox.read_text() if inbox.exists() else ""
+    new = [json.loads(ln) for ln in after[len(before):].strip().splitlines()] if len(after) > len(before) else []
+    assert any(n.get("to") == "alpha" and _HM_BOX in n.get("spec", "") and "edge VM" in n.get("spec", "")
+               for n in new), (new,)
+    # the task item's owner was already told this machine's items; its note is not duplicated
+    assert not any(n.get("to") == "beta" for n in new), new
+
+
