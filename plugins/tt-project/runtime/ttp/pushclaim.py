@@ -237,7 +237,7 @@ def landed_claims(p, text: str, repo) -> list[tuple[int, int, str, tuple]]:
             (_ref(repo, ref, tag=tag) if ref and ref.lower() not in _NOT_REFS else None) or target)
            for start, end, full, ref, tag in _sha_phrases(text, repo, foreign)]
     taken = [(start, end) for start, end, *_ in out]
-    from . import claimcheck   # its task/run-id rules: one parser, reused
+    from . import claimcheck   # its task and run id rules: the claim is about that id, not this run
     for m in _LANDED_VERB.finditer(text or ""):
         lo = max(text.rfind(c, 0, m.start()) for c in ".!?\n") + 1
         if _NEGATED.search(text[max(0, m.start() - NEG_WINDOW):m.start()]) \
@@ -293,9 +293,7 @@ def live_claims(text: str, repo) -> list[tuple[int, int, str]]:
 
 def _in_running(repo, sha: str, running: str) -> bool | None:
     """Whether `sha` is an ancestor of (or equals) `running`, the commit the daemon's own receipt
-    names; None when that cannot be told (no running commit, or git failed)."""
-    if not running:
-        return None
+    names; None when that cannot be told (git failed)."""
     return {0: True, 1: False}.get(_git(Path(repo), "merge-base", "--is-ancestor", sha, running).returncode)
 
 
@@ -322,8 +320,10 @@ def _landed_fixes(p, text: str, repo, target, fetches: dict, head: str = "",
             continue   # the push receipts hold this task's landing: the claim stands
         elif reply and (not sha or not target):
             # a reply's landed line names its commit; none is a failed claim
-            fixes.append((start, end, f"{NOT_LANDED}: no commit named" if target and not sha
-                          else text[start:end] + " " + UNVERIFIED_CLAIM))
+            if target and not sha:
+                fixes.append((start, end, f"{NOT_LANDED}: no commit named"))
+            elif not text[end:].startswith(" " + UNVERIFIED_CLAIM):
+                fixes.append((start, end, text[start:end] + " " + UNVERIFIED_CLAIM))  # never marked twice
             continue
         else:
             rc, why = landed.check(p, repo, what, fetch=False) if what else (landed.CANNOT, "no commit named")

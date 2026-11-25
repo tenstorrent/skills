@@ -206,6 +206,53 @@ def _text_names(alias: str, text: str) -> bool:
                                        for tok in re.split(r"\s", text))
 
 
+_NOTHING_RUNS = re.compile(r"(?i)\b(?:nothing|none)\b[^.!?]{0,160}"
+                           r"\b(?:runs?|running|use[sd]?|using|installed)\b")
+
+
+def mark_nothing_claims(text: str) -> str:
+    """`text` (a reply or notify) with its 'nothing runs there' claims checked against the
+    held-machine inventory: a sentence claiming that nothing (of ours) runs on or uses a machine
+    that is held machine-wide or under a whole-machine outage reads ' (unverified: still on
+    <alias>: ...)' after it while the inventory is not empty, so no coordinator can say 'nothing
+    of ours runs there' from the hold alone."""
+    from . import fleethold, machine_ledger as ml
+    if not text or not _NOTHING_RUNS.search(text):
+        return text
+    held = sorted(set(fleethold.active())
+                   | {a for a, o in ml.outages().items() if not o.get("covers")})
+    fixes: dict[tuple[int, int], str] = {}
+    items: dict[str, list] = {}
+    for start, end in _sentence_spans(text):
+        sent = text[start:end]
+        if text[end:].lstrip().startswith("(unverified:") or not _NOTHING_RUNS.search(sent):
+            continue   # already marked, or it claims nothing runs
+        for alias in held:
+            if (start, end) in fixes or not _text_names(alias, sent):
+                continue
+            if alias not in items:
+                items[alias] = live_items(alias)
+            if items[alias]:
+                mark = f" (unverified: {still_on_line(alias, items[alias])})"
+                body, tail = sent.rstrip(), sent[len(sent.rstrip()):]
+                fixes[(start, end)] = body + mark + tail
+    for (start, end), fix in sorted(fixes.items(), key=lambda kv: kv[0][0], reverse=True):
+        text = text[:start] + fix + text[end:]
+    return text
+
+
+def _sentence_spans(text: str) -> list[tuple[int, int]]:
+    """(start, end) of each sentence of `text`, cut at ., !, ? and line breaks."""
+    out, start = [], 0
+    for i, ch in enumerate(text):
+        if ch in ".!?\n":
+            out.append((start, i + 1))
+            start = i + 1
+    if start < len(text):
+        out.append((start, len(text)))
+    return [(s, e) for s, e in out if text[s:e].strip()]
+
+
 def still_on_line(alias: str, its: list[dict]) -> str:
     """'still on <alias>: <project>: <item>; ...' for the items `items` returned."""
     return "still on " + alias + ": " + "; ".join(f"{i['project']}: {i['text']}" for i in its)

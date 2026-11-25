@@ -182,3 +182,60 @@ def test_the_guard_and_inventory_match_a_machine_by_every_name_it_goes_by(env, m
     fleethold.lift(_HM_BOX, True, "test")
 
 
+
+
+def test_a_nothing_runs_line_for_a_held_machine_reads_unverified(env):
+    from ttp import fleethold, heldwork, machines
+    _hm_setup(env)
+    _hm_hold()
+    from ttp import machines
+    machines.add("hm-idle", tags="device")
+    fleethold.set_hold("hm-idle", "lent to another team", "user", "user",
+                       {"until": time.time() + 3600})
+    try:
+        fixed = heldwork.mark_nothing_claims(f"Nothing of ours runs on {_HM_BOX}.")
+        assert "unverified: still on hm-box:" in fixed and "open task" in fixed, fixed
+        # a claim about a held machine with an empty inventory, and one naming no machine, stay
+        assert heldwork.mark_nothing_claims("Nothing of ours runs on hm-idle.") == \
+               "Nothing of ours runs on hm-idle."
+        assert heldwork.mark_nothing_claims("Nothing of ours runs on hm-box. It is ours to keep.") \
+            .count("(unverified") == 1
+    finally:
+        fleethold.lift(_HM_BOX, True, "test")
+        fleethold.lift("hm-idle", True, "test")
+    assert heldwork.mark_nothing_claims("Nothing of ours runs on it.") == "Nothing of ours runs on it."
+
+
+def test_the_reply_check_marks_a_nothing_runs_line_on_a_held_machine(env):
+    from ttp import coordinator as coord, fleethold
+    alpha, beta = _hm_setup(env)
+    _hm_hold()
+    try:
+        notes: list = []
+        fixed = coord._deploy_checked(alpha, f"Nothing of ours runs on {_HM_BOX}.", notes)
+        assert "unverified: still on hm-box:" in fixed, fixed
+        assert any("heldwork" in n for n in notes), notes
+        notes.clear()
+        again = coord._deploy_checked(alpha, fixed, notes)
+        assert again == fixed, "a mark is never applied twice"
+        assert not notes, notes
+    finally:
+        fleethold.lift(_HM_BOX, True, "test")
+    notes.clear()
+    assert coord._deploy_checked(alpha, f"Nothing of ours runs on {_HM_BOX}.", notes) == \
+           f"Nothing of ours runs on {_HM_BOX}."
+    assert not notes, notes
+
+
+def test_the_digest_names_what_is_still_on_a_held_machine(env):
+    from ttp import coordinator as coord, fleethold
+    alpha, beta = _hm_setup(env)
+    try:
+        coord.pause_machine(alpha, _HM_BOX, True, reason="lent to another team", by="user",
+                            users_word=True, end={"until": time.time() + 3600})
+        parts = dict(coord.digest_parts(alpha, {}, [], [])[0])
+        assert any(ln.strip().startswith(f"still on {_HM_BOX}:") for ln in parts["paused"].splitlines())
+    finally:
+        fleethold.lift(_HM_BOX, True, "test")
+        parts = dict(coord.digest_parts(alpha, {}, [], [])[0])
+        assert not any(f"still on {_HM_BOX}" in ln for ln in parts.get("paused", "").splitlines())

@@ -483,3 +483,13 @@ def test_the_reply_path_marks_a_false_live_line_before_sending(env, monkeypatch)
     notes = coord.apply(p, [{"type": "reply", "chat": "c1", "text": "On it. I'll report by 14:00."}])
     sent = p.db.q("SELECT text FROM messages WHERE direction='out' AND kind='reply' ORDER BY id DESC LIMIT 1")
     assert sent[0]["text"] == "On it. I'll report by 14:00." and not notes, (sent, notes)
+
+
+def test_a_reply_s_unverified_landed_claim_is_never_marked_twice(env):
+    """A reply's sha-less landed claim in a project with no push branch reads (unverified); a
+    second pass over the marked text adds no second mark (review of the reply branch)."""
+    from ttp import pushclaim
+    p = make(env)
+    once = pushclaim.correct_reply_claims(p, "The change landed.", p.root)
+    assert "landed (unverified)" in once, once
+    assert pushclaim.correct_reply_claims(p, once, p.root) == once

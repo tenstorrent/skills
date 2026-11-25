@@ -1481,10 +1481,13 @@ def digest_parts(p: Project, gates: dict, event_ids: list[int], msg_ids: list[in
     paused = db.paused_resources()
     if paused:
         lines.append("## Paused resources (tasks using one are not dispatched; `ttp lock` refuses it)")
-        from . import fleethold
-        for hold in sorted({v["machine"]: v for v in paused.values() if v.get("fleet")}):
+        from . import fleethold, heldwork
+        for hold in sorted({v["machine"] for v in paused.values() if v.get("fleet")}
+                           | set(fleethold.active())):
             if h := fleethold.active().get(hold):
                 lines.append("- " + fleethold.line(h, p))
+                if its := heldwork.live_items(hold, where=p):
+                    lines.append("  " + heldwork.still_on_line(hold, its))
         known = machines.load()
         for name, v in sorted(paused.items()):
             if v.get("fleet"):
@@ -2740,8 +2743,9 @@ def _running_commit(p: Project) -> str:
 def _deploy_checked(p: Project, text: str, notes: list) -> str:
     """A reply or notify as pushclaim.correct_reply_claims posts it: a 'landed' line names a commit
     the push branch holds and a 'live' one a commit the running version contains; any other is
-    marked in place ('not landed'/'not live yet'). Any fault posts the text unchanged: a message
-    is never lost to this check."""
+    marked in place ('not landed'/'not live yet'). heldwork.mark_nothing_claims then marks a
+    'nothing runs there' line that names a held machine the inventory is not empty for. Any fault
+    posts the text unchanged: a message is never lost to this check."""
     try:
         from . import pushclaim
         fixed = pushclaim.correct_reply_claims(p, text, p.root, _running_commit(p))
@@ -2750,10 +2754,20 @@ def _deploy_checked(p: Project, text: str, notes: list) -> str:
                          "commit the push branch / the running version does not hold; it went "
                          "marked 'not landed'/'not live yet' or '(unverified)'. A line claiming a "
                          "landing or liveness names its commit")
-        return fixed
+        text = fixed
     except Exception as e:
         notes.append(f"pushclaim: the landed/live-claim check failed ({type(e).__name__}: {e}); "
                      f"the message went unchecked")
+    try:
+        from . import heldwork
+        fixed = heldwork.mark_nothing_claims(text)
+        if fixed != text:
+            notes.append("heldwork: a line in your message claimed nothing of ours runs on or "
+                         "uses a held machine the inventory is not empty for; it went marked "
+                         "'unverified' with what the inventory lists")
+        return fixed
+    except Exception as e:
+        notes.append(f"heldwork: the held-machine claim check failed ({type(e).__name__}: {e})")
         return text
 
 
