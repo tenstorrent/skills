@@ -340,18 +340,19 @@ def test_the_digest_shows_each_machines_reach_and_the_daemon_probes_due_machines
     assert reach.read()["box-b"]["ok"] is True
 
 
-@pytest.mark.parametrize("kind", ["hold", "outage"])
+@pytest.mark.parametrize("kind", ["hold", "outage", "pause"])
 def test_the_reach_probe_makes_no_ssh_to_a_held_or_out_machine_and_shows_it_held(env, monkeypatch, kind):
-    """A machine
-    held for every project, or out whole, is never probed and shows held, not probed; a partial outage (its
+    """A machine held for every project, paused for every project, or out whole, is never probed and shows held, not probed; a partial outage (its
     covers) is still probed; other machines are untouched; once it ends it is probed again."""
-    from ttp import daemon as dm, fleethold, machine_ledger as ml, machines, netwait, reach
+    from ttp import daemon as dm, fleethold, machine_ledger as ml, machines, netwait, reach, shared
     p = make(env)
     now = time.time()
     for h in ("box-a", "box-b"):
         machines.add(h)
     if kind == "hold":
         fleethold.set_hold("box-a", "lent to another team", "user", p.name, now=now)
+    elif kind == "pause":
+        shared.update_pause("box-a", lambda was: {"reason": "lent to another team", "by": "user"})
     else:
         ml.set_outage("box-b", "fan swap", p.name, "10d", covers="device", now=now)   # partial: still probed
         ml.set_outage("box-a", "lent to another team", p.name, "10d", now=now)
@@ -366,7 +367,8 @@ def test_the_reach_probe_makes_no_ssh_to_a_held_or_out_machine_and_shows_it_held
     d.check_reach()
     d._reach.join(5)
     assert asked == [["box-b"]], "no ssh goes to the held machine"
-    fleethold.lift("box-a", True, "test") if kind == "hold" else ml.clear_outage("box-a")
+    {"hold": lambda: fleethold.lift("box-a", True, "test"), "pause": lambda: shared.update_pause("box-a", lambda was: None),
+     "outage": lambda: ml.clear_outage("box-a")}[kind]()
     assert reach.due(now) == ["box-a"] and reach.digest_lines(p, now)[0] == "- box-a: never probed"
 
 
