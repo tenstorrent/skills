@@ -14,7 +14,8 @@ only general fixes go upstream to tt-project). Model-free throughout:
   a gate, required checks, a review or the ask gate; a config one names a key chat may set. The undo is
   the change's own inverse (UNDO_FORM): config `ttp config <project> <key> <value>` of the same key,
   memory `ttp memory --forget <name>` of the entry it adds; a charter note or schedule names in words
-  the charter_update or schedule_set that restores it (no CLI edits either).
+  the charter_update or schedule_set that restores it (no CLI edits either). One sent with no undo gets its
+  kind's own inverse where the kind alone gives it (_own_undo, then guarded as if sent).
 - add() (the `self_change` action): a general fix is filed upstream with its evidence; a local one is
   recorded in kv KEY as {miss evidence, metric, baseline, check_at, undo}. The change itself is made by
   its own action or task in the same batch, under that action's gates.
@@ -233,6 +234,9 @@ def add(p, a: dict, check_at: float | None, settable=None, now: float | None = N
                       f"Files: {', '.join(map(str, files)) or 'none named'}\nGeneral because {why}.")
         return f"self_change {cls}: general ({why}): filed upstream ({'new note' if n else 'already filed'}), " \
                "not recorded as a local change"
+    filled = "" if undo else _own_undo(p, kind, target, task)
+    if filled:
+        undo, filled = filled, f"; undo filled in as its kind's own inverse: {filled}"
     guard(kind, target, undo, settable, p.name)
     if check_at is None or check_at - now < MIN_CHECK_S:
         raise ValueError(f"start_after (when to measure it) must be at least {MIN_CHECK_S // 3600} h out")
@@ -258,7 +262,26 @@ def add(p, a: dict, check_at: float | None, settable=None, now: float | None = N
     except OSError:   # the cross-project count only; the record stands
         pass
     return f"self-change {rec['id']} recorded: {metric} baseline {rec['baseline']} over {len(before)} wakes" + \
-        (f"; measured once task #{task} lands its commit" if task is not None else "")
+        (f"; measured once task #{task} lands its commit" if task is not None else "") + filled
+
+
+def _own_undo(p, kind: str, target: str, task: int | None) -> str:
+    """The undo a self-change sent without one has by its kind alone, '' when none: a memory entry's
+    forget (UNDO_FORM), a config key's current scalar value set back (UNDO_FORM; an unset key has no
+    value to restore), a bound task's change reverted from its applied-change receipt (TASK_UNDO).
+    guard() then judges it as if sent."""
+    if kind == "memory" and target:
+        return f"ttp memory --forget {target}"
+    if kind == "config" and target:
+        val = p.config()
+        for part in target.split("."):
+            val = val.get(part) if isinstance(val, dict) else None
+        if isinstance(val, (str, int, float)) and not isinstance(val, bool) and str(val).strip():
+            return shlex.join(["ttp", "config", p.name, target, str(val)])
+        return ""
+    if kind in TASK_UNDO and task is not None:
+        return f"revert the commit task #{int(task)} lands (its applied-change receipt names it)"
+    return ""
 
 
 def _commit(p, task: dict) -> tuple[str, bool]:

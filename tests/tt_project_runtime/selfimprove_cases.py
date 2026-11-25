@@ -302,3 +302,31 @@ def test_selfimprove_a_task_bound_change_is_measured_only_with_its_applied_recei
     assert not probs, probs
     made = p.db.one("SELECT id FROM tasks WHERE title = 'shorten the poll script'")["id"]
     assert selfimprove.items(p.db)[-1]["task"] == made
+
+
+def test_selfimprove_a_self_change_sent_without_an_undo_gets_its_kinds_own_inverse(env, monkeypatch):
+    """Replayed refusal ('it needs an undo'): a code self-change bound to its task (`id`) with no `command`
+    is recorded with the revert of that task's commit as its undo, with a note. A memory change gets its
+    entry's forget, a config change its key's current value set back; a config key with no value, a
+    task-made change bound to no task, and a guarded target are still refused."""
+    from ttp import coordinator as coord, selfimprove
+    _si_home(env, monkeypatch)
+    p = make(env)
+    fix = p.db.add_task("route reviews off the cheap model", "s", kind="code", origin="coordinator")
+    sent = {"type": "self_change", "kind": "code", "id": fix, "key": "review-routed-to-glm",
+            "text": "route.eligible refuses kind review in every route class", "metric": "claims_failed",
+            "evidence": "correction repeats an earlier one; the first fix changed one class only", "generic": True}
+    assert coord.apply(p, [sent]) == []
+    notes = " ".join(p.db.kv(coord.NOTES_KEY) or [])
+    assert f"undo filled in as its kind's own inverse: revert the commit task #{fix} lands" in notes, notes
+    p.set_config("coordinator.effort", "high")
+    mem = {**sent, "kind": "memory", "name": "fact-stale", "key": "stale-fact"}
+    cfg = {**sent, "kind": "config", "name": "coordinator.effort", "key": "effort"}
+    del mem["id"], cfg["id"]
+    assert coord.apply(p, [mem, cfg]) == []
+    undos = [r["undo"] for r in selfimprove.items(p.db)]
+    assert undos[1:] == ["ttp memory --forget fact-stale", f"ttp config {p.name} coordinator.effort high"], undos
+    probs = coord.apply(p, [{**cfg, "name": "coordinator.no_such_key"}, {**mem, "kind": "script"},
+                            {**cfg, "name": "budget.daily_usd"}])
+    assert len(probs) == 3 and "needs an undo" in probs[0] and "needs an undo" in probs[1], probs
+    assert "budget" in probs[2], probs
