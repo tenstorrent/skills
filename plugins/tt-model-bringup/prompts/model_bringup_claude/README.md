@@ -115,5 +115,24 @@ passes `CLAUDE_CONFIG_DIR`, `HF_HOME`, `HF_TOKEN_PATH` and the venv's `PATH`. tm
 stay on the host. What then runs only inside the container: the build, device jobs, `tt-smi` and anything the session
 installs. Anything that needs the host itself (its packages, services, or a reboot) is out of the session's reach.
 
+## Knowledge
+
+The run's agent writes `bringup/lessons.md` as it goes; it never edits the `ttnn-knowledge` skill. When the run is
+finished, `harvest.sh` (started by `launch.sh` after the budget; `--no-harvest` to skip) runs one fresh read-only
+`claude -p` agent over the lessons, transcripts and commits, and writes `<run dir>/harvest/harvest.md`:
+
+- **Proposals**, held to a high bar: only what cost the agent hours or several attempts, lies in the hardware or the
+  stack rather than this model, and another model would plausibly hit. Each is written as the knowledge the agent
+  was missing, labelled `hardware` (will not change), `tt-metal` (low level, may change with a newer tt-metal; with
+  the base commit) or `stack` (code an agent can change), with one line on how this run solved it, as one way.
+- **Knowledge used**: each topic the run read, when, and what followed (helped, no visible effect, misled,
+  contradicted, stale).
+- **Lessons file vs brief**: whether the lessons held what the brief asked.
+
+A person reviews the proposals and merges what holds into `ttnn-knowledge`, one PR for one or several runs. An entry
+that misled once is flagged, and changed or removed when it happens again or its upstream fix is confirmed. To
+harvest a run by hand: `harvest.sh --tt <tt-metal> [--transcripts <dir>] [--out <dir>]` (`--dry-run` prints the
+prompt); Codex transcripts work too (`--transcripts <codex home>`).
+
 If a host is lost or a session ends, see `RESUME.md`. Running and watching runs from another machine, and what we
 did when hosts failed: `REMOTE.md`.

@@ -3,7 +3,7 @@
 #   launch.sh --hf-model org/name --tt-metal /path/to/tt-metal [--run-dir DIR] [--config-dir DIR]
 #             [--effort LEVEL] [--budget 48]
 #             [--scope open|contained] [--resets yes|no] [--notes file] [--inputs '{"targets": {...}, "evals": [...]}']
-#             [--session name] [--overseer-interval hours] [--no-overseer] [--dry-run]
+#             [--session name] [--overseer-interval hours] [--no-overseer] [--no-harvest] [--dry-run]
 # --dry-run writes inputs.json, prompt.md and the config dir, and prints the commands instead of starting them.
 set -euo pipefail
 PATH="$HOME/.local/bin:$PATH"  # claude installs here; ssh and nohup shells often lack it
@@ -11,9 +11,10 @@ CLAUDE=${CLAUDE_BIN:-claude}  # CLAUDE_BIN: e.g. a wrapper that runs the session
 command -v "$CLAUDE" >/dev/null || { echo "$CLAUDE not found on PATH" >&2; exit 2; }
 HERE=$(cd "$(dirname "$0")" && pwd); PLUGINS=$(cd "$HERE/../../.." && pwd)
 HF_MODEL= TT= BUDGET=48 SCOPE=open RESETS=no NOTES= EXTRA='{}' SESSION= MODEL=${CLAUDE_MODEL:-claude-opus-5-5}
-OVERSEER=1 CONFIG_DIR= EFFORT= DRY= RUN_DIR=
+OVERSEER=1 HARVEST=1 CONFIG_DIR= EFFORT= DRY= RUN_DIR=
 while [ $# -gt 0 ]; do case $1 in
-  --no-overseer) OVERSEER=; shift; continue;; --dry-run) DRY=1; shift; continue;;
+  --no-overseer) OVERSEER=; shift; continue;; --no-harvest) HARVEST=; shift; continue;;
+  --dry-run) DRY=1; shift; continue;;
   --overseer-interval) OVERSEER=$2;;
   --hf-model) HF_MODEL=$2;; --tt-metal) TT=$(cd "$2" && pwd);; --budget) BUDGET=$2;; --scope) SCOPE=$2;;
   --resets) RESETS=$2;; --notes) NOTES=$2;; --inputs) EXTRA=$2;; --session) SESSION=$2;;
@@ -98,6 +99,8 @@ CMD="${ENVS}[ -f python_env/bin/activate ] && source python_env/bin/activate
 TMUX_CMD=(tmux new-session -d -s "$SESSION" -c "$TT" bash -lc "$CMD")
 # Budget watchdog: tell the session when the budget is reached.
 WATCH="sleep \$(python3 -c 'print(int($BUDGET*3600))'); tmux send-keys -t $SESSION -l 'Budget reached: start nothing new; finish and commit REPORT.md.'; tmux send-keys -t $SESSION Enter"
+# Then, once the run is finished, the knowledge harvest: a fresh read-only agent proposes knowledge changes (README).
+[ -n "$HARVEST" ] && WATCH+="; $(printf '%q ' "$HERE/harvest.sh" --tt "$TT" --run-dir "$RUN_DIR" --session "$SESSION" --wait)>/dev/null 2>&1"
 # Overseer: every OVERSEER hours, a read-only agent reports on subagents, jobs, devices, CPU, disk and budget.
 OVS=("$HERE/overseer.sh" --session "$SESSION" --tt "$TT" --inputs "$RUN/inputs.json" --interval "${OVERSEER:-1}" --started-at "$(date +%s)")
 

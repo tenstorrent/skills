@@ -33,7 +33,7 @@ check_agentic_serving.py and others) are tools you may run, not gates.
 Fixed: the `tt-device-usage` rules for every device job; resets only as the run's brief allows (record it before
 the first device run; if nobody has said, do not reset). Never loosen or delete a check to pass. Local commits on one
 branch, never push, a tag at each milestone you choose. Commit before each device job, so a lost host keeps the
-work. When something took long to understand and is solved, add a few lines to bringup/lessons.md. When
+work. When something took long to understand and is solved, add a few lines to bringup/lessons.md, naming the `ttnn-knowledge` entry it confirms or contradicts, if any. When
 `budget_hours` is reached, start nothing new and finish the report.
 
 Nobody may be watching live. Do not stop to ask questions: take the option you would recommend, record it and
