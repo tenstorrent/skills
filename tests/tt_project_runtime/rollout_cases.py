@@ -896,7 +896,7 @@ def test_a_worse_glm_code_project_is_rolled_back_alone_at_its_ring_level_with_it
     now = time.time()
     t0 = now - 5 * 86400
     for n, p in projs.items():
-        p.set_config("route.glm_work", {"min_tasks": 4, "min_base": 4})
+        p.set_config("route.glm_work", {"min_tasks": 4, "min_base": 4, "model": _GS_GLM})
         for _ in range(4):
             _gs_code_arm(p, t0 - 3 * 86400, 1, arm="sonnet")
         for _ in range(4):   # beta's GLM code passes like its baseline; the others' fails

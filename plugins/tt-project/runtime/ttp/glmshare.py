@@ -637,11 +637,12 @@ def judge(p, cfg: dict, now: float) -> dict:
 def judge_code(p, cfg: dict, now: float) -> dict:
     """The glm_code flag's judge: the project's code-arm tasks (codearm's records) against its own Claude
     baseline on the metrics the flag owns: first review pass rate, bounce rate and tasks done per day. It waits
-    where glm_work is on: that route decides the project's code tasks (codearm.settings) and glm_work's judge
-    judges them."""
-    from . import rollout
-    if rollout.on("glm_work", getattr(p, "name", ""), p.raw_config()):
-        return {"state": "wait", "why": "glm_work is on here: its judge judges the code tasks", "n": 0, "signals": []}
+    where the GLM work route covers the project: that route decides its code tasks (codearm.settings) and
+    glm_work's judge judges them."""
+    from . import glmwork
+    if glmwork.settings(glmwork.ring_gate(dict(cfg), getattr(p, "name", ""), p.raw_config())):
+        return {"state": "wait", "why": "glm_work covers the code tasks here: its judge judges them", "n": 0,
+                "signals": []}
     return _judge_arms(p, cfg, now, True)
 
 
