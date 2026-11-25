@@ -2139,7 +2139,10 @@ def test_a_glm_run_may_not_hide_a_program_name_or_sleep_time_and_it_is_a_redirec
         assert glmguard.shell_refusal(cmd, str(wt), str(rd)) is None, cmd
     for cmd in ("S=sleep; $S 2", "sleep $I", "x; `printf sleep` 2", "x && $(printf sleep) 2", 'eval "$x"',
                 "echo ${!n}", "S=sl; ${S}eep 2", "x && sl${E} 2", _GG_HIDDEN_SLEEP):
-        assert (glmguard.shell_refusal(cmd, str(wt), str(rd)) or "").startswith(glmguard.HIDDEN_WHY), cmd
+        why = glmguard.shell_refusal(cmd, str(wt), str(rd)) or ""
+        # the refusal names the plain literal form to resend
+        assert why.startswith(glmguard.HIDDEN_WHY) and why.endswith(glmguard.HIDDEN_HINT), cmd
+        assert "write the target path literally in the command's own words" in why, cmd
     assert glmguard.classify(glmguard.HIDDEN_WHY)[:2] == ("expansion", glmguard.REDIRECTED)
     call = lambda: json.dumps(hook.pre_tool_use({"tool_name": "Bash", "tool_input": {"command": _GG_HIDDEN_SLEEP},
                                                  "cwd": str(wt)})[0])

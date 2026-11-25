@@ -136,6 +136,9 @@ HIDDEN = re.compile(rf"""(?m)(?:^\s*|{_CMD_AT})(?:["']?\\?\$(?:\{{\w+\}}|[A-Za-z
                     rf"""|{_CMD_AT}`|(?:^\s*|{_CMD_AT})eval\s+["'$\\]|\$\{{(?:\\?\$|!\w+\}})|(?<![\w.-])sleep\s+["']?\\?\$""")
 HIDDEN_WHY = "a program name or a checked operand comes from an expansion the guard cannot read"
 STATE_DB_WHY = "a run on the GLM arm may not read or write the project's database or machine records by hand"
+# the plain literal form to resend, named in every such refusal
+HIDDEN_HINT = ("write the target path literally in the command's own words, with no $VAR, ${...}, $( ), backticks or "
+               "globs in it (for example `rm /abs/dir/file` or `echo x > /abs/dir/file`)")
 STATE_DB = re.compile(r"\bproject\.db\b|\bmachine-workers\.json\b|\b\.tt-project/(?:locks|machines)\b")
 # Every run on the chat model (the code arm, a GLM work route, a routine coordinator lane, a bench run as a task):
 # human interaction stays on Opus, so its outward posts become drafts an Opus step reviews and sends.
@@ -825,7 +828,7 @@ def shell_refusal(cmd: str, cwd: str, run_dir: str = "", env=None, remote: bool 
     if services and (svc := SERVICE_RE.search(view)):
         return f"{SERVICE_WHY}: {svc.group(0)[:120]}"
     if writes and (m := HIDDEN.search(_inert(view))) and not _readers_only(view):
-        return f"{HIDDEN_WHY}: {m.group(0).strip()[:80]}"
+        return f"{HIDDEN_WHY}: {m.group(0).strip()[:80]}; {HIDDEN_HINT}"
     commands, _ = hook._split(cmd)   # heredoc bodies a program, not a shell, reads are its input
     for sub in pathguard._substitutions(commands):   # "$(...)" runs a command too
         if why := shell_refusal(sub, cwd, run_dir, e, remote, writes, power, services, made):
