@@ -10,7 +10,8 @@ passed, or another wake path made it due). In this order:
    timer or "probe passed" (failed checks, a broken probe, a reboot, a resumed resource, ...), a probe
    whose exit or output changed since the gate's last skip,
    a probe that answered anything but "not yet" (its pass or failed job keeps its model-free path),
-   and the cap (`max_skips` skips in a row, or `max_skip_h` hours since the last real turn). A
+   and the cap (`max_skips` skips in a row, or `max_skip_h` hours since the last real turn; past the
+   `cap_hard_h` ceiling only when its probe gave no "not yet" answer: a pending one sleeps). A
    planned check (`waiting.check_plan`) is never capped: past the cap it still takes its plan's rule,
    so an unchanged "not yet" starts no turn. A plain spec change is no event: it applies at the next
    real wake; its wake_now or `urgent:` line wakes through the daemon's spec wake (escalated).
@@ -22,7 +23,7 @@ passed, or another wake path made it due). In this order:
    those checks are queued, or run and their log still advances (within `waiting.wake_gate.checks_stall_s`), a
    timer, a planned check, a spec change or a changed progress line starts no turn (a spec change
    applies when they end: daemon._probe_passed); only an escalated wake, a real wake reason and the
-   `cap_hard_h` ceiling do. Checks that ended while the probe's last answer was still "not yet" re-defer
+   `cap_hard_h` ceiling (with no "not yet" answer) do. Checks that ended while the probe's last answer was still "not yet" re-defer
    a minute, so the probe's own model-free path (a pass records on_pass, a failure wakes as
    checks_failed) settles them, at most `max_skips` times. Neither counts toward the `max_skips` cap.
    Checks that died or stalled are not held: the fallback wake stays.
@@ -379,6 +380,13 @@ def decide(p, cfg: dict, task: dict, prev: dict, now: float, probe: tuple | None
     # daemon's spec wake (escalated). [note 304aeeb6c165c1df]
     elif gate.get("seen") and seen and gate["seen"] != seen and not matchwait:
         d = Decision(True, "event", "its probe's answer changed since the gate's last skip")
+    elif cap and hard and woke != "probe passed" and probe and probe[0] in _not_yet():
+        # An age-only re-check of a wait its probe still calls pending is no paid turn: the probe's pass,
+        # failure or broken exit still wakes it, and the daemon's one wait_stale line tells the coordinator.
+        # [note 92489d063849bb30]
+        d = Decision(False, "rule", f"past the hard ceiling (cap_hard_h; {capped}, waiting "
+                                    f"{(now - float(prev['waiting_since'])) / 3600:.1f} h) its probe still says "
+                                    f"not yet (exit {probe[0]}): no turn")
     elif cap and hard:
         d = Decision(True, "cap", f"{capped}: the hard ceiling (cap_hard_h)")
     elif cap and (woke == "probe passed" or probe and probe[0] != "timeout" and probe[0] not in _not_yet()):
@@ -433,7 +441,7 @@ def decide(p, cfg: dict, task: dict, prev: dict, now: float, probe: tuple | None
             want = max(want, float(s["backoff_s"]))
         until = ended + max(float(s["cap_hard_h"]), float(s["max_skip_h"])) * 3600 \
             if over or d.extra.get("hold") == "checks" else ended + float(s["max_skip_h"]) * 3600
-        d.delay_s = max(60.0, min(want, until - now))
+        d.delay_s = max(60.0, want if now >= until else min(want, until - now))   # past the ceiling: its backoff
     d.log_id = log(db, task["id"], d, wake_cost(db, cfg, now) if not d.wake and not d.extra.get("pending") else 0.0, now)
     d.extra = {**d.extra, "skips": skips}
     _WOKE.pop(key, None)

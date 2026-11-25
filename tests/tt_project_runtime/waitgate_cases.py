@@ -239,7 +239,7 @@ def test_the_wake_gate_cap_asks_the_watcher_which_may_skip_until_the_hard_ceilin
     w = _GateWatcher("skip")
     d = _gate_decide(p, _gate_task(p, tmp_path, ended_ago=4 * 3600 + 5), jev=w, probe=(4, "job failed"))
     assert d.wake and d.by == "cap" and w.calls == 0
-    # Near the hard ceiling a skip ends at it; past it the task wakes with no question.
+    # Near the hard ceiling a skip ends at it; past it the task wakes with no question (no "not yet" answer).
     d = _gate_decide(p, _gate_task(p, tmp_path, ended_ago=24 * 3600 - 300), jev=_GateWatcher("skip", delay_s=3600))
     assert not d.wake and 250 <= d.delay_s <= 300, d.delay_s
     w = _GateWatcher("skip")
@@ -877,6 +877,43 @@ def test_a_planned_check_no_rule_or_jev_judged_sleeps_and_brings_no_cap_closer(e
     assert _gate_decide(p, tid, jev=None).by == "cap"
 
 
+@pytest.mark.parametrize("rc", [1, 75, 255])
+def test_a_pending_probe_at_the_hard_ceiling_starts_no_turn_and_logs_one_line(env, tmp_path, rc):
+    """[note 92489d063849bb30] Past `cap_hard_h` a probe still saying "not yet" is no paid turn: one
+    model-free skip line names the task and its wait age, and it sleeps a backoff, never a minute."""
+    from ttp import daemon as dmod
+    p = make(env)
+    tid = _gate_task(p, tmp_path, ended_ago=30 * 3600)
+    w = _GateWatcher("wake")
+    d = _gate_decide(p, tid, jev=w, probe=(rc, "pending"))
+    assert not d.wake and d.by == "rule" and w.calls == 0, d
+    assert "hard ceiling" in d.reason and "waiting 30.0 h" in d.reason and f"exit {rc}" in d.reason, d.reason
+    assert d.delay_s >= 600, d.delay_s
+    rows = p.db.q("SELECT decision FROM wake_gate WHERE task=?", (tid,))
+    assert [r["decision"] for r in rows] == ["skip"]
+    dm = dmod.Daemon(p.base)   # the daemon's own path: no run, the skip's line on the task
+    dm._probe_rc[tid] = (rc, time.time(), "exit 1")
+    p.db.update_task(tid, not_before=time.time() - 1)
+    assert dm._wake_gate(p.db.task(tid)) == (True, None)
+    task = p.db.task(tid)
+    assert "waiting 30.0 h" in task["blocked_reason"] and task["not_before"] > time.time() + 500
+
+
+def test_at_the_hard_ceiling_a_broken_probe_a_pass_or_no_answer_still_wakes(env, tmp_path):
+    """The hard ceiling keeps its wake for everything but a "not yet": a broken probe, a pass (its task
+    starts), a timeout and no answer seen."""
+    p = make(env)
+    tid = _gate_task(p, tmp_path, ended_ago=30 * 3600)
+    for probe in ((2, "bad args"), ("timeout", ""), None):
+        d = _gate_decide(p, tid, probe=probe)
+        assert d.wake and d.by == "cap", (probe, d)
+    _gate_set(p, tid, woke="probe broken: exit 2")
+    assert _gate_decide(p, tid, probe=(2, "bad args")).wake
+    _gate_set(p, tid, woke="probe passed")
+    d = _gate_decide(p, tid, probe=(0, "done"))
+    assert d.wake and d.by == "cap", d
+
+
 @pytest.mark.parametrize("by", ["plain", "jev"])
 @pytest.mark.parametrize("ended_h, skips", [(5.0, 0), (30.0, 0), (1.0, 6)])
 def test_a_planned_check_past_the_cap_on_an_unchanged_not_yet_probe_starts_no_turn(env, tmp_path, by, ended_h, skips):
@@ -898,9 +935,10 @@ def test_a_planned_check_past_the_cap_on_an_unchanged_not_yet_probe_starts_no_tu
     assert _gate_decide(p, tid, jev=None, probe=(1, "pending: 1 reply, not terminal")).wake
     assert _gate_decide(p, tid, jev=None, probe=(0, "terminal reply")).wake
     assert _gate_decide(p, tid, jev=None, probe=(4, "job failed")).wake
-    # no plan: the cap is the gate's own and still wakes
+    # no plan: the cap is the gate's own and still wakes, but past the hard ceiling a "not yet" sleeps
     _gate_set(p, tid, woke="", wake_reason="", plan_by=None, plan_tier=None)
-    assert _gate_decide(p, tid, jev=None, probe=(1, "pending: no terminal reply yet")).by == "cap"
+    d = _gate_decide(p, tid, jev=None, probe=(1, "pending: no terminal reply yet"))
+    assert (d.wake, d.by) == ((False, "rule") if ended_h >= 24 else (True, "cap")), d
 
 
 def test_the_coordinator_sets_and_clears_a_tasks_check_plan(env, tmp_path):
