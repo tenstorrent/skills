@@ -23,6 +23,30 @@ def test_tform_a_task_add_with_no_title_and_depends_on_minus_one_applies_with_no
     assert any("the spec's first line" in n and f"depends_on=[{dep}]" in n for n in notes), notes
 
 
+def test_tform_a_continue_waiting_on_its_own_chains_landing_drops_that_wait_and_keeps_the_rest(env):
+    """Refused before: a continue whose start_when waits on the landing of the task it continues (that work
+    lands only with the continue's own, so the wait never passes). The wait is dropped, an and-ed outside
+    wait is kept, and an or-ed one goes with it."""
+    import json
+    from ttp import coordinator as coord
+    p = make(env)
+    old = p.db.add_task("code: fix the parser", "Fix it.", kind="code")
+    p.db.update_task(old, status="failed")
+    assert coord.apply(p, [{"type": "task_add", "kind": "code", "title": "continue the parser fix",
+                            "spec": "Finish it.", "continues": old,
+                            "start_when": f"ttp landed --task {old} && test -e /tmp/ready"}]) == []
+    t = p.db.one("SELECT * FROM tasks WHERE title='continue the parser fix'")
+    assert t and "start_when:test -e /tmp/ready" in json.loads(t["labels"]), (t["labels"], _tf_notes(p))
+    assert any("a wait on its own continue chain that could never pass" in n for n in _tf_notes(p)), _tf_notes(p)
+    p.db.update_task(t["id"], status="failed")
+    assert coord.apply(p, [{"type": "task_add", "kind": "code", "title": "continue the parser fix again",
+                            "spec": "Finish it.", "continues": t["id"],
+                            "start_when": f"ttp landed --task {old} || test -e /tmp/ready"}]) == []
+    t2 = p.db.one("SELECT * FROM tasks WHERE title='continue the parser fix again'")
+    assert t2 and not any(x.startswith("start_when:") for x in json.loads(t2["labels"])), dict(t2) if t2 else None
+    assert any("start_when=None" in n and "||" in n for n in _tf_notes(p)), _tf_notes(p)
+
+
 def test_tform_waits_on_ask_new_with_no_ask_in_the_batch_is_dropped(env):
     """Refused before: `waits_on ask:new` with no ask_user in the batch. The wait (and its blocked status)
     is dropped; the rest of the update applies."""
