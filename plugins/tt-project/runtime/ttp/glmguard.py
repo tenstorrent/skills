@@ -859,7 +859,8 @@ def shell_refusal(cmd: str, cwd: str, run_dir: str = "", env=None, remote: bool 
             return "a run on the GLM arm does not send data to a service (an HTTP post)"   # a local socket's API: no
         elif name in MAIL or name in NET:
             return f"`{name}` reaches a person or another service: not for a run on the GLM arm"
-        elif name in ("ssh", "scp", "sftp") and credguard.ssh_runs_local(seg):
+        elif name in ("ssh", "scp", "sftp") and credguard.ssh_runs_local(
+                seg, lambda v: credguard.ssh_own_file(v) or not remote and _own_ssh_config(v, cmd, cwd, run_dir, e)):
             return f"`{name}` options that run a local program (ProxyCommand and the like) would get past this guard"
         elif name in COPIERS and writes and (dest := _remote_dest(seg)):
             return f"{REMOTE_WHY}: {dest} (a copy)"
@@ -886,6 +887,22 @@ def shell_refusal(cmd: str, cwd: str, run_dir: str = "", env=None, remote: bool 
     if rec := next((p for p, _ in got if _run_record(p, run_dir)), None):
         return f"{GUARD_WHY}: {rec}"
     return f"it writes outside its worktree: {got[0][0]} ({got[0][1]})" if got else None
+
+
+def _own_ssh_config(value: str, cmd: str, cwd: str, run_dir: str, e) -> bool:
+    """`ssh -F value` names a settings file of the run's own: inside its worktree or run folder (by its real
+    path), with no line that runs a local program or reads another file (credguard.SSH_RUNS_RE), in a command that
+    is one plain call (no separator, pipe, redirection or substitution), so no step of it writes the file or moves
+    the folder first (fail closed)."""
+    from . import credguard, sidefx
+    path = os.path.realpath(os.path.join(cwd, os.path.expanduser(value)))
+    if credguard.SHELL_META_RE.search(cmd) or not sidefx._inside(path, _own_roots(cwd, run_dir, e)):
+        return False
+    try:
+        with open(path, encoding="utf-8", errors="replace") as f:
+            return not any(credguard.SSH_RUNS_RE.match(line) for line in f.read(1 << 20).splitlines())
+    except OSError:
+        return False
 
 
 def tool_refusal(payload: dict, env=None, made: list[str] | None = None) -> str | None:

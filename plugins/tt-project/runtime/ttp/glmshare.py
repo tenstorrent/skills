@@ -222,9 +222,12 @@ def _incidents(db, cfg: dict, runs: list[dict], tasks: dict, until: float) -> in
 
 
 def quality(db, cfg: dict, tids, tasks: dict, runs: dict, reviews: dict, fixes: dict, requeued: set,
-            days: float, until: float, fixed: dict | None = None) -> dict:
+            days: float, until: float, fixed: dict | None = None, arm: str = "glm") -> dict:
     """One arm's quality over tasks `tids` (the module doc); a bounce `fixed` (rollout.fixed_stops) lists from
-    before its fix went live is not counted: a task whose every bounce that is lands in q["not_counted"]."""
+    before its fix went live is not counted: a task whose every bounce that is lands in q["not_counted"]. A
+    task of the GLM arm that bounced and whose last run finished on the core provider keeps only its bounce
+    count (a retry after GLM's own failed or reopened work still counts against GLM): its outcome is Opus's,
+    not GLM's, so it moves none of the outcome metrics."""
     from . import effort, rollout
     q = {"tasks": 0, "done": 0, "failed": 0, "reopened": 0, "reviewed": 0, "first_pass": 0, "fix_rounds": 0,
          "bounces": 0, "decided": 0, "glm_runs": 0, "incidents": 0}
@@ -234,16 +237,18 @@ def quality(db, cfg: dict, tids, tasks: dict, runs: dict, reviews: dict, fixes: 
         if not t:
             continue
         rs, rv = runs.get(tid) or [], reviews.get(tid) or {}
-        q["tasks"] += 1
-        q["done"] += t["status"] == "done"
-        q["failed"] += t["status"] == "failed"
-        q["reopened"] += tid in requeued
-        if rv.get("first"):
-            q["reviewed"] += 1
-            q["first_pass"] += rv["first"] == "done"
-            q["fix_rounds"] += fixes.get(tid, 0)
-        q["decided"] += _outcome_at(t, rv, rs) is not None
         bounced = [r for r in rs if (_note(r["note"]).get(route.KEY) or {}).get("fallback") == route.BOUNCE]
+        finished_off = arm == "glm" and bounced and not on_glm(rs[-1]["provider"], rs[-1]["model"], rs[-1]["note"])
+        q["tasks"] += 1
+        if not finished_off:
+            q["done"] += t["status"] == "done"
+            q["failed"] += t["status"] == "failed"
+            q["reopened"] += tid in requeued
+            if rv.get("first"):
+                q["reviewed"] += 1
+                q["first_pass"] += rv["first"] == "done"
+                q["fix_rounds"] += fixes.get(tid, 0)
+            q["decided"] += _outcome_at(t, rv, rs) is not None
         off = [f for r in bounced if (f := rollout.not_counted(fixed or {}, r["id"], r["ended"] or r["started"]))]
         deep = effort.wants_deep(t.get("result"))
         q["not_counted"] += off if off and len(off) == len(bounced) and not deep else []   # the task's bounce it took out
@@ -391,7 +396,7 @@ def report(p, since: float, now: float) -> dict:
     for t in sorted(firsts):
         by_arm[arm_of(t, runs[t], work, code)].append(t)
     ctx = (_reviews(db, since), _fix_rounds(db, since), _requeued(db, since))
-    arms = {a: quality(db, cfg, ids, tasks, runs, *ctx, days, now) for a, ids in by_arm.items()}
+    arms = {a: quality(db, cfg, ids, tasks, runs, *ctx, days, now, arm=a) for a, ids in by_arm.items()}
     usd = (db.one("SELECT SUM(usd) s FROM ledger WHERE provider='claude' AND ts>=? AND ts<?", (since, now)) or {}).get("s")
     from . import correction
     corr = [c for c in (db.kv(correction.KEY, []) or []) if isinstance(c, dict) and since <= float(c.get("ts") or 0) < now]
@@ -678,9 +683,9 @@ def _judge_arms(p, cfg: dict, now: float, code: bool) -> dict:
     g = quality(db, cfg, glm, tasks, runs, *ctx, days, now, fixed)
     g["incidents"] += _incidents(db, cfg, [r for t in dev_glm for r in runs.get(t, [])
                                            if on_glm(r["provider"], r["model"], r["note"])], tasks, now)
-    b = quality(db, cfg, base, tasks, runs, *ctx, days, now)
-    before = quality(db, cfg, work(pre), tasks, runs, *ctx, BASE_DAYS, t0)
-    after = quality(db, cfg, work(post), tasks, runs, *ctx, days, now)
+    b = quality(db, cfg, base, tasks, runs, *ctx, days, now, arm="claude")
+    before = quality(db, cfg, work(pre), tasks, runs, *ctx, BASE_DAYS, t0, arm="claude")
+    after = quality(db, cfg, work(post), tasks, runs, *ctx, days, now, arm="claude")
     corr = sum(1 for c in (db.kv(correction.KEY, []) or [])
                if isinstance(c, dict) and now - CORR_DAYS * 86400 <= float(c.get("ts") or 0) < now)
     sig = signals(g, b, before, after, corr, st)

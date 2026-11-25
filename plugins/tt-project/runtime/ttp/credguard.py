@@ -324,12 +324,12 @@ def ssh_files(argv: list[str]) -> list[str]:
     return out
 
 
-def ssh_runs_local(argv: list[str]) -> bool:
+def ssh_runs_local(argv: list[str], own_file=ssh_own_file) -> bool:
     """An ssh, scp or sftp call whose options run a local program or read another config (-F with a
-    config outside ~/.ssh (ssh_own_file), ProxyCommand, LocalCommand, KnownHostsCommand, Match exec,
-    Include, a provider library, scp -S)."""
+    config that is not the caller's own, `own_file`: by default one in ~/.ssh (ssh_own_file), ProxyCommand,
+    LocalCommand, KnownHostsCommand, Match exec, Include, a provider library, scp -S)."""
     runs = SSH_OPTS.get(os.path.basename(argv[0]), SSH_OPTS["ssh"])[1]
-    return any(o in runs and not (o == "F" and ssh_own_file(v)) or o == "o" and SSH_RUNS_RE.match(v)
+    return any(o in runs and not (o == "F" and own_file(v)) or o == "o" and SSH_RUNS_RE.match(v)
                for o, v, _ in ssh_options(argv))
 
 

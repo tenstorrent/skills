@@ -72,6 +72,10 @@ PUBLISH = re.compile(
     r"external|upstream|their)\b[^\n.]{0,20}?\bbranch\b")
 NEGATED = re.compile(r"(?i)\b(?:never|not|no|nothing|without|don't|avoid)\b[^\n.;]{0,25}$")
 
+# A spec that has the run commit into the project's harness tree, outside its worktree: the guard refuses
+# every such write, so Opus does that work.
+HARNESS_COMMIT = re.compile(r"(?i)\b(?:commit|deliver)\w*\b[^.\n]{0,40}\bin the harness\b")
+
 
 def publishes(text: str) -> bool:
     """Whether `text` tells the run to publish to an outside branch (PUBLISH, not after a never/no/not)."""
@@ -324,9 +328,10 @@ def keeps_core(db, cfg: dict, task: dict, tier: str, cls: str | None = None, pic
     retries on GLM), a GLM bounce (needs Opus or deep), a run that talks to a person (`reply_chat` with
     person_writeup off, or an instruction to post, comment or notify with the outward-drafts redirect off: with
     them on, Opus writes the words and GLM does the work), a task titled as a review of another, optimization or
-    design work, a publish to an outside branch (publishes), device work (a broker job or a smoke on a named
-    host too; with glm_device on it runs on GLM under an Opus plan, deviceplan.py), urgent (only with
-    keep_urgent), a kind off the list. The design and judgment keepers read the title and own_spec; the publish
+    design work, a publish to an outside branch (publishes), a commit in the harness tree (HARNESS_COMMIT: the
+    guard refuses every such write), device work (a broker job or a smoke on a named host too; with glm_device
+    on it runs on GLM under an Opus plan, deviceplan.py), urgent (only with keep_urgent), a kind off the list.
+    The design and judgment keepers read the title and own_spec; the publish
     and device keepers the title and own_spec with quoted words kept (a quoted command is the task's own),
     besides its resources."""
     from . import codearm, deviceplan, effort, modelpick, untrusted, urgent
@@ -360,6 +365,9 @@ def keeps_core(db, cfg: dict, task: dict, tier: str, cls: str | None = None, pic
     own = {**task, "spec": own_spec(task.get("spec"), words=True)}
     if publishes(f"{task.get('title') or ''}\n{own['spec']}"):
         return "publish: pushes to an outside branch (GLM never publishes)"
+    text = f"{task.get('title') or ''}\n{own['spec']}"
+    if any(not NEGATED.search(text[max(0, m.start() - 40):m.start()]) for m in HARNESS_COMMIT.finditer(text)):
+        return "harness: the run commits in the harness tree, which its worktree does not hold"
     if (deviceplan.device(own, cfg) or BROKER_JOB.search(f"{task.get('title') or ''}\n{own['spec']}")) \
             and not deviceplan.on(cfg):
         return "device"   # with glm_device on, a device task runs on GLM under an Opus plan (deviceplan.py)

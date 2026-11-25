@@ -2639,3 +2639,52 @@ def test_a_glm_run_still_refuses_hidden_and_home_wide_writes(monkeypatch, tmp_pa
                 "unset TM''PDIR; TMPDIR=\"${TMPDIR:-" + home + "}\"; rm -rf \"$TMPDIR\"", "tee ${TMPDIR=/etc}/x",
                 "rm -rf ~", "rm -rf $HOME", "rm -rf " + home, "echo x > ~/.ssh/config"):
         assert glmguard.shell_refusal(cmd, str(wt), str(rd)), cmd
+
+
+@pytest.mark.parametrize("cmd", [
+    "ssh -F conf/ssh-config -o BatchMode=yes -o ConnectTimeout=10 box-a uptime",
+    "timeout 20 ssh -F conf/ssh-config -o BatchMode=yes box-a ls",
+    "ssh -o BatchMode=yes box-a ls", "ssh -o ConnectTimeout=10 box-a ls"])
+def test_glm_guard_allows_ssh_options_and_a_config_inside_the_runs_own_folders(cmd, tmp_path, monkeypatch):
+    from ttp import glmguard
+    _gg_tmp_taken(monkeypatch)
+    wt, rd = _gg_run(tmp_path)
+    (wt / "conf").mkdir()
+    (wt / "conf" / "ssh-config").write_text("Host box-a\n  User user\n")
+    e = {**_GG_RUN_ENV, "TMPDIR": str(rd / "tmp")}
+    assert not glmguard.shell_refusal(cmd, str(wt), str(rd), e), cmd
+
+
+@pytest.mark.parametrize("cmd", [
+    "ssh -F /etc/ssh/ssh_config box-a ls", "ssh -F /tmp/c box-a",
+    "ssh -o ProxyCommand='nc %h %p' box-a ls", "ssh -o LocalCommand=x box-a",
+    "ssh -o PermitLocalCommand=yes box-a", "ssh -o Include=/etc/ssh/config.d/* box-a",
+    "scp -S /tmp/prog a box-a:", "sftp -b /tmp/batch box-a", "sftp -o BatchMode=yes box-a"])
+def test_glm_guard_refuses_ssh_options_that_run_a_local_program_or_a_config_outside_its_own_folders(
+        cmd, tmp_path, monkeypatch):
+    from ttp import glmguard
+    _gg_tmp_taken(monkeypatch)
+    wt, rd = _gg_run(tmp_path)
+    e = {**_GG_RUN_ENV, "TMPDIR": str(rd / "tmp")}
+    assert glmguard.shell_refusal(cmd, str(wt), str(rd), e), cmd
+
+
+def test_glm_guard_refuses_a_config_in_its_own_folders_that_runs_a_program_or_that_the_command_writes_first(
+        tmp_path, monkeypatch):
+    from ttp import glmguard
+    _gg_tmp_taken(monkeypatch)
+    wt, rd = _gg_run(tmp_path)
+    (wt / "conf").mkdir()
+    (wt / "conf" / "bad").write_text("Host box-a\n  ProxyCommand nc %h %p\n")
+    (wt / "conf" / "inc").write_text("Include /etc/ssh/ssh_config.d/*\n")
+    (wt / "conf" / "ok").write_text("Host box-a\n  User user\n")
+    e = {**_GG_RUN_ENV, "TMPDIR": str(rd / "tmp")}
+    for cmd in ("ssh -F conf/bad box-a ls", "ssh -F conf/inc box-a ls", "ssh -F conf/missing box-a ls",
+                "printf 'ProxyCommand x\\n' >> conf/ok && ssh -F conf/ok box-a ls",
+                "ssh -F conf/ok box-a ls; cp conf/bad conf/ok; ssh -F conf/ok box-a ls",
+                "ssh -Fx>conf/ok box-a cat; ssh -F conf/ok box-a ls",
+                "cp conf/bad conf/o[k] && ssh -F conf/ok box-a ls", "cp conf/bad conf/'o'k && ssh -F conf/ok box-a ls",
+                "x=k; cp conf/bad conf/o$x && ssh -F conf/ok box-a ls", "cd sub && ssh -F conf/ok box-a ls",
+                "ssh box-a 'ssh -F conf/ok box-b ls'"):
+        assert glmguard.shell_refusal(cmd, str(wt), str(rd), e), cmd
+    assert not glmguard.shell_refusal("ssh -F conf/ok box-a ls", str(wt), str(rd), e)

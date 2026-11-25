@@ -501,3 +501,27 @@ def test_the_glm_code_judge_keeps_a_code_arm_that_matches_its_claude_baseline(en
     assert v["state"] == "ok", v
     assert v["why"].startswith("within every advance margin of the Claude baseline")
     assert "first review pass rate GLM 50 vs Claude 50, level, within the margins" in v["why"]
+
+
+def test_a_task_the_opus_arm_finished_counts_only_its_bounce_not_its_review_outcome(env):
+    """A GLM-arm task bounced to Opus and finished there keeps its bounce in the GLM arm's numbers, but its
+    first review is Opus's verdict, not GLM's: it moves no outcome metric of the GLM arm."""
+    from ttp import glmshare, route
+    p = make(env)
+    now = 1_000_000_000.0 + 60 * 86400
+    t0, glm = _gs_waved(p, now)
+    tid = _gs_task(p, status="done")
+    p.db.set_kv(f"glm_work_arm:{tid}", {"arm": "glm", "why": "x", "ts": t0})
+    _gs_run(p, tid, t0 + 1800, 1, note={route.KEY: {"to": route.TO, "fallback": route.BOUNCE}})
+    _gs_run(p, tid, t0 + 5400, 2, provider="claude", model="opus")   # Opus finishes what GLM bounced
+    _gs_review(p, tid, "failed")
+    v = glmshare.judge(p, _GS_CFG, now)
+    assert v["glm_pct"] == 100.0, "the failed review of the Opus-finished task is not GLM's"
+    assert "bounce rate GLM 20 vs Claude 0" in v["why"], v["why"]   # its bounce still counts: 1 of 5
+    assert all(s["verdict"] != "worse" for s in v["signals"] if s["signal"] == "first review pass rate")
+    retry = _gs_task(p, status="done")   # GLM's own work failed and Opus retried it: no bounce, still GLM's outcome
+    p.db.set_kv(f"glm_work_arm:{retry}", {"arm": "glm", "why": "x", "ts": t0})
+    _gs_run(p, retry, t0 + 1800, 1)
+    _gs_run(p, retry, t0 + 5400, 2, provider="claude", model="opus")
+    _gs_review(p, retry, "failed")
+    assert glmshare.judge(p, _GS_CFG, now)["glm_pct"] < 100.0, "the retry's failed review counts against GLM"

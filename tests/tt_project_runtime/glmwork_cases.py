@@ -156,6 +156,24 @@ def test_glm_work_design_and_device_keepers_read_only_the_tasks_own_goal(env):
         assert kc("Apply it.", title=title) == "review", title
 
 
+def test_glm_work_a_spec_that_commits_in_the_harness_tree_keeps_the_run_on_core(env):
+    """A spec that has the run deliver into the harness tree commits outside its worktree on projects
+    whose harness repo sits beside the checkout, so the guard bounces every such run; the goal line
+    alone keeps the run on core, and a Context-only mention keeps nothing."""
+    from ttp import glmwork
+    p = make(env)
+    cfg = _gw_cfg()
+    kc = lambda spec, title=None, kind="work": glmwork.keeps_core(
+        p.db, cfg, _gw_task(p, spec, kind=kind, **({} if title is None else {"title": title})), "standard")
+    assert kc("Fix the watcher so episodes are stable.\nDeliver by committing in the harness repo (no remote).") \
+        .startswith("harness")
+    assert kc("Fix it.\nReturn: commit sha in the harness repo (no remote, no push).").startswith("harness")
+    assert kc("Commit in the harness repo only, with no push.").startswith("harness")
+    assert kc("Fix it.\n\nContext:\n- The harness repo holds the script; read it only.") == ""
+    assert kc("Commit on your branch.", kind="code") == ""
+    assert kc("Fix it in your worktree; do not commit in the harness repo.") == ""
+
+
 def test_glm_work_bounce_keeps_the_task_on_core(env, monkeypatch):
     from ttp import codearm, glmwork
     p = make(env)
