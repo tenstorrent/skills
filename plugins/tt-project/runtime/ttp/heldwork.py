@@ -138,9 +138,9 @@ def live_items(alias: str, now: float | None = None, where=None) -> list[dict]:
                                 f"{timefmt.short(float(rec.get('since') or 0), where)}"})
     scheds: list[dict] = []
     for name, base, db in ml.project_dbs():   # open tasks and schedules that name it, every project
-        if isinstance(db, Exception):
-            out.append(_unread(name, "database", db))
-        if db is None or isinstance(db, Exception):
+        if db is None or isinstance(db, Exception):   # none yet, or one that cannot be opened (said)
+            if db is not None:
+                out.append(_unread(name, "database", db))
             continue
         try:
             for t, hit in ml.tasks_on(db, on):
@@ -280,11 +280,13 @@ def notes(p, its: list[dict], why: str = "") -> tuple[list[str], list[str]]:
     project's context, `upstream.send` when none exists (a project-less CLI call). The placing
     project's own items are returned instead of a note to itself. A note that is refused (a full
     outbox, a raise) gets one retry as a direct high-severity send, and the second failure is
-    returned as a "note to <project> failed" line, so it is never lost silently."""
+    returned as a "note to <project> failed" line, so it is never lost silently. An `unread` item is no
+    work of its project's on the machine: it stays in the status line and is never put in a note."""
     from . import upstream
     by: dict[str, list[str]] = {}
     for i in its:
-        by.setdefault(i["project"], []).append(i["text"])
+        if i.get("kind") != "unread":
+            by.setdefault(i["project"], []).append(i["text"])
     mine: list[str] = []
     failed: list[str] = []
     for owner, texts in sorted(by.items()):

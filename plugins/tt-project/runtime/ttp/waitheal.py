@@ -208,7 +208,7 @@ def refuse_wait(db, p, task: dict, result: dict, refused: str, why: str, logged:
     timer. The one path for every waiting hand-off whose probe is not stored."""
     db.x("INSERT INTO events(ts,source,kind,severity,text,status,task) VALUES(?,?,?,?,?,?,?)",
          (time.time(), f"task:{task['id']}", "handoff_probe_refused", "normal",
-          f"#{task['id']} {task['title']}: {why}", "queued", task["id"]))
+          f"#{task['id']} {task['title']}: {why}"[:1500], "queued", task["id"]))
     from .daemon import log   # daemon imports this module
     log(p, f"task {task['id']} hand-off: {logged}")
     return {**{k: v for k, v in result.items() if k != "retry_when"}, "retry_when_refused": refused}
