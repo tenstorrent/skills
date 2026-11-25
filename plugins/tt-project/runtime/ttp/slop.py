@@ -620,6 +620,17 @@ def _changed_paths(root, base: str, head: str) -> list[str] | None:
     return [p for p in r.stdout.split("\0") if p] if r.returncode == 0 else None
 
 
+def _new_noise(a: list, b: list) -> list[dict]:
+    old = {(i.path, t) for i in a for _, t in i.noisy}
+    return [{"at": f"{i.path}:{ln}", "text": t[:100]} for i in b for ln, t in i.noisy if (i.path, t) not in old]
+
+
+def new_noisy(root, base: str, head: str) -> list[dict]:
+    """The incident-style comment and docstring lines the change base..head adds, from its changed files only."""
+    changed = set(_changed_paths(root, base, head) or [])
+    return _new_noise(read_tree(root, base, only=changed), read_tree(root, head, only=changed)) if changed else []
+
+
 def delta(root, base: str, head: str, cfg: dict | None = None, cache: str | None = None,
           budget_s: float | None = None) -> dict:
     """What the change base..head adds: per-subsystem differences of the counted numbers (changed ones
@@ -655,9 +666,7 @@ def delta(root, base: str, head: str, cfg: dict | None = None, cache: str | None
         key = lambda g: (g["kind"], g["name"], tuple(a.rsplit(":", 1)[0] for a in g["at"]))   # noqa: E731
         was = {key(g) for g in ra["duplicate_groups"]}
         new_dups = [g for g in rb["duplicate_groups"] if key(g) not in was]
-        old = {(i.path, t) for i in a for _, t in i.noisy}
-        new_noise = [{"at": f"{i.path}:{ln}", "text": t[:100]} for i in b for ln, t in i.noisy if (i.path, t) not in old]
-        out = {"base": base, "head": head, "subsystems": rows, "new_duplicates": new_dups, "new_noisy": new_noise}
+        out = {"base": base, "head": head, "subsystems": rows, "new_duplicates": new_dups, "new_noisy": _new_noise(a, b)}
         if whole is None:
             out["duplicates_partial"] = True
         return out

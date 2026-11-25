@@ -646,6 +646,17 @@ def test_glm_test_hygiene_flags_added_test_lines_naming_real_paths_only():
     assert handoffcheck.glm_test_hygiene(_GW9846_DIFF.replace("+    out", "     out")) == got[1:]   # context line
 
 
+def test_handoff_gaps_want_a_base_failing_run_and_each_numbered_spec_step():
+    from ttp import handoffcheck
+    diff = "+++ b/tests/test_x.py\n+def test_y():\n+++ b/src/x.py\n+def test_helper():\n"
+    spec = "(a) fix x\n(b) test it\nContext:\n1. an earlier finding\n2. another\n"
+    ran = "pytest tests/test_x.py::test_y on base: 1 failed"
+    gaps = handoffcheck.handoff_gaps(diff, spec, {"self_check": "(a) done"})
+    assert len(gaps) == 2 and "test_y" in gaps[0] and "test_helper" not in gaps[0] and "step b:" in gaps[1], gaps
+    assert handoffcheck.handoff_gaps(diff, spec, {"self_check": f"{ran}. (a) done; (b) not done: no device"}) == []
+    assert handoffcheck.handoff_gaps("+++ b/src/x.py\n+x = 1\n", "1. one step\n", {}) == []
+
+
 def _gw9846_task(p, provider, model, branch):
     tid = p.db.add_task("fix the helper", "spec", kind="code", tier="standard", origin="coordinator")
     p.db.update_task(tid, branch=branch)
@@ -671,3 +682,21 @@ def test_a_glm_code_runs_hand_off_is_sent_back_for_a_test_on_the_real_tmp(env):
     assert handoffcheck.verdict(p, {}, glm, {"status": "waiting"}, None) == {}
     claude = _gw9846_task(p, "claude", "opus", "ttp/gw9846")
     assert handoffcheck.verdict(p, {}, claude, {"status": "done"}, None) == {}
+
+
+def test_a_glm_hand_off_is_sent_back_for_an_incident_comment_and_passes_once_it_states_the_rule(env):
+    from ttp import handoffcheck, route
+    p = make(env)
+    git = lambda *a: subprocess.run(["git", "-C", str(p.root), *a], check=True, capture_output=True)   # noqa: E731
+    git("checkout", "-q", "-b", "ttp/gw9860")
+    src = p.root / "gw9860.py"
+    src.write_text('def f():\n    """Fixed after the outage on 2026-11-24."""\n    return 1\n')
+    git("add", "-A")
+    git("commit", "-qm", "an incident docstring")
+    glm = _gw9846_task(p, route.TO, "example-org/glm-x", "ttp/gw9860")
+    got = handoffcheck.verdict(p, {}, glm, {"status": "done"}, None)
+    assert "gw9860.py:2: Fixed after the outage" in got["failed"]["output"], got
+    src.write_text('def f():\n    """One per call: a retry never doubles it."""\n    return 1\n')
+    git("commit", "-qam", "the rule instead")
+    git("checkout", "-q", "-")
+    assert handoffcheck.verdict(p, {}, glm, {"status": "done"}, None) == {}

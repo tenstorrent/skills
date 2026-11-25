@@ -26,8 +26,10 @@ STOP_BUDGET_S in all) or any fault of the hook lets the run end: the daemon's ch
 gate. A check sees AT_ENV=stop there, with the run's own variables (RUN_VARS) left out.
 
 A code task's hand-off from a run on the GLM model also meets one built-in check (glm_check, no setting): its
-branch's added test lines must not name the real /tmp, /home, ~ or Path.home() (glm_test_hygiene). It fails and
-sends back like a project check, under the same cap."""
+branch's added test lines must not name the real /tmp, /home, ~ or Path.home() (glm_test_hygiene), its added
+comments and docstrings must not tell an incident (slop.new_noisy), and its hand-off must show its new tests failing
+on the base and name each numbered spec step (handoff_gaps). It fails and sends back like a project check, under
+the same cap."""
 from __future__ import annotations
 
 import hashlib
@@ -59,13 +61,16 @@ RUN_VARS = ("TTP_RUN_DIR", "TTP_TASK", "TTP_TASK_ID", "TTP_RUN_ID", "TTP_PROJECT
 SEEN_TTL_S = 300
 KILL_WAIT_S = 5                   # the wait for a killed check's output; an escaped child is not waited for
 _seen: dict[tuple[str, int, str], tuple[float, dict]] = {}
-GLM_CHECK = "glm test hygiene"
+GLM_CHECK = "glm hand-off check"
 # The real machine's paths in a test (a temp dir or the user's home): a string literal that opens with one, or
 # Path.home(); tmp_path or monkeypatch on the line clears it. Paths in docstrings, comments, the middle of a string
 # (fixture data) and an endswith/startswith comparison are text, not files the test touches.
 REAL_PATH = re.compile(r"(?<!endswith\()(?<!startswith\()(?<![\w\"'])[rfbRFB]{0,2}[\"'](?:/tmp\b|/home/|~/)"
                        r"|\bPath\.home\(\)")
 TEST_FILE = re.compile(r"(?:^|/)(?:tests?/|test_[^/]*\.py$|[^/]*_test\.py$)")
+NEW_TEST = re.compile(r"^\+\s*(?:async\s+)?def (test_\w+)|^\+\s*(?:it|test)\(\s*[\"'`]([^\"'`]+)")
+BASE_FAILS = re.compile(r"(?i)\bbase\b.{0,120}\bfail|\bfail.{0,120}\bbase\b")   # a run line: the new test fails on base
+STEP = re.compile(r"^\s*(?:\(([a-z]|\d{1,2})\)|(\d{1,2})[.)])\s+\S")   # a spec's numbered step: (a), (1), 1. or 1)
 
 
 def rules(cfg: dict) -> tuple[list[dict], list[str]]:
@@ -120,21 +125,48 @@ def applies(cfg: dict, task: dict, handoff) -> list[dict]:
     return [c for c in rules(cfg)[0] if c["kinds"] is None or kind in c["kinds"]]
 
 
-def glm_test_hygiene(diff_text: str) -> list[str]:
-    """One line per added test-file line of the unified diff `diff_text` that names a real path (REAL_PATH),
-    comments and lines using tmp_path or monkeypatch aside."""
-    out, path = [], ""
+def _added(diff_text: str):
+    """(path, line) for each line a unified diff adds, the line with its leading '+'."""
+    path = ""
     for line in (diff_text or "").splitlines():
         if line.startswith(("diff --git", "+++ ")):
             path = line[4:].strip().removeprefix("b/") if line.startswith("+++ ") else ""
-            continue
+        elif line.startswith("+"):
+            yield path, line
+
+
+def glm_test_hygiene(diff_text: str) -> list[str]:
+    """One line per added test-file line of the unified diff `diff_text` that names a real path (REAL_PATH),
+    comments and lines using tmp_path or monkeypatch aside."""
+    out = []
+    for path, line in _added(diff_text):
         code = line[1:].split(" #")[0]
-        if not line.startswith("+") or not TEST_FILE.search(path) or code.lstrip().startswith(("#", '"""', "'''")) \
+        if not TEST_FILE.search(path) or code.lstrip().startswith(("#", '"""', "'''")) \
                 or "tmp_path" in code or "monkeypatch" in code:
             continue
         if m := REAL_PATH.search(code):
             real = m.group(0).lstrip("rfbRFB\"'")
             out.append(f"{path}: `{code.strip()[:160]}` uses the real {real}: use tmp_path or monkeypatch")
+    return out
+
+
+def handoff_gaps(diff_text: str, spec: str, handoff: dict) -> list[str]:
+    """What a hand-off leaves out: a run line showing the tests the diff adds fail on the base commit, and a
+    self_check naming each numbered step of the spec (the steps above its Context: block, two or more)."""
+    out = []
+    tests = [m.group(1) or m.group(2) for path, line in _added(diff_text) if TEST_FILE.search(path)
+             for m in [NEW_TEST.match(line)] if m]
+    if tests and not BASE_FAILS.search(json.dumps(handoff)):
+        out.append(f"New tests ({', '.join(tests[:5])}) with no line showing them fail on the base commit: run them "
+                   "there and put the command and its failing result in your self_check.")
+    steps = list(dict.fromkeys(m.group(1) or m.group(2) for line in re.split(r"(?mi)^\s*Context:", spec or "")[0]
+                               .splitlines() for m in [STEP.match(line)] if m))
+    check = handoff.get("self_check")
+    check = check if isinstance(check, str) else json.dumps(check or "")
+    missed = [s for s in steps if not re.search(rf"(?i)(?<![\w.#])(?:\({s}\)|{s}[.):]|(?:step|part|item)\s+{s}\b)", check)]
+    if len(steps) > 1 and missed:
+        out.append(f"Your self_check names no spec step {', '.join(missed)}: list each numbered step with done, or "
+                   "not done and why.")
     return out
 
 
@@ -149,8 +181,9 @@ def _glm_run(p: Project, task: dict) -> bool:
 
 
 def glm_check(p: Project, task: dict, handoff) -> dict | None:
-    """The built-in check's failure ({name, output}) on a GLM run's hand-off: glm_test_hygiene over its branch's
-    diff from its fork point (else the base). None when it passes, does not apply or git cannot tell."""
+    """The built-in check's failure ({name, output}) on a GLM run's hand-off: glm_test_hygiene, slop.new_noisy and
+    handoff_gaps over its branch's diff from its fork point (else the base). None when it passes, does not apply or
+    git cannot tell."""
     if not isinstance(handoff, dict) or handoff.get("status") not in STATUSES or not _glm_run(p, task):
         return None
     from . import worktree
@@ -165,9 +198,16 @@ def glm_check(p: Project, task: dict, handoff) -> dict | None:
                              capture_output=True, text=True, timeout=DEFAULT_TIMEOUT_S)
     except (OSError, RuntimeError, subprocess.SubprocessError):   # git cannot tell: the hand-off stands
         return None
-    bad = glm_test_hygiene(got.stdout) if got.returncode == 0 else []
-    return {"name": GLM_CHECK, "output": "Tests must not touch the real machine's paths:\n" + "\n".join(bad[:20])} \
-        if bad else None
+    if got.returncode != 0:
+        return None
+    from . import slop
+    bad = glm_test_hygiene(got.stdout)
+    noisy = slop.new_noisy(root, base, head)
+    out = (["Tests must not touch the real machine's paths:", *bad[:20]] if bad else []) \
+        + (["Comments and docstrings state the rule, never an incident (a date, id or host):",
+            *(f"{n['at']}: {n['text']}" for n in noisy[:20])] if noisy else []) \
+        + handoff_gaps(got.stdout, task.get("spec") or "", handoff)
+    return {"name": GLM_CHECK, "output": "\n".join(out)} if out else None
 
 
 def _digest(handoff: dict) -> str:

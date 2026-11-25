@@ -222,9 +222,11 @@ def size_check(advisor: bool = False) -> str:
             "correctness. Never widen what a change reads or runs on a device or live service beyond what the spec "
             "names, and bound any new read of one in time."
             "\n\n## Before you hand off: tests and spec steps\n"
-            "Tests use tmp_path and monkeypatch, never the real /tmp, /home or ~. Each new test must fail on the "
-            "base commit: run it there or reason it through. When you change a field or function, grep every reader "
-            "and update it. Your self_check names each numbered spec step and what does it.")
+            "Tests use tmp_path and monkeypatch, never the real /tmp, /home or ~, nor code whose default paths are "
+            "the real ones. Each new test must fail on the base commit: run it there and put the command and its "
+            "failing result in your self_check. When you change what a field, function or file holds, or stop "
+            "writing one, grep every reader, update it and list the readers in your self_check. Your self_check "
+            "names each numbered spec step with done, or not done and why.")
 
 
 def ring_gate(cfg: dict, project: str, raw: dict | None) -> dict:
