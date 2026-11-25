@@ -90,16 +90,21 @@ def tick_done(state: Path, receipt: dict | None) -> float | None:
         return None
 
 
-def running(state: Path, pid: int) -> dict | None:
+def running(state: Path, pid: int | None) -> dict | None:
     """The receipt of daemon `pid` from its heartbeat, else from its start marker (a daemon still in
-    its first tick); None when neither names that pid with a receipt (an older daemon)."""
+    its first tick); None when neither names that pid with a receipt (an older daemon). A `pid` of
+    None reads whichever daemon the record itself names, for a process beside the daemon (a
+    coordinator session): the record's own pid and its receipt's must still agree."""
     for name in ("heartbeat", "daemon.start"):
         try:
             d = json.loads((state / name).read_text())
         except (OSError, ValueError):
             continue
         r = d.get("receipt") if isinstance(d, dict) else None
-        if isinstance(r, dict) and int(d.get("pid") or 0) == pid and int(r.get("pid") or 0) == pid:
+        if not isinstance(r, dict):
+            continue
+        same = int(d.get("pid") or 0) == int(r.get("pid") or 0)
+        if same and (pid is None or (int(d.get("pid") or 0) == pid and int(r.get("pid") or 0) == pid)):
             return r
     return None
 

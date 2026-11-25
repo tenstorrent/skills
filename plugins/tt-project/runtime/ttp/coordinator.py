@@ -2756,21 +2756,10 @@ def _pending_checked(p: Project, text: str, notes: list, what: str) -> str:
 
 
 def _running_commit(p: Project) -> str:
-    """The commit of the runtime the project's daemon runs. The daemon reads its own receipt;
-    a session's coordinator (another process) reads the daemon's heartbeat, which names the
-    daemon and its receipt. "" when neither names one."""
+    """The commit of the runtime the project's daemon runs: its receipt, read from the heartbeat
+    or start marker, whether the coordinator runs in the daemon or beside it."""
     from . import identity
-    r = identity.running(p.state, os.getpid())
-    if r is None:
-        for name in ("heartbeat", "daemon.start"):
-            try:
-                d = json.loads((p.state / name).read_text())
-            except (OSError, ValueError):
-                continue
-            rc = d.get("receipt") if isinstance(d, dict) else None
-            if isinstance(rc, dict) and int(d.get("pid") or 0) == int(rc.get("pid") or 0):
-                r = rc   # the record's own receipt: the pid pair still has to agree
-                break
+    r = identity.running(p.state, os.getpid()) or identity.running(p.state, None)
     return str((r or {}).get("commit") or "")
 
 
@@ -3849,6 +3838,7 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                     if why:
                         raise ValueError(f"ask_user rejected: {why}")
                 text = _wakemode_checked(p, text, notes)
+                text = _deploy_checked(p, text, notes)   # a claim in an ask is tagged the same way
                 text, rec = db.for_user(text), db.for_user((a.get("recommendation") or "").strip())   # notes follow them
                 least = db.for_user(least)   # the least-disruptive part is appended mid-message: its tag would stay
                 if a["blocking"] == "restriction":

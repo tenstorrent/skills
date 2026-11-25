@@ -492,6 +492,26 @@ def test_the_reply_path_never_rewrites_and_tags_only_a_failing_live_or_landed_li
     assert sent[0]["text"] == "On it. I'll report by 14:00." and not notes, (sent, notes)
 
 
+def test_an_ask_with_a_failing_live_line_is_tagged_like_a_reply(env, monkeypatch):
+    """The ask path gets the same tag-only check: a live line whose named commit the running
+    version definitely does not hold goes out with one ' (unverified)' tag, and an ask with no
+    claim goes out as written."""
+    from ttp import coordinator as coord
+    p, repo, head = _claim_replay_setup(env, monkeypatch, landed=True)
+    _commit(repo, "side.txt", "side\n")
+    side = _git_out(repo, "rev-parse", "HEAD")   # a commit the running version does not hold
+    _git_out(repo, "reset", "-q", "--hard", head)
+    (p.state / "heartbeat").write_text(json.dumps(
+        {"pid": 999999, "receipt": {"pid": 999999, "commit": head}}))
+    coord.apply(p, [{"type": "ask_user", "text": f"The fix is live (commit {side[:10]}). May I close the task?",
+                     "blocking": "spend"}])
+    ask = p.db.one("SELECT text FROM messages WHERE kind='ask'")["text"]
+    assert f"The fix is live (unverified) (commit {side[:10]})." in ask, ask   # tagged, never rewritten
+    coord.apply(p, [{"type": "ask_user", "text": "May I spend $40 on the long run?", "blocking": "spend"}])
+    ask = p.db.q("SELECT text FROM messages WHERE kind='ask' ORDER BY id DESC LIMIT 1")[0]["text"]
+    assert ask.startswith("May I spend $40 on the long run?"), ask
+
+
 def test_a_reply_s_tagged_landed_claim_is_never_tagged_twice(env, monkeypatch):
     """A reply's landed line naming a commit the push branch does not hold gets one
     '(unverified)' tag; a second pass over the tagged text adds no second tag."""
