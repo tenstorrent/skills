@@ -470,16 +470,22 @@ DISCUSSES_RE = re.compile(r"\b(never|not|refuse\w*|reject\w*|den(?:y|ies|ied)|gu
 # punctuation or "then", so "No reviewers, then run gh pr ready" still orders it.
 CLAUSE_END_RE = re.compile(r"[,:;()\n]|\bthen\b", re.I)
 FORBIDS_RE = re.compile(r"\b(?:no|never|not|without)\b|n't\b|\bkeep\w*\b[^.;\n]*\bdraft\b", re.I)
+# The user (or owner) is the one who does it, right before the mention: "the user takes it out of draft".
+USER_ACTS_RE = re.compile(r"\b(?:user|owner)\s+(?:will\s+|then\s+|later\s+|alone\s+)?$", re.I)
 
 
 def _orders_ready(sentence: str) -> bool:
-    """`sentence` tells a worker to take a PR out of draft: a mention not forbidden in its clause."""
+    """`sentence` tells a worker to take a PR out of draft: a mention not forbidden in its clause, nor one
+    the user is the subject of ("the user takes it out of draft" says who does it, it orders no one)."""
     if DISCUSSES_RE.search(sentence):
         return False
-    for m in READY_INSTR_RE.finditer(sentence):
+    pos = 0
+    while m := READY_INSTR_RE.search(sentence, pos):
+        pos = m.start() + 1   # overlapping: "the user marks X, mark Y ready" is still an order
         before = sentence[:m.start()]
         ends = [e.end() for e in CLAUSE_END_RE.finditer(before)]
-        if not FORBIDS_RE.search(before[ends[-1] if ends else 0:]):
+        clause = before[ends[-1] if ends else 0:]
+        if not FORBIDS_RE.search(clause) and not USER_ACTS_RE.search(clause):
             return True
     return False
 

@@ -5295,6 +5295,17 @@ def test_tried_work_ledger_does_not_match_unrelated_work_sharing_numbered_steps_
     assert tried.params("Llama-3.1 e2e timing with the Llama 3.2 tokenizer, Python 3.12") == set()
 
 
+def test_the_same_step_on_another_commit_or_release_is_not_already_tried():
+    """A rollout or check under the same title on another commit or release is new work (its inputs
+    changed); on the same commit, or with no commit named, it is still a repeat."""
+    from ttp import tried
+    old = ("Rollout box-a", "Deploy 0.2.1540 (commit 1a2b3c4d) on box-a and run the smoke check.")
+    assert not tried.similar("Rollout box-a", "Deploy 0.2.1544 (commit 9f8e7d6c) on box-a and run the smoke check.", *old)
+    assert tried.similar("Rollout box-a", "Deploy 0.2.1540 (commit 1a2b3c4d5e) on box-a and run the smoke check.", *old)
+    assert tried.similar("Rollout box-a", "Deploy it on box-a and run the smoke check.", *old)
+    assert tried.targets("fix ea2d6eeacee60e19 in 0.2.300, task #12, 2026-11-25") == {"ea2d6ee", "0.2.300"}
+
+
 def test_actions_schema_lists_every_action_key_apply_reads():
     # A provider that enforces the schema strictly drops a key it does not list, so every key apply()
     # (or a helper it hands the action to) reads must be a property of ACTIONS_SCHEMA's action items.
@@ -12710,10 +12721,13 @@ def test_task_specs_that_forbid_leaving_draft_pass_the_gate_and_orders_still_do_
                               "Fix CI on acme/widgets#7; no gh pr ready, no reviewers.",
                               "Keep acme/widgets#7 in draft and leave gh pr ready to the user.",
                               "Request no reviewers and no gh pr ready on acme/widgets#7.",
-                              "Push fixes without marking it ready.")):
+                              "Push fixes without marking it ready.",
+                              "Leave acme/widgets#7 as is: the user takes it out of draft.",
+                              "Once green, the user will mark acme/widgets#7 ready.")):
         assert coord.apply(p, [{"type": "task_add", "title": f"ok {n}", "kind": "code", "spec": spec}]) == [], spec
     for spec in ("Run gh pr ready on acme/widgets#7.", "No reviewers, then run gh pr ready on acme/widgets#7.",
-                 "Fix the lint, no merge, mark acme/widgets#7 ready.", "No push: gh pr ready 7 in acme/widgets#7."):
+                 "Fix the lint, no merge, mark acme/widgets#7 ready.", "No push: gh pr ready 7 in acme/widgets#7.",
+                 "After the user marks the docs done, mark acme/widgets#7 ready."):
         out = " ".join(coord.apply(p, [{"type": "task_add", "title": "ready it", "kind": "code", "spec": spec}]))
         assert "approval is not on record" in out, spec
     assert not p.db.q("SELECT id FROM tasks WHERE title='ready it'")

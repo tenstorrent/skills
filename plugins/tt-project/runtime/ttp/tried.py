@@ -67,6 +67,7 @@ _BOUND_BEFORE = re.compile(r"\b(bound|ceiling|cap|limit|target|threshold|up to|a
 # work is, so left out of its words and parameters.
 _BOILERPLATE = re.compile(r"^\W*(restrictions?|binding restrictions|rules|constraints|return|hand-?off)\b", re.I)
 # A task title that redoes another task's change: "rebase #12 onto ...", "rebased #12" (landed._REBASE_TITLE).
+_SHA = re.compile(r"\b(?=[0-9a-f]*\d)(?=[0-9a-f]*[a-f])[0-9a-f]{7,40}\b")   # a commit: what a step acts on
 _REBASE_TITLE = re.compile(r"\brebas(?:e|ed|es|ing)\s+(?:task\s+)?#(\d+)(?!\d)", re.I)
 _DIFFERS = re.compile(r"\b(differ\w*|unlike|instead of)\b", re.I)
 _NAME_BEFORE = re.compile(r"\b[A-Za-z]*[A-Z][\w-]*\s$")
@@ -126,6 +127,13 @@ def params(text: str) -> frozenset[str]:
     return frozenset(out)
 
 
+def targets(text: str) -> frozenset[str]:
+    """The commits (7+ hex digits) and releases (0.2.300) a title or spec acts on: a rollout or check of
+    another commit is new work under the same title."""
+    text = text or ""
+    return frozenset(m[:7] for m in _SHA.findall(text.lower())) | frozenset(_VERSION.findall(text))
+
+
 def _jaccard(a: set, b: set) -> float:
     return len(a & b) / len(a | b) if a | b else 0.0
 
@@ -145,9 +153,12 @@ def common(ledger: list[dict]) -> frozenset:
 
 
 def similar(title1: str, spec1: str, title2: str, spec2: str, usual: frozenset = frozenset()) -> bool:
-    """Whether new work (title1, spec1) repeats earlier work (title2, spec2). `usual` (see common)
-    is left out of the shared parameters and title subject that the parameters rule needs."""
+    """Whether new work (title1, spec1) repeats earlier work (title2, spec2): never when both name the
+    commits or releases they act on (targets) and share none. `usual` (see common) is left out of the shared parameters and title subject that the parameters rule needs."""
     spec1, spec2 = content(spec1), content(spec2)
+    t1, t2 = targets(f"{title1} {spec1}"), targets(f"{title2} {spec2}")
+    if t1 and t2 and not t1 & t2:
+        return False   # the same step on another commit or release ("Rollout box-a" of a newer head)
     p1, p2 = params(f"{title1} {spec1}"), params(f"{title2} {spec2}")
     shared = len(p1 & p2)
     share = shared / len(p1) if p1 else 0.0
