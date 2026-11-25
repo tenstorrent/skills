@@ -7485,15 +7485,17 @@ def test_follow_ups_and_redos_carry_a_branch_only_when_they_should(env):
     assert coord.apply(p, [{"type": "task_add", "title": "Land the docs, redo", "kind": "code", "continues": bad2,
                             "pr_branch": "", "spec": "Land the docs."}]) == []
     assert push.pr_branch_of(p, task("Land the docs, redo")) == ""
-    # ... or on task_update before it starts, which also drops its own label; never once it runs.
+    # ... or on task_update before it starts, which also drops its own label; once it runs, a new task after it.
     assert coord.apply(p, [{"type": "task_update", "id": task("Feature PR again")["id"], "pr_branch": ""},
                            {"type": "task_update", "id": task("Fix the loader PR")["id"], "pr_branch": ""}]) == []
     assert labels("Feature PR again") == [f"continues:{gone}", "no_pr_branch"]
     assert labels("Fix the loader PR") == ["no_pr_branch"]
     assert push.pr_branch_of(p, task("Feature PR again")) == ""
     p.db.update_task(task("Land the docs, redo")["id"], status="running")
-    problems = coord.apply(p, [{"type": "task_update", "id": task("Land the docs, redo")["id"], "pr_branch": ""}])
-    assert problems and "running" in problems[0]
+    redo = task("Land the docs, redo")
+    assert coord.apply(p, [{"type": "task_update", "id": redo["id"], "pr_branch": ""}]) == []
+    assert task("Land the docs, redo")["labels"] == redo["labels"], "a running task's branch never changes"
+    assert any(f"a task_add of #{redo['id']}'s work after it ends" in n for n in p.db.kv(coord.NOTES_KEY, []))
 
 
 def test_own_push_refuses_a_pr_branch_that_exists_nowhere(env, monkeypatch):

@@ -1484,10 +1484,10 @@ def _obform_notes(p, coord):
     return [n for n in p.db.kv(coord.NOTES_KEY) or [] if "applied as" in n], " ".join(p.db.kv(coord.NOTES_KEY) or [])
 
 
-def test_obform_a_finished_owner_is_replaced_by_its_one_open_heir(env, monkeypatch):
+def test_obform_a_finished_owner_is_replaced_by_its_open_heirs(env, monkeypatch):
     """Item 5 (sample: owner done #A, open "Fix review #A"): the fix is attached instead, with one note, and
-    coordprecheck refuses nothing. A finished owner with no open successor, or two, is left out with
-    fit_owners' note and the rest attached."""
+    coordprecheck refuses nothing. A finished owner with two open successors gets both (#9824); one with
+    none is left out with fit_owners' note and the rest attached."""
     from ttp import coordinator as coord, coordprecheck, obligations as ob
     p, d, now, tid, check, mid, raised = _order_setup(env, monkeypatch)
 
@@ -1497,17 +1497,17 @@ def test_obform_a_finished_owner_is_replaced_by_its_one_open_heir(env, monkeypat
     for t in (done, lone, twice):
         p.db.update_task(t, status="done")
     fix = task(f"Fix review #{done}: build part a")
-    task(f"Fix review #{twice}: build part c")
-    task("continue: build part c", parent=twice)
+    fix2 = task(f"Fix review #{twice}: build part c")
+    hop2 = task("continue: build part c", parent=twice)
     oid = ob.add(p, "the benchmark table", [tid], now=now)
     act = {"type": "obligation", "key": oid, "owners": [done, lone, twice]}
     assert coordprecheck.problems(p, [dict(act)]) == []
     assert coord.apply(p, [act]) == []
     applied, notes = _obform_notes(p, coord)
-    assert applied == [f"actions[0] (obligation) applied as: owners=[{fix}, {lone}, {twice}] "
+    assert applied == [f"actions[0] (obligation) applied as: owners=[{fix}, {lone}, {fix2}, {hop2}] "
                        f"(was: [{done}, {lone}, {twice}])"], applied
-    assert sorted(ob.get(p.db, oid)["owners"]) == sorted([str(tid), str(fix)])
-    assert f"#{lone} is done, so not attached" in notes and f"#{twice} is done, so not attached" in notes
+    assert sorted(ob.get(p.db, oid)["owners"]) == sorted([str(tid), str(fix), str(fix2), str(hop2)])
+    assert f"#{lone} is done, so not attached" in notes and f"#{twice} is done" not in notes
 
 
 def test_obform_owner_0_is_left_out_and_the_rest_recorded(env, monkeypatch):

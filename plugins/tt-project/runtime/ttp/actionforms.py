@@ -6,8 +6,8 @@ A form with exactly one reading (a sweep key sent in the wrong field, an obligat
 finished with one open successor, a due move on an obligation already closed) is applied as that
 reading instead of being refused and resent. Each rewrite leaves one note, 'applied as: ... (was: ...)',
 shown in the next digest as information only and tallied as 'normalised' (rejtally). A form with
-more than one reading, or one the rules refuse on purpose (a receipt on partial work, the ask gate,
-a user-only setting, a quote only in relayer context), passes through unchanged and meets its usual
+more than one reading, or one the rules refuse on purpose (a post as the owner, a loosened Restriction,
+a spend cap or credential without the user's word), passes through unchanged and meets its usual
 check.
 
 coord.apply and the in-turn dry run (coordprecheck.problems) both call `normalise` first, so the dry
@@ -23,7 +23,8 @@ log = logging.getLogger(__name__)
 # action type -> the modules whose `normal_form(p, a, batch, home, now)` rewrite it, in order; each
 # returns (rewritten action, note) or None. A form lives beside the check it satisfies.
 FORMS = {"sweep": ("sweep",), "obligation": ("obligations", "coordsession"), "memory_add": ("coordsession",),
-         "observation_mute": ("throughmute",), "reply": ("turnrules",)}
+         "observation_mute": ("throughmute",), "reply": ("turnrules",), "task_add": ("taskforms",),
+         "task_update": ("taskforms",), "config_set": ("configwho",)}
 
 
 def normalise(p, actions: list, *, home: str, now: float) -> tuple[list, list[str]]:

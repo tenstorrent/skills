@@ -34,6 +34,10 @@ import time
 from .util import read_dict
 
 KEY = "config_provenance"
+# A value the user set that only their (or the owner's agent's) word changes (#9824): spend caps, credentials,
+# push permission and the machine allowlist. Any other user-set value a coordinator may change, with a note.
+USERS_WORD = re.compile(r"^(budget(\.|$)|delivery\.(push_allowed|code_tasks_may_push)$|machines(\.allowed)?$)|token|secret|password|credential"
+                        r"|api_?key|mcp_", re.I)
 ROLES = ("user", "coordinator", "worker", "harness", "default", "upgrade", "migration", "unknown")
 
 
@@ -362,15 +366,15 @@ def guard(p, key: str, setter: dict | None, before, after) -> bool:
 
 
 def _coordinator_guard(p, key: str, setter: dict | None, before, after) -> bool:
-    """guard() for a coordinator: it never changes a value under `key` whose recorded setter is the user,
-    raising or lowering it (only the user changes it: at a terminal, or in chat, where a config_set in the
+    """guard() for a coordinator: it never changes a value under `key` whose recorded setter is the user and
+    that only the user's word changes (USERS_WORD; any other it changes, noted by normal_form), raising or lowering it (only the user changes it: at a terminal, or in chat, where a config_set in the
     turn carrying their own message is recorded as theirs). Turning a switch its safe way (_safe_way) stays
     anyone's, as for an automated setter. The refusal names the
     user's value and when they set it, and is logged; the coordinator sees it as its rejected action.
     True when the value is already the user's (nothing written, their record stays)."""
     hits = []
     for k in [key] + sorted(k for k in _all(p.db) if k.startswith(key + ".")):
-        if at(before, k) != at(after, k) and not _safe_way(k, at(after, k)) \
+        if at(before, k) != at(after, k) and not _safe_way(k, at(after, k)) and USERS_WORD.search(k) \
                 and role(rec := lookup(p.db, k, before)) == "user":
             old = at(before, k)
             hits.append(f"{k} is {'unset' if old is _ABSENT else json.dumps(shown(k, old))} "
@@ -550,3 +554,29 @@ def review_lines(p, now: float | None = None) -> list[str]:
     """The last 24 h of config changes not made by the user, refusals included, for the daily review."""
     now = time.time() if now is None else now
     return [line(r, p) for r in history(p, since=now - 86400) if role(r) != "user"]
+
+
+def normal_form(p, a: dict, _batch: list, _home: str, _now: float):
+    """actionforms (#9824): a config_set of an unknown key that means one current key (its last part, or its
+    section and last part joined by '_', under one other section; or a near spelling) is applied to that key; one changing a value the user set,
+    outside USERS_WORD, is applied with a note naming the user's value. None otherwise."""
+    import difflib
+    from .project import _known_keys, account_keys, unknown_key_hint
+    key = str(a.get("key") or "").strip()
+    if not key or key in account_keys():   # an account key means itself, never a project key
+        return None
+    if unknown_key_hint(key) and not key.startswith(("budget.", "machines")):
+        *head, leaf = key.split(".")
+        tops = sorted(_known_keys([]) or ())
+        both = [f"{s}.{x}" for s in tops for x in (leaf, "_".join([*head[-1:], leaf]))
+                if s != (head or [""])[0] and x in (_known_keys([s]) or ())]
+        near = difflib.get_close_matches(leaf, sorted(_known_keys(head) or ()), n=2, cutoff=0.85) if head else []
+        to = both[0] if len(both) == 1 else ".".join([*head, near[0]]) if len(near) == 1 else None
+        if to and not unknown_key_hint(to):
+            return {**a, "key": to}, f"key={to!r} (was: {key!r}, no such key)"
+        return None
+    raw = p.raw_config()
+    if USERS_WORD.search(key) or at(raw, key) is _ABSENT or role(rec := lookup(p.db, key, raw)) != "user":
+        return None
+    return a, (f"{key} over the user's value {json.dumps(shown(key, at(raw, key)))[:120]} (set by {describe(rec, p)}); "
+               f"they can set it back with `ttp config` (was: refused, a value the user set)")

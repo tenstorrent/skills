@@ -414,12 +414,28 @@ def _descends(db, t: dict, owners: dict) -> str | None:
     return None
 
 
-def _heir(db, t: dict) -> int | None:
-    """The one open task (NAMED_OPEN) carrying finished task `t`'s work on (_descends); None when none or
-    several do."""
+def _heirs(db, t: dict) -> list[int]:
+    """The open tasks (NAMED_OPEN) carrying finished task `t`'s work on (_descends): its continuing or fix tasks."""
     rows = db.q(f"SELECT * FROM tasks WHERE status IN ({','.join('?' * len(NAMED_OPEN))})", NAMED_OPEN)
-    heirs = [r["id"] for r in rows if _descends(db, r, {str(t["id"]): t})]
-    return heirs[0] if len(heirs) == 1 else None
+    return [r["id"] for r in rows if _descends(db, r, {str(t["id"]): t})]
+
+
+def _change_tasks(db, t: dict) -> list[int]:
+    """For a task of a kind that cannot carry a change order (UNFIT_OWNER_KINDS): the tasks making its change.
+    A review's: the task it reviews (its auto_review: label, else its dependencies), or that one's open heirs
+    once it finished; a plan's or question's: its open child tasks of a fit kind."""
+    from .db import dependency_ids
+    if t["kind"] == "review":
+        named = [int(lb[12:]) for lb in json.loads(t.get("labels") or "[]")
+                 if isinstance(lb, str) and lb.startswith("auto_review:") and lb[12:].isdigit()] or dependency_ids(t)
+        out = []
+        for r in filter(None, (db.task(int(x)) for x in named)):
+            if r["kind"] not in UNFIT_OWNER_KINDS:
+                out += _heirs(db, r) if r["status"] in CLOSED else [r["id"]]
+        return out
+    return [r["id"] for r in db.q(f"SELECT id, kind FROM tasks WHERE parent=? AND status IN "
+                                  f"({','.join('?' * len(NAMED_OPEN))})", (t["id"], *NAMED_OPEN))
+            if r["kind"] not in UNFIT_OWNER_KINDS]
 
 
 def _attach_carriers(p, st: dict, now: float, tids=None) -> list[tuple[str, int]]:
@@ -2286,8 +2302,9 @@ class DueNote(ValueError):
 
 def normal_form(p, a: dict, _batch: list, _home: str, _now: float):
     """An `obligation` action's `owners` as meant (actionforms.normalise): a placeholder owner 0 left out,
-    and a finished owner not attached yet replaced by its one open heir (_heir) that can carry it
-    (unfit_owner). One with none or several is left to fit_owners, which notes it and attaches the rest.
+    a finished owner not attached yet replaced by its open heirs (_heirs) that can carry it (unfit_owner),
+    and a review, plan or question owner of a change order by the tasks making its change (_change_tasks).
+    One with none is left to fit_owners, which notes it and attaches the rest.
     None when nothing changes."""
     sent = a.get("owners")
     if not isinstance(sent, list):
@@ -2302,10 +2319,10 @@ def normal_form(p, a: dict, _batch: list, _home: str, _now: float):
         if x in (0, "0"):
             continue   # a placeholder, not a task
         t = db.task(int(x))
-        if t and t["status"] in CLOSED and str(t["id"]) not in owned and (heir := _heir(db, t)) \
-                and not unfit_owner(db, cls, [heir]):
-            x = heir
-        owners.append(x)
+        swap = [] if not t or str(t["id"]) in owned else \
+            _change_tasks(db, t) if unfit_owner(db, cls, [t["id"]]) else _heirs(db, t) if t["status"] in CLOSED else []
+        swap = [h for h in swap if not unfit_owner(db, cls, [h])]
+        owners += [h for h in swap if h not in owners] if swap else [x]
     if owners == sent:
         return None
     a["owners"] = owners

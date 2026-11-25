@@ -108,7 +108,8 @@ def apply(key: str, value: Any, by: dict) -> str:
     value = conv(key)(value)
     old = current(key)
     who = str((by or {}).get("by") or "unknown")
-    if who != "user" and user_set(key, old):
+    was_user = who != "user" and user_set(key, old)
+    if was_user and who != "coordinator":   # a coordinator lowers it, noted (#9824)
         raise ValueError(f"{key} is {json.dumps(old)}, set by the user: only the user changes it "
                          f"(ask them, with the value and why)")
     if who != "user" and raises(key, old, value):
@@ -118,7 +119,8 @@ def apply(key: str, value: Any, by: dict) -> str:
     set_account_setting(key, value)
     rec = {"ts": round(time.time(), 3), "key": key, "old": old, "new": value, "undo": undo_cmd(key, old), **(by or {})}
     durable_append(log_path(), json.dumps(rec, sort_keys=True) + "\n")
-    return (f"{key} = {json.dumps(value)} (account-level, every project on this host; was {json.dumps(old)}); "
+    return (f"{key} = {json.dumps(value)} (account-level, every project on this host; was {json.dumps(old)}"
+            + (", the user's value" if was_user else "") + "); "
             f"undo: {rec['undo']}")
 
 

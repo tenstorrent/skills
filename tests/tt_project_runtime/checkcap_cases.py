@@ -9893,7 +9893,7 @@ def test_a_wrapped_pool_shard_takes_a_host_slot_and_one_inside_a_held_slot_count
 
 def test_coordinator_sets_the_account_checks_host_cap_logged_with_its_setter_and_undo(env, capsys):
     """config_set of checks.host_max applies account-wide, is chat-settable, and logs who, old, new and
-    the undo; the value the user set is then refused to the coordinator and to a worker's queue."""
+    the undo; the coordinator may lower the value the user set (noted), a worker's queue may not."""
     import json as _json
     from ttp import accountset, cli, coordinator, project
     p = make(env)
@@ -9911,16 +9911,19 @@ def test_coordinator_sets_the_account_checks_host_cap_logged_with_its_setter_and
     # The user sets it at a terminal: theirs from then on.
     cli.main(["config", "--account", "checks.host_max", "5"])
     assert _json.loads(accountset.log_path().read_text().splitlines()[-1])["by"] == "user"
-    notes = coordinator.apply(p, [{"type": "config_set", "key": "checks.host_max", "value": "1"}])
-    assert project.load_account_settings()["checks"]["host_max"] == 5
-    assert any("set by the user" in n for n in notes), notes
+    # The coordinator lowering the user's value applies, noted as the user's (#9824); a worker's queue is refused.
+    assert coordinator.apply(p, [{"type": "config_set", "key": "checks.host_max", "value": "1"}]) == []
+    assert project.load_account_settings()["checks"]["host_max"] == 1
+    notes = p.db.kv(coordinator.NOTES_KEY, [])
+    assert any("the user's value" in n for n in notes), notes
+    cli.main(["config", "--account", "checks.host_max", "5"])
     with pytest.raises(ValueError, match="set by the user"):
         accountset.queue(p.state, "checks.host_max", 1, {"by": "worker", "task": "7"})
     # A value no logged change explains (set before the log, or by hand) is the user's too.
     project.set_account_setting("checks.load_extra", 4)
     assert accountset.user_set("checks.load_extra")
     with pytest.raises(ValueError, match="set by the user"):
-        accountset.apply("checks.load_extra", 0, {"by": "coordinator"})
+        accountset.apply("checks.load_extra", 0, {"by": "worker"})
 
 
 def test_a_workers_account_checks_cap_change_is_queued_for_the_daemon_which_applies_it_once(env, monkeypatch, capsys):

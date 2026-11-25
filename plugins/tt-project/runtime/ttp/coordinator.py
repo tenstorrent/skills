@@ -3030,6 +3030,10 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                     skip = set()
                 skip.add(str(a.get("continues")))
                 hit = tried.match(db, title, a.get("spec") or "", p, skip=skip)
+                if hit and hit["outcome"] in (*tried.REACHED, "done") and not a.get("force"):
+                    notes.append(f"task_add {title[:80]!r}: not queued, already done: {tried.describe(hit, p)}; "
+                                 f"that result stands (was: refused as already tried)")
+                    continue
                 if hit and not (a.get("force") and tried.differs(a.get("spec") or "", hit)):
                     raise (InfoRejection if hit["outcome"] in tried.REACHED else ValueError)(tried.rejection(hit, p))
                 if hit:
@@ -3040,6 +3044,11 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                             and _review_target(p, _draft_review(a.get("depends_on") or [], a.get("spec") or "")) \
                             != _review_target(p, same):
                         same = None   # another head, repository or packet: not the same review
+                    if same and same["status"] == "done":
+                        notes.append(f"task_add {title[:80]!r}: not queued, already done as #{same['id']} "
+                                     f"'{same['title'][:120]}': its result stands: {clip(same.get('result'), 300)} "
+                                     f"(was: refused as a near duplicate)")
+                        continue
                     if same:
                         raise (ValueError if same["status"] in TERMINAL_TASK_STATES else InfoRejection)(
                             f"near duplicate of task #{same['id']} ({same['status']}) "
@@ -3134,7 +3143,9 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                     prior = None   # it also covers a head whose patches differ: it gets its own review
                 prior = prior or (reviewreuse.judged(db, head, key) if head else None)
                 if prior and not (a.get("force") and str(a.get("reason") or "").strip()):
-                    raise ValueError(f"task_add rejected: {reviewreuse.rejection(prior, head)}")
+                    notes.append(f"task_add {title[:80]!r}: not queued, the earlier verdict returned: "
+                                 f"{reviewreuse.rejection(prior, head)} (was: refused)")
+                    continue
                 if prior:
                     labels.append(reviewreuse.FORCED_LABEL)
                     notes.append(f"task_add {title[:80]!r}: forced past review #{prior['id']}, which "
@@ -3146,9 +3157,15 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                                             (f'%"continues:{old["id"]}"%', *TERMINAL_TASK_STATES))):
                     raise ValueError(f"task_add continues #{old['id']} rejected: #{hop['id']} already continues "
                                      f"its split head; update #{hop['id']} instead")
-                followup = old if old and old["status"] == "done" and not split else None
+                followup = old if old and old["status"] in FOLLOW_UP and not split else None
+                if followup and followup["status"] != "done":
+                    notes.append(f"task_add {title[:80]!r}: #{old['id']} is {old['status']}, so it is added as "
+                                 f"a follow-up of #{old['id']} (was: continues #{a['continues']})")
+                elif old and str(old["id"]) != str(a["continues"]):
+                    notes.append(f"task_add {title[:80]!r}: continues #{old['id']}, the failed latest review of "
+                                 f"#{a['continues']} (was: continues #{a['continues']})")
                 if old:   # a continue chain over its cap, or in an area under review_area_cap (chaincap)
-                    if past := chaincap.check_add(p, cfg, old["id"], a.get("reason")):
+                    if past := chaincap.check_add(p, cfg, old["id"], a.get("reason"), a.get("spec")):
                         notes.append(past)
                 if followup:
                     # Done work is not taken over: the new task is a follow-up that starts fresh
@@ -4532,6 +4549,9 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                     notes.append(scr.hold_cap_note(m, a.get("escalate_after_h")))
                 if throughmute.cap_note(m, a.get("hours")):
                     notes.append(throughmute.cap_note(m, a.get("hours")))
+                if "coordinator" in ((m.get("throughput") or {}).get("owner") or {}):
+                    notes.append(f"observation_mute {m['source']} {m['match']!r}: no owner named, so the coordinator "
+                                 f"owns it (was: refused as needing an owner); the daily review lists it")
             elif t == "sweep":
                 sweep.record(db, a, parse_start_after(a.get("start_after") or "now", tz=timefmt.home(p)), where=p)
             elif t == "self_change":
@@ -4971,6 +4991,9 @@ def _pin_mark(db, req: Any, pin: dict, origin: dict | None) -> list[str]:
     return [failover.PREFERRED_LABEL] if origin and failover.required(db, origin) else []
 
 
+FOLLOW_UP = ("done", "review", "pushing")   # a task_add continuing one is added as a follow-up (fresh start)
+
+
 def _continued(db, raw: Any, deps: list[int]) -> dict:
     """The task a new one continues, checked: only work that can no longer finish is taken over,
     and the new task must not wait on the dependents it takes over."""
@@ -4980,14 +5003,13 @@ def _continued(db, raw: Any, deps: list[int]) -> dict:
         raise ValueError("task_add continues must be a task id") from None
     if not old:
         raise ValueError(f"task_add continues: no task #{raw}")
-    if old["status"] == "done":
+    if old["status"] == "review" and (rev := _failed_latest_review(db, old)):
+        old = rev   # its latest review failed: continuing that review builds on the reviewed branch
+    if old["status"] in FOLLOW_UP:
         return old   # the caller adds it as a follow-up instead
-    if old["status"] not in ("failed", "cancelled", "blocked"):
-        rev = _failed_latest_review(db, old) if old["status"] == "review" else None
-        fix = (f": its latest review #{rev['id']} failed, so continue that review instead (task_add "
-               f"continues={rev['id']} builds on the reviewed branch), then queue a re-review") if rev else ""
+    if old["status"] not in ("failed", "cancelled", "blocked"):   # running or queued: taskforms makes it a spec update
         raise ValueError(f"task_add continues rejected: #{old['id']} is {old['status']}; only a failed, "
-                         f"cancelled or blocked task can be continued (a done one gets a follow-up){fix}")
+                         f"cancelled or blocked task can be continued (a done or in-review one gets a follow-up)")
     if old["id"] in deps:
         raise ValueError(f"task_add cannot depend on #{old['id']}, the task it continues")
     if any(db.dependency_cycle(t["id"], deps) for t in _open_dependents(db, old["id"])):
@@ -7376,23 +7398,24 @@ def _in_obligation(spec: str, start: int, end: int, what: str) -> None:
 
 def replace_step(spec: str, rep) -> tuple[str, str]:
     """(the spec with `rep['old']` replaced by `rep['new']`, the update line saying so); ValueError when
-    `old` is not in the spec exactly once or touches a safety line."""
+    `old` is not in the spec or touches a safety line. Each identical copy of `old` is replaced (#9824)."""
     if not isinstance(rep, dict) or not str(rep.get("old") or "").strip():
         raise ValueError("`replace` is {old: the exact text of one spec step, new: its new text (\"\" withdraws it)}")
     old, new = str(rep["old"]), str(rep.get("new") or "")
-    if (n := spec.count(old)) != 1:
-        raise ValueError(f"`replace` old text is in the spec {n} times, not once: quote one step exactly")
-    start = spec.index(old)
-    _in_obligation(spec, start, start + len(old), "`replace` old text")
-    first, last = spec.count("\n", 0, start), spec.count("\n", 0, start + len(old))
-    if hit := sorted(_safety_lines(spec) & set(range(first, last + 1))):
-        line = spec.split("\n")[hit[0]].strip()
-        raise ValueError(f"`replace` touches a safety line ({line[:120]!r}): Restrictions and guards change only "
-                         f"through the charter, never by a task_update")
-    said = (f"Step replaced (the earlier text no longer applies): {' '.join(old.split())[:300]!r} now reads "
+    if not (n := spec.count(old)):
+        raise ValueError("`replace` old text is not in the spec: quote one step exactly")
+    safety = _safety_lines(spec)
+    for m in re.finditer(re.escape(old), spec):
+        _in_obligation(spec, m.start(), m.end(), "`replace` old text")
+        first, last = spec.count("\n", 0, m.start()), spec.count("\n", 0, m.end())
+        if hit := sorted(safety & set(range(first, last + 1))):
+            line = spec.split("\n")[hit[0]].strip()
+            raise ValueError(f"`replace` touches a safety line ({line[:120]!r}): Restrictions and guards change only "
+                             f"through the charter, never by a task_update")
+    said = (f"{n} identical copies replaced. " if n > 1 else "") + (f"Step replaced (the earlier text no longer applies): {' '.join(old.split())[:300]!r} now reads "
             f"{' '.join(new.split())[:300]!r}" if new.strip() else
             f"Step withdrawn (no longer required): {' '.join(old.split())[:300]!r}")
-    return spec[:start] + new + spec[start + len(old):], said
+    return spec.replace(old, new), said
 
 
 _STEP_SAID = re.compile(r"^Step (replaced \(the earlier text no longer applies\)|withdrawn \(no longer required\)): (.*)$",

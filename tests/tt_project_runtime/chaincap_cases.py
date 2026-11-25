@@ -770,7 +770,8 @@ def test_a_continue_over_a_soft_cap_with_a_reason_passes_in_the_same_action_and_
     from ttp import coordinator as coord
     why = "new evidence: the header parser was the slow step, a different approach caches it"
     _, _, tip = _chain(p, 2)   # two done hops with no progress: the stall cap
-    act = {"type": "task_add", "title": "continue: parser, next", "spec": "carry on", "kind": "code", "continues": tip}
+    # the hops' spec is "s": the same spec again is an identical retry, the only one a soft cap refuses (#9824)
+    act = {"type": "task_add", "title": "continue: parser, next", "spec": "s", "kind": "code", "continues": tip}
     assert "chains.max_stalls is 2" in chaincap.refusal(p, p.config(), chaincap.chain(p.db, tip))
     assert coord.apply(p, [dict(act, reason=why)]) == []
     (new,) = p.db.q("SELECT * FROM tasks WHERE parent=?", (tip,))
@@ -782,7 +783,11 @@ def test_a_continue_over_a_soft_cap_with_a_reason_passes_in_the_same_action_and_
     _, _, tip2 = _chain(p, 2)
     (bare,) = coord.apply(p, [dict(act, title="continue: lexer", continues=tip2)])
     assert "refused" in bare and "it has no `reason`" in bare and "add a `reason` field" in bare, bare
-    assert "new evidence, a different approach or a narrower scope" in bare
+    assert "new evidence, a different approach or a narrower scope" in bare and "identical retry" in bare
+    # A changed spec passes the soft cap with no reason, noted and recorded as an override (#9824).
+    assert coord.apply(p, [dict(act, title="continue: lexer", continues=tip2, spec="cache the header parse")]) == []
+    assert p.db.q("SELECT 1 FROM tasks WHERE parent=?", (tip2,))
+    assert any("past its cap" in n and "spec differs" in n for n in p.db.kv(coord.NOTES_KEY, []))
     for wording in ("narrower scope: only the header parser, not the body",
                     "new evidence: the profile shows the header is the slow step"):
         assert chaincap.reason_ok(wording), wording
@@ -794,7 +799,7 @@ def test_a_continue_over_a_soft_cap_with_a_reason_passes_in_the_same_action_and_
     assert not p.db.q("SELECT id FROM tasks WHERE parent=?", (ids[-1],))
     cap = p.db.one("SELECT * FROM events WHERE kind=? AND task=?", (chaincap.CAP_EVENT, ids[-1]))
     assert "no `reason` lifts it" in cap["text"] and json.loads(cap["data"])["cap"] == "max_usd"
-    assert len(p.db.q("SELECT 1 FROM events WHERE kind=?", (chaincap.OVERRIDE_EVENT,))) == 1
+    assert len(p.db.q("SELECT 1 FROM events WHERE kind=?", (chaincap.OVERRIDE_EVENT,))) == 2
     p.set_config("chains.max_hops", 2)
     ids = _chain(p, 2)
     (hops,) = coord.apply(p, [dict(act, title="continue: linker", continues=ids[-1], reason=why)])

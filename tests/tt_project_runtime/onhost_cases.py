@@ -295,7 +295,8 @@ def test_a_premature_claim_beside_facts_is_still_marked(env):
         coord.apply(p, [{"type": "reply", "text": text, "chat": "c1"}, dict(_OH_FREE)], turn=turn)
         got = _oh_sent(p)[-1]
         assert got.startswith(f"{_OH_FACTS[0]} {onhost.MARK} {claim}"), got
-        assert "new task 'free the check slots held by stale runs': queued for a worker" in got, got
+        assert ("new task 'free the check slots held by stale runs': queued for a worker" if turn == 1
+                else "#1: queued for a worker") in got, got   # later turns update the open task (#9824)
 
 
 def _oh_order_batch(p, env, reply):

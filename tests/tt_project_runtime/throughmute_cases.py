@@ -28,17 +28,18 @@ def test_tmute_the_one_open_task_naming_what_it_mutes_owns_an_ownerless_mute(env
     assert any("(observation_mute) applied as: why=" in n and f"owner #{tid}" in n for n in notes), notes
 
 
-def test_tmute_two_candidate_owners_or_one_this_batch_adds_leave_the_mute_refused(env):
+def test_tmute_two_candidate_owners_or_one_this_batch_adds_leave_the_coordinator_owning_it(env):
     """A second open task, or a task_add of the same batch, naming what it mutes: no single owner, so the
-    mute stays refused (a task the batch adds has no id to name yet)."""
+    coordinator owns the mute (#9824: was refused as needing an owner), with a note."""
     from ttp import coordinator as coord, screen as scr
     p, mute = _tmute_rig(env)
     p.db.add_task("Repair the check host", "Make env:check-host:box-a pass again.")
     add = {"type": "task_add", "title": "Move nightly builds to another host", "kind": "work",
            "spec": "Build elsewhere until env:check-host:box-a passes."}
-    out = coord.apply(p, [add, mute])
-    assert len(out) == 1 and "observation_mute needs an owner" in out[0], out
-    p.db.add_task("Watch the check host", "Report when env:check-host:box-a passes.")
-    out = coord.apply(p, [mute])
-    assert len(out) == 1 and "observation_mute needs an owner" in out[0], out
-    assert scr.mutes(p.db) == []
+    assert coord.apply(p, [add, mute]) == []
+    [m] = [m for m in scr.mutes(p.db) if m["source"] == "checks"]
+    assert "coordinator" in m["throughput"]["owner"], m
+    assert any("the coordinator owns it" in n for n in p.db.kv(coord.NOTES_KEY, []))
+    from ttp import throughmute as tm
+    line = [x for x in tm.review_lines(p.db) if "env:check-host:box-a" in x][0]
+    assert "owner the coordinator" in line and "PROBLEM" not in line, line

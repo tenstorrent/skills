@@ -135,8 +135,9 @@ def move_owner(db, m, tid):
 def vet(db: Any, source: Any, match: Any, why: Any, end_when: Any, cfg: dict | None = None,
         now: float | None = None) -> dict | None:
     """None when a mute of `source`/`match` is not throughput-class; else its owner and longest life,
-    {"owner": {"task": id} | {"probe": cmd} | {"outside": why}, "max_h": h}. Raises ValueError, with the
-    reason, for one with no owner, or a renewal whose `why` repeats the last one. Neither starts with
+    {"owner": {"task": id} | {"probe": cmd} | {"outside": why} | {"coordinator": why}, "max_h": h}: one
+    naming no owner is owned by the coordinator. Raises ValueError, with the reason, for a renewal whose
+    `why` repeats the last one. Neither starts with
     'observation_mute rejected: ' (coordinator.SETTLED_REFUSALS): the next turn can fix both."""
     from .screen import MUTES_KEY, _same_mute
     now = time.time() if now is None else now
@@ -154,13 +155,9 @@ def vet(db: Any, source: Any, match: Any, why: Any, end_when: Any, cfg: dict | N
         owner = {"probe": probe}
     elif OUTSIDE_RE.search(why):
         owner = {"outside": why[:200]}
-    else:
+    else:   # no owner named: the coordinator owns it (#9824), and its review lines show that
         named = ", ".join(f"#{t}" for t in dict.fromkeys(TASK_RE.findall(why)))
-        raise ValueError(
-            f"observation_mute needs an owner: {source} {match!r} is throughput-class (work not moving, or a limit, "
-            f"queue or wait as its cause), so its mute needs a `why` naming an open task (#<id>) that "
-            f"owns the fix, an `end_when` probe, or a `why` saying only the user or an outside party can clear it"
-            + (f"; {named} is not an open task" if named else "") + ". Else queue the fix instead of muting")
+        owner = {"coordinator": (f"{named} is not an open task; " if named else "") + (why[:200] or "no why given")}
     if old and old.get("throughput") and " ".join(why.lower().split()) == " ".join(str(old.get("why") or "").lower().split()):
         raise ValueError(f"observation_mute needs fresh evidence: renewing the throughput-class mute of {source} {match!r} "
                          f"needs fresh evidence in `why` (its count, rate or owner's state now), not the same reason")
@@ -168,20 +165,20 @@ def vet(db: Any, source: Any, match: Any, why: Any, end_when: Any, cfg: dict | N
 
 
 def normal_form(p, a: dict, batch: list, _home: str, now: float):
-    """actionforms: a mute `vet` refuses for want of an owner, whose `why` names no task, gets the one open
-    task whose title or spec names its `match` as the owner (`#<id>` in `why`); None when several tasks do,
-    or a task_add of this batch does too (a task the batch adds has no id to name yet), or nothing is wrong."""
+    """actionforms: a mute `vet` would give the coordinator for want of an owner, whose `why` names no task,
+    gets the one open task whose title or spec names its `match` as the owner (`#<id>` in `why`); None when
+    several tasks do, or a task_add of this batch does too (the coordinator then owns it), or nothing is wrong."""
     from .db import TERMINAL_TASK_STATES
     why = str(a.get("why") or a.get("reason") or a.get("text") or "").strip()
     match = str(a.get("match") or "").strip()
     if not match or named_tasks(why):
         return None
     try:
-        vet(p.db, a.get("source"), match, why, a.get("end_when"), p.config(), now)
-        return None
-    except ValueError as e:
-        if not str(e).startswith("observation_mute needs an owner"):
+        if "coordinator" not in ((vet(p.db, a.get("source"), match, why, a.get("end_when"), p.config(), now)
+                                  or {}).get("owner") or {}):
             return None
+    except ValueError:
+        return None
     ids = [r["id"] for r in p.db.q(
         f"SELECT id FROM tasks WHERE status NOT IN ({','.join('?' * len(TERMINAL_TASK_STATES))}) AND "
         "instr(lower(coalesce(title, '') || char(10) || coalesce(spec, '')), ?) > 0 LIMIT 2",
@@ -216,6 +213,8 @@ def owner_text(m: dict, owner: dict | None = None) -> str:
         return f"probe `{str(o['probe'])[:80]}`"
     if "outside" in o:
         return "only the user or an outside party (per its why)"
+    if "coordinator" in o:
+        return "the coordinator (no owner was named)"
     if m.get("end_when"):
         return f"probe `{str(m['end_when'])[:80]}`"
     return "none"

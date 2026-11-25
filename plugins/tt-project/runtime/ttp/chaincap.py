@@ -24,7 +24,8 @@ no-progress hops in a row) and max_usd (40 for the whole lineage). Once one is r
 the lineage's area is under review.area_fail_cap (a reviewcap.REVIEW_AREA_EVENT within
 reviewcap.AREA_WINDOW_S naming one of its tasks), a task_add that continues the lineage is refused,
 and a CAP_EVENT makes the next coordinator turn a triggered one (TRIGGER). The only way past the
-soft caps (max_stalls, the review area) is the action's `reason` naming what changed (REASON_RE: a
+soft caps (max_stalls, the review area) is a spec that differs from every hop's (only an identical
+retry is refused) or the action's `reason` naming what changed (REASON_RE: a
 new approach, a rescoped spec, new evidence): given with the first task_add it passes in that same
 action, recorded as an OVERRIDE_EVENT with the cap it lifted; the refusal names the field to add.
 max_hops and max_usd (HARD) are spend safety: no reason lifts them.
@@ -418,9 +419,14 @@ def reason_ok(reason) -> bool:
     return len(r) >= MIN_REASON and bool(REASON_RE.search(r))
 
 
-def check_add(p, cfg: dict, prev: int, reason) -> str:
-    """For a task_add continuing `prev`: '' when its lineage is under every cap, a note when `reason`
-    takes it past a soft one (max_stalls, review.area_fail_cap) in the same action; otherwise raises
+def _same_spec(a, b) -> bool:
+    return " ".join(str(a or "").split()) == " ".join(str(b or "").split())
+
+
+def check_add(p, cfg: dict, prev: int, reason, spec=None) -> str:
+    """For a task_add continuing `prev`: '' when its lineage is under every cap, a note when it passes a
+    soft one (max_stalls, review.area_fail_cap) in the same action: its `spec` differs from every hop's
+    (only an identical retry is refused there) or its `reason` names what changed; otherwise raises
     ValueError naming the field to add, with a CAP_EVENT for the next turn (once per lineage and hop
     count). No reason lifts a HARD cap (max_hops, max_usd)."""
     db = p.db
@@ -430,14 +436,16 @@ def check_add(p, cfg: dict, prev: int, reason) -> str:
         return ""
     hard = cap in HARD
     data = {"root": ch[0]["id"], "tip": prev, "hops": hop_count(ch), "usd": round(spend(ch), 2), "why": why, "cap": cap}
-    if not hard and reason_ok(reason):
+    changed = bool(str(spec or "").strip()) and not any(_same_spec(spec, t.get("spec")) for t in ch)
+    if not hard and (changed or reason_ok(reason)):
+        reason = reason if reason_ok(reason) else "its spec differs from every earlier hop's (only an identical retry is refused)"
         db.x("INSERT INTO events(ts,source,kind,severity,text,data,status,task) VALUES(?,?,?,?,?,?,?,?)",
              (time.time(), "coordinator", OVERRIDE_EVENT, "low", f"{why}; passed with reason: {str(reason)[:300]}",
               json.dumps({**data, "reason": str(reason)[:300]}), "handled", prev))
         return f"task_add continues #{prev} past its cap ({why}) with reason: {str(reason)[:200]}"
     fp = f"{CAP_EVENT}:{ch[0]['id']}:{hop_count(ch)}"
     way = (f"chains.{cap} is hard: no `reason` lifts it" if hard else
-           "a task_add that continues it passes only with a `reason` naming what changed")
+           "a task_add that continues it passes with a changed spec or a `reason` naming what changed")
     if not db.one("SELECT 1 FROM events WHERE fingerprint=?", (fp,)):
         db.x("INSERT INTO events(ts,source,kind,fingerprint,severity,text,data,status,task) VALUES(?,?,?,?,?,?,?,?,?)",
              (time.time(), "coordinator", CAP_EVENT, fp, "normal",
@@ -445,10 +453,10 @@ def check_add(p, cfg: dict, prev: int, reason) -> str:
               f"and report what is left; {way}.", json.dumps(data), "queued", prev))
     if hard:
         hint = f"chains.{cap} is hard and no `reason` lifts it: re-plan (narrow the scope) or stop and report what is left"
-    elif str(reason or "").strip():
-        hint = f"its `reason` does not name what changed; {REASON_HINT}"
-    else:
-        hint = f"it has no `reason`: {REASON_HINT}"
+    else:   # a soft cap: its spec repeats an earlier hop's word for word
+        hint = (f"its spec repeats an earlier hop's word for word (an identical retry) and "
+                + ("its `reason` does not name what changed" if str(reason or "").strip() else "it has no `reason`")
+                + f": change the spec, or {REASON_HINT}")
     raise ValueError(f"task_add continues #{prev} refused: {why}; {hint}")
 
 

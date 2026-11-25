@@ -510,14 +510,18 @@ def test_a_throughput_class_mute_needs_an_owner_and_is_bounded(env):
                 {**base, "source": "watcher:efficiency-watch", "match": "idle slots", "why": "not only the user can clear it"},
                 {**base, "source": "watcher:ci", "match": "runner queue full", "why": "noise"},
                 {**base, "source": "watcher:lanes", "match": "lane_wait", "why": "the user knows"}]
-    bad = coord.apply(p, no_owner)
-    assert len(bad) == len(no_owner) and all("throughput-class" in b and "owner" in b for b in bad), bad
-    assert "#999 is not an open task" in bad[1] and f"#{done} is not an open task" in bad[2], bad
-    assert scr.mutes(p.db) == []
+    assert coord.apply(p, no_owner) == []   # #9824: no owner named, so the coordinator owns each
+    got = {m["source"]: m["throughput"]["owner"] for m in scr.mutes(p.db)}
+    assert len(got) == len(no_owner) and all("coordinator" in o for o in got.values()), got
+    assert "#999 is not an open task" in got["daemon:wait_stale"]["coordinator"], got
+    assert f"#{done} is not an open task" in got["daemon:job_underuse"]["coordinator"], got
+    p.db.set_kv(scr.MUTES_KEY, [])
     # A watcher's own words are classified too: a match with no cause word that covers a queue observation.
     p.db.x("INSERT INTO events(ts,source,kind,severity,text,status) VALUES(?,?,?,?,?,?)",
            (time.time(), "watcher:ci", "observation", "normal", "builds pile up: queue at 40", "queued"))
-    assert "throughput-class" in coord.apply(p, [{**base, "source": "watcher:ci", "match": "builds pile up"}])[0]
+    assert coord.apply(p, [{**base, "source": "watcher:ci", "match": "builds pile up"}]) == []
+    assert any(m["match"] == "builds pile up" and m.get("throughput") for m in scr.mutes(p.db))
+    p.db.set_kv(scr.MUTES_KEY, [])
 
     owned = [{**base, "source": "daemon:progress", "match": "no progress since", "why": f"fix is #{live}"},
              {**base, "source": "daemon:wait_stale", "match": "has waited", "end_when": "test -e /nonexistent/x"},
@@ -4868,8 +4872,8 @@ def test_a_user_turns_task_add_with_a_null_title_or_spec_keeps_its_message_once(
     from ttp import coordinator as coord
     from ttp.daemon import Daemon
     d = Daemon(p.base)
-    for a, missing in (({"title": None, "spec": None}, "a title and a spec"), ({"title": "x", "spec": None}, "a spec"),
-                       ({"title": " ", "spec": "s"}, "a title")):
+    for a, missing in (({"title": None, "spec": None}, "a title and a spec"), ({"title": "x", "spec": None}, "a spec")):
+        # (no title with a spec: the spec's first line is its title, taskforms_cases)
         (x,) = coord.apply(p, [{"type": "task_add", **a}])
         assert x.startswith(f"task_add: task_add needs {missing}:") and coord.fixable_rejection(x), x
     assert not p.db.q("SELECT id FROM tasks"), "a task_add with a null title or spec created a task"
@@ -4927,8 +4931,12 @@ def test_a_user_turns_task_add_rejected_for_a_fixable_reason_keeps_its_message(e
     assert coord.fixable_rejection(dead), dead
     # Rejections the work settles, and a dropped resource (the task is added), keep nothing.
     p.db.add_task("busy", "the busy task's own spec", origin="user")
-    (dup,) = coord.apply(p, [{"type": "task_add", "title": "busy", "spec": "s"}])
-    (res,) = coord.apply(p, [{"type": "task_add", "title": "with a resource", "spec": "s", "resources": ["bad name!"]}])
+    # #9824: a duplicate is the open task's spec update, a bad resource name is sanitised: both apply, noted
+    assert coord.apply(p, [{"type": "task_add", "title": "busy", "spec": "s"}]) == []
+    assert any("duplicating open task" in n for n in p.db.kv(coord.NOTES_KEY, []))
+    assert coord.apply(p, [{"type": "task_add", "title": "with a resource", "spec": "s", "resources": ["bad name!"]}]) == []
+    assert any("resources=['bad-name-']" in n for n in p.db.kv(coord.NOTES_KEY, []))
+    dup, res = "task_add: duplicate of open task #1", "task_add: resource 'bad name!' dropped"
     p.set_config("coordinator.max_new_tasks_per_day", 0)
     (cap,) = coord.apply(p, [{"type": "task_add", "title": "capped", "spec": "s"}])
     entry = {"id": 7, "title": "t", "ts": 0, "date": "2026-01-01", "outcome": "shelved", "result": ""}
@@ -4938,7 +4946,7 @@ def test_a_user_turns_task_add_rejected_for_a_fixable_reason_keeps_its_message(e
                "task_update: #7 rejected: depends on #8 which is failed"]
     for x in settled:
         assert not coord.fixable_rejection(x), x
-    assert dup.startswith("task_add: duplicate of") and res.startswith("task_add: resource") and "cap" in cap
+    assert "cap" in cap
 
 
 def test_a_requeue_onto_a_dead_dependency_is_rejected_and_reported(env):
@@ -5029,9 +5037,13 @@ def test_task_add_continues_only_a_failed_cancelled_or_blocked_task(env, status)
     p.db.update_task(old, status=status)
     dep = p.db.add_task("dep", "s", origin="user", depends_on=[old])
     before = p.db.one("SELECT COUNT(*) n FROM tasks")["n"]
-    problems = coord.apply(p, [{"type": "task_add", "spec": "s", "title": "redo", "continues": old}])
-    assert len(problems) == 1 and f"#{old} is {status}" in problems[0], problems
-    assert p.db.one("SELECT COUNT(*) n FROM tasks")["n"] == before, "a rejected continue created a task"
+    problems = coord.apply(p, [{"type": "task_add", "spec": "new spec", "title": "redo", "continues": old}])
+    if status in ("queued", "running"):   # #9824: a continue of a running or queued task is its spec update
+        assert problems == [] and "new spec" in p.db.task(old)["spec"], (problems, p.db.task(old)["spec"], p.db.kv(coord.NOTES_KEY))
+        assert any(f"was: a task_add continuing #{old}" in n for n in p.db.kv(coord.NOTES_KEY, []))
+    else:
+        assert len(problems) == 1 and f"#{old} is {status}" in problems[0], problems
+    assert p.db.one("SELECT COUNT(*) n FROM tasks")["n"] == before, "a continue created a task"
     assert json.loads(p.db.task(dep)["depends_on"]) == [old]
     for bad, why in ((999, "no task #999"), ("x", "task id")):
         problems = coord.apply(p, [{"type": "task_add", "spec": "s", "title": f"redo {bad}", "continues": bad}])
@@ -5078,9 +5090,10 @@ def test_task_add_rejects_a_near_duplicate_naming_the_task(env):
     assert problem.startswith(f"task_add: near duplicate of task #{old} (waiting)"), problem
     assert "fix flaky upload test in CI" in problem and "force: true" in problem
     assert p.db.q("SELECT COUNT(*) n FROM tasks")[0]["n"] == 1
-    # The exact-title rejection keeps its own message.
-    assert coord.apply(p, [{**near, "title": "fix flaky upload test in CI"}]) == [
-        f"task_add: duplicate of open task #{old} {coord.INFO_MARK}"]
+    # The exact title is that open task: its spec takes the new one as an update (#9824).
+    assert coord.apply(p, [{**near, "title": "fix flaky upload test in CI"}]) == []
+    assert p.db.task(old)["spec"].endswith(near["spec"]) and p.db.q("SELECT COUNT(*) n FROM tasks")[0]["n"] == 1
+    assert any(f"duplicating open task #{old}" in n for n in p.db.kv(coord.NOTES_KEY, []))
     # Different numbers are different work, however alike the rest reads.
     p.db.add_task("benchmark candidate 3", "Run the benchmark suite on the candidate build and report.", origin="user")
     assert coord.apply(p, [{"type": "task_add", "title": "benchmark candidate 4",
@@ -5154,12 +5167,13 @@ def test_task_add_rejects_a_reworded_repeat_of_work_shelved_or_landed_the_same_d
               "spec": "Prefetch the next tile during compute of the current one; 1.4x bound."},
              {"type": "task_add", "title": "vectorise softmax lever up to 1.5x", "spec": "SIMD softmax, bound 1.5x."}]
     problems = coord.apply(p, again)
-    assert len(problems) == 3, problems
+    assert len(problems) == 2, problems
     assert problems[0].startswith(f"task_add: already tried: task #{shelved} 'lever: fuse the norm") and \
         "was shelved today at" in problems[0] and "1.05x" in problems[0], problems[0]
-    assert problems[1].startswith(f"task_add: already tried: task #{kept} 'lever: double-buffer") and \
-        "was landed today at" in problems[1] and "1.22x" in problems[1], problems[1]
-    assert problems[2].startswith(f"task_add: already tried: task #{many} 'lever: vectorize the softmax' was shelved"), problems[2]
+    # #9824: landed work is not queued again: its result comes back as a note, not a refusal
+    (done,) = [n for n in db.kv(coord.NOTES_KEY) if "not queued, already done" in n]
+    assert f"task #{kept} 'lever: double-buffer" in done and "was landed today at" in done and "1.22x" in done, done
+    assert problems[1].startswith(f"task_add: already tried: task #{many} 'lever: vectorize the softmax' was shelved"), problems[1]
     assert all(f"differs from #" in x and "force: true" in x for x in problems)
     # force alone does not pass; force with the difference stated does, and is noted.
     assert coord.apply(p, [{**again[0], "force": True}])[0].startswith(f"task_add: already tried: task #{shelved}")
@@ -5366,12 +5380,15 @@ def test_task_add_near_duplicate_skips_the_continued_task_and_old_done_work(env)
     p.db.update_task(done, status="done")
     redo = {"type": "task_add", "title": "compact the build cache",
             "spec": "Compact the build cache and drop entries unused for a month."}
-    assert coord.apply(p, [redo])[0].startswith(f"task_add: already tried: task #{done} 'compact the cache' "
-                                                f"was finished today")
+    # #9824: done work is not queued again; its result comes back as a note
+    n = p.db.one("SELECT COUNT(*) n FROM tasks")["n"]
+    assert coord.apply(p, [redo]) == [] and p.db.one("SELECT COUNT(*) n FROM tasks")["n"] == n
+    assert any(f"not queued, already done: task #{done} 'compact the cache' was finished today" in x
+               for x in p.db.kv(coord.NOTES_KEY))
     p.db.x("UPDATE tasks SET updated=? WHERE id=?", (time.time() - (coord.SIMILAR_DONE_DAYS + 1) * 86400, done))
-    assert coord.apply(p, [redo])[0].startswith(f"task_add: already tried: task #{done}")
+    assert coord.apply(p, [redo]) == [] and p.db.one("SELECT COUNT(*) n FROM tasks")["n"] == n
     p.db.x("UPDATE tasks SET updated=? WHERE id=?", (time.time() - (tried.LEDGER_DAYS + 1) * 86400, done))
-    assert coord.apply(p, [redo]) == []
+    assert coord.apply(p, [redo]) == [] and p.db.one("SELECT COUNT(*) n FROM tasks")["n"] == n + 1
 
 
 def test_a_code_task_continues_from_the_dead_tasks_branch(env):
@@ -5740,15 +5757,11 @@ def test_the_fix_the_failed_review_wake_names_passes_the_continues_check(env):
     named = [int(n) for n in re.findall(r"continues=(\d+)", text)]
     assert named == [rev] and f"continues #{code}" not in text, text
     assert coord._continued(db, named[0], [])["id"] == rev
-    # Continuing the task in review is refused, and the refusal names the review to continue.
-    with pytest.raises(ValueError, match=rf"latest review #{rev} failed.*continues={rev}"):
-        coord._continued(db, code, [])
-    # A newer review that has not failed is the latest one: the refusal names no review then.
-    rerev = db.add_task(f"Review #{code}: parser change", "s", kind="review", origin="coordinator",
-                        depends_on=[code])
-    with pytest.raises(ValueError) as e:
-        coord._continued(db, code, [])
-    assert "latest review" not in str(e.value) and f"#{rerev}" not in str(e.value)
+    # #9824: continuing the task in review continues the review that failed, as meant
+    assert coord._continued(db, code, [])["id"] == rev
+    # A newer review that has not failed is the latest one: the continue is a follow-up of the task.
+    db.add_task(f"Review #{code}: parser change", "s", kind="review", origin="coordinator", depends_on=[code])
+    assert coord._continued(db, code, [])["id"] == code
 
 
 def test_a_review_that_depends_on_the_task_it_reviews_runs_while_that_task_waits_in_review(env):
@@ -7675,13 +7688,13 @@ def test_a_rejection_goes_back_to_the_coordinator_not_into_the_users_reply(env, 
     p.db.update_task(tid, status="running")
     bad = SimpleNamespace(structured={"actions": [
         {"type": "reply", "text": "Moving it to the push branch.", "chat": "c1"},
-        {"type": "task_update", "id": tid, "pr_branch": ""}], "summary": ""}, error="", final_text="")
+        {"type": "task_update", "id": tid, "resources": ["board-a"]}], "summary": ""}, error="", final_text="")
     d._finish_coordinator({"dir": "x"}, bad, "ok", {})
     assert p.db.one("SELECT text FROM messages WHERE kind='reply'")["text"] == "Moving it to the push branch."
     [x] = p.db.kv(coord.REJECTED_KEY)
-    assert "is running" in x and "continues" in x, x
+    assert "is running" in x and "resources change only" in x, x
     text = coord.digest(p, {}, [], [])
-    # Refusing a running task's branch change is information only: it rides along, no fix asked.
+    # Refusing a running task's resource change is information only: it rides along, no fix asked.
     assert "action was refused, information only: nothing to fix" in text, text
     assert "Your reply already went out" in text and coord.INFO_MARK not in text, text
     assert "rejected again" not in text
@@ -9911,17 +9924,17 @@ def test_waits_and_dependency_blocks_alone_do_not_start_a_trouble_episode_and_ep
     assert len(events()) == 1, "a count hovering at the threshold started a second episode"
 
 
-def test_invalid_resource_names_are_reported_not_silently_dropped(env):
+def test_invalid_resource_names_are_sanitised_with_a_note(env):
     p = make(env)
     from ttp import coordinator as coord
     tid = p.db.add_task("soak", "s", kind="work", tier="light", origin="user", labels=["resource:box-a"])
     problems = coord.apply(p, [{"type": "task_update", "id": tid, "resources": ["box b", "box-c"]}])
-    assert len(problems) == 1 and "'box b' dropped" in problems[0] and problems[0].startswith("task_update")
-    assert json.loads(p.db.task(tid)["labels"]) == ["resource:box-c"]
+    assert problems == [] and any("resources=['box-b', 'box-c']" in n for n in p.db.kv(coord.NOTES_KEY, [])), problems
+    assert json.loads(p.db.task(tid)["labels"]) == ["resource:box-b", "resource:box-c"]   # sanitised (#9824)
     problems = coord.apply(p, [{"type": "task_add", "title": "new", "spec": "x", "resources": ["-bad", "ok1"]}])
-    assert len(problems) == 1 and "'-bad' dropped" in problems[0] and problems[0].startswith("task_add")
+    assert problems == [], problems
     new = p.db.one("SELECT labels FROM tasks WHERE title='new'")
-    assert json.loads(new["labels"]) == ["resource:ok1"]
+    assert json.loads(new["labels"]) == ["resource:bad", "resource:ok1"]
 
 
 def test_top_section_lists_open_asks_first_and_never_caps_them(env):
@@ -11210,9 +11223,11 @@ def test_task_update_changes_or_clears_a_deferral(env):
     assert "resource:board" in _labels(p, tid)
     assert coord.apply(p, [{"type": "task_update", "id": tid, "start_after": "now", "start_when": ""}]) == []
     assert _ready(p, tid) and _labels(p, tid) == ["resource:board"]
-    p.db.update_task(tid, status="running")
-    problems = coord.apply(p, [{"type": "task_update", "id": tid, "start_when": "true"}])
-    assert problems and "only a task that has not started" in problems[0]
+    p.db.update_task(tid, status="running")   # a running task's deferral is a new task after it (#9824)
+    assert coord.apply(p, [{"type": "task_update", "id": tid, "start_when": "true"}]) == []
+    assert _labels(p, tid) == ["resource:board"]
+    new = p.db.one("SELECT id FROM tasks WHERE title=?", (f"continue #{tid}: deferred",))
+    assert new and "start_when:true" in _labels(p, new["id"]), p.db.q("SELECT id, title FROM tasks")
 
 
 def test_ttp_task_set_when_start_after_now_or_empty_clears_a_deferral(env, capsys):
@@ -12751,8 +12766,11 @@ def test_a_draft_gate_rejection_keeps_the_whole_action_for_the_next_turn(env):
     p.db.set_kv(coord.REJECTED_KEY, [out[0].replace("task_update", "task_add", 1) + " " + spec])
     assert spec in coord.digest(p, {}, [], [])
     # other rejections keep their short form
-    out = coord.apply(p, [{"type": "task_add", "title": "", "kind": "code", "spec": "x"}])
+    out = coord.apply(p, [{"type": "task_update", "id": 999, "status": "queued"}])
     assert out and coord.GATE_MARK not in out[0]
+    # #9824: a missing title is the spec's first line, noted
+    assert coord.apply(p, [{"type": "task_add", "title": "", "kind": "code", "spec": "# Fix the parser\nmore"}]) == []
+    assert p.db.one("SELECT 1 FROM tasks WHERE title='Fix the parser'")
 
 
 def test_a_code_spec_without_a_where_line_gets_a_hint_never_a_rejection(env):
@@ -13489,7 +13507,7 @@ def test_a_hold_without_an_anchor_is_rejected_and_a_bad_anchor_too(env):
     assert len(problems) == 1 and "a hold needs `waits_on`" in problems[0] and "ask_user" in problems[0]
     assert "decide it yourself" in problems[0] and "until or when" in problems[0]
     assert p.db.task(tid)["status"] == "queued", "an unanchored hold was applied"
-    for bad in ("ask:999", "later:soon", "until:2001-01-01T00:00", "resource:", "ask:new"):
+    for bad in ("ask:999", "later:soon", "until:2001-01-01T00:00", "resource:"):   # ask:new alone: taskforms_cases
         got = coord.apply(p, [{"type": "task_update", "id": tid, "status": "blocked", "waits_on": bad}])
         assert len(got) == 1 and "rejected" in got[0], bad
         assert p.db.task(tid)["status"] == "queued", bad
@@ -14660,8 +14678,9 @@ def test_sweep_action_records_one_validated_outcome_per_item(env):
         {"type": "sweep", "id": t, "outcome": "maybe"},
         {"type": "sweep", "outcome": "retired"},
         {"type": "sweep", "id": 9999, "outcome": "retired"}])
-    assert len(probs) == 6 and db.kv(sweep.OUTCOMES_KEY) is None
-    assert "re-checkable condition" in probs[0] and "start_after" in probs[1] and "`why`" in probs[2]
+    # #9824: a still_blocked naming no condition is re-checked at the next sweep, noted
+    assert len(probs) == 5 and db.kv(sweep.OUTCOMES_KEY)[f"task:{t}"]["until"] == sweep.NEXT_SWEEP, probs
+    assert "start_after" in probs[0] and "`why`" in probs[1]
     assert coord.apply(p, [{"type": "sweep", "id": t, "outcome": "still_blocked",
                             "until": "the vendor sends the signed key", "start_after": "6h"},
                            {"type": "sweep", "resource": "rig", "outcome": "human_indispensable",
@@ -14817,18 +14836,18 @@ def test_sweep_form_item_key_sent_in_another_field_is_moved_to_its_own(env):
     assert any("promise=o1374 (was: id 'promise:o1374'); start_after=" in n for n in db.kv(coord.NOTES_KEY))
 
 
-def test_sweep_form_still_blocked_with_no_wait_on_record_and_a_vague_until_stays_refused(env):
+def test_sweep_form_still_blocked_with_no_wait_on_record_is_rechecked_at_the_next_sweep(env):
+    # #9824: was refused; nothing awaited on record means the next blocker sweep re-checks it, noted
     p = make(env)
     from ttp import coordinator as coord, coordprecheck, sweep
     db = p.db
     t = db.add_task("blocked")
     db.update_task(t, status="blocked", blocked_reason="x")
     sent = [{"type": "sweep", "id": t, "outcome": "still_blocked", "until": "keep it blocked"}]
-    [(i, why)] = coordprecheck.problems(p, sent)
-    assert i == 0 and "re-checkable condition" in why
-    [why] = coord.apply(p, sent)
-    assert "re-checkable condition" in why and db.kv(sweep.OUTCOMES_KEY) is None
-    assert not any("applied as" in n for n in db.kv(coord.NOTES_KEY) or [])
+    assert coordprecheck.problems(p, sent) == []
+    assert coord.apply(p, sent) == []
+    assert db.kv(sweep.OUTCOMES_KEY)[f"task:{t}"]["until"] == sweep.NEXT_SWEEP
+    assert any("applied as" in n and sweep.NEXT_SWEEP in n and "keep it blocked" in n for n in db.kv(coord.NOTES_KEY))
 
 
 def test_blocker_sweep_carries_and_flags_items_left_without_an_outcome(env):
@@ -15204,9 +15223,7 @@ def test_a_task_reference_to_a_missing_task_is_rejected_and_reaches_the_coordina
              ({"start_when": "landed:#987654"}, "names no task in this project (no task #987654)"),
              ({"start_when": "ttp landed --task 0 && test -f x"}, "(no task #0)"),
              ({"start_when": "ttp landed --task=abc"}, "(no task #abc)"),
-             ({"depends_on": [0]}, "depends_on #0 names no task in this project"),
-             ({"depends_on": [-3]}, "depends_on #-3 names no task in this project"),
-             ({"depends_on": [987654]}, "no task #987654")]
+             ({"depends_on": [987654]}, "no task #987654")]   # depends_on below 1 is dropped (taskforms_cases)
     for extra, why in cases:
         problems = coord.apply(p, [{"type": "task_add", "title": "after it", "spec": "s", **extra},
                                    {"type": "task_add", "title": f"fine {why}", "spec": "s"}])
@@ -16835,9 +16852,11 @@ def test_task_add_of_a_review_of_an_accepted_head_is_refused_unless_forced_with_
     p.db.update_task(first, status="done", result=json.dumps({"status": "done", "summary": "ok"}))
     add = {"type": "task_add", "title": f"Review #{tid} again", "kind": "review", "spec": "check it",
            "depends_on": [tid]}
-    problems = coord.apply(p, [add])
-    assert len(problems) == 1 and f"review #{first}" in problems[0] and "force" in problems[0]
-    assert len(coord.apply(p, [dict(add, force=True)])) == 1, "force needs a reason"
+    # #9824: not queued again; the earlier verdict comes back as a note
+    assert coord.apply(p, [add]) == []
+    assert any("the earlier verdict returned" in n and f"review #{first}" in n for n in p.db.kv(coord.NOTES_KEY))
+    assert coord.apply(p, [dict(add, force=True)]) == [], "force needs a reason"
+    assert not p.db.one("SELECT 1 FROM tasks WHERE title=?", (add["title"],))
     assert coord.apply(p, [dict(add, force=True, reason="the first review skipped the docs")]) == []
     forced = p.db.one("SELECT * FROM tasks WHERE title=?", (add["title"],))
     assert reviewreuse.FORCED_LABEL in json.loads(forced["labels"])
@@ -21134,12 +21153,20 @@ def test_information_only_refusals_ride_along_and_real_rules_still_raise_a_turn(
     db.update_task(shelved, status="done", attempts=1,
                    result=json.dumps({"status": "done", "summary": "Shelved: 1.05x of the 1.8x bound."}))
     info = [{"type": "task_update", "id": run, "resources": ["m1"]},
-            {"type": "task_update", "id": run, "pr_branch": "feature/x"},
             {"type": "task_update", "id": run, "model": "other"},
-            {"type": "task_update", "id": run, "status": "queued"},
-            {"type": "task_update", "id": run, "start_after": "+1h"},
-            {"type": "task_add", "title": "open work", "spec": "spec"},
-            {"type": "task_add", "title": "Compact the cache to 4 MB", "kind": "code", "spec": "Compact it to 4 MB."}]
+            {"type": "task_update", "id": run, "status": "queued"}]
+    # #9824: these apply as meant, with a note: a branch or deferral change on a running task is a task
+    # after it; a duplicate of an open task is its spec update; landed work returns its result.
+    freed = [({"type": "task_update", "id": run, "pr_branch": "feature/x"}, "after it ends"),
+             ({"type": "task_update", "id": run, "start_after": "1h"}, "is the open task carrying its changes"),
+             ({"type": "task_add", "title": "open work", "spec": "spec"}, "duplicating open task"),
+             ({"type": "task_add", "title": "Compact the cache to 4 MB", "kind": "code", "spec": "Compact it to 4 MB."},
+              f"not queued, already done: task #{landed}")]
+    for a, want in freed:
+        out = coord.apply(p, [a]); assert out == [], (a, out)
+        assert any(want in n for n in db.kv(coord.NOTES_KEY)), (a, db.kv(coord.NOTES_KEY))
+    assert db.one("SELECT COUNT(*) n FROM tasks")["n"] == 5, "one follow-up of the running task added"
+    db.x("DELETE FROM tasks WHERE id > 4")
     for a in info:
         out = coord.apply(p, [a])
         assert len(out) == 1 and coord.informational_rejection(out[0]), (a, out)
@@ -21147,7 +21174,6 @@ def test_information_only_refusals_ride_along_and_real_rules_still_raise_a_turn(
         assert trig() == [], (a, out)
         shown = coord.digest(p, {}, [], [])
         assert "refused, information only: nothing to fix" in shown and coord.INFO_MARK not in shown
-    assert f"ledger entry #{landed}: task done, closed, landed" in out[0], out[0]
     assert db.task(run)["status"] == "running" and json.loads(db.task(run)["labels"] or "[]") == []
     assert db.one("SELECT COUNT(*) n FROM tasks")["n"] == 4, "refused exactly as before: nothing added"
     # Refusals for a rule or a decision still raise the next turn, worded as before; so does work
@@ -23543,8 +23569,8 @@ def test_task_update_replace_withdraws_or_rewrites_one_step_and_keeps_the_old_te
 
 
 @pytest.mark.parametrize("old, why", [
-    ("2. run the board benchmark", "0 times"),
-    ("the", "times, not once"),
+    ("2. run the board benchmark", "not in the spec"),
+    ("the", "touches a safety line"),   # one of its copies is on a safety line: none is replaced
     ("- keep content generic", "touches a safety line"),             # a line of a Restrictions block
     ("Restrictions:", "touches a safety line"),
     ("never push to main", "touches a safety line"),
@@ -23559,6 +23585,17 @@ def test_task_update_replace_is_refused_off_one_exact_step_or_on_a_safety_line(e
     assert problems and why in " ".join(map(str, problems)), problems
     assert p.db.task(tid)["spec"] == _STEPS_SPEC
     assert p.db.q("SELECT 1 FROM events WHERE kind=?", (coord.STEP_REPLACED_KIND,)) == []
+
+
+def test_task_update_replace_of_text_found_twice_replaces_each_identical_copy(env):
+    """Was refused: "`replace` old text is in the spec 2 times, not once" (#9824): each copy is replaced."""
+    p = make(env)
+    from ttp import coordinator as coord
+    tid = p.db.add_task("loader", "1. run the board benchmark\n2. report\n3. run the board benchmark again", kind="work")
+    assert coord.apply(p, [{"type": "task_update", "id": tid,
+                            "replace": {"old": "run the board benchmark", "new": "run the host benchmark"}}]) == []
+    spec = p.db.task(tid)["spec"]
+    assert spec.split("## Update")[0].count("run the host benchmark") == 2 and "2 identical copies replaced" in spec
 
 
 _QUOTED = 'In the user\'s words: "run the full sweep tonight"'
@@ -24012,8 +24049,8 @@ def test_a_review_of_a_head_already_failed_keeps_that_verdict_with_no_run_and_no
     assert [e["task"] for e in ev] == [again]
     add = {"type": "task_add", "title": f"Review #{tid} once more", "kind": "review", "spec": "check it",
            "depends_on": [tid]}
-    problems = coord.apply(p, [add])
-    assert len(problems) == 1 and "already failed by review #" in problems[0] and "force" in problems[0]
+    assert coord.apply(p, [add]) == []   # #9824: the earlier verdict comes back as a note
+    assert any("the earlier verdict returned" in n and "already failed by review #" in n for n in p.db.kv(coord.NOTES_KEY))
     add.update(force=True, reason="the first review misread the spec")
     assert coord.apply(p, [add]) == []
     forced = p.db.one("SELECT * FROM tasks WHERE title=?", (add["title"],))
@@ -24204,7 +24241,7 @@ def test_a_deferred_task_add_is_replayed_with_its_turns_user_messages(env, monke
 def test_a_deferred_task_update_on_ask_new_waits_on_the_ask_its_turn_sent(env, monkeypatch):
     """A task_update holding a task on `ask:new` whose git check times out is kept re-pointed to the
     ask_user its turn sent after it, so its replay (which has no ask_user) holds the task on that ask;
-    with no ask of its turn going through, it is rejected at once, never deferred onto nothing."""
+    with no ask_user in its batch, the hold is dropped at once (noted), never deferred onto nothing."""
     import subprocess
     p = make(env)
     from ttp import actdefer, anchors, coordinator as coord
@@ -24228,6 +24265,6 @@ def test_a_deferred_task_update_on_ask_new_waits_on_the_ask_its_turn_sent(env, m
     task = p.db.task(tid)
     assert task["status"] == "blocked" and anchors.label("ask", str(ask_id)) in task["labels"], task["labels"]
     fails[0] = 1
-    assert coord.apply(p, [upd]) == [f"task_update: #{tid} rejected: it waits_on ask:new, but no ask_user of "
-                                     f"this turn went through"]
-    assert not actdefer.pending(p.db)
+    assert coord.apply(p, [upd]) == []   # no ask_user in its batch: the hold is dropped, noted (#9824)
+    assert any("waits_on ask:new, but the batch sends no ask_user" in n for n in p.db.kv(coord.NOTES_KEY, []))
+    assert all("waits_on" not in x["action"] for x in actdefer.pending(p.db)), "deferred onto nothing"

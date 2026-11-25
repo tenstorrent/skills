@@ -104,8 +104,9 @@ def test_inflight_cap_is_raised_or_removed_only_by_the_user(env, tmp_path):
             accountset.queue(tmp_path, "chat.max_inflight", v, by)
     accountset.apply("chat.max_inflight", 8, {"by": "user"})
     assert inflight.cap() == 8
-    with pytest.raises(ValueError, match="set by the user"):
-        accountset.apply("chat.max_inflight", 4, by)   # the user's value is theirs
+    # a coordinator lowers the user's value, noted as theirs (#9824); raising it stays the user's
+    assert "the user's value" in accountset.apply("chat.max_inflight", 4, by) and inflight.cap() == 4
+    accountset.apply("chat.max_inflight", 8, {"by": "user"})
     assert not accountset.raises("chat.max_inflight", 8, 4) and accountset.raises("chat.max_inflight", 8, 9)
     assert not accountset.raises("chat.max_inflight", None, 8), "setting one where none was lowers it"
 

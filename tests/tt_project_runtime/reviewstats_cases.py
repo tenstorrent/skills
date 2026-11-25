@@ -813,7 +813,7 @@ def test_another_repos_head_or_packet_neither_blocks_nor_reuses_a_verdict_but_an
         assert res["reviewed_head"] == head
 
 
-def test_task_add_refuses_only_a_review_of_the_exact_accepted_target(env, monkeypatch):
+def test_task_add_returns_the_verdict_only_for_a_review_of_the_exact_accepted_target(env, monkeypatch):
     from ttp import coordinator as coord
     p = make(env)
     tid, path, branch = _code_task(p, "make it")
@@ -828,7 +828,9 @@ def test_task_add_refuses_only_a_review_of_the_exact_accepted_target(env, monkey
         assert coord.apply(p, [dict(add, title=f"Review target {n}", spec=spec)]) == [], spec
     problems = coord.apply(p, [dict(add, title="Review the packet once more",
                                     spec=f"Review the detached packet reviews/p.md sha256 {_SUM_A}.")])
-    assert len(problems) == 1 and f"review #{first}" in problems[0], problems
+    notes = p.db.kv(coord.NOTES_KEY, [])   # not queued: the earlier verdict comes back, noted (#9824)
+    assert problems == [] and any(f"review #{first}" in n and "the earlier verdict returned" in n for n in notes), notes
+    assert not p.db.q("SELECT id FROM tasks WHERE title='Review the packet once more'")
 
 
 def test_task_add_is_not_refused_by_a_failed_review_of_another_target(env, monkeypatch):
@@ -847,7 +849,8 @@ def test_task_add_is_not_refused_by_a_failed_review_of_another_target(env, monke
                               f"Review repo other/b, branch x, head {_OTHER_HEAD}.")):
         assert coord.apply(p, [dict(add, title=f"Review target {n}", spec=spec)]) == [], spec
     problems = coord.apply(p, [dict(add, title="Review the change once more", spec="Review the change.")])
-    assert len(problems) == 1 and f"review #{plain}" in problems[0], problems
+    notes = p.db.kv(coord.NOTES_KEY, [])   # not queued: the earlier verdict comes back, noted (#9824)
+    assert problems == [] and any(f"review #{plain}" in n and "the earlier verdict returned" in n for n in notes), notes
 
 
 def test_a_spec_naming_a_commit_its_head_lacks_neither_reuses_nor_marks_that_head_verified(env, monkeypatch):

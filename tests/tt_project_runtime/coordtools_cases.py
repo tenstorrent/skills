@@ -389,11 +389,8 @@ def test_session_answer_check_refuses_what_apply_refuses_and_never_traps_the_tur
     p.db.update_task(done, status="done")
     cases = [({"type": "task_update", "id": tid, "status": "queued"}, f"task #{tid} is running"),
              ({"type": "task_update", "id": tid, "resources": ["box"]}, "its resources change only"),
-             ({"type": "task_update", "id": done, "start_after": "1h"}, "only a task that has not started"),
-             ({"type": "task_update", "id": done, "pr_branch": "x"}, "its branch changes only"),
              ({"type": "task_update", "id": tid, "status": "waiting"}, "status `waiting`"),
              ({"type": "task_update", "id": "abc"}, "needs the id of a task"),
-             ({"type": "task_add", "title": "bench", "spec": "s"}, f"duplicate of open task #{tid}"),
              ({"type": "task_add", "title": "x", "spec": " "}, coord.MISSING_FIELDS),
              ({"type": "task_add", "title": "x", "spec": "s", "kind": "nope"}, coord.UNKNOWN_KIND),
              ({"type": "task_add", "title": "x", "spec": "s", "continues": 99999}, "no task #99999"),

@@ -866,6 +866,7 @@ def record(db: DB, a: dict, next_at: float | None, now: float | None = None, whe
     return key
 
 
+NEXT_SWEEP = "the next blocker sweep re-checks it (no condition named)"   # a still_blocked naming no wait
 _KEY_FIELD = {"task": "id", "promise": "promise", "resource": "resource"}   # an item key's kind -> its field
 
 
@@ -898,8 +899,8 @@ def normal_form(p, a: dict, batch: list, home: str, now: float) -> tuple[dict, s
     """A `sweep` whose meaning is clear, in the form record() takes (actionforms): an item key sent in another
     field ('task:12' as `id`) moved to its own; on a task no task_update in the batch changes, `unblocked`
     while still deferred recorded as still_blocked, and a still_blocked without a re-checkable condition or
-    a future `start_after` given the item's own wait and next wake (else now + the sweep period). None when
-    nothing needs it; a record naming no wait leaves a vague 'keep it blocked' to its refusal."""
+    a future `start_after` given the item's own wait and next wake (else now + the sweep period); with no wait
+    on record it is re-checked at the next sweep (NEXT_SWEEP). None when nothing needs it."""
     from .coordinator import parse_start_after
     db, notes = p.db, []
     was = lambda v: repr(_clip(v, 80)) if v not in (None, "") else "none"   # noqa: E731
@@ -928,8 +929,8 @@ def normal_form(p, a: dict, batch: list, home: str, now: float) -> tuple[dict, s
         wakes, wait = _own_wait(db, key, now, home)
         sent = a.get("until") or a.get("reason")
         if not recheckable({"until": sent, "probe": a.get("until_probe")}):
-            if not wait:
-                return done()
+            # No wait of its own on record: the next blocker sweep re-checks it, with nothing awaited.
+            wait = wait or {"until": NEXT_SWEEP}
             for f, v in wait.items():
                 notes.append(f"{f}={_clip(v, 160)} (was: {was(a.get(f) if f == 'until_probe' else sent)})")
                 a[f] = v
