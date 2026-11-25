@@ -614,12 +614,11 @@ def wave_tick(now: float | None = None, judge=None, projects: dict | None = None
     now = time.time() if now is None else now
     cfg = settings()
     at = {f: lv for f in FLAGS if (lv := level(f, cfg)) == AUTO or lv != OFF and FLAGS[f].get("ring_judge")}
-    flags = list(at)
-    if not flags:
+    if not at:
         return []
     with _locked():
         seen = _wave_state()
-        due = [f for f in flags if not 0 <= now - float(seen.get(f) or 0) < WAVE_EVERY_S]
+        due = [f for f in at if not 0 <= now - float(seen.get(f) or 0) < WAVE_EVERY_S]
         if not due:
             return []
         seen.update({f: now for f in due})
@@ -655,7 +654,8 @@ def wave_tick(now: float | None = None, judge=None, projects: dict | None = None
             verdicts[name] = v if isinstance(v, dict) else {"state": "wait", "why": "no verdict", "n": 0}
         with _locked():
             cfg = settings()
-            if (level(flag, cfg), waves(flag, cfg), wave_at(flag, cfg), cfg.get("rings")) != (lv, ws, k, rings):
+            moved = (level(flag, cfg), waves(flag, cfg), wave_at(flag, cfg)) != (lv, ws, k)
+            if moved or lv != AUTO and cfg.get("rings") != rings:   # a ring level also reads the rings
                 continue   # the user changed it meanwhile: the next hour judges the new state
             back, worse = rolled_back(flag, cfg), []
             for name, v in verdicts.items():

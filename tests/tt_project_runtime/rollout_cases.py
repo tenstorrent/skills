@@ -917,7 +917,6 @@ def test_a_worse_glm_code_project_is_rolled_back_alone_at_its_ring_level_with_it
     assert rollout.wave_tick(now + 3600, None, projs) == [], "alpha waits for new outcomes; beta's ok opens no wave"
 
 
-
 def test_only_a_ring_judge_flag_is_judged_at_a_ring_level(env, capsys):
     """At a ring level the wave gate judges only a flag marked `ring_judge` (glm_code); glm_work and glm_device
     there are left to the health watch, even for a worse project."""
@@ -930,6 +929,26 @@ def test_only_a_ring_judge_flag_is_judged_at_a_ring_level(env, capsys):
     recs = rollout.wave_tick(time.time(), _judge({"alpha": "worse"}), projs)
     assert [(r["op"], r["flag"], r["project"]) for r in recs] == [("project_rollback", "glm_code", "alpha")], recs
     assert rollout.rolled_back("glm_work") == rollout.rolled_back("glm_device") == {}
+
+
+def test_a_ring_change_while_judging_drops_a_ring_level_verdict_not_an_auto_one(env, capsys):
+    """The rings changing while the gate judges void a ring-level flag's verdicts (the next hour judges again);
+    a flag at auto does not read the rings and keeps its verdicts."""
+    from ttp import rollout
+    projs = {"alpha": make(env, "alpha")}
+    _roll(capsys, "ring", "alpha", "1")
+    _roll(capsys, "set", "glm_code", "1")
+    _roll(capsys, "waves", "glm_work", "alpha")
+    _roll(capsys, "set", "glm_work", "auto")
+    calls = []
+
+    def judge(p, cfg, now):
+        _roll(capsys, "ring", "alpha", "1" if calls else "2")   # each judge call moves alpha's ring
+        calls.append(p.name)
+        return {"state": "worse", "why": "worse", "n": 12}
+    recs = rollout.wave_tick(time.time(), judge, projs)
+    assert calls == ["alpha", "alpha"]
+    assert [(r["op"], r["flag"], r["project"]) for r in recs] == [("project_rollback", "glm_work", "alpha")], recs
 
 def test_a_rollback_record_carries_both_pass_rates_and_the_baseline_window(env, capsys, tmp_path):
     from ttp import rollout
