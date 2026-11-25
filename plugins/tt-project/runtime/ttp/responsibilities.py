@@ -537,6 +537,7 @@ def machine_status(alias: str | None = None, now: float | None = None, where=Non
         finally:
             db.close()
     outs = machine_ledger.outages(now)
+    holds = fleethold.active()
     for a, v in view.items():
         for res in sorted({res for res in _shared_resources(a)}):
             pz = shared.read_pause(res)
@@ -548,7 +549,7 @@ def machine_status(alias: str | None = None, now: float | None = None, where=Non
         v["conditions"] = [machine_ledger.condition_line(c, now)
                            for k, c in machine_ledger.conditions().items() if c.get("alias") == a]
         v["outage"] = outs.get(a)
-        if v["outage"] or fleethold.active().get(a):   # held or out: what of any project's work is on it
+        if v["outage"] or holds.get(a):   # held or out: what of any project's work is on it
             from . import heldwork
             v["still_on"] = heldwork.live_items(a, now=now, where=where)
     return list(view.values())

@@ -19,23 +19,49 @@ from __future__ import annotations
 import json
 import os
 import re
+import subprocess
 import time
 from pathlib import Path
+
+from typing import Iterable
 
 from . import project
 
 PROBE_TIMEOUT_S = 10.0    # a live probe runs at most this long (ends.probe_once)
+SSH_G_S = 5.0              # `ssh -G <alias>` (read-only) is bounded by this
 UNVERIFIED = "unverified: owner {owner} must confirm"
 
 
-def alias_of(host: str, known: dict | None = None) -> str | None:
-    """The machine alias `host` names (the alias itself, or a machine's hostname), or None."""
+def names_of(alias: str) -> set[str]:
+    """Every name the machine goes by: its alias, its record's host name, and the HostName
+    `ssh -G <alias>` resolves to (read-only: ssh -G prints the config and never connects)."""
     from . import machines
-    known = machines.load() if known is None else (known or {})
-    for alias, m in known.items():
-        if host == alias or host == (m or {}).get("hostname"):
-            return alias
-    return None
+    rec = machines.load().get(alias) or {}
+    out = {alias, str(rec.get("hostname") or "").strip()} - {""}
+    return (out | _ssh_g_hostname(alias)) - {""}
+
+
+_SSH_G: dict[str, set[str]] = {}   # alias -> names its `ssh -G` gave (cached per process)
+
+
+def _ssh_g_hostname(alias: str) -> set[str]:
+    """The HostName `ssh -G <alias>` resolves to ({} when ssh or the config cannot say)."""
+    if os.environ.get("TTP_TEST_NO_SSH_CHECK") == "1":   # the test suite: no ssh reads
+        return set()
+    if alias not in _SSH_G:
+        try:
+            r = subprocess.run(["ssh", "-G", alias], capture_output=True, text=True,
+                                timeout=SSH_G_S, stdin=subprocess.DEVNULL)
+            _SSH_G[alias] = ({ln.split(" ", 1)[1].strip() for ln in r.stdout.splitlines()
+                              if ln.lower().startswith("hostname ")} if r.returncode == 0 else set())
+        except (OSError, subprocess.SubprocessError):
+            _SSH_G[alias] = set()
+    return _SSH_G[alias]
+
+
+def machine_of(host: str, candidates: Iterable[str]) -> str | None:
+    """The machine alias `host` names (an alias, its host name, its ssh-resolved HostName)."""
+    return next((a for a in candidates if host in names_of(a)), None)
 
 
 def ssh_refusal(cmd: str) -> str | None:
@@ -47,7 +73,7 @@ def ssh_refusal(cmd: str) -> str | None:
     if not holds and not outs:
         return None
     for host in hook.ssh_targets(cmd):
-        if not (alias := alias_of(host)):
+        if not (alias := machine_of(host, list(holds) + sorted(outs))):
             continue
         if hold := holds.get(alias):
             end = pauseends.describe(fleethold.entry(hold))
@@ -92,13 +118,15 @@ def live_items(alias: str, now: float | None = None, where=None) -> list[dict]:
         db_path = base / "state" / "project.db"
         if not db_path.is_file():
             continue
+        db = None
         try:
             db = rs.ReadOnly(globalcap.connect_ro(db_path))
             rows = db.q(f"SELECT id, title, status, labels FROM tasks WHERE {OPEN_TASKS}")
         except Exception:
             continue
         finally:
-            db.close()
+            if db is not None:
+                db.close()
         for t in rows:
             if hit := sorted(r for r in task_resources(t) if on(r)):
                 out.append({"kind": "task", "project": name,
@@ -166,11 +194,14 @@ def _script_texts(root, command: str) -> list[str]:
 
 
 def _text_names(alias: str, text: str) -> bool:
-    """Whether `text` names machine `alias` (or a resource on it) as a whole word or token."""
+    """Whether `text` names the machine: its alias or another of its names as a whole word, or a
+    resource named after it (`<alias>-...`)."""
     from . import responsibilities as rs
-    if rs._word(alias, text):
+    names = names_of(alias) - {alias}
+    if any(rs._word(n, text) for n in names):
         return True
-    return any(tok.split(":", 1)[0].startswith(alias + "-") for tok in re.split(r"\s", text))
+    return rs._word(alias, text) or any(tok.split(":", 1)[0].startswith(alias + "-")
+                                       for tok in re.split(r"\s", text))
 
 
 def still_on_line(alias: str, its: list[dict]) -> str:
@@ -179,7 +210,8 @@ def still_on_line(alias: str, its: list[dict]) -> str:
 
 
 def notes(p, its: list[dict], why: str = "") -> list[str]:
-    """One note per owner project naming its items (`upstream.send_or_queue`); the placing
+    """One note per owner project naming its items: `upstream.send_or_queue` in the placing
+    project's context, `upstream.send` when none exists (a project-less CLI call). The placing
     project's own items are returned instead of a note to itself."""
     from . import upstream
     by: dict[str, list[str]] = {}
@@ -193,7 +225,10 @@ def notes(p, its: list[dict], why: str = "") -> list[str]:
         body = (f"{why or 'A machine is held machine-wide'}; still on it from your project: "
                 + "; ".join(texts) + ". Stop what runs or is installed there, or reply why not.")
         try:
-            upstream.send_or_queue(p.state, p.name, None, owner, body, "normal")
+            if p is None:
+                upstream.send("user", None, owner, body, "normal")
+            else:
+                upstream.send_or_queue(p.state, p.name, None, owner, body, "normal")
         except Exception:
             pass   # the status line still shows the item; the owner's own status shows it too
     return mine

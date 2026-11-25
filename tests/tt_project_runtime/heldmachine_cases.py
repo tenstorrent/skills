@@ -146,3 +146,39 @@ def test_schedules_and_watcher_scripts_that_name_the_machine_are_listed(env):
     texts = [i["text"] for i in got if i["kind"] == "schedule"]
     assert any("watch-boxes" in t for t in texts) and any("journal-prompt-check" in t for t in texts), texts
     assert not any("unrelated" in t for t in texts)
+
+
+def test_a_hold_placed_without_a_project_context_still_notes_the_owners(env):
+    from ttp import heldwork, machines
+    from ttp import machine_ledger as ml
+    from ttp import upstream as up
+    machines.add(_HM_BOX, tags="device")
+    ml.add_change(_HM_BOX, "edge VM service", "systemctl disable --now svc", by="gamma", expires="1h")
+    inbox = pathlib.Path(up.path())
+    before = inbox.read_text() if inbox.exists() else ""
+    heldwork.notes(None, heldwork.live_items(_HM_BOX))
+    after = inbox.read_text() if inbox.exists() else ""
+    notes = [json.loads(ln) for ln in after[len(before):].strip().splitlines()] if after[len(before):] else []
+    assert any(n.get("to") == "gamma" and _HM_BOX in n.get("spec", "") for n in notes), notes
+
+
+def test_the_guard_and_inventory_match_a_machine_by_every_name_it_goes_by(env, monkeypatch):
+    from ttp import fleethold, heldwork, machines
+    from ttp import machine_ledger as ml
+    machines.add(_HM_BOX, tags="device", hostname="hm-box-host.internal")
+    ml.add_change(_HM_BOX, "edge VM service", "systemctl disable --now svc", by="gamma", expires="1h")
+    _hm_hold()
+    # ssh by the machine's host name, not only its alias: refused
+    why = heldwork.ssh_refusal("ssh hm-box-host.internal true")
+    assert why and "held machine-wide" in why, why
+    # the schedule inventory matches a script naming the host name too
+    from ttp import schedule as sched
+    alpha, beta = _hm_setup(env)
+    script = alpha.root / "scripts" / "watch.sh"
+    script.parent.mkdir(parents=True, exist_ok=True)
+    script.write_text("#!/bin/sh\nfor h in hm-box-host.internal; do probe $h; done\n")
+    sched.upsert(alpha.db, "watch-hosts", "command", "10m", payload={"command": f"sh {script}"})
+    assert any(i["kind"] == "schedule" for i in heldwork.live_items(_HM_BOX)), heldwork.live_items(_HM_BOX)
+    fleethold.lift(_HM_BOX, True, "test")
+
+
