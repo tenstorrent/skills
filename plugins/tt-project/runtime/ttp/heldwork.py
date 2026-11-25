@@ -138,21 +138,16 @@ def live_items(alias: str, now: float | None = None, where=None) -> list[dict]:
                                 f"{timefmt.short(float(rec.get('since') or 0), where)}"})
     scheds: list[dict] = []
     for name, base, db in ml.project_dbs():   # open tasks and schedules that name it, every project
-        if db is None or isinstance(db, Exception):   # none yet, or one that cannot be opened (said)
-            if db is not None:
-                out.append(_unread(name, "database", db))
+        if db is None or isinstance(db, Exception):
             continue
         try:
             for t, hit in ml.tasks_on(db, on):
                 out.append({"kind": "task", "project": name,
                             "text": f"open task #{t['id']} ({t['status']}) on {', '.join(hit)}: "
                                     f"{t['title']}"})
-        except Exception as e:   # each section on its own: a failed read is reported, never skips the next
-            out.append(_unread(name, "open tasks", e))
-        try:
             scheds += _schedules(alias, name, base, db)
-        except Exception as e:
-            scheds.append(_unread(name, "schedules", e))
+        except Exception:
+            continue
     o = ml.outages().get(alias)
     held = bool(fleethold.active().get(alias)) or (o is not None and not o.get("covers"))
     # a partial outage leaves the machine reachable, so its items stay verifiable
@@ -280,13 +275,11 @@ def notes(p, its: list[dict], why: str = "") -> tuple[list[str], list[str]]:
     project's context, `upstream.send` when none exists (a project-less CLI call). The placing
     project's own items are returned instead of a note to itself. A note that is refused (a full
     outbox, a raise) gets one retry as a direct high-severity send, and the second failure is
-    returned as a "note to <project> failed" line, so it is never lost silently. An `unread` item is no
-    work of its project's on the machine: it stays in the status line and is never put in a note."""
+    returned as a "note to <project> failed" line, so it is never lost silently."""
     from . import upstream
     by: dict[str, list[str]] = {}
     for i in its:
-        if i.get("kind") != "unread":
-            by.setdefault(i["project"], []).append(i["text"])
+        by.setdefault(i["project"], []).append(i["text"])
     mine: list[str] = []
     failed: list[str] = []
     for owner, texts in sorted(by.items()):
@@ -347,9 +340,3 @@ def _config(owner: str) -> dict:
 
 def _unverified(owner) -> str:
     return UNVERIFIED.format(owner=owner or "?")
-
-
-def _unread(name: str, what: str, e: Exception) -> dict:
-    """The item for project `name`'s `what` that could not be read: the inventory says it is incomplete."""
-    return {"kind": "unread", "project": name,
-            "text": f"its {what} could not be read ({type(e).__name__}: {str(e)[:120]}) — {_unverified(name)}"}

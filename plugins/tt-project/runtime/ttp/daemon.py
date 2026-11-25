@@ -8112,22 +8112,25 @@ class Daemon:
             # No shell command (JSON true, a number, a list): never run, nor read as passed through its
             # truthiness. It is dropped, said loudly, and the task wakes at its timer (or on its jobs' probe).
             bad = json.dumps(result["retry_when"])[:200]
-            result = waitheal.refuse_wait(
-                db, self.p, task, result, bad,
-                f"its waiting hand-off's retry_when {bad} is no shell command, so it was not stored; the task "
-                f"wakes at its retry timer" + ("; its on_pass_cmd runs only after a probe passes, so a run reads "
-                                               "it instead" if result.get("on_pass_cmd") is not None else ""),
-                f"retry_when {bad} refused: no shell command")
+            result = {**{k: v for k, v in result.items() if k != "retry_when"}, "retry_when_refused": bad}
+            text = (f"#{task['id']} {task['title']}: its waiting hand-off's retry_when {bad} is no shell command, "
+                    f"so it was not stored; the task wakes at its retry timer"
+                    + ("; its on_pass_cmd runs only after a probe passes, so a run reads it instead"
+                       if result.get("on_pass_cmd") is not None else ""))
+            db.x("INSERT INTO events(ts,source,kind,severity,text,status,task) VALUES(?,?,?,?,?,?,?)",
+                 (time.time(), f"task:{task['id']}", "handoff_probe_refused", "normal", text, "queued", task["id"]))
+            log(self.p, f"task {task['id']} hand-off: retry_when {bad} refused: no shell command")
         if rstatus == "waiting" and isinstance(result.get("retry_when"), str) \
                 and (named := checks_marker_probe(result["retry_when"])):
             # The marker outlives a killed run (its process is gone, the file stays): the task would never wake.
             refused = result["retry_when"][:200]
-            result = waitheal.refuse_wait(
-                db, self.p, task, result, refused,
-                f"its waiting hand-off's retry_when names the checks.running marker directly ({named!r}), which "
-                f"a killed run leaves behind, so it was not stored; wait on `ttp checks --result <run dir>` "
-                f"instead (detached or foreground checks); the task wakes at its retry timer",
-                f"retry_when refused: names {named}: {refused}")
+            result = {**{k: v for k, v in result.items() if k != "retry_when"}, "retry_when_refused": refused}
+            db.x("INSERT INTO events(ts,source,kind,severity,text,status,task) VALUES(?,?,?,?,?,?,?)",
+                 (time.time(), f"task:{task['id']}", "handoff_probe_refused", "normal",
+                  f"#{task['id']} {task['title']}: its waiting hand-off's retry_when names the checks.running marker directly ({named!r}), which "
+                  f"a killed run leaves behind, so it was not stored; wait on `ttp checks --result <run dir>` "
+                  f"instead (detached or foreground checks); the task wakes at its retry timer", "queued", task["id"]))
+            log(self.p, f"task {task['id']} hand-off: retry_when refused: names {named}: {refused}")
         if rstatus == "waiting" and isinstance(result.get("on_pass_cmd"), str) and not result["on_pass_cmd"].strip():
             # An empty on_pass_cmd names none (as `ttp task set-when --on-pass-cmd ""` does): dropped, so a
             # passed probe records its on_pass (or wakes it), never stops on "on_pass_cmd is not a command".
@@ -8157,10 +8160,13 @@ class Daemon:
         if rstatus == "waiting" and isinstance(result.get("retry_when"), str) and (unfiled := upstream.unfiled_waits(
                 result["retry_when"], self.p.state, upstream.filed_fps(self.p.name, task["id"], result.get("followups")))):
             # It would sleep until its deferral ran out: dropped, said loudly; the task wakes at its retry timer.
-            result = waitheal.refuse_wait(
-                db, self.p, task, result, result["retry_when"][:200],
-                f"its waiting hand-off's retry_when was not stored: {upstream.unfiled_words(unfiled)}; the task "
-                f"wakes at its retry timer", f"retry_when refused: note {unfiled[0]} never filed")
+            db.x("INSERT INTO events(ts,source,kind,severity,text,status,task) VALUES(?,?,?,?,?,?,?)",
+                 (time.time(), f"task:{task['id']}", "handoff_probe_refused", "normal",
+                  f"#{task['id']} {task['title']}: its waiting hand-off's retry_when was not stored: "
+                  f"{upstream.unfiled_words(unfiled)}; the task wakes at its retry timer", "queued", task["id"]))
+            log(self.p, f"task {task['id']} hand-off: retry_when refused: note {unfiled[0]} never filed")
+            result = {**{k: v for k, v in result.items() if k != "retry_when"},
+                      "retry_when_refused": result["retry_when"][:200]}
         if rstatus == "waiting" and isinstance(result.get("retry_when"), str):
             result = self._pin_handoff_probe(task, r, run_dir, result)
             if isinstance(result.get("retry_when"), str) \
@@ -19270,9 +19276,13 @@ class Daemon:
         try:
             pinned = probevars.pin(probe, "retry_when", env)
         except ValueError as e:
-            return waitheal.refuse_wait(self.p.db, self.p, task, result, probe[:200],
-                                        f"its waiting hand-off's {e}; it was not stored, so the task wakes at "
-                                        f"its retry timer", f"retry_when refused: {e}")
+            text = f"#{task['id']} {task['title']}: its waiting hand-off's {e}; it was not stored, so the task " \
+                   f"wakes at its retry timer"
+            self.p.db.x("INSERT INTO events(ts,source,kind,severity,text,status,task) VALUES(?,?,?,?,?,?,?)",
+                        (time.time(), f"task:{task['id']}", "handoff_probe_refused", "normal", text[:1500],
+                         "queued", task["id"]))
+            log(self.p, f"task {task['id']} hand-off: retry_when refused: {e}")
+            return {**{k: v for k, v in result.items() if k != "retry_when"}, "retry_when_refused": probe[:200]}
         if pinned == probe:
             return result
         log(self.p, f"task {task['id']} hand-off: retry_when's run variables written in: {pinned[:300]}")
