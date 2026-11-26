@@ -1723,7 +1723,7 @@ def test_glm_code_ring_flag_gates_the_coin_flip_and_the_projects_own_share_wins(
 # Every run on the chat model: outward posts become drafts for an Opus step; a device run stops at a failed gate.
 def _glm_run_env(monkeypatch, tmp_path, flag="1"):
     from ttp import glmguard
-    wt, rd = _gg_run(tmp_path)
+    wt, rd = _gg_run(tmp_path, arm=bool(flag))
     monkeypatch.setenv("TTP_RUN_DIR", str(rd))
     monkeypatch.setenv("TTP_PROJECT", str(tmp_path / "proj"))
     monkeypatch.delenv("TTP_CODE_ARM_GUARD", raising=False)
