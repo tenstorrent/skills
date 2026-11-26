@@ -132,16 +132,6 @@ PUSH_LOAD_WAIT_S, PUSH_LOAD_WAIT_KEY, PUSH_LOAD_WAIT_ENV = 300.0, "push_load_wai
 IONICE = ["-c3"]    # idle class: a live service's IO always goes first
 
 
-def _number(v) -> int | None:
-    if isinstance(v, bool):
-        return None
-    try:
-        n = int(str(v).strip())
-    except (TypeError, ValueError):
-        return None
-    return n if n >= 0 else None
-
-
 class Kind:
     """One slot pool: its lock-file names, settings and the words its lines use."""
 
@@ -165,7 +155,7 @@ CLIP_WAIT_S = 60.0   # `ttp clip` of a build waits this long for a build slot, t
 
 def _setting(env: str, key: str) -> int | None:
     for v in (os.environ.get(env), (project.load_account_settings().get("checks") or {}).get(key)):
-        if v not in (None, "") and (n := _number(v)) is not None:
+        if v not in (None, "") and (n := checkcap.non_negative_int(v)) is not None:
             return n
     return None
 
@@ -182,9 +172,9 @@ def sizes(cfg: dict | None = None, cores: int | None = None, kind: Kind = TESTS)
     top = _setting(*kind.setting("run_max"))
     top = min(RUN_MAX, max(1, pool // 2)) if not top else top
     own = _section(cfg, "checks")
-    if (n := _number(own.get(kind.setting("pool")[1]))):
+    if (n := checkcap.non_negative_int(own.get(kind.setting("pool")[1]))):
         pool = min(pool, n)
-    if (n := _number(own.get(kind.setting("run_max")[1]))):
+    if (n := checkcap.non_negative_int(own.get(kind.setting("run_max")[1]))):
         top = min(top, n)
     return pool, max(1, min(top, pool))
 
@@ -197,7 +187,7 @@ def pool_now(cfg: dict | None, pool: int, held: int, cores: int | None = None, l
     cores the pool leaves serves more checks only while nothing else keeps it busy. An unreadable load
     average, a set pool, checks.load_extra 0 (checkcap.extra_max) and the build pool keep `pool`."""
     if kind is not TESTS or not checkcap.extra_max() or _setting(*kind.setting("pool")) is not None \
-            or _number(_section(cfg, "checks").get(kind.setting("pool")[1])):
+            or checkcap.non_negative_int(_section(cfg, "checks").get(kind.setting("pool")[1])):
         return pool
     c = checkcap.cores() if cores is None else cores
     ld = checkcap._load() if load is None else load
@@ -209,7 +199,7 @@ def pool_now(cfg: dict | None, pool: int, held: int, cores: int | None = None, l
 def run_min(cfg: dict | None, run_max: int) -> int:
     """The fewest test slots a full checks run starts with: checks.test_run_min (the project's, then
     TTP_TEST_RUN_MIN or the account's), default max(WORKERS_FLOOR, run_max // 2); at most run_max."""
-    n = _number(_section(cfg, "checks").get(RUN_MIN_KEY)) or _setting(RUN_MIN_ENV, RUN_MIN_KEY) \
+    n = checkcap.non_negative_int(_section(cfg, "checks").get(RUN_MIN_KEY)) or _setting(RUN_MIN_ENV, RUN_MIN_KEY) \
         or max(WORKERS_FLOOR, run_max // 2)
     return max(1, min(n, run_max))
 
@@ -241,7 +231,7 @@ def project_workers(cfg: dict | None = None, cores: int | None = None, project_n
         c = checkcap.cores() if cores is None else cores
         top = max(WORKERS_FLOOR, min(PROJECT_WORKERS_MAX, c // CORES_PER_PROJECT_WORKER), admitted_workers(cfg, c))
         top = max(top, min(c // 2, top + spare_workers(c, _own_held(project_name, c) if project_name else 0)))
-    if (mine := _number(_section(cfg, "checks").get("test_project_workers"))) and mine > 0:
+    if (mine := checkcap.non_negative_int(_section(cfg, "checks").get("test_project_workers"))) and mine > 0:
         top = min(top, mine) if top else mine
     return max(0, top)
 
@@ -465,7 +455,7 @@ def project_max(cfg: dict | None = None, s: tuple[int, int] | None = None, kind:
     if not s[0]:
         return 0
     env, key = kind.setting(kind.budget)
-    mine = _number(_section(cfg, "checks").get(key))
+    mine = checkcap.non_negative_int(_section(cfg, "checks").get(key))
     top = _setting(env, key) or (mine if kind is TESTS else None)
     top = top or (min(s[0], 2 * s[1]) if kind is BUILDS else max(1, checklane.project_cap(cfg)) * s[1])
     if mine:
@@ -486,9 +476,9 @@ def project_max_from(cfg: dict | None = None, s: tuple[int, int] | None = None,
     if not s[0]:
         return ""
     env, key = TESTS.setting(TESTS.budget)
-    mine = _number(_section(cfg, "checks").get(key))
-    upper = _number(os.environ.get(env)) if os.environ.get(env) not in (None, "") else None
-    acct = _number((project.load_account_settings().get("checks") or {}).get(key))
+    mine = checkcap.non_negative_int(_section(cfg, "checks").get(key))
+    upper = checkcap.non_negative_int(os.environ.get(env)) if os.environ.get(env) not in (None, "") else None
+    acct = checkcap.non_negative_int((project.load_account_settings().get("checks") or {}).get(key))
     top = upper or acct or mine
     src = "env" if upper else "account" if acct else "project" if mine else ""
     if mine and top and mine < top:
@@ -601,7 +591,7 @@ def direct(cmd: str, holder: str, tell: Callable[[str], None]) -> Grant | None:
     as acquire) up to DIRECT_WAIT_S, then runs on one worker without a slot. The caller lowers -n to
     grant.k (clamp) and runs the command with grant.env() and the grant's files (inheritable here), so
     the test process holds the slots and its end or death frees them. None: nothing to take."""
-    share = _number(os.environ.get(SLOTS_ENV))
+    share = checkcap.non_negative_int(os.environ.get(SLOTS_ENV))
     if not share or os.environ.get(HELD_ENV) or os.environ.get(checkcap.HELD_ENV):
         return None
     if (n := asked(cmd, share) or 0) <= 1:
@@ -749,7 +739,7 @@ def acquire(holder: str, tell: Callable[[str], None] | None = None, wait_s: floa
     tell = tell or (lambda _line: None)
     what = f"{kind.name} slots"
     for env in (kind.held_env, HELD_ENV):   # HELD_ENV: a build in a check builds on the check's slots
-        if (held := _number(os.environ.get(env))):
+        if (held := checkcap.non_negative_int(os.environ.get(env))):
             return Grant(held, kind=kind)
     cfg = _cfg() if cfg is None else cfg
     name = _project_name() if project_name is None else project_name
@@ -2121,7 +2111,7 @@ def detach_argv(argv: list[str], ttp: list[str]) -> list[str]:
     worker outside `ttp clip` or `ttp sandbox` (unpooled), so the job takes its test workers from the
     host's pool for its life (direct), wherever it starts (here, the daemon, a reboot relaunch); else as
     it is."""
-    if not _number(os.environ.get(SLOTS_ENV)) or os.environ.get(HELD_ENV) or os.environ.get(checkcap.HELD_ENV):
+    if not checkcap.non_negative_int(os.environ.get(SLOTS_ENV)) or os.environ.get(HELD_ENV) or os.environ.get(checkcap.HELD_ENV):
         return argv
     return [*ttp, "sandbox", "--", *argv] if unpooled(shlex.join(argv)) else argv
 
@@ -2223,7 +2213,7 @@ def clamped(cmd: str, k: int) -> str:
 
 def clamp_for(cmd: str, env: dict | None) -> str:
     """clamp() to the grant `env` (default this process's) carries, else `cmd` as it is."""
-    k = _number((os.environ if env is None else env).get(HELD_ENV))
+    k = checkcap.non_negative_int((os.environ if env is None else env).get(HELD_ENV))
     return clamped(cmd, k) if k else cmd
 
 

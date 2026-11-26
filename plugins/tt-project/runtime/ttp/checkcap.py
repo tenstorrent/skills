@@ -359,7 +359,7 @@ def live_cores_on() -> bool:
     """The live-cores gate (cores_short, testslots.live_room): TTP_CHECKS_LIVE_CORES, else the account's
     checks.live_cores, default on; 0 turns it off."""
     for v in (os.environ.get(LIVE_ENV), (project.load_account_settings().get("checks") or {}).get("live_cores")):
-        if v not in (None, "") and (n := _int_field(v)) is not None:
+        if v not in (None, "") and (n := non_negative_int(v)) is not None:
             return bool(n)
     return True
 
@@ -405,7 +405,7 @@ def cores_short(every: list[Path], now: float | None = None) -> str:
     return f"{max(0.0, left):.0f} of {cores()} cores free now, one check takes {price:.0f}"
 
 
-def _int_field(v) -> int | None:
+def non_negative_int(v) -> int | None:
     try:
         n = int(str(v).strip())
     except (TypeError, ValueError):
@@ -416,7 +416,7 @@ def _int_field(v) -> int | None:
 def _set_limit() -> int | None:
     """TTP_CHECKS_HOST_MAX, else the account's checks.host_max; None when neither is readable."""
     for v in (os.environ.get("TTP_CHECKS_HOST_MAX"), (project.load_account_settings().get("checks") or {}).get("host_max")):
-        if v not in (None, "") and (n := _int_field(v)) is not None:
+        if v not in (None, "") and (n := non_negative_int(v)) is not None:
             return n
     return None
 
@@ -448,7 +448,7 @@ def extra_max() -> int:
     """Slots that may open beyond the cap: TTP_CHECKS_LOAD_EXTRA, else the account's checks.load_extra,
     else EXTRA_SLOTS; an unreadable value is the default."""
     for v in (os.environ.get("TTP_CHECKS_LOAD_EXTRA"), (project.load_account_settings().get("checks") or {}).get("load_extra")):
-        if v not in (None, "") and (n := _int_field(v)) is not None:
+        if v not in (None, "") and (n := non_negative_int(v)) is not None:
             return n
     return EXTRA_SLOTS
 
@@ -459,7 +459,7 @@ def priority_turns() -> int:
     0 serves them in the fair order only."""
     for v in (os.environ.get("TTP_CHECKS_PRIORITY_TURNS"),
               (project.load_account_settings().get("checks") or {}).get("priority_turns")):
-        if v not in (None, "") and (n := _int_field(v)) is not None:
+        if v not in (None, "") and (n := non_negative_int(v)) is not None:
             return n
     return PRIORITY_TURNS
 
@@ -468,7 +468,7 @@ def urgent_slots() -> int:
     """Reserved urgent slots (beyond the cap only with priority_beyond_cap()): TTP_CHECKS_URGENT_SLOTS, else the account's checks.urgent_slots,
     else URGENT_SLOTS; 0 turns them off, an unreadable value is the default."""
     for v in (os.environ.get(URGENT_SLOTS_ENV), (project.load_account_settings().get("checks") or {}).get("urgent_slots")):
-        if v not in (None, "") and (n := _int_field(v)) is not None:
+        if v not in (None, "") and (n := non_negative_int(v)) is not None:
             return n
     return URGENT_SLOTS
 
@@ -592,9 +592,9 @@ def small_tests() -> int:
     """A targeted run (checklane.cost's "tests") of fewer tests than this is short (is_small): TTP_CHECKS_SMALL_TESTS,
     else the account's checks.small_tests, else SMALL_TESTS; 0 turns it off. Account-level as starve_s: every waiter
     on the host orders the shared queues by it. Negative or unreadable: the default."""
-    v = _int_field(os.environ.get(SMALL_ENV))
+    v = non_negative_int(os.environ.get(SMALL_ENV))
     if v is None:
-        v = _int_field((project.load_account_settings().get("checks") or {}).get("small_tests"))
+        v = non_negative_int((project.load_account_settings().get("checks") or {}).get("small_tests"))
     return SMALL_TESTS if v is None else v
 
 
@@ -619,7 +619,7 @@ def bare_slots() -> int:
     """Host-wide slots runs with no project hold at once: TTP_CHECKS_BARE_SLOTS, else the account's
     checks.bare_slots, else BARE_SLOTS; at least 1. The cap binds only while a project's run waits (_take)."""
     for v in (os.environ.get(BARE_SLOTS_ENV), (project.load_account_settings().get("checks") or {}).get("bare_slots")):
-        if v not in (None, "") and (n := _int_field(v)) is not None:
+        if v not in (None, "") and (n := non_negative_int(v)) is not None:
             return max(n, 1)
     return BARE_SLOTS
 
@@ -1881,7 +1881,7 @@ class _Wait:
     def _gates(self) -> Slot | None:
         """One poll's reading of the gates: a twin's checks run, the test slots, and the queue place that follows."""
         if self.stop:
-            self.why = self.stop()   # a reason ends the wait; none leaves `why` empty, as parked_line reads it
+            self.why = self.stop()
             if self.why:
                 raise Cancelled(self.why)
         self.twin = _running_holders(self.every, self.same)
