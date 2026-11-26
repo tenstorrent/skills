@@ -55,6 +55,7 @@ QUIET_S = 60.0            # default quiet window after a stream's last live read
 TIMEOUT_S = 10.0          # default source timeout
 FILE_MAX_AGE_S = 120.0    # a file source older than this is unknown
 CACHE_S = 20.0            # a source is read at most this often, across every project on the host
+GATE_MARK_ENV = "TTP_GATE_MARK"   # `ttp lock` sets it to a path a start gate touches when it refuses the command
 HISTORY_S = 2 * 86400.0   # live spans kept this long, for the watchdog and status
 WAIT_S = 60.0             # callers that wait retry about this often
 STEPS = ("deploy", "restart", "test", "bench", "warmup", "health", "reset")
@@ -202,6 +203,24 @@ def _live_spans(rec: dict) -> list:
     return (rec.get("spans") or []) if rec.get("live_state") == "live" else []
 
 
+def mark_refused() -> None:
+    """Tell the enclosing `ttp lock` a start gate refused its command before anything ran, so its span is no job
+    of a stream. Generic: any wrapper's own gate may `touch "$TTP_GATE_MARK"` before it exits 75."""
+    if path := os.environ.get(GATE_MARK_ENV):
+        try:
+            Path(path).touch()
+        except OSError:
+            pass
+
+
+def _held_until(rec: dict) -> float | None:
+    """When the source's hold ended: its last live or unknown read, or a closed span's end (the first read off,
+    up to CACHE_S later), so the gate's quiet window ends where the watchdog's does."""
+    ends = [float(b) for _a, b in rec.get("spans") or [] if b is not None]
+    ends += [float(rec["last_live"])] if rec.get("last_live") is not None else []
+    return max(ends) if ends else None
+
+
 def _reading(proj: str, alias: str, src: dict, now: float, fresh: bool) -> dict:
     """The source's shared reading, read again when older than CACHE_S (or `fresh`); its live spans kept."""
     key = f"{proj}:{alias}"
@@ -243,7 +262,8 @@ def check(target: str, step: str = "test", now: float | None = None, fresh: bool
             rec = _reading(proj, stream, src, now, fresh)
             quiet = float(src.get("quiet_s", QUIET_S))
             last = rec.get("last_live")
-            clear_at = (float(last) + quiet) if last is not None else None
+            held = _held_until(rec)
+            clear_at = (held + quiet) if held is not None else None
             state = rec["state"]
             if state == "free" and clear_at is not None and now < clear_at:
                 state = "quiet"   # ended, but inside its quiet window: still live for every step
@@ -547,8 +567,8 @@ def watch(p, db, now: float | None = None, post: Callable[..., None] | None = No
         sid = str(s.get("id"))
         jobs[sid] = ("ended" if s.get("reaped") or s.get("end") is not None
                      else "unknown" if s.get("state") == "unknown" else "running")
-        if s.get("reaped"):
-            continue   # its process is gone: not a job of the stream
+        if s.get("reaped") or s.get("gate_refused"):
+            continue   # its process is gone, or a gate refused it before anything ran: not a job of the stream
         start = float(s.get("start") or 0)
         # A remote job's end is known only on its host: it is unknown here, so it counts only by its start.
         end = start if s.get("state") == "unknown" else float(s["end"]) if s.get("end") is not None else now

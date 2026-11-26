@@ -9129,6 +9129,8 @@ def cmd_occupancy(a) -> None:
     if also:
         res = {**res, "blocks": True, "why": also}
     print(json.dumps(res, indent=1, sort_keys=True) if a.json else (also or occupancy.text(res)))
+    if res["blocks"]:
+        occupancy.mark_refused()
     sys.exit(UPGRADE_BUSY if res["blocks"] else 0)
 
 
@@ -9270,6 +9272,7 @@ def cmd_lock(a) -> None:
         if not got["ok"]:
             if waiting:
                 _end_wait()
+            occupancy.mark_refused()
             die(f"{got['why']}; waited {got['waited_s']:.0f} s. Hand the task back now: result.json status "
                 f"`waiting`, retry_when `ttp lock --probe {' '.join(L['name'] for L in todo)}`", UPGRADE_BUSY)
 
@@ -9391,6 +9394,9 @@ def cmd_lock(a) -> None:
     if any(L["device"] for L in todo):
         child_env["TTP_NO_DEVICE"] = "0"   # a device lock is the sanctioned way to a device
         child_env = unmask_devices(child_env)   # and sees the devices a run's own commands do not
+    from . import occupancy
+    gate_mark = p.state / f"gate-mark-{os.getpid()}"   # a start gate in the command touches it when it refuses
+    child_env[occupancy.GATE_MARK_ENV] = str(gate_mark)
     from . import activity
     from .runner import boot_id
 
@@ -9411,8 +9417,10 @@ def cmd_lock(a) -> None:
             rc = run()
             return rc
         finally:
+            refused = {"gate_refused": True} if rc == UPGRADE_BUSY and gate_mark.exists() else {}
+            gate_mark.unlink(missing_ok=True)
             for aid in ids:
-                activity.append(p.state, {"ev": "release", "id": aid, "end": time.time(), "rc": rc})
+                activity.append(p.state, {"ev": "release", "id": aid, "end": time.time(), "rc": rc, **refused})
 
     whole = {lk.canonical(cfg, x.get("resource") or "") for x in spec.get("exclusive") or []}
     # run.json alone is not the hold: one recorded lost (its keeper died, another task took the slot)

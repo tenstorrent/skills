@@ -125,7 +125,7 @@ def spans(recs: list[dict], here: str | None = None) -> list[dict]:
         if ev in ("take", "job"):
             e = ends.get(r["id"], {})
             by[r["id"]] = {**r, "kind": "lock" if ev == "take" else "job", "end": e.get("end"), "rc": e.get("rc"),
-                           **({"reaped": True} if e.get("reaped") else {})}
+                           **{k: True for k in ("reaped", "gate_refused") if e.get(k)}}
     out = []
     for s in by.values():
         s.pop("ev", None)

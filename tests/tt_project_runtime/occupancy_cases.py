@@ -925,3 +925,77 @@ def test_occupancy_remote_detach_records_its_declared_device_use(env):
     assert occupancy._uses_devices({}, "box-a", {"machine": "box-a", "devices": 2}, "test")
     assert occupancy._uses_devices({}, "box-a", {"machine": "box-a", "step": "bench"}, "bench")
     assert not occupancy._uses_devices({}, "box-a", {"machine": "box-b", "devices": 2}, "test")
+
+
+def test_occupancy_gate_quiet_window_ends_where_the_watchdog_window_ends(env, monkeypatch):
+    """A stream's span ends at the first read off, up to CACHE_S after its last live read: the gate holds the
+    box until that end plus the quiet window, so no start the gate lets through is a job the watchdog flags."""
+    from ttp import occupancy
+    p = make(env)
+    occ = _occ_home(env["home"], monkeypatch)
+    occ.publish(_OccProj("streamer", p.root, {"box-a": {"cmd": "exit 1"}}))
+    t0 = time.time()
+    span = [[t0 - 100, t0 + 15]]   # last live read at t0, first read off at t0 + 15
+    occ._save(occ.READINGS, {"streamer:box-a": {"state": "free", "detail": "", "at": t0 + 15, "spans": span,
+                                                "live_spans": span, "last_live": t0, "live_state": "live",
+                                                "quiet_s": 60}})
+    for dt in (30, 61, 70, 74, 76, 90):
+        now = t0 + dt
+        res = occ.check("box-a", "test", now=now)
+        _watch_with(monkeypatch, [{"id": f"j{dt}", "kind": "lock", "start": now, "end": None,
+                                   "resource": "box-a-device", "task": 1, "cmd": "bench"}])
+        flagged = bool(occupancy.watch(p, p.db, now, None)["flags"])
+        assert res["blocks"] is flagged is (dt < 75), (dt, res, flagged)
+    assert abs(occ.check("box-a", "test", now=t0 + 70)["clear_at"] - (t0 + 75)) < 1e-6
+
+
+def test_occupancy_gate_quiet_window_of_a_reading_without_spans(tmp_path, monkeypatch):
+    """A reading written before spans were kept still holds until its last live read plus the quiet window."""
+    occ = _occ_home(tmp_path, monkeypatch)
+    occ.publish(_OccProj("streamer", tmp_path, {"box-a": {"cmd": "exit 1"}}))
+    t0 = time.time()
+    occ._save(occ.READINGS, {"streamer:box-a": {"state": "free", "detail": "", "at": t0, "last_live": t0,
+                                                "live_state": "live", "quiet_s": 60}})
+    res = occ.check("box-a", "test", now=t0 + 30)
+    assert res["blocks"] and abs(res["clear_at"] - (t0 + 60)) < 1e-6, res
+    assert not occ.check("box-a", "test", now=t0 + 70)["blocks"]
+
+
+def test_occupancy_watchdog_skips_a_lock_span_whose_gate_refused_its_command(env, monkeypatch):
+    """A `ttp lock` span whose wrapped command a start gate refused (rc 75, marked gate_refused) ran nothing on the
+    box; an rc 75 span with no mark is judged as any other job."""
+    from ttp import activity, occupancy
+    p = make(env)
+    occ = _occ_home(env["home"], monkeypatch)
+    occ.publish(_OccProj("streamer", p.root, {"box-a": {"cmd": "exit 0"}}))
+    now = time.time()
+    join = activity.spans   # the real join, before _watch_with stubs it
+    base = {"kind": "lock", "start": now + 1, "end": now + 2, "rc": 75, "resource": "box-a-device", "cmd": "bench"}
+    _watch_with(monkeypatch, [{**base, "id": "refused", "task": 1, "gate_refused": True},
+                              {**base, "id": "plain75", "task": 2}])
+    assert [f["task"] for f in occupancy.watch(p, p.db, now, None)["flags"]] == [2]
+    recs = [{"ev": "take", "id": "a", "start": now, "resource": "box-a-device"},
+            {"ev": "release", "id": "a", "end": now + 1, "rc": 75, "gate_refused": True},
+            {"ev": "take", "id": "b", "start": now, "resource": "box-a-device"},
+            {"ev": "release", "id": "b", "end": now + 1, "rc": 75}]
+    got = {s["id"]: s.get("gate_refused") for s in join(recs)}
+    assert got == {"a": True, "b": None}, got
+
+
+def test_occupancy_lock_marks_a_span_whose_inner_gate_refused(env, tmp_path):
+    """`ttp lock X -- ttp occupancy <held box>`: the inner gate refuses (exit 75) and marks the lock's release
+    gate_refused; a command that exits 75 on its own leaves no mark."""
+    from ttp import activity
+    p = make(env)
+    p.set_config("occupancy.sources", {"box-a": {"cmd": "exit 0"}})
+    e = {**os.environ, "TTP_PROJECT": str(p.root), "TTP_RUN_DIR": str(tmp_path / "run")}
+    (tmp_path / "run").mkdir()
+    r = subprocess.run([sys.executable, str(TTP), "lock", "box-free", "--", sys.executable, str(TTP), "occupancy",
+                        "box-a"], env=e, capture_output=True, text=True)
+    assert r.returncode == 75, r
+    r = subprocess.run([sys.executable, str(TTP), "lock", "box-free", "--", "sh", "-c", "exit 75"], env=e,
+                       capture_output=True, text=True)
+    assert r.returncode == 75, r
+    rel = [x for x in activity.entries(p.state) if x.get("ev") == "release"]
+    assert [(x["rc"], x.get("gate_refused")) for x in rel] == [(75, True), (75, None)], rel
+    assert not list(p.state.glob("gate-mark-*"))
