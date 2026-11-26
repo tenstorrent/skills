@@ -176,7 +176,7 @@ def graph(dirs: list[tuple[Path, str | None]]) -> dict:
                 w = party(wid, kind="process", project=_project_of(text, {}, proj), pid=pid,
                           command=cmdline(pid)[:200] if pid else "")
             w["waits"].add(res)
-            w["tickets"].append(t)
+            w["tickets"].append((res, t))
             for hid, excl in hids[res]:
                 if hid != w["id"] and (excl or not shared_wait):
                     edges.append((w["id"], hid, res))
@@ -265,25 +265,16 @@ def own(c: dict, project: str) -> bool:
     return all(m["kind"] == "task" and m.get("project") == project for m in c["members"])
 
 
-def _since(t: Path) -> float:
-    try:
-        return float(t.name.split("-", 1)[0])
-    except ValueError:
-        return 0.0
-
-
 def resolve(c: dict) -> tuple[dict, bool]:
     """Break cycle `c` by ending the wait of its newest waiter (the latest ticket on a lock of the cycle):
     its `ttp lock` exits busy and its task waits for the lock again (locks.end_wait). No process is
     signalled and no holder touched. Returns that party, and whether it was asked now (not already)."""
-    def mine(m: dict) -> list[Path]:
-        return [t for t in m.get("tickets") or [] if t.parent.name[:-len(".queue")] in c["locks"]]
-
-    m = max((m for m in c["members"] if mine(m)), key=lambda m: max(map(_since, mine(m))))
+    mine = {m["id"]: [t for r, t in m.get("tickets") or [] if r in c["locks"]] for m in c["members"]}
+    m = max((m for m in c["members"] if mine[m["id"]]), key=lambda m: max(map(locks._arrival, mine[m["id"]])))
     others = "; ".join(who(o) for o in c["members"] if o is not m)
     why = (f"ended by the daemon to break a lock-order deadlock over {', '.join(c['locks'])} with {others}: "
            "this was the newest waiter")
-    fresh = [locks.end_wait(t, why) for t in mine(m)]
+    fresh = [locks.end_wait(t, why) for t in mine[m["id"]]]
     return m, any(fresh)
 
 

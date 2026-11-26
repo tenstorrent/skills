@@ -14876,8 +14876,8 @@ class Daemon:
             if self.p.name not in c["projects"]:
                 continue   # routed to the projects in it
             key = lockcycle.key(c)
+            folded.update(c["locks"])
             if lockcycle.own(c, self.p.name):   # all this project's tasks: end the newest wait, no alert
-                folded.update(c["locks"])
                 m, fresh = lockcycle.resolve(c)
                 if fresh:
                     said = (f"{key}: lock-order deadlock over {', '.join(c['locks'])} broken: ended the wait of "
@@ -14887,7 +14887,6 @@ class Daemon:
                     log(self.p, said)
                 continue   # an open alert for it closes below
             keys.add(key)
-            folded.update(c["locks"])
             if db.one("SELECT id FROM alerts WHERE key=? AND cleared IS NULL LIMIT 1", (key,)):
                 db.x("UPDATE alerts SET last=? WHERE key=? AND cleared IS NULL", (now, key))
                 continue
