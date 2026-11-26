@@ -938,15 +938,13 @@ def test_eta_a_deferred_task_s_likely_and_conservative_times_start_after_its_pla
     assert e2["end"] == pytest.approx(now + 3 * (300 + 1200)) and e2["conservative"] >= e2["end"]
 
 
-def test_eta_field_dates_a_conservative_time_on_another_day():
-    """The conservative time keeps its date when it lands on another day than the likely one, so a
-    time days later never reads as earlier than the likely time (the weekday-only short form)."""
-    from ttp import eta, timefmt
+def test_eta_field_dates_a_time_a_week_away():
+    """A time 6 days or more away keeps its date, so a conservative time days past the likely one never
+    reads as earlier than it (the weekday-only form names the nearer day)."""
+    from ttp import eta
     now = 1795708800.0   # 2026-11-26 16:00 UTC
-    same_day = {"end": now + 3600, "conservative": now + 5400, "path": [1], "why": None,
-                "factor": 1.0, "overrun": False}
-    line = eta.field(same_day, "UTC", now)
-    assert "conservative 17:30 UTC" in line, line
-    later = {**same_day, "conservative": now + 6.5 * 86400}
-    line = eta.field(later, "UTC", now)
+    e = {"end": now + 3600, "conservative": now + 5400, "path": [1], "why": None, "factor": 1.0, "overrun": False}
+    assert "conservative 17:30 UTC" in eta.field(e, "UTC", now)
+    assert "conservative Sat 04:00 UTC" in eta.field({**e, "conservative": now + 12 * 3600 + 86400}, "UTC", now)
+    line = eta.field({**e, "conservative": now + 6.5 * 86400}, "UTC", now)
     assert "conservative 2026-12-03 04:00 UTC" in line, line

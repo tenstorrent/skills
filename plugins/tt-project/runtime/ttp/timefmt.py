@@ -150,8 +150,12 @@ def today(ts: float, where) -> str:
 
 
 def short(ts: float, where, now: float | None = None) -> str:
-    """'23:32 UTC' within 20 hours of now, else 'Fri 23:32 UTC'."""
-    fmt = "%H:%M %Z" if abs(ts - (now if now is not None else time.time())) < 20 * 3600 else "%a %H:%M %Z"
+    """'23:32 UTC' within 20 hours of now, 'Fri 23:32 UTC' within 6 days, else the date ('2026-12-03 23:32 UTC'):
+    a weekday-only time a week or more away reads as the nearer day of that name."""
+    gap = abs(ts - (now if now is not None else time.time()))
+    if gap >= 6 * 86400:
+        return long(ts, where)
+    fmt = "%H:%M %Z" if gap < 20 * 3600 else "%a %H:%M %Z"
     return datetime.fromtimestamp(ts, _tz(where)).strftime(fmt)
 
 
