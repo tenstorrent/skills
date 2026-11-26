@@ -899,7 +899,7 @@ def _unquoted(text: str) -> tuple[str, str]:
 # anywhere, is not straight-line
 _NOT_STRAIGHT = re.compile(r"(?<![\w./-])(?:eval|source|declare|typeset|local|export|readonly|read|mapfile|readarray|let|unset|"
                            r"getopts|trap|alias|builtin|break|continue|return|exit|function|select|coproc|IFS)\b|printf\s+-v|"
-                           r"(?<![\w./~-])\.\s|"
+                           r"(?<![\w./~-])\.(?![\w./-])|"
                            r"\w\s*\(\s*\)|\(\(|"
                            r"\$\[|\$\{!")
 
@@ -991,8 +991,9 @@ def literal_view(cmd: str, cwd: str, env=None) -> str | None:
     redirect or pipe after `done` still applies, and its last value after `done`), None when there is nothing to write out. A heredoc, a command that is
     not straight-line, a loop over anything else (`$(ls)`), a name used other than as a read, or read after `done` of
     a loop that may not have run in this shell, keeps the command as it is, which the guards judge as before."""
-    # a comment or `$'...'` quoting the quote reader does not follow
-    if "<<" in cmd or "$'" in cmd or re.search(r"(?<![^\s;&|()<>])#", cmd) or _NOT_STRAIGHT.search(_plain(cmd)):
+    # a comment, `$'...'` or a quote inside `${...}`: quoting the quote reader does not follow
+    if "<<" in cmd or "$'" in cmd or re.search(r"(?<![^\s;&|()<>])#|\$\{[^}]*['\"\\]", cmd) \
+            or _NOT_STRAIGHT.search(_plain(cmd)):
         return None
     e = os.environ if env is None else env
     home = e.get("HOME") or os.path.expanduser("~")
@@ -1011,7 +1012,7 @@ def literal_view(cmd: str, cwd: str, env=None) -> str | None:
                 end = m.end() + k.start(1)
                 break
         values = _values(text[m.start(2):m.end(2)], cwd, home,
-                         bool(re.search(r"(?<![\w./-])(?:cd|pushd|popd|shopt|set)\b", plain[:m.start()])))
+                         bool(re.search(r"(?<![\w./-])(?:cd|pushd|popd|shopt|set)\b", _plain(text[:m.start()]))))
         body = text[m.end():end] if end is not None else ""
         after, pre = text[end + 4:], plain[:m.start()]
         # after `done` it holds its last value only where the loop surely ran in this shell: nothing before it that

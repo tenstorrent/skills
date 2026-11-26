@@ -2808,6 +2808,9 @@ def test_glm_guard_reads_a_loop_variable_as_its_list_only_in_a_straight_line_com
                 f"for f in bash ls; do :; # ; done\n{run}; done", f"f=ls; $'\\x65'val 'f=bash'; {run}",
                 *(f"f=ls; {w} . <(echo 'f=bash'); {run}" for w in (">/dev/null", "a=1", "case x in x)")),
                 f"for f in ls; do >/dev/null . <(echo 'f=bash'); {run}; done", f"cd /usr/bin; for f in bas?; do {run}; done",
+                *(f"{w} /usr/bin; for f in bas?; do {run}; done" for w in ('"cd"', "c\\d")),
+                f"f=ls; .>/dev/null <(echo 'f=bash'); {run}", f"f=ls; .{{,}} <(echo 'f=bash'); {run}",
+                f"f=ls; y=\"${{x#'\"'}}\"; f=bash; z=\\'; {run}",
                 *(f"for f in bash ls; do {w}; done; {run}" for w in ("break", "return", "exit", "continue")),
                 'for f in $(cat l); do rm -rf "$f"; done', 'for f in $(find . -name x); do rm -rf "$f"; done',
                 'for f in $L; do rm -rf "$f"; done', 'for f in $(cat l); do echo x > "$f"; done'):
