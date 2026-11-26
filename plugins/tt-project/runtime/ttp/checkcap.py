@@ -2001,7 +2001,7 @@ class _Wait:
                 self._keep_claim()
             if not f and self.asked and not is_claim_live(self.claim):
                 self._lapse_ask()
-            if (not f and not self.asked and not self.twin and self.urgent and is_urgent(self.priority)
+            if (not f and not self.asked and self._urgent_wanted()
                     and not self.was_preempted and time.time() - self.since >= preempt_after_s()):
                 self._ask_to_preempt()
             if f:
@@ -2044,8 +2044,10 @@ def acquire(holder: str, what: str = "", tell: Callable[[str], None] | None = No
     n = limit()
     if not n or os.environ.get(HELD_ENV):
         return Slot()
-    w = _Wait(holder, what, n, same, since, tell, waiting, state, project_name, priority, owns, cap, lane_at,
-              waited, urgent, small, startable, parks, done, stop, why, preemptible, progress)
+    w = _Wait(holder=holder, what=what, n=n, same=same, since=since, tell=tell, waiting=waiting, state=state,
+              project_name=project_name, priority=priority, owns=owns, cap=cap, lane_at=lane_at, waited=waited,
+              urgent=urgent, small=small, startable=startable, parks=parks, done=done, stop=stop, why=why,
+              preemptible=preemptible, progress=progress)
     if (got := w.enter()) is not None:
         return got
     try:
