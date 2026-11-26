@@ -860,7 +860,8 @@ def _readers_only(view: str) -> bool:
 # A loop over literal words or a literal glob (`for f in a b`, `for f in dir/*.py`), and a variable set once to a
 # literal at the start of the command or of a loop body (`T=/abs/bin/ttp; $T ...`), read as the values they stand for:
 # each such value is a plain word (_SAFE_VALUE), at most _MAX_VALUES of them; a name the shell or a program reads
-# itself (PATH, IFS, LD_*, PYTHON*) is never one, nor one the body sets again (`read f`, `f=...`, `unset f`)
+# itself (PATH, IFS, LD_*, PYTHON*) is never one, and only a straight-line command (nothing _NOT_STRAIGHT) that only
+# reads it after it is set (_reads_only) is written out
 _SAFE_VALUE = re.compile(r"[\w./@:+,=%-]+")
 _MAX_VALUES = 200
 _SPECIAL_NAME = re.compile(r"PATH|IFS|HOME|PWD|OLDPWD|CDPATH|ENV|BASH_ENV|SHELLOPTS|BASHOPTS|PS4|PROMPT_COMMAND|"
@@ -890,13 +891,29 @@ def _unquoted(text: str) -> tuple[str, str]:
     return "".join(out), "".join(state)
 
 
-def _resets(name: str, plain: str) -> bool:
-    """Whether the unquoted shell text `plain` sets `name` (an assignment, read, unset, declare, printf -v, for) or
-    reads it in a form other than `$name` and `${name}` (`${name%x}`, `${!name}`)."""
-    n = re.escape(name)
-    return bool(re.search(rf"(?<![\w$]){n}\+?=|\b(?:read|unset|declare|typeset|local|export|readonly|mapfile|readarray)\b"
-                          rf"[^;&|\n]*(?<![\w$]){n}\b|printf\s+-v\s*{n}\b|\bfor\s+{n}\b|\$\{{!?{n}[^\w}}]|\$\{{!{n}",
-                          plain))
+# a word that sets a variable by other means, runs text as code or leaves a loop early (`eval`, `read`, `break`), `.`
+# as a command, a function definition, arithmetic or `${!`: a command holding one, anywhere, is not straight-line
+_NOT_STRAIGHT = re.compile(r"(?<![\w./-])(?:eval|source|declare|typeset|local|export|readonly|read|mapfile|readarray|let|unset|"
+                           r"getopts|trap|alias|builtin|break|continue|return|exit|function|select|coproc)\b|"
+                           r"printf\s+-v|(?:^|[;&|({`\n]|\b(?:do|then|else|command)\s)\s*\.\s|\w\s*\(\s*\)|\(\(|"
+                           r"\$\[|\$\{!")
+
+
+def _plain(text: str) -> str:
+    """Shell `text` with its quote characters dropped and their content kept (`e\\val "f=x"` reads `eval f=x`)."""
+    return re.sub(r"[\"'\\]", "", text)
+
+
+def _reads_only(name: str, text: str) -> bool:
+    """Whether `name` appears in shell `text` only as `$name` or `${name}` reads, quoted content included (never
+    `name=`, `${name:=x}`, `${!name}`, `\\$name` or the bare word; an option letter such as `-f` is no use).
+    Single-quoted text never expands or sets one (running it as code is _NOT_STRAIGHT), so it is left out."""
+    text = "".join(" " if q == "'" else c for c, q in zip(text, _unquoted(text)[1]))
+    plain, n = _plain(text), re.escape(name)
+    return not re.search(rf"\\\$\{{?{n}(?!\w)", re.sub(r"[\"']", "", text)) and all(
+        plain[:m.start()].endswith("$") and not plain[:m.start()].endswith("$$")
+        or plain[:m.start()].endswith("${") and plain[m.end():].startswith("}")
+        for m in re.finditer(rf"(?<![\w-]){n}(?!\w)", plain))
 
 
 def _put(text: str, state: str, name: str, value: str) -> str:
@@ -935,19 +952,38 @@ def _set_once(text: str, home: str) -> str:
     value = next(v for v in (m[2], m[3], m[4]) if v is not None)
     value = home + value[1:] if m[4] is not None and value.startswith("~/") else value
     rest = text[m.end():]
-    plain, state = _unquoted(rest)
-    if not _SAFE_VALUE.fullmatch(value) or _resets(m[1], plain):
+    if not _SAFE_VALUE.fullmatch(value) or not _reads_only(m[1], rest):
         return text
+    state = _unquoted(rest)[1]
     return text[:m.end()] + _set_once(_put(rest, state, m[1], value), home)
+
+
+# a loop over a list the guard cannot read (`for f in $(cat l)`, `$L`, a glob under `$D`) whose body or what follows
+# writes or deletes its variable (`rm "$f"`, `> "$f"`): a target the guard never sees
+_COMPUTED_FOR = re.compile(r"(?:^|[;&|({\n]|\b(?:do|then|else)\s)\s*for\s+([A-Za-z_]\w*)\s+in\s+([^;\n]*[$`][^;\n]*?)\s*(?:;|\n)\s*do\b")
+_WRITER = (r"(?:\b(?:rm|rmdir|unlink|mv|cp|ln|install|dd|tee|truncate|shred|touch|mkdir|chmod|chown|chgrp|rsync)\b|"
+           r"\b(?:sed|perl)\s[^;&|\n]*-i|\bfind\b[^;&|\n]*-delete\b)[^;&|\n]*|[<>]?>[|&]?\s*")
+
+
+def computed_loop_write(view: str) -> str | None:
+    """The `for` head of a loop over a computed list whose variable a write or delete in `view` names, else None."""
+    plain = _plain(view)
+    for m in _COMPUTED_FOR.finditer(plain):
+        if re.search(rf"(?:{_WRITER})[^\s;&|]*\$\{{?{m[1]}(?!\w)", plain[m.end():]):
+            return plain[m.start():m.end()].strip()
+    return None
+
+
+_BRANCH = re.compile(r"(?<![\w./-])(?:if|elif|while|until|case|for|select)\b|[(`|&]")
 
 
 def literal_view(cmd: str, cwd: str, env=None) -> str | None:
     """`cmd` as the guards read it with its loop variables and once-set variables written as the literal values they
     stand for (each loop over literal words or a literal glob written out, its body once per value, in braces so a
-    redirect or pipe after `done` still applies), None when there is nothing to write out. A heredoc, a loop over
-    anything else (`$(ls)`, `while read`) or a variable set again keeps the command as it is: what is left to read
-    stays an expansion, which the guards judge as before."""
-    if "<<" in cmd:
+    redirect or pipe after `done` still applies, and its last value after `done`), None when there is nothing to write out. A heredoc, a command that is
+    not straight-line, a loop over anything else (`$(ls)`), a name used other than as a read, or read after `done` of
+    a loop that may not have run in this shell, keeps the command as it is, which the guards judge as before."""
+    if "<<" in cmd or _NOT_STRAIGHT.search(_plain(cmd)):
         return None
     e = os.environ if env is None else env
     home = e.get("HOME") or os.path.expanduser("~")
@@ -967,15 +1003,20 @@ def literal_view(cmd: str, cwd: str, env=None) -> str | None:
                 break
         values = _values(text[m.start(2):m.end(2)], cwd, home)
         body = text[m.end():end] if end is not None else ""
-        bplain, bstate = _unquoted(body)
-        if not values or not body.strip() or _resets(m[1], bplain):
+        after, pre = text[end + 4:], plain[:m.start()]
+        # after `done` it holds its last value only where the loop surely ran in this shell: nothing before it that
+        # branches, loops, pipes or opens a subshell or group, and only `;`, a newline, `&&` or `||` after it
+        ran_here = not (_BRANCH.search(pre) or pre.count("{") > pre.count("}")) \
+            and re.match(r"\s*(?:$|[;\n]|&&|\|\|)", _unquoted(after)[0])
+        used = re.search(rf"(?<!\w){re.escape(m[1])}(?!\w)", _plain(after))
+        if not values or not body.strip() or not _reads_only(m[1], body) \
+                or used and not (ran_here and _reads_only(m[1], after)):
             return None if text == cmd else text
+        if used:
+            after = _put(after, _unquoted(after)[1], m[1], values[-1])
         start = m.start() + len(plain[m.start():]) - len(plain[m.start():].lstrip())
+        bstate = _unquoted(body)[1]
         runs = [_set_once(_put(body, bstate, m[1], v).strip().rstrip(";").strip(), home) for v in values]
-        after = text[end + 4:]
-        aplain, astate = _unquoted(after)
-        if not _resets(m[1], aplain):   # after the loop the variable keeps its last value
-            after = _put(after, astate, m[1], values[-1])
         text = text[:start] + "{ " + "\n".join(runs) + "\n}" + after
         if len(text) > 200_000:
             return None
@@ -1014,6 +1055,8 @@ def shell_refusal(cmd: str, cwd: str, run_dir: str = "", env=None, remote: bool 
         return f"{SERVICE_WHY}: {svc.group(0)[:120]}"
     if writes and (m := HIDDEN.search(_inert(view))) and not _readers_only(view):
         return f"{HIDDEN_WHY}: {m.group(0).strip()[:80]}; {HIDDEN_HINT}"
+    if writes and (loop := computed_loop_write(_inert(view))):
+        return f"a write or delete names the variable of a loop over a list the guard cannot read (`{loop[:80]}`); {HIDDEN_HINT}"
     commands, _ = hook._split(cmd)   # heredoc bodies a program, not a shell, reads are its input
     for sub in pathguard._substitutions(commands):   # "$(...)" runs a command too
         if why := shell_refusal(sub, cwd, run_dir, e, remote, writes, power, services, made):

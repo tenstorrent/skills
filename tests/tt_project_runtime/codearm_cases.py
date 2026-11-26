@@ -2760,7 +2760,7 @@ def test_glm_guard_refuses_a_config_in_its_own_folders_that_runs_a_program_or_th
 
 def test_glm_guard_reads_a_self_set_tmpdir_as_its_value_and_keeps_the_runs_own(monkeypatch, tmp_path):
     """cells: tmpdir_self_set, tmpdir_repro, tmpdir_default. A TMPDIR the command sets itself is that value, not
-    the run's own folder; a default counts only while the command leaves TMPDIR alone (review #9919)."""
+    the run's own folder; a default counts only while the command leaves TMPDIR alone."""
     deny, wt, rd = _gg9846_hook(monkeypatch, tmp_path)
     for cmd in ('ls "$TMPDIR"; echo "TMPDIR=$TMPDIR"; mkdir -p "$TMPDIR"', 'mkdir -p "${TMPDIR:-/tmp/x}/a"',
                 'echo hi > "${TMPDIR:-}/note.txt"', 'export TMPDIR="$TMPDIR"; mkdir -p "$TMPDIR/a"'):
@@ -2784,6 +2784,30 @@ def test_glm_guard_judges_a_loop_body_with_its_literal_list_or_glob(monkeypatch,
                 'for f in a ~; do :; done; rm -rf "$f"',
                 'for f in bash; do echo "tt-smi -r 0" | "$f"; done'):
         assert deny(cmd), cmd
+
+
+def test_glm_guard_reads_a_loop_variable_as_its_list_only_in_a_straight_line_command(monkeypatch, tmp_path):
+    """cells: loop_not_straight, loop_computed_target. A loop variable is read as its literal list only in a
+    command that cannot set it another way or leave the loop early, and after `done` only where the loop surely ran in
+    the same shell (its last value: `ls`); a write or delete
+    naming the variable of a loop over a list the guard cannot read is refused, a read of it is not."""
+    deny, _, _ = _gg9846_hook(monkeypatch, tmp_path)
+    run = "echo 'tt-smi -r 0' | $f"
+    for cmd in (f'for f in ls; do eval "f=bash"; {run}; done', f'for f in ls; do declare "f=bash"; {run}; done',
+                f"for f in ls; do eval 'f=bash'; {run}; done", f'f=ls; eval "f=bash"; {run}',
+                f"for f in ls; do g(){{ f=bash; }}; g; {run}; done", f"for f in ls; do : ${{f:=bash}}; {run}; done",
+                f"f=bash; for f in ls; do :; done | cat; {run}", f"f=bash; (for f in ls; do :; done); {run}",
+                f"{{ for f in ls; do :; done; }} | cat; {run}", f"f=bash; false && for f in ls; do :; done; {run}",
+                f"f=bash; for f in ls; do :; done & {run}",
+                *(f"for f in bash ls; do {w}; done; {run}" for w in ("break", "return", "exit", "continue")),
+                'for f in $(cat l); do rm -rf "$f"; done', 'for f in $(find . -name x); do rm -rf "$f"; done',
+                'for f in $L; do rm -rf "$f"; done', 'for f in $(cat l); do echo x > "$f"; done'):
+        assert deny(cmd), cmd
+    for cmd in ('for f in a b; do rm -rf "$f"; done', 'for f in $(cat l); do cat "$f"; done',
+                f"for f in bash ls; do :; done; {run}",
+                'for py in ~/.local/bin/python3 /usr/bin/python3; do $py -c "import json"; done',
+                'for d in 1 2; do f=x/$d/r.json; [ -f "$f" ] && python3 -c "print(\'$d\')"; done'):
+        assert not deny(cmd), cmd
 
 
 def test_a_refusal_off_the_glm_arm_is_neither_recorded_nor_ends_the_run(tmp_path):

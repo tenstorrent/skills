@@ -279,7 +279,7 @@ class _Proof:
             arg = fixed.rsplit("/", 1)[0] if "/" in fixed else "."
         return self._place(os.path.join(folder, arg), False, search=True)
 
-    def _own_module(self, path: str) -> bool:
+    def _own_module_file(self, path: str) -> bool:
         """A module file of the worktree's own code: inside the working folder, named like no standard or start-up
         module python could load from there instead (`json.py`, `json/__init__.py`, `sitecustomize.py`), no `.pth`."""
         real = os.path.realpath(os.path.join(self.cwd, os.path.expanduser(path)))
@@ -295,7 +295,7 @@ class _Proof:
         mine = [os.path.realpath(r).rstrip("/") + "/" for r in [self.cwd, *filter(None, (
             self.env.get("TMPDIR"), self.env.get("TTP_RUN_DIR")))]]
         self.wrote |= writes
-        if writes and path.endswith((*importlib.machinery.all_suffixes(), ".pth")) and not self._own_module(path):
+        if writes and path.endswith((*importlib.machinery.all_suffixes(), ".pth")) and not self._own_module_file(path):
             return False   # a module python may import in place of the one it names
         for base in self.bases:
             real = os.path.realpath(os.path.join(base, path))
@@ -624,7 +624,7 @@ def _may_shadow(shell: str, cwds: list[str], env, prefixed: bool = False) -> boo
         py = next((i for i, w in enumerate(argv) if PY_RE.match(os.path.basename(w))), None)
         if py and argv[0] == "env":   # `env -u NAME`: unsets a variable python need not have, never one it reads
             unset = argv[1:py]
-            if len(unset) % 2 or any(f != "-u" or ENV_SET_RE.search(n) for f, n in zip(unset[::2], unset[1::2])):
+            if len(unset) % 2 or any(f != "-u" or ENV_SET_RE.search(n) or n in ENV_PATHS for f, n in zip(unset[::2], unset[1::2])):
                 return True
             argv = [argv[0], *argv[py:]]
             py = 1
