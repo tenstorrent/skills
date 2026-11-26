@@ -935,6 +935,8 @@ def test_coordroute_memory_forget_of_a_standing_entry_is_refused_in_the_lane_and
     assert ok == [0, 5] and [i for i, _ in refused] == [1, 2, 3, 4]
     rec = coordroute.shadow_side(p.state, 40, "glm", acts[:3], "ok", 0.0, 1.0, p)
     assert rec["glm"]["refused"] == ["memory_forget of a standing entry"] * 2
+    opus = coordroute.shadow_side(p.state, 41, "opus", acts[:2], "ok", 0.0, 1.0, p)["opus"]["actions"]
+    assert [x.get("out_of_lane", False) for x in opus] == [False, True]
 
 
 def test_coordroute_observation_mute_is_capped_at_twelve_hours_and_never_a_device_hold():
@@ -966,3 +968,16 @@ def test_coordroute_an_outside_writes_event_of_only_reads_is_routine(env):
     for data in (None, "", "not json", json.dumps({"paths": ["/srv/a"]})):
         assert not coordroute.classify(p.db, cfg, evs=[{"kind": "outside_writes", "severity": "normal", "task": None,
                                                          "data": data}])[0]
+
+
+def test_coordroute_the_lane_never_renews_a_mute_in_force(env):
+    """Renewing replaces a mute's end (and may carry its hold), so only a new source and match is the lane's."""
+    from ttp import coordroute, screen
+    p = _cr_db(env)
+    screen.mute(p.db, "watcher:x", "queue wait", 6, why="known")
+    mute = lambda **kw: {"type": "observation_mute", "source": "watcher:x", "match": "queue wait", "why": "known",
+                         "hours": 6, **kw}
+    ok, refused, _ = coordroute.filter_actions([mute(), mute(source="WATCHER:X", match="Queue Wait"),
+                                                mute(match="stale gate"), mute(source="watcher:y")], (), p)
+    assert ok == [2, 3] and [w for _, w in refused] == ["observation_mute renewing a mute in force"] * 2
+    assert coordroute.filter_actions([mute()])[0] == [0]

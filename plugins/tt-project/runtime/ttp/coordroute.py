@@ -287,7 +287,7 @@ def _must_items(must: str) -> str:
     return "\n".join(ln for ln in lines if ln.startswith("- "))
 
 
-def _reads_only(e) -> bool:
+def _outside_reads_only(e) -> bool:
     """An outside_writes event whose every path the run-end scan classed a read: it wrote nothing to check."""
     from . import sidefx
     if str(e["kind"] or "") != sidefx.KIND:
@@ -302,7 +302,7 @@ def _event_reasons(db, e, promises=()) -> list[str]:
     from . import obligations
     kind, sev = str(e["kind"] or ""), str(e["severity"] or "")
     out = []
-    if kind not in ROUTINE_KINDS and not _reads_only(e):
+    if kind not in ROUTINE_KINDS and not _outside_reads_only(e):
         out.append(f"event {kind}")
     if sev in ("high", "critical"):
         out.append(f"{sev} event {kind}")
@@ -376,6 +376,9 @@ def _refusal(a, p=None) -> str:
             return f"observation_mute for more than {LANE_MUTE_MAX_H} h or without hours"
         if screen.holds_mute(str(a.get("match") or "")):
             return "observation_mute of a device hold"
+        if p is not None and any(screen._same_mute(m, str(a.get("source") or ""), str(a.get("match") or ""))
+                                 for m in screen.mutes(p.db)):
+            return "observation_mute renewing a mute in force"
     if t == "obligation" and not (set(a) <= {"type", "key", "owners", "why"} and a.get("key") and a.get("owners")):
         return "obligation beyond attaching owners"
     return ""
@@ -402,12 +405,12 @@ def _target(a: dict) -> str:
     return ""
 
 
-def _brief(a) -> dict:
+def _brief(a, p=None) -> dict:
     if not isinstance(a, dict):
         return {"type": "?", "target": "", "why": ""}
     why = a.get("why") or a.get("text") or a.get("title") or ""
     out = {"type": str(a.get("type") or ""), "target": _target(a), "why": str(why)[:200]}
-    if _refusal(a) not in ("", "escalate"):
+    if _refusal(a, p) not in ("", "escalate"):
         out["out_of_lane"] = True
     return out
 
@@ -705,7 +708,7 @@ def shadow_side(state_dir, opus_run, side: str, actions, status: str, cost: floa
     rec = read_dict(path)
     acts = actions if isinstance(actions, list) else []
     side_rec = {"status": status, "cost_usd": round(float(cost or 0), 4), "duration_s": round(float(duration_s or 0), 1),
-                "actions": [_brief(a) for a in acts]}
+                "actions": [_brief(a, p) for a in acts]}
     if side == "glm":
         ok, refused, esc = filter_actions(acts, rec.get("needs") or (), p) if isinstance(actions, list) else ([], [], "")
         side_rec.update({"refused": [w for _, w in refused], "escalated": esc})
