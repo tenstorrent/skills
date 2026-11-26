@@ -945,3 +945,24 @@ def test_coordroute_observation_mute_is_capped_at_twelve_hours_and_never_a_devic
         mute(), mute(hours=12), mute(hours=72), mute(hours=0), mute(hours="soon"), {**mute(), "hours": None},
         mute(match="device hold on box"), mute(hours=None, end_when="test -e /x")])
     assert ok == [0, 1] and [i for i, _ in refused] == [2, 3, 4, 5, 6, 7] and esc == ""
+
+
+def test_coordroute_an_outside_writes_event_of_only_reads_is_routine(env):
+    """A run that ended without a hand-off and only read outside its folders wrote nothing to check; a write,
+    a path of another class, a high event or an event without per-path classes stays the coordinator's."""
+    import json
+    from ttp import coordroute
+    p = _cr_db(env)
+    cfg = _cr_cfg()
+    ev = lambda classes, sev="normal", **d: {"kind": "outside_writes", "severity": sev, "task": None, "data": json.dumps(
+        {"run": 7, "paths": list(classes), "classes": classes, **d})}
+    reads = {"/srv/a/log.jsonl": "read", "/srv/b": "read"}
+    assert coordroute.classify(p.db, cfg, evs=[ev(reads)]) == (True, [])
+    for classes in ({**reads, "/srv/c": "probable write"}, {**reads, "/srv/c": "executed"},
+                    {**reads, "/srv/c": "mentioned only"}, {}):
+        assert coordroute.classify(p.db, cfg, evs=[ev(classes)]) == (False, ["event outside_writes"])
+    assert not coordroute.classify(p.db, cfg, evs=[ev(reads, "high")])[0]
+    assert not coordroute.classify(p.db, cfg, evs=[ev(reads, paths=["/srv/a/log.jsonl", "/srv/unlisted"])])[0]
+    for data in (None, "", "not json", json.dumps({"paths": ["/srv/a"]})):
+        assert not coordroute.classify(p.db, cfg, evs=[{"kind": "outside_writes", "severity": "normal", "task": None,
+                                                         "data": data}])[0]

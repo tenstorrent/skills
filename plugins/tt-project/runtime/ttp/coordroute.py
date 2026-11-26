@@ -32,7 +32,7 @@ import time
 from pathlib import Path
 
 from . import glmquota, looks
-from .util import num_in, read_dict
+from .util import loads_dict, num_in, read_dict
 
 KEY = "coord_routine"          # kv: {"last_opus", "turns": [...], "escalate", "suspended", "shadows": [run ids]}
 LANE = "coord_lane"            # a run note's field: "routine" on a live lane turn
@@ -287,11 +287,22 @@ def _must_items(must: str) -> str:
     return "\n".join(ln for ln in lines if ln.startswith("- "))
 
 
+def _reads_only(e) -> bool:
+    """An outside_writes event whose every path the run-end scan classed a read: it wrote nothing to check."""
+    from . import sidefx
+    if str(e["kind"] or "") != sidefx.KIND:
+        return False
+    d = loads_dict(e["data"] if "data" in e.keys() else None)
+    classes = d.get("classes") if isinstance(d.get("classes"), dict) else {}
+    paths = d.get("paths") if isinstance(d.get("paths"), list) else []
+    return bool(paths) and all(classes.get(x) == sidefx.LABEL["read"] for x in paths)
+
+
 def _event_reasons(db, e, promises=()) -> list[str]:
     from . import obligations
     kind, sev = str(e["kind"] or ""), str(e["severity"] or "")
     out = []
-    if kind not in ROUTINE_KINDS:
+    if kind not in ROUTINE_KINDS and not _reads_only(e):
         out.append(f"event {kind}")
     if sev in ("high", "critical"):
         out.append(f"{sev} event {kind}")
