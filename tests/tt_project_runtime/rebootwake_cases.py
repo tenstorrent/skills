@@ -768,3 +768,26 @@ def test_a_reboot_leaves_a_job_cut_short_on_an_older_boot_to_its_owner(env, tmp_
     _boot_daemon(p)
     assert not rc.exists() and counter.read_text().split() == ["run"] and not _relaunch_events(p, rc)
     assert "cut short on an older boot" in (p.logs / "daemon.log").read_text()
+
+
+def test_a_reboot_never_replays_a_job_whose_tasks_spec_changed_while_it_slept(env, tmp_path):
+    # An order changed the task's spec while it slept on its job (say, dropping a setting the job's
+    # script applies on resume): a reboot wakes it so its run reads the change, never replays the old job.
+    from ttp.prompts import spec_digest
+    p = make(env)
+    tid = p.db.add_task("soak", "resume the soak with the old setting", kind="work", tier="light", origin="user")
+    rc, counter = _resumable_job_cut_by_reboot(p, tmp_path, tid)
+    prev = json.loads(p.db.task(tid)["result"])
+    p.db.update_task(tid, result=json.dumps({**prev, "spec_seen": spec_digest(p.db.task(tid))}))
+    p.db.update_task(tid, spec=p.db.task(tid)["spec"] + "\nupdate: the setting is off; drop it from the job")
+    _boot_daemon(p)
+    assert not _job_relaunches(p, tid), "the reboot replayed the job written before the spec change"
+    assert _woken(p, tid) and counter.read_text().split() == ["run"]
+    assert "its spec changed since it went to sleep" in (p.logs / "daemon.log").read_text()
+    # The spec it slept on, unchanged: still relaunched model-free.
+    tid2 = p.db.add_task("soak2", "s", kind="work", tier="light", origin="user")
+    rc2, counter2 = _resumable_job_cut_by_reboot(p, tmp_path, tid2)
+    prev = json.loads(p.db.task(tid2)["result"])
+    p.db.update_task(tid2, result=json.dumps({**prev, "spec_seen": spec_digest(p.db.task(tid2))}))
+    _boot_daemon(p, boot="a-third-boot")
+    assert not _woken(p, tid2) and len(_job_relaunches(p, tid2)) == 1

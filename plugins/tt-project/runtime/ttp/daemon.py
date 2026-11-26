@@ -342,6 +342,9 @@ from .util import read_dict, task_labels
 from .liveness import pid_alive
 
 TICK_S = 3.0
+# A coordinator turn that failed while an urgent message waited is retried at once for this many failures
+# in a row (then the failure backoff holds, so a broken turn cannot loop on spend).
+URGENT_RETRY_FAILS = 2
 WASTE_LEDGER_KV = "waste_ledger_at"   # kv: when the waste ledger last ran (the daily review or check_daily_waste)
 NOTICE_EVERY_S = 10.0   # how often the heartbeat reads the device broker's power-cycle notice (Daemon._cycle_notice)
 # With no run, push or startable task the wait between ticks doubles each tick up to this (_between_ticks):
@@ -5834,6 +5837,10 @@ class Daemon:
         """Ack each urgent inbound message and watch its first-finding deadline (msgurgent); model-free."""
         for line in msgurgent.tick(self.p, self.cfg, steer=lambda t, k: msgurgent.deliver_running(self.p, t, k)):
             log(self.p, f"urgent message: {line}")
+        # No turn runs for an open urgent (a cut or failed turn just ended): the next one starts in this
+        # pass, not after the rest of the pass and the next (about 30 s on a busy project).
+        if self.cfg_status != "unavailable" and msgurgent.next_turn_due(self.p.db, self.cfg):
+            self.maybe_coordinate()
 
     def check_steer_reads(self) -> None:
         """A running worker that has not read its coordinator update (steer.md past steer.offset) for
@@ -7142,7 +7149,9 @@ class Daemon:
                         + ("the new session's first wake failed " if kept else "the session could not resume ")
                         + f"({state.get('fail_error') or 'no error recorded'}); its batch reruns "
                         + ("as the next session, seeded with the hand-off" if state.get("rejected") else
-                           f"at once in the same session {str(state.get('id') or '')[:8]}"))[:1500]
+                           f"at once in the same session {str(state.get('id') or '')[:8]}"
+                           + (" with a compact window clear of the cold cap (its auto-compaction thrashed)"
+                              if coordsession.THRASH.search(str(state.get("fail_error") or "")) else "")))[:1500]
                 log(self.p, text)
                 db.x("INSERT INTO events(ts,source,kind,severity,text,data,status) VALUES(?,?,?,?,?,?,?)",
                      (now, "daemon:coord-session", "coord_session_resume_failed", "low", text,
@@ -12658,8 +12667,9 @@ class Daemon:
         if db.one("SELECT id FROM runs WHERE role='coordinator' AND status='running' AND " + coordroute.NOT_SHADOW_SQL):
             return   # a shadow turn (coordroute.py) holds no wake back
         now = time.time()
-        if now < float(db.kv("coordinator_backoff_until", 0)):
-            return
+        if now < float(db.kv("coordinator_backoff_until", 0)) and not (
+                int(db.kv("coordinator_failures", 0)) <= URGENT_RETRY_FAILS and msgurgent.next_turn_due(db, self.cfg)):
+            return   # a turn that failed holding an urgent is retried at once, twice; then the backoff holds
         # Due looks the coordinator set itself (looks.py); a look whose check exits 0, or whose snapshot
         # state is unchanged (look_trim), is skipped.
         fire = looks.screen(db, self.p.base, looks.due(db, now), now, self.p) if looks.pending(db) else []
@@ -17050,7 +17060,8 @@ class Daemon:
         it on the task and keep the task asleep on its retry_when. Returns (asleep, cut). asleep when it
         stays asleep (relaunched now, or already on this boot: a daemon restart). Else it wakes as
         before: a job it waits on that did not opt in, one found lost on an earlier boot, one that
-        cannot start (the ones started before it are stopped again: all or none), one past budget.max_job_relaunches relaunches, or a relaunch that would reach
+        cannot start (the ones started before it are stopped again: all or none), a task whose spec changed
+        since its waiting hand-off (SPEC_SEEN_KEY: the job predates that order), one past budget.max_job_relaunches relaunches, or a relaunch that would reach
         budget.max_reboot_losses (noted on the task, so its run reads why). A job relaunched on this
         boot before a daemon restart counts as started: stopped when the task wakes, and its
         job_relaunched event written if the restart came first; one the restart cut off between
@@ -17071,6 +17082,19 @@ class Daemon:
         if what := rebootwait.transient_besides_jobs(str(prev.get("retry_when") or ""), (str(self.p.runs),)):
             skip(f"its retry_when also checks {what}, which the reboot ended")
             return False, False   # the probe also checks what the reboot ended: it wakes, never sleeps on
+        from .prompts import spec_digest
+        if isinstance(seen := prev.get(SPEC_SEEN_KEY), str) and seen != spec_digest(t):
+            # Its spec changed while it slept (an order that may cancel what the job does): replaying the
+            # job written before that change would redo a step the change may undo, so its run reads the
+            # change first. Jobs relaunched on this boot before a daemon restart are stopped again.
+            why = "its spec changed since it went to sleep, so its run reads the change before any job starts again"
+            skip(why)
+            for r, k in [(r, detach.running_pid(r, self._this_boot)) for r in rcs]:
+                if k:
+                    detach.stop(r, k, f"stopped right after its relaunch: the task wakes instead ({why})",
+                                reason="daemon.relaunch_resumable", by="daemon")
+            _task_note(rcs[0].parent, f"the reboot cut short detached job {rcs[0].stem}; not relaunched: {why}")
+            return False, False
         todo, done, cut = [], [], False
         cap = int(self.cfg["budget"].get("max_job_relaunches", detach.RELAUNCH_CAP))
 
