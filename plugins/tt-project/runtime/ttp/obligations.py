@@ -2408,6 +2408,9 @@ def add_order(p, text: str, message: int, owners=(), due=None, start_by=None, ac
         ids = _owners_known(p.db, owners)
         st = _load(p.db)
         o = next((x for x in st["items"].values() if _open(x) and (x.get("promise") or {}).get("order") == int(message)), None)
+        again = o is None and any((x.get("promise") or {}).get("order") == int(message) for x in st["items"].values())
+        if again and start_by in (None, ""):   # a follow-up order: its start clock runs from now, not from the message
+            start_at = now + ORDER_START_S
         if why := unfit_owner(p.db, action_class, sorted(set(ids) | set((o or {}).get("promise", {}).get("tasks") or []))):
             raise ValueError(f"order (message #{message}): {why}")
         if o:
@@ -2439,7 +2442,8 @@ def add_order(p, text: str, message: int, owners=(), due=None, start_by=None, ac
                             "due": due_at if due_at is not None else now + _hours(p) * 3600,
                             "timed": due_at is not None, "tasks": ids, "obligations": [], "raised": None,
                             "set_at": now, "order": int(message), "class": action_class, "start_by": start_at,
-                            "started": None, "late": None, "reason": oldorders.one_line(reason),
+                            "started": None, "late": None, "since": now if again else None,
+                            "reason": oldorders.one_line(reason),
                             "context": oldorders.clean_context(p, oldorders.context_for(p.db, "", int(message)))}}
             note = f"order {oid} recorded from message #{message}" + note_cap
         pr = o["promise"]
@@ -2480,20 +2484,21 @@ def _needed_no_task(o: dict) -> bool:
 
 def order_starts(db, since: float, until: float, now: float | None = None) -> tuple[int, int]:
     """(orders whose message came between `since` and `until`, those whose first owner run started more
-    than ORDER_START_S after the message or not at all by `now`). An order that needed no task is left
+    than ORDER_START_S after the message (a follow-up order on a message that already has one: after its own record) or not at all by `now`). An order that needed no task is left
     out: one closed or dropped with no run started and no owner task ever (a reply, a memory or charter
     change settled it), so the count matches the late orders the coordinator is told about."""
     now = time.time() if now is None else now
-    orders = {int(o["promise"]["order"]): (o, o["promise"]) for o in items(db)
-              if (o.get("promise") or {}).get("order") is not None and not _needed_no_task(o)}
+    orders = [(o, o["promise"]) for o in items(db)
+              if (o.get("promise") or {}).get("order") is not None and not _needed_no_task(o)]
     if not orders:
         return 0, 0
-    ids = list(orders)
+    ids = list({int(pr["order"]) for _, pr in orders})
     ts = {r["id"]: float(r["ts"]) for r in db.q(f"SELECT id, ts FROM messages WHERE id IN ({','.join('?' * len(ids))})", ids)}
     n = late = 0
-    for m, (o, pr) in orders.items():
-        at = ts.get(m)
-        if at is None or not since <= at < until or (pr.get("started") is None and now - at <= ORDER_START_S):
+    for o, pr in orders:
+        sent = ts.get(int(pr["order"]))
+        at = None if sent is None else max(sent, float(pr.get("since") or 0))   # a follow-up order: from its record
+        if sent is None or not since <= sent < until or (pr.get("started") is None and now - at <= ORDER_START_S):
             continue   # out of the window, or too new to say
         start = pr.get("started")
         start = float(start) if start is not None else first_run(db, _owner_ids(o), at)
@@ -2549,7 +2554,7 @@ def _order_line(o: dict) -> str:
 
 def _order_ts(db, pr: dict) -> float:
     m = db.one("SELECT ts FROM messages WHERE id=?", (int(pr["order"]),))
-    return float(m["ts"]) if m else float(pr.get("start_by") or 0) - ORDER_START_S
+    return max(float(m["ts"]), float(pr.get("since") or 0)) if m else float(pr.get("start_by") or 0) - ORDER_START_S
 
 
 def _check_order(p, o: dict, now: float, raised: list[str]) -> bool:

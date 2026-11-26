@@ -1243,6 +1243,28 @@ def test_an_order_closed_by_a_receipt_before_any_start_stamp_counts_its_on_time_
     assert ob.order_starts(p.db, now - 1, now + 1, now + 9 * 86400) == (1, 0)
 
 
+def test_a_follow_up_order_on_an_ordered_message_starts_its_clock_at_its_own_record(env, monkeypatch):
+    """A second order for a message whose first order is closed is on time when its owner runs within the
+    limit of its own record, not of the message: no order_late alarm, no late count, the first order kept."""
+    from ttp import obligations as ob
+    p, d, now, tid, check, mid, raised = _order_setup(env, monkeypatch)
+    first = ob.add_order(p, "first", mid, [tid], action_class="read", now=now).split()[1]
+    p.db.x("INSERT INTO runs(task, role, started, ended, status) VALUES(?,?,?,?,?)",
+           (tid, "worker", now + 60, now + 120, "done"))
+    ob.close_promise(p.db, first, "delivered", by="coordinator", now=now + 300)
+    later = now + 4 * 3600
+    again = ob.add_order(p, "follow-up", mid, [], action_class="read", now=later).split()[1]
+    pr = ob.get(p.db, again)["promise"]
+    assert pr["start_by"] == later + ob.ORDER_START_S and pr["since"] == later
+    check(later + 60)
+    assert ob.get(p.db, again)["promise"]["late"] is None and raised((ob.ORDER_LATE_KIND,)) == []
+    p.db.x("INSERT INTO runs(task, role, started, ended, status) VALUES(?,?,?,?,?)",
+           (tid, "worker", later + 600, later + 900, "done"))
+    ob.attach(p, again, [tid], now=later + 700)
+    check(later + 800)
+    assert ob.order_starts(p.db, now - 1, now + 1, later + 900) == (2, 0)
+
+
 def test_an_order_whose_owners_are_all_deferred_or_dropped_is_no_late_start(env, monkeypatch):
     """Owners deferred past the start limit (start_after, a start_when probe) or all cancelled unrun leave
     the order out of the late count; the deferral is kept on the order, so it holds after the label goes."""
