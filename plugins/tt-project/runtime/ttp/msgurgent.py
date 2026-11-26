@@ -224,7 +224,7 @@ def tick(p, cfg: dict | None, now: float | None = None, steer=None) -> list[str]
             db.post("out", _tagged(db, f"Holding note, not a finding: your urgent message from "
                                        f"{timefmt.short(rec['ts'], p, now)} is with the coordinator, which has not "
                                        f"posted its first finding yet. Next check {timefmt.short(max(rec['find_due'], now + 60), p, now)}."),
-                    chat=rec["chat"], kind=LATE_KIND, severity="high", keep_tag=True)
+                    chat=rec["chat"], kind="urgent_late", severity="high", keep_tag=True)
         if rec.get("late") is None and now >= rec["find_due"]:
             rec["late"] = now
             changed = True
