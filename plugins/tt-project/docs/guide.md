@@ -5443,10 +5443,10 @@ in a recorded outage or failing repeatedly moves at once to another machine the 
 (`machines.allowed`, `resources`, `shared_resources`), unless the task names the machine itself; a hold or
 pause is never lifted. A gate older than `coordinator.stale_gate_min` (default 30, 0: off) that states no
 reason (a `why`, a rule id, `needs #id` or `safety:`) is cleared. A cancelled, failed or gone dependency
-the task neither names nor shares a file with is dropped and the task requeued once the threshold passes
-(raised when the task names it or shares a file with it); until then the task stays blocked and the
-coordinator gets its dead-dependency event. An open dependency is dropped only from a queued task that is
-not a review, cites nothing and neither names nor shares a file with it. What cannot be fixed safely becomes a must-act item keyed
+the task neither names nor shares a file with is dropped and the task requeued once the threshold
+passes (raised when it does); until then the task stays blocked and the coordinator gets its
+dead-dependency event. An open dependency is dropped only from a queued task that is not a review,
+cites nothing and neither names nor shares a file with it. What cannot be fixed safely becomes a must-act item keyed
 `stale_gate-<task>`, and a promise whose live owners all cannot run is given its one clear replacement or
 raised as `stale_gate-<id>`. Each fix leaves an observation on the task. The Course check shows a
 `stale gate:` line for any task or promise held over the threshold.

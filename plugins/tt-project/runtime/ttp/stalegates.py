@@ -9,10 +9,11 @@ once as a must-act item `stale_gate-<task>` (mustact.STALE_GATE_KIND):
   repeated trouble: the task moves to another machine the project's config allows when the task does
   not name the machine itself, else it is raised. A hold is never lifted or bypassed;
 - a gate older than `coordinator.stale_gate_min` (default 30, 0 = off) that states no reason (a why,
-  a rule id, `needs #id` or `safety:`), or a dependency the dependent neither names nor shares a file
-  with (cancelled, failed or gone): dropped and requeued once the threshold passes, or raised when the task
-  names it or shares a file with it; until then it keeps the task blocked, as the dead-dependency event
-  says. An open dependency is dropped only from a queued task that is not a review and cites nothing;
+  a rule id, `needs #id` or `safety:`): cleared;
+- a cancelled, failed or gone dependency, once that threshold passes: dropped and the task requeued,
+  unless the task names it or shares a file with it, then raised; until then it keeps the task blocked,
+  as the dead-dependency event says. An open dependency is dropped only from a queued task that is not
+  a review and cites nothing, and neither names nor shares a file with it;
 - a promise whose live owners all sit behind such a gate or are failed or cancelled: one clear
   replacement task is attached, else raised.
 
@@ -174,8 +175,9 @@ def findings(db, cfg: dict, now: float | None = None) -> list[dict]:
         for dep in deps:
             dead = _first_dead([dep], states)
             named = bool(re.search(rf"#{dep}\b", text)) or str(dep) in cont or dep in keep
-            if dead and old:   # named or sharing a file with it: its output may still be needed, so raise
+            if dead and old:
                 drop = not named and not _shares(db, text, dep)
+                # named or sharing a file with it: its output may still be needed, so raise instead of drop
                 out.append({**base, "ident": f"dep:{dep}", "cause": "dead_dep", "action": "drop_dep" if drop else "raise",
                             "dep": dep, "gate": f"depends on #{dep}, which {dead[1]}",
                             "fix": f"dropped #{dep}" if drop else
