@@ -283,8 +283,9 @@ def first(db, cfg: dict | None, msgs: list) -> tuple[list, set]:
 
 def next_turn_due(db, cfg: dict | None) -> bool:
     """An open urgent message no turn has yet and no coordinator turn running: the daemon starts the next
-    turn now, in the same pass and past its failure backoff, not at the end of a full daemon pass."""
-    if not config(cfg).get("enabled", True) or _running(db):
+    turn now, in the same pass and past its failure backoff, not at the end of a full daemon pass. A paused
+    project starts none."""
+    if not config(cfg).get("enabled", True) or db.kv("paused", False) or _running(db):
         return False
     for rec in pending(db):
         row = db.one("SELECT handled FROM messages WHERE id=?", (rec["mid"],))
@@ -338,7 +339,6 @@ def reach(p, rec: dict, c: dict, now: float) -> str | None:
         if unread_update(run_dir)[0]:   # no tool call to carry the update (a long reasoning step or a
             # compaction): restart with it first
             return "steer" if waited < float(c["read_s"]) else _cut(run_dir)
-        rec.setdefault("read", now)
         # Read: the record stays "steer" so each pass checks that the first finding follows; tick closes
         # it at the reply. Read with none posted within answer_s: the turn is cut and the next one,
         # started at once, has it first.

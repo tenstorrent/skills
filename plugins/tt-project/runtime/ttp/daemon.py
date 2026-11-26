@@ -17082,6 +17082,11 @@ class Daemon:
         if what := rebootwait.transient_besides_jobs(str(prev.get("retry_when") or ""), (str(self.p.runs),)):
             skip(f"its retry_when also checks {what}, which the reboot ended")
             return False, False   # the probe also checks what the reboot ended: it wakes, never sleeps on
+        def stop_jobs(why: str, jobs) -> None:   # (rc, pid) jobs relaunched on this boot: a woken task keeps none
+            for r, k in jobs:
+                if k:
+                    detach.stop(r, k, f"stopped right after its relaunch: the task wakes instead ({why})",
+                                reason="daemon.relaunch_resumable", by="daemon")
         from .prompts import spec_digest
         if isinstance(seen := prev.get(SPEC_SEEN_KEY), str) and seen != spec_digest(t):
             # Its spec changed while it slept (an order that may cancel what the job does): replaying the
@@ -17089,10 +17094,7 @@ class Daemon:
             # change first. Jobs relaunched on this boot before a daemon restart are stopped again.
             why = "its spec changed since it went to sleep, so its run reads the change before any job starts again"
             skip(why)
-            for r, k in [(r, detach.running_pid(r, self._this_boot)) for r in rcs]:
-                if k:
-                    detach.stop(r, k, f"stopped right after its relaunch: the task wakes instead ({why})",
-                                reason="daemon.relaunch_resumable", by="daemon")
+            stop_jobs(why, [(r, detach.running_pid(r, self._this_boot)) for r in rcs])
             _task_note(rcs[0].parent, f"the reboot cut short detached job {rcs[0].stem}; not relaunched: {why}")
             return False, False
         todo, done, cut = [], [], False
@@ -17102,9 +17104,7 @@ class Daemon:
             return [(r, k) for r, k in ((r, detach.running_pid(r, self._this_boot)) for r, _, _ in done) if k]
 
         def wake(why: str) -> None:
-            for r, k in running():
-                detach.stop(r, k, f"stopped right after its relaunch: the task wakes instead ({why})",
-                            reason="daemon.relaunch_resumable", by="daemon")
+            stop_jobs(why, running())
         for rc in rcs:
             m = detach.read_resume(rc)
             if m is not None and self._this_boot(m.get("boot")) and m.get("relaunches"):
