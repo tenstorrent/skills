@@ -9859,7 +9859,7 @@ def _terminalbench(p, a, now: float) -> None:
         die(f"model-bench terminalbench: {why}")
     alias =str(((cfg.get("providers") or {}).get("chat") or {}).get("endpoint") or "")
     got = endpoint.credentials(alias) if alias else None
-    ok, msg, ids = endpoint.list_models(got.url, got.key) if got else (False, "no key saved", None)
+    ok, msg, ids = endpoint.list_models(got.url, got.key, alias=alias) if got else (False, "no key saved", None)
     if not ok or not ids:
         fail(f"no working key for chat endpoint {alias or '(none)'}: {msg}")
     if a.runner:   # the endpoint reaches harbor's environment only, never argv
@@ -9912,7 +9912,7 @@ def _terminalbench_reference(p, a, cfg: dict) -> None:
         return
     ids = None
     if got:
-        ok, msg, ids = endpoint.list_models(got.url, got.key)   # a model list read, no tokens
+        ok, msg, ids = endpoint.list_models(got.url, got.key, alias=alias)   # a model list read, no tokens
         if not ok:
             die(f"model-bench terminalbench --reference: endpoint {alias}: {msg}")
     print(json.dumps(tbcycle.ref_start(cfg, list(ids) if ids else None,
@@ -9998,10 +9998,10 @@ def _model_suite(p, a, now: float) -> None:
     else:
         alias = str(((cfg.get("providers") or {}).get("chat") or {}).get("endpoint") or "")
         got = endpoint.credentials(alias) if alias else None
-        ok, msg, ids = endpoint.list_models(got.url, got.key) if got else (False, "no key saved", None)
+        ok, msg, ids = endpoint.list_models(got.url, got.key, alias=alias) if got else (False, "no key saved", None)
         if not ok or not ids:
             die(f"model-bench suite: no working key for chat endpoint {alias or '(none)'}: {msg}")
-        served, ask = list(ids), (lambda m, q: modelbench._post(got.url, got.key, m, q))
+        served, ask = list(ids), (lambda m, q: modelbench._post(got.url, got.key, m, q, alias=alias))
     opts = {"timeout_s": a.timeout, "stall_s": min(900.0, a.timeout), "budget_usd": a.budget,
             "test_cmd": benchrun.TEST_CMD, "test_timeout_s": 900, "dry_run": a.dry_run, "harbor_tasks": a.harbor}
     bench_dir = Path(a.bench).expanduser().resolve() if a.bench else None
@@ -13333,8 +13333,9 @@ def cmd_account_config(key: str, value: str | None) -> None:
     from .project import ACCOUNT_NESTED_KEYS, account_value
     nested = key in ACCOUNT_NESTED_KEYS
     if value is None and nested:
-        print(json.dumps(account_value(key) if key in (rankfresh.KEY, rankfresh.KEY_FILE_KEY) else rankfresh.setting(key),
-                         indent=1))
+        from . import glmquota
+        print(json.dumps(account_value(key) if key in (rankfresh.KEY, rankfresh.KEY_FILE_KEY, *glmquota.KEYS)
+                         else rankfresh.setting(key), indent=1))
         return
     if value is None:
         node = deep_merge(DEFAULT_CONFIG, load_account_settings())
@@ -13346,7 +13347,7 @@ def cmd_account_config(key: str, value: str | None) -> None:
         val = json.loads(value)
     except ValueError:
         val = value
-    from . import checkspill
+    from . import checkspill, glmquota
     from .globalcap import setting_problems
     sec, _, k = key.partition(".")
     bad = setting_problems({k: val}) if sec == "budget" and val not in ("", None) else []
@@ -13362,7 +13363,7 @@ def cmd_account_config(key: str, value: str | None) -> None:
             val = checkspill.no_spill_of(val) or ""   # an empty ban list is none: removed
         except ValueError as e:
             bad = [str(e)]
-    if nested and (why := rankfresh.check_setting(key, val)):
+    if nested and (why := rankfresh.check_setting(key, val) or glmquota.check_setting(key, val)):
         bad = [why]
     if key == "machine.max_workers" and val not in ("", None) and (why := max_workers_problem(val)):
         bad = [f"{key}: {why}"]

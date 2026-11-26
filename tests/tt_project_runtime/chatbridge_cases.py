@@ -16,6 +16,7 @@ class _MockChat:
     def __init__(self, replies):
         self.replies, self.seen = list(replies), []
         self.models = None   # the ids GET /models lists; None: it answers 404
+        self.get_headers = {}   # extra response headers on GET /models
         mock = self
 
         class H(http.server.BaseHTTPRequestHandler):
@@ -28,6 +29,8 @@ class _MockChat:
                 self.send_response(404 if mock.models is None else 200)
                 self.send_header("Content-Type", "application/json")
                 self.send_header("Content-Length", str(len(data)))
+                for k, v in mock.get_headers.items():
+                    self.send_header(k, v)
                 self.end_headers()
                 self.wfile.write(data)
 

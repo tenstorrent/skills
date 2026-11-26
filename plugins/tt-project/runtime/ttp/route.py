@@ -497,7 +497,7 @@ def refresh_served(state: Path, alias: str, every: int | None = None) -> bool:
     got = endpoint.credentials(alias)
     if got is None:
         return False
-    ok, msg, ids = endpoint.list_models(got.url, got.key)
+    ok, msg, ids = endpoint.list_models(got.url, got.key, alias=alias)
     write_served(state, TO, ok, msg, ids, time.time(), every=every)
     return True
 

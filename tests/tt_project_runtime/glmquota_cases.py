@@ -183,3 +183,207 @@ def test_glm_quota_429_that_names_its_window_rolls_windows_on_it(monkeypatch, tm
     v = glmquota.view(cfg, _GQ_HOUR + 250)
     assert v["used"] == 1_000_000 and -0.16 < v["ahead"] < -0.13, (v, "ahead on the 429's minute window")
     assert glmquota.view(cfg, _GQ_HOUR + 301)["used"] == 0, "the second rollover on the 429's window"
+
+
+# The org's real remaining (X-Quota-Remaining-llm_tokens), our own hourly cap and its self-lift.
+
+_GQ_HDR = "X-Quota-Remaining-llm_tokens"
+_GQ_USAGE = {"usage": {"prompt_tokens": 1000, "completion_tokens": 50, "prompt_tokens_details": {"cached_tokens": 900}}}
+
+
+def _gq_account(**kv):
+    from ttp import project
+    for k, v in kv.items():
+        project.set_account_setting(f"providers.chat.{k}", v)
+
+
+def _gq_cap_cfg(reserve=0.1):
+    return {"providers": {"chat": {"endpoint": "cloud", "quota": {"size": _GQ_SIZE, "reserve": reserve}}}}
+
+
+def test_glm_quota_header_reading_is_recorded_with_its_time_and_a_bad_or_missing_one_is_ignored(monkeypatch, tmp_path):
+    from ttp import glmquota
+    _gq_home(monkeypatch, tmp_path)
+    now = _GQ_HOUR + 600
+    assert glmquota.note("cloud", {_GQ_HDR: "73000000"}, now=now) == 73_000_000
+    assert glmquota.note("cloud", {"x-quota-remaining-LLM_TOKENS": " 71000000 "}, now=now + 10) == 71_000_000
+    for bad in ({}, None, {_GQ_HDR: "lots"}, {_GQ_HDR: "-5"}, {_GQ_HDR: ""}):
+        assert glmquota.note("cloud", bad, now=now + 20) is None
+    st = json.loads((tmp_path / "quota" / "cloud.json").read_text())
+    assert st["remaining"] == {"v": 71_000_000, "at": now + 10}, "the newest good reading, with its time"
+    assert glmquota.view(_GQ_CFG, now + 30)["remaining"] == 71_000_000
+    assert glmquota.view(_GQ_CFG, _GQ_HOUR + 3600 + 30)["remaining"] is None, "a reading of the last UTC hour is stale"
+
+
+def test_glm_quota_answer_counts_tokens_and_the_reading_in_one_write_and_never_raises(monkeypatch, tmp_path):
+    from ttp import glmquota
+    _gq_home(monkeypatch, tmp_path)
+    now = _GQ_HOUR + 600
+    glmquota.answer("cloud", {_GQ_HDR: "90000000"}, _GQ_USAGE, now=now)
+    v = glmquota.view(_GQ_CFG, now)
+    assert (v["used"], v["ours_hour"], v["remaining"]) == (1050, 1050, 90_000_000), "cached tokens at full weight"
+    glmquota.answer("cloud", {}, {"choices": []}, now=now)           # no usage, no header: nothing
+    glmquota.answer("cloud", None, {"usage": "x"}, now=now)           # junk usage
+    glmquota.answer("", {_GQ_HDR: "5"}, _GQ_USAGE, now=now)           # no alias: nothing to key on
+    glmquota.answer("cloud", object(), _GQ_USAGE, count_cached=False, now=now)   # headers that are not a mapping
+    assert glmquota.view(_GQ_CFG, now)["used"] == 1050 + 150, "count_cached off leaves the cached tokens out"
+    assert glmquota.view(_GQ_CFG, now)["remaining"] == 90_000_000
+
+
+def test_glm_quota_hourly_cap_counts_cached_in_full_runs_out_mid_hour_and_resumes_next_utc_hour(monkeypatch, tmp_path):
+    from ttp import glmquota
+    _gq_home(monkeypatch, tmp_path)
+    cfg = _gq_cap_cfg()
+    plain = {"kind": "work", "priority": 1, "spec": "Goal: fix the parser."}
+    now = _GQ_HOUR + 1800
+    glmquota.add("cloud", 20_000_000, now=now - 60, cached=19_000_000)
+    assert glmquota.view(cfg, now)["cap"] == 0 and glmquota.paced(cfg, plain, "worker", now) == "", "no setting: no cap"
+    _gq_account(quota_hourly_cap=50_000_000)
+    v = glmquota.view(cfg, now)
+    assert (v["cap"], v["ours_hour"], v["exhausted"]) == (50_000_000, 20_000_000, False), "mostly cache reads, still counted"
+    glmquota.add("cloud", 24_000_000, now=now, cached=23_000_000)   # 44M of the 45M (50M less the 10% reserve)
+    assert not glmquota.view(cfg, now)["exhausted"]
+    glmquota.add("cloud", 2_000_000, now=now + 5, cached=1_900_000)
+    v = glmquota.view(cfg, now + 10)
+    assert v["exhausted"] and "our 50M tokens an hour" in v["why"], v
+    assert glmquota.paced(cfg, plain, "worker", now + 10) == "paced"
+    assert glmquota.paced(cfg, {"kind": "work", "priority": 5}, "coordinator", now + 10) == "paced", "a coordinator wake too"
+    nxt = _GQ_HOUR + 3600 + 5
+    assert glmquota.view(cfg, nxt)["ours_hour"] == 0 and glmquota.paced(cfg, plain, "worker", nxt) == "", \
+        "GLM resumes at the next UTC hour"
+    assert "50M" in glmquota.line(cfg, now + 10) and "cap" in glmquota.line(cfg, now + 10)
+    _gq_account(quota_hourly_cap=0)
+    assert glmquota.paced(cfg, plain, "worker", now + 10) == "", "0 clears the cap"
+
+
+def test_glm_quota_paces_on_the_smaller_of_our_budget_and_the_orgs_remaining(monkeypatch, tmp_path):
+    from ttp import glmquota
+    _gq_home(monkeypatch, tmp_path)
+    cfg = _gq_cap_cfg()
+    _gq_account(quota_hourly_cap=50_000_000)
+    plain = {"kind": "work", "priority": 1, "spec": "Goal: x"}
+    now = _GQ_HOUR + 1800
+    glmquota.add("cloud", 10_000_000, now=now - 60)
+    glmquota.note("cloud", {_GQ_HDR: "60000000"}, now=now - 30)   # the org has plenty: our own cap rules
+    v = glmquota.view(cfg, now)
+    assert not v["exhausted"] and "our" not in v["why"] and v["remaining"] == 60_000_000
+    glmquota.note("cloud", {_GQ_HDR: "9000000"}, now=now)         # only 9M left, the 10M reserve is gone: stop
+    v = glmquota.view(cfg, now + 1)
+    assert v["exhausted"] and "org's quota has 9.0M" in v["why"], v
+    assert glmquota.paced(cfg, plain, "worker", now + 1) == "paced"
+    glmquota.note("cloud", {_GQ_HDR: "40000000"}, now=now + 60)   # others eased off: 30M over the reserve for us
+    v = glmquota.view(cfg, now + 61)
+    assert not v["exhausted"] and glmquota.paced(cfg, plain, "worker", now + 61) == ""
+    assert glmquota.paced(cfg, plain, "worker", _GQ_HOUR + 3600 + 1) == "", "last hour's reading says nothing of the new one"
+
+
+def test_glm_quota_lift_needs_repeated_evidence_that_cached_tokens_stopped_counting(monkeypatch, tmp_path):
+    import random
+    from ttp import glmquota
+    _gq_home(monkeypatch, tmp_path)
+    cfg = _gq_cap_cfg()
+    _gq_account(quota_hourly_cap=50_000_000)
+
+    def run(key, weight, start, steps=330, cached_scale=1.0):
+        rng, left = random.Random(7), 80_000_000
+        glmquota.note(key, {_GQ_HDR: str(left)}, now=start)
+        for i in range(1, steps + 1):
+            t = start + 10 * i
+            cached, fresh = int(rng.uniform(0, 1.2e6) * cached_scale), int(rng.uniform(0, 4e5))
+            glmquota.add(key, cached + fresh, now=t - 1, cached=cached)
+            left -= int(10 * 28000 * rng.uniform(0.7, 1.3) + fresh + weight * cached)   # others use ~28k tokens/s
+            glmquota.note(key, {_GQ_HDR: str(left)}, now=t)
+        return json.loads((tmp_path / "quota" / f"{key}.json").read_text())
+
+    full = run("cloud", 1.0, _GQ_HOUR)      # cached tokens still count in full: never lifts
+    assert not (full.get("lift") or {}).get("lifted") and (full["lift"].get("weight") or 0) > 0.7, full.get("lift")
+    assert glmquota.view(cfg, _GQ_HOUR + 3500)["cap"] == 50_000_000
+    free = run("free", 0.0, _GQ_HOUR)       # same use, cached tokens now free: lifts after 3 evaluations in a row
+    assert free["lift"]["lifted"] and free["lift"]["votes"] >= glmquota.LIFT_VOTES and free["lift"]["weight"] < 0.2
+    cfg_free = {"providers": {"chat": {"endpoint": "free", "quota": {"size": _GQ_SIZE}}}}
+    v = glmquota.view(cfg_free, _GQ_HOUR + 3500)
+    assert v["lifted"] and v["cap"] == 0 and "cap is lifted" in glmquota.line(cfg_free, _GQ_HOUR + 3500), v
+    assert "lifted by itself" in glmquota.lift_notice("free", _GQ_HOUR + 3600), "one low notify's text"
+    assert glmquota.lift_notice("free", _GQ_HOUR + 3601) == "", "told once"
+    # A run too short (not enough rows) or with too few cached tokens (no power) never votes yes.
+    assert not (run("short", 0.0, _GQ_HOUR, steps=60).get("lift") or {}).get("lifted")
+    assert not (run("light", 0.0, _GQ_HOUR, cached_scale=0.01).get("lift") or {}).get("lifted"), "no cached tokens, no proof"
+
+
+def test_glm_quota_lift_vote_count_resets_on_a_failed_evaluation_and_modes_force_it_on_or_off(monkeypatch, tmp_path):
+    from ttp import glmquota
+    _gq_home(monkeypatch, tmp_path)
+    rows = lambda w, n=60, t0=1000.0: [[t0 + 10 * i, 10.0, 200_000 + 1000 * (i % 7), 900_000 + 20_000 * (i % 5),
+                                        int((0.28 + 0.2 * (i % 3) + 0.2 * (200_000 + 1000 * (i % 7)) / 1e6 * 5 +
+                                             w * (900_000 + 20_000 * (i % 5)) / 1e6) * 1e6 / 5)] for i in range(n)]
+    st = {"rows": rows(0.0), "lift": {"votes": 2, "at": 0}}
+    glmquota._judge(st, 5000.0, mode="auto")
+    assert st["lift"]["lifted"] and st["lift"]["votes"] == 3
+    st = {"rows": rows(0.0), "lift": {"votes": 2, "at": 0}}
+    glmquota._judge(st, 5000.0, mode="off")
+    assert st["lift"] == {"votes": 2, "at": 0}, "off: never evaluates"
+    st = {"rows": rows(1.0), "lift": {"votes": 2, "at": 0}}
+    glmquota._judge(st, 5000.0, mode="auto")
+    assert st["lift"]["votes"] == 0 and not st["lift"]["lifted"], "one failing evaluation starts over"
+    st = {"rows": rows(0.0), "lift": {"votes": 0, "at": 4800.0}}
+    glmquota._judge(st, 5000.0, mode="auto")
+    assert st["lift"]["at"] == 4800.0, "at most one evaluation per LIFT_EVERY_S"
+    _gq_account(quota_cap_lift="on", quota_hourly_cap=50_000_000)
+    v = glmquota.view(_gq_cap_cfg(), _GQ_HOUR + 60)
+    assert v["lifted"] and v["cap"] == 0, "on: lifted at once"
+    _gq_account(quota_cap_lift="off")
+    glmquota.add("cloud", 1, now=_GQ_HOUR)
+    path = tmp_path / "quota" / "cloud.json"
+    st = json.loads(path.read_text())
+    path.write_text(json.dumps({**st, "lift": {"lifted": _GQ_HOUR, "votes": 3}}))
+    v = glmquota.view(_gq_cap_cfg(), _GQ_HOUR + 60)
+    assert not v["lifted"] and v["cap"] == 50_000_000, "off: the cap holds whatever was found"
+
+
+def test_glm_quota_settings_are_account_keys_with_checked_values(monkeypatch, tmp_path):
+    from ttp import cli, glmquota, project
+    _gq_home(monkeypatch, tmp_path)
+    assert glmquota.CAP_KEY in project.ACCOUNT_NESTED_KEYS and glmquota.LIFT_KEY in project.ACCOUNT_NESTED_KEYS
+    assert glmquota.cap_setting() == 0 and glmquota.lift_mode() == "auto", "shipped default: no cap"
+    for k, bad in ((glmquota.CAP_KEY, "lots"), (glmquota.CAP_KEY, -1), (glmquota.CAP_KEY, True),
+                   (glmquota.LIFT_KEY, "maybe")):
+        assert glmquota.check_setting(k, bad), (k, bad)
+    for k, ok in ((glmquota.CAP_KEY, 50_000_000), (glmquota.CAP_KEY, 0), (glmquota.LIFT_KEY, "off")):
+        assert glmquota.check_setting(k, ok) == ""
+    project.set_account_setting(glmquota.CAP_KEY, 50_000_000)
+    project.set_account_setting(glmquota.LIFT_KEY, "off")
+    assert glmquota.cap_setting() == 50_000_000 and glmquota.lift_mode() == "off"
+
+
+def test_glm_quota_bridge_records_the_header_on_each_successful_answer_and_not_on_a_429(mock_chat, monkeypatch, tmp_path):
+    from ttp import chatbridge, glmquota
+    _gq_home(monkeypatch, tmp_path)
+    ok = {"choices": [{"message": {"content": "done"}, "finish_reason": "stop"}], **_GQ_USAGE}
+    up = mock_chat((200, ok, {_GQ_HDR: "88000000"}), (200, ok), (429, _QUOTA_BODY, {_GQ_HDR: "0"}))
+    now = time.time()
+    with chatbridge.Bridge(up.url, _CB_KEY, "up-model", quota={"key": "cloud", "window_s": 3600}) as b:
+        for _ in range(3):
+            _post(b, {"max_tokens": 50, "messages": [{"role": "user", "content": "hi"}]})
+    st = json.loads((tmp_path / "quota" / "cloud.json").read_text())
+    assert st["remaining"]["v"] == 88_000_000 and st["remaining"]["at"] >= now, "the 429's header is not a reading"
+    assert st["hours"][str(int(now - now % 3600))][0] >= 2100 and st["hours"][str(int(now - now % 3600))][1] >= 1800
+
+
+def test_glm_quota_off_run_posts_and_the_models_poll_land_in_the_quota_file(mock_chat, monkeypatch, tmp_path):
+    from ttp import babysit, endpoint, glmquota, modelbench, toolprobe
+    _gq_home(monkeypatch, tmp_path)
+    ok = {"choices": [{"message": {"content": "wake"}, "finish_reason": "stop"}], **_GQ_USAGE}
+    up = mock_chat((200, ok, {_GQ_HDR: "70000000"}), (200, ok, {_GQ_HDR: "69000000"}), (200, ok, {_GQ_HDR: "68000000"}))
+    up.models, up.get_headers = ["m"], {_GQ_HDR: "67000000"}
+    monkeypatch.setattr(endpoint, "credentials", lambda alias: endpoint.Credentials("k", up.url))
+    babysit._post({"alias": "cloud", "base_url": "", "model": "m"}, [{"role": "user", "content": "x"}], 10)
+    assert glmquota.view(_GQ_CFG)["used"] == 1050, "babysit's post"
+    modelbench._post(up.url, "k", "m", "hi", alias="cloud")
+    assert glmquota.view(_GQ_CFG)["used"] == 2100, "the model bench's post"
+    toolprobe.endpoint_post("cloud")({"model": "m", "messages": []})
+    assert glmquota.view(_GQ_CFG)["used"] == 3150, "the tool probe's post"
+    assert glmquota.view(_GQ_CFG)["remaining"] == 68_000_000
+    assert endpoint.list_models(up.url, "k", alias="cloud")[0]
+    assert glmquota.view(_GQ_CFG)["remaining"] == 67_000_000 and glmquota.view(_GQ_CFG)["used"] == 3150, \
+        "the /models poll gives a reading and no tokens"
+    assert endpoint.list_models(up.url, "k")[0] and True

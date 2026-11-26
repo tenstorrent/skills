@@ -4872,6 +4872,9 @@ class Daemon:
             if why == route.LISTED and route.clear_notice(self.p.db, model):
                 self.alert(f"route-model-served:{route.TO}|{model}", route.served_notice(route.TO, model),
                            severity="low", every_s=0)
+        if (q := glmquota.conf(self.cfg)) and (text := glmquota.lift_notice(q["key"], now)):   # once per host
+            log(self.p, f"glmquota: {text}")
+            self.alert("glm-quota-cap-lifted", text, severity="low", every_s=0)
         if os.environ.get("TTP_TEST_NO_MODELS_PROBE") or (self._models_probe and self._models_probe.is_alive()):
             return
         if now - self._models_tried < served.CHECK_S or not (alias := route.chat_alias(self.cfg)):

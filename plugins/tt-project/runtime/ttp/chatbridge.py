@@ -1213,7 +1213,8 @@ class Bridge:
         """Whether GET <base>/models lists this run's model (asked once per bridge), or None when the
         answer lists none or the check failed."""
         if self._listed == "":
-            ok, _, ids = endpoint.list_models(self.base_url, self._key, timeout=MODEL_CHECK_TIMEOUT_S)
+            ok, _, ids = endpoint.list_models(self.base_url, self._key, timeout=MODEL_CHECK_TIMEOUT_S,
+                                             alias=(self.quota or {}).get("key", ""))
             self._listed = (self.model in ids) if ok and ids else None
         return self._listed
 
@@ -1331,6 +1332,12 @@ class Bridge:
         call = self.calls.begin()
         try:
             resp = self._open(req)
+            if self.quota:   # the org's remaining tokens this UTC hour, from the answer's header (glmquota.py)
+                try:
+                    glmquota.note(self.quota["key"], getattr(resp, "headers", None),
+                                  float(self.quota.get("window_s") or 3600))
+                except Exception:   # counting must never break a call
+                    pass
         except BaseException as e:   # a 429 or 503 (the codes busy_wait waits out) is the server at capacity
             slot.release()
             code = getattr(e, "code", 0)
@@ -1519,10 +1526,10 @@ class Bridge:
             for k in ("input_tokens", "output_tokens", "cache_read_input_tokens"):
                 self.usage[k] += int(got.get(k) or 0)
         if self.quota:   # the endpoint's quota, shared by every run on this host (glmquota.py)
-            n = got["input_tokens"] + got["output_tokens"] + \
-                (got["cache_read_input_tokens"] if self.quota.get("count_cached", True) is not False else 0)
+            cached = got["cache_read_input_tokens"] if self.quota.get("count_cached", True) is not False else 0
+            n = got["input_tokens"] + got["output_tokens"] + cached
             try:
-                glmquota.add(self.quota["key"], n, float(self.quota.get("window_s") or 3600))
+                glmquota.add(self.quota["key"], n, float(self.quota.get("window_s") or 3600), cached=cached)
             except Exception:   # counting must never break a call
                 pass
 

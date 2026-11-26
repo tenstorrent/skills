@@ -40,7 +40,7 @@ import urllib.error
 import urllib.request
 from typing import Any
 
-from . import endpoint, inflight
+from . import endpoint, glmquota, inflight
 from .budget import TIER_ORDER
 
 KEY = "babysit"
@@ -172,7 +172,9 @@ def _post(s: dict, messages: list, timeout: float) -> dict:
         raise Unavailable("no free chat in-flight slot (chat.max_inflight)")
     try:
         with opener.open(req, timeout=timeout) as r:
-            return json.loads(r.read().decode())
+            data = json.loads(r.read().decode())
+            glmquota.answer(s["alias"], r.headers, data)   # an off-bridge post: counted like a bridge's
+            return data
     except urllib.error.HTTPError as e:
         if e.code in inflight.REFUSALS:
             inflight.refused()

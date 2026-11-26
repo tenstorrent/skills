@@ -24,6 +24,22 @@ or rollback (rollout.outage_refusal):
 Runs already going keep running: pacing only moves new starts.
 Settings (`providers.chat.quota`, every key optional): on (default true; false: no counting, no pacing),
 size, window_s (3600), reserve (0.1), count_cached (true).
+
+The org's remaining and our own hourly cap: the quota is the org's (every employee's use shares it), not
+ours. Every successful answer on every route (the bridge, and the off-bridge posts through `answer` and
+`note`) records its X-Quota-Remaining-llm_tokens header with the time into the same file, and our tokens
+(cached ones apart) into the UTC hour they were spent in. The newest reading of the current UTC hour is the
+org's remaining. Two limits then shed runs on the same ladder as above, over the UTC hour (`gone`):
+- the account setting providers.chat.quota_hourly_cap (tokens an hour; unset or 0: none): our own use this
+  UTC hour, cached prompt tokens at full weight, may not pass it;
+- the org's remaining less `reserve` of the quota's size: our use may not take more than that.
+The tighter budget paces; one spent (our use at the cap, or the org's remaining at the reserve) sends every
+run to core until the next UTC hour (a start's route fallback `paced`, never a rollback or freeze).
+The cap lifts by itself once cached tokens no longer count (judge): the readings' drops between our own
+answers are regressed on our uncached and cached tokens; only when the cached tokens' weight is clearly
+small (upper bound under LIFT_MAX_WEIGHT, on at least LIFT_MIN_ROWS readings and LIFT_MIN_CACHED cached
+tokens) in LIFT_VOTES evaluations in a row on fresh readings, LIFT_EVERY_S apart, does it lift, once, kept
+in the file. The account setting providers.chat.quota_cap_lift: auto (default), on (lifted now) or off (never).
 """
 from __future__ import annotations
 
@@ -49,6 +65,20 @@ RESETS_RE = re.compile(r'"resets_at"\s*:\s*"([^"\s]+)"')
 WINDOW_RE = re.compile(r"(?i)\b(minute|hourly|daily)\s+limit\b|\bper\s+(minute|hour|day)\b")
 WINDOWS = {"minute": 60, "hourly": 3600, "hour": 3600, "daily": 86400, "day": 86400}
 OBSERVED_KEEP_S = 86400             # 429s without a limit: the tokens we had counted, kept this long
+HEADER = "x-quota-remaining-llm_tokens"   # on a successful answer: the org's tokens left this UTC hour
+HOUR_S = 3600
+HOURS_KEEP_S = 2 * 86400            # our per-UTC-hour use is kept this long
+CAP_KEY = "providers.chat.quota_hourly_cap"   # account settings (project.ACCOUNT_NESTED_KEYS)
+LIFT_KEY = "providers.chat.quota_cap_lift"
+LIFT_MODES = ("auto", "on", "off")
+KEYS = (CAP_KEY, LIFT_KEY)
+ROW_MIN_S = 5                       # a reading closes a sample row only this long after the last one
+ROWS_KEEP = 400
+LIFT_EVERY_S = 600                  # one evaluation per this long, each on readings taken since the last
+LIFT_VOTES = 3                      # passing evaluations in a row before the cap lifts
+LIFT_MIN_ROWS = 40
+LIFT_MIN_CACHED = 10_000_000        # cached tokens of ours inside an evaluation's rows: else it had no power
+LIFT_MAX_WEIGHT = 0.5               # the cached tokens' weight, 2 standard errors up, must be under this
 
 
 def conf(cfg: dict | None) -> dict:
@@ -101,15 +131,182 @@ def _roll(st: dict, window_s: float, now: float) -> dict:
     return {**st, "reset": reset, "used": 0, "spent": 0}
 
 
-def add(key: str, tokens: int, window_s: float = 3600, now: float | None = None) -> None:
-    """Count `tokens` spent on the endpoint `key` now."""
-    if not key or tokens <= 0:
-        return
-    now = time.time() if now is None else now
+def count_cached(cfg: dict | None) -> bool:
+    return (conf(cfg) or DEFAULTS)["count_cached"] is not False
+
+
+def _tokens(body) -> tuple[int, int]:
+    """(tokens to count with cached ones at full weight, cached tokens) of a chat answer's usage object."""
+    u = (body or {}).get("usage") if isinstance(body, dict) else None
+    if not isinstance(u, dict):
+        return 0, 0
+    try:
+        cached = int(((u.get("prompt_tokens_details") or {}).get("cached_tokens")) or 0)
+        total = int(u.get("prompt_tokens") or 0) + int(u.get("completion_tokens") or 0)
+    except (TypeError, ValueError, AttributeError):
+        return 0, 0
+    return max(total, 0), max(min(cached, total), 0)
+
+
+def reading(headers) -> int | None:
+    """The org's remaining tokens a successful answer's headers give (HEADER), or None."""
+    try:
+        for k, v in (headers.items() if headers is not None else ()):
+            if str(k).lower() == HEADER and str(v).strip().isdigit():
+                return int(str(v).strip())
+    except Exception:
+        pass
+    return None
+
+
+def _record(key: str, window_s: float, now: float, tokens: int = 0, cached: int = 0,
+            remaining: int | None = None) -> None:
     with _locked(key) as path:
         st = _roll(_read(path), window_s, now)
-        st["used"] = int(st.get("used") or 0) + int(tokens)
+        if tokens > 0:
+            st["used"] = int(st.get("used") or 0) + int(tokens)
+            hour = str(int(now - now % HOUR_S))
+            row = (st.get("hours") or {}).get(hour) or [0, 0]
+            st["hours"] = {h: r for h, r in (st.get("hours") or {}).items() if int(h) > now - HOURS_KEEP_S} | \
+                {hour: [int(row[0]) + int(tokens), int(row[1]) + int(cached)]}
+            pend = st.get("pending") or [0, 0]
+            st["pending"] = [int(pend[0]) + int(tokens) - int(cached), int(pend[1]) + int(cached)]
+        if remaining is not None:
+            _reading(st, remaining, now)
         _write(path, st)
+
+
+def _reading(st: dict, remaining: int, now: float) -> None:
+    """Take the org's remaining `remaining` seen at `now`: the newest reading, and a sample row (the drop since
+    the last row's reading in this UTC hour, with our tokens in between) once ROW_MIN_S have passed."""
+    hour = now - now % HOUR_S
+    st["remaining"] = {"v": int(remaining), "at": now}
+    base = st.get("base") or {}
+    if float(base.get("at") or 0) < hour:   # the first reading of this UTC hour: the quota refilled
+        st["base"], st["pending"] = {"v": int(remaining), "at": now}, [0, 0]
+        return
+    dt = now - float(base["at"])
+    if dt < ROW_MIN_S:
+        return
+    pend = st.get("pending") or [0, 0]
+    rows = (st.get("rows") or [])[-(ROWS_KEEP - 1):]
+    rows.append([round(now, 1), round(dt, 1), int(pend[0]), int(pend[1]), int(base["v"]) - int(remaining)])
+    st["rows"], st["base"], st["pending"] = rows, {"v": int(remaining), "at": now}, [0, 0]
+    _judge(st, now)
+
+
+def add(key: str, tokens: int, window_s: float = 3600, now: float | None = None, cached: int = 0) -> None:
+    """Count `tokens` spent on the endpoint `key` now (`cached` of them cached prompt tokens)."""
+    if not key or tokens <= 0:
+        return
+    _record(key, window_s, time.time() if now is None else now, tokens, cached)
+
+
+def note(key: str, headers, window_s: float = 3600, now: float | None = None) -> int | None:
+    """Record the org's remaining from a successful answer's `headers` (HEADER); returns it, None when absent."""
+    left = reading(headers)
+    if key and left is not None:
+        _record(key, window_s, time.time() if now is None else now, remaining=left)
+    return left
+
+
+def answer(key: str, headers=None, body=None, count_cached: bool = True, window_s: float = 3600,
+           now: float | None = None) -> None:
+    """One off-bridge GLM answer (a direct post: babysit, benches, probes): its tokens from the body's usage
+    and the header's remaining, in one write. Never raises: counting must not break a call."""
+    try:
+        total, cached = _tokens(body)
+        left = reading(headers)
+        if key and (total > 0 or left is not None):
+            counted = total if count_cached else total - cached
+            _record(key, window_s, time.time() if now is None else now, counted, cached if count_cached else 0, left)
+    except Exception:
+        pass
+
+
+def _fit(rows: list) -> tuple[float, float, int, float] | None:
+    """Least squares of each row's drop on [seconds, uncached, cached] tokens (millions, no intercept): the
+    cached tokens' weight, its standard error, the rows and their cached tokens (millions); None when the
+    rows do not tell the weights apart."""
+    n = len(rows)
+    if n < 4:
+        return None
+    x = [[r[1], r[2] / 1e6, r[3] / 1e6] for r in rows]
+    y = [r[4] / 1e6 for r in rows]
+    a = [[sum(xi[i] * xi[j] for xi in x) for j in range(3)] for i in range(3)]
+    b = [sum(xi[i] * yi for xi, yi in zip(x, y)) for i in range(3)]
+    m = [a[i] + [b[i]] + [1.0 if i == j else 0.0 for j in range(3)] for i in range(3)]   # [A | b | I]
+    for c in range(3):
+        p = max(range(c, 3), key=lambda r: abs(m[r][c]))
+        if abs(m[p][c]) < 1e-9:
+            return None
+        m[c], m[p] = m[p], m[c]
+        m[c] = [v / m[c][c] for v in m[c]]
+        for r in range(3):
+            if r != c:
+                f = m[r][c]
+                m[r] = [v - f * w for v, w in zip(m[r], m[c])]
+    beta = [m[i][3] for i in range(3)]
+    rss = sum((yi - sum(bj * xj for bj, xj in zip(beta, xi))) ** 2 for xi, yi in zip(x, y))
+    var = max(m[2][6], 0.0) * rss / (n - 3)   # the inverse's last diagonal entry times the residual variance
+    return beta[2], math.sqrt(var), n, sum(r[3] for r in rows) / 1e6
+
+
+def _judge(st: dict, now: float, mode: str | None = None) -> None:
+    """One evaluation of whether cached tokens still count (the module doc), at most every LIFT_EVERY_S and
+    only on the rows taken since the last one, so each vote is fresh evidence."""
+    lift = st.get("lift") or {}
+    if lift.get("lifted") or (mode or lift_mode()) != "auto" or now - float(lift.get("at") or 0) < LIFT_EVERY_S:
+        return
+    rows = [r for r in (st.get("rows") or []) if float(r[0]) > float(lift.get("at") or 0)]
+    if len(rows) < LIFT_MIN_ROWS:
+        return
+    got = _fit(rows)
+    ok = bool(got and got[3] * 1e6 >= LIFT_MIN_CACHED and got[0] + 2 * got[1] < LIFT_MAX_WEIGHT)
+    votes = int(lift.get("votes") or 0) + 1 if ok else 0
+    st["lift"] = {"votes": votes, "at": now, "weight": round(got[0], 3) if got else None,
+                  "err": round(got[1], 3) if got else None, "lifted": now if votes >= LIFT_VOTES else 0,
+                  "told": 0}
+
+
+def lift_mode() -> str:
+    """providers.chat.quota_cap_lift from the account settings: auto (default), on or off."""
+    from .project import account_value
+    v = account_value(LIFT_KEY)
+    return v if v in LIFT_MODES else "auto"
+
+
+def cap_setting() -> int:
+    """providers.chat.quota_hourly_cap from the account settings: our tokens an hour at most; 0: none."""
+    from .project import account_value
+    v = account_value(CAP_KEY)
+    return int(v) if isinstance(v, (int, float)) and not isinstance(v, bool) and v > 0 else 0
+
+
+def check_setting(dotted: str, v) -> str:
+    """Why `v` is no good for account key `dotted` (CAP_KEY, LIFT_KEY), else ''."""
+    if v in ("", None):
+        return ""
+    if dotted == CAP_KEY and (isinstance(v, bool) or not isinstance(v, (int, float)) or v < 0):
+        return f"{dotted}: give tokens per UTC hour (a whole number, 0 for no cap)"
+    if dotted == LIFT_KEY and v not in LIFT_MODES:
+        return f"{dotted}: give one of {', '.join(LIFT_MODES)}"
+    return ""
+
+
+def lift_notice(key: str, now: float | None = None) -> str:
+    """Once, the text saying the self-lift happened (the daemon notifies it); '' otherwise."""
+    now = time.time() if now is None else now
+    with _locked(key) as path:
+        st = _read(path)
+        lift = st.get("lift") or {}
+        if not lift.get("lifted") or lift.get("told"):
+            return ""
+        st["lift"] = {**lift, "told": now}
+        _write(path, st)
+    return (f"GLM hourly cap lifted by itself: {lift.get('votes')} evaluations in a row found cached tokens no "
+            f"longer count against the org quota (weight {lift.get('weight')} +- {lift.get('err')}). "
+            f"Force it back with `ttp config --account {LIFT_KEY} off`.")
 
 
 def parse(detail: str, headers=None) -> dict:
@@ -165,9 +362,18 @@ def sync(key: str, got: dict, window_s: float = 3600, now: float | None = None, 
         _write(path, st)
 
 
+def lifted(st: dict) -> bool:
+    """Whether the hourly cap is lifted: forced on, or the self-lift found cached tokens no longer count."""
+    mode = lift_mode()
+    return mode == "on" or (mode == "auto" and bool((st.get("lift") or {}).get("lifted")))
+
+
 def view(cfg: dict | None, now: float | None = None) -> dict:
     """The quota's state now: {} when off; else {key, used, size, size_from, reset, short, ahead (the share
-    of the window's budget used ahead of an even spread), exhausted, last_429}."""
+    of the budget used ahead of an even spread), exhausted, last_429, and the hourly view: cap (our setting,
+    0 none or lifted), ours_hour (our tokens this UTC hour, cached ones in full), remaining (the org's, newest
+    reading of this UTC hour, else None), why}. Each limit (the window's size, our cap, the org's remaining)
+    gives its own ahead and exhausted; the stricter wins."""
     c = conf(cfg)
     if not c:
         return {}
@@ -178,15 +384,41 @@ def view(cfg: dict | None, now: float | None = None) -> dict:
     used = int(st.get("used") or 0)
     out = {"key": c["key"], "used": used, "size": size, "reset": float(st["reset"]),
            "size_from": st.get("size_from") if st.get("size") else "setting" if c["size"] else "observed" if size else "",
-           "short": False, "ahead": 0.0, "exhausted": False,
-           "last_429": st.get("last_429") or {}}
-    if not size:
-        return out
-    budget = size * (1 - float(c["reserve"] or 0))
-    window_s = float(st.get("window_s") or c["window_s"] or 3600)
-    gone = min(max((now - (out["reset"] - window_s)) / window_s, 0.0), 1.0)
-    out["exhausted"] = used >= size or float(st.get("spent") or 0) == out["reset"]   # the reserve is the margin for runs in flight and the band pacing tracks in
-    out["ahead"] = (used - budget * gone) / budget if budget > 0 else 1.0
+           "short": False, "ahead": 0.0, "exhausted": False, "why": "",
+           "last_429": st.get("last_429") or {}, "cap": 0, "ours_hour": 0, "remaining": None, "lifted": lifted(st)}
+    reserve = float(c["reserve"] or 0)
+    if size:
+        budget = size * (1 - reserve)
+        window_s = float(st.get("window_s") or c["window_s"] or 3600)
+        gone = min(max((now - (out["reset"] - window_s)) / window_s, 0.0), 1.0)
+        out["exhausted"] = used >= size or float(st.get("spent") or 0) == out["reset"]   # the reserve is the margin for runs in flight and the band pacing tracks in
+        out["ahead"] = (used - budget * gone) / budget if budget > 0 else 1.0
+        if out["exhausted"]:
+            out["why"] = "quota left is spent until the reset"
+    hour = now - now % HOUR_S
+    gone = (now - hour) / HOUR_S
+    ours = int(((st.get("hours") or {}).get(str(int(hour))) or [0, 0])[0])
+    left = st.get("remaining") or {}
+    out["ours_hour"] = ours
+    if float(left.get("at") or 0) >= hour:
+        out["remaining"] = int(left["v"])
+    cap = 0 if out["lifted"] else cap_setting()
+    out["cap"] = cap
+    # (budget this UTC hour, why it is spent) per limit: our cap less its reserve; ours plus what the org
+    # has left over its reserve
+    limits = []
+    if cap:
+        limits.append((cap * (1 - reserve), f"our {cap / 1e6:.0f}M tokens an hour are spent until the next UTC hour"))
+    if out["remaining"] is not None:
+        margin = reserve * size
+        limits.append((ours + max(out["remaining"] - margin, 0),
+                       f"the org's quota has {out['remaining'] / 1e6:.1f}M tokens left this UTC hour"))
+    for budget, why in limits:
+        ahead = (ours - budget * gone) / budget if budget > 0 else 1.0
+        if ours >= budget:
+            out["exhausted"], out["why"] = True, out["why"] or why
+        if ahead > out["ahead"]:
+            out["ahead"] = ahead
     out["short"] = out["exhausted"] or out["ahead"] > SLACK
     return out
 
@@ -196,7 +428,7 @@ def shed(task: dict, cls: str | None, v: dict) -> str:
     if not v.get("short"):
         return ""
     if v.get("exhausted"):
-        return "quota left is spent until the reset"
+        return v.get("why") or "quota left is spent until the reset"
     kind = str(task.get("kind") or "")
     if cls == "coordinator" or kind in SHORT_KINDS:
         return f"a {cls if cls == 'coordinator' else kind} run stays off GLM while its quota is short"
@@ -229,6 +461,14 @@ def line(cfg: dict | None, now: float | None = None, fmt=None) -> str:
     hit = v["last_429"]
     last = ("; last quota 429 at " + fmt(hit["at"]) + (f": {hit['used'] / 1e6:.1f}M" if "used" in hit else "") +
             (f" of {hit['limit'] / 1e6:.0f}M" if "limit" in hit else "") + " used") if hit.get("at") else ""
+    hourly = ""
+    if v["cap"]:
+        hourly += f"; our cap {v['cap'] / 1e6:.0f}M an hour ({v['ours_hour'] / 1e6:.1f}M used this UTC hour)"
+    elif v["lifted"]:
+        hourly += "; our hourly cap is lifted"
+    if v["remaining"] is not None:
+        hourly += f"; org has {v['remaining'] / 1e6:.1f}M left this UTC hour"
+    last += hourly
     if not v["size"]:
         return f"GLM quota: {used} tokens used this window (resets {fmt(v['reset'])}); size unknown, pacing waits for it{last}"
     state = ("spent: GLM runs start on core until the reset" if v["exhausted"] else

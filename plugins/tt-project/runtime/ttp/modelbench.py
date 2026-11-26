@@ -435,21 +435,23 @@ def _log(line: str) -> None:
         pass
 
 
-def _post(url: str, key: str, model: str, prompt: str, *, opener=None, sleep=time.sleep) -> str:
+def _post(url: str, key: str, model: str, prompt: str, *, opener=None, sleep=time.sleep, alias: str = "") -> str:
     body = json.dumps({"model": model, "messages": [{"role": "user", "content": prompt}],
                        "temperature": 0}).encode()
     req = urllib.request.Request(f"{url}/chat/completions", data=body, method="POST",
                                  headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"})
     from . import endpoint
     opener = opener or urllib.request.build_opener(endpoint._NoRedirect)
-    from . import inflight
+    from . import glmquota, inflight
     for n in range(1, RETRIES + 2):
         slot = inflight.acquire(TIMEOUT_S, sleep=sleep)   # the host's chat in-flight cap (chat.max_inflight)
         if slot is None:
             raise urllib.error.URLError("no free chat in-flight slot (chat.max_inflight)")
         try:
             with opener.open(req, timeout=TIMEOUT_S) as r:
-                return str(json.loads(r.read().decode())["choices"][0]["message"]["content"] or "")
+                data = json.loads(r.read().decode())
+                glmquota.answer(alias, r.headers, data)   # an off-bridge post: counted like a bridge's
+                return str(data["choices"][0]["message"]["content"] or "")
         except urllib.error.HTTPError as e:
             if e.code in inflight.REFUSALS:
                 inflight.refused()
@@ -511,7 +513,7 @@ def run(project: str, cfg: dict, parked: dict[str, float], now: float, *, force:
             owner_update(lambda o: {**o, "nokey_since": o.get("nokey_since") or now, "tried": now})
             _write(today, {"date": day(now), "owner": project, "at": now, "skipped": why, "report": report})
             return {"skipped": why, "report": report, "failed": why}
-        ask = ask or (lambda m, p: _post(got.url, got.key, m, p))
+        ask = ask or (lambda m, p: _post(got.url, got.key, m, p, alias=alias))
         picked = arms(modelrank.ranking(cfg), list(ids), parked, now)
         results = {m: {**bench(m, ask), "arm": arm} for m, arm in picked.items()}
         record({m: (r["score"], r["score"] < PASS_MIN, r["arm"]) for m, r in results.items()

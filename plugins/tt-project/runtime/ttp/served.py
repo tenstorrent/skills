@@ -195,7 +195,7 @@ def tick(state: Path, alias: str, routes: bool, now: float | None = None) -> str
         return "not due"
     if not take(eid, str(Path(state).resolve()), now):
         return "held"
-    ok, msg, ids = endpoint.list_models(got.url, got.key)
+    ok, msg, ids = endpoint.list_models(got.url, got.key, alias=alias)
     record(eid, ok, msg, ids, every, now)
     route.write_served(state, route.TO, ok, msg, ids, now, every=every)
     return "polled"

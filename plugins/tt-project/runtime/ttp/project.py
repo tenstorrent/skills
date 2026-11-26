@@ -3467,8 +3467,11 @@ ACCOUNT_OFF_VALUE = {"checks.spill_hosts": [], "rollout.flags": {}}
 # with its source, interval and key file; providers.chat.class_ranking and class_prefs: the model scoreboard's
 # per-class orders and their prefer settings (modelscore.py). providers.chat.served_every_s and served_idle_s: the
 # host's shared /models poll interval while any project routes to chat, and else (served.every_s).
+# providers.chat.quota_hourly_cap and quota_cap_lift: our GLM tokens per UTC hour at most (unset: no cap) and
+# whether the cap may lift by itself (glmquota.py).
 ACCOUNT_NESTED_KEYS = {"providers.chat.model_ranking", "providers.chat.rank_exclude", "providers.chat.class_ranking", "providers.chat.class_prefs", "providers.chat.ranking_source", "providers.chat.ranking_every_s",
-                       "providers.chat.ranking_key_file", "providers.chat.served_every_s", "providers.chat.served_idle_s"}
+                       "providers.chat.ranking_key_file", "providers.chat.served_every_s", "providers.chat.served_idle_s",
+                       "providers.chat.quota_hourly_cap", "providers.chat.quota_cap_lift"}
 HOST_WIDE_KEYS = {"checks.host_max", "route.host_max", "chat.max_inflight", "checks.spill_hosts", "checks.no_spill_hosts", "checks.dirty_max_mb", "checks.io_full_max",
                   "checks.push_priority_wait_s", "machine.max_workers"}
 

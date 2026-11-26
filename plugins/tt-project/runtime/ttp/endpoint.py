@@ -13,7 +13,7 @@ import urllib.parse
 import urllib.request
 from typing import NamedTuple
 
-from . import redact
+from . import glmquota, redact
 from .project import load_secrets, save_secret
 
 PREFIX = "endpoint/"
@@ -58,13 +58,17 @@ def model_ids(body) -> list[str]:
     return sorted({i for i in ids if isinstance(i, str) and i and len(i) <= 200})
 
 
-def list_models(url: str, key: str, timeout: float = VERIFY_TIMEOUT_S) -> tuple[bool, str, list[str] | None]:
+def list_models(url: str, key: str, timeout: float = VERIFY_TIMEOUT_S,
+                alias: str = "") -> tuple[bool, str, list[str] | None]:
     """GET <url>/models with the key: (ok, message, the served model ids, or None when the answer lists
-    none it can read). The message never holds the key or the URL."""
+    none it can read). The message never holds the key or the URL. With the endpoint's `alias`, the answer's
+    quota header is recorded (glmquota.note): no tokens, but a fresh reading of the org's remaining."""
     req = urllib.request.Request(f"{url}/models", headers={"Authorization": f"Bearer {key}",
                                                            "Accept": "application/json"})
     try:
         with urllib.request.build_opener(_NoRedirect).open(req, timeout=timeout) as r:
+            if alias:
+                glmquota.note(alias, r.headers)
             try:
                 ids = model_ids(json.loads(r.read(4_000_000) or b"null"))
             except Exception:   # not JSON, or no body: reachable all the same
@@ -141,7 +145,7 @@ def check(alias: str, cfg: dict | None = None) -> tuple[bool, str]:
     got = credentials(alias)
     if got is None:
         return False, f"no key saved for endpoint {alias!r}: `ttp secret endpoint {alias} --url <base url>`"
-    ok, msg, ids = list_models(got.url, got.key)
+    ok, msg, ids = list_models(got.url, got.key, alias=alias)
     if not ok:
         state = "auth failed" if re.match(r"HTTP (401|403)\b", msg) else "not ok"
         return False, f"{PREFIX}{alias}: {state} ({msg})"

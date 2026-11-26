@@ -29,7 +29,7 @@ import time
 import urllib.error
 import urllib.request
 
-from . import chatbridge, endpoint, inflight
+from . import chatbridge, endpoint, glmquota, inflight
 
 RETRIES = 4   # refusals waited out per probe before it counts as refused
 TIMEOUT_S = 300.0
@@ -236,7 +236,9 @@ def endpoint_post(alias: str, base_url: str = ""):
         req = urllib.request.Request(url, data=json.dumps(body).encode(), method="POST", headers={
             "Authorization": f"Bearer {key}", "Content-Type": "application/json"})
         with opener.open(req, timeout=TIMEOUT_S) as r:
-            return json.loads(r.read().decode())
+            data = json.loads(r.read().decode())
+            glmquota.answer(alias, r.headers, data)   # an off-bridge post: counted like a bridge's
+            return data
     return post
 
 
