@@ -286,6 +286,10 @@ class Provider:
     # policy and per-call protected-file guard. Without them the daemon guards the protected files
     # around the whole coordinator wake (coordtools.wake_snapshot, wake_guard).
     tool_hooks = False
+    # The agent's web tools run where no tool hook sees them (Codex: a hosted search on the model's
+    # server), so a project's guards.local tool_refusal cannot ask about them: such a project's runs
+    # start with the web off (localguard.asks_tools).
+    web_unhooked = False
 
     def reach_host(self, env: dict | None = None) -> str:
         """The host this provider's runs reach its API at: the base URL's host when its variable is

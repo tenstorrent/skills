@@ -116,6 +116,7 @@ class Codex(Provider):
     # (measured against a local stand-in API), so the harness sends the system prompt's diff too.
     resume_new_prompt = "diff"
     mcp_by_args = True   # `-c mcp_servers=...` (codexmcp.py): Codex has no per-run MCP config file
+    web_unhooked = True   # its web search is a hosted tool: the hook sees no call (build: web_search="disabled")
     # Whether build() left the harness hook out only because the user's config.toml defines hooks or
     # plugins; isolation_args() then adds it, as an isolated run ignores that file.
     _hook_held_by_user_config = ""
@@ -313,6 +314,10 @@ class Codex(Provider):
             if not restrictions.get("no_internet"):
                 argv += ["-c", "sandbox_workspace_write.network_access=true"]
             argv += self._hook_for(cwd, user_config=True)
+        if not web or restrictions.get("no_internet"):
+            # The hosted web search (no hook sees it: web_unhooked) off; measured on codex-cli 0.160,
+            # which checks the value (disabled, cached or live). Older builds ignore the key.
+            argv += ["-c", 'web_search="disabled"']
         if schema:
             argv += ["--output-schema", schema_file(strict_schema(schema))]
         argv += ["-"]

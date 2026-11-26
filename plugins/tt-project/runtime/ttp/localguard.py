@@ -13,8 +13,9 @@ edits, connector calls). Keep them fast and side-effect free: they run on each t
 
 hook.local_guard asks them after the built-in guards, from every tool check the harness runs:
 - the worker hook (hook.pre_tool_use): Claude Code on every tool; Codex on what its hook matches
-  (shell, apply_patch edits with the patch text as tool_input, mcp__ connector calls: its other tools,
-  such as web search, are not asked); Cursor through its per-run hooks.json (cursorhook.translate, the
+  (shell, apply_patch edits with the patch text as tool_input, mcp__ connector calls; its web search runs
+  on the model's server, where no hook sees it, so a project whose guards define `tool_refusal` runs
+  Codex with web search off: asks_tools); Cursor through its per-run hooks.json (cursorhook.translate, the
   call in Claude's shape: Shell is Bash, every file edit is Write, MCP:<tool> is mcp__cursor__<tool>);
 - the runner-side tool guard (streamguard) of runs the hook does not reach: it asks hook.pre_tool_use
   about each call read from the run's output and stops the run on a refusal, once the call has started;
@@ -140,6 +141,20 @@ def refusal(cfg: dict, tool: str, tool_input: dict, harness: Path | None = None)
         if why:
             return kind, f"{str(why).rstrip('.')} (the project's local guard {f.name})"
     return None
+
+
+def asks_tools(cfg: dict, harness: Path | None) -> bool:
+    """A listed guard is asked about tool calls other than shell commands: it defines `tool_refusal`, or
+    does not load (what it would refuse is unknown). A run whose agent has web tools no hook sees (Codex's
+    hosted web search, Provider.web_unhooked) then starts with the web off."""
+    files, _ = paths(cfg, harness)
+    for f in files:
+        try:
+            if callable(getattr(load(f), "tool_refusal", None)):
+                return True
+        except (Exception, SystemExit):
+            return True
+    return False
 
 
 UNREAD = ("project.json does not read and there is no last good copy, so its local guards ({key}), if it "

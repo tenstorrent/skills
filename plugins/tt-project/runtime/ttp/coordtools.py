@@ -67,6 +67,7 @@ import json
 import os
 import re
 import shlex
+import subprocess
 import time
 
 from .coordlimits import positive
@@ -512,7 +513,36 @@ def snapshot(payload: dict, run=None, protected=None) -> None:
         if not (d / "blobs" / sha).exists():
             durable_write(d / "blobs" / sha, data, sync=False)
     durable_write(d / f"{_guard_key(payload)}.json",
-                  json.dumps({"ts": ts, "files": {f: sha for f, (sha, _) in files.items()}}), sync=False)
+                  json.dumps({"ts": ts, "files": {f: sha for f, (sha, _) in files.items()},
+                              "heads": _harness_heads(files)}), sync=False)
+
+
+def _harness_heads(files) -> dict[str, str | None]:
+    """The HEAD commit of each harness checkout holding one of `files` (None: no commit read)."""
+    from .project import protected_log
+    out: dict[str, str | None] = {}
+    for f in files:
+        log = protected_log(f)
+        h = str(log.parent.parent / "harness") if log else None
+        if h and h not in out:
+            r = subprocess.run(["git", "-C", h, "rev-parse", "-q", "--verify", "HEAD"], capture_output=True,
+                               text=True, timeout=30)
+            out[h] = (r.stdout.strip() or None) if r.returncode == 0 else None
+    return out
+
+
+def _committed(f: str, sha: str | None, heads: dict, now: dict) -> bool:
+    """True when `f`'s content `sha` is what its harness checkout's HEAD holds and HEAD moved since the
+    snapshot (`heads`; `now`: HEAD at the check): another process (a harness task) committed it."""
+    import hashlib
+    from .project import protected_log
+    log = protected_log(f)
+    h = str(log.parent.parent / "harness") if log else None
+    if not h or sha is None or h not in heads or not now.get(h) or now[h] == heads[h]:
+        return False
+    rel = os.path.relpath(os.path.realpath(f), os.path.realpath(h))
+    r = subprocess.run(["git", "-C", h, "show", f"{now[h]}:{rel}"], capture_output=True, timeout=30)
+    return r.returncode == 0 and hashlib.sha256(r.stdout).hexdigest() == sha
 
 
 def guard(payload: dict, run=None, protected=None) -> str | None:
@@ -532,7 +562,10 @@ def guard(payload: dict, run=None, protected=None) -> str | None:
     forges the write log passes. Write/log race: durable_write logs only after its os.replace and
     fsync_dir, and tree_writes only after its git command ends, so a check inside that window takes
     ttp's own write as unlogged and puts it back (saved and reported), and a ttp write landing between
-    this read and the put-back is overwritten unsaved. Restore-to-snapshot: the put-back restores the
+    this read and the put-back is overwritten unsaved. A change whose content is what the harness
+    checkout's HEAD now holds, with HEAD moved since the snapshot, is kept: a harness task committed it
+    while the call ran (a call whose command names git may have committed it itself, so it is checked
+    as any other change). Restore-to-snapshot: the put-back restores the
     pre-call snapshot, so a call holding a logged ttp write and a later unlogged edit to the same file
     also undoes the ttp write (the combined content is saved)."""
     from pathlib import Path
@@ -562,6 +595,9 @@ def guard(payload: dict, run=None, protected=None) -> str | None:
                     continue
     changed = [f for f in files if before["files"].get(f) != now.get(f) and (f, now.get(f)) not in logged]
     command = str((payload.get("tool_input") or {}).get("command") or "")
+    if changed and "heads" in before and not re.search(r"\bgit\b", command):
+        heads = _harness_heads(changed)   # a commit another process made meanwhile is kept (docstring)
+        changed = [f for f in changed if not _committed(f, now.get(f), before["heads"], heads)]
     bad, saved = [], []
     for f in changed:
         if protected_log(f) is None:
@@ -621,7 +657,8 @@ def wake_guard(run_dir, protected) -> str | None:
     """After that wake, before its output is applied: guard() over the whole wake, so a protected file
     it changed outside ttp's own writes is saved, put back and reported as on a hooked agent. Its
     accepted gaps are guard()'s, over the wake's whole span: a user's own edit while it runs is put back
-    (saved and reported)."""
+    (saved and reported), and a commit the wake made itself is kept like a harness task's (it has no
+    command to read)."""
     return guard(WAKE, str(run_dir), list(protected))
 
 

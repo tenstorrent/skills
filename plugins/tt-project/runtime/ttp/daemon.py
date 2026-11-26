@@ -3864,13 +3864,16 @@ class Daemon:
         from .project import secrets_path
         from .web import token_path
         from .credguard import credential_files
+        from . import localguard
         no_reads = [*dict.fromkeys((str(token_path(self.p).resolve()),   # and by macOS's state link
                                     str(self.p.base / "state" / "web.token"))),
                     str(secrets_path().resolve()), *credential_files()]
+        # A web search no hook sees (Codex) would skip the project's tool_refusal guards: the run goes without.
+        web = not (prov.web_unhooked and localguard.asks_tools(self.cfg, self.p.base / "harness"))
         argv, env = prov.build(role=role, model=model, effort=effort, cwd=cwd, budget_usd=budget_usd,
                                read_only=read_only, schema=schema, restrictions=restrictions,
                                disallowed_tools=denied, denied_reads=no_reads,
-                               web=True)   # every kind, reviews too; no_internet still wins
+                               web=web)   # every kind, reviews too; no_internet still wins
         if pin.get("model") and (var := prov.subagent_model_env) and var not in env and var not in os.environ:
             env = {**env, var: pin["model"]}   # a pinned task's subagents run its model; an explicit setting wins
         if read_only:   # a decision-only turn, unsandboxed outside no_internet: its output goes through the action gates
@@ -4275,7 +4278,7 @@ class Daemon:
                 argv, coord_env = prov.coord_tools(
                     argv, cwd, coordtools.hook_settings(no_reads, full=full, protected=coordtools.protected_paths(self.p),
                                                         timeout_s=coordtools.tool_timeout_s(self.cfg)),
-                    full, web=not restrictions.get("no_internet"))
+                    full, web=web and not restrictions.get("no_internet"))
                 if prov.coord_tools_note:
                     log(self.p, f"run {run_id}: {prov.coord_tools_note}")
             if append_system is not None:

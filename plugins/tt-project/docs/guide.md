@@ -324,8 +324,9 @@ coordinator with that evidence.
   connector calls). Every provider path asks them after the built-in guards (the Claude, Codex and Cursor worker
   hooks, the runner-side guard of runs without one, and a session coordinator's tool check); a refusal blocks the call and is logged with kind `local:<file>`. A listed guard is never skipped: a
   file that is missing, does not import, has no `refusal` or raises refuses the calls it checks, naming itself
-  and the error. Only a harness task edits a listed guard file. `ttp doctor` shows each guard and whether it
-  loads. See the harness skill's references/local-guards.md.
+  and the error. Codex's web search runs on the model's server, where no hook sees it, so with a guard that
+  defines `tool_refusal` Codex runs start with web search off. Only a harness task edits a listed guard file.
+  `ttp doctor` shows each guard and whether it loads. See the harness skill's references/local-guards.md.
 - Hand-off checks (`worker.handoff_checks`, unset by default): the project's own model-free commands
   the daemon runs on each worker's hand-off before it accepts it, raises its `reply_chat` task's
   reply event or

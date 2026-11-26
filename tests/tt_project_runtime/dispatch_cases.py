@@ -640,8 +640,37 @@ def test_the_tool_set_change_leaves_coordinator_turns_codex_and_cursor_alone(env
     assert "--tools" not in turn and turn[turn.index("--disallowedTools") + 1:] == ["Edit", "Write", "NotebookEdit"]
     for name in ("codex", "cursor"):
         for role, read_only in (("worker", False), ("reviewer", False), ("coordinator", True)):
-            with_web = get_provider(name).build(role=role, read_only=read_only, web=True, **kw)
-            assert get_provider(name).build(role=role, read_only=read_only, web=False, **kw) == with_web, name
+            with_web = get_provider(name).build(role=role, read_only=read_only, web=True, **kw)[0]
+            off = ["-c", 'web_search="disabled"'] if name == "codex" else []   # only the hosted search goes
+            without = get_provider(name).build(role=role, read_only=read_only, web=False, **kw)[0]
+            assert without == with_web[:-1] + off + with_web[-1:], name
+
+
+def test_codex_runs_go_without_web_search_where_local_guards_ask_tool_calls(env, monkeypatch):
+    """Codex's web search runs on the model's server, where no hook sees it, so a guards.local
+    tool_refusal is never asked about it: a project with such a guard starts those runs with the web
+    off (fake provider standing in for one whose web no hook sees)."""
+    from ttp import daemon as dmod
+    from ttp.providers import fake
+    seen = []
+    real = fake.Fake.build
+    monkeypatch.setattr(fake.Fake, "web_unhooked", True)
+    monkeypatch.setattr(fake.Fake, "build", lambda self, **kw: (seen.append(kw["web"]), real(self, **kw))[1])
+    popen = dmod.subprocess.Popen   # only the runner is not launched
+    monkeypatch.setattr(dmod.subprocess, "Popen", lambda argv, *a, **k:
+                        type("P", (), {"pid": 4242})() if "ttp.runner" in argv else popen(argv, *a, **k))
+    p = make(env)
+    guards = p.base / "harness" / "guards"
+    guards.mkdir()
+    (guards / "shell.py").write_text("def refusal(cmd):\n    return None\n")
+    (guards / "tools.py").write_text("def refusal(cmd):\n    return None\n\n"
+                                     "def tool_refusal(tool, tool_input):\n    return None\n")
+    for n, listed in enumerate((["guards/shell.py"], ["guards/shell.py", "guards/tools.py"])):
+        p.set_config("guards.local", listed)
+        p.db.x("UPDATE tasks SET status='done' WHERE status='running'")
+        p.db.add_task(f"tidy docs {n}", "spec", kind="work", tier="light", origin="user")
+        dmod.Daemon(p.base).dispatch()
+    assert seen == [True, False], "a shell-only guard keeps the web; one asking other tools turns it off"
 
 
 def _stub_runner(monkeypatch):
