@@ -870,3 +870,25 @@ def test_coordroute_an_escalation_where_the_coordinator_acted_out_of_lane_is_cou
         rec = coordroute.shadow_side(p.state, run, "glm", esc, "ok", 0.1)
         assert not rec["compare"]["agree"] and rec["compare"]["escalated_right"] is right, run
     assert coordroute.report(p.db, p.state)["shadow"]["escalated_right"] == round(2 / 3, 3)
+
+
+def test_coordroute_session_compaction_is_a_shrink_due_on_this_wake_never_a_pending_restore(env):
+    """A restore pending after an agent compaction waits for the session's own next wake, so the wake
+    stays routine; a shrink the session can act on (coordsession.shrink_due) is the coordinator's."""
+    from ttp import coordroute, coordsession
+    p = _cr_db(env)
+    p.db.set_kv(coordsession.KEY, {"id": "s1", "restore": True, "shrink": True,
+                                   "context_tokens": 160000, "compact_floor": 160000})
+    assert coordroute.classify(p.db, _cr_cfg()) == (True, [])
+    p.db.set_kv(coordsession.KEY, {"id": "s1", "shrink": True, "context_tokens": 160000, "base_tokens": 60000})
+    assert "session compaction" in coordroute.classify(p.db, _cr_cfg())[1]
+
+
+def test_coordroute_a_course_line_naming_a_promise_is_routine_unless_a_promise_is_due(env):
+    """The Course check's fixed wording ("update any promise that waits on it") names no due promise; only
+    an open promise due soon or overdue (promise_reasons) sends the wake to the coordinator."""
+    from ttp import coordroute
+    p = _cr_db(env)
+    course = [("course_check", "## Course check\n- over_estimate: task #5 runs 60% over its estimate: "
+                               "steer, split or restart it, and update any promise that waits on it")]
+    assert coordroute.classify(p.db, _cr_cfg(), parts=course) == (True, [])

@@ -1549,3 +1549,16 @@ def test_an_unverified_daemon_start_names_no_runtime(env, monkeypatch):
     p, target, fix, head, older = _rearm_setup(env, monkeypatch)
     _daemon_starts(monkeypatch, target, [(time.time() - 120, older), (time.time() - 60, head)], provenance="unverified")
     assert rollout.daemon_starts(target) == []
+
+
+def test_digest_and_status_word_each_flags_effective_state_and_source_alike(env, capsys):
+    from ttp import rollout
+    p = make(env, "alpha")
+    p.set_config("coordinator.routine.mode", "shadow")
+    _roll(capsys, "set", "glm_code", "2")
+    line = rollout.digest_lines(p, time.time())[1]
+    assert "glm_coord: shadow (own setting; rollout off)" in line, "on only by its own setting"
+    assert "glm_code: on (rollout level 2, ring 2)" in line, "on by the rollout"
+    assert "deslop: off (rollout off)" in line, "off"
+    out = _roll(capsys, "status")[1]
+    assert "in alpha: shadow (own setting; rollout off)" in out, "the status view words it as the digest does"

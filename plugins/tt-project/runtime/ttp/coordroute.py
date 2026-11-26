@@ -229,16 +229,14 @@ def classify(db, cfg: dict, *, msgs=(), evs=(), triggers=(), due=None, rerun=Fal
     if not isinstance(sess, dict) or not sess.get("id"):
         why.append("coordinator session not started")
     else:
-        try:
-            if sess.get("restore") or coordsession.shrink_due(sess):
+        try:   # a pending restore waits for the session's own next wake: a lane turn never touches the session
+            if coordsession.shrink_due(sess):
                 why.append("session compaction")
         except Exception:
             why.append("session state unreadable")
     if must and _ORDERISH.search(_must_items(must)):
         why.append("must-act item tied to an order or promise")
-    for name, text in parts or ():
-        if name == "course_check" and "promise" in str(text).lower():
-            why.append("promise course line")
+    for name, text in parts or ():   # promises due soon or missed: promise_reasons(), from the obligations
         if name == "looks" and (r := look_reason(text)):
             why.append(r)
         if name in ("speed_complaint", "Speed complaint"):

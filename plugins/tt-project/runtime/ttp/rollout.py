@@ -128,15 +128,32 @@ def on(flag: str, project: str, raw: dict | None = None, cfg: dict | None = None
     key wins (the feature then reads that value). An unknown flag is off."""
     if flag not in FLAGS:
         return False
-    if own_setting(raw, FLAGS[flag]["key"]):
-        return True
+    return own_setting(raw, FLAGS[flag]["key"]) or by_rollout(flag, project, cfg)[0]
+
+
+def by_rollout(flag: str, project: str, cfg: dict | None = None) -> tuple[bool, str]:
+    """Whether the rollout alone turns `flag` on for `project`, and why in a few words."""
     cfg = settings() if cfg is None else cfg
     lv, ring = level(flag, cfg), ring_of(project, cfg)
-    if ring is None or project in rolled_back(flag, cfg):
-        return False
+    if ring is None:
+        return False, "excluded from rollout"
+    if project in rolled_back(flag, cfg):
+        return False, "rolled back here"
     if lv == AUTO:
-        return any(project in w for w in waves(flag, cfg)[:wave_at(flag, cfg) + 1])
-    return lv != OFF and ring <= lv
+        return any(project in w for w in waves(flag, cfg)[:wave_at(flag, cfg) + 1]), "rollout auto"
+    return lv != OFF and ring <= lv, "rollout off" if lv == OFF else f"rollout level {lv}, ring {ring}"
+
+
+def effective(flag: str, project: str, raw: dict | None = None, cfg: dict | None = None) -> str:
+    """`flag`'s effective state for `project` and its source: the project's own value for the flag's key wins
+    (that value is the state, e.g. `shadow (own setting; rollout off)`), else the rollout decides."""
+    got, why = by_rollout(flag, project, cfg)
+    if own_setting(raw, FLAGS[flag]["key"]):
+        from . import configwho
+        v = configwho.at(raw, FLAGS[flag]["key"])
+        shown = ("on" if v else "off") if isinstance(v, bool) else v if isinstance(v, str) else json.dumps(v)
+        return f"{shown} (own setting; rollout {'on' if got else 'off'})"
+    return f"{'on' if got else 'off'} ({why})"
 
 
 def waves(flag: str, cfg: dict | None = None) -> list[list[str]]:
@@ -211,8 +228,9 @@ DIGEST_HEADER = "## Rollout flags (the state is the signal: never hold flag-gate
 
 
 def state_line(project: str, raw: dict | None = None) -> str:
-    """Every flag's state for `project` on one line (its own setting for the flag's key wins)."""
-    return ", ".join(f"{f}: {'on' if on(f, project, raw) else 'off'}" for f in FLAGS)
+    """Every flag's effective state and source for `project` on one line, as `ttp rollout status` words it."""
+    cfg = settings()
+    return ", ".join(f"{f}: {effective(f, project, raw, cfg)}" for f in FLAGS)
 
 
 def change_lines(project: str, since: float, raw: dict | None = None, now: float | None = None) -> list[str]:
@@ -827,14 +845,18 @@ def scratch_hold(state: tuple[float, float] | None, task: dict, owners=()) -> st
 
 
 def status(projects: dict | None = None) -> dict:
-    """The rings, each flag's level and, per flag: its waves, current wave and per-project rollbacks, and the
-    projects whose own setting overrides it while it is on (overrides)."""
+    """The rings, each flag's level and, per flag: its waves, current wave and per-project rollbacks, the
+    projects whose own setting overrides it while it is on (overrides), and each local project's effective
+    state where its own setting decides it (own: the digest's wording)."""
     cfg = settings()
+    projects = local_projects() if projects is None else projects
+    raws = {n: _raw(p) for n, p in sorted(projects.items())}
     over = overrides(projects, cfg)
     return {"rings": cfg.get("rings") or {}, "excluded": cfg.get("excluded") or [],
             "flags": {f: {"level": level(f, cfg), "key": m["key"], "frozen": bool(frozen(f)),
                           "shadow": bool(m.get("shadow")), "waves": waves(f, cfg), "wave": wave_at(f, cfg),
                           "rolled_back": rolled_back(f, cfg), "overrides": over.get(f, []),
+                          "own": {n: effective(f, n, r, cfg) for n, r in raws.items() if own_setting(r, m["key"])},
                           "armed": next((r for r in reversed(ledger(f))
                                          if r.get("op") == "project_arm" and r.get("run")), None),
                           "fixed": fixed_shown(f)}
@@ -980,6 +1002,8 @@ def run(a) -> int:
                 projects = local_projects() if e["fixed"] else {}
                 for rec in e["fixed"]:
                     print(f"  in {rec.get('project')}: " + fixed_line(rec, projects.get(rec.get("project"))))
+                for n, text in e["own"].items():
+                    print(f"  in {n}: {text}")
                 for o in e["overrides"]:
                     print(f"  overridden in {o['project']} by its own setting since {o['at']} "
                           f"({e['key']} = {json.dumps(o['value'])})")

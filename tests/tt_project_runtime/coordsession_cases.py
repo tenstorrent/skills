@@ -3565,3 +3565,16 @@ def test_coordsession_the_compact_window_never_sits_at_the_wakes_own_size_and_th
     st = cs.record(st, None, "s1", {"mode": "resume", "provider": "fake", "model": "m", "effort": "high",
                                     "key": "k1"}, True, 2000.0)
     assert "thrash" not in st
+
+
+def test_coordsession_a_shrink_request_lasts_one_wake_even_when_the_session_is_too_small():
+    """wakecost asks for a shrink after a wake; the next ok wake is its only try: a session too small to
+    free anything (shrink_due False) does not compact, and the request clears instead of staying set."""
+    from types import SimpleNamespace
+    from ttp import coordsession as cs
+    st = _cs_state(context_tokens=150000, compact_floor=150000, shrink=True)
+    assert cs.decide(_cs_cfg(), st, "k1", "m", "high", lambda s: True, 0) == ("resume", "continued")
+    usage = SimpleNamespace(input_tokens=1, cache_read_tokens=150000, cache_write_tokens=0, output_tokens=10,
+                            session_id="s1", extra={})
+    turn = {"mode": "resume", "why": "continued", "key": "k1", "model": "m", "effort": "high", "provider": "fake"}
+    assert "shrink" not in cs.record(st, usage, "s1", turn, True, 1.0)

@@ -456,8 +456,8 @@ def record(state, usage, session_id: str, turn: dict, ok: bool, now: float, summ
                 row["post"] = post
             st["compactions"] = [*(st.get("compactions") or []), row][-COMPACTIONS_KEPT:]
             st.update({"restore": True, "compact_floor": st["context_tokens"]})
-        if mode == "resume" and turn.get("why") == "compact":
-            st.pop("shrink", None)   # a wake-cost shrink request is asked once: that wake was its try
+        # A wake-cost shrink request lasts one wake: it compacted, or the session had too little to free.
+        st.pop("shrink", None)
     elif mode == "new" and st["id"]:   # a kept first wake (its cap, its timeout): its rerun resumes it
         # with the seed's size, so limit() does not compact it in place right after the seed.
         if base := _telemetry(usage, "first_context"):
