@@ -969,15 +969,18 @@ def _set_once(text: str, home: str) -> str:
 # a loop over a list the guard cannot read (`for f in $(cat l)`, `$L`, a glob under `$D`) whose body or what follows
 # writes or deletes its variable (`rm "$f"`, `> "$f"`): a target the guard never sees
 _COMPUTED_FOR = re.compile(r"(?:^|[;&|({\n]|\b(?:do|then|else)\s)\s*for\s+([A-Za-z_]\w*)\s+in\s+([^;\n]*[$`][^;\n]*?)\s*(?:;|\n)\s*do\b")
-_WRITER = (r"(?:\b(?:rm|rmdir|unlink|mv|cp|ln|install|dd|tee|truncate|shred|touch|mkdir|chmod|chown|chgrp|rsync)\b|"
-           r"\b(?:sed|perl)\s[^;&|\n]*-i|\bfind\b[^;&|\n]*-delete\b)[^;&|\n]*|[<>]?>[|&]?\s*")
 
 
 def computed_loop_write(view: str) -> str | None:
-    """The `for` head of a loop over a computed list whose variable a write or delete in `view` names, else None."""
+    """The `for` head of a loop over a computed list whose variable a write or delete in `view` names (a writer of
+    sidefx.WRITE_RE, or a redirect), else None."""
+    from . import sidefx
     plain = _plain(view)
     for m in _COMPUTED_FOR.finditer(plain):
-        if re.search(rf"(?:{_WRITER})[^\s;&|]*\$\{{?{m[1]}(?!\w)", plain[m.end():]):
+        rest, var = plain[m.end():], re.compile(rf"\$\{{?{m[1]}(?!\w)")
+        # the writer's own words count too (`find "$f" -delete`, `git -C "$f" checkout .`), up to the command's end
+        if (re.search(rf"[<>]?>[|&]?\s*[^\s;&|]*{var.pattern}", rest)
+                or any(var.search(re.match(r"[^;&|\n]*", rest[w.start():])[0]) for w in sidefx.WRITE_RE.finditer(rest))):
             return plain[m.start():m.end()].strip()
     return None
 

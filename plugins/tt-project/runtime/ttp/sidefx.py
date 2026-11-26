@@ -51,7 +51,7 @@ REDIRECT_RE = re.compile(r"(?<![0-9&<>=-])(?:[0-9]?>>?|&>>?)(?![=&])\s*(?!&)([^\
 TEE_RE = re.compile(r"\btee\s+(?:-a\s+)?([^\s;|&<>()]+)")
 CD_RE = re.compile(r"(?:^|[;&|(]\s*|\n\s*)cd\s+([^\s;|&<>()]+)")
 WRITE_RE = re.compile(r"\b(?:rm|mv|cp|ln|mkdir|rmdir|touch|chmod|chown|install|rsync|dd|truncate|tee|shred|unlink|"
-                      r"ssh-keygen|scp|unzip|patch|wget)\b|\bcurl\b[^|;&\n]*\s-o\b|\bsed\s+(?:-\w+\s+)*-i|\bperl\s+-\w*i|\bgit\s+(?:-C\s+\S+\s+)?"
+                      r"ssh-keygen|scp|unzip|patch|wget|chgrp)\b|\bfind\b[^;&|\n]*\s-delete\b|\bcurl\b[^|;&\n]*\s-o\b|\bsed\s+(?:-\w+\s+)*-i|\bperl\s+-\w*i|\bgit\s+(?:-C\s+\S+\s+)?"
                       r"(?:config|clone|init|worktree|checkout|reset|commit|stash|apply)\b|open\([^)]*['\"][wax]\+?b?['\"]|"
                       r"\.write_(?:text|bytes)\(|\bshutil\.|\bos\.(?:remove|replace|rename|unlink|chmod|makedirs|mkdir)\(")
 # Text in a shell command that names no local path (_local_text)

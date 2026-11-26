@@ -2822,6 +2822,23 @@ def test_glm_guard_reads_a_loop_variable_as_its_list_only_in_a_straight_line_com
         assert not deny(cmd), cmd
 
 
+def test_glm_guard_refuses_every_sidefx_writer_naming_a_computed_loop_variable(monkeypatch, tmp_path):
+    """cells: loop_computed_writer. Whatever sidefx.WRITE_RE counts as a write refuses a loop over a list the guard
+    cannot read when it names the loop's variable; reading it passes."""
+    from ttp import glmguard, sidefx
+    deny, _, _ = _gg9846_hook(monkeypatch, tmp_path)
+    for body in ('patch "$f" < /tmp/x.diff', 'wget -O "$f" u', 'unzip -o a.zip -d "$f"', 'curl -s u -o "$f"',
+                 'git checkout -- "$f"', 'git -C "$f" checkout .', 'git clone u "$f"', 'chgrp g "$f"', 'find "$f" -delete', 'sed -i s/a/b/ "$f"',
+                 'perl -pi -e s/a/b/ "$f"', 'rmdir "$f"', 'cp a "$f"', 'echo x | tee -a "$f"'):
+        assert sidefx.WRITE_RE.search(body), body
+        for head in ("for f in $(cat l)", "for f in $L"):
+            cmd = f"{head}; do {body}; done"
+            assert glmguard.computed_loop_write(cmd) == f"{head}; do", cmd
+            assert deny(cmd), cmd
+    for body in ('cat "$f"', 'grep x "$f"', 'wc -l "$f"'):
+        assert not deny(f"for f in $(cat l); do {body}; done"), body
+
+
 def test_a_refusal_off_the_glm_arm_is_neither_recorded_nor_ends_the_run(tmp_path):
     """cells: guard_off_arm. Only a run on the GLM arm (its marker) records a guard refusal and ends as a bounce."""
     from ttp import glmguard
