@@ -402,8 +402,8 @@ def test_a_commit_the_check_cannot_run_on_reads_not_checked(env, monkeypatch):
 
 
 def test_a_commit_named_by_a_prefix_without_a_letter_is_never_checked(env, monkeypatch):
-    """The cause of two flaky footer tests: about 1 in 110 commits have a 10-character prefix of digits
-    only, which no reply names as a commit; the tests' commit helper re-dates such a commit."""
+    """A 10-character prefix of digits only (about 1 in 110 commits) reads as no commit, so the tests'
+    commit helper re-dates such a commit until its prefix is checked."""
     p, repo, head = _claim_replay_setup(env, monkeypatch, landed=False)
     tree = _git_out(repo, "rev-parse", "HEAD^{tree}")
     for n in range(100_000):   # re-dated per try until the prefix has no letter

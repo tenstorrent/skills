@@ -16856,9 +16856,6 @@ def _wait(cond, timeout=30.0):
     return cond()
 
 
-_gone = _pid_gone   # pid runs no more: a zombie counts as gone, and so does a pid reaped between the probes
-
-
 def _pid_in(path):
     """The pid on a pid file's first line, None while the file is missing or not written yet."""
     try:
@@ -16895,9 +16892,9 @@ def test_a_killed_supervisor_ends_its_agent_and_the_handoff_still_counts(env):
         proc.wait()
         os.utime(run_dir / "lease", (time.time() - 999, time.time() - 999))
         d.reap_runs()
-        assert _wait(lambda: _gone(agent), 15), "the agent kept running without its supervisor"
+        assert _wait(lambda: _pid_gone(agent), 15), "the agent kept running without its supervisor"
     finally:
-        if agent and not _gone(agent):
+        if agent and not _pid_gone(agent):
             with contextlib.suppress(ProcessLookupError):
                 os.killpg(agent, signal.SIGKILL)
         if proc.poll() is None:
@@ -17263,7 +17260,7 @@ def test_the_reaper_ends_the_tools_of_an_agent_that_already_exited(env, tmp_path
                (tid, "worker", "fake", old, "running", str(run_dir), d.boot))
         d.reap_runs()
         if ours:
-            assert _wait(lambda: _gone(tool), 15), "the agent's tool kept running after its agent and runner"
+            assert _wait(lambda: _pid_gone(tool), 15), "the agent's tool kept running after its agent and runner"
         else:
             assert not _gone_within(tool, 0.5), "the reaper ended a group that is not this run's"
         assert not mid_exec or next(empty, None) is None, "the reaper never met the tool mid-exec"
@@ -18056,8 +18053,7 @@ def _push_setup(env, monkeypatch, checks):
 
 def _sha_like(path):
     """Re-date HEAD until its 10-character prefix reads as a commit id to the claim check (a digit and
-    a letter, landed._LITERAL_SHA): about 1 in 110 commits would not, and a reply naming such a prefix
-    is never checked. Returns HEAD."""
+    a letter, landed._LITERAL_SHA), so a test reply naming it is always checked. Returns HEAD."""
     from ttp import landed
     for n in range(1000):
         head = _git_out(path, "rev-parse", "HEAD")
@@ -37211,7 +37207,7 @@ def test_devq_health_gate_refusal_skips_the_job_after_health_wait(devq_dir, tmp_
 
 
 def _gone_within(pid, timeout=10):
-    """pid ends within timeout s. Its own name: the zombie-aware _gone above must not be replaced."""
+    """pid ends within timeout s. Its own name: the zombie-aware _pid_gone above must not be replaced."""
     end = time.time() + timeout
     while time.time() < end:
         try:

@@ -2668,23 +2668,22 @@ def _caller_is_killed_the_command_ends(t, pidfile, sig):
         os.killpg(t.pid, sig)
         t.wait(timeout=30)
         deadline = time.time() + 25   # a watchdog's SIGTERM comes at once; a trapped one dies at its KILL
-        while not _gone(pid) and time.time() < deadline:
+        while not _pid_gone(pid) and time.time() < deadline:
             time.sleep(0.2)
-        assert _gone(pid), f"the command survived {sig.name} to its ttp lock's process group"
+        assert _pid_gone(pid), f"the command survived {sig.name} to its ttp lock's process group"
     finally:
-        if not _gone(pid):
+        if not _pid_gone(pid):
             os.kill(pid, signal.SIGKILL)
         if t.poll() is None:
             t.kill()
 
 
 def test_a_pid_reaped_between_the_probes_of_gone_counts_as_gone(monkeypatch):
-    """The cause of the flaky SIGKILL case below: kill(pid, 0) still saw the command's zombie, which was
-    reaped before its /proc entry was read, and _gone then said it still ran (its cleanup's kill failed)."""
+    """A pid whose zombie kill(pid, 0) still saw, reaped before its /proc entry is read, has ended."""
     done = subprocess.Popen(["true"])
     done.wait()
     monkeypatch.setattr(os, "kill", lambda pid, sig: None)   # the first probe saw the zombie
-    assert _gone(done.pid)
+    assert _pid_gone(done.pid)
 
 
 @pytest.mark.parametrize("sig", [signal.SIGTERM, signal.SIGKILL])
@@ -2714,7 +2713,7 @@ def test_the_lock_outlives_a_killed_probed_ttp_lock_until_the_command_is_gone(en
         os.killpg(t.pid, signal.SIGKILL)
         t.wait(timeout=30)
         time.sleep(2)
-        assert not _gone(pid), "the command should still be running: it ignores the watchdog's SIGTERM"
+        assert not _pid_gone(pid), "the command should still be running: it ignores the watchdog's SIGTERM"
         busy = _lock_probe(_lock_env(env, p), "rig", extra=("--no-yield",))
         assert busy.returncode == 75, "the lock was freed while the command still ran"
     finally:
