@@ -956,6 +956,13 @@ def test_eta_a_deferred_task_s_likely_and_conservative_times_start_after_its_pla
     ec3 = eta.estimate(p.db, c3, now)
     assert ej["path"][:2] == [j, c3] and not ej.get("deferred"), ej["path"]
     assert ej["end"] > ec3["end"] > eta.estimate(p.db, a1, now)["end"]   # the corrected chain, not the raw-later one
+    # A mixed-kind chain ranks every level by the root's correction: a measure task (x1) on top of the
+    # join sees the deferred branch, which is later raw, even though the work join alone (x3) picks the chain.
+    _eta_history(p, now, kind="measure")
+    m = p.db.add_task("measure it", "s", kind="measure", depends_on=[j])
+    em = eta.estimate(p.db, m, now)
+    assert em["path"][:3] == [m, j, a1] and em["deferred"] == s1, em["path"]
+    assert eta.estimate(p.db, j, now)["path"][:2] == [j, c3]   # the join's own estimate is unchanged
     # A promise on the deferred owner and an undeferred one: each owner corrected alone, the later wins.
     o = {"id": "o1", "owners": [a, b]}
     eo = eta.obligation_estimate(p.db, o, now)

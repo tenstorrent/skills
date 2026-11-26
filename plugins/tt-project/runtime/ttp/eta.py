@@ -347,7 +347,8 @@ class _Est:
         self._hi = None
         self.delivery = delivery or {}   # the project's delivery config: push_batch_max, push_age_s (_push_ahead)
         self.h = history(db, now) if hist is None else hist
-        self.memo: dict[int, dict] = {}
+        self.memo: dict[tuple, dict] = {}   # by (task, fx)
+        self.fx = 1.0   # the correction of the estimate's own task (its first): every branch ranks by it
         self._review_since = None
         self._reviews = None
         self.core = core or "claude"   # the provider of a task with none (config core_provider)
@@ -449,12 +450,16 @@ class _Est:
     def task(self, tid: int, seen: tuple = ()) -> dict:
         """{"done": when it is done (its dependants may start), "end": when its work has landed, "path":
         the critical path ids, "legs": the measured legs, "why": set when there is no estimate}."""
-        if tid in self.memo:
-            return self.memo[tid]
-        t = self.db.task(tid)
-        out = self._task(t, tid, seen + (tid,))
-        self.memo[tid] = out
-        return out
+        fx = self.fx
+        try:
+            if not seen:   # the root: its kind's correction ranks every branch below it (etaledger.kind_of)
+                from .etaledger import factor
+                self.fx = factor(self.db, (self.db.task(tid) or {}).get("kind") or "")
+            if (tid, self.fx) not in self.memo:
+                self.memo[(tid, self.fx)] = self._task(self.db.task(tid), tid, seen + (tid,))
+            return self.memo[(tid, self.fx)]
+        finally:
+            self.fx = fx
 
     def _open_review(self, t: dict) -> int | None:
         """The open review task (db.reviews_task) of a done code task: it is not landed until that review
@@ -471,7 +476,7 @@ class _Est:
         if rv in seen:
             return self._cycle(tid, seen, rv)
         # The review depends on this task, which is done: it may start now (task() replaces this memo).
-        self.memo[tid] = {"done": self.now, "end": self.now, "path": [tid], "legs": [], "why": None, "overrun": False}
+        self.memo[(tid, self.fx)] = {"done": self.now, "end": self.now, "path": [tid], "legs": [], "why": None, "overrun": False}
         e = self.task(rv, tuple(x for x in seen if x != tid))
         if e["why"]:
             return self._from(tid, e)
@@ -587,8 +592,7 @@ class _Est:
         else:
             from .daemon import time_gate
             from .db import deferral, dependency_ids
-            from .etaledger import factor
-            crit, fx = None, factor(self.db, t.get("kind") or "")   # branches rank as shown
+            crit, fx = None, self.fx   # branches rank as the root's correction shows them
             for d in dependency_ids(t):
                 if d is None:
                     return self._none(tid, f"#{tid} names a dependency that is not a task id")
