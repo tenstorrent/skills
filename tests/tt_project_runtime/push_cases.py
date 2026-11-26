@@ -13880,6 +13880,8 @@ def test_the_default_cap_test_pattern_matches_exactly_the_suites_size_cap_tests(
                    "test_coordinator_timeout_defaults_ceiling_and_prompt_size",
                    "test_the_coordinator_role_prompt_carries_only_the_rules_of_features_that_are_on_and_stays_small",
                    "test_the_worker_system_prompt_carries_only_the_rules_its_task_needs_and_stays_small"]
+    import conftest   # each runs before a change lands, so a prompt edit over its cap never lands
+    assert {f"tests/test_tt_project_runtime.py::{n}" for n in got} <= conftest.smoke_ids()
 
 
 def test_a_batch_check_tail_keeps_each_size_overshoot_from_anywhere_in_the_output(tmp_path):
