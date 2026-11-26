@@ -92,14 +92,16 @@ _TO_COME_RE = re.compile(r"\b(?:follows?|to come|yet|first|queued|once|later|soo
 _NO_RUN_RE = re.compile(r"\s*,?\s*(?:\w+\s+){0,3}?without (?:a |any )?(?:run|result|measurement)s?\b", re.I)
 _NEGATION = re.compile(r"\b(?:not|never|no|without|instead of|rather than|would)\b|n't\b", re.I)
 _PART_TAG_RE = re.compile(r"^\s*\[\d+/\d+\]\s*")
+# A part that says nothing yet: blank, a bare acknowledgement, or a short "re <ref>" heading.
+_PREAMBLE_RE = re.compile(r"^\s*(?:(?:acknowledg\w*|ack(?:ed)?|received|noted)\W*|re (?:#?\w+ ?){1,3}\W*)?$", re.I)
 
 
 def closed(text: str) -> bool:
     """Whether reply `text`, in the sender's own words, closes or declines the request without a result:
     a status line saying so, or (nothing still to come) a decline or withdrawal of the request, or a close
     followed at once by "without a run or result", in the first sentence of the reply or of a part after only
-    a preamble (no result word nor figure: a reply leads with its verdict, and a decline after a result is
-    about something else), negated nowhere in its clause nor by a "No"/"Not" after it. A close beside a
+    a preamble (_PREAMBLE_RE: a reply leads with its verdict, and a decline after a result is about
+    something else), negated nowhere in its clause nor by a "No"/"Not" after it. A close beside a
     result ("done, closing the request") is that result."""
     from .settinghold import SENTENCE_END
     text = _REPLY_MARK_RE.sub("", own_words(text))
@@ -110,8 +112,8 @@ def closed(text: str) -> bool:
     lines = text.splitlines()
     lead = next((i for i, line in enumerate(lines) if line.strip()), 0)
     for i, line in enumerate(lines):
-        before = re.sub(r"#\d+", "", "\n".join(_PART_TAG_RE.sub("", x) for x in lines[:i]))
-        if i != lead and (not _PART_TAG_RE.match(line) or _TERMINAL_RE.search(before) or re.search(r"\d", before)):
+        if i != lead and (not _PART_TAG_RE.match(line)
+                          or not all(_PREAMBLE_RE.match(_PART_TAG_RE.sub("", x)) for x in lines[:i])):
             continue
         line = _PART_TAG_RE.sub("", line)
         end = SENTENCE_END.search(line)
