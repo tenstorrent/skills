@@ -166,7 +166,7 @@ def test_terminalbench_reference_without_a_saved_endpoint_says_so_and_starts_not
     started = []
     monkeypatch.setattr(tbcycle, "launch", lambda *x, **k: started.append(x))
     monkeypatch.setattr(harborslice, "install", lambda *x, **k: started.append("install") or (None, "no"))
-    monkeypatch.setattr(endpoint, "list_models", lambda *x: started.append("list") or (True, "", ["r-a"]))
+    monkeypatch.setattr(endpoint, "list_models", lambda *x, **k: started.append("list") or (True, "", ["r-a"]))
     monkeypatch.setattr(endpoint, "credentials", lambda alias: None)
     for ref in ({}, {"endpoint": "gw"}):   # no alias set; an alias with nothing saved under it
         d, cfg, clock, sleeps, sleep = _tb_setup(env, monkeypatch, reference=ref)
@@ -237,7 +237,7 @@ def test_terminalbench_step_without_compose_stops_before_any_trial_with_one_mess
     monkeypatch.setattr(harborslice, "PLUGIN_DIRS", ())
     monkeypatch.setattr(tbcycle, "launch", lambda *x, **k: started.append(x))
     monkeypatch.setattr(tbcycle, "step", lambda *x, **k: started.append("step") or {})
-    monkeypatch.setattr(endpoint, "list_models", lambda *x: (True, "", ["m-a"]))
+    monkeypatch.setattr(endpoint, "list_models", lambda *x, **k: (True, "", ["m-a"]))
     monkeypatch.setattr(endpoint, "credentials", lambda alias: types.SimpleNamespace(url="u", key="k"))
     docker = _fake_docker(env["tmp"])
     monkeypatch.setattr(harborslice.shutil, "which", lambda n: docker if n == "docker" else None)

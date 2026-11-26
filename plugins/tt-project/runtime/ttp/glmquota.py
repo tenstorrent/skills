@@ -209,7 +209,10 @@ def note(key: str, headers, window_s: float = 3600, now: float | None = None) ->
     """Record the org's remaining from a successful answer's `headers` (HEADER); returns it, None when absent."""
     left = reading(headers)
     if key and left is not None:
-        _record(key, window_s, time.time() if now is None else now, remaining=left)
+        try:
+            _record(key, window_s, time.time() if now is None else now, remaining=left)
+        except OSError:   # an unwritable quota file must not fail the call it rides on
+            pass
     return left
 
 

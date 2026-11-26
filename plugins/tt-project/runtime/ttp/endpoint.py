@@ -68,7 +68,7 @@ def list_models(url: str, key: str, timeout: float = VERIFY_TIMEOUT_S,
     try:
         with urllib.request.build_opener(_NoRedirect).open(req, timeout=timeout) as r:
             if alias:
-                glmquota.note(alias, r.headers)
+                glmquota.note(alias, getattr(r, "headers", None))
             try:
                 ids = model_ids(json.loads(r.read(4_000_000) or b"null"))
             except Exception:   # not JSON, or no body: reachable all the same

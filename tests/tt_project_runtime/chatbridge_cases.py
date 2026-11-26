@@ -3815,7 +3815,7 @@ def _shared_watch(monkeypatch, url="https://chat.invalid/v1", ids=(_RT_MODEL, "r
     listed, polls = list(ids), []
     monkeypatch.setattr(endpoint, "credentials", lambda alias: endpoint.Credentials(_CB_KEY, url))
 
-    def list_models(u, key, timeout=0):
+    def list_models(u, key, timeout=0, alias=""):
         polls.append(u)
         return True, "HTTP 200", list(listed)
 
