@@ -97,26 +97,31 @@ _PART_TAG_RE = re.compile(r"^\s*\[\d+/\d+\]\s*")
 def closed(text: str) -> bool:
     """Whether reply `text`, in the sender's own words, closes or declines the request without a result:
     a status line saying so, or (nothing still to come) a decline or withdrawal of the request, or a close
-    followed at once by "without a run or result", in the first sentence of a line (a reply leads with its
-    verdict; a decline after a result is about something else), negated nowhere in its clause nor by a
-    "No"/"Not" after it. A close beside a result ("done, closing the request") is that result."""
+    followed at once by "without a run or result", in the first sentence of the reply or of a part of it (a
+    reply leads with its verdict; a decline after a result is about something else), negated nowhere in its
+    clause nor by a "No"/"Not" after it. A close beside a result ("done, closing the request") is that result."""
     from .settinghold import SENTENCE_END
     text = _REPLY_MARK_RE.sub("", own_words(text))
     for m in _STATUS_RE.finditer(text):
         return bool(_CLOSED_STATUS.match(m.group(1).strip()))
     if _TO_COME_RE.search(text):
         return False
-    for line in text.splitlines():
+    lines = text.splitlines()
+    lead = next((i for i, line in enumerate(lines) if line.strip()), 0)
+    for i, line in enumerate(lines):
+        if i != lead and not _PART_TAG_RE.match(line):
+            continue
         line = _PART_TAG_RE.sub("", line)
         end = SENTENCE_END.search(line)
-        first, rest = (line[:end.start()], line[end.end():]) if end else (line, "")
+        first = line[:end.start()] if end else line
+        rest = "\n".join([line[end.end():] if end else ""] + lines[i + 1:])
         m = _CLOSED_RE.search(first)
         no_run = m and _NO_RUN_RE.match(first, m.end())
         if not m or not (no_run or re.search(r"declin|withdr", m.group(0), re.I)):
             continue
         tail = re.split(r"[:,]", first[(no_run or m).end():], 1)[0]
         if not (_NEGATION.search(first, 0, m.start()) or _NEGATION.search(tail)
-                or re.search(r"(?:^|[.!?;]\s)\s*(?:no|not)\b", rest, re.I)):
+                or re.search(r"(?:^|[.!?;\n])\s*(?:no|not)\b", rest, re.I)):
             return True
     return False
 
