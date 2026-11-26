@@ -513,6 +513,10 @@ def test_urgent_no_nudge_to_a_turn_without_the_message_and_none_without_a_turn(e
     from ttp import msgurgent
     rec = msgurgent.records(p.db)[str(mid)]
     assert rec["nudged"] is None and rec["held"] is not None
+    p, run, mid, first = _urg_replay(env, turn_at=0, has_it=False)
+    rec = msgurgent.records(p.db)[str(mid)]
+    assert rec["nudged"] is None and rec["held"] is not None
+    assert "urgent-nudge" not in (run / "steer.md").read_text()
 
 
 def test_urgent_the_wake_prompt_leads_with_the_post_first_command_for_open_urgent_messages(env):

@@ -12,7 +12,7 @@ or turn it off). For each one the daemon, with no model call:
    5 min), in the project's home zone, ending with the project's AI tag;
 2. keeps the deadlines on disk (kv `urgent_msgs`), so a restart loses none and each fires once;
 3. closes a record at the coordinator's first substantive reply in that chat after receipt (kind reply
-   or ask: not the ack, a late notice or a digest line);
+   or ask: not the ack, a holding note or a digest line);
 4. with still no reply `hold_s` (4.5 min) after receipt, posts a holding note in the sender's chat (marked
    as not a finding: when it was received, that the coordinator is on it, the next check), so the chat
    hears back within 5 minutes even when the turn is still thinking;
