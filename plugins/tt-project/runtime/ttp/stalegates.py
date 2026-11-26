@@ -8,10 +8,10 @@ once as a must-act item `stale_gate-<task>` (mustact.STALE_GATE_KIND):
 - a resource on a machine that is held (a pause, a fleet or lent-out hold), marked out of service or in
   repeated trouble: the task moves to another machine the project's config allows when the task does
   not name the machine itself, else it is raised. A hold is never lifted or bypassed;
-- a dependency that is cancelled, failed or gone, which the dependent never names: dropped, requeued;
 - a gate older than `coordinator.stale_gate_min` (default 30, 0 = off) that states no reason (a why,
-  a rule id, `needs #id` or `safety:`), or an open dependency the dependent neither names nor shares a
-  file with: cleared, requeued;
+  a rule id, `needs #id` or `safety:`), or a dependency the dependent neither names nor shares a file
+  with (open, or cancelled, failed or gone): cleared or dropped, requeued. Until then a dead dependency
+  keeps the task blocked, as the dead-dependency event says;
 - a promise whose live owners all sit behind such a gate or are failed or cancelled: one clear
   replacement task is attached, else raised.
 
@@ -125,7 +125,7 @@ def _swap(labels: list, old: str, new: str) -> list:
 def findings(db, cfg: dict, now: float | None = None) -> list[dict]:
     """Every stale gate now, no writes: {task, ident, cause, gate, since, action, ...}. `action` is what the
     sweep does: rehome (swap `old` for `new` in the task's resources), drop_dep (`dep`), clear (the
-    deferral) or raise. A raise or clear waits for the threshold; a re-home and a dead dependency do not."""
+    deferral) or raise. Only a re-home skips the threshold."""
     now = time.time() if now is None else now
     limit = threshold_s(cfg)
     if limit <= 0:
@@ -173,7 +173,7 @@ def findings(db, cfg: dict, now: float | None = None) -> list[dict]:
         for dep in deps:
             dead = _first_dead([dep], states)
             named = bool(re.search(rf"#{dep}\b", text)) or str(dep) in cont or dep in keep
-            if dead and not named and not _shares(db, text, dep):
+            if dead and old and not named and not _shares(db, text, dep):
                 out.append({**base, "ident": f"dep:{dep}", "cause": "dead_dep", "action": "drop_dep", "dep": dep,
                             "gate": f"depends on #{dep}, which {dead[1]}", "fix": f"dropped #{dep}"})
             elif dead and old:   # named or sharing a file with it: its output may still be needed
@@ -211,7 +211,11 @@ def promises(db, cfg: dict, found: list[dict], now: float | None = None) -> list
     gated = {f["task"]: f for f in found if f["action"] == "raise"}   # the others are fixed this pass
     if limit <= 0:
         return out
-    for o in obligations.items(db):
+    try:
+        obs = obligations.items(db)
+    except (AttributeError, TypeError, KeyError):   # torn obligations state: its own detector reports it
+        return out
+    for o in obs:
         if not obligations._open(o):
             continue
         owners = obligations.live_owner_ids(db, o)

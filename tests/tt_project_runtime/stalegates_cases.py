@@ -95,8 +95,9 @@ def test_stalegate_outage_rehomes_and_machine_specific_or_no_alternative_raises(
 
 
 def test_stalegate_dead_dependency_dropped_unless_the_spec_names_it(env, monkeypatch):
-    """A cancelled dependency the task never names is dropped and the task requeued; one its spec names is
-    raised for the coordinator to re-point instead."""
+    """A cancelled dependency the task never names is dropped and the task requeued once the block is over the
+    threshold (until then it stays blocked, as the dead-dependency event says); one its spec names is raised
+    for the coordinator to re-point instead."""
     from ttp import stalegates
     _sg_env(monkeypatch)
     p = make(env)
@@ -108,9 +109,11 @@ def test_stalegate_dead_dependency_dropped_unless_the_spec_names_it(env, monkeyp
     now = time.time()
     stalegates.sweep(p, _SG_CFG, now)
     t = p.db.task(free)
-    assert json.loads(t["depends_on"]) == [other] and t["status"] == "queued"
-    assert p.db.task(named)["status"] == "blocked" and _sg_events(p) == []
+    assert json.loads(t["depends_on"]) == [dead, other] and t["status"] == "blocked"   # too young yet
     stalegates.sweep(p, _SG_CFG, now + _SG_OLD)
+    t = p.db.task(free)
+    assert json.loads(t["depends_on"]) == [other] and t["status"] == "queued"
+    assert p.db.task(named)["status"] == "blocked"
     assert [json.loads(e["data"])["must_act"]["key"] for e in _sg_events(p, "queued")] == [f"stale_gate-{named}"]
 
 
@@ -250,6 +253,7 @@ def test_stalegate_a_task_blocked_on_a_user_ask_stays_blocked(env, monkeypatch):
     ask = _sg_task(p, deps=[dead], status="blocked")
     p.db.update_task(ask, blocked_reason=f"ask #{dead}: waiting on the user's word")
     stalegates.sweep(p, _SG_CFG, time.time())
+    stalegates.sweep(p, _SG_CFG, time.time() + _SG_OLD)
     t = p.db.task(ask)
     assert json.loads(t["depends_on"]) == [] and t["status"] == "blocked"
     assert t["blocked_reason"] == f"ask #{dead}: waiting on the user's word"
@@ -270,6 +274,7 @@ def test_stalegate_a_wait_whose_retry_when_is_the_dead_dependency_is_released(en
                      result=dump_result({"status": "waiting", "summary": "waits",
                                          "retry_when": f"landed:#{dead}"}))
     stalegates.sweep(p, _SG_CFG, time.time())
+    stalegates.sweep(p, _SG_CFG, time.time() + _SG_OLD)
     t = p.db.task(waiting)
     assert json.loads(t["depends_on"]) == [] and t["status"] == "queued" and t["not_before"] is None
 
@@ -332,6 +337,7 @@ def test_stalegate_releases_a_wait_naming_the_dep_without_a_hash(env, monkeypatc
                      result=dump_result({"status": "waiting", "summary": "waits",
                                          "retry_when": f"landed:#{dead}"}))
     stalegates.sweep(p, _SG_CFG, time.time())
+    stalegates.sweep(p, _SG_CFG, time.time() + _SG_OLD)
     for tid in (landed, literal):
         t = p.db.task(tid)
         assert json.loads(t["depends_on"]) == [] and t["status"] == "queued" and t["not_before"] is None
