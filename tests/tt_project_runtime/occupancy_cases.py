@@ -103,6 +103,7 @@ def test_occupancy_front_box_blocks_deploy_not_test(tmp_path, monkeypatch):
     assert occ.blocks("box-a", "test")
     # once the stream is over (and its quiet window), the front box is free for deploys again
     occ.publish(_OccProj("streamer", tmp_path, {"box-a": {"cmd": "exit 1", "fronts": ["router-a"]}}))
+    occ.check("box-a", now=time.time() + 1, fresh=True)   # the first read off ends its span
     assert occ.blocks("router-a", "deploy", now=time.time() + 600) == ""
 
 
@@ -690,6 +691,7 @@ def test_occupancy_running_job_is_lowered_then_restored_and_never_killed(env, mo
     assert occupancy.lower_running(p, p.db, now + 1)["lowered"] == []   # once, while it stays live
     # the stream ends; past its quiet window the job gets back what it had
     occ.publish(_OccProj("streamer", p.root, {here: {"cmd": "exit 1"}}, quiet_s=60))
+    occ.check(here, now=now + 2, fresh=True)   # the first read off ends its span
     calls.clear()
     out = occupancy.lower_running(p, p.db, now + 600)
     assert out == {"lowered": [], "restored": ["j1"]}
@@ -722,6 +724,7 @@ def test_occupancy_lowering_without_autogroup_records_a_nice_it_could_not_raise_
     monkeypatch.setattr(activity, "append", lambda state, rec: logged.append(rec))
     assert occupancy.lower_running(p, p.db, now)["lowered"] == ["j2"]
     occ.publish(_OccProj("streamer", p.root, {here: {"cmd": "exit 1"}}, quiet_s=0))
+    occ.check(here, now=now + 1, fresh=True)   # the first read off ends its span
     assert occupancy.lower_running(p, p.db, now + 600)["restored"] == ["j2"]
     assert "raising it back needs privilege" in logged[-1]["errors"][0]
 
