@@ -31,12 +31,13 @@ PURE = {"json", "re", "collections", "itertools", "functools", "math", "statisti
         "heapq", "bisect", "decimal", "fractions", "pprint", "shlex", "ast", "tomllib", "html", "struct",
         "unicodedata", "zlib", "calendar", "copy", "ipaddress", "random", "keyword", "numbers", "abc"}
 LISTED = {"os": {"path", "getcwd", "listdir", "scandir", "walk", "stat", "lstat", "sep", "linesep", "cpu_count",
-                 "getpid", "fspath", "curdir", "pardir", "extsep", "name"},
+                 "getpid", "fspath", "curdir", "pardir", "extsep", "name", "getenv", "makedirs", "mkdir"},
           "sys": {"stdin", "stdout", "stderr", "argv", "exit", "version", "version_info", "platform", "maxsize",
                   "byteorder", "executable", "float_info", "getrecursionlimit", "getsizeof"},
           "time": {"time", "monotonic", "perf_counter", "strftime", "strptime", "localtime", "gmtime", "ctime",
                    "mktime", "time_ns", "timezone", "tzname"},
           "glob": {"glob", "iglob", "escape"},
+          "tempfile": {"gettempdir", "mkdtemp", "mkstemp", "NamedTemporaryFile", "TemporaryDirectory"},
           "pathlib": {"Path", "PurePath", "PurePosixPath", "PosixPath"},
           "operator": {"itemgetter", "add", "sub", "mul", "truediv", "floordiv", "mod", "neg", "eq", "ne", "lt",
                        "le", "gt", "ge", "contains", "getitem"},
@@ -70,26 +71,40 @@ PATH_LISTS = {"iterdir", "glob", "rglob", "walk"}
 FORMAT_FIELD_RE = re.compile(r"\{[^{}]*[.\[]")   # '{0.attr}', '{0[key]}': format() walks into its arguments
 GLOB_RE = re.compile(r"[*?\[{]")
 SYSTEM = ("/proc", "/sys", "/dev")
+# The owner's harm bar (a project's own temp paths, plugin code and PYTHONPATH are not harm): the variables naming
+# the run's own folders a snippet may read, the tempfile calls (they write under TMPDIR or a `dir` checked as a
+# write), and the plugin's own judges (pure checks of a command or path) it may import from its own runtime folder.
+ENV_PATHS = {"TTP_RUN_DIR", "TMPDIR", "HOME"}
+ENV_SET_RE = re.compile(r"PYTHON|LD_|TTP_PYAUDIT|PATH$")   # what a snippet may not set in its environment
+TEMP_MAKERS = {"tempfile.mkdtemp", "tempfile.mkstemp", "tempfile.NamedTemporaryFile", "tempfile.TemporaryDirectory"}
+MAKEDIRS = {"os.makedirs", "os.mkdir"}
+PATH_WRITES = {"write_text", "write_bytes", "mkdir", "touch"}
+JUDGES = {"pathguard", "credguard", "credwatch", "glmguard", "glmenv", "hook", "pyproof", "sidefx", "claimcheck",
+          "untrusted", "gitguard", "localguard", "prguard", "routeguard", "ruleguard", "streamguard", "redact"}
 
 
-def harmless(code: str, cwd: str, env=None, bases=None) -> bool:
+def harmless(code: str, cwd: str, env=None, bases=None, own=(), audited=False) -> bool:
     """Whether the whole of `code` is proven harmless (module doc); any doubt is False. `bases` are the folders
-    a relative path may start from (a `cd` before the snippet), else `cwd`."""
-    return _prove(code, cwd, env, bases) is not None
+    a relative path may start from (a `cd` before the snippet), else `cwd`. `own`: the plugin's own runtime
+    folders python searches (its PYTHONPATH, a `cd` there); `audited`: the run-time judge (pyaudit) runs under the
+    snippet, so a path it computes is read and judged then."""
+    return _prove(code, cwd, env, bases, own, audited) is not None
 
 
-def _prove(code: str, cwd: str, env=None, bases=None) -> "_Proof | None":
+def _prove(code: str, cwd: str, env=None, bases=None, own=(), audited=False) -> "_Proof | None":
     """The proof of `code` (its `wrote` says whether it opens a file for writing), None unless it is harmless."""
     try:
-        proof = _Proof(cwd, os.environ if env is None else env, bases)
+        proof = _Proof(cwd, os.environ if env is None else env, bases, own, audited)
         return proof if proof.ok(ast.parse(code)) else None
     except (SyntaxError, ValueError, RecursionError, OSError):
         return None
 
 
 class _Proof:
-    def __init__(self, cwd: str, env, bases):
+    def __init__(self, cwd: str, env, bases, own=(), audited=False):
         self.cwd, self.env, self.bases = os.path.realpath(cwd), env, bases or [cwd]
+        self.own, self.audited = bool(own), audited   # the plugin's own judges are importable; pyaudit runs
+        self.syspath: set[int] = set()    # the `sys.path` nodes of a sys.path.insert of the plugin's own runtime
         self.mods: dict[str, str] = {}    # name bound by an import -> its module's own name
         self.funcs: dict[str, str] = {}   # name bound by `from m import f` -> `m.f`
         self.lits: dict[str, str] = {}    # name bound once, to a literal path
@@ -98,21 +113,31 @@ class _Proof:
 
     def ok(self, tree: ast.AST) -> bool:
         nodes = list(ast.walk(tree))
+        self.parents = {c: p for p in nodes for c in ast.iter_child_nodes(p)}
+        for n in nodes:   # sys.path.insert(0, '<the plugin's own runtime folder>') at the top level, before an import
+            if isinstance(n, ast.Expr) and isinstance(c := n.value, ast.Call) and isinstance(f := c.func, ast.Attribute) \
+                    and f.attr in ("insert", "append") and isinstance(f.value, ast.Attribute) and f.value.attr == "path" \
+                    and isinstance(f.value.value, ast.Name) and f.value.value.id == "sys" and not c.keywords \
+                    and len(c.args) == (2 if f.attr == "insert" else 1) and isinstance(c.args[-1], ast.Constant) \
+                    and isinstance(c.args[-1].value, str) and self.parents.get(n) is tree \
+                    and any(_own_runtime(os.path.join(b, c.args[-1].value), [self.cwd, *self.bases]) for b in self.bases):
+                self.syspath.add(id(f.value))
+                self.own = True
         binds: dict[str, int] = {}        # every way a name is bound: a literal or an import must be bound once
         for n in nodes:
             for name in _names_bound(n):
                 binds[name] = binds.get(name, 0) + 1
             if isinstance(n, ast.Import):
                 for a in n.names:
-                    mod = _own_module(a.name if a.asname else a.name.split(".")[0])
+                    mod = self._module(a.name if a.asname else a.name.split(".")[0])
                     if mod is None:
                         return False
                     self.mods[a.asname or a.name.split(".")[0]] = mod
             elif isinstance(n, ast.ImportFrom):
                 for a in n.names:
-                    if n.level or a.name == "*" or (base := _own_module(str(n.module))) is None:
+                    if n.level or a.name == "*" or (base := self._module(str(n.module))) is None:
                         return False
-                    if (mod := _own_module(f"{n.module}.{a.name}")) is not None:
+                    if (mod := self._module(f"{n.module}.{a.name}")) is not None:
                         self.mods[a.asname or a.name] = mod
                     elif not self._attr(base, a.name):
                         return False
@@ -129,28 +154,50 @@ class _Proof:
                 self.lits[n.targets[0].id] = v
                 if self._pathish(n.value):
                     self.paths.add(n.targets[0].id)
-        parents = {c: p for p in nodes for c in ast.iter_child_nodes(p)}
-        return all(self._node(n, parents.get(n)) for n in nodes)
+        return all(self._node(n, self.parents.get(n)) for n in nodes)
+
+    def _module(self, name: str) -> str | None:
+        """_own_module, and the plugin's own judges (ttp.pathguard...) once its runtime folder is searched."""
+        if self.own and (name == "ttp" or name.startswith("ttp.") and name.split(".")[1] in JUDGES):
+            try:
+                importlib.import_module(f"{__package__}{name[3:]}")
+            except ImportError:
+                return None
+            return name if name.count(".") <= 1 else None
+        return _own_module(name)
 
     def _node(self, n, p) -> bool:
         call = p if isinstance(p, ast.Call) and p.func is n else None
+        if self._environ(n):   # os.environ only as one of the run's own folders, or set for a name python ignores
+            key = p.slice.value if isinstance(p, ast.Subscript) and isinstance(p.slice, ast.Constant) else None
+            if isinstance(p, ast.Subscript) and isinstance(key, str):
+                return key in ENV_PATHS if isinstance(p.ctx, ast.Load) else not (ENV_SET_RE.search(key)
+                                                                                    or key in ENV_PATHS)   # a self-set TMPDIR is no run folder
+            return isinstance(p, ast.Attribute) and p.attr == "get" and isinstance(c := self.parents.get(p), ast.Call) \
+                and c.func is p and self._env_get(c)
+        if isinstance(n, ast.Attribute) and n.attr == "path" and id(n) in self.syspath:
+            return True
         if isinstance(n, ast.Name):
             if n.id in self.mods:   # a module only as `mod.attr`
                 return isinstance(p, ast.Attribute) and p.value is n
             if n.id in self.funcs:
-                return self.funcs[n.id] not in LISTING or call is not None and self._list(call, self.funcs[n.id])
+                return self._checked(self.funcs[n.id], call)
             if n.id == "open":
                 return call is not None and self._call(call)
             return n.id == "_" or not n.id.startswith("_") and (n.id in BUILTINS or n.id not in ALL_BUILTINS)
         if not isinstance(n, ast.Attribute):
             return True
         if (base := self._dotted(n.value)) is not None:
-            full = f"{base}.{n.attr}"
-            return self._attr(base, n.attr) and (full not in LISTING or call is not None and self._list(call, full))
-        if n.attr in PATH_READS | PATH_LISTS:   # on a pathlib path of literal parts only
+            return self._attr(base, n.attr) and self._checked(f"{base}.{n.attr}", call)
+        if n.attr in PATH_READS | PATH_LISTS | PATH_WRITES:   # on a pathlib path of literal parts only
             path = self._path(n.value) if self._pathish(n.value) else None
-            if call is None or path is None:
+            if call is None or path is None and not (self.audited and self._pathish(n.value)):
                 return False
+            if path is None:   # computed: the run-time judge reads or writes it
+                self.wrote |= n.attr in PATH_WRITES or n.attr == "open"   # its mode is its first argument
+                return True
+            if n.attr in PATH_WRITES:
+                return self._place(path, True)
             if n.attr in PATH_LISTS:
                 return self._list(call, n.attr, path)
             return self._open(path, (call.args or [None])[0] if n.attr == "open" else None, call)
@@ -165,10 +212,40 @@ class _Proof:
         if isinstance(node, ast.Name):
             return self.mods.get(node.id)
         if isinstance(node, ast.Attribute) and (b := self._dotted(node.value)):
-            return _own_module(f"{b}.{node.attr}")
+            return self._module(f"{b}.{node.attr}")
         return None
 
+    def _checked(self, full: str, call) -> bool:
+        """A call of a module function that takes a path: a listing, a temp file, a folder made."""
+        if full in LISTING:
+            return call is not None and self._list(call, full)
+        if full == "os.getenv":
+            return self._env_get(call)
+        if full in TEMP_MAKERS:   # under TMPDIR, or a `dir` checked as a write; no module name
+            return call is not None and not call.args and all(
+                k.arg in ("dir", "prefix", "suffix", "mode", "delete", "text", "encoding", "ignore_cleanup_errors")
+                for k in call.keywords) and all(
+                (p := self._path(k.value)) is not None and self._place(p, True) if k.arg == "dir" else
+                isinstance(k.value, ast.Constant) and ("/" not in str(k.value.value)) and not str(k.value.value)
+                .endswith((*importlib.machinery.all_suffixes(), ".pth")) for k in call.keywords
+                if k.arg in ("dir", "prefix", "suffix"))
+        if full in MAKEDIRS:
+            return call is not None and len(call.args) == 1 and all(k.arg in ("exist_ok", "mode") for k in call.keywords) \
+                and (p := self._path(call.args[0])) is not None and self._place(p, True)
+        return True
+
+    def _environ(self, node) -> bool:
+        return isinstance(node, ast.Attribute) and node.attr == "environ" and self._dotted(node.value) == "os"
+
+    def _env_get(self, call) -> bool:
+        """os.environ.get / os.getenv of one of the run's own folders, by a literal name."""
+        return isinstance(call, ast.Call) and not call.keywords and 1 <= len(call.args) <= 2 \
+            and isinstance(call.args[0], ast.Constant) and call.args[0].value in ENV_PATHS
+
     def _attr(self, mod: str, attr: str) -> bool:
+        if mod == "ttp" or mod.startswith("ttp."):   # the plugin's own judges: their helpers too, never a dunder
+            return f"{mod}.{attr}" == self._module(f"{mod}.{attr}") if mod == "ttp" else not attr.startswith("__") \
+                and getattr(sys.modules.get(f"{__package__}{mod[3:]}"), attr, None) is not None
         if mod in LISTED:
             return attr in LISTED[mod]
         value = getattr(sys.modules.get(mod), attr, None)
@@ -177,6 +254,9 @@ class _Proof:
 
     def _call(self, call: ast.Call) -> bool:
         path = self._path(call.args[0]) if call.args else None
+        if path is None and call.args and self.audited:   # computed: the run-time judge reads or writes it
+            self.wrote |= _writes(call)
+            return len(call.args) <= 2 and all(k.arg in ("mode", "encoding", "errors", "newline") for k in call.keywords)
         return len(call.args) <= 2 and self._open(path, call.args[1] if len(call.args) > 1 else None, call)
 
     def _open(self, path: str | None, mode, call: ast.Call) -> bool:
@@ -192,8 +272,8 @@ class _Proof:
         if any(k.arg not in ("recursive", "topdown", "include_hidden") for k in call.keywords) or len(call.args) > 1:
             return False
         arg = self._path(call.args[0]) if call.args else "."
-        if arg is None:
-            return False
+        if arg is None:   # computed: only where the run-time judge reads it
+            return self.audited
         if func in ("glob.glob", "glob.iglob", "glob", "rglob"):
             fixed = GLOB_RE.split(arg, maxsplit=1)[0]
             arg = fixed.rsplit("/", 1)[0] if "/" in fixed else "."
@@ -203,8 +283,8 @@ class _Proof:
         from . import credguard, hook, pathguard, untrusted
         home = str(self.env.get("HOME") or os.path.expanduser("~"))
         path = os.path.expanduser(path) if path.startswith("~") else path
-        tmp = self.env.get("TMPDIR")
-        mine = [os.path.realpath(r).rstrip("/") + "/" for r in [self.cwd, *[tmp] * bool(tmp)]]
+        mine = [os.path.realpath(r).rstrip("/") + "/" for r in [self.cwd, *filter(None, (
+            self.env.get("TMPDIR"), self.env.get("TTP_RUN_DIR")))]]
         self.wrote |= writes
         if writes and path.endswith((*importlib.machinery.all_suffixes(), ".pth")):   # a module python may import
             return False
@@ -228,6 +308,29 @@ class _Proof:
             return node.value
         if isinstance(node, ast.Name):
             return self.lits.get(node.id)
+        if isinstance(node, ast.Subscript) and self._environ(node.value) and isinstance(node.slice, ast.Constant) \
+                and node.slice.value in ENV_PATHS:
+            return self.env.get(node.slice.value) or None
+        if isinstance(node, ast.Call) and (self._func(node) == "os.getenv" or isinstance(node.func, ast.Attribute)
+                                           and node.func.attr == "get" and self._environ(node.func.value)):
+            got = self.env.get(node.args[0].value) if self._env_get(node) else None
+            return got or (self._path(node.args[1]) if got is None and len(node.args) == 2 else None)
+        if isinstance(node, ast.Call) and self._func(node) in ("tempfile.gettempdir", "tempfile.mkdtemp"):
+            import tempfile
+            d = next((self._path(k.value) for k in node.keywords if k.arg == "dir"), None)
+            tmp = d or self.env.get("TMPDIR") or tempfile.gettempdir()
+            return tmp if self._func(node) == "tempfile.gettempdir" else os.path.join(tmp, "tmp.made")
+        if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add) and not self._pathish(node.left):
+            a, b = self._path(node.left), self._path(node.right)   # string concatenation
+            return a + b if a is not None and b is not None else None
+        if isinstance(node, ast.JoinedStr):
+            parts = [v.value if isinstance(v, ast.Constant) else self._path(v.value) if not v.format_spec
+                     and v.conversion == -1 else None for v in node.values]
+            return "".join(parts) if parts and None not in parts else None
+        if isinstance(node, ast.Call) and self._func(node) == f"{os.path.__name__}.expanduser" and len(node.args) == 1 \
+                and (lit := self._path(node.args[0])) is not None:
+            home = str(self.env.get("HOME") or os.path.expanduser("~"))
+            return home + lit[1:] if lit == "~" or lit.startswith("~/") else lit
         if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Div):
             a, b = self._path(node.left), self._path(node.right)
             return os.path.join(a, b) if a is not None and b is not None and self._pathish(node.left) else None
@@ -251,6 +354,22 @@ class _Proof:
         if isinstance(node, ast.BinOp):
             return self._pathish(node.left)
         return isinstance(node, ast.Name) and node.id in self.paths
+
+
+def _writes(call: ast.Call) -> bool:
+    """An open() call's mode may write (a mode not written as a literal may)."""
+    mode = call.args[1] if len(call.args) > 1 else next((k.value for k in call.keywords if k.arg == "mode"), None)
+    return mode is not None and not (isinstance(mode, ast.Constant) and isinstance(mode.value, str)
+                                     and not set(mode.value) & set("wax+"))
+
+
+def _own_runtime(folder: str, inside) -> bool:
+    """`folder` is the plugin's own runtime (it holds the ttp package and its judges): this module's own, or one
+    inside the folders the command works in (the worktree, the project's harness), shadowing no standard module."""
+    real = os.path.realpath(folder)
+    mine = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
+    return os.path.isfile(os.path.join(real, "ttp", "pyproof.py")) and not _holds_module(real) and (
+        real == mine or any((real + "/").startswith(os.path.realpath(i).rstrip("/") + "/") for i in inside))
 
 
 def _names_bound(n) -> list[str]:
@@ -303,6 +422,7 @@ def rewrite(cmd: str, cwd: str, env=None) -> str | None:
     if "\\\n" in cmd or "python" not in cmd:
         return None
     env = os.environ if env is None else env
+    cmd, prefixed = _own_pythonpath(cmd, cwd)
     segments = hook._segments(cmd, strip=False)   # a cd before the snippet: its relative paths start anywhere it may go
     moves = any(argv and (os.path.basename(argv[0]) in ("cd", "pushd", "popd")
                           or any(w.startswith(("-C", "--chdir")) for w in argv)) for argv in segments)
@@ -312,8 +432,16 @@ def rewrite(cmd: str, cwd: str, env=None) -> str | None:
     lines, bodies = hook._heredocs(cmd)
     if any(b.end is None for b in bodies):   # an unended heredoc: the shell reads it differently than we would
         return None
-    if _may_shadow("\n".join(lines), bases[1:] if bases else [cwd], env):
-        return None
+    shadow_cwds = bases[1:] if bases else [cwd]
+
+    def shadowed(i: int, pos: int) -> bool:
+        """python may import another module than the standard one the snippet at `pos` of line `i` names: read on
+        the command up to the end of its pipeline (what runs before or beside it); what runs after it cannot."""
+        return _may_shadow("\n".join([*lines[:i], lines[i][:_pipeline_end(lines[i], pos)]]), shadow_cwds, env,
+                           prefixed)
+    own = prefixed or any(_own_runtime(d, [cwd, *(bases or [])]) for d in [*(bases or [cwd]), *[
+        e for e in str(env.get("PYTHONPATH") or "").split(os.pathsep) if e]])
+    audited = _audited(env) and not prefixed and not re.search(r"(?<![^\s;&|(])env\s+-", cmd)
     changed = hidden = False
     proven = set()   # the python commands proven, by line and command start
     for b in bodies:
@@ -322,8 +450,8 @@ def rewrite(cmd: str, cwd: str, env=None) -> str | None:
         argv = list(hook._first_argv(hook._piece_at(lines[i], pos)[0]))
         fed = bool(argv) and bool(PY_RE.match(os.path.basename(argv[0]))) and hook._interpreter_args(argv) == "-"
         text = "\n".join(l.lstrip("\t") if m[1] == "-" else l for l in body)
-        if fed and text.strip() and (m[2] or not re.search(r"[$`\\]", text)) \
-                and (proof := _prove(text, cwd, env, bases)):
+        if fed and text.strip() and (m[2] or not re.search(r"[$`\\]", text)) and not shadowed(i, pos) \
+                and (proof := _prove(text, cwd, env, bases, own, audited and _keeps_site(argv))):
             named = _words_name_store(text, cwd, env)
             if named and proof.wrote:   # it could leave a script naming the store for a later call
                 return None
@@ -339,7 +467,9 @@ def rewrite(cmd: str, cwd: str, env=None) -> str | None:
         flags = hook._quoting(line)
         for m in reversed(list(DASH_C_RE.finditer(line))):
             code = m[1] if m[1] is not None else m[2]
-            if not flags[m.start()][0] and _code_at(line, m.start()) == code and (proof := _prove(code, cwd, env, bases)):
+            argv = list(hook._first_argv(hook._piece_at(line, m.start())[0]))
+            if not flags[m.start()][0] and _code_at(line, m.start()) == code and not shadowed(i, m.start()) \
+                    and (proof := _prove(code, cwd, env, bases, own, audited and _keeps_site(argv))):
                 proven.add((i, _piece_start(line, m.start())))
                 line, changed = f"{line[:m.start()]}-c 'pass'{line[m.end():]}", True
                 named = _words_name_store(code, cwd, env)
@@ -347,14 +477,89 @@ def rewrite(cmd: str, cwd: str, env=None) -> str | None:
                     return None
                 hidden |= named
         out += [line, *ends.get(i, [])]
-    # A snippet naming a store the guard would have seen in its words is freed only as the whole command: its
-    # output piped, captured, redirected or written for a later command could feed that name to the shell.
-    # Another python of the command (one not proven) could write a module a proven one then imports.
-    if len(proven) < sum(any(PY_RE.match(os.path.basename(w)) for w in argv) for argv in segments):
+    # Another python of the command (one not proven) could write a module a proven one then imports: it may run
+    # only after every proven one has ended. Each piece of a chain is judged on its own (the rest of the line as
+    # written), so the chain passes once its operators add no harm.
+    if not _after(lines, proven, sum(any(PY_RE.match(os.path.basename(w)) for w in argv) for argv in segments)):
         return None
-    if hidden and (len(lines) > 1 or re.search(r"[|>`;&]|\$\(|<\(", lines[0])):
+    # A snippet naming a store the guard would have seen in its words: its output piped into a program that runs
+    # it, captured, or redirected into a file a later command could run could feed that name to the shell.
+    if hidden and _feeds(lines):
         return None
     return "\n".join(out) if changed else None
+
+
+def _own_pythonpath(cmd: str, cwd: str) -> tuple[str, bool]:
+    """`cmd` without a `PYTHONPATH=<folder> python...` prefix whose folders are the plugin's own runtime or the
+    working folder (`$PWD` read as it while no `cd` came first), and whether there was one: python then searches
+    the plugin's own code, so a snippet may import its judges. The override drops the run-time judge's zip."""
+    m = re.search(r"(?<![^\s;&|(])PYTHONPATH=([^\s;&|'\"`]+)\s+(?=(?:\S*/)?python[\d.]*\s)", cmd)
+    if not m or re.search(r"(?<![^\s;&|(])(cd|pushd)\s", cmd[:m.start()]):
+        return cmd, False
+    entries = re.sub(r"\$\{?PWD\}?(?![\w])", cwd, m[1]).split(os.pathsep)
+    if not all(e and "$" not in e and (_own_runtime(os.path.join(cwd, e), [cwd]) or os.path.realpath(
+            os.path.join(cwd, e)) == os.path.realpath(cwd) and not _holds_module(cwd)) for e in entries):
+        return cmd, False
+    return cmd[:m.start()] + cmd[m.end():], True
+
+
+def _audited(env) -> bool:
+    """The run-time judge (pyaudit) loads in a python started with `env`: its zip first on PYTHONPATH."""
+    from . import pyaudit
+    dirs = pyaudit.guarded(env)
+    return bool(dirs) and str(env.get("PYTHONPATH") or "").split(os.pathsep)[0] == os.path.join(dirs[0], "pyaudit.zip")
+
+
+def _keeps_site(argv: list[str]) -> bool:
+    """python's own options before its code keep the site hook that loads the run-time judge (no -I, -E, -S)."""
+    for w in argv[1:]:
+        if w in ("-c", "-", "-m") or not w.startswith("-"):
+            return True
+        if w.startswith("--") or set(w[1:]) & set("IESX") or "c" in w[1:]:
+            return False
+    return True
+
+
+def _after(lines: list[str], proven: set, count: int) -> bool:
+    """Every python of the command that is not proven runs only after each proven one has ended: none before
+    one, in its pipeline or beside it in the background (every python a top-level command of its line)."""
+    from . import hook
+    pys = [(i, s, sep) for i, line in enumerate(lines) for s, e, sep in hook._pieces(line)
+           if (argv := list(hook._first_argv(line[s:e]))) and PY_RE.match(os.path.basename(argv[0]))]
+    if len(proven) >= count:
+        return True
+    if len(pys) != count:
+        return False
+    seen = False   # a proven python came first, with no `;`, `&&`, `||` or line break after it yet
+    for i, s, sep in pys:
+        if (i, s) not in proven:
+            if seen:
+                return False
+            continue
+        if any((j, t) not in proven for j, t, _ in pys if (j, t) < (i, s)):
+            return False
+        seen = sep in ("|", "|&", "&")
+    return True
+
+
+def _feeds(lines: list[str]) -> bool:
+    """The command's output may reach the shell: captured (`$(`, a backtick, `<(`), piped into anything but a
+    reader, or redirected into a file (not a terminal) a later command could run."""
+    from . import hook
+    for line in lines:
+        flags = hook._quoting(line)
+        plain = "".join(" " if flags[k][0] else c for k, c in enumerate(line))
+        if re.search(r"`|\$\(|[<>]\(", plain):
+            return True
+        for t in re.findall(r"(?<![<>])>{1,2}\|?\s*(&?[^\s;&|<>]*)", plain):
+            if not (t.startswith("&") or t in TERMINAL):
+                return True
+        pieces = hook._pieces(line)
+        for (s, e, sep), nxt in zip(pieces, pieces[1:]):
+            argv = list(hook._first_argv(line[nxt[0]:nxt[1]]))
+            if sep in ("|", "|&") and not (argv and os.path.basename(argv[0]) in READERS - {"echo"}):
+                return True
+    return False
 
 
 # bash's builtins and keywords (compgen -b -k): those but the few here may change the shell's folder or variables
@@ -369,9 +574,14 @@ UNQUOTED_RE = re.compile(r"\\.|'[^']*'|\"((?:\\.|[^\"\\])*)\"")
 TERMINAL = ("-", "/dev/null", "/dev/stdout", "/dev/stderr", "/dev/tty")   # redirect targets that write no file
 SHELL_BUILTINS = {"cd", "pushd", "echo", "true", "false", "pwd", "test", "[", ":"}   # the shell runs these itself
 READERS = {"cat", "echo", "ls", "head", "tail", "grep", "wc", "true", "pwd"}   # write no file without a redirect
+# Commands that create no module python could import (none, or only folders and deletions): sed and sort unless
+# their arguments write a file (SED_WRITE, -o), and the plugin's own CLI.
+NO_MODULE = READERS | {"sed", "sort", "cut", "tr", "jq", "column", "nl", "stat", "rm", "rmdir", "mkdir", "sleep", "date",
+                       "basename", "dirname", "realpath", "readlink", "diff", "cmp", "file", "du", "df", "ps", "ttp"}
+SED_WRITE = re.compile(r"^-(i|-in-place)|(^|[/;}\s\d])[wWe](\s|$)")
 
 
-def _may_shadow(shell: str, cwds: list[str], env) -> bool:
+def _may_shadow(shell: str, cwds: list[str], env, prefixed: bool = False) -> bool:
     """Whether python may import something other than the standard module a snippet (or a module it imports)
     names: it searches its working folder and each PYTHONPATH entry first, so a module named like a standard
     one there (one an earlier call wrote) runs instead. So also whenever the command may give python another
@@ -386,17 +596,23 @@ def _may_shadow(shell: str, cwds: list[str], env) -> bool:
         if argv and ASSIGN_RE.match(argv[0]):   # an exported variable (PATH, LD_PRELOAD) python could read
             return True
         py = next((i for i, w in enumerate(argv) if PY_RE.match(os.path.basename(w))), None)
+        if py and argv[0] == "env":   # `env -u NAME`: unsets a variable python need not have, never one it reads
+            unset = argv[1:py]
+            if len(unset) % 2 or any(f != "-u" or ENV_SET_RE.search(n) for f, n in zip(unset[::2], unset[1::2])):
+                return True
+            argv = [argv[0], *argv[py:]]
+            py = 1
         head = argv[:py] if py else argv[:2] if argv[:1] in (["cd"], ["pushd"]) else argv[:1]
         if any(re.search(r"[*?\[{~]", w) for w in head) or argv[:1] in (["cd"], ["pushd"]) and (
                 len(argv) != 2 or argv[1].startswith("-")) or head and head[0] in SHELL_WORDS - {"cd", "pushd"} \
                 or py and any(w not in WRAPPERS and not w.isdigit() for w in head) \
                 or py is not None and not _interpreter(argv[py], env) \
-                or any(w not in SHELL_BUILTINS and not w.isdigit() and not _trusted(w, env)
+                or any(w not in SHELL_BUILTINS and not w.isdigit() and not _trusted(w, env) and not _own_cli(w, cwds)
                        for w in argv[:1 if py is None else py]):
             return True
     if _plants(shell):
         return True
-    path = str(env.get("PYTHONPATH") or "")
+    path = "" if prefixed else str(env.get("PYTHONPATH") or "")   # a prefix's own folders were checked
     judge = [os.path.join(d, "pyaudit.zip") for d in pyaudit.guarded(env)]   # the run-time judge's own, protected
     entries = [""] + [e for e in (path.split(os.pathsep) if path else []) if e not in judge]
     user = env.get("PYTHONUSERBASE") or os.path.join(str(env.get("HOME") or os.path.expanduser("~")), ".local")
@@ -415,7 +631,7 @@ def _plants(shell: str) -> bool:
     except ValueError:
         return True
     ran = writes = py = False   # ran: a writer ran before this pipeline; writes, py: one is in it
-    start, target = True, ""
+    start, target, cur = True, "", ""
     for w in words + [";"]:
         if set(w) <= set("();<>|&"):
             if ">" in w or "<" in w:
@@ -429,6 +645,8 @@ def _plants(shell: str) -> bool:
         elif target:
             writes |= ">" in target and not (w.isdigit() or w in TERMINAL)
             target = False
+        elif not start:
+            writes |= cur == "sed" and bool(SED_WRITE.search(w)) or cur == "sort" and w.startswith(("-o", "--output"))
         elif start:
             name = os.path.basename(w)
             if PY_RE.match(name):
@@ -436,9 +654,22 @@ def _plants(shell: str) -> bool:
                     return True
                 py, start = True, False
             elif not (w.isdigit() or name in WRAPPERS):
-                writes |= name not in READERS | {"cd", "pushd"}
-                start = False
+                writes |= name not in NO_MODULE | {"cd", "pushd"}
+                start, cur = False, name
     return False
+
+
+def _pipeline_end(line: str, pos: int) -> int:
+    """Where the pipeline holding `pos` ends: the end of its piece and of each piece joined to it by `|`, `|&` or
+    a background `&` (they run beside it)."""
+    from . import hook
+    end = len(line)
+    for s, e, sep in hook._pieces(line):
+        if e >= pos:
+            end = e
+            if sep not in ("|", "|&", "&"):
+                break
+    return end
 
 
 def _piece_start(line: str, pos: int) -> int:
@@ -452,6 +683,12 @@ def _trusted(word: str, env) -> bool:
     exe = shutil.which(word, path=str(env.get("PATH") or os.defpath))
     real = exe and os.path.realpath(exe)
     return bool(real) and not any(os.access(p, os.W_OK) for f in (exe, real) for p in (f, os.path.dirname(f)))
+
+
+def _own_cli(word: str, cwds: list[str]) -> bool:
+    """`word` runs the plugin's own command-line tool (`ttp` beside its runtime folder), the project's own code."""
+    return os.path.basename(word) == "ttp" and "/" in word and any(_own_runtime(os.path.join(
+        os.path.dirname(os.path.dirname(os.path.realpath(os.path.join(c, word)))), "runtime"), [c]) for c in cwds)
 
 
 def _interpreter(word: str, env) -> bool:

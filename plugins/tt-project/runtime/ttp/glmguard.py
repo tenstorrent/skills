@@ -163,30 +163,58 @@ _SCRATCH_KEEP = re.compile(r"(?<![\w${])(\"?)(TMPDIR|TMP|TEMP)=(\"?)\$(?:\{\2(?:
                            r"(?=[\s;&|)]|$)|\b(?:environ\[|environ\.get\(|getenv\()[\"'](TMPDIR|TMP|TEMP)[\"'](?!\]\s*\S?=(?!=))")
 
 
-def _scratch_naming(cmd: str, run_dir: str, env) -> tuple[bool, bool]:
-    """(told, own) for the namings of TMPDIR (TMP, TEMP) in `cmd`: `told` where one may set it to something else,
-    `own` where one sets it to the run's own scratch folder (the folder itself or `$TTP_RUN_DIR/tmp`) and every other
-    keeps its value (_SCRATCH_KEEP)."""
+# A naming that sets it to a value the guard does not read: `read TMPDIR`, `for TMPDIR in`, `unset TMPDIR`, a
+# `printf -v`, a `declare`, or a Python environment write (`os.environ["TMPDIR"] = ...`, `putenv`, `update`, `pop`)
+_SCRATCH_HIDDEN = re.compile(
+    r"\b(?:read|for|unset|mapfile|readarray|getopts|declare|typeset|local|readonly|printf\s+-v)(?:\s+-\w+)*\s+"
+    r"(?:\w+\s+)*$|(?:putenv|update|setdefault|pop|del\s+\S*environ)\W*$|environ\W*$")
+
+
+def _scratch_naming(cmd: str, run_dir: str, env) -> tuple[bool, bool, list[str] | None]:
+    """(told, own, values) for the namings of TMPDIR (TMP, TEMP) in `cmd`: `told` where one may set it to something
+    else, `own` where one sets it to the run's own scratch folder (the folder itself or `$TTP_RUN_DIR/tmp`) and every
+    other keeps its value (_SCRATCH_KEEP); `values`: what the command sets it to (`TMPDIR=~`, `export TMPDIR=/x`),
+    each as the guard reads it, or None where one sets it to a value the guard cannot read."""
     own = {m.start() for m in _SCRATCH_OWN.finditer(cmd)
            if _own_tmp(m.group(2).replace("${TTP_RUN_DIR}", run_dir).replace("$TTP_RUN_DIR", run_dir), run_dir)}
     keep = {m.start(4) if m.group(4) else m.start(2) for m in _SCRATCH_KEEP.finditer(cmd)
             if m.group(4) or env.get(m.group(2))}
-    told = any(m.start() not in own | keep for m in _SCRATCH_SET.finditer(cmd))
-    return told, bool(own) and not told
+    sets = {m.start(): m.group(2) for m in _SCRATCH_OWN.finditer(cmd)}
+    home = str(env.get("HOME") or os.path.expanduser("~"))
+    told, values = False, []
+    for m in _SCRATCH_SET.finditer(cmd):
+        if m.start() in own | keep:
+            continue
+        told = True
+        if m.start() in sets:
+            v = re.sub(r"\$\{?TTP_RUN_DIR\}?(?!\w)", run_dir, sets[m.start()])
+            v = re.sub(r"^(?:~|\$\{?HOME\}?)(?=/|$)", home, v)
+            if values is not None:
+                values = None if re.search(r"[$`~*?\[]", v) or not v.startswith("/") else values + [v]
+        elif re.match(r"=\"?\$\(mktemp -d\)\"?(?=[\s;&|)]|$)", cmd[m.end():]):   # a new folder in its TMPDIR
+            values = values if values is None else values + [os.path.join(str(env.get("TMPDIR") or "/tmp"), "tmp.made")]
+        elif cmd[m.end():m.end() + 1] == "=" or _SCRATCH_HIDDEN.search(cmd[max(0, m.start() - 60):m.start()]):
+            values = None
+    return told, bool(own) and not told, values if told else []
 
 
-def _scratch_value(m: re.Match, env, own_tmp: str, told: bool) -> str:
-    """What a `$TMPDIR` reference (_SCRATCH_REF) reads as: the run's own folder where the command sets it so, `/tmp`
-    where it may set it to something else (a `${TMPDIR:-x}` there `/`: it may be either, so a write there stays
-    refused), else its value, the default only where it is unset (or empty, for `:-`)."""
+def _scratch_value(m: re.Match, env, own_tmp: str, told: bool, value: str | None = "") -> str:
+    """What a `$TMPDIR` reference (_SCRATCH_REF) reads as: the run's own folder where the command sets it so, `value`
+    where it sets it to that (its value before, when `value` is ""), `/` where it sets it to a value the guard
+    cannot read (None) or the reference has a default (it may be either: a write there stays refused), `/tmp` where
+    it only names it, else its value, the default only where it is unset (or empty, for `:-`)."""
     if own_tmp:
         return own_tmp
+    if value is None or told and value and m.group(3) is not None:
+        return "/"
+    if value:
+        return value
     if told:
         return "/" if m.group(3) is not None else "/tmp"
     name = m.group(1) or m.group(4)
     if m.group(3) is None or (env.get(name) if m.group(2) else name in env):
         return str(env.get(name) or "/tmp")
-    return m.group(3) or m.group(0)
+    return m.group(3)
 
 RUN_ENV = "TTP_GLM_RUN"       # "1", or DEVICE for a run on a device task
 RUN_MARK = "glm_run.json"     # in the run folder: {"device", "gates", "plan", "cwd", "dirs"}, read where the variable is gone
@@ -236,6 +264,12 @@ def _own_tmp(tmp: str, run_dir: str) -> bool:
     from . import shorttmp
     return bool(tmp) and ((bool(run_dir) and os.path.normpath(tmp) == os.path.normpath(Path(run_dir) / SCRATCH))
                           or shorttmp.owned(tmp))
+
+
+def on_arm(run_dir) -> bool:
+    """Whether the run in `run_dir` is on the GLM arm as the daemon launched it (its MARK or RUN_MARK): only such a
+    run records refusals and is ended by one, so a probe that sets the variable in another run never ends that run."""
+    return bool(run_dir) and any((Path(run_dir) / m).exists() for m in (MARK, RUN_MARK))
 
 
 def mark(run_dir) -> None:
@@ -410,6 +444,8 @@ def refused(run_dir, why: str, kind: str = "guard", cfg: dict | None = None) -> 
     redirects switched off end the run as a hand-back to Opus (hit()). The refused command never runs either way."""
     why = (why or "").strip()
     rule, cls, instead = classify(why)
+    if not on_arm(run_dir):   # not a GLM-arm run (a probe setting the variable): refused, nothing recorded or ended
+        return f"refused, not run: {why}.\nInstead: {instead}."
     s = refusal_settings(cfg)
     n = len(refusals(run_dir)) + 1
     back = cls == HARMFUL or not s["redirect"] or n >= s["hand_back_after"]
@@ -698,11 +734,14 @@ def writes_outside(cmd: str, cwd: str, run_dir: str = "", env=None, inline: bool
     home = os.path.expanduser("~")
     roots, own = _roots(cwd, run_dir, _scratch(run_dir, e), e), _own_roots(cwd, run_dir, e)
     # $TMPDIR (TMP, TEMP) is read as its value in the run's environment, or as /tmp where the command sets it itself
-    told, own_set = _scratch_naming(cmd, run_dir, e)
+    told, own_set, values = _scratch_naming(cmd, run_dir, e)
     own_tmp = _scratch(run_dir, e) if own_set else ""   # `TMPDIR=<its own folder>`
-    paths = _SCRATCH_REF.sub(lambda m: _scratch_value(m, e, own_tmp, told), cmd)
-    got = [(p, why) for p, (cls, why) in sidefx.classify_paths(paths, home, cwd or os.getcwd(),
-                                                                run_dir).items()
+    found: dict = {}   # each value it may hold where the command sets it: before the set, and each it sets
+    for v in ["", *(values or [])] if values is not None else [None]:
+        paths = _SCRATCH_REF.sub(lambda m: _scratch_value(m, e, own_tmp, told, v), cmd)
+        for p, got in sidefx.classify_paths(paths, home, cwd or os.getcwd(), run_dir).items():
+            found.setdefault(p, got)
+    got = [(p, why) for p, (cls, why) in found.items()
            # shortcut: inline code naming a records path counts as a write even where it only reads it (a copy from
            # the live harness): it fails closed; `cp` from there passes
            if cls == "write" and (inline or "inline code" not in why or records_write(p, home)) \
@@ -816,6 +855,127 @@ def _readers_only(view: str) -> bool:
     return bool(segs) and not pathguard._substitutions(view) and "`" not in view and all(
         w and (w[0] in _READ_LINE or w[0] == "read" and "$" not in " ".join(w)) and not hook._runs_inside(" ".join(w))
         for w in segs)
+
+
+# A loop over literal words or a literal glob (`for f in a b`, `for f in dir/*.py`), and a variable set once to a
+# literal at the start of the command or of a loop body (`T=/abs/bin/ttp; $T ...`), read as the values they stand for:
+# each such value is a plain word (_SAFE_VALUE), at most _MAX_VALUES of them; a name the shell or a program reads
+# itself (PATH, IFS, LD_*, PYTHON*) is never one, nor one the body sets again (`read f`, `f=...`, `unset f`)
+_SAFE_VALUE = re.compile(r"[\w./@:+,=%-]+")
+_MAX_VALUES = 200
+_SPECIAL_NAME = re.compile(r"PATH|IFS|HOME|PWD|OLDPWD|CDPATH|ENV|BASH_ENV|SHELLOPTS|BASHOPTS|PS4|PROMPT_COMMAND|"
+                           r"GLOBIGNORE|TMOUT|LD_\w*|PYTHON\w*|TTP_\w*|GIT_\w*|SSH_\w*|[A-Z_]*(?:TOKEN|KEY|SECRET)\w*")
+_FOR_HEAD = re.compile(r"(?:^|(?<=[;&|({\n]))\s*for\s+([A-Za-z_]\w*)\s+in\s+([^;\n]*?)\s*(?:;|\n)\s*do\b")
+_SET_HEAD = re.compile(r"\s*([A-Za-z_]\w*)=(?:'([^']*)'|\"([^\"$`\\]*)\"|([^\s;&|<>()'\"`$\\]+))[ \t]*(?:;|\n|&&)")
+
+
+def _unquoted(text: str) -> tuple[str, str]:
+    """(`text` with quoted characters blanked, each character's quote state: ' ', "'" or '"')."""
+    out, state, q, i = [], [], "", 0
+    while i < len(text):
+        c = text[i]
+        if q != "'" and c == "\\" and i + 1 < len(text):
+            out += [" ", " "] if q else [c, text[i + 1]]
+            state += [q or " "] * 2
+            i += 2
+            continue
+        if not q and c in "'\"" or q == c:
+            q = "" if q else c
+            out.append(" ")
+            state.append("'" if c == "'" else '"')
+        else:
+            out.append(" " if q else c)
+            state.append(q or " ")
+        i += 1
+    return "".join(out), "".join(state)
+
+
+def _resets(name: str, plain: str) -> bool:
+    """Whether the unquoted shell text `plain` sets `name` (an assignment, read, unset, declare, printf -v, for) or
+    reads it in a form other than `$name` and `${name}` (`${name%x}`, `${!name}`)."""
+    n = re.escape(name)
+    return bool(re.search(rf"(?<![\w$]){n}\+?=|\b(?:read|unset|declare|typeset|local|export|readonly|mapfile|readarray)\b"
+                          rf"[^;&|\n]*(?<![\w$]){n}\b|printf\s+-v\s*{n}\b|\bfor\s+{n}\b|\$\{{!?{n}[^\w}}]|\$\{{!{n}",
+                          plain))
+
+
+def _put(text: str, state: str, name: str, value: str) -> str:
+    """`text` with each `$name` and `${name}` outside single quotes written as `value`."""
+    return re.sub(rf"\$(?:{re.escape(name)}(?!\w)|\{{{re.escape(name)}\}})",
+                  lambda m: m[0] if state[m.start()] == "'" else value, text)
+
+
+def _values(words: str, cwd: str, home: str) -> list[str] | None:
+    """The values a literal for-list stands for (globs matched in `cwd`), None for any other list."""
+    out: list[str] = []
+    for w in words.split():
+        w = w[1:-1] if len(w) > 1 and w[0] == w[-1] and w[0] in "'\"" and "*" not in w and "?" not in w else w
+        if w == "~" or w.startswith("~/"):
+            w = home + w[1:]
+        if re.fullmatch(r"[\w./@:+,=%*?-]+", w) and re.search(r"[*?]", w):
+            got = sorted(glob.glob(w if os.path.isabs(w) else os.path.join(cwd, w)))
+            if not got:
+                return None
+            w_list = [g if os.path.isabs(w) else os.path.relpath(g, cwd) for g in got]
+        else:
+            w_list = [w]
+        if not all(_SAFE_VALUE.fullmatch(v) for v in w_list):
+            return None
+        out += w_list
+        if len(out) > _MAX_VALUES:
+            return None
+    return out or None
+
+
+def _set_once(text: str, home: str) -> str:
+    """`text` with a variable set to a literal at its very start (`T=/x/bin/ttp; $T lock`) read as that value."""
+    m = _SET_HEAD.match(text)
+    if not m or _SPECIAL_NAME.fullmatch(m[1]):
+        return text
+    value = next(v for v in (m[2], m[3], m[4]) if v is not None)
+    value = home + value[1:] if m[4] is not None and value.startswith("~/") else value
+    rest = text[m.end():]
+    plain, state = _unquoted(rest)
+    if not _SAFE_VALUE.fullmatch(value) or _resets(m[1], plain):
+        return text
+    return text[:m.end()] + _set_once(_put(rest, state, m[1], value), home)
+
+
+def literal_view(cmd: str, cwd: str, env=None) -> str | None:
+    """`cmd` as the guards read it with its loop variables and once-set variables written as the literal values they
+    stand for (each loop over literal words or a literal glob written out, its body once per value, in braces so a
+    redirect or pipe after `done` still applies), None when there is nothing to write out. A heredoc, a loop over
+    anything else (`$(ls)`, `while read`) or a variable set again keeps the command as it is: what is left to read
+    stays an expansion, which the guards judge as before."""
+    if "<<" in cmd:
+        return None
+    e = os.environ if env is None else env
+    home = e.get("HOME") or os.path.expanduser("~")
+    text = _set_once(cmd, home)
+    for _ in range(8):   # nested loops, outermost first
+        plain, state = _unquoted(text)
+        m = _FOR_HEAD.search(plain)
+        while m and _SPECIAL_NAME.fullmatch(m[1]):
+            m = _FOR_HEAD.search(plain, m.end())
+        if not m:
+            break
+        depth, end = 1, None
+        for k in re.finditer(r"(?<![\w$-])(do|done)(?![\w-])", plain[m.end():]):
+            depth += 1 if k[1] == "do" else -1
+            if not depth:
+                end = m.end() + k.start()
+                break
+        values = _values(text[m.start(2):m.end(2)], cwd, home)
+        body = text[m.end():end] if end is not None else ""
+        bplain, bstate = _unquoted(body)
+        if not values or not body.strip() or _resets(m[1], bplain):
+            return None if text == cmd else text
+        start = m.start() + len(plain[m.start():]) - len(plain[m.start():].lstrip())
+        runs = [_set_once(_put(body, bstate, m[1], v).strip().rstrip(";").strip(), home) for v in values]
+        text = text[:start] + "{ " + "\n".join(runs) + "\n}" + text[end + 4:]
+        if len(text) > 200_000:
+            return None
+    return None if text == cmd else text
 
 
 def shell_refusal(cmd: str, cwd: str, run_dir: str = "", env=None, remote: bool = False, writes: bool = True,

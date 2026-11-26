@@ -1475,16 +1475,23 @@ def _refusal_command(payload: dict) -> str:
 
 
 def _proven(payload: dict) -> dict:
-    """The Bash call the guards judge: each inline Python snippet pyproof proves harmless written as `pass`
-    (the guards read words, and such a snippet's words do nothing); the call as is otherwise."""
+    """The Bash call the guards judge: its literal loops and once-set variables written out (glmguard.literal_view),
+    then each inline Python snippet pyproof proves harmless written as `pass` (the guards read words, and such a
+    snippet's words do nothing); the call as is otherwise."""
     args = payload.get("tool_input")
     if payload.get("tool_name") != "Bash" or not isinstance(args, dict) or not isinstance(args.get("command"), str):
         return payload
-    from . import pyproof
+    from . import glmguard, pyproof
+    cwd = str(payload.get("cwd") or os.getcwd())
+    try:   # loops over literal words or globs, and variables set once to a literal, read as their values
+        cmd = glmguard.literal_view(args["command"], cwd) or args["command"]
+    except Exception:
+        cmd = args["command"]
     try:
-        new = pyproof.rewrite(args["command"], str(payload.get("cwd") or os.getcwd()))
+        new = pyproof.rewrite(cmd, cwd)
     except Exception:   # no proof: the call as written
-        return payload
+        new = None
+    new = new or (cmd if cmd != args["command"] else None)
     return {**payload, "tool_input": {**args, "command": new}} if new else payload
 
 

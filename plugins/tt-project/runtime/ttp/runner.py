@@ -825,7 +825,7 @@ def supervise(run_dir: Path) -> int:
             why = stop_reason(run_dir)
             if why:
                 threading.Thread(target=stop, args=(why,), daemon=True).start()
-            elif glmguard.hit_reason(run_dir):   # a run on the GLM arm tried a refused side effect: ended, bounced to Opus
+            elif glmguard.on_arm(run_dir) and glmguard.hit_reason(run_dir):   # a run on the GLM arm tried a refused side effect: ended, bounced to Opus
                 threading.Thread(target=stop, args=("glm_guard",), daemon=True).start()
 
         errors = 0

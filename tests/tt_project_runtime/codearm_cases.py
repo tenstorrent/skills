@@ -357,9 +357,13 @@ def test_a_live_share_on_a_harness_that_is_not_guarded_is_zero_and_logged_once(e
 _GG_RUN_ENV = {"TTP_CODE_ARM_GUARD": "1"}
 
 
-def _gg_run(tmp_path):
+def _gg_run(tmp_path, arm=True):
+    """A worktree and a run folder; `arm`: the run is on the GLM arm as the daemon launched it (its marker)."""
+    from ttp import glmguard
     wt, rd = tmp_path / "wt", tmp_path / "run"
     wt.mkdir(), rd.mkdir()
+    if arm:
+        glmguard.mark(rd)
     return wt, rd
 
 
@@ -375,7 +379,7 @@ def test_glm_guard_is_on_for_an_arm_run_by_its_variable_or_its_marker_and_off_fo
     assert glmguard.arm_env(glm) == _GG_RUN_ENV
     for note in (None, {}, {codearm.KEY: {"arm": "glm", "run": "opus"}}, {codearm.KEY: {"arm": "sonnet", "run": "sonnet"}}):
         assert glmguard.arm_env(note) == {}, note
-    wt, rd = _gg_run(tmp_path)
+    wt, rd = _gg_run(tmp_path, arm=False)
     assert not glmguard.active({}) and not glmguard.active({"TTP_RUN_DIR": str(rd)})
     assert glmguard.active(_GG_RUN_ENV)
     glmguard.mark(rd)   # a run that unsets its variable is still guarded
@@ -396,12 +400,13 @@ def test_glm_guard_cli_gate_ends_the_run_as_a_bounce_to_opus_and_a_normal_run_is
     import json
     from ttp import cli, codearm, glmguard
     p = make(env)
-    wt, rd = _gg_run(tmp_path)
+    wt, rd = _gg_run(tmp_path, arm=False)
     monkeypatch.setenv("TTP_PROJECT", str(p.base))
     monkeypatch.setenv("TTP_RUN_DIR", str(rd))
     monkeypatch.delenv("TTP_CODE_ARM_GUARD", raising=False)
     cli.glm_gate(type("A", (), {"cmd": "notify", "action": ""})())   # not a GLM-arm run: nothing happens
     assert not (rd / glmguard.HIT).exists()
+    glmguard.mark(rd)
     monkeypatch.setenv("TTP_CODE_ARM_GUARD", "1")
     cli.glm_gate(type("A", (), {"cmd": "checks", "action": ""})())   # an allowed command passes
     with _pytest.raises(SystemExit) as e:
@@ -581,7 +586,7 @@ def test_a_glm_runs_plain_note_goes_only_to_its_own_task_log(env, monkeypatch, t
     assert "milestone: built the parser" in (rd / "progress.md").read_text()
     assert not (rd / glmguard.HIT).exists() and not (rd / "result.json").exists()
     assert p.db.one("SELECT COUNT(*) n FROM messages")["n"] == before, "no chat outbox row"
-    assert sorted(x.name for x in rd.iterdir()) == ["progress.md"], "no notify, escalation or peer note file"
+    assert sorted(x.name for x in rd.iterdir() if x.name != glmguard.MARK) == ["progress.md"], "no notify, escalation or peer note file"
     assert glmguard.shell_refusal('ttp note "update: ack" 2>&1', str(wt), str(rd), {"TTP_PROJECT": str(p.base),
                                                                                  **_GG_RUN_ENV}) is None
 
@@ -837,7 +842,7 @@ def test_glm_guard_lets_a_run_write_its_own_new_temp_entries_and_keeps_every_oth
     import os
     import tempfile
     from ttp import glmguard
-    wt, rd = _gg_run(tmp_path)
+    wt, rd = _gg_run(tmp_path, arm=False)
     proj = tmp_path / "proj"
     (proj / "tt-project" / "state" / "logs").mkdir(parents=True)
     e = {"TTP_PROJECT": str(proj), "TTP_RUN_DIR": str(rd), "TMPDIR": str(rd / "tmp"), **_GG_RUN_ENV}
@@ -883,7 +888,7 @@ def test_glm_guard_checks_write_nothing_and_only_the_live_hook_keeps_the_runs_ow
     keeps an allowed command's new entries, in its own run's folder; another run never sees them."""
     import os
     from ttp import glmguard, hook
-    wt, rd = _gg_run(tmp_path)
+    wt, rd = _gg_run(tmp_path, arm=False)
     rd2 = tmp_path / "run2"
     rd2.mkdir()
     u = f"/tmp/ttp-gg-{os.getpid()}-{tmp_path.name}-own"
@@ -1014,7 +1019,7 @@ def test_a_glm_code_or_harness_run_gets_the_hand_off_line_and_every_glm_run_the_
 
 def test_glm_guard_hook_denies_a_refused_call_and_ends_the_run_as_a_bounce(monkeypatch, tmp_path):
     import json
-    from ttp import codearm, hook
+    from ttp import codearm, glmguard, hook
     wt, rd = _gg_run(tmp_path)
     monkeypatch.setenv("TTP_RUN_DIR", str(rd))
     monkeypatch.setenv("TTP_PROJECT", str(tmp_path / "proj"))
@@ -1024,7 +1029,7 @@ def test_glm_guard_hook_denies_a_refused_call_and_ends_the_run_as_a_bounce(monke
     assert "goes back to Opus" in out["hookSpecificOutput"]["permissionDecisionReason"]
     assert codearm.bounce_reason(json.loads((rd / "result.json").read_text())).startswith("guard: ")
     monkeypatch.delenv("TTP_CODE_ARM_GUARD")
-    (rd / "glm_guard.json").unlink(), (rd / "result.json").unlink()
+    (rd / "glm_guard.json").unlink(), (rd / "result.json").unlink(), (rd / glmguard.MARK).unlink()
     hook.pre_tool_use({"tool_name": "Bash", "tool_input": {"command": "ttp task add x"}, "cwd": str(wt)})
     assert not (rd / "result.json").exists()   # not a GLM-arm run: the guard does not apply
 
@@ -1073,6 +1078,7 @@ def test_glm_guard_hands_back_a_harmful_attempt_at_once_and_off_restores_the_fir
     assert "goes back to Opus" in text and glmguard.hit_reason(rd).endswith("never `git push`")
     off = tmp_path / "off"
     off.mkdir()
+    glmguard.mark(off)
     assert "goes back to Opus" in glmguard.refused(off, "`ttp upstream` is not allowed",
                                                    cfg={"route": {"glm_refusals": {"redirect": False}}})
     assert glmguard.hit_reason(off)
@@ -1844,6 +1850,7 @@ def test_glm_share_counts_the_guards_fires_per_day(env, tmp_path):
                                         "guard_redirects": 0}
     r2 = tmp_path / "r2"
     r2.mkdir()
+    glmguard.mark(r2)
     glmguard.refused(r2, "`ttp upstream` is not allowed", cfg={})
     assert glmshare.guard_fires(r2)["guard_redirects"] == 1 and not glmshare.guard_fires(r2)["guard_bounces"], \
         "a redirect is counted apart: it is no bounce for the rollout judges"
@@ -2631,10 +2638,11 @@ def test_glm_guard_runs_dev_redirects_dry_pushes_reader_expansions_and_env_i_of_
     deny, _, _ = _gg9846_hook(monkeypatch, tmp_path)
     for cmd in ("ls x 2>/dev", "ls x 2>/dev/null >/dev/stderr", "git push --dry-run origin ttp/t1-x", "git push -n",
                 "env -i make test", "env -i PATH=/usr/bin git status", "for f in a b; do cat ${!f}; done",
-                "while read f; do ls ${!f} | head; done < list"):
-        assert not deny(cmd), cmd
+                "while read f; do ls ${!f} | head; done < list", "for f in a; do \"$f\" x; done"):
+        assert not deny(cmd), cmd   # a loop over a literal list names its program: `a x`
     for cmd in ("git push origin ttp/t1-x", "env -i bash -c 'ttp say hi'", "env -i FOO=1 /usr/bin/python3 x.py",
-                "env -i ttp checks", "env TTP_TASK=9 make", "for f in a; do \"$f\" x; done", "rm -rf /dev"):
+                "env -i ttp checks", "env TTP_TASK=9 make", "for f in $(cat l); do \"$f\" x; done",
+                "for f in rm; do \"$f\" -rf ~; done", "rm -rf /dev"):
         assert deny(cmd), cmd
 
 
@@ -2748,3 +2756,40 @@ def test_glm_guard_refuses_a_config_in_its_own_folders_that_runs_a_program_or_th
                 "ssh box-a 'ssh -F conf/ok box-b ls'"):
         assert glmguard.shell_refusal(cmd, str(wt), str(rd), e), cmd
     assert not glmguard.shell_refusal("ssh -F conf/ok box-a ls", str(wt), str(rd), e)
+
+
+def test_glm_guard_reads_a_self_set_tmpdir_as_its_value_and_keeps_the_runs_own(monkeypatch, tmp_path):
+    """cells: tmpdir_self_set, tmpdir_repro, tmpdir_default. A TMPDIR the command sets itself is that value, not
+    the run's own folder; a default counts only while the command leaves TMPDIR alone (review #9919)."""
+    deny, wt, rd = _gg9846_hook(monkeypatch, tmp_path)
+    for cmd in ('ls "$TMPDIR"; echo "TMPDIR=$TMPDIR"; mkdir -p "$TMPDIR"', 'mkdir -p "${TMPDIR:-/tmp/x}/a"',
+                'echo hi > "${TMPDIR:-}/note.txt"', 'export TMPDIR="$TMPDIR"; mkdir -p "$TMPDIR/a"'):
+        assert not deny(cmd), cmd
+    for cmd in ('TMPDIR=~; echo x >> "$TMPDIR/.bashrc"', 'export TMPDIR="$TMPDIR"; TMPDIR=~; echo x >> "$TMPDIR/.bashrc"',
+                'export TMPDIR=~; echo x >> "$TMPDIR/.bashrc"', 'TMPDIR=$(cat f); echo x >> "$TMPDIR/.bashrc"',
+                'TMPDIR=~ ; echo x >> "${TMPDIR:-/tmp/x}/.bashrc"'):
+        assert deny(cmd), cmd
+
+
+def test_glm_guard_judges_a_loop_body_with_its_literal_list_or_glob(monkeypatch, tmp_path):
+    """cells: loop_list, loop_glob. A loop variable over a literal list or glob stands for those values."""
+    deny, wt, rd = _gg9846_hook(monkeypatch, tmp_path)
+    for cmd in ('for f in a.py b.py; do python3 -m py_compile "$f"; done', 'for f in src/*.py; do wc -l "$f"; done',
+                'for d in x y; do mkdir -p "$TMPDIR/$d"; done'):
+        assert not deny(cmd), cmd
+    ssh = "." + "ssh"
+    for cmd in (f'for f in ~/{ssh}/*; do cat "$f"; done', 'for f in ~ /etc; do rm -rf "$f"; done',
+                'for f in bash; do echo "tt-smi -r 0" | "$f"; done'):
+        assert deny(cmd), cmd
+
+
+def test_a_refusal_off_the_glm_arm_is_neither_recorded_nor_ends_the_run(tmp_path):
+    """cells: guard_off_arm. Only a run on the GLM arm (its marker) records a guard refusal and ends as a bounce."""
+    from ttp import glmguard
+    wt, rd = _gg_run(tmp_path, arm=False)
+    text = glmguard.refused(rd, "`ttp upstream` is not allowed", cfg={})
+    assert "not run" in text and not glmguard.hit_reason(rd)
+    assert not (rd / glmguard.HIT).exists() and not (rd / glmguard.REFUSALS).exists()
+    glmguard.mark(rd)
+    off = {"route": {"glm_refusals": {"redirect": False}}}
+    assert "goes back to Opus" in glmguard.refused(rd, "`ttp upstream` is not allowed", cfg=off) and glmguard.hit_reason(rd)

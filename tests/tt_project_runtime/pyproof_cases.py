@@ -8,6 +8,8 @@ _SSH = "." + "ssh"
 
 _PROVEN = [
     "import json,sys; d=json.load(sys.stdin); print(len(d))",
+    "p='x'+'y'\nopen(p)",                                       # a path folded from literal parts
+    "from pathlib import Path\nPath('x').write_text('y')",      # a write inside the worktree
     "import json; print(json.load(open('state/x.json'))['a'])",
     "from pathlib import Path\nfor l in Path('a.txt').read_text().splitlines(): print(l)",
     "import re,collections\nc=collections.Counter()\nprint(c.most_common(3))",
@@ -26,13 +28,13 @@ _UNPROVEN = [
     "open('/etc/passwd','w')", f"open('/x/{_SSH}/id_rsa').read()", "open('/proc/self/environ').read()",
     f"import os\nopen(os.path.expanduser('~/{_SSH}/id_rsa'))", f"open('~/{_SSH}/id_rsa').read()",
     f"from pathlib import Path\np=Path.home()/'{_SSH}'/'id_rsa'\nprint(p.read_text())",
-    "p='x'+'y'\nopen(p)", "import sys\nopen(sys.argv[1])",                     # computed paths
+    "p=input()+'y'\nopen(p)", "import sys\nopen(sys.argv[1])",                     # computed paths
     "from pathlib import Path\nimport sys\nPath(sys.argv[1]).read_text()",
     "import json; getattr(json,'loads')", "x=().__class__", "f=open; f('a','w')",  # getattr and alias tricks
     "import os as o; o=1", "from os import system", "import operator; operator.attrgetter('a')",
     "'{0.__globals__}'.format(print)", "fmt='{}'\nfmt.format(1)",
     "import functools\ndef g(x: 'evil') -> None: pass",
-    "from pathlib import Path\nPath('x').write_text('y')", "from pathlib import Path\nPath('a').replace('b')",
+    "from pathlib import Path\nPath('a').replace('b')",
     "import time; time.sleep(100)", "import socket", "import ctypes", "import importlib", "import os; os.environ['A']",
     "not python (",
     # modules under other names, frame objects, rebound literal names, keyword modes, listings
@@ -269,3 +271,37 @@ def test_the_hook_refuses_a_store_naming_snippet_beside_a_module_named_like_one_
         (tmp_path / planted).write_text("x")
         assert _bash_why(tmp_path, cmd), planted
         (tmp_path / planted).unlink()
+
+
+def test_pyproof_judges_each_python_of_a_chain_with_what_runs_before_or_beside_it(tmp_path, monkeypatch):
+    """cells: chain_pieces. Text after a snippet's pipeline cannot change which modules it imports."""
+    from ttp import pyproof
+    _plain_python(monkeypatch)
+    code = "import json; print(1)"
+    for cmd in (f"python3 -c '{code}' && PYTHONPATH=$PWD make", f"python3 -c '{code}'; echo \"$HOME\" | wc -c",
+                f"python3 -c '{code}' | wc -l; A=1; echo \"$A\""):
+        out = pyproof.rewrite(cmd, str(tmp_path))
+        assert out and "-c 'pass'" in out, cmd
+    for cmd in (f"PYTHONPATH=$X python3 -c '{code}'", f"cd \"$D\" && python3 -c '{code}' && ls",
+                f"export PYTHONPATH=x; python3 -c '{code}' | wc -l", f"python3 -c '{code}' | PYTHONPATH=x python3 -"):
+        assert pyproof.rewrite(cmd, str(tmp_path)) is None, cmd
+
+
+def test_pyproof_passes_the_own_runtime_and_judges_computed_paths_only_under_the_run_time_judge(tmp_path, monkeypatch):
+    """cells: own_syspath, own_pythonpath, audited_write. The plugin's own runtime on sys.path or PYTHONPATH is no
+    harm; a computed path is left to pyaudit when it runs, else stays unproven; secrets and stores stay refused."""
+    import os
+    from ttp import hook, pyproof
+    _plain_python(monkeypatch)
+    rt = os.path.dirname(os.path.dirname(os.path.realpath(hook.__file__)))
+    own = f"import sys\nsys.path.insert(0, '{rt}')\nfrom ttp import hook\nprint(hook._pieces('a; b'))"
+    assert pyproof.harmless(own, str(tmp_path))
+    assert pyproof.rewrite(f"PYTHONPATH={rt} python3 -c \"from ttp import pathguard; print(1)\"", str(tmp_path))
+    computed = "import sys\np=sys.argv[1]\nopen(p,'w').write('x')"
+    assert not pyproof.harmless(computed, str(tmp_path))
+    assert pyproof.harmless(computed, str(tmp_path), audited=True)
+    assert pyproof.harmless("from pathlib import Path\nimport sys\nPath(sys.argv[1]).write_text('x')", str(tmp_path),
+                            audited=True)
+    for code in (f"open('~/{_SSH}/id_rsa').read()", "exec(input())", "eval(open('x').read())",
+                 "import os\nos.environ['TMPDIR']='/home'", "import sys\nexec(sys.argv[1])"):
+        assert not pyproof.harmless(code, str(tmp_path), audited=True), code
