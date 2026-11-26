@@ -1496,11 +1496,12 @@ def _proven(payload: dict) -> dict:
     return {**payload, "tool_input": {**args, "command": new}} if new else payload
 
 
-def _staged(payload: dict, judged: dict) -> dict | None:
+def _staged(payload: dict, judged: dict, made: list[str]) -> dict | None:
     """The hook's reply for a Bash call of a GLM run the guards refuse only for an expansion they cannot read: each
     `$(...)` the rules pass runs alone first and its output is written in (glmguard.staged_parts, written_in); the
     literal command is judged by every rule and, if it passes, runs as judged; a harmful one is refused
-    with its reason. None when it cannot be staged: the up-front refusal stands."""
+    with its reason. None when it cannot be staged: the up-front refusal stands. The temp entries a body or the literal
+    command makes go to `made` (a body's are kept before it runs: it runs before pre_tool_use's own keep_tmp)."""
     from . import glmguard
     args, cmd = payload.get("tool_input"), (judged.get("tool_input") or {}).get("command")
     cwd = str(payload.get("cwd") or os.getcwd())
@@ -1514,9 +1515,11 @@ def _staged(payload: dict, judged: dict) -> dict | None:
     outputs, left, run_dir = [], 10.0, os.environ.get("TTP_RUN_DIR", "")
     for *_, body, _, there in parts:   # judged and run with the literal `cd` before it, as one command
         body = f"cd {shlex.quote(there)} && {{ {body}\n}}" if there else body
-        out, _ = _pre_tool_use(_proven({**payload, "tool_input": {**args, "command": body}}))
+        body_made: list[str] = []
+        out, _ = _pre_tool_use(_proven({**payload, "tool_input": {**args, "command": body}}), body_made)
         if ((out or {}).get("hookSpecificOutput") or {}).get("permissionDecision") == "deny":
             return out
+        glmguard.keep_tmp(body_made)
         start = time.monotonic()   # one budget well under the hook's own limit; the whole group ends with it
         try:
             # own session: the group is killed whole (killpg) when the 10 s budget runs out
@@ -1538,7 +1541,7 @@ def _staged(payload: dict, judged: dict) -> dict | None:
     staged = _proven({**payload, "tool_input": {**args, "command": new}})
     if glmguard.HIDDEN_WHY in (glmguard.shell_refusal(staged["tool_input"]["command"], cwd, run_dir) or ""):
         return None   # still unreadable once expanded: the up-front refusal stands, recorded once
-    out, _ = _pre_tool_use(staged)
+    out, _ = _pre_tool_use(staged, made)
     spec = (out or {}).get("hookSpecificOutput") or {}
     if spec.get("permissionDecision") == "deny" or spec.get("updatedInput"):
         return out
@@ -1555,7 +1558,7 @@ def pre_tool_use(payload: dict, stage: str = "before") -> tuple[dict | None, Non
     _refusal.update(logged=False, kind="worker_role")
     made: list[str] = []
     judged = _proven(payload)
-    out = _staged(payload, judged) if payload.get("tool_name") == "Bash" else None
+    out = _staged(payload, judged, made) if payload.get("tool_name") == "Bash" else None
     out, _ = (out, None) if out else _pre_tool_use(judged, made)
     spec = (out or {}).get("hookSpecificOutput") or {}
     if spec.get("permissionDecision") not in ("deny", "ask"):

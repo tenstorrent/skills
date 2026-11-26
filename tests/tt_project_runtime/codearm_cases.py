@@ -2899,3 +2899,21 @@ def test_a_glm_run_stops_a_hidden_command_once_its_expansion_shows_harm(cmd, har
     kind, _, why = _glm_staged(monkeypatch, tmp_path, cmd, run=False)
     assert kind == "deny" and "not-a-real-secret" not in why, why
     assert harm is None or (harm in why.lower() and glmguard.HIDDEN_WHY not in why), why
+
+
+@_pytest.mark.parametrize("cmd", [
+    "P=$(command -v mkdir); $P {u}; echo {u}",                                # the literal command makes the entry
+    "D=$(mktemp -d); $(command -v touch) \"$D/x\"; echo \"$D\""])             # a body the hook runs makes it
+def test_a_staged_command_records_the_temp_entries_it_makes_as_the_runs_own(cmd, monkeypatch, tmp_path):
+    import os
+    import shutil
+    from ttp import hook
+    u, entry = f"/tmp/ttp-st-{os.getpid()}-{tmp_path.name}", ""
+    try:
+        kind, rc, text = _glm_staged(monkeypatch, tmp_path, cmd.format(u=u))
+        entry = text.split()[-1]
+        assert kind == "staged" and rc == 0 and entry.startswith("/tmp/"), text
+        rm = hook.pre_tool_use({"tool_name": "Bash", "tool_input": {"command": f"rm -rf {entry}"}, "cwd": str(tmp_path / "wt")})[0]
+        assert ((rm or {}).get("hookSpecificOutput") or {}).get("permissionDecision") != "deny", rm
+    finally:
+        shutil.rmtree(entry or u, ignore_errors=True)
