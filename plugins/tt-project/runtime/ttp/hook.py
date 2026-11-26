@@ -88,6 +88,7 @@ import os
 import posixpath
 import re
 import shlex
+import signal
 import subprocess
 import sys
 import time
@@ -1495,6 +1496,55 @@ def _proven(payload: dict) -> dict:
     return {**payload, "tool_input": {**args, "command": new}} if new else payload
 
 
+def _staged(payload: dict, judged: dict) -> dict | None:
+    """The hook's reply for a Bash call of a GLM run the guards refuse only for an expansion they cannot read: each
+    `$(...)` the rules pass runs alone first and its output is written in (glmguard.staged_parts, written_in); the
+    literal command is judged by every rule and, if it passes, runs as judged; a harmful one is refused
+    with its reason. None when it cannot be staged: the up-front refusal stands."""
+    from . import glmguard
+    args, cmd = payload.get("tool_input"), (judged.get("tool_input") or {}).get("command")
+    cwd = str(payload.get("cwd") or os.getcwd())
+    if glmguard.glm_run() is None or not isinstance(args, dict) or not isinstance(cmd, str) or glmguard.HIDDEN_WHY not in (
+            glmguard.shell_refusal(cmd, cwd, os.environ.get("TTP_RUN_DIR", "")) or ""):
+        return None
+    if (parts := glmguard.staged_parts(args["command"])) is not None:   # as written: a loop runs it once
+        cmd = args["command"]
+    elif (parts := glmguard.staged_parts(cmd)) is None:   # else with a literal loop written out (_proven)
+        return None
+    outputs, left, run_dir = [], 10.0, os.environ.get("TTP_RUN_DIR", "")
+    for *_, body, _, there in parts:   # judged and run with the literal `cd` before it, as one command
+        body = f"cd {shlex.quote(there)} && {{ {body}\n}}" if there else body
+        out, _ = _pre_tool_use(_proven({**payload, "tool_input": {**args, "command": body}}))
+        if ((out or {}).get("hookSpecificOutput") or {}).get("permissionDecision") == "deny":
+            return out
+        start = time.monotonic()   # one budget well under the hook's own limit; the whole group ends with it
+        try:
+            proc = subprocess.Popen(["bash", "-c", body], cwd=cwd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                                    stderr=subprocess.DEVNULL, text=True, start_new_session=True)
+        except OSError:
+            return None
+        try:
+            outputs.append(proc.communicate(timeout=left)[0])
+        except subprocess.TimeoutExpired:
+            os.killpg(proc.pid, signal.SIGKILL)
+            proc.communicate()
+            return _deny(glmguard.refused(run_dir, "an expansion the guard must run first took over 10 s"))
+        left -= time.monotonic() - start
+    if (new := glmguard.written_in(cmd, parts, outputs)) == cmd:
+        return None
+    if why := glmguard.secret_in("\n".join([*outputs, new])):
+        return _deny(glmguard.refused(run_dir, f"{why}, which it may print"))
+    staged = _proven({**payload, "tool_input": {**args, "command": new}})
+    if glmguard.HIDDEN_WHY in (glmguard.shell_refusal(staged["tool_input"]["command"], cwd, run_dir) or ""):
+        return None   # still unreadable once expanded: the up-front refusal stands, recorded once
+    out, _ = _pre_tool_use(staged)
+    spec = (out or {}).get("hookSpecificOutput") or {}
+    if spec.get("permissionDecision") == "deny" or spec.get("updatedInput"):
+        return out
+    return {"hookSpecificOutput": {
+        "hookEventName": "PreToolUse", "permissionDecision": "allow", "updatedInput": staged["tool_input"]}}
+
+
 def pre_tool_use(payload: dict, stage: str = "before") -> tuple[dict | None, None]:
     """The tool hook's verdict on one call; a refusal no guard logged itself is logged to the run's
     refusals.jsonl as worker_role or provenance, so localfault counts it apart from the resource."""
@@ -1503,7 +1553,9 @@ def pre_tool_use(payload: dict, stage: str = "before") -> tuple[dict | None, Non
     CALL.update(id=str(payload.get("tool_use_id") or payload.get("call_id") or payload.get("id") or ""), stage=stage)
     _refusal.update(logged=False, kind="worker_role")
     made: list[str] = []
-    out, _ = _pre_tool_use(_proven(payload), made)
+    judged = _proven(payload)
+    out = _staged(payload, judged) if payload.get("tool_name") == "Bash" else None
+    out, _ = (out, None) if out else _pre_tool_use(judged, made)
     spec = (out or {}).get("hookSpecificOutput") or {}
     if spec.get("permissionDecision") not in ("deny", "ask"):
         from . import glmguard

@@ -1037,6 +1037,78 @@ def literal_view(cmd: str, cwd: str, env=None) -> str | None:
     return None if text == cmd else text
 
 
+# The staged check: a command refused only for a program name, target or `eval` it cannot read
+# (HIDDEN) is judged once the expansion is known. The hook judges each `$(...)` (staged_parts) as a command, runs it
+# alone, writes its output in as a literal and writes out each `eval` of a literal string (written_in), then judges and
+# runs that literal command: what runs is what the same rules passed, and a refusal names the harm.
+_CD = re.compile(r"(?:^|(?<=[;&|(\n{]))\s*cd\s+('[^']*'|\"[^\"`]*\"|[^\s;&|()'\"`]+)\s*(?=[;&|)\n]|$)")
+_BEFORE = re.compile(r"\b(?:cd|pushd|popd|source|eval|exec)\b|>(?!&|\s*/dev/null)|`|<<")
+_EVAL_LIT = re.compile(rf"""(?m)((?:^\s*|{_CMD_AT}))eval((?:[ \t]+(?:'[^']*'|"[^"$`\\]*"|[^\s;&|()<>'"$`\\#]+))+)"""
+                       r"""(?=[ \t]*(?:[;&|)\n]|$))""")
+SECRET_OUT_WHY = "a command known only once expanded names or holds a token, key or secret variable"
+
+
+def staged_parts(cmd: str) -> list[tuple[int, int, str, bool, str]] | None:
+    """Each `$(...)` of `cmd` outside single quotes as (start, end, body, quoted, the folder it runs in after each
+    literal `cd` before it), or None when one cannot run ahead of
+    the command alone: it nests, a backtick or heredoc is in the way, it names a variable the command sets or that is
+    unset, or a step before it changes what it reads (any other cd, a write: sidefx.WRITE_RE, a redirect, eval)."""
+    from . import sidefx
+    if "<<" in cmd:   # a heredoc's own quoting decides what expands in it
+        return None
+    out, i, sq, dq = [], 0, False, False
+    while i < len(cmd):
+        c = cmd[i]
+        if c == "\\" and not sq:
+            i += 2
+            continue
+        if c == "'" and not dq:
+            sq = not sq
+        elif c == '"' and not sq:
+            dq = not dq
+        elif c == "`" and not sq:
+            return None
+        elif cmd.startswith("$(", i) and not sq and not cmd.startswith("$((", i):
+            j, depth, q = i + 2, 1, ""
+            while j < len(cmd) and depth:
+                ch = cmd[j]
+                q = ("" if ch == q else q) if q else (ch if ch in "'\"" else "")
+                depth += 0 if q or ch in "'\"" else (ch == "(") - (ch == ")")
+                j += 1
+            body, before = cmd[i + 2:j - 1], cmd[:i]
+            earlier = before[:max(before.rfind(c) for c in ";&|\n") + 1]   # steps run before this one
+            there = [os.path.expanduser(os.path.expandvars(d.strip("\"'"))) for d in _CD.findall(earlier)]
+            earlier = _CD.sub(" ", earlier)
+            if depth or "$(" in body or "`" in body or "$" in "".join(there) or _BEFORE.search(earlier) or sidefx.WRITE_RE.search(earlier) or any(
+                    n not in os.environ or re.search(rf"\b{n}=|\b(?:for|read)\s+(?:-\w+\s+)*{n}\b", cmd)
+                    for n in re.findall(r"\$\{?([A-Za-z_]\w*)", body)):
+                return None
+            out.append((i, j, body, dq or bool(re.search(r"(?:^|[\s;&|(])[A-Za-z_]\w*=$", before)), os.path.join("", *there)))
+            i = j
+            continue
+        i += 1
+    return out
+
+
+def written_in(cmd: str, parts, outputs: list[str]) -> str:
+    """`cmd` with each part's output written in as bash would expand it, quoted, and each `eval` of a literal string
+    written out as a `{ ...; }` group in the same shell."""
+    import shlex
+    for (start, end, _, quoted, _), text in reversed(list(zip(parts, outputs))):
+        text = text.rstrip("\n")
+        lit = '"%s"' % re.sub(r'([\\"$`])', r"\\\1", text) if quoted else " ".join(map(shlex.quote, text.split()))
+        cmd = cmd[:start] + (lit[1:-1] if quoted and cmd[:start].count('"') % 2 else lit) + cmd[end:]
+    return _EVAL_LIT.sub(lambda m: f"{m[1]}{{ {' '.join(shlex.split(m[2]))}\n}}", cmd)
+
+
+def secret_in(text: str) -> str | None:
+    """SECRET_OUT_WHY when a staged command's `text` names or holds the value of a token, key, secret or password
+    variable, else None."""
+    from .untrusted import _CRED_VAR_RE
+    return SECRET_OUT_WHY if any(_CRED_VAR_RE.search(n) for n in re.findall(r"\$\{?(\w+)", text)) or any(
+        len(v) >= 8 and v in text for n, v in os.environ.items() if _CRED_VAR_RE.search(n)) else None
+
+
 def shell_refusal(cmd: str, cwd: str, run_dir: str = "", env=None, remote: bool = False, writes: bool = True,
                   power: bool = True, services: bool = True, made: list[str] | None = None) -> str | None:
     """Why a shell command of a GLM-arm run is refused (before it runs), else None. The denylist: writes or

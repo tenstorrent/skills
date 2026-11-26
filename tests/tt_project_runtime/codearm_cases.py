@@ -2851,3 +2851,51 @@ def test_a_refusal_off_the_glm_arm_is_neither_recorded_nor_ends_the_run(tmp_path
     glmguard.mark(rd)
     off = {"route": {"glm_refusals": {"redirect": False}}}
     assert "goes back to Opus" in glmguard.refused(rd, "`ttp upstream` is not allowed", cfg=off) and glmguard.hit_reason(rd)
+
+
+
+def _glm_staged(monkeypatch, tmp_path, cmd, run=True):
+    """The hook's verdict on `cmd` in a GLM run and, if `run` and it passes, the command it lets run, run in bash:
+    (hook decision, exit code, output); a refusal is never run."""
+    import subprocess
+    from ttp import glmguard, hook
+    wt, rd = _glm_run_env(monkeypatch, tmp_path)
+    glmguard.mark_run(rd, False, cwd=str(wt))
+    out, _ = hook.pre_tool_use({"tool_name": "Bash", "tool_input": {"command": cmd}, "cwd": str(wt)})
+    spec = (out or {}).get("hookSpecificOutput") or {}
+    if spec.get("permissionDecision") == "deny" or not run:
+        return spec.get("permissionDecision"), None, str(spec.get("permissionDecisionReason"))
+    staged = (spec.get("updatedInput") or {}).get("command", cmd)
+    p = subprocess.run(["bash", "-c", staged], cwd=wt, capture_output=True, text=True, timeout=120)
+    return ("staged" if staged != cmd else "plain"), p.returncode, p.stdout + p.stderr
+
+
+@_pytest.mark.parametrize("cmd,seen", [
+    ("P=$(command -v touch); $P ok.txt && ls ok.txt", "ok.txt"),                    # a program name from $(...)
+    ("eval \"$(printf 'echo hi > out.txt')\"; cat out.txt", "hi"),                   # an eval of a non-literal
+    ("for w in a b; do $(printf touch) \"$PWD/out-$w.txt\"; done; ls out-b.txt", "out-b.txt")])
+def test_a_glm_run_runs_a_hidden_program_name_or_eval_once_its_expansion_is_judged(cmd, seen, monkeypatch, tmp_path):
+    from ttp import glmguard
+    assert glmguard.HIDDEN_WHY in glmguard.shell_refusal(cmd, str(tmp_path), "")   # refused up front before
+    kind, rc, text = _glm_staged(monkeypatch, tmp_path, cmd)
+    assert kind == "staged" and rc == 0 and seen in text, text
+
+
+@_pytest.mark.parametrize("cmd,harm", [
+    ("eval \"$(printf 'cat ~/.s%s/id_%s' sh rsa)\"", "credential"),    # a credential read, known only once expanded
+    ("P=$(printf cat); $P ~/$(printf .s)sh/id_$(printf rs)a", "credential"),
+    ("P=$(printf touch); $P ../proj-b/x", "outside"),                    # another project's folder
+    ("T=$(printf /bin/touch); $T ../proj-b/x", "outside"),               # a program named by its path
+    ("unset -f touch; P=$(printf touch); $P ../proj-b/x", None),         # still refused up front
+    ("cd ..; P=$(rm -rf proj-b/src; printf ls); $P", "outside"),       # a body judged where it runs
+    ("P=$(sleep 30; printf rm); $P -rf ../proj-b", "10 s"),             # an expansion that outlasts the hook
+    ("P=$(printf echo); $P \"$DOCKER_AUTH_CONFIG\"", "secret"),          # any credential-like variable name
+    ("eval \"$(printf 'rm -rf /srv/x')\"", ""),
+    ("P=$(printf echo); $P \"$GITHUB_TOKEN\"", "secret"),               # a secret printed
+    ("echo $(printenv GITHUB_TOKEN) | $(printf cat)", "secret")])
+def test_a_glm_run_stops_a_hidden_command_once_its_expansion_shows_harm(cmd, harm, monkeypatch, tmp_path):
+    from ttp import glmguard
+    monkeypatch.setenv("GITHUB_TOKEN", "not-a-real-secret")
+    kind, _, why = _glm_staged(monkeypatch, tmp_path, cmd, run=False)
+    assert kind == "deny" and "not-a-real-secret" not in why, why
+    assert harm is None or (harm in why.lower() and glmguard.HIDDEN_WHY not in why), why
