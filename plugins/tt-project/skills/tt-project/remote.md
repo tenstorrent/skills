@@ -66,7 +66,9 @@
   (the one this computer reaches that target through): a forward whose target does not answer is
   then left alone the same way. An entry with no target whose port still connects without
   answering after one restart is not restarted again until its check changes or the network
-  changes on macOS (logged once).
+  changes on macOS (logged once). A destination whose name does not resolve from this computer
+  is never probed at all, so a probe can never hang on its lookup; it is left alone and logged
+  once like a target that is off.
   Known limits: the watch does not detect a wake (a sleep longer than the 60 s backoff ends it, so
   the first pass after waking checks every box); an entry with no target is healed best effort;
   boxes are checked one after another within a pass; a listener whose owner `ss` hides is never
