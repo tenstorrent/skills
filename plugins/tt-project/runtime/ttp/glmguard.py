@@ -153,19 +153,40 @@ HANDOFF_LINE = ("Before you hand off done, check your own diff as the independen
                 " see each new or changed test fail, then restore it; assert behaviour, not message wording; leave no"
                 " unused test setup. If the diff stays large, add a `why this size:` line to your summary. Every claim"
                 " in your summary cites the command or file that shows it.")
-_SCRATCH_REF = re.compile(r"\$(?:\{(TMPDIR|TMP|TEMP)\}|(TMPDIR|TMP|TEMP)(?!\w))")
+# `$TMPDIR`, `${TMPDIR}` or `${TMPDIR:-<default>}` (`:=`, `-`, `=`): the default is its value only where it is unset
+_SCRATCH_REF = re.compile(r"\$(?:\{(TMPDIR|TMP|TEMP)(?:(:?)[-=]([^{}$`\"']*))?\}|(TMPDIR|TMP|TEMP)(?!\w))")
 _SCRATCH_SET = re.compile(r"(?<![\w${])(?:TMPDIR|TMP|TEMP)(?!\w)")   # the command names one itself (sets it)
 _SCRATCH_OWN = re.compile(r"(?<![\w${])(?:TMPDIR|TMP|TEMP)=([\"']?)([^\s;&|\"'`()]+)\1(?=[\s;&|]|$)")   # `TMPDIR=<value>`
+# A naming that keeps the value: `TMPDIR="$TMPDIR"` or `TMPDIR="${TMPDIR:-x}"` (an echo of it too) while it is set, and
+# a Python read of it
+_SCRATCH_KEEP = re.compile(r"(?<![\w${])(\"?)(TMPDIR|TMP|TEMP)=(\"?)\$(?:\{\2(?::?[-=][^{}$`\"']*)?\}|\2(?!\w))\3\1"
+                           r"(?=[\s;&|)]|$)|\b(?:environ\[|environ\.get\(|getenv\()[\"'](TMPDIR|TMP|TEMP)[\"'](?!\]\s*\S?=(?!=))")
 
 
-def _sets_own_scratch(cmd: str, run_dir: str) -> bool:
-    """Whether every naming of TMPDIR (TMP, TEMP) in `cmd` is `TMPDIR=<the run's own scratch folder>` (the folder
-    itself or `$TTP_RUN_DIR/tmp`): that sets nothing but what the run already has, so `$TMPDIR` stays its value."""
-    named = [m for m in _SCRATCH_SET.finditer(cmd)]
-    own = [m for m in _SCRATCH_OWN.finditer(cmd)
-           if _own_tmp(m.group(2).replace("${TTP_RUN_DIR}", run_dir).replace("$TTP_RUN_DIR", run_dir), run_dir)]
-    return bool(named) and len(own) == len(named)
+def _scratch_naming(cmd: str, run_dir: str, env) -> tuple[bool, bool]:
+    """(told, own) for the namings of TMPDIR (TMP, TEMP) in `cmd`: `told` where one may set it to something else,
+    `own` where one sets it to the run's own scratch folder (the folder itself or `$TTP_RUN_DIR/tmp`) and every other
+    keeps its value (_SCRATCH_KEEP)."""
+    own = {m.start() for m in _SCRATCH_OWN.finditer(cmd)
+           if _own_tmp(m.group(2).replace("${TTP_RUN_DIR}", run_dir).replace("$TTP_RUN_DIR", run_dir), run_dir)}
+    keep = {m.start(4) if m.group(4) else m.start(2) for m in _SCRATCH_KEEP.finditer(cmd)
+            if m.group(4) or env.get(m.group(2))}
+    told = any(m.start() not in own | keep for m in _SCRATCH_SET.finditer(cmd))
+    return told, bool(own) and not told
 
+
+def _scratch_value(m: re.Match, env, own_tmp: str, told: bool) -> str:
+    """What a `$TMPDIR` reference (_SCRATCH_REF) reads as: the run's own folder where the command sets it so, `/tmp`
+    where it may set it to something else (a `${TMPDIR:-x}` there `/`: it may be either, so a write there stays
+    refused), else its value, the default only where it is unset (or empty, for `:-`)."""
+    if own_tmp:
+        return own_tmp
+    if told:
+        return "/" if m.group(3) is not None else "/tmp"
+    name = m.group(1) or m.group(4)
+    if m.group(3) is None or (env.get(name) if m.group(2) else name in env):
+        return str(env.get(name) or "/tmp")
+    return m.group(3) or m.group(0)
 
 RUN_ENV = "TTP_GLM_RUN"       # "1", or DEVICE for a run on a device task
 RUN_MARK = "glm_run.json"     # in the run folder: {"device", "gates", "plan", "cwd", "dirs"}, read where the variable is gone
@@ -677,9 +698,9 @@ def writes_outside(cmd: str, cwd: str, run_dir: str = "", env=None, inline: bool
     home = os.path.expanduser("~")
     roots, own = _roots(cwd, run_dir, _scratch(run_dir, e), e), _own_roots(cwd, run_dir, e)
     # $TMPDIR (TMP, TEMP) is read as its value in the run's environment, or as /tmp where the command sets it itself
-    told = bool(_SCRATCH_SET.search(cmd))
-    own_tmp = _scratch(run_dir, e) if told and _sets_own_scratch(cmd, run_dir) else ""   # `TMPDIR=<its own folder>`
-    paths = _SCRATCH_REF.sub(lambda m: own_tmp or ("/tmp" if told else str(e.get(m.group(1) or m.group(2)) or "/tmp")), cmd)
+    told, own_set = _scratch_naming(cmd, run_dir, e)
+    own_tmp = _scratch(run_dir, e) if own_set else ""   # `TMPDIR=<its own folder>`
+    paths = _SCRATCH_REF.sub(lambda m: _scratch_value(m, e, own_tmp, told), cmd)
     got = [(p, why) for p, (cls, why) in sidefx.classify_paths(paths, home, cwd or os.getcwd(),
                                                                 run_dir).items()
            # shortcut: inline code naming a records path counts as a write even where it only reads it (a copy from

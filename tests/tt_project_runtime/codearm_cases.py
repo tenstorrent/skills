@@ -847,7 +847,7 @@ def test_glm_guard_lets_a_run_write_its_own_new_temp_entries_and_keeps_every_oth
         made: list[str] = []
         for c in (f"mkdir -p {u}-metal && tar -xf dist/a.tar -C {u}-metal", f"rg -n x src > {u}.out 2>&1",
                   f"mkdir -p {u}-rc && cd {u}-rc && python3 - <<'PY'\nprint(1)\nPY",
-                  f'echo x > "$TMPDIR/{u[5:]}.sh"; echo "TMPDIR=$TMPDIR"'):
+                  f'TMPDIR=/tmp; echo x > "$TMPDIR/{u[5:]}.sh"'):
             assert ask(c, made=made) is None, c
         assert set(made) == {f"{u}-metal", f"{u}.out", f"{u}-rc", f"{u}.sh"} and not os.listdir(rd), "a check writes nothing"
         monkeypatch.setenv("TTP_RUN_DIR", str(rd))
@@ -955,6 +955,27 @@ def test_glm_guard_still_refuses_writes_to_tmp_and_to_a_tmpdir_the_command_set_i
     assert all(glmguard.shell_refusal(c, str(wt), str(rd), other) for c in ("cp a $TMPDIR/x", "echo > $TMP/x",
                                                                           "tee ${TEMP}/x"))
 
+
+def test_glm_guard_reads_a_naming_that_keeps_tmpdir_as_no_set(tmp_path, monkeypatch):
+    """cell scratch_keep: echoing `TMPDIR=$TMPDIR`, `TMPDIR="${TMPDIR:-x}"` and a Python read leave the run's own
+    scratch folder its own; a set, an unset or a TMPDIR outside the run stays refused."""
+    from ttp import glmguard
+    _gg_tmp_taken(monkeypatch)
+    wt, rd = _gg_run(tmp_path)
+    tmp = glmguard.scratch_env(rd)["TMPDIR"]
+    env_ = {"TTP_PROJECT": str(tmp_path / "proj"), "TTP_RUN_DIR": str(rd), "TMPDIR": tmp, **_GG_RUN_ENV}
+    ask = lambda c, env=env_: glmguard.shell_refusal(c, str(wt), str(rd), env)
+    repro = 'ls "$TMPDIR"; echo "TMPDIR=$TMPDIR"; mkdir -p "$TMPDIR" && echo ok'
+    for c in (repro, 'export TMPDIR="${TMPDIR:-/x}"; echo a > "$TMPDIR/a"',
+              'mktemp -d "${TMPDIR:-/tmp}/rev.XXXXXX"', "python3 -c 'import os; print(os.environ[\"TMPDIR\"])' > $TMPDIR/o"):
+        assert ask(c) is None, c
+    for c in ('TMPDIR=/tmp; echo "TMPDIR=$TMPDIR"; mkdir -p "$TMPDIR/x"', 'unset TMPDIR; echo "TMPDIR=$TMPDIR" > $TMPDIR/o',
+              'TMPDIR=/etc; echo x > "${TMPDIR:-/x}/passwd"',
+              "python3 -c 'import os; os.environ[\"TMPDIR\"] = \"/tmp\"' > $TMPDIR/o"):
+        assert "outside its worktree" in (ask(c) or ""), c
+    for out in ("/tmp", str(tmp_path / "home")):   # the run's TMPDIR is not its own
+        assert "outside its worktree" in (ask(repro.replace("mkdir -p \"$TMPDIR\"", "mkdir -p \"$TMPDIR/x\""),
+                                              {**env_, "TMPDIR": out}) or ""), out
 
 def test_a_glm_runs_scratch_folder_is_in_its_run_folder_or_its_own_short_temp_dir_and_its_prompt_names_it(tmp_path):
     """cell scratch_env: the daemon exports it for every run under the GLM guards; a Write there is allowed."""
