@@ -38,7 +38,8 @@ run to core until the next UTC hour (a start's route fallback `paced`, never a r
 The cap lifts by itself once cached tokens no longer count (judge): the readings' drops between our own
 answers are regressed on our uncached and cached tokens; only when the cached tokens' weight is clearly
 small (upper bound under LIFT_MAX_WEIGHT, on at least LIFT_MIN_ROWS readings and LIFT_MIN_CACHED cached
-tokens) in LIFT_VOTES evaluations in a row on fresh readings, LIFT_EVERY_S apart, does it lift, once, kept
+tokens, its standard error under LIFT_MAX_ERR; a noisier set of readings keeps collecting, never votes no;
+the fit also takes a charge that shows in the next reading) in LIFT_VOTES evaluations in a row on fresh readings, LIFT_EVERY_S apart, does it lift, once, kept
 in the file. The account setting providers.chat.quota_cap_lift: auto (default), on (lifted now) or off (never).
 """
 from __future__ import annotations
@@ -77,6 +78,7 @@ ROWS_KEEP = 400
 LIFT_EVERY_S = 600                  # one evaluation per this long, each on readings taken since the last
 LIFT_VOTES = 3                      # passing evaluations in a row before the cap lifts
 LIFT_MIN_ROWS = 40
+LIFT_MAX_ERR = 0.2                  # an evaluation votes only once the weight's standard error is under this
 LIFT_MIN_CACHED = 10_000_000        # cached tokens of ours inside an evaluation's rows: else it had no power
 LIFT_MAX_WEIGHT = 0.5               # the cached tokens' weight, 2 standard errors up, must be under this
 
@@ -162,8 +164,11 @@ def reading(headers) -> int | None:
 def _record(key: str, window_s: float, now: float, tokens: int = 0, cached: int = 0,
             remaining: int | None = None) -> None:
     with _locked(key) as path:
-        st = _roll(_read(path), window_s, now)
+        st = _read(path)
+        if remaining is not None:   # before our tokens, so both routes file them against the same reading
+            _reading(st, remaining, now)
         if tokens > 0:
+            st = _roll(st, window_s, now)   # a header-only write never rolls: it does not know the window
             st["used"] = int(st.get("used") or 0) + int(tokens)
             hour = str(int(now - now % HOUR_S))
             row = (st.get("hours") or {}).get(hour) or [0, 0]
@@ -171,8 +176,6 @@ def _record(key: str, window_s: float, now: float, tokens: int = 0, cached: int 
                 {hour: [int(row[0]) + int(tokens), int(row[1]) + int(cached)]}
             pend = st.get("pending") or [0, 0]
             st["pending"] = [int(pend[0]) + int(tokens) - int(cached), int(pend[1]) + int(cached)]
-        if remaining is not None:
-            _reading(st, remaining, now)
         _write(path, st)
 
 
@@ -225,31 +228,32 @@ def answer(key: str, headers=None, body=None, count_cached: bool = True, window_
 
 
 def _fit(rows: list) -> tuple[float, float, int, float] | None:
-    """Least squares of each row's drop on [seconds, uncached, cached] tokens (millions, no intercept): the
-    cached tokens' weight, its standard error, the rows and their cached tokens (millions); None when the
-    rows do not tell the weights apart."""
-    n = len(rows)
-    if n < 4:
+    """Least squares of each row's drop on [seconds, uncached, cached, previous row's uncached, previous row's
+    cached] tokens (millions, no intercept): a call's charge may show in its own reading or the next one's.
+    The cached tokens' weight (both alignments added), its standard error, the rows and their cached tokens
+    (millions); None when the rows do not tell the weights apart."""
+    n, k = len(rows) - 1, 5
+    if n < k + 1:
         return None
-    x = [[r[1], r[2] / 1e6, r[3] / 1e6] for r in rows]
-    y = [r[4] / 1e6 for r in rows]
-    a = [[sum(xi[i] * xi[j] for xi in x) for j in range(3)] for i in range(3)]
-    b = [sum(xi[i] * yi for xi, yi in zip(x, y)) for i in range(3)]
-    m = [a[i] + [b[i]] + [1.0 if i == j else 0.0 for j in range(3)] for i in range(3)]   # [A | b | I]
-    for c in range(3):
-        p = max(range(c, 3), key=lambda r: abs(m[r][c]))
-        if abs(m[p][c]) < 1e-9:
+    x = [[r[1], r[2] / 1e6, r[3] / 1e6, p[2] / 1e6, p[3] / 1e6] for p, r in zip(rows, rows[1:])]
+    y = [r[4] / 1e6 for r in rows[1:]]
+    m = [[sum(xi[i] * xi[j] for xi in x) for j in range(k)] + [sum(xi[i] * yi for xi, yi in zip(x, y))] +
+         [1.0 if i == j else 0.0 for j in range(k)] for i in range(k)]   # [A | b | I]
+    for c in range(k):
+        piv = max(range(c, k), key=lambda r: abs(m[r][c]))
+        if abs(m[piv][c]) < 1e-9:
             return None
-        m[c], m[p] = m[p], m[c]
+        m[c], m[piv] = m[piv], m[c]
         m[c] = [v / m[c][c] for v in m[c]]
-        for r in range(3):
+        for r in range(k):
             if r != c:
                 f = m[r][c]
                 m[r] = [v - f * w for v, w in zip(m[r], m[c])]
-    beta = [m[i][3] for i in range(3)]
+    beta = [m[i][k] for i in range(k)]
+    inv = [row[k + 1:] for row in m]
     rss = sum((yi - sum(bj * xj for bj, xj in zip(beta, xi))) ** 2 for xi, yi in zip(x, y))
-    var = max(m[2][6], 0.0) * rss / (n - 3)   # the inverse's last diagonal entry times the residual variance
-    return beta[2], math.sqrt(var), n, sum(r[3] for r in rows) / 1e6
+    var = max(inv[2][2] + inv[4][4] + 2 * inv[2][4], 0.0) * rss / (n - k)
+    return beta[2] + beta[4], math.sqrt(var), n, sum(r[3] for r in rows[:-1]) / 1e6
 
 
 def _judge(st: dict, now: float, mode: str | None = None) -> None:
@@ -261,12 +265,15 @@ def _judge(st: dict, now: float, mode: str | None = None) -> None:
     rows = [r for r in (st.get("rows") or []) if float(r[0]) > float(lift.get("at") or 0)]
     if len(rows) < LIFT_MIN_ROWS:
         return
+    if sum(r[3] for r in rows) < LIFT_MIN_CACHED:   # too little cached traffic to tell: keep collecting
+        return
     got = _fit(rows)
-    ok = bool(got and got[3] * 1e6 >= LIFT_MIN_CACHED and got[0] + 2 * got[1] < LIFT_MAX_WEIGHT)
+    if not got or got[1] > LIFT_MAX_ERR:   # too noisy to tell yet: keep collecting
+        return
+    ok = got[0] + 2 * got[1] < LIFT_MAX_WEIGHT
     votes = int(lift.get("votes") or 0) + 1 if ok else 0
-    st["lift"] = {"votes": votes, "at": now, "weight": round(got[0], 3) if got else None,
-                  "err": round(got[1], 3) if got else None, "lifted": now if votes >= LIFT_VOTES else 0,
-                  "told": 0}
+    st["lift"] = {"votes": votes, "at": now, "weight": round(got[0], 3), "err": round(got[1], 3),
+                  "lifted": now if votes >= LIFT_VOTES else 0, "told": 0}
 
 
 def lift_mode() -> str:
@@ -287,7 +294,7 @@ def check_setting(dotted: str, v) -> str:
     """Why `v` is no good for account key `dotted` (CAP_KEY, LIFT_KEY), else ''."""
     if v in ("", None):
         return ""
-    if dotted == CAP_KEY and (isinstance(v, bool) or not isinstance(v, (int, float)) or v < 0):
+    if dotted == CAP_KEY and (isinstance(v, bool) or not isinstance(v, (int, float)) or v < 0 or not float(v).is_integer()):
         return f"{dotted}: give tokens per UTC hour (a whole number, 0 for no cap)"
     if dotted == LIFT_KEY and v not in LIFT_MODES:
         return f"{dotted}: give one of {', '.join(LIFT_MODES)}"

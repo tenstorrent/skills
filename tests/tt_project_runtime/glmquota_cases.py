@@ -284,14 +284,19 @@ def test_glm_quota_lift_needs_repeated_evidence_that_cached_tokens_stopped_count
     cfg = _gq_cap_cfg()
     _gq_account(quota_hourly_cap=50_000_000)
 
-    def run(key, weight, start, steps=330, cached_scale=1.0):
-        rng, left = random.Random(7), 80_000_000
+    def run(key, weight, start, steps=330, cached_scale=1.0, late=False):
+        rng, left, owed = random.Random(7), 80_000_000, 0
         glmquota.note(key, {_GQ_HDR: str(left)}, now=start)
         for i in range(1, steps + 1):
             t = start + 10 * i
             cached, fresh = int(rng.uniform(0, 1.2e6) * cached_scale), int(rng.uniform(0, 4e5))
             glmquota.add(key, cached + fresh, now=t - 1, cached=cached)
-            left -= int(10 * 28000 * rng.uniform(0.7, 1.3) + fresh + weight * cached)   # others use ~28k tokens/s
+            charge = fresh + weight * cached
+            if late:   # the charge shows in the next answer's reading, not this one's
+                charge, owed = owed, charge
+            if t % 3600 < 10:
+                left = 80_000_000   # a new UTC hour: the quota refilled
+            left -= int(10 * 28000 * rng.uniform(0.7, 1.3) + charge)   # others use ~28k tokens/s
             glmquota.note(key, {_GQ_HDR: str(left)}, now=t)
         return json.loads((tmp_path / "quota" / f"{key}.json").read_text())
 
@@ -305,6 +310,11 @@ def test_glm_quota_lift_needs_repeated_evidence_that_cached_tokens_stopped_count
     assert v["lifted"] and v["cap"] == 0 and "cap is lifted" in glmquota.line(cfg_free, _GQ_HOUR + 3500), v
     assert "lifted by itself" in glmquota.lift_notice("free", _GQ_HOUR + 3600), "one low notify's text"
     assert glmquota.lift_notice("free", _GQ_HOUR + 3601) == "", "told once"
+    # Paced at the cap (about 40M an hour), one evaluation's rows hold too little cached traffic: they pile up
+    # across evaluations instead of voting no, so the lift still comes.
+    assert run("paced", 0.0, _GQ_HOUR, steps=1500, cached_scale=0.2)["lift"]["lifted"]
+    # Charges one reading late, cached tokens still counting in full: the lagged fit sees them, no lift.
+    assert not (run("late", 1.0, _GQ_HOUR, late=True).get("lift") or {}).get("lifted")
     # A run too short (not enough rows) or with too few cached tokens (no power) never votes yes.
     assert not (run("short", 0.0, _GQ_HOUR, steps=60).get("lift") or {}).get("lifted")
     assert not (run("light", 0.0, _GQ_HOUR, cached_scale=0.01).get("lift") or {}).get("lifted"), "no cached tokens, no proof"
@@ -313,9 +323,14 @@ def test_glm_quota_lift_needs_repeated_evidence_that_cached_tokens_stopped_count
 def test_glm_quota_lift_vote_count_resets_on_a_failed_evaluation_and_modes_force_it_on_or_off(monkeypatch, tmp_path):
     from ttp import glmquota
     _gq_home(monkeypatch, tmp_path)
-    rows = lambda w, n=60, t0=1000.0: [[t0 + 10 * i, 10.0, 200_000 + 1000 * (i % 7), 900_000 + 20_000 * (i % 5),
-                                        int((0.28 + 0.2 * (i % 3) + 0.2 * (200_000 + 1000 * (i % 7)) / 1e6 * 5 +
-                                             w * (900_000 + 20_000 * (i % 5)) / 1e6) * 1e6 / 5)] for i in range(n)]
+    import random
+
+    def rows(w, n=60, t0=1000.0):   # drops: others' use (noise) + our uncached in full + cached at weight w
+        rng, out = random.Random(3), []
+        for i in range(n):
+            unc, cached = rng.randint(100_000, 300_000), rng.randint(700_000, 1_100_000)
+            out.append([t0 + 10 * i, 10.0, unc, cached, int(rng.uniform(0.2, 0.4) * 1e6 + unc + w * cached)])
+        return out
     st = {"rows": rows(0.0), "lift": {"votes": 2, "at": 0}}
     glmquota._judge(st, 5000.0, mode="auto")
     assert st["lift"]["lifted"] and st["lift"]["votes"] == 3
@@ -386,4 +401,6 @@ def test_glm_quota_off_run_posts_and_the_models_poll_land_in_the_quota_file(mock
     assert endpoint.list_models(up.url, "k", alias="cloud")[0]
     assert glmquota.view(_GQ_CFG)["remaining"] == 67_000_000 and glmquota.view(_GQ_CFG)["used"] == 3150, \
         "the /models poll gives a reading and no tokens"
-    assert endpoint.list_models(up.url, "k")[0] and True
+    before = glmquota.view(_GQ_CFG)["remaining"]
+    assert endpoint.list_models(up.url, "k")[0]
+    assert glmquota.view(_GQ_CFG)["remaining"] == before, "no alias, no reading"
