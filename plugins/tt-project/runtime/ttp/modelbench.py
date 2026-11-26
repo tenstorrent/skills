@@ -450,7 +450,7 @@ def _post(url: str, key: str, model: str, prompt: str, *, opener=None, sleep=tim
         try:
             with opener.open(req, timeout=TIMEOUT_S) as r:
                 data = json.loads(r.read().decode())
-                glmquota.answer(alias, r.headers, data)   # an off-bridge post: counted like a bridge's
+                glmquota.answer(alias, getattr(r, "headers", None), data)   # an off-bridge post: counted like a bridge's
                 return str(data["choices"][0]["message"]["content"] or "")
         except urllib.error.HTTPError as e:
             if e.code in inflight.REFUSALS:

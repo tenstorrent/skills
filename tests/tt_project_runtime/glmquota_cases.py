@@ -225,9 +225,26 @@ def test_glm_quota_answer_counts_tokens_and_the_reading_in_one_write_and_never_r
     glmquota.answer("cloud", {}, {"choices": []}, now=now)           # no usage, no header: nothing
     glmquota.answer("cloud", None, {"usage": "x"}, now=now)           # junk usage
     glmquota.answer("", {_GQ_HDR: "5"}, _GQ_USAGE, now=now)           # no alias: nothing to key on
-    glmquota.answer("cloud", object(), _GQ_USAGE, count_cached=False, now=now)   # headers that are not a mapping
-    assert glmquota.view(_GQ_CFG, now)["used"] == 1050 + 150, "count_cached off leaves the cached tokens out"
+    glmquota.answer("cloud", object(), _GQ_USAGE, now=now)           # headers that are not a mapping
+    assert glmquota.view(_GQ_CFG, now)["used"] == 1050 * 2
     assert glmquota.view(_GQ_CFG, now)["remaining"] == 90_000_000
+
+
+def test_glm_quota_off_bridge_posts_take_no_project_setting_and_always_count_cached_tokens(monkeypatch, tmp_path):
+    """The off-bridge posts (babysit, benches, probes) carry only the endpoint alias, never a project's
+    providers.chat.quota: they record cached tokens at full weight even where a project sets count_cached
+    false, and there is no switch a caller could forget to pass."""
+    import inspect
+    from ttp import glmquota
+    _gq_home(monkeypatch, tmp_path)
+    assert "count_cached" not in inspect.signature(glmquota.answer).parameters
+    assert not hasattr(glmquota, "count_cached")
+    off = {"providers": {"chat": {"endpoint": "cloud", "quota": {"size": _GQ_SIZE, "count_cached": False}}}}
+    now = _GQ_HOUR + 600
+    glmquota.answer("cloud", None, _GQ_USAGE, now=now)
+    v = glmquota.view(off, now)
+    assert (v["used"], v["ours_hour"]) == (1050, 1050), "cached tokens at full weight off the bridge"
+
 
 
 def test_glm_quota_hourly_cap_counts_cached_in_full_runs_out_mid_hour_and_resumes_next_utc_hour(monkeypatch, tmp_path):

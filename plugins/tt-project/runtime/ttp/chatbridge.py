@@ -1334,8 +1334,7 @@ class Bridge:
             resp = self._open(req)
             if self.quota:   # the org's remaining tokens this UTC hour, from the answer's header (glmquota.py)
                 try:
-                    glmquota.note(self.quota["key"], getattr(resp, "headers", None),
-                                  float(self.quota.get("window_s") or 3600))
+                    glmquota.note(self.quota["key"], getattr(resp, "headers", None))
                 except Exception:   # counting must never break a call
                     pass
         except BaseException as e:   # a 429 or 503 (the codes busy_wait waits out) is the server at capacity

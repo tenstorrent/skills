@@ -173,7 +173,7 @@ def _post(s: dict, messages: list, timeout: float) -> dict:
     try:
         with opener.open(req, timeout=timeout) as r:
             data = json.loads(r.read().decode())
-            glmquota.answer(s["alias"], r.headers, data)   # an off-bridge post: counted like a bridge's
+            glmquota.answer(s["alias"], getattr(r, "headers", None), data)   # an off-bridge post: counted like a bridge's
             return data
     except urllib.error.HTTPError as e:
         if e.code in inflight.REFUSALS:

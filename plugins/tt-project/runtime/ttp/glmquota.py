@@ -23,7 +23,8 @@ or rollback (rollout.outage_refusal):
 - once the whole quota is spent, every run, until the reset.
 Runs already going keep running: pacing only moves new starts.
 Settings (`providers.chat.quota`, every key optional): on (default true; false: no counting, no pacing),
-size, window_s (3600), reserve (0.1), count_cached (true).
+size, window_s (3600), reserve (0.1), count_cached (true). They are a project's and steer its bridge runs
+only; the off-bridge posts (`answer`, `note`) carry no project and always record, cached tokens at full weight.
 
 The org's remaining and our own hourly cap: the quota is the org's (every employee's use shares it), not
 ours. Every successful answer on every route (the bridge, and the off-bridge posts through `answer` and
@@ -133,10 +134,6 @@ def _roll(st: dict, window_s: float, now: float) -> dict:
     return {**st, "reset": reset, "used": 0, "spent": 0}
 
 
-def count_cached(cfg: dict | None) -> bool:
-    return (conf(cfg) or DEFAULTS)["count_cached"] is not False
-
-
 def _tokens(body) -> tuple[int, int]:
     """(tokens to count with cached ones at full weight, cached tokens) of a chat answer's usage object."""
     u = (body or {}).get("usage") if isinstance(body, dict) else None
@@ -205,36 +202,35 @@ def add(key: str, tokens: int, window_s: float = 3600, now: float | None = None,
     _record(key, window_s, time.time() if now is None else now, tokens, cached)
 
 
-def note(key: str, headers, window_s: float = 3600, now: float | None = None) -> int | None:
+def note(key: str, headers, now: float | None = None) -> int | None:
     """Record the org's remaining from a successful answer's `headers` (HEADER); returns it, None when absent."""
     left = reading(headers)
     if key and left is not None:
         try:
-            _record(key, window_s, time.time() if now is None else now, remaining=left)
-        except OSError:   # an unwritable quota file must not fail the call it rides on
+            _record(key, 3600, time.time() if now is None else now, remaining=left)
+        except Exception:   # an unwritable or unreadable quota file must not fail the call it rides on
             pass
     return left
 
 
-def answer(key: str, headers=None, body=None, count_cached: bool = True, window_s: float = 3600,
-           now: float | None = None) -> None:
-    """One off-bridge GLM answer (a direct post: babysit, benches, probes): its tokens from the body's usage
-    and the header's remaining, in one write. Never raises: counting must not break a call."""
+def answer(key: str, headers=None, body=None, window_s: float = 3600, now: float | None = None) -> None:
+    """One off-bridge GLM answer (a direct post: babysit, benches, probes): its tokens from the body's usage,
+    cached ones at full weight, and the header's remaining, in one write. Never raises: counting must not
+    break a call."""
     try:
         total, cached = _tokens(body)
         left = reading(headers)
         if key and (total > 0 or left is not None):
-            counted = total if count_cached else total - cached
-            _record(key, window_s, time.time() if now is None else now, counted, cached if count_cached else 0, left)
+            _record(key, window_s, time.time() if now is None else now, total, cached, left)
     except Exception:
         pass
 
 
-def _fit(rows: list) -> tuple[float, float, int, float] | None:
+def _fit(rows: list) -> tuple[float, float] | None:
     """Least squares of each row's drop on [seconds, uncached, cached, previous row's uncached, previous row's
     cached] tokens (millions, no intercept): a call's charge may show in its own reading or the next one's.
-    The cached tokens' weight (both alignments added), its standard error, the rows and their cached tokens
-    (millions); None when the rows do not tell the weights apart."""
+    The cached tokens' weight (both alignments added) and its standard error; None when the rows do not tell
+    the weights apart."""
     n, k = len(rows) - 1, 5
     if n < k + 1:
         return None
@@ -256,14 +252,14 @@ def _fit(rows: list) -> tuple[float, float, int, float] | None:
     inv = [row[k + 1:] for row in m]
     rss = sum((yi - sum(bj * xj for bj, xj in zip(beta, xi))) ** 2 for xi, yi in zip(x, y))
     var = max(inv[2][2] + inv[4][4] + 2 * inv[2][4], 0.0) * rss / (n - k)
-    return beta[2] + beta[4], math.sqrt(var), n, sum(r[3] for r in rows[:-1]) / 1e6
+    return beta[2] + beta[4], math.sqrt(var)
 
 
 def _judge(st: dict, now: float, mode: str | None = None) -> None:
     """One evaluation of whether cached tokens still count (the module doc), at most every LIFT_EVERY_S and
     only on the rows taken since the last one, so each vote is fresh evidence."""
     lift = st.get("lift") or {}
-    if lift.get("lifted") or (mode or lift_mode()) != "auto" or now - float(lift.get("at") or 0) < LIFT_EVERY_S:
+    if lift.get("lifted") or now - float(lift.get("at") or 0) < LIFT_EVERY_S or (mode or lift_mode()) != "auto":
         return
     rows = [r for r in (st.get("rows") or []) if float(r[0]) > float(lift.get("at") or 0)]
     if len(rows) < LIFT_MIN_ROWS:
@@ -418,7 +414,7 @@ def view(cfg: dict | None, now: float | None = None) -> dict:
     # has left over its reserve
     limits = []
     if cap:
-        limits.append((cap * (1 - reserve), f"our {cap / 1e6:.0f}M tokens an hour are spent until the next UTC hour"))
+        limits.append((cap * (1 - reserve), f"our {cap / 1e6:g}M tokens an hour are spent until the next UTC hour"))
     if out["remaining"] is not None:
         margin = reserve * size
         limits.append((ours + max(out["remaining"] - margin, 0),
@@ -473,7 +469,7 @@ def line(cfg: dict | None, now: float | None = None, fmt=None) -> str:
             (f" of {hit['limit'] / 1e6:.0f}M" if "limit" in hit else "") + " used") if hit.get("at") else ""
     hourly = ""
     if v["cap"]:
-        hourly += f"; our cap {v['cap'] / 1e6:.0f}M an hour ({v['ours_hour'] / 1e6:.1f}M used this UTC hour)"
+        hourly += f"; our cap {v['cap'] / 1e6:g}M an hour ({v['ours_hour'] / 1e6:.1f}M used this UTC hour)"
     elif v["lifted"]:
         hourly += "; our hourly cap is lifted"
     if v["remaining"] is not None:
