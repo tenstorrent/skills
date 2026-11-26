@@ -943,11 +943,25 @@ def test_eta_a_deferred_task_s_likely_and_conservative_times_start_after_its_pla
     assert ed["deferred"] == start
     assert ed["end"] == pytest.approx(start + 3 * 2 * (300 + 1200)), ed["end"] - start
     assert ed["conservative"] >= ed["end"]
+    # Branches rank as shown: a short deferred branch (1 h wait, 1 leg) loses to a longer undeferred chain
+    # (3 legs) that is earlier raw but later once corrected.
+    s1 = now + 3600
+    a1 = p.db.add_task("soon", "s", kind="work", labels=[f"start_after:{s1:.0f}"])
+    p.db.x("UPDATE tasks SET not_before=? WHERE id=?", (s1, a1))
+    c1 = p.db.add_task("c1", "s", kind="work")
+    c2 = p.db.add_task("c2", "s", kind="work", depends_on=[c1])
+    c3 = p.db.add_task("c3", "s", kind="work", depends_on=[c2])
+    j = p.db.add_task("join", "s", kind="work", depends_on=[a1, c3])
+    ej = eta.estimate(p.db, j, now)
+    ec3 = eta.estimate(p.db, c3, now)
+    assert ej["path"][:2] == [j, c3] and not ej.get("deferred"), ej["path"]
+    assert ej["end"] > ec3["end"] > eta.estimate(p.db, a1, now)["end"]   # the corrected chain, not the raw-later one
     # A promise on the deferred owner and an undeferred one: each owner corrected alone, the later wins.
     o = {"id": "o1", "owners": [a, b]}
     eo = eta.obligation_estimate(p.db, o, now)
-    assert eo["end"] == pytest.approx(e["end"]) and eo["conservative"] >= eo["end"]
-    assert eo["conservative"] == pytest.approx(max(e["conservative"], e2["conservative"]))
+    ea, eb = eta.estimate(p.db, a, now), eta.estimate(p.db, b, now)   # as queued now, more tasks ahead
+    assert eo["end"] == pytest.approx(max(ea["end"], eb["end"])) and eo["conservative"] >= eo["end"]
+    assert eo["conservative"] == pytest.approx(max(ea["conservative"], eb["conservative"]))
 
 
 def test_eta_field_dates_a_time_a_week_away():

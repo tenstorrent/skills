@@ -502,6 +502,12 @@ class _Est:
     def _cycle(self, tid, seen: tuple, d: int) -> dict:
         return self._none(tid, "dependency cycle " + "→".join(f"#{i}" for i in seen[seen.index(d):] + (d,)))
 
+    def _shown(self, x: float, e: dict, f: float) -> float:
+        """Time `x` of a branch carrying `e`'s planned start as the correction `f` shows it (etaledger.shown:
+        the planned wait unscaled), so a deferred branch never outranks a longer undeferred one on raw time."""
+        plan = max(0.0, min(float(e.get("deferred") or 0) - self.now, x - self.now))
+        return plan + f * (x - self.now - plan)
+
     def _none(self, tid, why: str) -> dict:
         return {"done": None, "end": None, "path": [tid], "legs": [], "why": why, "overrun": False}
 
@@ -581,7 +587,8 @@ class _Est:
         else:
             from .daemon import time_gate
             from .db import deferral, dependency_ids
-            crit = None
+            from .etaledger import factor
+            crit, fx = None, factor(self.db, t.get("kind") or "")   # branches rank as shown
             for d in dependency_ids(t):
                 if d is None:
                     return self._none(tid, f"#{tid} names a dependency that is not a task id")
@@ -592,9 +599,9 @@ class _Est:
                 e = self.task(d, seen)
                 if e["why"]:
                     return self._from(tid, e)
-                if crit is None or e["done"] > crit["done"]:
+                if crit is None or self._shown(e["done"], e, fx) > self._shown(crit["done"], crit, fx):
                     crit = e
-            if crit and crit["done"] > start:   # its planned start, if any, still bounds the uncorrected wait
+            if crit and self._shown(crit["done"], crit, fx) > self._shown(start, {"deferred": deferred}, fx):
                 start, path, deferred = crit["done"], [tid] + crit["path"], crit.get("deferred")
             for n in landing_waits(t) if st != "running" else []:
                 from .landed import recorded
@@ -609,7 +616,7 @@ class _Est:
                 e = self.task(n, seen)
                 if e["why"]:
                     return self._after(tid, e.get("after") or f"landed:#{n}", e["why"], [tid] + e["path"])
-                if e["end"] > start:   # its own finish, review and landing: the probe passes then
+                if self._shown(e["end"], e, fx) > self._shown(start, {"deferred": deferred}, fx):   # the probe passes then
                     start, path, deferred = e["end"], [tid] + e["path"], e.get("deferred")
             tg = None
             if st != "running" and (when := deferral(t).get("when")) and not landing_waits(t) \
@@ -687,13 +694,12 @@ class _Est:
                 "notes": notes, "deferred": deferred}
 
 
-def with_p90(est: _Est, e: dict, *tids: int) -> dict:
-    """`e` with `p90_end`: the latest of the conservative (p90) ends of the tasks `tids` (the owners it
-    was the latest of), never before its own end; `e` as it is when it has no estimate or a p90 has none."""
-    if e.get("why") or not e.get("end"):
+def with_p90(est: _Est, e: dict, tid: int) -> dict:
+    """`e` with `p90_end`: task `tid`'s conservative (p90) end, never before its own end; `e` as it is when
+    it has no estimate or no p90."""
+    if e.get("why") or not e.get("end") or (p90 := est.p90(tid)) is None:
         return e
-    ends = [est.p90(t) for t in tids]
-    return e if not ends or any(x is None for x in ends) else {**e, "p90_end": max(max(ends), e["end"])}
+    return {**e, "p90_end": max(p90, e["end"])}
 
 
 def corrected(db, e: dict, now: float) -> dict:
