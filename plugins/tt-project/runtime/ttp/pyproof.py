@@ -438,10 +438,11 @@ def rewrite(cmd: str, cwd: str, env=None) -> str | None:
     bases = credguard._cwds(segments, cwd, str(env.get("HOME") or os.path.expanduser("~"))) if moves else None
     if bases and len(bases) >= credguard.CWDS_CAP:   # more folders than the guard follows: no proof
         return None
+    bases = bases[1:] if bases else None   # HOME leads the guard's list; python starts there only if it is listed again
     lines, bodies = hook._heredocs(cmd)
     if any(b.end is None for b in bodies):   # an unended heredoc: the shell reads it differently than we would
         return None
-    shadow_cwds = bases[1:] if bases else [cwd]
+    shadow_cwds = bases or [cwd]
 
     def shadowed(i: int, pos: int) -> bool:
         """python may import another module than the standard one the snippet at `pos` of line `i` names: read on

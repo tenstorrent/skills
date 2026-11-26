@@ -334,3 +334,18 @@ def test_pyproof_reads_the_runs_own_folders_by_name_where_the_command_never_sets
         assert pyproof.rewrite(c + q, str(tmp_path), env) is None, c
     (run / "json.py").write_text("x")
     assert pyproof.rewrite("cd $TTP_RUN_DIR; python3" + q, str(tmp_path), env) is None
+
+
+def test_pyproof_judges_a_write_after_cd_where_python_runs_and_home_only_where_a_cd_can_reach_it(tmp_path):
+    """cells: cd_bases. After `cd <run folder>` a relative write lands there or in the working folder, never in
+    HOME; a bare `cd`, `cd ~` or `cd ..` can reach HOME or above the worktree and stays unproven."""
+    from ttp import pyproof
+    run, wt = tmp_path / "run", tmp_path / "home" / "wt"
+    run.mkdir()
+    wt.mkdir(parents=True)
+    env = {"TTP_RUN_DIR": str(run), "TMPDIR": str(run / "tmp"), "HOME": str(tmp_path / "home"), "PATH": "/usr/bin:/bin"}
+    q = " - <<'EOF'\nopen('result.json','w').write('{}')\nEOF"
+    for c in (f"cd {run} && python3", f"cd {run}; python3", 'cd "$TTP_RUN_DIR" && python3'):
+        assert pyproof.rewrite(c + q, str(wt), env), c
+    for c in ("cd && python3", "cd ~ && python3", "cd .. && python3", "cd /etc; python3"):
+        assert pyproof.rewrite(c + q, str(wt), env) is None, c
