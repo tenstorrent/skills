@@ -115,6 +115,13 @@ def factor(db, kind: str) -> float:
     return float(f) if isinstance(f, (int, float)) and f > 0 else 1.0
 
 
+def shown_at(x: float, start: float | None, now: float, f: float) -> float:
+    """Time `x` with the correction `f` on its work time only: the wait until the planned `start` passes
+    unscaled (the correction covers work, not waiting)."""
+    plan = max(0.0, min(float(start or 0) - now, x - now))
+    return now + plan + f * (x - now - plan) if x > now + plan else x
+
+
 def shown(db, e: dict, now: float, kind: str = "") -> dict:
     """`e` (an eta.py estimate) with its time left scaled by the kind's factor: `end`, plus `raw_end`,
     `factor`, `kind`, `conservative`, and `p90_end` scaled alike (`raw_p90_end`: before). Neither of the
@@ -125,27 +132,23 @@ def shown(db, e: dict, now: float, kind: str = "") -> dict:
         return e
     f = factor(db, kind)
     raw = e["end"]
-    def scaled(x: float, start: float | None = e.get("deferred")) -> float:
-        """`x` with the correction on its work time only; the wait for the planned `start` passes unscaled."""
-        plan = max(0.0, min(float(start or 0) - now, x - now))
-        return now + plan + f * (x - now - plan) if x > now + plan else x
-    plan = max(0.0, min(float(e.get("deferred") or 0) - now, raw - now))   # the planned wait
-    end = scaled(raw)
+    start = e.get("deferred")
+    end = shown_at(raw, start, now, f)
     p90 = e.get("p90_end")
-    p90_start = e.get("p90_deferred", e.get("deferred"))   # the p90 walk's own planned start
+    p90_start = e.get("p90_deferred", start)   # the p90 walk's own planned start
     if end <= now:
         cons = end
     elif isinstance(p90, (int, float)) and p90 > raw:
         # The history's own spread (every leg at its p90, scaled by the same correction); once the ledger
         # has measured its 80th percentile of actual / shown, the larger of the two.
-        cons = scaled(p90, p90_start)
+        cons = shown_at(p90, p90_start, now, f)
         if measured_x(db):
-            cons = max(cons, now + plan + conservative_x(db) * (end - now - plan))
+            cons = max(cons, shown_at(end, start, now, conservative_x(db)))
     else:
-        cons = now + plan + conservative_x(db) * (end - now - plan)
+        cons = shown_at(end, start, now, conservative_x(db))
     out = {**e, "end": end, "raw_end": raw, "factor": f, "kind": kind, "conservative": max(cons, end)}
     if isinstance(p90, (int, float)):
-        out.update(p90_end=max(scaled(p90, p90_start), end), raw_p90_end=p90)
+        out.update(p90_end=max(shown_at(p90, p90_start, now, f), end), raw_p90_end=p90)
     return out
 
 
