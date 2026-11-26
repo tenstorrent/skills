@@ -1678,8 +1678,16 @@ def test_ack_wait_terminal_counts_a_reply_closing_the_request_without_a_run_but_
         assert ackwait.terminal(text) is True and ackwait.closed(text), text
     assert ackwait.packet_terminal(["[1/2] Acknowledged.", "[2/2] Closing your request without a run."]) is True
     for text in ("received, will run it soon", "I will close the request once the run is in", "status: queued",
-                 "status: in progress; closing this request needs a run first, a result follows later"):
+                 "status: in progress; closing this request needs a run first, a result follows later",
+                 "I am not closing your request yet; a run follows.", "I won't be closing the request.",
+                 "Closing this request needs a run first; the result follows later.",
+                 "I am not declining the request, the run is queued and a result will follow."):
         assert ackwait.terminal(text) is False and not ackwait.closed(text), text
+    # a real result that mentions closing is a result, settled as asked
+    for text in ("Done: the timing passed, 41 s; closing the request.",
+                 "Finished the run and closed your request: 41 s.", "Landed in PR 5, which closes the request."):
+        assert ackwait.terminal(text) is True and not ackwait.closed(text), text
+        assert ackwait.handoff({"spec": text, "fp": "c" * 16}, "peer", "abc")["status"] == "done", text
     # the status line decides, as for any reply: a result naming something closed is still done
     assert ackwait.terminal("status: done; the old request is closed") is True
     assert not ackwait.closed("status: done; the old request is closed")
