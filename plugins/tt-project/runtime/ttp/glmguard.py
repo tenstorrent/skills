@@ -9,8 +9,9 @@ every harness the arm runs:
 
 The guard is a short explicit denylist of the harmful kinds measured on real GLM runs;
 everything else runs, with Opus's plan and the post-run audit as the backstop (deviceplan.py):
-- writes or deletes outside the run's worktree, run folder and scratch folder (a redirect, tee, a writing
-  verb's target, a copy's destination; never inferred from interpreter code), any write an ssh call makes on
+- writes or deletes outside the run's worktree, run folder and scratch folder but for ones below the home
+  folder or /tmp that harm nobody (_open_write) (a redirect, tee, a writing verb's target, a copy's
+  destination; never inferred from interpreter code), any write an ssh call makes on
   another host (REMOTE_WHY: a device plan's own step may), a write into a project's tt-project state or harness
   folder unless it is the run's own worktree or run folder, and the guard's own files, its identity variables
   and the project's database and machine records (TAMPER, STATE_DB); protected and served paths are
@@ -145,8 +146,9 @@ STATE_DB = re.compile(r"\bproject\.db\b|\bmachine-workers\.json\b|\b\.tt-project
 SCRATCH = "tmp"               # in the run folder: the run's own scratch folder, its TMPDIR (TMP, TEMP)
 SCRATCH_VARS = ("TMPDIR", "TMP", "TEMP")
 SCRATCH_LINE = ("Keep scratch files in $TMPDIR (a folder of your own in your run folder) or your worktree: write"
-                ' `> "$TMPDIR/body.md"`, never a literal `/tmp/...` path, and never create files in the project\'s'
-                " `state/` folder. The guard refuses writes anywhere else.")
+                ' `> "$TMPDIR/body.md"`. Writes below the home folder or /tmp pass too, never in a credential folder,'
+                " ~/.tt-project, another project or the project's `state/` folder. The guard refuses writes anywhere"
+                " else.")
 # What a code run's own checklist (template kind-code.md) leaves out of its check before it hands off done: the
 # review fails tests that pass without the change, and a large diff with no reason.
 HANDOFF_LINE = ("Before you hand off done, check your own diff as the independent review will. Revert your fix once and"
@@ -201,19 +203,17 @@ def _scratch_naming(cmd: str, run_dir: str, env) -> tuple[bool, bool, list[str] 
 def _scratch_value(m: re.Match, env, own_tmp: str, told: bool, value: str | None = "") -> str:
     """What a `$TMPDIR` reference (_SCRATCH_REF) reads as: the run's own folder where the command sets it so, `value`
     where it sets it to that (its value before, when `value` is ""), `/` where it sets it to a value the guard
-    cannot read (None) or the reference has a default (it may be either: a write there stays refused), `/tmp` where
-    it only names it, else its value, the default only where it is unset (or empty, for `:-`)."""
+    cannot read (None) or the reference has a default (it may be either: a write there stays refused), else its
+    value (`/` where it has none), the default only where it is unset (or empty, for `:-`)."""
     if own_tmp:
         return own_tmp
-    if value is None or told and value and m.group(3) is not None:
+    if value is None or told and m.group(3) is not None:
         return "/"
     if value:
         return value
-    if told:
-        return "/" if m.group(3) is not None else "/tmp"
     name = m.group(1) or m.group(4)
     if m.group(3) is None or (env.get(name) if m.group(2) else name in env):
-        return str(env.get(name) or "/tmp")
+        return str(env.get(name) or "/")
     return m.group(3)
 
 RUN_ENV = "TTP_GLM_RUN"       # "1", or DEVICE for a run on a device task
@@ -332,8 +332,7 @@ def hit_reason(run_dir) -> str:
 HARMFUL, REDIRECTED = "harmful", "redirect"
 REFUSALS = "glm_refusals.jsonl"   # in the run folder: one {ts, rule, class, why, n, back} per refusal
 # The run folder's own records: the rest of it is the run's to write (`> "$TTP_RUN_DIR/advise.out"`)
-TMP_MADE = "glm_tmp.txt"   # in the run folder: the system temp dir entries the run made, one per line (keep_tmp)
-RUN_RECORDS = frozenset({"run.json", "refusals.jsonl", RUN_MARK, MARK, HIT, REFUSALS, TMP_MADE})
+RUN_RECORDS = frozenset({"run.json", "refusals.jsonl", RUN_MARK, MARK, HIT, REFUSALS})
 GUARD_WHY = "a command may not edit the run's identity or the guard's own files"
 
 
@@ -361,10 +360,10 @@ RULES = (
      "write the note as a hand-off follow-up titled `upstream: ...`"),
     ("secret_text", REDIRECTED, re.escape(SECRET_TEXT_WHY), "",   # the credentials line covers it in the prompt
      "leave key and credential paths out of test strings"),
-    ("scratch", REDIRECTED, _OUTSIDE, "write to a literal `/tmp/...` path or create files outside your worktree",
+    ("scratch", REDIRECTED, _OUTSIDE, "create files outside your worktree, the home folder and /tmp",
      'write scratch files under `"$TMPDIR"` (a folder of your own) or in your worktree'),
     ("records", HARMFUL, None, "write in a project's `state/` folder, another task's worktree or another project, or "
-     "delete or overwrite a file outside your worktree and `$TMPDIR`", _OWN_TREE),
+     "delete or overwrite a file outside your worktree, the home folder and /tmp", _OWN_TREE),
     ("delete", HARMFUL, None, None, _OWN_TREE),
     ("outward", HARMFUL, r"`ttp (?:notify|say|ask|note)\b", "post outward (`ttp notify`, `ttp say`, "
      "`ask`, `ttp note --to`/`--reply`)", 'put what a person should read in your hand-off summary; a plain `ttp note "<text>"` '
@@ -624,14 +623,53 @@ def records_write(path: str, home: str) -> bool:
     return any(parts[i] == "tt-project" and parts[i + 1] in RECORDS_DIRS for i in range(len(parts) - 1))
 
 
-def _outside_roots(path: str, roots: list[str], own: list[str], home: str) -> bool:
+def _other_project(path: str) -> bool:
+    """Whether `path` is in, is or holds a registered project's folder (`ttp list`), or is in a project's tt-project
+    folder (holds_project, without its walk): the run's own folders are judged before this."""
+    from . import sidefx
+    from .project import load_registry
+    dirs = [os.path.realpath(str(e["dir"])) for e in load_registry().get("projects", {}).values()
+            if isinstance(e, dict) and e.get("dir")]
+    p = Path(path)
+    return sidefx._inside(path, dirs) or any(sidefx._inside(d, [path]) for d in dirs) \
+        or any(project_dir(a / "tt-project") or project_dir(a) for a in (p, *p.parents))
+
+
+def _open_write(path: str, home: str) -> bool:
+    """Whether a write to `path` outside the run's own folders harms nobody: by its literal and its real path it
+    lands below (never on) the home folder or a shared temp dir (_TMP), with no glob or expansion, in or holding
+    no credential store, config folder or code-starting file of the home (sidefx.SENSITIVE: the agents' hook
+    settings, shell startup files, ~/.local/bin and lib), protected path (pathguard.roots,
+    credguard.read_refusal) or the harness's folder (but for its work folders, HOME_WORK), not in another
+    project's folder, and in nothing another user owns."""
+    from . import credguard, pathguard, project, sidefx
+    tops = [os.path.normpath(t) for t in (home, *_TMP) if t and os.path.normpath(t) != "/"]
+    spellings = {os.path.normpath(path), os.path.realpath(path)}
+    harness = [os.path.realpath(t) for t in (project.HOME_DIR, os.path.join(home, ".tt-project") if home else "") if t]
+    work = [os.path.join(h, w[1]) for h in harness for w in HOME_WORK]
+    homes = {os.path.normpath(home), os.path.realpath(home)} if home else set()
+    protected = [*pathguard.roots(), *(os.path.join(h, s) for h in homes for s in sidefx.SENSITIVE)]
+    if re.search(r"[*?\[{$`]", path) or not all(sidefx._inside(p, tops) and p not in tops for p in spellings) or any(
+            pathguard._holds(p, protected) or credguard.read_refusal(p, search=True, home=home) or _other_project(p)
+            or any(sidefx._inside(r, [p]) for r in harness)
+            or sidefx._inside(p, harness) and not sidefx._inside(p, work) for p in spellings):
+        return False
+    top = os.path.realpath(path)
+    while not os.path.lexists(top):
+        top = os.path.dirname(top)
+    return top in tops or os.lstat(top).st_uid == os.getuid()
+
+
+def _outside_roots(path: str, roots: list[str], own: list[str], home: str, wide: bool = True) -> bool:
     """Whether a write to `path` lands outside the run's write roots: a write into a project's tt-project state
     or harness folder is outside them unless it is inside the run's own worktree or run folder (`own`). The
     literal path decides: what a link inside the run's own folders points at is the post-run audit's to read; a
-    path whose real path is in the run's own folders (a linked spelling of its worktree) is in them."""
+    path whose real path is in the run's own folders (a linked spelling of its worktree) is in them. With `wide`
+    (no link made in the same command), a write that harms nobody (_open_write) is inside them too."""
     from . import sidefx
     mine = sidefx._inside(path, own) or sidefx._inside(os.path.realpath(path), own)   # its worktree by any spelling
-    return not (mine or sidefx._inside(path, roots)) or (records_write(path, home) and not mine)
+    return not (mine or sidefx._inside(path, roots) or wide and _open_write(path, home)) \
+        or (records_write(path, home) and not mine)
 
 
 def _remote_dest(seg: list[str]) -> str:
@@ -644,116 +682,33 @@ def _remote_dest(seg: list[str]) -> str:
 
 # a command that makes a link (`ln -s ~/.bashrc /tmp/n; echo x >> /tmp/n`): its temp dir writes stay outside
 _LINKS = re.compile(r"(?<![\w./-])(?:ln\s|cp\s(?:[^;&|\n]*\s)?-[A-Za-z]*s)")
+_AS_ROOT = re.compile(r"(?<![\w./-])(?:sudo|doas|su|pkexec|run0)(?![\w.-])")   # a write as another user is never open
 
 
-def _tmp_entry(path: str, made: set[str]) -> str:
-    """The system temp dir entry (`/tmp/<name>`) a write to `path` lands in when it is the run's own: a plain name
-    that does not exist yet, or one the run made (`made`) that is no link and that `path` still resolves inside;
-    '' for any other path, an existing temp file it did not make, a glob or variable (`/tmp/*`) and a link out of
-    the entry too, even to another temp entry."""
-    path = os.path.normpath(path)
-    for t in _TMP:
-        if path.startswith(t + "/"):
-            name = path[len(t) + 1:].split("/")[0]
-            top = os.path.join(t, name)
-            if not re.fullmatch(r"[\w.@%+=:,-]+", name):
-                return ""
-            if top in made or any(_from_template(top, m) for m in made):
-                real, there = os.path.realpath(top), os.path.realpath(path)
-                return top if not os.path.islink(top) and (there == real or there.startswith(real + "/")) else ""
-            return "" if os.path.lexists(top) else top
-    return ""
-
-
-_MKTEMP = re.compile(r"(?<![\w./-])mktemp((?:[ \t]+[^\s;&|<>()`]+)*)")
-_TEMPLATE = re.compile(r"(X{3,})([^/X]*)$")   # mktemp's run of X's, then its --suffix
-
-
-def _from_template(top: str, made: str) -> bool:
-    """Whether temp dir entry `top` is one mktemp made from template `made` (`/tmp/x.XXXX`: `/tmp/x.a1B2`)."""
-    m = _TEMPLATE.search(made)
-    return bool(m) and os.path.dirname(made) == os.path.dirname(top) and bool(re.fullmatch(
-        re.escape(made[:m.start()]) + rf"[A-Za-z0-9]{{{len(m[1])}}}" + re.escape(m[2]), top))
-
-
-def mktemp_templates(cmd: str, env=None) -> list[str]:
-    """The system temp dir templates the `mktemp` calls of `cmd` make their entries from (`mktemp -d /tmp/x.XXXX`,
-    `mktemp -p /tmp`): the entries are the run's own, so TMP_MADE records the template (_from_template). One under
-    its own TMPDIR or worktree is already its own."""
-    e = os.environ if env is None else env
-    out = []
-    for m in _MKTEMP.finditer(cmd):
-        where, tmpl, suffix, take = "", "", "", False
-        for a in (w.strip("'\"") for w in m[1].split()):
-            if take:
-                where, take = a, False
-            elif a.startswith(("--tmpdir=", "--suffix=")):
-                where, suffix = (a[9:], suffix) if a[2] == "t" else (where, a[9:])
-            elif re.fullmatch(r"-[dqut]+|--tmpdir", a):   # -t, --tmpdir: in TMPDIR unless -p names a folder
-                where = where or (str(e.get("TMPDIR") or "/tmp") if "t" in a else "")
-            elif p := re.fullmatch(r"-[dqut]*p(.*)", a):
-                where, take = p[1], not p[1]
-            elif not a.startswith("-") and not tmpl:
-                tmpl = a
-        if not tmpl:
-            where, tmpl = where or str(e.get("TMPDIR") or "/tmp"), "tmp.XXXXXXXXXX"
-        path = os.path.normpath(os.path.join(where, tmpl) + suffix) if where or tmpl.startswith("/") else ""
-        if path and os.path.dirname(path) in _TMP and _TEMPLATE.search(path):
-            out.append(path)
-    return out
-
-
-def _tmp_made(run_dir: str) -> set[str]:
-    """The system temp dir entries the run made (TMP_MADE)."""
-    try:
-        return set((Path(run_dir) / TMP_MADE).read_text().split("\n")) - {""} if run_dir else set()
-    except OSError:
-        return set()
-
-
-def keep_tmp(made: list[str]) -> None:
-    """Record in the live run's own folder (TTP_RUN_DIR) the system temp dir entries a command it is about to run
-    makes: the tool hook's step once it lets the command run, never a check's (every check writes nothing)."""
-    run_dir = os.environ.get("TTP_RUN_DIR")
-    if made and run_dir:
-        try:
-            with open(Path(run_dir) / TMP_MADE, "a") as f:
-                f.write("".join(t + "\n" for t in made))
-        except OSError:
-            pass
-
-
-def writes_outside(cmd: str, cwd: str, run_dir: str = "", env=None, inline: bool = False,
-                   made: list[str] | None = None) -> list[tuple[str, str]]:
+def writes_outside(cmd: str, cwd: str, run_dir: str = "", env=None, inline: bool = False) -> list[tuple[str, str]]:
     """(path, why) for each file `cmd` writes or deletes outside the run's worktree, run folder and scratch folder
-    (a device and an fd aside). Writes read from interpreter code count only with `inline` (the post-run scan).
-    A write in a system temp dir entry of the run's own (_tmp_entry) is no such write, but in a device run, the
-    post-run scan (`inline`) or a command that makes a link (_LINKS): `made` gets each new entry and mktemp template."""
+    (a device and an fd aside). Writes read from interpreter code count only with `inline` (the post-run scan)."""
     from . import sidefx
     e = os.environ if env is None else env
     home = os.path.expanduser("~")
     roots, own = _roots(cwd, run_dir, _scratch(run_dir, e), e), _own_roots(cwd, run_dir, e)
-    # $TMPDIR (TMP, TEMP) is read as its value in the run's environment, or as /tmp where the command sets it itself
+    # $TMPDIR (TMP, TEMP) is read as its value in the run's environment, and as each value the command sets it to
+    # (as `/` where the guard cannot read one)
     told, own_set, values = _scratch_naming(cmd, run_dir, e)
     own_tmp = _scratch(run_dir, e) if own_set else ""   # `TMPDIR=<its own folder>`
     found: dict = {}   # each value it may hold where the command sets it: before the set, and each it sets
-    for v in ["", *(values or [])] if values is not None else [None]:
+    for v in [None] if values is None or told and not values else ["", *values]:
         paths = _SCRATCH_REF.sub(lambda m: _scratch_value(m, e, own_tmp, told, v), cmd)
         for p, got in sidefx.classify_paths(paths, home, cwd or os.getcwd(), run_dir).items():
             found.setdefault(p, got)
+    wide = not (_LINKS.search(cmd) or _AS_ROOT.search(_plain(cmd)))
     got = [(p, why) for p, (cls, why) in found.items()
            # shortcut: inline code naming a records path counts as a write even where it only reads it (a copy from
            # the live harness): it fails closed; `cp` from there passes
            if cls == "write" and (inline or "inline code" not in why or records_write(p, home)) \
            and not p.startswith(sidefx.HARMLESS) and not (p == "/dev" and "redirect" in why)   # `2>/dev`: fails, writes nothing
-           and (_outside_roots(p, roots, own, home) or _run_record(p, run_dir))]
-    mine = not inline and not _LINKS.search(cmd) and not (glm_run({**e, "TTP_RUN_DIR": run_dir or e.get("TTP_RUN_DIR") or ""}) or {}).get("device")
-    ours = _tmp_made(run_dir) if mine else set()   # a device run's scratch is its plan's folder (deviceplan)
-    tops = {p: mine and not _run_record(p, run_dir) and _tmp_entry(p, ours) for p, _ in got}
-    if made is not None:
-        new = {t for t in tops.values() if t} | set(mktemp_templates(cmd, e) if mine else ())
-        made += sorted(new - ours - set(made))
-    return [(p, why) for p, why in got if not tops[p]]
+           and (_outside_roots(p, roots, own, home, wide) or _run_record(p, run_dir))]
+    return got
 
 
 def remote_writes(cmd: str, cwd: str = "") -> list[tuple[str, str]]:
@@ -904,6 +859,15 @@ _NOT_STRAIGHT = re.compile(r"(?<![\w./-])(?:eval|source|declare|typeset|local|ex
                            r"\$\[|\$\{!")
 
 
+# `read` of plain literal names only (`while read f; do`): what it sets is a name _reads_only sees
+_LITERAL_READ = re.compile(r"(?<![^\s;&|()])read(?:[ \t]+[\w-]+)*[ \t]*(?=[;&|\n)]|$)")
+
+
+def _single_blank(text: str) -> str:
+    """`text` with its single-quoted parts blanked: bash reads no name, comment or expansion there."""
+    return "".join(" " if q == "'" else c for c, q in zip(text, _unquoted(text)[1]))
+
+
 def _plain(text: str) -> str:
     """Shell `text` with its quote characters dropped and their content kept (`e\\val "f=x"` reads `eval f=x`)."""
     return re.sub(r"[\"'\\]", "", text)
@@ -912,9 +876,14 @@ def _plain(text: str) -> str:
 def _reads_only(name: str, text: str) -> bool:
     """Whether `name` appears in shell `text` only as `$name` or `${name}` reads, quoted content included (never
     `name=`, `${name:=x}`, `${!name}`, `\\$name` or the bare word; an option letter such as `-f` is no use).
-    Single-quoted text never expands or sets one (running it as code is _NOT_STRAIGHT), so it is left out."""
-    text = "".join(" " if q == "'" else c for c, q in zip(text, _unquoted(text)[1]))
-    plain, n = _plain(text), re.escape(name)
+    Single-quoted text never expands or sets one (running it as code is _NOT_STRAIGHT), so it is left out, and so
+    is the bare name in double-quoted text with no `$(`, `${`, `$[` or backtick in it (`python3 -c "d=1"`)."""
+    text, state = _single_blank(text), _unquoted(text)[1]
+    words = list(text)
+    for m in re.finditer(r'"+', state):
+        if not re.search(r"\$[({\[]|`", text[m.start():m.end()]):
+            words[m.start():m.end()] = " " * (m.end() - m.start())
+    plain, n = _plain("".join(words)), re.escape(name)
     return not re.search(rf"\\\$\{{?{n}(?!\w)", re.sub(r"[\"']", "", text)) and all(
         plain[:m.start()].endswith("$") and not plain[:m.start()].endswith("$$")
         or plain[:m.start()].endswith("${") and plain[m.end():].startswith("}")
@@ -995,8 +964,8 @@ def literal_view(cmd: str, cwd: str, env=None) -> str | None:
     not straight-line, a loop over anything else (`$(ls)`), a name used other than as a read, or read after `done` of
     a loop that may not have run in this shell, keeps the command as it is, which the guards judge as before."""
     # a comment, `$'...'` or a quote inside `${...}`: quoting the quote reader does not follow
-    if "<<" in cmd or "$'" in cmd or re.search(r"(?<![^\s;&|()<>])#|\$\{[^}]*['\"\\]", cmd) \
-            or _NOT_STRAIGHT.search(_plain(cmd)):
+    if "<<" in cmd or "$'" in cmd or re.search(r"(?<![^\s;&|()<>])#", _single_blank(cmd)) \
+            or re.search(r"\$\{[^}]*['\"\\]", cmd) or _NOT_STRAIGHT.search(_plain(_LITERAL_READ.sub(" ", cmd))):
         return None
     e = os.environ if env is None else env
     home = e.get("HOME") or os.path.expanduser("~")
@@ -1110,14 +1079,13 @@ def secret_in(text: str) -> str | None:
 
 
 def shell_refusal(cmd: str, cwd: str, run_dir: str = "", env=None, remote: bool = False, writes: bool = True,
-                  power: bool = True, services: bool = True, made: list[str] | None = None) -> str | None:
+                  power: bool = True, services: bool = True) -> str | None:
     """Why a shell command of a GLM-arm run is refused (before it runs), else None. The denylist: writes or
     deletes outside the run's worktree and run folder (and on another host), pushes and landing, outward
     posts, machine-ledger writes, service starts and stops (SERVICE_RE) and, with `power`, resets,
     power cycles and flashes outside the approved routes; the hook adds protected paths, held Slurm nodes and
     replayed undos (pathguard, ruleguard). Everything else runs. `remote`: the command an ssh call runs on another
-    host. `writes` and `services`: False skips those checks (a step of Opus's plan, deviceplan._static). `made`
-    gets the system temp dir entries an allowed command makes (writes_outside); nothing is written here."""
+    host. `writes` and `services`: False skips those checks (a step of Opus's plan, deviceplan._static)."""
     from . import credguard, hook, pathguard
     e = os.environ if env is None else env
     lines, bodies = hook._heredocs(cmd)
@@ -1145,7 +1113,7 @@ def shell_refusal(cmd: str, cwd: str, run_dir: str = "", env=None, remote: bool 
         return f"a write or delete names the variable of a loop over a list the guard cannot read (`{loop[:80]}`); {HIDDEN_HINT}"
     commands, _ = hook._split(cmd)   # heredoc bodies a program, not a shell, reads are its input
     for sub in pathguard._substitutions(commands):   # "$(...)" runs a command too
-        if why := shell_refusal(sub, cwd, run_dir, e, remote, writes, power, services, made):
+        if why := shell_refusal(sub, cwd, run_dir, e, remote, writes, power, services):
             return why
     # `scp f box:/x 2>/dev/null`: a redirect's fd number is no argument of the call (else it hides the copy's target)
     bare = _FD.sub("", commands)
@@ -1197,7 +1165,7 @@ def shell_refusal(cmd: str, cwd: str, run_dir: str = "", env=None, remote: bool 
     if remote:
         got = remote_writes(cmd)
         return f"{REMOTE_WHY}: {got[0][0]} ({got[0][1]})" if got else None
-    got = writes_outside(cmd, cwd, run_dir, e, made=made)
+    got = writes_outside(cmd, cwd, run_dir, e)
     if rec := next((p for p, _ in got if _run_record(p, run_dir)), None):
         return f"{GUARD_WHY}: {rec}"
     return f"it writes outside its worktree: {got[0][0]} ({got[0][1]})" if got else None
@@ -1214,16 +1182,16 @@ def _own_ssh_config(value: str, cmd: str, cwd: str, run_dir: str, e) -> bool:
         value, roots=_own_roots(cwd, run_dir, e), cwd=cwd)
 
 
-def tool_refusal(payload: dict, env=None, made: list[str] | None = None) -> str | None:
+def tool_refusal(payload: dict, env=None) -> str | None:
     """Why a hook payload (the tool name, its input, the cwd) of a GLM-arm run is refused, else None: the
-    Bash command checks above (`made` as there), a file write outside the worktree and run folder, any connector tool."""
+    Bash command checks above, a file write outside the worktree and run folder, any connector tool."""
     from . import sidefx
     e = os.environ if env is None else env
     tool = str(payload.get("tool_name") or "")
     args = payload.get("tool_input") if isinstance(payload.get("tool_input"), dict) else {}
     cwd, run_dir = str(payload.get("cwd") or os.getcwd()), str(e.get("TTP_RUN_DIR") or "")
     if tool == "Bash":
-        return shell_refusal(str(args.get("command") or ""), cwd, run_dir, e, made=made)
+        return shell_refusal(str(args.get("command") or ""), cwd, run_dir, e)
     if tool.startswith("mcp__"):
         return "a connector tool reaches a person or a service outside the hand-off"
     if tool in WRITE_TOOLS:

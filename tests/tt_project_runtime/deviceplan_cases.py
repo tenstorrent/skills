@@ -270,12 +270,12 @@ def test_the_hook_passes_device_reads_and_refuses_writes_outside_the_worktree_in
     pre = lambda c: hook._pre_tool_use({"tool_name": "Bash", "tool_input": {"command": c}, "cwd": ws})[0]
     for c in ("ipmitool sdr 2>&1 | tail -5", "ttp occupancy >&2", "tt-smi -s 2>/dev/null"):
         assert pre(c) is None, c
-    for c in ("echo x > /tmp/f", "cmd 2> /tmp/f"):
+    for c in ("echo x > /srv/f", "cmd 2> /srv/f"):
         out = pre(c)
         assert out and out["hookSpecificOutput"]["permissionDecision"] == "deny", c
         assert "Instead:" in out["hookSpecificOutput"]["permissionDecisionReason"], c
     assert not (run / "glm_guard.json").exists(), "a scratch write is a redirect: the run goes on"
-    pre("cmd > /tmp/g")
+    pre("cmd > /srv/g")
     assert (run / "glm_guard.json").exists(), "the third refusal in one run hands it back to Opus"
 
 
@@ -294,11 +294,11 @@ def test_the_guarded_runner_passes_device_reads_and_refuses_writes_outside_the_w
     reads = ["ipmitool sdr 2>&1 | tail -5", "ttp occupancy >&2", "tt-smi -s 2>/dev/null"]
     for c in reads:
         assert env.execute({"command": c}, ws)["returncode"] == 0, c
-    for c in ("echo x > /tmp/f", "cmd 2> /tmp/f"):
+    for c in ("echo x > /srv/f", "cmd 2> /srv/f"):
         got = env.execute({"command": c}, ws)
         assert got["returncode"] == 2 and "Instead:" in got["output"], c
     with pytest.raises(glmenv.Submitted):
-        env.execute({"command": "cmd > /tmp/g"}, ws)
+        env.execute({"command": "cmd > /srv/g"}, ws)
     assert ran == reads, "a refused command never ran"
 
 
@@ -573,7 +573,7 @@ def test_a_glm_device_run_writes_inside_the_plans_scratch_folder_on_its_host_and
                   f"ssh box-a 'mv /etc/hosts /tmp/ttp-{tid}/'", f"ssh box-a 'ln -s / /tmp/ttp-{tid}/root'",
                   f"ssh box-a 'rm -rf /tmp/ttp-{tid}/../x'", f"ssh box-b mkdir -p /tmp/ttp-{tid}/x",
                   f"ssh box-a 'sudo mkdir /tmp/ttp-{tid}/x'", f"ssh box-a 'ssh box-b mkdir /tmp/ttp-{tid}/x'",
-                  f"ssh box-a 'mkdir /tmp/ttp-{tid}/x; echo x > /tmp/y'", f"mkdir -p /tmp/ttp-{tid}/x"):
+                  f"ssh box-a 'mkdir /tmp/ttp-{tid}/x; echo x > /tmp/y'"):
             assert deviceplan.refusal(c, ws, e, {}), c
 
 

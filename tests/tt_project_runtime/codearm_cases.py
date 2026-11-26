@@ -367,12 +367,6 @@ def _gg_run(tmp_path, arm=True):
     return wt, rd
 
 
-def _gg_tmp_taken(monkeypatch):
-    """Every system temp dir entry is another's (a temp file the run did not make): writes there stay outside."""
-    from ttp import glmguard
-    monkeypatch.setattr(glmguard, "_tmp_entry", lambda path, made: "")
-
-
 def test_glm_guard_is_on_for_an_arm_run_by_its_variable_or_its_marker_and_off_for_other_runs(tmp_path):
     from ttp import codearm, glmguard
     glm = {codearm.KEY: {"arm": "glm", "run": "glm"}}
@@ -696,13 +690,12 @@ def test_glm_guard_keeps_a_hand_off_the_run_wrote_before_it_was_stopped(tmp_path
     "gh issue create -t x", "gh api repos/o/r/issues -f title=x", "curl -X POST https://x.invalid -d a=b",
     "curl --data a=b https://x.invalid", "ssh host 'ls > /srv/x'", "mail -s x a@b", "sqlite3 $TTP_PROJECT/state/project.db 'x'",
     "unset TTP_CODE_ARM_GUARD; ttp notify x", "TTP_CODE_ARM_GUARD=0 ttp notify x", "env -i ttp notify x",
-    "rm $TTP_RUN_DIR/glm_guard.on", "echo x > /etc/hosts-copy", "cd /tmp/elsewhere-x && echo x > ~/note.txt",
+    "rm $TTP_RUN_DIR/glm_guard.on", "echo x > /etc/hosts-copy", "cd /srv/elsewhere-x && echo x > note.txt",
     "bash -c 'ttp notify x'", "bash -c 'ttp note --to other x'", "ttp note --reply abc x",
     "cat > ~/.tt-project/machine-workers.json", "ssh host 'echo hi >> ~/.bashrc'", "ssh host 'run.sh > $HOME/out.log'",
-    "ssh host 'cd ~/wt && make > b.log'", "sed -i 's/a/b/w /etc/x-copy' src/mod.py", "cd /tmp/elsewhere-x && sed -i s/a/b/ rel.py"])
+    "ssh host 'cd ~/wt && make > b.log'", "sed -i 's/a/b/w /etc/x-copy' src/mod.py", "cd /srv/elsewhere-x && sed -i s/a/b/ rel.py"])
 def test_glm_guard_refuses_a_shell_command_that_reaches_a_person_a_project_or_something_outside_the_worktree(cmd, tmp_path, monkeypatch):
     from ttp import glmguard
-    _gg_tmp_taken(monkeypatch)
     wt, rd = _gg_run(tmp_path)
     assert glmguard.shell_refusal(cmd, str(wt), str(rd), {"TTP_PROJECT": str(tmp_path / "proj"), **_GG_RUN_ENV}), cmd
 
@@ -748,10 +741,9 @@ def test_glm_guard_reads_a_copied_or_closed_fd_as_no_file_after_a_cd_outside_the
 
 @_pytest.mark.parametrize("cmd", [
     "cd /work/repo && echo x > f", "cd /work/repo && echo x >> f 2>&1", "cd /work/repo && echo x >&f",
-    "cd /work/repo && ls 2>err.log", "ls &>/tmp/x", "ls 2>&1 >/tmp/x", "ls >&/tmp/x"])
+    "cd /work/repo && ls 2>err.log", "ls &>/srv/x", "ls 2>&1 >/srv/x", "ls >&/srv/x"])
 def test_glm_guard_still_refuses_a_redirect_to_a_file_outside_the_worktree(cmd, tmp_path, monkeypatch):
     from ttp import glmguard
-    _gg_tmp_taken(monkeypatch)
     wt, rd = _gg_run(tmp_path)
     assert glmguard.shell_refusal(cmd, str(wt), str(rd), {"TTP_PROJECT": str(tmp_path / "proj"), **_GG_RUN_ENV}), cmd
 
@@ -834,11 +826,9 @@ def test_glm_guard_allows_writes_to_the_runs_own_scratch_folder(cmd, tmp_path):
                                   "cwd": str(wt)}, env_) is None, cmd
 
 
-def test_glm_guard_lets_a_run_write_its_own_new_temp_entries_and_keeps_every_other_temp_file_outside(tmp_path,
-                                                                                                    monkeypatch):
-    """Replayed stops: a new scratch dir or file under /tmp is the run's own (the check returns it, the live hook
-    keeps it in TMP_MADE, so later writes under it pass); an existing temp file it did not make, a glob, a link out,
-    a device run and the record stay refused, and so does deleting the project's own state logs."""
+def test_glm_guard_lets_a_run_write_new_temp_entries_and_keeps_links_globs_and_records_outside(tmp_path):
+    """A new scratch dir or file under /tmp and a temp file of the account's own harm nobody; a glob, an unread name,
+    a link out, a link the command makes, the record and deleting the project's own state logs stay refused."""
     import os
     import tempfile
     from ttp import glmguard
@@ -846,46 +836,35 @@ def test_glm_guard_lets_a_run_write_its_own_new_temp_entries_and_keeps_every_oth
     proj = tmp_path / "proj"
     (proj / "tt-project" / "state" / "logs").mkdir(parents=True)
     e = {"TTP_PROJECT": str(proj), "TTP_RUN_DIR": str(rd), "TMPDIR": str(rd / "tmp"), **_GG_RUN_ENV}
-    ask = lambda c, env=e, made=None: glmguard.shell_refusal(c, str(wt), str(rd), env, made=made)
+    ask = lambda c, env=e: glmguard.shell_refusal(c, str(wt), str(rd), env)
     u, taken = f"/tmp/ttp-gg-{os.getpid()}-{tmp_path.name}", ""
     try:
-        made: list[str] = []
         for c in (f"mkdir -p {u}-metal && tar -xf dist/a.tar -C {u}-metal", f"rg -n x src > {u}.out 2>&1",
                   f"mkdir -p {u}-rc && cd {u}-rc && python3 - <<'PY'\nprint(1)\nPY",
                   f'TMPDIR=/tmp; echo x > "$TMPDIR/{u[5:]}.sh"'):
-            assert ask(c, made=made) is None, c
-        assert set(made) == {f"{u}-metal", f"{u}.out", f"{u}-rc", f"{u}.sh"} and not os.listdir(rd), "a check writes nothing"
-        monkeypatch.setenv("TTP_RUN_DIR", str(rd))
-        glmguard.keep_tmp(made)   # the live hook's step once it lets the commands run
-        os.mkdir(f"{u}-rc")
-        assert ask(f"echo y > {u}-rc/f && rm -rf {u}-rc") is None, "an entry the run made stays its own"
+            assert ask(c) is None, c
+        assert not os.listdir(rd), "a check writes nothing"
         fd, taken = tempfile.mkstemp(dir="/tmp")
         os.close(fd)
-        os.symlink(str(tmp_path), f"{u}-ln")
-        os.symlink(taken, f"{u}-lt")   # a link to another temp entry, whatever the test's basetemp
-        os.symlink(taken, f"{u}-rc/lt")
-        with open(rd / glmguard.TMP_MADE, "a") as f:
-            f.write(f"{u}-ln\n{u}-lt\n")
-        for c in (f"echo x > {taken}", f"rm {taken}", "rm -rf /tmp/*", "echo x > /tmp/$X/y", f"echo x > {u}-ln/f",
-                  f"echo x > {u}-lt", f"echo x > {u}-rc/lt",
+        os.symlink("/etc", f"{u}-ln")
+        os.symlink(taken, f"{u}-lt")
+        for c in (f"echo x > {taken}", f"rm {taken}", f"echo x > {u}-lt"):
+            assert ask(c) is None, c
+        assert ask(f"echo x > {u}-dev", {**e, glmguard.RUN_ENV: glmguard.DEVICE}) is None, "a device run's too"
+        assert not glmguard.writes_outside(f"echo x > {u}-new", str(wt), str(rd), e, inline=True), "the post-run scan too"
+        for c in ("rm -rf /tmp/*", "echo x > /tmp/$X/y", f"echo x > {u}-ln/f",
                   f"ln -s ~/.bashrc {u}-l2", f"cp -s ~/.bashrc {u}-l3", f"cp -as ~/.bashrc {u}-l4",
                   f"rm {proj}/tt-project/state/logs/changes-pre-expiry.json"):
             assert "outside its worktree" in (ask(c) or ""), c
-        assert ask(f"echo {taken} >> $TTP_RUN_DIR/{glmguard.TMP_MADE}") == f"{glmguard.GUARD_WHY}: {rd}/{glmguard.TMP_MADE}"
-        assert ask(f"echo x > {u}-dev", {**e, glmguard.RUN_ENV: glmguard.DEVICE}), "a device run's scratch is its plan's"
-        assert glmguard.writes_outside(f"echo x > {u}-new", str(wt), str(rd), e, inline=True), "the post-run scan too"
     finally:
-        for p in (f"{u}-rc/lt", f"{u}-rc", f"{u}-ln", f"{u}-lt", taken):
+        for p in (f"{u}-ln", f"{u}-lt", taken):
             if os.path.islink(p) or os.path.isfile(p):
                 os.unlink(p)
-            elif os.path.isdir(p):
-                os.rmdir(p)
 
 
-def test_glm_guard_checks_write_nothing_and_only_the_live_hook_keeps_the_runs_own_temp_entries(monkeypatch, tmp_path):
-    """Review finding: a check (shell_refusal, tool_refusal, writes_outside) once appended to TMP_MADE, so a replay
-    wrote into the run folders it read and a refused or never-run command counted as made. Only the live hook
-    keeps an allowed command's new entries, in its own run's folder; another run never sees them."""
+def test_glm_guard_checks_write_nothing_and_the_live_hook_lets_every_runs_temp_writes_through(monkeypatch, tmp_path):
+    """A check (shell_refusal, tool_refusal, writes_outside) writes nothing into the run folder it reads, and a new
+    /tmp entry passes for every run."""
     import os
     from ttp import glmguard, hook
     wt, rd = _gg_run(tmp_path, arm=False)
@@ -894,9 +873,8 @@ def test_glm_guard_checks_write_nothing_and_only_the_live_hook_keeps_the_runs_ow
     u = f"/tmp/ttp-gg-{os.getpid()}-{tmp_path.name}-own"
     e = {"TTP_RUN_DIR": str(rd), "TMPDIR": str(rd / "tmp"), **_GG_RUN_ENV}
     bash = lambda c: {"tool_name": "Bash", "tool_input": {"command": c}, "cwd": str(wt)}
-    made: list[str] = []
     assert glmguard.shell_refusal(f"echo hi > {u}", str(wt), str(rd), {}) is None
-    assert glmguard.shell_refusal(f"echo hi > {u}", str(wt), str(rd), e, made=made) is None and made == [u]
+    assert glmguard.shell_refusal(f"echo hi > {u}", str(wt), str(rd), e) is None
     assert glmguard.tool_refusal(bash(f"mkdir {u}"), e) is None and not glmguard.writes_outside(f"echo x > {u}", str(wt), str(rd), e)
     assert not os.listdir(rd), "a dry check creates no file in the run folder"
     monkeypatch.setenv("TTP_PROJECT", str(tmp_path / "proj"))
@@ -905,13 +883,10 @@ def test_glm_guard_checks_write_nothing_and_only_the_live_hook_keeps_the_runs_ow
     pre = lambda c: (hook.pre_tool_use(bash(c))[0] or {}).get("hookSpecificOutput", {}).get("permissionDecision")
     try:
         assert pre(f"mkdir -p {u} && echo x > {u}/a") != "deny"
-        assert (rd / glmguard.TMP_MADE).read_text().split() == [u], "the live hook keeps the allowed command's entry"
         os.mkdir(u)
-        assert pre(f"echo y > {u}/b") != "deny", "a later write into the run's own entry passes"
-        assert pre("ttp land 5") == "deny" and (rd / glmguard.TMP_MADE).read_text().split() == [u]
+        assert pre("ttp land 5") == "deny"
         monkeypatch.setenv("TTP_RUN_DIR", str(rd2))
-        assert pre(f"echo y > {u}/c") == "deny", "another run does not see the first run's entries"
-        assert not (rd2 / glmguard.TMP_MADE).exists()
+        assert pre(f"echo y > {u}/c") != "deny", "another run's write there harms no one either"
     finally:
         if os.path.isdir(u):
             os.rmdir(u)
@@ -947,25 +922,26 @@ def test_the_readers_that_may_name_the_guards_files_have_no_output_file_form():
 
 @_pytest.mark.parametrize("cmd", [
     "git diff > /tmp/daemon_diff.txt", "cp src/a.py /tmp/a.orig.py", "echo x > /tmp/x", "TMPDIR=/tmp; cp a $TMPDIR/x",
-    "export TMPDIR=/var/tmp && echo x > $TMPDIR/y", "TMP=/tmp cp a ${TMP}/x", "echo x > $TMPDIR/../../../escape"])
-def test_glm_guard_still_refuses_writes_to_tmp_and_to_a_tmpdir_the_command_set_itself(cmd, tmp_path, monkeypatch):
-    """cell scratch_tmp_refused: the scratch folder opens no other part of /tmp (each entry there another's)."""
+    "export TMPDIR=/var/tmp && echo x > $TMPDIR/y"])
+def test_glm_guard_lets_a_run_write_to_tmp_and_to_a_tmpdir_the_command_set_itself(cmd, tmp_path, monkeypatch):
+    """cell scratch_tmp_open: a new file in /tmp or /var/tmp harms nobody; /tmp itself,
+    a glob there, an unset TMP and an escape out of the scratch folder stay refused."""
     from ttp import glmguard
-    _gg_tmp_taken(monkeypatch)
     wt, rd = _gg_run(tmp_path)
     tmp = glmguard.scratch_env(rd)["TMPDIR"]
     env_ = {"TTP_PROJECT": str(tmp_path / "proj"), "TTP_RUN_DIR": str(rd), "TMPDIR": tmp, **_GG_RUN_ENV}
-    assert "outside its worktree" in (glmguard.shell_refusal(cmd, str(wt), str(rd), env_) or ""), cmd
+    assert glmguard.shell_refusal(cmd, str(wt), str(rd), env_) is None, cmd
     other = {**env_, "TMPDIR": "/tmp", "TMP": "", "TEMP": "/var/tmp"}   # a run whose TMPDIR is not its own
-    assert all(glmguard.shell_refusal(c, str(wt), str(rd), other) for c in ("cp a $TMPDIR/x", "echo > $TMP/x",
-                                                                          "tee ${TEMP}/x"))
+    assert not any(glmguard.shell_refusal(c, str(wt), str(rd), other) for c in ("cp a $TMPDIR/x", "tee ${TEMP}/x"))
+    for c in ("echo > $TMP/x", "rm -rf /tmp", "rm -rf /tmp/*", "echo x > $TMPDIR/../../../escape"):
+        assert "outside its worktree" in (glmguard.shell_refusal(c, str(wt), str(rd), env_ if "escape" in c else other)
+                                          or ""), c
 
 
 def test_glm_guard_reads_a_naming_that_keeps_tmpdir_as_no_set(tmp_path, monkeypatch):
     """cell scratch_keep: echoing `TMPDIR=$TMPDIR`, `TMPDIR="${TMPDIR:-x}"` and a Python read leave the run's own
     scratch folder its own; a set, an unset or a TMPDIR outside the run stays refused."""
     from ttp import glmguard
-    _gg_tmp_taken(monkeypatch)
     wt, rd = _gg_run(tmp_path)
     tmp = glmguard.scratch_env(rd)["TMPDIR"]
     env_ = {"TTP_PROJECT": str(tmp_path / "proj"), "TTP_RUN_DIR": str(rd), "TMPDIR": tmp, **_GG_RUN_ENV}
@@ -974,11 +950,11 @@ def test_glm_guard_reads_a_naming_that_keeps_tmpdir_as_no_set(tmp_path, monkeypa
     for c in (repro, 'export TMPDIR="${TMPDIR:-/x}"; echo a > "$TMPDIR/a"',
               'mktemp -d "${TMPDIR:-/tmp}/rev.XXXXXX"', "python3 -c 'import os; print(os.environ[\"TMPDIR\"])' > $TMPDIR/o"):
         assert ask(c) is None, c
-    for c in ('TMPDIR=/tmp; echo "TMPDIR=$TMPDIR"; mkdir -p "$TMPDIR/x"', 'unset TMPDIR; echo "TMPDIR=$TMPDIR" > $TMPDIR/o',
+    for c in ('TMPDIR=/srv; echo "TMPDIR=$TMPDIR"; mkdir -p "$TMPDIR/x"', 'unset TMPDIR; echo "TMPDIR=$TMPDIR" > $TMPDIR/o',
               'TMPDIR=/etc; echo x > "${TMPDIR:-/x}/passwd"',
-              "python3 -c 'import os; os.environ[\"TMPDIR\"] = \"/tmp\"' > $TMPDIR/o"):
+              "python3 -c 'import os; os.environ[\"TMPDIR\"] = \"/srv\"' > $TMPDIR/o"):
         assert "outside its worktree" in (ask(c) or ""), c
-    for out in ("/tmp", str(tmp_path / "home")):   # the run's TMPDIR is not its own
+    for out in ("/srv", str(tmp_path / "home")):   # the run's TMPDIR is not its own
         assert "outside its worktree" in (ask(repro.replace("mkdir -p \"$TMPDIR\"", "mkdir -p \"$TMPDIR/x\""),
                                               {**env_, "TMPDIR": out}) or ""), out
 
@@ -994,7 +970,7 @@ def test_a_glm_runs_scratch_folder_is_in_its_run_folder_or_its_own_short_temp_di
     assert glmguard.tool_refusal({"tool_name": "Write", "tool_input": {"file_path": str(rd / "tmp" / "a.txt")},
                                   "cwd": str(wt)}, run) is None
     assert "outside its worktree" in glmguard.tool_refusal(
-        {"tool_name": "Write", "tool_input": {"file_path": "/tmp/a.txt"}, "cwd": str(wt)}, run)
+        {"tool_name": "Write", "tool_input": {"file_path": "/srv/a.txt"}, "cwd": str(wt)}, run)
     assert "tmp_env.update(glmguard.scratch_env(run_dir, tmp_env))" in inspect.getsource(daemon)
 
 
@@ -1039,7 +1015,6 @@ def test_glm_guard_redirects_a_refusal_with_its_allowed_way_and_hands_back_on_th
     goes on; the third refusal in one run hands it back."""
     from ttp import glmguard, hook
     wt, rd = _gg_run(tmp_path)
-    _gg_tmp_taken(monkeypatch)
     monkeypatch.setenv("TTP_RUN_DIR", str(rd))
     monkeypatch.setenv("TTP_PROJECT", str(tmp_path / "proj"))
     monkeypatch.setenv("TTP_CODE_ARM_GUARD", "1")
@@ -1050,7 +1025,7 @@ def test_glm_guard_redirects_a_refusal_with_its_allowed_way_and_hands_back_on_th
         return out["hookSpecificOutput"]["permissionDecisionReason"]
     why = pre("sqlite3 state/" + "project" + ".db 'select 1'")
     assert "`ttp task <project> show <id>`" in why and "goes back to Opus" not in why
-    assert "$TMPDIR" in pre("echo x > /tmp/notes.md")
+    assert "$TMPDIR" in pre("echo x > /srv/notes.md")
     assert not glmguard.hit_reason(rd) and not (rd / "result.json").exists(), "the run goes on"
     assert "goes back to Opus" in pre("ttp upstream 'fix the parser'")
     assert glmguard.hit_reason(rd).startswith("refusal 3 in one run")
@@ -1139,7 +1114,7 @@ def test_glmenv_refuses_what_the_guard_refuses_and_a_secret_read_and_allows_ordi
     assert ask("cat " + "~/." + "ssh/" + "id_" + "rsa")   # a stored private key
 
 
-def test_the_guarded_environment_keeps_a_run_command_s_new_temp_entry_and_a_refused_one_s_never(tmp_path, monkeypatch):
+def test_the_guarded_environment_lets_a_run_command_s_temp_write_through_with_no_temp_entry_to_keep(tmp_path, monkeypatch):
     """The mini-swe-agent command layer is that provider's live hook: it keeps what it runs, as hook.pre_tool_use."""
     import os
     from ttp import glmenv, glmguard
@@ -1154,17 +1129,15 @@ def test_the_guarded_environment_keeps_a_run_command_s_new_temp_entry_and_a_refu
         pytest.skip("minisweagent is importable here: its own environment class is the base")
     env = type("Env", (glmenv.GuardedEnvironment, Base), {})()
     u = f"/tmp/ttp-gg-{os.getpid()}-{tmp_path.name}-mini"
-    assert glmenv.refusal(f"echo x > {u}", str(wt), str(rd)) is None and not (rd / glmguard.TMP_MADE).exists()
+    assert glmenv.refusal(f"echo x > {u}", str(wt), str(rd)) is None
     assert env.execute({"command": f"echo x > {u}-a"}, str(wt))["returncode"] == 0
     assert env.execute({"command": f"echo x > {u}-b && sqlite3 state/project.db 'select 1'"}, str(wt))["returncode"] == 2
-    assert (rd / glmguard.TMP_MADE).read_text().split() == [f"{u}-a"]
 
 
 def test_the_guarded_environment_ends_a_run_on_a_refused_command_and_runs_the_rest(tmp_path, monkeypatch):
     import json
     from ttp import codearm, glmenv, glmguard
     wt, rd = _gg_run(tmp_path)
-    _gg_tmp_taken(monkeypatch)
     monkeypatch.setenv("TTP_RUN_DIR", str(rd))
     monkeypatch.setenv("TTP_CODE_ARM_GUARD", "1")
     ran: list = []
@@ -1181,7 +1154,7 @@ def test_the_guarded_environment_ends_a_run_on_a_refused_command_and_runs_the_re
     got = env.execute({"command": "ttp note --to other hi"}, str(wt))
     assert got["returncode"] == 2 and got["output"].startswith("not sent: ") and ran == ["ls"]
     assert (rd / glmguard.DRAFTS).exists() and not (rd / "result.json").exists()
-    got = env.execute({"command": "echo x > /tmp/notes.md"}, str(wt))   # a redirect: the run goes on
+    got = env.execute({"command": "echo x > /srv/notes.md"}, str(wt))   # a redirect: the run goes on
     assert got["returncode"] == 2 and "$TMPDIR" in got["output"] and not (rd / "result.json").exists()
     with pytest.raises(glmenv.Submitted) as ei:
         env.execute({"command": "git push origin HEAD"}, str(wt))
@@ -1197,7 +1170,6 @@ def test_the_guarded_environment_hands_a_coordinator_update_to_the_model_at_its_
     import json
     from ttp import cli, glmenv, hook
     wt, rd = _gg_run(tmp_path)
-    _gg_tmp_taken(monkeypatch)
     monkeypatch.setenv("TTP_RUN_DIR", str(rd))
     monkeypatch.setenv("TTP_CODE_ARM_GUARD", "1")
     monkeypatch.setenv("TTP_TASK", "7")
@@ -1222,7 +1194,7 @@ def test_the_guarded_environment_hands_a_coordinator_update_to_the_model_at_its_
     assert env.execute({"command": "ls"}, str(wt))["output"] == "ok", "handed over once"
     with open(rd / "steer.md", "a") as f:
         f.write("\n## Update Thu 10:20 PST\nkeep notes in the worktree\n")
-    got = env.execute({"command": "echo x > /tmp/notes.md"}, str(wt))   # a redirect carries it too
+    got = env.execute({"command": "echo x > /srv/notes.md"}, str(wt))   # a redirect carries it too
     assert got["returncode"] == 2 and "$TMPDIR" in got["output"] and got["output"].endswith("keep notes in the worktree")
     assert "build only" not in got["output"] and hook.unread_update(rd)[0] == ""
 
@@ -1825,17 +1797,17 @@ def test_every_route_to_the_chat_model_starts_under_the_outward_guard(name):
 @_pytest.mark.parametrize("name", sorted(_glm_route_notes()))
 def test_every_route_to_the_chat_model_gets_the_scratch_redirect_in_the_tool_hook(name, monkeypatch, tmp_path):
     """A run marked only as a chat-model run (no arm variable) hits the same write check: a report's
-    `ttp said ... > /tmp/x.json` (an existing temp file) is redirected to the run's scratch folder, never let through."""
+    `ttp said ... > /srv/x.json` (a new file outside the home folder and /tmp) is redirected to the run's scratch
+    folder, never let through."""
     import json
     from ttp import glmguard, hook
-    _gg_tmp_taken(monkeypatch)
     flag = glmguard.run_env("claude", _glm_route_notes()[name])[glmguard.RUN_ENV]
     wt, rd = _glm_run_env(monkeypatch, tmp_path, flag)
     glmguard.mark_run(rd, False, cwd=str(wt))
-    cmd = "ttp said baseline --json --days 5 -n 30 > /tmp/said_baseline.json 2>&1"
+    cmd = "ttp said baseline --json --days 5 -n 30 > /srv/said_baseline.json 2>&1"
     out, _ = hook.pre_tool_use({"tool_name": "Bash", "tool_input": {"command": cmd}, "cwd": str(wt)})
     why = json.dumps(out)
-    assert "deny" in why and "/tmp/said_baseline.json" in why, name
+    assert "deny" in why and "/srv/said_baseline.json" in why, name
     assert not (rd / glmguard.HIT).exists(), "a scratch file outside its folders is a redirect: the run goes on"
 
 
@@ -1981,7 +1953,7 @@ def test_a_review_of_a_change_touching_a_listed_file_names_it_on_a_covered_proje
 
 # The denylist: only the harmful kinds measured on real runs are refused; everything else runs.
 _GG_DENIED = [
-    "echo hi > /tmp/a", "rm -rf /srv/x", "ssh box-a rm -rf /srv/x", "curl -X POST -d a=b https://x.invalid",
+    "rm -rf /srv/x", "ssh box-a rm -rf /srv/x", "curl -X POST -d a=b https://x.invalid",
     "ttp land 5", "ttp express 5", "ttp push --land", "ttp p express 5 --why x", "git push", "ttp remove p",
     "ttp machines change add box-a 'w' --undo true", "ttp machines set box-a --tag a", "ttp notify x",
     "bash <<'EOF'\nttp notify x\nEOF", 'echo "<<EOF"; ttp notify x',
@@ -1989,7 +1961,7 @@ _GG_DENIED = [
     "bash -c 'systemctl --user enable svc-a'", "ssh box-a bash -s <<'EOF'\nls\nsudo systemctl restart svc-a\nEOF",
     "bash -s <<EOF\nsystemctl --now mask svc-a\nEOF"]
 _GG_ALLOWED = [
-    "echo hi > $TMPDIR/a", "echo hi > out.txt", "ssh box-a mkdir -p out", "curl --unix-socket /run/b.sock -X POST http://l/x",
+    "echo hi > $TMPDIR/a", "echo hi > /tmp/a", "echo hi > out.txt", "ssh box-a mkdir -p out", "curl --unix-socket /run/b.sock -X POST http://l/x",
     "ttp machines change show 3", "ttp machines --help", "python3 <<'EOF'\nprint('`ttp notify x`')\nEOF",
     "grep -o x f", "ssh -o BatchMode=yes box-a ls", "journalctl -o cat -n 5", "ttp lock b -- ssh -o x box-a ls",
     "ttp note --status 5", "ttp slop", "ttp memory --search notify", "ttp task add t s", "ttp obligation progress o1 x",
@@ -2000,7 +1972,6 @@ _GG_ALLOWED = [
 @_pytest.mark.parametrize("cmd", _GG_DENIED)
 def test_glm_guard_refuses_each_kind_on_the_denylist(cmd, tmp_path, monkeypatch):
     from ttp import glmguard
-    _gg_tmp_taken(monkeypatch)
     wt, rd = _gg_run(tmp_path)
     e = {**_GG_RUN_ENV, "TMPDIR": str(rd / "tmp")}
     assert glmguard.shell_refusal(cmd, str(wt), str(rd), e), cmd
@@ -2083,13 +2054,12 @@ def test_glm_guard_refuses_a_protected_name_anywhere_else_in_the_command(cmd, tm
 
 
 @_pytest.mark.parametrize("cmd", [
-    "TMPDIR=/tmp; echo hi > $TMPDIR/out", "export \"TMPDIR=/tmp\"; echo hi > $TMPDIR/out",
-    "unset TMPDIR; echo hi > $TMPDIR/out", "python3 -c 'import os' TMP=/tmp; echo hi > $TMP/out",
-    "export 'TMPDIR'=/tmp; echo hi > $TMPDIR/x", "declare -x \"TMPDIR\"=/tmp; echo hi > $TMPDIR/x",
-    "read 'TMPDIR' <<< /tmp; echo hi > $TMPDIR/x"])
+    "TMPDIR=/srv; echo hi > $TMPDIR/out", "export \"TMPDIR=/srv\"; echo hi > $TMPDIR/out",
+    "unset TMPDIR; echo hi > $TMPDIR/out", "python3 -c 'import os' TMP=/srv; echo hi > $TMP/out",
+    "export 'TMPDIR'=/srv; echo hi > $TMPDIR/x", "declare -x \"TMPDIR\"=/srv; echo hi > $TMPDIR/x",
+    "read 'TMPDIR' <<< /srv; echo hi > $TMPDIR/x"])
 def test_glm_guard_reads_scratch_as_tmp_where_the_command_names_tmpdir(cmd, tmp_path, monkeypatch):
     from ttp import glmguard
-    _gg_tmp_taken(monkeypatch)
     wt, rd = _gg_run(tmp_path)
     e = {"TTP_PROJECT": str(tmp_path / "proj"), "TMPDIR": str(rd / "tmp"), **_GG_RUN_ENV}
     assert glmguard.shell_refusal(cmd, str(wt), str(rd), e), cmd
@@ -2315,8 +2285,9 @@ def test_glm_guard_lets_a_run_write_in_the_work_folders_its_spec_names_and_no_pr
     assert glmguard.shell_refusal(f"cd {bench} && cp run.py run.py.bak", str(wt), str(rd), e) is None
     assert glmguard.tool_refusal({"tool_name": "Write", "tool_input": {"file_path": f"{bench}/run.py"},
                                   "cwd": str(wt)}, e) is None
-    for d in (home / "w" / "bench" / "set", tp / "locks" / "a", scratch):
+    for d in (tp / "locks" / "a", scratch):   # the harness's own folder, a project's folder
         assert glmguard.shell_refusal(f"cp {wt}/a {d}/a", str(wt), str(rd), e), d
+    assert glmguard.shell_refusal(f"cp {wt}/a {home}/w/bench/set/a", str(wt), str(rd), e) is None   # a home write
     for path in (f"{proj}/tt-project/state/x.json", f"{proj}/tt-project/harness/CHARTER.md",
                  f"{scratch}/tt-project/state/x.json"):
         for cmd in (f"echo x > {path}", f"echo x >> {path}"):
@@ -2393,12 +2364,11 @@ def test_glmenv_hands_back_a_key_copy_before_it_redirects_the_scratch_write(cmd,
     wt, rd = _gg_run(tmp_path)
     got = glmenv.refusal(cmd.replace("/k", f"/k-{tmp_path.name}"), str(wt), str(rd), {"TTP_RUN_DIR": str(rd), "TMPDIR": "/tmp", **_GG_RUN_ENV})
     assert got == glmguard.SECRET_WHY, got   # a new temp entry of the run's own: still a key read
-    _gg_tmp_taken(monkeypatch)
     got = glmenv.refusal(cmd, str(wt), str(rd), {"TTP_RUN_DIR": str(rd), "TMPDIR": "/tmp", **_GG_RUN_ENV})
     assert got == glmguard.SECRET_WHY, got
     assert glmguard.classify(got)[:2] == ("credentials", glmguard.HARMFUL)
-    plain = glmenv.refusal("cp a.txt /tmp/k", str(wt), str(rd), {"TTP_RUN_DIR": str(rd), **_GG_RUN_ENV})
-    assert glmguard.classify(plain)[1] == glmguard.REDIRECTED   # a plain scratch copy stays a redirect
+    plain = glmenv.refusal(f"cp a.txt /tmp/k-{tmp_path.name}", str(wt), str(rd), {"TTP_RUN_DIR": str(rd), **_GG_RUN_ENV})
+    assert plain is None, plain   # a plain copy to /tmp harms nobody
 
 
 def test_glmenv_keeps_a_sed_edit_with_an_fd_redirect_inside_the_worktree(tmp_path):
@@ -2432,14 +2402,13 @@ def test_glmguard_gives_no_run_root_to_the_harness_owned_folders_a_spec_names(tm
 def test_glmenv_lets_a_run_export_its_own_scratch_folder_and_still_refuses_an_identity_edit(tmp_path, monkeypatch):
     from ttp import glmenv
     wt, rd = _gg_run(tmp_path)
-    _gg_tmp_taken(monkeypatch)
     env = {"TTP_RUN_DIR": str(rd), "TMPDIR": str(rd / "tmp"), **_GG_RUN_ENV}
     for cmd in ('mkdir -p "$TTP_RUN_DIR/tmp" && export TMPDIR="$TTP_RUN_DIR/tmp"; echo x > "$TMPDIR/a.sh"; echo "TTP_RUN_DIR=$TTP_RUN_DIR"',
                 f'export TMPDIR={rd}/tmp && mkdir -p "$TMPDIR" && echo x > "$TMPDIR/p"',
-                'export KEEP="$TTP_RUN_DIR/keep"; echo ok'):
+                'export KEEP="$TTP_RUN_DIR/keep"; echo ok', f'export TMPDIR=/tmp/x-{tmp_path.name} && echo x > "$TMPDIR/p"'):
         assert glmenv.refusal(cmd, str(wt), str(rd), env) is None, cmd
     for cmd in ("export TTP_RUN_DIR=/x", "export FOO=1 TTP_RUN_DIR=/x", 'export FOO="$TTP_RUN_DIR"; TTP_RUN_DIR=/x',
-                'export TMPDIR=/tmp/x && echo x > "$TMPDIR/p"', "TMPDIR=/etc echo x > $TMPDIR/p",
+                "TMPDIR=/etc echo x > $TMPDIR/p",
                 "export {TTP_RUN_DIR,X}=/x", "unset {TTP_RUN_DIR,X}", "export {TTP_TASK,X}=t9999"):   # brace expansion names it
         assert glmenv.refusal(cmd, str(wt), str(rd), env), cmd   # another folder, or the identity itself, stays refused
 
@@ -2646,17 +2615,67 @@ def test_glm_guard_runs_dev_redirects_dry_pushes_reader_expansions_and_env_i_of_
         assert deny(cmd), cmd
 
 
-def test_glm_guard_counts_a_mktemp_entry_as_the_runs_own_and_not_its_neighbours(monkeypatch, tmp_path):
-    deny, _, rd = _gg9846_hook(monkeypatch, tmp_path)
-    tmp = tmp_path / "systmp"
-    assert not deny(f"d=$(mktemp -d {tmp}/gg.XXXXXX) && echo $d")
-    made, other = tmp / "gg.a1B2c3", tmp / "gg.a1B2c3d4"   # what mktemp made, and an entry the run did not make
-    made.mkdir(), other.mkdir()
-    assert not deny(f"echo a > {made}/f && rm -rf {made}")
-    assert deny(f"echo a > {other}/f") and deny(f"rm -rf {other}")
+def _gg_login_home(monkeypatch, tmp_path):
+    """The GLM run's tmp HOME of _gg_home plus the two agent login files and a notes file, and the run's refusal
+    for a command as a function."""
     from ttp import glmguard
-    assert glmguard.mktemp_templates(f"mktemp -p {tmp}", {}) == [f"{tmp}/tmp.XXXXXXXXXX"]
-    assert glmguard.mktemp_templates(f"mktemp -d -p {rd / 'tmp'}", {}) == [], "its own TMPDIR is its own already"
+    _, home, _ = _gg_home(monkeypatch, tmp_path)
+    for d in (".claude", ".codex"):
+        (home / d).mkdir()
+    (home / ".claude" / ".credentials.json").write_text("{}")
+    (home / ".codex" / "auth.json").write_text("{}")
+    (home / "notes.txt").write_text("n")
+    wt, rd = home / "proj/tt-project/worktrees/t1", tmp_path / "run"
+    return home, lambda c: glmguard.shell_refusal(c, str(wt), str(rd), dict(os.environ))
+
+
+def test_glm_guard_refuses_deleting_or_moving_a_folder_that_holds_a_login_file_and_lets_a_plain_home_file_through(
+        monkeypatch, tmp_path):
+    """Removing or moving the folder of an agent login file, or the parent of one (a
+    `.config` holding a login file), is refused as a write onto a credential store, as is the file itself; a plain
+    home file is not."""
+    home, ask = _gg_login_home(monkeypatch, tmp_path)
+    (home / ".config" / "tool").mkdir(parents=True)
+    (home / ".config" / "tool" / "auth.json").write_text("x")
+    (home / ".config" / "gh").mkdir()
+    (home / ".config" / "gh" / "hosts.yml").write_text("x")
+    for c in (f"rm -rf {home}/.claude", f"rm -rf {home}/.codex", f"rm -rf {home}/.config", "rm -rf ~/.claude",
+              f"mv {home}/.claude {home}/old", f"mv {home}/.codex /tmp/x-{tmp_path.name}",
+              f"mv {home}/.config {home}/old", f"rm {home}/.claude/.credentials.json",
+              f"echo x > {home}/.codex/auth.json"):
+        assert "outside its worktree" in (ask(c) or ""), c
+    for c in (f"echo x > {home}/notes.txt", f"rm {home}/notes.txt", f"mkdir -p {home}/newdir && echo x > {home}/newdir/a"):
+        assert ask(c) is None, c
+
+
+def test_glm_guard_refuses_the_agents_config_folders_in_home_and_lets_other_home_files_through(monkeypatch, tmp_path):
+    """The agents' config (hook settings, installed plugins and their hooks, Codex's config) and the home's other
+    config files (sidefx.SENSITIVE) are protected harness files: a write there, or a removal of a folder holding
+    one, is refused; a plain home file or folder is not."""
+    home, ask = _gg_login_home(monkeypatch, tmp_path)
+    hooks = f"{home}/.claude/plugins/cache/m/p/1.0/hooks/hooks.json"
+    for t in (f"{home}/.claude/settings.json", f"{home}/.claude/settings.local.json", f"{home}/.claude/notes.md",
+              f"{home}/.claude/plugins/installed_plugins.json", hooks, f"{home}/.codex/config.toml",
+              f"{home}/.gitconfig", f"{home}/.cursor/hooks.json", f"{home}/.npmrc"):
+        for c in (f"echo x > {t}", f"rm -f {t}", f"mv {home}/old {t}", f"echo x | tee -a {t}", f"cp {home}/old {t}"):
+            assert "outside its worktree" in (ask(c) or ""), c
+    for c in (f"rm -rf {home}/.claude/plugins", f"mv {home} {home}-old",
+              f"echo x > {home}/.claude/projects/p/tool-results/a.txt", f"echo x > {home}/.claude.json"):
+        assert "outside its worktree" in (ask(c) or ""), c
+    (home / "work" / "codex").mkdir(parents=True)
+    (home / "work" / "codex" / "auth.json").write_text("{}")
+    monkeypatch.setenv("CODEX_HOME", str(home / "work" / "codex"))   # a store moved out of the config folders
+    assert "outside its worktree" in (ask(f"rm -rf {home}/work") or "")
+    for c in (f"echo x > {home}/notes.txt", f"echo x > {home}/.claude-notes", f"mkdir -p {home}/work/.config-x"):
+        assert ask(c) is None, c
+
+
+def test_glm_guard_refuses_a_sudo_write_to_tmp_like_every_other_root_write(monkeypatch, tmp_path):
+    """`sudo tee /tmp/new` is a refused root write like every other; the same write as the run's own user is not."""
+    _, ask = _gg_login_home(monkeypatch, tmp_path)
+    name = f"/tmp/ttp-gg-{os.getpid()}-{tmp_path.name}-new"
+    assert "outside its worktree" in (ask(f"echo x | sudo tee {name}") or "")
+    assert ask(f"echo x | tee {name}") is None, "the same write as the run's own user stays open"
 
 
 def test_glm_guard_rm_of_nothing_or_an_unread_glob_is_a_redirect_and_a_real_delete_harmful(tmp_path):
@@ -2691,18 +2710,97 @@ def test_glm_guard_redirect_refusals_never_undo_a_done_hand_off(tmp_path):
 
 
 def test_a_glm_run_still_refuses_hidden_and_home_wide_writes(monkeypatch, tmp_path):
-    """A default written into $TMPDIR by expansion, a program name hidden behind quoting, and a recursive delete
+    """A default written into $TMPDIR by expansion (onto the harness's folder), a program name hidden behind quoting, and a recursive delete
     of the home folder stay refused."""
     from ttp import glmguard
     wt, rd = _glm_run_env(monkeypatch, tmp_path)
     glmguard.mark_run(rd, False, cwd=str(wt))
     home = os.path.expanduser("~")
     for cmd in ("x=rm; (echo \"$(printf '$(')\"); $x -rf /srv/x; echo \"y\"",
-                "unset TMPDIR; echo > ${TMPDIR:=" + home + "}/.bashrc", "TMPDIR= ; echo > ${TMPDIR:=" + home + "}/.bashrc",
-                "cp a ${TMPDIR:=" + home + "}/.bashrc", "env -u TMPDIR sh -c \"echo > ${TMPDIR:=" + home + "}/.bashrc\"",
+                "unset TMPDIR; echo > ${TMPDIR:=" + home + "}/.tt-project/lib/x", "TMPDIR= ; echo > ${TMPDIR:=" + home + "}/.tt-project/lib/x",
+                "cp a ${TMPDIR:=" + home + "}/.tt-project/lib/x", "env -u TMPDIR sh -c \"echo > ${TMPDIR:=" + home + "}/.tt-project/lib/x\"",
                 "unset TM''PDIR; TMPDIR=\"${TMPDIR:-" + home + "}\"; rm -rf \"$TMPDIR\"", "tee ${TMPDIR=/etc}/x",
                 "rm -rf ~", "rm -rf $HOME", "rm -rf " + home, "echo x > ~/.ssh/config"):
         assert glmguard.shell_refusal(cmd, str(wt), str(rd)), cmd
+
+
+def _gg_home(monkeypatch, tmp_path):
+    """A GLM run in a tmp HOME whose registry lists another project, `other`: the live hook's deny, home and other."""
+    from ttp import glmguard, hook, project
+    home = tmp_path / "home"
+    other, wt, rd = home / "other", home / "proj/tt-project/worktrees/t1", tmp_path / "run"
+    for d in (other / "tt-project", home / ".tt-project/lib", wt, rd / "tmp"):
+        d.mkdir(parents=True)
+    (home / ".tt-project/registry.json").write_text(json.dumps({"projects": {"other": {"dir": str(other)}}}))
+    for k, v in {"HOME": str(home), "TTP_RUN_DIR": str(rd), "TMPDIR": str(rd / "tmp"),
+                 "TTP_PROJECT": str(home / "proj"), **_GG_RUN_ENV}.items():
+        monkeypatch.setenv(k, v)
+    monkeypatch.setattr(project, "HOME_DIR", home / ".tt-project")
+    glmguard.mark_run(rd, False, cwd=str(wt))
+
+    def deny(cmd):
+        out = (hook.pre_tool_use({"tool_name": "Bash", "tool_input": {"command": cmd}, "cwd": str(wt)})[0] or {})
+        return (out.get("hookSpecificOutput") or {}).get("permissionDecision") == "deny"
+    return deny, home, other
+
+
+@pytest.mark.parametrize("cmd", ["echo x > ~/notes.txt", "mkdir -p ~/scratch/a", "echo x > /tmp/foo-{n}.txt",
+                                 "echo x > /var/tmp/foo-{n}.txt"])
+def test_a_glm_run_writes_below_the_home_folder_and_tmp(cmd, monkeypatch, tmp_path):
+    """Writes below the home folder or /tmp hurt nobody: they pass, onto the account's own
+    existing temp file too."""
+    deny, _, _ = _gg_home(monkeypatch, tmp_path)
+    n = f"{os.getpid()}-{tmp_path.name}"
+    made = [Path(t, f"foo-{n}.txt") for t in ("/tmp", "/var/tmp")]   # entries the account has, not this run's
+    for f in made:
+        f.write_text("")
+    try:
+        assert not deny(cmd.format(n=n))
+    finally:
+        for f in made:
+            f.unlink()
+
+
+@pytest.mark.parametrize("cmd", ["echo x >> ~/.bashrc", "echo x >> ~/.profile",
+                                 "echo x > ~/.local/lib/python3.12/site-packages/zz.pth",
+                                 "cp /bin/true ~/.local/bin/git"])
+def test_a_glm_run_never_writes_what_starts_code_in_the_homes_sessions(cmd, monkeypatch, tmp_path):
+    """Shell startup files, ~/.local/bin and ~/.local/lib start code in every later session: refused, while
+    a plain notes file in the home and a new /tmp folder pass."""
+    deny, home, _ = _gg_home(monkeypatch, tmp_path)
+    assert deny(cmd.replace("~", str(home)))
+    assert not deny(f"echo x > {home}/notes.txt")
+    assert not deny(f"mkdir /tmp/x-{os.getpid()}-{tmp_path.name}")
+
+
+@pytest.mark.parametrize("cmd", [
+    "grep -l '\"task\": 744\\|#744' {p}/state/runs/*/result.json 2>/dev/null | while read f; do d=$(dirname $f); "
+    "sed -n '1p' $f | head -c 150; echo \" <== $d\"; done; for d in 1 2; do f={p}/state/runs/$d/result.json; "
+    "if [ -f \"$f\" ]; then python3 -c \"\nimport json\nr=json.load(open('$f'))\nprint('$d', r.get('status'))\n\" "
+    "2>/dev/null || echo \"$d (parse fail)\"; fi; done",
+    "for d in 1 2; do f={p}/state/runs/$d/result.json; [ -f \"$f\" ] && python3 -c \"\nimport json; "
+    "d=json.load(open('$f'))\nprint('=== run $d:', d.get('status'))\"; done"])
+def test_a_glm_run_reads_another_projects_run_results_with_a_hash_or_a_quoted_script(cmd, monkeypatch, tmp_path):
+    """A `#` inside single quotes is no comment, and a double-quoted script that reads only
+    plain variables expands nothing: both commands only read."""
+    deny, _, other = _gg_home(monkeypatch, tmp_path)
+    assert not deny(cmd.format(p=other / "tt-project"))
+
+
+def test_a_glm_run_still_refuses_writes_to_credentials_other_projects_the_harness_and_outside_home(monkeypatch, tmp_path):
+    """Writes touching a credential folder, another registered project, the harness's own folder, outside the home
+    folder and /tmp, onto another user's file or as another user stay refused; so do credential and secrets-store
+    reads."""
+    deny, home, other = _gg_home(monkeypatch, tmp_path)
+    for cmd in ("echo x > ~/.ssh/config", f"echo x > {other}/a.txt", f"rm -rf {other}", f"echo x > {other}/tt-project/x",
+                "echo x > ~/.tt-project/lib/x", f"echo x > {home}/.tt-project/registry.json", "echo x > /etc/x",
+                "echo x > /x", "rm -rf /", "rm -rf ~", "rm -rf /tmp", "echo x | sudo tee ~/n", "cat ~/.ssh/id_rsa",
+                "cat ~/.tt-project/secrets.json"):
+        assert deny(cmd), cmd
+    (home / "theirs.txt").write_text("")
+    assert not deny("echo x > ~/theirs.txt")
+    monkeypatch.setattr(os, "getuid", lambda: os.stat(home).st_uid + 1)   # the file is now another user's
+    assert deny("echo x > ~/theirs.txt")
 
 
 @pytest.mark.parametrize("cmd", [
@@ -2711,7 +2809,6 @@ def test_a_glm_run_still_refuses_hidden_and_home_wide_writes(monkeypatch, tmp_pa
     "ssh -o BatchMode=yes box-a ls", "ssh -o ConnectTimeout=10 box-a ls"])
 def test_glm_guard_allows_ssh_options_and_a_config_inside_the_runs_own_folders(cmd, tmp_path, monkeypatch):
     from ttp import glmguard
-    _gg_tmp_taken(monkeypatch)
     wt, rd = _gg_run(tmp_path)
     (wt / "conf").mkdir()
     (wt / "conf" / "ssh-config").write_text("Host box-a\n  User user\n")
@@ -2727,7 +2824,6 @@ def test_glm_guard_allows_ssh_options_and_a_config_inside_the_runs_own_folders(c
 def test_glm_guard_refuses_ssh_options_that_run_a_local_program_or_a_config_outside_its_own_folders(
         cmd, tmp_path, monkeypatch):
     from ttp import glmguard
-    _gg_tmp_taken(monkeypatch)
     wt, rd = _gg_run(tmp_path)
     e = {**_GG_RUN_ENV, "TMPDIR": str(rd / "tmp")}
     assert glmguard.shell_refusal(cmd, str(wt), str(rd), e), cmd
@@ -2736,7 +2832,6 @@ def test_glm_guard_refuses_ssh_options_that_run_a_local_program_or_a_config_outs
 def test_glm_guard_refuses_a_config_in_its_own_folders_that_runs_a_program_or_that_the_command_writes_first(
         tmp_path, monkeypatch):
     from ttp import glmguard
-    _gg_tmp_taken(monkeypatch)
     wt, rd = _gg_run(tmp_path)
     (wt / "conf").mkdir()
     (wt / "conf" / "bad").write_text("Host box-a\n  ProxyCommand nc %h %p\n")
@@ -2765,10 +2860,10 @@ def test_glm_guard_reads_a_self_set_tmpdir_as_its_value_and_keeps_the_runs_own(m
     for cmd in ('ls "$TMPDIR"; echo "TMPDIR=$TMPDIR"; mkdir -p "$TMPDIR"', 'mkdir -p "${TMPDIR:-/tmp/x}/a"',
                 'echo hi > "${TMPDIR:-}/note.txt"', 'export TMPDIR="$TMPDIR"; mkdir -p "$TMPDIR/a"'):
         assert not deny(cmd), cmd
-    for cmd in ('TMPDIR=~; echo x >> "$TMPDIR/.bashrc"', 'export TMPDIR="$TMPDIR"; TMPDIR=~; echo x >> "$TMPDIR/.bashrc"',
-                'export TMPDIR=~; echo x >> "$TMPDIR/.bashrc"', 'TMPDIR=$(cat f); echo x >> "$TMPDIR/.bashrc"',
-                'TMPDIR=~ ; echo x >> "${TMPDIR:-/tmp/x}/.bashrc"', 'TMPDIR+=/../../home; echo x >> "$TMPDIR/.bashrc"',
-                'export TMPDIR+=/../../home; echo x >> "$TMPDIR/.bashrc"'):
+    for cmd in ('TMPDIR=~; echo x >> "$TMPDIR/.tt-project/lib/x"', 'export TMPDIR="$TMPDIR"; TMPDIR=~; echo x >> "$TMPDIR/.tt-project/lib/x"',
+                'export TMPDIR=~; echo x >> "$TMPDIR/.tt-project/lib/x"', 'TMPDIR=$(cat f); echo x >> "$TMPDIR/.tt-project/lib/x"',
+                'TMPDIR=~ ; echo x >> "${TMPDIR:-/tmp/x}/.tt-project/lib/x"', 'TMPDIR+=/../../home; echo x >> "$TMPDIR/.tt-project/lib/x"',
+                'export TMPDIR+=/../../home; echo x >> "$TMPDIR/.tt-project/lib/x"'):
         assert deny(cmd), cmd
 
 
@@ -2904,7 +2999,7 @@ def test_a_glm_run_stops_a_hidden_command_once_its_expansion_shows_harm(cmd, har
 @_pytest.mark.parametrize("cmd", [
     "P=$(command -v mkdir); $P {u}; echo {u}",                                # the literal command makes the entry
     "D=$(mktemp -d); $(command -v touch) \"$D/x\"; echo \"$D\""])             # a body the hook runs makes it
-def test_a_staged_command_records_the_temp_entries_it_makes_as_the_runs_own(cmd, monkeypatch, tmp_path):
+def test_a_staged_command_may_make_and_remove_new_temp_entries(cmd, monkeypatch, tmp_path):
     import os
     import shutil
     from ttp import hook

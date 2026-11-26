@@ -37,9 +37,12 @@ FILE = "outside.json"
 SEEN_BY = "recorded by the run-end scan; no guard blocks writes outside protected paths"
 KIND = "outside_writes"
 MAX_PATHS = 15   # named in the prompt block and the event; the rest are counted
-# Under the home: config and credential folders and files (a path there makes the event high)
+# Under the home: config and credential folders and files, and what starts code in every session (shell startup
+# files, ~/.local/bin and lib): a path there makes the event high
 SENSITIVE = (".config", ".ssh", ".gnupg", ".aws", ".azure", ".kube", ".docker", ".netrc", ".git-credentials",
-             ".gitconfig", ".pypirc", ".npmrc", ".local/share/keyrings", ".claude", ".codex", ".cursor")
+             ".gitconfig", ".pypirc", ".npmrc", ".local/share/keyrings", ".claude", ".claude.json", ".codex", ".cursor",
+             ".bashrc", ".profile", ".bash_profile", ".bash_login", ".zshrc", ".zprofile", ".zshenv",
+             ".local/bin", ".local/lib")
 EDIT_TOOLS = {"Write", "Edit", "MultiEdit", "NotebookEdit"}
 PATH_KEYS = ("file_path", "notebook_path", "path", "target", "destination", "dest", "source", "target_file")
 MCP_WRITE_RE = re.compile(r"write|edit|create|move|rename|delete|remove|patch|upload|mkdir|copy", re.I)
@@ -160,7 +163,7 @@ def _tool_output(path: str, home: str) -> bool:
 
 
 def sensitive(path: str, home: str) -> bool:
-    """`path` is under one of the home's config or credential folders (SENSITIVE), not saved tool output."""
+    """`path` is under one of the home's config, credential or code-starting paths (SENSITIVE), not saved tool output."""
     h = os.path.normpath(home)
     return not _tool_output(path, home) and any(path == f"{h}/{s}" or path.startswith(f"{h}/{s}/") for s in SENSITIVE)
 

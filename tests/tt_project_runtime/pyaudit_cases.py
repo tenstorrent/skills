@@ -168,11 +168,11 @@ def test_pyaudit_judges_the_computed_paths_the_static_proof_leaves_to_it(env, cr
     key.write_text("secret")
     e = _pa_env(cred_home, glm=True)
     home = str(cred_home.home)
-    for code in (f"import os; os.environ['TMPDIR']={home!r}; open(os.environ['TMPDIR']+'/.bashrc','a').write('x')",
+    for code in (f"import os; os.environ['TMPDIR']={home!r}; open(os.environ['TMPDIR']+'/.tt-project/x','a').write('x')",
                  f"p=''.join([{home!r}, '/.s', 'sh/id_', 'ed25519']); print(open(p).read())",
                  f"p=''.join([{str(cred_home.run)!r}, '/run', '.json']); open(p,'w')"):
         r = _pa_run(e, code, cred_home.work)
         assert r.returncode != 0 and "tt-project guard" in r.stderr and "secret" not in r.stdout, code
-    assert not (cred_home.home / ".bashrc").exists()
+    assert not (cred_home.home / ".tt-project" / "x").exists()
     r = _pa_run(e, "p=''.join(['ok', '2.txt']); open(p,'w').write('x')", cred_home.work)
     assert r.returncode == 0 and (cred_home.work / "ok2.txt").exists(), r.stderr
