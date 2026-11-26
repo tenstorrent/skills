@@ -570,7 +570,7 @@ REDIRECT_RE = re.compile(r"(?<![<>&])>>?(?![&>(])\s*([\"']?)([^\s\"';&|<>()]+)\1
 STDIN_SCRIPT_RE = re.compile(r"(?:^|[\s;&|(])(?:python[\d.]*|[a-z]*sh|node|ruby|perl|source|\.)\s[^;&|\n<]*"
                              r"(?<!<)<(?![<(])\s*[\"']?([^\s\"';&|<>()]+)")
 # Commands whose quoted arguments are only data (printed, searched for or recorded), never run; also
-# `git commit` and ttp's message calls (as pathguard._blank_messages decides). Their output may go on only into
+# `git commit`, `git grep` and ttp's message calls (as pathguard._blank_messages decides). Their output may go on only into
 # READERS.
 INERT = {"echo", "printf", "cat", "grep", "egrep", "fgrep", "rg"}
 INERT_RE = re.compile(r"\b(?:echo|printf|cat|e?grep|fgrep|rg|git|ttp)\b")
@@ -824,6 +824,24 @@ def _unquoted(text: str) -> str:
     return "".join(" " * (e - b) if q else text[b:e] for b, e, q in _quoted_runs(text))
 
 
+# `git -c key=value`: only these keys, which run no program
+_GIT_PLAIN_CONFIG = frozenset({"commit.gpgsign", "user.name", "user.email"})
+
+
+def _git_sub(argv: list[str]) -> list[str]:
+    """`argv` of a git call without its leading `-c key=value` options of _GIT_PLAIN_CONFIG (other options stay)."""
+    i = 1
+    while i + 1 < len(argv) and argv[i] == "-c" and argv[i + 1].partition("=")[0].lower() in _GIT_PLAIN_CONFIG:
+        i += 2
+    return argv[:1] + argv[i:]
+
+
+def _git_search(argv: list[str]) -> bool:
+    """`git grep` that only searches (not `-O`/`--open-files-in-pager`, which runs a program on the matches)."""
+    return argv[1:2] == ["grep"] and not any(
+        a.startswith("--open-files") or re.fullmatch(r"-[^-]*O.*", a) for a in argv[2:])
+
+
 def _data_only(piece: str, sep: str, commands: str, after: list[str] | tuple = ()) -> bool:
     """`piece` only prints, searches for or records text (INERT, `git commit`, ttp's message calls), runs nothing
     inside, pipes on (`after`) only into READERS, and writes no file that `commands` runs afterwards. Fail closed:
@@ -831,7 +849,7 @@ def _data_only(piece: str, sep: str, commands: str, after: list[str] | tuple = (
     from . import pathguard
     argv = list(_first_argv(piece))
     name = _first_word(piece)
-    if not (name in INERT or name == "git" and argv[1:2] == ["commit"] or name == "ttp"
+    if not (name in INERT or name == "git" and (_git_sub(argv)[1:2] == ["commit"] or _git_search(_git_sub(argv))) or name == "ttp"
             and pathguard._message_pieces(piece + sep) and pathguard._blank_messages(commands) != commands) \
             or _runs_inside(piece) or sep in ("|", "|&") and not (
                 after and all(_first_word(p) in READERS and not _runs_inside(p) for p in after)):

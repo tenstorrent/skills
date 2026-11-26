@@ -850,6 +850,31 @@ def _unquoted(text: str) -> tuple[str, str]:
     return "".join(out), "".join(state)
 
 
+def _shell_text(text: str) -> str:
+    """`text` with each quoted span that holds whitespace or a shell metacharacter blanked (`python3 -c "x = 1; read"`
+    prints or runs a word of its own, never one of this shell's): bash cannot read a keyword out of it. A span
+    that may hold a `$(...)` or backtick (quotes inside it nest), or a quote left open, keeps `text` as it is."""
+    out, i = [], 0
+    while i < len(text):
+        c = text[i]
+        if c == "\\":
+            out.append(text[i:i + 2])
+            i += 2
+        elif c in "'\"":
+            j = i + 1
+            while j < len(text) and text[j] != c:
+                j += 2 if c == '"' and text[j] == "\\" else 1
+            span = text[i:j + 1]
+            if j >= len(text) or c == '"' and re.search(r"\$[({]|`", span):
+                return text
+            out.append(" " * len(span) if re.search(r"[\s;&|<>()]", span) else span)
+            i = j + 1
+        else:
+            out.append(c)
+            i += 1
+    return "".join(out)
+
+
 # a word that sets a variable by other means, runs text as code or leaves a loop early (`eval`, `read`, `break`),
 # `IFS` (it splits a value), `.` as a command, a function definition, arithmetic or `${!`: a command holding one,
 # anywhere, is not straight-line
@@ -922,18 +947,43 @@ def _values(words: str, cwd: str, home: str, moved: bool = False) -> list[str] |
     return out or None
 
 
+# what may stand before a once-set variable's assignment: simple commands only, no group, branch or loop, so the
+# assignment runs whenever a later read does
+_NOT_SIMPLE = re.compile(r"(?<![\w./-])(?:if|then|else|elif|fi|do|done|case|esac|for|while|until|select|time)\b|[(){}`!]")
+
+
 def _set_once(text: str, home: str) -> str:
-    """`text` with a variable set to a literal at its very start (`T=/x/bin/ttp; $T lock`) read as that value."""
-    m = _SET_HEAD.match(text)
-    if not m or _SPECIAL_NAME.fullmatch(m[1]):
-        return text
-    value = next(v for v in (m[2], m[3], m[4]) if v is not None)
-    value = home + value[1:] if m[4] is not None and value.startswith("~/") else value
-    rest = text[m.end():]
-    if not _SAFE_VALUE.fullmatch(value) or not _reads_only(m[1], rest):
-        return text
-    state = _unquoted(rest)[1]
-    return text[:m.end()] + _set_once(_put(rest, state, m[1], value), home)
+    """`text` with a variable set to a literal as a statement of its own at the top level (at its start, or after
+    simple commands ending in `;` or a newline: `cd x; T=/x/bin/ttp; $T lock`) read as that value."""
+    plain = _unquoted(text)[0]
+    for start in [0] + [b.end() for b in re.finditer(r"[;\n]", plain) if plain[b.start() - 1:b.start()] != "\\"]:
+        m = _SET_HEAD.match(text, start)
+        if not m or _SPECIAL_NAME.fullmatch(m[1]):
+            continue
+        if _NOT_SIMPLE.search(plain[:start]) or re.search(rf"(?<![\w-]){m[1]}(?!\w)", _plain(text[:start])):
+            continue
+        value = next(v for v in (m[2], m[3], m[4]) if v is not None)
+        value = home + value[1:] if m[4] is not None and value.startswith("~/") else value
+        rest = text[m.end():]
+        if not _SAFE_VALUE.fullmatch(value) or not _reads_only(m[1], rest):
+            return text
+        state = _unquoted(rest)[1]
+        return text[:m.end()] + _set_once(_put(rest, state, m[1], value), home)
+    return text
+
+
+# the two variables a run's own environment sets to a plain path: read in a command that never sets them, each is the
+# value the hook sees (`$TMPDIR/x`, `$TTP_RUN_DIR`), written out for the guards to judge
+_RUN_ENV = ("TMPDIR", "TTP_RUN_DIR")
+
+
+def _env_read(text: str, env) -> str:
+    """`text` with each read of a _RUN_ENV variable written as its value, where `text` never sets it."""
+    for name in _RUN_ENV:
+        value = env.get(name) or ""
+        if _SAFE_VALUE.fullmatch(value) and _reads_only(name, text):
+            text = _put(text, _unquoted(text)[1], name, value)
+    return text
 
 
 # a loop over a list the guard cannot read (`for f in $(cat l)`, `$L`, a glob under `$D`) whose body or what follows
@@ -966,11 +1016,11 @@ def literal_view(cmd: str, cwd: str, env=None) -> str | None:
     a loop that may not have run in this shell, keeps the command as it is, which the guards judge as before."""
     # a comment, `$'...'` or a quote inside `${...}`: quoting the quote reader does not follow
     if "<<" in cmd or "$'" in cmd or re.search(r"(?<![^\s;&|()<>])#", _single_blank(cmd)) \
-            or re.search(r"\$\{[^}]*['\"\\]", cmd) or _NOT_STRAIGHT.search(_plain(_LITERAL_READ.sub(" ", cmd))):
+            or re.search(r"\$\{[^}]*['\"\\]", cmd) or _NOT_STRAIGHT.search(_plain(_LITERAL_READ.sub(" ", _shell_text(cmd)))):
         return None
     e = os.environ if env is None else env
     home = e.get("HOME") or os.path.expanduser("~")
-    text = _set_once(cmd, home)
+    text = _env_read(_set_once(cmd, home), e)
     for _ in range(8):   # nested loops, outermost first
         plain, state = _unquoted(text)
         m = _FOR_HEAD.search(plain)

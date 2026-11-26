@@ -461,6 +461,7 @@ def items(run_dir: Path, own_only: bool = False) -> list[dict]:
 
 STRENGTH = {"write": 3, "executed": 2, "read": 1, "mentioned": 0}
 LABEL = {"write": "probable write", "executed": "executed", "read": "read", "mentioned": "mentioned only"}
+LISTERS = ("ls argument", "stat argument")   # classify_paths' reason for a path these list
 REMOVERS = {"rm", "rmdir", "mkdir", "touch", "chmod", "chown", "chgrp", "truncate", "shred", "unlink"}
 COPIERS = {"cp", "mv", "install", "rsync", "scp", "ln"}
 READERS = {"cat", "head", "tail", "less", "more", "ls", "stat", "wc", "diff", "cmp", "file", "md5sum", "sha256sum",
@@ -772,7 +773,7 @@ def record(run_dir: Path, run_id: int, cwd: str, home: str | None = None) -> dic
     when it touched nothing outside its folders. High for a sensitive path in a call a guard did not
     refuse before it ran: whatever its class on a credential store (credguard.read_refusal), else on a
     probable write outside a cache (a top entry named like `.cache`). A read, run or `source` of a
-    startup file or a ~/.local program is no harm."""
+    startup file or a ~/.local program is no harm, nor is an `ls` or `stat` of a folder that holds a credential."""
     from . import credguard
     home = os.path.normpath(home or os.path.expanduser("~"))
     found = scan(run_dir, cwd, home)
@@ -781,7 +782,8 @@ def record(run_dir: Path, run_id: int, cwd: str, home: str | None = None) -> dic
 
     def harm(f: dict) -> bool:
         cache = "cache" in f["path"][len(home) + 1:].split("/", 1)[0].lower()
-        return credguard.read_refusal(f["path"], search=True, home=home) or f["class"] == "write" and not cache
+        listing = f["why"].startswith(LISTERS)   # names only: a folder holding a credential file is no read of it
+        return credguard.read_refusal(f["path"], search=not listing, home=home) or f["class"] == "write" and not cache
     rec = {"run": run_id, "found": found,
            "high": any(f["status"] != "refused" and sensitive(f["path"], home) and harm(f) for f in found)}
     from .project import durable_write

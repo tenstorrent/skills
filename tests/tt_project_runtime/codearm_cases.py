@@ -2944,6 +2944,50 @@ def test_glm_guard_refuses_every_sidefx_writer_naming_a_computed_loop_variable(m
         assert not deny(f"for f in $(cat l); do {body}; done"), body
 
 
+def test_glm_guard_reads_a_program_name_set_once_after_simple_commands_and_past_quoted_keywords(monkeypatch, tmp_path):
+    """cells: set_once_prefix, quoted_keyword. A variable set once to a literal after simple commands, or in a command
+    whose quoted text only mentions a keyword (`eval`, `read`), stands for its value; one that may be set another
+    way, or a branch away, is still refused."""
+    deny, wt, _ = _gg9846_hook(monkeypatch, tmp_path)
+    run = "echo 'tt-smi -r 0' | $T"
+    for cmd in ("cd src; T=ls; $T -l", "echo start && cd src\nT=wc; $T -l f", 'T=ls; echo "eval and read are words here"; $T',
+                'T=ls; git log --grep "source of it" | head -1; $T'):
+        assert not deny(cmd), cmd
+    for cmd in (f"false && T=bash; {run}", f"if x; then T=bash; fi; {run}", f"echo $T; T=bash; {run}",
+                f"cd src; T=bash; {run}", f'T=bash; echo "read this"; {run}', f'T=ls; echo "x y"; eval "T=bash"; {run}',
+                f'T=ls; echo "{{}}"; read T; {run}', f"cd src; T=ls; eval 'T=bash'; {run}", f"{{ T=bash; }}; {run}"):
+        assert deny(cmd), cmd
+
+
+def test_glm_guard_reads_the_runs_own_temp_and_run_folders_as_a_program_path(monkeypatch, tmp_path):
+    """cells: run_env_program. `$TMPDIR` and `$TTP_RUN_DIR` the command never sets are the run's own folders; one it
+    sets, or a path out of them, is judged as written."""
+    deny, wt, rd = _gg9846_hook(monkeypatch, tmp_path)
+    for cmd in ('"$TMPDIR/check.sh" a', "$TTP_RUN_DIR/tools/probe --help", 'bash "$TMPDIR/x.sh"',
+                'T=$("$TMPDIR" 2>/dev/null); echo $T', '$TTP_RUN_DIR && echo x'):
+        assert not deny(cmd), cmd
+    for cmd in ('echo x >> "$TMPDIR/../../home/.bashrc"', 'cat "$TMPDIR/../../home/.ssh/id_x"',
+                'TMPDIR=~; echo x >> "$TMPDIR/.bashrc"', 'eval "TMPDIR=~"; echo x >> "$TMPDIR/.bashrc"',
+                'export TMPDIR=~; echo x >> "$TMPDIR/.bashrc"'):
+        assert deny(cmd), cmd
+
+
+def test_glm_guard_commits_and_searches_with_git_that_runs_no_program(monkeypatch, tmp_path):
+    """cells: git_commit_config, git_grep_pattern. `git commit` under `-c commit.gpgsign=false` (a message from a
+    heredoc) and a `git grep` whose pattern holds shell characters run no program; `-c` for any other key and
+    `git grep -O` (a pager on the matches) are judged as before."""
+    deny, wt, _ = _gg9846_hook(monkeypatch, tmp_path)
+    for cmd in ("git -c commit.gpgsign=false commit -F- <<'EOF'\nfix: a | `b`\nEOF",
+                "git -c user.name=a -c user.email=b commit -m 'fix: x | `a`'",
+                "git grep -ohE 'x [a-z]+| `y`' -- deploy | sort | uniq -c | head -5", "git grep -n 'a | `b`' -- src"):
+        assert not deny(cmd), cmd
+    for cmd in ("git -c core.fsmonitor=x commit -m 'fix: x | `a`'", "git -c core.editor=x commit -F- <<'EOF'\nfix: a | `b`\nEOF",
+                "git -c core.editor=x -c commit.gpgsign=false commit -m 'x | `a`'", "git grep -O'sh -c x' 'a | `b`'",
+                "git grep -nOsh 'a | `b`' pat", "git grep --open-files-in-pager=sh 'a | `b`'",
+                "git -c alias.x='!sh' commit -m 'x | `a`'"):
+        assert deny(cmd), cmd
+
+
 def test_a_refusal_off_the_glm_arm_is_neither_recorded_nor_ends_the_run(tmp_path):
     """cells: guard_off_arm. Only a run on the GLM arm (its marker) records a guard refusal and ends as a bounce."""
     from ttp import glmguard
