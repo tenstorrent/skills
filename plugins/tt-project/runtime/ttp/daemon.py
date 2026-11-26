@@ -12899,7 +12899,7 @@ class Daemon:
             cached, parts = coord.split_cached(parts)
             must = mustact.block(db, [e["id"] for e in evs])
             # An urgent message's first post comes before the turn reads anything (msgurgent.lead).
-            urgent_lead = [("urgent_first", t)] if (t := msgurgent.lead(self.p, urgent_msgs)) else []
+            urgent_lead = [("urgent_first", t)] if (t := msgurgent.lead(self.p, self.cfg, msgs, urgent_msgs)) else []
             parts = urgent_lead + ([(mustact.SECTION, must)] if must else []) + parts
             parts += [(slowcomplaint.SECTION, speed)] if speed else []
             # Looks due within the wake gap ride this turn, so none starts a wake of its own (look_trim).

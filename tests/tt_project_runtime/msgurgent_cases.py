@@ -521,12 +521,30 @@ def test_urgent_the_wake_prompt_leads_with_the_post_first_command_for_open_urgen
     now = time.time()
     mid = _urg_inbound(p, "urgent: the live stream is down", ts=now)
     other = _urg_inbound(p, "urgent: also down", chat="c2", ts=now)
-    msgurgent.tick(p, p.config(), now=now + 1)
-    text = msgurgent.lead(p, {mid, other})
+    calm = _urg_inbound(p, "status: all green", ts=now)
+    rows = lambda: p.db.q("SELECT * FROM messages WHERE direction='in' ORDER BY id")
+    # Before the daemon's scan made a record (the message came in after this pass's watch step).
+    msgs, ids = msgurgent.first(p.db, p.config(), rows())
+    text = msgurgent.lead(p, p.config(), msgs, ids)
     assert text.startswith("## Urgent: post first") and "before you read" in text.lower(), text
-    assert 'ttp urgent-reply c1 "' in text and 'ttp urgent-reply c2 "' in text, text
+    assert 'ttp urgent-reply c1 "' in text and 'ttp urgent-reply c2 "' in text and f"#{calm}" not in text, text
     assert msgurgent.timefmt.short(now + 300, p, now) in text, text
+    msgurgent.tick(p, p.config(), now=now + 1)
     p.db.post("out", "it is fixed", chat="c2", kind="reply")
     msgurgent.tick(p, p.config(), now=now + 2)
-    assert "c2" not in msgurgent.lead(p, {mid, other}) and msgurgent.lead(p, {other}) == ""
-    assert msgurgent.lead(p, set()) == ""
+    msgs, ids = msgurgent.first(p.db, p.config(), rows())
+    assert ids == {mid} and "c2" not in msgurgent.lead(p, p.config(), msgs, ids)
+    assert msgurgent.lead(p, p.config(), msgs, set()) == ""
+
+
+def test_urgent_a_short_first_finding_window_still_gets_the_holding_note_with_a_future_next_check(env):
+    from ttp import msgurgent
+    p = _urgent_project(env)
+    cfg = {**p.config(), "urgent_msg": {"first_s": 180}}
+    now = time.time()
+    mid = _urg_inbound(p, "urgent: help", ts=now)
+    msgurgent.tick(p, cfg, now=now + 1)
+    out = msgurgent.tick(p, cfg, now=now + 181)
+    assert out == [f"hold {mid}", f"late {mid}"], out
+    held = _urg_outs(p, "urgent_late")
+    assert len(held) == 1 and msgurgent.timefmt.short(now + 241, p, now) in held[0]["text"], held[0]["text"]

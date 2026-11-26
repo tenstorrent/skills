@@ -216,13 +216,14 @@ def tick(p, cfg: dict | None, now: float | None = None, steer=None) -> list[str]
             rec["nudged"] = now
             changed = True
             out.append(f"nudge {key}")
-        if rec.get("held") is None and rec.get("late") is None and now >= rec["ts"] + float(c["hold_s"]):
+        if rec.get("held") is None and rec.get("late") is None and now >= min(rec["ts"] + float(c["hold_s"]),
+                                                                              rec["find_due"]):
             rec["held"] = now
             changed = True
             out.append(f"hold {key}")
             db.post("out", _tagged(db, f"Holding note, not a finding: your urgent message from "
                                        f"{timefmt.short(rec['ts'], p, now)} is with the coordinator, which has not "
-                                       f"posted its first finding yet. Next check {timefmt.short(rec['find_due'], p, now)}."),
+                                       f"posted its first finding yet. Next check {timefmt.short(max(rec['find_due'], now + 60), p, now)}."),
                     chat=rec["chat"], kind=LATE_KIND, severity="high", keep_tag=True)
         if rec.get("late") is None and now >= rec["find_due"]:
             rec["late"] = now
@@ -276,17 +277,17 @@ def _nudge(p, rec: dict, now: float, steer) -> bool:
         return False
 
 
-def lead(p, ids) -> str:
-    """The wake prompt's first lines for the open urgent messages among `ids`: post first, then read."""
-    recs = records(p.db)
-    rows = [r for i in sorted(ids or ()) if (r := recs.get(str(i))) and not r.get("closed")]
+def lead(p, cfg: dict | None, msgs: list, ids) -> str:
+    """The wake prompt's first lines for the urgent messages among `msgs` (`first`'s ids, a record made
+    or not yet): post first, then read."""
+    rows = [m for m in msgs if m["id"] in (ids or ())]
     if not rows:
         return ""
-    now = time.time()
+    now, first_s = time.time(), float(config(cfg)["first_s"])
     return ("## Urgent: post first\nBefore you read or run anything else, post what you know now in each chat "
             "below (one line, with times), then investigate:\n" + "\n".join(
-                f"- message #{r['mid']}, received {timefmt.short(r['ts'], p, now)}, first finding due "
-                f"{timefmt.short(r['find_due'], p, now)}: `ttp urgent-reply {r['chat'] or 'all'} \"<what you know "
+                f"- message #{r['id']}, received {timefmt.short(float(r['ts']), p, now)}, first finding due "
+                f"{timefmt.short(float(r['ts']) + first_s, p, now)}: `ttp urgent-reply {r['chat'] or 'all'} \"<what you know "
                 f"now, with times>\"`" for r in rows))
 
 
