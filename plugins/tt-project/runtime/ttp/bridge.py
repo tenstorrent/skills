@@ -9,8 +9,10 @@ This computer (the user's workstation) keeps one ssh session per box and agent a
 login, each restart after a random 0-60 s wait so a wake does not log them all in at once). Each session forwards exactly one of this computer's agents and links the box's end of it
 to a stable path, `<socket_dir>/<agent>.sock` (default `~/.ssh/tt-agent`), and stays up only while
 that agent socket exists. Hosts the box cannot reach by itself are reverse-forwarded from this
-computer to a loopback port on the box (`-R 127.0.0.1:<port>:<host>:22`, ssh ports only), so the
-hosts' own source-address limits still see this computer. Hosts the box reaches by itself (GitHub,
+computer to a loopback port on the box (ssh ports only), so the hosts' own
+source-address limits still see this computer. A destination that is a host name is carried by the
+relay (bounded name resolution) and never a raw `-R <port>:<name>:22` that ssh resolves in its event
+loop; only IP-literal and localhost destinations stay raw ssh forwards. Hosts the box reaches by itself (GitHub,
 say) only get the agent; their traffic never passes through this computer.
 
 On the box the tool writes one marked block at the top of ~/.ssh/config (the old file backed up
@@ -61,6 +63,7 @@ docs/access-bridge.example.json.
 """
 from __future__ import annotations
 
+import ipaddress
 import json
 import os
 import plistlib
@@ -295,6 +298,20 @@ def remote_command(cfg: dict, agent: str) -> str:
             f'exit {AGENT_DEAD}; }}; fi; done')
 
 
+def named_target(target: str) -> bool:
+    """Whether the forward's destination is a host name ssh must not resolve itself: ssh resolves
+    -R destinations in its event loop when a connection reaches the port, so a name that does not
+    resolve here would freeze the whole session; the relay resolves within a bound instead."""
+    from .netwait import loopback
+    if loopback(target):
+        return False
+    try:
+        ipaddress.ip_address(target)
+        return False
+    except ValueError:
+        return True
+
+
 def ssh_argv(cfg: dict, box: str, agent: str, ssh: str | None = None) -> list[str]:
     """The session for one box and agent: forwards that agent and the reverse forwards of its
     hosts; its own connection (never a shared ControlMaster); exits on a lost forward or link."""
@@ -320,7 +337,8 @@ def ssh_argv(cfg: dict, box: str, agent: str, ssh: str | None = None) -> list[st
     for h in a["forward"]:
         if h["adopt"]:
             continue
-        dest = str(relay_dir(box, agent) / f"{h['name']}.sock") if h["interface"] else f"{h['target']}:22"
+        dest = (str(relay_dir(box, agent) / f"{h['name']}.sock")
+                if h["interface"] or named_target(h["target"]) else f"{h['target']}:22")
         argv += ["-R", f"127.0.0.1:{h['port']}:{dest}"]
     return argv + ["--", box, remote_command(cfg, agent)]
 
@@ -338,12 +356,14 @@ def service_argv(cfg: dict, box: str, agent: str, ssh: str | None = None, platfo
     reached through one interface and, on macOS unless `keep_awake` is off, holds the sleep assertion; each
     restart first waits the random start delay (tunnel.spread()) so a wake does not log every session in at once."""
     argv = ssh_argv(cfg, box, agent, ssh)
-    bound = [h for h in cfg["boxes"][box]["agents"][agent]["forward"] if h["interface"] and not h["adopt"]]
+    bound = [h for h in cfg["boxes"][box]["agents"][agent]["forward"]
+             if (h["interface"] or named_target(h["target"])) and not h["adopt"]]
     py = "/usr/bin/python3" if os.path.exists("/usr/bin/python3") else sys.executable
     awake = ["--keep-awake"] if cfg.get("keep_awake", True) and (platform or sys.platform) == "darwin" else []
     from .tunnel import spread
     return spread([py, str(RELAY), "--tag", f"{box}/{agent}", "--link", link(cfg, agent), *awake,
-                   str(relay_dir(box, agent)), *[f"{h['name']}={h['target']}%{h['interface']}" for h in bound], "--",
+                   str(relay_dir(box, agent)), *[f"{h['name']}={h['target']}%{h['interface']}"
+                                                 if h["interface"] else f"{h['name']}={h['target']}" for h in bound], "--",
                    *argv], bridge_marker(box, agent))
 
 

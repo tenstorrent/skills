@@ -7,7 +7,7 @@ is used through ssh's BindInterface, say). A reverse forward cannot bind its con
 session forwards such a host's box port to a unix socket here instead, and this relay connects
 each connection to that host's port 22 bound to the interface. Nothing else is carried.
 
-usage: bridge_relay.py [--tag <box>/<agent>] [--link <~/agent link>] [--keep-awake] <socket dir> [<name>=<host>%<interface> ...] -- <ssh argv...>
+usage: bridge_relay.py [--tag <box>/<agent>] [--link <~/agent link>] [--keep-awake] <socket dir> [<name>=<host>[%<interface>] ...] -- <ssh argv...>
 
 It listens on <socket dir>/<name>.sock (mode 600, the directory 700), runs the ssh session, and
 exits with it, removing its sockets: the relay lives exactly as long as the session. It exits 4
@@ -93,9 +93,9 @@ FD_RESERVE = 64   # descriptors kept free for listeners, logs and the session
 
 def parse_spec(spec: str) -> tuple[str, str, str]:
     name, _, rest = spec.partition("=")
-    host, _, iface = rest.rpartition("%")
-    if not name or not host or not iface or "/" in name:
-        raise ValueError(f"relay spec {spec!r}: <name>=<host>%<interface>")
+    host, sep, iface = rest.rpartition("%") if "%" in rest else (rest, "", "")
+    if not name or not host or "/" in name or (sep and not iface):
+        raise ValueError(f"relay spec {spec!r}: <name>=<host>[%<interface>]")
     return name, host, iface
 
 
@@ -130,14 +130,15 @@ def bound_connect(host: str, iface: str, port: int = 22, timeout: float | None =
             break
         s = socket.socket(fam, typ, proto)
         try:
-            if sys.platform == "darwin":
-                idx = socket.if_nametoindex(iface)
-                if fam == socket.AF_INET6:
-                    s.setsockopt(socket.IPPROTO_IPV6, IPV6_BOUND_IF, idx)
+            if iface:   # no interface: the default route, as ssh itself would take it
+                if sys.platform == "darwin":
+                    idx = socket.if_nametoindex(iface)
+                    if fam == socket.AF_INET6:
+                        s.setsockopt(socket.IPPROTO_IPV6, IPV6_BOUND_IF, idx)
+                    else:
+                        s.setsockopt(socket.IPPROTO_IP, IP_BOUND_IF, idx)
                 else:
-                    s.setsockopt(socket.IPPROTO_IP, IP_BOUND_IF, idx)
-            else:
-                s.setsockopt(socket.SOL_SOCKET, SO_BINDTODEVICE, iface.encode())
+                    s.setsockopt(socket.SOL_SOCKET, SO_BINDTODEVICE, iface.encode())
             s.settimeout(left)
             s.connect(addr)
             s.settimeout(None)
@@ -203,7 +204,7 @@ def _handle(conn: socket.socket, host: str, iface: str) -> None:
         try:
             up = bound_connect(host, iface)
         except OSError as e:
-            print(f"ttp bridge relay: {host} over {iface}: {e}", file=sys.stderr, flush=True)
+            print(f"ttp bridge relay: {host}{f' over {iface}' if iface else ''}: {e}", file=sys.stderr, flush=True)
             return
         ended = threading.Event()
 
@@ -268,7 +269,7 @@ def private_dir(d: str) -> bool:
 
 
 class Listener:
-    """One relay socket: <path> carried to host:22 over iface, kept listening (see supervise)."""
+    """One relay socket: <path> carried to host:22 (over iface when one is named), kept listening."""
 
     def __init__(self, path: str, host: str, iface: str, sock=socket.socket):
         self.path, self.host, self.iface, self.sock = path, host, iface, sock

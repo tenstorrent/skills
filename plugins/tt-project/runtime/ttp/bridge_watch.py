@@ -37,7 +37,6 @@ import json
 import os
 import re
 import shlex
-import socket
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -54,6 +53,7 @@ ALERT_AFTER_S = 300                  # a box unreachable this long gets one desk
 STALE_S = 3 * max(BACKOFF_S)         # a failed check this long after the last one (a sleep between) starts a new outage
 #                                     (a restarted session needs some seconds to log in and forward its ports)
 LOGIN_S = INTERVAL_S                # a session's login younger than this may not have set up its forwards yet
+RESOLVE_S = 5                       # the bound on one destination name lookup before probing it
 FAST_S, FAST_STEP_S = 120, 5        # after a network change: a check every FAST_STEP_S until all answer, at most FAST_S
 STATE, HEAL_LOG = "bridge-watch.json", "bridge-heal.log"   # in the bridge home (~/.tt-project)
 
@@ -112,17 +112,25 @@ def _net_stamp(platform: str) -> float:
 
 def dest_answers(h: dict) -> bool:
     """A forward's target answers (on port 22 unless "to" names another) from this computer, by the route the
-    relay itself takes."""
+    relay itself takes (its name resolution is bounded: a destination whose name hangs a lookup here
+    is never waited on)."""
     from . import bridge_relay
-    port = h.get("to", 22)
     try:
-        if h["interface"]:
-            s = bridge_relay.bound_connect(h["target"], h["interface"], port, timeout=5)
-        else:
-            s = socket.create_connection((h["target"], port), timeout=5)
+        s = bridge_relay.bound_connect(h["target"], h["interface"], h.get("to", 22), timeout=5)
         s.close()
         return True
     except (OSError, ValueError):
+        return False
+
+
+def dest_resolves(h: dict) -> bool:
+    """Whether a destination's name resolves from here within a bound: one that does not is never
+    probed, so a probe can never set off the frozen name lookup of a raw ssh forward."""
+    from . import bridge_relay
+    try:
+        bridge_relay._resolve(h["target"], h.get("to", 22), RESOLVE_S)
+        return True
+    except OSError:
         return False
 
 
@@ -245,6 +253,14 @@ def run_pass(cfg: dict, platform: str | None = None, now: float | None = None) -
         if bs.get("next", 0) > now and not fast:
             continue
         ports = sorted({p for t in mine for p in t["ports"]})
+        # every destination resolves before anything is probed: one whose name does not resolve here
+        # is never probed at all (connecting to its forwarded port could hang a raw ssh forward on
+        # the same lookup) and never counted as a dead link
+        probes = [(t["service"], p, t["dests"][p]) for t in mine if t.get("dests") for p in t["dests"]]
+        with ThreadPoolExecutor(max(1, len(probes))) as ex:
+            resolves = dict(zip([n[:2] for n in probes], ex.map(dest_resolves, [n[2] for n in probes])))
+        unresolved = {sp for sp, ok in resolves.items() if not ok}
+        ports = [p for p in ports if not any((t["service"], p) in unresolved for t in mine)]
         r = bridge._box(box, "sh -c " + shlex.quote(CHECK) + " ttp-watch " + " ".join(map(str, ports)), timeout=40)
         if "ttp-watch-done" not in r.stdout:
             if "ttp-watch-nocheck" in r.stdout:   # it answered; it only lacks the tools, nothing is restarted
@@ -278,14 +294,17 @@ def run_pass(cfg: dict, platform: str | None = None, now: float | None = None) -
         down = {int(ln.split()[1]) for ln in r.stdout.splitlines() if ln.startswith("down ")}
         none = {int(ln.split()[1]) for ln in r.stdout.splitlines() if ln.startswith("none ")}
         up = {int(ln.split()[1]) for ln in r.stdout.splitlines() if ln.startswith("up ")}
+        down |= {p for t in mine for p in t["ports"] if (t["service"], p) in unresolved}
         # a bridge session holds all its forwards or exits (ExitOnForwardFailure): one answering port shows it live,
         # so a silent one whose target answers is only slow there, and a restart would only drop the others
         live = {t["service"] for t in mine if t["agent"] and up & set(t["ports"])}
         # a port with no listener is dead whatever its target does; one that connects but sends nothing may be a
         # live forward whose target is off: its targets are asked all at once
-        ask = [(t["service"], p, t["dests"][p]) for t in mine if t.get("dests") for p in t["ports"] if p in down]
+        ask = [(t["service"], p, t["dests"][p]) for t in mine if t.get("dests") for p in t["ports"]
+               if p in down and (t["service"], p) not in unresolved]
         with ThreadPoolExecutor(max(1, len(ask))) as ex:
             answers = dict(zip([a[:2] for a in ask], ex.map(dest_answers, [a[2] for a in ask])))
+        answers.update({sp: False for sp in unresolved})   # never asked: its name does not resolve here
         for t in mine:
             # a port that failed while its destination was off is not spared once it answers: a session (re)built
             # then can stay broken for it, so it gets one restart if the port still fails

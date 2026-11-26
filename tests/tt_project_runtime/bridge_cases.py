@@ -104,7 +104,7 @@ def test_bridge_session_forwards_one_agent_and_only_ssh_ports_on_its_own_connect
     # 'env': the service's own SSH_AUTH_SOCK, under a name ssh's IdentityAgent does not overwrite
     assert argv[:2] == ["/bin/sh", "-c"] and 'TTP_BRIDGE_AGENT="$SSH_AUTH_SOCK"' in argv[2] and argv[4] == "ssh"
     assert "ForwardAgent=${TTP_BRIDGE_AGENT}" in argv and "ForwardAgent=yes" not in argv
-    assert argv[argv.index("-R") + 1] == "127.0.0.1:2301:build-a.example.com:22"
+    assert argv[argv.index("-R") + 1].endswith("bridge-relay/box-1.auto/build-a.sock")   # a name: the relay carries it
     assert argv.count("-R") == 1   # the adopted port is someone else's forward
     assert "-D" not in argv and "-L" not in argv and "ProxyJump" not in line   # no route for other traffic
     assert f"IdentityFile={tmp_path}/keys/login.pub" in argv and "IdentitiesOnly=yes" in argv
@@ -231,10 +231,30 @@ def test_bridge_interface_hosts_go_through_the_relay_socket(tmp_path, monkeypatc
     assert svc[5:12] == [str(tmp_path / "bridge_relay.py"), "--tag", "box-1/auto", "--link", bridge.link(cfg, "auto"),
                         str(sock.parent), "build-a=build-a.example.com%vpn0"]
     assert svc[svc.index("--") + 1:] == argv
-    plain = bridge.service_argv(_bridge_cfg(), "box-1", "auto", ssh="ssh")   # no interface host: still wrapped
+    plain = bridge.service_argv(_bridge_cfg(), "box-1", "auto", ssh="ssh")   # a name with no interface: carried too
     assert plain[5:11] == [str(tmp_path / "bridge_relay.py"), "--tag", "box-1/auto", "--link", bridge.link(cfg, "auto"),
                            str(sock.parent)]
-    assert plain[11] == "--" and plain[12] == "/bin/sh"
+    assert plain[11:13] == ["build-a=build-a.example.com", "--"] and plain[13] == "/bin/sh"
+    assert plain[11:13] == ["build-a=build-a.example.com", "--"] and plain[13] == "/bin/sh"
+
+
+def test_bridge_named_targets_go_through_the_relay_and_literals_stay_raw(tmp_path, monkeypatch):
+    # cells: named-target, ip-literal, localhost, no-spec-for-literals
+    from ttp import bridge
+    monkeypatch.setattr(bridge, "HOME_DIR", tmp_path)
+    monkeypatch.setattr(bridge, "RELAY", tmp_path / "bridge_relay.py")
+    cfg = bridge.parse({"boxes": {"box-1": {"login": {}, "agents": {"auto": {"agent": "env", "forward": [
+        {"name": "named", "target": "h1.example.com", "port": 2301},
+        {"name": "literal", "target": "192.0.2.10", "port": 2302},
+        {"name": "local", "target": "localhost", "port": 2303}]}}}}})
+    argv = bridge.ssh_argv(cfg, "box-1", "auto", ssh="ssh")
+    want = [f"127.0.0.1:{p}:{d}" for p, d in [(2301, f"{tmp_path}/bridge-relay/box-1.auto/named.sock"),
+                                               (2302, "192.0.2.10:22"), (2303, "localhost:22")]]
+    rs = [i + 1 for i, a in enumerate(argv) if a == "-R"]
+    assert [argv[i] for i in rs] == want   # a name goes to the relay socket; a literal stays raw
+    svc = bridge.service_argv(cfg, "box-1", "auto", ssh="ssh")
+    specs = svc[svc.index(str(tmp_path / "bridge-relay" / "box-1.auto")) + 1:svc.index("--")]
+    assert specs == ["named=h1.example.com"]   # the named target's spec carries no interface
 
 
 
@@ -354,6 +374,101 @@ def test_bridge_relay_carries_one_connection_and_exits_with_its_session(monkeypa
     rc = bridge_relay.main([str(tmp_path / "d"), "x=10.0.0.3%vpn0", "--", sys.executable, "-c", "raise SystemExit(7)"])
     assert rc == 7 and not (tmp_path / "d" / "x.sock").exists()
 
+
+def test_bridge_relay_carries_a_named_target_without_an_interface_and_refuses_only_its_connections(monkeypatch, request):
+    # cells: spec-no-interface, empty-iface-no-bind, bad-name-refuses-only-that-connection, others-still-served
+    import socket
+    import threading
+    from ttp import bridge_relay
+    d = _relay_dir(request)
+    assert bridge_relay.parse_spec("h=h1.example.com") == ("h", "h1.example.com", "")
+    assert bridge_relay.parse_spec("h=10.0.0.2%vpn0") == ("h", "10.0.0.2", "vpn0")
+
+    class NoBind:   # a connect that records which socket options it is asked for
+        binds = []
+
+        def __init__(self, *a):
+            pass
+
+        def setsockopt(self, level, opt, val):
+            if (level, opt) in ((socket.SOL_SOCKET, bridge_relay.SO_BINDTODEVICE),
+                                 (socket.IPPROTO_IP, bridge_relay.IP_BOUND_IF),
+                                 (socket.IPPROTO_IPV6, bridge_relay.IPV6_BOUND_IF)):
+                self.binds.append((level, opt))
+
+        def settimeout(self, t):
+            pass
+
+        def connect(self, addr):
+            pass
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(bridge_relay.socket, "socket", NoBind)
+    monkeypatch.setattr(bridge_relay.socket, "getaddrinfo",
+                        lambda *a, **k: [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("10.0.0.9", 22))])
+    bridge_relay.bound_connect("h9.example.invalid", "")   # an empty interface binds to none
+    assert NoBind.binds == []
+    monkeypatch.undo()
+
+    srv = socket.socket()
+    srv.bind(("127.0.0.1", 0))
+    srv.listen(4)
+    echo_port = srv.getsockname()[1]
+
+    def echo():
+        while True:
+            try:
+                c, _ = srv.accept()
+            except OSError:
+                return
+
+            def one(c=c):
+                c.recv(64)
+                c.sendall(b"pong")
+                c.close()
+
+            threading.Thread(target=one, daemon=True).start()
+
+    threading.Thread(target=echo, daemon=True).start()
+    real_gai = socket.getaddrinfo
+
+    def stub_getaddrinfo(host, *a, **k):
+        if host.endswith(".invalid"):
+            raise OSError("name or service not known")   # a stubbed resolver: never real DNS
+        return real_gai(host, *a, **k)
+
+    monkeypatch.setattr(bridge_relay.socket, "getaddrinfo", stub_getaddrinfo)
+    calls = []
+    real_bc = bridge_relay.bound_connect
+
+    def stub_connect(host, iface, port=22, timeout=None):
+        calls.append((host, iface))
+        if host.endswith(".invalid"):
+            return real_bc(host, iface, port, timeout)
+        return socket.create_connection(("127.0.0.1", echo_port), timeout=2)
+
+    monkeypatch.setattr(bridge_relay, "bound_connect", stub_connect)
+    bad = bridge_relay.listen(str(d / "bad.sock"), "gone.example.invalid", "")
+    good = bridge_relay.listen(str(d / "good.sock"), "10.0.0.9", "")
+    refused = []
+    for _ in range(2):   # a name that does not resolve refuses its own connection, twice
+        c = socket.socket(socket.AF_UNIX)
+        c.settimeout(10)
+        c.connect(str(d / "bad.sock"))
+        refused.append(c.recv(1))   # EOF: the connection ends, the listener stays
+        c.close()
+    assert refused == [b"", b""]
+    c = socket.socket(socket.AF_UNIX)
+    c.settimeout(10)
+    c.connect(str(d / "good.sock"))   # the other listener still serves
+    c.sendall(b"ping")
+    assert c.recv(64) == b"pong"
+    c.close()
+    assert calls == [("gone.example.invalid", ""), ("gone.example.invalid", ""), ("10.0.0.9", "")]
+    bad.close()
+    good.close()
 
 
 def _relay_dir(request):
@@ -2452,6 +2567,7 @@ def _watch_env(tmp_path, monkeypatch, platform, answers, loaded=True, watch=None
     monkeypatch.setattr(bridge, "_box", box)
     monkeypatch.setattr(bridge, "_run", run)
     monkeypatch.setattr(bridge_watch, "dest_answers", lambda d: True)
+    monkeypatch.setattr(bridge_watch, "dest_resolves", lambda d: True)
     monkeypatch.setattr(bridge_watch, "release",
                         lambda cfg, t, ports: seen["release"].append((t["service"], t["agent"], ports)) or True)
     return cfg, seen
@@ -2896,7 +3012,6 @@ def test_bridge_watch_spares_a_session_still_logging_in(tmp_path, monkeypatch):
 
 def test_bridge_watch_dest_answers_by_the_route_the_relay_takes(monkeypatch):
     # cells: direct-target, interface-target
-    import socket
     from ttp import bridge_relay, bridge_watch
     calls = []
 
@@ -2904,21 +3019,49 @@ def test_bridge_watch_dest_answers_by_the_route_the_relay_takes(monkeypatch):
         def close(self):
             calls.append("closed")
 
-    def direct(addr, timeout):
-        calls.append(("direct", addr, timeout))
+    def bound(host, iface, port=22, timeout=None):
+        calls.append((host, iface, port, timeout))
+        if host == "h2":
+            raise OSError("no route")
         return Conn()
 
-    def bound(host, iface, port=22, timeout=None):
-        calls.append(("bound", host, iface, port, timeout))
-        raise OSError("no route")
-
-    monkeypatch.setattr(socket, "create_connection", direct)
     monkeypatch.setattr(bridge_relay, "bound_connect", bound)
-    assert bridge_watch.dest_answers({"target": "h1", "interface": ""})
+    assert bridge_watch.dest_answers({"target": "h1", "interface": ""})   # a bounded lookup, no interface
     assert not bridge_watch.dest_answers({"target": "h2", "interface": "en9"})
     assert bridge_watch.dest_answers({"target": "h3", "to": 8022, "interface": ""})   # a watch entry's target port
-    assert calls == [("direct", ("h1", 22), 5), "closed", ("bound", "h2", "en9", 22, 5),
-                     ("direct", ("h3", 8022), 5), "closed"]
+    assert calls == [("h1", "", 22, 5), "closed", ("h2", "en9", 22, 5), ("h3", "", 8022, 5), "closed"]
+
+def test_bridge_watch_resolves_a_destination_within_a_bound_before_probing_it(monkeypatch):
+    # cells: resolve-ok, resolve-refused, resolve-bounded
+    import time
+    from ttp import bridge_relay, bridge_watch
+    monkeypatch.setattr(bridge_relay, "_resolve", lambda host, port, t: [(2, 1, 6, "", ("127.0.0.1", port))])
+    assert bridge_watch.dest_resolves({"target": "h.example.invalid", "interface": ""})
+    monkeypatch.setattr(bridge_relay, "_resolve", lambda host, port, t: (_ for _ in ()).throw(OSError("no such name")))
+    assert not bridge_watch.dest_resolves({"target": "gone.example.invalid", "interface": ""})
+    real_gai = bridge_relay.socket.getaddrinfo
+    monkeypatch.setattr(bridge_watch, "RESOLVE_S", 0.2)
+    monkeypatch.setattr(bridge_relay.socket, "getaddrinfo",
+                        lambda *a, **k: (time.sleep(30), real_gai(*a, **k)))
+    t0 = time.monotonic()
+    assert not bridge_watch.dest_resolves({"target": "slow.example.invalid", "to": 8022, "interface": ""})
+    assert time.monotonic() - t0 < 4.5   # the lookup is bounded, not waited out
+
+
+def test_bridge_watch_never_probes_a_forward_whose_destination_does_not_resolve(tmp_path, monkeypatch):
+    # cells: unresolvable-skipped-and-logged-once, no-restart, probe-skipped
+    from ttp import bridge_watch
+    watch = [{"label": "my-forward", "box": "box-2", "port": 2400, "target": "gone.example.invalid:22"}]
+    cfg, seen = _watch_env(tmp_path, monkeypatch, "linux", ["ttp-watch-done\n"] * 3, watch=watch, agents=False)
+    asked = []
+    monkeypatch.setattr(bridge_watch, "dest_resolves", lambda d: False)
+    monkeypatch.setattr(bridge_watch, "dest_answers", lambda d: asked.append(d) or True)
+    out = bridge_watch.run_pass(cfg, "linux", 1_000_000.0)
+    assert "2400" not in seen["box"][0]   # the port is never probed on the box
+    assert asked == []                     # nor its destination: nothing connects to either end
+    assert len(out) == 1 and "destination does not answer" in out[0] and "nothing restarted" in out[0]
+    assert seen["release"] == [] and not any("restart" in c for c in seen["run"])
+    assert bridge_watch.run_pass(cfg, "linux", 1_050_000.0) == []   # logged once per state change
 
 
 def test_bridge_watch_check_tells_a_byte_from_silence_from_no_listener(tmp_path):
