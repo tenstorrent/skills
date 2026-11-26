@@ -81,27 +81,31 @@ _PENDING_RE = re.compile(r"\b(?:acknowledg\w*|ack(?:ed|s)?|received|noted|will|g
 
 
 # A reply that closes or declines the request without a result: it ends the wait, yet it is no success
-# (handoff()). Its status line decides, as for terminal(); else its words, which say it is closed (not negated,
-# never that it will be), with nothing still to come and no success result unless it closes without a run.
+# (handoff()). Its status line decides, as for terminal(); else its words must say so outright: a decline or
+# withdrawal, or a close without a run or result. Word lists cannot tell a result that mentions closing from a close.
 _CLOSED_STATUS = re.compile(r"^(?:closed|declined|withdrawn)\b", re.I)
 _CLOSED_RE = re.compile(r"\b(?:(?:closed|closes|closing|declined|declines|declining|withdrawn|withdrew|withdraws|"
                         r"withdrawing) (?:(?:the|this|that|your|my) )?(?:\w+ ){0,2}request|"
                         r"request (?:is |was |has been )?(?:closed|declined|withdrawn))\b", re.I)
-_NEGATED_RE = re.compile(r"(?:\b(?:not|never|cannot|wont)|n't)\s+(?:\w+\s+){0,2}$", re.I)
 _TO_COME_RE = re.compile(r"\b(?:follows?|to come|yet|first|queued|once|later|soon|pending|in progress|under ?way)\b",
                          re.I)
-_SUCCESS_RE = re.compile(r"\b(?:done|completed|finished|passed|landed|pushed|succeeded)\b", re.I)
-_NO_RESULT_RE = re.compile(r"\b(?:without (?:a |any )?(?:run|result|measurement)s?|declin\w*|withdr\w*)\b", re.I)
+_NO_RUN_RE = re.compile(r"\bwithout (?:a |any )?(?:run|result|measurement)s?\b", re.I)
 
 
 def closed(text: str) -> bool:
-    """Whether reply `text`, in the sender's own words, closes or declines the request without a result."""
+    """Whether reply `text`, in the sender's own words, closes or declines the request without a result:
+    a status line saying so, or (nothing still to come) a decline or withdrawal of the request, or a close
+    that says it is without a run or result; never one negated earlier in its sentence. A close beside a
+    result ("done, closing the request") is that result."""
+    from .settinghold import _negated
     text = _REPLY_MARK_RE.sub("", own_words(text))
     for m in _STATUS_RE.finditer(text):
         return bool(_CLOSED_STATUS.match(m.group(1).strip()))
-    if _TO_COME_RE.search(text) or (_SUCCESS_RE.search(text) and not _NO_RESULT_RE.search(text)):
+    if _TO_COME_RE.search(text):
         return False
-    return any(not _NEGATED_RE.search(text[:m.start()]) for m in _CLOSED_RE.finditer(text))
+    no_run = any(not _negated(text, m.start()) for m in _NO_RUN_RE.finditer(text))
+    return any(not _negated(text, m.start()) and (no_run or re.search(r"declin|withdr", m.group(0), re.I))
+               for m in _CLOSED_RE.finditer(text))
 
 
 _FACTS_RE = re.compile(r"\s*\[facts at send time from ", re.I)

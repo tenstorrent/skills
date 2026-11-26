@@ -1673,7 +1673,8 @@ def test_ack_wait_terminal_counts_a_reply_closing_the_request_without_a_run_but_
         got = json.loads(out.read_text())
         assert got["status"] == "needs_review" and got["metrics"]["reply_closed"] is True, (status, got)
         assert "closed without a result" in got["summary"] and "without a run" in got["summary"]
-    for text in ("Declined the request: no budget for it.", "status: withdrawn", "The request was closed.",
+    for text in ("Declined the request: no budget for it.", "status: withdrawn",
+                 "The request was closed without a result.",
                  "Withdrawing your request: the fix landed elsewhere."):
         assert ackwait.terminal(text) is True and ackwait.closed(text), text
     assert ackwait.packet_terminal(["[1/2] Acknowledged.", "[2/2] Closing your request without a run."]) is True
@@ -1688,6 +1689,13 @@ def test_ack_wait_terminal_counts_a_reply_closing_the_request_without_a_run_but_
                  "Finished the run and closed your request: 41 s.", "Landed in PR 5, which closes the request."):
         assert ackwait.terminal(text) is True and not ackwait.closed(text), text
         assert ackwait.handoff({"spec": text, "fp": "c" * 16}, "peer", "abc")["status"] == "done", text
+    # a close counts only said outright: no negation anywhere earlier in its sentence, no close beside a result
+    for text in ("I am not going to be closing your request.", "I am not, as you asked, closing the request.",
+                 "No reason for closing the request; I will rerun it tomorrow.",
+                 "Closing the request after tomorrow's run.", "Measured 41 s on the new cache; closing the request.",
+                 "Fixed in PR 5, which closes the request.", "Merged PR 5 and closed the request: 41 s.",
+                 "The timing is 41 s; request closed.", "Done: 41 s, closing the request; I declined the extra rerun."):
+        assert not ackwait.closed(text), text
     # the status line decides, as for any reply: a result naming something closed is still done
     assert ackwait.terminal("status: done; the old request is closed") is True
     assert not ackwait.closed("status: done; the old request is closed")
