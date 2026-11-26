@@ -653,6 +653,8 @@ class _Est:
                 nb = max(float(t.get("not_before") or 0), tg or 0)   # a clock start_when: its time
                 if st != "queued":
                     start = max(start, nb)
+                    if start == nb > now:
+                        deferred = nb   # its wait for the planned start is never corrected, only its work
                 if hold := self._held(t):
                     if hold[0] is None:
                         return {**self._held_none(tid, hold[1]), "path": path}
@@ -783,9 +785,16 @@ def field(e: dict, where, now: float | None = None) -> str:
         return f"ETA: no estimate yet ({e['why']})"
     path = "→".join(f"#{i}" for i in e["path"])
     cons = e.get("conservative")
+    con_txt = ""
+    if cons and cons > e["end"]:
+        # a conservative time on another day than the likely one needs its date: the weekday-only
+        # short form of a time landing days later reads as earlier than the likely time it follows
+        short = timefmt.today(cons, where) == timefmt.today(e["end"], where)
+        con_txt = f"; conservative {timefmt.short(cons, where, now)}" if short \
+            else f"; conservative {timefmt.long(cons, where)}"
     return (f"ETA {timefmt.short(e['end'], where, now)} (critical path {path}"
             + (", overrunning its median" if e["overrun"] else "")
-            + (f"; conservative {timefmt.short(cons, where, now)}" if cons and cons > e["end"] else "")
+            + con_txt
             + (f"; corrected x{e['factor']:g} from past deliveries" if e.get("factor", 1.0) != 1.0 else "") + ")")
 
 

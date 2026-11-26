@@ -906,3 +906,47 @@ def test_eta_order_with_all_owners_dead_says_no_live_owner(env):
     # history_kept: the stored owners and the ledger line still list the dead owners.
     assert {a, b} <= set(ob._owner_ids(o)) and a in o["promise"]["tasks"] and str(b) in o["owners"]
     assert any(f"#{a}" in line for line in ob.promise_lines(p.db, now))
+
+
+
+def test_eta_a_deferred_task_s_likely_and_conservative_times_start_after_its_planned_start(env):
+    """A task deferred to a start_after (spec: its likely and conservative times must both sit after
+    its start, and conservative is never before likely; the correction scales only its work, never the
+    wait for the planned start)."""
+    from ttp import eta, etaledger
+    p = make(env)
+    now = time.time()
+    _eta_history(p, now)                                   # run median 1200, queue wait median 300
+    p.db.set_kv(etaledger.KEY, {"on": True, "factors": {"work": 3.0}, "conservative_x": 5.5, "at": now})
+    start = now + 9.5 * 3600
+    a = p.db.add_task("later", "s", kind="work", labels=[f"start_after:{start:.0f}"])
+    p.db.x("UPDATE tasks SET not_before=? WHERE id=?", (start, a))
+    e = eta.estimate(p.db, a, now)
+    assert e["deferred"] == start
+    assert e["end"] == pytest.approx(start + 3 * (300 + 1200)), e["end"] - start   # the wait itself unscaled
+    assert e["end"] > start and e["conservative"] >= e["end"] > start and e["p90_end"] >= e["end"]
+    # A waiting task held to the same planned start: same rule, whatever holds it there.
+    w = p.db.add_task("waiting", "s", kind="work", status="waiting")
+    p.db.update_task(w, not_before=start)
+    ew = eta.estimate(p.db, w, now)
+    assert ew["deferred"] == start and ew["end"] == pytest.approx(start + 3 * (300 + 1200))
+    assert ew["conservative"] >= ew["end"] > start
+    # An undeferred task keeps the correction over its whole time left, as before.
+    b = p.db.add_task("now", "s", kind="work")
+    e2 = eta.estimate(p.db, b, now)
+    assert "deferred" not in e2 or not e2["deferred"]
+    assert e2["end"] == pytest.approx(now + 3 * (300 + 1200)) and e2["conservative"] >= e2["end"]
+
+
+def test_eta_field_dates_a_conservative_time_on_another_day():
+    """The conservative time keeps its date when it lands on another day than the likely one, so a
+    time days later never reads as earlier than the likely time (the weekday-only short form)."""
+    from ttp import eta, timefmt
+    now = 1795708800.0   # 2026-11-26 16:00 UTC
+    same_day = {"end": now + 3600, "conservative": now + 5400, "path": [1], "why": None,
+                "factor": 1.0, "overrun": False}
+    line = eta.field(same_day, "UTC", now)
+    assert "conservative 17:30 UTC" in line, line
+    later = {**same_day, "conservative": now + 6.5 * 86400}
+    line = eta.field(later, "UTC", now)
+    assert "conservative 2026-12-03 04:00 UTC" in line, line

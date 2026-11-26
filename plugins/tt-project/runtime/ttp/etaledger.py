@@ -8,7 +8,8 @@ delivered (`delivered`) or closed without delivery (`closed`). Obligation promis
 backfilled once from their due and receipt.
 
 The correction: per task kind, the trailing 7-day median of actual / raw-estimated time, bounded (CLAMP)
-and used only from MIN_SAMPLES deliveries on, multiplies the time left in eta.py's estimates (measured
+and used only from MIN_SAMPLES deliveries on, multiplies the time left in eta.py's estimates, save the wait
+for a task's planned start (its `deferred`): that wait is known exactly and is never corrected (measured
 against the raw estimate, not the promised one: the promised time already carries the factor in use, so
 a factor taken from it would undo itself once right). It is
 kept in the project's kv (`eta_factors`) so every estimate reads the same one. Config `eta`: `correction`
@@ -117,26 +118,32 @@ def factor(db, kind: str) -> float:
 def shown(db, e: dict, now: float, kind: str = "") -> dict:
     """`e` (an eta.py estimate) with its time left scaled by the kind's factor: `end`, plus `raw_end`,
     `factor`, `kind`, `conservative`, and `p90_end` scaled alike (`raw_p90_end`: before). Neither of the
-    conservative times is ever before `end`. An estimate with no time left or none is returned as it is."""
+    conservative times is ever before `end`, and the wait for a planned start (`deferred`: a task's
+    start_after) is never scaled: the correction covers work, not waiting. An estimate with no time
+    left or none is returned as it is."""
     if e.get("why") or not e.get("end"):
         return e
     f = factor(db, kind)
     raw = e["end"]
-    end = now + f * (raw - now) if raw > now else raw
+    plan = max(0.0, min(float(e.get("deferred") or 0) - now, raw - now))   # the planned wait
+    def scaled(x: float) -> float:
+        """`x` with the correction on its work time only; the planned wait passes unscaled."""
+        return now + plan + f * (x - now - plan) if x > now + plan else x
+    end = scaled(raw)
     p90 = e.get("p90_end")
     if end <= now:
         cons = end
     elif isinstance(p90, (int, float)) and p90 > raw:
         # The history's own spread (every leg at its p90, scaled by the same correction); once the ledger
         # has measured its 80th percentile of actual / shown, the larger of the two.
-        cons = now + f * (p90 - now)
+        cons = scaled(p90)
         if measured_x(db):
-            cons = max(cons, now + conservative_x(db) * (end - now))
+            cons = max(cons, now + plan + conservative_x(db) * (end - now - plan))
     else:
-        cons = now + conservative_x(db) * (end - now)
+        cons = now + plan + conservative_x(db) * (end - now - plan)
     out = {**e, "end": end, "raw_end": raw, "factor": f, "kind": kind, "conservative": max(cons, end)}
     if isinstance(p90, (int, float)):
-        out.update(p90_end=max(now + f * (p90 - now) if p90 > now else p90, end), raw_p90_end=p90)
+        out.update(p90_end=max(scaled(p90), end), raw_p90_end=p90)
     return out
 
 
