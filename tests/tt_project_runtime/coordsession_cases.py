@@ -3371,7 +3371,8 @@ def test_wakecost_cold_resumes_cap_the_default_compaction_point_at_a_wake_usd_re
     assert cs.decide(_cs_cfg(compact_growth_tokens=225000), big, "k1", "m", "high", lambda s: True, 0) \
         == ("resume", "compact")   # in place: the same session, never a new one
     after = {**big, "compact_floor": 110000}   # a compaction must free compact_min_free: no compaction loop
-    assert cs.limit(_cs_cfg(compact_growth_tokens=225000), after) == int(110000 / 0.7)
+    assert cs.limit(_cs_cfg(compact_growth_tokens=225000), after) == 110000 + cs.COMPACT_HEADROOM_TOKENS \
+        >= int(110000 / 0.7)   # the headroom over the floor, which also frees compact_min_free
     assert cs.limit(_cs_cfg(compact_tokens=200000), big) == 200000   # the user's fixed point wins
     assert "cold_cap_tokens" not in wakecost.cold_cap({**cfg, "waste": {"wake_usd": 0}}, p.db, p.runs, st, None,
                                                       "claude")
