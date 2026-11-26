@@ -914,9 +914,8 @@ def worker_task(p: Project, task: dict, cwd: str, branch: str | None, wake: dict
                     f"at once: the task runs again now at its own tier, without costing an attempt.\n")
     if wake and run_tier != task["tier"] and not wake.get("escalated") and tierfloor.reasons(task, cfg):
         history += (f"This task ends in a conclusion the user reads, a verdict or a device or machine action, so the "
-                    f"work it does when the wait is over is that: never do it at {run_tier}. Once the wait is over, "
-                    f"hand off `waiting` with "
-                    f"`retry_after_s: 0` and `wake_tier: \"{task['tier']}\"` instead.\n")
+                    f"work it does when the wait is over is that: never do it at {run_tier}; once the wait is over, "
+                    "hand off `waiting` for its own tier as above.\n")
     if wake and not wake.get("escalated"):
         stale = bud.stale_wakes(prev)
         cap = int((cfg.get("waiting") or {}).get("max_stale_wakes", 3) or 0)
@@ -951,7 +950,7 @@ def worker_task(p: Project, task: dict, cwd: str, branch: str | None, wake: dict
                     f"ttp/t{task['id']}-<topic>, in the repo you change"
                     + (f" (from #{old['id']}'s branch; never edit in its worktree)" if old and continues_id(task) else "")
                     + f": `git worktree add <dir>/t{task['id']} -b ttp/t{task['id']}-<topic> <start>`, <start> "
-                    "the branch you build on. Never edit another task's worktree.\n")
+                    "the branch you build on.\n")
     history += verified_line(p, task, cwd)
     if kind in ("code", "review", "work", "harness"):
         history += remote_only_line(cfg)
@@ -1200,7 +1199,7 @@ def root_behind_line(p: Project, cwd: str) -> str:
         return ""
     return (f"project root checkout: HEAD is {n} commit{'s' if int(n) != 1 else ''} behind {ref}, so its files "
             f"are old. Read current code with `git show {ref}:<path>` or `git grep <pattern> {ref}`; never move "
-            "the root's HEAD (no checkout, pull, reset or rebase there).\n")
+            "the root's HEAD.\n")
 
 
 def verified_line(p: Project, task: dict, cwd: str) -> str:

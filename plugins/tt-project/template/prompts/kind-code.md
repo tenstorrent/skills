@@ -10,7 +10,7 @@
 - Reproduce first, then fix. Add or update a test that fails without the fix (in its area's case file, if any).
   Run each new test on the base commit too: its command and failing result go in your self_check, or the
   hand-off check refuses. Fixing review findings: test each class of bug found, not only the reported case.
-- Run the full checks before handing off, committed, through `ttp checks`: the project's checks,
+- Run the full checks through `ttp checks`: the project's checks,
   plus after `--` only the repository's test and lint commands they do not already run, each
   command quoted as one word (`-- 'pytest -q tests/a.py' 'ruff check .'`). It reuses
   a pass for the same tree and commands. If they outlast a tool call,
@@ -18,9 +18,8 @@
   the worktree. Hand off `waiting` with the `retry_when` it prints (`ttp checks --result <run dir>`)
   and no `wake_tier`; failed checks wake you;
   that probe also wakes the task if the checks were killed. A foreground `ttp checks` ends with its
-  tool call and then reports incomplete: wait only on `ttp checks --result <run dir>`, never on run-dir
-  files such as checks.running (refused). If only recording the result is
-  left, put it in `on_pass` (`"on_pass": {"status": "done", "summary": "..."}`): a pass on the
+  tool call and then reports incomplete; never wait on run-dir files such as checks.running
+  (refused). If only recording the result is left, put it in `on_pass` (`"on_pass": {"status": "done", "summary": "..."}`): a pass on the
   same head records it model-free. No `on_pass`, `next_step`, PR or landing left: a pass records `done`.
 - Urgent (priority 1 or `urgent:`): once your CPU checks pass, hand off `done`; a device, cluster or
   remote smoke runs beside the review (say in `summary` how to read it). The push still waits for required checks.
@@ -28,8 +27,7 @@
   never the full suite: each fix would cost a full run. Run `ttp checks`
   once at the end, committed, before the hand-off. A direct full-suite run is refused.
   Below the project root run pytest as `PYTHONPATH=$PWD python3 -m pytest --rootdir=. --confcutdir=.`.
-- Do the whole job in this change: every change the spec lists, the root cause, and the related
-  problems you find on the way. No unrelated rewrites.
+- Do the whole job in this change: every change the spec lists and the root cause. No unrelated rewrites.
 - Before the hand-off, try to break it (tt-project-harness self-check.md): tick each spec step;
   a guard or parser: test 3+ bypasses (feed hooks and guards under HOME, XDG_CONFIG_HOME and
   GH_CONFIG_DIR at a fresh `mktemp -d`); exit codes: an unexpected one, an interrupted run; no
@@ -54,14 +52,14 @@
   A note answered by design: never in `resolves`; `ttp upstream --resolve <fp> --wontfix "<reason>"`.
 <!-- /ttp:if upstream_ingest -->
 
-## Landing on the project's branch (only when both hold)
+## Landing on the project's branch
 
 - Only when the delivery policy line says "code tasks may land on <branch> with ttp push=True"
   AND your spec asks you to land on that branch. Otherwise never push to a shared branch (`ttp push`
   and `git push` refuse the push branch): commit, test and hand off; the review lands it.
 - A landing waits only on the required checks (suite, any smoke test) and the review's verdict;
   a test that passed on the head is never rerun.
-- Land only with `ttp push`, run in your worktree after committing and testing. NEVER use
+- Land only with `ttp push`, run in your worktree. NEVER use
   `git push` to a shared branch. It refuses a spec with no landing step: if yours has one in other
   words, add `--land`.
 - Run `ttp push --detach`: it pushes in the background, prints `marker:` and `retry_when:`. Hand off
@@ -85,10 +83,10 @@
 
 ## Pull requests (when the task asks for delivery)
 
-- Open a DRAFT PR only once the change is fully tested: commit, run `ttp checks` (as above) and
-  fix what fails. `gh` opens a PR only after they passed on HEAD in this task (a clean tree, no rerun). Say in `summary` what ran and passed. One PR per task, holding all of its changes.
+- Open a DRAFT PR only once `ttp checks` (as above) passed on HEAD in this task (a clean tree, no
+  rerun): `gh` refuses it before. Say in `summary` what ran and passed. One PR per task, holding all of its changes.
 - Publish your own branch with `ttp push --own --detach` (same probe and exit codes as above): it
-  checks your HEAD and pushes it as is under its own name, never a shared branch.
+  checks your HEAD and pushes it as is under its own name.
   A branch your spec names instead of `ttp/t<id>-...` goes too, checked out in your worktree, but
   only as a fast-forward of the remote's (never main/master, the default or the push branch).
   Another task's branch your spec names in no `pr_branch:` line is refused;

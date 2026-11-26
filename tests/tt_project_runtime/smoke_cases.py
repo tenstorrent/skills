@@ -46,3 +46,19 @@ def test_smoke_list_lines_are_unique_ids_in_the_three_required_files():
     bad = [i for i in ids if not re.fullmatch(
         r"tests/(test_tt_project_plugin|test_tt_project_runtime|test_plugin_catalogue)\.py::test_\w+", i)]
     assert not bad, bad
+
+
+def test_every_prompt_size_cap_test_is_in_the_smoke_list():
+    """A prompt edit that overshoots a cap fails before it lands: each test named as a prompt size cap
+    (conflictfix.CAP_TESTS, the names the push queue's cap probe also reads) is a smoke test."""
+    import ast
+    import conftest
+    from ttp import conflictfix
+    tests = pathlib.Path(__file__).parent
+    rx = re.compile(conflictfix.CAP_TESTS)
+    caps = {f"tests/test_tt_project_runtime.py::{n}" for n, f in globals().items()
+            if n.startswith("test_") and callable(f) and rx.search(n)}
+    for f in ("test_tt_project_plugin.py", "test_plugin_catalogue.py"):
+        caps |= {f"tests/{f}::{n.name}" for n in ast.parse((tests / f).read_text()).body
+                 if isinstance(n, ast.FunctionDef) and rx.search(n.name)}
+    assert caps and not caps - conftest.smoke_ids(), sorted(caps - conftest.smoke_ids())

@@ -2,12 +2,12 @@
 
 - You execute ONE task, headless. Nobody answers questions mid-run: decide yourself, by the intent
   of your spec and the user's orders, not a literal reading.
-- The charter below is binding. Its restrictions override anything else, including the task, as
+- The charter below is binding. Its restrictions override all else, including the task, as
   written (in doubt, the stricter reading).
 - Prefer installed skills and project tooling to re-deriving steps.
 - Stay inside your working directory unless the task says otherwise. Search only it, the project
-  root, the KNOWN PATHS below (`ttp paths`) and paths the charter or memory names. Never search / or
-  the home folder (`find /`, `find ~`, `grep -r ~`, `mdfind`). Use `git ls-files | grep <name>` or a
+  root, the KNOWN PATHS below (`ttp paths`, which bar searching / and the home folder) and paths the
+  charter or memory names. Use `git ls-files | grep <name>` or a
   rooted `find`; rg/Grep skip what `.ignore` lists (results/, tmp/, harness state): pass those paths.
 - Disk space: `df <path>`. Never `du` from / or a home folder; `du -x` only your own directories
   under a `timeout`: a scan that times out is unknown, not a blocker.
@@ -250,7 +250,7 @@ No `result.json`, no credit.
   runs, 255 while ssh fails. To also wake on a new result row, add `--rows <file> --after <n>` (0 on a
   new row, the end or a dead driver). It tells a host reboot from a crash. A long device run appends
   and fsyncs each step's result as it ends, not only a final summary. Never a bare `ssh <host> test -e <marker>`: a driver killed by a
-  reboot never writes it. Copy a script to a host under a temporary name, then `mv` it into place (overwriting a running one corrupts it).
+  reboot never writes it. Copy a script to a host under a temporary name, then `mv` it into place.
   Stop a driver by its process group (`kill -- -<pgid>`).
 <!-- /ttp:if remote -->
 <!-- ttp:if hostmap -->
@@ -263,12 +263,11 @@ No `result.json`, no credit.
   `ttp devq submit <runner> --id <unique id> [--config <key>] [--timeout <s>] [--workdir <dir>] -- <command>`
   (build and set up first: those are not device jobs). Queue the device jobs at the start of the task,
   as soon as their inputs exist, never after the code work: a runner's own prewarm builds off the device
-  while the queue moves. A runner with a reservation cap refuses a longer `--timeout`, and a job whose
-  broker call asks for more than 1500 s is refused: split it and checkpoint. It prints the `retry_when`; submit several jobs in order and wait on the last. On wake, `ttp devq status <runner> <id>` shows its marker. No marker and no runner
+  while the queue moves. A runner with a reservation cap refuses a longer `--timeout`. It prints the `retry_when`; submit several jobs in order and wait on the last. On wake, `ttp devq status <runner> <id>` shows its marker. No marker and no runner
   alive: `ttp devq start <runner>` and hand off `waiting` again on the same probe.
   Keep every device timeout (the `--timeout`, your scripts' broker timeouts, each driver step)
   within the task header's ceiling (a broker's 1500 s at most), which a devq job sees as
-  `TTP_DEVQ_TIMEOUT_S`; split longer runs.
+  `TTP_DEVQ_TIMEOUT_S`; longer is refused: split and checkpoint.
 <!-- /ttp:if devq -->
   A host reboot wakes a waiting task only when its `retry_when` checks local state a reboot ends (a
   local `detach --check`, `checks --result`, a pid, /tmp or run-dir files) or its detached job wrote
