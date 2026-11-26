@@ -2442,8 +2442,7 @@ def add_order(p, text: str, message: int, owners=(), due=None, start_by=None, ac
                             "due": due_at if due_at is not None else now + _hours(p) * 3600,
                             "timed": due_at is not None, "tasks": ids, "obligations": [], "raised": None,
                             "set_at": now, "order": int(message), "class": action_class, "start_by": start_at,
-                            "started": None, "late": None, "since": now if again else None,
-                            "reason": oldorders.one_line(reason),
+                            "started": None, "late": None, "reason": oldorders.one_line(reason),
                             "context": oldorders.clean_context(p, oldorders.context_for(p.db, "", int(message)))}}
             note = f"order {oid} recorded from message #{message}" + note_cap
         pr = o["promise"]
@@ -2484,7 +2483,7 @@ def _needed_no_task(o: dict) -> bool:
 
 def order_starts(db, since: float, until: float, now: float | None = None) -> tuple[int, int]:
     """(orders whose message came between `since` and `until`, those whose first owner run started more
-    than ORDER_START_S after the message (a follow-up order on a message that already has one: after its own record) or not at all by `now`). An order that needed no task is left
+    than ORDER_START_S after the message (a follow-up order: after its own record) or not at all by `now`). An order that needed no task is left
     out: one closed or dropped with no run started and no owner task ever (a reply, a memory or charter
     change settled it), so the count matches the late orders the coordinator is told about."""
     now = time.time() if now is None else now
@@ -2493,11 +2492,14 @@ def order_starts(db, since: float, until: float, now: float | None = None) -> tu
     if not orders:
         return 0, 0
     ids = list({int(pr["order"]) for _, pr in orders})
+    first = {}   # message -> when its first order was recorded: a later one is a follow-up, timed from its record
+    for o, pr in orders:
+        first[int(pr["order"])] = min(first.get(int(pr["order"]), o["created"]), o["created"])
     ts = {r["id"]: float(r["ts"]) for r in db.q(f"SELECT id, ts FROM messages WHERE id IN ({','.join('?' * len(ids))})", ids)}
     n = late = 0
     for o, pr in orders:
         sent = ts.get(int(pr["order"]))
-        at = None if sent is None else max(sent, float(pr.get("since") or 0))   # a follow-up order: from its record
+        at = None if sent is None else max(sent, o["created"] if o["created"] > first[int(pr["order"])] else 0)
         if sent is None or not since <= sent < until or (pr.get("started") is None and now - at <= ORDER_START_S):
             continue   # out of the window, or too new to say
         start = pr.get("started")
@@ -2554,7 +2556,7 @@ def _order_line(o: dict) -> str:
 
 def _order_ts(db, pr: dict) -> float:
     m = db.one("SELECT ts FROM messages WHERE id=?", (int(pr["order"]),))
-    return max(float(m["ts"]), float(pr.get("since") or 0)) if m else float(pr.get("start_by") or 0) - ORDER_START_S
+    return float(m["ts"]) if m else float(pr.get("start_by") or 0) - ORDER_START_S
 
 
 def _check_order(p, o: dict, now: float, raised: list[str]) -> bool:

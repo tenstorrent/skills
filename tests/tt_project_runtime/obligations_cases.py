@@ -1255,7 +1255,7 @@ def test_a_follow_up_order_on_an_ordered_message_starts_its_clock_at_its_own_rec
     later = now + 4 * 3600
     again = ob.add_order(p, "follow-up", mid, [], action_class="read", now=later).split()[1]
     pr = ob.get(p.db, again)["promise"]
-    assert pr["start_by"] == later + ob.ORDER_START_S and pr["since"] == later
+    assert pr["start_by"] == later + ob.ORDER_START_S
     check(later + 60)
     assert ob.get(p.db, again)["promise"]["late"] is None and raised((ob.ORDER_LATE_KIND,)) == []
     p.db.x("INSERT INTO runs(task, role, started, ended, status) VALUES(?,?,?,?,?)",
