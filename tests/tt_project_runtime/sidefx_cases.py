@@ -197,6 +197,9 @@ def test_outside_writes_skips_regex_text_ssh_remote_commands_and_saved_tool_outp
     assert found(f"sed -n 1,40p {saved}", f"grep -n x {saved} | head") == set()
     assert not sidefx.sensitive(saved, h) and sidefx.sensitive(f"{h}/.claude/settings.json", h)
     assert sidefx.sensitive(f"{h}/.claude/projects/-wt/memory.md", h)
+    # any hidden home entry and ~/bin are sensitive; visible home paths and the harness's own folder are not
+    assert all(sidefx.sensitive(f"{h}/{x}", h) for x in (".bash_aliases", ".config/autostart/x.desktop", "bin/git"))
+    assert not any(sidefx.sensitive(f"{h}/{x}", h) for x in ("notes.txt", "work/.hidden", ".tt-project/x", "binx"))
     # real writes still count: an awk program's own output file, a grep's redirect, a quoted target
     assert found("awk '/x/ {print > \"/tmp/a\"}' f", "grep -n '/^def' f.py > /tmp/defs",
                  "sed -i 's/a/b/' \"$HOME/.config/c\"") == {"/tmp/a", "/tmp/defs", f"{h}/.config/c"}
