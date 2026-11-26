@@ -915,7 +915,7 @@ def test_glm_guard_lets_a_plain_reader_name_the_guards_files_of_any_run(tmp_path
 def test_the_readers_that_may_name_the_guards_files_have_no_output_file_form():
     """Nor a command-running form: `rg --pre`, `find -exec` and `xargs` run a command on the file."""
     from ttp import glmguard, hook
-    assert glmguard.GUARD_READERS <= hook.READERS
+    assert glmguard.GUARD_READERS <= hook.READERS | {"jq", "ls"}   # jq and ls write no file and run no command
     assert not glmguard.GUARD_READERS & {"uniq", "sort", "tee", "dd", "cp", "less", "more", "sed", "awk", "rg",
                                          "find", "xargs"}
 
@@ -2241,6 +2241,45 @@ def test_glm_guard_lets_python_code_in_a_quoted_heredoc_name_the_run_variables(m
     # the run folder stays writable: a note or a scratch file there is no record of the guard's
     for ok in (f'echo "step 1 done" >> "{rd}/notes.md"', f"cat > {rd}/scratch.txt <<'EOF'\nx\nEOF"):
         assert glmguard.shell_refusal(ok, str(wt), str(rd)) is None, ok
+
+
+def test_glm_guard_lets_commands_read_or_name_the_guard_files_and_refuses_their_edits(monkeypatch, tmp_path):
+    """cells: guard_file_reads. A `cd` before plain readers, jq, ls, and inline python the run-time judge watches
+    (replayed stops: `cd <run>; head glm_guard.json`, a loop of `python3 -c` json reads) read the guard's files;
+    every edit of them stays refused."""
+    from ttp import glmguard, pyaudit
+    wt, rd = _glm_run_env(monkeypatch, tmp_path)
+    (rd / "glm_guard.json").write_text("{}")
+    other = tmp_path / "runs" / "9"
+    py = f'python3 -c "import json; print(json.load(open(\'{other}/glm_guard.json\')))"'
+    reads = [f"cd {rd.parent}; head -c 500 {rd.name}/run.json; echo; head -c 400 {rd.name}/glm_guard.json",
+             f"cd {rd} && grep -n on glm_guard.json 2>/dev/null | head -5 | cut -c1-40; tail -1 glm_guard.on",
+             f"jq .why {rd}/glm_guard.json", f"wc -l {other}/glm_guard.json", "echo glm_guard.on",
+             f"cd {rd}; cat glm_guard.json | head -c 600; ls ../ | grep -v x | head",
+             "python3 -m pytest -q tests/x.py -k 'glm_guard or glmenv'", f"for r in 9; do echo $r; {py}; done"]
+    edits = [f"cd {rd}; rm glm_guard.on", f"cd {rd} && echo off > glm_guard.on", f"cd {rd}; cat x >> glm_guard.json",
+             f"echo x | tee {rd}/glm_guard.on", f"sed -i 1d {rd}/glm_guard.json", f"cp /dev/null {rd}/glm_guard.on",
+             f"mv x {rd}/glm_guard.json", f"truncate -s0 {rd}/glm_guard.on", f"ln -sf /dev/null {rd}/glm_guard.on",
+             "echo glm_guard.on | xargs rm", 'cd "$(rm glm_guard.on)"', "F=glm_guard.on; cd x; rm $F",
+             f"sed -n 1p {rd}/glm_guard.json", f"sed -n 'w {rd}/glm_guard.on' x", f"jq . x > {rd}/glm_guard.json",
+             f"{py}; rm {rd}/glm_guard.on", f'python3 -c "print(\'{rd}/glm_guard.on\')" | xargs rm',
+             f'python3 -c "print(\'rm {rd}/glm_guard.on\')" | bash', f'f=$(python3 -c "print(\'{rd}/glm_guard.on\')"); rm "$f"',
+             f'bash -c "$(python3 -c "print(\'rm {rd}/glm_guard.on\')")"', f'python3 -B -c "print(1)"; rm {rd}/glm_guard.on',
+             f'python3 -c "open(\'{rd}/glm_guard.on\', \'w\')"']
+    for c in reads[:-1]:
+        assert glmguard.shell_refusal(c, str(wt), str(rd)) is None, c
+    for c in edits:
+        assert (glmguard.shell_refusal(c, str(wt), str(rd)) or "").startswith(glmguard.GUARD_WHY), c
+    assert glmguard.shell_refusal(reads[-1], str(wt), str(rd)) == glmguard.GUARD_WHY   # no run-time judge: refused
+    _audited_env(monkeypatch, tmp_path)
+    for c in reads:   # the judge loads: the python read is judged as it runs
+        assert glmguard.shell_refusal(c, str(wt), str(rd)) is None, c
+    for c in edits[:-1]:
+        assert (glmguard.shell_refusal(c, str(wt), str(rd)) or "").startswith(glmguard.GUARD_WHY), c
+    assert glmguard.shell_refusal(reads[-1].replace("python3 -c", "PYTHONPATH= python3 -c"), str(wt), str(rd))
+    # what the judge refuses as the python runs: a write to the run's guard record
+    assert (pyaudit.glm_write(str(rd / "glm_guard.on"), {"run_dir": str(rd), "roots": [str(wt), str(rd)]})
+            or "").startswith(glmguard.GUARD_WHY)
 
 
 @pytest.mark.parametrize("cmd, ok", [

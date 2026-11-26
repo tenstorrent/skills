@@ -120,7 +120,7 @@ TAMPER = re.compile(   # an id after `$` or `${` is a value read (`export TMPDIR
 GUARD_FILE = re.compile(r"\bglm_guard\.(?:on|json)\b")
 # readers with no output-file form (`uniq IN OUT`, `sort -o`, `less -o` write one) and no command-running form
 # (`rg --pre`, `find -exec`, `xargs` run one): only these may name the guard's files
-GUARD_READERS = frozenset({"cat", "grep", "egrep", "fgrep", "head", "tail", "wc", "cut"})
+GUARD_READERS = frozenset({"cat", "grep", "egrep", "fgrep", "head", "tail", "wc", "cut", "jq", "ls"})
 SAME_ID = re.compile(r"\b(TTP_RUN_DIR|TTP_TASK|TTP_PROJECT|TTP_RUN_ID)=(['\"]?)([^\s'\"`$~\\;&|<>()]*)\2(?=[\s;&|)]|$)",
                      re.M)   # not TTP_CODE_ARM_GUARD: setting the guard switch stays refused
 # A redirection's fd digit (the 2 of `2>/dev/null`): no word of the command it follows
@@ -1163,8 +1163,12 @@ def shell_refusal(cmd: str, cwd: str, run_dir: str = "", env=None, remote: bool 
         for ln in body])
     # an identity set to the value it already has (`TTP_PROJECT=<this run's TTP_PROJECT> ttp ...`) edits nothing
     same = SAME_ID.sub(lambda m: " " * len(m[0]) if m[3] and m[3] == e.get(m[1]) else m[0], view)
-    if TAMPER.search(same) or GUARD_FILE.search(same) and not all(   # every command a reader: `rm $F` can't hide one
-            os.path.basename(w[0]) in GUARD_READERS | {"echo", "printf", "for"} for w in hook._all_segments(hook._split(same)[0]) if w):
+    # every command a reader (`rm $F` can't hide one) or a `cd`, or inline python the run-time judge watches (its
+    # code blanked: pyaudit refuses its writes to these files as it runs; what it prints still meets the others)
+    if TAMPER.search(same) or GUARD_FILE.search(same) and not all(
+            os.path.basename(w[0]) in GUARD_READERS | {"echo", "printf", "for", "cd"} or (
+                re.fullmatch(r"python[\d.]*", w[0]) and w[1:2] == ["-c"] and not "".join(w[2:]).strip())
+            for w in hook._all_segments(hook._split(_audited_code(same, e))[0]) if w):
         return GUARD_WHY
     if STATE_DB.search(named):
         return STATE_DB_WHY
