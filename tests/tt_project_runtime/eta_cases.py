@@ -1006,6 +1006,7 @@ def test_eta_a_deferred_task_s_likely_and_conservative_times_start_after_its_pla
     ed, et = eta.estimate(p.db, dep, now), eta.estimate(p.db, t, now)
     assert ed["end"] - now < 6000 < ed["p90_end"] - now, (ed["end"] - now, ed["p90_end"] - now)   # the split
     assert et["conservative"] >= et["end"] and et["p90_end"] >= et["end"]
+    assert et["p90_end"] >= ed["p90_end"] + 3 * 1800   # the dependency keeps its correction, then T's own p90 run (at least 1800 s) x3
     assert et["p90_end"] - now == pytest.approx(3 * (et["raw_p90_end"] - now)), (et["p90_end"] - now, et["raw_p90_end"] - now)
 
 
