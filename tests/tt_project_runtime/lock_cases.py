@@ -2678,6 +2678,15 @@ def _caller_is_killed_the_command_ends(t, pidfile, sig):
             t.kill()
 
 
+def test_a_pid_reaped_between_the_probes_of_gone_counts_as_gone(monkeypatch):
+    """The cause of the flaky SIGKILL case below: kill(pid, 0) still saw the command's zombie, which was
+    reaped before its /proc entry was read, and _gone then said it still ran (its cleanup's kill failed)."""
+    done = subprocess.Popen(["true"])
+    done.wait()
+    monkeypatch.setattr(os, "kill", lambda pid, sig: None)   # the first probe saw the zombie
+    assert _gone(done.pid)
+
+
 @pytest.mark.parametrize("sig", [signal.SIGTERM, signal.SIGKILL])
 def test_a_kill_of_a_probed_ttp_locks_group_ends_the_command(env, tmp_path, sig):
     p = make(env)

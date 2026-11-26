@@ -401,6 +401,26 @@ def test_a_commit_the_check_cannot_run_on_reads_not_checked(env, monkeypatch):
         "The fix is live (commit 9aa4c1f88ea7)."
 
 
+def test_a_commit_named_by_a_prefix_without_a_letter_is_never_checked(env, monkeypatch):
+    """The cause of two flaky footer tests: about 1 in 110 commits have a 10-character prefix of digits
+    only, which no reply names as a commit; the tests' commit helper re-dates such a commit."""
+    p, repo, head = _claim_replay_setup(env, monkeypatch, landed=False)
+    tree = _git_out(repo, "rev-parse", "HEAD^{tree}")
+    for n in range(100_000):   # re-dated per try until the prefix has no letter
+        env_dates = {**os.environ, "GIT_AUTHOR_DATE": f"{1_700_000_000 + n} +0000",
+                     "GIT_COMMITTER_DATE": f"{1_700_000_000 + n} +0000"}
+        bare = subprocess.run(["git", "-C", str(repo), "commit-tree", tree, "-p", head, "-m", "x"],
+                              capture_output=True, text=True, check=True, env=env_dates).stdout.strip()
+        if bare[:10].isdigit():
+            break
+    _git_out(repo, "reset", "-q", "--hard", bare)
+    text = f"The fix is live (commit {bare[:10]})."
+    assert _footer(p, text, None) == text   # the claim check does not see a commit in it
+    assert _sha_like(repo) != bare
+    text = f"The fix is live (commit {_git_out(repo, 'rev-parse', 'HEAD')[:10]})."
+    assert _footer(p, text, None).endswith("not checked")
+
+
 def test_a_message_with_no_live_or_landed_word_is_never_checked(env, monkeypatch):
     """No live/landed word: nothing is checked, even a commit the running release lacks; a
     negated word is no claim either."""

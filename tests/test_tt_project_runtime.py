@@ -16856,16 +16856,7 @@ def _wait(cond, timeout=30.0):
     return cond()
 
 
-def _gone(pid):
-    """pid runs no more (a zombie waiting for its reaper counts as gone)."""
-    try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return True
-    try:
-        return pathlib.Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[0] == "Z"
-    except (OSError, IndexError):
-        return False
+_gone = _pid_gone   # pid runs no more: a zombie counts as gone, and so does a pid reaped between the probes
 
 
 def _pid_in(path):
@@ -18063,10 +18054,24 @@ def _push_setup(env, monkeypatch, checks):
     return p, repo, origin, other
 
 
+def _sha_like(path):
+    """Re-date HEAD until its 10-character prefix reads as a commit id to the claim check (a digit and
+    a letter, landed._LITERAL_SHA): about 1 in 110 commits would not, and a reply naming such a prefix
+    is never checked. Returns HEAD."""
+    from ttp import landed
+    for n in range(1000):
+        head = _git_out(path, "rev-parse", "HEAD")
+        if landed._LITERAL_SHA.fullmatch(head[:10]):
+            return head
+        _git_out(path, "commit", "-q", "--amend", "--no-edit", "--allow-empty", f"--date={1_700_000_000 + n} +0000")
+    raise AssertionError("no re-dating gave a sha-like prefix")
+
+
 def _commit(path, name, text):
     (path / name).write_text(text)
     _git_out(path, "add", name)
     _git_out(path, "commit", "-qm", f"edit {name}")
+    _sha_like(path)
 
 
 def _ttp_push():
