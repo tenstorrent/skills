@@ -21,7 +21,7 @@ restarts, and only while the stream is live. Each project's sources are publishe
 registered for a box, not only its own.
 
 Answer: live, free or unknown, with each source, the time it was read and `clear_at`: the stream's
-last live reading plus a quiet window (`occupancy.quiet_s`, default 60 s, the largest any registering
+end (its first read off, or its last live read) plus a quiet window (`occupancy.quiet_s`, default 60 s, the largest any registering
 project set). Inside the window the box still counts as live. Unknown on a box with a source counts
 as live too (never a silent pass), and the source's own daemon raises one event (watch). With no
 source registered for a box the answer is free and nothing changes.
@@ -51,7 +51,7 @@ from .util import flocked, read_dict
 SOURCES = "occupancy-sources.json"
 READINGS = "occupancy-readings.json"
 LOCK = "occupancy.lock"
-QUIET_S = 60.0            # default quiet window after a stream's last live reading
+QUIET_S = 60.0            # default quiet window after a stream's end (its first read off)
 TIMEOUT_S = 10.0          # default source timeout
 FILE_MAX_AGE_S = 120.0    # a file source older than this is unknown
 CACHE_S = 20.0            # a source is read at most this often, across every project on the host
@@ -205,7 +205,7 @@ def _live_spans(rec: dict) -> list:
 
 def mark_refused() -> None:
     """Tell the enclosing `ttp lock` a start gate refused its command before anything ran, so its span is no job
-    of a stream. Generic: any wrapper's own gate may `touch "$TTP_GATE_MARK"` before it exits 75."""
+    of a stream. Generic: any wrapper's own gate may `touch "$TTP_GATE_MARK"` and then exit 75; the refusal must end the command."""
     if path := os.environ.get(GATE_MARK_ENV):
         try:
             Path(path).touch()

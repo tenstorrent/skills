@@ -9394,10 +9394,9 @@ def cmd_lock(a) -> None:
     if any(L["device"] for L in todo):
         child_env["TTP_NO_DEVICE"] = "0"   # a device lock is the sanctioned way to a device
         child_env = unmask_devices(child_env)   # and sees the devices a run's own commands do not
-    from . import occupancy
-    gate_mark = p.state / f"gate-mark-{os.getpid()}"   # a start gate in the command touches it when it refuses
+    from . import activity, occupancy
+    gate_mark = p.state / f"gate-mark-{activity.new_id()}"   # unique per lock; a start gate in the command touches it when it refuses
     child_env[occupancy.GATE_MARK_ENV] = str(gate_mark)
-    from . import activity
     from .runner import boot_id
 
     def _logged(mode: str, ls: list[dict], run) -> int:

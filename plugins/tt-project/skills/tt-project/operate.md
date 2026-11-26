@@ -122,7 +122,8 @@ guarantees) holds a box: `ttp occupancy <alias> --step <step>` prints live, quie
 with each source, when it was read and when the box clears (the stream's end plus a quiet window,
 `occupancy.quiet_s`, default 60 s). Exit 0: the step may run; 75: stay off. `--wait` looks again
 about every 15 s until the box is free (`--timeout` bounds it, `--also <alias>` adds boxes);
-`--list` shows every source registered on the host.
+`--list` shows every source registered on the host. A wrapper's own start gate that refuses inside
+`ttp lock` touches `$TTP_GATE_MARK` and exits 75, so the watchdog counts that lock span as no job.
 
 - Register a source in the project that runs the stream, per machine alias, as a read-only command
   (exit 0 live, 1 none, anything else or a timeout counts as live) or a file it reads (JSON
