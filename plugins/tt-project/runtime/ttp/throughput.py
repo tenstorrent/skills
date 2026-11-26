@@ -1086,10 +1086,10 @@ def measure(db: DB, cfg: dict, since_s: float = DAY, now: float | None = None, g
     # checks.slots or checks.test_project_max changes nothing. Reported, never raised here.
     if ck_lane["waits"] and not ck_lane.get("holder") and lanes_n and cap_n:
         try:
-            from . import testslots
+            from . import checkcap, testslots
             env, key = testslots.TESTS.setting(testslots.TESTS.budget)
             s = testslots.sizes(cfg)
-            set_ = testslots._number(_cfg(cfg, f"checks.{key}", None)) or testslots._setting(env, key)
+            set_ = checkcap.non_negative_int(_cfg(cfg, f"checks.{key}", None)) or testslots._setting(env, key)
             budget = testslots.project_max(cfg, s) if s and set_ else 0
             fits = budget // testslots.run_min(cfg, s[1]) if budget else 0
             src = testslots.project_max_from(cfg, s) if budget else ""
@@ -1097,7 +1097,7 @@ def measure(db: DB, cfg: dict, since_s: float = DAY, now: float | None = None, g
             budget = fits = 0
         if budget and fits < min(lanes_n, cap_n):
             # Name the setting that binds (testslots.project_max_from): a raise of any other changes nothing.
-            mine = testslots._number(_cfg(cfg, f"checks.{key}", None))
+            mine = checkcap.non_negative_int(_cfg(cfg, f"checks.{key}", None))
             fix = {
                 "account": (f", the account's setting{f': its own {mine} only lowers it' if mine else ''}",
                             f"raise or unset the account's (ttp config --account checks.{key}; it holds every "
