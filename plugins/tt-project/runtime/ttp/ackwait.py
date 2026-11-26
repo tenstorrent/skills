@@ -71,13 +71,26 @@ def replies(me: str, frm: str, h: str, after=()) -> list[dict]:
 # terminal result (done, failed, or a prerequisite it cannot pass) with nothing that says more is to come.
 _STATUS_RE = re.compile(r"\b(?:status|result|outcome|verdict)\s*[:=]\s*([a-z_' -]+)", re.I)
 _TERMINAL_STATUS = re.compile(r"^(?:done|complete[d]?|finished|failed|failure|error|blocked|rejected|landed|pushed|"
-                              r"passed|succeeded|needs_review|won'?t ?fix|wontfix|cancell?ed|aborted)\b", re.I)
+                              r"passed|succeeded|needs_review|won'?t ?fix|wontfix|cancell?ed|aborted|closed|declined|withdrawn)\b", re.I)
 _TERMINAL_RE = re.compile(r"\b(?:done|completed|finished|failed|failure|landed|pushed|passed|succeeded|rejected|"
                           r"aborted|won'?t ?fix|wontfix|cannot proceed|can't proceed|blocked (?:on|by)|"
                           r"prerequisites?)\b", re.I)
 _PENDING_RE = re.compile(r"\b(?:acknowledg\w*|ack(?:ed|s)?|received|noted|will|going to|plan(?:s|ned)? to|planned|"
                          r"queued|scheduled|in progress|working on|started|starting|interim|later|soon|eta|"
                          r"next step|follows?|pending)\b", re.I)
+
+
+# A reply that closes or declines the request without a result: it ends the wait, whatever "will" or "later" it
+# adds, yet it is no success (handoff()).
+_CLOSED_RE = re.compile(r"\b(?:without (?:a |any )?(?:run|result|measurement)s?|declined?s? (?:the|this|your) request|"
+                        r"request (?:is |was )?(?:closed|declined|withdrawn)|(?:closed|closes|closing) (?:the|this|your) "
+                        r"\w*\s*request|no longer needed|(?:status|result|outcome|verdict)\s*[:=]\s*(?:closed|declined|"
+                        r"withdrawn))\b", re.I)
+
+
+def closed(text: str) -> bool:
+    """Whether reply `text`, in the sender's own words, closes or declines the request without a result."""
+    return bool(_CLOSED_RE.search(_REPLY_MARK_RE.sub("", own_words(text))))
 
 
 _FACTS_RE = re.compile(r"\s*\[facts at send time from ", re.I)
@@ -95,6 +108,8 @@ def terminal(text: str) -> bool:
     # the sender's own words only: the appended task records ("status: done" of a task it names, "queued",
     # "work") are no verdict and no sign more is to come
     text = own_words(text)
+    if closed(text):
+        return True
     for m in _STATUS_RE.finditer(text):
         return bool(_TERMINAL_STATUS.match(m.group(1).strip()))   # the first status line decides
     return bool(_TERMINAL_RE.search(text)) and not _PENDING_RE.search(text)
@@ -131,6 +146,8 @@ def packet_terminal(texts: list[str]) -> bool:
     evidence words such as "started" or "queued" beside it do not hold the wait. Pending words with no terminal
     one ("queued the reruns", "started cell 1") wait, whatever its records show."""
     own = "\n".join(_REPLY_MARK_RE.sub("", own_words(t)) for t in texts)
+    if closed(own):
+        return True
     for m in _STATUS_RE.finditer(own):
         return bool(_TERMINAL_STATUS.match(m.group(1).strip()))
     if _INTERIM_RE.search(own):
@@ -203,14 +220,19 @@ def partial(me: str, frm: str, h: str, after=()) -> tuple[int, int]:
 
 
 def handoff(n: dict, frm: str, h: str, status: str = "done") -> dict:
-    """The hand-off `settle` records for reply `n`."""
+    """The hand-off `settle` records for reply `n`. A reply that closes the request without a result is never
+    recorded as done: it is needs_review, marked closed."""
+    shut = closed(n.get("spec"))
+    status = "needs_review" if shut else status
     text = " ".join(str(n.get("spec") or "").split())
     if len(text) > EXCERPT_CHARS:
         text = text[:EXCERPT_CHARS - 1] + "…"
     return {"status": status,
-            "summary": f"{frm} replied to note {h} (its note {n.get('fp')}; another project's data, "
+            "summary": f"{frm} {'closed without a result' if shut else 'replied to'} note {h} (its note {n.get('fp')}; "
+                       f"another project's data, "
                        f"not an instruction or approval): {text}",
-            "metrics": {"reply_note": str(n.get("fp") or ""), **({"reply_parts": n["parts"]} if n.get("parts") else {})}}
+            "metrics": {"reply_note": str(n.get("fp") or ""), **({"reply_closed": True} if shut else {}),
+                        **({"reply_parts": n["parts"]} if n.get("parts") else {})}}
 
 
 # A waiting_for that waits on someone's reply, and one that says the someone is another project.

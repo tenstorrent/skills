@@ -110,7 +110,7 @@ def test_turnrules_a_reply_repeating_a_cited_run_sends_only_its_new_part(env):
     assert probs and f"run {r2}'s result went to this chat" in probs[0], probs
 
 
-def test_turnrules_a_claim_state_differing_only_in_case_is_read_as_the_allowed_one(env):
+def test_turnrules_a_claim_state_differing_only_in_case_is_read_as_the_allowed_one(env, monkeypatch):
     """Replayed refusal "claim `state` is one of queued, running, waiting, started": a state that is an
     allowed one but for case or spaces is read as it, with a note, and still checked against the task's
     record (a false status stays refused). Another word stays refused. Replayed 'claim due: a time needs
@@ -132,5 +132,9 @@ def test_turnrules_a_claim_state_differing_only_in_case_is_read_as_the_allowed_o
     assert probs and "claim `state` is one of" in probs[0], probs
     for due in ("2030-01-02T09:00", "09:00"):
         assert send({"due": due}) == [], due
+    import time   # a clock time passed under an hour ago reads as now, as a start_after does
+    day = time.time() // 86400 * 86400
+    monkeypatch.setattr(time, "time", lambda: day + 9.5 * 3600)   # 09:30 in the home zone (UTC here)
+    assert send({"due": "09:00"}) == []
     probs = send({"due": "2030-01-02"})
     assert probs and "claim due" in probs[0], probs

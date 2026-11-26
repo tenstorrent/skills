@@ -1649,6 +1649,41 @@ def test_ack_wait_terminal_reads_a_multi_part_reply_as_one_and_still_waits_past_
         assert ackwait.part(text) == want, text
 
 
+def test_ack_wait_terminal_counts_a_reply_closing_the_request_without_a_run_but_never_as_done(env, monkeypatch, capsys,
+                                                                                             tmp_path):
+    # A peer that closes or declines the request without a run has answered: --terminal passes on it, whatever
+    # "will" it adds, and settle records it as needs_review marked closed, never as done.
+    from ttp import ackwait, cli, upstream
+    from ttp.project import register
+    p = make(env)
+    (env["tmp"] / "peer").mkdir()
+    register("peer", {"host": "testhost", "dir": str(env["tmp"] / "peer")})
+    monkeypatch.setenv("TTP_PROJECT", str(p.base))
+    request = "please time the warm start and report it"
+    assert upstream.send(p.name, 4, "peer", request) == "sent"
+    fp = upstream.note_id("peer", request)
+    reply = f"re {fp}: closing this timing request without a run; the cache it measures is gone, so I will not rearm it"
+    assert upstream.send("peer", 1, p.name, reply) == "sent"
+    probe = ["probe", "--from", "peer", "--hash", fp, "--terminal"]
+    assert _ack_wait(cli, *probe) == 0, capsys.readouterr().out
+    out = tmp_path / "result.json"
+    monkeypatch.setenv("TTP_RESULT", str(out))
+    for status in ("done", "needs_review"):
+        cli.main(["ack-wait", "settle", "--from", "peer", "--hash", fp, "--terminal", "--status", status])
+        got = json.loads(out.read_text())
+        assert got["status"] == "needs_review" and got["metrics"]["reply_closed"] is True, (status, got)
+        assert "closed without a result" in got["summary"] and "without a run" in got["summary"]
+    for text in ("Declined the request: no budget for it.", "status: withdrawn", "The request was closed.",
+                 "No longer needed, the fix landed elsewhere."):
+        assert ackwait.terminal(text) is True and ackwait.closed(text), text
+    assert ackwait.packet_terminal(["[1/2] Acknowledged.", "[2/2] Closing your request without a run."]) is True
+    for text in ("received, will run it soon", "I will close it once the run is in", "status: queued"):
+        assert ackwait.terminal(text) is False and not ackwait.closed(text), text
+    done = {"spec": "re abc: the timing passed, 41 s", "fp": "f" * 16}
+    assert ackwait.handoff(done, "peer", "abc")["status"] == "done", "a real result still settles as asked"
+    assert "reply_closed" not in ackwait.handoff(done, "peer", "abc")["metrics"]
+
+
 def test_a_note_this_machine_only_sends_on_is_kept_handled_and_an_addressed_one_wakes(env, monkeypatch):
     """A note addressed to the project that names another machine (`at`) is only sent on from here: kept
     as a handled event (no coordinator wake) and still forwarded. One addressed to it with no `at` wakes

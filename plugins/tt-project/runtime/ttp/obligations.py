@@ -2278,7 +2278,8 @@ def _when(value, what: str, p=None) -> float:
 def _home_time(value, p):
     """A due given without a zone (an ISO date and time, or a bare clock time such as '18:05') read in
     project `p`'s home zone, as the coordinator prompt says a time it sets without one is: a mechanical
-    fill from the project's settings. A clock time is its next one there. Any other value,
+    fill from the project's settings. A clock time is read as a start_after is (one passed under an hour
+    ago: now). Any other value,
     a date alone among them, comes back unchanged for _due to judge."""
     if p is None or not isinstance(value, str):
         return value
@@ -2289,7 +2290,7 @@ def _home_time(value, p):
         zone = timefmt.home(p)
         if re.fullmatch(r"([01]?[0-9]|2[0-3]):[0-5][0-9]", s):
             from .coordinator import parse_start_after
-            return parse_start_after(s, tz=zone) or value
+            return parse_start_after(s, tz=zone) or time.time()
         if len(s) > 10 and (dt := datetime.fromisoformat(s)).tzinfo is None:
             return dt.replace(tzinfo=ZoneInfo(zone)).timestamp()
     except (ValueError, KeyError, OSError):
