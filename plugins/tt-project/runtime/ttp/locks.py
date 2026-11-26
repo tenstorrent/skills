@@ -1360,7 +1360,7 @@ def enqueue(locks_dir: Path, resource: str, holder: str, since: float | None = N
 def dequeue(ticket: Path | None) -> None:
     if ticket is None:
         return
-    for path in (ticket, _owner_file(ticket)):
+    for path in (ticket, _owner_file(ticket), _ended_file(ticket)):
         try:
             path.unlink()
         except OSError:
@@ -1376,6 +1376,32 @@ OWNER_TICKET = ".who"   # beside a ticket, hidden (".<ticket>.who"): its waiter'
 
 def _owner_file(ticket: Path) -> Path:
     return ticket.with_name(f".{ticket.name}{OWNER_TICKET}")
+
+
+ENDED_TICKET = ".ended"   # beside a ticket, hidden (".<ticket>.ended"): why a reader ended its wait (end_wait)
+
+
+def _ended_file(ticket: Path) -> Path:
+    return ticket.with_name(f".{ticket.name}{ENDED_TICKET}")
+
+
+def end_wait(ticket: Path, why: str) -> bool:
+    """Ask a ticket's waiter to stop waiting (its `ttp lock` exits busy with `why`; lockcycle.resolve).
+    The ticket stays until the waiter leaves, so the reason is never cleaned up before it is read. False
+    when the ticket is gone or was asked already."""
+    f = _ended_file(ticket)
+    if not os.path.lexists(ticket) or os.path.lexists(f):
+        return False
+    durable_write(f, why)
+    return True
+
+
+def ended(ticket: Path | None) -> str:
+    """Why a reader ended this ticket's wait (end_wait), or ""."""
+    try:
+        return _ended_file(ticket).read_text().strip() if ticket is not None else ""
+    except OSError:
+        return ""
 
 
 def _ticket_owner(env=None) -> dict:
@@ -1483,7 +1509,7 @@ def _ticket_live(path: Path) -> bool:
 def queued(locks_dir: Path, resource: str) -> list[Path]:
     """Live tickets in arrival order; tickets whose waiter is gone are removed: its lock is free, or its
     owner record says its process or run has ended though another process keeps the lock (_waiter_gone).
-    So are owner records left without their ticket."""
+    So are owner records and end_wait markers left without their ticket."""
     d = queue_dir(locks_dir, resource)
     out = []
     try:
@@ -1493,16 +1519,17 @@ def queued(locks_dir: Path, resource: str) -> list[Path]:
     for name in names:
         path = d / name
         if name.startswith("."):
-            if name.endswith(OWNER_TICKET) and not os.path.lexists(d / name[1:-len(OWNER_TICKET)]):
-                try:
-                    path.unlink()
-                except OSError:
-                    pass
+            for end in (OWNER_TICKET, ENDED_TICKET):
+                if name.endswith(end) and not os.path.lexists(d / name[1:-len(end)]):
+                    try:
+                        path.unlink()
+                    except OSError:
+                        pass
             continue
         if path in _TICKETS or (_ticket_live(path) and not _waiter_gone(path)):
             out.append(path)
         else:
-            for f in (path, _owner_file(path)):
+            for f in (path, _owner_file(path), _ended_file(path)):
                 try:
                     f.unlink()
                 except OSError:

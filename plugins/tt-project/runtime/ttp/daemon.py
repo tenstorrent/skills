@@ -14855,8 +14855,10 @@ class Daemon:
         """Every tick, model-free (ttp.lockcycle): one critical lock-cycle:<hash> alert, at once, per
         lock-order cycle among `ttp lock` holders and waiters on this host (the project's own locks and
         every shared resource's) that a party of this project is in, naming every party and lock and the
-        wait that breaks the lock order; it clears once the cycle breaks. Returns the locks of the
-        cycles alerted, whose lock-wait alerts fold into them."""
+        wait that breaks the lock order; it clears once the cycle breaks. A cycle among this project's
+        own tasks only is broken instead (lockcycle.resolve: the newest waiter's `ttp lock` exits busy),
+        logged as a lock_cycle_resolved event. Returns the locks of the cycles alerted or broken, whose
+        lock-wait alerts fold into them."""
         from . import lockcycle
         db = self.p.db
         try:
@@ -14874,6 +14876,16 @@ class Daemon:
             if self.p.name not in c["projects"]:
                 continue   # routed to the projects in it
             key = lockcycle.key(c)
+            if lockcycle.own(c, self.p.name):   # all this project's tasks: end the newest wait, no alert
+                folded.update(c["locks"])
+                m, fresh = lockcycle.resolve(c)
+                if fresh:
+                    said = (f"{key}: lock-order deadlock over {', '.join(c['locks'])} broken: ended the wait of "
+                            f"{lockcycle.who(m)}, the newest waiter; its task waits for the lock again")
+                    db.x("INSERT INTO events(ts,source,kind,severity,text,status,task) VALUES(?,?,?,?,?,?,?)",
+                         (now, "daemon", "lock_cycle_resolved", "low", said, "handled", m.get("task")))
+                    log(self.p, said)
+                continue   # an open alert for it closes below
             keys.add(key)
             folded.update(c["locks"])
             if db.one("SELECT id FROM alerts WHERE key=? AND cleared IS NULL LIMIT 1", (key,)):

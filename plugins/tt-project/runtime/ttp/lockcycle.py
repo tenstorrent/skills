@@ -16,7 +16,15 @@ The daemon (Daemon.reap_locks) raises one critical alert per cycle at once, keye
 fold into it. A cycle must show in two graphs read one after the other, so a release and a new wait
 read between two files never look like one.
 
-The documented lock order (references/resource-locks.md): narrower locks (one host, device or
+When every party is a task of the daemon's own project (lockcycle.own), it breaks the cycle instead:
+the newest waiter's `ttp lock` wait ends (lockcycle.resolve: a marker beside its tickets, read by the
+waiting `ttp lock`, which exits busy so its task hands back `waiting` with no attempt spent). No holder
+and no process is touched; the action is logged as a lock_cycle_resolved event. A cycle with a party
+of another project, or a command outside any task, keeps the alert only.
+
+The documented lock order (references/resource-locks.md): a resource's own lock before each
+`<prefix>:<resource>` lock of it (box1 before probe:box1; `ttp lock` refuses to wait for box1 while
+holding probe:box1, so that pair cannot close a cycle); narrower locks (one host, device or
 machine) before wider ones (site- or cluster-wide: a power-cycle or maintenance lock); never wait for
 a narrower lock while holding a wider one. A lock is wide when config `locks.wide` lists it or a word
 of its name is in WIDE_WORDS; the alert names each wait that breaks that order.
@@ -92,7 +100,7 @@ def graph(dirs: list[tuple[Path, str | None]]) -> dict:
     locks_seen: list[tuple] = []  # (lock, [(holder record, exclusive)], [(ticket, shared)], blocked)
 
     def party(pid_: str, **info) -> dict:
-        got = parties.setdefault(pid_, {"id": pid_, "holds": set(), "waits": set(), **info})
+        got = parties.setdefault(pid_, {"id": pid_, "holds": set(), "waits": set(), "tickets": [], **info})
         got.update({k: v for k, v in info.items() if v and not got.get(k)})   # a holder's label names more
         return got
 
@@ -168,6 +176,7 @@ def graph(dirs: list[tuple[Path, str | None]]) -> dict:
                 w = party(wid, kind="process", project=_project_of(text, {}, proj), pid=pid,
                           command=cmdline(pid)[:200] if pid else "")
             w["waits"].add(res)
+            w["tickets"].append(t)
             for hid, excl in hids[res]:
                 if hid != w["id"] and (excl or not shared_wait):
                     edges.append((w["id"], hid, res))
@@ -249,6 +258,33 @@ def who(m: dict) -> str:
                 + (f", `{m['command'][:80]}`" if m.get("command") else "") + ")")
     return (f"a command outside any task (pid {m.get('pid') or '?'}, `{(m.get('command') or '?')[:80]}`"
             + (f", project {m['project']}" if m.get("project") else "") + ")")
+
+
+def own(c: dict, project: str) -> bool:
+    """Whether every party of cycle `c` is a task of `project` (a command outside any task is not)."""
+    return all(m["kind"] == "task" and m.get("project") == project for m in c["members"])
+
+
+def _since(t: Path) -> float:
+    try:
+        return float(t.name.split("-", 1)[0])
+    except ValueError:
+        return 0.0
+
+
+def resolve(c: dict) -> tuple[dict, bool]:
+    """Break cycle `c` by ending the wait of its newest waiter (the latest ticket on a lock of the cycle):
+    its `ttp lock` exits busy and its task waits for the lock again (locks.end_wait). No process is
+    signalled and no holder touched. Returns that party, and whether it was asked now (not already)."""
+    def mine(m: dict) -> list[Path]:
+        return [t for t in m.get("tickets") or [] if t.parent.name[:-len(".queue")] in c["locks"]]
+
+    m = max((m for m in c["members"] if mine(m)), key=lambda m: max(map(_since, mine(m))))
+    others = "; ".join(who(o) for o in c["members"] if o is not m)
+    why = (f"ended by the daemon to break a lock-order deadlock over {', '.join(c['locks'])} with {others}: "
+           "this was the newest waiter")
+    fresh = [locks.end_wait(t, why) for t in mine(m)]
+    return m, any(fresh)
 
 
 def breaks(c: dict, cfg: dict | None = None) -> list[str]:

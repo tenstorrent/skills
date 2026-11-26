@@ -872,6 +872,58 @@ def test_lock_cycle_two_parties_task_and_command_outside_a_task_one_critical_ale
     assert lockcycle.width("bay-7", {"locks": {"wide": ["bay-7"]}}) == "wide"
 
 
+def test_lock_cycle_among_one_projects_tasks_ends_the_newest_wait_and_leaves_the_holders(env, monkeypatch):
+    # cells: same-project-resolve
+    # The observed pair: task 1's driver holds box1 and waits for probe:box1; task 2 holds probe:box1 and
+    # waits for box1, later. The daemon ends task 2's wait only (its `ttp lock` exits busy), raises no alert.
+    from ttp import daemon as dm, lockreap, locks
+    p = make(env)
+    d = p.state / "locks"
+    _ReapProcs(monkeypatch, {4101: {"start": "11"}, 4102: {"start": "11"}}, None)
+    _cycle_procs(monkeypatch, {})
+    now = time.time()
+    fs = (_cycle_party(d, "box1", "probe:box1", "task #1 (run 1)", 4101, task=1, since=now - 60)
+          + _cycle_party(d, "probe:box1", "box1", "task #2 (run 2)", 4102, task=2, since=now - 30))
+    older, newer = (Path(f.name) for f in (fs[1], fs[3]))
+    try:
+        dm.Daemon(p.base).reap_locks()
+        dm.Daemon(p.base).reap_locks()
+        assert "newest waiter" in locks.ended(newer) and "probe:box1" in locks.ended(newer)
+        assert not locks.ended(older)
+        assert newer.exists() and older.exists()   # the waiter leaves on its own; nothing is signalled
+        assert lockreap._held(d / "box1.0.lock") == "held" and lockreap._held(d / "probe:box1.0.lock") == "held"
+        assert not p.db.q("SELECT id FROM messages WHERE ref LIKE 'lock-cycle:%'")
+        [ev] = p.db.q("SELECT text, task FROM events WHERE kind='lock_cycle_resolved'")   # once, not per check
+        assert ev["task"] == 2 and "task #2" in ev["text"]
+        locks.dequeue(newer)   # the waiter left: its marker goes with its ticket
+        assert not list(d.glob("box1.queue/.*"))
+    finally:
+        for f in fs:
+            f.close()
+
+
+def test_lock_cycle_across_projects_is_alerted_and_no_wait_is_ended(env, monkeypatch):
+    # cells: cross-project-alert
+    from ttp import daemon as dm, locks
+    p = make(env)
+    d = p.state / "locks"
+    _ReapProcs(monkeypatch, {4101: {"start": "11"}, 4102: {"start": "11"}}, None)
+    _cycle_procs(monkeypatch, {})
+    now = time.time()
+    fs = (_cycle_party(d, "box1", "probe:box1", "task #1 (run 1)", 4101, task=1, since=now - 60)
+          + _cycle_party(d, "probe:box1", "box1", "elsewhere task #2 (run 2)", 4102, project="elsewhere", task=2,
+                         since=now - 30))
+    try:
+        dm.Daemon(p.base).reap_locks()
+        [msg] = p.db.q("SELECT severity FROM messages WHERE direction='out' AND ref LIKE 'lock-cycle:%'")
+        assert msg["severity"] == "critical"
+        assert not any(locks.ended(Path(f.name)) for f in (fs[1], fs[3]))
+        assert not p.db.q("SELECT id FROM events WHERE kind='lock_cycle_resolved'")
+    finally:
+        for f in fs:
+            f.close()
+
+
 def test_lock_cycle_of_three_tasks_across_shared_dirs_is_one_cycle_with_every_party(tmp_path, monkeypatch):
     from ttp import lockcycle
     _ReapProcs(monkeypatch, {4101: {"start": "11"}, 4102: {"start": "11"}, 4103: {"start": "11"}}, None)

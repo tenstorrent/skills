@@ -688,14 +688,20 @@ def installed_argv(box: str, agent: str, platform: str | None = None) -> list[st
 def refresh(platform: str | None = None, path: Path | None = None, restarted: dict | None = None) -> list[str]:
     """After `ttp setup` or an upgrade: re-install the relay copy and restart each installed session
     whose command changed, or every one when the relay copy changed (a running session keeps the old
-    relay's code until it restarts), into `restarted`: (box, agent) -> what the restart said. Nothing
-    when no bridge is configured or installed here."""
-    if os.environ.get("TTP_TEST_NO_BRIDGE_REFRESH") or not (path or CONFIG).is_file():
+    relay's code until it restarts), into `restarted`: (box, agent) -> what the restart said. An installed
+    self-heal watch moves onto this release's runtime, config or not. Nothing when no bridge is
+    configured or installed here."""
+    if os.environ.get("TTP_TEST_NO_BRIDGE_REFRESH"):
         return []
+    from . import bridge_watch
+    watched = bridge_watch.service_files(platform)[0].is_file()
+    if not (path or CONFIG).is_file():
+        return _refresh_watch(platform) if watched else []
     try:
         cfg = load(path)
     except (BadConfig, OSError, ValueError) as e:
-        return [f"bridge: config not read ({e}); services left as they are"]
+        return [f"bridge: config not read ({e}); services left as they are"] + (
+            _refresh_watch(platform) if watched else [])
     out, have = [], {(box, an): installed_argv(box, an, platform) for box, b in cfg["boxes"].items()
                      for an in b["agents"]}
     have = {k: v for k, v in have.items() if v is not None}
@@ -707,12 +713,15 @@ def refresh(platform: str | None = None, path: Path | None = None, restarted: di
             if restarted is not None:
                 restarted[(box, an)] = said
             out.append(f"bridge {box} {an}: {'service command' if old != argv else 'relay'} changed; {said}")
-    if have or cfg.get("watch"):
-        from . import bridge_watch
-        said = bridge_watch.install(platform)
-        if said != "unchanged":
-            out.append(f"bridge self-heal watch: {said}")
+    if have or cfg.get("watch") or watched:
+        out += _refresh_watch(platform)
     return out
+
+
+def _refresh_watch(platform: str | None) -> list[str]:
+    from . import bridge_watch
+    said = bridge_watch.install(platform)
+    return [] if said == "unchanged" else [f"bridge self-heal watch: {said}"]
 
 
 CHECK_WAIT_S = 30   # a restarted session needs a few seconds to log in and forward its links

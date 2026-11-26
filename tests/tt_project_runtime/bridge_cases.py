@@ -3218,3 +3218,32 @@ def test_bridge_status_flags_a_gh_pull_loop_that_keeps_restarting(tmp_path, monk
     for _ in range(30):
         bridge.loop_started("box-1", now)
     assert len((tmp_path / f"bridge-box-1-{bridge.GH_PULL}.starts").read_text().split()) <= 2 * bridge.CRASH_STARTS + 1
+
+
+def test_bridge_refresh_moves_an_installed_watch_onto_the_new_runtime_with_no_bridge_config(tmp_path, monkeypatch):
+    # cells: watch-moves-darwin, watch-moves-linux
+    # A Mac whose bridge config is gone (or never written) still runs the watch from an old release:
+    # `ttp setup` (bridge.refresh) rewrites it to the runtime of the release it installs.
+    import plistlib
+    import subprocess
+    from ttp import bridge, bridge_watch, hoststate, release
+    monkeypatch.delenv("TTP_TEST_NO_BRIDGE_REFRESH", raising=False)
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setattr(bridge, "HOME_DIR", tmp_path / "ttp")
+    monkeypatch.setattr(hoststate, "unit_dir", lambda: tmp_path / "units")
+    ran = []
+    monkeypatch.setattr(bridge, "_run", lambda argv, timeout=60, inp=None: ran.append(argv) or
+                        subprocess.CompletedProcess(argv, 113 if argv[:2] == ["launchctl", "print"] else 0, "", ""))
+    monkeypatch.setattr(release, "service_runtime", lambda: tmp_path / "lib" / "0.0.1" / "runtime")
+    conf = tmp_path / "no-bridge.json"
+    for platform in ("darwin", "linux"):
+        assert bridge.refresh(platform, conf) == []   # no watch installed: nothing is put there
+        bridge_watch.install(platform)
+        monkeypatch.setattr(release, "service_runtime", lambda: tmp_path / "lib" / "0.0.2" / "runtime")
+        out = bridge.refresh(platform, conf)
+        assert out and out[0].startswith("bridge self-heal watch: "), out
+        f = bridge_watch.service_files(platform)[0]
+        text = " ".join(plistlib.loads(f.read_bytes())["ProgramArguments"]) if platform == "darwin" else f.read_text()
+        assert "lib/0.0.2/runtime" in text and "0.0.1" not in text, text
+        assert bridge.refresh(platform, conf) == []   # already on it
+        monkeypatch.setattr(release, "service_runtime", lambda: tmp_path / "lib" / "0.0.1" / "runtime")

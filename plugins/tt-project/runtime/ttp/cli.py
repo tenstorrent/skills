@@ -9434,6 +9434,11 @@ def cmd_lock(a) -> None:
             sys.exit(_logged("exclusive", run_held,
                              lambda: lockyield.run_whole(cmd, child_env, yprobe)))
     what = ",".join(L["name"] for L in todo)   # what the messages and the retry_when name
+    # Lock order (resource-locks.md): a resource's own lock before each `<prefix>:<resource>` lock of it
+    # (box1 before probe:box1). Holding probe:box1, this never waits for box1, which a run holding box1
+    # may be waiting on probe:box1 for (a cycle): it takes box1 if it is free now, else exits busy.
+    after = sorted({h for L in todo for h in held_locks + shared_locks
+                    if ":" in h and lk.canonical(cfg, h.split(":", 1)[1]) == L["res"]})
     from . import pregrant
     from .runner import PRE_GRANT_FRESH_S
     check, asked_at, tries = pregrant.command(cfg), 0.0, 0
@@ -9654,6 +9659,16 @@ def cmd_lock(a) -> None:
         if any(lk.dropped(t) for t in tickets):   # its run ended: a reader took its place out of the queue
             _end_wait()
             die(f"the run this waited for has ended, so its place in the queue for {what} was dropped", UPGRADE_BUSY)
+        retry = f"retry_when `ttp lock --probe{' --shared' if a.shared else ''} {what}`"
+        if after:
+            _end_wait()
+            die(f"not waiting for {what} while holding {', '.join(after)}: a resource's own lock comes before its "
+                f"`<prefix>:` locks (a run holding {what} may be waiting for {after[0]}). Take {what} first, or "
+                f"both at once (`ttp lock {what},{after[0]} -- ...`). Hand the task back now: result.json status "
+                f"`waiting`, {retry}", UPGRADE_BUSY)
+        if why := next((w for t in tickets if (w := lk.ended(t))), ""):   # lockcycle.resolve
+            _end_wait()
+            die(f"{why}. Hand the task back now: result.json status `waiting`, {retry}", UPGRADE_BUSY)
         if check_wait is None:
             check_wait = checkwait.begin(f"ttp lock {what}") or ()
         if wait_dir and not waiting:

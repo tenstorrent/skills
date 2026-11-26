@@ -201,6 +201,42 @@ def test_a_multi_lock_honours_its_timeout_and_names_every_resource_in_its_retry_
     assert r.returncode == 75 and "retry_when `ttp lock --probe rig-a,rig-b`" in r.stderr, (r.returncode, r.stderr)
 
 
+def test_a_lock_held_inside_its_probe_lock_never_waits_and_an_ended_wait_exits_busy(env, tmp_path):
+    # cells: box-before-probe, ended-wait-exits
+    # The observed deadlock: a driver holds box1 and waits for probe:box1, while a command holding
+    # probe:box1 waits for box1. Inside probe:box1, `ttp lock box1` takes box1 only if it is free now.
+    from ttp import locks, shared
+    p = make(env)
+    run_env = _lock_env(env, p)
+    held, go = tmp_path / "held", tmp_path / "go"
+    h = _lock(run_env, "box1", cmd=("sh", "-c", f"touch {shlex.quote(str(held))}; {shlex.join(_until(go))}"))
+    try:
+        _wait_for_file(held, h)
+        t0 = time.time()
+        r = subprocess.run([sys.executable, str(TTP), "lock", "--timeout", "60", "box1", "--", "true"],
+                           env={**run_env, "TTP_LOCKS_HELD": "probe:box1"}, capture_output=True, text=True, timeout=90)
+        assert r.returncode == 75 and time.time() - t0 < 30, (r.returncode, r.stderr)
+        assert "not waiting for box1 while holding probe:box1" in r.stderr, r.stderr
+        assert "retry_when `ttp lock --probe box1`" in r.stderr and _queue_len(p, "box1") == 0
+        # A plain waiter whose wait a reader ended (lockcycle.resolve) leaves with the reason, busy.
+        w = _lock(run_env, "box1")
+        _until_or_ended(lambda: _queue_len(p, "box1") == 1, [w])
+        d = shared.locks_dir(p, "box1", p.config())
+        [ticket] = locks.queued(d, "box1")
+        assert locks.end_wait(ticket, "ended by the daemon to break a lock-order deadlock")
+        assert not locks.end_wait(ticket, "again")
+        assert w.wait(timeout=60) == 75
+        err = w.stderr.read()
+        assert "ended by the daemon to break a lock-order deadlock. Hand the task back now" in err, err
+        assert _queue_len(p, "box1") == 0 and not list((d / "box1.queue").iterdir())
+    finally:
+        go.touch()
+    assert h.wait(timeout=30) == 0
+    r = subprocess.run([sys.executable, str(TTP), "lock", "box1", "--", "true"],
+                       env={**run_env, "TTP_LOCKS_HELD": "probe:box1"}, capture_output=True, text=True, timeout=60)
+    assert r.returncode == 0, r.stderr   # free: taken at once, in either order
+
+
 def test_a_multi_lock_keeps_the_device_and_nested_rules(env, tmp_path):
     p = make(env)
     run_env = _lock_env(env, p)
