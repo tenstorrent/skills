@@ -64,7 +64,7 @@ MAX_HOLD_S = 6 * 3600.0
 DEAD = ("failed", "cancelled")
 # What the daemon writes when it puts a task back to sleep: a reason's "; next try <timefmt.short>" tail, and a
 # time-only deferral's "starts after <timefmt.long of not_before>" (sweep.items).
-NEXT_TRY = re.compile(r"; next try ([A-Z][a-z]{2} )?\d{2}:\d{2} \S+$")
+NEXT_TRY = re.compile(r"; next try (?:[A-Z][a-z]{2} |\d{4}-\d{2}-\d{2} )?\d{2}:\d{2} \S+$")
 STARTS_AT = re.compile(r"^starts after \d{4}-\d{2}-\d{2} \d{2}:\d{2} \S+$")
 RECHECKS = ("next check due", "daily re-check due")   # sweep._signals lines for a re-check a turn asked for
 

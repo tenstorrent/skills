@@ -594,8 +594,8 @@ class _Est:
                     return self._from(tid, e)
                 if crit is None or e["done"] > crit["done"]:
                     crit = e
-            if crit and crit["done"] > start:
-                start, path = crit["done"], [tid] + crit["path"]
+            if crit and crit["done"] > start:   # its planned start, if any, still bounds the uncorrected wait
+                start, path, deferred = crit["done"], [tid] + crit["path"], crit.get("deferred")
             for n in landing_waits(t) if st != "running" else []:
                 from .landed import recorded
                 if recorded(self.db, n)[0]:
@@ -610,7 +610,7 @@ class _Est:
                 if e["why"]:
                     return self._after(tid, e.get("after") or f"landed:#{n}", e["why"], [tid] + e["path"])
                 if e["end"] > start:   # its own finish, review and landing: the probe passes then
-                    start, path = e["end"], [tid] + e["path"]
+                    start, path, deferred = e["end"], [tid] + e["path"], e.get("deferred")
             tg = None
             if st != "running" and (when := deferral(t).get("when")) and not landing_waits(t) \
                     and merge_gate(when) is None and (tg := time_gate(when)) is None:
@@ -758,14 +758,16 @@ def obligation_estimate(db, o: dict, now: float | None = None, est: _Est | None 
     if not ids:
         return {"done": None, "end": None, "path": [], "legs": [], "overrun": False,
                 "why": "no live owner task (all cancelled or replaced)"}
-    worst = None
-    for tid in ids:
+    worst, cons = None, []
+    for tid in ids:   # each owner corrected alone: a planned wait is never scaled, so raw ends do not rank them
         e = est.task(tid)
         if e["why"]:
             return e
+        e = corrected(db, with_p90(est, e, tid), est.now)
+        cons.append(e.get("conservative") or e["end"])
         if worst is None or e["end"] > worst["end"]:
             worst = e
-    return corrected(db, with_p90(est, worst, *ids), est.now)
+    return {**worst, "conservative": max(cons)} if "conservative" in worst else worst
 
 
 def _dur(s: float) -> str:

@@ -937,6 +937,18 @@ def test_eta_a_deferred_task_s_likely_and_conservative_times_start_after_its_pla
     assert "deferred" not in e2 or not e2["deferred"]
     assert e2["end"] == pytest.approx(now + 3 * (300 + 1200)) and e2["conservative"] >= e2["end"]
 
+    # A dependant of the deferred task: the planned wait stays unscaled through the chain.
+    d = p.db.add_task("after later", "s", kind="work", depends_on=[a])
+    ed = eta.estimate(p.db, d, now)
+    assert ed["deferred"] == start
+    assert ed["end"] == pytest.approx(start + 3 * 2 * (300 + 1200)), ed["end"] - start
+    assert ed["conservative"] >= ed["end"]
+    # A promise on the deferred owner and an undeferred one: each owner corrected alone, the later wins.
+    o = {"id": "o1", "owners": [a, b]}
+    eo = eta.obligation_estimate(p.db, o, now)
+    assert eo["end"] == pytest.approx(e["end"]) and eo["conservative"] >= eo["end"]
+    assert eo["conservative"] == pytest.approx(max(e["conservative"], e2["conservative"]))
+
 
 def test_eta_field_dates_a_time_a_week_away():
     """A time 6 days or more away keeps its date, so a conservative time days past the likely one never

@@ -220,6 +220,7 @@ NT = "; next try 07:10 PST"   # the tail the daemon puts on every waiting task's
     ("", "waiting for ttp checks: queued for a host-wide checks slot" + NT, ("checks", "")),
     ("ttp checks --result /r/1", "waiting for checks (ttp checks: running (pid 9))" + NT, None),
     ("ttp push --result /r/m", "waiting for the push; next try Fri 07:10 PST", ("push", "")),
+    ("ttp push --result /r/m", "waiting for the push; next try 2026-12-03 07:10 PST", ("push", "")),   # a week out: dated
     ("ttp lock --probe dev0", "waiting for dev0 held by #5" + NT, ("device", "dev0")),
     ("ttp lock --probe 'build-dir'", "waiting for build-dir" + NT, ("lock", "build-dir")),
     ("ttp devq status 3", "waiting for the device run" + NT, ("device", "")),
