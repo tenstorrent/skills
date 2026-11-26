@@ -509,8 +509,7 @@ class _Est:
         return self._none(tid, "dependency cycle " + "→".join(f"#{i}" for i in seen[seen.index(d):] + (d,)))
 
     def _shown(self, x: float, e: dict, f: float) -> float:
-        """Time left to `x` of a branch carrying `e`'s planned start as the correction `f` shows it, so a
-        deferred branch never outranks a longer undeferred one on raw time."""
+        """Time left to `x` as `f` shows it with `e`'s planned wait unscaled: a deferred branch never outranks a longer one."""
         from .etaledger import shown_at
         return shown_at(x, e.get("deferred"), self.now, f) - self.now
 

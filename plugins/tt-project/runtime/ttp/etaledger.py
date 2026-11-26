@@ -116,8 +116,7 @@ def factor(db, kind: str) -> float:
 
 
 def shown_at(x: float, start: float | None, now: float, f: float) -> float:
-    """Time `x` with the correction `f` on its work time only: the wait until the planned `start` passes
-    unscaled (the correction covers work, not waiting)."""
+    """Time `x` with `f` on its work time only; the wait until the planned `start` passes unscaled."""
     plan = max(0.0, min(float(start or 0) - now, x - now))
     return now + plan + f * (x - now - plan) if x > now + plan else x
 
@@ -132,10 +131,8 @@ def shown(db, e: dict, now: float, kind: str = "") -> dict:
         return e
     f = factor(db, kind)
     raw = e["end"]
-    start = e.get("deferred")
-    end = shown_at(raw, start, now, f)
-    p90 = e.get("p90_end")
-    p90_start = e.get("p90_deferred", start)   # the p90 walk's own planned start
+    end = shown_at(raw, e.get("deferred"), now, f)
+    p90, p90_start = e.get("p90_end"), e.get("p90_deferred", e.get("deferred"))   # the p90 walk's own planned start
     if end <= now:
         cons = end
     elif isinstance(p90, (int, float)) and p90 > raw:
@@ -143,9 +140,9 @@ def shown(db, e: dict, now: float, kind: str = "") -> dict:
         # has measured its 80th percentile of actual / shown, the larger of the two.
         cons = shown_at(p90, p90_start, now, f)
         if measured_x(db):
-            cons = max(cons, shown_at(end, start, now, conservative_x(db)))
+            cons = max(cons, shown_at(end, e.get("deferred"), now, conservative_x(db)))
     else:
-        cons = shown_at(end, start, now, conservative_x(db))
+        cons = shown_at(end, e.get("deferred"), now, conservative_x(db))
     out = {**e, "end": end, "raw_end": raw, "factor": f, "kind": kind, "conservative": max(cons, end)}
     if isinstance(p90, (int, float)):
         out.update(p90_end=max(shown_at(p90, p90_start, now, f), end), raw_p90_end=p90)
