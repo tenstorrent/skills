@@ -59,8 +59,17 @@ if [ -n "${TTP_TASK:-}" ] || [ -n "$coord" ]; then
     symbolic-ref|tag|update-index|update-ref|var|verify-commit|verify-tag|version|worktree|write-tree) ;;
     *) sub=" push " ;;
     esac
-    case $sub in   # a task run's index-writing and HEAD-moving commands: gitguard.COMMITS logs their protected files
-    commit|merge|cherry-pick|revert|am|pull|rebase|reset|add|rm|mv|update-index) [ -n "$coord" ] || sub=" push " ;;
+    # A task run's HEAD-moving and index-writing commands in a harness checkout: gitguard.COMMITS logs the
+    # protected files they change. Elsewhere they go straight to git; after global options, gitguard decides.
+    case $sub in
+    commit|merge|cherry-pick|revert|am|pull|rebase|reset|add|rm|mv|update-index)
+        if [ -z "$coord" ]; then
+            if [ "$1" != "$sub" ]; then
+                sub=" push "
+            else
+                case $("$real" rev-parse --show-toplevel 2>/dev/null) in */tt-project/harness) sub=" push " ;; esac
+            fi
+        fi ;;
     esac
     case " $* $sub " in
     *" push "*)

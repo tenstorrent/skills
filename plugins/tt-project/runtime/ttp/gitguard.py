@@ -452,19 +452,26 @@ def noting_commits(real: str, cmd: list[str], env: dict) -> int:
         os.execve(real, cmd, env)
 
     def index():   # the protected paths' index entries: mode, object, stage and path
-        return set(git("-C", top, "ls-files", "-s", "-z", "--", "project.json", "MEMORY.md", "CHARTER*", "memory")
+        return set(git("-C", top, "ls-files", "-s", "-z", "--", "project.json", *project.SWEPT_PATHS)
                    .stdout.split(b"\0"))
+
+    def note(old, staged):   # log each protected file the command staged, removed or committed
+        new = git("rev-parse", "-q", "--verify", "HEAD").stdout.decode().strip()
+        names = {os.fsdecode(e.split(b"\t", 1)[1]) for e in staged ^ index() if b"\t" in e}
+        if old and new and new != old:
+            names |= set(filter(None, os.fsdecode(git("diff", "--name-only", "-z", "--no-renames", old, new)
+                                                  .stdout).split("\0")))
+        for n in sorted(names):
+            if project.protected_log(f := Path(top, n)) is not None:
+                r = git("show", f":{n}")   # what it staged or committed; out of the index: the file as it is
+                project.note_protected(f, r.stdout if r.returncode == 0 else None)
+
     old, staged = git("rev-parse", "-q", "--verify", "HEAD").stdout.decode().strip(), index()
     rc = subprocess.run(cmd, env=env).returncode
-    new = git("rev-parse", "-q", "--verify", "HEAD").stdout.decode().strip()
-    names = {e.split(b"\t", 1)[1].decode() for e in staged ^ index() if b"\t" in e}
-    if old and new and new != old:
-        names |= set(filter(None, git("diff", "--name-only", "-z", "--no-renames", old, new).stdout.decode()
-                            .split("\0")))
-    for n in sorted(names):
-        if project.protected_log(f := Path(top, n)) is not None:
-            r = git("show", f":{n}")   # what it staged or committed; out of the index: the file as it is
-            project.note_protected(f, r.stdout if r.returncode == 0 else None)
+    try:
+        note(old, staged)
+    except Exception:   # the log is best effort: git's own exit code stands
+        pass
     return rc
 
 
