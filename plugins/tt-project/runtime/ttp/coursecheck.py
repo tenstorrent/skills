@@ -343,7 +343,7 @@ def lines(db: DB, cfg: dict | None, pushes: Path | None = None, now: float | Non
     """Course check lines (no header; [] when none fires) and their identity for collapsing. A detector
     that fails on bad state is skipped (named to `warn`): it never stops the digest."""
     import time
-    from . import course, stalegates, timefmt
+    from . import course, timefmt
     now = time.time() if now is None else now
     got = ((cfg or {}).get("coordinator") or {}).get(course.KEY) or {}
     s = {}
@@ -405,7 +405,4 @@ def lines(db: DB, cfg: dict | None, pushes: Path | None = None, now: float | Non
                        f"{': ' + r['reason'] if r['reason'] else ''}) | re-read it by intent: if its reason is gone, "
                        "retire it (`memory_forget` or the obligation, with a `why`) and lift the hold this turn")
             ident.append(f"old_order:{r['key']}:{h}")
-    for line, ident_ in safe(stalegates.course_lines, db, cfg or {}, now):
-        out.append(line)
-        ident.append(ident_)
     return out[:MAX_LINES], "\n".join(ident)

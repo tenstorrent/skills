@@ -26,8 +26,7 @@ REWAKE_KIND = "must_act_rewake"
 QUEUE_KIND = "queue_wait"   # queuewait.KIND: a wait on a queue or cap past its threshold, re-raised on a new cause or a doubled wait
 URGENT_MSG_KIND = "urgent_msg_late"   # msgurgent.EVENT_KIND: an urgent message with no finding by its deadline
 MISSING_KIND = "missing_entry"   # missingentry.KIND: a guard or allowlist refused a step the user ordered
-STALE_GATE_KIND = "stale_gate"   # stalegates.KIND: a task or promise behind a gate that no longer truly blocks it
-KINDS = (*obligations.MUST_ACT_KINDS, REWAKE_KIND, QUEUE_KIND, URGENT_MSG_KIND, MISSING_KIND, STALE_GATE_KIND)
+KINDS = (*obligations.MUST_ACT_KINDS, REWAKE_KIND, QUEUE_KIND, URGENT_MSG_KIND, MISSING_KIND)
 KV = "must_act"                 # {"told": {fingerprint: at}}: the model-free updates already posted
 TOLD_KEPT = 200
 SECTION = "Must act now"
@@ -36,8 +35,7 @@ LATE = {obligations.PROMISE_KIND: "promise overdue", obligations.ORDER_KIND: "or
         obligations.LANDING_STUCK_KIND: "stuck behind a landing nothing can make",
         obligations.PROMISE_SLACK_KIND: "promise far beyond its work",
         QUEUE_KIND: "queue wait", URGENT_MSG_KIND: "urgent message unanswered",
-        MISSING_KIND: "guard refused a user-ordered step",
-        STALE_GATE_KIND: "stuck behind a gate that no longer blocks"}
+        MISSING_KIND: "guard refused a user-ordered step"}
 
 
 def item(ev) -> dict | None:
@@ -104,10 +102,6 @@ def block(db, ids, now: float | None = None) -> str:
                      "updating the task), or a noop whose `why` names the key and the safety rule that holds it; "
                      "else it "
                      "comes back once its cause changes or the wait doubles)")
-        if ev["kind"] == STALE_GATE_KIND:
-            again = (" (stale gate: re-home, re-point or clear it now (task_update naming the key, a config_set such "
-                     "as machines.allowed, or an owner for the promise), or a noop whose `why` names the key and the "
-                     "rule that truly holds it; never lift a user's hold or pause)")
         if ev["kind"] == URGENT_MSG_KIND:
             again = (" (urgent message with no finding yet: post the first finding in its chat now, with times, "
                      "before anything else; `ttp urgent-reply <chat> <text>` posts it mid-turn)")
@@ -131,7 +125,7 @@ def _names(text, key: str) -> bool:
 def acted(it: dict, actions: list, applied) -> str | None:
     """How an applied action of the turn acted on must-act item `it`; None when none did."""
     key, chat, owners = it["key"], obligations._chat(it.get("chat")), set(it.get("tasks") or [])
-    queue = it.get("kind") in (QUEUE_KIND, MISSING_KIND, STALE_GATE_KIND)   # the fix is a setting change or naming the rule
+    queue = it.get("kind") in (QUEUE_KIND, MISSING_KIND)   # the fix is a setting change or naming the rule
     for i in sorted(applied or ()):
         a = actions[i] if 0 <= i < len(actions) else None
         if not isinstance(a, dict):
