@@ -3055,7 +3055,9 @@ def test_a_glm_run_runs_a_program_name_from_a_variable_once_its_value_is_written
     ("if true; then T=bash; fi; echo x | $T", glmguard_hidden),
     ("T=ls; eval \"T=bash\"; echo x | $T", glmguard_hidden),                 # set again by text run as code
     ("T=ls; echo x | T=bash; echo y | $T", glmguard_hidden),                 # set in a pipe's subshell
-    ("T=ls; . ./env.sh; echo y | $T", glmguard_hidden)])
+    ("T=ls; . ./env.sh; echo y | $T", glmguard_hidden),
+    ("echo a; false && T=bash; echo x | $T", glmguard_hidden),               # set only if a test passes
+    ("echo a; T=X=bash; echo x | $T", glmguard_hidden)])                     # a value that reads as a setting
 def test_a_variable_written_out_still_stops_harm(cmd, harm, monkeypatch, tmp_path):
     _fresh_home(monkeypatch, tmp_path)
     monkeypatch.setenv("GITHUB_TOKEN", "not-a-real-secret")

@@ -204,6 +204,7 @@ def test_outside_writes_is_not_high_on_a_listing_of_a_credential_folder_only_on_
     for cmd in ("cat ~/.claude/.credentials.json", "grep -r x ~/.ssh", "cp -r ~/.ssh /tmp/k", "ls ~/.ssh > ~/.ssh/list",
                 "stat ~/.ssh/id_ed25519"):
         assert high(cmd) is True, cmd
+    assert high("ls ~/.s" + "sh", "grep -r x ~/.s" + "sh") is True   # a listing first keeps the read's alert
 
 
 def test_inline_code_writing_only_its_own_files_leaves_other_paths_in_its_text_mentioned(tmp_path, scratch_home):
@@ -221,7 +222,10 @@ def test_inline_code_writing_only_its_own_files_leaves_other_paths_in_its_text_m
     assert found(f"python3 - <<'EOF'\n{edit}EOF\n", f'python3 -c "open(\'out.txt\', \'w\').write(\'{loc}\')"') \
         == {local: "mentioned"}
     for code in (f"open('{loc}/t', 'w').write('x')", f"p = '{loc}/t'; open(p, 'w')",   # its write goes elsewhere
-                 f"import os; open('a', 'w'); os.replace('a', '{loc}/t')", f"open('../t', 'w'); s = '{loc}'"):
+                 f"import os; open('a', 'w'); os.replace('a', '{loc}/t')", f"open('../t', 'w'); s = '{loc}'",
+                 f"import os as o; open('a', 'w'); o.replace('a', '{loc}/t')",
+                 f"from pathlib import Path; p = Path('a'); p.write_text('x'); p.replace('{loc}/t')",
+                 f"import sys; open(sys.argv[1], 'w').write('{loc}')"):   # a target the prover cannot place
         assert "write" in found(f'python3 -c "{code}"').values(), code
 
 

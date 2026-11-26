@@ -987,7 +987,7 @@ def resolved(cmd: str, env) -> str:
     at = 0
     while at is not None:
         plain, start, at = _unquoted(head)[0], at, None
-        for b in [0] + [x.end() for x in re.finditer(r";|\n|&&", plain)]:
+        for b in [0] + [x.end() for x in re.finditer(r";|\n", plain)]:
             m = _SET_HEAD.match(head, b) if b >= start else None
             if not m or _SPECIAL_NAME.fullmatch(m[1]) or _NOT_SIMPLE.search(plain[:b]) \
                     or re.search(rf"(?<![\w-]){m[1]}(?!\w)", _plain(head[:b])):
@@ -995,7 +995,8 @@ def resolved(cmd: str, env) -> str:
             value = next(v for v in (m[2], m[3], m[4]) if v is not None)
             value = (env.get("HOME") or "~") + value[1:] if m[4] is not None and value.startswith("~/") else value
             rest = head[m.end():]
-            if _SAFE_VALUE.fullmatch(value) and _reads_only(m[1], rest + tail) and "$" + m[1] in rest.replace("{", ""):
+            if _SAFE_VALUE.fullmatch(value) and "=" not in value and _reads_only(m[1], rest + tail) \
+                    and "$" + m[1] in rest.replace("{", ""):
                 head, at = head[:m.end()] + _put(rest, _unquoted(rest)[1], m[1], value), m.end()
                 break
     return head + tail

@@ -9,5 +9,5 @@ protected harness files and secret printing stay refused, and a variable set con
 by a sourced file still is. With the run-time Python judge loaded, the code of a plain `python3 -c "..."` call holding
 an expansion (a loop's `open('$f')`) is judged as it runs, not refused up front; not when the command changes a python
 setting, calls `env`, or nests a `$(...)` in that code. Outside writes: an `ls` or `stat` of a credential folder no
-longer raises a high event (reading a file in it still does), and a path that is only text inside inline code that
-writes only its own literal files under the run's folders is listed as mentioned, not as a write.
+longer raises a high event (reading a file in it still does), and a path that is only text inside inline Python whose
+every write the Python prover places under the run's own folders is listed as mentioned, not as a write.
