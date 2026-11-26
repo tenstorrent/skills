@@ -441,3 +441,21 @@ def test_urgent_a_failed_coordinator_turn_holding_an_urgent_is_retried_past_the_
     p2.db.set_kv("coordinator_failures", dm.URGENT_RETRY_FAILS + 1)
     p2.db.set_kv("coordinator_backoff_until", clock2[0] + 600)
     assert not _turn_within(d2, clock2, starts2, 10, step=1), "past URGENT_RETRY_FAILS the backoff holds"
+
+
+def test_urgent_a_paused_project_starts_no_turn_for_an_urgent_message(env, monkeypatch):
+    """The urgent step runs before the tick's paused return and bypasses the failure backoff: a paused
+    project with an open urgent message and no turn running must still start no coordinator turn."""
+    from ttp import daemon as dm, msgurgent
+    p, d, clock, starts, _ = _wg_setup(env, monkeypatch)
+    _wg_msg(p, clock, "urgent: the live stream is down for a customer")
+    msgurgent.tick(p, d.cfg, now=clock[0])
+    p.db.set_kv("paused", True)
+    p.db.set_kv("coordinator_failures", 1)
+    p.db.set_kv("coordinator_backoff_until", clock[0] + 600)
+    assert not msgurgent.next_turn_due(p.db, d.cfg)
+    d.watch_urgent_messages()
+    d._maybe_coordinate()
+    assert not starts, "a paused project started a coordinator turn"
+    p.db.set_kv("paused", False)
+    assert msgurgent.next_turn_due(p.db, d.cfg)

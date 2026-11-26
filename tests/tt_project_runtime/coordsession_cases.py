@@ -3559,7 +3559,7 @@ def test_coordsession_the_compact_window_never_sits_at_the_wakes_own_size_and_th
     for _ in range(cs.REJECT_AFTER + 1):
         st, _alert = cs.fail(cfg, st, 1000.0, error=err, idle=True)
         assert not st["rejected"], "thrashing started the next session"
-    assert st["rerun"] and st["thrash"] == cs.REJECT_AFTER + 1
+    assert st["rerun"] and st["thrash"] is True
     assert cs.limit(cfg, st) == 90000 + 225000, "the cold cap still clamped the thrashing session"
     st = cs.record(st, None, "s1", {"mode": "resume", "provider": "fake", "model": "m", "effort": "high",
                                     "key": "k1"}, True, 2000.0)

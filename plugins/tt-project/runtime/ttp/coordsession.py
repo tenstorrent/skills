@@ -491,7 +491,7 @@ def fail(cfg: dict, state, now: float, error: str = "", idle: bool = False,
     st.update({"failures": fails, "rerun": True, "last_why": "resume failed", "fail_error": error,
                "idle_fails": run, "rejected": rejected(error) or run >= REJECT_AFTER})
     if thrash:
-        st["thrash"] = int(as_float(st.get("thrash"), 0)) + 1
+        st["thrash"] = True
     st.pop("capped_usd", None)
     if capped_usd and float(capped_usd) > 0:
         st["capped_usd"] = round(float(capped_usd), 2)
