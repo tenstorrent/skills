@@ -2791,7 +2791,8 @@ def test_glm_guard_reads_a_loop_variable_as_its_list_only_in_a_straight_line_com
     command that cannot set it another way or leave the loop early, and after `done` only where the loop surely ran in
     the same shell (its last value: `ls`); a write or delete
     naming the variable of a loop over a list the guard cannot read is refused, a read of it is not."""
-    deny, _, _ = _gg9846_hook(monkeypatch, tmp_path)
+    deny, wt, _ = _gg9846_hook(monkeypatch, tmp_path)
+    (wt / "basx").write_text("")
     run = "echo 'tt-smi -r 0' | $f"
     for cmd in (f'for f in ls; do eval "f=bash"; {run}; done', f'for f in ls; do declare "f=bash"; {run}; done',
                 f"for f in ls; do eval 'f=bash'; {run}; done", f'f=ls; eval "f=bash"; {run}',
@@ -2803,6 +2804,10 @@ def test_glm_guard_reads_a_loop_variable_as_its_list_only_in_a_straight_line_com
                 "for _ in ls; do echo bash; echo 'tt-smi -r 0' | $_; done", "_=ls; echo bash; echo 'tt-smi -r 0' | $_",
                 "for BASH_REMATCH in ls; do [[ bash =~ .* ]]; echo 'tt-smi -r 0' | $BASH_REMATCH; done",
                 "for f in tt-smi,-r,0; do IFS=,; $f; done", "f=rm,-rf,/home/u; IFS=,; $f",
+                f"f=ls; # don't\nf=bash; # '\n{run}", f"f=ls; x=$'\\''; f=bash; y=\\'; {run}",
+                f"for f in bash ls; do :; # ; done\n{run}; done", f"f=ls; $'\\x65'val 'f=bash'; {run}",
+                *(f"f=ls; {w} . <(echo 'f=bash'); {run}" for w in (">/dev/null", "a=1", "case x in x)")),
+                f"for f in ls; do >/dev/null . <(echo 'f=bash'); {run}; done", f"cd /usr/bin; for f in bas?; do {run}; done",
                 *(f"for f in bash ls; do {w}; done; {run}" for w in ("break", "return", "exit", "continue")),
                 'for f in $(cat l); do rm -rf "$f"; done', 'for f in $(find . -name x); do rm -rf "$f"; done',
                 'for f in $L; do rm -rf "$f"; done', 'for f in $(cat l); do echo x > "$f"; done'):

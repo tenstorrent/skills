@@ -899,7 +899,7 @@ def _unquoted(text: str) -> tuple[str, str]:
 # anywhere, is not straight-line
 _NOT_STRAIGHT = re.compile(r"(?<![\w./-])(?:eval|source|declare|typeset|local|export|readonly|read|mapfile|readarray|let|unset|"
                            r"getopts|trap|alias|builtin|break|continue|return|exit|function|select|coproc|IFS)\b|printf\s+-v|"
-                           r"(?:^|[;&|({`\n!]|\b(?:do|then|else|elif|if|while|until|time|command)(?:\s+-\w+)*\s)\s*\.\s|"
+                           r"(?<![\w./~-])\.\s|"
                            r"\w\s*\(\s*\)|\(\(|"
                            r"\$\[|\$\{!")
 
@@ -927,14 +927,17 @@ def _put(text: str, state: str, name: str, value: str) -> str:
                   lambda m: m[0] if state[m.start()] == "'" else value, text)
 
 
-def _values(words: str, cwd: str, home: str) -> list[str] | None:
-    """The values a literal for-list stands for (globs matched in `cwd`), None for any other list."""
+def _values(words: str, cwd: str, home: str, moved: bool = False) -> list[str] | None:
+    """The values a literal for-list stands for (globs matched in `cwd`), None for any other list or for a glob
+    after something that may change the folder or how globs match (`moved`)."""
     out: list[str] = []
     for w in words.split():
         w = w[1:-1] if len(w) > 1 and w[0] == w[-1] and w[0] in "'\"" and "*" not in w and "?" not in w else w
         if w == "~" or w.startswith("~/"):
             w = home + w[1:]
         if re.fullmatch(r"[\w./@:+,=%*?-]+", w) and re.search(r"[*?]", w):
+            if moved:
+                return None
             got = sorted(glob.glob(w if os.path.isabs(w) else os.path.join(cwd, w)))
             if not got:
                 return None
@@ -988,7 +991,8 @@ def literal_view(cmd: str, cwd: str, env=None) -> str | None:
     redirect or pipe after `done` still applies, and its last value after `done`), None when there is nothing to write out. A heredoc, a command that is
     not straight-line, a loop over anything else (`$(ls)`), a name used other than as a read, or read after `done` of
     a loop that may not have run in this shell, keeps the command as it is, which the guards judge as before."""
-    if "<<" in cmd or _NOT_STRAIGHT.search(_plain(cmd)):
+    # a comment or `$'...'` quoting the quote reader does not follow
+    if "<<" in cmd or "$'" in cmd or re.search(r"(?<![^\s;&|()<>])#", cmd) or _NOT_STRAIGHT.search(_plain(cmd)):
         return None
     e = os.environ if env is None else env
     home = e.get("HOME") or os.path.expanduser("~")
@@ -1006,7 +1010,8 @@ def literal_view(cmd: str, cwd: str, env=None) -> str | None:
             if not depth:
                 end = m.end() + k.start(1)
                 break
-        values = _values(text[m.start(2):m.end(2)], cwd, home)
+        values = _values(text[m.start(2):m.end(2)], cwd, home,
+                         bool(re.search(r"(?<![\w./-])(?:cd|pushd|popd|shopt|set)\b", plain[:m.start()])))
         body = text[m.end():end] if end is not None else ""
         after, pre = text[end + 4:], plain[:m.start()]
         # after `done` it holds its last value only where the loop surely ran in this shell: nothing before it that
