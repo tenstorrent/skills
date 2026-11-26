@@ -285,6 +285,7 @@ def test_pyproof_judges_each_python_of_a_chain_with_what_runs_before_or_beside_i
     for cmd in (f"PYTHONPATH=$X python3 -c '{code}'", f"cd \"$D\" && python3 -c '{code}' && ls",
                 f"export PYTHONPATH=x; python3 -c '{code}' | wc -l", f"python3 -c '{code}' | PYTHONPATH=x python3 -"):
         assert pyproof.rewrite(cmd, str(tmp_path)) is None, cmd
+    assert pyproof.rewrite("sed -n 2,16p s.txt; python3 -c 'import json; print(1)'", str(tmp_path))   # it only prints
 
 
 def test_pyproof_passes_the_own_runtime_and_judges_computed_paths_only_under_the_run_time_judge(tmp_path, monkeypatch):

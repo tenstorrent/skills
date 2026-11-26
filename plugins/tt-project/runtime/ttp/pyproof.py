@@ -585,9 +585,10 @@ TERMINAL = ("-", "/dev/null", "/dev/stdout", "/dev/stderr", "/dev/tty")   # redi
 SHELL_BUILTINS = {"cd", "pushd", "echo", "true", "false", "pwd", "test", "[", ":"}   # the shell runs these itself
 READERS = {"cat", "echo", "ls", "head", "tail", "grep", "wc", "true", "pwd"}   # write no file without a redirect
 # Commands that create no module python could import (none, or only folders and deletions), and the plugin's own CLI.
-# Not sed or sort: their scripts and grouped flags write files in more ways than a pattern reads.
+# Not sort, nor sed beyond SED_PRINT: their scripts and grouped flags write files in more ways than a pattern reads.
 NO_MODULE = READERS | {"cut", "tr", "jq", "column", "nl", "stat", "rm", "rmdir", "mkdir", "sleep", "date",
                        "basename", "dirname", "realpath", "readlink", "diff", "cmp", "file", "du", "df", "ps", "ttp"}
+SED_PRINT = re.compile(r"-[nEr]+|(\d+|\$)(,(\d+|\$))?p")   # `sed -n 2,16p f`: its flags and a line-range print script
 
 
 RUN_VARS = ("TTP_RUN_DIR", "TMPDIR")
@@ -656,9 +657,10 @@ def _plants(shell: str) -> bool:
     except ValueError:
         return True
     ran = writes = py = False   # ran: a writer ran before this pipeline; writes, py: one is in it
-    start, target = True, ""
+    start, target, sed = True, "", None   # sed: whether this sed's script word has been read
     for w in words + [";"]:
         if set(w) <= set("();<>|&"):
+            sed = sed if ">" in w or "<" in w else None
             if ">" in w or "<" in w:
                 target = w
             elif w in ("|", "|&"):
@@ -670,6 +672,10 @@ def _plants(shell: str) -> bool:
         elif target:
             writes |= ">" in target and not (w.isdigit() or w in TERMINAL)
             target = False
+        elif sed is not None and not start:   # a sed that only prints lines; any other word may write a file
+            flag = w.startswith("-")
+            writes |= (flag or not sed) and not SED_PRINT.fullmatch(w)   # later words are the files it reads
+            sed = sed or not flag
         elif start:
             name = os.path.basename(w)
             if PY_RE.match(name):
@@ -677,8 +683,8 @@ def _plants(shell: str) -> bool:
                     return True
                 py, start = True, False
             elif not (w.isdigit() or name in WRAPPERS):
-                writes |= name not in NO_MODULE | {"cd", "pushd"}
-                start = False
+                writes |= name not in NO_MODULE | {"cd", "pushd", "sed"}
+                start, sed = False, (False if name == "sed" else None)
     return False
 
 
