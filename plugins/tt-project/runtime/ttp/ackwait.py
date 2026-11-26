@@ -85,26 +85,33 @@ _PENDING_RE = re.compile(r"\b(?:acknowledg\w*|ack(?:ed|s)?|received|noted|will|g
 # withdrawal, or a close without a run or result. Word lists cannot tell a result that mentions closing from a close.
 _CLOSED_STATUS = re.compile(r"^(?:closed|declined|withdrawn)\b", re.I)
 _CLOSED_RE = re.compile(r"\b(?:(?:closed|closes|closing|declined|declines|declining|withdrawn|withdrew|withdraws|"
-                        r"withdrawing) (?:(?:the|this|that|your|my) )?(?:\w+ ){0,2}request|"
+                        r"withdrawing) (?:(?:the|this|that|your|my) )?(?:\w+ )?request|"
                         r"request (?:is |was |has been )?(?:closed|declined|withdrawn))\b", re.I)
-_TO_COME_RE = re.compile(r"\b(?:follows?|to come|yet|first|queued|once|later|soon|pending|in progress|under ?way)\b",
-                         re.I)
-_NO_RUN_RE = re.compile(r"\bwithout (?:a |any )?(?:run|result|measurement)s?\b", re.I)
+_TO_COME_RE = re.compile(r"\b(?:follows?|to come|yet|first|queued|once|later|soon|pending|in progress|under ?way|"
+                         r"would|will(?! not| never))\b|'ll\b", re.I)
+_NO_RUN_RE = re.compile(r"\s*,?\s*(?:\w+\s+){0,3}?without (?:a |any )?(?:run|result|measurement)s?\b", re.I)
+_NEGATION = re.compile(r"\b(?:not|never|no|without|instead of|rather than|would)\b|n't\b", re.I)
+
+
+def _negated(text: str, at: int) -> bool:
+    """Whether the sentence holding text[at] negates it before it (settinghold's rule, wider words)."""
+    from .settinghold import SENTENCE_END
+    start = max((m.end() for m in SENTENCE_END.finditer(text, 0, at)), default=0)
+    return bool(_NEGATION.search(text, start, at))
 
 
 def closed(text: str) -> bool:
     """Whether reply `text`, in the sender's own words, closes or declines the request without a result:
     a status line saying so, or (nothing still to come) a decline or withdrawal of the request, or a close
-    that says it is without a run or result; never one negated earlier in its sentence. A close beside a
+    followed at once by "without a run or result"; never one negated earlier in its sentence. A close beside a
     result ("done, closing the request") is that result."""
-    from .settinghold import _negated
     text = _REPLY_MARK_RE.sub("", own_words(text))
     for m in _STATUS_RE.finditer(text):
         return bool(_CLOSED_STATUS.match(m.group(1).strip()))
     if _TO_COME_RE.search(text):
         return False
-    no_run = any(not _negated(text, m.start()) for m in _NO_RUN_RE.finditer(text))
-    return any(not _negated(text, m.start()) and (no_run or re.search(r"declin|withdr", m.group(0), re.I))
+    return any(not _negated(text, m.start()) and (re.search(r"declin|withdr", m.group(0), re.I)
+                                                  or _NO_RUN_RE.match(text, m.end()))
                for m in _CLOSED_RE.finditer(text))
 
 
