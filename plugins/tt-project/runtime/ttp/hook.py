@@ -1519,6 +1519,7 @@ def _staged(payload: dict, judged: dict) -> dict | None:
             return out
         start = time.monotonic()   # one budget well under the hook's own limit; the whole group ends with it
         try:
+            # own session: the group is killed whole (killpg) when the 10 s budget runs out
             proc = subprocess.Popen(["bash", "-c", body], cwd=cwd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
                                     stderr=subprocess.DEVNULL, text=True, start_new_session=True)
         except OSError:
