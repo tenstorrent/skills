@@ -68,7 +68,7 @@ STORE_RE = re.compile(r"(?:(?<![\w.-])gh|GH_CONFIG_DIR\}?)/+hosts\.ya?ml\b|(?<![
                       r"|(?:(?<![\w.-])\.codex|CODEX_HOME\}?)/+auth\.json\b"
                       r"|(?:(?<![\w.-])\.docker|DOCKER_CONFIG\}?)/+config\.json\b|(?<![\w.-])\.kube/+config\b"
                       r"|(?<![\w.-])\.pypirc(?![\w.-])|(?:(?<![\w.-])\.config|XDG_CONFIG_HOME\}?)/+git/+credentials(?![\w.-])"
-                      r"|(?<![\w.-])Library/+Keychains(?![\w.-])")
+                      r"|(?<![\w.-])(?i:Library/+Keychains)(?![\w.-])")
 # Store folders (the variable that moves each) and the entries in them that hold a token or key; their
 # other entries hold none (aws `config`, gcloud `configurations`, azure `azureProfile.json`, kube `cache`,
 # docker `buildx`, gh `config.yml`). A bare folder counts (`grep -r token ~/.kube`), but to ls, stat or mkdir it

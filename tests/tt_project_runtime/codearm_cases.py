@@ -2802,7 +2802,8 @@ def test_a_glm_run_still_refuses_writes_to_credentials_other_projects_the_harnes
     for cmd in ("echo x > ~/.ssh/config", f"echo x > {other}/a.txt", f"rm -rf {other}", f"echo x > {other}/tt-project/x",
                 "echo x > ~/.tt-project/lib/x", f"echo x > {home}/.tt-project/registry.json", "echo x > /etc/x",
                 "echo x > /x", "rm -rf /", "rm -rf ~", "rm -rf /tmp", "echo x | sudo tee ~/n", "cat ~/.ssh/id_rsa",
-                "cat ~/.tt-project/secrets.json", "cat ~/Library/Keychains/login.keychain-db"):
+                "cat ~/.tt-project/secrets.json", "cat ~/Library/Keychains/login.keychain-db",
+                "cat ~/library/keychains/login.keychain-db"):
         assert deny(cmd), cmd
     (home / "theirs.txt").write_text("")
     assert not deny("echo x > ~/theirs.txt")
