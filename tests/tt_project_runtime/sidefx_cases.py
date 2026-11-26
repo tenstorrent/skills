@@ -206,6 +206,25 @@ def test_outside_writes_is_not_high_on_a_listing_of_a_credential_folder_only_on_
         assert high(cmd) is True, cmd
 
 
+def test_inline_code_writing_only_its_own_files_leaves_other_paths_in_its_text_mentioned(tmp_path, scratch_home):
+    from ttp import sidefx
+    wt, rd = tmp_path / "wt", tmp_path / "run"
+    wt.mkdir(), rd.mkdir()
+    loc = "~/.lo" + "cal/bin"
+
+    def found(*cmds):
+        (rd / "output.jsonl").write_text(json.dumps(_claude_calls(*(("Bash", {"command": c}) for c in cmds))[0]) + "\n")
+        return {f["path"]: f["class"] for f in sidefx.scan(rd, str(wt), str(scratch_home))}
+
+    local = str(scratch_home / ".lo") + "cal/bin"
+    edit = f"s = open('{wt}/x.py').read().replace('a', '{loc}')\nopen('{wt}/x.py', 'w').write(s)\n"
+    assert found(f"python3 - <<'EOF'\n{edit}EOF\n", f'python3 -c "open(\'out.txt\', \'w\').write(\'{loc}\')"') \
+        == {local: "mentioned"}
+    for code in (f"open('{loc}/t', 'w').write('x')", f"p = '{loc}/t'; open(p, 'w')",   # its write goes elsewhere
+                 f"import os; open('a', 'w'); os.replace('a', '{loc}/t')", f"open('../t', 'w'); s = '{loc}'"):
+        assert "write" in found(f'python3 -c "{code}"').values(), code
+
+
 def test_outside_writes_skips_regex_text_ssh_remote_commands_and_saved_tool_output(tmp_path, scratch_home):
     from ttp import sidefx
     wt, rd = tmp_path / "wt", tmp_path / "run"

@@ -2944,50 +2944,6 @@ def test_glm_guard_refuses_every_sidefx_writer_naming_a_computed_loop_variable(m
         assert not deny(f"for f in $(cat l); do {body}; done"), body
 
 
-def test_glm_guard_reads_a_program_name_set_once_after_simple_commands_and_past_quoted_keywords(monkeypatch, tmp_path):
-    """cells: set_once_prefix, quoted_keyword. A variable set once to a literal after simple commands, or in a command
-    whose quoted text only mentions a keyword (`eval`, `read`), stands for its value; one that may be set another
-    way, or a branch away, is still refused."""
-    deny, wt, _ = _gg9846_hook(monkeypatch, tmp_path)
-    run = "echo 'tt-smi -r 0' | $T"
-    for cmd in ("cd src; T=ls; $T -l", "echo start && cd src\nT=wc; $T -l f", 'T=ls; echo "eval and read are words here"; $T',
-                'T=ls; git log --grep "source of it" | head -1; $T'):
-        assert not deny(cmd), cmd
-    for cmd in (f"false && T=bash; {run}", f"if x; then T=bash; fi; {run}", f"echo $T; T=bash; {run}",
-                f"cd src; T=bash; {run}", f'T=bash; echo "read this"; {run}', f'T=ls; echo "x y"; eval "T=bash"; {run}',
-                f'T=ls; echo "{{}}"; read T; {run}', f"cd src; T=ls; eval 'T=bash'; {run}", f"{{ T=bash; }}; {run}"):
-        assert deny(cmd), cmd
-
-
-def test_glm_guard_reads_the_runs_own_temp_and_run_folders_as_a_program_path(monkeypatch, tmp_path):
-    """cells: run_env_program. `$TMPDIR` and `$TTP_RUN_DIR` the command never sets are the run's own folders; one it
-    sets, or a path out of them, is judged as written."""
-    deny, wt, rd = _gg9846_hook(monkeypatch, tmp_path)
-    for cmd in ('"$TMPDIR/check.sh" a', "$TTP_RUN_DIR/tools/probe --help", 'bash "$TMPDIR/x.sh"',
-                'T=$("$TMPDIR" 2>/dev/null); echo $T', '$TTP_RUN_DIR && echo x'):
-        assert not deny(cmd), cmd
-    for cmd in ('echo x >> "$TMPDIR/../../home/.bashrc"', 'cat "$TMPDIR/../../home/.ssh/id_x"',
-                'TMPDIR=~; echo x >> "$TMPDIR/.bashrc"', 'eval "TMPDIR=~"; echo x >> "$TMPDIR/.bashrc"',
-                'export TMPDIR=~; echo x >> "$TMPDIR/.bashrc"'):
-        assert deny(cmd), cmd
-
-
-def test_glm_guard_commits_and_searches_with_git_that_runs_no_program(monkeypatch, tmp_path):
-    """cells: git_commit_config, git_grep_pattern. `git commit` under `-c commit.gpgsign=false` (a message from a
-    heredoc) and a `git grep` whose pattern holds shell characters run no program; `-c` for any other key and
-    `git grep -O` (a pager on the matches) are judged as before."""
-    deny, wt, _ = _gg9846_hook(monkeypatch, tmp_path)
-    for cmd in ("git -c commit.gpgsign=false commit -F- <<'EOF'\nfix: a | `b`\nEOF",
-                "git -c user.name=a -c user.email=b commit -m 'fix: x | `a`'",
-                "git grep -ohE 'x [a-z]+| `y`' -- deploy | sort | uniq -c | head -5", "git grep -n 'a | `b`' -- src"):
-        assert not deny(cmd), cmd
-    for cmd in ("git -c core.fsmonitor=x commit -m 'fix: x | `a`'", "git -c core.editor=x commit -F- <<'EOF'\nfix: a | `b`\nEOF",
-                "git -c core.editor=x -c commit.gpgsign=false commit -m 'x | `a`'", "git grep -O'sh -c x' 'a | `b`'",
-                "git grep -nOsh 'a | `b`' pat", "git grep --open-files-in-pager=sh 'a | `b`'",
-                "git -c alias.x='!sh' commit -m 'x | `a`'"):
-        assert deny(cmd), cmd
-
-
 def test_a_refusal_off_the_glm_arm_is_neither_recorded_nor_ends_the_run(tmp_path):
     """cells: guard_off_arm. Only a run on the GLM arm (its marker) records a guard refusal and ends as a bounce."""
     from ttp import glmguard
@@ -3064,3 +3020,68 @@ def test_a_staged_command_may_make_and_remove_new_temp_entries(cmd, monkeypatch,
         assert ((rm or {}).get("hookSpecificOutput") or {}).get("permissionDecision") != "deny", rm
     finally:
         shutil.rmtree(entry or u, ignore_errors=True)
+
+
+def _fresh_home(monkeypatch, tmp_path):
+    """HOME and the config folders at a fresh empty folder, so a guard reads no path of the real home."""
+    h = tmp_path / "home"
+    h.mkdir()
+    for v in ("HOME", "XDG_CONFIG_HOME", "GH_CONFIG_DIR"):
+        monkeypatch.setenv(v, str(h))
+
+
+@_pytest.mark.parametrize("cmd,seen", [
+    ("echo a; T=ls; $T -d /", "/"),                                           # a literal set mid-command
+    ("cd /; T=$(command -v ls); $T -d /", "/"),                               # set mid-command from a $(...)
+    ("$TTP_RUN_DIR || echo ok", "ok"),                                       # the run folder as the program word
+    ("echo a; T=ls; $T -d / && cat <<'EOF'\n$T x\nEOF", "$T x")])            # a quoted heredoc body stays as written
+def test_a_glm_run_runs_a_program_name_from_a_variable_once_its_value_is_written_out(cmd, seen, monkeypatch, tmp_path):
+    from ttp import glmguard
+    _fresh_home(monkeypatch, tmp_path)
+    assert glmguard.HIDDEN_WHY in glmguard.shell_refusal(cmd, str(tmp_path), "")   # refused up front before
+    kind, rc, text = _glm_staged(monkeypatch, tmp_path, cmd)
+    assert kind == "staged" and rc == 0 and seen in text, text
+
+
+@_pytest.mark.parametrize("cmd,harm", [
+    ("echo a; T=cat; $T ~/.s" + "sh/id_" + "rsa", "credential"),
+    ("echo a; T=$(printf cat); $T ~/.s" + "sh/id_" + "rsa", "credential"),
+    ("echo a; T=rm; $T -rf ../proj-b", "outside"),                           # another project's folder
+    ("echo a; T=touch; $T ~/.bashrc", "outside"),
+    ("echo a; T=cp; $T x ~/bin/x", "outside"),
+    ("echo a; T=echo; $T \"$GITHUB_TOKEN\"", "secret"),
+    ("echo a; T=rm; $T -rf ~/.tt-project/lib", ""),                          # the installed harness
+    ("false || T=bash; echo x | $T", glmguard_hidden := "expansion"),       # set on one branch only
+    ("if true; then T=bash; fi; echo x | $T", glmguard_hidden),
+    ("T=ls; eval \"T=bash\"; echo x | $T", glmguard_hidden),                 # set again by text run as code
+    ("T=ls; echo x | T=bash; echo y | $T", glmguard_hidden),                 # set in a pipe's subshell
+    ("T=ls; . ./env.sh; echo y | $T", glmguard_hidden)])
+def test_a_variable_written_out_still_stops_harm(cmd, harm, monkeypatch, tmp_path):
+    _fresh_home(monkeypatch, tmp_path)
+    monkeypatch.setenv("GITHUB_TOKEN", "not-a-real-secret")
+    kind, _, why = _glm_staged(monkeypatch, tmp_path, cmd, run=False)
+    assert kind == "deny" and harm in why.lower() and "not-a-real-secret" not in why, why
+
+
+def _audited_env(monkeypatch, tmp_path):
+    """The run-time Python judge (pyaudit) on: its zip first on PYTHONPATH and its policy naming it."""
+    import json
+    zp = str(tmp_path / "pyaudit" / "pyaudit.zip")
+    monkeypatch.setenv("TTP_PYAUDIT_POLICY", json.dumps({"zip": zp}))
+    monkeypatch.setenv("PYTHONPATH", zp)
+
+
+@_pytest.mark.parametrize("cmd,audited,allowed", [
+    ("printf 'a\\nb\\n' | while read f; do python3 -c \"print('$f')\"; done", True, True),     # judged as it runs
+    ("printf 'a\\nb\\n' | while read f; do python3 -c \"print('$f')\"; done", False, False),   # no run-time judge: refused up front
+    ("printf 'a\\nb\\n' | while read f; do PYTHONPATH= python3 -c \"print('$f')\"; done", True, False),   # the judge may not load
+    ("printf 'a\\nb\\n' | while read f; do env -i python3 -c \"print('$f')\"; done", True, False),
+    ("printf 'a\\nb\\n' | while read f; do python3 -I -c \"print('$f')\"; done", True, False)])
+def test_inline_python_code_with_an_expansion_runs_under_the_run_time_judge(cmd, audited, allowed, monkeypatch, tmp_path):
+    from ttp import glmguard
+    _fresh_home(monkeypatch, tmp_path)
+    if audited:
+        _audited_env(monkeypatch, tmp_path)
+    assert glmguard.shell_refusal(cmd, str(tmp_path), "", env={})   # refused up front with no run-time judge
+    kind, rc, text = _glm_staged(monkeypatch, tmp_path, cmd, run=allowed)
+    assert (kind == "plain" and rc == 0 and text == "a\nb\n") if allowed else kind == "deny", text

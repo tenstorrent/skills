@@ -570,7 +570,7 @@ REDIRECT_RE = re.compile(r"(?<![<>&])>>?(?![&>(])\s*([\"']?)([^\s\"';&|<>()]+)\1
 STDIN_SCRIPT_RE = re.compile(r"(?:^|[\s;&|(])(?:python[\d.]*|[a-z]*sh|node|ruby|perl|source|\.)\s[^;&|\n<]*"
                              r"(?<!<)<(?![<(])\s*[\"']?([^\s\"';&|<>()]+)")
 # Commands whose quoted arguments are only data (printed, searched for or recorded), never run; also
-# `git commit`, `git grep` and ttp's message calls (as pathguard._blank_messages decides). Their output may go on only into
+# `git commit` and ttp's message calls (as pathguard._blank_messages decides). Their output may go on only into
 # READERS.
 INERT = {"echo", "printf", "cat", "grep", "egrep", "fgrep", "rg"}
 INERT_RE = re.compile(r"\b(?:echo|printf|cat|e?grep|fgrep|rg|git|ttp)\b")
@@ -824,24 +824,6 @@ def _unquoted(text: str) -> str:
     return "".join(" " * (e - b) if q else text[b:e] for b, e, q in _quoted_runs(text))
 
 
-# `git -c key=value`: only these keys, which run no program
-_GIT_PLAIN_CONFIG = frozenset({"commit.gpgsign", "user.name", "user.email"})
-
-
-def _git_sub(argv: list[str]) -> list[str]:
-    """`argv` of a git call without its leading `-c key=value` options of _GIT_PLAIN_CONFIG (other options stay)."""
-    i = 1
-    while i + 1 < len(argv) and argv[i] == "-c" and argv[i + 1].partition("=")[0].lower() in _GIT_PLAIN_CONFIG:
-        i += 2
-    return argv[:1] + argv[i:]
-
-
-def _git_search(argv: list[str]) -> bool:
-    """`git grep` that only searches (not `-O`/`--open-files-in-pager`, which runs a program on the matches)."""
-    return argv[1:2] == ["grep"] and not any(
-        a.startswith("--open-files") or re.fullmatch(r"-[^-]*O.*", a) for a in argv[2:])
-
-
 def _data_only(piece: str, sep: str, commands: str, after: list[str] | tuple = ()) -> bool:
     """`piece` only prints, searches for or records text (INERT, `git commit`, ttp's message calls), runs nothing
     inside, pipes on (`after`) only into READERS, and writes no file that `commands` runs afterwards. Fail closed:
@@ -849,7 +831,7 @@ def _data_only(piece: str, sep: str, commands: str, after: list[str] | tuple = (
     from . import pathguard
     argv = list(_first_argv(piece))
     name = _first_word(piece)
-    if not (name in INERT or name == "git" and (_git_sub(argv)[1:2] == ["commit"] or _git_search(_git_sub(argv))) or name == "ttp"
+    if not (name in INERT or name == "git" and argv[1:2] == ["commit"] or name == "ttp"
             and pathguard._message_pieces(piece + sep) and pathguard._blank_messages(commands) != commands) \
             or _runs_inside(piece) or sep in ("|", "|&") and not (
                 after and all(_first_word(p) in READERS and not _runs_inside(p) for p in after)):
@@ -1516,8 +1498,9 @@ def _proven(payload: dict) -> dict:
 
 def _staged(payload: dict, judged: dict) -> dict | None:
     """The hook's reply for a Bash call of a GLM run the guards refuse only for an expansion they cannot read: each
-    `$(...)` the rules pass runs alone first and its output is written in (glmguard.staged_parts, written_in); the
-    literal command is judged by every rule and, if it passes, runs as judged; a harmful one is refused
+    `$(...)` the rules pass runs alone first and its output is written in (glmguard.staged_parts, written_in), and
+    so is each variable read glmguard.resolved can write out; the literal command is judged by every rule and, if
+    it passes, runs as judged; a harmful one is refused
     with its reason. None when it cannot be staged: the up-front refusal stands."""
     from . import glmguard
     args, cmd = payload.get("tool_input"), (judged.get("tool_input") or {}).get("command")
@@ -1528,7 +1511,7 @@ def _staged(payload: dict, judged: dict) -> dict | None:
     if (parts := glmguard.staged_parts(args["command"])) is not None:   # as written: a loop runs it once
         cmd = args["command"]
     elif (parts := glmguard.staged_parts(cmd)) is None:   # else with a literal loop written out (_proven)
-        return None
+        parts, cmd = [], args["command"]   # none runs ahead; its variables may still be written out (resolved)
     outputs, left, run_dir = [], 10.0, os.environ.get("TTP_RUN_DIR", "")
     for *_, body, _, there in parts:   # judged and run with the literal `cd` before it, as one command
         body = f"cd {shlex.quote(there)} && {{ {body}\n}}" if there else body
@@ -1549,7 +1532,7 @@ def _staged(payload: dict, judged: dict) -> dict | None:
             proc.communicate()
             return _deny(glmguard.refused(run_dir, "an expansion the guard must run first took over 10 s"))
         left -= time.monotonic() - start
-    if (new := glmguard.written_in(cmd, parts, outputs)) == cmd:
+    if (new := glmguard.resolved(glmguard.written_in(cmd, parts, outputs), os.environ)) == cmd:
         return None
     if why := glmguard.secret_in("\n".join([*outputs, new])):
         return _deny(glmguard.refused(run_dir, f"{why}, which it may print"))

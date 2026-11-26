@@ -471,6 +471,22 @@ OUTPUT_OPTS = {"-o", "--output", "--output-file", "--output-document", "--out"}
 NO_OUTPUT_OPTS = {"ps", "pgrep", "ss", "lsof", "ssh", "scp", "sftp", "journalctl", "grep", "ttp"}   # their -o: a format or an option
 CODE_WRITE_RE = re.compile(r"""open\([^)]*['"][wax]|\.write(?:_text|_bytes)?\(|unlink|remove\(|rmtree|rename\(|"""
                            r"""replace\(|mkdir|chmod|writeFile|appendFile|copyfile|shutil\.(?:copy|move)""")
+LIT_WRITE_RE = re.compile(r"""\bopen\(\s*(['"])([^'"$`\n]+)\1\s*,\s*(?:mode\s*=\s*)?['"][wax]|"""
+                          r"""\bPath\(\s*(['"])([^'"$`\n]+)\3\s*\)\.write_(?:text|bytes)\(""")
+HANDLE_RE = re.compile(r"""\.write\(|\.replace\(""")   # a handle's write, a string's replace
+RENAME_RE = re.compile(r"""\bos\.replace\(|\bPath\([^)\n]*\)\.replace\(""")
+
+
+def _own_writes(code: str, home: str, cwd: str, run_dir: str, base: str | None) -> list[str] | None:
+    """The files inline code writes when each write it makes is to a literal file under the run's own folders
+    (open('<file>', 'w'), Path('<file>').write_text(), and a handle's write() or a string's replace() beside
+    them); else None. Its other paths are then only text it holds (a replacement string), not writes."""
+    targets = [m[2] or m[4] for m in LIT_WRITE_RE.finditer(code)]
+    if not targets or RENAME_RE.search(code) or CODE_WRITE_RE.search(HANDLE_RE.sub(" ", LIT_WRITE_RE.sub(" ", code))):
+        return None
+    own = [d.rstrip("/") + "/" for d in (cwd, run_dir) if d]
+    paths = [_expand(t, home, cwd, run_dir, base) + "/" for t in targets]
+    return targets if all(any(p.startswith(d) for d in own) for p in paths) else None
 
 
 def commands(cmd: str, depth: int = 0) -> list[str]:
@@ -622,8 +638,10 @@ def classify_paths(cmd: str, home: str, cwd: str, run_dir: str, depth: int = 0) 
                 continue
             if name in INTERPS and a in ("-c", "-e") and k + 1 < len(args):
                 code = args[k + 1]
+                for t in (own := _own_writes(code, home, cwd, run_dir, base)) or []:
+                    put(t, "write", f"{name} {a} inline code writes it", True)
                 cls, why = ("write", f"{name} {a} inline code that writes") if CODE_WRITE_RE.search(code) \
-                    else ("mentioned", f"in {name} {a} inline code")
+                    and own is None else ("mentioned", f"in {name} {a} inline code")
                 put(code, cls, why)
                 k += 2
                 continue
