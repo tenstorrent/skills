@@ -236,14 +236,14 @@ def classify(db, cfg: dict, *, msgs=(), evs=(), triggers=(), due=None, rerun=Fal
             why.append("session state unreadable")
     if must and _ORDERISH.search(_must_items(must)):
         why.append("must-act item tied to an order or promise")
-    for name, text in parts or ():   # promises due soon or missed: promise_reasons(), from the obligations
+    for name, text in parts or ():
         if name == "looks" and (r := look_reason(text)):
             why.append(r)
         if name in ("speed_complaint", "Speed complaint"):
             why.append("speed complaint")
     from . import obligations
     promises = obligations.open_promises(db)
-    why += promise_reasons(promises, now)
+    why += promise_reasons(promises, now)   # due soon or missed, from the obligations, never wording
     for e in evs or ():
         why += _event_reasons(db, e, promises)
     return (not why), list(dict.fromkeys(why))

@@ -1020,7 +1020,7 @@ def test_status_shows_a_projects_overriding_own_setting_since_it_was_set(env, ca
     assert [(x["project"], x["value"]) for x in o] == [("alpha", 0)]
     assert o[0]["since"] == rollout.override_since(p, "route.code_sonnet.glm_share") and o[0]["since"] <= time.time()
     out = _roll(capsys, "status")[1]
-    assert f"overridden in alpha by its own setting since {timefmt.long(o[0]['since'], p.raw_config())}" in out
+    assert f"in alpha: 0 (own setting; rollout on), overriding the rollout since {timefmt.long(o[0]['since'], p.raw_config())}" in out
     raw = p.read_config()[0]
     raw.setdefault("deslop", {})["enabled"] = True
     p.config_path.write_text(json.dumps(raw))

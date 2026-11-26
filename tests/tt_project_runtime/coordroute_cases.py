@@ -884,9 +884,8 @@ def test_coordroute_session_compaction_is_a_shrink_due_on_this_wake_never_a_pend
     assert "session compaction" in coordroute.classify(p.db, _cr_cfg())[1]
 
 
-def test_coordroute_a_course_line_naming_a_promise_is_routine_unless_a_promise_is_due(env):
-    """The Course check's fixed wording ("update any promise that waits on it") names no due promise; only
-    an open promise due soon or overdue (promise_reasons) sends the wake to the coordinator."""
+def test_coordroute_a_course_line_naming_a_promise_is_routine(env):
+    """The Course check's fixed wording ("update any promise that waits on it") names no due promise."""
     from ttp import coordroute
     p = _cr_db(env)
     course = [("course_check", "## Course check\n- over_estimate: task #5 runs 60% over its estimate: "

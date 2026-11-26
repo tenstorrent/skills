@@ -1002,11 +1002,9 @@ def run(a) -> int:
                 projects = local_projects() if e["fixed"] else {}
                 for rec in e["fixed"]:
                     print(f"  in {rec.get('project')}: " + fixed_line(rec, projects.get(rec.get("project"))))
+                since = {o["project"]: o["at"] for o in e["overrides"]}
                 for n, text in e["own"].items():
-                    print(f"  in {n}: {text}")
-                for o in e["overrides"]:
-                    print(f"  overridden in {o['project']} by its own setting since {o['at']} "
-                          f"({e['key']} = {json.dumps(o['value'])})")
+                    print(f"  in {n}: {text}" + (f", overriding the rollout since {since[n]}" if n in since else ""))
             return 0
         reason = (a.reason or "").strip()
         if act == "fixed":
