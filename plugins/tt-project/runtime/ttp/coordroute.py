@@ -63,7 +63,8 @@ NOT_SHADOW_SQL = "COALESCE(note,'') NOT LIKE '%\"" + SHADOW + "\"%'"
 # Only the coordinator's own session turns (no lane or shadow turn): those that read messages and steer.
 OWN_SQL = NOT_SHADOW_SQL + " AND COALESCE(note,'') NOT LIKE '%\"" + LANE + "\"%'"
 
-ALLOWED = ("task_add", "task_update", "look", "sweep", "noop", "obligation")
+ALLOWED = ("task_add", "task_update", "look", "sweep", "noop", "obligation", "memory_forget", "observation_mute")
+LANE_MUTE_MAX_H = 12   # the longest mute the lane sets; a longer one is the coordinator's call
 # Event kinds a routine wake may carry; any other kind, an unknown one included, is the coordinator's own.
 ROUTINE_KINDS = frozenset({
     "task_done", "task_waiting", "task_failed", "task_cancelled", "task_requeued", "task_queued", "task_notes",
@@ -72,7 +73,7 @@ ROUTINE_KINDS = frozenset({
     "occupancy_unknown", "run_cap", "steer_unread", "idle_capacity", "continue_auto", "lane_wait",
     "resource_resumed", "job_underuse", "schedule_gap", "job_relaunched", "premise_check",
     "resource_pause_removed", "checks_flaky_test", "queue_wait", "ready_not_started", "dispatch_held",
-    "checks_slot_wait"})
+    "checks_slot_wait", "urgent_started"})
 ROUTINE_DUE = (None, "", "look", "idle")
 # A due look naming a chat, a reply or a person to tell: the coordinator's own session answers people.
 _TO_PERSON = re.compile(r"(?i)\b(?:chat|reply|replies|tell|answer|notify)\b")
@@ -88,8 +89,9 @@ LANE_PROMPT = """# Routine lane
 
 You are handling a routine wake of this project's coordinator, on its routine lane: nothing in it needs a
 user-facing answer or a judgement call. Act only with these actions: task_add, task_update, look, sweep,
-noop, and obligation only to attach owners (`key` and `owners`). Never reply, notify, ask_user, change the
-charter, memory, config, schedules, caps, pauses or rollout; never pin a provider, model or effort, use the
+noop, obligation only to attach owners (`key` and `owners`), memory_forget (with a `why`, never a standing
+entry) and observation_mute (at most 12 `hours`, never a device hold). Never reply, notify, ask_user, change the
+charter, add memory (memory_add is the coordinator's: escalate), config, schedules, caps, pauses or rollout; never pin a provider, model or effort, use the
 deep tier, set pr_branch, cancel a task or wake one now. If the wake needs any of those, or you are unsure,
 return one action `{"type": "noop", "why": "escalate: <what needs the coordinator and why>"}` and nothing
 else: the coordinator's own session then takes this wake with your note. Give every action a `why`.
@@ -188,7 +190,7 @@ def _save(db, st: dict) -> None:
 
 
 def classify(db, cfg: dict, *, msgs=(), evs=(), triggers=(), due=None, rerun=False, urgent=(), lead=None,
-             sweep_event=None, hot=False, must: str = "", parts=(), now: float | None = None) -> tuple[bool, list]:
+             sweep_event=None, must: str = "", parts=(), now: float | None = None) -> tuple[bool, list]:
     """(routine, reasons): routine only when no reason names something for the coordinator's own session."""
     from . import coordsession
     now = time.time() if now is None else now
@@ -204,8 +206,6 @@ def classify(db, cfg: dict, *, msgs=(), evs=(), triggers=(), due=None, rerun=Fal
         why.append("lead wake")
     if sweep_event is not None:
         why.append("blocker sweep")
-    if hot:
-        why.append("deadline hangs on an event")
     if triggers:
         why.append("effort trigger: " + ", ".join(str(t) for t in triggers)[:400])
     if due not in ROUTINE_DUE:
@@ -305,8 +305,6 @@ def _event_reasons(db, e, promises=()) -> list[str]:
                 out.append(f"plan #{tid} done")
             if t["kind"] == "review" and kind != "task_done":
                 out.append(f"review #{tid} {kind}")
-            if int(t["priority"] or 3) <= 1 or re.search(r"(?mi)^urgent:", t["spec"] or ""):
-                out.append(f"urgent task #{tid}")
             if t["reply_chat"]:
                 out.append(f"task #{tid} answers a chat")
             if kind == "task_done" and any(int(tid) in obligations._owner_ids(o) for o in promises or ()):
@@ -314,12 +312,13 @@ def _event_reasons(db, e, promises=()) -> list[str]:
     return out
 
 
-def filter_actions(actions, needs=()) -> tuple[list[int], list[tuple[int, str]], str]:
+def filter_actions(actions, needs=(), p=None) -> tuple[list[int], list[tuple[int, str]], str]:
     """(allowed indexes, refused [(index, why)], escalation why or "") for a lane turn's actions. With `needs`
-    (idle_needs), an answer of only noops and looks is an escalation: the wake needs an action the lane did not take."""
+    (idle_needs), an answer of only noops and looks is an escalation: the wake needs an action the lane did not take.
+    With the project `p`, a memory_forget of a standing entry is refused."""
     ok, refused, esc = [], [], ""
     for i, a in enumerate(actions if isinstance(actions, list) else []):
-        why = _refusal(a)
+        why = _refusal(a, p)
         if why == "escalate":
             esc = esc or str(a.get("why") or a.get("text") or "")[len(ESCALATE):].strip() or "escalated"
         elif why:
@@ -333,7 +332,7 @@ def filter_actions(actions, needs=()) -> tuple[list[int], list[tuple[int, str]],
     return ok, refused, esc
 
 
-def _refusal(a) -> str:
+def _refusal(a, p=None) -> str:
     if not isinstance(a, dict):
         return "not an action"
     t = str(a.get("type") or "")
@@ -351,9 +350,34 @@ def _refusal(a) -> str:
         if "pr_branch" in a or a.get("untrusted_input") is False or a.get("untrusted_write") is not None \
                 or a.get("wake_now") or a.get("status") == "cancelled":
             return "task_update setting pr_branch, an untrusted label, wake_now or cancelling"
+    if t == "memory_forget":
+        if not str(a.get("why") or "").strip():
+            return "memory_forget without a why"
+        if p is not None and _standing(p, str(a.get("name") or "")):
+            return "memory_forget of a standing entry"
+    if t == "observation_mute":
+        from . import screen
+        try:
+            hours = float(a.get("hours"))
+        except (TypeError, ValueError):
+            hours = None
+        if hours is None or not 0 < hours <= LANE_MUTE_MAX_H:
+            return f"observation_mute for more than {LANE_MUTE_MAX_H} h or without hours"
+        if screen.holds_mute(str(a.get("match") or "")):
+            return "observation_mute of a device hold"
     if t == "obligation" and not (set(a) <= {"type", "key", "owners", "why"} and a.get("key") and a.get("owners")):
         return "obligation beyond attaching owners"
     return ""
+
+
+def _standing(p, name: str) -> bool:
+    """Whether memory_forget's `name` (as the apply path resolves it) is a standing entry; an unknown or
+    ambiguous one is not: applying it fails on its own."""
+    try:
+        entry = p._resolve_memory_name(Path(name.strip().strip("[]")).stem)[0]
+    except ValueError:
+        return False
+    return any(e["name"] == entry and e["standing"] for e in p._memory_entries())
 
 
 def _target(a: dict) -> str:
@@ -663,7 +687,7 @@ def _prune(folder: Path, now: float) -> None:
 
 
 def shadow_side(state_dir, opus_run, side: str, actions, status: str, cost: float = 0.0,
-                duration_s: float = 0.0) -> dict:
+                duration_s: float = 0.0, p=None) -> dict:
     """Records one side ("opus" or "glm") of a shadow pair; with both in, the comparison. Returns the record."""
     path = shadow_path(state_dir, opus_run)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -672,7 +696,7 @@ def shadow_side(state_dir, opus_run, side: str, actions, status: str, cost: floa
     side_rec = {"status": status, "cost_usd": round(float(cost or 0), 4), "duration_s": round(float(duration_s or 0), 1),
                 "actions": [_brief(a) for a in acts]}
     if side == "glm":
-        ok, refused, esc = filter_actions(acts, rec.get("needs") or ()) if isinstance(actions, list) else ([], [], "")
+        ok, refused, esc = filter_actions(acts, rec.get("needs") or (), p) if isinstance(actions, list) else ([], [], "")
         side_rec.update({"refused": [w for _, w in refused], "escalated": esc})
     rec[side] = side_rec
     if "opus" in rec and "glm" in rec:

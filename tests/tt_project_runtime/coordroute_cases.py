@@ -66,7 +66,6 @@ def test_coordroute_classify_sends_anything_but_routine_events_to_the_coordinato
     assert coordroute.classify(p.db, cfg, evs=[ev("task_done")]) == (True, [])
     plan = p.db.add_task("plan it", "s", kind="plan", tier="standard")
     review = p.db.add_task("review it", "s", kind="review", tier="standard")
-    urgent = p.db.add_task("hot", "urgent: now\ndo it", kind="work", tier="light")
     cases = {
         "user or relayed message": {"msgs": [1]},
         "urgent message": {"urgent": [1]},
@@ -79,7 +78,6 @@ def test_coordroute_classify_sends_anything_but_routine_events_to_the_coordinato
         "high event": {"evs": [ev("task_done", "high")]},
         f"plan #{plan} done": {"evs": [ev("task_done", task=plan)]},
         f"review #{review} task_failed": {"evs": [ev("task_failed", task=review)]},
-        f"urgent task #{urgent}": {"evs": [ev("task_done", task=urgent)]},
         "task #99999 not found": {"evs": [ev("task_done", task=99999)]},
         "blocker sweep": {"sweep_event": {"id": 1}},
         "session rerun": {"rerun": True},
@@ -891,3 +889,59 @@ def test_coordroute_a_course_line_naming_a_promise_is_routine(env):
     course = [("course_check", "## Course check\n- over_estimate: task #5 runs 60% over its estimate: "
                                "steer, split or restart it, and update any promise that waits on it")]
     assert coordroute.classify(p.db, _cr_cfg(), parts=course) == (True, [])
+
+
+def test_coordroute_an_urgent_task_or_its_start_is_routine_and_a_due_promise_stays_the_coordinators(env):
+    """Urgent tasks and urgent_started events no longer send a wake to the coordinator by themselves: a due
+    promise (the urgent deadline) does, as do a user message and a high event."""
+    from ttp import coordroute
+    p = _cr_db(env)
+    cfg = _cr_cfg()
+    hot = p.db.add_task("hot", "urgent: now\ndo it", kind="work", tier="light")
+    p1 = p.db.add_task("first", "s", kind="work", tier="light", priority=1)
+    ev = lambda kind, sev="normal", task=None: {"kind": kind, "severity": sev, "task": task}
+    for task in (hot, p1):
+        assert coordroute.classify(p.db, cfg, evs=[ev("task_done", task=task)]) == (True, [])
+        assert coordroute.classify(p.db, cfg, evs=[ev("task_failed", task=task)]) == (True, [])
+    assert coordroute.classify(p.db, cfg, evs=[ev("urgent_started", task=hot)]) == (True, [])
+    assert not coordroute.classify(p.db, cfg, evs=[ev("urgent_started", "high", task=hot)])[0]
+    assert not coordroute.classify(p.db, cfg, evs=[ev("task_done", task=hot)], msgs=[1])[0]
+
+
+def test_coordroute_memory_forget_needs_a_why_and_memory_add_stays_the_coordinators():
+    from ttp import coordroute
+    ok, refused, esc = coordroute.filter_actions([
+        {"type": "memory_forget", "name": "fact-1", "why": "done"},
+        {"type": "memory_forget", "name": "fact-1"},
+        {"type": "memory_forget", "name": "fact-1", "why": "  "}])
+    assert ok == [0] and [i for i, _ in refused] == [1, 2] and esc == ""
+    assert "memory_forget" in coordroute.ALLOWED and "memory_add" not in coordroute.ALLOWED
+    assert coordroute.filter_actions([{"type": "memory_add", "text": "x"}])[1][0][0] == 0
+
+
+def test_coordroute_memory_forget_of_a_standing_entry_is_refused_in_the_lane_and_its_shadow(env):
+    from ttp import coordroute
+    p = _cr_db(env)
+    p.add_memory("a plain fact", kind="fact")
+    p.add_memory("a recurring duty", kind="decision", standing=True)
+    plain, duty = [e["name"] for e in p._memory_entries()]
+    acts = [{"type": "memory_forget", "name": plain, "why": "done"},
+            {"type": "memory_forget", "name": duty, "why": "done"},
+            {"type": "memory_forget", "name": f"[{duty}]", "why": "done"},
+            {"type": "memory_forget", "name": duty + ".md", "why": "done"},
+            {"type": "memory_forget", "name": duty[:12], "why": "done"},
+            {"type": "memory_forget", "name": "no-such-entry", "why": "done"}]
+    ok, refused, _ = coordroute.filter_actions(acts, (), p)
+    assert ok == [0, 5] and [i for i, _ in refused] == [1, 2, 3, 4]
+    rec = coordroute.shadow_side(p.state, 40, "glm", acts[:3], "ok", 0.0, 1.0, p)
+    assert rec["glm"]["refused"] == ["memory_forget of a standing entry"] * 2
+
+
+def test_coordroute_observation_mute_is_capped_at_twelve_hours_and_never_a_device_hold():
+    from ttp import coordroute
+    mute = lambda **kw: {"type": "observation_mute", "source": "watcher:x", "match": "queue wait", "why": "known",
+                         "hours": 6, **kw}
+    ok, refused, esc = coordroute.filter_actions([
+        mute(), mute(hours=12), mute(hours=72), mute(hours=0), mute(hours="soon"), {**mute(), "hours": None},
+        mute(match="device hold on box"), mute(hours=None, end_when="test -e /x")])
+    assert ok == [0, 1] and [i for i, _ in refused] == [2, 3, 4, 5, 6, 7] and esc == ""

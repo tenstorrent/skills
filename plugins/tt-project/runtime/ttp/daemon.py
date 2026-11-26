@@ -12915,7 +12915,7 @@ class Daemon:
                 try:
                     routine, routine_why = coordroute.classify(
                         db, self.cfg, msgs=msgs, evs=evs, triggers=triggers, due=due, rerun=rerun,
-                        urgent=urgent_msgs, lead=lead, sweep_event=sweep_event, hot=hot, must=must, parts=parts, now=now)
+                        urgent=urgent_msgs, lead=lead, sweep_event=sweep_event, must=must, parts=parts, now=now)
                     needs = coordroute.idle_needs(evs, must)   # what an idle lane answer cannot settle
                 except Exception as e:   # what it cannot place goes to the coordinator's own session
                     routine, routine_why = False, [f"classifier failed: {type(e).__name__}"]
@@ -13046,7 +13046,7 @@ class Daemon:
         dur = max(0.0, time.time() - float(r.get("started") or time.time()))
         if lane == "shadow":
             coordroute.shadow_side(self.p.state, (note.get(coordroute.SHADOW) or {}).get("of"), "glm", actions,
-                                   status, cost, dur)
+                                   status, cost, dur, self.p)
             return True
         if status in ("lost", "shutdown") or note.get("lost_to_sleep") or note.get("lost_to_network"):
             return True   # its events stay queued for the next wake
@@ -13057,7 +13057,7 @@ class Daemon:
             coordroute.record_turn(db, r["id"], note, actions, [], [], "", failed=failed)
             log(self.p, f"routine lane turn {r['id']} failed ({failed[:200]}): the coordinator's own session takes it")
             return True
-        ok, refused, esc = coordroute.filter_actions(actions, note.get("needs") or ())
+        ok, refused, esc = coordroute.filter_actions(actions, note.get("needs") or (), self.p)
         if refused or esc:
             coordroute.record_turn(db, r["id"], note, actions, [], refused, esc, summary=summary)
             log(self.p, f"routine lane turn {r['id']} escalated: {(esc or '; '.join(w for _, w in refused))[:200]}")
