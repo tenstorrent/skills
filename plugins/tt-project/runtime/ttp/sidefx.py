@@ -37,12 +37,6 @@ FILE = "outside.json"
 SEEN_BY = "recorded by the run-end scan; no guard blocks writes outside protected paths"
 KIND = "outside_writes"
 MAX_PATHS = 15   # named in the prompt block and the event; the rest are counted
-# Under the home: config and credential folders and files, and what starts code in every session (shell startup
-# files, ~/.local/bin and lib): a path there makes the event high
-SENSITIVE = (".config", ".ssh", ".gnupg", ".aws", ".azure", ".kube", ".docker", ".netrc", ".git-credentials",
-             ".gitconfig", ".pypirc", ".npmrc", ".local/share/keyrings", ".claude", ".claude.json", ".codex", ".cursor",
-             ".bashrc", ".profile", ".bash_profile", ".bash_login", ".zshrc", ".zprofile", ".zshenv",
-             ".local/bin", ".local/lib")
 EDIT_TOOLS = {"Write", "Edit", "MultiEdit", "NotebookEdit"}
 PATH_KEYS = ("file_path", "notebook_path", "path", "target", "destination", "dest", "source", "target_file")
 MCP_WRITE_RE = re.compile(r"write|edit|create|move|rename|delete|remove|patch|upload|mkdir|copy", re.I)
@@ -162,10 +156,17 @@ def _tool_output(path: str, home: str) -> bool:
     return path.startswith(f"{h}/.claude/projects/") and bool(TOOL_OUTPUT_RE.match(path, len(h)))
 
 
-def sensitive(path: str, home: str) -> bool:
-    """`path` is under one of the home's config, credential or code-starting paths (SENSITIVE), not saved tool output."""
+def home_entry(path: str, home: str) -> bool:
+    """`path` is below the home in a hidden entry (config, credentials, shell startup files, ~/.local) or in ~/bin: what
+    every later session reads or runs. The harness's own ~/.tt-project is judged by its own rules."""
     h = os.path.normpath(home)
-    return not _tool_output(path, home) and any(path == f"{h}/{s}" or path.startswith(f"{h}/{s}/") for s in SENSITIVE)
+    top = path[len(h) + 1:].split("/", 1)[0] if path.startswith(h + "/") else ""
+    return (top.startswith(".") and top not in (".", "..", ".tt-project")) or top == "bin"
+
+
+def sensitive(path: str, home: str) -> bool:
+    """`path` is in a hidden or bin entry of the home (home_entry), not saved tool output."""
+    return not _tool_output(path, home) and home_entry(path, home)
 
 
 def _local_text(cmd: str, depth: int = 0) -> str:

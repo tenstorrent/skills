@@ -146,8 +146,8 @@ STATE_DB = re.compile(r"\bproject\.db\b|\bmachine-workers\.json\b|\b\.tt-project
 SCRATCH = "tmp"               # in the run folder: the run's own scratch folder, its TMPDIR (TMP, TEMP)
 SCRATCH_VARS = ("TMPDIR", "TMP", "TEMP")
 SCRATCH_LINE = ("Keep scratch files in $TMPDIR (a folder of your own in your run folder) or your worktree: write"
-                ' `> "$TMPDIR/body.md"`. Writes below the home folder or /tmp pass too, never in a credential folder,'
-                " ~/.tt-project, another project or the project's `state/` folder. The guard refuses writes anywhere"
+                ' `> "$TMPDIR/body.md"`. Writes below the home folder or /tmp pass too,'
+                " never in a hidden home entry (a credential or config folder, a shell startup file), ~/bin, ~/.tt-project, another project or the project's `state/` folder. The guard refuses writes anywhere"
                 " else.")
 # What a code run's own checklist (template kind-code.md) leaves out of its check before it hands off done: the
 # review fails tests that pass without the change, and a large diff with no reason.
@@ -363,7 +363,8 @@ RULES = (
     ("scratch", REDIRECTED, _OUTSIDE, "create files outside your worktree, the home folder and /tmp",
      'write scratch files under `"$TMPDIR"` (a folder of your own) or in your worktree'),
     ("records", HARMFUL, None, "write in a project's `state/` folder, another task's worktree or another project, or "
-     "delete or overwrite a file outside your worktree, the home folder and /tmp", _OWN_TREE),
+     "delete or overwrite a file outside your worktree, the home folder and /tmp, or in a hidden home entry or ~/bin",
+     _OWN_TREE),
     ("delete", HARMFUL, None, None, _OWN_TREE),
     ("outward", HARMFUL, r"`ttp (?:notify|say|ask|note)\b", "post outward (`ttp notify`, `ttp say`, "
      "`ask`, `ttp note --to`/`--reply`)", 'put what a person should read in your hand-off summary; a plain `ttp note "<text>"` '
@@ -638,19 +639,19 @@ def _other_project(path: str) -> bool:
 def _open_write(path: str, home: str) -> bool:
     """Whether a write to `path` outside the run's own folders harms nobody: by its literal and its real path it
     lands below (never on) the home folder or a shared temp dir (_TMP), with no glob or expansion, in or holding
-    no credential store, config folder or code-starting file of the home (sidefx.SENSITIVE: the agents' hook
-    settings, shell startup files, ~/.local/bin and lib), protected path (pathguard.roots,
-    credguard.read_refusal) or the harness's folder (but for its work folders, HOME_WORK), not in another
-    project's folder, and in nothing another user owns."""
+    no hidden entry of the home or ~/bin (sidefx.home_entry: credentials, config, the agents' hook settings, shell
+    startup files, ~/.local), protected path (pathguard.roots, credguard.read_refusal) or the harness's folder (but
+    for its work folders, HOME_WORK), not in another project's folder, and in nothing another user owns."""
     from . import credguard, pathguard, project, sidefx
     tops = [os.path.normpath(t) for t in (home, *_TMP) if t and os.path.normpath(t) != "/"]
     spellings = {os.path.normpath(path), os.path.realpath(path)}
     harness = [os.path.realpath(t) for t in (project.HOME_DIR, os.path.join(home, ".tt-project") if home else "") if t]
     work = [os.path.join(h, w[1]) for h in harness for w in HOME_WORK]
     homes = {os.path.normpath(home), os.path.realpath(home)} if home else set()
-    protected = [*pathguard.roots(), *(os.path.join(h, s) for h in homes for s in sidefx.SENSITIVE)]
+    protected = pathguard.roots()
     if re.search(r"[*?\[{$`]", path) or not all(sidefx._inside(p, tops) and p not in tops for p in spellings) or any(
-            pathguard._holds(p, protected) or credguard.read_refusal(p, search=True, home=home) or _other_project(p)
+            pathguard._holds(p, protected) or any(sidefx.home_entry(p, h) for h in homes)
+            or credguard.read_refusal(p, search=True, home=home) or _other_project(p)
             or any(sidefx._inside(r, [p]) for r in harness)
             or sidefx._inside(p, harness) and not sidefx._inside(p, work) for p in spellings):
         return False

@@ -1115,7 +1115,7 @@ def test_glmenv_refuses_what_the_guard_refuses_and_a_secret_read_and_allows_ordi
 
 
 def test_the_guarded_environment_lets_a_run_command_s_temp_write_through_with_no_temp_entry_to_keep(tmp_path, monkeypatch):
-    """The mini-swe-agent command layer is that provider's live hook: it keeps what it runs, as hook.pre_tool_use."""
+    """The mini-swe-agent command layer is that provider's live hook: it judges each command as hook.pre_tool_use does."""
     import os
     from ttp import glmenv, glmguard
     wt, rd = _gg_run(tmp_path)
@@ -2058,7 +2058,7 @@ def test_glm_guard_refuses_a_protected_name_anywhere_else_in_the_command(cmd, tm
     "unset TMPDIR; echo hi > $TMPDIR/out", "python3 -c 'import os' TMP=/srv; echo hi > $TMP/out",
     "export 'TMPDIR'=/srv; echo hi > $TMPDIR/x", "declare -x \"TMPDIR\"=/srv; echo hi > $TMPDIR/x",
     "read 'TMPDIR' <<< /srv; echo hi > $TMPDIR/x"])
-def test_glm_guard_reads_scratch_as_tmp_where_the_command_names_tmpdir(cmd, tmp_path, monkeypatch):
+def test_glm_guard_refuses_a_write_through_a_tmpdir_the_command_sets_outside_tmp(cmd, tmp_path, monkeypatch):
     from ttp import glmguard
     wt, rd = _gg_run(tmp_path)
     e = {"TTP_PROJECT": str(tmp_path / "proj"), "TMPDIR": str(rd / "tmp"), **_GG_RUN_ENV}
@@ -2650,7 +2650,7 @@ def test_glm_guard_refuses_deleting_or_moving_a_folder_that_holds_a_login_file_a
 
 def test_glm_guard_refuses_the_agents_config_folders_in_home_and_lets_other_home_files_through(monkeypatch, tmp_path):
     """The agents' config (hook settings, installed plugins and their hooks, Codex's config) and the home's other
-    config files (sidefx.SENSITIVE) are protected harness files: a write there, or a removal of a folder holding
+    config files (hidden home entries, sidefx.home_entry) are protected harness files: a write there, or a removal of a folder holding
     one, is refused; a plain home file or folder is not."""
     home, ask = _gg_login_home(monkeypatch, tmp_path)
     hooks = f"{home}/.claude/plugins/cache/m/p/1.0/hooks/hooks.json"
@@ -2666,8 +2666,9 @@ def test_glm_guard_refuses_the_agents_config_folders_in_home_and_lets_other_home
     (home / "work" / "codex" / "auth.json").write_text("{}")
     monkeypatch.setenv("CODEX_HOME", str(home / "work" / "codex"))   # a store moved out of the config folders
     assert "outside its worktree" in (ask(f"rm -rf {home}/work") or "")
-    for c in (f"echo x > {home}/notes.txt", f"echo x > {home}/.claude-notes", f"mkdir -p {home}/work/.config-x"):
+    for c in (f"echo x > {home}/notes.txt", f"mkdir -p {home}/work/.config-x"):
         assert ask(c) is None, c
+    assert "outside its worktree" in (ask(f"echo x > {home}/.claude-notes") or "")
 
 
 def test_glm_guard_refuses_a_sudo_write_to_tmp_like_every_other_root_write(monkeypatch, tmp_path):
@@ -2761,16 +2762,20 @@ def test_a_glm_run_writes_below_the_home_folder_and_tmp(cmd, monkeypatch, tmp_pa
             f.unlink()
 
 
-@pytest.mark.parametrize("cmd", ["echo x >> ~/.bashrc", "echo x >> ~/.profile",
+@pytest.mark.parametrize("cmd", ["echo x >> ~/.bashrc", "echo x >> ~/.profile", "echo x > ~/.bash_aliases",
+                                 "echo x > ~/.bash_logout", "cp /bin/true ~/bin/git", "echo x > ~/.pythonrc",
+                                 "echo x > ~/.npmrc", "echo x > ~/.config/autostart/x.desktop",
+                                 "echo x > ~/.config/systemd/user/x.service",
                                  "echo x > ~/.local/lib/python3.12/site-packages/zz.pth",
                                  "cp /bin/true ~/.local/bin/git"])
 def test_a_glm_run_never_writes_what_starts_code_in_the_homes_sessions(cmd, monkeypatch, tmp_path):
-    """Shell startup files, ~/.local/bin and ~/.local/lib start code in every later session: refused, while
-    a plain notes file in the home and a new /tmp folder pass."""
+    """Every hidden entry of the home (shell startup files, ~/.config, ~/.local) and ~/bin start code or hold
+    config for every later session: refused, while visible home paths and new /tmp and /var/tmp entries pass."""
     deny, home, _ = _gg_home(monkeypatch, tmp_path)
     assert deny(cmd.replace("~", str(home)))
-    assert not deny(f"echo x > {home}/notes.txt")
-    assert not deny(f"mkdir /tmp/x-{os.getpid()}-{tmp_path.name}")
+    for ok in (f"echo x > {home}/notes.txt", f"mkdir -p {home}/work && echo x > {home}/work/x",
+               f"mkdir /tmp/x-{os.getpid()}-{tmp_path.name}", f"mkdir /var/tmp/x-{os.getpid()}-{tmp_path.name}"):
+        assert not deny(ok), ok
 
 
 @pytest.mark.parametrize("cmd", [
