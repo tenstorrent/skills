@@ -229,7 +229,7 @@ def tick(p, cfg: dict | None, now: float | None = None, steer=None) -> list[str]
             rec["late"] = now
             changed = True
             out.append(f"late {key}")
-            _late(p, db, rec, c, now, steer)
+            _late(p, db, rec, now, steer)
         if rec.get("late") is not None and rec.get("escalated") is None and now >= rec["second_due"]:
             rec["escalated"] = now
             changed = True
@@ -243,7 +243,7 @@ def tick(p, cfg: dict | None, now: float | None = None, steer=None) -> list[str]
     return out
 
 
-def _late(p, db, rec: dict, c: dict, now: float, steer) -> None:
+def _late(p, db, rec: dict, now: float, steer) -> None:
     text = (f"Urgent message #{rec['mid']} in chat {rec['chat'] or 'all'} got no finding by "
             f"{timefmt.short(rec['find_due'], p, now)} ({rec['why']}). Post the first finding in that chat now "
             f"(`ttp urgent-reply`, or a reply action), with times.")
