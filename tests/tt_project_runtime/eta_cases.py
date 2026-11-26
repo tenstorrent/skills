@@ -974,6 +974,19 @@ def test_eta_a_deferred_task_s_likely_and_conservative_times_start_after_its_pla
         p.db.x("UPDATE tasks SET not_before=? WHERE id=?", (s3, tt))
         ec, et = eta.estimate(p.db, ch[-1], now), eta.estimate(p.db, tt, now)
         assert et["end"] >= ec["end"] and et["conservative"] >= et["end"], (status, et["end"] - now, ec["end"] - now)
+    # A correction below 1: a start between the dependency's corrected and raw end is the start, so no task
+    # shows done before its own planned start.
+    p.db.set_kv(etaledger.KEY, {"on": True, "factors": {"work": 0.7}, "conservative_x": 5.5, "at": now})
+    ch2 = [p.db.add_task(f"v{i}", "s", kind="work") for i in range(10)]
+    for prev, nxt in zip(ch2, ch2[1:]):
+        p.db.update_task(nxt, depends_on=[prev])
+    s4 = now + 15000   # the chain is 18000 s raw, 12600 s shown x0.7
+    for status in ("waiting", "queued"):
+        tt = p.db.add_task(f"low {status}", "s", kind="work", status=status, depends_on=[ch2[-1]], labels=[f"start_after:{s4:.0f}"])
+        p.db.x("UPDATE tasks SET not_before=? WHERE id=?", (s4, tt))
+        et = eta.estimate(p.db, tt, now)
+        assert et["end"] >= s4 and et["conservative"] >= et["end"], (status, et["end"] - now)
+    p.db.set_kv(etaledger.KEY, {"on": True, "factors": {"work": 3.0}, "conservative_x": 5.5, "at": now})
     # A promise on the deferred owner and an undeferred one: each owner corrected alone, the later wins.
     o = {"id": "o1", "owners": [a, b]}
     eo = eta.obligation_estimate(p.db, o, now)
