@@ -296,14 +296,21 @@ def test_pyproof_passes_the_own_runtime_and_judges_computed_paths_only_under_the
     rt = os.path.dirname(os.path.dirname(os.path.realpath(hook.__file__)))
     own = f"import sys\nsys.path.insert(0, '{rt}')\nfrom ttp import hook\nprint(hook._pieces('a; b'))"
     assert pyproof.harmless(own, str(tmp_path))
-    assert pyproof.rewrite(f"PYTHONPATH={rt} python3 -c \"from ttp import pathguard; print(1)\"", str(tmp_path))
+    assert pyproof.rewrite(f"PYTHONPATH={rt} python3 -c \"from ttp import hook; print(hook._pieces('a'))\"", str(tmp_path))
+    for code in ("from ttp import redact\nprint(redact.pairs())", "from ttp import glmguard\nglmguard.mark('/x')",
+                 "import ttp.hook\nttp.hook.pre_tool_use({})"):   # only the judges' pure checks
+        assert not pyproof.harmless(f"import sys\nsys.path.insert(0, '{rt}')\n{code}", str(tmp_path)), code
+    for cmd in ("sed -n '$w json.py' s.txt && python3 -c 'import json; print(1)'",
+                "sort -uo json.py s.txt && python3 -c 'import json; print(1)'"):   # sed and sort may plant a module
+        assert pyproof.rewrite(cmd, str(tmp_path)) is None, cmd
     computed = "import sys\np=sys.argv[1]\nopen(p,'w').write('x')"
     assert not pyproof.harmless(computed, str(tmp_path))
     assert pyproof.harmless(computed, str(tmp_path), audited=True)
     assert pyproof.harmless("from pathlib import Path\nimport sys\nPath(sys.argv[1]).write_text('x')", str(tmp_path),
                             audited=True)
     for code in (f"open('~/{_SSH}/id_rsa').read()", "exec(input())", "eval(open('x').read())",
-                 "import os\nos.environ['TMPDIR']='/home'", "import sys\nexec(sys.argv[1])"):
+                 "import os\nos.environ['TMPDIR']='/home'", "import sys\nexec(sys.argv[1])",
+                 "import os\nos.environ['TTP_GLM_RUN']='0'"):
         assert not pyproof.harmless(code, str(tmp_path), audited=True), code
 
 

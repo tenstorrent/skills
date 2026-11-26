@@ -75,12 +75,13 @@ SYSTEM = ("/proc", "/sys", "/dev")
 # the run's own folders a snippet may read, the tempfile calls (they write under TMPDIR or a `dir` checked as a
 # write), and the plugin's own judges (pure checks of a command or path) it may import from its own runtime folder.
 ENV_PATHS = {"TTP_RUN_DIR", "TMPDIR", "HOME"}
-ENV_SET_RE = re.compile(r"PYTHON|LD_|TTP_PYAUDIT|PATH$")   # what a snippet may not set in its environment
+ENV_SET_RE = re.compile(r"PYTHON|LD_|TTP_|PATH$")   # what a snippet may not set in its environment
 TEMP_MAKERS = {"tempfile.mkdtemp", "tempfile.mkstemp", "tempfile.NamedTemporaryFile", "tempfile.TemporaryDirectory"}
 MAKEDIRS = {"os.makedirs", "os.mkdir"}
 PATH_WRITES = {"write_text", "write_bytes", "mkdir", "touch"}
-JUDGES = {"pathguard", "credguard", "credwatch", "glmguard", "glmenv", "hook", "pyproof", "sidefx", "claimcheck",
-          "untrusted", "gitguard", "localguard", "prguard", "routeguard", "ruleguard", "streamguard", "redact"}
+# The plugin's own judges a snippet may call: pure checks that read no secret and write nothing.
+JUDGES = {"hook": {"_pieces", "_segments"}, "pyproof": {"harmless", "rewrite"}, "glmguard": {"literal_view"},
+          "credguard": {"_cwds"}}
 
 
 def harmless(code: str, cwd: str, env=None, bases=None, own=(), audited=False) -> bool:
@@ -243,9 +244,8 @@ class _Proof:
             and isinstance(call.args[0], ast.Constant) and call.args[0].value in ENV_PATHS
 
     def _attr(self, mod: str, attr: str) -> bool:
-        if mod == "ttp" or mod.startswith("ttp."):   # the plugin's own judges: their helpers too, never a dunder
-            return f"{mod}.{attr}" == self._module(f"{mod}.{attr}") if mod == "ttp" else not attr.startswith("__") \
-                and getattr(sys.modules.get(f"{__package__}{mod[3:]}"), attr, None) is not None
+        if mod == "ttp" or mod.startswith("ttp."):   # the plugin's own judges: only their pure checks
+            return f"{mod}.{attr}" == self._module(f"{mod}.{attr}") if mod == "ttp" else attr in JUDGES.get(mod[4:], ())
         if mod in LISTED:
             return attr in LISTED[mod]
         value = getattr(sys.modules.get(mod), attr, None)
@@ -584,11 +584,10 @@ UNQUOTED_RE = re.compile(r"\\.|'[^']*'|\"((?:\\.|[^\"\\])*)\"")
 TERMINAL = ("-", "/dev/null", "/dev/stdout", "/dev/stderr", "/dev/tty")   # redirect targets that write no file
 SHELL_BUILTINS = {"cd", "pushd", "echo", "true", "false", "pwd", "test", "[", ":"}   # the shell runs these itself
 READERS = {"cat", "echo", "ls", "head", "tail", "grep", "wc", "true", "pwd"}   # write no file without a redirect
-# Commands that create no module python could import (none, or only folders and deletions): sed and sort unless
-# their arguments write a file (SED_WRITE, -o), and the plugin's own CLI.
-NO_MODULE = READERS | {"sed", "sort", "cut", "tr", "jq", "column", "nl", "stat", "rm", "rmdir", "mkdir", "sleep", "date",
+# Commands that create no module python could import (none, or only folders and deletions), and the plugin's own CLI.
+# Not sed or sort: their scripts and grouped flags write files in more ways than a pattern reads.
+NO_MODULE = READERS | {"cut", "tr", "jq", "column", "nl", "stat", "rm", "rmdir", "mkdir", "sleep", "date",
                        "basename", "dirname", "realpath", "readlink", "diff", "cmp", "file", "du", "df", "ps", "ttp"}
-SED_WRITE = re.compile(r"^-(i|-in-place)|(^|[/;}\s\d])[wWe](\s|$)")
 
 
 RUN_VARS = ("TTP_RUN_DIR", "TMPDIR")
@@ -657,7 +656,7 @@ def _plants(shell: str) -> bool:
     except ValueError:
         return True
     ran = writes = py = False   # ran: a writer ran before this pipeline; writes, py: one is in it
-    start, target, cur = True, "", ""
+    start, target = True, ""
     for w in words + [";"]:
         if set(w) <= set("();<>|&"):
             if ">" in w or "<" in w:
@@ -671,8 +670,6 @@ def _plants(shell: str) -> bool:
         elif target:
             writes |= ">" in target and not (w.isdigit() or w in TERMINAL)
             target = False
-        elif not start:
-            writes |= cur == "sed" and bool(SED_WRITE.search(w)) or cur == "sort" and w.startswith(("-o", "--output"))
         elif start:
             name = os.path.basename(w)
             if PY_RE.match(name):
@@ -681,7 +678,7 @@ def _plants(shell: str) -> bool:
                 py, start = True, False
             elif not (w.isdigit() or name in WRAPPERS):
                 writes |= name not in NO_MODULE | {"cd", "pushd"}
-                start, cur = False, name
+                start = False
     return False
 
 

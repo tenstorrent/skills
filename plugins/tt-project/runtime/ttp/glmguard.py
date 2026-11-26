@@ -193,7 +193,7 @@ def _scratch_naming(cmd: str, run_dir: str, env) -> tuple[bool, bool, list[str] 
                 values = None if re.search(r"[$`~*?\[]", v) or not v.startswith("/") else values + [v]
         elif re.match(r"=\"?\$\(mktemp -d\)\"?(?=[\s;&|)]|$)", cmd[m.end():]):   # a new folder in its TMPDIR
             values = values if values is None else values + [os.path.join(str(env.get("TMPDIR") or "/tmp"), "tmp.made")]
-        elif cmd[m.end():m.end() + 1] == "=" or _SCRATCH_HIDDEN.search(cmd[max(0, m.start() - 60):m.start()]):
+        elif cmd[m.end():].startswith(("=", "+=")) or _SCRATCH_HIDDEN.search(cmd[max(0, m.start() - 60):m.start()]):
             values = None
     return told, bool(own) and not told, values if told else []
 
@@ -960,10 +960,10 @@ def literal_view(cmd: str, cwd: str, env=None) -> str | None:
         if not m:
             break
         depth, end = 1, None
-        for k in re.finditer(r"(?<![\w$-])(do|done)(?![\w-])", plain[m.end():]):
+        for k in re.finditer(r"(?:^|[;&|\n{(])[ \t]*(do|done)(?=[\s;&|)]|$)", plain[m.end():]):   # keywords only
             depth += 1 if k[1] == "do" else -1
             if not depth:
-                end = m.end() + k.start()
+                end = m.end() + k.start(1)
                 break
         values = _values(text[m.start(2):m.end(2)], cwd, home)
         body = text[m.end():end] if end is not None else ""

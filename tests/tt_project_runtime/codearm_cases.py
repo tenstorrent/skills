@@ -2767,7 +2767,8 @@ def test_glm_guard_reads_a_self_set_tmpdir_as_its_value_and_keeps_the_runs_own(m
         assert not deny(cmd), cmd
     for cmd in ('TMPDIR=~; echo x >> "$TMPDIR/.bashrc"', 'export TMPDIR="$TMPDIR"; TMPDIR=~; echo x >> "$TMPDIR/.bashrc"',
                 'export TMPDIR=~; echo x >> "$TMPDIR/.bashrc"', 'TMPDIR=$(cat f); echo x >> "$TMPDIR/.bashrc"',
-                'TMPDIR=~ ; echo x >> "${TMPDIR:-/tmp/x}/.bashrc"'):
+                'TMPDIR=~ ; echo x >> "${TMPDIR:-/tmp/x}/.bashrc"', 'TMPDIR+=/../../home; echo x >> "$TMPDIR/.bashrc"',
+                'export TMPDIR+=/../../home; echo x >> "$TMPDIR/.bashrc"'):
         assert deny(cmd), cmd
 
 
@@ -2779,6 +2780,7 @@ def test_glm_guard_judges_a_loop_body_with_its_literal_list_or_glob(monkeypatch,
         assert not deny(cmd), cmd
     ssh = "." + "ssh"
     for cmd in (f'for f in ~/{ssh}/*; do cat "$f"; done', 'for f in ~ /etc; do rm -rf "$f"; done',
+                'for f in ~ /etc; do echo done.x; rm -rf "$f"; done',
                 'for f in bash; do echo "tt-smi -r 0" | "$f"; done'):
         assert deny(cmd), cmd
 
