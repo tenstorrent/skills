@@ -1195,34 +1195,41 @@ def test_coordinator_bash_guard_keeps_a_concurrent_daemon_write(env, tmp_path, m
 
 
 def test_coordinator_bash_guard_keeps_a_harness_tasks_commit_made_while_the_call_ran(env, tmp_path, monkeypatch):
-    # (c2) A harness task edits project.json (and a memory entry) and commits it with git while a slow
-    # coordinator call runs: the committed content is kept (upstream note a1f819569c57b25c), and the
-    # call's own commit of an out-of-band edit is still put back.
+    # (c2) A harness task edits project.json (and a memory entry) and commits it through the run's git
+    # (gitguard) while a slow coordinator call runs: the commit's content is kept (upstream note
+    # a1f819569c57b25c). The same commit by a coordinator run, a git read, or an uncommitted edit by
+    # another process, is still put back.
+    import shutil
+    import ttp
     from ttp import coordtools
     p, run, files = _bash_guard_project(env, tmp_path, monkeypatch)
-    git = lambda *a: subprocess.run(["git", "-C", str(p.harness), "-c", "user.name=t", "-c",  # noqa: E731
-                                     "user.email=t@t", *a], check=True, capture_output=True, text=True)
+    real = shutil.which("git")
+    ident = ["-c", "user.name=t", "-c", "user.email=t@t"]
     p.commit_harness([p.memory_dir / "fact-a.md", p.config_path], "test: base")
-    def harness_task():
+    rt = str(pathlib.Path(ttp.__file__).resolve().parents[1])
+    task_env = {k: v for k, v in os.environ.items() if not k.startswith("TTP_")} | {"TTP_TASK": "7"}
+
+    def commit_via_gitguard(sub_env, guards):
         cfg = json.loads(p.config_path.read_text())
-        p.config_path.write_text(json.dumps({**cfg, "guards": {"local": ["guards/new.py"]}}, indent=2))
-        (p.memory_dir / "fact-b.md").write_text("---\nkind: fact\n---\nbeta\n")
-        git("add", "-A")
-        git("commit", "-q", "-m", "guards: add a local guard")
-    committed = p.config_path
-    assert _bash_guarded_call(p, tmp_path, "sleep 0.1", 0, harness_task) is None
-    assert json.loads(committed.read_text())["guards"]["local"] == ["guards/new.py"]
-    assert (p.memory_dir / "fact-b.md").exists()
-    assert not (p.state / coordtools.PUT_BACK_LOG).exists()
-    # An edit the call commits itself is still put back.
-    cmd = 'cd "$H" && f="CHART""ER.md" && echo "- out of band" >> "$f" && git -c user.name=t -c user.email=t@t commit -qam x'
-    before = p.charter_path.read_bytes()
-    notice = _bash_guarded_call(p, tmp_path, cmd, 1)
-    assert notice and "put back" in notice and p.charter_path.read_bytes() == before
+        p.config_path.write_text(json.dumps({**cfg, "guards": {"local": guards}}, indent=2))
+        (p.memory_dir / "fact-b.md").write_text(f"---\nkind: fact\n---\n{guards}\n")
+        subprocess.run([real, "-C", str(p.harness), "add", "-A"], check=True)
+        subprocess.run([sys.executable, "-I", "-c", "import sys; sys.path.insert(0, sys.argv[1]); "
+                        "from ttp.gitguard import main; sys.exit(main(sys.argv[2:]))", rt, real, "-C",
+                        str(p.harness), *ident, "commit", "-qm", "guards: add a local guard"],
+                       check=True, env=sub_env)
+    assert _bash_guarded_call(p, tmp_path, "git -C \"$H\" log -1 >/dev/null; sleep 0.1", 0,
+                              lambda: commit_via_gitguard(task_env, ["guards/new.py"])) is None
+    assert json.loads(p.config_path.read_text())["guards"]["local"] == ["guards/new.py"]
+    assert "guards/new.py" in (p.memory_dir / "fact-b.md").read_text()
+    # A coordinator run's commit through the same git is not logged: put back.
+    coord_env = task_env | {coordtools.FULL_ENV: "1"}
+    notice = _bash_guarded_call(p, tmp_path, "true", 1, lambda: commit_via_gitguard(coord_env, ["guards/x.py"]))
+    assert notice and "put back" in notice and "guards/new.py" in p.config_path.read_text()
     # So is an uncommitted edit by another process.
-    notice = _bash_guarded_call(p, tmp_path, "true", 2,
-                                lambda: committed.write_text(committed.read_text().replace("new.py", "x.py")))
-    assert notice and "put back" in notice and "guards/new.py" in committed.read_text()
+    notice = _bash_guarded_call(p, tmp_path, "true", 2, lambda: p.config_path.write_text(
+        p.config_path.read_text().replace("new.py", "y.py")))
+    assert notice and "put back" in notice and "guards/new.py" in p.config_path.read_text()
 
 
 def test_coordinator_bash_guard_only_reports_a_file_no_ttp_writer_logs(env, tmp_path, monkeypatch):

@@ -59,6 +59,9 @@ if [ -n "${TTP_TASK:-}" ] || [ -n "$coord" ]; then
     symbolic-ref|tag|update-index|update-ref|var|verify-commit|verify-tag|version|worktree|write-tree) ;;
     *) sub=" push " ;;
     esac
+    case $sub in   # a task run's HEAD-moving commands: gitguard.COMMITS logs a harness commit's protected files
+    commit|merge|cherry-pick|revert|am|pull|rebase|reset) [ -n "$coord" ] || sub=" push " ;;
+    esac
     case " $* $sub " in
     *" push "*)
         [ -x "${TTP_PYTHON:-}" ] || TTP_PYTHON=python3

@@ -144,17 +144,21 @@ def refusal(cfg: dict, tool: str, tool_input: dict, harness: Path | None = None)
 
 
 def asks_tools(cfg: dict, harness: Path | None) -> bool:
-    """A listed guard is asked about tool calls other than shell commands: it defines `tool_refusal`, or
-    does not load (what it would refuse is unknown). A run whose agent has web tools no hook sees (Codex's
-    hosted web search, Provider.web_unhooked) then starts with the web off."""
-    files, _ = paths(cfg, harness)
+    """A listed guard may be asked about tool calls other than shell commands: its text names `tool_refusal`,
+    or the file or setting does not read (what it would refuse is unknown). Read, never run: the daemon asks
+    this as it starts a run whose agent has web tools no hook sees (Codex's hosted web search,
+    Provider.web_unhooked), which then starts with the web off."""
+    import ast
+    files, why = paths(cfg, harness)
     for f in files:
         try:
-            if callable(getattr(load(f), "tool_refusal", None)):
-                return True
-        except (Exception, SystemExit):
+            text = f.read_text()
+            ast.parse(text)
+        except (OSError, SyntaxError, ValueError):
             return True
-    return False
+        if "tool_refusal" in text:
+            return True
+    return bool(why)
 
 
 UNREAD = ("project.json does not read and there is no last good copy, so its local guards ({key}), if it "
