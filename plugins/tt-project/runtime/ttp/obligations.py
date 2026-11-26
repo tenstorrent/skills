@@ -1819,7 +1819,7 @@ def _check_promise(p, o: dict, st: dict, now: float, raised: list[str]) -> bool:
     kept = _kept(p.db, o, st)
     if kept:
         if pr.get("order") is not None and pr.get("started") is None:   # closed before the start was stamped
-            pr["started"] = first_run(p.db, _owner_ids(o), _order_ts(p.db, pr))
+            pr["started"] = first_run(p.db, _owner_ids(o), _order_ts(p.db, o))
         o["receipt"] = {"at": now, "task": None, "evidence": kept}
         _retire(p.db, now, "promise kept", prefix=fp)
         return True
@@ -2208,8 +2208,8 @@ def deliver_twins(p, twins: list[tuple], now: float | None = None) -> list[str]:
 # orders and claims --------------------------------------------------------------------------------
 # An order (add_order): a user message that asks for something, recorded by the coordinator's
 # `obligation` action with `order` (the message id), `action_class` (read, change or device), optional
-# `due` (else promise_default_h after it is recorded) and `start_by` (else ORDER_START_S after the
-# message), and its owner tasks. It is promise-shaped (the `promise` field with `order`), so it has no
+# `due` (else promise_default_h after it is recorded) and `start_by` (else ORDER_START_S after its
+# reference time: the message, or for a follow-up order, its own record), and its owner tasks. It is promise-shaped (the `promise` field with `order`), so it has no
 # owner clocks and closes like a promise (_kept). check() raises one high `order_late` event when no
 # owner run has started by its start_by, and one high `order_overdue` event at its due time.
 # A claim (record_claims): a coordinator reply or notify saying something is done, live, running or
@@ -2235,7 +2235,7 @@ LANDING_STUCK_KIND = "order_landing_stuck"
 PROMISE_SLACK_KIND = "promise_slack"   # a promise far beyond its work, before its owner starts (_check_promise_slack)
 MUST_ACT_KINDS = (PROMISE_KIND, ORDER_LATE_KIND, ORDER_KIND, CLAIM_KIND, LANDING_STUCK_KIND, PROMISE_SLACK_KIND)
 ORDER_CLASSES = ("read", "change", "device")
-ORDER_START_S = 1800          # an order with no start_by: its owner's run starts within this after the message
+ORDER_START_S = 1800          # an order with no start_by: its owner's run starts within this after its reference time (_order_ts)
 # Words asking for it the same day: an order given no due is due by the end of the message's home-zone day
 # (or SAME_DAY_MIN_S after it, sent late), so an urgent ask is not promised for tomorrow. Negated ('not
 # urgent') never counts; an explicit due always wins.
@@ -2403,14 +2403,12 @@ def add_order(p, text: str, message: int, owners=(), due=None, start_by=None, ac
         sent = datetime.fromtimestamp(float(row["ts"]), timefmt.zone(p))
         cap = max(sent.replace(hour=23, minute=59, second=0, microsecond=0).timestamp(),
                   float(row["ts"]) + SAME_DAY_MIN_S, now + 1800)
-    start_at = _when(start_by, "order start_by", p) if start_by not in (None, "") else float(row["ts"]) + ORDER_START_S
+    start_at = _when(start_by, "order start_by", p) if start_by not in (None, "") else \
+        _order_ts(p.db, {"created": now, "promise": {"order": int(message)}}) + ORDER_START_S
     with p.db.tx():
         ids = _owners_known(p.db, owners)
         st = _load(p.db)
         o = next((x for x in st["items"].values() if _open(x) and (x.get("promise") or {}).get("order") == int(message)), None)
-        again = o is None and any((x.get("promise") or {}).get("order") == int(message) for x in st["items"].values())
-        if again and start_by in (None, ""):   # a follow-up order: its start clock runs from now, not from the message
-            start_at = now + ORDER_START_S
         if why := unfit_owner(p.db, action_class, sorted(set(ids) | set((o or {}).get("promise", {}).get("tasks") or []))):
             raise ValueError(f"order (message #{message}): {why}")
         if o:
@@ -2483,7 +2481,8 @@ def _needed_no_task(o: dict) -> bool:
 
 def order_starts(db, since: float, until: float, now: float | None = None) -> tuple[int, int]:
     """(orders whose message came between `since` and `until`, those whose first owner run started more
-    than ORDER_START_S after the message (a follow-up order: after its own record) or not at all by `now`). An order that needed no task is left
+    than ORDER_START_S after its reference time (_order_ts: the message, or a follow-up order's own
+    record) or not at all by `now`). An order that needed no task is left
     out: one closed or dropped with no run started and no owner task ever (a reply, a memory or charter
     change settled it), so the count matches the late orders the coordinator is told about."""
     now = time.time() if now is None else now
@@ -2492,15 +2491,12 @@ def order_starts(db, since: float, until: float, now: float | None = None) -> tu
     if not orders:
         return 0, 0
     ids = list({int(pr["order"]) for _, pr in orders})
-    first = {}   # message -> when its first order was recorded: a later one is a follow-up, timed from its record
-    for o, pr in orders:
-        first[int(pr["order"])] = min(first.get(int(pr["order"]), o["created"]), o["created"])
     ts = {r["id"]: float(r["ts"]) for r in db.q(f"SELECT id, ts FROM messages WHERE id IN ({','.join('?' * len(ids))})", ids)}
     n = late = 0
     for o, pr in orders:
         sent = ts.get(int(pr["order"]))
-        at = None if sent is None else max(sent, o["created"] if o["created"] > first[int(pr["order"])] else 0)
-        if sent is None or not since <= sent < until or (pr.get("started") is None and now - at <= ORDER_START_S):
+        at = None if sent is None else max(sent, _order_ts(db, o))
+        if at is None or not since <= sent < until or (pr.get("started") is None and now - at <= ORDER_START_S):
             continue   # out of the window, or too new to say
         start = pr.get("started")
         start = float(start) if start is not None else first_run(db, _owner_ids(o), at)
@@ -2554,7 +2550,14 @@ def _order_line(o: dict) -> str:
             f"{o['text']}\nOwner: " + (f"#{', #'.join(map(str, ids))}" if ids else "no task"))
 
 
-def _order_ts(db, pr: dict) -> float:
+def _order_ts(db, o: dict) -> float:
+    """The time an order's start clock runs from: its message's time, or for a follow-up order
+    (one recorded later than another order of the same message), its own record time."""
+    created = float(o.get("created") or 0)
+    pr = o.get("promise") or {}
+    if any(float(x.get("created") or 0) < created
+           for x in items(db) if (x.get("promise") or {}).get("order") == pr.get("order")):
+        return created
     m = db.one("SELECT ts FROM messages WHERE id=?", (int(pr["order"]),))
     return float(m["ts"]) if m else float(pr.get("start_by") or 0) - ORDER_START_S
 
@@ -2567,12 +2570,12 @@ def _check_order(p, o: dict, now: float, raised: list[str]) -> bool:
     if pr.get("started") is None and ids:
         q = ",".join("?" * len(ids))
         # A batch member has no run of its own: the live batch run it is in is its run.
-        at = _order_ts(db, pr)
+        at = _order_ts(db, o)
         if (run := first_run(db, ids, at)) is not None or batchrun.held(db) & set(map(int, ids)):
             pr["started"], changed = (now if run is None else run), True   # the owner run's own start
             _retire(db, now, "order started", prefix=f"obligation:{o['id']}:order:late")
     if pr.get("started") is None and now >= pr["start_by"] and not pr.get("deferred") and \
-            _held_by_design(db, ids, _order_ts(db, pr)):
+            _held_by_design(db, ids, _order_ts(db, o)):
         pr["deferred"], changed = now, True   # kept: a deferral label goes once the probe passes
     if pr.get("started") is None and now >= pr["start_by"] and pr.get("late") is None:
         pr["late"], changed = now, True

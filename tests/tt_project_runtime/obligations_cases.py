@@ -1265,6 +1265,45 @@ def test_a_follow_up_order_on_an_ordered_message_starts_its_clock_at_its_own_rec
     assert ob.order_starts(p.db, now - 1, now + 1, later + 900) == (2, 0)
 
 
+def test_a_follow_up_order_owned_by_the_task_that_ran_for_the_first_order_is_late_until_it_runs_again(
+        env, monkeypatch):
+    """A follow-up order owned by the task that already ran for the first order is not started by
+    that old run: with no new run it raises one order_late past its own start_by and counts late."""
+    from ttp import obligations as ob
+    p, d, now, tid, check, mid, raised = _order_setup(env, monkeypatch)
+    first = ob.add_order(p, "first", mid, [tid], action_class="read", now=now).split()[1]
+    p.db.x("INSERT INTO runs(task, role, started, ended, status) VALUES(?,?,?,?,?)",
+           (tid, "worker", now + 60, now + 120, "done"))
+    ob.close_promise(p.db, first, "delivered", by="coordinator", now=now + 300)
+    later = now + 4 * 3600
+    again = ob.add_order(p, "follow-up", mid, [tid], action_class="read", now=later).split()[1]
+    check(later + 60)
+    assert ob.get(p.db, again)["promise"]["started"] is None, "the run for the first order does not start it"
+    check(later + ob.ORDER_START_S + 60)
+    pr = ob.get(p.db, again)["promise"]
+    assert pr["late"] is not None and len(raised((ob.ORDER_LATE_KIND,))) == 1
+    assert ob.order_starts(p.db, now - 1, now + 1, later + ob.ORDER_START_S + 120) == (2, 1)
+
+
+def test_a_follow_up_order_running_again_within_its_limit_starts_at_the_new_run(env, monkeypatch):
+    """The same task running again within ORDER_START_S of the follow-up's record starts the order at
+    the new run's own start: on time, no order_late, no late count."""
+    from ttp import obligations as ob
+    p, d, now, tid, check, mid, raised = _order_setup(env, monkeypatch)
+    first = ob.add_order(p, "first", mid, [tid], action_class="read", now=now).split()[1]
+    p.db.x("INSERT INTO runs(task, role, started, ended, status) VALUES(?,?,?,?,?)",
+           (tid, "worker", now + 60, now + 120, "done"))
+    ob.close_promise(p.db, first, "delivered", by="coordinator", now=now + 300)
+    later = now + 4 * 3600
+    again = ob.add_order(p, "follow-up", mid, [tid], action_class="read", now=later).split()[1]
+    p.db.x("INSERT INTO runs(task, role, started, ended, status) VALUES(?,?,?,?,?)",
+           (tid, "worker", later + 600, later + 900, "done"))
+    check(later + 700)
+    assert ob.get(p.db, again)["promise"]["started"] == later + 600
+    assert ob.get(p.db, again)["promise"]["late"] is None and raised((ob.ORDER_LATE_KIND,)) == []
+    assert ob.order_starts(p.db, now - 1, now + 1, later + 900) == (2, 0)
+
+
 def test_an_order_whose_owners_are_all_deferred_or_dropped_is_no_late_start(env, monkeypatch):
     """Owners deferred past the start limit (start_after, a start_when probe) or all cancelled unrun leave
     the order out of the late count; the deferral is kept on the order, so it holds after the label goes."""
