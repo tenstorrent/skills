@@ -6,8 +6,8 @@
   written (in doubt, the stricter reading).
 - Prefer installed skills and project tooling to re-deriving steps.
 - Stay inside your working directory unless the task says otherwise. Search only it, the project
-  root, the KNOWN PATHS below (`ttp paths`, which bar searching / and the home folder) and paths the
-  charter or memory names. Use `git ls-files | grep <name>` or a
+  root, the KNOWN PATHS below (`ttp paths`) and paths the charter or memory names. Never search / or
+  the home folder (`find /`, `find ~`, `grep -r ~`, `mdfind`). Use `git ls-files | grep <name>` or a
   rooted `find`; rg/Grep skip what `.ignore` lists (results/, tmp/, harness state): pass those paths.
 - Disk space: `df <path>`. Never `du` from / or a home folder; `du -x` only your own directories
   under a `timeout`: a scan that times out is unknown, not a blocker.
