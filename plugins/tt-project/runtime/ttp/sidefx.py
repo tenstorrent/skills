@@ -464,7 +464,7 @@ LABEL = {"write": "probable write", "executed": "executed", "read": "read", "men
 LISTERS = ("ls argument", "stat argument")   # classify_paths' reason for a path these list
 
 
-def _rank(cls: str, why: str) -> tuple[int, bool]:
+def _use_rank(cls: str, why: str) -> tuple[int, bool]:
     """Which use of a path is kept: the stronger class, then any use over a listing (names only)."""
     return STRENGTH[cls], not why.startswith(LISTERS)
 
@@ -591,7 +591,7 @@ def classify_paths(cmd: str, home: str, cwd: str, run_dir: str, depth: int = 0) 
             found = [word]   # a relative target, under the last cd
         for w in found:
             p = _expand(w, home, cwd, run_dir, base)
-            if p not in out or _rank(cls, why) > _rank(*out[p]):
+            if p not in out or _use_rank(cls, why) > _use_rank(*out[p]):
                 out[p] = (cls, why)
 
     starts = _commands(toks, punct)
@@ -618,7 +618,7 @@ def classify_paths(cmd: str, home: str, cwd: str, run_dir: str, depth: int = 0) 
             for k, a in enumerate(args[:-1]):
                 if re.fullmatch(r"-\w*c", a) and depth < 3:
                     for p, (cls, why) in classify_paths(args[k + 1], home, cwd, run_dir, depth + 1).items():
-                        if p not in out or _rank(cls, why) > _rank(*out[p]):
+                        if p not in out or _use_rank(cls, why) > _use_rank(*out[p]):
                             out[p] = (cls, f"{why} (inner command of {name} {a})")
                     break
             continue
@@ -744,8 +744,8 @@ def scan(run_dir: Path, cwd: str, home: str | None = None) -> list[dict]:
             if f["status"] != "refused":
                 f["guard"] = SEEN_BY   # no hook blocks a write outside the protected paths: say who saw it
             old = found.get(p)
-            if old is None or (old["status"] != "refused", *_rank(old["class"], old["why"])) \
-                    < (f["status"] != "refused", *_rank(cls, why)):
+            if old is None or (old["status"] != "refused", *_use_rank(old["class"], old["why"])) \
+                    < (f["status"] != "refused", *_use_rank(cls, why)):
                 found[p] = f
     return list(found.values())
 
