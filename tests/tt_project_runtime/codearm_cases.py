@@ -2828,8 +2828,10 @@ def test_glm_guard_refuses_every_sidefx_writer_naming_a_computed_loop_variable(m
     from ttp import glmguard, sidefx
     deny, _, _ = _gg9846_hook(monkeypatch, tmp_path)
     for body in ('patch "$f" < /tmp/x.diff', 'wget -O "$f" u', 'unzip -o a.zip -d "$f"', 'curl -s u -o "$f"',
-                 'git checkout -- "$f"', 'git -C "$f" checkout .', 'git clone u "$f"', 'chgrp g "$f"', 'find "$f" -delete', 'sed -i s/a/b/ "$f"',
-                 'perl -pi -e s/a/b/ "$f"', 'rmdir "$f"', 'cp a "$f"', 'echo x | tee -a "$f"'):
+                 'git checkout -- "$f"', 'git -C "$f" checkout .', 'git clone u "$f"', 'chgrp g "$f"',
+                 'find "$f" -delete', 'sed -i s/a/b/ "$f"', 'sed -e s/a/b/ -i "$f"', 'sed s/a/b/ --in-place "$f"',
+                 'perl -pi -e s/a/b/ "$f"', 'perl -p -i -e s/a/b/ "$f"', 'rmdir "$f"', 'cp a "$f"',
+                 'echo x | tee -a "$f"'):
         assert sidefx.WRITE_RE.search(body), body
         for head in ("for f in $(cat l)", "for f in $L"):
             cmd = f"{head}; do {body}; done"
