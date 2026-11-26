@@ -183,7 +183,8 @@ def test_outside_writes_is_high_on_a_home_entry_write_or_a_credential_store_not_
         return sidefx.record(rd, 7, str(wt))["high"]
 
     assert high("source ~/.bashrc", "~/.local/bin/python3 -V", "echo x > ~/.cache/pip/x") is False
-    for cmd in ("echo x >> ~/.bashrc", "echo x > ~/Library/LaunchAgents/x.plist", "cat ~/.netrc"):
+    for cmd in ("echo x >> ~/.bashrc", "echo x > ~/Library/LaunchAgents/x.plist", "cat ~/.netrc",
+                "cp ~/Library/Keychains/login.keychain-db /tmp/k"):
         assert high(cmd) is True, cmd
 
 
@@ -213,9 +214,10 @@ def test_outside_writes_skips_regex_text_ssh_remote_commands_and_saved_tool_outp
     assert found(f"sed -n 1,40p {saved}", f"grep -n x {saved} | head") == set()
     assert not sidefx.sensitive(saved, h) and sidefx.sensitive(f"{h}/.claude/settings.json", h)
     assert sidefx.sensitive(f"{h}/.claude/projects/-wt/memory.md", h)
-    # any hidden home entry and ~/bin are sensitive; visible home paths and the harness's own folder are not
+    # any hidden home entry, ~/bin and a credential store are sensitive; visible home paths and the harness's own folder are not
     assert all(sidefx.sensitive(f"{h}/{x}", h) for x in (".bash_aliases", ".config/autostart/x.desktop", "bin/git",
-                                                         "Library/LaunchAgents/x.plist"))
+                                                         "Library/LaunchAgents/x.plist", "library/LaunchAgents/x",
+                                                         "Library/Keychains/login.keychain-db"))
     assert not any(sidefx.sensitive(f"{h}/{x}", h) for x in ("notes.txt", "work/.hidden", ".tt-project/x", "binx",
                                                              "Library/Caches/x", "Library/LaunchAgentsX"))
     # real writes still count: an awk program's own output file, a grep's redirect, a quoted target

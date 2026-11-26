@@ -164,12 +164,14 @@ def home_entry(path: str, home: str) -> bool:
     rel = path[len(h) + 1:] if path.startswith(h + "/") else ""
     top = rel.split("/", 1)[0]
     return (top.startswith(".") and top not in (".", "..", ".tt-project")) or top == "bin" \
-        or (rel + "/").startswith("Library/LaunchAgents/")
+        or (rel + "/").lower().startswith("library/launchagents/")
 
 
 def sensitive(path: str, home: str) -> bool:
-    """`path` is in a hidden or bin entry of the home (home_entry), not saved tool output."""
-    return not _tool_output(path, home) and home_entry(path, home)
+    """`path` is in a hidden or bin entry of the home (home_entry) or a credential store (credguard.read_refusal,
+    ~/Library/Keychains among them), not saved tool output."""
+    from . import credguard
+    return not _tool_output(path, home) and (home_entry(path, home) or bool(credguard.read_refusal(path, home=home)))
 
 
 def _local_text(cmd: str, depth: int = 0) -> str:
