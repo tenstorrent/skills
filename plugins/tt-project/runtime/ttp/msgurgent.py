@@ -21,12 +21,9 @@ or turn it off). For each one the daemon, with no model call:
 A classifier false positive costs one ack and, if no reply follows, a late notice: nothing else changes.
 The coordinator's turn takes an urgent message ahead of the relay window, debounce and queue (`first`),
 and a turn already running gets it mid-run (`reach`): as a steer update where the provider's hook hands
-updates over (read within `read_s`, 20 s, else the turn is cut; read but with no first finding posted
-(`ttp urgent-reply`) within `answer_s`, 120 s, it is cut too), else the turn is cut after `cut_after_s`
-(20 s) and the next one, which starts past the batching holds, reads the urgent message first. With no
-turn running (a cut turn ended, a failed one, none yet) the daemon starts that next turn in the same
-pass, past the coordinator's failure backoff (`next_turn_due`), not at the end of a full daemon pass.
-Every provider ends with the message in a turn within seconds."""
+updates over (read within `read_s`, else the turn is cut), else the turn is cut after `cut_after_s` and
+the next one, which starts past the batching holds, reads the urgent message first. Every provider ends
+with the message in a turn within seconds."""
 from __future__ import annotations
 
 import json
@@ -42,7 +39,7 @@ ACK_KIND, LATE_KIND = "urgent_ack", "urgent_late"
 EVENT_KIND = "urgent_msg_late"
 REPLY_KINDS = ("reply", "ask")   # an outbound message of these kinds answers the sender
 DEFAULTS = {"enabled": True, "ack_s": 60, "first_s": 300, "second_s": 300, "markers": [], "keep_h": 24,
-            "stale_s": 900, "cut_after_s": 20, "read_s": 20, "answer_s": 120}
+            "stale_s": 900, "cut_after_s": 30, "read_s": 90}
 DONE_STATES = ("done", "failed", "cancelled")
 
 _MARK_RE = re.compile(r"^\s*(?:\[urgent\]|urgent\s*[:!\-]|\*\*urgent\*\*)", re.I)
@@ -197,9 +194,7 @@ def tick(p, cfg: dict | None, now: float | None = None, steer=None) -> list[str]
             rec["acked"] = now
             changed = True
             out.append(f"ack {key}")
-        # A turn that had it and ended with no reply (cut, failed, lost): reached again, so the next turn
-        # is started for it at once (next_turn_due).
-        if rec.get("reached") in (None, "steer") or rec.get("reached") in ("in_turn", "cut") and not _running(db):
+        if rec.get("reached") in (None, "steer"):
             how = reach(p, rec, c, now)
             if how != rec.get("reached"):
                 rec["reached"] = how
@@ -281,19 +276,6 @@ def first(db, cfg: dict | None, msgs: list) -> tuple[list, set]:
     return sorted(msgs, key=lambda m: m["id"] not in ids), ids
 
 
-def next_turn_due(db, cfg: dict | None) -> bool:
-    """An open urgent message no turn has yet and no coordinator turn running: the daemon starts the next
-    turn now, in the same pass and past its failure backoff, not at the end of a full daemon pass. A paused
-    project starts none."""
-    if not config(cfg).get("enabled", True) or db.kv("paused", False) or _running(db):
-        return False
-    for rec in pending(db):
-        row = db.one("SELECT handled FROM messages WHERE id=?", (rec["mid"],))
-        if row and not row["handled"]:
-            return True
-    return False
-
-
 def _running(db):
     return db.one("SELECT id, dir, provider, started, note FROM runs WHERE role='coordinator' AND "
                   "status='running' AND " + coordroute.OWN_SQL + " ORDER BY id DESC LIMIT 1")
@@ -309,8 +291,7 @@ def _in_turn(run, mid: int) -> bool:
 def reach(p, rec: dict, c: dict, now: float) -> str | None:
     """Get the urgent message to the coordinator now. Returns where it stands, kept in the record:
     "next" (no turn runs: the next one starts past the holds), "in_turn" (the running turn already has it
-    in its prompt), "steer" (an update is in the running turn's steer.md, read or not, and no first finding
-    yet: watched until `answer_s`), "cut" (the
+    or read the update), "steer" (an update is in the running turn's steer.md, not read yet), "cut" (the
     turn was stopped to restart with it first: its messages and events stay queued; the session resumes),
     None (a turn that cannot read updates is younger than `cut_after_s`: tried again next pass)."""
     db = p.db
@@ -335,14 +316,11 @@ def reach(p, rec: dict, c: dict, now: float) -> str | None:
             rec["steered"] = now
             return "steer"
         from .hook import unread_update
-        waited = now - float(rec.get("steered") or now)
-        if unread_update(run_dir)[0]:   # no tool call to carry the update (a long reasoning step or a
-            # compaction): restart with it first
-            return "steer" if waited < float(c["read_s"]) else _cut(run_dir)
-        # Read: the record stays "steer" so each pass checks that the first finding follows; tick closes
-        # it at the reply. Read with none posted within answer_s: the turn is cut and the next one,
-        # started at once, has it first.
-        return "steer" if waited < float(c.get("answer_s", DEFAULTS["answer_s"])) else _cut(run_dir)
+        if not unread_update(run_dir)[0]:
+            return "in_turn"
+        if now - float(rec.get("steered") or now) < float(c["read_s"]):
+            return "steer"
+        return _cut(run_dir)   # no tool call to carry the update (a long reasoning step): restart with it first
     if now - float(run["started"] or now) < float(c["cut_after_s"]):
         return None
     return _cut(run_dir)

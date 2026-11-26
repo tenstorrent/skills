@@ -29,10 +29,7 @@ compact_tokens above 0 sets a fixed size instead (the older rollover_* names are
 resumed wake that fails (provider down, a cap, a crash, its process lost) is rerun at once (rerun)
 on the same queued batch, resuming the same session; only a failure that says the provider rejected
 the session id (REJECTED), or REJECT_AFTER failed resumes of the same session in a row in which the
-agent did no work, reruns it as the next session seeded with the hand-off. A wake that failed with the
-agent's auto-compaction thrashing (THRASH: the window sat at the wake's own size) never counts toward
-that: the same session resumes with the cold cap lifted, and no window is ever set under the session's
-floor plus COMPACT_HEADROOM_TOKENS. Each failed resume
+agent did no work, reruns it as the next session seeded with the hand-off. Each failed resume
 records an event, and FAIL_ALERT of them within an hour raise an issue. An auth failure, a reboot,
 a host sleep or a lost network leaves the session as it was: the next wake resumes it.
 
@@ -111,9 +108,6 @@ REJECT_AFTER = 3      # failed resumes of one session in a row, the agent doing 
 REJECTED = re.compile(r"no conversation found|session (?:id )?(?:\S+ )?(?:not found|does not exist|expired)|"
                       r"(?:unknown|invalid|expired) session|no (?:saved )?(?:session|rollout) found|"
                       r"could not (?:find|load) (?:the )?session", re.I)
-# A failed wake's error that says the agent's own auto-compaction kept refilling the context to its limit:
-# the compact window sat at or under the wake's own size. The same session resumes with room (thrash).
-THRASH = re.compile(r"autocompact is thrashing|context refilled to the limit", re.I)
 RECENT_WAKES = 8      # the wakes' own summaries kept for the next session's seed
 RECENT_CHARS = 600    # each one's cap
 LONG_WINDOW = 1_000_000   # a model id ending "[1m]" (Claude's long-context variant)
@@ -322,9 +316,6 @@ def salvaged_line(n) -> str:
 SHRINK_MIN_TOKENS = 20000      # growth over the session's floor below which a shrink frees too little
 SHRINK_MIN_CONTEXT = 100000    # a smaller session is not what makes its wakes dear (and Claude Code's
                                # compaction switch takes no window under it)
-COMPACT_HEADROOM_TOKENS = 60000   # room a compact window keeps over the session's floor (its wake prompt or
-                                  # post-compaction size): the agent's own reserve (about 33k on Claude Code)
-                                  # and a few calls; under it the agent compacts on every call and fails
 
 
 def shrink_due(state) -> bool:
@@ -358,11 +349,8 @@ def _limit(cfg: dict, st: dict, model: str) -> float:
     floor = as_float(st.get("compact_floor"), 0)
     out = max(as_float(st.get("base_tokens"), 0), floor) \
         + as_float(s.get("compact_growth_tokens"), DEFAULTS["compact_growth_tokens"])
-    cold = as_float(st.get("cold_cap_tokens"), 0)
-    if cold and not st.get("thrash"):   # quiet project resuming cold (wakecost.cold_cap): stay under a
-        out = min(out, max(cold, floor + SHRINK_MIN_TOKENS, SHRINK_MIN_CONTEXT))   # waste.wake_usd rewrite
-    # Never at or under what the wake itself fills: the agent would compact on every call (thrash).
-    out = max(out, max(as_float(st.get("base_tokens"), 0), floor) + COMPACT_HEADROOM_TOKENS)
+    if cold := as_float(st.get("cold_cap_tokens"), 0):   # quiet project resuming cold (wakecost.cold_cap): stay
+        out = min(out, max(cold, floor + SHRINK_MIN_TOKENS, SHRINK_MIN_CONTEXT))   # under a waste.wake_usd rewrite
     # A compaction is expected to come back to about the size the last one left (compact_floor): one
     # sooner would free under compact_min_free of the context, so it waits. The window cap below still
     # forces one.
@@ -408,7 +396,6 @@ def record(state, usage, session_id: str, turn: dict, ok: bool, now: float, summ
     st.pop("rejected", None)
     if ok:
         st.pop("idle_fails", None)
-        st.pop("thrash", None)   # the roomier window held: the cold cap applies again
         st.pop("salvaged", None)   # the wake it was told in ran
         if turn.get("salvaged"):   # its answer, cut off at its budget end, was applied: the next wake is told
             st["salvaged"] = int(turn["salvaged"])
@@ -484,14 +471,9 @@ def fail(cfg: dict, state, now: float, error: str = "", idle: bool = False,
     stateless."""
     st = dict(state) if isinstance(state, dict) else {}
     fails = [t for t in (st.get("failures") or []) if isinstance(t, (int, float)) and now - t < 3600] + [now]
-    # Auto-compaction thrashing is the compact window's fault, not the session's: the same session resumes
-    # in place with a window clear of the cold cap (_limit), never counted toward the next session.
-    thrash = bool(THRASH.search(str(error or "")))
-    run = int(as_float(st.get("idle_fails"), 0)) + 1 if idle and not thrash else 0
+    run = int(as_float(st.get("idle_fails"), 0)) + 1 if idle else 0
     st.update({"failures": fails, "rerun": True, "last_why": "resume failed", "fail_error": error,
                "idle_fails": run, "rejected": rejected(error) or run >= REJECT_AFTER})
-    if thrash:
-        st["thrash"] = True
     st.pop("capped_usd", None)
     if capped_usd and float(capped_usd) > 0:
         st["capped_usd"] = round(float(capped_usd), 2)

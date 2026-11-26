@@ -2377,20 +2377,10 @@ Urgent also jumps the queue (part 2). An urgent message skips the debounce and t
 first in the coordinator's digest and tagged `[URGENT: ...]`, and, when a turn is already running, reaches
 it at once: an update in the run's steer file that the turn's hook hands over after its next tool call (the
 same path task updates take). A turn that cannot read updates, or has not read it within
-`urgent_msg.read_s` (20 s), or has read it but posted no first finding within `urgent_msg.answer_s`
-(120 s), is cut at a safe point with a resumable stop: its messages and events stay queued, nothing is
-marked failed, and the next turn resumes the same session with the urgent message first. A turn on a
-provider with no update hook is cut after `urgent_msg.cut_after_s` (20 s). Once no turn runs (a cut or
-failed turn ended) the daemon starts the next one in the same pass, and a turn that failed holding an
-urgent message is retried at once for two failures in a row before the failure backoff applies. The
-queue's other safety holds (spend gates, a stopped provider) still apply. Every provider behaves the same.
-
-A coordinator session's compact window never sits at or under its own wake's size: it keeps 60k tokens
-of room over the wake prompt (or the size its last compaction left), even when a quiet project's cold
-cap would set it lower, since a window the wake refills at once makes the agent compact on every call
-("Autocompact is thrashing") and fail the turn. A turn that still fails that way resumes the same
-session in place with the cold cap lifted until a wake ends ok; it never counts toward starting a new
-session.
+`urgent_msg.read_s` (90 s), is cut at a safe point with a resumable stop: its messages and events stay
+queued, nothing is marked failed, and the next turn resumes the same session with the urgent message
+first. A turn on a provider with no update hook is cut after `urgent_msg.cut_after_s` (30 s). The queue's
+safety holds (backoff, spend gates, a stopped provider) still apply. Every provider behaves the same.
 
 The coordinator's prompt makes the first finding due within 5 minutes with times, exempt from the rule
 that acks wait for the chat digest. During a long turn it posts it with `ttp urgent-reply <chat> <text>`

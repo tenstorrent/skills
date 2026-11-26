@@ -290,10 +290,10 @@ def test_reach_a_hooked_running_turn_gets_the_urgent_update_and_is_cut_only_when
     rec["reached"] = "steer"
     assert msgurgent.reach(p, rec, c, now + 2 + c["read_s"] - 1) == "steer", "cut before read_s"
     assert not (run / "STOP").exists()
-    # The hook reads it: the turn has it and is watched for its first finding until answer_s.
+    # The hook reads it: the turn has the message, so nothing is cut however long it waits.
     text, off = hook.unread_update(run)
     hook.mark_seen(run, off)
-    assert msgurgent.reach(p, rec, c, now + 2 + c["read_s"] + 60) == "steer"
+    assert msgurgent.reach(p, rec, c, now + 2 + c["read_s"] + 60) == "in_turn"
     assert not (run / "STOP").exists()
     # Unread past read_s (a long reasoning step with no tool call): the turn is cut and resumes later.
     p.db.x("UPDATE runs SET status='ok'")
@@ -375,87 +375,3 @@ def test_tick_records_where_the_urgent_message_reached_and_logs_it_once(env):
     out = msgurgent.tick(p, p.config(), now=now + 1 + msgurgent.config(p.config())["read_s"] + 2)
     assert f"reach {mid} cut" in out and (run / "STOP").exists()
     assert not any(o.startswith("reach") for o in msgurgent.tick(p, p.config(), now=now + 200))
-
-
-def test_urgent_an_unread_update_cuts_the_turn_after_20s_and_a_read_one_with_no_first_finding_after_answer_s(env):
-    """Seen in a project: a turn deep in a compaction never read the update and was cut only after 90 s; a turn
-    that read it but spent minutes before `ttp urgent-reply` was never cut. Now: unread past 20 s, or read
-    with no first finding past answer_s, the turn is cut and the next one has it first."""
-    from ttp import hook, msgurgent
-    p = _urgent_project(env)
-    c = msgurgent.config(p.config())
-    assert c["read_s"] == 20 and c["cut_after_s"] == 20 and c["answer_s"] <= 120
-    now = time.time()
-    mid = _urg_inbound(p, "urgent: the live stream is down", ts=now)
-    msgurgent.tick(p, p.config(), now=now + 1)
-    run = _urg_turn(p, env["tmp"], provider="claude", started=now - 600)
-    rec = _urg_rec(p, mid, now)
-    assert msgurgent.reach(p, rec, c, now + 2) == "steer"
-    rec["reached"] = "steer"
-    assert msgurgent.reach(p, rec, c, now + 2 + 21) == "cut", "unread for 21 s: cut"
-    p.db.x("UPDATE runs SET status='ok'")
-    run2 = _urg_turn(p, env["tmp"], provider="claude", started=now - 600)
-    rec2 = _urg_rec(p, mid, now, reached=None)
-    assert msgurgent.reach(p, rec2, c, now + 30) == "steer"
-    rec2["reached"] = "steer"
-    _, off = hook.unread_update(run2)
-    hook.mark_seen(run2, off)
-    assert msgurgent.reach(p, rec2, c, now + 30 + c["answer_s"] - 1) == "steer"
-    assert not (run2 / "STOP").exists()
-    assert msgurgent.reach(p, rec2, c, now + 30 + c["answer_s"] + 1) == "cut", "read, no first finding: cut"
-    assert "preempt" in (run2 / "STOP").read_text()
-
-
-def test_urgent_a_cut_or_failed_turn_is_followed_by_the_next_turn_in_the_same_daemon_pass(env, monkeypatch):
-    """Seen in a project: after the cut the next turn started about 30 s later, one full daemon pass. Now the
-    urgent step starts it itself once no turn runs, and a record whose turn ended unanswered is reached
-    again."""
-    from ttp import msgurgent
-    p, d, clock, starts, _ = _wg_setup(env, monkeypatch)
-    _wg_msg(p, clock, "urgent: the live stream is down for a customer")
-    mid = p.db.one("SELECT id FROM messages WHERE direction='in' ORDER BY id DESC LIMIT 1")["id"]
-    run = _urg_turn(p, env["tmp"], provider="claude", started=clock[0] - 600, messages=(mid,))
-    msgurgent.tick(p, d.cfg, now=clock[0])
-    assert msgurgent.records(p.db)[str(mid)]["reached"] == "in_turn"
-    assert not msgurgent.next_turn_due(p.db, d.cfg), "a turn runs: nothing to start"
-    p.db.x("UPDATE runs SET status='failed' WHERE dir=?", (str(run),))   # the turn died with no reply
-    assert msgurgent.next_turn_due(p.db, d.cfg)
-    d.watch_urgent_messages()
-    assert len(starts) == 1, "the next turn waited for the end of the daemon pass"
-    assert msgurgent.records(p.db)[str(mid)]["reached"] == "next"
-
-
-def test_urgent_a_failed_coordinator_turn_holding_an_urgent_is_retried_past_the_failure_backoff(env, monkeypatch):
-    """A turn that failed with an urgent queued waited out coordinator_backoff_until (60 s and up). Now it is
-    retried at once for URGENT_RETRY_FAILS failures in a row; then the backoff holds (no spend loop)."""
-    from ttp import daemon as dm, msgurgent
-    p, d, clock, starts, _ = _wg_setup(env, monkeypatch)
-    _wg_msg(p, clock, "urgent: the live stream is down for a customer")
-    msgurgent.tick(p, d.cfg, now=clock[0])
-    p.db.set_kv("coordinator_failures", 1)
-    p.db.set_kv("coordinator_backoff_until", clock[0] + 600)
-    assert _turn_within(d, clock, starts, 4, step=1), "the failed urgent turn waited out the backoff"
-    p2, d2, clock2, starts2, _ = _wg_setup(env, monkeypatch)
-    _wg_msg(p2, clock2, "urgent: the live stream is down for a customer")
-    msgurgent.tick(p2, d2.cfg, now=clock2[0])
-    p2.db.set_kv("coordinator_failures", dm.URGENT_RETRY_FAILS + 1)
-    p2.db.set_kv("coordinator_backoff_until", clock2[0] + 600)
-    assert not _turn_within(d2, clock2, starts2, 10, step=1), "past URGENT_RETRY_FAILS the backoff holds"
-
-
-def test_urgent_a_paused_project_starts_no_turn_for_an_urgent_message(env, monkeypatch):
-    """The urgent step runs before the tick's paused return and bypasses the failure backoff: a paused
-    project with an open urgent message and no turn running must still start no coordinator turn."""
-    from ttp import daemon as dm, msgurgent
-    p, d, clock, starts, _ = _wg_setup(env, monkeypatch)
-    _wg_msg(p, clock, "urgent: the live stream is down for a customer")
-    msgurgent.tick(p, d.cfg, now=clock[0])
-    p.db.set_kv("paused", True)
-    p.db.set_kv("coordinator_failures", 1)
-    p.db.set_kv("coordinator_backoff_until", clock[0] + 600)
-    assert not msgurgent.next_turn_due(p.db, d.cfg)
-    d.watch_urgent_messages()
-    d._maybe_coordinate()
-    assert not starts, "a paused project started a coordinator turn"
-    p.db.set_kv("paused", False)
-    assert msgurgent.next_turn_due(p.db, d.cfg)

@@ -644,7 +644,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
     # ack_s and a first finding due first_s after receipt; a miss tells the sender's chat and wakes the
     # coordinator, a second one (second_s later) notifies the user at high. markers: extra words that
     # count as urgent; enabled false: off. Such a message also skips the relay window and debounce.
-    "urgent_msg": {"enabled": True, "ack_s": 60, "first_s": 300, "second_s": 300, "markers": [], "keep_h": 24, "stale_s": 900, "cut_after_s": 20, "read_s": 20, "answer_s": 120},
+    "urgent_msg": {"enabled": True, "ack_s": 60, "first_s": 300, "second_s": 300, "markers": [], "keep_h": 24, "stale_s": 900, "cut_after_s": 30, "read_s": 90},
     # Paths no run writes (pathguard): added to its built-in credential folders, never replacing them;
     # also an account setting (ttp config --account), which every project on the host adds.
     # user_site: "auto" refuses installs into the shared ~/.local while `ttp list` shows several projects

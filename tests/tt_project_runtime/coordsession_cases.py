@@ -3544,23 +3544,3 @@ def test_coordsession_a_quote_only_in_a_relayers_context_gets_no_cite(env):
     assert cs.DATA_LABEL in e["body"] and e["kind"] == "fact", e
     [(_, why)] = coordprecheck.problems(p, [{"type": "obligation", "text": line}])
     assert "cites no user message" in why, why
-
-
-def test_coordsession_the_compact_window_never_sits_at_the_wakes_own_size_and_thrashing_resumes_in_place():
-    """Seen in a project: a cold cap of about 100k against a wake prompt of about 90k gave the agent a compact window
-    it refilled on every call ("Autocompact is thrashing"), and the turn failed. The window now keeps
-    COMPACT_HEADROOM_TOKENS over the session's floor, and a thrash failure resumes the same session (never
-    the next one) with the cold cap lifted until a wake ends ok."""
-    from ttp import coordsession as cs
-    cfg = _cs_cfg(compact_growth_tokens=225000)
-    st = _cs_state(context_tokens=95000, base_tokens=90000, cold_cap_tokens=100000)
-    assert cs.limit(cfg, st) >= 150000   # 90k floor + 60k headroom (COMPACT_HEADROOM_TOKENS); was 100k
-    err = "Autocompact is thrashing: the context refilled to the limit within 3 turns of the previous compact"
-    for _ in range(cs.REJECT_AFTER + 1):
-        st, _alert = cs.fail(cfg, st, 1000.0, error=err, idle=True)
-        assert not st["rejected"], "thrashing started the next session"
-    assert st["rerun"] and st["thrash"] is True
-    assert cs.limit(cfg, st) == 90000 + 225000, "the cold cap still clamped the thrashing session"
-    st = cs.record(st, None, "s1", {"mode": "resume", "provider": "fake", "model": "m", "effort": "high",
-                                    "key": "k1"}, True, 2000.0)
-    assert "thrash" not in st
