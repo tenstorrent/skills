@@ -125,25 +125,27 @@ def shown(db, e: dict, now: float, kind: str = "") -> dict:
         return e
     f = factor(db, kind)
     raw = e["end"]
-    plan = max(0.0, min(float(e.get("deferred") or 0) - now, raw - now))   # the planned wait
-    def scaled(x: float) -> float:
-        """`x` with the correction on its work time only; the planned wait passes unscaled."""
+    def scaled(x: float, start: float | None = e.get("deferred")) -> float:
+        """`x` with the correction on its work time only; the wait for the planned `start` passes unscaled."""
+        plan = max(0.0, min(float(start or 0) - now, x - now))
         return now + plan + f * (x - now - plan) if x > now + plan else x
+    plan = max(0.0, min(float(e.get("deferred") or 0) - now, raw - now))   # the planned wait
     end = scaled(raw)
     p90 = e.get("p90_end")
+    p90_start = e.get("p90_deferred", e.get("deferred"))   # the p90 walk's own planned start
     if end <= now:
         cons = end
     elif isinstance(p90, (int, float)) and p90 > raw:
         # The history's own spread (every leg at its p90, scaled by the same correction); once the ledger
         # has measured its 80th percentile of actual / shown, the larger of the two.
-        cons = scaled(p90)
+        cons = scaled(p90, p90_start)
         if measured_x(db):
             cons = max(cons, now + plan + conservative_x(db) * (end - now - plan))
     else:
         cons = now + plan + conservative_x(db) * (end - now - plan)
     out = {**e, "end": end, "raw_end": raw, "factor": f, "kind": kind, "conservative": max(cons, end)}
     if isinstance(p90, (int, float)):
-        out.update(p90_end=max(scaled(p90), end), raw_p90_end=p90)
+        out.update(p90_end=max(scaled(p90, p90_start), end), raw_p90_end=p90)
     return out
 
 

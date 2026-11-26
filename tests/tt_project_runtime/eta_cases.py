@@ -996,6 +996,17 @@ def test_eta_a_deferred_task_s_likely_and_conservative_times_start_after_its_pla
     ea, eb = eta.estimate(p.db, a, now), eta.estimate(p.db, b, now)   # as queued now, more tasks ahead
     assert eo["end"] == pytest.approx(max(ea["end"], eb["end"])) and eo["conservative"] >= eo["end"]
     assert eo["conservative"] == pytest.approx(max(ea["conservative"], eb["conservative"]))
+    # A dependency whose likely end falls before the planned start but whose p90 end falls after it: the
+    # conservative walk is not planned, so the dependency's p90 work keeps its correction.
+    _eta_history(p, now, kind="measure", runs=(500, 1000, 6000))
+    p.db.set_kv(etaledger.KEY, {"on": True, "factors": {"work": 3.0, "measure": 3.0}, "at": now})
+    dep = p.db.add_task("dep", "s", kind="work")
+    t = p.db.add_task("t", "s", kind="measure", status="waiting", depends_on=[dep])
+    p.db.update_task(t, not_before=now + 6000)
+    ed, et = eta.estimate(p.db, dep, now), eta.estimate(p.db, t, now)
+    assert ed["end"] - now < 6000 < ed["p90_end"] - now, (ed["end"] - now, ed["p90_end"] - now)   # the split
+    assert et["conservative"] >= et["end"] and et["p90_end"] >= et["end"]
+    assert et["p90_end"] - now == pytest.approx(3 * (et["raw_p90_end"] - now)), (et["p90_end"] - now, et["raw_p90_end"] - now)
 
 
 def test_eta_field_dates_a_time_a_week_away():

@@ -375,14 +375,14 @@ class _Est:
             self._depth_in = (qd, rn)
         return depth_factor(*self._depth_in)
 
-    def p90(self, tid: int) -> float | None:
-        """The conservative end of task `tid`: the same walk with every leg at its 90th percentile (None
+    def p90(self, tid: int) -> dict | None:
+        """The conservative estimate of task `tid`: the same walk with every leg at its 90th percentile (None
         when it has no estimate)."""
         if self._hi is None:
             self._hi = _Est(self.db, self.now, self.h, self.core, self.delivery, P90, self.load,
                             self._depth_in)
         e = self._hi.task(int(tid))
-        return None if e["why"] or not e.get("end") else e["end"]
+        return None if e["why"] or not e.get("end") else e
 
     def reports(self) -> list[dict]:
         """The project's `ttp progress report` lines (read once per estimate; none when unreadable)."""
@@ -699,11 +699,12 @@ class _Est:
 
 
 def with_p90(est: _Est, e: dict, tid: int) -> dict:
-    """`e` with `p90_end`: task `tid`'s conservative (p90) end, never before its own end; `e` as it is when
-    it has no estimate or no p90."""
+    """`e` with `p90_end`: task `tid`'s conservative (p90) end, never before its own end, and `p90_deferred`:
+    the planned start of that walk, which can differ from the likely one's; `e` as it is when it has no
+    estimate or no p90."""
     if e.get("why") or not e.get("end") or (p90 := est.p90(tid)) is None:
         return e
-    return {**e, "p90_end": max(p90, e["end"])}
+    return {**e, "p90_end": max(p90["end"], e["end"]), "p90_deferred": p90.get("deferred")}
 
 
 def corrected(db, e: dict, now: float) -> dict:
