@@ -13,12 +13,18 @@ or turn it off). For each one the daemon, with no model call:
 2. keeps the deadlines on disk (kv `urgent_msgs`), so a restart loses none and each fires once;
 3. closes a record at the coordinator's first substantive reply in that chat after receipt (kind reply
    or ask: not the ack, a late notice or a digest line);
-4. at a missed first-finding deadline tells the sender's chat the reply is late with the next check
-   time, raises one high `urgent_msg_late` event whose must-act item wakes the coordinator at once past
-   the batching holds (or, with a turn running, reaches that turn as a steer update), and at a second
-   miss (`second_s` later) notifies the user at high.
+4. with still no reply `hold_s` (4.5 min) after receipt, posts a holding note in the sender's chat (marked
+   as not a finding: when it was received, that the coordinator is on it, the next check), so the chat
+   hears back within 5 minutes even when the turn is still thinking;
+5. at a missed first-finding deadline raises one high `urgent_msg_late` event whose must-act item wakes
+   the coordinator at once past the batching holds (or, with a turn running, reaches that turn as a steer
+   update), and at a second miss (`second_s` later) notifies the user at high.
 
-A classifier false positive costs one ack and, if no reply follows, a late notice: nothing else changes.
+A turn that has the message in its prompt is told first, before its digest (`lead`), to post what it
+knows with `ttp urgent-reply` before it reads anything; one still silent `nudge_s` (2.5 min) after
+receipt gets a steer update saying so, which its hook hands over at its next tool call (`_nudge`).
+
+A classifier false positive costs one ack and, if no reply follows, a holding note: nothing else changes.
 The coordinator's turn takes an urgent message ahead of the relay window, debounce and queue (`first`),
 and a turn already running gets it mid-run (`reach`): as a steer update where the provider's hook hands
 updates over (read within `read_s`, 20 s, else the turn is cut; read but with no first finding posted
@@ -42,7 +48,7 @@ ACK_KIND, LATE_KIND = "urgent_ack", "urgent_late"
 EVENT_KIND = "urgent_msg_late"
 REPLY_KINDS = ("reply", "ask")   # an outbound message of these kinds answers the sender
 DEFAULTS = {"enabled": True, "ack_s": 60, "first_s": 300, "second_s": 300, "markers": [], "keep_h": 24,
-            "stale_s": 900, "cut_after_s": 20, "read_s": 20, "answer_s": 120}
+            "stale_s": 900, "cut_after_s": 20, "read_s": 20, "answer_s": 120, "nudge_s": 150, "hold_s": 270}
 DONE_STATES = ("done", "failed", "cancelled")
 
 _MARK_RE = re.compile(r"^\s*(?:\[urgent\]|urgent\s*[:!\-]|\*\*urgent\*\*)", re.I)
@@ -130,8 +136,7 @@ def ack_text(p, rec: dict) -> str:
         f" (task #{', #'.join(map(str, rec['tasks']))} " + ("owns" if len(rec["tasks"]) == 1 else "own") + " it)"
         if rec.get("tasks") else "")
     return _tagged(p.db, f"Got your urgent message ({timefmt.short(rec['ts'], p, rec['ts'])}). {who}. First finding due by "
-            f"{timefmt.short(rec['find_due'], p, rec['ts'])}; if none arrives by then you get a late notice "
-            f"here with the next check time.")
+            f"{timefmt.short(rec['find_due'], p, rec['ts'])}.")
 
 
 def _tagged(db, text: str) -> str:
@@ -161,7 +166,8 @@ def scan(p, cfg: dict | None, now: float) -> list[dict]:
         rec = {"mid": m["id"], "chat": m["chat"], "ts": ts, "why": why, "tasks": _owners(db, m["text"] or ""),
                "ack_due": ts + float(c["ack_s"]), "find_due": ts + float(c["first_s"]),
                "second_due": ts + float(c["first_s"]) + float(c["second_s"]),
-               "acked": None, "late": None, "escalated": None, "closed": None, "reached": None}
+               "acked": None, "late": None, "escalated": None, "closed": None, "reached": None,
+               "nudged": None, "held": None}
         recs[str(m["id"])] = rec
         new.append(rec)
     db.set_kv(CURSOR, cur)
@@ -206,6 +212,18 @@ def tick(p, cfg: dict | None, now: float | None = None, steer=None) -> list[str]
                 changed = True
                 if how:
                     out.append(f"reach {key} {how}")
+        if rec.get("nudged") is None and now >= rec["ts"] + float(c["nudge_s"]) and _nudge(p, rec, now, steer):
+            rec["nudged"] = now
+            changed = True
+            out.append(f"nudge {key}")
+        if rec.get("held") is None and rec.get("late") is None and now >= rec["ts"] + float(c["hold_s"]):
+            rec["held"] = now
+            changed = True
+            out.append(f"hold {key}")
+            db.post("out", _tagged(db, f"Holding note, not a finding: your urgent message from "
+                                       f"{timefmt.short(rec['ts'], p, now)} is with the coordinator, which has not "
+                                       f"posted its first finding yet. Next check {timefmt.short(rec['find_due'], p, now)}."),
+                    chat=rec["chat"], kind=LATE_KIND, severity="high", keep_tag=True)
         if rec.get("late") is None and now >= rec["find_due"]:
             rec["late"] = now
             changed = True
@@ -225,11 +243,6 @@ def tick(p, cfg: dict | None, now: float | None = None, steer=None) -> list[str]
 
 
 def _late(p, db, rec: dict, c: dict, now: float, steer) -> None:
-    nxt = now + float(c["second_s"])
-    db.post("out", _tagged(db, f"Your urgent message from {timefmt.short(rec['ts'], p, now)} has no finding yet (due "
-                          f"{timefmt.short(rec['find_due'], p, now)}). The coordinator has been woken for it; next "
-                          f"check {timefmt.short(nxt, p, now)}."),
-          chat=rec["chat"], kind="urgent_late", severity="high", keep_tag=True)
     text = (f"Urgent message #{rec['mid']} in chat {rec['chat'] or 'all'} got no finding by "
             f"{timefmt.short(rec['find_due'], p, now)} ({rec['why']}). Post the first finding in that chat now "
             f"(`ttp urgent-reply`, or a reply action), with times.")
@@ -242,6 +255,39 @@ def _late(p, db, rec: dict, c: dict, now: float, steer) -> None:
             steer(text, f"urgent-late-{rec['mid']}")
         except Exception:   # the event still wakes the next turn
             pass
+
+
+def _nudge(p, rec: dict, now: float, steer) -> bool:
+    """A running turn that has the urgent message in its prompt but posted nothing yet: one steer update
+    telling it to post what it knows now (its hook hands it over at the next tool call). True once sent."""
+    if steer is None or rec.get("reached") == "steer":   # a steered turn was already told to post first
+        return False
+    run = _running(p.db)
+    row = p.db.one("SELECT handled FROM messages WHERE id=?", (rec["mid"],))
+    if not run or not (_in_turn(run, rec["mid"]) or (row and row["handled"])):
+        return False
+    try:
+        return bool(steer(f"Urgent message #{rec['mid']} in chat {rec['chat'] or 'all'} (received "
+                          f"{timefmt.short(rec['ts'], p, now)}) still has no finding; due "
+                          f"{timefmt.short(rec['find_due'], p, now)}. Post what you know now: `ttp urgent-reply "
+                          f"{rec['chat'] or 'all'} \"<finding so far, with times>\"`, then keep going.",
+                          f"urgent-nudge-{rec['mid']}"))
+    except Exception:   # the holding note still reaches the chat
+        return False
+
+
+def lead(p, ids) -> str:
+    """The wake prompt's first lines for the open urgent messages among `ids`: post first, then read."""
+    recs = records(p.db)
+    rows = [r for i in sorted(ids or ()) if (r := recs.get(str(i))) and not r.get("closed")]
+    if not rows:
+        return ""
+    now = time.time()
+    return ("## Urgent: post first\nBefore you read or run anything else, post what you know now in each chat "
+            "below (one line, with times), then investigate:\n" + "\n".join(
+                f"- message #{r['mid']}, received {timefmt.short(r['ts'], p, now)}, first finding due "
+                f"{timefmt.short(r['find_due'], p, now)}: `ttp urgent-reply {r['chat'] or 'all'} \"<what you know "
+                f"now, with times>\"`" for r in rows))
 
 
 # the turn ---------------------------------------------------------------------------------------

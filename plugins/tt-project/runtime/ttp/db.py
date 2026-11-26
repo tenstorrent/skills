@@ -1099,7 +1099,7 @@ END""")
              handled: bool = False, provenance: str | None = None, ext_id: str | None = None,
              context: str | None = None, broadcast: str | None = None, keep_tag: bool = False) -> int:
         """`keep_tag` (outbound): keep a trailing AI-authorship tag, for a model-free reply to a sender who
-        may not be the user (msgurgent's ack and late notice).
+        may not be the user (msgurgent's ack and holding note).
         `provenance` (inbound): how the message came in, set by the code that received it, never
         taken from the sender. Only some count as the user's word for a PR approval (prguard).
         `context` (inbound): what a relayer added to the user's words; `text` holds only those words.

@@ -193,7 +193,7 @@ def settle(p, ids, actions, applied, now: float | None = None) -> list[tuple[str
         it = item(ev)
         if not it or not isinstance(actions, list):
             continue
-        if it.get("kind") == URGENT_MSG_KIND:   # msgurgent's watchdog owns the follow-up (late notice, user alert)
+        if it.get("kind") == URGENT_MSG_KIND:   # msgurgent's watchdog owns the follow-up (holding note, user alert)
             continue
         if it.get("kind") == QUEUE_KIND:   # acted: no more raises for this wait; else a new cause or doubled wait does
             if acted(it, actions, applied):

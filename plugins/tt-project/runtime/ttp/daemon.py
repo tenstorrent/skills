@@ -12898,7 +12898,9 @@ class Daemon:
             # The sections rendered from the prompt snapshot end the cached context block.
             cached, parts = coord.split_cached(parts)
             must = mustact.block(db, [e["id"] for e in evs])
-            parts = ([(mustact.SECTION, must)] if must else []) + parts
+            # An urgent message's first post comes before the turn reads anything (msgurgent.lead).
+            urgent_lead = [("urgent_first", t)] if (t := msgurgent.lead(self.p, urgent_msgs)) else []
+            parts = urgent_lead + ([(mustact.SECTION, must)] if must else []) + parts
             parts += [(slowcomplaint.SECTION, speed)] if speed else []
             # Looks due within the wake gap ride this turn, so none starts a wake of its own (look_trim).
             fire = fire + looks.ahead(db, self.cfg, now, {x["id"] for x in fire})
@@ -12931,7 +12933,7 @@ class Daemon:
             parts += [("routine_lane", read_back)] if read_back else []
             prompt = "\n".join(text for _, text in parts)
             # A session wake may send only what changed.
-            full = (([(mustact.SECTION, must)] if must else []) + coord.split_cached(whole)[1]
+            full = (urgent_lead + ([(mustact.SECTION, must)] if must else []) + coord.split_cached(whole)[1]
                     + ([(slowcomplaint.SECTION, speed)] if speed else []) + seen_looks + lead_part
                     + ([("routine_lane", read_back)] if read_back else []))
             session_digest = {"parts": parts, "full": full, "seen": coordsession.fingerprint(baseline),

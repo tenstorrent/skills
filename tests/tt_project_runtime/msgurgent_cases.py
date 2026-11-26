@@ -54,7 +54,7 @@ def test_a_late_notice_fires_once_reaches_the_senders_chat_and_wakes_the_coordin
     assert f"late {mid}" in out
     late = _urg_outs(p, "urgent_late")
     assert len(late) == 1 and late[0]["chat"] == "c1" and late[0]["severity"] == "high"
-    assert "next check" in late[0]["text"] and late[0]["text"].endswith("[authored by AI]")
+    assert "Next check" in late[0]["text"] and late[0]["text"].endswith("[authored by AI]")
     assert len(seen) == 1 and seen[0][1] == f"urgent-late-{mid}" and "first finding" in seen[0][0]
     ev = p.db.q("SELECT * FROM events WHERE kind=?", (msgurgent.EVENT_KIND,))
     assert len(ev) == 1 and ev[0]["severity"] == "high"
@@ -107,7 +107,8 @@ def test_the_coordinators_first_reply_closes_the_deadline(env):
     msgurgent.tick(p, p.config(), now=now + 1)
     p.db.post("out", "digest line", chat="c1", kind="digest")
     p.db.post("out", "it is fixed", chat="c2", kind="reply")
-    assert msgurgent.tick(p, p.config(), now=now + 302) == [f"late {msgurgent.open_for_chat(p.db, 'c1')[0]['mid']}"]
+    c1 = msgurgent.open_for_chat(p.db, 'c1')[0]['mid']
+    assert msgurgent.tick(p, p.config(), now=now + 302) == [f"hold {c1}", f"late {c1}"]
     assert [r["chat"] for r in msgurgent.open_for_chat(p.db, None)] == ["c1"], "only c2 was answered"
     p.db.post("out", "first finding", chat="c1", kind="reply")
     assert msgurgent.tick(p, p.config(), now=now + 900) == []
@@ -459,3 +460,73 @@ def test_urgent_a_paused_project_starts_no_turn_for_an_urgent_message(env, monke
     assert not starts, "a paused project started a coordinator turn"
     p.db.set_kv("paused", False)
     assert msgurgent.next_turn_due(p.db, d.cfg)
+
+
+def _urg_replay(env, turn_at=None, has_it=True, posts_at=None):
+    """One urgent message replayed on a 10 s daemon pass to 330 s after receipt: a coordinator turn from
+    `turn_at` (holding it in its prompt when `has_it`) that posts its own reply at `posts_at` (None:
+    never). Returns (project, run dir, message id, the first chat post after the ack as (s, kind))."""
+    from ttp import msgurgent
+    p = _urgent_project(env)
+    t0 = time.time() - 1000
+    mid = _urg_inbound(p, "urgent: the live stream is down", ts=t0)
+    run, first = None, None
+    for s in range(0, 331, 10):
+        if turn_at is not None and s >= turn_at and run is None:
+            run = _urg_turn(p, env["tmp"], started=t0 + s, messages=(mid,) if has_it else (), hooked=True)
+        if posts_at is not None and s >= posts_at and not _urg_outs(p, "reply"):
+            p.db.post("out", "first finding", chat="c1", kind="reply")
+        msgurgent.tick(p, p.config(), now=t0 + s, steer=lambda t, k: msgurgent.deliver_running(p, t, k))
+        if first is None:
+            got = [o for o in _urg_outs(p) if o["kind"] != "urgent_ack"]
+            first = (s, got[0]["kind"]) if got else None
+    return p, run, mid, first
+
+
+@pytest.mark.parametrize("miss,turn_at", [
+    ("cold turn after a reboot thinks 4.4 min before its first command", 10),
+    ("turn reads build logs for 5 min before posting", 0),
+    ("turn with no tool calls answers only at its end, 5.5 min in", 0),
+])
+def test_urgent_replay_of_the_recorded_misses_gets_a_first_post_into_the_chat_by_4_5_min(env, miss, turn_at):
+    p, run, mid, first = _urg_replay(env, turn_at=turn_at, posts_at=None)
+    assert first and first[0] <= 270 and first[1] == "urgent_late", (miss, first)
+    hold = _urg_outs(p, "urgent_late")[0]["text"]
+    assert hold.startswith("Holding note, not a finding") and "Next check" in hold, hold
+    # The turn holding it was told at 2.5 min to post now: its hook hands that over at its next tool call.
+    body = (run / "steer.md").read_text()
+    assert f"(turn urgent-nudge-{mid})" in body and "ttp urgent-reply c1" in body, body
+    assert body.count("urgent-nudge") == 1, "one nudge per message"
+
+
+def test_urgent_a_turn_that_posts_early_gets_no_nudge_no_holding_note_and_no_late_wake(env):
+    p, run, mid, first = _urg_replay(env, turn_at=0, posts_at=60)
+    assert first == (60, "reply")
+    assert [o["kind"] for o in _urg_outs(p)] == ["urgent_ack", "reply"]
+    assert not (run / "steer.md").exists()
+    assert not p.db.q("SELECT 1 FROM events WHERE kind='urgent_msg_late'")
+
+
+def test_urgent_no_nudge_to_a_turn_without_the_message_and_none_without_a_turn(env):
+    p, run, mid, first = _urg_replay(env, turn_at=None)
+    assert first and first[0] <= 270
+    from ttp import msgurgent
+    rec = msgurgent.records(p.db)[str(mid)]
+    assert rec["nudged"] is None and rec["held"] is not None
+
+
+def test_urgent_the_wake_prompt_leads_with_the_post_first_command_for_open_urgent_messages(env):
+    from ttp import msgurgent
+    p = _urgent_project(env)
+    now = time.time()
+    mid = _urg_inbound(p, "urgent: the live stream is down", ts=now)
+    other = _urg_inbound(p, "urgent: also down", chat="c2", ts=now)
+    msgurgent.tick(p, p.config(), now=now + 1)
+    text = msgurgent.lead(p, {mid, other})
+    assert text.startswith("## Urgent: post first") and "before you read" in text.lower(), text
+    assert 'ttp urgent-reply c1 "' in text and 'ttp urgent-reply c2 "' in text, text
+    assert msgurgent.timefmt.short(now + 300, p, now) in text, text
+    p.db.post("out", "it is fixed", chat="c2", kind="reply")
+    msgurgent.tick(p, p.config(), now=now + 2)
+    assert "c2" not in msgurgent.lead(p, {mid, other}) and msgurgent.lead(p, {other}) == ""
+    assert msgurgent.lead(p, set()) == ""

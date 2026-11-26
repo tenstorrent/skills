@@ -2359,7 +2359,7 @@ model-free classifier sees an urgent marker word (`urgent`, `asap`, `emergency`,
 everything` ...) or a report that a person's live service is broken (a word like down or broken near a
 word like live, stream, production or customers). "Not urgent", "no rush" and "whenever" switch the
 marker words off. `urgent_msg.markers` adds words, `urgent_msg.enabled: false` turns it off; a false
-positive costs one ack and, if no reply follows, one late notice.
+positive costs one ack and, if no reply follows, one holding note.
 
 For each urgent message the daemon, with no model call:
 
@@ -2368,9 +2368,11 @@ For each urgent message the daemon, with no model call:
    `first_s`, 5 min) in the project's home zone, ending with `delivery.ai_tag`;
 2. keeps the deadlines on disk (kv `urgent_msgs`), so a restart loses none and each fires once;
 3. closes them at the coordinator's first substantive reply in that chat after receipt (a reply or an ask:
-   not the ack, a late notice or a digest line);
-4. at a missed first-finding deadline tells the sender's chat the reply is late with the next check time,
-   and raises one high `urgent_msg_late` event: its must-act item wakes the coordinator at once, or, with
+   not the ack, a holding note or a digest line);
+4. with still no reply `urgent_msg.hold_s` (4.5 min) after receipt, posts a holding note in the sender's
+   chat, marked as not a finding (when it arrived, that the coordinator is on it, the next check), so the
+   chat hears back within 5 minutes even while the turn is still thinking;
+5. at a missed first-finding deadline raises one high `urgent_msg_late` event: its must-act item wakes the coordinator at once, or, with
    a turn running, reaches that turn as an update; a second miss (`second_s` later) notifies the user at
    high. Each deadline fires once.
 
@@ -2380,7 +2382,10 @@ it at once: an update in the run's steer file that the turn's hook hands over af
 same path task updates take). A turn that cannot read updates, or has not read it within
 `urgent_msg.read_s` (20 s), or has read it but posted no first finding within `urgent_msg.answer_s`
 (120 s), is cut at a safe point with a resumable stop: its messages and events stay queued, nothing is
-marked failed, and the next turn resumes the same session with the urgent message first. A turn on a
+marked failed, and the next turn resumes the same session with the urgent message first. A turn whose prompt already holds the urgent message starts with an "Urgent: post
+first" section above everything else, naming the exact `ttp urgent-reply <chat> "<text>"` to run before it
+reads anything; if it has still posted nothing `urgent_msg.nudge_s` (2.5 min) after receipt, it gets one
+update telling it to post what it knows now. A turn that posts early sees neither. A turn on a
 provider with no update hook is cut after `urgent_msg.cut_after_s` (20 s). Once no turn runs (a cut or
 failed turn ended) the daemon starts the next one in the same pass, and a turn that failed holding an
 urgent message is retried at once for two failures in a row before the failure backoff applies. The
