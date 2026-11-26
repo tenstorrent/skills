@@ -3715,21 +3715,8 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                             and (named := worktree.spec_line_branch(spec)) is not None:
                         upd["labels"] = _branch_labels(upd.get("labels", json.loads(task["labels"] or "[]")), named)
                 if (asked := a.get("wake_now")) is True or asked in bud.TIER_ORDER:
-                    # A spec change alone lets a task asleep on its retry_when sleep on (Daemon._spec_wake):
-                    # this asks the daemon to wake it, at the tier asked (true: its own), never above its own.
-                    # Requests before the wake run starts make one wake at the highest tier asked.
-                    prev = load_result(upd.get("result") or task["result"])
-                    asleep = (upd.get("not_before", task["not_before"]) or 0) > time.time()
-                    own = upd.get("tier", task["tier"])
-                    if upd.get("status", task["status"]) == "queued" and prev.get("status") == "waiting" \
-                            and str(prev.get("retry_when") or "").strip() and not deferral(task).get("when") \
-                            and (asleep or prev.get("woke") and prev.get("escalated_wake")):
-                        if asleep:
-                            tier = bud.wake_now_tier(asked, own, prev.get("wake_now"))
-                            upd["result"] = dump_result({**prev, "wake_now": tier})
-                        else:   # woken, its run not started yet: it runs once, at the highest tier asked
-                            tier = bud.wake_now_tier(asked, own, prev.get("wake_tier"))
-                            upd["result"] = dump_result({**prev, "wake_tier": tier})
+                    if (woke := _wake_request(task, upd, asked)) is not None:
+                        upd["result"] = woke
                     else:
                         notes.append(f"task_update: #{task['id']} wake_now ignored: it is not asleep on a retry_when "
                                      f"(a start_when deferral wakes by `start_when` \"\"; a blocked task by status queued)")
@@ -4719,6 +4706,14 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
             notes.append(_fan_order(p, oid, msg, steps))
         except Exception as e:
             notes.append(f"user msg #{msg} not told to running tasks: {type(e).__name__}: {str(e)[:200]}")
+    respecs = {int(a["id"]) for i, a in enumerate(actions) if i not in failed and a.get("type") == "task_update"
+               and str(a.get("id") or "").isdigit() and str(a.get("spec") or "").strip()}
+    for oid, msg, steps in fan_orders:   # and every task asleep on a wait whose steps it changed wakes now
+        try:
+            if note := _order_wakes(p, oid, msg, steps, respecs):
+                notes.append(note)
+        except Exception as e:
+            notes.append(f"user msg #{msg} woke no waiting task: {type(e).__name__}: {str(e)[:200]}")
     try:   # a reply already went out: marking what it delivered never undoes or rejects it
         notes += obligations.deliver(p, delivered)
     except Exception as e:
@@ -6300,13 +6295,59 @@ def _fan(p: Project, head: str, **kw) -> str:
         return f"{clip(head, 80)}: running tasks not told: {type(e).__name__}: {str(e)[:200]}"
 
 
+def _wake_request(task, upd: dict, asked) -> str | None:
+    """The result asking the daemon to wake `task` (updated by `upd`), asleep on its retry_when, now: a spec
+    change alone lets it sleep on (Daemon._spec_wake). The tier asked (true: its own) is never above its own;
+    requests before the wake run starts make one wake at the highest tier asked. None when it is not asleep
+    on a retry_when (a start_when deferral, a blocked or running task)."""
+    prev = load_result(upd.get("result") or task["result"])
+    asleep = (upd.get("not_before", task["not_before"]) or 0) > time.time()
+    own = upd.get("tier", task["tier"])
+    if upd.get("status", task["status"]) != "queued" or prev.get("status") != "waiting" \
+            or not str(prev.get("retry_when") or "").strip() or deferral(task).get("when") \
+            or not (asleep or prev.get("woke") and prev.get("escalated_wake")):
+        return None
+    if asleep:
+        return dump_result({**prev, "wake_now": bud.wake_now_tier(asked, own, prev.get("wake_now"))})
+    # woken, its run not started yet: it runs once, at the highest tier asked
+    return dump_result({**prev, "wake_tier": bud.wake_now_tier(asked, own, prev.get("wake_tier"))})
+
+
+ORDER_WAKE_KIND = "user_order_wake"   # event: a user order woke a task asleep on its wait (once per order and task)
+WAKE_ORDER_KEY = "wake_order"   # result: the user message whose order asked this wake (Daemon._spec_wake)
+
+
+def _order_wakes(p: Project, oid: str | None, msg: int, steps, respecs: set[int]) -> str:
+    """A user order recorded in this batch wakes, at its own tier as `wake_now` does, each task asleep on its
+    retry_when whose steps the batch changed: a task_update `spec` (`respecs`), an owner of the order's
+    obligation, or a task still carrying a step it supersedes. A spec note with no order keeps sleeping
+    (Daemon._spec_wake). Once per order and task (ORDER_WAKE_KIND); the daemon's holds still apply."""
+    o = obligations.get(p.db, oid) if oid else obligations.open_order(p.db, msg)
+    ids = set(respecs) | set(obligations._owner_ids(o) if o else ())
+    if steps:
+        ids |= {int(t["id"]) for t in p.db.q("SELECT id, spec, created FROM tasks WHERE status='queued'")
+                if (hit := supersede.superseded_step(p.db, t)) and hit[0] == int(msg)}
+    woke = []
+    for tid in sorted(ids):
+        task = p.db.task(tid)
+        if not task or any(json.loads(e["data"] or "{}").get("msg") == int(msg) for e in p.db.q(
+                "SELECT data FROM events WHERE task=? AND kind=?", (tid, ORDER_WAKE_KIND))):
+            continue
+        if (res := _wake_request(task, {}, True)) is None:
+            continue
+        p.db.update_task(tid, result=dump_result({**load_result(res), WAKE_ORDER_KEY: int(msg)}))
+        p.db.x("INSERT INTO events(ts,source,kind,severity,text,data,status,task) VALUES(?,?,?,?,?,?,?,?)",
+               (time.time(), "coordinator", ORDER_WAKE_KIND, "low", f"user msg #{msg} wakes #{tid}",
+                json.dumps({"msg": int(msg)}), "handled", tid))
+        woke.append(tid)
+    return f"user msg #{msg} wakes waiting " + ", ".join(f"#{t}" for t in woke) if woke else ""
+
+
 def _fan_order(p: Project, oid: str | None, msg: int, steps) -> str:
     """Tell the running tasks the order of user message `msg` affects (userorder.fan_out): its obligation's
     owners (`oid`, else the open order recorded for `msg`), tasks answering its chat, and tasks whose spec,
     branch or resources name what it names. Returns its note."""
-    o = obligations.get(p.db, oid) if oid else next(
-        (x for x in obligations.items(p.db) if (x.get("promise") or {}).get("order") == int(msg)
-         and not x.get("receipt") and not x.get("dropped")), None)
+    o = obligations.get(p.db, oid) if oid else obligations.open_order(p.db, msg)
     o = o or {}
     pr = o.get("promise") or {}
     words = o.get("text") or ""

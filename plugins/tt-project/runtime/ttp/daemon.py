@@ -18200,6 +18200,7 @@ class Daemon:
                                                      got[1]), **(extra or {})}
         extra, why = _with_pending_spec(task, prev, {waketier.KEY: kind, **(extra or {})}, why)
         prev.pop(SPEC_WAKE_NOW_KEY, None)
+        prev.pop(coord.WAKE_ORDER_KEY, None)
         self.p.db.update_task(tid, not_before=min(task["not_before"] or now, now),
                               result=dump_result({**prev, **extra, "woke": why}))
         self._urgent_woke_from[tid] = (why, min(task["not_before"] or now, now))   # check_urgent_start counts from it
@@ -18213,15 +18214,15 @@ class Daemon:
         the coordinator or the user; a worker writes no spec) sleeps on: the change applies when its wait
         ends (_probe_passed, or any other _wake_waiting, wakes it at its own tier with the change), priority
         1 too. It wakes at once only when the change adds an `urgent:` line (_urgent_added), once per wait
-        key (SPEC_URGENT_WOKE_KEY), or when a task_update `wake_now` asks it to (SPEC_WAKE_NOW_KEY, which
-        needs no spec change). The hand-off keeps the digest of the spec it slept on; the wake stores the
+        key (SPEC_URGENT_WOKE_KEY), or when a task_update `wake_now` or a user order recorded in the same batch
+        asks it to (SPEC_WAKE_NOW_KEY, which needs no spec change; coord._order_wakes). The hand-off keeps the digest of the spec it slept on; the wake stores the
         new one, so several edits between ticks wake it once and a re-sleep on that spec stays asleep. Another hold keeps it asleep with the old digest
         (_spec_wake_hold): it wakes once that hold is over, if the probe has not woken it first. At most
         SPEC_WAKES_PER_H an hour. A wake_now wakes at the tier it asked (bud.wake_now_tier: never above the
         task's own); within SPEC_WAKE_COALESCE_S of the last spec wake it waits for that window to end
-        (an added `urgent:` line does not), and the requests that came meanwhile wake once. After a
-        spec wake whose run handed back the same wait (SPEC_HOLD_KEY) it sleeps on until that hold ends,
-        noted on its row; only an urgent wake_now on a changed wait key goes past it. True when it woke."""
+        (an added `urgent:` line or a user order does not), and the requests that came meanwhile wake once.
+        After a spec wake whose run handed back the same wait (SPEC_HOLD_KEY) it sleeps on until that hold
+        ends, noted on its row; only a user order or an urgent wake_now on a changed wait key goes past it. True when it woke."""
         from .prompts import spec_digest
         seen, sha, tid = prev.get(SPEC_SEEN_KEY), spec_digest(t), t["id"]
         asked = prev.get(SPEC_WAKE_NOW_KEY)
@@ -18240,9 +18241,10 @@ class Daemon:
                             f"its own tier when its wait ends" + ("" if not added else
                             " (an urgent spec wake already woke it on this wait)"))
             return False
+        ordered = bool(asked) and prev.get(coord.WAKE_ORDER_KEY) is not None   # a user order's wake (coord._order_wakes)
         hold = prev.get(SPEC_HOLD_KEY)
         if isinstance(hold, dict) and isinstance(hold.get("until"), (int, float)) and now < hold["until"] \
-                and not (hurry and asked and _wait_key(prev) != hold.get("key")):
+                and not ordered and not (hurry and asked and _wait_key(prev) != hold.get("key")):
             if tid not in self._spec_held:
                 self._spec_held.add(tid)
                 log(self.p, f"task {tid}: its last spec wake handed back the same wait; this one sleeps on its "
@@ -18258,7 +18260,7 @@ class Daemon:
                 log(self.p, f"task {tid}: its spec changed, but it woke {len(wakes)} times in the last hour "
                             f"on spec changes; it sleeps on its retry_when until that falls under {SPEC_WAKES_PER_H}")
             return False
-        if not hurry and wakes and now - max(wakes) < SPEC_WAKE_COALESCE_S:
+        if not (hurry or ordered) and wakes and now - max(wakes) < SPEC_WAKE_COALESCE_S:
             if tid not in self._spec_coalesced:
                 self._spec_coalesced.add(tid)
                 log(self.p, f"task {tid}: wake_now came within {SPEC_WAKE_COALESCE_S // 60} min of its last spec "

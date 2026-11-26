@@ -1001,3 +1001,106 @@ def test_a_planned_check_due_under_a_dormant_spec_update_starts_no_run_and_the_u
     assert _run_until(d, p, lambda: runs() == 2)
     wake = _last_wake(p, tid)
     assert wake.get("reason") == "spec_change" and wake.get("tier") == "standard" and wake.get("escalated") is True, wake
+
+
+def _wake_order_msg(p, text="stop using that setting now"):
+    return p.db.x("INSERT INTO messages(ts,chat,direction,text) VALUES(?,?,?,?)", (time.time() - 30, "c", "in", text))
+
+
+def _respec_with_order(p, tid, mid, spec="Stop: never use that setting again.", **order):
+    """One coordinator batch recording user msg `mid`'s order and re-specifying waiting task `tid`."""
+    from ttp import coordinator as coord
+    assert coord.apply(p, [{"type": "obligation", "order": mid, "text": "stop using that setting",
+                            "action_class": "change", **order},
+                           {"type": "task_update", "id": tid, "spec": spec}]) == []
+
+
+def test_a_user_order_that_respecs_a_sleeping_task_wakes_it_once_and_its_run_reads_the_update(env, monkeypatch):
+    """An order recorded in the batch that re-specifies a task asleep on its retry_when wakes it at once, at its
+    own tier and past the coalesce window of an earlier spec wake, as wake_now does; the woken run is told to act
+    on the spec's latest `## Update` first. The same order recorded again wakes it no more."""
+    from ttp import coordinator as coord
+    p = make(env)
+    tid = _spec_sleeper(p)
+    d = _spec_daemon(p, monkeypatch)
+    res = json.loads(p.db.task(tid)["result"])   # a spec wake 10 minutes ago: a plain wake_now would wait
+    p.db.update_task(tid, result=json.dumps({**res, "spec_wakes": [time.time() - 600]}))
+    mid = _wake_order_msg(p)
+    _respec_with_order(p, tid, mid)
+    d.probe_waiting()
+    t = p.db.task(tid)
+    res = json.loads(t["result"])
+    assert not _asleep(p, tid) and t["status"] == "queued", "the order did not wake it"
+    assert res["woke"].startswith("its spec changed") and "latest `## Update`" in res["woke"]
+    assert res["wake_tier"] == t["tier"] and "wake_now" not in res and coord.WAKE_ORDER_KEY not in res
+    assert t["spec"].rstrip().endswith("never use that setting again.")
+    assert len(p.db.q("SELECT id FROM events WHERE task=? AND kind=?", (tid, coord.ORDER_WAKE_KIND))) == 1
+    # Back asleep on its hand-off: the same order, recorded again with another note, wakes it no more.
+    p.db.update_task(tid, not_before=time.time() + 3600, result=json.dumps({**res, "woke": "", "spec_wakes": []}))
+    assert coord.apply(p, [{"type": "obligation", "order": mid, "text": "stop using that setting",
+                            "action_class": "change", "owners": [tid]}]) == []
+    d.probe_waiting()
+    assert _asleep(p, tid)
+    assert len(p.db.q("SELECT id FROM events WHERE task=? AND kind=?", (tid, coord.ORDER_WAKE_KIND))) == 1
+
+
+def test_a_spec_note_without_a_user_order_leaves_a_sleeping_task_asleep(env, monkeypatch):
+    p = make(env)
+    tid = _spec_sleeper(p)
+    d = _spec_daemon(p, monkeypatch)
+    _edit_spec(p, tid, "also report the peak memory", wake_now=False)
+    d.probe_waiting()
+    assert _asleep(p, tid), "a spec note with no order sleeps on until its wait ends"
+    assert "wake_now" not in json.loads(p.db.task(tid)["result"])
+
+
+def test_a_user_order_wakes_a_sleeping_owner_it_names_without_a_spec_update(env, monkeypatch):
+    p = make(env)
+    tid = _spec_sleeper(p)
+    d = _spec_daemon(p, monkeypatch)
+    from ttp import coordinator as coord
+    mid = _wake_order_msg(p)
+    assert coord.apply(p, [{"type": "obligation", "order": mid, "text": "stop using that setting",
+                            "action_class": "change", "owners": [tid]}]) == []
+    d.probe_waiting()
+    assert not _asleep(p, tid), "the order's owner did not wake"
+
+
+def test_a_user_order_never_wakes_a_task_in_a_paused_project_or_on_a_paused_resource(env, monkeypatch):
+    """Holds win over an order's wake: the task stays asleep while its project or resource is paused, and
+    wakes once the hold lifts."""
+    from ttp import coordinator as coord
+    p = make(env)
+    d = _spec_daemon(p, monkeypatch)
+    tid = _spec_sleeper(p, labels=["resource:board"])
+    coord.pause_resource(p, "board", True, reason="maintenance")
+    _respec_with_order(p, tid, _wake_order_msg(p))
+    d.probe_waiting()
+    assert _asleep(p, tid), "a paused resource holds the order's wake"
+    coord.pause_resource(p, "board", False)
+    d.probe_waiting()
+    assert not _asleep(p, tid), "the hold lifted: the order's wake goes ahead"
+    other = _spec_sleeper(p)
+    p.db.set_paused(True, by="user")
+    _respec_with_order(p, other, _wake_order_msg(p, "and stop the other one"))
+    d.tick()
+    assert _asleep(p, other), "a paused project starts nothing, an order's wake included"
+    assert not p.db.q("SELECT id FROM runs WHERE task=?", (other,))
+
+
+def test_a_user_order_wakes_a_sleeping_task_that_still_carries_a_step_it_supersedes(env, monkeypatch):
+    from ttp import coordinator as coord
+    p = make(env)
+    tid = _spec_sleeper(p)
+    p.db.update_task(tid, spec="Step 1: run the soak with the old clock setting.\nStep 2: report.")
+    p.db.x("UPDATE tasks SET created=created-120 WHERE id=?", (tid,))
+    res = json.loads(p.db.task(tid)["result"])
+    from ttp.prompts import spec_digest
+    p.db.update_task(tid, result=json.dumps({**res, "spec_seen": spec_digest(p.db.task(tid))}))
+    d = _spec_daemon(p, monkeypatch)
+    mid = _wake_order_msg(p, "stop the old clock setting")
+    assert coord.apply(p, [{"type": "obligation", "order": mid, "text": "no old clock setting", "action_class": "change",
+                            "supersedes": ["run the soak with the old clock setting"]}]) == []
+    d.probe_waiting()
+    assert not _asleep(p, tid), "the task carrying the superseded step slept on"
+    assert len(p.db.q("SELECT id FROM events WHERE task=? AND kind=?", (tid, coord.ORDER_WAKE_KIND))) == 1
