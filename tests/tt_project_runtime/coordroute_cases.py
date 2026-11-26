@@ -970,14 +970,16 @@ def test_coordroute_an_outside_writes_event_of_only_reads_is_routine(env):
                                                          "data": data}])[0]
 
 
-def test_coordroute_the_lane_never_renews_a_mute_in_force(env):
-    """Renewing replaces a mute's end (and may carry its hold), so only a new source and match is the lane's."""
+def test_coordroute_the_lane_never_renews_a_device_hold_mute(env):
+    """Renewing a mute carries its hold (screen.mute), so the lane refuses one whose mute in force is a hold."""
     from ttp import coordroute, screen
     p = _cr_db(env)
     screen.mute(p.db, "watcher:x", "queue wait", 6, why="known")
+    screen.mute(p.db, "watcher:h", "box down", 1, why="known", escalate_after_h=1)
+    p.db.set_kv(screen.MUTES_KEY, [{**m, "hold": m["source"] == "watcher:h"} for m in p.db.kv(screen.MUTES_KEY, [])])
     mute = lambda **kw: {"type": "observation_mute", "source": "watcher:x", "match": "queue wait", "why": "known",
                          "hours": 6, **kw}
-    ok, refused, _ = coordroute.filter_actions([mute(), mute(source="WATCHER:X", match="Queue Wait"),
-                                                mute(match="stale gate"), mute(source="watcher:y")], (), p)
-    assert ok == [2, 3] and [w for _, w in refused] == ["observation_mute renewing a mute in force"] * 2
-    assert coordroute.filter_actions([mute()])[0] == [0]
+    acts = [mute(), mute(source="WATCHER:H", match="Box Down"), mute(source="watcher:y", match="box down")]
+    ok, refused, _ = coordroute.filter_actions(acts, (), p)
+    assert ok == [0, 2] and [w for _, w in refused] == ["observation_mute of a device hold"]
+    assert coordroute.filter_actions(acts)[0] == [0, 1, 2]

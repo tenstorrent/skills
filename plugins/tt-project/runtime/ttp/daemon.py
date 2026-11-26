@@ -6984,7 +6984,7 @@ class Daemon:
             if not lane and coordroute.shadow_path(self.p.state, r["id"]).exists():   # a shadowed turn's side
                 coordroute.shadow_side(self.p.state, r["id"], "opus", actions, status,
                                        float(getattr(usage, "cost_usd", 0) or 0),
-                                       max(0.0, time.time() - float(r.get("started") or time.time())))
+                                       max(0.0, time.time() - float(r.get("started") or time.time())), self.p)
             if lane and self._finish_lane(r, usage, status, note, lane, actions):
                 return
         except Exception:   # a lane turn that cannot be judged applies nothing

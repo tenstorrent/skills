@@ -374,11 +374,11 @@ def _refusal(a, p=None) -> str:
             hours = None
         if hours is None or not 0 < hours <= LANE_MUTE_MAX_H:
             return f"observation_mute for more than {LANE_MUTE_MAX_H} h or without hours"
-        if screen.holds_mute(str(a.get("match") or "")):
+        match = str(a.get("match") or "")
+        old = next((m for m in screen.mutes(p.db) if screen._same_mute(m, str(a.get("source") or ""), match)),
+                   None) if p is not None else None
+        if screen.holds_mute(match) or old and (old.get("hold") or screen.holds_mute(match, old)):
             return "observation_mute of a device hold"
-        if p is not None and any(screen._same_mute(m, str(a.get("source") or ""), str(a.get("match") or ""))
-                                 for m in screen.mutes(p.db)):
-            return "observation_mute renewing a mute in force"
     if t == "obligation" and not (set(a) <= {"type", "key", "owners", "why"} and a.get("key") and a.get("owners")):
         return "obligation beyond attaching owners"
     return ""
