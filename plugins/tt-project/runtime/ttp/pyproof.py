@@ -279,6 +279,15 @@ class _Proof:
             arg = fixed.rsplit("/", 1)[0] if "/" in fixed else "."
         return self._place(os.path.join(folder, arg), False, search=True)
 
+    def _own_module(self, path: str) -> bool:
+        """A module file of the worktree's own code: inside the working folder, named like no standard or start-up
+        module python could load from there instead (`json.py`, `json/__init__.py`, `sitecustomize.py`), no `.pth`."""
+        real = os.path.realpath(os.path.join(self.cwd, os.path.expanduser(path)))
+        name = os.path.relpath(real, self.cwd).split(os.sep, 1)[0].split(".", 1)[0]   # what an import names
+        return not real.endswith(".pth") and real.startswith(os.path.realpath(self.cwd).rstrip("/") + "/") \
+            and name not in (*sys.stdlib_module_names, *sys.builtin_module_names, "sitecustomize", "usercustomize") \
+            and not name.startswith("_")
+
     def _place(self, path: str, writes: bool, search: bool = False) -> bool:
         from . import credguard, hook, pathguard, untrusted
         home = str(self.env.get("HOME") or os.path.expanduser("~"))
@@ -286,8 +295,8 @@ class _Proof:
         mine = [os.path.realpath(r).rstrip("/") + "/" for r in [self.cwd, *filter(None, (
             self.env.get("TMPDIR"), self.env.get("TTP_RUN_DIR")))]]
         self.wrote |= writes
-        if writes and path.endswith((*importlib.machinery.all_suffixes(), ".pth")):   # a module python may import
-            return False
+        if writes and path.endswith((*importlib.machinery.all_suffixes(), ".pth")) and not self._own_module(path):
+            return False   # a module python may import in place of the one it names
         for base in self.bases:
             real = os.path.realpath(os.path.join(base, path))
             if os.path.basename(real) == untrusted.RUN_MARK:   # the run's mark of untrusted input: the guards judge it

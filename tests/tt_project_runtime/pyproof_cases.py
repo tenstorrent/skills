@@ -305,3 +305,15 @@ def test_pyproof_passes_the_own_runtime_and_judges_computed_paths_only_under_the
     for code in (f"open('~/{_SSH}/id_rsa').read()", "exec(input())", "eval(open('x').read())",
                  "import os\nos.environ['TMPDIR']='/home'", "import sys\nexec(sys.argv[1])"):
         assert not pyproof.harmless(code, str(tmp_path), audited=True), code
+
+
+def test_pyproof_lets_a_snippet_edit_its_own_worktree_code_and_refuses_a_module_python_would_load_instead(tmp_path):
+    """cells: own_module_write. Editing the worktree's own module (the common read, replace, write) is no harm; a
+    file named like a standard or start-up module, a .pth, or one outside the worktree stays unproven."""
+    from ttp import pyproof
+    for code in ("p='tool.py'\ns=open(p).read()\nopen(p,'w').write(s.replace('a','b'))",
+                 "from pathlib import Path\nPath('pkg/mod.py').write_text('x')", "open('pkg/json.py','w')"):
+        assert pyproof.harmless(code, str(tmp_path), {}), code
+    for code in ("open('json.py','w').write('x')", "open('json/__init__.py','w')", "open('sitecustomize.py','w')",
+                 "open('x.pth','w')", "open('../y.py','w')", "open('_x.py','w')"):
+        assert not pyproof.harmless(code, str(tmp_path), {}), code
