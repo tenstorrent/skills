@@ -484,8 +484,7 @@ def _own_writes(name: str, code: str, home: str, cwd: str, run_dir: str, base: s
     """Inline Python whose every write the Python prover (pyproof) places under the run's own folders (the
     working folder, the run folder): its other paths are then only text it holds (a replacement string)."""
     from . import pyproof
-    return name.startswith("python") and pyproof._prove(code, cwd, {"HOME": home, "TTP_RUN_DIR": run_dir},
-                                                         [base or cwd]) is not None
+    return name.startswith("python") and pyproof.harmless(code, cwd, {"HOME": home, "TTP_RUN_DIR": run_dir}, [base or cwd])
 
 
 def commands(cmd: str, depth: int = 0) -> list[str]:

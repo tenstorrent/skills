@@ -3057,6 +3057,8 @@ def test_a_glm_run_runs_a_program_name_from_a_variable_once_its_value_is_written
     ("T=ls; echo x | T=bash; echo y | $T", glmguard_hidden),                 # set in a pipe's subshell
     ("T=ls; . ./env.sh; echo y | $T", glmguard_hidden),
     ("echo a; false && T=bash; echo x | $T", glmguard_hidden),               # set only if a test passes
+    ("echo a; false &&\nT=bash; echo x | $T", glmguard_hidden),             # the same, over two lines
+    ("echo a; echo x |\nT=bash; echo y | $T", glmguard_hidden),
     ("echo a; T=X=bash; echo x | $T", glmguard_hidden)])                     # a value that reads as a setting
 def test_a_variable_written_out_still_stops_harm(cmd, harm, monkeypatch, tmp_path):
     _fresh_home(monkeypatch, tmp_path)

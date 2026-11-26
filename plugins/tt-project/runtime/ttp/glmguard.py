@@ -930,7 +930,7 @@ def _set_once(text: str, home: str) -> str:
     value = next(v for v in (m[2], m[3], m[4]) if v is not None)
     value = home + value[1:] if m[4] is not None and value.startswith("~/") else value
     rest = text[m.end():]
-    if not _SAFE_VALUE.fullmatch(value) or not _reads_only(m[1], rest):
+    if not _SAFE_VALUE.fullmatch(value) or "=" in value or not _reads_only(m[1], rest):
         return text
     state = _unquoted(rest)[1]
     return text[:m.end()] + _set_once(_put(rest, state, m[1], value), home)
@@ -990,6 +990,7 @@ def resolved(cmd: str, env) -> str:
         for b in [0] + [x.end() for x in re.finditer(r";|\n", plain)]:
             m = _SET_HEAD.match(head, b) if b >= start else None
             if not m or _SPECIAL_NAME.fullmatch(m[1]) or _NOT_SIMPLE.search(plain[:b]) \
+                    or re.search(r"(?:&&|\||\\)\s*$", plain[:b]) \
                     or re.search(rf"(?<![\w-]){m[1]}(?!\w)", _plain(head[:b])):
                 continue
             value = next(v for v in (m[2], m[3], m[4]) if v is not None)
