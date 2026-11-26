@@ -1700,7 +1700,14 @@ def test_ack_wait_terminal_counts_a_reply_closing_the_request_without_a_run_but_
                  "Closing this request without a run? Not at all; I will measure it tomorrow.",
                  "Withdrawing the request would be wrong; I will rerun it tomorrow.",
                  "Passed: 41 s. I declined your second rerun request.",
-                 "Done in 41 s, measured without a result cache; closing the request."):
+                 "Done in 41 s, measured without a result cache; closing the request.",
+                 "Closing your request without a run is not an option; measuring it now.",
+                 "Closing the request without a run makes no sense, so I am running it now.",
+                 "Declining the request is not needed; the run is going now.",
+                 "Closing this request without a run? No. Measuring it now.",
+                 "Withdrawing my request was a mistake, the run is going now.",
+                 "Passed: 41 s. I declined your rerun request.",
+                 "Timing passed at 41 s; declined the rerun request since the numbers are stable."):
         assert not ackwait.closed(text), text
     # the status line decides, as for any reply: a result naming something closed is still done
     assert ackwait.terminal("status: done; the old request is closed") is True
