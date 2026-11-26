@@ -3033,14 +3033,24 @@ def _fresh_home(monkeypatch, tmp_path):
 @_pytest.mark.parametrize("cmd,seen", [
     ("echo a; T=ls; $T -d /", "/"),                                           # a literal set mid-command
     ("cd /; T=$(command -v ls); $T -d /", "/"),                               # set mid-command from a $(...)
-    ("$TTP_RUN_DIR || echo ok", "ok"),                                       # the run folder as the program word
-    ("echo a; T=ls; $T -d / && cat <<'EOF'\n$T x\nEOF", "$T x")])            # a quoted heredoc body stays as written
+    ("$TTP_RUN_DIR || echo ok", "ok")])                                      # the run folder as the program word
 def test_a_glm_run_runs_a_program_name_from_a_variable_once_its_value_is_written_out(cmd, seen, monkeypatch, tmp_path):
     from ttp import glmguard
     _fresh_home(monkeypatch, tmp_path)
     assert glmguard.HIDDEN_WHY in glmguard.shell_refusal(cmd, str(tmp_path), "")   # refused up front before
     kind, rc, text = _glm_staged(monkeypatch, tmp_path, cmd)
     assert kind == "staged" and rc == 0 and seen in text, text
+
+
+@_pytest.mark.parametrize("cmd", [
+    "echo a; T=ls; $T -d /; cat > notes.txt <<'EOF'\neval \"make all\"\nEOF",
+    "cat > notes.txt <<'EOF'\neval \"make all\"\nEOF"])
+def test_staging_never_changes_a_heredoc_command(cmd, monkeypatch, tmp_path):
+    _fresh_home(monkeypatch, tmp_path)
+    kind, _, text = _glm_staged(monkeypatch, tmp_path, cmd)
+    assert kind != "staged", text
+    if kind != "deny":   # where it runs, the file holds the body as written
+        assert (tmp_path / "wt" / "notes.txt").read_text() == 'eval "make all"\n'
 
 
 @_pytest.mark.parametrize("cmd,harm", [

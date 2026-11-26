@@ -1501,12 +1501,13 @@ def _staged(payload: dict, judged: dict) -> dict | None:
     `$(...)` the rules pass runs alone first and its output is written in (glmguard.staged_parts, written_in), and
     so is each variable read glmguard.resolved can write out; the literal command is judged by every rule and, if
     it passes, runs as judged; a harmful one is refused
-    with its reason. None when it cannot be staged: the up-front refusal stands."""
+    with its reason. None when it cannot be staged (a heredoc command never is: its bodies are files, not
+    commands): the up-front refusal stands."""
     from . import glmguard
     args, cmd = payload.get("tool_input"), (judged.get("tool_input") or {}).get("command")
     cwd = str(payload.get("cwd") or os.getcwd())
     if glmguard.glm_run() is None or not isinstance(args, dict) or not isinstance(cmd, str) or glmguard.HIDDEN_WHY not in (
-            glmguard.shell_refusal(cmd, cwd, os.environ.get("TTP_RUN_DIR", "")) or ""):
+            glmguard.shell_refusal(cmd, cwd, os.environ.get("TTP_RUN_DIR", "")) or "") or "<<" in args["command"]:
         return None
     if (parts := glmguard.staged_parts(args["command"])) is not None:   # as written: a loop runs it once
         cmd = args["command"]
