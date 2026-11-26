@@ -432,7 +432,7 @@ def rewrite(cmd: str, cwd: str, env=None) -> str | None:
         return None
     env = os.environ if env is None else env
     cmd, prefixed = _own_pythonpath(cmd, cwd)
-    segments = hook._segments(cmd, strip=False)   # a cd before the snippet: its relative paths start anywhere it may go
+    segments = hook._segments(_run_vars(cmd, env), strip=False)   # a cd before the snippet: its paths start there
     moves = any(argv and (os.path.basename(argv[0]) in ("cd", "pushd", "popd")
                           or any(w.startswith(("-C", "--chdir")) for w in argv)) for argv in segments)
     bases = credguard._cwds(segments, cwd, str(env.get("HOME") or os.path.expanduser("~"))) if moves else None
@@ -446,8 +446,8 @@ def rewrite(cmd: str, cwd: str, env=None) -> str | None:
     def shadowed(i: int, pos: int) -> bool:
         """python may import another module than the standard one the snippet at `pos` of line `i` names: read on
         the command up to the end of its pipeline (what runs before or beside it); what runs after it cannot."""
-        return _may_shadow("\n".join([*lines[:i], lines[i][:_pipeline_end(lines[i], pos)]]), shadow_cwds, env,
-                           prefixed)
+        return _may_shadow(_run_vars("\n".join([*lines[:i], lines[i][:_pipeline_end(lines[i], pos)]]), env),
+                           shadow_cwds, env, prefixed)
     own = prefixed or any(_own_runtime(d, [cwd, *(bases or [])]) for d in [*(bases or [cwd]), *[
         e for e in str(env.get("PYTHONPATH") or "").split(os.pathsep) if e]])
     audited = _audited(env) and not prefixed and not re.search(r"(?<![^\s;&|(])env\s+-", cmd)
@@ -588,6 +588,22 @@ READERS = {"cat", "echo", "ls", "head", "tail", "grep", "wc", "true", "pwd"}   #
 NO_MODULE = READERS | {"sed", "sort", "cut", "tr", "jq", "column", "nl", "stat", "rm", "rmdir", "mkdir", "sleep", "date",
                        "basename", "dirname", "realpath", "readlink", "diff", "cmp", "file", "du", "df", "ps", "ttp"}
 SED_WRITE = re.compile(r"^-(i|-in-place)|(^|[/;}\s\d])[wWe](\s|$)")
+
+
+RUN_VARS = ("TTP_RUN_DIR", "TMPDIR")
+
+
+def _run_vars(shell: str, env) -> str:
+    """`shell` with the run's own folders (`$TTP_RUN_DIR`, `${TMPDIR}`) written as their values where the command
+    never sets, reads into or unsets that name: there they name one known folder, like a literal path."""
+    for name in RUN_VARS:
+        value = str(env.get(name) or "")
+        if not re.fullmatch(r"/[\w./@:+,=%-]*", value) or re.search(
+                rf"\b{name}\+?=|\b(?:read|declare|typeset|local|unset|export|for|getopts|mapfile|printf\s+-v)\b[^;&|\n]*"
+                rf"\b{name}\b", shell):
+            continue
+        shell = re.sub(rf"\$(?:\{{{name}\}}|{name}(?!\w))", lambda _: value, shell)
+    return shell
 
 
 def _may_shadow(shell: str, cwds: list[str], env, prefixed: bool = False) -> bool:

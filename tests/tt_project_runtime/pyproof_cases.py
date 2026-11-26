@@ -317,3 +317,20 @@ def test_pyproof_lets_a_snippet_edit_its_own_worktree_code_and_refuses_a_module_
     for code in ("open('json.py','w').write('x')", "open('json/__init__.py','w')", "open('sitecustomize.py','w')",
                  "open('x.pth','w')", "open('../y.py','w')", "open('_x.py','w')"):
         assert not pyproof.harmless(code, str(tmp_path), {}), code
+
+
+def test_pyproof_reads_the_runs_own_folders_by_name_where_the_command_never_sets_them(tmp_path):
+    """cells: run_vars. `cd "$TTP_RUN_DIR"` before a snippet names the run's own folder, read like that literal
+    path; a command that sets, loops over or defaults the name, or a module planted there, stays unproven."""
+    from ttp import pyproof
+    run = tmp_path / "run"
+    (run / "q").mkdir(parents=True)
+    env = {"TTP_RUN_DIR": str(run), "TMPDIR": str(run / "tmp"), "HOME": str(tmp_path), "PATH": "/usr/bin:/bin"}
+    q = " - <<'EOF'\nimport json\nprint(json.load(open('result.json')))\nEOF"
+    for c in ("cd $TTP_RUN_DIR; python3", 'cd "$TTP_RUN_DIR" && python3', "cd ${TTP_RUN_DIR}/q; python3"):
+        assert pyproof.rewrite(c + q, str(tmp_path), env), c
+    for c in ("TTP_RUN_DIR=/x; cd $TTP_RUN_DIR; python3", 'export TTP_RUN_DIR=/x; cd "$TTP_RUN_DIR"; python3',
+              "cd ${TTP_RUN_DIR:-/x}; python3", "cd $TTP_RUN_DIRX; python3", "read TTP_RUN_DIR; cd $TTP_RUN_DIR; python3"):
+        assert pyproof.rewrite(c + q, str(tmp_path), env) is None, c
+    (run / "json.py").write_text("x")
+    assert pyproof.rewrite("cd $TTP_RUN_DIR; python3" + q, str(tmp_path), env) is None
