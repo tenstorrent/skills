@@ -1674,11 +1674,19 @@ def test_ack_wait_terminal_counts_a_reply_closing_the_request_without_a_run_but_
         assert got["status"] == "needs_review" and got["metrics"]["reply_closed"] is True, (status, got)
         assert "closed without a result" in got["summary"] and "without a run" in got["summary"]
     for text in ("Declined the request: no budget for it.", "status: withdrawn", "The request was closed.",
-                 "No longer needed, the fix landed elsewhere."):
+                 "Withdrawing your request: the fix landed elsewhere."):
         assert ackwait.terminal(text) is True and ackwait.closed(text), text
     assert ackwait.packet_terminal(["[1/2] Acknowledged.", "[2/2] Closing your request without a run."]) is True
-    for text in ("received, will run it soon", "I will close it once the run is in", "status: queued"):
+    for text in ("received, will run it soon", "I will close the request once the run is in", "status: queued",
+                 "status: in progress; closing this request needs a run first, a result follows later"):
         assert ackwait.terminal(text) is False and not ackwait.closed(text), text
+    # the status line decides, as for any reply: a result naming something closed is still done
+    assert ackwait.terminal("status: done; the old request is closed") is True
+    assert not ackwait.closed("status: done; the old request is closed")
+    # a packet whose first part carries the sender's records still reads its later parts' own words
+    records = " [facts at send time from peer's records: #12 t (work, done)]"
+    packet = ackwait._joined([{"spec": "[1/2] re #12 timing" + records, "fp": "a" * 16}, {"spec": "[2/2] Closing your request without a run.", "fp": "b" * 16}])
+    assert ackwait.handoff(packet, "peer", "abc")["status"] == "needs_review"
     done = {"spec": "re abc: the timing passed, 41 s", "fp": "f" * 16}
     assert ackwait.handoff(done, "peer", "abc")["status"] == "done", "a real result still settles as asked"
     assert "reply_closed" not in ackwait.handoff(done, "peer", "abc")["metrics"]

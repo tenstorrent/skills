@@ -81,16 +81,20 @@ _PENDING_RE = re.compile(r"\b(?:acknowledg\w*|ack(?:ed|s)?|received|noted|will|g
 
 
 # A reply that closes or declines the request without a result: it ends the wait, whatever "will" or "later" it
-# adds, yet it is no success (handoff()).
-_CLOSED_RE = re.compile(r"\b(?:without (?:a |any )?(?:run|result|measurement)s?|declined?s? (?:the|this|your) request|"
-                        r"request (?:is |was )?(?:closed|declined|withdrawn)|(?:closed|closes|closing) (?:the|this|your) "
-                        r"\w*\s*request|no longer needed|(?:status|result|outcome|verdict)\s*[:=]\s*(?:closed|declined|"
-                        r"withdrawn))\b", re.I)
+# adds, yet it is no success (handoff()). Its status line decides, as for terminal(); else its words, which
+# say it is closed, never that it will be.
+_CLOSED_STATUS = re.compile(r"^(?:closed|declined|withdrawn)\b", re.I)
+_CLOSED_RE = re.compile(r"\b(?:(?:closed|closes|closing|declined|declines|declining|withdrawn|withdrew|withdraws|"
+                        r"withdrawing) (?:(?:the|this|that|your|my) )?(?:\w+ ){0,2}request|"
+                        r"request (?:is |was |has been )?(?:closed|declined|withdrawn))\b", re.I)
 
 
 def closed(text: str) -> bool:
     """Whether reply `text`, in the sender's own words, closes or declines the request without a result."""
-    return bool(_CLOSED_RE.search(_REPLY_MARK_RE.sub("", own_words(text))))
+    text = _REPLY_MARK_RE.sub("", own_words(text))
+    for m in _STATUS_RE.finditer(text):
+        return bool(_CLOSED_STATUS.match(m.group(1).strip()))
+    return bool(_CLOSED_RE.search(text))
 
 
 _FACTS_RE = re.compile(r"\s*\[facts at send time from ", re.I)
@@ -108,10 +112,10 @@ def terminal(text: str) -> bool:
     # the sender's own words only: the appended task records ("status: done" of a task it names, "queued",
     # "work") are no verdict and no sign more is to come
     text = own_words(text)
-    if closed(text):
-        return True
     for m in _STATUS_RE.finditer(text):
         return bool(_TERMINAL_STATUS.match(m.group(1).strip()))   # the first status line decides
+    if closed(text):
+        return True
     return bool(_TERMINAL_RE.search(text)) and not _PENDING_RE.search(text)
 
 
@@ -146,10 +150,10 @@ def packet_terminal(texts: list[str]) -> bool:
     evidence words such as "started" or "queued" beside it do not hold the wait. Pending words with no terminal
     one ("queued the reruns", "started cell 1") wait, whatever its records show."""
     own = "\n".join(_REPLY_MARK_RE.sub("", own_words(t)) for t in texts)
-    if closed(own):
-        return True
     for m in _STATUS_RE.finditer(own):
         return bool(_TERMINAL_STATUS.match(m.group(1).strip()))
+    if closed(own):
+        return True
     if _INTERIM_RE.search(own):
         return False
     backed = any(_DONE_FACT_RE.search(str(t or "")[len(own_words(t)):]) for t in texts)
@@ -159,6 +163,7 @@ def packet_terminal(texts: list[str]) -> bool:
 def _joined(parts: list[dict]) -> dict:
     """One reply standing for a complete packet: the last part's record, every part's text in order."""
     return {**parts[-1], "spec": "\n".join(str(n.get("spec") or "") for n in parts),
+            "own": "\n".join(_REPLY_MARK_RE.sub("", own_words(n.get("spec"))) for n in parts),
             "parts": [str(n.get("fp") or "") for n in parts]}
 
 
@@ -222,7 +227,7 @@ def partial(me: str, frm: str, h: str, after=()) -> tuple[int, int]:
 def handoff(n: dict, frm: str, h: str, status: str = "done") -> dict:
     """The hand-off `settle` records for reply `n`. A reply that closes the request without a result is never
     recorded as done: it is needs_review, marked closed."""
-    shut = closed(n.get("spec"))
+    shut = closed(n.get("own", n.get("spec")))   # a packet's own words, each part's records cut
     status = "needs_review" if shut else status
     text = " ".join(str(n.get("spec") or "").split())
     if len(text) > EXCERPT_CHARS:
