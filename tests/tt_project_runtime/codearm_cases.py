@@ -2781,6 +2781,7 @@ def test_glm_guard_judges_a_loop_body_with_its_literal_list_or_glob(monkeypatch,
     ssh = "." + "ssh"
     for cmd in (f'for f in ~/{ssh}/*; do cat "$f"; done', 'for f in ~ /etc; do rm -rf "$f"; done',
                 'for f in ~ /etc; do echo done.x; rm -rf "$f"; done',
+                'for f in a ~; do :; done; rm -rf "$f"',
                 'for f in bash; do echo "tt-smi -r 0" | "$f"; done'):
         assert deny(cmd), cmd
 

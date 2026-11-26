@@ -972,7 +972,11 @@ def literal_view(cmd: str, cwd: str, env=None) -> str | None:
             return None if text == cmd else text
         start = m.start() + len(plain[m.start():]) - len(plain[m.start():].lstrip())
         runs = [_set_once(_put(body, bstate, m[1], v).strip().rstrip(";").strip(), home) for v in values]
-        text = text[:start] + "{ " + "\n".join(runs) + "\n}" + text[end + 4:]
+        after = text[end + 4:]
+        aplain, astate = _unquoted(after)
+        if not _resets(m[1], aplain):   # after the loop the variable keeps its last value
+            after = _put(after, astate, m[1], values[-1])
+        text = text[:start] + "{ " + "\n".join(runs) + "\n}" + after
         if len(text) > 200_000:
             return None
     return None if text == cmd else text
