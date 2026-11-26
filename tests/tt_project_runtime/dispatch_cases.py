@@ -3037,3 +3037,99 @@ def test_a_branch_held_note_is_cleared_once_the_task_is_held_for_another_reason(
     d.dispatch()
     got = p.db.task(tid)
     assert got["status"] == "queued" and not (got["blocked_reason"] or "").startswith(dm.BRANCH_HELD_NOTE), got
+
+
+def _urgent_arm_project(env, monkeypatch, chat_slots=1):
+    """A project whose code tasks run on the chat provider's GLM arm (route.glm_work), a claude slot free and
+    `chat_slots` chat slots; its start_run stand-in records [(task id, provider)]. Returns (p, d, started)."""
+    from ttp import budget as bud
+    from ttp import codearm, configwho
+    from ttp.daemon import Daemon
+    monkeypatch.setattr(codearm, "HARNESSES", ("claude-code", "mini-swe-agent"))
+    p, user = _glmfb_project(env), configwho.by("user", via="cli")
+    p.set_config("route.code_sonnet", {}, by=user)
+    p.set_config("route.glm_work", {"on": True, "model": "glm-x", "holdout": 0}, by=user)
+    _no_events(p)
+    p.db.x("UPDATE tasks SET status='done'")
+    d, started = Daemon(p.base), []
+    monkeypatch.setattr(d, "start_run", lambda role, prompt, provider, tier, cwd, **k: started.append(
+        (k["task"]["id"], provider)) or 0)
+    monkeypatch.setattr(d, "_workdir_for", lambda t: (str(p.root), None))
+    for prov, slots in (("claude", 4), ("chat", chat_slots)):
+        d.gates[prov] = bud.Gate(prov, regime="windows", max_parallel=slots)
+    return p, d, started
+
+
+def _urgent_task(p, title="hot fix"):
+    return p.db.add_task(title, "fix the guard\nurgent: the user ordered it now", kind="code", tier="standard",
+                         priority=1, budget_usd=1.0)
+
+
+def test_urgent_task_routed_to_a_full_chat_arm_starts_on_core_on_the_first_pass_and_preempts_nothing(
+        env, monkeypatch, tmp_path):
+    """The dispatch thrash: urgent work waited up to route.wait_s for a chat slot while a core slot was free,
+    and a run on chat was preempted for it."""
+    p, d, started = _urgent_arm_project(env, monkeypatch)
+    victim = p.db.add_task("routine victim", "rename a helper", kind="code", tier="standard", priority=2,
+                           budget_usd=1.0)
+    p.db.update_task(victim, status="running")
+    run_dir = tmp_path / "victim-run"
+    run_dir.mkdir()
+    p.db.x("INSERT INTO runs(role,provider,task,started,status,boot_id,dir) VALUES('worker','chat',?,?,'running',?,?)",
+           (victim, time.time() - 60, d.boot, str(run_dir)))
+    hot = _urgent_task(p)
+    d.dispatch()
+    assert started == [(hot, "claude")], started
+    assert not (run_dir / "STOP").exists(), "a run was preempted for a task a free core slot could take"
+    assert not p.db.q("SELECT * FROM events WHERE kind='task_preempted'")
+
+
+def test_a_routine_chat_task_and_an_urgent_arm_task_both_start_on_the_first_pass(env, monkeypatch):
+    """One urgent task waiting on the GLM arm's own cap, one p2 task pinned to chat, free slots on both: the
+    urgent one takes core at once, the p2 one starts on chat, and nothing is stopped."""
+    from ttp import codearm
+    p, d, started = _urgent_arm_project(env, monkeypatch, chat_slots=2)
+    monkeypatch.setattr(codearm, "full", lambda db, cfg: True)   # the arm's concurrency cap is taken
+    hot = _urgent_task(p)
+    lo = p.db.add_task("routine chat task", "rename a helper", kind="work", tier="standard", priority=2,
+                       budget_usd=1.0, provider="chat")
+    d.dispatch()
+    assert sorted(started) == sorted([(hot, "claude"), (lo, "chat")]), started
+    assert not p.db.q("SELECT * FROM events WHERE kind='task_preempted'")
+
+
+def test_a_task_preempted_for_urgent_work_is_not_started_again_while_that_task_waits(env, monkeypatch):
+    p, d, started = _urgent_arm_project(env, monkeypatch)
+    lo = p.db.add_task("routine victim", "rename a helper", kind="code", tier="standard", priority=2, budget_usd=1.0)
+    dep = p.db.add_task("dependency", "s", kind="work", tier="standard", priority=3, budget_usd=1.0)
+    p.db.update_task(dep, status="blocked", blocked_reason="x")
+    hot = p.db.add_task("hot fix", "fix the guard\nurgent: the user ordered it now", kind="code", tier="standard",
+                        priority=1, budget_usd=1.0, depends_on=[dep])   # queued, not ready yet
+    now = time.time()
+    d._preempted[lo] = (hot, now + 60)
+    d.dispatch()
+    assert started == [], "the preempted task took its slot straight back"
+    d._preempted[lo] = (hot, now - 1)   # the hold has run out
+    d.dispatch()
+    assert [s[0] for s in started] == [lo] and lo not in d._preempted, started
+    p.db.update_task(hot, status="done")
+    d._preempted[lo] = (hot, now + 60)
+    assert not d._preempted_for_waiting(lo, now), "the urgent task is gone: nothing to keep the slot for"
+
+
+def test_runs_preempted_for_urgent_work_do_not_count_toward_the_task_run_cap(env):
+    from ttp import runcap
+    p = make(env)
+    tid = p.db.add_task("routine", "rename a helper", kind="code", tier="standard", priority=2, budget_usd=1.0)
+    t0 = time.time() - 600
+    for i in range(5):   # five preempted runs, each stopped by an urgent task a few seconds in
+        p.db.x("INSERT INTO runs(role,provider,task,started,ended,status) VALUES('worker','chat',?,?,?,'shutdown')",
+               (tid, t0 + i * 100, t0 + i * 100 + 4))
+        p.db.x("INSERT INTO events(ts,source,kind,severity,text,status,task) VALUES(?,?,?,?,?,?,?)",
+               (t0 + i * 100 + 3, "daemon", "task_preempted", "low", "preempted", "handled", tid))
+    p.db.x("INSERT INTO runs(role,provider,task,started,ended,status) VALUES('worker','claude',?,?,?,'shutdown')",
+           (tid, t0 + 550, t0 + 560))   # a stop nobody asked urgent work for still counts
+    p.db.x("INSERT INTO runs(role,provider,task,started,ended,status) VALUES('worker','claude',?,?,?,'failed')",
+           (tid, t0 + 570, t0 + 580))
+    rows, _ = runcap.runs(p.db, tid)
+    assert [r["status"] for r in rows] == ["shutdown", "failed"], rows

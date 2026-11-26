@@ -1434,6 +1434,7 @@ class Daemon:
         self._urgent_woke_from: dict[int, tuple] = {}   # task -> (its woke text, when that wake made it due); pruned by check_urgent_start
         self._wake_directs: dict[int, dict] = {}   # task id -> its wake's direct decision (_wake_direct), until a run starts
         self._route_waits: dict[int, float] = {}   # task id -> since when it waits for a routed slot (route.wait_s)
+        self._preempted: dict[int, tuple[int, float]] = {}   # preempted task id -> (its urgent task, hold until)
         self._stall_probes: dict[str, list] = {}   # probe (or a caller's key) -> its re-check: [Pending, started, answer or None]
         self._writeups: dict[int, dict] = {}   # task -> the Opus write-up made before its finish transaction (_prewrite)
         self._git_memo: dict[int, dict] = {}   # task -> git facts its hand-off is judged by, read before the tx (_prefetch_git)
@@ -13364,6 +13365,9 @@ class Daemon:
             if holds and self._setting_hold(task, holds, now):
                 fate[task["id"]] = "hold"
                 continue
+            if self._preempted_for_waiting(task["id"], now):   # its slot is the urgent task's, not its own again
+                fate[task["id"]] = "hold"
+                continue
             if task["kind"] not in publishkind.SKIP and not (task := self._publish_kind(task)):
                 continue   # refused: no run is spent finding out it may not publish
             # No run starts without a dollar cap: an unbudgeted run would get no --max-budget-usd and
@@ -13535,8 +13539,8 @@ class Daemon:
                 if not why:
                     lease = self._route_lease(task, routed, tier, now)
                     why = "" if lease else "slots"
-                if why == "slots":   # its slots are full: it waits for one, then falls back
-                    waited = self._route_wait(task["id"], now)
+                if why == "slots":   # its slots are full: it waits for one, then falls back (urgent work does not wait)
+                    waited = self._route_wait(task, now)
                     if waited is not None:
                         fate[task["id"]] = "full"
                         reached.discard(task["id"])
@@ -13806,7 +13810,17 @@ class Daemon:
             db.x("INSERT INTO events(ts,source,kind,severity,text,status,task) VALUES(?,?,?,?,?,?,?)",
                  (now, "daemon", "task_preempted", "low", text, "handled", v["id"]))
             log(self.p, text)
+            self._preempted[v["id"]] = (t["id"], now + PREEMPT_HOLD_S)
         return out
+
+    def _preempted_for_waiting(self, tid: int, now: float) -> bool:
+        """Whether task `tid`, preempted for an urgent task, must wait: that task is still queued and
+        PREEMPT_HOLD_S has not passed, so the freed slot is not taken straight back (the hold ends with either)."""
+        got = self._preempted.get(tid)
+        if got and now < got[1] and (self.p.db.task(got[0]) or {}).get("status") == "queued":
+            return True
+        self._preempted.pop(tid, None)
+        return False
 
     def _log_slot_fill(self, free: int, ready: list[dict], fate: dict[int, str], ctx: dict, core: str) -> None:
         """One schedlog line for this slot fill: the ready tasks dispatch walked, in its order, that started or
@@ -14363,15 +14377,17 @@ class Daemon:
         if not routed or routed["fallback"] != "none":
             return provider
         why = self._no_room(routed["to"], ctx)
-        if why == "slots" and self._route_wait(task["id"], ctx["now"]) is not None:
+        if why == "slots" and self._route_wait(task, ctx["now"]) is not None:
             ctx.setdefault("route_wait", {})[task["id"]] = routed["to"]   # it waits for a routed slot
             return routed["to"]
         return provider if why else routed["to"]
 
-    def _route_wait(self, tid: int, now: float) -> float | None:
-        """Seconds task `tid` has waited for a routed slot (its wait starts now if it was not
-        waiting), or None once route.wait_s has passed."""
-        since = self._route_waits.setdefault(tid, now)
+    def _route_wait(self, task: dict, now: float) -> float | None:
+        """Seconds `task` has waited for a routed slot (its wait starts now if it was not waiting), or None
+        once route.wait_s has passed; urgent work (urgent.extra_ok) never waits, it falls back to core."""
+        if urgent.extra_ok(task, now):
+            return None
+        since = self._route_waits.setdefault(task["id"], now)
         return now - since if now - since < route.wait_s(self.cfg) else None
 
     def _route_key(self, tid) -> str:
@@ -23132,6 +23148,7 @@ RESOURCE_BUSY_NOTE = "its resource stayed busy"   # an exclusive run that lost t
 LOGGED_OUT_NOTE = "held: logged out"
 NET_HELD_NOTE = "held: network,"
 BRANCH_HELD_NOTE = "held: waits for #"   # Daemon._branch_clash: another live task uses its branch or worktree
+PREEMPT_HOLD_S = 120.0   # a task preempted for an urgent one is not started again while that one still waits
 # _start_hold's reasons as schedlog reasons (Daemon._log_slot_fill); budget, caps and optional are other.
 SLOT_HELD_BY = {"held": "hold", "paused": "hold", "logged_out": "provider_gate", "net": "provider_gate",
                 "gate": "provider_gate", "device": "lock", "resource": "lock"}

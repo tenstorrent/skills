@@ -5,7 +5,7 @@
 A task whose runs since its last explicit requeue (dispatchguard.EXPLICIT_SOURCES: the coordinator, the
 user or a chain continue; never the daemon's or push queue's own requeues) reach `chains.max_task_runs`
 (4), or whose last `chains.max_idle_runs` (2) runs each spent money with no progress, is not started again. Daemon retries (a tier up after a failure, a lost or
-stalled run, a waiting wake, a restart) all count; runs that never reached the model (FREE) do not.
+stalled run, a waiting wake, a restart) all count; runs that never reached the model (FREE) or were preempted for urgent work do not.
 A run that handed off `waiting` on its own progress (unblock.classify_wait 'self': its detached checks, a
 batch or Slurm job, a planned window) is a step of one try, not a retry: it counts toward
 `chains.max_self_waits` (12) instead, so a task mid-gate is not blocked while a fix-and-recheck loop still
@@ -52,6 +52,10 @@ def runs(db, task_id: int) -> tuple[list[dict], int]:
     rows = db.q("SELECT * FROM runs WHERE task=? AND role!='coordinator' AND ended IS NOT NULL AND started>=? "
                 f"AND status NOT IN ({','.join('?' * len(FREE))}) ORDER BY id",
                 (task_id, float((last or {}).get("ts") or 0), *FREE))
+    cut = [float(e["ts"]) for e in db.q("SELECT ts FROM events WHERE task=? AND kind='task_preempted' AND ts>=?",
+                                        (task_id, float((last or {}).get("ts") or 0)))]
+    # A run stopped to give its slot to urgent work (preempt.py) was not the task's try: it does not count.
+    rows = [r for r in rows if not (r["status"] == "shutdown" and any(r["started"] <= t <= r["ended"] + 1 for t in cut))]
     return rows, int((last or {}).get("id") or 0)
 
 
