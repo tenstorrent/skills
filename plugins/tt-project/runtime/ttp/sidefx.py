@@ -17,8 +17,8 @@ body (data, unless a shell or interpreter runs it); so is
 Claude Code's saved large tool output (~/.claude/projects/*/tool-results), which the model only reads.
 The list (paths only, never a command's text or a file's contents) goes to the run dir's
 outside.json, to the next run of the task as one prompt block (still named when a later run also ends
-without a hand-off and touches nothing), and to the coordinator as an
-`outside_writes` event, high when a path is under those folders in a call no guard refused. Each path
+without a hand-off and touches nothing), and to the coordinator as an `outside_writes` event, high
+on a credential store or a probable write there in a call no guard refused (record). Each path
 carries its class (classify_paths: probable write, executed, read or mentioned only, with the reason)
 and its call's status (items: started, completed with its exit code, or refused by which guard)."""
 from __future__ import annotations
@@ -157,11 +157,14 @@ def _tool_output(path: str, home: str) -> bool:
 
 
 def home_entry(path: str, home: str) -> bool:
-    """`path` is below the home in a hidden entry (config, credentials, shell startup files, ~/.local) or in ~/bin: what
-    every later session reads or runs. The harness's own ~/.tt-project is judged by its own rules."""
+    """`path` is below the home in a hidden entry (config, credentials, shell startup files, ~/.local), in ~/bin or
+    in ~/Library/LaunchAgents: what every later session reads or runs. The harness's own ~/.tt-project is judged
+    by its own rules."""
     h = os.path.normpath(home)
-    top = path[len(h) + 1:].split("/", 1)[0] if path.startswith(h + "/") else ""
-    return (top.startswith(".") and top not in (".", "..", ".tt-project")) or top == "bin"
+    rel = path[len(h) + 1:] if path.startswith(h + "/") else ""
+    top = rel.split("/", 1)[0]
+    return (top.startswith(".") and top not in (".", "..", ".tt-project")) or top == "bin" \
+        or (rel + "/").startswith("Library/LaunchAgents/")
 
 
 def sensitive(path: str, home: str) -> bool:
@@ -764,14 +767,21 @@ def _names(found: list[dict]) -> str:
 
 def record(run_dir: Path, run_id: int, cwd: str, home: str | None = None) -> dict | None:
     """Scan a run that ended without a valid hand-off and write its outside.json; the record, or None
-    when it touched nothing outside its folders. High for a sensitive path in any call a guard did not
-    refuse before it ran, whatever its class: the class only words it."""
+    when it touched nothing outside its folders. High for a sensitive path in a call a guard did not
+    refuse before it ran: whatever its class on a credential store (credguard.read_refusal), else on a
+    probable write outside a cache (a top entry named like `.cache`). A read, run or `source` of a
+    startup file or a ~/.local program is no harm."""
+    from . import credguard
     home = os.path.normpath(home or os.path.expanduser("~"))
     found = scan(run_dir, cwd, home)
     if not found:
         return None
+
+    def harm(f: dict) -> bool:
+        cache = "cache" in f["path"][len(home) + 1:].split("/", 1)[0].lower()
+        return credguard.read_refusal(f["path"], search=True, home=home) or f["class"] == "write" and not cache
     rec = {"run": run_id, "found": found,
-           "high": any(sensitive(f["path"], home) and f["status"] != "refused" for f in found)}
+           "high": any(f["status"] != "refused" and sensitive(f["path"], home) and harm(f) for f in found)}
     from .project import durable_write
     durable_write(Path(run_dir) / FILE, json.dumps(rec, indent=1))
     return rec

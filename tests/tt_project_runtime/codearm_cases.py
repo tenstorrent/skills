@@ -2767,10 +2767,12 @@ def test_a_glm_run_writes_below_the_home_folder_and_tmp(cmd, monkeypatch, tmp_pa
                                  "echo x > ~/.npmrc", "echo x > ~/.config/autostart/x.desktop",
                                  "echo x > ~/.config/systemd/user/x.service",
                                  "echo x > ~/.local/lib/python3.12/site-packages/zz.pth",
-                                 "cp /bin/true ~/.local/bin/git"])
+                                 "cp /bin/true ~/.local/bin/git", "echo x > ~/Library/LaunchAgents/x.plist",
+                                 "echo x > ~/Library/Keychains/login.keychain-db"])
 def test_a_glm_run_never_writes_what_starts_code_in_the_homes_sessions(cmd, monkeypatch, tmp_path):
-    """Every hidden entry of the home (shell startup files, ~/.config, ~/.local) and ~/bin start code or hold
-    config for every later session: refused, while visible home paths and new /tmp and /var/tmp entries pass."""
+    """Every hidden entry of the home (shell startup files, ~/.config, ~/.local), ~/bin and ~/Library/LaunchAgents
+    start code or hold config for every later session, and the keychain folder holds credentials: refused, while
+    visible home paths and new /tmp and /var/tmp entries pass."""
     deny, home, _ = _gg_home(monkeypatch, tmp_path)
     assert deny(cmd.replace("~", str(home)))
     for ok in (f"echo x > {home}/notes.txt", f"mkdir -p {home}/work && echo x > {home}/work/x",
@@ -2800,7 +2802,7 @@ def test_a_glm_run_still_refuses_writes_to_credentials_other_projects_the_harnes
     for cmd in ("echo x > ~/.ssh/config", f"echo x > {other}/a.txt", f"rm -rf {other}", f"echo x > {other}/tt-project/x",
                 "echo x > ~/.tt-project/lib/x", f"echo x > {home}/.tt-project/registry.json", "echo x > /etc/x",
                 "echo x > /x", "rm -rf /", "rm -rf ~", "rm -rf /tmp", "echo x | sudo tee ~/n", "cat ~/.ssh/id_rsa",
-                "cat ~/.tt-project/secrets.json"):
+                "cat ~/.tt-project/secrets.json", "cat ~/Library/Keychains/login.keychain-db"):
         assert deny(cmd), cmd
     (home / "theirs.txt").write_text("")
     assert not deny("echo x > ~/theirs.txt")

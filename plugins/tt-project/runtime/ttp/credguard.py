@@ -6,8 +6,9 @@ Runs are unsandboxed: they can read all of HOME and reach any host. A credential
 stays in the run's log and transcript, so the stores are kept out of tool calls model-free:
 - the daemon gives Claude Code runs a Read deny rule for each file credential_files() names (gh's
   hosts file, git's and netrc's credential files, the agents' own login files, the token and key
-  files of aws, gcloud and azure (DIR_STORES), docker's and kubectl's config, ~/.pypirc, and every
-  file in ~/.ssh but the known public ones, see ssh_public);
+  files of aws, gcloud and azure (DIR_STORES), docker's and kubectl's config, ~/.pypirc, macOS's
+  keychain folder (~/Library/Keychains), and every file in ~/.ssh but the known public ones, see
+  ssh_public);
 - the worker hook refuses a Read, Grep or Glob call that reaches one, also by a symlink, inside one
   of the folders it names, or one made later in ~/.ssh, and a Grep or Glob over a folder holding one
   (tool_refusal);
@@ -66,7 +67,8 @@ STORE_RE = re.compile(r"(?:(?<![\w.-])gh|GH_CONFIG_DIR\}?)/+hosts\.ya?ml\b|(?<![
                       r"|(?<![\w.-])\.netrc(?![\w.-])|(?<![\w.-])\.credentials\.json\b"
                       r"|(?:(?<![\w.-])\.codex|CODEX_HOME\}?)/+auth\.json\b"
                       r"|(?:(?<![\w.-])\.docker|DOCKER_CONFIG\}?)/+config\.json\b|(?<![\w.-])\.kube/+config\b"
-                      r"|(?<![\w.-])\.pypirc(?![\w.-])|(?:(?<![\w.-])\.config|XDG_CONFIG_HOME\}?)/+git/+credentials(?![\w.-])")
+                      r"|(?<![\w.-])\.pypirc(?![\w.-])|(?:(?<![\w.-])\.config|XDG_CONFIG_HOME\}?)/+git/+credentials(?![\w.-])"
+                      r"|(?<![\w.-])Library/+Keychains(?![\w.-])")
 # Store folders (the variable that moves each) and the entries in them that hold a token or key; their
 # other entries hold none (aws `config`, gcloud `configurations`, azure `azureProfile.json`, kube `cache`,
 # docker `buildx`, gh `config.yml`). A bare folder counts (`grep -r token ~/.kube`), but to ls, stat or mkdir it
@@ -201,7 +203,7 @@ def _stores(home: Path, environ=None) -> list[Path]:
            Path(env("CLAUDE_CONFIG_DIR") or home / ".claude") / ".credentials.json",
            Path(env("CODEX_HOME") or home / ".codex") / "auth.json",
            Path(env("DOCKER_CONFIG") or home / ".docker") / "config.json", home / ".pypirc",
-           config / "git" / "credentials",
+           config / "git" / "credentials", home / "Library" / "Keychains",
            *[Path(p) for p in (env("KUBECONFIG") or str(home / ".kube" / "config")).split(os.pathsep) if p]]
     if env("AWS_SHARED_CREDENTIALS_FILE"):
         out.append(Path(env("AWS_SHARED_CREDENTIALS_FILE")))
