@@ -864,8 +864,11 @@ def _readers_only(view: str) -> bool:
 # reads it after it is set (_reads_only) is written out
 _SAFE_VALUE = re.compile(r"[\w./@:+,=%-]+")
 _MAX_VALUES = 200
-_SPECIAL_NAME = re.compile(r"PATH|IFS|HOME|PWD|OLDPWD|CDPATH|ENV|BASH_ENV|SHELLOPTS|BASHOPTS|PS4|PROMPT_COMMAND|"
-                           r"GLOBIGNORE|TMOUT|LD_\w*|PYTHON\w*|TTP_\w*|GIT_\w*|SSH_\w*|[A-Z_]*(?:TOKEN|KEY|SECRET)\w*")
+# never written out: names the shell itself sets or reads (`_`, `PWD`, `BASH_REMATCH`, `IFS`) or that carry the env
+_SPECIAL_NAME = re.compile(r"_|[0-9]\w*|PATH|IFS|HOME|PWD|OLDPWD|CDPATH|ENV|BASH\w*|SHELL\w*|PS\d|PROMPT_COMMAND|GLOBIGNORE|"
+                           r"TMOUT|RANDOM|SRANDOM|SECONDS|LINENO|REPLY|OPT\w*|HOSTNAME|HOSTTYPE|PPID|E?UID|GROUPS|COLUMNS|"
+                           r"LINES|HIST\w*|FUNCNAME|PIPESTATUS|MAPFILE|EPOCH\w*|COPROC\w*|DIRSTACK|MACHTYPE|OSTYPE|"
+                           r"LD_\w*|PYTHON\w*|TTP_\w*|GIT_\w*|SSH_\w*|[A-Z_]*(?:TOKEN|KEY|SECRET)\w*")
 _FOR_HEAD = re.compile(r"(?:^|(?<=[;&|({\n]))\s*for\s+([A-Za-z_]\w*)\s+in\s+([^;\n]*?)\s*(?:;|\n)\s*do\b")
 _SET_HEAD = re.compile(r"\s*([A-Za-z_]\w*)=(?:'([^']*)'|\"([^\"$`\\]*)\"|([^\s;&|<>()'\"`$\\]+))[ \t]*(?:;|\n|&&)")
 
@@ -891,11 +894,13 @@ def _unquoted(text: str) -> tuple[str, str]:
     return "".join(out), "".join(state)
 
 
-# a word that sets a variable by other means, runs text as code or leaves a loop early (`eval`, `read`, `break`), `.`
-# as a command, a function definition, arithmetic or `${!`: a command holding one, anywhere, is not straight-line
+# a word that sets a variable by other means, runs text as code or leaves a loop early (`eval`, `read`, `break`),
+# `IFS` (it splits a value), `.` as a command, a function definition, arithmetic or `${!`: a command holding one,
+# anywhere, is not straight-line
 _NOT_STRAIGHT = re.compile(r"(?<![\w./-])(?:eval|source|declare|typeset|local|export|readonly|read|mapfile|readarray|let|unset|"
-                           r"getopts|trap|alias|builtin|break|continue|return|exit|function|select|coproc)\b|"
-                           r"printf\s+-v|(?:^|[;&|({`\n]|\b(?:do|then|else|command)\s)\s*\.\s|\w\s*\(\s*\)|\(\(|"
+                           r"getopts|trap|alias|builtin|break|continue|return|exit|function|select|coproc|IFS)\b|printf\s+-v|"
+                           r"(?:^|[;&|({`\n!]|\b(?:do|then|else|elif|if|while|until|time|command)(?:\s+-\w+)*\s)\s*\.\s|"
+                           r"\w\s*\(\s*\)|\(\(|"
                            r"\$\[|\$\{!")
 
 

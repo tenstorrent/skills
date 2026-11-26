@@ -2799,6 +2799,10 @@ def test_glm_guard_reads_a_loop_variable_as_its_list_only_in_a_straight_line_com
                 f"f=bash; for f in ls; do :; done | cat; {run}", f"f=bash; (for f in ls; do :; done); {run}",
                 f"{{ for f in ls; do :; done; }} | cat; {run}", f"f=bash; false && for f in ls; do :; done; {run}",
                 f"f=bash; for f in ls; do :; done & {run}",
+                *(f"for f in ls; do {w} . <(echo f=bash); {run}; done" for w in ("!", "if", "time")),
+                "for _ in ls; do echo bash; echo 'tt-smi -r 0' | $_; done", "_=ls; echo bash; echo 'tt-smi -r 0' | $_",
+                "for BASH_REMATCH in ls; do [[ bash =~ .* ]]; echo 'tt-smi -r 0' | $BASH_REMATCH; done",
+                "for f in tt-smi,-r,0; do IFS=,; $f; done", "f=rm,-rf,/home/u; IFS=,; $f",
                 *(f"for f in bash ls; do {w}; done; {run}" for w in ("break", "return", "exit", "continue")),
                 'for f in $(cat l); do rm -rf "$f"; done', 'for f in $(find . -name x); do rm -rf "$f"; done',
                 'for f in $L; do rm -rf "$f"; done', 'for f in $(cat l); do echo x > "$f"; done'):
