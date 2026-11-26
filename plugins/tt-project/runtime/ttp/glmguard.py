@@ -971,36 +971,35 @@ def resolved(cmd: str, env) -> str:
     _RUN_ENV variable it never sets written as the value in `env`, and each read of a variable it sets once to a
     plain value as a top-level statement of its own (`cd x; T=/x/bin/ttp; $T lock`, a staged `$(...)` already
     written in) written as that value. The rules judge the text that then runs, so no reading of how bash would
-    expand it is trusted; the checks here only keep what runs what the command meant. A heredoc's body, comments,
-    `$'...'` and a quote in `${...}` are left as written (cmd itself), as is a command naming IFS (its word splitting)."""
+    expand it is trusted; the checks here only keep what runs what the command meant. Comments, `$'...'` and a quote
+    in `${...}` are left as written, as is a command naming IFS (its word splitting). The caller never passes a heredoc
+    command: its bodies are files, not commands."""
     if "$'" in cmd or re.search(r"\bIFS\b|\$\{[^}]*['\"\\]", cmd) \
             or re.search(r"(?<![^\s;&|()<>])#", _single_blank(cmd)):
         return cmd
-    cut = cmd.find("\n", cmd.find("<<")) if "<<" in cmd else -1
-    head, tail = (cmd, "") if cut < 0 else (cmd[:cut], cmd[cut:])
-    if _SH_RUNS.search(_plain(head)):
+    if _SH_RUNS.search(_plain(cmd)):
         return cmd
     for name in _RUN_ENV:
         value = env.get(name) or ""
-        if _SAFE_VALUE.fullmatch(value) and _reads_only(name, head) and not re.search(rf"\b{name}=", tail):
-            head = _put(head, _unquoted(head)[1], name, value)
+        if _SAFE_VALUE.fullmatch(value) and _reads_only(name, cmd):
+            cmd = _put(cmd, _unquoted(cmd)[1], name, value)
     at = 0
     while at is not None:
-        plain, start, at = _unquoted(head)[0], at, None
+        plain, start, at = _unquoted(cmd)[0], at, None
         for b in [0] + [x.end() for x in re.finditer(r";|\n", plain)]:
-            m = _SET_HEAD.match(head, b) if b >= start else None
+            m = _SET_HEAD.match(cmd, b) if b >= start else None
             if not m or _SPECIAL_NAME.fullmatch(m[1]) or _NOT_SIMPLE.search(plain[:b]) \
                     or re.search(r"(?:&&|\||\\)\s*$", plain[:b]) \
-                    or re.search(rf"(?<![\w-]){m[1]}(?!\w)", _plain(head[:b])):
+                    or re.search(rf"(?<![\w-]){m[1]}(?!\w)", _plain(cmd[:b])):
                 continue
             value = next(v for v in (m[2], m[3], m[4]) if v is not None)
             value = (env.get("HOME") or "~") + value[1:] if m[4] is not None and value.startswith("~/") else value
-            rest = head[m.end():]
-            if _SAFE_VALUE.fullmatch(value) and "=" not in value and _reads_only(m[1], rest + tail) \
+            rest = cmd[m.end():]
+            if _SAFE_VALUE.fullmatch(value) and "=" not in value and _reads_only(m[1], rest) \
                     and "$" + m[1] in rest.replace("{", ""):
-                head, at = head[:m.end()] + _put(rest, _unquoted(rest)[1], m[1], value), m.end()
+                cmd, at = cmd[:m.end()] + _put(rest, _unquoted(rest)[1], m[1], value), m.end()
                 break
-    return head + tail
+    return cmd
 
 
 _BRANCH = re.compile(r"(?<![\w./-])(?:if|elif|while|until|case|for|select)\b|[(`|&]")
