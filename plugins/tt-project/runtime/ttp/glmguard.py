@@ -922,18 +922,21 @@ def _values(words: str, cwd: str, home: str, moved: bool = False) -> list[str] |
     return out or None
 
 
+def _set_value(m: re.Match, rest: str, home: str) -> str | None:
+    """The value assignment `m` writes out (`~/` as `home`); None unless plain, without `=` and only read in `rest`."""
+    value = next(v for v in (m[2], m[3], m[4]) if v is not None)
+    value = home + value[1:] if m[4] is not None and value.startswith("~/") else value
+    return value if _SAFE_VALUE.fullmatch(value) and "=" not in value and _reads_only(m[1], rest) else None
+
+
 def _set_once(text: str, home: str) -> str:
     """`text` with a variable set to a literal at its very start (`T=/x/bin/ttp; $T lock`) read as that value."""
     m = _SET_HEAD.match(text)
     if not m or _SPECIAL_NAME.fullmatch(m[1]):
         return text
-    value = next(v for v in (m[2], m[3], m[4]) if v is not None)
-    value = home + value[1:] if m[4] is not None and value.startswith("~/") else value
     rest = text[m.end():]
-    if not _SAFE_VALUE.fullmatch(value) or "=" in value or not _reads_only(m[1], rest):
-        return text
-    state = _unquoted(rest)[1]
-    return text[:m.end()] + _set_once(_put(rest, state, m[1], value), home)
+    value = _set_value(m, rest, home)
+    return text if value is None else text[:m.end()] + _set_once(_put(rest, _unquoted(rest)[1], m[1], value), home)
 
 
 # a loop over a list the guard cannot read (`for f in $(cat l)`, `$L`, a glob under `$D`) whose body or what follows
@@ -992,11 +995,8 @@ def resolved(cmd: str, env) -> str:
                     or re.search(r"(?:&&|\||\\)\s*$", plain[:b]) \
                     or re.search(rf"(?<![\w-]){m[1]}(?!\w)", _plain(cmd[:b])):
                 continue
-            value = next(v for v in (m[2], m[3], m[4]) if v is not None)
-            value = (env.get("HOME") or "~") + value[1:] if m[4] is not None and value.startswith("~/") else value
             rest = cmd[m.end():]
-            if _SAFE_VALUE.fullmatch(value) and "=" not in value and _reads_only(m[1], rest) \
-                    and "$" + m[1] in rest.replace("{", ""):
+            if (value := _set_value(m, rest, env.get("HOME") or "~")) is not None and "$" + m[1] in rest.replace("{", ""):
                 cmd, at = cmd[:m.end()] + _put(rest, _unquoted(rest)[1], m[1], value), m.end()
                 break
     return cmd
