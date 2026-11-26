@@ -2209,8 +2209,8 @@ def deliver_twins(p, twins: list[tuple], now: float | None = None) -> list[str]:
 # An order (add_order): a user message that asks for something, recorded by the coordinator's
 # `obligation` action with `order` (the message id), `action_class` (read, change or device), optional
 # `due` (else promise_default_h after it is recorded) and `start_by` (else ORDER_START_S after its
-# reference time: the message, or for a follow-up order, its own record), and its owner tasks. It is promise-shaped (the `promise` field with `order`), so it has no
-# owner clocks and closes like a promise (_kept). check() raises one high `order_late` event when no
+# reference time: the message, or for a follow-up order, its own record), and its owner tasks. It is
+# promise-shaped (the `promise` field with `order`), so it has no owner clocks and closes like a promise (_kept). check() raises one high `order_late` event when no
 # owner run has started by its start_by, and one high `order_overdue` event at its due time.
 # A claim (record_claims): a coordinator reply or notify saying something is done, live, running or
 # landed can carry `claims`, each `{text, task | action | expect, due}`. A `task` (or `action`: the index
@@ -2486,7 +2486,8 @@ def order_starts(db, since: float, until: float, now: float | None = None) -> tu
     out: one closed or dropped with no run started and no owner task ever (a reply, a memory or charter
     change settled it), so the count matches the late orders the coordinator is told about."""
     now = time.time() if now is None else now
-    orders = [(o, o["promise"]) for o in items(db)
+    every = items(db)
+    orders = [(o, o["promise"]) for o in every
               if (o.get("promise") or {}).get("order") is not None and not _needed_no_task(o)]
     if not orders:
         return 0, 0
@@ -2495,7 +2496,7 @@ def order_starts(db, since: float, until: float, now: float | None = None) -> tu
     n = late = 0
     for o, pr in orders:
         sent = ts.get(int(pr["order"]))
-        at = None if sent is None else max(sent, _order_ts(db, o))
+        at = None if sent is None else max(sent, _order_ts(db, o, every))
         if at is None or not since <= sent < until or (pr.get("started") is None and now - at <= ORDER_START_S):
             continue   # out of the window, or too new to say
         start = pr.get("started")
@@ -2550,13 +2551,13 @@ def _order_line(o: dict) -> str:
             f"{o['text']}\nOwner: " + (f"#{', #'.join(map(str, ids))}" if ids else "no task"))
 
 
-def _order_ts(db, o: dict) -> float:
+def _order_ts(db, o: dict, every=None) -> float:
     """The time an order's start clock runs from: its message's time, or for a follow-up order
     (one recorded later than another order of the same message), its own record time."""
     created = float(o.get("created") or 0)
     pr = o.get("promise") or {}
     if any(float(x.get("created") or 0) < created
-           for x in items(db) if (x.get("promise") or {}).get("order") == pr.get("order")):
+           for x in (items(db) if every is None else every) if (x.get("promise") or {}).get("order") == pr.get("order")):
         return created
     m = db.one("SELECT ts FROM messages WHERE id=?", (int(pr["order"]),))
     return float(m["ts"]) if m else float(pr.get("start_by") or 0) - ORDER_START_S
@@ -2567,15 +2568,15 @@ def _check_order(p, o: dict, now: float, raised: list[str]) -> bool:
     from . import batchrun, replan, timefmt
     pr, db, changed = o["promise"], p.db, False
     ids = _owner_ids(o)
+    at = _order_ts(db, o) if pr.get("started") is None else None
     if pr.get("started") is None and ids:
         q = ",".join("?" * len(ids))
         # A batch member has no run of its own: the live batch run it is in is its run.
-        at = _order_ts(db, o)
         if (run := first_run(db, ids, at)) is not None or batchrun.held(db) & set(map(int, ids)):
             pr["started"], changed = (now if run is None else run), True   # the owner run's own start
             _retire(db, now, "order started", prefix=f"obligation:{o['id']}:order:late")
     if pr.get("started") is None and now >= pr["start_by"] and not pr.get("deferred") and \
-            _held_by_design(db, ids, _order_ts(db, o)):
+            _held_by_design(db, ids, at):
         pr["deferred"], changed = now, True   # kept: a deferral label goes once the probe passes
     if pr.get("started") is None and now >= pr["start_by"] and pr.get("late") is None:
         pr["late"], changed = now, True
