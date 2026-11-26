@@ -375,12 +375,10 @@ def test_bridge_relay_carries_one_connection_and_exits_with_its_session(monkeypa
     assert rc == 7 and not (tmp_path / "d" / "x.sock").exists()
 
 
-def test_bridge_relay_carries_a_named_target_without_an_interface_and_refuses_only_its_connections(monkeypatch, request):
-    # cells: spec-no-interface, empty-iface-no-bind, bad-name-refuses-only-that-connection, others-still-served
+def test_bridge_relay_spec_without_an_interface_binds_no_interface(monkeypatch):
+    # cells: spec-no-interface, empty-iface-no-bind
     import socket
-    import threading
     from ttp import bridge_relay
-    d = _relay_dir(request)
     assert bridge_relay.parse_spec("h=h1.example.com") == ("h", "h1.example.com", "")
     assert bridge_relay.parse_spec("h=10.0.0.2%vpn0") == ("h", "10.0.0.2", "vpn0")
 
@@ -394,7 +392,7 @@ def test_bridge_relay_carries_a_named_target_without_an_interface_and_refuses_on
             if (level, opt) in ((socket.SOL_SOCKET, bridge_relay.SO_BINDTODEVICE),
                                  (socket.IPPROTO_IP, bridge_relay.IP_BOUND_IF),
                                  (socket.IPPROTO_IPV6, bridge_relay.IPV6_BOUND_IF)):
-                self.binds.append((level, opt))
+                NoBind.binds.append((level, opt))
 
         def settimeout(self, t):
             pass
@@ -410,12 +408,15 @@ def test_bridge_relay_carries_a_named_target_without_an_interface_and_refuses_on
                         lambda *a, **k: [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("10.0.0.9", 22))])
     bridge_relay.bound_connect("h9.example.invalid", "")   # an empty interface binds to none
     assert NoBind.binds == []
-    monkeypatch.undo()
 
+
+def _tcp_echo() -> int:
+    """A local echo server; returns its port (loopback only, for a stubbed relay connect)."""
+    import socket
+    import threading
     srv = socket.socket()
     srv.bind(("127.0.0.1", 0))
     srv.listen(4)
-    echo_port = srv.getsockname()[1]
 
     def echo():
         while True:
@@ -432,6 +433,27 @@ def test_bridge_relay_carries_a_named_target_without_an_interface_and_refuses_on
             threading.Thread(target=one, daemon=True).start()
 
     threading.Thread(target=echo, daemon=True).start()
+    return srv.getsockname()[1]
+
+
+def _relay_refused(path: str) -> bool:
+    """A client that connects and reads EOF: the listener refused it without a byte."""
+    import socket
+    c = socket.socket(socket.AF_UNIX)
+    c.settimeout(10)
+    c.connect(path)
+    try:
+        return c.recv(1) == b""
+    finally:
+        c.close()
+
+
+def test_bridge_relay_refuses_only_a_dead_named_target_and_keeps_serving_the_rest(monkeypatch, request):
+    # cells: bad-name-refuses-only-that-connection, others-still-served
+    import socket
+    from ttp import bridge_relay
+    d = _relay_dir(request)
+    echo_port = _tcp_echo()
     real_gai = socket.getaddrinfo
 
     def stub_getaddrinfo(host, *a, **k):
@@ -452,17 +474,10 @@ def test_bridge_relay_carries_a_named_target_without_an_interface_and_refuses_on
     monkeypatch.setattr(bridge_relay, "bound_connect", stub_connect)
     bad = bridge_relay.listen(str(d / "bad.sock"), "gone.example.invalid", "")
     good = bridge_relay.listen(str(d / "good.sock"), "10.0.0.9", "")
-    refused = []
-    for _ in range(2):   # a name that does not resolve refuses its own connection, twice
-        c = socket.socket(socket.AF_UNIX)
-        c.settimeout(10)
-        c.connect(str(d / "bad.sock"))
-        refused.append(c.recv(1))   # EOF: the connection ends, the listener stays
-        c.close()
-    assert refused == [b"", b""]
-    c = socket.socket(socket.AF_UNIX)
+    assert _relay_refused(str(d / "bad.sock")) and _relay_refused(str(d / "bad.sock"))   # twice: it stays up
+    c = socket.socket(socket.AF_UNIX)   # the other listener still serves
     c.settimeout(10)
-    c.connect(str(d / "good.sock"))   # the other listener still serves
+    c.connect(str(d / "good.sock"))
     c.sendall(b"ping")
     assert c.recv(64) == b"pong"
     c.close()
