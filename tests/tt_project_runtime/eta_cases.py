@@ -965,7 +965,7 @@ def test_eta_a_deferred_task_s_likely_and_conservative_times_start_after_its_pla
     assert eta.estimate(p.db, j, now)["path"][:2] == [j, c3]   # the join's own estimate is unchanged
     # A planned start inside a dependency's corrected work never shows its task before that dependency
     # (the chain is 5 x 1500 s raw, shown x3; the start sits between the raw and the shown end).
-    ch = [p.db.add_task(f"w{i}", "s", kind="work", depends_on=[] if i == 0 else None) for i in range(5)]
+    ch = [p.db.add_task(f"w{i}", "s", kind="work") for i in range(5)]
     for prev, nxt in zip(ch, ch[1:]):
         p.db.update_task(nxt, depends_on=[prev])
     s3 = now + 3 * 3600
@@ -981,11 +981,14 @@ def test_eta_a_deferred_task_s_likely_and_conservative_times_start_after_its_pla
     for prev, nxt in zip(ch2, ch2[1:]):
         p.db.update_task(nxt, depends_on=[prev])
     s4 = now + 15000   # the chain is 18000 s raw, 12600 s shown x0.7
+    low = {}
     for status in ("waiting", "queued"):
         tt = p.db.add_task(f"low {status}", "s", kind="work", status=status, depends_on=[ch2[-1]], labels=[f"start_after:{s4:.0f}"])
         p.db.x("UPDATE tasks SET not_before=? WHERE id=?", (s4, tt))
-        et = eta.estimate(p.db, tt, now)
+        low[status] = et = eta.estimate(p.db, tt, now)
         assert et["end"] >= s4 and et["conservative"] >= et["end"], (status, et["end"] - now)
+    # Only the queue wait differs: the dependency's leftover work is not counted again after the planned start.
+    assert low["queued"]["end"] - low["waiting"]["end"] <= 300 * 3, (low["queued"]["end"] - now, low["waiting"]["end"] - now)
     p.db.set_kv(etaledger.KEY, {"on": True, "factors": {"work": 3.0}, "conservative_x": 5.5, "at": now})
     # A promise on the deferred owner and an undeferred one: each owner corrected alone, the later wins.
     o = {"id": "o1", "owners": [a, b]}

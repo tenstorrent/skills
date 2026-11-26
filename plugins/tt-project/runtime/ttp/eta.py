@@ -666,8 +666,8 @@ class _Est:
                 # The planned start covers the dependency only when it is later as the correction shows both;
                 # else the dependency's start and planned wait stay, so no task shows before its dependency.
                 planned = nb > now and nb >= now + self._shown(start, {"deferred": deferred}, fx)
-                if st != "queued" and planned:
-                    start, deferred = nb, nb   # its wait for the planned start is never corrected, only its work
+                if planned:   # its wait for the planned start is never corrected, only its work
+                    start, deferred = (min(start, nb) if st == "queued" else nb), nb
                 if hold := self._held(t):
                     if hold[0] is None:
                         return {**self._held_none(tid, hold[1]), "path": path}
@@ -676,8 +676,6 @@ class _Est:
                     # A queued task deferred to its not_before (start_after, the tests gate) waits that out in
                     # its queue leg, so the leg never reads 0m while the task cannot start for hours.
                     defer = max(0.0, nb - start) if planned else 0.0
-                    if planned:
-                        deferred = nb
                     locks = _locks(t)
                     waits = [w for lk in locks if (w := self._m(self.h["queue"].get(lk, [])) ) is not None]
                     wait = max(waits) if waits else self._m(self.h["wait"])
