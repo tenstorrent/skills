@@ -477,7 +477,8 @@ class _Est:
             return self._cycle(tid, seen, rv)
         # The review depends on this task, which is done: it may start now (task() replaces this memo).
         self.memo[(tid, self.fx)] = {"done": self.now, "end": self.now, "path": [tid], "legs": [], "why": None, "overrun": False}
-        e = self.task(rv, tuple(x for x in seen if x != tid))
+        # Never a root (empty seen): the review ranks its branches by the estimate's own task's correction.
+        e = self.task(rv, tuple(x for x in seen if x != tid) or (tid,))
         if e["why"]:
             return self._from(tid, e)
         legs, end = list(e["legs"]), e["end"]
@@ -662,10 +663,11 @@ class _Est:
                 legs.append(("run", left * lx))
             else:
                 nb = max(float(t.get("not_before") or 0), tg or 0)   # a clock start_when: its time
-                if st != "queued":
-                    start = max(start, nb)
-                    if start == nb > now:
-                        deferred = nb   # its wait for the planned start is never corrected, only its work
+                # The planned start covers the dependency only when it is later as the correction shows both;
+                # else the dependency's start and planned wait stay, so no task shows before its dependency.
+                planned = nb > now and nb >= now + self._shown(start, {"deferred": deferred}, fx)
+                if st != "queued" and planned:
+                    start, deferred = max(start, nb), nb   # its wait for the planned start is never corrected, only its work
                 if hold := self._held(t):
                     if hold[0] is None:
                         return {**self._held_none(tid, hold[1]), "path": path}
@@ -673,7 +675,7 @@ class _Est:
                 if st == "queued":
                     # A queued task deferred to its not_before (start_after, the tests gate) waits that out in
                     # its queue leg, so the leg never reads 0m while the task cannot start for hours.
-                    defer = max(0.0, nb - start)
+                    defer = max(0.0, nb - start) if planned else 0.0
                     if defer:
                         deferred = nb
                     locks = _locks(t)

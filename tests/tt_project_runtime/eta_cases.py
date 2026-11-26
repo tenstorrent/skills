@@ -963,6 +963,17 @@ def test_eta_a_deferred_task_s_likely_and_conservative_times_start_after_its_pla
     em = eta.estimate(p.db, m, now)
     assert em["path"][:3] == [m, j, a1] and em["deferred"] == s1, em["path"]
     assert eta.estimate(p.db, j, now)["path"][:2] == [j, c3]   # the join's own estimate is unchanged
+    # A planned start inside a dependency's corrected work never shows its task before that dependency
+    # (the chain is 5 x 1500 s raw, shown x3; the start sits between the raw and the shown end).
+    ch = [p.db.add_task(f"w{i}", "s", kind="work", depends_on=[] if i == 0 else None) for i in range(5)]
+    for prev, nxt in zip(ch, ch[1:]):
+        p.db.update_task(nxt, depends_on=[prev])
+    s3 = now + 3 * 3600
+    for status in ("waiting", "queued"):
+        tt = p.db.add_task(f"held {status}", "s", kind="work", status=status, depends_on=[ch[-1]], labels=[f"start_after:{s3:.0f}"])
+        p.db.x("UPDATE tasks SET not_before=? WHERE id=?", (s3, tt))
+        ec, et = eta.estimate(p.db, ch[-1], now), eta.estimate(p.db, tt, now)
+        assert et["end"] >= ec["end"] and et["conservative"] >= et["end"], (status, et["end"] - now, ec["end"] - now)
     # A promise on the deferred owner and an undeferred one: each owner corrected alone, the later wins.
     o = {"id": "o1", "owners": [a, b]}
     eo = eta.obligation_estimate(p.db, o, now)
