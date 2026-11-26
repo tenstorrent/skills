@@ -195,7 +195,10 @@ Every project cuts its queue times with the resources its charter allows (the te
   worker runs to the OpenAI-compatible `chat` provider; endpoint faults fall back to the core provider
   with no attempt spent and a cool-down (`route_cooldown_s`, default 900). While the endpoint's token
   quota runs ahead of an even spread over its window (`providers.chat.quota`, glmquota.py), new GLM
-  runs start on core, lowest priority and judgement runs first (fallback `paced`). A 404 for a model the
+  runs start on core, lowest priority and judgement runs first (fallback `paced`); the pace also follows the
+  org's remaining tokens (the `X-Quota-Remaining-llm_tokens` header of every answer) and the account's
+  `providers.chat.quota_hourly_cap` (tokens per UTC hour, off by default, self-lifting once cached tokens
+  stop counting unless `providers.chat.quota_cap_lift` is `off`). A 404 for a model the
   endpoint no longer serves (`model_missing`) holds only that tier's route to that model, with one notice naming
   the setting it came from (the tier's model or a `providers.chat.routes` rule's), until that setting changes or the
   model-free /models check lists it again; `ttp status` shows the hold

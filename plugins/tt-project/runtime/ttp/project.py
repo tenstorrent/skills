@@ -922,7 +922,8 @@ PROVIDER_KEYS = {"billing", "tiers", "plugin_dirs", "worker_isolation", "mcp_ser
                  # options) are checked by modelpick.config_problems.
                  "dispatch",
                  # quota: the endpoint's token quota count and pacing (glmquota.py: on, size, window_s,
-                 # reserve, count_cached).
+                 # reserve, count_cached). The account keys quota_hourly_cap and quota_cap_lift are
+                 # ACCOUNT_NESTED_KEYS (glmquota.KEYS).
                  "quota"}
 
 

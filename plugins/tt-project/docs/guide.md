@@ -2090,6 +2090,19 @@ Messages calls into `<base url>/chat/completions` calls and back, and ends with 
    all; and every run once the whole quota is spent, until the reset. Runs already going keep
    running, and no flag is rolled back or frozen. `ttp status` and the web app show the tokens
    used, the size, the reset and whether pacing acts.
+   The endpoint's quota is shared by everyone in the organisation, per model, so the pace also
+   follows the org's real remaining: every successful answer on every route (bridge, babysit,
+   benches, probes, the `/models` poll) records its `X-Quota-Remaining-llm_tokens` header (a number
+   with its UTC time) in the quota file, and the newest reading of the current UTC hour limits
+   the budget to our use this hour plus what the org has left over the reserve. Account setting
+   `providers.chat.quota_hourly_cap` (tokens per UTC hour; unset or 0: no cap, the shipped default)
+   also caps our own use per UTC hour, cached prompt tokens at full weight; GLM runs and coordinator
+   wakes over the smaller of the two budgets start on core (fallback `paced`) until the next UTC
+   hour. `providers.chat.quota_cap_lift` is `auto` (default), `on` (cap lifted) or `off` (never
+   lifted): in `auto` the cap lifts by itself once the readings show cached tokens no longer count
+   (a least-squares fit of the org's drops on our uncached and cached tokens, three passing
+   evaluations in a row on fresh readings, never one noisy sample), with one low notice. Set them with
+   `ttp config --account <key> <value>`.
 8. Human interaction stays on Opus. On every run on the chat model, whatever route sent it there
    (the chat provider, a code arm's GLM run, a routine coordinator lane), an outward post (`ttp
    notify`, `say`, `ask`, `ttp note --to` or `--reply`, a `gh` comment or other write, an HTTP
