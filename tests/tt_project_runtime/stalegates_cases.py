@@ -177,6 +177,26 @@ def test_stalegate_promise_whose_only_owner_is_stuck_is_repointed_or_raised(env,
     assert carrier in obligations._owner_ids(obligations.get(p.db, oid))
 
 
+def test_stalegate_torn_obligations_state_gives_no_promise_findings_and_the_rest_still_runs(env, monkeypatch):
+    """A torn obligation (any error while reading its owners) gives no promise findings; the task findings and
+    the Course check's stale-gate line still come out."""
+    from ttp import coursecheck, obligations, stalegates
+    _sg_env(monkeypatch)
+    p = make(env)
+    _sg_hold(p, "box-c")
+    tid = _sg_task(p, labels=["resource:box-c"])
+    now = time.time()
+    obligations.add(p, "ship the promised work", [tid], now=now)
+
+    def torn(db, o):
+        raise ValueError("torn owners")
+    monkeypatch.setattr(obligations, "live_owner_ids", torn)
+    found = stalegates.findings(p.db, _SG_CFG, now + _SG_OLD)
+    assert stalegates.promises(p.db, _SG_CFG, found, now + _SG_OLD) == []
+    lines, _ = coursecheck.lines(p.db, _SG_CFG, None, now + _SG_OLD)
+    assert any(f"#{tid}" in x and "stale gate" in x for x in lines), lines
+
+
 def test_stalegate_detector_fires_in_the_course_check_and_off_switch(env, monkeypatch):
     """The Course check names a task held over 30 min behind a held machine and nothing under 30 min; the
     threshold 0 turns the sweep and the detector off."""

@@ -10,8 +10,9 @@ once as a must-act item `stale_gate-<task>` (mustact.STALE_GATE_KIND):
   not name the machine itself, else it is raised. A hold is never lifted or bypassed;
 - a gate older than `coordinator.stale_gate_min` (default 30, 0 = off) that states no reason (a why,
   a rule id, `needs #id` or `safety:`), or a dependency the dependent neither names nor shares a file
-  with (open, or cancelled, failed or gone): cleared or dropped, requeued. Until then a dead dependency
-  keeps the task blocked, as the dead-dependency event says;
+  with (cancelled, failed or gone): dropped and requeued once the threshold passes, or raised when the task
+  names it or shares a file with it; until then it keeps the task blocked, as the dead-dependency event
+  says. An open dependency is dropped only from a queued task that is not a review and cites nothing;
 - a promise whose live owners all sit behind such a gate or are failed or cancelled: one clear
   replacement task is attached, else raised.
 
@@ -173,13 +174,12 @@ def findings(db, cfg: dict, now: float | None = None) -> list[dict]:
         for dep in deps:
             dead = _first_dead([dep], states)
             named = bool(re.search(rf"#{dep}\b", text)) or str(dep) in cont or dep in keep
-            if dead and old and not named and not _shares(db, text, dep):
-                out.append({**base, "ident": f"dep:{dep}", "cause": "dead_dep", "action": "drop_dep", "dep": dep,
-                            "gate": f"depends on #{dep}, which {dead[1]}", "fix": f"dropped #{dep}"})
-            elif dead and old:   # named or sharing a file with it: its output may still be needed
-                out.append({**base, "ident": f"dep:{dep}", "cause": "dead_dep", "action": "raise",
-                            "gate": f"depends on #{dep}, which {dead[1]}",
-                            "fix": f"its spec names or shares files with #{dep}: re-point it with depends_on or cancel it"})
+            if dead and old:   # named or sharing a file with it: its output may still be needed, so raise
+                drop = not named and not _shares(db, text, dep)
+                out.append({**base, "ident": f"dep:{dep}", "cause": "dead_dep", "action": "drop_dep" if drop else "raise",
+                            "dep": dep, "gate": f"depends on #{dep}, which {dead[1]}",
+                            "fix": f"dropped #{dep}" if drop else
+                            f"its spec names or shares files with #{dep}: re-point it with depends_on or cancel it"})
             elif (not dead and old and not named and not CITE.search(text) and t["status"] == "queued"
                   and t["kind"] != "review"):   # a review always waits on its subject
                 if states.get(dep) in ("queued", "blocked", "waiting") and not _shares(db, text, dep):
@@ -212,20 +212,20 @@ def promises(db, cfg: dict, found: list[dict], now: float | None = None) -> list
     if limit <= 0:
         return out
     try:
-        obs = obligations.items(db)
-    except (AttributeError, TypeError, KeyError):   # torn obligations state: its own detector reports it
-        return out
-    for o in obs:
-        if not obligations._open(o):
-            continue
-        owners = obligations.live_owner_ids(db, o)
-        why = [_owner_gated(db, i, gated) for i in owners]
-        if not owners or not all(why):
-            continue
-        since = max(float((db.task(i) or {}).get("updated") or now) for i in owners)
-        if now - since >= limit:
-            out.append({"oid": o["id"], "owners": owners, "why": "; ".join(why), "text": o["text"], "since": since,
-                        "cands": [c for c in obligations._candidates(db, o) if c["id"] not in gated]})
+        for o in obligations.items(db):
+            if not obligations._open(o):
+                continue
+            owners = obligations.live_owner_ids(db, o)
+            why = [_owner_gated(db, i, gated) for i in owners]
+            if not owners or not all(why):
+                continue
+            since = max(float((db.task(i) or {}).get("updated") or now) for i in owners)
+            if now - since >= limit:
+                out.append({"oid": o["id"], "owners": owners, "why": "; ".join(why), "text": o["text"],
+                            "since": since,
+                            "cands": [c for c in obligations._candidates(db, o) if c["id"] not in gated]})
+    except (AttributeError, TypeError, KeyError, ValueError):   # torn obligations state: its own detector reports it
+        return []
     return out
 
 
