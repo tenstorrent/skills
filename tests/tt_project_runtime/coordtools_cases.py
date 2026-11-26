@@ -1232,6 +1232,39 @@ def test_coordinator_bash_guard_keeps_a_harness_tasks_commit_made_while_the_call
     assert notice and "put back" in notice and "guards/new.py" in p.config_path.read_text()
 
 
+def test_coordinator_bash_guard_keeps_a_harness_tasks_staged_edit_committed_in_a_later_call(env, tmp_path, monkeypatch):
+    # (c3) A harness task edits project.json and a memory entry and stages them (`git add`, from the harness
+    # root and from memory/) during one coordinator call, and commits in a later one: the edit is kept
+    # (upstream note a1f819569c57b25c). A coordinator run's own staged edit is still put back.
+    import shutil
+    import ttp
+    from ttp import coordtools
+    p, run, files = _bash_guard_project(env, tmp_path, monkeypatch)
+    real = shutil.which("git")
+    p.commit_harness([p.memory_dir / "fact-a.md", p.config_path], "test: base")
+    rt = str(pathlib.Path(ttp.__file__).resolve().parents[1])
+    task_env = {k: v for k, v in os.environ.items() if not k.startswith("TTP_")} | {"TTP_TASK": "7"}
+
+    def git(sub_env, cwd, *a):
+        subprocess.run([sys.executable, "-I", "-c", "import sys; sys.path.insert(0, sys.argv[1]); "
+                        "from ttp.gitguard import main; sys.exit(main(sys.argv[2:]))", rt, real, *a],
+                       check=True, env=sub_env, cwd=str(cwd))
+
+    def stage(sub_env, guards):
+        p.config_path.write_text(json.dumps({**json.loads(p.config_path.read_text()), "guards": {"local": guards}}))
+        (p.memory_dir / "fact-a.md").write_text(f"---\nkind: fact\n---\n{guards}\n")
+        git(sub_env, p.harness, "add", "project.json")
+        git(sub_env, p.memory_dir, "add", "fact-a.md")
+    assert _bash_guarded_call(p, tmp_path, "sleep 0.1", 0, lambda: stage(task_env, ["guards/new.py"])) is None
+    assert _bash_guarded_call(p, tmp_path, "true", 1, lambda: git(
+        task_env, p.harness, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "guards: add one")) is None
+    assert json.loads(p.config_path.read_text())["guards"]["local"] == ["guards/new.py"]
+    assert "guards/new.py" in (p.memory_dir / "fact-a.md").read_text()
+    notice = _bash_guarded_call(p, tmp_path, "true", 2, lambda: stage(task_env | {coordtools.FULL_ENV: "1"},
+                                                                       ["guards/x.py"]))
+    assert notice and "put back" in notice and "guards/new.py" in p.config_path.read_text()
+
+
 def test_coordinator_bash_guard_only_reports_a_file_no_ttp_writer_logs(env, tmp_path, monkeypatch):
     # (d) A guarded file outside a project's harness folder has no write log: reported, never put back.
     from ttp import coordtools

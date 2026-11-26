@@ -374,3 +374,17 @@ def test_a_project_guards_setting_keeps_the_other_guards_key(env, raw):
     assert g["local"] == raw["guards"].get("local", [])
     assert set(raw["guards"].get("protected_paths", [])) <= set(g["protected_paths"])
     assert isinstance(g["protected_paths"], list)
+
+
+def test_asks_tools_reads_each_listed_guard_without_running_it():
+    """A guard asks tool calls when it names tool_refusal, star-imports a module (which may bring one in),
+    or is missing or does not parse: Codex then runs with its unhooked web search off."""
+    import tempfile
+    from ttp import localguard
+    h = Path(tempfile.mkdtemp())
+    for name, src in {"shell.py": NO_WIPE, "tools.py": NO_SECRET_EDIT, "star.py": "from shared_guard import *\n",
+                      "broken.py": "def refusal(cmd:\n", "runs.py": "raise SystemExit('never run')\n"}.items():
+        (h / name).write_text(src)
+    for listed, asks in ((["shell.py"], False), (["runs.py"], False), (["shell.py", "tools.py"], True),
+                         (["star.py"], True), (["broken.py"], True), (["missing.py"], True)):
+        assert localguard.asks_tools({"guards": {"local": listed}}, h) is asks, listed

@@ -519,15 +519,17 @@ def guard(payload: dict, run=None, protected=None) -> str | None:
     """After a full-tools coordinator's Bash call: put back every protected file the call changed,
     created or removed outside ttp's own writes, from the snapshot, record an event, and return the
     notice for the tool result (None: nothing changed out of band). ttp's writers log each protected
-    write at one choke point (project.durable_write, durable_append, the memory archive renames and
-    project.tree_writes around every git command that changes the harness checkout); a change whose
+    write at one choke point (project.durable_write, durable_append, the memory archive renames,
+    project.tree_writes around every git command that changes the harness checkout, and a task run's git
+    staging or committing in it, gitguard.noting_commits); a change whose
     path and new digest are logged since the snapshot is kept. Before a put-back the changed content is
     saved (PUT_BACK_DIR under the project's state folder, indexed by PUT_BACK_LOG with path, digest,
     time and command), and the notice names it, so nothing is lost. A changed file no ttp writer logs
     for (project.protected_log is None: outside a project's harness folder) is reported, never put
     back. It reads files, not commands, so a variable, glob or script write is caught too. Accepted
-    gaps: a user's own editor edit to the charter, memory or project.json during the call is put back
-    (saved and reported), not recognised as theirs; a call whose post hook never runs (an interrupted
+    gaps: a user's own editor edit to the charter, memory or project.json during the call, and a harness
+    task's edit not yet staged when the call ends, are put back (saved and reported), not recognised as
+    theirs; a call whose post hook never runs (an interrupted
     call) and a write by a process the call left in the background are not checked; a script that also
     forges the write log passes. Write/log race: durable_write logs only after its os.replace and
     fsync_dir, and tree_writes only after its git command ends, so a check inside that window takes

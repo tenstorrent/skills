@@ -144,8 +144,9 @@ def refusal(cfg: dict, tool: str, tool_input: dict, harness: Path | None = None)
 
 
 def asks_tools(cfg: dict, harness: Path | None) -> bool:
-    """A listed guard may be asked about tool calls other than shell commands: its text names `tool_refusal`,
-    or the file or setting does not read (what it would refuse is unknown). Read, never run: the daemon asks
+    """A listed guard may be asked about tool calls other than shell commands: its text names `tool_refusal`
+    or star-imports a module (which may bring one in), or the file or setting does not read (what it would
+    refuse is unknown). Read, never run: the daemon asks
     this as it starts a run whose agent has web tools no hook sees (Codex's hosted web search,
     Provider.web_unhooked), which then starts with the web off."""
     import ast
@@ -153,10 +154,11 @@ def asks_tools(cfg: dict, harness: Path | None) -> bool:
     for f in files:
         try:
             text = f.read_text()
-            ast.parse(text)
+            tree = ast.parse(text)
         except (OSError, SyntaxError, ValueError):
             return True
-        if "tool_refusal" in text:
+        if "tool_refusal" in text or any(isinstance(n, ast.ImportFrom) and any(a.name == "*" for a in n.names)
+                                         for n in ast.walk(tree)):
             return True
     return bool(why)
 

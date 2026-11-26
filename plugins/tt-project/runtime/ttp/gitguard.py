@@ -431,14 +431,17 @@ def command(real: str, args: list[str], env: dict) -> tuple[list[str], dict]:
     return [real, *globals_, "-c", f"core.hooksPath={guard}", "push", "--verify", *rest], env
 
 
-COMMITS = ("commit", "merge", "cherry-pick", "revert", "am", "pull", "rebase", "reset")   # bin/git sends them here
+# bin/git sends a task run's HEAD-moving and index-writing commands here
+COMMITS = ("commit", "merge", "cherry-pick", "revert", "am", "pull", "rebase", "reset", "add", "stage", "rm", "mv",
+           "update-index")
 
 
 def noting_commits(real: str, cmd: list[str], env: dict) -> int:
-    """Run `cmd`, a task run's HEAD-moving git command (COMMITS). In a project's harness checkout, log each
-    protected file its new commits changed (project.note_protected), as tree_writes logs ttp's own writes,
-    so a session coordinator's Bash guard (coordtools.guard) running meanwhile keeps a harness task's
-    committed edit instead of putting it back. A coordinator run's own commits are never logged."""
+    """Run `cmd`, a task run's index-writing or HEAD-moving git command (COMMITS). In a project's harness
+    checkout, log each protected file it staged, removed or committed (project.note_protected, with its staged
+    content), as tree_writes logs ttp's own writes, so a session coordinator's Bash guard (coordtools.guard)
+    running meanwhile keeps a harness task's edit once it is staged, even when the commit comes in a later
+    call. A coordinator run's own commands are never logged."""
     from . import project
     globals_ = split(cmd[1:])[0]
 
@@ -447,14 +450,21 @@ def noting_commits(real: str, cmd: list[str], env: dict) -> int:
     top = git("rev-parse", "--show-toplevel").stdout.decode().strip()
     if not top or project.protected_log(Path(top, "project.json")) is None:
         os.execve(real, cmd, env)
-    old = git("rev-parse", "-q", "--verify", "HEAD").stdout.decode().strip()
+
+    def index():   # the protected paths' index entries: mode, object, stage and path
+        return set(git("-C", top, "ls-files", "-s", "-z", "--", "project.json", "MEMORY.md", "CHARTER*", "memory")
+                   .stdout.split(b"\0"))
+    old, staged = git("rev-parse", "-q", "--verify", "HEAD").stdout.decode().strip(), index()
     rc = subprocess.run(cmd, env=env).returncode
     new = git("rev-parse", "-q", "--verify", "HEAD").stdout.decode().strip()
+    names = {e.split(b"\t", 1)[1].decode() for e in staged ^ index() if b"\t" in e}
     if old and new and new != old:
-        for n in filter(None, git("diff", "--name-only", "-z", "--no-renames", old, new).stdout.decode().split("\0")):
-            if project.protected_log(f := Path(top, n)) is not None:
-                r = git("show", f"{new}:{n}")
-                project.note_protected(f, r.stdout if r.returncode == 0 else None)
+        names |= set(filter(None, git("diff", "--name-only", "-z", "--no-renames", old, new).stdout.decode()
+                            .split("\0")))
+    for n in sorted(names):
+        if project.protected_log(f := Path(top, n)) is not None:
+            r = git("show", f":{n}")   # what it staged or committed; out of the index: the file as it is
+            project.note_protected(f, r.stdout if r.returncode == 0 else None)
     return rc
 
 
