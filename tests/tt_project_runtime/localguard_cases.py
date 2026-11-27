@@ -414,6 +414,26 @@ def test_an_upgrade_commits_local_changes_past_untracked_embedded_repos_and_igno
     assert not _git_out(p.harness, "status", "--porcelain", "--ignored=no").replace("?? nested/", "").strip()
 
 
+def test_an_upgrade_local_commit_hands_git_its_paths_on_stdin_and_writes_no_scratch_file(env, monkeypatch):
+    p = make(env)
+    from ttp import cli
+    odd = "two words\nand a line.txt"
+    (p.harness / odd).write_text("x\n")
+    (p.harness / "plain.txt").write_text("y\n")
+    real, adds = cli._git, []
+
+    def seen(cwd, *args, **kw):
+        if "add" in args and "--pathspec-file-nul" in args:
+            adds.append((args, kw.get("stdin")))
+        return real(cwd, *args, **kw)
+    monkeypatch.setattr(cli, "_git", seen)
+    monkeypatch.setattr(cli.tempfile, "mkdtemp", lambda *a, **k: pytest.fail("a scratch folder was made"))
+    cli._commit_local_changes(p, ["-c", "user.name=t", "-c", "user.email=t@t"])
+    (args, stdin), = adds
+    assert "--pathspec-from-file=-" in args and stdin == f"plain.txt\0{odd}\0"
+    assert {odd, "plain.txt"} <= set(_git_out(p.harness, "ls-tree", "-r", "--name-only", "-z", "HEAD").split("\0"))
+
+
 def test_an_upgrade_local_commit_skips_a_file_removed_while_it_is_added_and_fails_on_a_real_error(env, monkeypatch):
     p = make(env)
     from ttp import cli
@@ -421,10 +441,10 @@ def test_an_upgrade_local_commit_skips_a_file_removed_while_it_is_added_and_fail
     (p.harness / "kept.txt").write_text("y\n")
     real = cli._git
 
-    def vanishing(cwd, *args):
-        if "--pathspec-from-file" in args:
+    def vanishing(cwd, *args, **kw):
+        if "--pathspec-from-file=-" in args:
             (p.harness / "gone.txt").unlink()      # the directory listing was taken; the file goes before the add
-        return real(cwd, *args)
+        return real(cwd, *args, **kw)
     monkeypatch.setattr(cli, "_git", vanishing)
     cli._commit_local_changes(p, ["-c", "user.name=t", "-c", "user.email=t@t"])
     tree = _git_out(p.harness, "ls-tree", "-r", "--name-only", "HEAD").split("\n")

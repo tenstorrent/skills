@@ -696,9 +696,9 @@ def _copy_tree(src: Path, dst: Path) -> None:
               f" ({', '.join(sorted(skipped)[:5])}{', ...' if len(skipped) > 5 else ''})", file=sys.stderr)
 
 
-def _git(cwd: Path, *args: str) -> str:
+def _git(cwd: Path, *args: str, stdin: str | None = None) -> str:
     return gitmemo.run(["git", "-C", str(cwd), *args], capture_output=True, text=True, check=True,
-                       timeout=None).stdout.strip()
+                       timeout=None, input=stdin).stdout.strip()
 
 
 SOURCE_FILE = "SOURCE_COMMIT"      # in runtime/ttp/: the git commit (or content hash) `ttp setup` installed this runtime from
@@ -15346,11 +15346,9 @@ def _stage_all(h: Path, names) -> None:
     plain = sorted(n for n in untracked if not n.endswith("/") and os.path.lexists(h / n))
     if not plain:
         return
-    scratch = Path(tempfile.mkdtemp(prefix="ttp-add-"))
-    spec = scratch / "paths"
-    durable_write(spec, "\0".join(plain) + "\0", sync=False)
     try:
-        _git(h, "--literal-pathspecs", "add", "--pathspec-from-file", str(spec), "--pathspec-file-nul")
+        _git(h, "--literal-pathspecs", "add", "--pathspec-from-file=-", "--pathspec-file-nul",
+             stdin="\0".join(plain) + "\0")
     except subprocess.CalledProcessError:
         for n in plain:     # one is gone or unreadable: add the rest one by one
             try:
@@ -15358,8 +15356,6 @@ def _stage_all(h: Path, names) -> None:
             except subprocess.CalledProcessError:
                 if os.path.lexists(h / n):
                     raise
-    finally:
-        shutil.rmtree(scratch, ignore_errors=True)
 
 
 def _commit_local_changes(p: Project, ident: list[str]) -> list[str]:
