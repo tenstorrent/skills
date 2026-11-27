@@ -768,7 +768,7 @@ def test_gh_workstation_allows_pr_upkeep_title_body_edits_review_replies_and_clo
     assert ghqueue.allowed(["pr", "edit", "3", "--body-file", "-"], f"Body.\n{tag}\n".encode()) == ""
     for bad in (["pr", "edit", "3", "--add-reviewer", "someone"], ["pr", "edit", "3", "--remove-reviewer", "x"],
                 ["pr", "edit", "3", "--base", "main"],
-                ["pr", "edit", "3", "--remove-label", "x"], ["pr", "edit", "3", "--add-assignee", "x"],
+                ["pr", "edit", "3", "--add-assignee", "x"],
                 ["pr", "edit", "3", "--remove-assignee", "x"], ["pr", "edit", "3", "--add-project", "x"],
                 ["pr", "edit", "3", "--milestone", "x"], ["pr", "edit", "3", "--some-new-flag", "x"],
                 ["pr", "edit", "3", "--title", "x", "--add-reviewer", "x"], ["pr", "edit", "3"],
@@ -822,10 +822,11 @@ def test_gh_workstation_allows_pr_upkeep_title_body_edits_review_replies_and_clo
     assert ghqueue.pull("lab-box", gh) == "lab-box: no gh calls queued"
 
 
-def test_gh_workstation_reruns_only_a_run_on_its_own_open_draft_prs_head(env, monkeypatch):
+def test_gh_workstation_reruns_only_a_run_on_its_own_open_prs_ttp_head(env, monkeypatch):
     """`run rerun <id>` (optionally --failed) passes the allowlist; the workstation reads the run's head,
     the repo's default branch, the open PRs on that branch and its own login just before, and reruns only
-    when the head sha is the head of an open draft its gh user opened. Every other `run` call is refused."""
+    when the head sha is the head of an open PR (draft or not) its gh user opened on one of the project's
+    own branches. Every other `run` write is refused."""
     from ttp import ghqueue
     _cfg, _repo, _gh, ws_calls = _workstation(env, monkeypatch)
     for ok in (["run", "rerun", "77", "--failed"], ["run", "rerun", "77"],
@@ -851,7 +852,8 @@ def test_gh_workstation_reruns_only_a_run_on_its_own_open_draft_prs_head(env, mo
     def pr(draft=True, login="ME", head=sha):
         return {"isDraft": draft, "author": {"login": login}, "headRefOid": head}
     for branch, open_prs, refused in (("ttp/t1-x", [pr(login="someone-else")], "someone else's"),
-                                      ("ttp/t1-x", [pr(draft=False)], "not a draft"),
+                                      ("ttp/t1-x", [pr(draft=False)], ""),
+                                      ("feature/x", [pr()], "the run's branch: only the project's own ttp/"),
                                       ("ttp/t1-x", [pr(head=old)], "not on the head of an open PR"),
                                       ("ttp/t1-x", [], "not on the head of an open PR"),
                                       ("main", [pr()], "default branch"),
@@ -862,7 +864,7 @@ def test_gh_workstation_reruns_only_a_run_on_its_own_open_draft_prs_head(env, mo
         got = ghqueue.answer({"key": "e" * 32, "argv": rerun, "stdin": ""}, str(stub))
         assert (refused in got["stderr"] and got["rc"] == 1) if refused else (got["rc"] == 0 and not got["stderr"]), got
     calls = ws_calls.read_text().splitlines()
-    assert sum(c.startswith("run rerun") for c in calls) == 1, calls   # only the run on its own draft's head
+    assert sum(c.startswith("run rerun") for c in calls) == 2, calls   # only runs on its own PR's head
     assert "run view 77 --repo=acme/widgets --json headBranch,headSha" in calls
     assert ("pr list --repo=acme/widgets --head ttp/t1-x --state open --json isDraft,author,headRefOid" in calls)
 
@@ -1716,7 +1718,7 @@ def test_gh_workstation_runs_a_workflow_and_adds_a_label_only_on_its_own_open_pr
                 ["workflow", "run", "heavy.yml", "--repo", "acme/widgets"],
                 ["workflow", "run", "a.yml", "b.yml", "--ref", "x", "-R", "acme/widgets"],
                 ["workflow", "enable", "heavy.yml"], ["workflow", "disable", "heavy.yml"],
-                ["pr", "edit", "3", "--add-label"], ["pr", "edit", "3", "--remove-label", "x"]):
+                ["pr", "edit", "3", "--add-label"], ["pr", "edit", "3", "--remove-label"]):
         assert ghqueue.allowed(bad), bad
     ws = ws_calls.parent
     prs, view = ws / "prs.json", ws / "view.json"
@@ -1746,6 +1748,60 @@ def test_gh_workstation_runs_a_workflow_and_adds_a_label_only_on_its_own_open_pr
         got = ghqueue.answer({"key": "c" * 32, "argv": label, "stdin": ""}, str(stub))
         assert (refused in got["stderr"] and got["rc"] == 1) if refused else (got["rc"] == 0 and not got["stderr"]), got
     assert sum(c.startswith("pr edit") for c in ws_calls.read_text().splitlines()) == 1
+
+
+def test_gh_workstation_reads_runs_and_edits_labels_and_comments_only_on_its_own_open_ttp_prs(env, monkeypatch):
+    """Run, workflow and PR-diff reads pass the allowlist; a label edit (add or remove, never a merge, approve
+    or ready label) and a tagged comment on a PR (`api -X POST .../issues/<n>/comments -f body=...`) pass it
+    too, and the workstation then runs them only on an open PR its gh user opened whose head is one of the
+    project's branches. A read of the comments stays a plain read. Gate, admin and secret calls are refused."""
+    from ttp import ghqueue
+    from ttp.aitag import DEFAULT as tag
+    _cfg, _repo, _gh, ws_calls = _workstation(env, monkeypatch)
+    post = ["api", "-X", "POST", "repos/acme/widgets/issues/3/comments", "-f", f"body=CI is green again.\n{tag}"]
+    for ok in (["run", "list", "--branch", "ttp/x", "-R", "acme/widgets"], ["run", "view", "77", "--log"],
+               ["run", "view", "77", "--log-failed", "-R", "acme/widgets"], ["run", "watch", "77", "--exit-status"],
+               ["workflow", "list"], ["workflow", "view", "ci.yml"], ["pr", "diff", "3", "--name-only"],
+               ["pr", "edit", "3", "--remove-label", "needs-rerun", "-R", "acme/widgets"],
+               ["pr", "edit", "3", "--add-label", "heavy", "--remove-label", "light"], post,
+               ["api", "--method", "post", "/repos/acme/widgets/issues/3/comments", f"--raw-field=body=ok\n{tag}"],
+               ["api", "repos/acme/widgets/issues/3/comments"]):
+        assert ghqueue.allowed(ok) == "", ok
+    for bad in (["pr", "edit", "3", "--remove-label", "do-not-merge"], ["pr", "edit", "3", "--add-label", "automerge"],
+                ["pr", "edit", "3", "--add-label", "Approved"], ["pr", "edit", "3", "--remove-label", "not-ready"],
+                ["pr", "edit", "3", "--add-label", "x,ready-for-review"], ["pr", "edit", "3", "--base", "main"],
+                ["pr", "edit", "3", "--add-reviewer", "x"], ["pr", "merge", "3"], ["pr", "ready", "3"],
+                ["pr", "ready", "3", "--undo"], ["pr", "review", "3", "--approve"], ["run", "view", "77", "--web"],
+                ["run", "cancel", "77"], ["workflow", "enable", "ci.yml"], ["workflow", "disable", "ci.yml"],
+                ["secret", "list"], ["secret", "set", "X"], ["variable", "set", "X"], ["ruleset", "list"],
+                ["release", "create", "v1"], ["ssh-key", "add", "k.pub"], ["gpg-key", "list"], ["auth", "token"],
+                ["api", "graphql", "-f", "query=x"], ["api", "-X", "POST", "repos/acme/widgets/git/refs", "-f", "ref=x"],
+                ["api", "-X", "POST", "repos/acme/widgets/issues/3/comments", "-f", "body=no tag"],
+                ["api", "-X", "POST", "repos/acme/widgets/issues/3/comments", "-F", f"body={tag}"],
+                ["api", "-X", "POST", "repos/acme/widgets/issues/3/comments", "-f", f"body={tag}", "-f", f"body={tag}"],
+                ["api", "-X", "PATCH", "repos/acme/widgets/issues/3/comments", "-f", f"body={tag}"]):
+        assert ghqueue.allowed(bad), bad
+    ws = ws_calls.parent
+    view = ws / "view.json"
+    stub = ws / "gh-own"
+    stub.write_text("#!/bin/sh\n"
+                    f'printf "%s\\n" "$*" >> "{ws_calls}"\n'
+                    f'case "$1 $2" in "pr view") cat "{view}";; "api user") echo me;; *) echo "ws: $*";; esac\n')
+    stub.chmod(0o755)
+    label = ["pr", "edit", "3", "--remove-label", "needs-rerun", "-R", "acme/widgets"]
+    for argv in (label, post):
+        for state, login, head, refused in (("CLOSED", "me", "ttp/x", "not the head of an open PR"),
+                                            ("OPEN", "someone-else", "ttp/x", "someone else's"),
+                                            ("OPEN", "me", "feature/x", "that PR's head: only the project's own ttp/"),
+                                            ("OPEN", "me", "ttp/x", "")):
+            view.write_text(json.dumps({"state": state, "author": {"login": login}, "headRefName": head}))
+            got = ghqueue.answer({"key": "c" * 32, "argv": argv, "stdin": ""}, str(stub))
+            assert (refused in got["stderr"] and got["rc"] == 1) if refused else (got["rc"] == 0 and not got["stderr"]), got
+    calls = ws_calls.read_text().splitlines()
+    assert sum(c.startswith(("pr edit", "api -X POST")) for c in calls) == 2, calls
+    assert "pr view 3 --repo=acme/widgets --json author,state,headRefName" in calls
+    got = ghqueue.answer({"key": "d" * 32, "argv": ["api", "repos/acme/widgets/issues/3/comments"], "stdin": ""}, str(stub))
+    assert got["rc"] == 0 and ws_calls.read_text().splitlines()[len(calls):] == ["api repos/acme/widgets/issues/3/comments"]
 
 
 def test_gh_workflow_run_takes_up_to_eight_plain_inputs_and_nothing_else_on_both_ends_of_the_route(env, monkeypatch):

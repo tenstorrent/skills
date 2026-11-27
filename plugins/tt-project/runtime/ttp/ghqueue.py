@@ -43,19 +43,25 @@ GH_TIMEOUT_S = 120
 REMOTE = 'PATH="$HOME/.local/bin:$PATH" ttp gh-queue'   # setup's default shim folder, off a non-login PATH
 _KEY = re.compile(r"[0-9a-f]{32}")
 _SHA = re.compile(r"[0-9a-f]{40}([0-9a-f]{24})?")
-_READS = {("pr", "view"), ("pr", "list"), ("pr", "checks"), ("issue", "view"), ("issue", "list")}
+_READS = {("pr", "view"), ("pr", "list"), ("pr", "checks"), ("pr", "diff"), ("issue", "view"), ("issue", "list"),
+          ("run", "list"), ("run", "view"), ("run", "watch"), ("workflow", "list"), ("workflow", "view")}
 _POSTS = {("pr", "comment"), ("issue", "comment"), ("pr", "create")}
 _API_FIELDS = {"-f", "-F", "--field", "--raw-field"}
 _BUNDLED = re.compile(r"-[A-Za-z]\S+")   # -XPOST, -cw, -bText: a bundle or an attached value
 _NEVER = {"--web", "-w", "--editor", "-e", "--delete-last"}   # opens a browser or editor there, or deletes
 # The only flags each of these upkeep calls may carry (every flag takes a value; anything else is refused)
 _EDIT_FLAGS = {"--title": "--title", "-t": "--title", "--body": "--body", "-b": "--body", "--body-file": "--body",
-               "-F": "--body", "--repo": "--repo", "-R": "--repo", "--add-label": "--add-label"}
+               "-F": "--body", "--repo": "--repo", "-R": "--repo", "--add-label": "--add-label",
+               "--remove-label": "--remove-label"}
+_LABELS = ("--add-label", "--remove-label")
+_GATE_LABEL = re.compile(r"merge|approv|ready", re.I)   # a label a bot may read as leave to merge or ready a PR
 _DISPATCH_FLAGS = {"--ref": "--ref", "-r": "--ref", "--repo": "--repo", "-R": "--repo"}
 _CLOSE_FLAGS = {"--comment": "--comment", "-c": "--comment", "--repo": "--repo", "-R": "--repo"}
 _REPO_FLAGS = {"--repo": "--repo", "-R": "--repo"}
 _RUN_ID = re.compile(r"[0-9]+")
-_REPLY_PATH = re.compile(r"/?repos/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+/pulls/[0-9]+/comments/[0-9]+/replies")
+# A comment post: a reply to a PR review comment, or a comment on a PR's conversation (issues/<n>/comments)
+_REPLY_PATH = re.compile(r"/?repos/([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)/(?:pulls/[0-9]+/comments/[0-9]+/replies|"
+                         r"issues/([0-9]+)/comments)")
 _REPLY_FLAGS = {"-X": "method", "--method": "method", "-f": "field", "--raw-field": "field"}
 # A project's own task branches (worktree's ttp/t<id>-<topic>, harness and revert branches); only these may be
 # deleted, one plain ref each: no `..`, no %-encoding, no empty or dot-led segment, never main, master or default
@@ -120,13 +126,15 @@ def _upkeep(argv: list[str], stdin: bytes) -> str:
     edit = argv[1] == "edit"
     pos, opts, why = _parse(argv[2:], _EDIT_FLAGS if edit else _CLOSE_FLAGS)
     if why:
-        return f"`gh pr {argv[1]}`: {why}" + (" (only --title, --body or --body-file -)" if edit else
+        return f"`gh pr {argv[1]}`: {why}" + (" (only --title, --body, --body-file - or a label)" if edit else
                                                 " (only an optional --comment; never --delete-branch)")
     if len(pos) != 1:
         return f"`gh pr {argv[1]}` names exactly one PR"
     if edit:
-        if not set(opts) & {"--title", "--body", "--add-label"}:
-            return "`gh pr edit` runs only to change the title or body, or to add a label"
+        if not set(opts) & {"--title", "--body", *_LABELS}:
+            return "`gh pr edit` runs only to change the title or body, or to add or remove a label"
+        if bad := next((v[0] for k, v in opts.items() if k in _LABELS and _GATE_LABEL.search(v[0])), None):
+            return f"`gh pr edit` never adds or removes a merge, approve or ready label (`{bad}`)"
         body = opts.get("--body", [None])[0]
         is_file = any(a.split("=", 1)[0] in ("--body-file", "-F") for a in argv[2:])
         if is_file:
@@ -176,20 +184,27 @@ def _dispatch(argv: list[str]) -> tuple[str, str, str]:
 
 
 def _reply(argv: list[str]) -> str | None:
-    """None unless `gh api` posts to a PR review comment's replies; then why it is refused, or "": one
-    `-X POST` to exactly repos/<o>/<r>/pulls/<n>/comments/<id>/replies with one raw field, body, ending
-    with the AI tag."""
-    if not any(_REPLY_PATH.fullmatch(a) for a in argv[1:]):
+    """None unless `gh api` names a comment post (_REPLY_PATH); then why it is refused, or "": one `-X POST`
+    to exactly repos/<o>/<r>/pulls/<n>/comments/<id>/replies or repos/<o>/<r>/issues/<n>/comments with one
+    raw field, body, ending with the AI tag."""
+    m = next((m for a in argv[1:] if (m := _REPLY_PATH.fullmatch(a))), None)
+    if m is None or (m[2] and not is_write(argv)):   # a read of a PR's comments stays a GET read
         return None
     pos, opts, why = _parse(argv[1:], _REPLY_FLAGS)
     if why:
-        return f"a review-comment reply: {why} (only -X POST and -f body=...)"
+        return f"a comment post: {why} (only -X POST and -f body=...)"
     if len(pos) != 1 or [m.upper() for m in opts.get("method", [])] != ["POST"]:
-        return "a review-comment reply is one `-X POST` to one replies path"
+        return "a comment post is one `-X POST` to one replies or issue-comments path"
     field = opts.get("field", [""])[0]
     if not field.startswith("body=") or not _tagged(field[5:]):
-        return f"a review-comment reply carries one field, body, ending with the AI-authorship tag {aitag.DEFAULT!r}"
+        return f"a comment post carries one field, body, ending with the AI-authorship tag {aitag.DEFAULT!r}"
     return ""
+
+
+def _pr_comment(argv: list[str]) -> re.Match | None:
+    """The issues/<n>/comments path a `gh api` write posts to, or None."""
+    m = next((m for a in argv[1:] if (m := _REPLY_PATH.fullmatch(a))), None)
+    return m if m and m[2] and is_write(argv) else None
 
 
 def _gh_login(gh: str) -> str | None:
@@ -201,16 +216,16 @@ def _gh_login(gh: str) -> str | None:
         return None
 
 
-def _own_draft_reason(pr: object, login: str, act: str) -> str:
-    """Why the PR record `pr` is not an open draft this workstation's gh user opened, or "": the author's
-    login must match `login` without regard to case and isDraft must be True; `act` opens the refusal
-    ("`gh pr close` closes only" / "`gh run rerun` reruns only a run of")."""
+def _own_draft_reason(pr: object, login: str, act: str, draft: bool = True) -> str:
+    """Why the PR record `pr` is not an open draft (`draft` False: any open PR) this workstation's gh user
+    opened, or "": the author's login must match `login` without regard to case and isDraft must be True;
+    `act` opens the refusal ("`gh pr close` closes only" / "`gh run rerun` reruns only a run of")."""
     if not isinstance(pr, dict):
         pr = {}
     author = pr.get("author") if isinstance(pr.get("author"), dict) else {}
     if not login or str(author.get("login") or "").lower() != login.lower():
-        return f"{act} a draft this workstation's gh user opened, and this PR is someone else's"
-    if pr.get("isDraft") is not True:
+        return f"{act} a {'draft' if draft else 'PR'} this workstation's gh user opened, and this PR is someone else's"
+    if draft and pr.get("isDraft") is not True:
         return f"{act} a draft PR, and this one is not a draft"
     return ""
 
@@ -247,12 +262,17 @@ def _rerun(argv: list[str]) -> tuple[str, str, str]:
     return "", pos[0], opts.get("--repo", [""])[0]
 
 
-def own_open_pr(gh: str, argv: list[str]) -> str:
-    """Why the workstation must not run `gh workflow run argv` or `gh pr edit argv --add-label`, or "": the
-    ref must be the head of an open PR its own gh user opened (a label: the named PR), never the default branch."""
+def own_open_pr(gh: str, argv: list[str], prefixes=()) -> str:
+    """Why the workstation must not run `gh workflow run argv`, a label edit (`gh pr edit argv --add-label` or
+    --remove-label) or a comment on a PR (`gh api -X POST repos/<o>/<r>/issues/<n>/comments`), or "": the
+    ref must be the head of an open PR its own gh user opened, never the default branch; a label or comment:
+    the named PR, its head one of the project's own branches (branch_problem with `prefixes`)."""
     repo, ref, num = "", "", ""
     if argv[:2] == ["workflow", "run"]:
         why, repo, ref = _dispatch(argv)
+    elif argv[0] == "api":
+        m = _pr_comment(argv)
+        why, repo, num = ("", m[1], m[2]) if m else ("not a comment on one PR", "", "")
     else:
         pos, opts, why = _parse(argv[2:], _EDIT_FLAGS)
         repo, num = opts.get("--repo", [""])[0], pos[0] if pos else ""
@@ -273,17 +293,20 @@ def own_open_pr(gh: str, argv: list[str]) -> str:
     if ref and ref == _default_branch(gh, repo):
         return f"`{ref}` is the repo's default branch"
     mine = [p for p in found if str((p.get("author") or {}).get("login") or "").lower() == login.lower()]
-    return "" if mine else "that PR is someone else's"
+    if not mine:
+        return "that PR is someone else's"
+    return "" if ref else (f"that PR's head: {why}" if (why := branch_problem(mine[0].get("headRefName"), prefixes))
+                           else "")
 
 
-def own_draft_run(gh: str, argv: list[str]) -> str:
+def own_draft_run(gh: str, argv: list[str], prefixes=()) -> str:
     """Why the workstation must not rerun the run `gh run rerun argv` names, or "": read just before it,
-    the run's head sha must be the head of an open draft PR this workstation's gh user opened, and its
-    branch never the repo's default branch."""
+    the run's head sha must be the head of an open PR this workstation's gh user opened, and its branch one
+    of the project's own (branch_problem with `prefixes`), never the repo's default branch."""
     why, run, repo = _rerun(argv)
     if why or not repo:
         return why or "`gh run rerun` names no repo"
-    unread = "could not resolve the run's head to check it is our own draft PR's"
+    unread = "could not resolve the run's head to check it is our own PR's"
     try:
         view = subprocess.run([gh, "run", "view", run, f"--repo={repo}", "--json", "headBranch,headSha"],
                               capture_output=True, timeout=GH_TIMEOUT_S)
@@ -297,6 +320,8 @@ def own_draft_run(gh: str, argv: list[str]) -> str:
             return "could not read the repo's default branch before a rerun"
         if branch == default:
             return f"the run is on `{branch}`, the repo's default branch, and is never rerun from here"
+        if why := branch_problem(branch, prefixes):
+            return f"the run's branch: {why}"
         prs = subprocess.run([gh, "pr", "list", f"--repo={repo}", "--head", branch, "--state", "open", "--json",
                               "isDraft,author,headRefOid"], capture_output=True, timeout=GH_TIMEOUT_S)
         if prs.returncode:
@@ -311,7 +336,7 @@ def own_draft_run(gh: str, argv: list[str]) -> str:
     if not found:
         return "the run is not on the head of an open PR"
     for p in found:
-        if not (why := _own_draft_reason(p, login, "`gh run rerun` reruns only a run of")):
+        if not (why := _own_draft_reason(p, login, "`gh run rerun` reruns only a run of", draft=False)):
             return ""
     return why
 
@@ -436,19 +461,24 @@ def fork_free(gh: str, argv: list[str]) -> str:
 
 def allowed(argv, stdin: bytes = b"", prefixes=()) -> str:
     """Why the workstation must not run `gh argv`, or "": the allowlist, checked on both sides. `gh api`
-    GET reads, pr view/list/checks, issue view/list, pr and issue comments, `pr create --draft`, a reply
-    to a PR review comment (`gh api -X POST .../pulls/<n>/comments/<id>/replies -f body=...`), deleting one
-    of the project's own ttp/ branches (`gh api -X DELETE repos/<o>/<r>/git/refs/heads/ttp/...`; the
-    workstation also reads its tip first and refuses the default branch), `pr edit`
-    of the title or body only and `pr close` (the workstation also checks the PR is its own draft), each
-    post, body or comment ending with the AI-authorship tag, and `repo fork <owner>/<repo> --fork-name
-    <name> --clone=false` (the workstation also checks <its gh user>/<name> does not exist yet), `workflow run
-    <name> --ref <branch> --repo <r>` with up to 8 plain `-f key=value` inputs and `pr edit --add-label` (the workstation also checks the PR is its own open one), `run rerun
-    <id>` with an optional --failed (the workstation also checks the run is on its own open draft PR's
-    head, never the default branch), and the
-    queue's own `git-publish` of one such branch (a new branch or a fast-forward); `prefixes` grants branch
-    prefixes beyond ttp/ (the workstation's bridge config, the box's delivery.gh_branch_prefixes); never
-    `pr ready`, a merge, a reviewer, `run cancel` or anything else."""
+    GET reads, pr view/list/checks/diff, issue view/list, run list/view/watch (--log, --log-failed),
+    workflow list/view, pr and issue comments, `pr create --draft`, a reply to a PR review comment
+    (`gh api -X POST .../pulls/<n>/comments/<id>/replies -f body=...`) or a comment on a PR (`gh api -X POST
+    .../issues/<n>/comments -f body=...`; the workstation also checks it is its own open PR on one of the
+    project's branches), deleting one of the project's own ttp/ branches (`gh api -X DELETE
+    repos/<o>/<r>/git/refs/heads/ttp/...`; the workstation also reads its tip first and refuses the default
+    branch), `pr edit` of the title, body or a label (never a merge, approve or ready label; a label: the
+    workstation also checks it is its own open PR on one of the project's branches) and `pr close` (the
+    workstation also checks the PR is its own draft), each post, body or comment ending with the
+    AI-authorship tag, `repo fork <owner>/<repo> --fork-name <name> --clone=false` (the workstation also
+    checks <its gh user>/<name> does not exist yet), `workflow run <name> --ref <branch> --repo <r>` with up
+    to 8 plain `-f key=value` inputs (the workstation also checks the ref heads its own open PR), `run rerun
+    <id>` with an optional --failed (the workstation also checks the run is on its own open PR's head, on
+    one of the project's branches, never the default branch), and the queue's own `git-publish` of one such
+    branch (a new branch or a fast-forward); `prefixes` grants branch prefixes beyond ttp/ (the
+    workstation's bridge config, the box's delivery.gh_branch_prefixes); never `pr ready`, a merge, a
+    review, a reviewer, --base, `run cancel`, workflow enable/disable, secrets, variables, rulesets,
+    releases, keys, GraphQL or anything else."""
     if not isinstance(argv, list) or not argv or not all(isinstance(a, str) and "\0" not in a for a in argv):
         return "not a list of plain arguments"
     if bad := next((a for a in argv if _BUNDLED.fullmatch(a)), None):
@@ -760,10 +790,11 @@ def answer(entry: dict, gh: str | None = None, prefixes=(), where: str = "on the
                 **({"pushed": argv[3]} if rc == 0 else {})}
     if argv[:2] == ["pr", "close"] and (why := own_draft(gh, argv)):
         return {"key": key, "rc": 1, "stdout": "", "stderr": f"refused {where}: {why}"}
-    if argv[:2] == ["run", "rerun"] and (why := own_draft_run(gh, argv)):
+    if argv[:2] == ["run", "rerun"] and (why := own_draft_run(gh, argv, prefixes)):
         return {"key": key, "rc": 1, "stdout": "", "stderr": f"refused {where}: {why}"}
     if (argv[:2] == ["workflow", "run"] or (argv[:2] == ["pr", "edit"] and any(
-            a.split("=", 1)[0] == "--add-label" for a in argv))) and (why := own_open_pr(gh, argv)):
+            a.split("=", 1)[0] in _LABELS for a in argv)) or (argv[0] == "api" and _pr_comment(argv))) \
+            and (why := own_open_pr(gh, argv, prefixes)):
         return {"key": key, "rc": 1, "stdout": "", "stderr": f"refused {where}: {why}"}
     if argv[:2] == ["repo", "fork"] and (why := fork_free(gh, argv)):
         return {"key": key, "rc": 1, "stdout": "", "stderr": f"refused {where}: {why}"}
