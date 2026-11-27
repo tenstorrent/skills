@@ -12,7 +12,7 @@ at that commit, one on the project host to the web app's file view. A '#N' after
 chat message's '#N' ('Re #N', 'msg #N', 'user msg #N') never links: message and task ids overlap. A
 bare '#N' links as a task only when no message has that id; one naming nothing stays as written, as
 does a '#N' inside a longer token (a branch name, path or URL fragment) or right after a repository
-name or GitHub word ('tt-metal #12', 'PR #12'). Existing URLs, markdown links, code spans, code
+name or GitHub word ('<repo> #N', 'PR #N'). Existing URLs, markdown links, code spans, code
 fences and command lines are left alone, so a second pass links nothing twice.
 Stored records stay raw; callers linkify only at the outgoing boundary (the listener's line, the
 web app's message list and asks, `ttp status`).
@@ -87,15 +87,20 @@ def _fmt(text: str, url: str, fmt: str) -> str:
     return f"[{text}]({url})" if fmt == MD else f"{text} ({url})"
 
 
-def _github_named(cfg: dict):
-    """A test of the text before a bare '#N': whether its last word names a configured repo (or is
-    owner/repo), which makes the '#N' a GitHub ref and never one of our ids."""
-    repos = {str(k).lower(): v for k, v in (cfg.get("repos") or {}).items()}
+def _repos(cfg: dict) -> dict:
+    """links.repos keyed by lowercased short name."""
+    return {str(k).lower(): v for k, v in (cfg.get("repos") or {}).items()}
+
+
+def _github_named(cfg: dict, repos: dict):
+    """A test of the text before a bare '#N': whether its last word is owner/repo or names a repo
+    the project configures, which makes the '#N' a GitHub ref and never one of our ids. A repo the
+    project does not configure is not known by name, so its bare '#N' still reads as an id."""
     names = set(repos) | {str(v).rsplit("/", 1)[-1].lower() for v in [*repos.values(), cfg.get("single_repo")] if v}
 
     def named(before: str) -> bool:
-        w = re.search(r"([\w./-]+)\s+$", before)
-        return bool(w and (w.group(1).lower() in names or "/" in w.group(1)))
+        w = re.search(r"(?<![\w./-])([\w.-]+(?:/[\w.-]+)?)\s+\Z", before[-200:])   # only its tail: one word
+        return bool(w and (w.group(1).lower() in names or re.fullmatch(r"[\w.-]+/[\w.-]+", w.group(1))))
     return named
 
 
@@ -104,11 +109,11 @@ def linkify(text: str, cfg: dict, fmt: str = MD) -> str:
     plain values plus `file_url(path) -> url | None` and `is_file(path) -> bool` (a project file even
     when no link exists for it)."""
     ticket = _ticket_re(cfg)
-    repos = {str(k).lower(): v for k, v in (cfg.get("repos") or {}).items()}
+    repos = _repos(cfg)
     single = str(cfg.get("single_repo") or "")
     file_url = cfg.get("file_url")
     ref = cfg.get("ref_url")
-    github_named = _github_named(cfg)
+    github_named = _github_named(cfg, repos)
 
     def id_link(text_: str, n: int, kind: str) -> str:
         url = ref(n, kind) if ref else None
@@ -133,7 +138,7 @@ def linkify(text: str, cfg: dict, fmt: str = MD) -> str:
             head = m.group(0)[:len(m.group(0)) - len(ilist)]
             kind = _kind(word)
             if not word and github_named(m.string[:m.start()]):
-                return m.group(0)   # 'tt-metal #12', 'skills #12': a GitHub ref, never one of our ids
+                return m.group(0)   # '<repo> #N': a GitHub ref, never one of our ids
 
             def item(x: re.Match) -> str:   # a list id not of its word's kind reads as a bare id,
                 url = ref(int(x.group(1)), kind) if ref else None   # as a second pass would read it
@@ -163,12 +168,13 @@ def problems(text: str, cfg: dict) -> list[str]:
     if not cfg.get("jira_base") and alts:
         for m in re.finditer(r"(?<![A-Za-z0-9])(" + alts + r")-\d+\b", text):
             out.append(f"{m.group(0)}: set links.jira_base to link it")
-    named = _github_named(cfg)
+    repos = _repos(cfg)
+    named = _github_named(cfg, repos)
     taken: list[tuple[int, int]] = [m.span() for m in PROTECTED.finditer(text)]   # never linked, never reported
     for m in re.finditer(REF, text):
         if any(a <= m.start() < b for a, b in taken):
             continue
-        if "/" not in m.group("rname") and not (cfg.get("repos") or {}).get(m.group("rname").lower()):
+        if "/" not in m.group("rname") and not repos.get(m.group("rname").lower()):
             out.append(f"{m.group(0)} names no configured repo (links.repos)")
         taken.append(m.span())
     for m in re.finditer(PR_PHRASE, text):
@@ -190,7 +196,7 @@ def problems(text: str, cfg: dict) -> list[str]:
         taken.append(m.span())
         word = (m.group("ikind") or m.group("kkind") or "").lower()
         if word in PLAIN or (not word and named(text[:m.start()])):
-            continue   # a chat message id is left plain on purpose
+            continue   # a chat message id or a GitHub ref is left plain on purpose
         ids = [int(m.group("inum") or m.group("knum"))] + [int(x) for x in re.findall(r"#(\d+)", m.group("ilist") or "")]
         for i, n in enumerate(ids):
             kinds = [_kind(word)] + ([""] if i and word else [])   # a list id may also read as bare

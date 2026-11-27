@@ -49,7 +49,8 @@ def test_unresolved_refs_and_code_are_never_rewritten():
            if kind in ("", "task") and n in (5, 55) else None}
     same = (
         "Superseded by #66874 and #64844",                       # unresolved: as written
-        "branch sample-repo #0-hc2-tests-integration",           # a repo name right before the ref
+        "branch sample-repo #0-hc2-tests-integration",           # a ref glued to a branch name
+        "see smi #5 and example-org/other #5",                   # a configured or owner/repo name before it
         'gh pr close 12 -c "Superseded by #5 in favour of #66874"',   # an unfenced command line
         "  $ git log --grep '#5'",                                # a prompt and indentation
         "run `ttp status #5` then",                              # an inline code span
@@ -66,6 +67,8 @@ def test_unresolved_refs_and_code_are_never_rewritten():
         assert links.linkify(text, cfg) == text, text
         assert links.linkify(links.linkify(text, cfg), cfg) == text
     assert links.linkify("see the follow-up #5", cfg) == "see the follow-up [#5](http://w/#task=5)"
+    long = ("x" * 3000 + " #5 ") * 30   # the repo-name test reads only the tail before each id
+    assert links.linkify(long, cfg).count("[#5]") == 30
     assert links.linkify("PR #12-fix", {**cfg, "single_repo": "o/r"}) == "PR #12-fix"
     assert links.problems("run `gh pr close #66874` or example-smi #66874", cfg) == []
     assert links.linkify("then task #5 and #55 done, see #66874", cfg) == (
