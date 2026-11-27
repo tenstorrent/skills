@@ -7,7 +7,7 @@ drafts, so the harness refuses it model-free.
 `backrefs` finds the phrases that stand in for content: an explicit back-reference ('see above', 'in
 my earlier messages', 'drafts above', 'as drafted earlier', 'the draft I sent'), and an item word
 (draft/ask/request/command) that awaits the user ('ready to send', 'pending your', 'for you to',
-'please run' and the like after it; 'still open' or 'still pending' after an ask) in the same clause, not negated.
+a request to the user to act, after it; 'still open' or 'still pending' after an ask) in the same clause, not negated.
 A pull request, a PR or a draft PR is no such item. A phrase is fine only when the text is attached
 to it: quoted material (a blockquote, a fenced block, an inline code span, a quoted span of 30+
 chars) later in its own sentence or as the first line after it (or in the message's later numbered
