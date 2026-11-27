@@ -221,7 +221,7 @@ def pick(p, cfg: dict, lead: dict, ready: list[dict], inflight: list[dict] | Non
     if n <= 0:
         return []
     mine = _paths(p, lead)
-    try:   # as Daemon._owner_due: an unreadable store still keeps the order tasks
+    try:   # a malformed obligation that breaks the inheritance still leaves the order tasks
         owners = set(rankinherit.inherited_due(p.db)) | obligations.order_tasks(p.db)
     except Exception:
         owners = set(obligations.order_tasks(p.db))

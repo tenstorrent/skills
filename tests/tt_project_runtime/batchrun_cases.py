@@ -103,6 +103,13 @@ def test_batch_pick_keeps_urgent_and_routine_work_in_separate_runs(env):
     got = batchrun.pick(p, p.config(), p1, [p2, p3, p1b, flagged, ordered, negated])
     assert ids(got) == sorted([102, 103, owned["id"]])
     assert batchrun.pick(p, p.config(), p1, [p2, p3]) == []
+    # A task an urgent one waits on is urgent too (dispatch's inherited rank): it runs with urgent work only.
+    need = p.db.add_task("prerequisite", "Fix it.", kind="code", tier="standard", priority=3, origin="coordinator")
+    p.db.add_task("wants it", "Fix it.", kind="code", tier="standard", priority=1, origin="coordinator",
+                  depends_on=json.dumps([need]))
+    prereq = row(need, priority=3)
+    assert need in ids(batchrun.pick(p, p.config(), p1, [prereq, p3]))
+    assert need not in ids(batchrun.pick(p, p.config(), p3, [prereq, p3b]))
     # A routine lead takes no urgent task; (c) routine tasks batch as before, a negated `urgent:` line included.
     assert ids(batchrun.pick(p, p.config(), p3, [p1, flagged, ordered, p2, p3b, p3c, negated])) == [105, 107, 108, 109]
 
