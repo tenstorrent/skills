@@ -8915,7 +8915,7 @@ def _fake_cpu(monkeypatch, tmp_path, busy, running, blocked, load=67.0, cores=64
     stat.write_text(f"cpu  {busy * 50} 0 {busy * 50} {idle} 0 0 0 0 0 0\ncpu0 1 0 1 1 0 0 0 0 0 0\n"
                     f"intr 1\nprocs_running {running}\nprocs_blocked {blocked}\n")
     monkeypatch.setattr(hostcpu, "STAT", stat)
-    monkeypatch.setattr(hostcpu, "_LAST", {"at": (time.monotonic() - 2 * hostcpu.SAMPLE_S, 0, 0, running)})
+    monkeypatch.setattr(hostcpu, "_LAST", {"at": (time.monotonic() - 2 * hostcpu.SAMPLE_S, 0, 0, running, None)})
     monkeypatch.setattr(hostcpu, "cores", lambda: cores)
     monkeypatch.setattr(checkcap, "cores", lambda: cores)
     monkeypatch.setattr(os, "cpu_count", lambda: cores)
@@ -8975,7 +8975,7 @@ def _fake_mac(monkeypatch, tmp_path, idle, mem, load, cores=14):
     monkeypatch.setattr(hostcpu, "STAT", tmp_path / "missing")
     monkeypatch.setattr(hostcpu, "MACH", True)
     monkeypatch.setattr(hostcpu, "mach_ticks", lambda: (round((1 - idle) * 1000), 1000))
-    monkeypatch.setattr(hostcpu, "_LAST", {"at": (time.monotonic() - 2 * hostcpu.SAMPLE_S, 0, 0, None)})
+    monkeypatch.setattr(hostcpu, "_LAST", {"at": (time.monotonic() - 2 * hostcpu.SAMPLE_S, 0, 0, None, None)})
     monkeypatch.setattr(hostcpu, "mach_mem_free", lambda: mem)
     monkeypatch.setattr(hostcpu, "cores", lambda: cores)
     monkeypatch.setattr(checkcap, "cores", lambda: cores)
@@ -13500,6 +13500,20 @@ def test_the_check_slots_own_niced_commands_still_count_as_busy(env, tmp_path, m
     assert checkcap.free_cores() == 2.0, "the check's 2 cores stay busy, the foreign 1 is free"
 
 
+def test_the_harness_niced_test_workers_builds_and_shards_count_as_busy(env, tmp_path, monkeypatch):
+    """A test worker's, build job's or pool shard's niced commands are the harness's own load, like a check's."""
+    from ttp import checkcap, testslots
+    checkcap.slot_dir().mkdir(parents=True, exist_ok=True)
+    (checkcap.slot_dir() / f"{testslots.TESTS.resource}.3.lock").write_text(json.dumps({"pid": 40}))
+    (checkcap.slot_dir() / f"{testslots.BUILDS.own}.g.0.lock").write_text(json.dumps({"pid": 45}))
+    checkcap.shard_dir().mkdir()
+    (checkcap.shard_dir() / "run.47.ab12").write_text("")
+    rows = {40: (1, 19, 0, 100), 45: (1, 19, 0, 100), 47: (1, 19, 0, 100), 50: (1, 19, 0, 100)}
+    _fake_procs(monkeypatch, tmp_path, rows)
+    assert sorted(checkcap.slot_pids()) == [40, 45, 47]
+    assert checkcap.free_cores() == 2.0, "the 3 cores of our own niced work stay busy, only the foreign one is free"
+
+
 def test_unreadable_process_stats_keep_the_aggregate_reading(env, tmp_path, monkeypatch):
     """Without per-process stats in both of the window's passes, free cores fall back to /proc/stat's whole
     busy reading, niced time included."""
@@ -13508,7 +13522,7 @@ def test_unreadable_process_stats_keep_the_aggregate_reading(env, tmp_path, monk
     (proc / "50" / "stat").write_text("garbled")
     assert checkcap.free_cores() == 1.0, "no process read now: the aggregate"
     _fake_procs(monkeypatch, tmp_path, {50: (1, 19, 100, 300)})
-    hostcpu._LAST["at"] = hostcpu._LAST["at"][:4]
+    hostcpu._LAST["at"] = (*hostcpu._LAST["at"][:4], None)
     assert checkcap.free_cores() == 1.0, "no pass at the window's start: the aggregate"
 
 

@@ -19,8 +19,10 @@ The cap is the account setting `checks.host_max` (`ttp config --account checks.h
 environment's TTP_CHECKS_HOST_MAX; 0 turns it off. Unset, it follows the load (default_limit()):
 as many checks as the cores left over the measured CPU demand (_load(): /proc/stat or macOS's CPU ticks,
 not the load average, which counts tasks waiting on I/O) hold at check_load() each, at least one
-slot per CORES_PER_SLOT cores (and at least one), at most one per CORES_PER_SLOT_MAX cores. Our own
-running checks count in that load, so the cap shrinks as they load the host; a check keeps its slot
+slot per CORES_PER_SLOT cores (and at least one), at most one per CORES_PER_SLOT_MAX cores and at most
+cores() // check_load(). The checks running now come off that demand at their price, so they do not shrink
+the cap they hold; CPU niced above the runner's nice (yield_nice) outside the harness's own slots
+(slot_pids) counts as free. A check keeps its slot
 until it ends, and a waiter reads the cap again on every try. Check commands run with HELD_ENV
 set, so a `ttp checks` nested in them runs at once instead of waiting for the slot its parent holds.
 A check command that waits on an outside CPU pool gives the slot up meanwhile (`ttp checks-yield`: ask_yield,
@@ -369,23 +371,36 @@ def live_cores_on() -> bool:
 
 def yield_nice() -> int:
     """The nice level above which a process's CPU counts as free for checks: the checks runner's own
-    (project's runner.nice default), since work niced below the runner gives its cores up to it."""
+    (project's runner.nice default). Work niced below it yields to the runner and un-niced work; check
+    commands themselves run at checks.nice, so beside many runnable tasks at that same nice they get only
+    their share of those cores."""
     return project.nice_level(None)[0]
 
 
-SLOT_KINDS = (RESOURCE, PRIORITY, URGENT)   # the check-slots labels whose holders run checks (ours)
+def slot_kinds() -> tuple[str, ...]:
+    """The check-slots labels whose holders run the harness's own niced work: checks, test workers and
+    build jobs (testslots' pools, host and per project)."""
+    from . import testslots
+    pools = (testslots.TESTS, testslots.BUILDS)
+    return (RESOURCE, PRIORITY, URGENT) + tuple(n for k in pools for n in (k.resource, k.own))
 
 
 def slot_pids() -> list[int]:
-    """The pids the check slots' labels name (holder and keeper's taker), read in one listing; their
-    process trees' CPU counts as busy however niced (hostcpu's `ours`)."""
+    """The pids the check slots' labels name (holder and keeper's taker) and the running shards' (their
+    run.<pid>.* names), one listing each; their process trees' CPU counts as busy however niced
+    (hostcpu's `ours`)."""
     out = []
     try:
         names = os.listdir(slot_dir())
     except OSError:
         return out
+    try:
+        out += [int(n.split(".")[1]) for n in os.listdir(shard_dir()) if re.fullmatch(r"run\.\d+\..*", n)]
+    except OSError:
+        pass
+    kinds = slot_kinds()
     for name in names:
-        if name.endswith(".lock") and name.split(".", 1)[0] in SLOT_KINDS:
+        if name.endswith(".lock") and name.split(".", 1)[0] in kinds:
             try:
                 h = json.loads((slot_dir() / name).read_text() or "{}")
             except (OSError, ValueError):

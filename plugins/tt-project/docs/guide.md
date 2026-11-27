@@ -3094,8 +3094,10 @@ the pick order, so it takes the first starts. A resumed resource ramps only its 
   Slots are OS file locks, so a crash or reboot frees them. Where the slot directory cannot be written, the checks stop with an error naming it (exit 2; a push
   does not go) instead of running uncapped. Unset, the cap follows the load: as many checks as the
   cores left over the 1-minute load average hold at an assumed load of 4 each, at least one slot
-  per 16 cores (and at least one), at most one per 8. Running checks count in that load, so the cap
-  shrinks as they load the host; a running check keeps its slot. Whatever the cap (unless 0), a check starts only
+  per 16 cores (and at least one), at most one per 8 and at most cores // a check's price. The checks
+  running now come off that load at their price, so they do not shrink the cap they hold; CPU niced
+  above the runner's `runner.nice` outside the harness's own checks, test workers, builds and shards
+  counts as free. A running check keeps its slot. Whatever the cap (unless 0), a check starts only
   while the host's free cores now (busy cores read from /proc/stat over a few seconds) cover one check's
   measured cores; with no check running one always starts. Its test grant is then at most those free
   cores (at least 2); `checks.live_cores 0` turns both off. Nor does a new check start here while the

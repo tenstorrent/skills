@@ -189,7 +189,7 @@ def _sample(read, sleep, clock, cpus, above: int | None = None, ours=None) -> tu
 def _window(read, sleep, clock, cpus) -> tuple[float, float | None, tuple | None] | None:
     now = clock()
     if (b := _LAST.get("busy")) and 0 <= now - b[0] < SAMPLE_S:
-        return b[1], b[2], (b[3] if len(b) > 3 else None)
+        return b[1], b[2], b[3]
     cur = _read(read)
     if cur is None:
         return None
@@ -212,7 +212,7 @@ def _window(read, sleep, clock, cpus) -> tuple[float, float | None, tuple | None
         # reader itself runs too.
         c = cores()
         runnable = max(0.0, (prev[3] + cur[2]) / 2 - 1) * min(1.0, c / (os.cpu_count() or c))
-    niced = _niced(prev[4] if len(prev) > 4 else None, cur[3], dt)
+    niced = _niced(prev[4], cur[3], dt)
     _LAST["busy"] = (now, busy, runnable, niced)
     return busy, runnable, niced
 
