@@ -411,21 +411,16 @@ def test_the_ssh_wrapper_never_reads_the_remote_commands_words(tmp_path):
     assert log[0].endswith("-i -N host-a rm -Rf /tmp/x")
 
 
-def test_a_post_destination_option_takes_the_pre_change_paths(tmp_path):
-    """OpenSSH re-reads options after the destination, so the master must not be opened from the
-    pre-destination args alone: a plain option (-p 2222) runs the command with mux options and no
-    master open, and a sharing or forward option runs unshared."""
-    r, log = _run_wrapper(tmp_path, ["box-a", "-p", "2222", "true"])
-    assert r.returncode == 0 and len(log) == 1                 # the command runs, no master open
-    assert "ControlMaster=auto" in log[0] and "-fN" not in log[0]
-    assert log[0].endswith("box-a -p 2222 true")               # the option stays with the call
-    r, log = _run_wrapper(tmp_path, ["box-a", "-L", "1:h:2", "true"])
-    assert r.returncode == 0 and log == ["box-a -L 1:h:2 true"]   # not shared at all
-
-
 def test_options_after_the_host_open_no_master_but_the_commands_words_still_do(tmp_path, short_cm):
+    """OpenSSH reads options after the destination too, so a master opened from the words before it would
+    differ: a plain one (-p 2222) runs with the mux options and opens none, a forward runs unshared, and
+    a remote command's own words (ls -p) are not ssh's."""
     out, log = _spawn_wrappers(tmp_path, short_cm, 1, args=("box-a", "-p", "2222", "true"))
-    assert out[0][0] == 0 and not _opens(log) and log[-1].endswith("box-a -p 2222 true")
+    assert out[0][0] == 0 and not _opens(log) and log == [log[-1]] and log[-1].endswith("box-a -p 2222 true")
+    assert "ControlMaster=auto" in log[-1]
+    (tmp_path / "log").unlink()
+    out, log = _spawn_wrappers(tmp_path, short_cm, 1, args=("box-a", "-L", "1:h:2", "true"))
+    assert out[0][0] == 0 and log == ["box-a -L 1:h:2 true"]   # not shared at all
     (tmp_path / "log").unlink()
     out, log = _spawn_wrappers(tmp_path, short_cm, 1, args=("box-a", "ls", "-p", "2222"))
     assert out[0][0] == 0 and len(_opens(log)) == 1 and log[-1].endswith("box-a ls -p 2222")
@@ -855,6 +850,26 @@ def test_a_failed_start_from_before_a_call_began_waiting_does_not_fail_it(tmp_pa
     (tmp_path / "log").unlink()
     out, log = _spawn_wrappers(tmp_path, short_cm, 1)         # the host is back: this call opens again
     assert out[0][0] == 0 and len(_opens(log)) == 1 and not list(short_cm.glob("*.fail"))
+
+
+def test_a_queued_caller_with_other_options_runs_its_own_start(tmp_path, short_cm):
+    """The fail-fast is for callers with the same words: a plain call queued behind a failing -p 2222 start
+    tries its own start (and gets ssh's own answer) rather than the other port's error."""
+    import subprocess, time
+    w, e = _wrapper_env(tmp_path, FAKE_MASTER=tmp_path / "master", TTP_SSH_CM_DIR=short_cm, FAKE_RC=255,
+                        FAKE_OPEN_ERR="ssh: connect to host box-a port 2222: Connection timed out", FAKE_OPEN_DELAY=0.6)
+    first = subprocess.Popen([str(w), "-p", "2222", "box-a", "true"], env=e, stderr=subprocess.PIPE, text=True)
+    time.sleep(0.2)
+    second = subprocess.Popen([str(w), "box-a", "true"], env=e, stderr=subprocess.PIPE, text=True)
+    assert first.wait(timeout=30) == 255 and second.wait(timeout=30) == 255
+    assert len(_opens((tmp_path / "log").read_text().splitlines())) == 2   # the plain caller started its own
+
+
+def test_a_call_with_options_after_the_host_honours_the_backoff(tmp_path, short_cm):
+    out, log = _spawn_wrappers(tmp_path, short_cm, 1, FAKE_RC=255, FAKE_OPEN_ERR=_REFUSED)
+    assert out[0][0] == 255 and _backoff_rec(tmp_path) is not None
+    out, log2 = _spawn_wrappers(tmp_path, short_cm, 1, args=("box-a", "-p", "2222", "true"))
+    assert out[0][0] == 255 and log2 == log                        # no call reached ssh during the backoff
 
 
 def test_a_backoff_record_is_per_destination_and_survives_the_socket_folder_cleanup(tmp_path, short_cm):

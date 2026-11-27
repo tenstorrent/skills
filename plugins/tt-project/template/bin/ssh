@@ -32,9 +32,10 @@
 # project on the host. While now < until, calls to that destination fail at once with 255 and one stderr
 # line naming it and the retry time; after it, one call probes again. Steps double 60 120 240 480 900
 # (the cap) s; the first successful start clears the record. A start that fails with no refusal line
-# (host down, auth, host key) writes <dir>/<destination>.fail ("<epoch> <rc> <pid>" then ssh's stderr, ssh's
-# own message kept): callers queued behind that start fail at once with its rc and stderr instead of
-# each retrying the start; the record is cleared by a start that succeeds.
+# (host down, auth, host key) writes <dir>/<destination>.fail ("<epoch> <rc> <pid> <hash of the words up
+# to the destination>" then ssh's stderr, ssh's own message kept): callers with the same words queued
+# behind that start fail at once with its rc and stderr instead of each retrying the start; a call during
+# backoff with options after the destination fails the same way; a start that succeeds clears the record.
 # Re-entry (an "ssh" further down PATH that execs plain ssh, finding this script again in the same
 # process) ends with 125 and a message instead of looping: the pid is marked before every exec.
 set -f
@@ -108,7 +109,7 @@ for a in "$@"; do
        dest=$a; nd=$n ;;
     esac
 done
-[ -n "$nd" ] && n=$nd
+n=$nd
 dir=${TTP_SSH_CM_DIR:-${HOME:-/nonexistent}/.tt-project/cm}
 if [ ${#dir} -gt 45 ] || ! { [ -d "$dir" ] || mkdir -p -m 700 "$dir" 2>/dev/null; }; then
     dir=/tmp/ttp-cm-$(id -u)
@@ -126,7 +127,7 @@ for f in "$dir"/* "$dir"/.[!.]*; do
     { [ -S "$f" ] && ! [ -L "$f" ]; } || [ -d "$f" ] || rm -f "$f"
 done
 set -f
-if [ -n "$dest" ] && [ -z "$post" ]; then
+if [ -n "$dest" ]; then
     thome=${TTP_HOME:-${HOME:-/nonexistent}/.tt-project}
     key=$(printf %s "$dest" | tr -c 'A-Za-z0-9._@-' _)
     rec=$thome/ssh-backoff/$key
@@ -158,7 +159,7 @@ if [ -n "$dest" ] && [ -z "$post" ]; then
             backing
             rc=255
         else
-            { printf '%s %s %s\n' "$(date +%s)" "$rc" $$; cat "$err"; } >"$failf.$$" && mv -f "$failf.$$" "$failf"
+            { printf '%s %s %s %s\n' "$(date +%s)" "$rc" $$ "$sig"; cat "$err"; } >"$failf.$$" && mv -f "$failf.$$" "$failf"
         fi
         rm -f "$err"
         unlock
@@ -174,21 +175,25 @@ if [ -n "$dest" ] && [ -z "$post" ]; then
         done
     }
     unlock() { exec 9>&-; rmdir "$dir/$key.lockd" 2>/dev/null; }
-    if up "$@"; then
+    if [ -n "$post" ]; then
+        ! backing || exit 255
+    elif up "$@"; then
         [ ! -e "$rec" ] || rm -f "$rec"
     else
         ! backing || exit 255
+        sig=$(printf '%s\n' "$@" | head -n $n | cksum | tr ' ' _)
         seen=$(head -n 1 "$failf" 2>/dev/null)
         lock
-        # A start that failed while this call was queued behind it: fail with its rc and stderr.
-        fline=$(head -n 1 "$failf" 2>/dev/null)
-        if [ -n "$fline" ] && [ "$fline" != "$seen" ]; then
-            tail -n +2 "$failf" >&2
-            unlock
-            set -- $fline
-            exit "${2:-255}"
+        if up "$@"; then [ ! -e "$rec" ] || rm -f "$rec"; else
+            ! backing || { unlock; exit 255; }
+            # A start with the same words that failed while this call was queued: fail with its rc and stderr.
+            fline=$(head -n 1 "$failf" 2>/dev/null)
+            case $fline in
+            "$seen") ;;
+            *" $sig") tail -n +2 "$failf" >&2; unlock; frc=${fline#* }; exit "${frc%% *}" ;;
+            esac
+            open_master $n "$@"
         fi
-        if up "$@"; then [ ! -e "$rec" ] || rm -f "$rec"; else ! backing || { unlock; exit 255; }; open_master $n "$@"; fi
         unlock
     fi
 fi
