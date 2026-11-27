@@ -76,7 +76,7 @@ import subprocess
 import time
 from pathlib import Path
 
-from . import detach, locks, procinfo, procowner
+from . import detach, locks, procinfo, procowner, testslots
 from .db import load_result
 from .project import Project, durable_write, write_json
 from .util import read_dict
@@ -860,6 +860,7 @@ def _env_task(pid: int) -> str | None:
     return None if env is None else env.get("TTP_TASK") or env.get("TTP_TASK_ID") or ""
 
 
+@testslots.one_listing()
 def cancelled_checks(p: Project, task: int) -> list[dict]:
     """The live process groups of cancelled task `task`'s `ttp checks`, attached or detached: each holder of
     one of the project's checks lanes labelled with the task (but a daemon review precheck its open review
@@ -962,6 +963,7 @@ def end_cancelled_checks(p: Project, task: int, why: str, grace: float = CANCEL_
     return out
 
 
+@testslots.one_listing()
 def lane_tasks(p: Project) -> set[int]:
     """The tasks whose `ttp checks` hold or wait for one of the project's checks lanes now (their labels)."""
     from . import checkcap, checklane, testslots

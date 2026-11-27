@@ -13413,3 +13413,32 @@ def test_waits_lists_the_folder_a_bounded_number_of_times_not_once_per_waiting_b
             g.close()
         for t in tickets:
             locks.dequeue(t)
+
+
+def test_lane_holder_readers_list_the_slot_folder_once_per_call_however_many_bases_hold_lanes(env, monkeypatch):
+    """cells: run_costs_one_listing, finished_holders_one_listing, run_owners_one_listing, lane_tasks_one_listing,
+    cancelled_checks_one_listing. Each reads the folder once and returns what a per-base listing finds."""
+    from ttp import checklane, jobstop, testslots
+    p = make(env)
+    _lane_env(monkeypatch)
+    tid = p.db.add_task("t", "s", kind="code")
+    p.db.x("UPDATE tasks SET status='done', updated=? WHERE id=?", (time.time(), tid))
+    monkeypatch.setenv("TTP_TASK", str(tid))
+    n = 12
+    held = [testslots.suite_hold(p.name, repo=f"{i:012x}", who=f"run {100 + i}", cost={"est_s": 60 + i}, wait_s=5)
+            for i in range(n)]
+    calls = _count_listings(monkeypatch)
+    try:
+        def once(fn):
+            calls.clear()
+            got = fn()
+            assert len(calls) == 1, (fn, len(calls))
+            return got
+        assert once(lambda: checklane.run_costs(p.name)) == {str(100 + i): {"est_s": 60 + i} for i in range(n)}
+        assert len(once(lambda: checklane.finished_holders(p, {}, time.time() + 400))) == n
+        assert len(once(lambda: checklane.run_owners(p.name, 105))) == 1
+        assert once(lambda: jobstop.lane_tasks(p)) == {tid}
+        assert once(lambda: jobstop.cancelled_checks(p, tid)) == []
+    finally:
+        for g in held:
+            g.close()

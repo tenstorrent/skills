@@ -724,6 +724,7 @@ def much_cheaper(mine: dict | None, theirs: dict | None) -> bool:
     return _targeted_only(mine, theirs) and mine["tests"] * CHEAP_FACTOR <= max(1, int(mine.get("of") or 0))
 
 
+@testslots.one_listing()
 def run_costs(project_name: str | None) -> dict[str, dict]:
     """The cost (lane label "cost") of each run holding one of `project_name`'s checks lanes, by run id."""
     if not project_name:
@@ -760,6 +761,7 @@ def done_grace_s(cfg: dict | None, rec: dict) -> float:
     return max(base, done_flag_s(cfg))
 
 
+@testslots.one_listing()
 def finished_holders(p, cfg: dict | None, now: float | None = None) -> list[dict]:
     """The project's lanes held by a check whose task has ended (FINISHED) for done_flag_s or longer (0:
     off): lane, pid, task, run, status, ended_s (since the task ended, or the lane was taken if later),
@@ -1263,6 +1265,7 @@ def _precheck_of(text) -> str:
     return m.group(1) if m else ""
 
 
+@testslots.one_listing()
 def run_owners(project_name: str, run) -> list[dict]:
     """The owner fields (checkcap.OWNER_KEYS) of project `project_name`'s lane holders whose run is `run`, as
     lane_status names it: the run folder's name, also for checks the daemon started again under another
