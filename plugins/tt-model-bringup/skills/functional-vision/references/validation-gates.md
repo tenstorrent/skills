@@ -10,9 +10,14 @@ downloaded assets or silently shrink the contracted metric.
 ## Top-k selection
 
 Run selectors independently, retain upstream indices and align downstream tensors by shared
-index before PCC; never feed reference indices into TTNN. Report both selected counts, shared
-and unmatched counts. Aligned PCC alone is insufficient: run the task metric and check rank order
-when the declared output requires it.
+index before PCC; never feed reference indices into TTNN acceptance runs. Report both selected
+counts, shared and unmatched counts. Record the reference score gap between ranks k and k+1, and
+each unmatched candidate's reference-score distance from the rank-k score. Every unmatched
+candidate must lie within the measured upstream score error of that boundary; one outside it is a
+selector or upstream defect, not precision noise. Do not raise model precision only to make
+selections identical; boundary swaps within score error are expected and are judged by the task
+metric. Aligned PCC alone is insufficient: run the task metric and check rank order when the
+declared output requires it.
 
 ## Task evaluation
 
