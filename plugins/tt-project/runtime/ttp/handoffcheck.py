@@ -26,7 +26,8 @@ STOP_BUDGET_S in all) or any fault of the hook lets the run end: the daemon's ch
 gate. A check sees AT_ENV=stop there, with the run's own variables (RUN_VARS) left out.
 
 A code task's hand-off also meets one built-in check (builtin_check, no setting): it must show a run line
-of its new tests failing on the base commit (new_test_gap), whatever ran it; a run on the GLM model is checked
+of its new tests failing on the base commit (new_test_gap), whatever ran it, counting only the tests its own
+commits add (_own_tests: never those unchanged in the accepted head it continues or in base it merged in); a run on the GLM model is checked
 further: its branch's added test lines must not name the real /tmp, /home, ~ or Path.home()
 (glm_test_hygiene), its added comments and docstrings must state the rule and never tell what happened
 (slop.new_noisy), and its hand-off must name each numbered spec step (handoff_gaps). A failure sends back like a project check, under
@@ -155,11 +156,17 @@ def glm_test_hygiene(diff_text: str) -> list[str]:
     return out
 
 
-def new_test_gap(diff_text: str, handoff: dict) -> str | None:
+def _new_tests(diff_text: str) -> list[tuple[str, str]]:
+    """(path, test name) for each test definition `diff_text` adds in a test file."""
+    return [(path, m.group(1) or m.group(2)) for path, line in _added(diff_text) if TEST_FILE.search(path)
+            for m in [NEW_TEST.match(line)] if m]
+
+
+def new_test_gap(diff_text: str, handoff: dict, own: set | None = None) -> str | None:
     """The one line a hand-off adding tests owes: a run of them failing on the base commit, which stops a test
-    that cannot fail (it already passed there, or its stub records too little)."""
-    tests = [m.group(1) or m.group(2) for path, line in _added(diff_text) if TEST_FILE.search(path)
-             for m in [NEW_TEST.match(line)] if m]
+    that cannot fail (it already passed there, or its stub records too little). `own` (from _own_tests) keeps
+    only the tests the task's own commits add; None counts every one the diff adds."""
+    tests = [name for path, name in _new_tests(diff_text) if own is None or (path, name) in own]
     told = json.dumps({k: v for k, v in handoff.items() if k != "commits"})   # its own commit ids run nothing
     if tests and not BASE_FAILS.search(told):
         return ("New tests (" + ", ".join(tests[:5]) + ") with no line showing them fail on the base commit: "
@@ -167,11 +174,12 @@ def new_test_gap(diff_text: str, handoff: dict) -> str | None:
     return None
 
 
-def handoff_gaps(diff_text: str, spec: str, handoff: dict) -> list[str]:
-    """What a hand-off leaves out: a run line showing the tests the diff adds fail on the base commit, and a
-    self_check naming each numbered step of the spec (its own steps, glmwork.goal_spec, two or more)."""
+def handoff_gaps(diff_text: str, spec: str, handoff: dict, own: set | None = None) -> list[str]:
+    """What a hand-off leaves out: a run line showing the tests the diff adds (of `own`, new_test_gap) fail on
+    the base commit, and a self_check naming each numbered step of the spec (its own steps, glmwork.goal_spec,
+    two or more)."""
     out = []
-    if gap := new_test_gap(diff_text, handoff):
+    if gap := new_test_gap(diff_text, handoff, own):
         out.append(gap)
     from .glmwork import goal_spec
     steps = list(dict.fromkeys(m.group(1) or m.group(2) for line in goal_spec(spec).splitlines()
@@ -224,6 +232,33 @@ def _branch_diff(p: Project, task: dict):
         return None
 
 
+def _own_tests(p: Project, task: dict, root: Path, head: str, fork: str) -> set | None:
+    """The (path, test) pairs the task's own commits add: those its diff from every scope base adds, where a
+    scope base is the accepted head it continues (worktree.continued_head, unless it shares this task's branch)
+    and the base branch it merged in (merge-base with worktree.resolve_base), each an ancestor of head other
+    than the fork. A definition unchanged there is inherited. None (count all) when there is no such base or
+    git cannot tell."""
+    from . import worktree
+    git = lambda *a: subprocess.run(["git", "-C", str(root), *a], capture_output=True, text=True,   # noqa: E731
+                                    timeout=DEFAULT_TIMEOUT_S)
+    try:
+        old = p.db.task(worktree.continues_id(task)) if worktree.continues_id(task) else None
+        accepted = worktree.continued_head(p, task) if old and old.get("branch") != task.get("branch") else None
+        main = worktree.resolve_base(p)
+        merged = git("merge-base", main, head).stdout.strip() if main else ""
+        own = None
+        for base in dict.fromkeys(b for b in (accepted, merged) if b):
+            if git("rev-parse", base).stdout.strip() == git("rev-parse", fork).stdout.strip() \
+                    or git("merge-base", "--is-ancestor", base, head).returncode != 0:
+                continue
+            got = git("diff", "--no-color", "--no-ext-diff", "-U0", base, head)
+            if got.returncode == 0:
+                own = set(_new_tests(got.stdout)) if own is None else own & set(_new_tests(got.stdout))
+        return own
+    except (OSError, RuntimeError, subprocess.SubprocessError):   # git cannot tell: every new test counts
+        return None
+
+
 def builtin_check(p: Project, task: dict, handoff) -> dict | None:
     """The built-in check's failure ({name, output}) on a code task's hand-off: glm_test_hygiene, slop.new_noisy
     and handoff_gaps on a GLM run's branch diff, else only its new tests' base-failing run line (new_test_gap).
@@ -234,8 +269,9 @@ def builtin_check(p: Project, task: dict, handoff) -> dict | None:
     if got is None:
         return None
     root, head, diff, fork = got
+    own = _own_tests(p, task, root, head, fork) if _new_tests(diff) else None
     if not _glm_run(p, task):   # a blocked or failed hand-off may owe no run: it could not run the test
-        gap = new_test_gap(diff, handoff) if handoff.get("status") in ("done", "needs_review") else None
+        gap = new_test_gap(diff, handoff, own) if handoff.get("status") in ("done", "needs_review") else None
         return {"name": CODE_CHECK, "output": gap} if gap else None
     from . import slop
     try:
@@ -246,7 +282,7 @@ def builtin_check(p: Project, task: dict, handoff) -> dict | None:
     out = (["Tests must not touch the real machine's paths:", *bad[:20]] if bad else []) \
         + (["Comments and docstrings state the rule, never an incident (a date, id or host):",
             *(f"{n['at']}: {n['text']}" for n in noisy[:20])] if noisy else []) \
-        + handoff_gaps(diff, task.get("spec") or "", handoff)
+        + handoff_gaps(diff, task.get("spec") or "", handoff, own)
     return {"name": GLM_CHECK, "output": "\n".join(out)} if out else None
 
 

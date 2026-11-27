@@ -699,6 +699,90 @@ def test_a_glm_code_runs_hand_off_is_sent_back_for_a_test_on_the_real_tmp(env):
     assert handoffcheck.verdict(p, {}, claude, {"status": "done", "self_check": ran}, None) == {}
 
 
+def _scope_repo(env):
+    """A project, a git helper and a commit helper writing one file per commit on the current branch."""
+    p = make(env)
+    def git(*a):
+        return subprocess.run(["git", "-C", str(p.root), *a], check=True, capture_output=True, text=True).stdout.strip()
+    def commit(rel, text):
+        (p.root / rel).parent.mkdir(parents=True, exist_ok=True)
+        (p.root / rel).write_text(text)
+        git("add", "-A")
+        git("commit", "-qm", f"add {rel}")
+        return git("rev-parse", "HEAD")
+    return p, git, commit
+
+
+def _scope_task(p, branch, fork, labels=()):
+    from ttp import worktree
+    tid = p.db.add_task("fix the helper", "spec", kind="code", tier="standard", origin="coordinator",
+                        labels=list(labels))
+    p.db.update_task(tid, branch=branch)
+    worktree.record_fork_point(p.root, tid, fork)
+    return p.db.task(tid)
+
+
+def test_the_new_test_check_skips_tests_a_merge_brings_in_unchanged_from_main(env):
+    """A branch that merged the base branch in owes no base-failing run for the tests main added since its
+    fork: they are blob-identical to merged main; a test the branch adds itself still owes one."""
+    from ttp import handoffcheck
+    p, git, commit = _scope_repo(env)
+    main = git("rev-parse", "--abbrev-ref", "HEAD")
+    fork = git("rev-parse", "HEAD")
+    git("checkout", "-q", "-b", "ttp/scope-merge")
+    commit("src_merge.py", "x = 1\n")
+    git("checkout", "-q", main)
+    commit("tests/test_from_main.py", "def test_main_one():\n    assert True\n")
+    git("checkout", "-q", "ttp/scope-merge")
+    git("merge", "-q", "--no-edit", main)
+    git("checkout", "-q", main)
+    task = _scope_task(p, "ttp/scope-merge", fork)
+    assert handoffcheck.verdict(p, {}, task, {"status": "done"}, None) == {}
+    git("checkout", "-q", "ttp/scope-merge")
+    commit("tests/test_mine.py", "def test_mine_one():\n    assert True\n")
+    git("checkout", "-q", main)
+    got = handoffcheck.verdict(p, {}, task, {"status": "done"}, None)
+    assert got["failed"]["name"] == handoffcheck.CODE_CHECK, got
+    assert "test_mine_one" in got["failed"]["output"] and "test_main_one" not in got["failed"]["output"], got
+
+
+def test_the_new_test_check_skips_a_continued_tasks_accepted_tests_with_no_delta(env):
+    """A task continuing an accepted head, with no commit of its own, owes no base-failing run for the tests
+    that head already holds, though its recorded fork is the lineage's original one."""
+    from ttp import handoffcheck
+    p, git, commit = _scope_repo(env)
+    main = git("rev-parse", "--abbrev-ref", "HEAD")
+    fork = git("rev-parse", "HEAD")
+    git("checkout", "-q", "-b", "ttp/t1-old")
+    commit("tests/test_old.py", "def test_old_one():\n    assert True\n")
+    git("branch", "ttp/t2-new")
+    git("checkout", "-q", main)
+    old = _scope_task(p, "ttp/t1-old", fork)
+    new = _scope_task(p, "ttp/t2-new", fork, labels=[f"continues:{old['id']}"])
+    assert handoffcheck.verdict(p, {}, new, {"status": "done"}, None) == {}
+    assert handoffcheck.verdict(p, {}, old, {"status": "done"}, None)["failed"]["name"] == handoffcheck.CODE_CHECK
+
+
+def test_the_new_test_check_still_wants_a_base_failing_run_for_a_continued_tasks_own_test(env):
+    """A continued task's own new test still owes the base-failing run line; the accepted head's do not."""
+    from ttp import handoffcheck
+    p, git, commit = _scope_repo(env)
+    main = git("rev-parse", "--abbrev-ref", "HEAD")
+    fork = git("rev-parse", "HEAD")
+    git("checkout", "-q", "-b", "ttp/t1-old")
+    commit("tests/test_old.py", "def test_old_one():\n    assert True\n")
+    git("checkout", "-q", "-b", "ttp/t2-new")
+    commit("tests/test_new.py", "def test_new_one():\n    assert True\n")
+    git("checkout", "-q", main)
+    old = _scope_task(p, "ttp/t1-old", fork)
+    new = _scope_task(p, "ttp/t2-new", fork, labels=[f"continues:{old['id']}"])
+    got = handoffcheck.verdict(p, {}, new, {"status": "done"}, None)
+    assert got["failed"]["name"] == handoffcheck.CODE_CHECK, got
+    assert "test_new_one" in got["failed"]["output"] and "test_old_one" not in got["failed"]["output"], got
+    ran = "pytest tests/test_new.py at base 1111111: 1 failed"
+    assert handoffcheck.verdict(p, {}, new, {"status": "done", "self_check": ran}, None) == {}
+
+
 def test_the_stop_hook_refuses_a_code_hand_off_adding_a_test_with_no_base_failing_run(env, monkeypatch):
     """With no project checks configured at all, the Stop hook still refuses a code hand-off whose new
     test shows no run failing on the base, and lets it through once the run line is in self_check."""
