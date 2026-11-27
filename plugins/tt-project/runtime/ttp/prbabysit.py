@@ -35,6 +35,7 @@ FLOWS_KEY = "pr_workflows"   # {"owner/repo:path:blob": {"at": ts, "info": {"nam
 READ_S = 900                 # a PR no task opened is read this often while the sweep is on
 ROUTE_SILENT_S = 24 * 3600   # a route silent longer than this makes the sweep raise pr_route_silent
 ROUTE_KEY = "pr_route"       # kv: {"via", "at"} of the silence already told
+SHOWN_FILES = 5             # how many shared files an overlap event names
 OVERLAP_KEY = "pr_overlap"   # kv: the overlapping PR pairs already told: {f"{a}|{b}": 1}
 FILES_KEY = "pr_files"       # kv: {key: {"head": sha, "files": [name, ...]}}
 HOST_FILE = "pr-overlap.json"   # under the tt-project home: {project: {"at": ts, "prs": {key: {"head", "files"}}}}
@@ -327,7 +328,7 @@ def overlap_check(daemon, gh) -> None:
     for a, b, shared in pairs:
         if f"{a}|{b}" in had:
             continue   # once per pair while the overlap stands
-        shown = ", ".join(shared[:5]) + (f" and {len(shared) - 5} more" if len(shared) > 5 else "")
+        shown = ", ".join(shared[:SHOWN_FILES]) + (f" and {len(shared) - SHOWN_FILES} more" if len(shared) > SHOWN_FILES else "")
         _post_event(daemon, "pr_overlap",
                f"PRs {_pr_link(a)} and {_pr_link(b)} change the same files ({shown}): the projects behind "
                "them must coordinate - one carries the change and the version bump, the other rebases.", None)
