@@ -650,7 +650,7 @@ class _Est:
             if lx > 1.0:
                 notes.append(f"host load x{lx:.2f}")
             ow = outside_wait(t, now, self.reports, Path(self.db.path).parent) if st != "running" else None
-            if ow and ow["at"] is None and jf and jf.get("end") is not None:
+            if ow and ow["at"] is None and jf and jf.get("end") is not None and jf.get("open"):
                 ow = {**ow, "at": jf["end"], "label": "detached jobs"}   # measured, never padded
             elif ow and ow["at"] is None and jf and jf.get("why"):
                 return self._gated(tid, f"#{tid} waits on its detached jobs: {jf['why']}", path)
@@ -686,7 +686,7 @@ class _Est:
                 r = self.db.one("SELECT started FROM runs WHERE task=? AND status='running' AND role!='coordinator' "
                                 "ORDER BY id DESC LIMIT 1", (tid,))
                 left, over = self._left(runs, now - float(r["started"])) if r and r["started"] else (self._m(runs), False)
-                if jf and jf.get("end") is not None and jf["end"] - now > left * lx:
+                if jf and jf.get("end") is not None and jf["end"] - now > (left or 0) * lx:
                     legs.extend((n if n in ("queue", "startup") else f"job {n}", s) for n, s in jf["legs"])
                 else:
                     legs.append(("run", left * lx))

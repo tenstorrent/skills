@@ -111,7 +111,8 @@ def finish(db, t: dict, h: dict, now: float, cache: dict | None = None) -> dict 
             why = f"no measured {name} job run yet"
             continue
         legs.append((name, left))
-        hi.append(_left(e, xs, now, P80) or left)
+        l80 = _left(e, xs, now, P80)
+        hi.append(l80 if l80 is not None else left)
         started = started or e.get("status") not in ("queued",)
     if why:
         return {"end": None, "conservative": None, "legs": [], "why": why}
@@ -122,7 +123,9 @@ def finish(db, t: dict, h: dict, now: float, cache: dict | None = None) -> dict 
     if not started and (s := pct(h.get("startup") or [], 0.5)) is not None:
         legs.insert(0, ("startup", s))
         hi.insert(0, s)
-    return {"end": now + sum(x for _, x in legs), "conservative": now + sum(hi), "legs": legs, "why": None}
+    open_jobs = sum(1 for e in ents if e.get("status") not in ("ended", "died"))
+    return {"end": now + sum(x for _, x in legs), "conservative": now + sum(hi), "legs": legs,
+            "why": None, "open": open_jobs}
 
 
 def queue_wait(db, tid: int, names: set, h: dict, now: float, cache: dict | None = None) -> float:
