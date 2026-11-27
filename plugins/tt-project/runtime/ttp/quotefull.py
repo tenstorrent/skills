@@ -24,7 +24,8 @@ their body (daemon.relay_worker_notifies).
 
 Known gaps (accepted): a status phrase after a colon ('Drafts for A and B: ready to send.') is
 not matched; an item reported as sent out that the user is asked to act on ('request sent, please
-confirm') is refused like a pending one, and the writer adds its text and resends."""
+confirm') is refused like a pending one, and the writer adds its text and resends; an ask named
+by its words (not its id) is refused when the open asks could not be read."""
 from __future__ import annotations
 
 import re
