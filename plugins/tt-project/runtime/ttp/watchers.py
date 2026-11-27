@@ -434,7 +434,7 @@ _CONNS = {
     "reviews": ("reviews(first:100){" + _PAGE + "nodes{id " + _AUTHOR + "state body submittedAt url "
                 "comments(first:50){totalCount nodes{" + _AUTHOR + "body}}}}", ("reviews",)),
     "checks": ("commits(last:1){nodes{commit{committedDate statusCheckRollup{contexts(first:100){" + _PAGE
-               + "nodes{__typename ... on CheckRun{name status conclusion startedAt completedAt detailsUrl checkSuite{workflowRun{workflow{name}}}} "
+               + "nodes{__typename ... on CheckRun{name status conclusion startedAt completedAt checkSuite{workflowRun{workflow{name}}}} "
                "... on StatusContext{context state}}}}}}}",
                ("commits", "nodes", -1, "commit", "statusCheckRollup", "contexts")),
 }
