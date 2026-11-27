@@ -375,3 +375,95 @@ def test_prbabysit_dispatch_keys_match_any_case_and_a_nameless_workflow_is_named
     p, d, _ = _pb_run(env, monkeypatch, _pb_pr(), cfg={"pr_babysit.dispatch": {"Acme/Widgets": ["nightly.yml"]}})
     watchers.watch_prs(d)
     assert [t for k, t in _pb_events(p) if k == "pr_ci_not_run" and "Nightly" in t], _pb_events(p)
+
+
+def _pb_route_state(alias: str, age_s: float) -> None:
+    """The host-wide gh-route record: `alias` last answered `age_s` ago."""
+    from ttp import ghauth, ghroute
+    from ttp.project import write_json
+    write_json(ghauth._home(None) / ghroute.STATE, {"ok": True, "at": time.time() - age_s, "via": alias})
+
+
+def test_prbabysit_a_route_silent_past_24_h_gets_one_keyed_event_and_clears_when_it_answers(env):
+    from ttp import prbabysit
+    from ttp.daemon import Daemon
+    _logged_out()
+    p = make(env, "route")
+    d = Daemon(p.base)
+    d.cfg = {"delivery": {"gh_route": "box1"}}
+    _pb_route_state("box1", 25 * 3600)
+    prbabysit.route_check(d)
+    ev = [t for k, t in _pb_events(p) if k == "pr_route_silent"]
+    assert len(ev) == 1 and "box1" in ev[0] and "25 h" in ev[0] and "ssh alias" in ev[0], ev
+    prbabysit.route_check(d)   # the same silence is told once
+    assert len([1 for k, _ in _pb_events(p) if k == "pr_route_silent"]) == 1
+    _pb_route_state("box1", 3600)   # the route answered: the condition clears
+    prbabysit.route_check(d)
+    assert not p.db.kv("pr_route"), "the mark clears once the route answers"
+    _pb_route_state("box1", 26 * 3600)   # a fresh silence is told again
+    prbabysit.route_check(d)
+    ev = [t for k, t in _pb_events(p) if k == "pr_route_silent"]
+    assert len(ev) == 2 and "26 h" in ev[1], ev
+
+
+def test_prbabysit_a_silent_workstation_queue_names_the_user_step(env):
+    from ttp import prbabysit
+    from ttp.daemon import Daemon
+    _logged_out()
+    p = make(env, "route2")
+    d = Daemon(p.base)
+    _pb_route_state("workstation", 25 * 3600)
+    prbabysit.route_check(d)
+    ev = [t for k, t in _pb_events(p) if k == "pr_route_silent"]
+    assert len(ev) == 1 and "gh queue" in ev[0] and "ttp bridge gh-pull" in ev[0], ev
+
+
+def _pb_files_gh(files: dict):
+    """A `watchers._gh` stand-in answering the changed-files read, and the calls it got."""
+    calls = []
+
+    def gh(a, c):
+        calls.append(a)
+        return files.get(a[1].split("/pulls/")[1].split("/")[0])
+    return gh, calls
+
+
+def test_prbabysit_two_open_prs_changing_the_same_files_get_one_event_per_pair(env, monkeypatch):
+    from ttp import prbabysit
+    from ttp.daemon import Daemon
+    p = make(env, "overlap")
+    p.db.set_kv("pr_babysit", {"acme/widgets#7": {"open": True, "branch": "b", "head": "h7"},
+                                "acme/widgets#5": {"open": True, "branch": "b", "head": "h5"},
+                                "acme/widgets#9": {"open": True, "branch": "b", "head": "h9"}})
+    files = {"5": [{"filename": "a.py"}, {"filename": "b.py"}],
+             "7": [{"filename": "a.py"}, {"filename": "c.py"}],
+             "9": [{"filename": "z.py"}]}
+    gh, calls = _pb_files_gh(files)
+    prbabysit.overlap_check(Daemon(p.base), gh)
+    ev = [t for k, t in _pb_events(p) if k == "pr_overlap"]
+    assert len(ev) == 1 and "acme/widgets#7" in ev[0] and "acme/widgets#5" in ev[0], ev
+    assert "a.py" in ev[0] and "#9" not in ev[0], ev[0]
+    assert sorted(calls) == [["api", "repos/acme/widgets/pulls/5/files?per_page=100"],
+                             ["api", "repos/acme/widgets/pulls/7/files?per_page=100"],
+                             ["api", "repos/acme/widgets/pulls/9/files?per_page=100"]], calls
+    n_calls = len(calls)
+    prbabysit.overlap_check(Daemon(p.base), gh)   # once per pair
+    assert len([1 for k, _ in _pb_events(p) if k == "pr_overlap"]) == 1
+    assert calls[n_calls:] == [], "the files are cached per head"
+
+
+def test_prbabysit_a_pair_with_another_project_pr_and_a_disjoint_pair_give_no_event(env, monkeypatch):
+    from ttp import ghauth, prbabysit
+    from ttp.daemon import Daemon
+    from ttp.project import write_json
+    p = make(env, "overlap2")
+    p.db.set_kv("pr_babysit", {"acme/widgets#55": {"open": True, "branch": "b", "head": "h55"}})
+    write_json(ghauth._home(None) / prbabysit.HOST_FILE, {"tt-buddy": {"at": time.time(),
+             "prs": {"acme/widgets#46": {"files": ["b.py"], "head": "h46"},
+                     "acme/widgets#47": {"files": ["q.py"], "head": "h47"}}}})
+    gh, _ = _pb_files_gh({"55": [{"filename": "a.py"}, {"filename": "b.py"}]})
+    prbabysit.overlap_check(Daemon(p.base), gh)
+    ev = [t for k, t in _pb_events(p) if k == "pr_overlap"]
+    assert len(ev) == 1 and "acme/widgets#55" in ev[0] and "#46" in ev[0] and "b.py" in ev[0], ev
+    assert not any("#47" in t for t in ev), "disjoint files: no pair"
+    assert "overlap2" in (ghauth._home(None) / prbabysit.HOST_FILE).read_text()

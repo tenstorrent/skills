@@ -1684,7 +1684,8 @@ def test_pr_watch_stops_reading_merged_and_closed_prs(env, monkeypatch):
     assert p.db.one("SELECT COUNT(*) n FROM events WHERE kind='pr_changed' AND text LIKE '%MERGED%'")["n"] == 1
     calls.clear()
     assert watchers.watch_prs(d).startswith("ok (1 PRs")
-    assert [c for c in calls if "/contents/" not in c] == [urls[0], "number=1"], "merged and closed PRs are not read again"
+    assert [c for c in calls if "/contents/" not in c and "/files?" not in c] == \
+        [urls[0], "number=1"], "merged and closed PRs are not read again"
     assert not [c for c in calls if "/pull/2" in c or "/pull/3" in c]
 
 
@@ -1806,6 +1807,8 @@ def test_pr_watch_parallel_reads_find_what_one_by_one_reads_find(env, monkeypatc
         time.sleep(0.01)
         if args[0] == "api" and "/contents/" in args[1]:
             return None
+        if args[0] == "api" and not any(a.startswith("number=") for a in args):
+            return None   # the overlap check's changed-files read
         if args[0] == "api":
             n = int(next(a for a in args if a.startswith("number=")).split("=")[1])
             pr = {"comments": {"nodes": []}, "reviews": {"nodes": []}, "reviewThreads": {"nodes": []}}
@@ -2034,7 +2037,7 @@ class _BatchGh:
             return boundedchild.Result(None, "", "", timed_out=True, error=f"timed out after {timeout} s")
         if self.fail:
             return boundedchild.Result(self.fail[0], "", self.fail[1])
-        q = next(x for x in a if x.startswith("query="))[6:]
+        q = next((x for x in a if x.startswith("query=")), "")[6:]   # a REST read: no answer
         vals = dict(x.split("=", 1) for x in a if "=" in x and not x.startswith("query="))
         if q == watchers.BOT_QUERY:
             pr = self.prs[int(vals["number"])]
@@ -2207,17 +2210,22 @@ def test_pr_watch_makes_one_gh_call_per_repo_per_poll_and_the_cycle_reuses_it(en
     with monkeypatch.context() as m:   # per-PR reads, as before batching: 2 gh calls a PR
         m.setattr(watchers.PrCycle, "plan", lambda self, urls: None)
         assert watchers.watch_prs(d).startswith(f"ok ({n} PRs")
-    assert len(gh.calls) == 2 * n, gh.calls
+    reads = [c for c in gh.calls if not any("/files?" in x for x in c)]   # the sweep's files reads sit beside them
+    assert len(reads) == 2 * n, gh.calls
     gh.calls.clear()
     with watchers.pr_cycle():
         assert watchers.watch_prs(d).startswith(f"ok ({n} PRs")
-        assert len(gh.calls) == 1 and gh.calls[0][:2] == ["api", "graphql"], gh.calls
+        reads = [c for c in gh.calls if not any("/files?" in x for x in c)]
+        assert len(reads) == 1 and reads[0][:2] == ["api", "graphql"], gh.calls
         url = "https://github.com/acme/widgets/pull/3"
         assert watchers._gh(["pr", "view", url, "--json", "state,isDraft,headRefOid"], str(p.root)) == \
             {"state": "OPEN", "isDraft": True, "headRefOid": HEAD}
         assert watchers.watch_prs(d).startswith(f"ok ({n} PRs")
-        assert len(gh.calls) == 1, "a second consumer in the cycle reads the cached answers"
-    assert watchers.watch_prs(d).startswith(f"ok ({n} PRs") and len(gh.calls) == 2, "the next poll reads afresh"
+        assert len([c for c in gh.calls if not any("/files?" in x for x in c)]) == 1, \
+            "a second consumer in the cycle reads the cached answers"
+    assert watchers.watch_prs(d).startswith(f"ok ({n} PRs")
+    reads = [c for c in gh.calls if not any("/files?" in x for x in c)]
+    assert len(reads) == 2, "the next poll reads afresh"
 
 
 def test_pr_watch_batched_reads_find_what_per_pr_reads_find(env, monkeypatch):
@@ -2263,7 +2271,7 @@ def test_pr_watch_batched_reads_find_what_per_pr_reads_find(env, monkeypatch):
         findings = {k: {**r, "owner": r["owner"] and "#new"} for k, r in p.db.kv(prguard.FINDINGS_KEY).items()}
         got.append((p.db.kv("pr_signatures"), findings, events, p.db.kv(prguard.HEADS_KEY).keys()))
         if batched:
-            assert len(gh.calls) == 2 + 2 * 2 + 2, gh.calls   # a query a poll; per PR: 130 comments twice, 105 checks once
+            assert len([c for c in gh.calls if not any("/files?" in x for x in c)]) == 2 + 2 * 2 + 2, gh.calls   # a query a poll; per PR: 130 comments twice, 105 checks once
     assert got[0] == got[1]
     sigs, findings, events, _ = got[1]
     kinds = {k for k, *_ in events}
@@ -2289,7 +2297,7 @@ def test_a_failed_batched_read_fails_its_prs_or_lets_each_ask_gh(env, monkeypatc
     gh.fail = fail
     status = watchers.run_builtin(Daemon(p.base), "prs", {"deadline_s": 60, "gh_timeout_s": 5})
     if per_pr:
-        assert status == "ok (5 PRs, 5 changed)" and len(gh.calls) == 1 + 5 * 2, (status, gh.calls)
+        assert status == "ok (5 PRs, 5 changed)" and len([c for c in gh.calls if not any("/files?" in x for x in c)]) == 1 + 5 * 2, (status, gh.calls)
         assert set(p.db.kv("pr_signatures")) == {f"https://github.com/acme/widgets/pull/{i}" for i in range(1, 6)}
         return
     assert len(gh.calls) == 1, gh.calls
@@ -2340,7 +2348,7 @@ def test_batched_prs_with_more_pages_each_read_them_in_their_own_time(env, monke
         sigs.append(p.db.kv("pr_signatures"))
     assert len(sigs[1]) == 8 and sigs[0] == sigs[1]
     assert all(s["failing"] == ["job7"] for s in sigs[1].values())
-    assert len(gh.calls) == 8 * 2 + 1 + 8 * 2 + 1, "per-PR: view and findings; batched: one query, then each PR's; the base's checks once"
+    assert len([c for c in gh.calls if not any("/files?" in x for x in c)]) == 8 * 2 + 1 + 8 * 2 + 1, "per-PR: view and findings; batched: one query, then each PR's; the base's checks once"
 
 
 def test_a_batched_pr_whose_pages_outlast_its_time_shows_as_not_checked(env, monkeypatch):
@@ -2424,7 +2432,7 @@ def test_a_multi_page_batched_pr_is_read_per_pr_with_no_paging_in_the_batch(env,
     p, gh = _pr_batch_setup(env, monkeypatch, {1: _gql_node(1), 2: _gql_node(2, checks=many), 3: _gql_node(3)})
     assert watchers.watch_prs(Daemon(p.base)).startswith("ok (3 PRs, 3 changed)")
     assert not any("$after" in x for c in gh.calls for x in c), gh.calls
-    assert len(gh.calls) == 4, gh.calls   # the batched query, PR 2's view and findings, its base's checks
+    assert len([c for c in gh.calls if not any("/files?" in x for x in c)]) == 4, gh.calls   # the batched query, PR 2's view and findings, its base's checks
     assert gh.calls[1][:3] == ["pr", "view", "https://github.com/acme/widgets/pull/2"] and "number=2" in gh.calls[2]
     assert p.db.kv("pr_signatures")["https://github.com/acme/widgets/pull/2"]["failing"] == ["job120"]
 
@@ -2453,7 +2461,8 @@ def test_pr_watch_batches_per_repo_in_chunks(env, monkeypatch):
     p.db.x("INSERT INTO tasks(title,kind,status,pr_url,created) VALUES(?,?,?,?,?)",
            ("t", "code", "done", "https://github.com/acme/gadgets/pull/1", time.time()))
     assert watchers.watch_prs(Daemon(p.base)).startswith("ok (8 PRs")
-    repos = sorted(next(x for x in c if x.startswith("name=")) for c in gh.calls)
+    repos = sorted(next(x for x in c if x.startswith("name=")) for c in gh.calls
+                    if c[:2] == ["api", "graphql"])
     assert repos == ["name=gadgets"] + ["name=widgets"] * 3, gh.calls
 
 

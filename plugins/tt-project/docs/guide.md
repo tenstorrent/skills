@@ -4106,7 +4106,13 @@ the pick order, so it takes the first starts. A resumed resource ramps only its 
   unanswered comments as a draft does. `pr_ci_not_run` lists checks skipped, or workflows that need a
   manual or label trigger, never ran on the head and are listed in `pr_babysit.dispatch`, each with its trigger
   (read from the repo's workflows at the head). `pr_idle` fires once per idle stretch past `pr_babysit.idle_h` (24) hours without commit,
-  review, comment or check activity, naming the requested reviewers. Status changes since the last
+  review, comment or check activity, naming the requested reviewers. Once per run, not per PR, the sweep
+  also raises `pr_route_silent` when the gh route PRs are read through has not answered for 24 h (naming the
+  route, the silence and the user's own step to bring it back; it clears once the route answers) and
+  `pr_overlap` for two open PRs in the same repo, one the project owns, that change the same files, so the
+  projects behind them coordinate (one carries the change and the version bump, the other rebases); each
+  project's sweep records its open PRs and their changed files for the host's other projects' sweeps.
+  Status changes since the last
   sweep (out of draft, review approved or changes requested, CI red or green, merged or closed, a new
   conflict) are one chat line per PR with its link, once per change: a review approved and red CI on a ready PR
   post at once, the rest join the digest. A gh call that is not answered yet (exit 75) gives nothing.

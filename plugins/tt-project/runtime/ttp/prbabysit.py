@@ -10,21 +10,35 @@ Per PR, on each watcher run:
 - status changes since the last sweep (merged or closed, out of draft, review approved or changes requested,
   CI red or green, a new conflict): one plain chat line per PR with its link, kept once per change. A review
   approved and red CI on a ready PR post at once; the rest join the chat digest. A first sighting is a baseline.
+Once per run, not per PR:
+- `pr_route_silent` event: the route PRs are read through (delivery.gh_route) has not answered for over 24 h,
+  naming the route, how long it has been silent and the user's own step to bring it back; once per silence,
+  clearing once the route answers.
+- `pr_overlap` event: two open PRs in the same repo, at least one the project owns, that change the same
+  files, naming the files and both PRs, once per pair, so the two projects coordinate. Every project's sweep
+  records its open PRs and their changed files for the host's other projects' sweeps to read.
 The sweep posts nothing to GitHub and runs no workflow. A gh call that gives no answer (exit 75: not in yet,
 an error) gives no event: the next sweep asks again.
 """
 from __future__ import annotations
 
 import base64
+import json
 import re
 import time
 from datetime import datetime
 
 from . import project
 
-KEY = "pr_babysit"           # {pr_key: {"told": {condition: value}, "idle": mark, "notrun": mark, "branch", "open"}}
-FLOWS_KEY = "pr_workflows"   # {"owner/repo:path:blob": {"at": ts, "info": {"name", "file", "manual", "trigger", "labels"}}}
+KEY = "pr_babysit"           # {pr_key: {"told": {condition: value}, "idle": mark, "notrun": mark, "branch", "open", "head"}}
+FLOWS_KEY = "pr_workflows"   # {"owner/repo:path:blob": {"at": ts, "info": {"name", "file", "manual", "trigger", "labels"}}
 READ_S = 900                 # a PR no task opened is read this often while the sweep is on
+ROUTE_SILENT_S = 24 * 3600   # a route silent longer than this makes the sweep raise pr_route_silent
+ROUTE_KEY = "pr_route"       # kv: {"via", "at"} of the silence already told
+OVERLAP_KEY = "pr_overlap"   # kv: the overlapping PR pairs already told: {f"{a}|{b}": 1}
+FILES_KEY = "pr_files"       # kv: {key: {"head": sha, "files": [name, ...]}}
+HOST_FILE = "pr-overlap.json"   # under the tt-project home: {project: {"at": ts, "prs": {key: {"head", "files"}}}}
+HOST_STALE_S = 48 * 3600     # a host project's record older than this is dropped when the file is read
 DEFAULTS = project.DEFAULT_CONFIG["pr_babysit"]
 PING = "This PR has had no recent activity: a review or a reply would unblock it. Thank you."
 
@@ -231,6 +245,8 @@ def sweep(daemon, t: dict, pr: dict, sig: dict, gh) -> None:
     state = allstate.setdefault(key, {})
     _told(daemon, state, key, url, sig, pr.get("isDraft") is False)
     state["branch"], state["open"] = pr.get("headRefName") or "", sig["state"] == "OPEN"
+    if pr.get("headRefOid"):
+        state["head"] = pr["headRefOid"]   # overlap_check caches the changed files by it
     events = []
     if sig["state"] == "OPEN":
         text = _not_run(daemon, pr, key, gh, now, sig["checks"] == "pending")
@@ -255,3 +271,133 @@ def sweep(daemon, t: dict, pr: dict, sig: dict, gh) -> None:
         db.x("INSERT INTO events(ts,source,kind,severity,text,status,task) VALUES(?,?,?,?,?,?,?)",
              (now, "pr", kind, "normal", text, status, t.get("id")))
     db.set_kv(KEY, allstate)
+
+
+def route_check(daemon) -> None:
+    """One `pr_route_silent` event while the route PRs are read through (delivery.gh_route) has not
+    answered for over a day: the sweep is blind without saying so. Names the route, how long it has
+    been silent and the user's own step to bring it back; fires once per silence and clears by itself
+    once the route answers (its answer moves the silence window)."""
+    from . import ghroute, screen as scr
+    alias = ghroute.route(getattr(daemon, "cfg", None), str(daemon.p.root))
+    st = {} if ghroute.local_ok() or not alias else ghroute.last_answer()
+    db, now = daemon.p.db, time.time()
+    if st.get("via") != alias or not st.get("at"):
+        db.set_kv(ROUTE_KEY, {})   # our route has never answered: the gh-auth condition covers that
+        return
+    silent, told = now - float(st["at"]), {"via": alias, "at": float(st["at"])}
+    if silent <= ROUTE_SILENT_S:
+        if db.kv(ROUTE_KEY, {}):
+            db.set_kv(ROUTE_KEY, {})   # the route answered: the condition clears
+        return
+    if db.kv(ROUTE_KEY, {}) == told:
+        return   # this silence is already told
+    db.set_kv(ROUTE_KEY, told)
+    step = (f"run `ttp bridge gh-pull` on your workstation to drain the gh queue"
+            if alias == ghroute.WORKSTATION else
+            f"bring the machine behind ssh alias {alias!r} back, or fix delivery.gh_route")
+    text = (f"PR watch is blind: the gh route {alias!r} PRs are read through has not answered for "
+            f"{silent / 3600:.0f} h. {step}.")
+    _event(daemon, "pr_route_silent", text, None)
+
+
+def overlap_check(daemon, gh) -> None:
+    """One `pr_overlap` event per pair of open PRs in the same repo that change the same files, one of
+    them a PR this project owns: they must coordinate (one carries the change and the version bump,
+    the other rebases). Each project's sweep records its open PRs and their changed files under the
+    tt-project home, so every project's sweep sees every other's."""
+    db = daemon.p.db
+    own = {k: v for k, v in (db.kv(KEY, {}) or {}).items() if v.get("open")}
+    files = {k: fs for k in own if (fs := _pr_files(db, gh, k, own[k].get("head"), str(daemon.p.root)))}
+    _host_write(daemon, {k: {"head": own[k].get("head"), "files": fs} for k, fs in files.items()})
+    known = _host_prs(time.time())
+    marks = dict(db.kv(OVERLAP_KEY, {}) or {})
+    had = set(marks)
+    keys = sorted(known)
+    for i, a in enumerate(keys):
+        for b in keys[i + 1:]:
+            if (a not in own and b not in own) or a.split("#")[0] != b.split("#")[0]:
+                continue   # a pair this project has no say in, or another repo's two PRs
+            shared = sorted(set(known[a]) & set(known[b]))
+            pair = f"{a}|{b}"
+            marks.pop(pair, None)
+            if not shared:
+                continue
+            marks[pair] = 1
+            if pair in had:
+                continue   # once per pair while the overlap stands
+            shown = ", ".join(shared[:5]) + (f" and {len(shared) - 5} more" if len(shared) > 5 else "")
+            _event(daemon, "pr_overlap",
+                   f"PRs {_link(a)} and {_link(b)} change the same files ({shown}): the projects behind "
+                   "them must coordinate - one carries the change and the version bump, the other rebases.", None)
+    db.set_kv(OVERLAP_KEY, marks)
+
+
+def _event(daemon, kind: str, text: str, task) -> None:
+    from . import screen as scr
+    db = daemon.p.db
+    status = "muted" if scr.count_muted(db, "pr", text, "normal") else "queued"
+    db.x("INSERT INTO events(ts,source,kind,severity,text,status,task) VALUES(?,?,?,?,?,?,?)",
+         (time.time(), "pr", kind, "normal", text, status, task))
+
+
+def _link(key: str) -> str:
+    """`[owner/repo#N](url)` for a pr key."""
+    return f"[{key}](https://github.com/{key.split('#')[0]}/pull/{key.split('#')[1]})"
+
+
+def _pr_files(db, gh, key: str, head, cwd: str) -> list[str] | None:
+    """The PR's changed file names, cached by its head: None while the read has no answer. A PR whose
+    head is unknown is read but not cached, so a new head is never judged by the old files."""
+    cache = db.kv(FILES_KEY, {}) or {}
+    hit = cache.get(key)
+    if head and hit and hit.get("head") == head and hit.get("files"):
+        return hit["files"]
+    repo, n = key.split("#")
+    rows = gh(["api", f"repos/{repo}/pulls/{n}/files?per_page=100"], cwd)
+    if not isinstance(rows, list):
+        return None
+    out = sorted({str(r.get("filename")) for r in rows if isinstance(r, dict) and r.get("filename")})
+    if out and head:
+        db.set_kv(FILES_KEY, {k: v for k, v in {**cache, key: {"head": head, "files": out}}.items()
+                              if k == key or (db.kv(KEY, {}) or {}).get(k, {}).get("open")})
+    return out or None
+
+
+def _host_write(daemon, prs: dict) -> None:
+    """Record this project's open PRs and their changed files for the host's other projects' sweeps."""
+    from . import ghauth
+    from .ghqueue import _project
+    from .project import write_json
+
+    def put():
+        rec = _host_read()
+        rec[_project(str(daemon.p.root)) or daemon.p.name] = {"at": time.time(), "prs": prs}
+        for k, v in list(rec.items()):
+            if time.time() - float(v.get("at") or 0) > HOST_STALE_S:
+                del rec[k]
+        write_json(ghauth._home(None) / HOST_FILE, rec, 0o600)
+    try:
+        ghauth._locked(None, put, block=True, lock="pr-overlap.lock")
+    except OSError:
+        pass
+
+
+def _host_read() -> dict:
+    from . import ghauth
+    try:
+        rec = json.loads((ghauth._home(None) / HOST_FILE).read_text())
+    except (OSError, ValueError):
+        return {}
+    return rec if isinstance(rec, dict) else {}
+
+
+def _host_prs(now: float) -> dict[str, list[str]]:
+    """{pr key: changed files} of every fresh host project's open PRs, ours included."""
+    out = {}
+    for v in _host_read().values():
+        if now - float(v.get("at") or 0) > HOST_STALE_S:
+            continue
+        for k, pv in (v.get("prs") or {}).items():
+            out[k] = list(pv.get("files") or [])
+    return out

@@ -30760,7 +30760,7 @@ def test_pr_watch_never_changes_a_prs_draft_state_or_reviewers(env, tmp_path, mo
     for _ in range(3):
         watchers.watch_prs(d)
     calls = log.read_text().splitlines()
-    assert calls and all(c.startswith(("pr view ", "pr list ", "api graphql ")) for c in calls), calls
+    assert calls and all(c.startswith(("pr view ", "pr list ", "api graphql ", "api repos/")) for c in calls), calls
     assert not [c for c in calls if "--undo" in c or "reviewer" in c or "PATCH" in c or "DELETE" in c]
     assert json.loads(prs.read_text()) == {by_user: False, by_run: False, ok: False}
     assert set(p.db.kv(prguard.UNAPPROVED_KEY)) == {"acme/widgets#7"}

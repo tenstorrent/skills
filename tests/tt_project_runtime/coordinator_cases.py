@@ -13187,13 +13187,13 @@ def test_pr_watch_reads_inline_comments_only_for_open_prs(env, monkeypatch):
                                                      "reviewThreads": {"nodes": []}}}}}
 
     def gh(args, cwd):
-        calls.append(args[0])
-        return graph if args[0] == "api" else pr
+        calls.append("pr" if args[0] != "api" else ("graphql" if "graphql" in args else "files"))
+        return graph if args[0] == "api" and "graphql" in args else ([] if args[0] == "api" else pr)
 
     monkeypatch.setattr(watchers, "_gh", gh)
     d = Daemon(p.base)
     watchers.watch_prs(d)
-    assert calls.count("api") == 1
+    assert calls == ["pr", "graphql", "files"], calls
     pr["state"] = "MERGED"
     calls.clear()
     watchers.watch_prs(d)

@@ -923,6 +923,9 @@ def watch_prs(daemon, payload: dict | None = None) -> str:
         status = "muted" if scr.count_muted(db, "pr", text, sev) else "queued"
         db.x("INSERT INTO events(ts,source,kind,severity,text,status,task) VALUES(?,?,?,?,?,?,?)",
              (time.time(), "pr", "pr_changed", sev, text, status, t["id"]))
+    if prbabysit.settings(getattr(daemon, "cfg", None))["enabled"]:   # the sweep's run-level checks
+        prbabysit.route_check(daemon)
+        prbabysit.overlap_check(daemon, _gh)
     # A flag whose task is gone (cancelled, say) or whose PR gh has not read for a day is dropped,
     # so its alert clears.
     tasks, now = {t["id"] for t in rows}, time.time()

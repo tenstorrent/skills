@@ -300,16 +300,22 @@ def seen(rc: int, via: str = "") -> None:
         mark(_answered(rc), via=via)
 
 
-def works(home=None, within_s: float = 3600, via: str | None = None) -> bool:
-    """Whether a routed gh call succeeded here within `within_s` and none failed since; with `via`, only
-    a call over that route counts (another project's route or the workstation queue answering is no
-    route of this project's working)."""
+def last_answer(home=None) -> dict:
+    """The route's last recorded answer ({"ok", "at", "via"}), or {} when it has none."""
     from . import ghauth
     try:
         st = json.loads((ghauth._home(home) / STATE).read_text())
     except (OSError, ValueError):
-        return False
-    return (isinstance(st, dict) and st.get("ok") is True and time.time() - float(st.get("at") or 0) < within_s
+        return {}
+    return st if isinstance(st, dict) else {}
+
+
+def works(home=None, within_s: float = 3600, via: str | None = None) -> bool:
+    """Whether a routed gh call succeeded here within `within_s` and none failed since; with `via`, only
+    a call over that route counts (another project's route or the workstation queue answering is no
+    route of this project's working)."""
+    st = last_answer(home)
+    return (st.get("ok") is True and time.time() - float(st.get("at") or 0) < within_s
             and (via is None or st.get("via") == via))
 
 

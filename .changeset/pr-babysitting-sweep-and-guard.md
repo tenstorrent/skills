@@ -10,4 +10,6 @@ status change; it posts and dispatches nothing. The `gh` guard now lets a worker
 `gh workflow run` outside an owned PR's head is refused), and ping reviewers with a comment that ends with the
 AI tag. A PR in `pr_babysit.no_post_prs` gets no comment, edit, dispatch or push. The gh route's workstation
 runs a dispatch and a label only on an open PR its own gh user opened.
-`watchers.purview_extra` also takes `owner/repo#N`.
+`watchers.purview_extra` also takes `owner/repo#N`. The sweep also raises `pr_route_silent` when the gh route
+PRs are read through has not answered for 24 h (with the user's step to bring it back), and `pr_overlap` for two
+open PRs of the host's projects that change the same files, so their projects coordinate.
