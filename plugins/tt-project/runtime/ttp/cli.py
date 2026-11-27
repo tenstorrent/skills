@@ -10635,6 +10635,9 @@ def cmd_detach(a) -> None:
         die("--remote-pid and --remote-marker go with --remote-host <ssh alias>")
     if rhost and (a.remote or a.check is not None):
         die("--remote-host is for a local job that drives another host; --remote starts the job there itself")
+    retry = [getattr(a, k, None) for k in ("retry", "retry_rc", "retry_delay")]
+    if any(x is not None for x in retry) and (a.check is not None or not a.command):
+        die("--retry, --retry-rc and --retry-delay go with the command that starts a job")
     held_on = _detach_occupied(a, rhost) if a.check is None and a.command else []
     if a.remote:
         _detach_remote(a, _own_ttp())
@@ -10697,6 +10700,7 @@ def cmd_detach(a) -> None:
         print("ttp detach: its pytest runs under `ttp sandbox`, which takes its test workers from the host's "
               "test slots (fewer, or a short wait, while other runs hold them)", file=sys.stderr)
         cmd = pooled
+    cmd = _retry_cmd(a, cmd)   # inside the lock: it stays held across the tries
     if job_locks:
         cmd = _lock_job(job_locks, cmd)
     if held_on:   # waits outside its locks, so it holds none of them while the stream is live
@@ -11160,6 +11164,16 @@ def _detach_stop_pids(what: str) -> int:
     return 0
 
 
+def _retry_cmd(a, cmd: list) -> list:
+    """`cmd` under the in-job retry loop when --retry was given (detach.retry_argv)."""
+    from . import detach
+    try:
+        return detach.retry_argv(getattr(a, "retry", None), getattr(a, "retry_rc", None),
+                                 getattr(a, "retry_delay", None), cmd)
+    except ValueError as e:
+        die(str(e))
+
+
 def _lock_job(names: list, cmd: list) -> list:
     """`ttp detach --lock A --lock B`: the job's command as `ttp lock A,B -- <command...>`, so the job takes
     them by ttp lock's rules unchanged (all or nothing, in arrival order, device, reserved and nested rules;
@@ -11262,6 +11276,7 @@ def _start_options(a) -> None:
     never runs as the command."""
     words = list(a.command or [])
     known = {"--cores": int, "--devices": int, "--mem-gb": float, "--resumable": None, "--lock": list,
+             "--retry": int, "--retry-rc": str, "--retry-delay": float,
              **({"--dir": str} if a.remote else {"--remote-host": str, "--remote-pid": str, "--remote-marker": str,
                                                   "--idle-ok": str,
                                                   "--results": str, "--spend-cmd": str, "--spend-cap": float,
@@ -11409,7 +11424,7 @@ def _detach_remote(a, ttp: str) -> None:
             "(name: letters, digits, . _ -)")
     run = Path(os.environ.get("TTP_RUN_DIR") or "").name or time.strftime("manual-%Y%m%d-%H%M%S")
     rdir = (a.dir or f"~/.ttp-detach/{run}").rstrip("/") or "/"
-    r = _ssh_sh(a.remote, _REMOTE_START, [rdir, a.name, *cmd], here=False)
+    r = _ssh_sh(a.remote, _REMOTE_START, [rdir, a.name, *_retry_cmd(a, cmd)], here=False)
     if r is None or r.returncode == SSH_FAILED:
         die(f"ssh to {a.remote} failed{': ' + r.stderr.strip()[-300:] if r and r.stderr.strip() else ''}", SSH_FAILED)
     out = (r.stdout.strip().splitlines() or [""])[-1].split(" ", 2)
@@ -17657,6 +17672,14 @@ def ttp_parser():
                    help="the job is safe to rerun from the start: after a host reboot cuts it short, the daemon "
                    "starts it again while the task still waits on it, with no model run (up to "
                    "budget.max_job_relaunches times, default 3)")
+    s.add_argument("--retry", type=int, metavar="N",
+                   help="with --retry-rc: retry the command up to N more times inside the job when it exits with a "
+                   "listed code, so a transient failure costs no new run; each try's exit code and time go to the "
+                   "log, the .rc holds only the last try's, and --lock stays held across the tries")
+    s.add_argument("--retry-rc", metavar="RC[,RC...]",
+                   help="exit codes worth a retry (no default: an unlisted code ends the job at once)")
+    s.add_argument("--retry-delay", type=float, metavar="SECONDS",
+                   help="seconds between tries (default 30)")
     s.add_argument("--results", metavar="GLOB",
                    help="files the job writes per finished unit, relative to its working dir (e.g. 'out/*.json'): "
                    "each new match counts as a result report from the job, keeping an obligation its task owns on "

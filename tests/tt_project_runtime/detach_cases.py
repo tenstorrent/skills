@@ -3660,3 +3660,72 @@ def test_a_failed_step_of_a_live_driver_wakes_its_waiting_task_once_and_a_health
     rc.write_text("0\n")   # once the job ended, its own exit code is the verdict, never a stale step
     detach.note_step_failure(rc, "tb/driver", "late")
     assert detach.take_step_failures(f"ttp detach --check {rc}") == []
+
+
+def _flaky(tmp_path, *codes):
+    """A command whose k-th try exits codes[k-1] (the last code from then on); its tries are counted in a file."""
+    n = tmp_path / "tries"
+    q = shlex.quote(str(n))
+    return ["sh", "-c", f'k=$(( $(cat {q} 2>/dev/null || echo 0) + 1 )); echo $k > {q}; '
+                        f'set -- {" ".join(map(str, codes))}; [ $k -le $# ] || k=$#; shift $((k-1)); exit $1'], n
+
+
+def test_detach_retry_succeeds_on_try_2_under_its_lock_and_writes_the_rc_once(env, tmp_path):
+    p = make(env)
+    run_dir = p.runs / "7"
+    run_dir.mkdir(parents=True)
+    cmd, tries = _flaky(tmp_path, 7, 0)
+    r = _ttp_run(p, "detach", "job", "--lock", "rig-a", "--retry", "2", "--retry-rc", "3,7", "--retry-delay", "3",
+                 "--", *cmd, env=_lock_job_env(env, p, run_dir))
+    assert r.returncode == 0, r.stderr
+    rc, log = (run_dir / "job.rc").resolve(), (run_dir / "job.log").resolve()
+    assert _until_true(lambda: log.exists() and "retrying in 3 s" in log.read_text())
+    assert not rc.exists(), "the rc waits for the last try"
+    assert _held_now(p, "rig-a"), "the lock stays held between the tries"
+    assert _wait_for_path(rc) and rc.read_text().strip() == "0"
+    text = log.read_text()
+    assert "try 1 exited 7 at " in text and "try 2 exited 0 at " in text and "try 3" not in text, text
+    assert tries.read_text().strip() == "2"
+    assert _until_true(lambda: not _held_now(p, "rig-a"))
+
+
+def test_detach_retry_stops_at_an_unlisted_code_and_gives_the_last_code_once_its_tries_run_out(env, tmp_path):
+    p = make(env)
+    run_dir = p.runs / "7"
+    run_dir.mkdir(parents=True)
+    for name, codes, rcs, want, ran in (("unlisted", (5, 0), "7", 5, 1), ("spent", (7, 7, 9, 0), "7,9", 9, 3)):
+        d = tmp_path / name
+        d.mkdir()
+        cmd, tries = _flaky(d, *codes)
+        r = _ttp_run(p, "detach", name, "--retry", "2", "--retry-rc", rcs, "--retry-delay", "0", "--", *cmd,
+                     env=_lock_job_env(env, p, run_dir))
+        assert r.returncode == 0, r.stderr
+        rc = (run_dir / f"{name}.rc").resolve()
+        assert _wait_for_path(rc) and rc.read_text().strip() == str(want), name
+        assert tries.read_text().strip() == str(ran), name
+        assert _ttp_run(p, "detach", "--check", str(rc)).returncode == 4
+
+
+def test_detach_retry_runs_on_the_remote_host_and_odd_retry_options_start_nothing(env, tmp_path):
+    p = _device_project(env, device=False)
+    run_dir = p.runs / "21"
+    run_dir.mkdir(parents=True)
+    e = {**_ssh_stub(tmp_path), "TTP_RUN_DIR": str(run_dir)}
+    cmd, tries = _flaky(tmp_path, 9, 0)
+    r = _ttp_run(p, "detach", "--remote", "box-a", "drv", "--retry", "1", "--retry-rc", "9", "--retry-delay", "0",
+                 "--", *cmd, env=e)
+    assert r.returncode == 0, r.stderr
+    remote = tmp_path / "home" / ".ttp-detach" / "21"
+    assert _wait_for_path(remote / "drv.rc") and (remote / "drv.rc").read_text().strip() == "0"
+    assert "try 1 exited 9" in (remote / "drv.log").read_text() and tries.read_text().strip() == "2"
+    calls = (tmp_path / "ssh.log").read_text().split()
+    for bad in (["--retry", "2"], ["--retry-rc", "7"], ["--retry", "0", "--retry-rc", "7"],
+                ["--retry", "1", "--retry-rc", "a,7"], ["--retry", "1", "--retry-rc", "300"],
+                ["--retry", "1", "--retry-rc", "7", "--retry-delay", "-1"]):
+        for where in ([], ["--remote", "box-a"]):
+            r = _ttp_run(p, "detach", *where, "bad", *bad, "--", "true", env=e)
+            assert r.returncode != 0 and "--retry" in r.stderr, (bad, r.stderr)
+    assert not any(run_dir.glob("bad.*")) and not (remote / "bad.pid").exists()
+    assert (tmp_path / "ssh.log").read_text().split() == calls, "a refused option reaches no host"
+    r = _ttp_run(p, "detach", "--check", "--retry", "1", str(remote / "drv.rc"), env=e)
+    assert r.returncode != 0 and "go with the command" in r.stderr, r.stderr

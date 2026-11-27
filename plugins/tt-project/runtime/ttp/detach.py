@@ -409,6 +409,28 @@ WRAPPER = ('o="$1" r="$2" s="$3" t="$4" k="$5" py="$6" cl="$7" fd="$8" lk="$9"; 
            'printf \'{"end": %s, "ev": "job_end", "id": "%s", "rc": %s}\\n\' "$(date +%s)" "$i" "$c" >>"$a" 2>/dev/null; '
            'if [ -x "$py" ]; then exec "$py" -I -S -c "$cl" "$fd" "$lk" "$t" "$k" 2>/dev/null; fi; rm -rf "$t" "$k"')
 _TMP_VARS = ("TMPDIR", "TMP", "TEMP")
+# `ttp detach --retry N --retry-rc RC[,RC] [--retry-delay S] -- <command...>`: the command runs under this
+# loop ($1 retries, $2 comma-listed exit codes worth a retry, $3 seconds between tries), so a transient
+# failure retries inside the one job. Every try's exit code and time go to the log; the wrapper writes the
+# .rc once, from the last try, so a reader of the .rc or `--check` never sees an earlier try's code.
+RETRY_SH = (r'n=$1 w=$2 d=$3; shift 3; t=1; while :; do "$@"; c=$?; '
+            r'echo "ttp detach: try $t exited $c at $(date "+%F %T %Z")"; '
+            r'[ "$c" = 0 ] && exit 0; [ "$t" -gt "$n" ] && exit $c; case ",$w," in *",$c,"*) ;; *) exit $c ;; esac; '
+            r'echo "ttp detach: retrying in $d s"; sleep "$d"; t=$((t+1)); done')
+
+
+def retry_argv(retry, codes, delay, cmd: list) -> list:
+    """`cmd` under the retry loop (RETRY_SH); SystemExit-free: a ValueError names an unusable option."""
+    if retry is None and codes is None and delay is None:
+        return cmd
+    if retry is None or retry < 1:
+        raise ValueError("--retry-rc and --retry-delay go with --retry N (N at least 1)")
+    if not codes or not re.fullmatch(r"\d{1,3}(,\d{1,3})*", codes) or any(int(c) > 255 for c in codes.split(",")):
+        raise ValueError("--retry needs --retry-rc RC[,RC...] (exit codes 0-255): no code retries by default")
+    if delay is not None and not 0 <= delay < 1e6:
+        raise ValueError("--retry-delay is a number of seconds, 0 or more")
+    wait = "30" if delay is None else ("%.3f" % delay).rstrip("0").rstrip(".")
+    return ["sh", "-c", RETRY_SH, "sh", str(retry), codes, wait, *cmd]
 
 
 def started(rc: Path) -> Path:
