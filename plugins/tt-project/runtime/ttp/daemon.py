@@ -10583,7 +10583,7 @@ class Daemon:
         if out.returncode != 0:
             log(self.p, f"schedule {s['name']}: precheck exited rc={out.returncode} "
                         f"({output_tail(out.stderr) or 'no stderr'}); the run goes ahead")
-            return "", precheckbind.parse(out.stdout)
+            return "", precheckbind.parse(out.stdout, out.returncode)
         line = next((x.strip() for x in (out.stdout or "").splitlines() if x.strip()), "") or "exit 0"
         return f"skipped: precheck: {line}"[:200], None
 

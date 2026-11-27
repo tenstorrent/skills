@@ -257,8 +257,9 @@ coordinator with that evidence.
   time or epoch), other keys kept as they are. It is stored with the task in the write that queues it
   and handed to that run unchanged, as the file `$TTP_PRECHECK_JSON` names and one line in its spec;
   a later precheck, a moved latest pointer or a stats re-read never replaces it. Missing, invalid or
-  oversized output, a failed precheck and a timeout bind `{"binding": "unknown"}`, never another snapshot
-  (`runtime/ttp/precheckbind.py`).
+  oversized output, a `captured_at` that is neither an ISO time nor an epoch, an exit other than 1, a
+  failed precheck and a timeout bind `{"binding": "unknown", "why": "<reason>"}`: no precheck evidence,
+  never another snapshot (`runtime/ttp/precheckbind.py`).
 - Home time zone: each project keeps the IANA zone of the user's workstation as `home_timezone` in
   its `project.json`. `ttp new` records the zone of the machine it runs on (with `--host`, the
   workstation's, never the box's). `ttp connect` from a workstation (not from an ssh login), and a workstation's spend push

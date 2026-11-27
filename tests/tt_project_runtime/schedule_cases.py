@@ -322,6 +322,9 @@ def test_an_llm_precheck_that_raises_lets_the_run_go_ahead(env, monkeypatch):
     status, n, log = _summary(p)
     assert status == "queued" and n == 1, status
     assert "schedule summary: precheck failed (OSError: no shell); the run goes ahead" in log, log
+    from ttp import precheckbind
+    task = p.db.one("SELECT id FROM tasks WHERE origin='schedule' ORDER BY id DESC LIMIT 1")
+    assert p.db.kv(f"{precheckbind.KEY}{task['id']}", None) == precheckbind.unknown("precheck failed (OSError)")
 
 
 def _bound_run(env, precheck):
@@ -382,11 +385,19 @@ def test_a_precheck_without_usable_metadata_binds_unknown(env, tmp_path):
                      (json.dumps({"x": "y" * precheckbind.MAX_BYTES}), "last line over 4096 bytes")]:
         assert precheckbind.parse(out) == precheckbind.unknown(why), out[:40]
     assert precheckbind.parse('{"note": "kept"}\n\n') == {"note": "kept"}   # no snapshot: kept as it is
+    for at in ("2030-01-01T00:00:00Z", "2030-01-01", 1893456000, 1893456000.5):
+        assert precheckbind.parse(json.dumps({"captured_at": at})) == {"captured_at": at}, at
+    for at in ("yesterday", "", True, None, [1]):
+        assert precheckbind.parse(json.dumps({"captured_at": at})) == precheckbind.unknown(
+            "captured_at is not an ISO time or epoch"), at
+    unknown_line = precheckbind.line(precheckbind.unknown("no output"))
+    assert "no precheck evidence (no output)" in unknown_line and "use it" not in unknown_line, unknown_line
     assert _handed(p, {"id": 999999}, tmp_path) == (None, {}) and precheckbind.line(None) == ""
 
 
 @pytest.mark.parametrize("precheck,why", [
-    ("cat /no/such/latest.json; exit 2", "no output"),
+    ("cat /no/such/latest.json; exit 2", "precheck exited 2"),
+    ("echo '{\"snapshot\": \"/data/snap-new\"}'; exit 3", "precheck exited 3"),
     ("sleep 5", "precheck timed out"),
 ])
 def test_a_failed_precheck_binds_unknown_never_the_old_latest(env, tmp_path, precheck, why):
