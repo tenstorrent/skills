@@ -50,7 +50,8 @@ _BUNDLED = re.compile(r"-[A-Za-z]\S+")   # -XPOST, -cw, -bText: a bundle or an a
 _NEVER = {"--web", "-w", "--editor", "-e", "--delete-last"}   # opens a browser or editor there, or deletes
 # The only flags each of these upkeep calls may carry (every flag takes a value; anything else is refused)
 _EDIT_FLAGS = {"--title": "--title", "-t": "--title", "--body": "--body", "-b": "--body", "--body-file": "--body",
-               "-F": "--body", "--repo": "--repo", "-R": "--repo"}
+               "-F": "--body", "--repo": "--repo", "-R": "--repo", "--add-label": "--add-label"}
+_DISPATCH_FLAGS = {"--ref": "--ref", "-r": "--ref", "--repo": "--repo", "-R": "--repo"}
 _CLOSE_FLAGS = {"--comment": "--comment", "-c": "--comment", "--repo": "--repo", "-R": "--repo"}
 _REPO_FLAGS = {"--repo": "--repo", "-R": "--repo"}
 _RUN_ID = re.compile(r"[0-9]+")
@@ -124,8 +125,8 @@ def _upkeep(argv: list[str], stdin: bytes) -> str:
     if len(pos) != 1:
         return f"`gh pr {argv[1]}` names exactly one PR"
     if edit:
-        if not set(opts) & {"--title", "--body"}:
-            return "`gh pr edit` runs only to change the title or body"
+        if not set(opts) & {"--title", "--body", "--add-label"}:
+            return "`gh pr edit` runs only to change the title or body, or to add a label"
         body = opts.get("--body", [None])[0]
         is_file = any(a.split("=", 1)[0] in ("--body-file", "-F") for a in argv[2:])
         if is_file:
@@ -136,6 +137,15 @@ def _upkeep(argv: list[str], stdin: bytes) -> str:
     if "--comment" in opts and not _tagged(opts["--comment"][0]):
         return f"the close comment does not end with the AI-authorship tag {aitag.DEFAULT!r}"
     return ""
+
+
+def _dispatch(argv: list[str]) -> tuple[str, str, str]:
+    """(why `gh workflow run argv` is refused or "", the repo, the ref): one workflow name, --ref and
+    --repo, no inputs."""
+    pos, opts, why = _parse(argv[2:], _DISPATCH_FLAGS)
+    if why or len(pos) != 1 or "--ref" not in opts or "--repo" not in opts:
+        return f"`gh workflow run` takes one workflow, --ref and --repo, no inputs ({why or 'form'})", "", ""
+    return "", opts["--repo"][0], opts["--ref"][0]
 
 
 def _reply(argv: list[str]) -> str | None:
@@ -208,6 +218,35 @@ def _rerun(argv: list[str]) -> tuple[str, str, str]:
     if len(pos) != 1 or not _RUN_ID.fullmatch(pos[0]):
         return "`gh run rerun` names exactly one run by its numeric id", "", ""
     return "", pos[0], opts.get("--repo", [""])[0]
+
+
+def own_open_pr(gh: str, argv: list[str]) -> str:
+    """Why the workstation must not run `gh workflow run argv` or `gh pr edit argv --add-label`, or "": the
+    ref must be the head of an open PR its own gh user opened (a label: the named PR), never the default branch."""
+    repo, ref, num = "", "", ""
+    if argv[:2] == ["workflow", "run"]:
+        why, repo, ref = _dispatch(argv)
+    else:
+        pos, opts, why = _parse(argv[2:], _EDIT_FLAGS)
+        repo, num = opts.get("--repo", [""])[0], pos[0] if pos else ""
+    if why or not repo:
+        return why or "no repo named"
+    unread = "could not read the PR or this gh user to check it is our own"
+    try:
+        view = [gh, "pr", "list", f"--repo={repo}", "--head", ref, "--state", "open", "--json", "author,headRefName"] if ref \
+            else [gh, "pr", "view", num, f"--repo={repo}", "--json", "author,state,headRefName"]
+        r = subprocess.run(view, capture_output=True, timeout=GH_TIMEOUT_S)
+        found, login = json.loads(r.stdout) if r.returncode == 0 else None, _gh_login(gh)
+    except (OSError, subprocess.TimeoutExpired, ValueError):
+        return unread
+    found = [found] if isinstance(found, dict) and found.get("state") == "OPEN" else found if isinstance(found, list) else []
+    found = [p for p in found if isinstance(p, dict) and (not ref or p.get("headRefName") == ref)]
+    if login is None or not found:
+        return unread if login is None else "the ref is not the head of an open PR"
+    if ref and ref == _default_branch(gh, repo):
+        return f"`{ref}` is the repo's default branch"
+    mine = [p for p in found if str((p.get("author") or {}).get("login") or "").lower() == login.lower()]
+    return "" if mine else "that PR is someone else's"
 
 
 def own_draft_run(gh: str, argv: list[str]) -> str:
@@ -376,12 +415,13 @@ def allowed(argv, stdin: bytes = b"", prefixes=()) -> str:
     workstation also reads its tip first and refuses the default branch), `pr edit`
     of the title or body only and `pr close` (the workstation also checks the PR is its own draft), each
     post, body or comment ending with the AI-authorship tag, and `repo fork <owner>/<repo> --fork-name
-    <name> --clone=false` (the workstation also checks <its gh user>/<name> does not exist yet), `run rerun
+    <name> --clone=false` (the workstation also checks <its gh user>/<name> does not exist yet), `workflow run
+    <name> --ref <branch> --repo <r>` and `pr edit --add-label` (the workstation also checks the PR is its own open one), `run rerun
     <id>` with an optional --failed (the workstation also checks the run is on its own open draft PR's
     head, never the default branch), and the
     queue's own `git-publish` of one such branch (a new branch or a fast-forward); `prefixes` grants branch
     prefixes beyond ttp/ (the workstation's bridge config, the box's delivery.gh_branch_prefixes); never
-    `pr ready`, a merge, a reviewer, a label, `run cancel`, `workflow run` or anything else."""
+    `pr ready`, a merge, a reviewer, `run cancel` or anything else."""
     if not isinstance(argv, list) or not argv or not all(isinstance(a, str) and "\0" not in a for a in argv):
         return "not a list of plain arguments"
     if bad := next((a for a in argv if _BUNDLED.fullmatch(a)), None):
@@ -413,6 +453,8 @@ def allowed(argv, stdin: bytes = b"", prefixes=()) -> str:
         return _fork(argv)[0]
     if pair == ("run", "rerun"):
         return _rerun(argv)[0]
+    if pair == ("workflow", "run"):
+        return _dispatch(argv)[0]
     if pair not in _POSTS:
         return f"`gh {' '.join(argv[:2])}` is not on the workstation's allowlist"
     if pair == ("pr", "create") and not any(a in ("--draft", "-d") for a in argv):
@@ -672,6 +714,9 @@ def answer(entry: dict, gh: str | None = None, prefixes=(), where: str = "on the
     if argv[:2] == ["pr", "close"] and (why := own_draft(gh, argv)):
         return {"key": key, "rc": 1, "stdout": "", "stderr": f"refused {where}: {why}"}
     if argv[:2] == ["run", "rerun"] and (why := own_draft_run(gh, argv)):
+        return {"key": key, "rc": 1, "stdout": "", "stderr": f"refused {where}: {why}"}
+    if (argv[:2] == ["workflow", "run"] or (argv[:2] == ["pr", "edit"] and any(
+            a.split("=", 1)[0] == "--add-label" for a in argv))) and (why := own_open_pr(gh, argv)):
         return {"key": key, "rc": 1, "stdout": "", "stderr": f"refused {where}: {why}"}
     if argv[:2] == ["repo", "fork"] and (why := fork_free(gh, argv)):
         return {"key": key, "rc": 1, "stdout": "", "stderr": f"refused {where}: {why}"}

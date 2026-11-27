@@ -594,7 +594,11 @@ DEFAULT_CONFIG: dict[str, Any] = {
     # pr_babysit: the model-free sweep of every open PR the project owns, draft or not (prbabysit): events
     # pr_ci_not_run and pr_idle, and a chat line per status change. idle_h: quiet hours before pr_idle.
     # extra_prs: 'owner/repo#N' PRs it owns though no record of its own names them.
-    "pr_babysit": {"enabled": True, "idle_h": 24, "extra_prs": []},
+    # dispatch: {'owner/repo': [workflow names or 'label:<name>']} the guard lets a worker dispatch or label on
+    # an owned PR. ping_after_h: quiet hours before pr_idle names a reviewer ping (0: none). no_post_prs:
+    # 'owner/repo#N' PRs that get no comment, edit, dispatch or push: fixes stay local commits.
+    "pr_babysit": {"enabled": True, "idle_h": 24, "extra_prs": [], "dispatch": {}, "ping_after_h": 24,
+                   "no_post_prs": []},
     # credentials false: this project keeps no GitHub login here, so no alert suggests `gh auth login`.
     "gh": {"credentials": True},
     # Who hears of a heal check its self-fix task could not repair (a heal block's own `escalate`

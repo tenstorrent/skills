@@ -493,7 +493,7 @@ def test_workers_gh_refuses_a_pr_body_with_internal_ids_or_over_the_cap_on_every
     p.set_config("delivery.pr_body_max_words", 400)   # only project config raises the cap
     for args in (("pr", "create", "--draft", "--body-file", str(long)), ("pr", "create", "--draft", "--fill"),
                  ("pr", "create", "--draft", "-t", "t"), ("pr", "create", "--draft", "-b", "Fixes #12; run 3 times."),
-                 ("pr", "edit", "7", "--add-label", "x"), ("api", "-X", "PATCH", "repos/acme/widgets/pulls/7", "-f", "title=t")):
+                 ("api", "-X", "PATCH", "repos/acme/widgets/pulls/7", "-f", "title=t")):
         rc, err, ran = gh(*args)
         assert rc == 0 and ran == [" ".join(args)], (args, err)
 

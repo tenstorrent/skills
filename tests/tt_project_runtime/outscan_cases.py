@@ -223,18 +223,18 @@ def test_runs_gh_reads_stdin_ahead_only_where_gh_reads_it(env, tmp_path, monkeyp
         log.write_text("")
         r = _gh_main(p, tmp_path, args, f"x {_OUT_SHAPE}".encode(), fake=fake)
         assert r.returncode == 1 and "refused" in r.stderr.decode() and log.read_text() == "", args
-    # `while read x; do gh workflow run w -f a=$x; done < list` calls gh once per line.
+    # `while read x; do gh workflow view w$x; done < list` calls gh once per line.
     from ttp import prguard
     (tmp_path / "list").write_text("one\ntwo\n")
     code = ("import sys; from ttp import prguard; "
-            "sys.exit(prguard.main(['gh', 'workflow', 'run', 'w', '-f', 'a=' + sys.argv[2]], sys.argv[1]))")
+            "sys.exit(prguard.main(['gh', 'workflow', 'view', 'w' + sys.argv[2]], sys.argv[1]))")
     log.write_text("")
     r = subprocess.run(["sh", "-c", 'while read x; do "$0" -c "$1" "$2" "$x"; done < "$3"', sys.executable, code,
                         str(p.harness / "bin"), str(tmp_path / "list")], capture_output=True, timeout=60,
                        env={**os.environ, "PATH": f"{p.harness / 'bin'}:{fake}:{os.environ['PATH']}",
                             "TTP_PROJECT": str(p.base), "FAKE_GH_LOG": str(log)},
                        cwd=str(pathlib.Path(prguard.__file__).parents[1]))
-    assert log.read_text() == "workflow run w -f a=one\nworkflow run w -f a=two\n", r.stderr
+    assert log.read_text() == "workflow view wone\nworkflow view wtwo\n", r.stderr
 
 
 def _push_run(env, tmp_path, monkeypatch):

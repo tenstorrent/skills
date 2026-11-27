@@ -153,7 +153,8 @@ def test_prbabysit_disabled_runs_nothing(env, monkeypatch):
 
 def test_prbabysit_defaults_and_extra_prs_enter_the_watch_even_while_gh_is_logged_out(env, monkeypatch):
     from ttp import prbabysit, watchers
-    assert prbabysit.settings({}) == {"enabled": True, "idle_h": 24, "extra_prs": []}
+    assert prbabysit.settings({}) == {"enabled": True, "idle_h": 24, "extra_prs": [], "dispatch": {}, "ping_after_h": 24,
+                                       "no_post_prs": []}
     _logged_out()
     p, d, _ = _pb_run(env, monkeypatch, _pb_pr(), cfg={"pr_babysit.extra_prs": ["acme/widgets#9"]}, task=False)
     seen = []
@@ -175,3 +176,110 @@ def test_prbabysit_an_idle_purview_pr_is_read_every_sweep_not_daily(env, monkeyp
     watchers.watch_prs(d)
     assert reads() > first, "a PR nobody works on is still read, so an approval or a conflict is told"
     assert prbabysit.READ_S < 3600
+
+
+def _pb_guarded(env, extra=None):
+    """A project whose sweep has recorded one open owned PR (acme/widgets#7, branch ttp/x), and its settings."""
+    p = make(env)
+    p.db.set_kv("pr_babysit", {_PB_URL: {"branch": "ttp/x", "open": True}})
+    cfg = {"pr_babysit": {"dispatch": {"acme/widgets": ["heavy.yml", "label:run-heavy"]}, **(extra or {})}}
+    return p, cfg
+
+
+def _pb_why(p, cfg, *args):
+    from ttp import prguard
+    return prguard.check(list(args), "/nonexistent/gh", db=p.db, cfg=cfg)
+
+
+def test_prbabysit_guard_lets_a_listed_workflow_run_on_an_owned_prs_head_and_nothing_else(env):
+    p, cfg = _pb_guarded(env)
+    p.db.set_kv("pr_babysit", {"acme/widgets#7": {"branch": "ttp/x", "open": True}})
+    run = ("workflow", "run", "heavy.yml", "-R", "acme/widgets")
+    assert _pb_why(p, cfg, *run, "--ref", "ttp/x") is None
+    assert _pb_why(p, cfg, *run, "--ref=ttp/x") is None
+    assert "not the head of an open PR this project owns" in _pb_why(p, cfg, *run, "--ref", "main")
+    assert "not the head of an open PR this project owns" in _pb_why(p, cfg, *run, "--ref", "ttp/other")
+    assert "not the head of an open PR this project owns" in _pb_why(
+        p, cfg, "workflow", "run", "heavy.yml", "-R", "acme/other", "--ref", "ttp/x")
+    assert "not listed" in _pb_why(p, cfg, "workflow", "run", "nightly.yml", "-R", "acme/widgets", "--ref", "ttp/x")
+    for extra in (["-f", "a=b"], ["-F", "a=b"], ["--raw-field", "a=b"], ["--json"], ["--ref", "main"]):
+        assert "no inputs or other options" in _pb_why(p, cfg, *run, "--ref", "ttp/x", *extra), extra
+    assert "no inputs or other options" in _pb_why(p, cfg, "workflow", "run", "-R", "acme/widgets", "--ref", "ttp/x")
+
+
+def test_prbabysit_guard_adds_only_a_listed_label_to_an_owned_pr_and_never_a_reviewer(env):
+    p, cfg = _pb_guarded(env)
+    p.db.set_kv("pr_babysit", {"acme/widgets#7": {"branch": "ttp/x", "open": True}})
+    edit = ("pr", "edit", "7", "-R", "acme/widgets")
+    assert _pb_why(p, cfg, *edit, "--add-label", "run-heavy") is None
+    assert "not listed" in _pb_why(p, cfg, *edit, "--add-label", "other")
+    assert "not listed" in _pb_why(p, cfg, *edit, "--add-label", "run-heavy,other")
+    assert "only on an open PR this project owns" in _pb_why(p, cfg, "pr", "edit", "8", "-R", "acme/widgets",
+                                                              "--add-label", "run-heavy")
+    assert "only on an open PR this project owns" in _pb_why(p, cfg, "issue", "edit", "7", "-R", "acme/widgets",
+                                                              "--add-label", "run-heavy")
+    assert _pb_why(p, cfg, *edit, "--add-reviewer", "someone"), "reviewer requests stay refused"
+    assert _pb_why(p, cfg, *edit, "--add-label", "run-heavy", "--add-reviewer", "someone")
+
+
+def test_prbabysit_guard_requires_the_ai_tag_on_a_reviewer_ping_comment(env):
+    p, cfg = _pb_guarded(env)
+    call = ("pr", "comment", "7", "-R", "acme/widgets", "-b")
+    assert "[Authored by AI]" in (_pb_why(p, cfg, *call, "Friendly ping: a review would unblock this.") or "")
+    assert _pb_why(p, cfg, *call, "Friendly ping: a review would unblock this.\n\n[Authored by AI]") is None
+
+
+def test_prbabysit_no_post_prs_refuse_comments_edits_dispatch_and_the_push(env, monkeypatch, tmp_path):
+    from ttp import push
+    p, cfg = _pb_guarded(env, {"no_post_prs": ["Acme/Widgets#7"]})
+    p.db.set_kv("pr_babysit", {"acme/widgets#7": {"branch": "ttp/x", "open": True}})
+    for args in (("pr", "comment", "7", "-R", "acme/widgets", "-b", "hi\n\n[Authored by AI]"),
+                 ("pr", "comment", _PB_URL, "-b", "hi\n\n[Authored by AI]"),
+                 ("pr", "edit", "7", "-R", "acme/widgets", "--add-label", "run-heavy"),
+                 ("pr", "edit", _PB_URL, "--title", "t"),
+                 ("workflow", "run", "heavy.yml", "-R", "acme/widgets", "--ref", "ttp/x")):
+        assert "pr_babysit.no_post_prs" in _pb_why(p, cfg, *args), args
+    other = ("pr", "comment", "8", "-R", "acme/widgets", "-b", "hi\n\n[Authored by AI]")
+    assert _pb_why(p, cfg, *other) is None, "another PR in the repo is not held"
+    p.set_config("pr_babysit.no_post_prs", ["acme/widgets#7"])
+    repo = tmp_path / "r"
+    subprocess.run(["git", "init", "-q", "-b", "ttp/x", str(repo)], check=True)
+    monkeypatch.delenv("TTP_TASK", raising=False)
+    with pytest.raises(ValueError, match="no_post_prs"):
+        push.own_target(p, repo)
+
+
+def test_prbabysit_new_settings_default(env):
+    from ttp import prbabysit
+    assert prbabysit.settings({}) == prbabysit.DEFAULTS and prbabysit.DEFAULTS["dispatch"] == {}
+    assert prbabysit.DEFAULTS["ping_after_h"] == 24 and prbabysit.DEFAULTS["no_post_prs"] == []
+    assert prbabysit.settings({"pr_babysit": {"ping_after_h": 0}})["ping_after_h"] == 0
+    assert make(env).config()["pr_babysit"] == prbabysit.DEFAULTS
+
+
+@pytest.mark.parametrize("cfg,want,absent", [
+    ({}, "Ping them once", "No-post"),
+    ({"pr_babysit.ping_after_h": 0}, "rev1", "Ping them"),
+    ({"pr_babysit.no_post_prs": ["acme/widgets#7"]}, "No-post PR: tell the user", "Ping them")])
+def test_prbabysit_pr_idle_text_follows_ping_after_h_and_no_post_prs(env, monkeypatch, cfg, want, absent):
+    from ttp import watchers
+    old = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() - 50 * 3600))
+    pr = _pb_pr(updatedAt=old, reviewRequests=[{"__typename": "User", "login": "rev1"}],
+                statusCheckRollup=[{"name": "validate", "workflowName": "ci", "status": "COMPLETED",
+                                    "conclusion": "SUCCESS", "completedAt": old}])
+    _pb_gh(monkeypatch)
+    p, d, _ = _pb_run(env, monkeypatch, pr, cfg=cfg)
+    watchers.watch_prs(d)
+    text = [t for k, t in _pb_events(p) if k == "pr_idle"]
+    assert len(text) == 1 and want in text[0] and absent not in text[0], text
+
+
+def test_prbabysit_guard_covers_gh_api_writes_to_a_no_post_pr_and_workflow_dispatches(env):
+    p, cfg = _pb_guarded(env, {"no_post_prs": ["acme/widgets#7"]})
+    api = ("api", "-X", "POST")
+    assert "no_post_prs" in _pb_why(p, cfg, *api, "repos/acme/widgets/issues/7/comments", "-f", "body=hi\n[Authored by AI]")
+    assert "no_post_prs" in _pb_why(p, cfg, "api", "repos/acme/widgets/pulls/7/reviews", "-f", "event=APPROVE")
+    assert "no_post_prs" in _pb_why(p, cfg, *api, "graphql", "-f", "query=mutation{addComment}")
+    assert "gh workflow run" in _pb_why(p, cfg, *api, "repos/acme/widgets/actions/workflows/heavy.yml/dispatches")
+    assert _pb_why(p, cfg, "api", "repos/acme/widgets/issues/7/comments") is None   # a read
+    assert _pb_why(p, cfg, *api, "repos/acme/widgets/issues/9/labels") is None   # another PR

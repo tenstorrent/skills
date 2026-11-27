@@ -20,16 +20,97 @@ import re
 import time
 from datetime import datetime
 
-KEY = "pr_babysit"           # {pr_key: {"told": {condition: value}, "idle": mark, "notrun": mark}}
+KEY = "pr_babysit"           # {pr_key: {"told": {condition: value}, "idle": mark, "notrun": mark, "branch", "open"}}
 FLOWS_KEY = "pr_workflows"   # {"owner/repo@sha": {"at": ts, "flows": [{"name", "manual", "trigger"}]}}
 FLOWS_RETRY_S = 3600
 MAX_FLOWS = 40
 READ_S = 900                 # a PR no task opened is read this often while the sweep is on
-DEFAULTS = {"enabled": True, "idle_h": 24, "extra_prs": []}
+DEFAULTS = {"enabled": True, "idle_h": 24, "extra_prs": [], "dispatch": {}, "ping_after_h": 24, "no_post_prs": []}
+PING = "This PR has had no activity for a day: a review or a reply would unblock it. Thank you."
 
 
 def settings(cfg: dict | None) -> dict:
     return {**DEFAULTS, **((cfg or {}).get("pr_babysit") or {})}
+
+
+def owned(db) -> dict[str, str]:
+    """{"owner/repo#N": head branch} of the open PRs the sweep reads, the ones this project owns."""
+    return {k: v["branch"] for k, v in (db.kv(KEY, {}) or {}).items() if v.get("open") and v.get("branch")}
+
+
+def _target(real: str, more: list[str]) -> str:
+    """The "owner/repo#N" a `gh pr/issue <sub> [N] [-R repo]` call names, or ""."""
+    from . import prguard
+    pos = prguard._positionals(more, ("-R", "--repo", "--add-label", "--remove-label", "-t", "--title", "-b", "--body",
+                                      "-F", "--body-file", "-c", "--comment", "-m", "--message"))
+    repo = (prguard._opts(more, ("-R", "--repo")) or [None])[-1]
+    if pos[:1] and pos[0].isdigit() and repo:
+        return f"{repo}#{pos[0]}"
+    out = pos[0] if pos[:1] and pos[0].startswith("http") else prguard._gh(
+        real, "pr", "view", *pos[:1], *(["-R", repo] if repo else []), "--json", "url", "-q", ".url")
+    return prguard.pr_key(out) or ""
+
+
+def guard(args: list[str], real: str, db, cfg: dict) -> str | None:
+    """Why `gh args` must not run for this project's PR babysitting rules, or None: a PR in
+    pr_babysit.no_post_prs gets no post, edit or dispatch; a workflow dispatch (`workflow run <name> --ref
+    <head>`) or a label (`pr edit N --add-label L`) goes only on an open PR the project owns and only as
+    pr_babysit.dispatch lists it for the repo ('<workflow>' or 'label:<name>'); a dispatch carries no inputs."""
+    from . import prguard
+    cmd, sub, more = args[0], (args[1] if len(args) > 1 else ""), args[2:]
+    cfg_ = settings(cfg)
+    no_post = {k.lower() for k in cfg_["no_post_prs"]}
+    if cmd == "workflow" and sub == "run":
+        flags = {"--ref": "--ref", "-r": "--ref", "--repo": "--repo", "-R": "--repo"}
+        pos, opts, bad = [], {}, ""
+        it = iter(more)
+        for a in it:
+            name, eq, val = a.partition("=")
+            if not a.startswith("-"):
+                pos.append(a)
+            elif name in flags and (eq or (val := next(it, ""))):
+                opts.setdefault(flags[name], []).append(val)
+            else:
+                bad = a
+        if bad or len(pos) != 1 or len(opts.get("--ref", [])) != 1 or any(len(v) > 1 for v in opts.values()):
+            return ("refused: `gh workflow run` runs one named workflow with --ref <the PR's head branch>, and "
+                    f"no inputs or other options ({bad or 'form'})")
+        repo = (opts.get("--repo") or [prguard._gh(real, "repo", "view", "--json", "nameWithOwner", "-q",
+                                                   ".nameWithOwner").strip()])[0]
+        ref, what = opts["--ref"][0], pos[0]
+        key = next((k for k, b in owned(db).items() if k.startswith(f"{repo}#") and b == ref), "") if db else ""
+        if not key:
+            return f"refused: {ref!r} is not the head of an open PR this project owns in {repo}"
+        if key.lower() in no_post:
+            return f"refused: {key} is in pr_babysit.no_post_prs: nothing is dispatched or posted on it"
+        if what not in cfg_["dispatch"].get(repo, []):
+            return f"refused: workflow {what!r} is not listed for {repo} in pr_babysit.dispatch"
+        return None
+    if cmd == "api":   # the same refusals when a write goes through the REST or GraphQL endpoint
+        endpoint, method = prguard._api_target(args[1:])
+        m = re.match(r"repos/([^/]+/[^/]+)/(?:issues|pulls)/(\d+)", endpoint, re.I)
+        if method != "GET" and re.search(r"/actions/workflows/[^/]+/dispatches$", endpoint, re.I):
+            return "refused: dispatch a workflow with `gh workflow run <name> --ref <the PR's head>`"
+        if method != "GET" and (m and f"{m[1]}#{m[2]}".lower() in no_post
+                                or no_post and endpoint.strip("/").lower() == "graphql"):
+            return "refused: a write on a PR in pr_babysit.no_post_prs: fix it by local commits and tell the user"
+        return None
+    if cmd not in ("pr", "issue") or sub not in ("comment", "edit", "review", "close", "reopen", "ready", "merge"):
+        return None
+    labels = [x for v in prguard._opts(more, ("--add-label",)) for x in v.split(",")]
+    if not no_post and not labels:
+        return None
+    key = _target(real, more)
+    if not key:
+        return "refused: this call's PR could not be read, so pr_babysit.no_post_prs and dispatch cannot be checked"
+    if key.lower() in no_post:
+        return f"refused: {key} is in pr_babysit.no_post_prs: fix it by local commits and tell the user; nothing is posted"
+    for label in labels:
+        if not (cmd == "pr" and sub == "edit" and key in (owned(db) if db else {})):
+            return f"refused: a label goes only on an open PR this project owns ({key})"
+        if f"label:{label}" not in cfg_["dispatch"].get(key.split("#")[0], []):
+            return f"refused: label {label!r} is not listed for {key.split('#')[0]} in pr_babysit.dispatch"
+    return None
 
 
 def _ts(s) -> float:
@@ -130,6 +211,7 @@ def sweep(daemon, t: dict, pr: dict, sig: dict, gh) -> None:
     allstate = dict(db.kv(KEY, {}) or {})
     state = allstate.setdefault(key, {})
     _told(daemon, state, key, url, sig, pr.get("isDraft") is False)
+    state["branch"], state["open"] = pr.get("headRefName") or "", sig["state"] == "OPEN"
     events = []
     if sig["state"] == "OPEN" and sig["checks"] != "pending":
         text = _not_run(daemon, pr, key, gh, now)
@@ -143,8 +225,12 @@ def sweep(daemon, t: dict, pr: dict, sig: dict, gh) -> None:
         if last and hours >= float(cfg["idle_h"]) and state.get("idle") != last:
             state["idle"] = last
             who = [r.get("login") or r.get("name") for r in pr.get("reviewRequests") or []]
+            quiet = key.lower() in {k.lower() for k in cfg["no_post_prs"]}
+            ping = "" if quiet or not who or not 0 < float(cfg["ping_after_h"]) <= hours else \
+                f" Ping them once (a comment ending with the AI tag): {PING!r}"   # the ping is activity: once per quiet period
             events.append(("pr_idle", f"PR {url} idle for {hours:.0f} h (no commit, review, comment or check "
-                           f"activity). Requested reviewers: {', '.join(x for x in who if x) or 'none'}."))
+                           f"activity). Requested reviewers: {', '.join(x for x in who if x) or 'none'}."
+                           f"{' No-post PR: tell the user, post nothing.' if quiet else ''}{ping}"))
     for kind, text in events:
         from . import screen as scr
         status = "muted" if scr.count_muted(db, "pr", text, "normal") else "queued"

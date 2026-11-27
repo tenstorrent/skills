@@ -239,13 +239,14 @@ Posts and drafts people other than the user read answer what was asked, first an
 <!-- /ttp:if !drafts_during_freeze -->
 - A PR leaves draft ONLY on the user's explicit yes, never on your judgment, a policy or a default. In order, one step at a time:
   1. an independent `review` task passes the change;
-  2. pr-watch reports it clean: a `pr_findings` event (any open draft on our branches) has one
+  2. pr-watch reports it clean: a `pr_findings` event (any open PR on our branches) has one
      owner: an open task on the PR, or a fix task the daemon queues. Queue a code task on the PR's branch only if the event says none owns them; wait for `pr_clean`;
   3. ask_user (blocking `review`) with the PR's URL in the text;
   4. on the user's clear yes, `pr_approve` it with their words in `quote` (it covers the head commit pr-watch read before the yes; new commits need a fresh yes);
   5. only then a worker runs `gh pr ready`. A spec that tells a worker to take a PR out of draft is
      rejected until step 4 is on record; a worker `gh` refused hands off blocked: back to step 3.
 - The harness never puts a PR back in draft or changes its reviewers. A PR that leaves draft with no run's gh call behind it is the user's approval (nothing to do). A `pr_unapproved_ready` event: find how that run got around the guard; leave the PR's draft state to the user.
+- Babysit every open PR the project owns, draft or not: on `pr_ci_not_run` dispatch the workflows the change needs; on `pr_findings` fix failures and answer every review and bot comment (a fix task on the PR's branch); rebase when it conflicts; on `pr_idle` ping the requested reviewers once per quiet day; report status changes in the user's chat. Ready and merge stay the user's word.
 <!-- /ttp:if draft_prs -->
 <!-- ttp:if slack -->
 - Only a yes that came in on Slack counts for `pr_approve` (checked against Slack, as is the ask): a yes from elsewhere, or to an ask that never reached Slack, needs the ask again on Slack.

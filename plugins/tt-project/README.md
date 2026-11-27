@@ -38,7 +38,7 @@ Features:
 - Each project has its own memory and remembers your preferences and lessons learned.
 - The project self-improves periodically by assessing its own performance.
 - Safe(ish?). It doesn't merge PRs or talk to humans in your name. It leaves sensitive operations to you, unless you tell it otherwise.
-- Changes are reviewed by a review agent before they're pushed.
+- Changes are reviewed by a review agent before they're pushed. It babysits every open PR it owns, draft or not: it watches CI, dispatches the workflows the change needs, fixes failures, answers review and bot comments, rebases on conflict, pings reviewers after a quiet day and reports status changes in your chat. It never marks a PR ready or merges it without your word ([guide](docs/guide.md)).
 - Reviews also fail slop: duplicate rules, incident-diary comments and tests that only replay one incident. `ttp slop <project>` measures it per subsystem without a model.
 - Each project has a Web UI dashboard that you can check to see progress, critical messages, token budget, etc.
 - It keeps going when you close your computer (if it's running on an always-on box), or even if you close the chat.

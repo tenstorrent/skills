@@ -767,7 +767,7 @@ def test_gh_workstation_allows_pr_upkeep_title_body_edits_review_replies_and_clo
         assert ghqueue.allowed(ok) == "", ok
     assert ghqueue.allowed(["pr", "edit", "3", "--body-file", "-"], f"Body.\n{tag}\n".encode()) == ""
     for bad in (["pr", "edit", "3", "--add-reviewer", "someone"], ["pr", "edit", "3", "--remove-reviewer", "x"],
-                ["pr", "edit", "3", "--base", "main"], ["pr", "edit", "3", "--add-label", "x"],
+                ["pr", "edit", "3", "--base", "main"],
                 ["pr", "edit", "3", "--remove-label", "x"], ["pr", "edit", "3", "--add-assignee", "x"],
                 ["pr", "edit", "3", "--remove-assignee", "x"], ["pr", "edit", "3", "--add-project", "x"],
                 ["pr", "edit", "3", "--milestone", "x"], ["pr", "edit", "3", "--some-new-flag", "x"],
@@ -1641,3 +1641,50 @@ def test_gh_pull_answers_a_raising_entry_with_an_error_and_the_loop_goes_on(env,
     assert bridge.crash_loop("lab-box") == 0 and not list(bridge.HOME_DIR.glob("*.starts")), "a round finished"
     with pytest.raises(RuntimeError):   # a one-off pull still says it failed
         cli._bridge_gh_pull(argparse.Namespace(loop=False, every=5), {"boxes": {"lab-box": {}}}, ["lab-box"])
+
+
+def test_gh_workstation_runs_a_workflow_and_adds_a_label_only_on_its_own_open_prs_head(env, monkeypatch):
+    """`workflow run <name> --ref <branch> --repo <r>` (no inputs) and `pr edit N --add-label L` pass the
+    allowlist; the workstation then reads the open PR on that branch and its own login, and runs only when
+    its gh user opened it and the ref is not the default branch. Inputs, other options and a bare form fail."""
+    from ttp import ghqueue
+    _cfg, _repo, _gh, ws_calls = _workstation(env, monkeypatch)
+    for ok in (["workflow", "run", "heavy.yml", "--ref", "ttp/x", "-R", "acme/widgets"],
+               ["workflow", "run", "heavy.yml", "--ref=ttp/x", "--repo=acme/widgets"],
+               ["pr", "edit", "3", "--add-label", "run-heavy", "-R", "acme/widgets"]):
+        assert ghqueue.allowed(ok) == "", ok
+    for bad in (["workflow", "run", "heavy.yml", "--ref", "ttp/x", "-R", "acme/widgets", "-f", "a=b"],
+                ["workflow", "run", "heavy.yml", "--ref", "ttp/x"], ["workflow", "run", "-R", "acme/widgets"],
+                ["workflow", "run", "heavy.yml", "--repo", "acme/widgets"],
+                ["workflow", "run", "a.yml", "b.yml", "--ref", "x", "-R", "acme/widgets"],
+                ["workflow", "enable", "heavy.yml"], ["workflow", "disable", "heavy.yml"],
+                ["pr", "edit", "3", "--add-label"], ["pr", "edit", "3", "--remove-label", "x"]):
+        assert ghqueue.allowed(bad), bad
+    ws = ws_calls.parent
+    prs, view = ws / "prs.json", ws / "view.json"
+    stub = ws / "gh-flow"
+    stub.write_text("#!/bin/sh\n"
+                    f'printf "%s\\n" "$*" >> "{ws_calls}"\n'
+                    f'case "$1 $2" in "pr list") cat "{prs}";; "pr view") cat "{view}";; "api user") echo me;;\n'
+                    ' "api repos/acme/widgets") echo main;; *) echo "ws: $*";; esac\n')
+    stub.chmod(0o755)
+    run = ["workflow", "run", "heavy.yml", "--ref", "ttp/x", "-R", "acme/widgets"]
+
+    def pr(login="ME", head="ttp/x"):
+        return {"author": {"login": login}, "headRefName": head}
+    for ref, open_prs, refused in (("ttp/x", [pr(login="someone-else")], "someone else's"),
+                                   ("ttp/x", [], "not the head of an open PR"),
+                                   ("ttp/x", [pr(head="other")], "not the head of an open PR"),
+                                   ("main", [pr(head="main")], "default branch"),
+                                   ("ttp/x", [pr(login="someone-else"), pr()], "")):
+        prs.write_text(json.dumps(open_prs))
+        got = ghqueue.answer({"key": "f" * 32, "argv": [*run[:3], "--ref", ref, *run[5:]], "stdin": ""}, str(stub))
+        assert (refused in got["stderr"] and got["rc"] == 1) if refused else (got["rc"] == 0 and not got["stderr"]), got
+    assert sum(c.startswith("workflow run") for c in ws_calls.read_text().splitlines()) == 1
+    label = ["pr", "edit", "3", "--add-label", "run-heavy", "-R", "acme/widgets"]
+    for state, login, refused in (("CLOSED", "me", "not the head of an open PR"), ("OPEN", "someone-else", "someone else's"),
+                                  ("OPEN", "me", "")):
+        view.write_text(json.dumps({"state": state, "author": {"login": login}, "headRefName": "ttp/x"}))
+        got = ghqueue.answer({"key": "c" * 32, "argv": label, "stdin": ""}, str(stub))
+        assert (refused in got["stderr"] and got["rc"] == 1) if refused else (got["rc"] == 0 and not got["stderr"]), got
+    assert sum(c.startswith("pr edit") for c in ws_calls.read_text().splitlines()) == 1

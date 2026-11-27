@@ -4094,7 +4094,8 @@ the pick order, so it takes the first starts. A resumed resource ramps only its 
 - PR babysitting sweep (`pr_babysit.enabled`, default true), read-only, run by pr-watch on every open PR the
   project owns, draft or not: one of its tasks opened it, its head is a branch the project pushed, or it is
   in `pr_babysit.extra_prs` (`owner/repo#N`; read even while gh is logged out, anonymously or through the
-  route). It posts nothing and dispatches nothing. A non-draft PR gets `pr_findings` for failed checks and
+  route). The sweep itself posts nothing and dispatches nothing; the coordinator's duty is to act on what
+  it reports (fix tasks on the PR's branch, dispatch, rebase, ping), through the workers' `gh` guard. A non-draft PR gets `pr_findings` for failed checks and
   unanswered comments as a draft does. `pr_ci_not_run` lists checks skipped, or workflows that need a
   manual or label trigger and never ran on the head, each with its trigger (read from the repo's workflows
   at the head). `pr_idle` fires once per idle stretch past `pr_babysit.idle_h` (24) hours without commit,
@@ -4102,6 +4103,15 @@ the pick order, so it takes the first starts. A resumed resource ramps only its 
   sweep (out of draft, review approved or changes requested, CI red or green, merged or closed, a new
   conflict) are one chat line per PR with its link, once per change: a review approved and red CI on a ready PR
   post at once, the rest join the digest. A gh call that is not answered yet (exit 75) gives nothing.
+  The workers' `gh` guard (the same wrapper on every provider) lets a worker, on an open PR the project
+  owns, run `gh workflow run <workflow> --ref <the PR's head>` (no inputs) and `gh pr edit N --add-label L`
+  only as `pr_babysit.dispatch` lists them for the repo (`{"owner/repo": ["<workflow>", "label:<name>"]}`,
+  empty by default), and post a reviewer ping comment that ends with the AI tag. Reviewer requests, `gh pr
+  ready` without the user's recorded yes and merges outside `delivery.auto_merge_repos` stay refused. `pr_idle`
+  names the ping (once per quiet stretch) after `pr_babysit.ping_after_h` (24; 0: no ping). A PR in
+  `pr_babysit.no_post_prs` (`owner/repo#N`) gets no comment, edit, dispatch or `ttp push --own`: the
+  project fixes and answers it by local commits and tells the user, who pushes. Through the gh route the
+  workstation runs a dispatch or label only on an open PR its own gh user opened.
 - Draft PRs are taken to the finish line, and pr-watch enforces it. Its GitHub purview is every open
   PR of the project's tasks plus every open PR whose head is a branch the project works on (the push
   branch, task branches and `pr_branch:` lines of tasks open or made in the last 30 days), even one a
