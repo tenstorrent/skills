@@ -29,7 +29,7 @@ def normal(name) -> str:
     return s or str(name or "").strip()
 
 
-def history(state, db, now: float | None = None) -> dict:
+def job_history(state, db, now: float | None = None) -> dict:
     """The window's measured job history: {"job": {normalised name: [durations]}, "startup": [each
     run's wait from its start to its first detached job]}."""
     now = time.time() if now is None else now
@@ -65,7 +65,7 @@ def history(state, db, now: float | None = None) -> dict:
     return h
 
 
-def entries(db, tid: int, cache: dict | None = None) -> list[dict]:
+def job_entries(db, tid: int, cache: dict | None = None) -> list[dict]:
     """The registry entries of task `tid`'s detached jobs (jobstop.task_jobs, ancestors included).
     `cache` memoizes per task id across one estimate walk's queue scan (a dict the caller owns)."""
     if cache is not None and tid in cache:
@@ -78,7 +78,7 @@ def entries(db, tid: int, cache: dict | None = None) -> list[dict]:
     return got
 
 
-def _left(e: dict, xs: list, now: float, q: float) -> float | None:
+def job_left(e: dict, xs: list, now: float, q: float) -> float | None:
     """A job's time left at quantile `q` of its name's samples: 0 once it ended, the full sample
     while it is queued, the sample less what has elapsed while it runs; None with no sample."""
     from .eta import pct
@@ -93,7 +93,7 @@ def _left(e: dict, xs: list, now: float, q: float) -> float | None:
     return max(0.0, m - (now - float(e["started"])))
 
 
-def finish(db, t: dict, h: dict, now: float, cache: dict | None = None) -> dict | None:
+def job_finish(db, t: dict, h: dict, now: float, cache: dict | None = None) -> dict | None:
     """The measured finish of task `t`'s detached jobs: {"end": the median (p50) finish,
     "conservative": the p80 one, "legs": [(name, seconds)], "why"}; None when the task has no
     registry entries. Legs are one per still-unfinished job, "queue" for the wait behind another open
@@ -106,12 +106,12 @@ def finish(db, t: dict, h: dict, now: float, cache: dict | None = None) -> dict 
     for e in ents:
         name = normal(e.get("name"))
         xs = (h.get("job") or {}).get(name) or []
-        left = _left(e, xs, now, 0.5)
+        left = job_left(e, xs, now, 0.5)
         if left is None:
             why = f"no measured {name} job run yet"
             continue
         legs.append((name, left))
-        l80 = _left(e, xs, now, P80)
+        l80 = job_left(e, xs, now, P80)
         hi.append(l80 if l80 is not None else left)
         started = started or e.get("status") not in ("queued",)
     if why:

@@ -394,9 +394,9 @@ class _Est:
         if t["id"] not in self._jobs:
             from . import etajobs
             if self._jobhist is None:
-                self._jobhist = etajobs.history(Path(self.db.path).parent, self.db, self.now)
+                self._jobhist = etajobs.job_history(Path(self.db.path).parent, self.db, self.now)
             try:
-                self._jobs[t["id"]] = etajobs.finish(self.db, t, self._jobhist, self.now, self._entries)
+                self._jobs[t["id"]] = etajobs.job_finish(self.db, t, self._jobhist, self.now, self._entries)
             except Exception:
                 self._jobs[t["id"]] = None
         return self._jobs[t["id"]]

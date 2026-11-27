@@ -192,7 +192,7 @@ def hist_end(db, ref: str, now: float, h: dict | None = None, jh: dict | None = 
     if not t:
         return None
     from . import etajobs
-    if t["kind"] != "code" and jh is not None and (jf := etajobs.finish(db, t, jh, now)) \
+    if t["kind"] != "code" and jh is not None and (jf := etajobs.job_finish(db, t, jh, now)) \
             and jf.get("end") is not None:
         return jf["end"]   # a task that runs detached jobs: its shadow is the jobs' own medians
     from . import eta
@@ -245,7 +245,7 @@ def record(db, where, items: list[tuple[str, str, dict]], now: float, src: str =
                 if hist is None:
                     from . import eta, etajobs
                     hist = eta.history(db, now)
-                    jhist = etajobs.history(Path(db.path).parent, db, now)
+                    jhist = etajobs.job_history(Path(db.path).parent, db, now)
                 if (he := hist_end(db, ref, now, hist, jhist)) is not None:
                     row["hist"] = round(he, 1)
             except Exception:   # a shadow never costs the ETA row

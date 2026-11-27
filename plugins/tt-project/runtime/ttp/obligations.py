@@ -1970,18 +1970,18 @@ def promise_lines(db, now: float | None = None, where=None, sender: str = "") ->
     out = [f"## Promises made in chat: {len(rows)} open" + (f", {late} OVERDUE" if late else "")
            + " (send each deliverable in its chat; an honest update waits for its digest; close with `obligation` key + evidence)"]
     out += [f"- {o['id']} {o['text'][:200]} [{_promise_state(o, now, where)}"
-            + _measured(db, o, now, where) + _peer_hold(sender, o, now, where) + "]"
+            + _measured_finish(db, o, now, where) + _peer_hold(sender, o, now, where) + "]"
             for o in rows]
     return out
 
 
-def _measured(db, o: dict, now: float, where) -> str:
+def _measured_finish(db, o: dict, now: float, where) -> str:
     """'; measured finish <time>' beside a promise whose owner task runs detached jobs with a
     measured history (etajobs): the estimate the history gives, so padding is visible."""
     from . import eta, etajobs, timefmt
     try:
         for tid in _owner_ids(o):
-            if etajobs.entries(db, int(tid)):
+            if etajobs.job_entries(db, int(tid)):
                 e = eta.obligation_estimate(db, o, now)
                 if not e.get("why") and e.get("end"):
                     return f"; measured finish {timefmt.short(e['end'], where, now)}"
