@@ -1,6 +1,6 @@
 ---
 name: tt-vllm-serving-review
-description: Reviews the vLLM and tt-inference-server serving path — generator_vllm.py contracts, plugin registration, the tt_data_parallel ambiguity, and TT-fork branch and config conventions. Use when reviewing changes to generator_vllm.py, vLLM plugin registration, or serving configuration.
+description: Reviews the vLLM and tt-inference-server serving path — generator_vllm.py contracts, plugin registration, the tt_data_parallel ambiguity, and vLLM and plugin source and version conventions. Use when reviewing changes to generator_vllm.py, vLLM plugin registration, or serving configuration.
 metadata:
   tier: model
   upstream:
@@ -54,12 +54,12 @@ nothing and falls back to a default implementation. Check that the entry point n
 vLLM looks up, and that registration happens on the import path actually taken when the server
 starts — not only under a test import.
 
-## TT-fork conventions
+## vLLM and plugin sources
 
-vLLM here is a Tenstorrent fork. Branch and config conventions are load-bearing: a change pinning
-the wrong branch, or assuming upstream behaviour the fork has changed, breaks at deploy rather than
-in CI. Where a diff pins or bumps a fork reference, check it against the convention in the
-surrounding config rather than assuming upstream semantics.
+TT serving uses upstream vLLM plus the `tenstorrent/vllm-tt-plugin` package. It does not use a
+Tenstorrent fork of vLLM. Flag changes that install, import, or configure a vLLM fork. When a change
+sets or updates the vLLM or plugin version, check it against the plugin's current install
+instructions, not against a version remembered from elsewhere.
 
 ## Perf evidence works differently here
 
