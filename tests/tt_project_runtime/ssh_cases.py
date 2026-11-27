@@ -901,13 +901,6 @@ def _no_flock_env(tmp_path, short_cm, fast_poll=False, **extra):
     return w, e
 
 
-def _dead_pid():
-    import subprocess
-    p = subprocess.Popen(["true"])
-    p.wait()
-    return p.pid
-
-
 def test_parallel_ssh_wrapper_calls_open_one_master_on_a_host_without_flock(tmp_path, short_cm):
     import subprocess
     w, e = _no_flock_env(tmp_path, short_cm, FAKE_OPEN_DELAY=0.5)
