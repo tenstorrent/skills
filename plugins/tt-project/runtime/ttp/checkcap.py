@@ -364,11 +364,40 @@ def live_cores_on() -> bool:
     return True
 
 
+def yield_nice() -> int:
+    """The nice level above which a process's CPU counts as free for checks: the checks runner's own
+    (project's runner.nice default), since work niced below the runner gives its cores up to it."""
+    return project.nice_level(None)[0]
+
+
+SLOT_KINDS = (RESOURCE, PRIORITY, URGENT)   # the check-slots labels whose holders run checks (ours)
+
+
+def slot_pids() -> list[int]:
+    """The pids the check slots' labels name (holder and keeper's taker), read in one listing; their
+    process trees' CPU counts as busy however niced (hostcpu's `ours`)."""
+    out = []
+    try:
+        names = os.listdir(slot_dir())
+    except OSError:
+        return out
+    for name in names:
+        if name.endswith(".lock") and name.split(".", 1)[0] in SLOT_KINDS:
+            try:
+                h = json.loads((slot_dir() / name).read_text() or "{}")
+            except (OSError, ValueError):
+                continue
+            if isinstance(h, dict):
+                out += [v for v in (h.get("pid"), h.get("taker_pid")) if isinstance(v, int) and v > 1]
+    return out
+
+
 def free_cores() -> float | None:
     """This host's cores no process keeps busy now: its cores less hostcpu.busy_cores() (/proc/stat over
-    the last few seconds, or macOS's CPU ticks), or less the 1-minute load average where neither can be
+    the last few seconds, or macOS's CPU ticks), without the CPU of processes niced above yield_nice()
+    outside the check slots' process trees, or less the 1-minute load average where neither can be
     read; None with nothing readable."""
-    busy = hostcpu.busy_cores()
+    busy = hostcpu.busy_cores(above=yield_nice(), ours=slot_pids)
     if busy is None and ((busy := _loadavg()) != busy or busy == float("inf")):
         return None
     return max(0.0, cores() - busy)
@@ -776,8 +805,9 @@ def _load() -> float:
     """The cores in use now as every pacing read counts them (the cap's default, extra slots, the test
     pool, repository lanes, the load guard): the runnable CPU demand measured over a short window
     (hostcpu.demand: /proc/stat on Linux, the kernel's CPU ticks on macOS), which leaves out tasks waiting
-    on I/O; the 1-minute load average only where neither can be read (inf when nothing can)."""
-    d = hostcpu.demand()
+    on I/O, and CPU that yields (free_cores); the 1-minute load average only where neither can be read
+    (inf when nothing can)."""
+    d = hostcpu.demand(above=yield_nice(), ours=slot_pids)
     return _loadavg() if d is None else d
 
 

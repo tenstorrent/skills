@@ -6777,7 +6777,7 @@ def test_one_heavy_checks_run_among_normal_ones_never_sets_the_check_price(env, 
     runs(*[6] * 19, 40)
     every = checkcap.all_paths(4)
     monkeypatch.setattr(checkcap, "held_since", lambda paths: [0.0])   # one check running, granted long ago
-    monkeypatch.setattr(hostcpu, "busy_cores", lambda: 50.0)
+    monkeypatch.setattr(hostcpu, "busy_cores", lambda **k: 50.0)
     assert checkcap.cores_short(every) == "", "14 free cores hold one 6-core check"
 
 
@@ -6846,7 +6846,7 @@ def test_hostcpu_busy_cores_and_checkcap_cores_count_the_same_cores_under_a_rest
         stats.pop(0)
     assert checkcap.cores() == hostcpu.cores() == 4
     assert hostcpu.busy_cores(lambda: stats[0], sleep, lambda: clock[0]) == 2.0, "half of the 4 cores"
-    monkeypatch.setattr(hostcpu, "busy_cores", lambda: 2.0)
+    monkeypatch.setattr(hostcpu, "busy_cores", lambda **k: 2.0)
     assert checkcap.free_cores() == 2.0
     monkeypatch.delattr(os, "sched_getaffinity", raising=False)   # macOS: no affinity
     assert checkcap.cores() == hostcpu.cores() == 64
@@ -6896,7 +6896,7 @@ def test_checks_live_cores_gate_waits_on_a_saturated_host_and_always_admits_one(
     monkeypatch.setattr(checkcap, "cores", lambda: 64)
     monkeypatch.setattr(checkcap, "check_load", lambda: 8.0)
     busy = [60.0]
-    monkeypatch.setattr(hostcpu, "busy_cores", lambda: busy[0])
+    monkeypatch.setattr(hostcpu, "busy_cores", lambda **k: busy[0])
     first = checkcap.acquire("first")
     try:
         assert first.f is not None, "the floor: none running, so one starts on a saturated host"
@@ -6913,7 +6913,7 @@ def test_checks_live_cores_gate_waits_on_a_saturated_host_and_always_admits_one(
         third = checkcap.acquire("third", max_wait_s=5)
         assert third is not None and third.f is not None, "once they show in the busy cores, 23 free admit one"
         third.close()
-        monkeypatch.setattr(hostcpu, "busy_cores", lambda: None)   # no /proc/stat: the load average
+        monkeypatch.setattr(hostcpu, "busy_cores", lambda **k: None)   # no /proc/stat: the load average
         monkeypatch.setattr(checkcap.os, "getloadavg", lambda: (70.0, 0.0, 0.0))
         assert checkcap.cores_short(checkcap.all_paths(8)) == "0 of 64 cores free now, one check takes 8"
         monkeypatch.setattr(checkcap.os, "getloadavg", lambda: (_ for _ in ()).throw(OSError()))
@@ -6932,7 +6932,7 @@ def test_test_slots_grant_follows_the_hosts_live_free_cores(env, monkeypatch):
     monkeypatch.setenv("TTP_CHECKS_LIVE_CORES", "1")
     monkeypatch.setattr(checkcap, "cores", lambda: 64)
     busy = [0.0]
-    monkeypatch.setattr(hostcpu, "busy_cores", lambda: busy[0])
+    monkeypatch.setattr(hostcpu, "busy_cores", lambda **k: busy[0])
     assert testslots.sizes() == (32, 8)
     with testslots.acquire("idle") as g:
         assert g.k == 8 and g.env()[testslots.XDIST_ENV] == "8", "an idle host: the full share"
@@ -7212,11 +7212,11 @@ def test_a_project_s_test_worker_ceiling_reads_runnable_cpu_demand_not_the_load_
     _spare_load(monkeypatch, 64, 0.0)
     monkeypatch.setattr(checkcap, "cpu_demand", real)
     monkeypatch.setattr(checkcap.os, "getloadavg", lambda: (67.0, 67.0, 67.0))
-    monkeypatch.setattr(hostcpu, "demand", lambda: 20.0)
+    monkeypatch.setattr(hostcpu, "demand", lambda **k: 20.0)
     assert testslots.spare_workers(64) == 28 and testslots.project_workers() == 32, "I/O waiters are not CPU load"
-    monkeypatch.setattr(hostcpu, "demand", lambda: 40.0)
+    monkeypatch.setattr(hostcpu, "demand", lambda **k: 40.0)
     assert testslots.project_workers() == 16, "CPU demand of 40 shrinks it"
-    monkeypatch.setattr(hostcpu, "demand", lambda: None)
+    monkeypatch.setattr(hostcpu, "demand", lambda **k: None)
     assert testslots.project_workers() == 8, "no /proc/stat: the load average of 67 leaves no spare cores"
 
 
@@ -7530,7 +7530,7 @@ def test_every_run_the_host_wide_cap_admits_gets_run_min_on_a_64_core_host_at_lo
     monkeypatch.setenv("TTP_TEST_RUN_MIN", "4")
     monkeypatch.setattr(checkcap, "_load", lambda: 67.0)
     monkeypatch.setattr(checkcap, "cpu_demand", lambda: hostcpu.demand() or checkcap._load())
-    monkeypatch.setattr(hostcpu, "demand", lambda: 20.0)
+    monkeypatch.setattr(hostcpu, "demand", lambda **k: 20.0)
     monkeypatch.setattr(checkcap, "extra_max", lambda: 2 if spare else 0)
     want = 32 if spare else 16
     assert testslots.project_workers({}, project_name="pa") == want
@@ -13442,3 +13442,71 @@ def test_lane_holder_readers_list_the_slot_folder_once_per_call_however_many_bas
     finally:
         for g in held:
             g.close()
+
+
+def _fake_procs(monkeypatch, tmp_path, rows, cores=4, busy=300, total=400, running=1):
+    """A host for hostcpu with per-process stats: /proc/stat and /proc/<pid>/stat under tmp_path, read once at
+    the start of a window and again SAMPLE_S+ later (no sleep). `rows` is {pid: (ppid, nice, ticks before,
+    ticks after)}; the aggregate counters move by `busy` busy jiffies of `total`."""
+    from ttp import checkcap, hostcpu
+    proc = tmp_path / "proc"
+    proc.mkdir(exist_ok=True)
+    stat = proc / "stat"
+
+    def write(at: int):
+        b = busy if at else 0
+        stat.write_text(f"cpu  {b} 0 0 {(total - busy) if at else 0} 0 0 0 0\nprocs_running {running}\n")
+        for pid, (ppid, nice, *ticks) in rows.items():
+            (proc / str(pid)).mkdir(exist_ok=True)
+            (proc / str(pid) / "stat").write_text(
+                f"{pid} (job) R {ppid} 0 0 0 0 0 0 0 0 0 {ticks[at]} 0 0 0 20 {nice} 1 0 {pid * 7} 0\n")
+
+    write(0)
+    monkeypatch.setattr(hostcpu, "STAT", stat)
+    monkeypatch.setattr(hostcpu, "_LAST", {"at": (time.monotonic() - 2 * hostcpu.SAMPLE_S, 0, 0, running, hostcpu.procs())})
+    write(1)
+    monkeypatch.setattr(hostcpu, "cores", lambda: cores)
+    monkeypatch.setattr(checkcap, "cores", lambda: cores)
+    monkeypatch.setattr(os, "cpu_count", lambda: cores)
+    return proc
+
+
+def test_niced_batch_work_leaves_its_cores_free_for_checks(env, tmp_path, monkeypatch):
+    """Free cores and CPU demand leave out what processes niced above the checks runner's own nice used,
+    since that work yields its cores: a nice-19 hog using 2 of 4 cores leaves them free; the same hog at
+    nice 0, or at the runner's own nice, keeps them busy."""
+    from ttp import checkcap, hostcpu, project
+    assert checkcap.yield_nice() == project.DEFAULT_CONFIG["runner"]["nice"]
+    rows = {50: (1, 19, 100, 300), 60: (1, 0, 0, 100)}   # the hog: 200 of 400 jiffies, half the host
+    _fake_procs(monkeypatch, tmp_path, rows, running=9)
+    assert checkcap.free_cores() == 3.0, "3 cores busy, 2 of them niced: 3 free"
+    assert round(checkcap._load(), 2) == 2.67, "8 runnable tasks scaled to the 1 of 3 busy cores that does not yield"
+    assert hostcpu.busy_cores() == 3.0, "the plain reading still counts it"
+    _fake_procs(monkeypatch, tmp_path, {**rows, 50: (1, 0, 100, 300)}, running=9)
+    assert checkcap.free_cores() == 1.0 and checkcap._load() == 8.0, "an un-niced hog is busy"
+    _fake_procs(monkeypatch, tmp_path, {**rows, 50: (1, checkcap.yield_nice(), 100, 300)})
+    assert checkcap.free_cores() == 1.0, "work at the runner's own nice does not yield to it"
+
+
+def test_the_check_slots_own_niced_commands_still_count_as_busy(env, tmp_path, monkeypatch):
+    """A check's commands run niced too, under the process holding its slot: their CPU stays busy while a
+    foreign process at the same nice yields."""
+    from ttp import checkcap
+    checkcap.slot_dir().mkdir(parents=True, exist_ok=True)
+    (checkcap.slot_dir() / f"{checkcap.RESOURCE}.0.lock").write_text(json.dumps({"holder": "a check", "pid": 40}))
+    rows = {40: (1, 10, 0, 0), 41: (40, 19, 0, 0), 42: (41, 19, 0, 200), 50: (1, 19, 0, 100)}
+    _fake_procs(monkeypatch, tmp_path, rows)
+    assert checkcap.slot_pids() == [40]
+    assert checkcap.free_cores() == 2.0, "the check's 2 cores stay busy, the foreign 1 is free"
+
+
+def test_unreadable_process_stats_keep_the_aggregate_reading(env, tmp_path, monkeypatch):
+    """Without per-process stats in both of the window's passes, free cores fall back to /proc/stat's whole
+    busy reading, niced time included."""
+    from ttp import checkcap, hostcpu
+    proc = _fake_procs(monkeypatch, tmp_path, {50: (1, 19, 100, 300)})
+    (proc / "50" / "stat").write_text("garbled")
+    assert checkcap.free_cores() == 1.0, "no process read now: the aggregate"
+    _fake_procs(monkeypatch, tmp_path, {50: (1, 19, 100, 300)})
+    hostcpu._LAST["at"] = hostcpu._LAST["at"][:4]
+    assert checkcap.free_cores() == 1.0, "no pass at the window's start: the aggregate"

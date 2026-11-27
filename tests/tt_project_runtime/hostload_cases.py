@@ -8,7 +8,7 @@ from __future__ import annotations
 def _overloaded_host(monkeypatch, load=(105.0, 98.0, 123.0), cores=32, cap=4, demand=98.0):
     from ttp import checkcap, hostcpu
     monkeypatch.setattr(os, "getloadavg", lambda: load)
-    monkeypatch.setattr(hostcpu, "demand", lambda: demand)
+    monkeypatch.setattr(hostcpu, "demand", lambda **k: demand)
     monkeypatch.setattr(checkcap, "cores", lambda: cores)
     monkeypatch.setenv("TTP_CHECKS_HOST_MAX", str(cap))
 
@@ -68,7 +68,7 @@ def test_the_daemon_raises_a_checks_host_overload_from_held_slots_and_closes_it_
         d.check_host_load()
         assert len(p.db.q("SELECT id FROM events WHERE text LIKE 'checks host overloaded:%'")) == 1, "once"
         monkeypatch.setattr(os, "getloadavg", lambda: (10.0, 20.0, 60.0))
-        monkeypatch.setattr(hostcpu, "demand", lambda: 20.0)
+        monkeypatch.setattr(hostcpu, "demand", lambda **k: 20.0)
         d._host_load_checked = 0.0
         d.check_host_load()
         assert not _host_load_issues(p, "open")

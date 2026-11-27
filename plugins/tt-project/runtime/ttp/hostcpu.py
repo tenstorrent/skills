@@ -18,6 +18,13 @@ the 1-minute load where more once the CPU is SATURATED (no idle left to show the
 Mac's load average also counts threads blocked on I/O (endpoint tools keep it at 30-57 on a mostly
 idle laptop), so pacing reads these instead.
 
+Both take `above` and `ours` to leave out CPU that yields: the cores used by processes niced above `above`
+outside the process trees of the pids `ours()` returns, read from each process's /proc/<pid>/stat
+(utime+stime) in one pass beside /proc/stat at every reading; a process seen in only one of the window's
+two passes counts as busy. The runnable tasks shrink by the same share of the busy cores (niced tasks
+get less CPU each, so they are at least that share of the run queue). Where the per-process stats cannot
+be read, the aggregate reading stands.
+
 mem_free() is the share of memory free now: MemAvailable over MemTotal (/proc/meminfo) on Linux, the
 kernel's memory-free level (kern.memorystatus_level, as memory_pressure prints it) on macOS; mem_short()
 says why new work should wait when it is under MEM_FREE_MIN.
@@ -101,22 +108,88 @@ def mach_ticks() -> tuple[int, int] | None:
     return user + system + nice, user + system + idle + nice
 
 
-def _read(read=None) -> tuple[int, int, int | None] | None:
+def procs(root: Path | None = None) -> dict | None:
+    """One pass over the processes beside STAT (/proc/<pid>/stat): {pid: (start time, ppid, nice, utime+stime
+    ticks)}; None where none can be read."""
+    root = str(STAT.parent if root is None else root)
+    try:
+        names = os.listdir(root)
+    except OSError:
+        return None
+    out = {}
+    for name in names:
+        if not name.isdigit():
+            continue
+        try:   # os.read, not open(): a pass reads every process on a busy host
+            fd = os.open(f"{root}/{name}/stat", os.O_RDONLY)
+            try:
+                v = os.read(fd, 1024).rsplit(b")", 1)[1].split()
+            finally:
+                os.close(fd)
+            out[int(name)] = (int(v[19]), int(v[1]), int(v[16]), int(v[11]) + int(v[12]))
+        except (OSError, IndexError, ValueError):
+            continue   # ended meanwhile
+    return out or None
+
+
+def _read(read=None) -> tuple[int, int, int | None, dict | None] | None:
     try:
         text = STAT.read_text() if read is None else read()
         j = jiffies(text)
     except (OSError, ValueError):
         if read is None and MACH and (m := mach_ticks()) is not None:
-            return (*m, None)
+            return (*m, None, None)
         return None
-    return None if j is None else (*j, running(text))
+    return None if j is None else (*j, running(text), procs() if read is None else None)
 
 
-def _sample(read, sleep, clock, cpus) -> tuple[float, float | None] | None:
-    """(busy cores, runnable tasks scaled to `cpus`, or None) over the window busy_cores describes."""
+def _niced(prev: dict | None, cur: dict | None, dt: int) -> tuple[dict, dict] | None:
+    """({pid: ppid}, {pid: (nice, share of the host's CPU over the window)} of the niced processes seen in
+    both passes), or None without both passes."""
+    if not prev or not cur:
+        return None
+    shares = {}
+    for pid, (start, _, nice, ticks) in cur.items():
+        if nice > 0 and (p := prev.get(pid)) and p[0] == start and ticks > p[3]:
+            shares[pid] = (nice, (ticks - p[3]) / dt)
+    return {pid: v[1] for pid, v in cur.items()}, shares
+
+
+def _yielded(niced: tuple[dict, dict] | None, above: int, ours) -> float | None:
+    """The share of the host's CPU that processes niced above `above` used over the window, leaving out the
+    trees of the pids ours() returns; None without per-process stats."""
+    if niced is None:
+        return None
+    parent, shares = niced
+    picked = [pid for pid, (nice, _) in shares.items() if nice > above]
+    if not picked:
+        return 0.0
+    roots, mine = set(ours() if ours else ()), {}
+    def of_ours(pid: int) -> bool:
+        path = []
+        while pid > 1 and pid not in mine and pid not in roots and len(path) < len(parent):
+            path.append(pid)
+            pid = parent.get(pid, 0)
+        got = pid in roots or mine.get(pid, False)
+        mine.update(dict.fromkeys(path, got))
+        return got
+    return sum(shares[pid][1] for pid in picked if not of_ours(pid))
+
+
+def _sample(read, sleep, clock, cpus, above: int | None = None, ours=None) -> tuple[float, float | None] | None:
+    """(busy cores, runnable tasks scaled to `cpus`, or None) over the window busy_cores describes, without
+    the CPU that yields with `above` set (the module's doc)."""
+    got = _window(read, sleep, clock, cpus)
+    if got is None or above is None or not got[0] or (y := _yielded(got[2], above, ours)) is None:
+        return None if got is None else got[:2]
+    busy = max(0.0, got[0] - y * (cpus or cores()))
+    return busy, None if got[1] is None else got[1] * busy / got[0]
+
+
+def _window(read, sleep, clock, cpus) -> tuple[float, float | None, tuple | None] | None:
     now = clock()
     if (b := _LAST.get("busy")) and 0 <= now - b[0] < SAMPLE_S:
-        return b[1], b[2]
+        return b[1], b[2], (b[3] if len(b) > 3 else None)
     cur = _read(read)
     if cur is None:
         return None
@@ -139,21 +212,24 @@ def _sample(read, sleep, clock, cpus) -> tuple[float, float | None] | None:
         # reader itself runs too.
         c = cores()
         runnable = max(0.0, (prev[3] + cur[2]) / 2 - 1) * min(1.0, c / (os.cpu_count() or c))
-    _LAST["busy"] = (now, busy, runnable)
-    return busy, runnable
+    niced = _niced(prev[4] if len(prev) > 4 else None, cur[3], dt)
+    _LAST["busy"] = (now, busy, runnable, niced)
+    return busy, runnable, niced
 
 
-def busy_cores(read=None, sleep=time.sleep, clock=time.monotonic, cpus: int | None = None) -> float | None:
+def busy_cores(read=None, sleep=time.sleep, clock=time.monotonic, cpus: int | None = None,
+               above: int | None = None, ours=None) -> float | None:
     """Cores busy now (above); `read` returns /proc/stat's text, `sleep` and `clock` are for tests."""
-    got = _sample(read, sleep, clock, cpus)
+    got = _sample(read, sleep, clock, cpus, above, ours)
     return None if got is None else got[0]
 
 
-def demand(read=None, sleep=time.sleep, clock=time.monotonic, cpus: int | None = None) -> float | None:
+def demand(read=None, sleep=time.sleep, clock=time.monotonic, cpus: int | None = None,
+           above: int | None = None, ours=None) -> float | None:
     """The runnable CPU demand now in cores (above): the busy cores, or the runnable tasks where more;
     without a run queue (macOS) a CPU at least SATURATED busy takes the 1-minute load where more, as no
     idle is left to show the waiters. None where neither /proc/stat nor the ticks can be read."""
-    got = _sample(read, sleep, clock, cpus)
+    got = _sample(read, sleep, clock, cpus, above, ours)
     if got is None:
         return None
     if got[1] is not None:
