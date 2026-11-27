@@ -1779,7 +1779,11 @@ def test_gh_workstation_reads_runs_and_edits_labels_and_comments_only_on_its_own
                 ["api", "-X", "POST", "repos/acme/widgets/issues/3/comments", "-f", "body=no tag"],
                 ["api", "-X", "POST", "repos/acme/widgets/issues/3/comments", "-F", f"body={tag}"],
                 ["api", "-X", "POST", "repos/acme/widgets/issues/3/comments", "-f", f"body={tag}", "-f", f"body={tag}"],
-                ["api", "-X", "PATCH", "repos/acme/widgets/issues/3/comments", "-f", f"body={tag}"]):
+                ["api", "-X", "PATCH", "repos/acme/widgets/issues/3/comments", "-f", f"body={tag}"],
+                ["api", "-X", "GET", "-X", "PUT", "repos/acme/widgets/pulls/3/merge"],
+                ["api", "-X", "GET", "--method=POST", "repos/acme/widgets/issues/3/comments", "-f", "body=x"],
+                ["pr", "edit", "3", "--add-label", "lgtm"], ["pr", "edit", "3", "--remove-label", "on-hold"],
+                ["pr", "edit", "3", "--remove-label", "wip"]):
         assert ghqueue.allowed(bad), bad
     ws = ws_calls.parent
     view = ws / "view.json"
@@ -1825,6 +1829,8 @@ def test_gh_publish_with_a_lease_replaces_its_branch_only_at_the_old_sha_and_onl
     assert ghqueue.lease_problem(sent[:4], None) == ""
     p.set_config("delivery.rebase_replace", "lease")
     assert ghqueue.lease_problem(sent, None) == ""
+    p.set_config("delivery.never_force", True)
+    assert "never_force off" in ghqueue.lease_problem(sent, None)
 
     git = ["git", "-c", "user.name=t", "-c", "user.email=t@example.com", "-c", "init.defaultBranch=main"]
     bare, work = tmp_path / "origin.git", tmp_path / "work"
@@ -1842,7 +1848,10 @@ def test_gh_publish_with_a_lease_replaces_its_branch_only_at_the_old_sha_and_onl
     first, second, third = commit("first"), commit("second"), commit("third")
     subprocess.run(["git", "-C", str(work), "push", "-q", str(bare), "first:refs/heads/ttp/t7-x"], check=True)
     gh = tmp_path / "gh"
-    gh.write_text('#!/bin/sh\ncase "$*" in "api repos/acme/widgets --jq .default_branch") echo main;; *) exit 1;; esac\n')
+    prs = tmp_path / "prs.json"
+    prs.write_text(json.dumps([{"author": {"login": "ME"}}]))
+    gh.write_text('#!/bin/sh\ncase "$*" in "api repos/acme/widgets --jq .default_branch") echo main;;\n'
+                  f' "api user --jq .login") echo me;; "pr list"*) cat "{prs}";; *) exit 1;; esac\n')
     gh.chmod(0o755)
     monkeypatch.setattr(ghqueue, "GIT_URL", f"file://{bare}")
 
@@ -1854,6 +1863,9 @@ def test_gh_publish_with_a_lease_replaces_its_branch_only_at_the_old_sha_and_onl
     assert rc == 0 and tip() == second, said
     rc, _said = ghqueue.publish_here(str(gh), [*sent[:3], third, ghqueue.LEASE + first], bundled("third"))
     assert rc and tip() == second   # a stale lease leaves the branch as it is
+    prs.write_text(json.dumps([{"author": {"login": "ME"}}, {"author": {"login": "someone-else"}}]))
+    rc, said = ghqueue.publish_here(str(gh), [*sent[:3], third, ghqueue.LEASE + second], bundled("third"))
+    assert rc and "someone else's" in said and tip() == second
 
 
 def test_gh_workflow_run_takes_up_to_eight_plain_inputs_and_nothing_else_on_both_ends_of_the_route(env, monkeypatch):

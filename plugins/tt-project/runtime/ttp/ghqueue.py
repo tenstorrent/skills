@@ -54,7 +54,8 @@ _EDIT_FLAGS = {"--title": "--title", "-t": "--title", "--body": "--body", "-b": 
                "-F": "--body", "--repo": "--repo", "-R": "--repo", "--add-label": "--add-label",
                "--remove-label": "--remove-label"}
 _LABELS = ("--add-label", "--remove-label")
-_GATE_LABEL = re.compile(r"merge|approv|ready", re.I)   # a label a bot may read as leave to merge or ready a PR
+# a label a bot may read as leave to merge, ship or ready a PR (added, or removed as a hold)
+_GATE_LABEL = re.compile(r"merge|approv|ready|lgtm|hold|wip|block|ship|queue", re.I)
 _DISPATCH_FLAGS = {"--ref": "--ref", "-r": "--ref", "--repo": "--repo", "-R": "--repo"}
 _CLOSE_FLAGS = {"--comment": "--comment", "-c": "--comment", "--repo": "--repo", "-R": "--repo"}
 _REPO_FLAGS = {"--repo": "--repo", "-R": "--repo"}
@@ -490,6 +491,8 @@ def allowed(argv, stdin: bytes = b"", prefixes=()) -> str:
     if argv[0] == PUBLISH:
         return _publish(argv, stdin, prefixes)
     if argv[0] == "api":
+        if sum(a in ("-X", "--method") or a.startswith("--method=") for a in argv) > 1:
+            return "`gh api` names its method once"   # gh takes the last one, our checks read the first
         if (why := _reply(argv)) is not None:
             return why
         if (why := _delete(argv, prefixes)) is not None:
@@ -593,16 +596,17 @@ def enqueue(args: list[str], input: bytes | None = None, cwd: str | None = None,
 
 def lease_problem(sent: list[str], cwd: str | None) -> str:
     """Why this project must not queue `sent`, a publish that replaces its branch (--lease), or "": only
-    under its delivery.rebase_replace `lease`."""
+    under its delivery.rebase_replace `lease` with delivery.never_force off."""
     if sent[:1] != [PUBLISH] or len(sent) < 5:
         return ""
-    from .project import here, rebase_replace
+    from .project import here, never_force, rebase_replace
     try:
         p = here(cwd)
-        lease = p is not None and rebase_replace(p.config()) == "lease"
+        lease = p is not None and rebase_replace(cfg := p.config()) == "lease" and not never_force(cfg)
     except Exception:
         lease = False
-    return "" if lease else "a publish that replaces its branch (--lease) runs only under delivery.rebase_replace lease"
+    return "" if lease else ("a publish that replaces its branch (--lease) runs only under delivery.rebase_replace "
+                             "lease, with delivery.never_force off")
 
 
 def _key(repo: str, sent: list[str], data: bytes) -> str:
@@ -726,18 +730,38 @@ def put(results, home=None) -> int:
 
 # --- the workstation --------------------------------------------------------------------------------
 
+def _lease_free(gh: str, repo: str, branch: str) -> str:
+    """Why a lease publish must not replace `branch`, or "": every open PR on it is one this gh user opened."""
+    unread = "could not read the open PRs on the branch before replacing it"
+    try:
+        r = subprocess.run([gh, "pr", "list", f"--repo={repo}", "--head", branch, "--state", "open", "--json", "author"],
+                           capture_output=True, timeout=GH_TIMEOUT_S)
+        found = json.loads(r.stdout) if r.returncode == 0 else None
+    except (OSError, subprocess.TimeoutExpired, ValueError):
+        return unread
+    login = _gh_login(gh)
+    if login is None or not isinstance(found, list):
+        return unread
+    if any(_own_draft_reason(x, login, "", draft=False) for x in found):
+        return f"an open PR on `{branch}` is someone else's, and a lease publish never replaces it"
+    return ""
+
+
 def publish_here(gh: str, argv: list[str], bundle: bytes) -> tuple[int, str]:
     """Push a `git-publish`'s commit to its branch with this computer's own login (gh as git's helper for
     github.com): in a scratch repo, fetch the bundle's prerequisites (commits the remote already has),
     unbundle, then `git push <url> <sha>:refs/heads/<branch>`, with no `+`, so only a new branch or a
     fast-forward, never a delete; with a lease, --force-with-lease on the old sha, so it replaces the branch
-    only while the branch is still there; never the repo's default branch. (rc, what happened)."""
+    only while the branch is still there and no one else's open PR is on it; never the repo's default branch.
+    (rc, what happened)."""
     repo, branch, sha = argv[1:4]
     lease = [f"--force-with-lease=refs/heads/{branch}:{argv[4][len(LEASE):]}"] if argv[4:] else []
     default = _default_branch(gh, repo)
     if not default or branch == default:
         return 1, ("refused on the workstation: " + (f"`{branch}` is the repo's default branch" if default else
                    "could not read the repo's default branch before publishing"))
+    if lease and (why := _lease_free(gh, repo, branch)):
+        return 1, f"refused on the workstation: {why}"
     url = GIT_URL.format(repo=repo)
     head = bundle.split(b"\n\n", 1)[0].decode("utf-8", "replace").splitlines()
     prereq = [x[1:].split()[0] for x in head if x.startswith("-") and len(x) > 1]
