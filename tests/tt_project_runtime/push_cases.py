@@ -12817,6 +12817,40 @@ def test_a_detached_push_claim_the_remote_cannot_settle_is_unverifiable_and_rank
     assert "; 1 unverifiable" in pushclaim.summary_line(a)
 
 
+def _rebased_claim(env, monkeypatch, record: bool):
+    """A summary claiming the task's local head, which `ttp push` rebased and pushed as another sha
+    (recorded in its push record when `record`): the claims of its run and their overall check."""
+    from ttp import pushclaim
+    p, repo, origin, _ = _push_setup(env, monkeypatch, ["true"])
+    _commit(repo, "a.txt", "a\n")
+    head = _sha_like(repo)
+    _git_out(repo, "commit", "-q", "--amend", "-m", "rebased")
+    pushed = _git_out(repo, "rev-parse", "HEAD")
+    _git_out(repo, "push", "-q", "origin", "HEAD:refs/heads/proj")
+    tid = p.db.add_task("t", "s", kind="code", origin="user", branch="work")
+    if record:
+        pushes = p.state / "pushes"
+        pushes.mkdir(parents=True, exist_ok=True)
+        (pushes / f"t{tid}-x.json").write_text(json.dumps({
+            "task": str(tid), "run": 7, "repo": str(repo), "status": "pushed", "exit": 0,
+            "head": head, "sha": pushed, "target": "origin/proj"}))
+    cs = pushclaim.claims(p, p.db.task(tid), {"summary": f"pushed {head[:10]} to origin/proj"}, {"id": 7})
+    assert [c["sha"] for c in cs if not c.get("marker")] == [head], cs
+    return head, pushed, pushclaim.check_all(p, cs)
+
+
+def test_a_claimed_head_its_push_record_maps_to_a_pushed_sha_on_the_target_is_confirmed(env, monkeypatch):
+    from ttp import pushclaim
+    head, pushed, (state, why, _) = _rebased_claim(env, monkeypatch, record=True)
+    assert state == pushclaim.CONFIRMED and pushed[:12] in why and head[:12] in why, why
+
+
+def test_a_claimed_head_with_no_push_record_and_not_on_the_remote_is_still_missing(env, monkeypatch):
+    from ttp import pushclaim
+    head, _, (state, why, _) = _rebased_claim(env, monkeypatch, record=False)
+    assert state == pushclaim.MISSING and f"{head[:12]} is not on origin/proj" in why, why
+
+
 def test_a_push_queue_landing_is_checked_by_the_commit_it_landed_as(env, monkeypatch):
     from ttp import pushclaim
     p, repo, origin, _ = _push_setup(env, monkeypatch, ["true"])

@@ -529,6 +529,8 @@ def claims(p, task: dict, result: dict, run: dict | None) -> list[dict]:
             seen.add(k)
             if pr and (c.get("marker") or c["ref"] == f"refs/heads/{pr}"):
                 c["pr_branch"] = pr
+            if not c.get("marker"):
+                c["task"] = task["id"]   # its own landing can confirm it (_own_landing)
             out.append(c)
     return out
 
@@ -781,7 +783,32 @@ def check(p, c: dict, cache: dict) -> tuple[str, str]:
         s2, w2 = verify(repo, d[0], d[1], c["sha"], cache)
         if s2 == CONFIRMED:
             return s2, f"{w2} ({why})"
+    if state == MISSING and c.get("task") and (own := _own_landing(p, c, repo, cache)):
+        return own[0], f"{own[1]} ({why})"
     return state, why
+
+
+def _own_landing(p, c: dict, repo, cache: dict) -> tuple[str, str] | None:
+    """A claimed commit the remote lacks, confirmed as its task's landing: a push record of the task
+    that pushed that commit as its head under another sha (a rebase) now on the claim's target, else
+    the task's landing found as `ttp landed --task` finds it, when the target is the push branch
+    (local refs only: the tracking ref verify just fetched; another branch's may be stale). None
+    when neither holds."""
+    from . import landed
+    sha = c["sha"]
+    for _, m in _markers(p, c["task"]):
+        pushed = str(m.get("sha") or "")
+        if m.get("status") == "pushed" and m.get("head") == sha and pushed and pushed != sha:
+            state, why = verify(repo, c["remote"], c["ref"], pushed, cache)
+            if state == CONFIRMED:
+                return state, f"{sha[:12]} was pushed as {pushed[:12]} (its push record): {why}"
+    try:
+        if short_ref(c["remote"], c["ref"]) != landed._push_ref(p, Path(repo)):
+            return None
+        rc, why = landed.check(p, Path(repo), tid=int(c["task"]), fetch=False)
+    except Exception:
+        return None
+    return (CONFIRMED, f"its task's landing: {why}") if rc == 0 else None
 
 
 def check_all(p, cs: list[dict], cache: dict | None = None) -> tuple[str, str, list[tuple[dict, str, str]]]:
