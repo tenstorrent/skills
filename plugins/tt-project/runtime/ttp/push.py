@@ -49,7 +49,7 @@ from pathlib import Path
 from typing import Any, Callable
 from urllib.parse import quote, unquote
 
-from . import (checkcap, checkdirs, checkspill, checkwait, checklane, cleantree, coordtools, envfault, gatejudge, gatetime, gitcache, ghroute, gitmemo, hoststate, landed, landmark, leakfile, locks, machines, outscan, ponytail, pooladmit, prguard, prhead, remotecheck, remoteload, repoid, runner, runnerenv, scratchhome,
+from . import (checkcap, checkdirs, checkspill, checkwait, checklane, cleantree, coordtools, envfault, gatejudge, gatetime, gitcache, ghroute, gitmemo, hoststate, landed, landmark, leakfile, locks, machines, outscan, ponytail, pooladmit, prbabysit, prguard, prhead, remotecheck, remoteload, repoid, runner, runnerenv, scratchhome,
                settinghold, setupfault, sharedchecks, shorttmp, syntaxfault, testslots, timefmt, verified, workerloss, worktree)
 from . import __version__
 from .budget import DOC_SUFFIXES, task_default_usd
@@ -2313,7 +2313,6 @@ def own_target(p: Project, repo: Path) -> tuple[str, str]:
         if not local and not _branch_on_remote(repo, remote, branch):
             raise ValueError(f"this task's pr_branch {branch} exists neither here nor on {remote}: --own "
                              f"publishes onto an existing branch only, never creates one")
-    from . import prbabysit
     no_post = {k.lower() for k in prbabysit.settings(p.config())["no_post_prs"]}
     if (key := next((k for k, b in prbabysit.owned(p.db).items() if b == branch and k.lower() in no_post), "")):
         raise ValueError(f"{key} is in pr_babysit.no_post_prs: its branch {branch} is not pushed. Commit locally "

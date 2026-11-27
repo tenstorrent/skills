@@ -123,7 +123,7 @@ with open(os.environ["FAKE_GH_LOG"], "a") as f:
 
 
 def test_runs_gh_scans_kept_stdin_aliases_and_field_files(env, tmp_path, monkeypatch):
-    """Review #6111: stdin gh keeps without a `-` (gist create, variable set, workflow run, an alias or
+    """Review #6111: stdin gh keeps without a `-` (gist create, variable set, secret set, an alias or
     extension), a gh alias's expansion (its files, a shell alias's text) and `-F key=@file` on any command
     are scanned; clean ones run with their stdin passed on; auth login's stdin is left to gh."""
     p = _outscan_project(env, monkeypatch)
@@ -134,14 +134,14 @@ def test_runs_gh_scans_kept_stdin_aliases_and_field_files(env, tmp_path, monkeyp
     log, f = tmp_path / "gh.log", tmp_path / "payload.txt"
     routes = [lambda t: (["gist", "create", "--public"], t.encode()),
               lambda t: (["variable", "set", "X"], t.encode()),
-              lambda t: (["workflow", "run", "w", "--json"], t.encode()),
+              lambda t: (["secret", "set", "Y"], t.encode()),
               lambda t: (["myext", "send"], t.encode()),
               lambda t: (["put"], t.encode()),
               lambda t: (f.write_text(t) and ["post", str(f)], b""),
               lambda t: (["sh", t], b""),
               lambda t: (["sh", "x"], t.encode()),
-              lambda t: (f.write_text(t) and ["workflow", "run", "w", "-F", f"note=@{f}"], b""),
-              lambda t: (f.write_text(t) and ["workflow", "run", "w", "--field=note=@" + str(f)], b"")]
+              lambda t: (f.write_text(t) and ["api", "x", "-F", f"note=@{f}"], b""),
+              lambda t: (f.write_text(t) and ["api", "x", "--field=note=@" + str(f)], b"")]
     for leak in (_OUT_SECRET, _OUT_SHAPE, "serial " + _OUT_FORBIDDEN):
         for route in routes:
             args, data = route(f"status: {leak}")
@@ -191,7 +191,7 @@ def test_runs_gh_reads_stdin_ahead_only_where_gh_reads_it(env, tmp_path, monkeyp
     (fake / "gh").chmod(0o755)
     log, f = tmp_path / "gh.log", tmp_path / "f.txt"
     f.write_text("all green\n")
-    idle = [["workflow", "run", "w", "-f", "a=b"], ["variable", "set", "X", "--body", "v"],
+    idle = [["api", "x", "-f", "a=b"], ["variable", "set", "X", "--body", "v"],
             ["secret", "set", "X", "-bv"], ["variable", "set", "X", "--env-file", str(f)],
             ["secret", "set", "X", "-f", str(f)], ["gist", "create", str(f)], ["gist", "create", "-d", "x", str(f)],
             ["ssh-key", "add", str(f), "-t", "k"], ["gpg-key", "add", str(f)], ["alias", "import", str(f)]]

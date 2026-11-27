@@ -82,7 +82,7 @@ def test_pr_body_check_covers_edits_that_set_the_body_only(env, tmp_path, monkey
     assert rc == 0 and ran == ["pr edit 7 -R acme/widgets -bType: docs"], err
     assert seen() == ["edit acme/widgets Type: docs"]
     for args in (("pr", "edit", "7", "-t", "new title"), ("pr", "edit", "7", "-t", "-b"),
-                 ("pr", "edit", "7", "--add-label", "x", "--title=--body")):
+                 ("pr", "edit", "7", "--add-assignee", "x", "--title=--body")):
         rc, err, ran = gh(*args)
         assert rc == 0 and ran == [" ".join(args)], err
     assert seen() == []
