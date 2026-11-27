@@ -401,7 +401,7 @@ def test_glm_quota_lift_never_votes_on_a_degenerate_evaluation(monkeypatch, tmp_
     assert glmquota._flat_or_not_ours(few), "too few readings with a drop"
     assert not glmquota._flat_or_not_ours(_gq_rows(0.1))
     # Others' use dwarfs ours: the fit cannot tell our weight, however tight it is.
-    dwarfed = _gq_rows(0.0, others=lambda rng: 8e6 + rng.uniform(-1e4, 1e4))
+    dwarfed = _gq_rows(0.0, others=lambda rng: 8e6 + rng.uniform(-2e5, 2e5))
     lift = judged(dwarfed)
     assert lift["votes"] == 0 and not lift.get("lifted"), lift
     # A real set (clear small cached weight, enough error, enough share) still votes and lifts on the third.
