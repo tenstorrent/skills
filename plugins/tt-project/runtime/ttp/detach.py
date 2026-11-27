@@ -182,13 +182,15 @@ def last_progress(probe: str, cwd=None) -> float | None:
     return best
 
 
-def check_args(probe: str) -> tuple[str | None, str | None, list[str]]:
-    """A `detach --check` probe's (host, mirror, checked paths): the one parse of its argument
-    list, shared by every reader of such a probe (_remote_progress, the timeline)."""
+def _remote_progress(probe: str, cwd=None) -> float | None:
+    """last_progress for a `detach --check --host <alias> --mirror <dir> <path>...` probe: the newest time
+    a mirrored job not known to have ended last moved (its log grew, or it started: mirror_save's
+    "moved"; a mirror written before that key, its .remote.log's mtime). None without a mirror folder,
+    or when no named job has a live mirror: the wait counts as before."""
     try:
         words = shlex.split(probe or "")
     except ValueError:
-        return None, None, []
+        return None
     host = mirror = None
     paths: list[str] = []
     for i, w in enumerate(words):
@@ -207,15 +209,6 @@ def check_args(probe: str) -> tuple[str | None, str | None, list[str]]:
             else:
                 paths.append(w)
         break
-    return host, mirror, paths
-
-
-def _remote_progress(probe: str, cwd=None) -> float | None:
-    """last_progress for a `detach --check --host <alias> --mirror <dir> <path>...` probe: the newest time
-    a mirrored job not known to have ended last moved (its log grew, or it started: mirror_save's
-    "moved"; a mirror written before that key, its .remote.log's mtime). None without a mirror folder,
-    or when no named job has a live mirror: the wait counts as before."""
-    host, mirror, paths = check_args(probe)
     if not host or not mirror:
         return None
     d = Path(cwd or ".") / mirror
