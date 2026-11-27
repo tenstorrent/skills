@@ -211,3 +211,4 @@ def test_an_item_reported_as_sent_out_is_not_pending():
     from ttp import quotefull
     assert quotefull.backrefs("Restart request sent, please confirm the board is back.") == []
     assert quotefull.backrefs("The request was sent, please confirm it went out.") == []
+    assert quotefull.backrefs("The ask was sent, please reply.") != []   # a sent ask is still pending

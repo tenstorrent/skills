@@ -51,8 +51,9 @@ _BARE = re.compile(_EARLIER.replace("|see", ""), re.I)   # points back only with
 _PENDING = re.compile(rf"\b{_ITEM}|{_AWAITS}", re.I)
 _NON_ASK = re.compile(r"(?<!pull\s)(?<!PR\s)(?<!\()(?:requests?|commands?|drafts?|questions?)"
                       r"\b(?!\s+PRs?\b|\s+pull\s+request|\s*\))", re.I)   # an item that is not an ask
-_SENT_OUT = re.compile(rf"{_ITEM}(?:\s+(?:was|were))?\s+(?:sent|posted|filed|answered|closed|resolved)\b",
-                       re.I)   # 'request sent', 'draft was posted': it went out, so it is not pending
+_SENT_OUT = re.compile(rf"{_NON_ASK.pattern}(?:\s+(?:was|were))?\s+"
+                       r"(?:sent|posted|filed|answered|closed|resolved)\b",
+                       re.I)   # 'request sent', 'draft was posted': it went out; an ask sent is still pending
 
 
 def _attached(text: str, start: int, after: str, back: bool) -> bool:
