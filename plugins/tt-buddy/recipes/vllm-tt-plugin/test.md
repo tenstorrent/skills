@@ -6,7 +6,7 @@ Run from the `vllm-tt-plugin` repository root after completing [build.md](build.
 
 ```bash
 uv pip install --python "$TT_METAL_HOME/python_env/bin/python" -e ".[dev]"
-PYTHONPATH=ci/host-stubs \
+PYTHONPATH=tests/host-stubs \
   "$TT_METAL_HOME/python_env/bin/python" -m pytest tests/ --ignore=tests/tt
 "$TT_METAL_HOME/python_env/bin/pre-commit" run --all-files
 ```
