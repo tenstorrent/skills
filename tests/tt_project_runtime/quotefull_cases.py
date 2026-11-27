@@ -249,3 +249,26 @@ def test_an_open_ask_lookup_fault_never_refuses_an_urgent_reply_naming_an_ask(en
     cli.main(["urgent-reply", "c1", "Ask 12 is still open, waiting on you."])
     assert "Ask 12 is still open" in _sent(p)[-1], _sent(p)
     assert "open asks not expanded" in capsys.readouterr().err
+
+
+def test_an_item_and_its_pending_state_in_either_order_need_the_text():
+    from ttp import quotefull
+    # one rule: an item word and a pending-state phrase in one clause, in any order, colon or not
+    for refused in ("Drafts for A and B: ready to send.", "Ready to send: the drafts from earlier.",
+                    "Pending your approval: the request.", "Waiting for you: the request.",
+                    "The draft needs your review."):
+        assert quotefull.backrefs(refused) != [], refused
+    assert quotefull.backrefs("Still open: ask 12.", (), []) != []   # no such open ask
+    assert quotefull.backrefs("Please answer ask 12.") == []   # open asks unknown: pendingask owns the id
+    for ok in ("Draft for A, ready to send: Hi A, the update follows.",
+               "Ready to send, the draft for A:\n> Hi A, the update follows in full here.",
+               "Drafts for A and B: ready to send.\n> Hi A, the update follows in full here.",
+               "The command is ready to run: `ttp push --detach`",
+               "> Draft for A: the notes in full, ready to send.",   # its text sits between colon and state
+               "The command is waiting for your CI runner to come back."):
+        assert quotefull.backrefs(ok) == [], ok
+    assert quotefull.backrefs("Request still open: please approve the budget raise.") == []   # its text follows
+    for refused in ("Drafts for A and B: ready to send, as noted.", "Draft for A: needs your review.",
+                    "Worker says:\n> Drafts for A and B are ready to send.",
+                    "> see above for the drafts, ready to send"):
+        assert quotefull.backrefs(refused) != [], refused

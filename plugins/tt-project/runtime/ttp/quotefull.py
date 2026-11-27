@@ -6,8 +6,9 @@ drafts, so the harness refuses it model-free.
 
 `backrefs` finds the phrases that stand in for content: an explicit back-reference ('see above', 'in
 my earlier messages', 'drafts above', 'as drafted earlier', 'the draft I sent'), and an item word
-(draft/ask/request/command) that awaits the user ('ready to send', 'pending your', 'for you to',
-a request to the user to act, after it; 'still open' or 'still pending' after an ask) in the same clause, not negated.
+(draft/ask/request/command) and a state awaiting the user ('ready to send', 'pending your',
+'waiting for you', 'needs your', a request to the user to act; 'still open' or 'still pending' for an
+ask) in the same clause, in either order and across a colon, not negated.
 A pull request, a PR or a draft PR is no such item. A phrase is fine only when the text is attached
 to it: quoted material (a blockquote, a fenced block, an inline code span, a quoted span of 30+
 chars) later in its own sentence or as the first line after it (or in the message's later numbered
@@ -22,10 +23,12 @@ their pending item's full text: ask reminders quote the question (coordinator.de
 askrethink.text), `ttp status` shows each open ask whole (cli.status_text) and worker notifies carry
 their body (daemon.relay_worker_notifies).
 
-Known gaps (accepted): a status phrase after a colon ('Drafts for A and B: ready to send.') is
-not matched; an item reported as sent out that the user is asked to act on ('request sent, please
-confirm') is refused like a pending one, and the writer adds its text and resends; an ask named
-by its words (not its id) is refused when the open asks could not be read."""
+Known gaps (accepted): an item before its state with a bare item name after a closing colon
+('Drafts ready to send: the ones from earlier.') passes as content, as do words between an item's colon and its state ('Drafts for A: the ones from
+earlier, ready to send.'); an item reported
+as sent out that the user is asked to act on ('request sent, please confirm') is refused like a
+pending one, and the writer adds its text and resends; an ask named by its words (not its id) is
+refused when the open asks could not be read."""
 from __future__ import annotations
 
 import re
@@ -38,12 +41,33 @@ _POINT_BACK = re.compile(
     rf"{_EARLIER}|\bsee above\b(?!\s+in\s+the\b)|\bdrafts?\s+above\b|\bas\s+drafted\s+(?:earlier|before|above)\b"
     r"|\bthe\s+drafts?\s+(?:I|we)\s+(?:sent|posted|shared|wrote)\b",
     re.I)
-_SPAN = r"(?:(?!,\s*(?:and|but|so|while)\b)[^.;:\n]){0,120}"   # one clause: no . ; : , and/but or line break
+_SPAN = r"(?:(?!,\s*(?:and|but|so|while)\b)[^.;\n]){0,120}"   # one clause: no . ; , and/but or line break
 _ITEM = r"(?<!pull\s)(?<!PR\s)(?<!\()(?:asks?|requests?|commands?|drafts?|questions?)\b(?!\s+PRs?\b|\s+pull\s+request|\s*\))"
-_AWAITS = r"ready\s+to\s+send|pending\s+your|(?:for\s+you\s+to|please)\s+(?:run|approve|review|reply|answer|confirm|decide)\b"
-_STATUS_PHRASE = re.compile(   # an item that awaits the user; 'pending your <item>' names it after
-    rf"\b(?:{_ITEM}{_SPAN}\b(?:{_AWAITS})|(?<!pull\s)asks?\b{_SPAN}\bstill\s+(?:open|pending)\b"
-    rf"|pending\s+your\s+{_ITEM})", re.I)
+_AWAITS = (r"ready\s+to\s+(?:send|run|post)|pending\s+your|waiting\s+(?:for|on)\s+you\b|needs?\s+your"
+           r"|(?:for\s+you\s+to|please)\s+(?:run|approve|review|reply|answer|confirm|decide)\b")
+
+
+def _either(item: str, state: str) -> str:
+    """An item and a state phrase in one clause, in either order (an ask id after a trailing item)."""
+    return rf"{item}{_SPAN}\b(?:{state})|(?:{state}){_SPAN}\b{item}(?:\s+{pendingask.IDS})?"
+
+
+_ASK, _OPEN = r"(?<!pull\s)asks?\b", r"still\s+(?:open|pending)\b"
+# an item awaiting the user
+_STATUS_PHRASE = re.compile(rf"\b(?:{_either(_ITEM, _AWAITS)}|{_either(_ASK, _OPEN)})", re.I)
+
+
+def _colon_content(phrase: str, line_end: str) -> bool:
+    """'<item>: <words> <state>', or '<item>: please <verb> <words>': the words after the colon, the
+    state phrase not counted, are the item's text."""
+    if ":" not in phrase or not re.match(_ITEM, phrase, re.I):
+        return False
+    after = phrase[phrase.rfind(":") + 1:]
+    state = list(re.finditer(rf"{_AWAITS}|{_OPEN}", after, re.I))[-1]
+    return bool(re.search(r"\w", after[:state.start()]) or (
+        re.match(r"(?:for\s+you\s+to|please)\s", state.group(0), re.I) and re.match(r"\s+\w", line_end)))
+
+
 _NEGATED = re.compile(r"\b(?:no|none|nothing|not|zero|neither|nor)\b|(?<![\w.])0(?![\w.])", re.I)
 _OPENS = re.compile(r"(?:^|[\s(\[])['\"`‘“][^'\"`’”\n]{0,40}$")   # a quote mark opening a span, not an apostrophe
 _CLOSES = re.compile(r"^[^'\"`’”\n]{0,40}['\"`’”](?!\w)")
@@ -107,7 +131,8 @@ def backrefs(text: str, later: list[str] | tuple = (), open_asks: list[dict] | t
             if not _PENDING.search(text[lo:hi.start() if hi else len(text)]) and not line_end.endswith(":"):
                 continue
         if (_attached(text, m.start(), after, back) or (not back and line_end.endswith(":") and has_content(after))
-                or (not back and re.match(r":\s*\S", line_end))):
+                or (not back and re.match(r":\s*\S", line_end))
+                or (not back and _colon_content(m.group(0), line_end))):
             continue
         p = " ".join(m.group(0).split()) if back else \
             f"the {item.group(0).lower()} named as pending, without its text"

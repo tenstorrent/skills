@@ -14,7 +14,8 @@ from . import reask
 
 HEADER = "\n\nStill open, in full:"
 # 'ask 297', 'asks 12 and 14', 'ask #297': an ask id, never a task (#297 alone reads as a task).
-_REF = re.compile(r"\basks?\s+#?(\d+)((?:\s*(?:,|and|&|/)\s*#?\d+)*)", re.I)
+IDS = r"#?(\d+)((?:\s*(?:,|and|&|/)\s*#?\d+)*)"   # the id list after 'ask'
+_REF = re.compile(rf"\basks?\s+{IDS}", re.I)
 _MORE = re.compile(r"\d+")
 # Words that say the user still owes something, with no ask id next to them.
 _WAITING = re.compile(
