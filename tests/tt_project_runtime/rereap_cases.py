@@ -4,7 +4,7 @@
 from __future__ import annotations
 
 
-def _quarantined(p, tmp_path, result, cost=1.5):
+def _rr_quarantined(p, tmp_path, result, cost=1.5):
     """A worker run whose reap was cut off twice (Daemon._quarantine_run), its run dir holding `result`."""
     from ttp import daemon as dm
     d = dm.Daemon(p.base)
@@ -23,13 +23,13 @@ def _quarantined(p, tmp_path, result, cost=1.5):
     return d, tid, rid
 
 
-_DONE = {"status": "done", "summary": "all of it"}
+_RR_DONE = {"status": "done", "summary": "all of it"}
 
 
 def test_a_quarantined_run_with_a_complete_result_is_reaped_once_more_and_its_task_ends_done(env, tmp_path):
     from ttp import rereap
     p = make(env)
-    d, tid, rid = _quarantined(p, tmp_path, _DONE)
+    d, tid, rid = _rr_quarantined(p, tmp_path, _RR_DONE)
     d.reap_runs()
     assert p.db.one("SELECT status FROM runs WHERE id=?", (rid,))["status"] == "ok"
     assert p.db.task(tid)["status"] == "done"
@@ -42,7 +42,7 @@ def test_a_quarantined_run_with_a_complete_result_is_reaped_once_more_and_its_ta
 def test_a_quarantined_run_with_a_missing_or_broken_result_stays_quarantined(env, tmp_path, result):
     from ttp import rereap
     p = make(env)
-    d, tid, rid = _quarantined(p, tmp_path, result)
+    d, tid, rid = _rr_quarantined(p, tmp_path, result)
     d.reap_runs()
     assert p.db.one("SELECT status FROM runs WHERE id=?", (rid,))["status"] == "failed"
     assert p.db.task(tid)["status"] == "failed" and not p.db.kv(rereap.KEY)
@@ -52,7 +52,7 @@ def test_a_quarantined_run_with_a_missing_or_broken_result_stays_quarantined(env
 def test_a_quarantined_end_is_read_again_once_only(env, tmp_path):
     from ttp import rereap
     p = make(env)
-    d, tid, rid = _quarantined(p, tmp_path, _DONE)
+    d, tid, rid = _rr_quarantined(p, tmp_path, _RR_DONE)
     assert rereap.reread(p, rid) == ""
     assert "already re-read" in rereap.reread(p, rid)
     # Quarantined again (the reap cut off twice more): the sweep leaves it alone.
@@ -65,7 +65,7 @@ def test_a_quarantined_end_is_read_again_once_only(env, tmp_path):
 def test_reread_refuses_a_run_that_was_not_quarantined_or_has_a_later_run(env, tmp_path):
     from ttp import rereap
     p = make(env)
-    d, tid, rid = _quarantined(p, tmp_path, _DONE)
+    d, tid, rid = _rr_quarantined(p, tmp_path, _RR_DONE)
     assert "no run" in rereap.reread(p, 9999)
     p.db.x("DELETE FROM messages WHERE ref=?", (f"reap-quarantine:{rid}",))
     assert "not quarantined" in rereap.reread(p, rid)
@@ -83,7 +83,7 @@ def test_the_sweep_re_reads_at_most_a_few_runs_a_tick(env, tmp_path):
     for n in range(rereap.PER_TICK + 1):
         sub = tmp_path / str(n)
         sub.mkdir()
-        rids.append(_quarantined(p, sub, _DONE)[2])
+        rids.append(_rr_quarantined(p, sub, _RR_DONE)[2])
     rereap.sweep(p, lambda *_: None)
     assert len(p.db.kv(rereap.KEY)) == rereap.PER_TICK
     rereap.sweep(p, lambda *_: None)
@@ -93,7 +93,7 @@ def test_the_sweep_re_reads_at_most_a_few_runs_a_tick(env, tmp_path):
 def test_ttp_task_reread_puts_a_quarantined_run_back_and_says_why_it_cannot(env, tmp_path, capsys):
     from ttp import cli
     p = make(env)
-    d, tid, rid = _quarantined(p, tmp_path, _DONE)
+    d, tid, rid = _rr_quarantined(p, tmp_path, _RR_DONE)
     cli.main(["task", p.name, "reread", str(rid)])
     assert "read again from its files" in capsys.readouterr().out
     assert p.db.one("SELECT status FROM runs WHERE id=?", (rid,))["status"] == "running"
