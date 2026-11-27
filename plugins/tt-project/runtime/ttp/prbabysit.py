@@ -385,6 +385,30 @@ def overlap_check(daemon, gh) -> None:
     db.set_kv(OVERLAP_KEY, {f"{a}|{b}": 1 for a, b, _ in pairs})   # a pair that stops overlapping is told again when it returns
 
 
+def unpublished_repair(daemon, key: str, rec: dict, head: str) -> tuple[dict, str] | None:
+    """The done task whose repair of PR `key`'s open findings (pr-watch's record `rec`) is not on the PR
+    yet, and the step still open that publishes it: none of its hand-off's commits is the PR's head
+    (`head`) and the PR had no new commit since it finished. That task keeps the findings until the step
+    is taken (on a no-post PR, by the user), so no second fix is queued. None: no such repair."""
+    from .batchrun import _shas
+    from .db import load_result
+    db = daemon.p.db
+    since = float(((db.kv(KEY, {}) or {}).get(key) or {}).get("head_at") or 0)
+    last = db.one("SELECT id FROM tasks WHERE labels LIKE ? ORDER BY id DESC LIMIT 1", (f'%"pr_fix:{key}"%',))
+    for tid in dict.fromkeys(i for i in (rec.get("owner"), last and last["id"], rec.get("task")) if i):
+        t = db.task(int(tid))
+        mine = _shas(load_result(t["result"]).get("commits")) if t and t["status"] == "done" else []
+        if not (head and since and mine) or float(t["updated"] or 0) < since \
+                or any(head.startswith(c) or c.startswith(head) for c in mine):
+            continue
+        where = f"onto the PR's branch {rec.get('branch')}" if rec.get("branch") else "onto the PR"
+        quiet = key.lower() in {k.lower() for k in settings(getattr(daemon, "cfg", None))["no_post_prs"]}
+        return t, (f"its commit {mine[-1][:12]} is not on the PR yet: "
+                   + (f"the user publishes it {where} (a no-post PR: the project pushes nothing to it)" if quiet
+                      else f"publish it {where}"))
+    return None
+
+
 def _post_event(daemon, kind: str, text: str, task) -> None:
     from . import screen as scr
     db = daemon.p.db

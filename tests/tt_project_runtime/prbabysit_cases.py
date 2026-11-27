@@ -596,3 +596,68 @@ def test_prbabysit_a_skipped_or_never_run_listed_workflow_or_an_unread_one_holds
     _pb_gh(monkeypatch)
     read(ok, {**heavy, "conclusion": "SUCCESS"}, head="e" * 40)
     assert len(clean()) == 1, "every workflow ran on the head: clean"
+
+
+def _pb_review_graph(summary, inline, answered=True):
+    """A BOT_QUERY answer: one bot CHANGES_REQUESTED review with `summary` and inline comments `inline`,
+    each on its own thread, answered by a person when `answered`."""
+    bot, human = {"__typename": "Bot", "login": "scan-bot"}, {"__typename": "User", "login": "dev"}
+    threads = [{"isResolved": False, "isOutdated": False, "path": "src/app.py", "comments": {"nodes": [
+        {"author": bot, "url": f"t{i}", "body": b}, *([{"author": human, "url": f"a{i}", "body": "Fixed."}]
+                                                     if answered else [])]}} for i, b in enumerate(inline)]
+    review = {"id": "rv", "author": bot, "state": "CHANGES_REQUESTED", "submittedAt": "2026-01-02T00:00:00Z",
+              "url": "rv", "body": summary,
+              "comments": {"totalCount": len(inline), "nodes": [{"author": bot, "body": b} for b in inline]}}
+    return {"data": {"repository": {"pullRequest": {"comments": {"nodes": []}, "reviews": {"nodes": [review]},
+                                                    "reviewThreads": {"nodes": threads}}}}}
+
+
+def test_prbabysit_a_bot_review_summary_only_repeating_answered_threads_is_no_new_finding():
+    from ttp import watchers
+    inline = ["Unchecked return value in `load`.", "Hardcoded secret found (see commit abc1234)."]
+    summary = "\n\n".join(f"**{b}**" for b in inline) + "\n<!-- review-id: 9 -->"
+    assert watchers.bot_open(_pb_review_graph(summary, inline)) == []
+    assert watchers.bot_open(_pb_review_graph("", inline)) == [], "an empty summary only wraps its threads"
+    assert watchers.bot_open(_pb_review_graph(summary, inline, answered=False)) == ["t0", "t1", "rv"], \
+        "threads still open keep the summary open too"
+
+
+def test_prbabysit_a_bot_review_summary_with_text_of_its_own_still_is_a_finding():
+    from ttp import watchers
+    inline = ["Unchecked return value in `load`."]
+    own = "Also: the migration drops the index on `users`.\n\n" + inline[0]
+    assert watchers.bot_open(_pb_review_graph(own, inline)) == ["rv"]
+    assert watchers.bot_open(_pb_review_graph(inline[0], [])) == ["rv"], "no inline comments: nothing covers it"
+
+
+def _pb_done_repair(env, monkeypatch, commits, cfg=None):
+    """A failing PR whose delivering task finished done, after the sweep last saw the PR's head move, with
+    `commits` in its hand-off; one pr-watch run. Returns (project, events)."""
+    from ttp import watchers
+    _pb_gh(monkeypatch)
+    pr = _pb_pr(statusCheckRollup=[{"name": "validate", "workflowName": "ci", "status": "COMPLETED",
+                                    "conclusion": "FAILURE"}])
+    p, d, _ = _pb_run(env, monkeypatch, pr, cfg=cfg)
+    _pb_quiet(p, hours=2)
+    p.db.x("UPDATE tasks SET status='done', updated=?, result=? WHERE pr_url=?",
+           (time.time() - 3600, json.dumps({"commits": commits}), _PB_URL))
+    watchers.watch_prs(d)
+    watchers.watch_prs(d)
+    return p, _pb_events(p)
+
+
+def test_prbabysit_a_done_repair_waiting_on_its_publication_keeps_its_owner_and_queues_no_second_fix(env, monkeypatch):
+    p, ev = _pb_done_repair(env, monkeypatch, ["c" * 40], cfg={"pr_babysit.no_post_prs": ["acme/widgets#7"]})
+    assert p.db.q("SELECT id FROM tasks WHERE title LIKE 'Fix PR findings%'") == []
+    found = [t for k, t in ev if k == "pr_findings"]
+    assert len(found) == 1 and "Done task #1 repaired them" in found[0] and "the user publishes it" in found[0] \
+        and "ttp/x" in found[0], found
+    rec = p.db.kv("pr_findings")["acme/widgets#7"]
+    assert rec["owner"] == 1 and rec["finish"] == "finishing" and "c" * 12 in rec["prereq"], rec
+
+
+def test_prbabysit_a_done_task_whose_commit_is_the_prs_head_queues_the_fix_as_before(env, monkeypatch):
+    p, ev = _pb_done_repair(env, monkeypatch, ["a" * 40])
+    assert len(p.db.q("SELECT id FROM tasks WHERE title LIKE 'Fix PR findings%'")) == 1
+    rec = p.db.kv("pr_findings")["acme/widgets#7"]
+    assert "prereq" not in rec and rec["owner"] == 2, rec

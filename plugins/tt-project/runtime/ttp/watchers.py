@@ -1058,33 +1058,56 @@ def finding_key(c: dict, path: str | None = None) -> str:
     if not body.strip():
         return "url:" + str(c.get("url") or id(c))
     m = _RULE_RE.search(body)
+    return hashlib.sha1(json.dumps([path or c.get("path") or "", m.group(1).lower() if m else "",
+                                    _finding_text(body)]).encode()).hexdigest()[:12]
+
+
+def _finding_text(body: str) -> str:
+    """A comment's words as finding_key compares them: lower case, no links, commit ids or hidden markup."""
     text = _SHA_RE.sub(" ", _URL_RE.sub(" ", _HIDDEN_RE.sub(" ", body)).lower())
-    text = " ".join(re.sub(r"\W+", " ", text).split())
-    return hashlib.sha1(json.dumps([path or c.get("path") or "", m.group(1).lower() if m else "", text])
-                        .encode()).hexdigest()[:12]
+    return " ".join(re.sub(r"\W+", " ", text).split())
+
+
+def _repeats_answered(review: dict, threads: dict[str, bool]) -> bool:
+    """Whether a bot review's summary only repeats its inline comments and each of those is on a thread
+    already answered or resolved (`threads`: first comment's words -> answered): it then has their
+    disposition. A summary with words of its own, or an inline comment on no known thread, still counts."""
+    inline = [_finding_text(str(c.get("body") or "")) for c in (review.get("comments") or {}).get("nodes") or []]
+    if not inline or not all(threads.get(t) for t in inline):
+        return False
+    rest = " " + _finding_text(str(review.get("body") or "")) + " "
+    for t in sorted(inline, key=len, reverse=True):
+        rest = rest.replace(" " + t + " ", " ") if t else rest
+    return not rest.strip()
 
 
 def bot_findings(data: dict) -> list[tuple[str, str]]:
     """(finding_key, URL) of bot review findings on a PR that are neither fixed nor answered: a review
     thread a bot started that is unresolved, not outdated and has no reply from a person; a bot's
-    top-level comment, or review asking for changes, with no comment from a person after it. A bot
+    top-level comment, or review asking for changes, with no comment from a person after it (a review
+    whose summary only repeats its answered or resolved threads has their disposition). A bot
     re-posting a finding (same key) is one finding, listed once; once any post of it was answered
     (or its thread resolved), its re-posts are not open work."""
     pr = (((data or {}).get("data") or {}).get("repository") or {}).get("pullRequest") or {}
     items = []   # (key, url, answered, open)
+    threads: dict[str, bool] = {}   # a bot thread's first comment's words -> answered (any copy of it)
     for th in (pr.get("reviewThreads") or {}).get("nodes") or []:
         cs = (th.get("comments") or {}).get("nodes") or []
         if cs and _is_bot(cs[0].get("author")):
             answered = bool(th.get("isResolved")) or not all(_is_bot(c.get("author")) for c in cs[1:])
             items.append((finding_key(cs[0], th.get("path")), cs[0].get("url") or "?", answered,
                           not answered and not th.get("isOutdated")))
+            t = _finding_text(str(cs[0].get("body") or ""))
+            threads[t] = threads.get(t, False) or answered
     comments = (pr.get("comments") or {}).get("nodes") or []
     human_times = sorted(c.get("createdAt") or "" for c in comments if not _is_bot(c.get("author")))
     last_human = human_times[-1] if human_times else ""
     tops = [(c.get("createdAt") or "", c) for c in comments if _is_bot(c.get("author"))]
     tops += [(r.get("submittedAt") or "", r) for r in (pr.get("reviews") or {}).get("nodes") or []
              if _is_bot(r.get("author")) and r.get("state") == "CHANGES_REQUESTED"]
-    items += [(finding_key(c), c.get("url") or "?", ts <= last_human, ts > last_human) for ts, c in tops]
+    for ts, c in tops:
+        done = ts <= last_human or _repeats_answered(c, threads)
+        items.append((finding_key(c), c.get("url") or "?", done, not done))
     answered = {k for k, _, a, _ in items if a}
     out, seen = [], set()
     for k, u, _, live in items:
@@ -1150,8 +1173,12 @@ def _check_findings(daemon, t: dict, pr: dict, sig: dict, findings: dict, data: 
     who = f"PR for task #{t['id']}" if t["id"] else "PR on a branch this project works on (no task of it opened it)"
     # Open findings always have one owner: an open task on the PR, else a fix task the daemon queues
     # once the task that delivered it is done (Daemon.pr_findings_owner). pr-watch only reports them.
-    owner, made = daemon.pr_findings_owner(key, rec, what) if dirty and hasattr(daemon, "pr_findings_owner") \
-        else (None, False)
+    # A done repair not yet published keeps them while that step is open: no second fix (prbabysit).
+    held = prbabysit.unpublished_repair(daemon, key, rec, pr.get("headRefOid") or "") if dirty else None
+    if held:
+        rec["prereq"] = held[1]
+    owner, made = (held[0], False) if held else daemon.pr_findings_owner(key, rec, what) \
+        if dirty and hasattr(daemon, "pr_findings_owner") else (None, False)
     lost = dirty and not owner and rec["owner"] is not None
     rec["owner"] = owner["id"] if owner else None
     now = time.time()
@@ -1170,7 +1197,7 @@ def _check_findings(daemon, t: dict, pr: dict, sig: dict, findings: dict, data: 
     # Clean is told once per head: a new head that is clean again is news (its draft may be asked about).
     head = pr.get("headRefOid") or ""
     mark = json.dumps([rec["failing"], bot_keys, humans, bool(stale)] if (humans or stale) else
-                      [rec["failing"], bot_keys]) if dirty else f"clean@{head}" if head else "clean"
+                      [rec["failing"], bot_keys]) + (f" {owner['id']} waits to publish" if held else "") if dirty else f"clean@{head}" if head else "clean"
     if dirty and "bot_keys" not in old and rec["notified"] == json.dumps([rec["failing"], sorted(bots)]):
         rec["notified"] = mark   # a record from before keys were kept, already told these findings
     if not dirty and rec["notified"] == "clean":
@@ -1186,6 +1213,10 @@ def _check_findings(daemon, t: dict, pr: dict, sig: dict, findings: dict, data: 
                 f"queued code task #{owner['id']} on the PR's branch to fix or answer each. Queue no other task "
                 f"for them. Do not ask the user to review it until pr-watch reports it clean.")
         status = "handled"
+    elif held:
+        text = (f"{who} ({url}) has open findings: {what}. Done task #{owner['id']} repaired them, but "
+                f"{held[1]}. It keeps them until then: queue no second fix. Do not ask the user to review "
+                "it until pr-watch reports it clean.")
     elif owner:
         text = (f"{who} ({url}) has open findings: {what}. Open task #{owner['id']} "
                 f"({owner['status']}) owns them"
