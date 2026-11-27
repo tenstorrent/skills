@@ -760,9 +760,10 @@ HARNESS_ROOT_FILES = ("pytest.ini",)
 HARNESS_GITIGNORE = ("__pycache__/", "*.pyc", "tmp/")     # tmp/: scratch (test temp dirs, even git repos) kept out of commits
 
 
-def _gitignore_text(names) -> str:
+def _gitignore_text(names: list | tuple) -> str:
     """The .gitignore body for a list of ignore lines: one line each, in order."""
     return "".join(f"{n}\n" for n in names)
+
 # Files that hold a pytest config at a directory's root, and the section that makes them one
 _PYTEST_CONFIGS = {"pytest.ini": "", ".pytest.ini": "", "pytest.toml": "", ".pytest.toml": "",
                    "pyproject.toml": "[tool.pytest", "tox.ini": "[pytest]", "setup.cfg": "[tool:pytest]"}
