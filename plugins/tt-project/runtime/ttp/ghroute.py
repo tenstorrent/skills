@@ -323,7 +323,7 @@ def last_answer(via: str, home=None) -> dict:
     return {"via": via, **rec} if rec else {}
 
 
-def _fresh(rec: dict, within_s: float) -> bool:
+def _ok_within(rec: dict, within_s: float) -> bool:
     try:
         return rec.get("ok") is True and time.time() - float(rec.get("at") or 0) < within_s
     except (TypeError, ValueError):
@@ -335,8 +335,8 @@ def works(home=None, within_s: float = 3600, via: str | None = None) -> bool:
     a call over that route counts (another project's route or the workstation queue answering is no
     route of this project's working)."""
     if via is not None:
-        return _fresh(last_answer(via, home), within_s)
-    return any(_fresh(r, within_s) for r in _state_read(home).values())
+        return _ok_within(last_answer(via, home), within_s)
+    return any(_ok_within(r, within_s) for r in _state_read(home).values())
 
 
 def live(cfg: dict | None = None, cwd: str | None = None) -> bool:
