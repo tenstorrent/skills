@@ -43,10 +43,11 @@ def backrefs(text: str) -> list[str]:
         after = text[eol + 1 if eol >= 0 else len(text):]
         if not (_QUOTED.search(text) or _has_content(after)) and (p := " ".join(m.group(0).split())) not in out:
             out.append(p)
-    m = _STATUS_PHRASE.search(text)
-    eol = text.find("\n", m.start()) if m else -1   # only lines after the phrase's own line count
-    if m and not (_QUOTED.search(text) or _has_content(text[eol + 1 if eol >= 0 else len(text):])):
-        out.append(f"the {m.group(1) if m.lastindex else 'item'} named as pending, without its text")
+    for m in _STATUS_PHRASE.finditer(text):
+        eol = text.find("\n", m.end())   # only lines after the phrase's own line count as its text
+        if not (_QUOTED.search(text) or _has_content(text[eol + 1 if eol >= 0 else len(text):])):
+            out.append(f"the {m.group(1) if m.lastindex else 'item'} named as pending, without its text")
+            break
     return out
 
 

@@ -72,3 +72,9 @@ def test_urgent_reply_refuses_a_back_reference(env, monkeypatch, capsys):
     assert "urgent reply rejected" in capsys.readouterr().err and _out(p) == []
     cli.main(["urgent-reply", "c1", "Found it: the encoder died; restarting it now."])
     assert "restarting it now" in _out(p)[-1]
+
+
+def test_an_ask_rethink_event_carries_the_whole_question():
+    from ttp import askrethink
+    question = "Reboot the board?\nOptions: A) now, B) after the soak. " + "Detail. " * 60 + "My recommendation: B"
+    assert "My recommendation: B" in askrethink.text(7, [1], 3.0, question, "human")
