@@ -334,3 +334,70 @@ def test_remove_drops_the_registry_row_even_when_its_daemon_is_gone_or_a_step_fa
         assert f"unregistered {name}" in out
         assert name not in project.load_registry()["projects"] and "other" in project.load_registry()["projects"]
         assert p.base.is_dir() != delete
+
+
+def _remote_entries(env, *names):
+    from ttp import project
+    for n in names:
+        project.register(n, {"host": "nowhere.invalid", "dir": f"/srv/{n}"})
+
+
+def test_remove_force_drops_only_the_row_of_a_remote_project_without_contacting_its_host(env, monkeypatch, capsys):
+    from ttp import cli, outbox, project
+    _remote_entries(env, "gone", "kept")
+    outbox.add("gone", ["say", "hi"], "c1", None)
+    monkeypatch.setattr(cli, "forward", lambda *a, **k: (_ for _ in ()).throw(AssertionError("ssh was used")))
+    monkeypatch.setattr(cli, "flush_outbox", lambda *a, **k: (_ for _ in ()).throw(AssertionError("ssh was used")))
+    cli.main(["remove", "gone", "--force"])
+    out = capsys.readouterr().out
+    assert "unregistered gone" in out and "not contacted" in out and "left as it was" in out and "1 message(s) still queued" in out
+    assert list(project.load_registry()["projects"]) == ["kept"]
+
+
+def test_remove_without_force_still_forwards_a_remote_project_and_keeps_its_row(env, monkeypatch):
+    import sys
+    import pytest
+    from ttp import cli, project
+    _remote_entries(env, "far")
+    sent = []
+    monkeypatch.setattr(cli, "flush_outbox", lambda *a, **k: None)
+    monkeypatch.setattr(cli, "forward", lambda entry, argv: sent.append(argv) or 0)
+    monkeypatch.setattr(sys, "argv", ["ttp", "remove", "far"])   # need() forwards the command line as typed
+    with pytest.raises(SystemExit) as e:
+        cli.main(["remove", "far"])
+    assert e.value.code == 0 and sent and sent[0][0] == "remove"
+    assert "far" in project.load_registry()["projects"]
+
+
+def test_remove_force_on_a_local_project_removes_it_as_before(env, monkeypatch, capsys):
+    from ttp import cli, project
+    make(env, "scratch")
+    monkeypatch.setattr(cli, "stop_project", lambda proj, kill: "stopped")
+    cli.main(["remove", "scratch", "--force"])
+    assert "unregistered scratch" in capsys.readouterr().out and "scratch" not in project.load_registry()["projects"]
+
+
+def test_register_refuses_a_project_inside_a_runs_tmp_folder_unless_the_registry_is_inside_it_too(env, monkeypatch):
+    import pytest
+    from ttp import project
+    scratch = env["tmp"] / "state" / "runs" / "7" / "tmp" / "demo"
+    real_home = env["tmp"] / "real-home"
+    monkeypatch.setattr(project, "HOME_DIR", real_home)
+    with pytest.raises(project.RegistryRefused, match="tmp TTP_HOME"):
+        project.register("demo", {"host": "testhost", "dir": str(scratch)})
+    assert not (real_home / "registry.json").exists()
+    project.register("ok", {"host": "testhost", "dir": str(env["tmp"] / "state" / "runs" / "7" / "other")})   # not the tmp folder
+    monkeypatch.setattr(project, "HOME_DIR", env["tmp"] / "state" / "runs" / "7" / "tmp" / "home")   # a test's own TTP_HOME
+    project.register("demo", {"host": "testhost", "dir": str(scratch)})
+    assert "demo" in project.load_registry()["projects"]
+
+
+def test_adopt_into_a_registry_outside_a_runs_tmp_folder_is_refused_cleanly(env, monkeypatch, capsys):
+    import pytest
+    from ttp import cli, project
+    monkeypatch.setattr(project, "HOME_DIR", env["tmp"] / "real-home")
+    scratch = env["tmp"] / "state" / "runs" / "9" / "tmp" / "demo"
+    monkeypatch.setattr(cli, "adopt_refusal", lambda *a, **k: None)
+    with pytest.raises(SystemExit) as e:
+        cli.main(["adopt", "demo", "--dir", str(scratch)])
+    assert e.value.code != 0 and "not registering 'demo'" in capsys.readouterr().err

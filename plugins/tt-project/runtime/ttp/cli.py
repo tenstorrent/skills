@@ -13265,6 +13265,14 @@ def stop_project(p: Project, kill: bool) -> str:
 
 def cmd_remove(a) -> None:
     """Take a project off this machine (projectremove.py): stop it, prune its rows from the shared records, unregister it."""
+    if a.force and (entry := remote_entry(a.name)):   # its host may never answer (a name that does not resolve): drop only the row
+        from . import project
+        project.unregister(a.name)
+        print(f"unregistered {a.name} (host {entry['host']}, not contacted)")
+        queued = outbox.count(a.name)
+        print(f"left as it was: the project's folder and daemon on {entry['host']}"
+              + (f", and {queued} message(s) still queued here for it" if queued else ""))
+        return
     p = need(a.name, sys.argv[1:])
     own = os.environ.get("TTP_PROJECT")
     if os.environ.get("TTP_RUN_DIR") and own and Path(own).resolve() in (Path(p.base).resolve(), Path(p.root).resolve()):
@@ -17706,6 +17714,9 @@ def ttp_parser():
     s.add_argument("name", help="the project")
     s.add_argument("--delete-files", action="store_true",
                    help="also delete the project's tt-project folder (state, runs, worktrees, harness); the code repo stays")
+    s.add_argument("--force", action="store_true",
+                   help="for a project on another machine that cannot be reached (its host name does not resolve): "
+                        "drop only its registry row here, without contacting the host; nothing there is touched")
     s.set_defaults(fn=cmd_remove)
     s = sub.add_parser("adopt", help="record where a project lives")
     s.add_argument("name", help="the project")
@@ -18287,10 +18298,10 @@ def main(argv: list[str] | None = None) -> None:
         _recover_setup()     # a `ttp setup` a reboot cut short: finished or rolled back before anything else
     except Exception as e:
         print(f"ttp: could not recover an interrupted `ttp setup`: {e}", file=sys.stderr)
-    from .project import SecretsUnreadable
+    from .project import RegistryRefused, SecretsUnreadable
     try:
         a.fn(a)
-    except SecretsUnreadable as e:   # a command that needs a secret: a clear message, not a traceback
+    except (SecretsUnreadable, RegistryRefused) as e:   # a command that needs a secret, a row the registry refuses: a clear message, not a traceback
         die(str(e))
 
 

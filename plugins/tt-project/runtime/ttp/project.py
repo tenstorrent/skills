@@ -3411,7 +3411,26 @@ def _registry_locked() -> Iterator[None]:
         os.close(fd)
 
 
+class RegistryRefused(ValueError):
+    """A registry row that must not be written (register)."""
+
+
+_RUN_TMP = re.compile(r"^(.*/state/runs/\d+/tmp)(/|$)")   # a worker run's own scratch folder
+
+
+def _run_tmp_refusal(entry: dict) -> str | None:
+    """Why `entry` may not be registered, else None: a project folder inside a run's own tmp folder is scratch
+    that vanishes with the run, so it must not land in a registry outside that tmp (a debug run once left a stray
+    row in the real registry that way). A registry under the same tmp folder (a test's TTP_HOME) is fine."""
+    m = _RUN_TMP.match(os.path.realpath(str(entry.get("dir") or "")))
+    if m and not (os.path.realpath(str(HOME_DIR)) + "/").startswith(m.group(1) + "/"):
+        return f"{entry['dir']} is inside a run's own tmp folder, but the registry {registry_path()} is not: use a tmp TTP_HOME"
+    return None
+
+
 def register(name: str, entry: dict) -> None:
+    if why := _run_tmp_refusal(entry):
+        raise RegistryRefused(f"not registering {name!r}: {why}")
     with _registry_locked():
         reg = load_registry()
         reg.setdefault("projects", {})[name] = {**reg["projects"].get(name, {}), **entry, "updated": time.time()}
