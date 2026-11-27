@@ -2860,6 +2860,22 @@ def cmd_runs_live(a) -> None:
         print(runwatch.text(data, task))
 
 
+def cmd_timeline(a) -> None:
+    """One task's time, step by step (timeline.py): creation, queueing, each run's dispatch, worker
+    start and end, each detached job's start, end and exit code, each wait with the wake that ended
+    it, and totals by bucket (queue, start-up, test, wait, failed-and-redone). Read-only."""
+    from . import timeline
+    p = need(a.name, sys.argv[1:])
+    ref = str(a.task).strip().lstrip("#")
+    if not ref.isdigit():
+        die(f"timeline needs a task id, not {a.task!r}")
+    t = p.db.task(int(ref))
+    if not t:
+        die(f"no task #{ref} in {p.name}", 1)
+    rep = timeline.task(p, t)
+    print(json.dumps(rep, indent=1) if a.json else timeline.timeline_text(rep, p))
+
+
 def cmd_eta(a) -> None:
     """Expected finish of a task or obligation from its critical path (eta.py): measured medians, no padding.
     Workers read it before setting a retry or deadline wake."""
@@ -16491,7 +16507,7 @@ COMMAND_GROUPS = (
     ("admin", ("setup", "upgrade", "start", "stop", "restart", "remove", "adopt", "prune", "secret", "consent",
                "notifier", "schedules", "heal", "upstream", "check-plan", "stats", "audit",
                "push-audit", "retire-tip", "ttr", "selfchange", "chat-load", "spend-today", "throughput", "model-trip", "echoes", "course",
-               "uninstall", "bench", "model-bench", "model", "waste", "slop", "bridge", "gh-queue", "move", "landings")),
+               "uninstall", "bench", "model-bench", "model", "waste", "slop", "bridge", "gh-queue", "move", "landings", "timeline")),
 )
 
 
@@ -17124,6 +17140,15 @@ def ttp_parser():
                         "delivered by the conservative time or due) and the per-kind correction in use")
     s.add_argument("--days", type=float, default=7.0, help="with --calibration: the window (default 7)")
     s.set_defaults(fn=cmd_eta)
+
+    s = sub.add_parser("timeline", help="one task's time, step by step: creation, queueing, each "
+                                       "run's dispatch, worker start and end, each detached job's start, "
+                                       "end and exit code, each wait and the wake that ended it, and "
+                                       "totals by bucket (queue, start-up, test, wait, failed-and-redone)")
+    s.add_argument("name", help="the project")
+    s.add_argument("task", help="the task id")
+    s.add_argument("--json", action="store_true", help="print JSON")
+    s.set_defaults(fn=cmd_timeline)
 
     s = sub.add_parser("landings", help="where landing time goes: created to landed split into queue, runs, "
                                         "review, checks, push queue and gaps between runs by cause (model-free)")

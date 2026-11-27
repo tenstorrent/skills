@@ -970,6 +970,13 @@ coordinator with that evidence.
   task's current step and how long it has been in it. The daily review lists the 5 slowest landings of 24 h
   and the top recurring cause of 7 days, and queues one fix task titled `landing time: <cause>` for that
   cause, never a second while one is open.
+- Per-task time breakdown (timeline.py, `ttp timeline <project> <task>`), model-free from the
+  records the harness already keeps: the task row, its runs, each run folder's detached-job registry
+  and files, and its wait events. It lists creation and queueing, each run's dispatch, worker start
+  and end, each detached job's start, end and exit code (a job on another host from the wait record
+  that polls it), and each wait with the wake that ended it, then totals the wall time by bucket:
+  queue, start-up, test (detached jobs running), wait, model, with time spent on failed attempts
+  that were run again called out. `--json` prints the same as JSON.
 - ETA ledger (etaledger.py, `ttp eta --calibration`): every ETA shown (the Expected finish of a task or a
   promise, an obligation due, `ttp eta` output) is appended to `state/eta-ledger.jsonl` with its likely
   and conservative times, and its delivered time once the work lands or the obligation closes. Promises
