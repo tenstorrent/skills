@@ -4890,6 +4890,7 @@ class Daemon:
             log(self.p, f"glmquota: {text}")
             self.alert("glm-quota-cap-lifted", text, severity="low", every_s=0)
         if q and (text := glmquota.rearm_notice(q["key"], now)):
+            log(self.p, f"glmquota: {text}")
             self.alert("glm-quota-cap-rearmed", text, severity="low", every_s=0)
         if os.environ.get("TTP_TEST_NO_MODELS_PROBE") or (self._models_probe and self._models_probe.is_alive()):
             return

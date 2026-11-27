@@ -263,6 +263,11 @@ def _fit(rows: list) -> tuple[float, float] | None:
     return beta[2] + beta[4], math.sqrt(var)
 
 
+def _ours_hour(st: dict, now: float) -> int:
+    """Our own tokens in the UTC hour `now` falls in."""
+    return int(((st.get("hours") or {}).get(str(int(now - now % HOUR_S))) or [0])[0])
+
+
 def _flat_or_not_ours(rows: list) -> bool:
     """Whether the rows' drops are too flat, or too little of them ours, for the fit to tell our weight."""
     drops = [r[4] for r in rows]
@@ -294,7 +299,8 @@ def _judge(st: dict, now: float, mode: str | None = None) -> None:
     ok = got[0] + 2 * got[1] < LIFT_MAX_WEIGHT
     votes = int(lift.get("votes") or 0) + 1 if ok else 0
     st["lift"] = {"votes": votes, "at": now, "weight": round(got[0], 3), "err": round(got[1], 3),
-                  "lifted": now if votes >= LIFT_VOTES else 0, "told": 0}
+                  "lifted": now if votes >= LIFT_VOTES else 0, "told": 0,
+                  **{k: lift[k] for k in ("rearmed", "rearm_told") if k in lift}}   # a re-arm's notice still goes out
 
 
 def lift_mode() -> str:
@@ -322,16 +328,24 @@ def check_setting(dotted: str, v) -> str:
     return ""
 
 
-def lift_notice(key: str, now: float | None = None) -> str:
-    """Once, the text saying the self-lift happened (the daemon notifies it); '' otherwise."""
+def _tell_once(key: str, flag: str, told: str, now: float | None) -> dict:
+    """The lift record when its `flag` is set and not yet told (marking it told now), else {}: each daemon
+    notice goes out once per host."""
     now = time.time() if now is None else now
     with _locked(key) as path:
         st = _read(path)
         lift = st.get("lift") or {}
-        if not lift.get("lifted") or lift.get("told"):
-            return ""
-        st["lift"] = {**lift, "told": now}
+        if not lift.get(flag) or lift.get(told):
+            return {}
+        st["lift"] = {**lift, told: now}
         _write(path, st)
+    return lift
+
+
+def lift_notice(key: str, now: float | None = None) -> str:
+    """Once, the text saying the self-lift happened (the daemon notifies it); '' otherwise."""
+    if not (lift := _tell_once(key, "lifted", "told", now)):
+        return ""
     return (f"GLM hourly cap lifted by itself: {lift.get('votes')} evaluations in a row found cached tokens no "
             f"longer count against the org quota (weight {lift.get('weight')} +- {lift.get('err')}). "
             f"Force it back with `ttp config --account {LIFT_KEY} off`.")
@@ -339,14 +353,8 @@ def lift_notice(key: str, now: float | None = None) -> str:
 
 def rearm_notice(key: str, now: float | None = None) -> str:
     """Once, the text saying a quota 429 re-armed the lifted cap (the daemon notifies it); '' otherwise."""
-    now = time.time() if now is None else now
-    with _locked(key) as path:
-        st = _read(path)
-        lift = st.get("lift") or {}
-        if not lift.get("rearmed") or lift.get("rearm_told"):
-            return ""
-        st["lift"] = {**lift, "rearm_told": now}
-        _write(path, st)
+    if not _tell_once(key, "rearmed", "rearm_told", now):
+        return ""
     return ("GLM hourly cap re-armed: the org quota refused us while the cap was lifted and our own use was past "
             f"the cap. The lift is cleared; it is judged again from fresh readings. Keep it off with "
             f"`ttp config --account {LIFT_KEY} off`.")
@@ -397,8 +405,8 @@ def sync(key: str, got: dict, window_s: float = 3600, now: float | None = None, 
         if "used" in got:
             st["used"] = max(ours, int(got["used"]))
         if spent:
-            if lift_mode() == "auto" and (st.get("lift") or {}).get("lifted") and cap_setting() > 0 and \
-                    int(((st.get("hours") or {}).get(str(int(now - now % HOUR_S))) or [0])[0]) >= cap_setting():
+            if lift_mode() == "auto" and (st.get("lift") or {}).get("lifted") and 0 < cap_setting() <= \
+                    _ours_hour(st, now):
                 st["lift"] = {"votes": 0, "at": now, "lifted": 0, "rearmed": now, "told": 0}   # the org refused us
             if not int(got.get("limit") or 0) and ours > 0:
                 st["observed"] = [o for o in (st.get("observed") or []) if float(o[0]) > now - OBSERVED_KEEP_S] + \
@@ -443,7 +451,7 @@ def view(cfg: dict | None, now: float | None = None) -> dict:
             out["why"] = "quota left is spent until the reset"
     hour = now - now % HOUR_S
     gone = (now - hour) / HOUR_S
-    ours = int(((st.get("hours") or {}).get(str(int(hour))) or [0, 0])[0])
+    ours = _ours_hour(st, now)
     left = st.get("remaining") or {}
     out["ours_hour"] = ours
     if float(left.get("at") or 0) >= hour:
