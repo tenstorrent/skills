@@ -2660,6 +2660,35 @@ def test_dispatch_holds_daemon_reviews_of_one_unchanged_subject_but_not_a_re_rev
     assert supersede.dispatch_hold(p.db, p.db.task(r2)) == ""
 
 
+def test_dispatch_never_holds_the_fix_tasks_of_different_failing_schedules_as_duplicates(env):
+    """The daemon's fix task for a schedule that failed twice reads alike for every schedule, so the second
+    schedule's fix was held as a duplicate of the first's. Fix tasks of other schedules are other work; the
+    same schedule's second fix task (same title) is still a duplicate."""
+    from ttp import coordinator as coord
+    from ttp import daemon as dm
+    from ttp import supersede, tried
+    p = make(env)
+    d = dm.Daemon(p.base)
+    names = ("page-watch", "stale-reap", "push-posted", "stale-locks")
+    fixes = {}
+    for name in names:   # two failed runs in a row make the daemon queue the fix task, as in service
+        p.db.x("INSERT INTO schedules(name, kind, every_s, enabled, payload) VALUES(?,?,?,?,?)",
+               (name, "command", 600, 1, json.dumps({"command": "x"})))
+        for _ in range(2):
+            d._schedule_ran({"name": name}, "error: boom", None)
+        (fixes[name],) = [r["id"] for r in p.db.q("SELECT id FROM tasks WHERE title LIKE ?",
+                                                  (f"Fix schedule {name}:%",))]
+    for name in names:
+        assert supersede.dispatch_hold(p.db, p.db.task(fixes[name])) == "", name
+    for name, other in [(x, y) for x in names for y in names if x != y]:
+        a, b = p.db.task(fixes[name]), p.db.task(fixes[other])
+        assert not coord.looks_same(a["title"], a["spec"], b["title"], b["spec"]), (name, other)
+        assert not tried.similar(a["title"], a["spec"], b["title"], b["spec"]), (name, other)
+    again = p.db.add_task(p.db.task(fixes["page-watch"])["title"], p.db.task(fixes["page-watch"])["spec"],
+                          kind="harness", origin="daemon", labels=["schedule_fix:page-watch"])
+    assert f"duplicates #{fixes['page-watch']}" in supersede.dispatch_hold(p.db, p.db.task(again))
+
+
 def test_dispatch_never_holds_owners_of_different_obligations_as_duplicates(env):
     """The owner note the harness appends to each owner's spec reads alike for any two obligations, so two owners
     of different obligations looked like one task and the second was held. Owning other obligations is other

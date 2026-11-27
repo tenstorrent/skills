@@ -4909,6 +4909,8 @@ def looks_same(title1: str, spec1: str, title2: str, spec2: str) -> bool:
     iterations, candidates) and name different ones are different work, however alike they read."""
     if _same_text(title1, title2):
         return True
+    if tried.named_apart(title1, title2):
+        return False
     n1, n2 = (set(re.findall(r"\d[\w.-]*", t.lower())) for t in (title1, title2))
     if n1 and n2 and n1 != n2:
         return False

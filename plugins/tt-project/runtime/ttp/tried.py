@@ -74,6 +74,20 @@ _NAME_BEFORE = re.compile(r"\b[A-Za-z]*[A-Z][\w-]*\s$")
 _LIST_DOT = re.compile(r"\.(?:\s|$)")
 
 
+# Daemon-made title templates whose one slot names the thing the task is about (a schedule): two titles
+# of one template that fill the slot differently are different work, however alike the rest reads.
+_NAMED = (re.compile(r"^fix schedule (\S+?): "),)
+
+
+def named_apart(title1: str, title2: str) -> bool:
+    """Whether both titles fill one daemon template's name slot, with different names."""
+    for rx in _NAMED:
+        m1, m2 = rx.match((title1 or "").strip().lower()), rx.match((title2 or "").strip().lower())
+        if m1 and m2 and m1.group(1) != m2.group(1):
+            return True
+    return False
+
+
 def _stem(w: str) -> str:
     for suffix in ("ing", "ed", "s"):
         if w.endswith(suffix) and len(w) - len(suffix) >= 3:
@@ -156,6 +170,8 @@ def similar(title1: str, spec1: str, title2: str, spec2: str, usual: frozenset =
     """Whether new work (title1, spec1) repeats earlier work (title2, spec2): never when both name the
     commits or releases they act on (targets) and share none. `usual` (see common) is left out of the
     shared parameters and title subject that the parameters rule needs."""
+    if named_apart(title1, title2):
+        return False
     spec1, spec2 = content(spec1), content(spec2)
     t1, t2 = release_targets(f"{title1} {spec1}"), release_targets(f"{title2} {spec2}")
     if t1 and t2 and not t1 & t2:
