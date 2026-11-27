@@ -1022,15 +1022,28 @@ def _record_branchless(p, tid: int, sha: str, ref: str, repos: list[Path]) -> st
     return f"task #{tid}: no branch; recorded as superseded by {full[:10]} ({words})"
 
 
-def _keys(repo: Path, args: list[str], skip: list[str]) -> list[tuple[str, str]]:
+# equivalent's bounds: how many of the branch's own commits and how many bytes of diff it compares,
+# and how long it may take in all. Past one it has no answer (None): never "landed".
+EQUIV_MAX_OWN = 200
+EQUIV_MAX_BYTES = 8_000_000
+EQUIV_BUDGET_S = 20.0
+
+
+class _OverBound(Exception):
+    """A comparison past EQUIV_MAX_OWN commits, EQUIV_MAX_BYTES bytes or EQUIV_BUDGET_S seconds."""
+
+
+def _keys(repo: Path, args: list[str], skip: list[str], timeout: float = 60) -> list[tuple[str, str]]:
     """[(commit, key)] of `git log <args>`, oldest first: the key is a hash of each file's added and
     removed lines (no context, no line numbers), with the `skip` paths left out. A rebase that moved
     the context or took the version files keeps the key; git's patch-id does not. Merges and commits
-    that change only `skip` paths are left out."""
+    that change only `skip` paths are left out. _OverBound when the diff is past EQUIV_MAX_BYTES."""
     out = _git(repo, "log", "--reverse", "--no-merges", "-p", "-U0", "--no-renames", "--no-color",
-               "--format=%x00%H", *args, "--", ".", *(f":(exclude){x}" for x in skip), timeout=60)
+               "--format=%x00%H", *args, "--", ".", *(f":(exclude){x}" for x in skip), timeout=timeout)
     if out.returncode != 0:
         return []
+    if len(out.stdout) > EQUIV_MAX_BYTES:
+        raise _OverBound
     keys = []
     for chunk in out.stdout.split("\0")[1:]:
         sha, _, body = chunk.partition("\n")
@@ -1090,14 +1103,27 @@ def equivalent(p, branch: str, bump=None) -> tuple[str, str] | None:
     seen = (str(repo), head, tip, tuple(skip))
     if seen in _timed_out:
         raise _timed_out[seen]
+    end = time.monotonic() + EQUIV_BUDGET_S
+    left = lambda: max(1.0, min(60.0, end - time.monotonic()))   # noqa: E731
     try:
         # Each side's own commits: a branch that merged upstream commits the push branch also has
         # (criss-cross history, whose merge base can be the old fork point) does not read them.
-        mine = _keys(repo, [f"{tip}..{head}"], skip)
+        mine = _keys(repo, [f"--max-count={EQUIV_MAX_OWN + 1}", f"{tip}..{head}"], skip, left())
+        if len(mine) > EQUIV_MAX_OWN or time.monotonic() > end:
+            return None
         theirs: dict[str, str] = {}
         if mine:
-            for sha, key in _keys(repo, ["--max-count=500", f"{head}..{tip}"], skip):
+            for sha, key in _keys(repo, ["--max-count=500", f"{head}..{tip}"], skip, left()):
                 theirs.setdefault(key, sha)
+        if mine and not all(key in theirs for _, key in mine):
+            if time.monotonic() > end:
+                return None
+            whole = _git(repo, "diff", "-U0", "--no-renames", "--no-color", base, head, "--", ".",
+                         *(f":(exclude){x}" for x in skip), timeout=left())
+            if len(whole.stdout) > EQUIV_MAX_BYTES:
+                return None
+    except _OverBound:
+        return None
     except subprocess.TimeoutExpired as e:
         if not isinstance(e, gitmemo.Spent):
             while len(_timed_out) >= 64:
@@ -1108,8 +1134,6 @@ def equivalent(p, branch: str, bump=None) -> tuple[str, str] | None:
         return None
     if all(key in theirs for _, key in mine):
         return theirs[mine[-1][1]], head
-    whole = _git(repo, "diff", "-U0", "--no-renames", "--no-color", base, head, "--", ".",
-                 *(f":(exclude){x}" for x in skip), timeout=60)
     key = _key_of(whole.stdout) if whole.returncode == 0 else ""
     return (theirs[key], head) if key in theirs else None
 

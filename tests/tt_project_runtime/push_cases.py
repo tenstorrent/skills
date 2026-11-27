@@ -23525,8 +23525,8 @@ def test_landed_equivalent_reads_only_the_task_own_commits_when_both_sides_merge
     scanned = []
     keys = landed._keys
 
-    def spy(repo, args, skip):
-        out = keys(repo, args, skip)
+    def spy(repo, args, skip, *rest):
+        out = keys(repo, args, skip, *rest)
         scanned.append((args, out))
         return out
 
@@ -23572,3 +23572,59 @@ def test_landed_equivalent_does_not_rerun_a_timed_out_scan_until_a_head_moves(en
         with pytest.raises(subprocess.TimeoutExpired):
             landed.equivalent(p, branch, None)
     assert len(logs) == 4, "a call its budget never let start is not kept"
+
+
+def _relanded_change(env, monkeypatch, n, behind=0):
+    """A task branch of `n` one-file commits, each re-landed as another commit on the push branch,
+    which also gained `behind` unrelated commits since. Returns (p, branch, head, relanded)."""
+    p, repo, origin, other = _push_setup(env, monkeypatch, ["true"])
+    tid, path, branch = _code_task(p, "own change", status="review")
+    for i in range(n):
+        _commit(path, f"own{i}.txt", f"change {i}\n")
+        (other / f"own{i}.txt").write_text(f"change {i}\n")
+        _git_out(other, "add", f"own{i}.txt")
+        _git_out(other, "commit", "-qm", f"re-land {i} under another task")
+    relanded = _git_out(other, "rev-parse", "HEAD")
+    stream = [f"commit refs/heads/far\ncommitter t <t@t> {1_700_000_000 + i} +0000\ndata 1\nx\n"
+              + (f"from {relanded}\n" if i == 0 else "") + f"M 644 inline far/{i}.txt\ndata 2\nx\n\n"
+              for i in range(behind)]
+    if stream:
+        subprocess.run(["git", "-C", str(other), "fast-import", "--quiet"], input="".join(stream), text=True,
+                       check=True)
+        _git_out(other, "push", "-q", "origin", "far:proj")
+    else:
+        _git_out(other, "push", "-q", "origin", "HEAD:proj")
+    _git_out(repo, "fetch", "-q", "origin")
+    return p, branch, _git_out(path, "rev-parse", "HEAD"), relanded
+
+
+def test_landed_equivalent_with_a_push_branch_far_behind_still_finds_the_change_in_time(env, monkeypatch):
+    from ttp import landed
+    p, branch, head, relanded = _relanded_change(env, monkeypatch, 2, behind=2100)
+    start = time.monotonic()
+    found = landed.equivalent(p, branch, None)
+    assert time.monotonic() - start < 10
+    assert found is None   # the 500 newest commits do not reach it: no answer, never landed
+
+
+def test_landed_equivalent_over_its_commit_bound_has_no_answer_never_landed(env, monkeypatch):
+    from ttp import landed
+    p, branch, head, relanded = _relanded_change(env, monkeypatch, 4)
+    assert landed.equivalent(p, branch, None) == (relanded, head), "within the bound it is found"
+    monkeypatch.setattr(landed, "EQUIV_MAX_OWN", 3)
+    assert landed.equivalent(p, branch, None) is None
+
+
+def test_landed_equivalent_over_its_diff_bytes_bound_has_no_answer_never_landed(env, monkeypatch):
+    from ttp import landed
+    p, branch, head, relanded = _relanded_change(env, monkeypatch, 2)
+    assert landed.equivalent(p, branch, None) == (relanded, head)
+    monkeypatch.setattr(landed, "EQUIV_MAX_BYTES", 20)
+    assert landed.equivalent(p, branch, None) is None
+
+
+def test_landed_equivalent_past_its_time_budget_has_no_answer(env, monkeypatch):
+    from ttp import landed
+    p, branch, head, relanded = _relanded_change(env, monkeypatch, 2)
+    monkeypatch.setattr(landed, "EQUIV_BUDGET_S", -1.0)
+    assert landed.equivalent(p, branch, None) is None
