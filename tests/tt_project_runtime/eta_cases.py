@@ -1088,7 +1088,7 @@ def test_eta_detached_jobs_estimate_from_measured_job_history(env):
     # The task under estimate: three running jobs, 300 s in, named with suffixes that normalise.
     t = _waiting_jobs_task(p, now, ["load-2", "plain", "full-run3"])
     e = eta.estimate(p.db, t, now)
-    # medians 600 + 300 + 1800 less the 300 s elapsed; the startup median never lands (jobs run).
+    # medians 600 + 300 + 1800 less the 300 s elapsed.
     assert e["end"] == pytest.approx(now + (600 - 300) + (300 - 300) + (1800 - 300)), e["legs"]
     assert [k for k, _ in e["legs"]] == ["load", "plain", "full"]
     assert e["p90_end"] == pytest.approx(now + (600 - 300) + 0 + (5040 - 300)), e["p90_end"]   # the p80 sum
