@@ -83,7 +83,8 @@ def backrefs(text: str, later: list[str] | tuple = (), open_asks: list[dict] | t
         cut = max((x.end() for x in re.finditer(r"[.;:,](?=\s|$)|\n", text[:m.start()])), default=0)   # not 'v1.0'
         clause = (text[cut:m.start()]   # an aside ', not sent yet,' never negates
                   + re.sub(r",[^,]*,", " ", m.group(0)))
-        if (not back and (_NEGATED.search(clause) or _SENT_OUT.search(m.group(0)))) or (
+        if (not back and (_NEGATED.search(clause) or _SENT_OUT.search(m.group(0))
+                          and not re.search(r"\bstill\b|pending\s+your", m.group(0)))) or (
                 # an item already sent out is not pending, whatever awaits phrase follows it
                 _OPENS.search(text[:m.start()]) and _CLOSES.search(text[m.end():])):
             continue
