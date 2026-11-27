@@ -22,11 +22,12 @@ from __future__ import annotations
 
 import re
 
-from .pointers import has_content
+from . import pendingask
+from .pointers import has_content, part_of
 
 _EARLIER = r"\b(?:in|from|of|see)\s+(?:my|the|our)\s+(?:earlier|previous|prior|last)\s+messages?\b"
 _POINT_BACK = re.compile(
-    rf"{_EARLIER}|\bsee above\b|\bdrafts?\s+above\b|\bas\s+drafted\s+(?:earlier|before|above)\b"
+    rf"{_EARLIER}|\bsee above\b(?!\s+in\s+the\b)|\bdrafts?\s+above\b|\bas\s+drafted\s+(?:earlier|before|above)\b"
     r"|\bthe\s+drafts?\s+(?:I|we)\s+(?:sent|posted|shared|wrote)\b",
     re.I)
 _SPAN = r"(?:(?!,\s*(?:and|but|so|while)\b)[^.;:\n]){0,120}"   # one clause: no . ; : , and/but or line break
@@ -42,9 +43,11 @@ _BLOCK = r"^\s*>|^```|\"[^\"]{30,}\"|“[^”]{30,}”"   # quoted text a back-r
 _BLOCKS = re.compile(_BLOCK, re.M)
 _QUOTED = re.compile(_BLOCK + r"|`[^`\n]+`", re.M)
 _STOP = re.compile(r"[.;!?](?=\s|$)|\n")
+_BARE = re.compile(_EARLIER, re.I)   # points back only with a pending item in its sentence
+_PENDING = re.compile(rf"\b{_ITEM}|{_AWAITS}", re.I)
 
 
-def _attached(text: str, start: int, after: str, ids: list[str], back: bool) -> bool:
+def _attached(text: str, start: int, after: str, ids: list[int], back: bool) -> bool:
     """Whether quoted text belongs to the phrase at `start`: in its own sentence, as the first lines
     after it, or (an ask) its '- ask <id>:' line. A back-reference takes no inline code span: a
     command is not the earlier text."""
@@ -52,9 +55,12 @@ def _attached(text: str, start: int, after: str, ids: list[str], back: bool) -> 
     q = quoted.search(text, start)
     if q and not _STOP.search(text[start:q.start()]):
         return True
-    first = next((ln for ln in after.splitlines() if ln.strip() and not re.fullmatch(r"\s*\(\d+/\d+\)\s*", ln)), "")
-    return bool(quoted.search(first)) or bool(
-        ids and all(re.search(rf"^\s*- ask\s+{i}:", text, re.M) for i in ids))
+    first = next((ln for ln in after.splitlines() if ln.strip() and not part_of(ln)), "")
+    if quoted.search(first) or (ids and all(re.search(rf"^\s*- ask\s+{i}:", text, re.M) for i in ids)):
+        return True
+    # an ask quoted in full (pendingask.expand appended nothing): its question follows in the next sentence
+    nxt = re.split(r"(?<=[.!?])\s+|\n", text[start:].split("\n\n")[0], maxsplit=1)
+    return bool(ids and len(nxt) > 1 and "?" in nxt[1] and not re.match(r"\s*- ask\s+\d+:", nxt[1]))
 
 
 def backrefs(text: str, later: list[str] | tuple = ()) -> list[str]:
@@ -75,8 +81,13 @@ def backrefs(text: str, later: list[str] | tuple = ()) -> list[str]:
         line_end = text[m.end():eol if eol >= 0 else len(text)].rstrip()
         after = text[eol + 1 if eol >= 0 else len(text):] + "\n" + tail
         item = re.search(_ITEM, m.group(0), re.I)
-        ids = re.findall(r"\b\d+\b", m.group(0)) if item and item.group(0).lower().startswith("ask") else []
-        if (_attached(text, m.start(), after, ids, back) or (line_end.endswith(":") and has_content(after))
+        ids = pendingask.refs(m.group(0))
+        if back and _BARE.fullmatch(m.group(0)):   # 'in my earlier message I said ...' with nothing pending
+            lo = max((x.end() for x in _STOP.finditer(text[:m.start()])), default=0)
+            hi = _STOP.search(text, m.end())
+            if not _PENDING.search(text[lo:hi.start() if hi else len(text)]) and not line_end.endswith(":"):
+                continue
+        if (_attached(text, m.start(), after, ids, back) or (not back and line_end.endswith(":") and has_content(after))
                 or (not back and re.match(r":\s*\S", line_end))):
             continue
         p = " ".join(m.group(0).split()) if back else \

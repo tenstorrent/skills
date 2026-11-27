@@ -133,3 +133,17 @@ def test_plain_pull_request_and_command_status_passes():
                   "Every draft written for you to post carries the tag; the ask for the tag went out."):
         assert quotefull.backrefs(plain) == [], plain
     assert quotefull.backrefs("Please run the command for you to approve.") != []
+
+
+def test_an_earlier_message_pointer_needs_a_pending_item_and_an_ask_quoted_in_full_passes():
+    from ttp import quotefull
+    for miss in ("See above:\nTask 12 landed.", _MISS[:-1] + ":\nTask 12 landed.",
+                 "Drafts in my earlier messages, ready to send. Ran:\n`ttp status`",
+                 "Ask 12 is still open. Task 9 landed.", "Ask 12 is still open.\n- ask 13: Other?"):
+        assert quotefull.backrefs(miss) != [], miss
+    for ok in ("In my earlier message I said the board was down; it is back up.",
+               "As in my previous message, the board is back up.", "See above in the log: CI is green.",
+               "Ask 12 from 3 days ago is still open.\n- ask 12: Reboot?",
+               "Ask 12 for board 2 is still pending.\n- ask 12: Reboot?",
+               "Ask 12 is still open. Reboot the board now or after the soak? Recommendation: after the soak"):
+        assert quotefull.backrefs(ok) == [], ok
