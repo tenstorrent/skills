@@ -822,10 +822,12 @@ def watch_prs(daemon, payload: dict | None = None) -> str:
         except Exception as e:   # noqa: BLE001 - the purview never stops the task PRs' reads
             _log(daemon, f"pr-watch: purview not read: {type(e).__name__}: {e}")
     elif prbabysit.settings(getattr(daemon, "cfg", None))["enabled"]:   # no discovery, but the known PRs are read
-        known = set(((db.kv(PURVIEW_KEY, {}) or {}).get("prs") or {})) | _purview_scope(daemon)[2]
+        rows = (db.kv(PURVIEW_KEY, {}) or {}).get("prs") or {}
         named = {t["pr_url"] for t in watch}
-        watch += [{"id": None, "pr_url": u, "title": "", "status": "open", "purview": True} for u in sorted(known - named)
-                  if (seen.get(u) or {}).get("state") not in DONE_STATES]
+        watch += [{"id": None, "pr_url": u, "title": "", "status": "open", "purview": True}
+                  for u in sorted((set(rows) | _purview_scope(daemon)[2]) - named)
+                  if (seen.get(u) or {}).get("state") not in DONE_STATES
+                  and time.time() - float((rows.get(u) or {}).get("read") or 0) >= prbabysit.READ_S]
     tried = {u: n for u, n in (db.kv(PR_TRIED_KEY, {}) or {}).items() if u in {t["pr_url"] for t in watch}}
     stint = max(tried.values(), default=0) + 1
     order = sorted(watch, key=lambda t: tried.get(t["pr_url"], 0))

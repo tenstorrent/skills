@@ -307,7 +307,35 @@ def test_prbabysit_a_workflow_read_not_answered_is_asked_again_next_sweep_and_ke
     assert not p.db.kv("pr_workflows"), "an unanswered read caches nothing"
     gone["on"] = False
     watchers.watch_prs(d)
-    assert len(p.db.kv("pr_workflows")) == len(_PB_FLOWS)
+    assert len(p.db.kv("pr_workflows")) == len(_PB_FLOWS) + 1, "each file by blob, the listing by sha"
     n = len(calls)
     watchers.watch_prs(d)
     assert [c for c in calls[n:] if "/contents/.github/workflows/" in c[1]] == [], "each file is read once per blob"
+
+
+def test_prbabysit_a_skipped_job_of_a_workflow_that_ran_is_not_not_run_and_a_label_entry_lists_its_workflow(env, monkeypatch):
+    from ttp import watchers
+    _pb_gh(monkeypatch)
+    pr = _pb_pr(statusCheckRollup=[
+        {"name": "validate", "workflowName": "ci", "status": "COMPLETED", "conclusion": "SUCCESS"},
+        {"name": "publish", "workflowName": "ci", "status": "COMPLETED", "conclusion": "SKIPPED"}])
+    p, d, _ = _pb_run(env, monkeypatch, pr, cfg={"pr_babysit.dispatch": {"acme/widgets": ["label:run-heavy"]}})
+    watchers.watch_prs(d)
+    ev = [t for k, t in _pb_events(p) if k == "pr_ci_not_run"]
+    assert len(ev) == 1 and "Heavy (trigger: label run-heavy)" in ev[0] and "ci (" not in ev[0], ev
+    assert "Nightly" not in ev[0], "only what dispatch lists"
+
+
+def test_prbabysit_pending_checks_hold_back_only_the_never_run_list_and_a_mergeable_unknown_repeats_nothing(env, monkeypatch):
+    from ttp import prbabysit
+    _pb_gh(monkeypatch)
+    old = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() - 50 * 3600))
+    p, d, lines = _pb_run(env, monkeypatch, _pb_pr(), cfg={"pr_babysit.dispatch": {"acme/widgets": ["heavy.yml"]}})
+    sig = lambda m, checks="pending": {"state": "OPEN", "draft": False, "decision": "", "mergeable": m, "checks": checks}
+    pr = _pb_pr(updatedAt=old, reviewRequests=[{"login": "rev1"}], statusCheckRollup=[
+        {"name": "x", "workflowName": "ci", "status": "IN_PROGRESS", "conclusion": ""}])
+    for m in ("MERGEABLE", "CONFLICTING", "UNKNOWN", "CONFLICTING"):
+        prbabysit.sweep(d, {"id": None, "pr_url": _PB_URL}, pr, sig(m), lambda a, c: None)
+    ev = [k for k, _ in _pb_events(p)]
+    assert "pr_idle" in ev and "pr_ci_not_run" not in ev, ev
+    assert [x for x, _ in lines].count(f"[acme/widgets#7]({_PB_URL}): has a merge conflict") == 1, lines
