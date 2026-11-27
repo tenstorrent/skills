@@ -185,6 +185,13 @@ def sentences(text: str) -> list[tuple[str, ...]]:
     return out
 
 
+def _closing(text: str) -> tuple[str, ...] | None:
+    """The sentence alone on the last line of a message of several lines (a sign-off), or None."""
+    lines = [x for x in str(text or "").splitlines() if x.strip()]
+    got = sentences(lines[-1]) if len(lines) > 1 else []
+    return got[0] if len(got) == 1 else None
+
+
 def _effort(level: str) -> str:
     return "xhigh" if level.startswith("extra") else level
 
@@ -257,7 +264,8 @@ def repeats(db: DB, msgs: list[dict], now: float | None = None) -> dict[int, tup
     """{message id: (first id, sentence)} for the inbound messages in `msgs` with a sentence an earlier
     inbound message of the last REPEAT_S already had (or an anchored instruction of any length one
     already gave): the first message that said it, and the sentence as first said. A routine report
-    (`report`: a push acknowledgment, a status line naming a commit) asks for nothing and never repeats."""
+    (`report`: a push acknowledgment, a status line naming a commit) asks for nothing and never repeats, nor
+    does a sign-off (`_closing`: the line a sender ends each message with, an earlier one ended with too)."""
     now = time.time() if now is None else now
     new = sorted((m for m in msgs if m.get("direction", "in") == "in" and m.get("kind", "user") != "finding"
                   and (m.get("text") or "").strip() and not report(m.get("text"))), key=lambda m: int(m["id"]))
@@ -269,6 +277,7 @@ def repeats(db: DB, msgs: list[dict], now: float | None = None) -> dict[int, tup
     first: dict[tuple, tuple[int, str]] = {}   # normalized sentence: (first id, its words)
     last: dict[tuple, float] = {}              # normalized sentence: when it was last said
     recent: list[tuple[frozenset, tuple]] = []
+    closed: set[tuple] = set()               # sentences an earlier message ended with (`_closing`)
     by_anchor: dict[str, list[tuple]] = {}   # anchor: (id, ts, non-anchor content, clause, anchors)
     df: Counter = Counter()   # content word: how many earlier clauses had it
     out, i = {}, 0
@@ -280,6 +289,7 @@ def repeats(db: DB, msgs: list[dict], now: float | None = None) -> dict[int, tup
                     first[s] = (int(rows[i]["id"]), " ".join(s))
                     recent.append((frozenset(s), s))
                 last[s] = float(rows[i]["ts"] or 0)
+            closed.add(_closing(rows[i]["text"]))
             for words, anc, ask, rest in clauses(rows[i]["text"], cited.get(rows[i]["chat"], ())):
                 df.update(rest)
                 for a in anc if not ask else ():
@@ -288,13 +298,14 @@ def repeats(db: DB, msgs: list[dict], now: float | None = None) -> dict[int, tup
                     del got[:-REPEAT_NEAR]
             i += 1
         recent = recent[-REPEAT_NEAR:]
-        ts = float(m.get("ts") or now)
+        ts, end = float(m.get("ts") or now), _closing(m.get("text"))
         for s in sentences(m.get("text") or ""):
             hit = s if s in first else None
             if not hit:
                 toks = frozenset(s)
                 hit = next((o for t, o in recent if _near(toks, t)), None)   # oldest first
-            if hit and ts - last[hit] > RESEND_S:   # sooner: one message delivered twice (`resends`)
+            # sooner: one message delivered twice (`resends`); a sign-off both end with: no repeat
+            if hit and ts - last[hit] > RESEND_S and not (s == end and hit in closed):
                 out[mid] = first[hit]
                 break
         if mid in out:

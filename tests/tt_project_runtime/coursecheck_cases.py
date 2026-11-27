@@ -667,6 +667,25 @@ def test_a_plain_order_sharing_only_a_model_name_and_two_words_with_an_earlier_c
     assert correction.flag(p.db, p.config(), rows(again), now) == {again: f"repeats #{old}"}
 
 
+def test_a_sign_off_line_every_relayed_message_ends_with_is_no_repeat(env):
+    """A relayer that closes each message in a thread with the same line: that line repeats nothing, so a new
+    order or a question after an earlier correction is no correction; a message repeating the correction's
+    own words still is."""
+    from ttp import correction
+    p = make(env)
+    now = time.time()
+    sign = "\nAnd you can pass everything without my word!"
+    say = lambda text, ts: p.db.x("INSERT INTO messages(ts,direction,kind,chat,text) VALUES(?,?,?,?,?)",
+                                  (ts, "in", "user", "relay-thread", text + sign))
+    rows = lambda *ids: p.db.q(f"SELECT * FROM messages WHERE id IN ({','.join('?' * len(ids))})", ids)
+    fixed = say("I told you: run all of this research on Fable at xhigh, not on Opus.", now - 4 * 3600)
+    assert correction.flag(p.db, p.config(), rows(fixed), now - 4 * 3600)
+    order = say("Queue the follow-ups now and spread the device work over both boxes.", now - 3 * 3600)
+    ask = say("How long does the whole clip take at ten seconds with the new kernel?", now - 2 * 3600)
+    fix = say("You are still running on Opus. Run all of this research on Fable at xhigh, not on Opus.", now - 3600)
+    assert correction.flag(p.db, p.config(), rows(order, ask, fix), now) == {fix: f"repeats #{fixed}"}
+
+
 def _cc_plan_with_followups(p, n=7, urgent_order=True):
     """A done plan whose n follow-ups a turn has seen, under a user order owned by a priority 1 (or 3) task."""
     from ttp import obligations as ob
