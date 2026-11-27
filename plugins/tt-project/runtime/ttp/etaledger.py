@@ -183,7 +183,7 @@ def hist_end(db, ref: str, now: float, h: dict | None = None, jh: dict | None = 
         ends = []
         for tid in owners:
             t = db.task(tid)
-            ends.append(now if t and t["status"] in obligations.CLOSED else hist_end(db, f"t{tid}", now, h))
+            ends.append(now if t and t["status"] in obligations.CLOSED else hist_end(db, f"t{tid}", now, h, jh))
         ends = [e for e in ends if e is not None]
         return max(ends) if ends else None
     if not (ref.startswith("t") and ref[1:].isdigit()):
