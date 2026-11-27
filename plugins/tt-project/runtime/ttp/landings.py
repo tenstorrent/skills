@@ -237,16 +237,17 @@ def intervals(ctx: Ctx, t: dict, end: float) -> list[tuple[float, float, str]]:
     return out
 
 
-def paint(ivs: list[tuple[float, float, str]], lo: float, hi: float, first_run: float | None) -> list[tuple[float, float, str]]:
-    """The elementary segments of [lo, hi], each with its winning cause; unexplained time is `queue` before
-    the first run and `unknown` after it."""
+def paint(ivs: list[tuple[float, float, str]], lo: float, hi: float, first_run: float | None,
+          rank: dict[str, int] = PRIORITY) -> list[tuple[float, float, str]]:
+    """The elementary segments of [lo, hi], each with its winning cause (the lowest `rank`); unexplained
+    time is `queue` before the first run and `unknown` after it."""
     ivs = [(max(a, lo), min(b, hi), c) for a, b, c in ivs if min(b, hi) > max(a, lo)]
     cuts = sorted({lo, hi, *(x for a, b, _ in ivs for x in (a, b))})
     out: list[tuple[float, float, str]] = []
     for a, b in zip(cuts, cuts[1:]):
         mid = (a + b) / 2
         got = [c for s, e, c in ivs if s <= mid < e]
-        cause = min(got, key=PRIORITY.__getitem__) if got else (
+        cause = min(got, key=rank.__getitem__) if got else (
             "queue" if first_run is None or mid < first_run else "unknown")
         if out and out[-1][2] == cause and out[-1][1] == a:
             out[-1] = (out[-1][0], b, cause)
