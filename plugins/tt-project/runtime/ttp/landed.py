@@ -1106,7 +1106,7 @@ def equivalent(p, branch: str, bump=None) -> tuple[str, str] | None:
         raise _timed_out[seen]
     end = time.monotonic() + EQUIV_BUDGET_S
     left = lambda: max(1.0, min(60.0, end - time.monotonic()))   # noqa: E731
-    spent = lambda: time.monotonic() > end - 1   # noqa: E731  (a git read cut by the budget is not a timeout to remember)
+    spent = lambda: time.monotonic() > end - 1   # noqa: E731
     try:
         # Each side's own commits: a branch that merged upstream commits the push branch also has
         # (criss-cross history, whose merge base can be the old fork point) does not read them.
@@ -1128,6 +1128,8 @@ def equivalent(p, branch: str, bump=None) -> tuple[str, str] | None:
         return None
     except subprocess.TimeoutExpired as e:
         if not isinstance(e, gitmemo.Spent):
+            if spent():   # cut by this comparison's own budget: no answer, not a scan to stop rerunning
+                return None
             while len(_timed_out) >= 64:
                 _timed_out.pop(next(iter(_timed_out)))
             _timed_out[seen] = e
