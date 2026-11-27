@@ -699,6 +699,11 @@ def test_course_self_review_flags_a_plans_follow_ups_left_unqueued_under_an_urge
 def test_course_self_review_plan_follow_ups_clear_once_one_is_queued(env):
     p = make(env)
     plan, _, _, now = _cc_plan_with_followups(p)
+    res = json.loads(p.db.task(plan)["result"])
+    res["followups"].append({"title": "continue: read the speed-up result", "spec": "x"})
+    p.db.update_task(plan, result=json.dumps(res))
+    p.db.add_task("continue: read the speed-up result", "s", kind="work", origin="daemon")
+    assert [x for x in _cc(p, now)[0] if "follow-ups unqueued" in x], "a continue: hop has its own owner"
     taken = p.db.add_task("Speed up step 3 of the nightly run", "s", kind="code", origin="coordinator")
     assert not [x for x in _cc(p, now)[0] if "follow-ups unqueued" in x]
     p.db.update_task(taken, title="Cache the nightly inputs")

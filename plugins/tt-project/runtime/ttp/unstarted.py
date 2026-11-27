@@ -54,6 +54,7 @@ DEFER_S = 600           # task_update adding spec to a task deferred further tha
 MAX_AGE_S = 86400
 FOLLOWUPS_SHOWN = 8   # open follow-ups listed per digest
 READY_TITLE = re.compile(r"(?i)^\s*ready\s*:\s*")   # a hand-off follow-up whose inputs are ready now
+OWNED_TITLE = re.compile(r"(?i)\s*(continue|upstream)\s*:")   # a follow-up with its own owner (open_followups)
 START_SLACK_S = 60      # a run started just before the reply that announced it counts
 NUDGE_KV = "parked_work_nudges"   # kv: {"n": total, "day": "YYYY-MM-DD", "today": n, "at": ts}
 LIVE = ("queued", "blocked", "waiting", "review")
@@ -202,7 +203,7 @@ def open_followups(db, now: float) -> list[dict]:
         fups = load_result((db.task(e["task"]) or {}).get("result")).get("followups")
         title = next((str(f["title"]).strip() for f in fups if isinstance(f, dict) and f.get("title")
                       and str(f["title"])[:200] in e["text"]), None) if isinstance(fups, list) else None
-        if not title or re.match(r"(?i)\s*(continue|upstream)\s*:", title):
+        if not title or OWNED_TITLE.match(title):
             continue
         if not _taken_by(db.q("SELECT id, title, spec FROM tasks WHERE id>?", (e["task"],)), title):
             out.append({"id": e["id"], "task": e["task"], "title": title})

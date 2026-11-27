@@ -364,7 +364,7 @@ def plan_followups(db: DB, on: float, now: float) -> list[dict]:
         later = db.q("SELECT id, title, spec FROM tasks WHERE id>?", (tid,))
         fups = load_result(t.get("result")).get("followups")
         titles = [str(f["title"]).strip() for f in fups if isinstance(f, dict) and f.get("title")
-                  and not re.match(r"(?i)\s*(continue|upstream)\s*:", str(f["title"]))] if isinstance(fups, list) else []
+                  and not unstarted.OWNED_TITLE.match(str(f["title"]))] if isinstance(fups, list) else []
         cite = re.compile(rf"#{tid}\b")
         if any(unstarted._taken_by(later, x) for x in titles) or any(cite.search(f"{r['title']} {r['spec']}")
                                                                       for r in later):
