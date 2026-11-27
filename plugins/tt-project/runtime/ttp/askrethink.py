@@ -75,7 +75,7 @@ def text(ask_id: int, tasks: list[int], age_h: float, question: str = "", blocki
          f"human_indispensable with a why. To decide: act, resolve the ask, memory_add the decision, notify "
          f"low with what you chose and that a reply reverses it.")
     if question:
-        s += f" The question ({blocking or 'blocking'}) was: {' '.join(question.split())}"
+        s += f" The question ({blocking or 'blocking'}) was: {' '.join(question.split())[:300]}"
     return s
 
 
@@ -90,7 +90,7 @@ def raise_due(db: DB, cfg: dict | None, now: float | None = None) -> list[int]:
         new = [aid for aid in found if str(aid) not in keep]
         for aid in new:
             x = found[aid]
-            question = x["ask"]["text"]   # the whole ask: a reminder of it quotes it in full
+            question = x["ask"]["text"].split("\n")[0]
             db.x("INSERT INTO events(ts,source,kind,severity,text,data,status) VALUES(?,?,?,?,?,?,?)",
                  (now, "daemon", KIND, "normal",
                   text(aid, x["tasks"], x["age_h"], question, x["ask"]["ref"][len(_REF):]),

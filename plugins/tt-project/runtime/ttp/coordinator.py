@@ -147,7 +147,6 @@ from . import wakecost
 from . import spans
 from . import coordtools
 from . import pointers
-from . import quotefull
 from . import ctxblock
 from . import overlap as file_overlap   # apply() has a local `overlap`
 from . import screen as scr
@@ -3035,10 +3034,9 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                 if why := msgparts.too_long(a["text"], "reply"):
                     raise ValueError(why)
                 chat = a.get("chat") or default_chat
-                later = pointers.later_parts(a["text"], [
-                    str(b.get("text") or "") for _, b in order[k + 1:]
-                    if (b or {}).get("type") == "reply" and (b.get("chat") or default_chat) == chat])
-                if why := pointers.refused(a["text"], "reply", later):
+                if why := pointers.refused(a["text"], "reply", pointers.later_parts(a["text"], [
+                        str(b.get("text") or "") for _, b in order[k + 1:]
+                        if (b or {}).get("type") == "reply" and (b.get("chat") or default_chat) == chat])):
                     raise ValueError(why)
                 if why := handback.refused(a["text"], "reply"):
                     raise ValueError(why)
@@ -3051,8 +3049,6 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                                             batch_tasks, notes)
                 a["text"] = _wakemode_checked(p, a["text"], notes)
                 a["text"] = _pending_checked(p, a["text"], notes, "reply")
-                if why := quotefull.refused(a["text"], "reply", later):
-                    raise ValueError(why)
                 a["text"], false = _claims_checked(p, a, notes)
                 a["text"] = _deploy_checked(p, a["text"], notes, a.get("claims"))
                 if (text := chatdigest.checked(db, cfg, a["text"], a, chat, notes, twins=(dup := []))) is None:
@@ -3981,9 +3977,8 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                     raise ValueError(f"notify rejected: {why}")
                 if why := msgparts.too_long(a["text"], "notify"):
                     raise ValueError(why)
-                later = pointers.later_parts(a["text"], [
-                    str(b.get("text") or "") for _, b in order[k + 1:] if (b or {}).get("type") == "notify"])
-                if why := pointers.refused(a["text"], "notify", later):
+                if why := pointers.refused(a["text"], "notify", pointers.later_parts(a["text"], [
+                        str(b.get("text") or "") for _, b in order[k + 1:] if (b or {}).get("type") == "notify"])):
                     raise ValueError(why)
                 if a.get("claims"):
                     notes += obligations.check_claims(a["claims"], p)
@@ -3992,8 +3987,6 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                 a["text"] = _onhost_checked(p, a["text"], None, a, order[k + 1:], batch_tasks, notes)
                 a["text"] = _wakemode_checked(p, a["text"], notes)
                 a["text"] = _pending_checked(p, a["text"], notes, "notify")
-                if why := quotefull.refused(a["text"], "notify", later):
-                    raise ValueError(why)
                 a["text"], false = _claims_checked(p, a, notes)
                 a["text"] = _deploy_checked(p, a["text"], notes, a.get("claims"))
                 if (text := chatdigest.checked(db, cfg, a["text"], a, None, notes)) is None:

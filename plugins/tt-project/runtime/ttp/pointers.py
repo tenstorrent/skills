@@ -64,7 +64,7 @@ def later_parts(text: str, nexts: list[str]) -> list[str]:
     return out
 
 
-def has_content(text: str) -> bool:
+def _has_content(text: str) -> bool:
     return any(re.search(r"\w", ln) and not _TAG.match(ln) for ln in text.splitlines())
 
 
@@ -79,9 +79,9 @@ def dangling(text: str, later: list[str] | tuple = ()) -> list[str]:
         line_rest = text[m.end():] if eol < 0 else text[m.end():eol]
         after = (text[eol + 1:] if eol >= 0 else "") + "\n" + tail
         if "below" in m.group(0).lower():
-            ok = bool(re.match(r"\s*\)?\s*:\s*\S", line_rest)) or has_content(after)
+            ok = bool(re.match(r"\s*\)?\s*:\s*\S", line_rest)) or _has_content(after)
         else:
-            ok = has_content(line_rest) or has_content(after)
+            ok = _has_content(line_rest) or _has_content(after)
         if not ok and (phrase := " ".join(m.group(0).split())) not in out:
             out.append(phrase)
     return out
