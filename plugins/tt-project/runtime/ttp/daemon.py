@@ -46,6 +46,7 @@ from . import (   # one name per line: two changes adding names merge without a 
     handback,
     prbabysit,
     precheckbind,
+    rereap,
 )
 from . import rolerestore
 from . import stalegates
@@ -4646,6 +4647,7 @@ class Daemon:
 
     def reap_runs(self) -> None:
         up = self._awake.tick()
+        rereap.sweep(self.p, log)   # a quarantined run whose hand-off is on disk is reaped once more
         running = self.p.db.q("SELECT * FROM runs WHERE status='running'")
         for gone in set(self._stale_since) - {r["id"] for r in running}:
             self._stale_since.pop(gone, None)

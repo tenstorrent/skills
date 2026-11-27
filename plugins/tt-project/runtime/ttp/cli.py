@@ -11989,6 +11989,13 @@ def cmd_task(a) -> None:
         if refused:
             die(refused)
         print(f"task #{tid} restarts at a safe point (after any `ttp lock` it holds), its work kept: {why}")
+    elif a.action == "reread":
+        from . import rereap
+        if not a.title.strip().isdigit():
+            die(f"reread needs a run id, not {a.title!r}")
+        if why := rereap.reread(p, int(a.title)):
+            die(why)
+        print(f"run {a.title}'s end is read again from its files by the next reap tick; the worker does not run again")
     elif a.action == "requeue":
         if not a.title.strip().isdigit():
             die(f"requeue needs a task id, not {a.title!r}")
@@ -17906,12 +17913,12 @@ def ttp_parser():
                                     "or a commit on the push branch or --ref, is recorded superseded, its verdict kept); abandon records that a done code task's "
                                     "work will never land (its branch is kept), so local-only, push-audit and landed "
                                     "checks leave it out; drop-followup takes an open follow-up (its id in the digest) off the digest's list, with why; relink-fix re-points a correction's fix to another task of this project, done or not, with --why (kept on the correction); adopt-branch binds a task to a reviewed branch its saved work is on (checked: no running user, clean, its saved head or built on its lineage, not another open task's; no checkout, delete or rename); rejudge reruns the daemon's hand-off checks on a done or "
-                                    "failed task's stored hand-off and corrects a wrong partial mark")
+                                    "failed task's stored hand-off and corrects a wrong partial mark; reread <run id> puts a run the reap quarantined, whose exit.json and result.json are complete, back for the daemon to finish from those files, once (the worker is not run again)")
     s.add_argument("name", help="the project")
     s.add_argument("action", choices=["add", "list", "show", "cancel", "requeue", "restart", "set-when", "superseded",
-                                          "abandon", "adopt-branch", "rejudge", "relink-fix", "drop-followup"],
+                                          "abandon", "adopt-branch", "rejudge", "relink-fix", "drop-followup", "reread"],
                    help="what to do")
-    s.add_argument("title", nargs="?", default="", help="add: the title; show/cancel/requeue/restart/set-when/superseded/abandon/adopt-branch/rejudge: the task id; relink-fix: the correction (its message id); drop-followup: the follow-up's id")
+    s.add_argument("title", nargs="?", default="", help="add: the title; show/cancel/requeue/restart/set-when/superseded/abandon/adopt-branch/rejudge: the task id; reread: the quarantined run's id; relink-fix: the correction (its message id); drop-followup: the follow-up's id")
     s.add_argument("probe", nargs="?", help="restart: why, with the new instructions (a running task stops at a "
                    "safe point, after any `ttp lock` it holds, and is queued again with its work kept and no attempt "
                    "spent; budget.restart_max per budget.restart_window_h); "
