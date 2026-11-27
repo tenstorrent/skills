@@ -14,7 +14,9 @@ chars) later in its own sentence or as the first line after it (or in the messag
 parts; a code span there only as the whole line or after a closing ':'), or, for a status phrase,
 text after a colon on its line, or non-empty lines after a closing ':'. Quoted text elsewhere in
 the message never counts. An ask named by id is pendingask's: it runs first and appends the ask in
-full unless the text already quotes it. 'In my earlier message' counts only with a pending item in
+full unless the text already quotes it; a draft, request or command named in the same clause still
+needs its own text, and an item already sent out ('request sent, please confirm') is not pending.
+'In my earlier message' counts only with a pending item in
 its sentence. A phrase inside a short quoted span is only named. `refused` turns
 the findings into a coordinator reply or notify rejection. Daemon-built lines were audited and carry
 their pending item's full text: ask reminders quote the question (coordinator.defaults,
@@ -47,6 +49,10 @@ _QUOTED = re.compile(_BLOCK + r"|`[^`\n]+`", re.M)
 _STOP = re.compile(r"[.;!?](?=\s|$)|\n")
 _BARE = re.compile(_EARLIER.replace("|see", ""), re.I)   # points back only with a pending item in its sentence
 _PENDING = re.compile(rf"\b{_ITEM}|{_AWAITS}", re.I)
+_NON_ASK = re.compile(r"(?<!pull\s)(?<!PR\s)(?<!\()(?:requests?|commands?|drafts?|questions?)"
+                      r"\b(?!\s+PRs?\b|\s+pull\s+request|\s*\))", re.I)   # an item that is not an ask
+_SENT_OUT = re.compile(rf"{_ITEM}(?:\s+(?:was|were))?\s+(?:sent|posted|filed|answered|closed|resolved)\b",
+                       re.I)   # 'request sent', 'draft was posted': it went out, so it is not pending
 
 
 def _attached(text: str, start: int, after: str, back: bool) -> bool:
@@ -68,6 +74,7 @@ def backrefs(text: str, later: list[str] | tuple = (), open_asks: list[dict] | t
     text = str(text or "")
     tail = "\n".join(t or "" for t in later)
     head, added = pendingask.appended(text)
+    by_id = {int(a["id"]): a for a in open_asks}
     found = [(m, True) for m in _POINT_BACK.finditer(text)] + [(m, False) for m in _STATUS_PHRASE.finditer(text)]
     for m, back in sorted(found, key=lambda f: f[0].start()):
         if m.start() >= head:   # an appended ask's own words are its text, not a pointer
@@ -75,7 +82,8 @@ def backrefs(text: str, later: list[str] | tuple = (), open_asks: list[dict] | t
         cut = max((x.end() for x in re.finditer(r"[.;:,](?=\s|$)|\n", text[:m.start()])), default=0)   # not 'v1.0'
         clause = (text[cut:m.start()]   # an aside ', not sent yet,' never negates
                   + re.sub(r",[^,]*,", " ", m.group(0)))
-        if (not back and _NEGATED.search(clause)) or (   # named as an example: 'see above' in quotes
+        if (not back and (_NEGATED.search(clause) or _SENT_OUT.search(m.group(0)))) or (
+                # an item already sent out is not pending, whatever awaits phrase follows it
                 _OPENS.search(text[:m.start()]) and _CLOSES.search(text[m.end():])):
             continue
         eol = text.find("\n", m.end())
@@ -84,11 +92,14 @@ def backrefs(text: str, later: list[str] | tuple = (), open_asks: list[dict] | t
         item = re.search(_ITEM, m.group(0), re.I)
         lo = max((x.end() for x in _STOP.finditer(text[:m.start()])), default=0)
         hi = _STOP.search(text, m.end())
-        if not back and (pendingask.refs(m.group(0)) or (   # pendingask.expand, run first, appended it or saw it quoted
-                item and item.group(0).lower() in ("ask", "asks")   # ... or matched it by its words, as expand does
+        if not back and not _NON_ASK.search(m.group(0)) and (
+                # an ask named by id: pendingask.expand, run first, appended it or saw it quoted
+                (ids := pendingask.refs(m.group(0))) and (not by_id or all(
+                    i in added or (i in by_id and pendingask.quoted(text[:head], by_id[i])) for i in ids))
+                or item and item.group(0).lower() in ("ask", "asks")   # ... or matched by its words, as expand does
                 and (hit := pendingask.match(text[lo:hi.start() if hi else head], list(open_asks))
                      or pendingask.match(text[:head], list(open_asks)))
-                and all(int(a["id"]) in added or pendingask.quoted(text[:head], a) for a in hit))):
+                and all(int(a["id"]) in added or pendingask.quoted(text[:head], a) for a in hit)):
             continue
         if back and _BARE.fullmatch(m.group(0)):   # 'in my earlier message I said ...' with nothing pending
             if not _PENDING.search(text[lo:hi.start() if hi else len(text)]) and not line_end.endswith(":"):

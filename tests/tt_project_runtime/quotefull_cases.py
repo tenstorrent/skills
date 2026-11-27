@@ -193,3 +193,21 @@ def test_an_ask_matched_by_its_words_and_appended_in_full_is_not_refused():
     assert pendingask.expand(said, two)[0] == said and quotefull.backrefs(said, (), two) == []
     # without the open asks, nothing matched by words is cleared
     assert quotefull.backrefs(expanded) != []
+
+
+def test_an_ask_id_in_a_clause_with_another_item_still_needs_its_own_text():
+    from ttp import pendingask, quotefull
+    asks = [{"id": 12, "text": "Reboot the board now or after the soak?"}]
+    ok, _ = pendingask.expand("Ask 12 is ready to send.", asks)   # ask 12 appended in full
+    assert quotefull.backrefs(ok, (), asks) == []
+    for both in ("Ask 12 and the drafts for A are ready to send.",
+                 "The drafts for A and ask 12 are ready to send."):
+        gone, _ = pendingask.expand(both, asks)
+        assert quotefull.backrefs(gone, (), asks) != [], both   # the drafts still need their text
+        assert quotefull.backrefs(both) != [], both
+
+
+def test_an_item_reported_as_sent_out_is_not_pending():
+    from ttp import quotefull
+    assert quotefull.backrefs("Restart request sent, please confirm the board is back.") == []
+    assert quotefull.backrefs("The request was sent, please confirm it went out.") == []
