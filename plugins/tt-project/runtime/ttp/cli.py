@@ -12494,12 +12494,13 @@ def cmd_schedules(a) -> None:
 
 def cmd_mute(a) -> None:
     """Observation mutes: `list` shows a project's active mutes; `end <source> <match>` ends one now, without
-    a coordinator turn, with its usual end summary and who ended it."""
+    a coordinator turn, with its usual end summary and who ended it; `update <source> <match>` changes its
+    owner, why or end probe and keeps its end, threshold and escalation."""
     from . import screen
     p = need(a.project, sys.argv[1:])
     own = os.environ.get("TTP_PROJECT")
-    if a.action == "end" and os.environ.get("TTP_RUN_DIR") and own and Path(own).resolve() != Path(p.base).resolve():
-        die(f"a run may end only its own project's mutes, not {a.project}'s")
+    if a.action != "list" and os.environ.get("TTP_RUN_DIR") and own and Path(own).resolve() != Path(p.base).resolve():
+        die(f"a run may {a.action} only its own project's mutes, not {a.project}'s")
     if a.action == "list":
         ms = screen.mutes(p.db)
         if not ms:
@@ -12507,13 +12508,22 @@ def cmd_mute(a) -> None:
         for m in ms:
             print(screen.mute_line(m, where=p))
         return
-    task = os.environ.get("TTP_TASK")
-    who = f"task #{task}" if os.environ.get("TTP_RUN_DIR") and task else "the user (ttp mute end)"
-    m = screen.end_mute_by(p.db, a.source, a.match, who, where=p)
+    if a.action == "update":
+        if a.owner is None and a.why is None and a.end_when is None:
+            die("ttp mute update needs --owner, --why or --end-when")
+        try:
+            m = screen.update_mute(p.db, a.source, a.match, owner=a.owner, why=a.why, end_when=a.end_when)
+        except ValueError as e:
+            die(str(e))
+    else:
+        task = os.environ.get("TTP_TASK")
+        who = f"task #{task}" if os.environ.get("TTP_RUN_DIR") and task else "the user (ttp mute end)"
+        m = screen.end_mute_by(p.db, a.source, a.match, who, where=p)
     if m is None:
         live = "; ".join(f"{x['source']} {x['match']!r}" for x in screen.mutes(p.db)) or "none"
         die(f"no active mute of {a.source} {a.match!r} (source and match as `ttp mute list` shows them; active: {live})")
-    print(f"ended the mute of {m['source']} {m['match']!r} ({m['count']} muted); the coordinator gets its summary")
+    print(f"updated: {screen.mute_line(m, where=p)}" if a.action == "update" else
+          f"ended the mute of {m['source']} {m['match']!r} ({m['count']} muted); the coordinator gets its summary")
 
 
 def cmd_issues(a) -> None:
@@ -17960,7 +17970,7 @@ def ttp_parser():
     m.add_argument("--project", help="the project (default: the one this folder or run belongs to)")
     s.set_defaults(fn=cmd_issues)
 
-    s = sub.add_parser("mute", help="a project's observation mutes: list them, or end one now (list/end)")
+    s = sub.add_parser("mute", help="a project's observation mutes: list, end or update one (list/end/update)")
     ms = s.add_subparsers(dest="action", required=True, help="what to do")
     m = ms.add_parser("list", help="the project's active mutes")
     m.add_argument("project", help="the project")
@@ -17968,6 +17978,13 @@ def ttp_parser():
     m.add_argument("project", help="the project")
     m.add_argument("source", help="the mute's source as `ttp mute list` shows it (e.g. watcher:<name>)")
     m.add_argument("match", help="the mute's match text (any case)")
+    m = ms.add_parser("update", help="change a mute's owner, why or end probe; its end, threshold and escalation stay")
+    m.add_argument("project", help="the project")
+    m.add_argument("source", help="the mute's source as `ttp mute list` shows it (e.g. watcher:<name>)")
+    m.add_argument("match", help="the mute's match text (any case)")
+    m.add_argument("--owner", help="its recovery owner: `#<task id>`, a project name, or both ('#12 other-project')")
+    m.add_argument("--why", help="its new reason")
+    m.add_argument("--end-when", dest="end_when", help="a read-only probe: exit 0 once the mute can end")
     s.set_defaults(fn=cmd_mute)
 
     s = sub.add_parser("machines", help="your machines, shared by all your projects (add/list/status/remove/push)")

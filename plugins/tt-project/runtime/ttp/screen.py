@@ -589,7 +589,7 @@ MUTE_PERSISTS = "under mute: is the expected recovery happening?"   # the escala
 
 def mute(db: DB, source: Any, match: Any, hours: Any, below: Any = None, why: Any = "",
          now: float | None = None, escalate_after_h: Any = None, end_when: Any = None,
-         hold_cap_h: float | None = None, throughput: dict | None = None) -> dict:
+         hold_cap_h: float | None = None, throughput: dict | None = None, owner: Any = None) -> dict:
     """Mute observations from `source` whose text contains `match` (any case) and whose severity is
     below `below` (default critical), for `hours`, or until probe `end_when` passes (`hours` is then
     optional), never past MUTE_CAP_S from its start. A matching condition still seen `escalate_after_h`
@@ -598,7 +598,7 @@ def mute(db: DB, source: Any, match: Any, hours: Any, below: Any = None, why: An
     and probe (the last two kept when not given) and keeps its start, its count and the clocks of its
     conditions, except those that already escalated, which re-arm from now. Raises ValueError on bad
     input. `throughput` (throughmute.vet: a throughput-class mute's owner and max_h) caps its life at
-    max_h from now and is kept on it."""
+    max_h from now and is kept on it. `owner` (mute_owner) is its recovery owner, kept when not given."""
     now = time.time() if now is None else now
     source, match = str(source or "").strip(), str(match or "").strip()
     why = str(why or "").strip()[:300]
@@ -608,14 +608,8 @@ def mute(db: DB, source: Any, match: Any, hours: Any, below: Any = None, why: An
     if len(match) < MUTE_MIN_MATCH:
         raise ValueError(f"observation_mute needs `match`, a piece of the observation's text of at least "
                          f"{MUTE_MIN_MATCH} characters; got {match!r}")
-    probe = end_when.strip() if isinstance(end_when, str) else end_when
-    if probe and (not isinstance(probe, str) or "\n" in probe or len(probe) > MUTE_PROBE_CHARS):
-        raise ValueError(f"observation_mute `end_when` must be one shell command on one line, at most "
-                         f"{MUTE_PROBE_CHARS} characters (exit 0 once the mute can end, 1 while not)")
-    if probe:
-        from .ends import check_not_trivial, check_sh
-        check_sh(probe, "observation_mute `end_when`")
-        check_not_trivial(probe, "observation_mute `end_when`")
+    probe = _mute_probe(end_when)
+    who = mute_owner(owner)
     h = None
     if not (probe and hours in (None, "")):
         try:
@@ -625,21 +619,8 @@ def mute(db: DB, source: Any, match: Any, hours: Any, below: Any = None, why: An
         if not 1 <= h <= MUTE_MAX_H:
             raise ValueError(f"observation_mute needs `hours` from 1 to {MUTE_MAX_H} (optional with an "
                              f"`end_when` probe); got {hours!r}")
-    below = str(below or "critical").strip().lower()
-    if below not in MUTE_BELOW:
-        raise ValueError(f"observation_mute `below` must be one of {', '.join(MUTE_BELOW)}; got {below!r}")
-    esc = None
-    if escalate_after_h not in (None, ""):
-        try:
-            esc = float(escalate_after_h)
-        except (TypeError, ValueError):
-            esc = float("nan")
-        if not (esc == 0 or MUTE_ESCALATE_MIN_H <= esc <= MUTE_MAX_H):
-            raise ValueError(f"observation_mute `escalate_after_h` must be 0 (never) or from "
-                             f"{MUTE_ESCALATE_MIN_H:g} to {MUTE_MAX_H}; got {escalate_after_h!r}")
-        if esc == 0 and not why:
-            raise ValueError("observation_mute `escalate_after_h` 0 (never escalate) needs a `why` naming who "
-                             "handles the recovery")
+    below = _mute_below(below or "critical")
+    esc = _mute_esc(escalate_after_h, why)
     cap_h = _hold_cap_h({"hold_cap_h": hold_cap_h})   # hold_cap(cfg) from the caller, else the default
     with db.tx():
         active = db.kv(MUTES_KEY, []) or []
@@ -676,6 +657,8 @@ def mute(db: DB, source: Any, match: Any, hours: Any, below: Any = None, why: An
                 m[k] = old[k]
         if throughput:
             m["throughput"] = throughput
+        if who or (old or {}).get("owner"):
+            m["owner"] = who or old["owner"]
         if held:
             m["hold"] = True
         if probe:
@@ -683,6 +666,108 @@ def mute(db: DB, source: Any, match: Any, hours: Any, below: Any = None, why: An
             if old and old.get("end_when") == probe and old.get("probe_broken"):
                 m["probe_broken"] = old["probe_broken"]   # reported once per probe, not again on each extension
         db.set_kv(MUTES_KEY, [x for x in active if x is not old] + [m])
+    return m
+
+
+def _mute_probe(end_when: Any) -> str | None:
+    """A mute's `end_when`, stripped and checked (one safe shell line), else None; raises ValueError."""
+    probe = end_when.strip() if isinstance(end_when, str) else end_when
+    if probe and (not isinstance(probe, str) or "\n" in probe or len(probe) > MUTE_PROBE_CHARS):
+        raise ValueError(f"observation_mute `end_when` must be one shell command on one line, at most "
+                         f"{MUTE_PROBE_CHARS} characters (exit 0 once the mute can end, 1 while not)")
+    if probe:
+        from .ends import check_not_trivial, check_sh
+        check_sh(probe, "observation_mute `end_when`")
+        check_not_trivial(probe, "observation_mute `end_when`")
+    return probe or None
+
+
+def _mute_below(below: Any) -> str:
+    below = str(below).strip().lower()
+    if below not in MUTE_BELOW:
+        raise ValueError(f"observation_mute `below` must be one of {', '.join(MUTE_BELOW)}; got {below!r}")
+    return below
+
+
+def _mute_esc(escalate_after_h: Any, why: str) -> float | None:
+    """A given `escalate_after_h` checked (0 needs a `why`), else None; raises ValueError."""
+    if escalate_after_h in (None, ""):
+        return None
+    try:
+        esc = float(escalate_after_h)
+    except (TypeError, ValueError):
+        esc = float("nan")
+    if not (esc == 0 or MUTE_ESCALATE_MIN_H <= esc <= MUTE_MAX_H):
+        raise ValueError(f"observation_mute `escalate_after_h` must be 0 (never) or from "
+                         f"{MUTE_ESCALATE_MIN_H:g} to {MUTE_MAX_H}; got {escalate_after_h!r}")
+    if esc == 0 and not why:
+        raise ValueError("observation_mute `escalate_after_h` 0 (never escalate) needs a `why` naming who "
+                         "handles the recovery")
+    return esc
+
+
+_OWNER_PROJECT = re.compile(r"[A-Za-z][A-Za-z0-9._-]{0,63}")
+
+
+def mute_owner(value: Any) -> dict | None:
+    """A mute's recovery owner from `#<task>`, a project name, or both ('#12 other-project'), or a dict
+    {"task": int, "project": str}: {"task"?, "project"?}; None when not given. Raises ValueError otherwise."""
+    if value in (None, "", {}):
+        return None
+    bad = ValueError(f"observation_mute `owner` must be `#<task id>`, a project name, or both "
+                     f"(e.g. '#12 other-project'); got {value!r}")
+    if isinstance(value, dict):
+        if set(value) - {"task", "project"}:
+            raise bad
+        parts = ([f"#{value['task']}"] if value.get("task") not in (None, "") else []) \
+            + ([str(value["project"])] if value.get("project") else [])
+    elif isinstance(value, str):
+        parts = value.replace(",", " ").split()
+    else:
+        raise bad
+    out: dict = {}
+    for tok in parts:
+        if re.fullmatch(r"#\d{1,9}", tok) and "task" not in out:
+            out["task"] = int(tok[1:])
+        elif _OWNER_PROJECT.fullmatch(tok) and "project" not in out:
+            out["project"] = tok
+        else:
+            raise bad
+    if not out:
+        raise bad
+    return out
+
+
+def update_mute(db: DB, source: str, match: str, *, owner: Any = None, why: Any = None, end_when: Any = None,
+                below: Any = None, escalate_after_h: Any = None, now: float | None = None) -> dict | None:
+    """Change only the given fields of the active mute of `source` and `match`: its owner, why, end probe,
+    threshold or escalation. Its end (`until`), start, count and conditions' clocks are kept; a new
+    `escalate_after_h` re-arms conditions that already escalated. None when no such mute is active;
+    raises ValueError on bad input."""
+    now = time.time() if now is None else now
+    who, probe = mute_owner(owner), _mute_probe(end_when)
+    below = _mute_below(below) if below not in (None, "") else None
+    why = str(why).strip()[:300] if why not in (None, "") else None
+    with db.tx():
+        active = db.kv(MUTES_KEY, []) or []
+        m = next((x for x in active if _same_mute(x, str(source or ""), str(match or ""))
+                  and float(x["until"]) > now), None)
+        if m is None:
+            return None
+        esc = _mute_esc(escalate_after_h, why if why is not None else str(m.get("why") or ""))
+        if esc is not None and m.get("hold") and not 0 < esc <= _hold_cap_h(m):
+            esc = _hold_cap_h(m)
+        for k, v in (("owner", who), ("why", why), ("below", below)):
+            if v is not None:
+                m[k] = v
+        if probe and probe != m.get("end_when"):
+            m["end_when"] = probe
+            m.pop("probe_broken", None)
+        if esc is not None and esc != float(m.get("escalate_after_h", MUTE_ESCALATE_H)):
+            m["escalate_after_h"], m["armed_at"] = esc, now
+            m["conds"] = {k: ({**c, "first_at": now, "escalated": False} if c.get("escalated") else c)
+                          for k, c in (m.get("conds") or {}).items()}
+        db.set_kv(MUTES_KEY, active)
     return m
 
 
@@ -1010,11 +1095,13 @@ def mute_line(m: dict, now: float | None = None, where: Any = None) -> str:
     seen = f"{n} muted, last at {_when(m['last_at'], where)}" if n else "none muted yet"
     ages = mute_ages(m, now)
     esc = float(m.get("escalate_after_h", MUTE_ESCALATE_H))
+    owner = throughmute.owner_text(m)
+    owner = "its end probe" if owner.startswith("probe ") else owner
     return (f"{m['source']} {m['match']!r} below {m['below']}: {seen}; "
             + (f"persisting {', '.join(ages)}; " if ages else "")
             + (f"asks after {_h(esc * 3600)} h; " if esc > 0 else "never asks; ")
             + f"ends in {max(0.0, (float(m['until']) - now) / 3600):.1f} h" + mute_probe(m)
-            + throughmute.rate_text(m, now) + (f" ({m['why']})" if m.get("why") else ""))
+            + throughmute.rate_text(m, now) + f"; owner {owner}" + (f" ({m['why']})" if m.get("why") else ""))
 
 
 def mute_probe(m: dict) -> str:

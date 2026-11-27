@@ -271,6 +271,7 @@ ACTIONS_SCHEMA: dict[str, Any] = {
             "end_when": {"type": "string"}, "report_from": {"type": "string"},
             "source": {"type": "string"}, "match": {"type": "string"}, "hours": {"type": "number"},
             "escalate_after_h": {"type": "number"}, "below": {"type": "string"}, "why": {"type": "string"},
+            "owner": {"type": "string"},
             "quote": {"type": "string"}, "excepts": {"type": "string"},
             "start_after": {"type": "string", "pattern": START_AFTER_RE}, "start_when": {"type": "string"},
             "waits_on": {"type": "string"}, "outcome": {"type": "string", "enum": list(sweep.OUTCOMES)},
@@ -4602,18 +4603,23 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                     notes.append(f"resource_pause {name}: {line}")
             elif t == "observation_mute":
                 why = a.get("why") or a.get("reason") or a.get("text") or ""
-                m = scr.mute(db, a.get("source"), a.get("match"), a.get("hours"), a.get("below"), why,
-                             escalate_after_h=a.get("escalate_after_h"), end_when=a.get("end_when"),
-                             hold_cap_h=scr.hold_cap(cfg),
-                             throughput=throughmute.vet(db, a.get("source"), a.get("match"), why,
-                                                        a.get("end_when"), cfg))
-                if scr.hold_cap_note(m, a.get("escalate_after_h")):
-                    notes.append(scr.hold_cap_note(m, a.get("escalate_after_h")))
-                if throughmute.cap_note(m, a.get("hours")):
-                    notes.append(throughmute.cap_note(m, a.get("hours")))
-                if "coordinator" in ((m.get("throughput") or {}).get("owner") or {}):
-                    notes.append(f"observation_mute {m['source']} {m['match']!r}: no owner named, so the coordinator "
-                                 f"owns it (was: refused as needing an owner); the daily review lists it")
+                if a.get("hours") in (None, "") and scr.update_mute(   # no new hours: an update keeps its end
+                        db, a.get("source"), a.get("match"), owner=a.get("owner"), why=why, end_when=a.get("end_when"),
+                        below=a.get("below"), escalate_after_h=a.get("escalate_after_h")):
+                    notes.append(f"observation_mute {a.get('source')} {a.get('match')!r}: updated; its end is kept")
+                else:
+                    m = scr.mute(db, a.get("source"), a.get("match"), a.get("hours"), a.get("below"), why,
+                                 escalate_after_h=a.get("escalate_after_h"), end_when=a.get("end_when"),
+                                 hold_cap_h=scr.hold_cap(cfg), owner=a.get("owner"),
+                                 throughput=throughmute.vet(db, a.get("source"), a.get("match"), why,
+                                                            a.get("end_when"), cfg))
+                    if scr.hold_cap_note(m, a.get("escalate_after_h")):
+                        notes.append(scr.hold_cap_note(m, a.get("escalate_after_h")))
+                    if throughmute.cap_note(m, a.get("hours")):
+                        notes.append(throughmute.cap_note(m, a.get("hours")))
+                    if "coordinator" in ((m.get("throughput") or {}).get("owner") or {}) and not m.get("owner"):
+                        notes.append(f"observation_mute {m['source']} {m['match']!r}: no owner named, so the "
+                                     f"coordinator owns it (was: refused as needing an owner); the daily review lists it")
             elif t == "sweep":
                 sweep.record(db, a, parse_start_after(a.get("start_after") or "now", tz=timefmt.home(p)), where=p)
             elif t == "self_change":

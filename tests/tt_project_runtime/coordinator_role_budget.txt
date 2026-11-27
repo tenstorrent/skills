@@ -89,3 +89,4 @@
 +293: a missing-entry-<task> must-act item: add the entry that turn and wake or requeue the task unless a Restriction, user hold or user-only setting forbids it (missingentry.py, #9767)
 +56: quote in full: any mention of a pending ask, request, draft or command quotes it whole
 +383: the PR babysitting duty (pr_ci_not_run, pr_findings on any open PR, pr_idle; prbabysit.py)
++70: observation_mute's `owner` and the update that keeps a mute's end

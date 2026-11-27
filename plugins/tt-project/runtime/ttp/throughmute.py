@@ -171,7 +171,7 @@ def normal_form(p, a: dict, batch: list, _home: str, now: float):
     from .db import TERMINAL_TASK_STATES
     why = str(a.get("why") or a.get("reason") or a.get("text") or "").strip()
     match = str(a.get("match") or "").strip()
-    if not match or named_tasks(why):
+    if not match or named_tasks(why) or a.get("owner"):
         return None
     try:
         if "coordinator" not in ((vet(p.db, a.get("source"), match, why, a.get("end_when"), p.config(), now)
@@ -204,11 +204,23 @@ def cap_note(m: dict, hours: Any) -> str:
             f"{asked:g}; renew it then with fresh evidence if its owner still works on it")
 
 
+def shown_owner(m: dict) -> dict:
+    """The mute's recovery owner: its structured `owner`, else its throughput owner, else the first task its
+    `why` names ({} when none of these)."""
+    if m.get("owner") or (m.get("throughput") or {}).get("owner"):
+        return m.get("owner") or m["throughput"]["owner"]
+    named = named_tasks(str(m.get("why") or ""))
+    return {"task": named[0]} if named else {}
+
+
 def owner_text(m: dict, owner: dict | None = None) -> str:
-    """The mute's owner as shown in review lines; `owner` overrides the stored one (a match-derived owner)."""
-    o = owner if owner is not None else (m.get("throughput") or {}).get("owner") or {}
+    """The mute's owner as shown in review and digest lines; `owner` overrides `shown_owner` (a match-derived owner)."""
+    o = owner if owner is not None else shown_owner(m)
     if "task" in o:
-        return f"task #{o['task']}" + (f" (moved from finished #{o['moved_from']})" if o.get("moved_from") else "")
+        return (f"task #{o['task']}" + (f" of project {o['project']}" if o.get("project") else "")
+                + (f" (moved from finished #{o['moved_from']})" if o.get("moved_from") else ""))
+    if "project" in o:
+        return f"project {o['project']}"
     if "probe" in o:
         return f"probe `{str(o['probe'])[:80]}`"
     if "outside" in o:
@@ -259,12 +271,13 @@ def review_lines(db: Any, now: float | None = None, where: Any = None) -> list[s
     out = []
     for m in mutes(db, now):
         cls = marked(m)
-        o = (m.get("throughput") or {}).get("owner") or {}
-        stored = bool(o)
+        o = m.get("owner") or (m.get("throughput") or {}).get("owner") or {}
+        stored = bool(o) and not m.get("owner")
         if cls and not o:
             o = match_owner(db, m.get("match")) or {}   # the match itself may name its owner task
+        o = o or shown_owner(m)
         problem = ""
-        if cls and "task" in o:
+        if cls and "task" in o and "project" not in o:   # another project's task is not in this db
             row = db.one("SELECT status FROM tasks WHERE id=?", (int(o["task"]),))
             if row is None or row["status"] in TERMINAL_TASK_STATES:
                 if (tid := probe_owner(db, m, o)) is not None:   # its end probe names the live task now owning it
