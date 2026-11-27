@@ -387,8 +387,8 @@ def overlap_check(daemon, gh) -> None:
 
 def unpublished_repair(daemon, key: str, rec: dict) -> dict | None:
     """The done task whose repair of PR `key`'s open findings (pr-watch's record `rec`) is not on the PR
-    yet: none of its hand-off's commits is the head the sweep last saw, and that head is older than the
-    task. It keeps the findings while the step that publishes it is open (on a no-post PR, the user's
+    yet: none of its hand-off's commits is the PR's head (`rec["head"]`, which the sweep saw too: a sweep
+    switched off leaves a stale one), and that head is older than the task. It keeps the findings while the step that publishes it is open (on a no-post PR, the user's
     push), so no second fix is queued; the step goes in `rec["prereq"]`. None: no such repair."""
     from .batchrun import _shas
     from .db import load_result
@@ -399,7 +399,7 @@ def unpublished_repair(daemon, key: str, rec: dict) -> dict | None:
     for tid in dict.fromkeys(i for i in (rec.get("owner"), last and last["id"], rec.get("task")) if i):
         t = db.task(int(tid))
         mine = _shas(load_result(t["result"]).get("commits")) if t and t["status"] == "done" else []
-        if not (head and since and mine) or since >= float(t["created"] or 0) or any(head.startswith(c) for c in mine):
+        if not (head and since and mine) or head != rec.get("head") or since >= float(t["created"] or 0) or any(head.startswith(c) for c in mine):
             continue   # a head that moved after the task started may hold its work: the usual owner decides
         where = f"onto the PR's branch {rec.get('branch')}" if rec.get("branch") else "onto the PR"
         quiet = key.lower() in {k.lower() for k in settings(getattr(daemon, "cfg", None))["no_post_prs"]}

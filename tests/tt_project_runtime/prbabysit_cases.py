@@ -630,16 +630,18 @@ def test_prbabysit_a_bot_review_summary_with_text_of_its_own_still_is_a_finding(
     assert watchers.bot_open(_pb_review_graph(inline[0], [])) == ["rv"], "no inline comments: nothing covers it"
 
 
-def _pb_done_repair(env, monkeypatch, commits, cfg=None, moved_h=2):
+def _pb_done_repair(env, monkeypatch, commits, cfg=None, moved_h=2, stored=None):
     """A failing PR whose delivering task finished done with `commits` in its hand-off; the sweep last saw
-    the PR's head move `moved_h` hours ago (the task started 1 h ago); two pr-watch runs. Returns
-    (project, daemon, events)."""
+    the PR's head (or `stored`) move `moved_h` hours ago (the task started 1 h ago); two pr-watch runs.
+    Returns (project, daemon, events)."""
     from ttp import watchers
     _pb_gh(monkeypatch)
     pr = _pb_pr(statusCheckRollup=[{"name": "validate", "workflowName": "ci", "status": "COMPLETED",
                                     "conclusion": "FAILURE"}])
     p, d, _ = _pb_run(env, monkeypatch, pr, cfg=cfg)
     _pb_quiet(p, hours=moved_h)
+    if stored:
+        p.db.set_kv("pr_babysit", {"acme/widgets#7": {"head": stored, "head_at": time.time() - moved_h * 3600}})
     p.db.x("UPDATE tasks SET status='done', created=?, result=? WHERE pr_url=?",
            (time.time() - 3600, json.dumps({"commits": commits}), _PB_URL))
     watchers.watch_prs(d)
@@ -662,10 +664,15 @@ def test_prbabysit_a_done_repair_waiting_on_its_publication_keeps_its_owner_and_
     assert p.db.kv("pr_findings")["acme/widgets#7"]["owner"] == 2, "an open task on the PR's branch comes first"
 
 
-@pytest.mark.parametrize("commits,moved_h", [(["a" * 40], 2), (["c" * 40], 0.5)], ids=["published", "head_moved"])
-def test_prbabysit_a_done_task_with_no_open_publication_queues_the_fix_as_before(env, monkeypatch, commits, moved_h):
-    """Its commit is the PR's head, or the head moved after it started (it may hold its work)."""
-    p, _, ev = _pb_done_repair(env, monkeypatch, commits, moved_h=moved_h)
+@pytest.mark.parametrize("commits,moved_h,stored", [(["a" * 40], 2, None), (["c" * 40], 0.5, None),
+                                                    (["a" * 40], 2, "0" * 40)],
+                         ids=["published", "head_moved", "sweep_off_stale_head"])
+def test_prbabysit_a_done_task_with_no_open_publication_queues_the_fix_as_before(env, monkeypatch, commits, moved_h,
+                                                                                stored):
+    """Its commit is the PR's head, the head moved after it started (it may hold its work), or the sweep
+    switched off left a stale head that is not the PR's."""
+    cfg = {"pr_babysit.enabled": False} if stored else None
+    p, _, ev = _pb_done_repair(env, monkeypatch, commits, moved_h=moved_h, stored=stored, cfg=cfg)
     assert len(p.db.q("SELECT id FROM tasks WHERE title LIKE 'Fix PR findings%'")) == 1
     rec = p.db.kv("pr_findings")["acme/widgets#7"]
     assert "prereq" not in rec and rec["owner"] == 2, rec

@@ -1155,7 +1155,7 @@ def _check_findings(daemon, t: dict, pr: dict, sig: dict, findings: dict, data: 
            "notified": old.get("notified"), "owner": old.get("owner"),
            "draft": draft, "stale": stale, "human": humans[:10], "finish": old.get("finish"),
            "stalled_since": old.get("stalled_since"), "paged": old.get("paged"),
-           "title": pr.get("title") or old.get("title") or ""}
+           "title": pr.get("title") or old.get("title") or "", "head": pr.get("headRefOid") or ""}
     if t.get("purview"):
         rec["purview"] = True
     findings[key] = rec
