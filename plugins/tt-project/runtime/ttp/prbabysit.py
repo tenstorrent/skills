@@ -308,7 +308,7 @@ def overlap_check(daemon, gh) -> None:
     the other rebases). Each project's sweep records its open PRs and their changed files under the
     tt-project home, so every project's sweep sees every other's."""
     db = daemon.p.db
-    own = {k: v for k, v in (db.kv(KEY, {}) or {}).items() if v.get("open")}
+    own = {k: v for k, v in (db.kv(KEY, {}) or {}).items() if v.get("open") and "#" in k}
     files = {k: fs for k in own if (fs := _pr_files(db, gh, k, own[k].get("head"), str(daemon.p.root)))}
     if files:   # a blind sweep (no answer) keeps the last record instead of blanking the entry
         _host_write(daemon, {k: {"head": own[k].get("head"), "files": fs} for k, fs in files.items()})
