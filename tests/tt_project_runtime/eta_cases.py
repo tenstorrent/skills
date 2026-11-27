@@ -1076,7 +1076,7 @@ def test_eta_detached_jobs_estimate_from_measured_job_history(env):
     assert e["end"] == pytest.approx(now + (600 - 300) + (300 - 300) + (1800 - 300)), e["legs"]
     assert [k for k, _ in e["legs"]] == ["load", "plain", "full"]
     assert e["p90_end"] == pytest.approx(now + (600 - 300) + 0 + (5040 - 300)), e["p90_end"]   # the p80 sum
-    h = etajobs.history(p.state, p.db, now)
+    h = etajobs.job_history(p.state, p.db, now)
     assert sorted(h["job"]) == ["full", "load", "plain"] and len(h["job"]["full"]) == 5
     assert h["startup"] == [100.0] + [120.0] * 5   # the waiting task's own run, then the five past runs
     assert "load 5m" in eta.text(e, p, now) and "full 25m" in eta.text(e, p, now)
@@ -1166,5 +1166,7 @@ def test_eta_history_shadow_uses_the_measured_job_medians(env):
     now = time.time()
     _jobs_registry(p, [("load", now - 86400, "ended", now - 86400 + 600)])
     t = _waiting_jobs_task(p, now, ["load-2"])
-    he = etaledger.hist_end(p.db, f"t{t}", now, None, etajobs.history(p.state, p.db, now))
+    he = etaledger.hist_end(p.db, f"t{t}", now, None, etajobs.job_history(p.state, p.db, now))
     assert he == pytest.approx(now + 600 - 300)
+
+

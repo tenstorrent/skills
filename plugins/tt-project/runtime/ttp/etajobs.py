@@ -99,7 +99,7 @@ def job_finish(db, t: dict, h: dict, now: float, cache: dict | None = None) -> d
     registry entries. Legs are one per still-unfinished job, "queue" for the wait behind another open
     task's running job of the same name, "startup" while no job has started yet."""
     from .eta import pct
-    ents = entries(db, t["id"], cache)
+    ents = job_entries(db, t["id"], cache)
     if not ents:
         return None
     legs, hi, why, started = [], [], None, False
@@ -136,7 +136,7 @@ def queue_wait(db, tid: int, names: set, h: dict, now: float, cache: dict | None
     for r in db.q("SELECT id FROM tasks WHERE status='waiting'"):
         if r["id"] == tid:
             continue
-        for e in entries(db, r["id"], cache):
+        for e in job_entries(db, r["id"], cache):
             if normal(e.get("name")) in names and e.get("status") not in ("ended", "died", "queued"):
                 xs = (h.get("job") or {}).get(normal(e.get("name"))) or []
                 m = pct(xs, 0.5)
