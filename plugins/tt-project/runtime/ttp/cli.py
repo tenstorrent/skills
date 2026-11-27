@@ -4911,6 +4911,7 @@ def _cmd_checks(a) -> None:
     excused = []   # checks whose failing tests the gate judged not new on this head (gatejudge): landing only
     proven_new = []   # the gate's verdicts with ids proven new (gatejudge.proven): the base passing them on that host
     fail_ids = []   # the failing check's pytest ids, when its output names them all (configwho.watch)
+    own_out = ""    # the failing check's own output, before any rerun the judge appends (a spill rerun's ids)
     run_wrap = None   # on a spill host, the digest of the checks.spill_wrap_cmd it ran behind (configwho.watch)
     base = _checks_base(p, Path(top), cmds, a.target)
     (Path(run_dir) / "check_failure.json").unlink(missing_ok=True)
@@ -5375,7 +5376,8 @@ def _cmd_checks(a) -> None:
                 if rc != 0:
                     passed, failed = False, c
                     from . import sharedchecks
-                    ids, complete = sharedchecks.failing_ids(_log_since(out, log, check_start))
+                    own_out = _log_since(out, log, check_start)
+                    ids, complete = sharedchecks.failing_ids(own_out)
                     fail_ids = ids if complete else []
                     if cwd != top and not clean.path.is_dir():
                         tree_gone = _tree_gone(clean, c, head)
@@ -5652,7 +5654,7 @@ def _cmd_checks(a) -> None:
                 if wait_kept:
                     os.environ[_WAIT_KEPT_ENV] = wait_kept
                 os.environ[checkspill.OFF_ENV] = no_spill
-                if not timed_out and not env_why and failed in todo and (ids := _spill_failed_ids(rc, ran_out)):
+                if not timed_out and not env_why and failed in todo and (ids := _spill_failed_ids(rc, own_out or ran_out)):
                     os.environ[_RETRY_IDS_ENV] = json.dumps({"n": todo.index(failed), "ids": ids, "host": spilled.host})
                 os.environ[_RERUN_HEAD_ENV] = head   # the commit the spill host tested, in a clean checkout of it
                 if join_rec:   # the run here registers again; its followers queue again and join that one (checkjoin)
