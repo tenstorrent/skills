@@ -264,7 +264,6 @@ def record(db, where, items: list[tuple[str, str, dict]], now: float, src: str =
     return len(rows)
 
 
-
 def _rowless(db) -> list[dict]:
     """The tasks the row rule covers (eta.row_tasks) with no task ETA row since they were created."""
     from . import eta

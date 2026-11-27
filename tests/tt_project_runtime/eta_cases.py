@@ -925,7 +925,6 @@ def test_eta_order_with_all_owners_dead_says_no_live_owner(env):
     assert any(f"#{a}" in line for line in ob.promise_lines(p.db, now))
 
 
-
 def test_eta_a_deferred_task_s_likely_and_conservative_times_start_after_its_planned_start(env):
     """A task deferred to a start_after (spec: its likely and conservative times must both sit after
     its start, and conservative is never before likely; the correction scales only its work, never the
@@ -1039,7 +1038,6 @@ def test_eta_field_dates_a_time_a_week_away():
     assert "conservative 2026-12-03 04:00 UTC" in line, line
 
 
-
 def _jobs_registry(p, rows):
     """A done task whose registry (state/runs/<id>/detached.json) records `rows`: (name, started,
     status, ended) entries of its detached jobs; the runs row points at the registry folder."""
@@ -1123,8 +1121,6 @@ def test_eta_detached_jobs_count_the_queue_position(env):
     assert dict(e["legs"])["queue"] == pytest.approx(600 - 300), e["legs"]
     assert eta.estimate(p.db, ahead, now)["end"] == pytest.approx(now + 600 - 300)
     assert e["end"] == pytest.approx(now + sum(v for _, v in e["legs"]))
-
-
 
 
 def test_eta_detached_jobs_each_running_their_own_job_never_queue(env):
@@ -1275,6 +1271,5 @@ def test_eta_detached_jobs_shadow_with_all_jobs_ended_is_the_normal_shadow(env):
     # median wait 300; the run median is 960 (600, 720, 1200, 1800: the registry task's own sample
     # is one of them), never the jobs' zero-left medians a missing guard would give (now).
     assert he == pytest.approx(now + 300 + 960, abs=1.0), he   # abs: epoch values, no rel slack
-
 
 
