@@ -357,6 +357,7 @@ class _Est:
         self._reports = None
         self._jobhist = jobhist        # etajobs.history, shared with the p90 walk
         self._jobs: dict[int, dict | None] = {}
+        self._entries: dict[int, list] = {}   # etajobs.entries per task: one registry read per task
 
     def _m(self, xs: list[float]) -> float | None:
         """The leg statistic of samples `xs`: their q-quantile (the median at q=0.5)."""
@@ -383,6 +384,7 @@ class _Est:
         if self._hi is None:
             self._hi = _Est(self.db, self.now, self.h, self.core, self.delivery, P90, self.load,
                             self._depth_in, self._jobhist)
+            self._hi._entries = self._entries
         e = self._hi.task(int(tid))
         return None if e["why"] or not e.get("end") else e
 
@@ -394,7 +396,7 @@ class _Est:
             if self._jobhist is None:
                 self._jobhist = etajobs.history(Path(self.db.path).parent, self.db, self.now)
             try:
-                self._jobs[t["id"]] = etajobs.finish(self.db, t, self._jobhist, self.now)
+                self._jobs[t["id"]] = etajobs.finish(self.db, t, self._jobhist, self.now, self._entries)
             except Exception:
                 self._jobs[t["id"]] = None
         return self._jobs[t["id"]]
@@ -844,6 +846,8 @@ def text(e: dict, where, now: float | None = None) -> str:
         legs += f"; deferred until {timefmt.short(e['deferred'], where, now)}"
     return field(e, where, now) + (f"; legs of #{e['path'][0]}: {legs}" if legs else "") + (
         f"; adjusted: {notes}" if notes else "") + (
+        "; likely = medians (p50) and conservative = p80 of this project's detached-job history by name"
+        if e.get("job_cons") else
         "; likely = medians (p50) and conservative = p90 of this project's last 14 days, by kind and size"
         if not e["why"] else "")
 

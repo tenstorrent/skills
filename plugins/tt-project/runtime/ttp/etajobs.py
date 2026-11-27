@@ -35,14 +35,17 @@ def history(state, db, now: float | None = None) -> dict:
     now = time.time() if now is None else now
     h: dict = {"job": {}, "startup": []}
     try:
-        rows = db.q("SELECT id, started, dir FROM runs WHERE started>? ORDER BY id DESC LIMIT ?",
-                    (now - WINDOW_S, ROWS))
+        rows = db.q("SELECT id, started, dir FROM runs WHERE started>? AND role!='coordinator' "
+                    "ORDER BY id DESC LIMIT ?", (now - WINDOW_S, ROWS))
     except Exception:
         return h
     runs = Path(state) / "runs"
     for r in rows:
+        d = Path(r["dir"]) if r["dir"] else runs / str(r["id"])
+        if d.resolve().parent != runs.resolve():
+            continue   # a registry outside the project's runs folder is not this project's work
         try:
-            jobs = json.loads(((Path(r["dir"]) if r["dir"] else runs / str(r["id"])) / "detached.json").read_text())
+            jobs = json.loads((d / "detached.json").read_text())
         except (OSError, ValueError):
             continue
         if not isinstance(jobs, list):
@@ -62,11 +65,17 @@ def history(state, db, now: float | None = None) -> dict:
     return h
 
 
-def entries(db, tid: int) -> list[dict]:
-    """The registry entries of task `tid`'s detached jobs (jobstop.task_jobs, ancestors included)."""
+def entries(db, tid: int, cache: dict | None = None) -> list[dict]:
+    """The registry entries of task `tid`'s detached jobs (jobstop.task_jobs, ancestors included).
+    `cache` memoizes per task id across one estimate walk's queue scan (a dict the caller owns)."""
+    if cache is not None and tid in cache:
+        return cache[tid]
     import types
     from . import jobstop
-    return [e for _, e in jobstop.task_jobs(types.SimpleNamespace(db=db, runs=str(Path(db.path).parent / "runs")), tid)]
+    got = [e for _, e in jobstop.task_jobs(types.SimpleNamespace(db=db, runs=str(Path(db.path).parent / "runs")), tid)]
+    if cache is not None:
+        cache[tid] = got
+    return got
 
 
 def _left(e: dict, xs: list, now: float, q: float) -> float | None:
@@ -84,13 +93,13 @@ def _left(e: dict, xs: list, now: float, q: float) -> float | None:
     return max(0.0, m - (now - float(e["started"])))
 
 
-def finish(db, t: dict, h: dict, now: float) -> dict | None:
+def finish(db, t: dict, h: dict, now: float, cache: dict | None = None) -> dict | None:
     """The measured finish of task `t`'s detached jobs: {"end": the median (p50) finish,
     "conservative": the p80 one, "legs": [(name, seconds)], "why"}; None when the task has no
     registry entries. Legs are one per still-unfinished job, "queue" for the wait behind another open
     task's running job of the same name, "startup" while no job has started yet."""
     from .eta import pct
-    ents = entries(db, t["id"])
+    ents = entries(db, t["id"], cache)
     if not ents:
         return None
     legs, hi, why, started = [], [], None, False
@@ -106,7 +115,7 @@ def finish(db, t: dict, h: dict, now: float) -> dict | None:
         started = started or e.get("status") not in ("queued",)
     if why:
         return {"end": None, "conservative": None, "legs": [], "why": why}
-    wait = queue_wait(db, t["id"], {n for n, _ in legs}, h, now)
+    wait = queue_wait(db, t["id"], {n for n, _ in legs}, h, now, cache)
     if wait:
         legs.append(("queue", wait))
         hi.append(wait)
@@ -116,7 +125,7 @@ def finish(db, t: dict, h: dict, now: float) -> dict | None:
     return {"end": now + sum(x for _, x in legs), "conservative": now + sum(hi), "legs": legs, "why": None}
 
 
-def queue_wait(db, tid: int, names: set, h: dict, now: float) -> float:
+def queue_wait(db, tid: int, names: set, h: dict, now: float, cache: dict | None = None) -> float:
     """The wait of a task queued behind another open task's still-running job of one of `names`: the
     longest median time left of those jobs (one device at a time: the task waits for it to end)."""
     from .eta import pct
@@ -124,7 +133,7 @@ def queue_wait(db, tid: int, names: set, h: dict, now: float) -> float:
     for r in db.q("SELECT id FROM tasks WHERE status='waiting'"):
         if r["id"] == tid:
             continue
-        for e in entries(db, r["id"]):
+        for e in entries(db, r["id"], cache):
             if normal(e.get("name")) in names and e.get("status") not in ("ended", "died", "queued"):
                 xs = (h.get("job") or {}).get(normal(e.get("name"))) or []
                 m = pct(xs, 0.5)
