@@ -7181,7 +7181,7 @@ def _checks_base(p: Project | None, top: Path, cmds: list, target: str = "") -> 
     branch the change lands on, as last fetched. That is `target` (`--target`; else any commit git
     resolves) when given, else, while `delivery.own_push` is not off, the branch the running task (or
     a code task the running review covers) delivers onto as `ttp push --own` finds it
-    (push.pr_branch_source) when a copy of it is here, else `delivery.push_branch`. In a repo with no
+    (push.pr_branch_source, on push._own_remote) when a copy of it is here, else `delivery.push_branch`. In a repo with no
     git remote at all, the local branch; else "" (no project, no target or no copy of it here), and
     then those checks run."""
     from . import project as projmod, push
@@ -7203,8 +7203,12 @@ def _checks_base(p: Project | None, top: Path, cmds: list, target: str = "") -> 
         return tip(*push._split_target(target, remotes.stdout.split())) or rev(target)
     if (tid := os.environ.get("TTP_TASK", "")).isdigit() and projmod.own_push(p.config()) != "off":
         rows = [push._task_row(p, tid), *push._reviewed_tasks(p, tid)]
+        try:
+            own = push._own_remote(p, top, p.config().get("delivery") or {})[0]
+        except ValueError:
+            own = ""
         for branch in dict.fromkeys(push.pr_branch_source(p, r)[1] for r in rows if r):
-            if branch and (base := tip(*push._split_target(branch, remotes.stdout.split()))):
+            if own and branch and (base := tip(own, branch)):
                 return base
     try:
         return tip(*push.target(p, top))

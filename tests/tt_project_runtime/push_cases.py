@@ -7049,6 +7049,33 @@ def test_checks_judges_the_head_against_the_branch_it_lands_on(env, monkeypatch)
     assert cli._checks_base(p, repo, []) == proj
 
 
+def test_checks_finds_a_task_branch_on_the_remote_its_own_push_uses(env, monkeypatch):
+    """With the push branch on a remote other than origin, a task's `pr_branch` is read where `ttp push
+    --own` publishes it (push._own_remote), not on origin."""
+    from ttp import cli
+    for var, val in (("GIT_AUTHOR_NAME", "t"), ("GIT_AUTHOR_EMAIL", "t@t"),
+                     ("GIT_COMMITTER_NAME", "t"), ("GIT_COMMITTER_EMAIL", "t@t")):
+        monkeypatch.setenv(var, val)
+    p = make(env)
+    repo = env["repo"]
+    origin, relay = env["tmp"] / "origin.git", env["tmp"] / "relay.git"
+    _bare_init(env, origin)
+    _bare_init(env, relay)
+    _remote_add(repo, origin)
+    _remote_add(repo, relay, "relay")
+    p.set_config("delivery.push_branch", "relay/proj")
+    p.set_config("delivery.own_push", "on")
+    proj = _git_out(repo, "rev-parse", "HEAD")
+    _commit(repo, "x.txt", "x\n")
+    feat = _git_out(repo, "rev-parse", "HEAD")
+    _git_out(repo, "push", "-q", "relay", f"{proj}:refs/heads/proj", f"{feat}:refs/heads/feat")
+    _git_out(repo, "push", "-q", "origin", f"{proj}:refs/heads/feat")   # origin's feat is another branch
+    _git_out(repo, "fetch", "-q", "--all")
+    tid = p.db.add_task("Stacked", "s", kind="code", origin="coordinator", labels=["pr_branch:feat"])
+    monkeypatch.setenv("TTP_TASK", str(tid))
+    assert cli._checks_base(p, repo, []) == feat
+
+
 def test_an_if_changed_check_fails_when_git_cannot_give_the_diff(env, monkeypatch, tmp_path):
     from ttp import push
     p, repo, origin, other = _push_setup(env, monkeypatch, [SCOPED])

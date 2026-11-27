@@ -805,10 +805,10 @@ def _own_landing(p, c: dict, repo, cache: dict) -> tuple[str, str] | None:
     try:
         if short_ref(c["remote"], c["ref"]) != landed._push_ref(p, Path(repo)):
             return None
-        tip = landed.commits_sha(p, [sha])
+        rc, words = landed.check(p, Path(repo), sha, fetch=False)
     except Exception:
         return None
-    return (CONFIRMED, f"{sha[:12]} or a rebased copy of it is on the push branch at {tip[:12]}") if tip else None
+    return (CONFIRMED, f"{sha[:12]} or a rebased copy of it is on the push branch: {words}") if rc == 0 else None
 
 
 def check_all(p, cs: list[dict], cache: dict | None = None) -> tuple[str, str, list[tuple[dict, str, str]]]:

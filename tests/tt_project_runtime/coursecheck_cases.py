@@ -678,12 +678,27 @@ def test_a_sign_off_line_every_relayed_message_ends_with_is_no_repeat(env):
     say = lambda text, ts: p.db.x("INSERT INTO messages(ts,direction,kind,chat,text) VALUES(?,?,?,?,?)",
                                   (ts, "in", "user", "relay-thread", text + sign))
     rows = lambda *ids: p.db.q(f"SELECT * FROM messages WHERE id IN ({','.join('?' * len(ids))})", ids)
+    say("Start the clip bench on the new kernel once the build is done.", now - 5 * 3600)
     fixed = say("I told you: run all of this research on Fable at xhigh, not on Opus.", now - 4 * 3600)
     assert correction.flag(p.db, p.config(), rows(fixed), now - 4 * 3600)
     order = say("Queue the follow-ups now and spread the device work over both boxes.", now - 3 * 3600)
     ask = say("How long does the whole clip take at ten seconds with the new kernel?", now - 2 * 3600)
     fix = say("You are still running on Opus. Run all of this research on Fable at xhigh, not on Opus.", now - 3600)
     assert correction.flag(p.db, p.config(), rows(order, ask, fix), now) == {fix: f"repeats #{fixed}"}
+
+
+def test_a_correction_two_messages_end_with_still_repeats(env):
+    """One earlier message ending with the same line is not yet a sign-off: the line may be the correction
+    itself, said again under a different opening."""
+    from ttp import correction
+    p = make(env)
+    now = time.time()
+    say = lambda text, ts: p.db.x("INSERT INTO messages(ts,direction,kind,chat,text) VALUES(?,?,?,?,?)",
+                                  (ts, "in", "user", "relay-thread", text))
+    rows = lambda *ids: p.db.q(f"SELECT * FROM messages WHERE id IN ({','.join('?' * len(ids))})", ids)
+    old = say("Hi there.\nplease stop restarting the build server every hour while the soak runs.", now - 3600)
+    again = say("Still the same.\nplease stop restarting the build server every hour while the soak runs.", now)
+    assert correction.flag(p.db, p.config(), rows(again), now) == {again: f"repeats #{old}"}
 
 
 def _cc_plan_with_followups(p, n=7, urgent_order=True):
