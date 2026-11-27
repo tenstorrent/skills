@@ -678,7 +678,6 @@ def test_a_sign_off_line_every_relayed_message_ends_with_is_no_repeat(env):
     say = lambda text, ts: p.db.x("INSERT INTO messages(ts,direction,kind,chat,text) VALUES(?,?,?,?,?)",
                                   (ts, "in", "user", "relay-thread", text + sign))
     rows = lambda *ids: p.db.q(f"SELECT * FROM messages WHERE id IN ({','.join('?' * len(ids))})", ids)
-    say("Start the clip bench on the new kernel once the build is done.", now - 5 * 3600)
     fixed = say("I told you: run all of this research on Fable at xhigh, not on Opus.", now - 4 * 3600)
     assert correction.flag(p.db, p.config(), rows(fixed), now - 4 * 3600)
     order = say("Queue the follow-ups now and spread the device work over both boxes.", now - 3 * 3600)
@@ -687,9 +686,23 @@ def test_a_sign_off_line_every_relayed_message_ends_with_is_no_repeat(env):
     assert correction.flag(p.db, p.config(), rows(order, ask, fix), now) == {fix: f"repeats #{fixed}"}
 
 
-def test_a_correction_two_messages_end_with_still_repeats(env):
-    """One earlier message ending with the same line is not yet a sign-off: the line may be the correction
-    itself, said again under a different opening."""
+def test_three_messages_sharing_only_a_closing_line_flag_nothing(env):
+    """Three relayed messages with different bodies and the same closing line: none repeats another."""
+    from ttp import correction
+    p = make(env)
+    now = time.time()
+    say = lambda text, ts: p.db.x("INSERT INTO messages(ts,direction,kind,chat,text) VALUES(?,?,?,?,?)",
+                                  (ts, "in", "user", "relay-thread", text + "\nAnd you can pass everything without my word!"))
+    ids = [say(body, now - (3 - n) * 3600) for n, body in enumerate((
+        "Start the clip bench on the new kernel once the build is done.",
+        "Queue the follow-ups now and spread the device work over both boxes.",
+        "How long does the whole clip take at ten seconds with the new kernel?"))]
+    rows = p.db.q(f"SELECT * FROM messages WHERE id IN ({','.join('?' * len(ids))})", ids)
+    assert correction.flag(p.db, p.config(), rows, now) == {}
+
+
+def test_a_correction_under_a_bare_opener_still_repeats(env):
+    """A last line under a bare opener is no sign-off: it is the correction itself, said again."""
     from ttp import correction
     p = make(env)
     now = time.time()
