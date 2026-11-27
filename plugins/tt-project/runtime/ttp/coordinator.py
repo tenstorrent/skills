@@ -2798,16 +2798,18 @@ def _wakemode_checked(p: Project, text: str, notes: list) -> str:
     return text
 
 
-def _pending_checked(p: Project, text: str, notes: list, what: str) -> str:
-    """A reply or notify as pendingask.expand sends it: an open ask it names only by id goes with its full
-    text appended. Any fault posts the text unchanged: a message is never lost to this check."""
+def _pending_checked(p: Project, text: str, notes: list, what: str) -> tuple[str, list[dict]]:
+    """(a reply or notify as pendingask.expand sends it: an open ask it names only by id goes with its full
+    text appended, the open asks). Any fault posts the text unchanged: a message is never lost to this check."""
+    asks: list[dict] = []
     try:
         from . import pendingask, waits
-        text, why = pendingask.expand(text, waits.open_asks(p.db), what)
+        asks = waits.open_asks(p.db)
+        text, why = pendingask.expand(text, asks, what)
         notes += why
     except Exception as e:
         notes.append(f"pendingask: the open-ask check failed ({type(e).__name__}: {e}); the message went unchecked")
-    return text
+    return text, asks
 
 
 def _deploy_checked(p: Project, text: str, notes: list, claims: list | None = None) -> str:
@@ -3055,8 +3057,8 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                 a["text"] = _onhost_checked(p, a["text"], None if chat in (None, "all") else chat, a, order[k + 1:],
                                             batch_tasks, notes)
                 a["text"] = _wakemode_checked(p, a["text"], notes)
-                a["text"] = _pending_checked(p, a["text"], notes, "reply")
-                if why := quotefull.refused(a["text"], "reply", later):
+                a["text"], asks = _pending_checked(p, a["text"], notes, "reply")
+                if why := quotefull.refused(a["text"], "reply", later, asks):
                     raise ValueError(why)
                 a["text"], false = _claims_checked(p, a, notes)
                 a["text"] = _deploy_checked(p, a["text"], notes, a.get("claims"))
@@ -3996,8 +3998,8 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                 authored = a["text"]   # promises come only from what the coordinator wrote, never the checks' footers
                 a["text"] = _onhost_checked(p, a["text"], None, a, order[k + 1:], batch_tasks, notes)
                 a["text"] = _wakemode_checked(p, a["text"], notes)
-                a["text"] = _pending_checked(p, a["text"], notes, "notify")
-                if why := quotefull.refused(a["text"], "notify", later):
+                a["text"], asks = _pending_checked(p, a["text"], notes, "notify")
+                if why := quotefull.refused(a["text"], "notify", later, asks):
                     raise ValueError(why)
                 a["text"], false = _claims_checked(p, a, notes)
                 a["text"] = _deploy_checked(p, a["text"], notes, a.get("claims"))

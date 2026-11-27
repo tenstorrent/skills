@@ -60,9 +60,10 @@ def _attached(text: str, start: int, after: str, back: bool) -> bool:
     return bool(_BLOCKS.search(first) or (not back and re.fullmatch(r"\s*`[^`\n]+`\s*", first)))
 
 
-def backrefs(text: str, later: list[str] | tuple = ()) -> list[str]:
+def backrefs(text: str, later: list[str] | tuple = (), open_asks: list[dict] | tuple = ()) -> list[str]:
     """The phrases standing in for a pending item's content, each once, in order; [] for a plain
-    status message that names nothing pending (`later`: the text's later numbered parts)."""
+    status message that names nothing pending (`later`: the text's later numbered parts; `open_asks`:
+    those pendingask.expand, run first, could match by their words)."""
     out: list[str] = []
     text = str(text or "")
     tail = "\n".join(t or "" for t in later)
@@ -84,8 +85,9 @@ def backrefs(text: str, later: list[str] | tuple = ()) -> list[str]:
         lo = max((x.end() for x in _STOP.finditer(text[:m.start()])), default=0)
         hi = _STOP.search(text, m.end())
         if not back and (pendingask.refs(m.group(0)) or (   # pendingask.expand, run first, appended it or saw it quoted
-                item and item.group(0).lower() == "ask"   # ... or matched it by its words and appended it
-                and pendingask.about(text[lo:hi.start() if hi else head], added))):
+                item and item.group(0).lower() in ("ask", "asks")   # ... or matched it by its words and appended it
+                and (hit := pendingask.match(text[lo:hi.start() if hi else head], list(open_asks)))
+                and {int(a["id"]) for a in hit} <= added)):
             continue
         if back and _BARE.fullmatch(m.group(0)):   # 'in my earlier message I said ...' with nothing pending
             if not _PENDING.search(text[lo:hi.start() if hi else len(text)]) and not line_end.endswith(":"):
@@ -100,10 +102,10 @@ def backrefs(text: str, later: list[str] | tuple = ()) -> list[str]:
     return out
 
 
-def refused(text: str, what: str, later: list[str] | tuple = ()) -> str:
+def refused(text: str, what: str, later: list[str] | tuple = (), open_asks: list[dict] | tuple = ()) -> str:
     """Why a coordinator `what` (reply, notify, urgent reply) is refused for pointing back at a
     pending item instead of quoting it, else ''."""
-    gone = backrefs(text, later)
+    gone = backrefs(text, later, open_asks)
     if not gone:
         return ""
     return (f"{what} rejected: {', '.join(gone)}: quote the draft/ask/request/command in full "

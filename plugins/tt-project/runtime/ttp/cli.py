@@ -3298,11 +3298,13 @@ def cmd_urgent_reply(a) -> None:
     if why := msgparts.too_long(text, "ttp urgent-reply"):
         die(why)
     from . import pendingask, quotefull, waits
+    asks: list[dict] = []
     try:   # as coordinator._pending_checked: a fault expanding asks never loses the urgent reply
-        text, _ = pendingask.expand(text, waits.open_asks(p.db), "urgent reply")
+        asks = waits.open_asks(p.db)
+        text, _ = pendingask.expand(text, asks, "urgent reply")
     except Exception as e:
         print(f"ttp urgent-reply: open asks not expanded ({type(e).__name__}: {e})", file=sys.stderr)
-    if why := quotefull.refused(text, "urgent reply"):
+    if why := quotefull.refused(text, "urgent reply", (), asks):
         die(why)
     ids = msgparts.post(p.db, text, chat=chat, kind="reply", severity="normal")
     print(f"posted ({', '.join(f'#{i}' for i in ids)})")

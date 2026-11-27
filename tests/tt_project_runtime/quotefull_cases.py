@@ -158,20 +158,30 @@ def test_an_ask_matched_by_its_words_and_appended_in_full_is_not_refused():
     from ttp import pendingask, quotefull
     asks = [{"id": 12, "text": "Reboot the board now or after the soak? Still waiting on you."}]
     text = "The ask about the board reboot is still open, waiting on you."
-    assert quotefull.backrefs(text) != []
+    assert quotefull.backrefs(text, (), asks) != []
     expanded, _ = pendingask.expand(text, asks)
     assert pendingask.HEADER in expanded
-    assert quotefull.backrefs(expanded) == []
+    assert quotefull.backrefs(expanded, (), asks) == []
+    assert quotefull.refused(expanded, "reply", (), asks) == ""
+    # the only open ask is appended whatever the words say
+    bare, _ = pendingask.expand("The ask is still open, waiting on you.", asks)
+    assert quotefull.backrefs(bare, (), asks) == []
+    # the plural, once every ask it matches was appended
+    budget = {"id": 14, "text": "Raise the budget cap for the board soak?"}
+    both, _ = pendingask.expand("The asks about the board soak are still open, waiting on you.", asks + [budget])
+    assert quotefull.backrefs(both, (), asks + [budget]) == []
     # a header with no appended ask line clears nothing
-    assert quotefull.backrefs(text + pendingask.HEADER) != []
+    assert quotefull.backrefs(text + pendingask.HEADER, (), asks) != []
     # an ask by its words that is not the one appended is still refused
-    budget = {"id": 14, "text": "Raise the budget cap for the soak?"}
     other, _ = pendingask.expand("Ask 12 is still open. The ask about the vendor contract is still open too.",
                                  asks + [budget])
-    assert quotefull.backrefs(other) == ["the ask named as pending, without its text"]
+    assert quotefull.backrefs(other, (), asks + [budget]) == ["the ask named as pending, without its text"]
     # only the block expand appends at the very end counts: a header written earlier hides nothing
     early = "Status below." + pendingask.HEADER + "\n- ask 12: Reboot?\n- drafts in my earlier messages, ready to send"
-    assert quotefull.backrefs(early) != []
-    assert quotefull.backrefs(pendingask.expand(early, asks)[0]) != []
-    made_up = "The ask about the vendor contract is still open." + pendingask.HEADER + "\n- ask 99: x"
-    assert quotefull.backrefs(made_up) != []
+    assert quotefull.backrefs(early, (), asks) != []
+    assert quotefull.backrefs(pendingask.expand(early, asks)[0], (), asks) != []
+    # a block naming an ask that is not open clears nothing
+    made_up = "The ask about the board reboot is still open." + pendingask.HEADER + "\n- ask 99: board reboot"
+    assert quotefull.backrefs(made_up, (), asks) != []
+    # without the open asks, nothing matched by words is cleared
+    assert quotefull.backrefs(expanded) != []

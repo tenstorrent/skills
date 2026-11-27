@@ -53,24 +53,21 @@ def quoted(text: str, ask: dict) -> bool:
     return bool(head) and head in _flat(text).lower()
 
 
-def _match(text: str, asks: list[dict]) -> list[dict]:
+def match(text: str, asks: list[dict]) -> list[dict]:
     """The open asks a reference-free 'waiting on you' most likely means: the only one open, else those
     sharing at least two content words with the text."""
-    return asks if len(asks) == 1 else about(text, asks)
-
-
-def about(text: str, asks: list[dict]) -> list[dict]:
-    """The asks sharing at least two content words with `text`."""
+    if len(asks) == 1:
+        return asks
     said = reask.words(text)
     return [a for a in asks if len(said & reask.words(a.get("text") or "")) >= 2]
 
 
-def appended(text: str) -> tuple[int, list[dict]]:
-    """(where the block `expand` appends starts, the asks in it); (len(text), []) with none at the end."""
+def appended(text: str) -> tuple[int, set[int]]:
+    """(where the block `expand` appends at the end starts, the ask ids in it); (len(text), set()) with none."""
     m = re.search(re.escape(HEADER) + r"((?:\n- ask \d+: [^\n]*)+)\Z", text)
     if not m:
-        return len(text), []
-    return m.start(), [{"id": int(i), "text": t} for i, t in re.findall(r"^- ask (\d+): (.*)$", m.group(1), re.M)]
+        return len(text), set()
+    return m.start(), {int(i) for i in re.findall(r"^- ask (\d+):", m.group(1), re.M)}
 
 
 def expand(text: str, open_asks: list[dict], what: str = "reply") -> tuple[str, list[str]]:
@@ -83,7 +80,7 @@ def expand(text: str, open_asks: list[dict], what: str = "reply") -> tuple[str, 
     gone = [i for i in ids if i not in by_id]
     notes: list[str] = []
     if not hit and waiting(text):
-        hit = _match(text, open_asks)
+        hit = match(text, open_asks)
         if not hit:
             notes.append(f"pendingask: your {what} says the user still owes something but names no open ask it "
                          "could match" + (f" (ask {', '.join(map(str, gone))} is not open)" if gone else "")
