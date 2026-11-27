@@ -2798,10 +2798,11 @@ def _wakemode_checked(p: Project, text: str, notes: list) -> str:
     return text
 
 
-def _pending_checked(p: Project, text: str, notes: list, what: str) -> tuple[str, list[dict]]:
+def _pending_checked(p: Project, text: str, notes: list, what: str) -> tuple[str, list[dict] | None]:
     """(a reply or notify as pendingask.expand sends it: an open ask it names only by id goes with its full
-    text appended, the open asks). Any fault posts the text unchanged: a message is never lost to this check."""
-    asks: list[dict] = []
+    text appended, the open asks; None when they could not be read). Any fault posts the text
+    unchanged: a message is never lost to this check."""
+    asks: list[dict] | None = None
     try:
         from . import pendingask, waits
         asks = waits.open_asks(p.db)

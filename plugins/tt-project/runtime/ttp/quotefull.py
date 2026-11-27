@@ -15,13 +15,16 @@ parts; a code span there only as the whole line or after a closing ':'), or, for
 text after a colon on its line, or non-empty lines after a closing ':'. Quoted text elsewhere in
 the message never counts. An ask named by id is pendingask's: it runs first and appends the ask in
 full unless the text already quotes it; a draft, request or command named in the same clause still
-needs its own text, and an item already sent out ('request sent, please confirm') is not pending.
-'In my earlier message' counts only with a pending item in
+needs its own text. 'In my earlier message' counts only with a pending item in
 its sentence. A phrase inside a short quoted span is only named. `refused` turns
 the findings into a coordinator reply or notify rejection. Daemon-built lines were audited and carry
 their pending item's full text: ask reminders quote the question (coordinator.defaults,
 askrethink.text), `ttp status` shows each open ask whole (cli.status_text) and worker notifies carry
-their body (daemon.relay_worker_notifies)."""
+their body (daemon.relay_worker_notifies).
+
+Known gaps (accepted): a status phrase after a colon ('Drafts for A and B: ready to send.') is
+not matched; an item reported as sent out that the user is asked to act on ('request sent, please
+confirm') is refused like a pending one, and the writer adds its text and resends."""
 from __future__ import annotations
 
 import re
@@ -51,9 +54,6 @@ _BARE = re.compile(_EARLIER.replace("|see", ""), re.I)   # points back only with
 _PENDING = re.compile(rf"\b{_ITEM}|{_AWAITS}", re.I)
 _NON_ASK = re.compile(r"(?<!pull\s)(?<!PR\s)(?<!\()(?:requests?|commands?|drafts?|questions?)"
                       r"\b(?!\s+PRs?\b|\s+pull\s+request|\s*\))", re.I)   # an item that is not an ask
-_SENT_OUT = re.compile(rf"{_NON_ASK.pattern}(?:\s+(?:was|were))?\s+"
-                       r"(?:sent|posted|filed|answered|closed|resolved)\b",
-                       re.I)   # 'request sent', 'draft was posted': it went out; an ask sent is still pending
 
 
 def _attached(text: str, start: int, after: str, back: bool) -> bool:
@@ -84,9 +84,7 @@ def backrefs(text: str, later: list[str] | tuple = (), open_asks: list[dict] | t
         cut = max((x.end() for x in re.finditer(r"[.;:,](?=\s|$)|\n", text[:m.start()])), default=0)   # not 'v1.0'
         clause = (text[cut:m.start()]   # an aside ', not sent yet,' never negates
                   + re.sub(r",[^,]*,", " ", m.group(0)))
-        if (not back and (_NEGATED.search(clause) or _SENT_OUT.search(m.group(0))
-                          and not re.search(r"\bstill\b|pending\s+your", m.group(0)))) or (
-                # an item already sent out is not pending, whatever awaits phrase follows it
+        if (not back and _NEGATED.search(clause)) or (
                 _OPENS.search(text[:m.start()]) and _CLOSES.search(text[m.end():])):
             continue
         eol = text.find("\n", m.end())

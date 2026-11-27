@@ -3298,7 +3298,7 @@ def cmd_urgent_reply(a) -> None:
     if why := msgparts.too_long(text, "ttp urgent-reply"):
         die(why)
     from . import pendingask, quotefull, waits
-    asks: list[dict] = []
+    asks: list[dict] | None = None
     try:   # as coordinator._pending_checked: a fault expanding asks never loses the urgent reply
         asks = waits.open_asks(p.db)
         text, _ = pendingask.expand(text, asks, "urgent reply")

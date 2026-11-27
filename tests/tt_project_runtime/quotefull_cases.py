@@ -207,12 +207,45 @@ def test_an_ask_id_in_a_clause_with_another_item_still_needs_its_own_text():
         assert quotefull.backrefs(both) != [], both
 
 
-def test_an_item_reported_as_sent_out_is_not_pending():
+def test_an_item_reported_as_sent_out_still_needs_its_text():
     from ttp import quotefull
-    assert quotefull.backrefs("Restart request sent, please confirm the board is back.") == []
-    assert quotefull.backrefs("The request was sent, please confirm it went out.") == []
-    assert quotefull.backrefs("The request sent yesterday is still pending your review.") != []
-    assert quotefull.backrefs("The ask was sent, please reply.") != []   # a sent ask is still pending
+    # sent out or not, an item the user is asked to act on needs its text; a false refusal
+    # of one already sent is accepted: the writer adds the text and resends
+    for refused in ("The push command was sent, please run it.",
+                    "Command sent, please run it when you can.",
+                    "Draft posted above, please review it.",
+                    "Questions answered, the drafts for A are ready to send.",
+                    "The draft posted earlier and the commands for B are ready to send.",
+                    "Restart request sent, please confirm the board is back.",
+                    "The request was sent, please confirm it went out.",
+                    "The request sent yesterday is still pending your review.",
+                    "The ask was sent, please reply."):   # a sent ask is still pending
+        assert quotefull.backrefs(refused) != [], refused
     # with the open asks known, a fabricated id is refused: there is no such pending item
     assert quotefull.backrefs("Ask 12 is still open.", (), []) != []
     assert quotefull.backrefs("Ask 12 is still open.") == []   # no open-ask knowledge: pendingask owns the id
+
+
+def _open_asks_fault(db):
+    raise RuntimeError("db locked")
+
+
+def test_an_open_ask_lookup_fault_never_refuses_a_reply_naming_an_ask(env, monkeypatch):
+    from ttp import coordinator as coord, waits
+    p = make(env)
+    monkeypatch.setattr(waits, "open_asks", _open_asks_fault)
+    problems = coord.apply(p, [{"type": "reply", "chat": "c1", "text": "Ask 12 is still open."}], turn=1)
+    assert problems == [] and _sent(p) == ["Ask 12 is still open."], problems
+
+
+def test_an_open_ask_lookup_fault_never_refuses_an_urgent_reply_naming_an_ask(env, monkeypatch, capsys):
+    from ttp import cli, coordtools, msgurgent, waits
+    p = make(env)
+    monkeypatch.chdir(p.root)
+    monkeypatch.setenv(coordtools.ROLE_ENV, "coordinator")
+    p.db.post("in", "urgent: the endpoint is down", chat="c1", provenance="cli-legacy")
+    msgurgent.tick(p, p.config(), now=time.time() + 1)
+    monkeypatch.setattr(waits, "open_asks", _open_asks_fault)
+    cli.main(["urgent-reply", "c1", "Ask 12 is still open, waiting on you."])
+    assert "Ask 12 is still open" in _sent(p)[-1], _sent(p)
+    assert "open asks not expanded" in capsys.readouterr().err
