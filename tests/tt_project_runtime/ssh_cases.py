@@ -780,7 +780,7 @@ def test_parallel_ssh_wrapper_calls_open_one_master_and_the_rest_reuse_it(tmp_pa
 _REFUSED = "kex_exchange_identification: read: Connection reset by peer"
 
 
-def _record(tmp_path):
+def _backoff_rec(tmp_path):
     f = tmp_path / "home" / ".tt-project" / "ssh-backoff" / "box-a"
     return f.read_text().split() if f.exists() else None
 
@@ -790,7 +790,7 @@ def test_a_refused_connection_start_backs_off_for_every_caller_and_doubles_per_s
     refused = dict(FAKE_RC=255, FAKE_OPEN_ERR=_REFUSED, FAKE_OPEN_DELAY=0.3)
     out, log = _spawn_wrappers(tmp_path, short_cm, 20, **refused)
     assert [rc for rc, _ in out] == [255] * 20 and len(log) == 1 and len(_opens(log)) == 1
-    until, step = _record(tmp_path)
+    until, step = _backoff_rec(tmp_path)
     assert step == "60" and 0 < int(until) - time.time() <= 60
     assert all("box-a" in err for _, err in out)                    # each caller's stderr names the alias
     out, log2 = _spawn_wrappers(tmp_path, short_cm, 5, **refused)   # during the backoff: no start reaches ssh
@@ -800,16 +800,16 @@ def test_a_refused_connection_start_backs_off_for_every_caller_and_doubles_per_s
         rec.write_text(f"1 {prev}\n")
         out, log2 = _spawn_wrappers(tmp_path, short_cm, 20, **refused)
         assert [rc for rc, _ in out] == [255] * 20 and len(_opens(log2)) == len(_opens(log)) + 1
-        assert _record(tmp_path)[1] == step
+        assert _backoff_rec(tmp_path)[1] == step
         log = log2
     rec.write_text("1 900\n")                                       # a success clears the record
     out, log2 = _spawn_wrappers(tmp_path, short_cm, 20, FAKE_OPEN_DELAY=0.3)
-    assert [rc for rc, _ in out] == [0] * 20 and _record(tmp_path) is None and (tmp_path / "master").exists()
+    assert [rc for rc, _ in out] == [0] * 20 and _backoff_rec(tmp_path) is None and (tmp_path / "master").exists()
 
 
 def test_a_start_that_fails_without_a_refusal_line_starts_no_backoff(tmp_path, short_cm):
     out, log = _spawn_wrappers(tmp_path, short_cm, 3, FAKE_RC=255, FAKE_OPEN_ERR="Permission denied (publickey).")
-    assert [rc for rc, _ in out] == [255] * 3 and _record(tmp_path) is None
+    assert [rc for rc, _ in out] == [255] * 3 and _backoff_rec(tmp_path) is None
     assert len(_opens(log)) == 3 and all("Permission denied" in err for _, err in out)   # each is ssh's own answer
 
 
@@ -817,7 +817,7 @@ def test_a_backoff_record_is_per_destination_and_survives_the_socket_folder_clea
     out, log = _spawn_wrappers(tmp_path, short_cm, 1, FAKE_RC=255, FAKE_OPEN_ERR=_REFUSED)
     out, log = _spawn_wrappers(tmp_path, short_cm, 1, args=("box-b", "true"), FAKE_RC=255, FAKE_OPEN_ERR=_REFUSED)
     assert len(_opens(log)) == 2 and out[0][0] == 255              # box-b was started although box-a is backing off
-    assert (short_cm / "box-a.lock").exists() and _record(tmp_path) is not None
+    assert (short_cm / "box-a.lock").exists() and _backoff_rec(tmp_path) is not None
 
 
 def test_parallel_ssh_wrapper_calls_open_one_master_on_a_host_without_flock(tmp_path, short_cm):
