@@ -34,7 +34,7 @@ skills.** If a diff genuinely spans more than two domains, it is usually two rev
 | CCL, fabric, mesh, `all_gather`, `reduce_scatter`, `all_reduce` | `tt-multichip-ccl-review` |
 | Trace capture or replay, program cache | `tt-trace-review` |
 | Dtype, fidelity, `*_cache_dtype`, precision config | `tt-precision-review` |
-| `generator_vllm.py`, vLLM plugin registration, tt-inference-server | `tt-vllm-serving-review` |
+| `generator_vllm.py`, vLLM plugin registration, `vllm-tt-plugin` scheduling or capabilities, tt-inference-server | `tt-vllm-serving-review` |
 | `tests/**` — or any diff whose behaviour change needs a test | `tt-test-coverage-review` |
 | A PR body or comment asserting a speedup or a perf number | `tt-perf-claim-review` |
 | Any diff (cheap, runs alongside) | `tt-comment-hygiene-review` |
