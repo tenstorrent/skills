@@ -864,7 +864,7 @@ def _git(wd: str, *args: str) -> str | None:
     return r.stdout.decode(errors="replace") if r.returncode == 0 else None
 
 
-def _porcelain_paths(wd: str, porcelain: str) -> list:
+def _porcelain_paths(porcelain: str) -> list:
     """Paths `git status --porcelain -z` names, relative to the checkout's top (a rename's old name skipped)."""
     out, parts = [], porcelain.split("\0")
     i = 0
@@ -915,7 +915,7 @@ def build_stamp(workdir: str, artifact: str = "") -> dict:
         stamp["artifact"] = {"path": str(a), "size": st.st_size, "mtime": st.st_mtime, "mtime_utc": _utc(st.st_mtime),
                              "sha256": _sha256_of(a) if a.is_file() and st.st_size <= HASH_MAX_BYTES else None}
         if stamp["dirty"]:
-            for rel in _porcelain_paths(wd, status or ""):
+            for rel in _porcelain_paths(status or ""):
                 f = Path(top, rel)
                 with contextlib.suppress(OSError):
                     if f.suffix in _SOURCES and f.stat().st_mtime > st.st_mtime:
