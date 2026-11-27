@@ -118,7 +118,7 @@ for json_path in json_paths:
                 autoport_hits.append(where)
             elif normalized.startswith("models/autoports/"):
                 wrong_autoport_hits.append(f"{where}={normalized}")
-            elif normalized == "models/ttt_compat" or normalized.startswith("models/demos/"):
+            elif normalized == "models/ttt_compat" or normalized.startswith(("models/ttt_compat/", "models/demos/")):
                 stock_hits.append(f"{where}={normalized}")
 
         if key in {"model_impl", "impl_name", "impl_id"} and text.strip().lower() in {

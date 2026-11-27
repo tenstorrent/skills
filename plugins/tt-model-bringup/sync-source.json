@@ -435,7 +435,7 @@
       "destination": "skills/tti-release/scripts/check-evidence.sh",
       "blob": "9cf16e6d4a2a45ab49fc88337fae474010a05ff2",
       "source_sha256": "7f2e4e78a03f9de87daa6086626643b45c5331d7a25e5dfb1213e95e8712294b",
-      "packaged_sha256": "71753d9fe5a7a63ca519ef01a03a040d6b6701043bf231280395c62614fe24bd"
+      "packaged_sha256": "42e8473a2c7e6ef4c1b6e4073d577b3de9c7c40542b97c359bbdc77dbe8975da"
     },
     {
       "source": ".agents/skills/tti-release/SKILL.md",
