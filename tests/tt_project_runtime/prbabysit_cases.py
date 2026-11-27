@@ -487,7 +487,10 @@ def test_ghroute_a_corrupt_route_file_reads_as_no_record_and_never_raises(env):
     from ttp import ghauth, ghroute
     path = ghauth._home(None) / ghroute.STATE
     path.parent.mkdir(parents=True, exist_ok=True)
-    for bad in ('{"via": "box1"}', '{"box1": 5, "via": ""}', '{"box1": {"ok": true, "at": "soon"}}', "[1]", "{"):
+    for bad in ('{"via": "box1"}', '{"via": "box1", "ok": true}', '{"via": [1], "ok": true, "at": 1}',
+                '{"box1": 5, "via": ""}', '{"box1": {"ok": true, "at": "soon"}}', "[1]", "{"):
+        path.write_text(bad)
+        assert ghroute.works(via="box1") is False and ghroute.last_answer("box1").get("ok") is not False, bad
         path.write_text(bad)
         ghroute.mark(True, via="box3")   # never raises into the gh call path
         assert ghroute.last_answer("box3")["ok"] is True, bad
@@ -497,7 +500,7 @@ def test_ghroute_a_corrupt_route_file_reads_as_no_record_and_never_raises(env):
 
 
 def test_prbabysit_an_unread_pr_keeps_its_cached_files_in_the_host_record_and_a_project_with_no_open_pr_clears_it(env):
-    from ttp import prbabysit
+    from ttp import ghauth, prbabysit
     from ttp.daemon import Daemon
     p = make(env, "overlap3")
     p.db.set_kv("pr_babysit", {"acme/widgets#7": {"open": True, "branch": "b", "head": "h7"},
@@ -513,3 +516,5 @@ def test_prbabysit_an_unread_pr_keeps_its_cached_files_in_the_host_record_and_a_
     p.db.set_kv("pr_babysit", {"acme/widgets#7": {"open": False}, "acme/widgets#5": {"open": False}})
     prbabysit.overlap_check(Daemon(p.base), _pb_files_gh({})[0])
     assert prbabysit._host_prs(time.time()) == {}, "closed PRs leave the record other projects read"
+    (ghauth._home(None) / prbabysit.HOST_FILE).write_text('{"other": 5}')
+    assert prbabysit._host_prs(time.time()) == {}, "a bad entry in the host record is no record"

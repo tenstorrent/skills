@@ -303,9 +303,16 @@ def _state_path(home) -> "os.PathLike":
 def _state_read(home=None) -> dict:
     """STATE's records, by route: a flat record (pre-per-route) counts for the route it names; anything
     else unreadable in the file is no record."""
-    st = last_answer(home=home)
-    if st.get("via"):
-        return {st["via"]: {"ok": st.get("ok"), "at": st.get("at")}}
+    from . import ghauth
+    try:
+        st = json.loads((ghauth._home(home) / STATE).read_text())
+    except (OSError, ValueError):
+        return {}
+    if not isinstance(st, dict):
+        return {}
+    if "via" in st:
+        via = st["via"]
+        return {via: {"ok": st.get("ok"), "at": st.get("at")}} if isinstance(via, str) and via else {}
     return {k: v for k, v in st.items() if isinstance(v, dict)}
 
 
@@ -316,22 +323,10 @@ def seen(rc: int, via: str = "") -> None:
         mark(_answered(rc), via=via)
 
 
-def last_answer(via: str | None = None, home=None) -> dict:
-    """The record of one route's last answer ({"ok", "at", "via"}), or {} when it has none. With no
-    `via`, the file's single record whatever its route: the host-wide gh-auth read."""
-    from . import ghauth
-    try:
-        st = json.loads((ghauth._home(home) / STATE).read_text())
-    except (OSError, ValueError):
-        return {}
-    if not isinstance(st, dict):
-        return {}
-    if via is None:
-        return st
-    rec = st.get(via)
-    if not isinstance(rec, dict) and "via" in st:   # a pre-per-route record: flat, its own route only
-        rec = {k: st[k] for k in ("ok", "at")} if st.get("via") == via else None
-    return {"via": via, **rec} if isinstance(rec, dict) else {}
+def last_answer(via: str, home=None) -> dict:
+    """The record of one route's last answer ({"ok", "at", "via"}), or {} when it has none."""
+    rec = _state_read(home).get(via)
+    return {"via": via, **rec} if rec else {}
 
 
 def _fresh(rec: dict, within_s: float) -> bool:
@@ -347,9 +342,7 @@ def works(home=None, within_s: float = 3600, via: str | None = None) -> bool:
     route of this project's working)."""
     if via is not None:
         return _fresh(last_answer(via, home), within_s)
-    st = last_answer(home=home)   # the whole record: every route's last answer
-    recs = [st] if st.get("via") else [v for v in st.values() if isinstance(v, dict)]
-    return any(_fresh(r, within_s) for r in recs)
+    return any(_fresh(r, within_s) for r in _state_read(home).values())
 
 
 def live(cfg: dict | None = None, cwd: str | None = None) -> bool:

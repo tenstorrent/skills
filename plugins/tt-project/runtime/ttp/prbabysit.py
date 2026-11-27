@@ -267,10 +267,7 @@ def sweep(daemon, t: dict, pr: dict, sig: dict, gh) -> None:
                            f"activity). Requested reviewers: {', '.join(x for x in who if x) or 'none'}."
                            f"{' No-post PR: tell the user, post nothing.' if quiet else ''}{ping}"))
     for kind, text in events:
-        from . import screen as scr
-        status = "muted" if scr.count_muted(db, "pr", text, "normal") else "queued"
-        db.x("INSERT INTO events(ts,source,kind,severity,text,status,task) VALUES(?,?,?,?,?,?,?)",
-             (now, "pr", kind, "normal", text, status, t.get("id")))
+        _post_event(daemon, kind, text, t.get("id"))
     db.set_kv(KEY, allstate)
 
 
@@ -363,8 +360,9 @@ def _pr_files(db, gh, key: str, head, cwd: str) -> list[str] | None:
         return hit.get("files") if hit else None
     out = sorted({str(r.get("filename")) for r in rows if isinstance(r, dict) and r.get("filename")})
     if out and head:
+        own = db.kv(KEY, {}) or {}
         db.set_kv(FILES_KEY, {k: v for k, v in {**cache, key: {"head": head, "files": out}}.items()
-                              if k == key or (db.kv(KEY, {}) or {}).get(k, {}).get("open")})
+                              if k == key or own.get(k, {}).get("open")})
     return out or None
 
 
@@ -393,7 +391,7 @@ def _host_read() -> dict:
         rec = json.loads((ghauth._home(None) / HOST_FILE).read_text())
     except (OSError, ValueError):
         return {}
-    return rec if isinstance(rec, dict) else {}
+    return {k: v for k, v in rec.items() if isinstance(v, dict)} if isinstance(rec, dict) else {}
 
 
 def _host_prs(now: float) -> dict[str, list[str]]:
