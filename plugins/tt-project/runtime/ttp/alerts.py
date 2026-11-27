@@ -26,7 +26,7 @@ folder, and the others post theirs on the `quiet` channel, shown in the web app 
 but never sent to a chat, Slack or the desktop.
 
 A logout is the exception to the one daily reminder: every project waiting on the logged-out CLI
-reports itself into the claim (machine_round), and the claimer reminds the chats at LOGOUT_REMIND_S
+reports itself into the claim (machine_round), and the claimer reminds the chats (first after 15 minutes) at LOGOUT_REMIND_S
 with how many projects, queued tasks and high events wait, whichever project holds the claim then.
 
 Page severity of daemon events that need no user decision, so they wake the coordinator only when it matters.
@@ -184,7 +184,7 @@ START_RETRY_S = 600.0   # a start failure retries within a minute; a task not du
 # that fails and recovers every minute is one alert and one clear, not one of each per recovery.
 CLEAR_HOLD_S = 600.0
 HEALTHY = "alerts_healthy"   # kv: open episode id -> when sweep first saw its condition healthy since its last report
-LOGOUT_REMIND_S = (3600.0, 4 * 3600.0, 12 * 3600.0)   # a logout is reminded this long after it began, then daily
+LOGOUT_REMIND_S = (900.0, 3600.0, 4 * 3600.0, 12 * 3600.0)   # a logout is reminded this long after it began, then daily
 WAITER_TTL = 1800.0     # a project's report into a logout claim counts this long (it renews every few minutes)
 # What the chat hears once an episode clears.
 CLEARED_TEXT = {

@@ -27076,6 +27076,7 @@ def test_a_logged_out_provider_starts_one_probe_per_backoff_and_holds_the_rest(e
     assert started == ["small"], started
     out = cli.status_text(p)
     assert out.count("held: logged out") >= 2 and "#1 held: logged out: big" in out, out
+    assert "#1 held: logged out: big — log in once on the project's machine: log in to the agent CLI there" in out, out
     # The probe ended logged out again: its pause holds everything, then one more probe goes.
     p.db.x("UPDATE tasks SET status='queued' WHERE title='small'")
     p.db.set_kv("limited:fake", {"until": time.time() + AUTH_PROBE_S, "note": "logged out"})

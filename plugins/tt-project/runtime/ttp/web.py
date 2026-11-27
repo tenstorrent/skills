@@ -470,7 +470,7 @@ def health(p: Project, db: DB, alive: bool = True, now: float | None = None) -> 
     if logged_out:
         provs = sorted({t["provider"] or core for t in logged_out})
         why.append(f"{len(logged_out)} task(s) held: logged out ({', '.join(provs)}); they start once a login "
-                   f"check passes")
+                   f"check passes: {'; '.join(sorted({fix_for(x, 'logged out') for x in provs}))}")
     if net_held:
         provs = sorted({t["provider"] or core for t in net_held})
         why.append(f"{len(net_held)} task(s) held: network ({', '.join(provs)}); they start once the API host "
@@ -542,7 +542,8 @@ def health(p: Project, db: DB, alive: bool = True, now: float | None = None) -> 
                         "route": coord.coordinator_route(cfg), "route_line": coord.route_line(cfg)},
         "providers_paused": paused_providers, "resources_paused": paused_resources, "waiting": waiting,
         "deferred": deferred, "dep_held": dep_held,
-        "logged_out": [{k: t[k] for k in ("id", "title", "provider")} for t in logged_out],
+        "logged_out": [{**{k: t[k] for k in ("id", "title", "provider")}, "fix": fix_for(t["provider"] or core, "logged out")}
+                       for t in logged_out],
         "net_held": [{k: t[k] for k in ("id", "title", "provider")} for t in net_held],
         "breakers": breakers,
         "asks": asks, "running": running, "working": working,

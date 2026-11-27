@@ -144,7 +144,7 @@ def test_a_stopped_claimers_claim_does_not_silence_the_others(env, monkeypatch):
 
 
 
-def test_a_logout_is_one_alert_per_machine_reminded_at_1_4_and_12_hours_with_what_waits(env, monkeypatch):
+def test_a_logout_is_one_alert_per_machine_reminded_at_15_minutes_1_4_and_12_hours_with_what_waits(env, monkeypatch):
     from ttp import alerts
     from ttp.daemon import Daemon
     p, q = _two_projects(env)
@@ -162,7 +162,7 @@ def test_a_logout_is_one_alert_per_machine_reminded_at_1_4_and_12_hours_with_wha
            (start, "watch", "obs", "high", "a box is down", "queued"))
     told = lambda x: [m["text"] for m in x.db.unread_for_chat("c1", 0)]
     seen = []
-    for hours in (0.5, 1.01, 2, 3.9, 4.01, 8, 11.9, 12.01, 20, 35.9, 36.01):
+    for hours in (0.2, 0.26, 0.5, 1.01, 2, 3.9, 4.01, 8, 11.9, 12.01, 20, 35.9, 36.01):
         clock["t"] = start + hours * 3600
         for d in (dq, dp):   # each project reports every few minutes; here the claimer goes last
             d._logout_round = 0.0
@@ -170,8 +170,8 @@ def test_a_logout_is_one_alert_per_machine_reminded_at_1_4_and_12_hours_with_wha
         seen.append((hours, len(told(p))))
     assert told(q) == [], "the second project paged the chat too"
     sent = told(p)
-    assert sent[0] == "fake is logged out" and len(sent) == 5, sent
-    assert [h for (h, n), (_, m) in zip(seen[1:], seen) if n > m] == [1.01, 4.01, 12.01, 36.01]
+    assert sent[0] == "fake is logged out" and len(sent) == 6, sent
+    assert [h for (h, n), (_, m) in zip(seen[1:], seen) if n > m] == [0.26, 1.01, 4.01, 12.01, 36.01]
     assert all("still logged out" in t and "2 project(s) wait on it (demo, second)" in t
                and "1 task(s) no other provider can run and 1 high event(s)" in t for t in sent[1:]), sent[1]
     rows = p.db.q("SELECT channel, severity FROM messages WHERE ref='auth:fake'")
@@ -194,6 +194,44 @@ def test_a_logout_is_one_alert_per_machine_reminded_at_1_4_and_12_hours_with_wha
     dq.remind_logouts()
     assert len(told(q)) == 1
 
+
+
+def test_a_logout_with_work_waiting_alerts_once_at_15_minutes_with_the_step_across_a_restart(env, monkeypatch):
+    from ttp import alerts
+    from ttp.daemon import Daemon
+    p = make(env)
+    monkeypatch.setattr(alerts, "owner_alive", lambda owner: True)
+    start = time.time()
+    clock = {"t": start}
+    monkeypatch.setattr(time, "time", lambda: clock["t"])
+    p.db.x("INSERT INTO chats(id,created,label,last_active,last_read) VALUES('c1',?,?,?,0)", (start, "t", start))
+    d = Daemon(p.base)
+    d.open_breaker("fake", "logged out")
+    d.alert("auth:fake", "fake is logged out", "high")
+    p.db.add_task("queued work", "")
+    told = lambda: [m["text"] for m in p.db.unread_for_chat("c1", 0) if m["text"] != "fake is logged out"]
+    clock["t"] = start + 14 * 60
+    d._logout_round = 0.0
+    d.remind_logouts()
+    assert told() == [], "alerted before the hold was 15 minutes old"
+    clock["t"] = start + 16 * 60
+    d._logout_round = 0.0
+    d.remind_logouts()
+    assert len(told()) == 1 and "log in to the agent CLI there" in told()[0], told()
+    rows = p.db.q("SELECT severity FROM messages WHERE ref='auth:fake' AND text LIKE '%still logged out%'")
+    assert [r["severity"] for r in rows] == ["high"]
+    restarted = Daemon(p.base)   # a restart in the middle of the hold
+    for minutes in (17, 30, 59):
+        clock["t"] = start + minutes * 60
+        restarted._logout_round = 0.0
+        restarted.remind_logouts()
+    assert len(told()) == 1, "a restart sent the alert again"
+    # Logged in again: the hold clears and no later reminder comes.
+    restarted._close_breaker("fake", alerts.breaker(p.db, "fake"), "login check passed")
+    clock["t"] = start + 2 * 3600
+    restarted._logout_round = 0.0
+    restarted.remind_logouts()
+    assert len(told()) == 1
 
 
 def test_account_mismatch_then_match_keeps_caps_meanwhile_and_alerts_once(env, monkeypatch):

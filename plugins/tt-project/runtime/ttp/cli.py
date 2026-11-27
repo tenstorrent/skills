@@ -2183,7 +2183,7 @@ def status_text(p: Project, verbose: bool = False) -> str:
     for t in h.get("dep_held", [])[:5]:
         row(t, "queued, waits on " + ", ".join(f"#{d['id']} ({d['status']})" for d in t["on"][:3]))
     for t in h["logged_out"][:5]:
-        row(t, "held: logged out")
+        row(t, "held: logged out", t["fix"])
     for t in h.get("net_held", [])[:5]:
         row(t, "held: network")
     # Landing: one line for the review and push stages, naming only a task stalled past its stage's bound.
