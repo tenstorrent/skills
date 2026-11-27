@@ -531,6 +531,9 @@ def answers(db: DB, m: dict, now: float | None = None) -> str:
     or '' for a new instruction, a question or anything else."""
     now = time.time() if now is None else now
     text = str(m.get("text") or "").replace("’", "'")
+    from . import relaypin
+    if relaypin.is_order(text):   # a stop order or added scope is an order, not a correction
+        return ""
     if any(line.lstrip().startswith(">") for line in text.splitlines()):
         return "quotes earlier output"
     spans = [_same(a or b) for a, b in _QUOTED.findall(text)]

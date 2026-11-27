@@ -98,6 +98,7 @@ from . import (   # one name per line: two changes adding names merge without a 
     queuetrim,
     rejtally,
     relay,
+    relaypin,
     responsibilities,
     restriction_audit,
     restriction_source,
@@ -1820,6 +1821,9 @@ def digest_parts(p: Project, gates: dict, event_ids: list[int], msg_ids: list[in
                              f"{spans.wrap(m['context'], 'relayer context', tag)}")
             else:
                 lines.append(f"{head} {m['text']}")
+            if (m["context"] or "").strip() or prov in ("cli-peer", "cli-legacy"):   # relayed
+                if pin := relaypin.pin_line(p, m["text"] + (f"\n{m['context']}" if agent else "")):
+                    lines.append(f"  {pin}")
     folded = fold_events(events, tag)
     for e in events:
         if e["id"] in folded:
