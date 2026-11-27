@@ -186,6 +186,46 @@ def test_code_arm_day_table_guard_and_review_lines(env):
     assert codearm.review_lines(p.db, {}, now) == []
 
 
+def test_code_arm_guard_report_lines_show_review_fails_bounces_cost_and_a_small_sample_warning(env):
+    """Beside the switch-back verdict, per arm over its window: first-review fail rate, bounces and $ per task, and
+    a warning for a compared arm under min_tasks decided tasks. The verdict itself is the guard's alone."""
+    from ttp import codearm, route
+    p = make(env)
+    cfg = _ca_cfg(glm_share=0.5, glm_guard_min=3)
+    now = time.time()
+
+    def arm_task(arm, review, bounce, usd):
+        t = _ca_task(p)
+        p.db.set_kv(f"{codearm.ARM_KV}{t['id']}", {"arm": arm, "why": "coin", "seed": "", "ts": now})
+        p.db.x("UPDATE tasks SET status='done' WHERE id=?", (t["id"],))
+        p.db.x("INSERT INTO push_queue(task,branch,head,target,status,created,updated,landed_sha) "
+               "VALUES(?,?,?,?,?,?,?,?)", (t["id"], f"b{t['id']}", "h", "main", "landed", now, now, "abc"))
+        r = p.db.add_task(f"review #{t['id']}", "s", kind="review", origin="daemon", labels=[f"auto_review:{t['id']}"])
+        p.db.x("UPDATE tasks SET status=? WHERE id=?", (review, r))
+        note = {codearm.KEY: {"arm": arm}, route.KEY: {"fallback": route.BOUNCE} if bounce else {}}
+        p.db.x("INSERT INTO runs(task,role,provider,model,started,ended,status,cost_usd,note) VALUES(?,?,?,?,?,?,?,?,?)",
+               (t["id"], "worker", "chat", "m", now - 60, now - 30, "ok", usd, json.dumps(note)))
+    for review, bounce in (("failed", True), ("done", True), ("done", False)):
+        arm_task("glm", review, bounce, 5.0)
+    for _ in range(2):
+        arm_task("sonnet", "done", False, 4.0)
+    row = codearm.guard_check(p.db, cfg, now + 1)
+    assert (row["enough"], row["gap_pts"], row["tripped"]) == (False, None, False)   # sonnet is under min_tasks
+    lines = codearm.guard_report_lines(row)
+    assert lines[0] == f"- switch-back guard, 7 days to {time.strftime('%m-%d %H:%M', time.localtime(now + 1))}: not tripped"
+    assert "  - glm: first-review fails 33% of 3, 0.67 bounces per task, $5.00 per task" in lines
+    assert "  - sonnet: first-review fails 0% of 2, 0 bounces per task, $4.00 per task" in lines
+    assert ("  - small sample: sonnet has 2 decided tasks, under the guard's 3, so their landing rates are not "
+            "compared") in lines
+    assert not any("small sample: glm" in ln for ln in lines)
+    assert "(GLM 5 points above Sonnet" in codearm.guard_report_lines(dict(row, gap_pts=-5.0))[0]
+    assert codearm.guard_report_lines(dict(row, gap_pts=30.0, tripped=True, why="w"))[0].endswith(": tripped: w")
+    assert codearm.guard_report_lines(row)[1:] == codearm.guard_text(row).split("\n")[2:]
+    codearm.guard_run(p.db, cfg, now + 1)
+    assert codearm.review_lines(p.db, cfg, now + 2)[-len(lines):] == codearm.guard_report_lines(
+        codearm.guard_check(p.db, cfg, now + 1))   # the daily review shows the last stored verdict
+
+
 def test_code_arm_switch_back_never_counts_the_tasks_that_tripped_it_once_the_setting_changes(env, monkeypatch):
     """Re-armed by a new route.code_sonnet, the guard judges only tasks dealt after its trip; new bad ones trip it
     again."""

@@ -575,7 +575,28 @@ def guard_run(db, cfg: dict, now: float | None = None) -> dict | None:
 
 def guard_text(row: dict) -> str:
     return (f"Code route GLM arm switched back: {row.get('why')}. Its share is held at 0 (new code tasks take Sonnet "
-            "or Opus as before) until route.code_sonnet changes.")
+            "or Opus as before) until route.code_sonnet changes.\n" + "\n".join(guard_report_lines(row)))
+
+
+def guard_report_lines(row: dict) -> list[str]:
+    """The switch-back verdict beside what it does not weigh, per arm over its window: first-review fail rate,
+    bounces and $ per task, and a warning for each compared arm under `min_tasks` decided tasks."""
+    gap = row.get("gap_pts")
+    out = [f"- switch-back guard, 7 days to {time.strftime('%m-%d %H:%M', time.localtime(row['ts']))}: "
+           + (f"tripped: {row['why']}" if row.get("tripped") else "not tripped")
+           + (f" (GLM {abs(gap):g} points {'below' if gap >= 0 else 'above'} Sonnet on landing within one fix round, "
+              f"limit {row['pts']:g})" if gap is not None and not row.get("tripped") else "")]
+    arms = (row.get("table") or {}).get("arms") or {}
+    for name, a in arms.items():
+        if a.get("tasks"):
+            fr = f"{a['fail_rate']:.0%} of {a['reviewed']}" if a.get("fail_rate") is not None else "n/a"
+            out.append(f"  - {name}: first-review fails {fr}, {a['bounces'] / a['tasks']:.2g} bounces per task, "
+                       f"${a['usd'] / a['tasks']:.2f} per task")
+    for name in ("glm", "sonnet"):   # the arms the guard compares
+        if (n := (arms.get(name) or {}).get("decided", 0)) < row["min_tasks"]:
+            out.append(f"  - small sample: {name} has {n} decided tasks, under the guard's {row['min_tasks']}, so "
+                       "their landing rates are not compared")
+    return out
 
 
 def table_lines(tab: dict, held_why: str = "") -> list[str]:
@@ -602,7 +623,10 @@ def review_lines(db, cfg: dict, now: float | None = None) -> list[str]:
     if not settings(cfg) and not held(db, cfg):
         return []
     off = db.kv(OFF_KV) if held(db, cfg) else None
-    return table_lines(day_table(db, cfg, now - 86400, now), str((off or {}).get("why") or ""))
+    rows = db.kv(DAYS_KV)
+    last = rows[-1] if isinstance(rows, list) and rows and isinstance(rows[-1], dict) else None
+    return (table_lines(day_table(db, cfg, now - 86400, now), str((off or {}).get("why") or ""))
+            + (guard_report_lines(last) if last else []))
 
 
 def running(db) -> int:
