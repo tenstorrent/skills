@@ -10736,6 +10736,8 @@ def cmd_detach(a) -> None:
     job_env, aid = dict(os.environ), activity.new_id()
     from .progress import JOB_ENV
     job_env[JOB_ENV] = str(rc)   # its `ttp progress report` lines name the job (progress.py)
+    if _runs_ttp(asked):   # a ttp command keeps its own verdict: a lock, retry or wait wrap hides its first word
+        job_env["TTP_DETACH_RC_ONLY"] = "1"
     state = rd.parent.parent if rd.parent.name == "runs" else None
     if state is not None:   # the wrapper appends the job's end to the project's activity log
         job_env.update({activity.ENV_LOG: str(activity.log_path(state)), activity.ENV_ID: aid})
@@ -11188,6 +11190,19 @@ def _detach_stop_pids(what: str) -> int:
         return 0
     print(jobstop.stop_pids(p, f, int(caller), targets, gone, "stopped by `ttp detach --stop-pids`")["text"])
     return 0
+
+
+def _runs_ttp(cmd: list) -> bool:
+    """Whether `cmd` runs ttp: as `ttp ...`, `python <.../bin/ttp> ...` or `python -m ttp ...`."""
+    if not cmd:
+        return False
+    if os.path.basename(cmd[0]) == "ttp":
+        return True
+    if os.path.basename(cmd[0]).startswith("python") and len(cmd) > 1:
+        if cmd[1] == "-m":
+            return len(cmd) > 2 and cmd[2] == "ttp"
+        return os.path.basename(cmd[1]) == "ttp"
+    return False
 
 
 def _retry_cmd(a, cmd: list) -> list:

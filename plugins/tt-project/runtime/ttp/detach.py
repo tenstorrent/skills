@@ -428,6 +428,8 @@ def retry_argv(retry, codes, delay, cmd: list) -> list:
         raise ValueError("--retry-rc and --retry-delay go with --retry N (N at least 1)")
     if not codes or not re.fullmatch(r"\d{1,3}(,\d{1,3})*", codes) or any(int(c) > 255 for c in codes.split(",")):
         raise ValueError("--retry needs --retry-rc RC[,RC...] (exit codes 0-255): no code retries by default")
+    if 0 in map(int, codes.split(",")):
+        raise ValueError("--retry-rc cannot list 0: the job ends at once on a 0, retry or not")
     if delay is not None and not 0 <= delay < 1e6:
         raise ValueError("--retry-delay is a number of seconds, 0 or more")
     wait = "30" if delay is None else ("%.3f" % delay).rstrip("0").rstrip(".")

@@ -3728,6 +3728,32 @@ def test_detach_retry_keeps_a_ttp_commands_own_verdict_and_reads_a_padded_code(e
     assert tries.read_text().strip() == "2"
 
 
+def test_a_retried_ttp_command_under_lock_keeps_its_own_verdict(env, tmp_path):
+    """A retried ttp command keeps its own verdict under --lock too: under the lock wrap the wrapper
+    cannot tell a ttp command from its words, so the retry sets the rc-only env for the job."""
+    p = make(env)
+    run_dir = p.runs / "8"
+    run_dir.mkdir(parents=True)
+    (tmp_path / "bin").mkdir()
+    n = tmp_path / "tries"
+    q = shlex.quote(str(n))
+    (tmp_path / "bin" / "ttp").write_text(
+        "#!/bin/sh\nk=$(( $(cat %s 2>/dev/null || echo 0) + 1 )); echo $k > %s\n"
+        'if [ "$k" = 1 ]; then echo "1 failed, 2 passed in 0.10s"; exit 7; fi\n'
+        'echo "1 failed, 2 passed in 0.20s"\n' % (q, q))
+    (tmp_path / "bin" / "ttp").chmod(0o755)
+    r = _ttp_run(p, "detach", "lockedttp", "--lock", "rig-a", "--retry", "1", "--retry-rc", "7",
+                 "--retry-delay", "0", "--", str(tmp_path / "bin" / "ttp"), env=_lock_job_env(env, p, run_dir))
+    assert r.returncode == 0, r.stderr
+    rc = (run_dir / "lockedttp.rc").resolve()
+    assert _wait_for_path(rc) and rc.read_text().strip() == "0", (rc.read_text(), (run_dir / "lockedttp.log").read_text())
+    from ttp import cli
+    for argv, own in ((["ttp", "checks"], True), (["/usr/bin/python3", "/x/bin/ttp", "push"], True),
+                      (["python3", "-m", "ttp", "note"], True), (["python3", "-m", "pytest"], False),
+                      (["sh", "-c", "ttp checks"], False), ([], False)):
+        assert cli._runs_ttp(argv) is own, argv
+
+
 def test_detach_retry_runs_on_the_remote_host_and_odd_retry_options_start_nothing(env, tmp_path):
     p = _device_project(env, device=False)
     run_dir = p.runs / "21"
@@ -3742,6 +3768,7 @@ def test_detach_retry_runs_on_the_remote_host_and_odd_retry_options_start_nothin
     assert "try 1 exited 9" in (remote / "drv.log").read_text() and tries.read_text().strip() == "2"
     calls = (tmp_path / "ssh.log").read_text().split()
     for bad in (["--retry", "2"], ["--retry-rc", "7"], ["--retry", "0", "--retry-rc", "7"],
+                ["--retry", "1", "--retry-rc", "0,7"], ["--retry", "1", "--retry-rc", "00"],
                 ["--retry", "1", "--retry-rc", "a,7"], ["--retry", "1", "--retry-rc", "300"],
                 ["--retry", "1", "--retry-rc", "7", "--retry-delay", "-1"]):
         for where in ([], ["--remote", "box-a"]):
@@ -3751,3 +3778,4 @@ def test_detach_retry_runs_on_the_remote_host_and_odd_retry_options_start_nothin
     assert (tmp_path / "ssh.log").read_text().split() == calls, "a refused option reaches no host"
     r = _ttp_run(p, "detach", "--check", "--retry", "1", str(remote / "drv.rc"), env=e)
     assert r.returncode != 0 and "go with the command" in r.stderr, r.stderr
+
