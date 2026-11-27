@@ -69,6 +69,7 @@ RETRY_LABEL = "device_audit_retry"
 DEFAULTS = {"power_routes": ["broker"], "device_scripts": [], "device_audits": 20,
             "device_tools": ["run_cluster_validation", "test_system_health", "test_tt_fabric"]}
 FENCE = re.compile(r"```(?:json)?\s*(\{.*?\})\s*```", re.S)
+SUBST_TICK = re.compile(r"(?<!\\)(?:\\\\)*`")   # a backquote after an even run of backslashes starts a command
 PROSE = re.compile(r"[A-Z][a-z]+(?:,?\s+[a-z][a-z'-]*){2,}[.:]?$")   # "Check the holder first." is no command
 IPMI_POWER = re.compile(r"(?:chassis\s+)?power\s+(?!status\b)\S+|raw\b|mc\s+reset\b|chassis\s+bootdev\b")
 RISKY = re.compile(r"(?i)\b(?:reboot|shutdown|poweroff|tt-flash|tt-topology|glx_reset|reset|power[ _-]?cycle|firmware|flash)\b")
@@ -222,18 +223,20 @@ def _ssh_shell_feeds(cmd: str) -> list[tuple[str, str]]:
 
 def _segs(cmd: str):
     """hook's simple commands of `cmd` (wrappers dropped, `bash -c` and `$( )` read, file redirects gone), None
-    when it cannot be read: a backquote hides a command from that parser."""
+    when it cannot be read: a backquote hides a command from that parser (an escaped one, `\\``, is only text)."""
     from . import glmguard, hook
     try:   # heredoc bodies no shell reads: gone, before REDIRECT takes their `<<`
         cmd = "\n".join([hook._split(cmd)[0], *(text for _, text in _ssh_shell_feeds(cmd))])
     except Exception:
         return None
-    if "`" in cmd:
+    if SUBST_TICK.search(cmd):
         return None
     try:
         segs = hook._all_segments(hook._split(glmguard.REDIRECT.sub(" ", cmd))[0])
     except Exception:
         return None
+    if "`" in cmd and any(w and os.path.basename(w[0]) not in ("cd", "python", "python3") for w in segs):
+        return None   # an escaped backquote is only text to python; any other program may hand it on to a shell
     return [w for w in segs if w and not (os.path.basename(w[0]) in ("bash", "sh", "zsh", "dash") and w[1:2] == ["-c"])]
 
 

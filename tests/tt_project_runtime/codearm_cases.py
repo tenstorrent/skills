@@ -2221,6 +2221,8 @@ def test_glm_guard_lets_a_run_read_a_rollout_and_refuses_changing_one(monkeypatc
     assert glmguard.shell_refusal(cmd, str(wt), str(rd)) is None
     assert glmguard.cli_refusal("rollout", "status") is None and glmguard.cli_refusal("rollout") is None
     assert glmguard.cli_refusal("rollout", "arm", ["--help"]) is None
+    assert glmguard.cli_refusal("remove", "", ["-h"]) is None and glmguard.cli_refusal("remove", "", ["--help"]) is None
+    assert glmguard.cli_refusal("remove", "", ["demo"]), "a remove that deletes stays refused"
     for act in ("arm", "set", "waves", "rollback"):
         why = glmguard.cli_refusal("rollout", act)
         assert why, act

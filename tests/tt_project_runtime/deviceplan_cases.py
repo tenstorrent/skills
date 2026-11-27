@@ -161,6 +161,21 @@ def test_a_plan_with_a_raw_power_step_or_needs_opus_goes_back_to_opus(tmp_path):
     assert deviceplan.bounce_kind(run2) == "plan"
 
 
+def test_a_backquote_escaped_in_a_string_is_text_not_a_hidden_command(tmp_path):
+    from ttp import deviceplan
+    run, e = _dp_run(tmp_path)
+    ws = str(tmp_path)
+    ref = lambda c: deviceplan.refusal(c, ws, e, {})
+    text = 'python3 -c "print(\'Reboot? the power cycle of \\`reset\\` is not run\')"'
+    assert not deviceplan.risky(text) and ref(text) is None, "an escaped backquote is only text"
+    assert deviceplan.risky('echo "`reboot`"'), "a real substitution still hides a command"
+    assert deviceplan.risky('echo "\\\\`reboot`"'), "an even run of backslashes leaves the backquote live"
+    for nested in ('bash -c "echo \\`reboot\\`"', 'timeout 5 sh -c "\\`reboot\\`"', 'ssh box "echo \\`reboot\\`"',
+                   'find . -exec sh -c "\\`reboot\\`" \\;', "bash <<EOF\necho \\`reboot\\`\nEOF"):
+        assert deviceplan.risky(nested), "another program may hand the text to a shell that runs it: " + nested
+    assert ref("ipmitool chassis power cycle").startswith("power cycles and resets")
+
+
 def test_a_glm_device_run_runs_reads_bookkeeping_and_plan_steps_and_checks_risky_ones(tmp_path):
     from ttp import deviceplan
     run, e = _dp_run(tmp_path)

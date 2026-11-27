@@ -512,7 +512,7 @@ def cli_refusal(cmd: str, action: str = "", flags=(), words=()) -> str | None:
     if cmd == "pause" and not {"-h", "--help"} & set(flags):
         return ("`ttp pause` pauses a project's work: not for a run on the GLM arm, which hands off "
                 "`waiting` instead")
-    if cmd == "remove":
+    if cmd == "remove" and not {"-h", "--help"} & set(flags):
         return "`ttp remove` deletes a project, outside the run's worktree and run folder: not for a run on the GLM arm"
     if cmd == "machines" and not {"-h", "--help"} & set(flags) and not read_only(list(words) or [cmd, action], flags):
         return ("a run on the GLM arm does not write the machine ledger (`ttp machines` writes): say in the "
