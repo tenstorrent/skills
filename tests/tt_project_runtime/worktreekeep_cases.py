@@ -289,3 +289,26 @@ def test_a_push_that_starts_after_the_sweeps_snapshot_still_keeps_its_worktree(e
     assert res[str(path)]["why"] == "a detached `ttp push` runs in it" and res[str(path)].get("held"), res
     assert not removed and path.is_dir()
     monkeypatch.setattr(push, "running", real)
+
+
+def test_a_hung_git_keeps_its_worktree_and_the_daemon_sweep_stops_at_its_budget(env, monkeypatch, tmp_path):
+    p = make(env)
+    _no_grace(monkeypatch)
+    from ttp import worktree
+    done = [_code_task(p, f"hung{n}", status="done")[:2] for n in range(2)]
+    # A git whose `submodule status` hangs (as on a stuck mount); the rest is the real git.
+    shim = tmp_path / "bin"
+    shim.mkdir()
+    (shim / "git").write_text('#!/bin/sh\nfor a; do [ "$a" = submodule ] && exec sleep 120; done\n'
+                              f'exec {shutil.which("git")} "$@"\n')
+    (shim / "git").chmod(0o755)
+    monkeypatch.setenv("PATH", f"{shim}{os.pathsep}{os.environ['PATH']}")
+    monkeypatch.setattr(worktree, "SWEEP_GIT_S", 1.0, raising=False)
+    monkeypatch.setattr(worktree, "SWEEP_BUDGET_S", 0.5, raising=False)
+    t0 = time.monotonic()
+    res = {r["task"]: r for r in worktree.sweep(p, full_view=True)}
+    assert time.monotonic() - t0 < 30, "the daemon's sweep waited on a hung git"
+    (first, a), (second, b) = done
+    assert "timed out" in res[first]["why"] and not res[first].get("deferred")   # kept, never taken as clean
+    assert res[second].get("deferred") and res[second]["why"]   # past the budget: left for the next sweep
+    assert a.exists() and b.exists()

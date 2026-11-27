@@ -1702,8 +1702,9 @@ def inspect(path: Path) -> dict:
     import hashlib
 
     def git(*args: str, text: bool = True) -> subprocess.CompletedProcess:
+        # all of them only read (submodule status too), so a bounded() scope caps each (see sweep)
         return gitmemo.run(["git", "-C", str(path), *args], capture_output=True, text=text,
-                           timeout=300)
+                           timeout=300, read=True)
     out = {"why": None, "dirty": None}
     # A submodule's repository lives in the worktree's own git directory (modules/), so commits made
     # in it exist nowhere else and removing the worktree would delete them. Such a worktree stays.
@@ -2240,6 +2241,11 @@ def _forget_gone(p: Project, dry_run: bool) -> list[dict]:
 
 
 HARNESS_LOCKS = ("initializing",)   # worktree lock reasons git or the harness sets; cleared once stale
+# The daemon's sweep (full_view) runs within its tick: each git read it makes (inspect's too) ends
+# within SWEEP_GIT_S, and none starts on another worktree past SWEEP_BUDGET_S; the rest are deferred
+# to the next tick. A git read that times out keeps its worktree (`why` 'error: ...'), never removes it.
+SWEEP_GIT_S = 5.0
+SWEEP_BUDGET_S = 5.0
 ARCHIVE_MAX_MB = 200   # disk.worktree_archive_max_mb: unnamed untracked files archived per task, the rest dropped
 
 
@@ -2316,7 +2322,10 @@ def sweep(p: Project, *, older_than_s: float = 0, names: list[str] | None = None
     archiving cut off part way is finished or rolled back first (archive.recover). Neither a skipped
     nor a failed archive (`why` 'error: ...') counts against `archive_limit`.
     `full_view` (the daemon, which sees the whole tree): a record keep() locked whose folder was
-    deleted outside the harness is unlocked and dropped (gone_kept; reported with `gone` set)."""
+    deleted outside the harness is unlocked and dropped (gone_kept; reported with `gone` set), and the
+    sweep is bounded by time (SWEEP_GIT_S, SWEEP_BUDGET_S): the worktrees it did not reach are reported
+    `deferred`."""
+    import contextlib
     import fcntl
     import time
     from . import archive
@@ -2325,11 +2334,16 @@ def sweep(p: Project, *, older_than_s: float = 0, names: list[str] | None = None
         return []
     p.state.mkdir(parents=True, exist_ok=True)
     fd = os.open(p.state / "prune.lock", os.O_RDWR | os.O_CREAT, 0o600)
+    bound = contextlib.ExitStack()
     try:
         try:
             fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except OSError:
             return []
+        stop = time.monotonic() + SWEEP_BUDGET_S if full_view else None
+        if full_view:
+            bound.enter_context(gitmemo.bounded(SWEEP_GIT_S))
+        spent = "the sweep's time budget is spent: checked at the next sweep"
         out = []
         now = time.time()
         entries = None
@@ -2388,13 +2402,20 @@ def sweep(p: Project, *, older_than_s: float = 0, names: list[str] | None = None
             if w is None:
                 res = {"task": task["id"], "path": str(path), "branch": task["branch"], "status": task["status"],
                        "updated": task["updated"], "cleared": []}
-                why = held_by(p, task, open_tasks, now, pushes=sweep_pushes())
             else:
                 run = w["run"] or {}
                 res = {"task": task["id"] if task else None, "run": run.get("id"), "path": str(path),
                        "branch": rec["branch"] or (task or {}).get("branch"),
                        "status": (task or run).get("status") or "?", "updated": run.get("ended"), "cleared": []}
-                why = run_held(p, w, task, open_tasks, now, older_than_s, sweep_pushes())
+            if stop is not None and time.monotonic() > stop:
+                out.append({**res, "why": spent, "deferred": True})
+                continue
+            try:   # held_by may inspect (reader_hold): a git read that timed out keeps the worktree
+                why = held_by(p, task, open_tasks, now, pushes=sweep_pushes()) if w is None else \
+                    run_held(p, w, task, open_tasks, now, older_than_s, sweep_pushes())
+            except subprocess.TimeoutExpired as e:
+                out.append({**res, "why": f"error: {e}"[:300]})
+                continue
             users = [] if why else _users(path)
             if users:
                 why = f"process {users[0]} runs in it" + (f" (+{len(users) - 1} more)" if len(users) > 1 else "")
@@ -2509,17 +2530,21 @@ def sweep(p: Project, *, older_than_s: float = 0, names: list[str] | None = None
         for w in stray_worktrees(p):
             if skip_run(w):
                 continue
+            res = {"task": w["task"], "run": None, "stray": True, "path": str(w["path"]),
+                   "branch": w["rec"]["branch"], "status": "?", "updated": None, "cleared": []}
+            if stop is not None and time.monotonic() > stop:
+                out.append({**res, "why": spent, "deferred": True})
+                continue
             progress()
             entries = handoff_paths(p) if entries is None else entries
             try:
                 pushes = sweep_pushes()
                 out.append(_sweep_stray(p, w, open_tasks, now, older_than_s, entries, dry_run, pushes))
             except Exception as e:
-                out.append({"task": w["task"], "run": None, "stray": True, "path": str(w["path"]),
-                            "branch": w["rec"]["branch"], "status": "?", "updated": None, "cleared": [],
-                            "why": f"error: {e}"[:300]})
+                out.append({**res, "why": f"error: {e}"[:300]})
         return out
     finally:
+        bound.close()
         os.close(fd)
 
 
