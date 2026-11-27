@@ -4,7 +4,9 @@
 
 A change that delivers onto an open PR's branch is judged on the PR's cumulative diff against its
 merge base, not on this task's commits alone: a PR can grow far past its purpose one reviewed
-commit at a time. review_prompt_lines builds the block the review prompt carries: the PR's whole diffstat
+commit at a time. The budget gate (budget_gate) refuses a push onto a branch whose open PR
+is past its size budget, raising one keyed event so the coordinator posts a plan; a recorded
+plan (record_plan, the `ttp pr plan` CLI) lifts the gate. review_prompt_lines builds the block the review prompt carries: the PR's whole diffstat
 (lines added and removed, split into code, tests, docs and generated files), the repo's norm (median
 and p90 added lines of its recently merged PRs, read anonymously through the gh route and cached per
 repo for a day; 'norm unknown' when the route cannot answer) and the ponytail lane's duty to judge
@@ -125,6 +127,99 @@ def repo_norm(repo: str) -> dict | None:
     mid = len(adds) // 2
     return {"median": (adds[mid] if len(adds) % 2 else (adds[mid - 1] + adds[mid]) // 2),
             "p90": _quantile(adds, 0.9), "n": len(adds)}
+
+
+# --- the PR size budget ---------------------------------------------------------------------
+
+PLAN_KEY = "pr-size-plans"    # db kv: the recorded plans {"owner/repo#N": {"budget", "msg", "at"}}
+BUDGET_EVENT = "pr_size_budget"   # one keyed event when a push passes a PR's budget
+DEFAULT_BUDGET = 800   # added non-test lines when a repo's norm cannot be read: about twice the
+                        # ponytail landing cap, so a PR of a few tasks passes and a runaway one is caught
+
+
+def budget_of(p, repo: str) -> int:
+    """The PR size budget of `repo`, in added non-test lines: review.pr_budget_lines when set
+    (0: the gate is off), else the repo norm's p90, else DEFAULT_BUDGET. Off in the test suite's
+    size-gate-off mode (ponytail._test_off), like the landing size gate."""
+    from . import ponytail
+    if ponytail._test_off():
+        return 0
+    v = (((p.config() or {}).get("review") or {}).get("pr_budget_lines")) if p is not None else None
+    try:
+        if v not in (None, ""):
+            return max(0, int(v))
+    except (TypeError, ValueError):
+        pass
+    n = repo_norm(repo)
+    return int(n["p90"]) if n else DEFAULT_BUDGET
+
+
+def plan_budget(db, key: str) -> int | None:
+    """The budget a recorded plan lifted the PR size gate to for `key` ("owner/repo#N"), else None."""
+    row = (db.kv(PLAN_KEY, {}) or {}).get(key.lower()) or {}
+    try:
+        return int(row["budget"])
+    except (KeyError, TypeError, ValueError):
+        return None
+
+
+def record_plan(db, key: str, budget: int, msg: str) -> None:
+    """Record a PR size plan (`ttp pr plan`): the new budget that lifts the gate for `key`
+    ("owner/repo#N"), with the chat message id of the plan the coordinator posted to the user."""
+    plans = db.kv(PLAN_KEY, {}) or {}
+    plans[key.lower()] = {"budget": int(budget), "msg": str(msg or ""), "at": time.time()}
+    db.set_kv(PLAN_KEY, plans)
+
+
+def _budget_event(p, pr: dict, size: int, budget: int) -> None:
+    """One keyed event (one per PR and budget) naming the PR, its size, the norm and the budget,
+    so the coordinator posts a plan (`ttp pr plan`) that lifts the gate."""
+    key = f"{pr['repo']}#{pr['number']}"
+    fp = f"{BUDGET_EVENT}:{key}:{budget}"
+    if p.db.one("SELECT 1 FROM events WHERE fingerprint=?", (fp,)):
+        return
+    n = repo_norm(pr["repo"])
+    norm = (f"median {n['median']}, p90 {n['p90']} added lines over {n['n']} recent merges"
+            if n else "unknown (the gh route did not answer)")
+    text = (f"PR {pr['url']} (\"{pr['title']}\") is over its size budget: {size} non-test added "
+            f"lines against a budget of {budget}; the repo's merged-PR norm: {norm}. No further "
+            f"commits may land on its branch until a plan is recorded: "
+            f"`ttp pr plan {key} --budget <lines> --msg <chat message id>`")
+    p.db.x("INSERT INTO events(ts,source,kind,fingerprint,severity,text,status) VALUES(?,?,?,?,?,?,?)",
+           (time.time(), "pr", BUDGET_EVENT, fp, "normal", text, "queued"))
+
+
+def budget_gate(p, task: dict | None, branch: str) -> str:
+    """Why a push onto `branch` is refused ("" when it is not): its open PR's cumulative added
+    non-test lines are past the budget (review.pr_budget_lines, else the repo norm's p90, else
+    DEFAULT_BUDGET; a recorded plan's budget lifts the gate). Raises one keyed event naming the
+    PR, its size, the norm and the budget the first time a budget is passed."""
+    if p is None or not branch:
+        return ""
+    try:
+        pr = open_pr(p, task or {}, branch)
+        if not pr or pr["branch"] != branch:
+            return ""
+        st = cumulative_stat(p, branch)
+        if not st:
+            return ""
+        budget = plan_budget(p.db, f"{pr['repo']}#{pr['number']}")
+        budget = budget if budget is not None and budget > 0 else budget_of(p, pr["repo"])
+        if budget <= 0:
+            return ""
+        size = st["adds"] - st["tests"][0]
+        if size <= budget:
+            return ""
+        _budget_event(p, pr, size, budget)
+        return (f"{branch} heads {pr['url']}, which is over its size budget: {size} non-test "
+                f"added lines against a budget of {budget}. No further commits may land on it "
+                f"until a plan is recorded: `ttp pr plan {pr['repo']}#{pr['number']} "
+                f"--budget <lines> --msg <chat message id>`")
+    except Exception as e:
+        from .daemon import log
+        if p is not None:
+            log(p, f"the PR size gate could not read the PR headed by {branch} ({e})")
+        return ""
 
 
 def _stat_line(st: dict, ref: str) -> str:

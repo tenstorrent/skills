@@ -817,7 +817,11 @@ def publish(branch: str, cwd: str | None = None, home=None) -> int:
     """`ttp push --publish <branch>`: queue the branch's commits that origin's refs here do not hold, as a git
     bundle, for the workstation to push with its own login (a new branch or a fast-forward). The answer,
     once in, names the pushed sha (rerun the same call); HELD_RC until then."""
-    why, repo, grants, _ = _branch_call(cwd, branch)
+    from . import prsize
+    why, repo, grants, p = _branch_call(cwd, branch)
+    if not why and (budget := prsize.budget_gate(p, None, branch)):
+        print(f"ttp push --publish: refused: {budget}.", file=sys.stderr)
+        return 1
     sha = _git(cwd, "rev-parse", "--verify", "-q", f"refs/heads/{branch}^{{commit}}").stdout.strip() if not why else ""
     if not why and not _SHA.fullmatch(sha):
         why = f"no local branch `{branch}` here"

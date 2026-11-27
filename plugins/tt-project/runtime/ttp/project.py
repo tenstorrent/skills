@@ -496,7 +496,11 @@ DEFAULT_CONFIG: dict[str, Any] = {
                # Defaults from this repo's landed commits (n=5643 at 0.2.1379, added lines per commit:
                # p90 288, p95 383): landing about p95 (400), PRs under p90 (200).
                "ponytail_lane": True, "ponytail_model": "opus", "ponytail_land_lines": 400,
-               "ponytail_pr_lines": 200},
+               "ponytail_pr_lines": 200,
+               # prsize.py: a PR's cumulative non-test added lines past this budget refuses further
+               # commits to its branch (a recorded plan lifts the gate): None keeps the repo norm's
+               # p90, else 800 (about twice the landing cap); 0 turns the gate off.
+               "pr_budget_lines": None},
     # Continue chains (chaincap): a task_add that continues a lineage past max_hops hops, max_stalls
     # failed or no-progress hops in a row or max_usd spent (0 turns one off), or one in an area under
     # review.area_fail_cap, is refused unless its `reason` names what changed in a tricky turn.

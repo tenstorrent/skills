@@ -156,3 +156,79 @@ def test_the_stat_splits_the_prs_cumulative_diff_into_code_tests_docs_and_genera
     assert st["generated"] == [20, 0, 2] and st["code"] == [10, 0, 2], st   # the binary counts as a code file
     assert st["base"] == "origin/HEAD"
     assert prsize.cumulative_stat(p, "no-such-branch") is None
+
+
+def _over_budget_pr(env, monkeypatch, closed_adds=(700, 900)):
+    """A project whose `feature/x` branch heads an open PR over its budget, and its task: the
+    branch's cumulative diff is +5000 code, +100 tests; the repo norm comes from the closed PRs'
+    added lines. Returns (p, task id), with TTP_TASK set to the task carrying the pr_branch."""
+    monkeypatch.delenv("TTP_TEST_PONYTAIL")
+    p = make(env)
+    p.set_config("delivery.push_branch", "main")
+    p.set_config("delivery.own_push", "on")
+    base = _git_out(p.root, "rev-parse", "HEAD")
+    _git_out(p.root, "update-ref", "refs/remotes/origin/HEAD", base)
+    for name, lines in (("big.py", 5000), ("tests/test_big.py", 100)):
+        (p.root / name).parent.mkdir(parents=True, exist_ok=True)
+        (p.root / name).write_text("".join(f"{i}\n" for i in range(lines)))
+    _git_out(p.root, "add", ".")
+    _git_out(p.root, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "the big PR work")
+    _git_out(p.root, "update-ref", "refs/heads/feature/x", "HEAD")
+    nums = list(range(11, 11 + len(closed_adds)))
+    _anon(env, monkeypatch, _anon_pr_routes(nums, head="feature/x",
+                                            additions={n: a for n, a in zip(nums, closed_adds)}))
+    monkeypatch.setattr("ttp.ghroute.repo_of", lambda cwd: "acme/widgets")
+    t = p.db.add_task("Carry it", "s", kind="code", labels=["pr_branch:feature/x"])
+    p.db.update_task(t, status="running", branch=f"ttp/t{t}-carry-it")
+    _git_out(p.root, "checkout", "-q", "-B", f"ttp/t{t}-carry-it")
+    monkeypatch.setenv("TTP_TASK", str(t))
+    return p, t
+
+
+def test_a_push_onto_an_over_budget_pr_branch_is_refused_and_raises_one_keyed_event(env, monkeypatch):
+    """Once a PR's cumulative non-test diff passes its budget (the repo norm's p90 when
+    review.pr_budget_lines is unset), a push onto its branch is refused on the pr_branch push path,
+    and one keyed event tells the coordinator the PR, its size, the norm and the budget."""
+    from ttp import push
+    p, _t = _over_budget_pr(env, monkeypatch)
+    with pytest.raises(ValueError, match="over its size budget") as e:
+        push.own_target(p, p.root)
+    assert "5000 non-test added lines against a budget of 900" in str(e.value), str(e.value)
+    ev = p.db.q("SELECT * FROM events WHERE kind='pr_size_budget'")
+    assert len(ev) == 1 and ev[0]["status"] == "queued", ev
+    assert "acme/widgets/pull/7" in ev[0]["text"] and "5000 non-test" in ev[0]["text"]
+    assert "p90 900" in ev[0]["text"] and ev[0]["fingerprint"], ev[0]
+    with pytest.raises(ValueError):
+        push.own_target(p, p.root)
+    assert len(p.db.q("SELECT * FROM events WHERE kind='pr_size_budget'")) == 1, "the event is keyed"
+
+
+def test_a_recorded_plan_lifts_the_pr_size_gate_and_the_cli_records_it(env, monkeypatch):
+    """`ttp pr plan <repo>#<n> --budget N --msg <id>` records the plan that lifts the gate to the
+    new budget: the same push then goes through. A PR under the budget and a branch heading no open
+    PR are never gated; review.pr_budget_lines 0 turns the gate off."""
+    from types import SimpleNamespace
+    from ttp import cli, push, prsize
+    p, t = _over_budget_pr(env, monkeypatch)
+    with pytest.raises(ValueError):
+        push.own_target(p, p.root)
+    monkeypatch.setenv("TTP_PROJECT", str(p.base))
+    cli.cmd_pr(SimpleNamespace(action="plan", pr="https://github.com/acme/widgets/pull/7",
+                               budget=9000, msg="4781"))
+    assert prsize.plan_budget(p.db, "acme/widgets#7") == 9000
+    assert push.own_target(p, p.root) == ("local", "feature/x")   # no git remote: LOCAL
+    p.set_config("review.pr_budget_lines", 6000)     # an explicit budget, still above the PR
+    assert push.own_target(p, p.root) == ("local", "feature/x")
+    assert prsize.budget_gate(p, None, "main") == ""   # a branch heading no open PR
+    p.set_config("review.pr_budget_lines", 0)         # 0 turns the gate off
+    assert prsize.budget_gate(p, {"id": t}, "feature/x") == ""
+
+
+def test_the_gh_route_publish_path_refuses_an_over_budget_pr_branch(env, monkeypatch):
+    """The gh route's publish (`ttp push --publish`) refuses to push a branch whose open PR is
+    over its budget, with the same refusal the pr_branch push path gets."""
+    from ttp import ghqueue
+    p, _t = _over_budget_pr(env, monkeypatch)
+    monkeypatch.setattr("ttp.ghqueue._branch_call", lambda *a, **k: ("", "acme/widgets", [], p))
+    assert ghqueue.publish("feature/x", cwd=str(p.root)) == 1
+    assert p.db.one("SELECT 1 FROM events WHERE kind='pr_size_budget'")

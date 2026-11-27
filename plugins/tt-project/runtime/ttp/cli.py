@@ -10437,6 +10437,25 @@ def cmd_retire_tip(a) -> None:
     print(f"ttp retire-tip: {recorded[:10]} recorded as a retired push-branch tip of {p.name}")
 
 
+def cmd_pr(a) -> None:
+    """`ttp pr plan <owner/repo#N> --budget N --msg <chat message id>`: record a PR size plan,
+    which lifts the PR size gate to the new budget. The coordinator posts the plan to the user's
+    chat first; `--msg` names that chat message."""
+    from . import prsize, prguard
+    p = here()
+    if not p:
+        die("ttp pr plan: no project here (run it in a project or with TTP_PROJECT set)")
+    key = prguard.pr_key(a.pr or "")
+    if not key:
+        die("ttp pr plan: name the PR as owner/repo#N or give its URL")
+    if not a.budget or a.budget <= 0:
+        die("ttp pr plan: --budget is the PR's new size budget in added non-test lines (a positive number)")
+    if not str(a.msg or "").strip():
+        die("ttp pr plan: --msg names the chat message id of the plan you posted to the user")
+    prsize.record_plan(p.db, key, a.budget, a.msg)
+    print(f"ttp pr: plan recorded for {key}: its size gate lifts to {a.budget} added non-test lines")
+
+
 def cmd_quarantine(a) -> None:
     """`ttp quarantine list`: the tests the gate quarantined as flaky and the lifts of the last day.
     `ttp quarantine lift <test id> --why <text>`: drop one, logged as the daemon's lifts are (gatejudge).
@@ -17532,6 +17551,15 @@ def ttp_parser():
                                           "(a squash, a rewrite): its commits keep counting as landed")
     s.add_argument("sha", help="the tip commit the branch no longer holds")
     s.set_defaults(fn=cmd_retire_tip)
+
+    s = sub.add_parser("pr", help="a PR's size plan: the budget that lifts the PR size gate")
+    ps = s.add_subparsers(dest="action", required=True)
+    m = ps.add_parser("plan", help="record the PR size budget a plan grants (the plan goes to the "
+                                    "user's chat first; --msg names that chat message)")
+    m.add_argument("pr", help="the PR (owner/repo#N or its URL)")
+    m.add_argument("--budget", type=int, help="the PR's new size budget, in added non-test lines")
+    m.add_argument("--msg", help="the chat message id of the plan the coordinator posted to the user")
+    s.set_defaults(fn=cmd_pr)
 
     s = sub.add_parser("quarantine", help="list the tests the tests gate quarantined as flaky (and the last day's "
                                           "lifts), or lift one by hand with --why (logged)")
