@@ -1001,11 +1001,13 @@ def sweep_superseded_checks(p: Project, now: float | None = None) -> list[dict]:
         seen.add(row["dir"])
         info = _read_checks_pid(d)
         old, every = info.get("checks_set"), ids[bool(info.get("checks_task"))]
+        if not old or old == every or (d / CHECKS_RC).exists() or not _checks_alive(info):
+            continue
         try:
             current = checks_set_id(delivery, bool(info.get("checks_task")), info.get("worktree") or None, p)
         except Exception:   # its worktree is gone or unreadable: every check's id stands
             current = every
-        if not old or old in (current, every) or (d / CHECKS_RC).exists() or not _checks_alive(info):
+        if old == current:
             continue
         if checks_refused(p, d, row["id"]):
             continue

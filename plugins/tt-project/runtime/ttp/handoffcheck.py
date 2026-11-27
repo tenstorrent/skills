@@ -244,7 +244,10 @@ def _own_tests(p: Project, task: dict, root: Path, head: str, fork: str) -> set 
     try:
         old = p.db.task(worktree.continues_id(task)) if worktree.continues_id(task) else None
         accepted = worktree.continued_head(p, task) if old and old.get("branch") != task.get("branch") else None
-        main = worktree.resolve_base(p)
+        try:
+            main = worktree.resolve_base(p)
+        except RuntimeError:   # no base branch here: the accepted head alone still scopes it
+            main = ""
         merged = git("merge-base", main, head).stdout.strip() if main else ""
         own = None
         for base in dict.fromkeys(b for b in (accepted, merged) if b):
