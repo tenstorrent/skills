@@ -2554,9 +2554,10 @@ the pick order, so it takes the first starts. A resumed resource ramps only its 
   leads a batch. A queued task that waits only on the lead or on other members joins too, after them.
   Tasks naming files the lead's spec names come first, then by priority; one whose files a task on
   another branch is changing stays out. Whatever dispatch picks first leads, so an urgent task never
-  waits for a batch to fill; an urgent task (priority 1, an `urgent:` line, or a task of an open
-  obligation or user order) shares a run only with urgent tasks, and a routine one only with routine
-  tasks. So a project landing many changes lands them as a few batches, not one by one. The worker commits each task
+  waits for a batch to fill; an urgent task (priority 1, an `urgent:` line that asks for it, or a
+  task of an open obligation or user order) shares a run only with urgent tasks, and a routine one
+  only with routine tasks. So a project landing many changes lands them as a few batches, not one
+  by one. The worker commits each task
   separately, with no task number in its
   messages (a public repository's squash-merge would carry one), and hands off one outcome per task
   with its commit ids (`members` in result.json; with none, the branch's commits when the batch

@@ -98,11 +98,13 @@ def test_batch_pick_keeps_urgent_and_routine_work_in_separate_runs(env):
     mid = p.db.post("in", "please fix it", chat="c1")
     obligations.add_order(p, "fix it", mid, [owned["id"]], action_class="change")
     ordered = dict(owned, priority=2)   # a user order's task is urgent whatever its priority
+    negated = row(109, priority=3, spec="urgent: none\nTidy.")   # a negated line: routine, as dispatch reads it
     # (a) an urgent lead takes no routine task; (b) urgent tasks, whatever makes them urgent, share its run.
-    assert ids(batchrun.pick(p, p.config(), p1, [p2, p3, p1b, flagged, ordered])) == sorted([102, 103, owned["id"]])
+    got = batchrun.pick(p, p.config(), p1, [p2, p3, p1b, flagged, ordered, negated])
+    assert ids(got) == sorted([102, 103, owned["id"]])
     assert batchrun.pick(p, p.config(), p1, [p2, p3]) == []
-    # A routine lead takes no urgent task; (c) routine tasks batch as before.
-    assert ids(batchrun.pick(p, p.config(), p3, [p1, flagged, ordered, p2, p3b, p3c])) == [105, 107, 108]
+    # A routine lead takes no urgent task; (c) routine tasks batch as before, a negated `urgent:` line included.
+    assert ids(batchrun.pick(p, p.config(), p3, [p1, flagged, ordered, p2, p3b, p3c, negated])) == [105, 107, 108, 109]
 
 
 def test_batch_pick_takes_members_whose_resources_the_lead_holds(env):
