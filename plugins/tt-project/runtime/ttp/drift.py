@@ -147,10 +147,10 @@ def detect(e: dict, s: dict, named: list[str], waiting: bool, now: float,
         run_share, wall_share = run_usd / budget, wall.get("share")
         left = budget - (float(sp.get("task_usd") or 0) - run_usd)   # the budget this run started with
         git = e.get("git") or {}
-        new = set(git.get("committed") or []) - set((e.get("drift") or {}).get("base_files") or [])
+        no_new = git.get("head") == (e.get("drift") or {}).get("base_head")   # the branch tip has not moved
         if wall_share is not None and run_share >= PACE_FLOOR and run_share > s["pace"] * wall_share:
             flags["pace"] = f"{run_share:.0%} of the budget spent in {wall_share:.0%} of the wall limit"
-        elif git and not new and left > 0 and run_usd / left > PACE_NO_COMMIT:   # only this run's spend and output
+        elif git and no_new and left > 0 and run_usd / left > PACE_NO_COMMIT:   # only this run's spend and output
             flags["pace"] = f"{run_usd / left:.0%} of the budget it started with spent and nothing new committed"
     return flags
 
@@ -206,6 +206,8 @@ def check(p, cfg: dict, data: dict, now: float) -> list[int]:
         if "base_files" not in st:   # what its branch had changed before this run: not this run's drift
             st["base_files"] = list(e.get("files") or [])
         head = (e.get("git") or {}).get("head")
+        if head:
+            st.setdefault("base_head", head)   # the branch tip before this run added anything
         if head and head != st.get("head"):
             st["head_at"] = now if st.get("head") else float(e.get("started") or now)
             st["head"] = head
