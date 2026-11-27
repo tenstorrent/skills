@@ -30,6 +30,7 @@ An llm schedule may name a `precheck`: a shell command, run off the tick from th
 the budget, open-run, debounce and idle gates (`precheck_timeout_s`, 120, capped like a command
 watcher's `timeout_s`; see over_caps). Exit 0 skips the trigger as "skipped: precheck: <its first output line>"; any other exit,
 a timeout or an error lets the run go ahead and is logged. It judges outside state no model needs to.
+The run it admits is bound to the JSON object on its last stdout line, or to `unknown` (precheckbind).
 
 A project may keep its schedules in `harness/schedules.json` (the format of the template's
 recurring.json), so every change to them is a commit in the harness. Once that file exists it is

@@ -252,6 +252,13 @@ coordinator with that evidence.
   the median cost of its last 10 runs x 1.25; none under 3 runs), and the daily review lists caps under it.
   Past 80% of its own cap with a green gate, a schedule raises one `schedule-cap-80:<name>` observation per
   budget day, closed at the day's reset. Caps never change by themselves.
+- Schedule precheck evidence: an llm schedule's `precheck` that exits nonzero (run) may print one JSON
+  object, at most 4 KB, as its last stdout line: `snapshot` (an absolute path) and `captured_at` (ISO
+  time or epoch), other keys kept as they are. It is stored with the task in the write that queues it
+  and handed to that run unchanged, as the file `$TTP_PRECHECK_JSON` names and one line in its spec;
+  a later precheck, a moved latest pointer or a stats re-read never replaces it. Missing, invalid or
+  oversized output, a failed precheck and a timeout bind `{"binding": "unknown"}`, never another snapshot
+  (`runtime/ttp/precheckbind.py`).
 - Home time zone: each project keeps the IANA zone of the user's workstation as `home_timezone` in
   its `project.json`. `ttp new` records the zone of the machine it runs on (with `--host`, the
   workstation's, never the box's). `ttp connect` from a workstation (not from an ssh login), and a workstation's spend push

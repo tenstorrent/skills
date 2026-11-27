@@ -324,6 +324,85 @@ def test_an_llm_precheck_that_raises_lets_the_run_go_ahead(env, monkeypatch):
     assert "schedule summary: precheck failed (OSError: no shell); the run goes ahead" in log, log
 
 
+def _bound_run(env, precheck):
+    """A daily review queued through `precheck`: (daemon, schedule, payload, its task)."""
+    from ttp import daemon
+    p = make(env)
+    dm = daemon.Daemon(p.base)
+    s = {"name": "daily-review", "budget_usd_day": None, "last_run": None, "description": "review"}
+    payload = {"precheck": precheck}
+    p.db.x("DELETE FROM tasks WHERE origin='schedule'")
+    assert dm._schedule_llm(s, payload) == "queued"
+    return p, dm, s, payload, p.db.one("SELECT * FROM tasks WHERE origin='schedule'")
+
+
+def _handed(p, task, tmp_path):
+    """What the run of `task` is handed: (the $TTP_PRECHECK_JSON file's object, its env)."""
+    from ttp import precheckbind
+    run_dir = tmp_path / f"run-{task['id']}"
+    run_dir.mkdir(exist_ok=True)
+    env = precheckbind.hand_over(p.db, task["id"], run_dir)
+    return json.loads(open(env[precheckbind.ENV]).read()) if env else None, env
+
+
+def test_a_run_a_precheck_admits_keeps_its_snapshot_when_latest_moves_before_it_starts(env, tmp_path):
+    """The case behind it: the precheck's output was dropped, so a run read whatever was newest when
+    it started, not the snapshot that admitted it."""
+    latest = tmp_path / "latest.json"
+    a = {"snapshot": "/data/snap-A", "captured_at": "2030-01-01T00:00:00Z", "rows": 3}
+    latest.write_text(json.dumps(a) + "\n")
+    p, dm, s, payload, task = _bound_run(env, f"echo progress; cat {latest}; exit 1")
+    latest.write_text(json.dumps({"snapshot": "/data/snap-B"}) + "\n")   # latest moves before the run starts
+    assert dm._schedule_llm(s, payload) != "queued"   # a later precheck queues nothing and rebinds nothing
+    got, run_env = _handed(p, task, tmp_path)
+    assert got == a and list(run_env) == ["TTP_PRECHECK_JSON"], (got, run_env)
+    spec = p.db.one("SELECT spec FROM tasks WHERE id=?", (task["id"],))["spec"]
+    assert "/data/snap-A" in spec and "snap-B" not in spec, spec[-600:]
+
+
+def test_a_delayed_feed_refresh_keeps_the_precheck_binding(env, tmp_path):
+    from ttp import schedule as sched
+    latest = tmp_path / "latest.json"
+    latest.write_text(json.dumps({"snapshot": "/data/snap-A"}))
+    p, dm, s, payload, task = _bound_run(env, f"cat {latest}; exit 1")
+    latest.write_text(json.dumps({"snapshot": "/data/snap-B"}))
+    p.db.x("UPDATE tasks SET created=created-? WHERE id=?", (sched.FEED_STALE_S + 60, task["id"]))
+    spec = dm._fresh_feed(p.db.one("SELECT * FROM tasks WHERE id=?", (task["id"],)))["spec"]
+    assert "[stats re-read at " in spec and "/data/snap-A" in spec and "snap-B" not in spec, spec[-600:]
+    assert _handed(p, task, tmp_path)[0] == {"snapshot": "/data/snap-A"}
+
+
+def test_a_precheck_without_usable_metadata_binds_unknown(env, tmp_path):
+    from ttp import precheckbind
+    p, dm, s, payload, task = _bound_run(env, "echo some reason; exit 1")
+    assert _handed(p, task, tmp_path)[0] == {"binding": "unknown", "why": "last line is not JSON"}
+    assert '"binding": "unknown"' in task["spec"]
+    for out, why in [("", "no output"), ("[1, 2]", "last line is not a JSON object"),
+                     ('{"snapshot": "rel/path"}', "snapshot is not an absolute path"),
+                     (json.dumps({"x": "y" * precheckbind.MAX_BYTES}), "last line over 4096 bytes")]:
+        assert precheckbind.parse(out) == precheckbind.unknown(why), out[:40]
+    assert precheckbind.parse('{"note": "kept"}\n\n') == {"note": "kept"}   # no snapshot: kept as it is
+    assert _handed(p, {"id": 999999}, tmp_path) == (None, {}) and precheckbind.line(None) == ""
+
+
+@pytest.mark.parametrize("precheck,why", [
+    ("cat /no/such/latest.json; exit 2", "no output"),
+    ("sleep 5", "precheck timed out"),
+])
+def test_a_failed_precheck_binds_unknown_never_the_old_latest(env, tmp_path, precheck, why):
+    """An old latest exists, but this precheck did not report it: the run is not handed it instead."""
+    (tmp_path / "latest.json").write_text(json.dumps({"snapshot": "/data/snap-old"}))
+    from ttp import daemon
+    p = make(env)
+    dm = daemon.Daemon(p.base)
+    s = {"name": "daily-review", "budget_usd_day": None, "last_run": None, "description": "review"}
+    p.db.x("DELETE FROM tasks WHERE origin='schedule'")
+    assert dm._schedule_llm(s, {"precheck": precheck, "precheck_timeout_s": 1}) == "queued"
+    task = p.db.one("SELECT * FROM tasks WHERE origin='schedule'")
+    assert _handed(p, task, tmp_path)[0] == {"binding": "unknown", "why": why}
+    assert "snap-old" not in task["spec"]
+
+
 def test_an_llm_precheck_is_not_run_when_an_earlier_gate_already_skipped(env, tmp_path):
     from types import SimpleNamespace
     from ttp.daemon import Daemon
@@ -1541,7 +1620,7 @@ def _window_daemon(p, monkeypatch, barrier=None):
     sched.upsert(p.db, "nightly", "llm", "1d", at="04:30", payload={"skip_if_idle": False})
     base = dmod.Daemon(p.base)
     if barrier is not None:
-        monkeypatch.setattr(dmod.Daemon, "_schedule_precheck", lambda self, s, payload: barrier.wait(10) and "")
+        monkeypatch.setattr(dmod.Daemon, "_schedule_precheck", lambda self, s, payload: (barrier.wait(10) and "", None))
 
     def host():
         h = copy.copy(base)

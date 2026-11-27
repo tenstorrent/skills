@@ -44,6 +44,7 @@ from . import (   # one name per line: two changes adding names merge without a 
     glmassist,
     glmquota,
     handback,
+    precheckbind,
 )
 from . import rolerestore
 from . import stalegates
@@ -4318,6 +4319,7 @@ class Daemon:
             venv_vars = worktree.venv_env(venv, path) if venv else {}
             env = {**env, **venv_vars, **tmp_env, "TTP_RUN_DIR": str(run_dir), "TTP_PROJECT": str(self.p.base),
                    "TTP_RUN_ID": str(run_id), **task_env(task["id"] if task else ""), "PYTHONPATH": runtime_dir,
+                   **precheckbind.hand_over(self.p.db, task["id"] if task else None, run_dir),   # the evidence it was admitted on
                    **blindreview.env(task),   # a blind review's `ttp` masks the model (every provider)
                    **glmguard.arm_env(note),  # a run on the code arm's GLM side runs under glmguard (every provider)
                    **coordroute.guard_env(note),   # so does a routine coordinator lane or shadow turn
@@ -10238,7 +10240,7 @@ class Daemon:
         if (not owed and not force and payload.get("skip_if_idle", s["name"] == "daily-review") and s["last_run"]
                 and not self._active_since(float(s["last_run"]), s["name"])):
             return "skipped: nothing happened since the last run"
-        skip = "" if force else self._schedule_precheck(s, payload)
+        skip, bound = ("", None) if force else self._schedule_precheck(s, payload)
         if skip:
             return skip
         picked = deslop.plan(self.p, self.cfg) if payload.get("deslop") else None
@@ -10248,6 +10250,7 @@ class Daemon:
         prompt_file = payload.get("prompt")
         if prompt_file and (self.p.harness / "prompts" / prompt_file).exists():
             spec = (self.p.harness / "prompts" / prompt_file).read_text() + "\n\n" + spec
+        spec += precheckbind.line(bound)   # fixed at admission: a feed refresh never rewrites it
         if feed := self._review_feed(s, payload):   # marked with when it was read: a late start re-reads it
             spec += sched.wrap_feed(feed, time.time(), timefmt.home(self.p))
         with db.tx():   # the evidence is the state at enqueue: what changes during the run stays new
@@ -10261,6 +10264,7 @@ class Daemon:
                               budget_usd=sched.run_budget(self.cfg, s, payload, spent),
                               origin="schedule", labels=[s["name"]])
             sched.claim_window(db, s, start, tid)
+            precheckbind.store(db, tid, bound)
             if evidence is not None:
                 sched.record_evidence(db, s["name"], tid, evidence)
             if picked:
@@ -10556,29 +10560,30 @@ class Daemon:
         self._schedule_ran(row, status, None)
         return status
 
-    def _schedule_precheck(self, s: dict, payload: dict) -> str:
+    def _schedule_precheck(self, s: dict, payload: dict) -> tuple[str, dict | None]:
         """An llm schedule's model-free `precheck` (shell, run from the project root, `precheck_timeout_s`
         capped like a command watcher's): exit 0 skips this trigger, its first output line the reason.
-        Any other exit, a timeout or an error lets the run go ahead (fail open) and is logged."""
+        Any other exit, a timeout or an error lets the run go ahead (fail open) and is logged.
+        Returns (skip reason or "", the evidence a run it admits is bound to: precheckbind)."""
         cmd = _precheck_cmd(payload)
         if not cmd:
-            return ""
+            return "", None
         timeout = _watcher_timeout({"timeout_s": payload.get("precheck_timeout_s")})
         try:   # 0 (skip) and 1 (go ahead) are its answers
             out = schedrun.run_group(cmd, cwd=str(self.p.root), timeout=timeout, env=command_env(self.p))
         except subprocess.TimeoutExpired:
             log(self.p, f"schedule {s['name']}: precheck timed out after {timeout} s"
                         f"{sched.capped_note(payload.get('precheck_timeout_s'), WATCHER_MAX_S)}; the run goes ahead")
-            return ""
+            return "", precheckbind.unknown("precheck timed out")
         except Exception as e:
             log(self.p, f"schedule {s['name']}: precheck failed ({type(e).__name__}: {e}); the run goes ahead")
-            return ""
+            return "", precheckbind.unknown(f"precheck failed ({type(e).__name__})")
         if out.returncode != 0:
             log(self.p, f"schedule {s['name']}: precheck exited rc={out.returncode} "
                         f"({output_tail(out.stderr) or 'no stderr'}); the run goes ahead")
-            return ""
+            return "", precheckbind.parse(out.stdout)
         line = next((x.strip() for x in (out.stdout or "").splitlines() if x.strip()), "") or "exit 0"
-        return f"skipped: precheck: {line}"[:200]
+        return f"skipped: precheck: {line}"[:200], None
 
     def _active_since(self, since: float, schedule: str) -> bool:
         """Whether any worker ran or finished, other than this schedule's own, or the user wrote, since
