@@ -2210,8 +2210,8 @@ def test_pr_watch_makes_one_gh_call_per_repo_per_poll_and_the_cycle_reuses_it(en
     with monkeypatch.context() as m:   # per-PR reads, as before batching: 2 gh calls a PR
         m.setattr(watchers.PrCycle, "plan", lambda self, urls: None)
         assert watchers.watch_prs(d).startswith(f"ok ({n} PRs")
-    reads = [c for c in gh.calls if not any("/files?" in x for x in c)]   # the sweep's files reads sit beside them
-    assert len(reads) == 2 * n, gh.calls
+    reads = [c for c in gh.calls if not any("/files?" in x or "/branches/" in x for x in c)]   # the sweep's files and
+    assert len(reads) == 2 * n, gh.calls                                                      # base rules reads sit beside them
     gh.calls.clear()
     with watchers.pr_cycle():
         assert watchers.watch_prs(d).startswith(f"ok ({n} PRs")

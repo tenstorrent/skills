@@ -4141,7 +4141,8 @@ the pick order, so it takes the first starts. A resumed resource ramps only its 
   in `watchers.purview_extra` (a PR URL or `owner/repo#N`; read even while gh is logged out, anonymously or
   through the route). The sweep itself posts nothing and dispatches nothing; the coordinator's duty is to act on what
   it reports (fix tasks on the PR's branch, dispatch, rebase, ping), through the workers' `gh` guard. A non-draft PR gets `pr_findings` for failed checks and
-  unanswered comments as a draft does. `pr_ci_not_run` lists checks skipped, or workflows that need a
+  unanswered comments as a draft does. `pr_ci_not_run` lists checks the base branch's protection or rulesets
+  require and the head does not report, workflow runs whose checks were all skipped, or workflows that need a
   manual or label trigger, never ran on the head and are listed in `pr_babysit.dispatch`, each with its trigger
   (read from the repo's workflows at the head). `pr_idle` fires once per idle stretch past `pr_babysit.idle_h` (24) hours without commit,
   review, comment or check activity, naming the requested reviewers. Once per run, not per PR, the sweep

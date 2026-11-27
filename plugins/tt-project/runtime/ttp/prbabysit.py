@@ -2,9 +2,11 @@
 draft or not, beyond failed checks and unanswered comments (those stay in watchers._check_findings).
 
 Per PR, on each watcher run:
-- `pr_ci_not_run` event: checks skipped, or workflows that need a manual or label trigger and never ran on the
-  PR head and that `pr_babysit.dispatch` lists for the repo. Each is listed with its trigger (workflow_dispatch,
-  a label name, or none), read from the repo's .github/workflows at the head (REST, each file kept by its blob).
+- `pr_ci_not_run` event: checks the base branch's protection or rulesets require and the head does not report,
+  workflow runs whose checks were all skipped, or workflows that need a manual or label trigger and never ran on
+  the PR head and that `pr_babysit.dispatch` lists for the repo. Each workflow is listed with its trigger
+  (workflow_dispatch, a label name, or none), read from the repo's .github/workflows at the head (REST, each file
+  kept by its blob).
 - `pr_idle` event: no new head and no comment or review from a person for `pr_babysit.idle_h` hours, with the
   requested reviewers. Once per idle stretch: bots, check runs and the runs' own posts do not reset it.
 - status changes since the last sweep (merged or closed, out of draft, review approved or changes requested,
@@ -30,10 +32,14 @@ from datetime import datetime
 
 from . import project
 
-KEY = "pr_babysit"           # {pr_key: {"told": {condition: value}, "idle": mark, "notrun": [head, names], "unrun": [head, text],
+KEY = "pr_babysit"           # {pr_key: {"told": {condition: value}, "idle": mark, "notrun": [head, rules, names],
+                            #  "unrun": [head, base sha, rules, text],
                             #  "branch", "open", "head", "head_at"}}
-SENT_KEY = "pr_dispatched"   # kv: {"owner/repo workflow head": ts} of the dispatches the guard let through
+SENT_KEY = "pr_dispatched"   # kv: {"owner/repo workflow head [k=v ...]": {"at": ts, "seen": [run ids], "run": id}}
 LIVE = ("queued", "in_progress", "waiting", "requested", "pending")   # a run in one of these covers its jobs
+COVERING = ("push", "pull_request", "pull_request_target")   # events whose run on the head covers a dispatch
+RULES_KEY = "pr_rules"       # kv: {"owner/repo@base": {"at": ts, "sha": base sha, "required": [name]} or {"at", "unread"}}
+RULES_S = 3600               # how long a base branch's required checks are kept
 FLOWS_KEY = "pr_workflows"   # {"owner/repo:path:blob": {"at": ts, "info": {"name", "file", "manual", "trigger", "labels"}}}
 READ_S = 900                 # a PR no task opened is read this often while the sweep is on
 ROUTE_SILENT_S = 24 * 3600   # a route silent longer than this makes the sweep raise pr_route_silent
@@ -70,21 +76,34 @@ def _target(real: str, more: list[str]) -> str:
     return prguard.pr_key(out) or ""
 
 
-def _live_run(real: str, db, repo: str, what: str, ref: str, head: str) -> str:
-    """The id of a queued or running run of workflow `what` on exactly `head` whose inputs are proven equal to
-    a dispatch's (none): one a push or PR event started, or a workflow_dispatch run created after this project's
-    own receipt for that head. '' when there is none, or the run list cannot be read (not proven)."""
+def _head_runs(real: str, repo: str, what: str, ref: str, head: str) -> list[dict] | None:
+    """The runs of workflow `what` on exactly `head`, or None when the list cannot be read."""
     from . import prguard
     try:
         runs = json.loads(prguard._gh(real, "run", "list", "-R", repo, "--workflow", what, "--branch", ref, "--json",
                                       "databaseId,headSha,status,event,createdAt", "-L", "20") or "[]")
     except ValueError:
-        return ""
-    sent = (db.kv(SENT_KEY, {}) or {}).get(f"{repo.lower()} {what} {head}")
-    for r in runs if isinstance(runs, list) else []:
-        if not isinstance(r, dict) or r.get("headSha") != head or str(r.get("status")).lower() not in LIVE:
+        return None
+    return [r for r in runs if isinstance(r, dict) and r.get("headSha") == head] if isinstance(runs, list) else None
+
+
+def _live_run(db, sent_key: str, runs: list[dict]) -> str:
+    """The id of a queued or running run in `runs` proven to do what the dispatch `sent_key` names would: one a push
+    or PR event started, or the run this project's own earlier dispatch produced with the same inputs (the receipt,
+    kept per input set, binds the first workflow_dispatch run that was not there when the guard let it through).
+    '' when there is none."""
+    sent = (db.kv(SENT_KEY, {}) or {}).get(sent_key)
+    sent = sent if isinstance(sent, dict) else {}
+    if sent and not sent.get("run"):
+        new = [r for r in runs if r.get("event") == "workflow_dispatch" and str(r.get("databaseId")) not in sent["seen"]
+               and _ts(r.get("createdAt")) >= sent["at"] - 60]
+        if new:
+            sent["run"] = str(min(new, key=lambda r: _ts(r.get("createdAt")))["databaseId"])
+            db.set_kv(SENT_KEY, {**(db.kv(SENT_KEY, {}) or {}), sent_key: sent})
+    for r in runs:
+        if str(r.get("status")).lower() not in LIVE:
             continue
-        if r.get("event") != "workflow_dispatch" or (sent and _ts(r.get("createdAt")) >= sent - 60):
+        if r.get("event") in COVERING or str(r.get("databaseId")) == sent.get("run"):
             return str(r.get("databaseId") or "?")
     return ""
 
@@ -117,12 +136,17 @@ def guard(args: list[str], real: str, db, cfg: dict, stdin_text: str | None = No
             return f"refused: workflow {what!r} is not listed for {repo} in pr_babysit.dispatch"
         head = (prguard._gh(real, "api", f"repos/{repo}/commits/{ref}", "-q", ".sha").strip()   # what --ref runs on
                 or ((db.kv(KEY, {}) or {}).get(key) or {}).get("head") or "")
-        if head and (run := _live_run(real, db, repo, what, ref, head)):
+        inputs = sorted(more[i + 1] for i, a in enumerate(more[:-1]) if a == "-f")
+        sent_key = " ".join([repo.lower(), what, head, *inputs])   # one receipt per input set
+        runs = _head_runs(real, repo, what, ref, head) if head else None
+        if runs and (run := _live_run(db, sent_key, runs)):
             return (f"refused: run {run} of {what} is already queued or running on {key}'s head {head[:12]} and "
                     "covers its jobs: wait for it")
-        if head:
-            sent = {k: v for k, v in (db.kv(SENT_KEY, {}) or {}).items() if v > time.time() - 7 * 86400}
-            db.set_kv(SENT_KEY, {**sent, f"{repo.lower()} {what} {head}": time.time()})
+        if head:   # the runs already there are never taken for the one this dispatch produces
+            sent = {k: v for k, v in (db.kv(SENT_KEY, {}) or {}).items()
+                    if isinstance(v, dict) and v.get("at", 0) > time.time() - 7 * 86400}
+            seen = [str(r.get("databaseId")) for r in runs or []]
+            db.set_kv(SENT_KEY, {**sent, sent_key: {"at": time.time(), "seen": seen}})
         return None
     if cmd == "api":   # the same refusals when a write goes through the REST or GraphQL endpoint
         endpoint, method = prguard._api_target(args[1:])
@@ -227,30 +251,77 @@ def _listed(f: dict | None, listed) -> bool:
     return bool(f) and (f["file"] in listed or f["name"] in listed or any(f"label:{x}" in listed for x in f.get("labels", [])))
 
 
-def _not_run(daemon, pr: dict, key: str, gh, now: float, pending: bool) -> tuple[str, str, list] | None:
-    """The `pr_ci_not_run` text: workflows with only skipped checks, and (once nothing is pending) manual workflows
+def _check_run(c: dict) -> str:
+    m = re.search(r"/actions/runs/(\d+)", str(c.get("detailsUrl") or ""))
+    return m.group(1) if m else ""
+
+
+def _base_rules(daemon, gh, repo: str, base: str, now: float) -> dict | None:
+    """The base branch's tip and the checks its protection and rulesets require, read through the gh route and
+    kept RULES_S: {"sha", "required": [name]}. None when the route cannot read them (no permission, no answer):
+    said once in the daemon log, asked again after RULES_S."""
+    from . import watchers
+    db, k = daemon.p.db, f"{repo}@{base}"
+    cache = {x: v for x, v in (db.kv(RULES_KEY, {}) or {}).items() if now - float(v.get("at") or 0) < 86400}
+    got = cache.get(k) or {}
+    if now - float(got.get("at") or 0) >= RULES_S:
+        branch = gh(["api", f"repos/{repo}/branches/{base}"], str(daemon.p.root))
+        sets = gh(["api", f"repos/{repo}/rules/branches/{base}"], str(daemon.p.root)) if isinstance(branch, dict) else None
+        if isinstance(branch, dict) and isinstance(sets, list):
+            req = (branch.get("protection") or {}).get("required_status_checks") or {}
+            names = list(req.get("contexts") or []) + [c.get("context") for c in req.get("checks") or []]
+            names += [c.get("context") for r in sets if isinstance(r, dict) and r.get("type") == "required_status_checks"
+                      for c in (r.get("parameters") or {}).get("required_status_checks") or []]
+            new = {"at": now, "sha": (branch.get("commit") or {}).get("sha") or "", "required": sorted({n for n in names if n})}
+        else:
+            new = {"at": now, "unread": True}
+            if not got.get("unread"):
+                watchers._log(daemon, f"pr-watch: the required checks of {k} could not be read through the gh route "
+                              "(no permission or no answer): checks skipped or never run are judged without them")
+        got = cache[k] = new
+        db.set_kv(RULES_KEY, cache)
+    return None if got.get("unread") else got
+
+
+def _not_run(daemon, pr: dict, key: str, gh, now: float, pending: bool) -> tuple[str, str, list, list] | None:
+    """The `pr_ci_not_run` text: checks the base branch's protection or rulesets require that the head does not
+    report (once nothing is pending), workflows with a run whose checks were all skipped (per run: another run of
+    the same workflow covers only the jobs it ran), and (once nothing is pending) manual workflows
     `pr_babysit.dispatch` lists, by file, name or label, that never ran on the head; then the same text for the
-    listed ones alone, which hold CI green; then the names of all of them, which the alert is keyed on. None: the
-    workflow files could not be read, so what ran is unknown."""
+    listed and required ones alone, which hold CI green; then the names of all of them, which the alert is keyed
+    on; then [base sha, required names or "unread"], the rules the verdict was read against. None: the workflow
+    files could not be read, so what ran is unknown."""
     sha, repo = pr.get("headRefOid"), key.split("#")[0]
     checks = pr.get("statusCheckRollup") or []
     listed = settings(getattr(daemon, "cfg", None))["dispatch"].get(repo, [])
+    rules = _base_rules(daemon, gh, repo, pr["baseRefName"], now) if sha and pr.get("baseRefName") else None
+    bound = [rules["sha"], rules["required"]] if rules else ["", "unread"]
+    reported = {c.get("name") or c.get("context") for c in checks}
+    todo = {n: (f"required by {pr['baseRefName']}'s rules, not reported on the head", "required")
+            for n in (rules or {}).get("required", []) if n not in reported and not pending}
+    text = lambda held: "; ".join(f"{n} ({why})" for n, (why, f) in sorted(todo.items())
+                                  if not held or f == "required" or _listed(f, listed))
     skip = any((c.get("conclusion") or "").upper() == "SKIPPED" for c in checks)
     if not (sha and (skip or listed)):
-        return "", "", []
+        return text(False), text(True), sorted(todo), bound
     flows = _flows(daemon.p.db, gh, repo, sha, str(daemon.p.root), now)
     if flows is None:
         return None
     by_name = {f["name"]: f for f in flows}
     ran = {_workflow(c) for c in checks}
-    ran_ok = {_workflow(c) for c in checks if (c.get("conclusion") or "").upper() != "SKIPPED"}
-    skipped = {_workflow(c) or c.get("name") or "?" for c in checks if (c.get("conclusion") or "").upper() == "SKIPPED"}
-    todo = {n: by_name.get(n) for n in skipped - ran_ok}
+    jobs_ok = {(_workflow(c), c.get("name")) for c in checks if (c.get("conclusion") or "").upper() != "SKIPPED"}
+    runs: dict[tuple, list] = {}
+    for c in checks:
+        runs.setdefault((_workflow(c) or c.get("name") or "?", _check_run(c)), []).append(c)
+    for (n, _), cs in runs.items():   # a run that ran nothing; a re-run of its skipped jobs covers it
+        if all((c.get("conclusion") or "").upper() == "SKIPPED" for c in cs) and not all(
+                (_workflow(c), c.get("name")) in jobs_ok for c in cs):
+            f = by_name.get(n)
+            todo[n] = (f"{f['file']}, trigger: {f['trigger']}" if f else "trigger: none", f)
     named = not checks or any(ran - {""})   # a read that names no workflow cannot say which never ran
-    todo.update({f["name"]: f for f in flows if f["manual"] and f["name"] not in ran and named and not pending and _listed(f, listed)})
-    text = lambda held: "; ".join(f"{n} ({f['file'] + ', trigger: ' + f['trigger'] if f else 'trigger: none'})"
-                                  for n, f in sorted(todo.items(), key=lambda x: x[0]) if not held or _listed(f, listed))
-    return text(False), text(True), sorted(todo)
+    todo.update({f["name"]: (f"{f['file']}, trigger: {f['trigger']}", f) for f in flows
+                 if f["manual"] and f["name"] not in ran and named and not pending and _listed(f, listed)})
+    return text(False), text(True), sorted(todo), bound
 
 
 def _told(daemon, state: dict, key: str, url: str, sig: dict, ready: bool, unrun) -> None:
@@ -293,11 +364,11 @@ def sweep(daemon, t: dict, pr: dict, sig: dict, gh) -> str | None:
     allstate = dict(db.kv(KEY, {}) or {})
     state = allstate.setdefault(key, {})
     head = pr.get("headRefOid") or ""
-    text, held, names = (_not_run(daemon, pr, key, gh, now, sig["checks"] == "pending") if sig["state"] == "OPEN"
-                         else ("", "", [])) or (None, None, None)
+    text, held, names, bound = (_not_run(daemon, pr, key, gh, now, sig["checks"] == "pending") if sig["state"] == "OPEN"
+                                else ("", "", [], ["", "unread"])) or (None, None, None, None)
     if held is not None or (state.get("unrun") or [""])[0] != head:   # an unread answer keeps what was known
-        state["unrun"] = [head, held]
-    _told(daemon, state, key, url, sig, pr.get("isDraft") is False, state["unrun"][1])
+        state["unrun"] = [head, *(bound or ["", "unread"]), held]
+    _told(daemon, state, key, url, sig, pr.get("isDraft") is False, state["unrun"][-1])
     state["branch"], state["open"] = pr.get("headRefName") or "", sig["state"] == "OPEN"
     if head:
         if state.get("head") != head or "head_at" not in state:
@@ -307,7 +378,7 @@ def sweep(daemon, t: dict, pr: dict, sig: dict, gh) -> str | None:
     if sig["state"] == "OPEN":
         if text == "" and sig["checks"] != "pending":   # covered: the same workflows skipped again alert again
             state.pop("notrun", None)
-        elif text and state.get("notrun") != (mark := [head, names]):   # new wording of one condition: no alert
+        elif text and state.get("notrun") != (mark := [head, state["unrun"][2], names]):   # a moved base alone: no alert
             state["notrun"] = mark
             events.append(("pr_ci_not_run", f"PR {url}: checks skipped or never run on the head: {text}. Dispatch "
                            "or label what this change needs (the project's own PRs only)."))
@@ -324,7 +395,7 @@ def sweep(daemon, t: dict, pr: dict, sig: dict, gh) -> str | None:
     for kind, text in events:
         _post_event(daemon, kind, text, t.get("id"))
     db.set_kv(KEY, allstate)
-    return state["unrun"][1]
+    return state["unrun"][-1]
 
 
 def route_check(daemon) -> None:
