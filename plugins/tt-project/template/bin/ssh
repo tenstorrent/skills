@@ -14,11 +14,21 @@
 # ControlMaster, ControlPath) or forwards ports or stdio (-L -R -D -W -w -N -f: a forward added to a
 # shared connection would outlive the command); -v (a verbose master keeps the caller's stderr open for
 # its 10 minutes, so a captured call would hang); -G, -V, -Q.
-# The real ssh replaces this script (exec), so the caller's pid is ssh's own: a kill of the caller
-# (SIGTERM, a timeout's SIGKILL) stops ssh and its remote command, never only the wrapper. A shared
-# connection that fails before the command starts is OpenSSH's own to handle: with ControlMaster=auto
-# it removes a stale socket and connects directly. A file in the folder that is no socket (ssh would
-# then run unshared on every call) is removed before ssh starts.
+# The real ssh replaces this script (exec) for the command itself, so the caller's pid is ssh's own: a
+# kill of the caller (SIGTERM, a timeout's SIGKILL) stops ssh and its remote command, never only the
+# wrapper. A file in the folder that is no socket (ssh would then run unshared on every call) is removed
+# before ssh starts.
+# Hosts limit connection starts (sshd MaxStartups), so no call opens a second connection: while no master
+# is up for the destination, calls queue on one flock (<dir>/<destination>.lock, skipped where there is no
+# flock) and the first opens the master (ssh -fN, command-less, lock not inherited); the rest find it up
+# and reuse it. A start that ends 255 with a refusal line (Exceeded MaxStartups, Connection reset,
+# Connection closed by remote host, banner exchange, kex_exchange_identification) writes the backoff
+# record <tt-project home>/ssh-backoff/<destination> ("<until epoch> <step seconds>", destination with
+# characters outside A-Za-z0-9._@- as _; the home is $TTP_HOME, else ~/.tt-project), shared by every
+# project on the host. While now < until, calls to that destination fail at once with 255 and one stderr
+# line naming it and the retry time; after it, one call probes again. Steps double 60 120 240 480 900
+# (the cap) s; the first successful start clears the record. A start that fails otherwise (auth, host
+# key) is ssh's own message and exit code, the command not run.
 # Re-entry (an "ssh" further down PATH that execs plain ssh, finding this script again in the same
 # process) ends with 125 and a message instead of looping: the pid is marked before every exec.
 set -f
@@ -61,7 +71,10 @@ ctl() {
 }
 # The options before the destination: the remote command's words are never read as ssh's.
 want=
+dest=
+n=0
 for a in "$@"; do
+    n=$((n+1))
     if [ -n "$want" ]; then
         want=
         ! ctl "$a" || exec "$real" "$@"
@@ -82,7 +95,7 @@ for a in "$@"; do
             esac
         done
         [ "$want" = 0 ] && want=v ;;
-    *) break ;;
+    *) dest=$a; break ;;
     esac
 done
 dir=${TTP_SSH_CM_DIR:-${HOME:-/nonexistent}/.tt-project/cm}
@@ -97,8 +110,52 @@ fi
 mux="-o ControlMaster=auto -o ControlPath=$dir/%C -o ControlPersist=600 -o ServerAliveInterval=15 -o ServerAliveCountMax=3"
 set +f
 for f in "$dir"/* "$dir"/.[!.]*; do
+    case $f in *.lock|*.err) continue ;; esac
     [ -e "$f" ] || [ -L "$f" ] || continue
     { [ -S "$f" ] && ! [ -L "$f" ]; } || [ -d "$f" ] || rm -f "$f"
 done
 set -f
+if [ -n "$dest" ]; then
+    thome=${TTP_HOME:-${HOME:-/nonexistent}/.tt-project}
+    key=$(printf %s "$dest" | tr -c 'A-Za-z0-9._@-' _)
+    rec=$thome/ssh-backoff/$key
+    # 0 and the one-line refusal while the destination is in backoff.
+    backing() {
+        read -r until step 2>/dev/null < "$rec" || return 1
+        now=$(date +%s)
+        [ "$now" -lt "$until" ] 2>/dev/null || return 1
+        t=$(date -d "@$until" +%T 2>/dev/null || date -r "$until" +%T 2>/dev/null)
+        echo "ssh $dest: backing off after a refused connection start (the host limits them); retry at $t, in $((until - now))s" >&2
+    }
+    up() { "$real" $mux -O check "$@" >/dev/null 2>&1; }
+    # Opens the master with the first $1 args (through the destination), under the lock.
+    open_master() {
+        k=$1; shift; j=$k; err=$dir/$key.$$.err
+        while [ $j -gt 0 ]; do set -- "$@" "$1"; shift; j=$((j - 1)); done
+        shift $(($# - k))
+        "$real" $mux -fN "$@" </dev/null >/dev/null 2>"$err" 9>&-
+        rc=$?
+        cat "$err" >&2
+        if [ $rc -eq 0 ]; then rm -f "$err" "$rec"; return 0; fi
+        if [ $rc -eq 255 ] && grep -qiE 'Exceeded MaxStartups|Connection reset|Connection closed by remote host|banner exchange|kex_exchange_identification' "$err"; then
+            step=60
+            if read -r _ prev 2>/dev/null < "$rec" && [ "$prev" -ge 60 ] 2>/dev/null; then
+                step=$((prev * 2)); [ $step -le 900 ] || step=900
+            fi
+            mkdir -p "$thome/ssh-backoff" && printf '%s %s\n' $(($(date +%s) + step)) $step > "$rec.$$" && mv -f "$rec.$$" "$rec"
+            backing
+            rc=255
+        fi
+        rm -f "$err"
+        exit $rc
+    }
+    if up "$@"; then
+        rm -f "$rec"
+    else
+        ! backing || exit 255
+        ! command -v flock >/dev/null 2>&1 || { exec 9>"$dir/$key.lock"; flock 9; }
+        if up "$@"; then rm -f "$rec"; else ! backing || exit 255; open_master $n "$@"; fi
+        exec 9>&-
+    fi
+fi
 exec "$real" $mux "$@"

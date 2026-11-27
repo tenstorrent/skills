@@ -329,8 +329,16 @@ def test_ttp_new_on_another_host_quotes_every_forwarded_word_so_empty_or_spaced_
 # ssh connection reuse (template/bin/ssh, sshmux.py). A fake "real ssh" further down PATH records its
 # argv; the wrapper is a copy of the template's.
 _FAKE_SSH = """#!/bin/sh
+# The wrapper's control check talks to the local socket only: it is not logged, and answers by FAKE_MASTER (a file
+# that exists while a master is up; unset: always up). `-fN` is the wrapper's command-less master open.
+case " $* " in *ControlMaster=auto*" -O check "*) [ -z "${FAKE_MASTER+x}" ] || [ -e "$FAKE_MASTER" ]; exit $? ;; esac
 printf '%s\\n' "$*" >> "$FAKE_LOG"
 case " $* " in *" -O stop "*) exit 0 ;; esac
+case " $* " in *" -fN "*)
+  sleep "${FAKE_OPEN_DELAY:-0}"
+  [ -z "$FAKE_OPEN_ERR" ] || echo "$FAKE_OPEN_ERR" >&2
+  [ "${FAKE_RC:-0}" != 0 ] || [ -z "$FAKE_MASTER" ] || : > "$FAKE_MASTER"
+  exit "${FAKE_RC:-0}" ;; esac
 [ -n "$FAKE_PID" ] && { echo $$ > "$FAKE_PID"; exec sleep "${FAKE_SLEEP:-30}"; }
 case " $* " in *"ControlMaster=auto"*) [ -n "$FAKE_MUX_FAIL" ] && { echo "mux_client_hello_exchange: write packet: Broken pipe" >&2; exit 255; } ;; esac
 exit "${FAKE_RC:-0}"
@@ -735,3 +743,78 @@ def test_no_runtime_code_runs_ssh_keygen_or_ssh_add():
                        r"""|\bssh-keygen\s+-[tf]""")
     hits = [f.name for f in root.rglob("*.py") if f.name not in guards and call.search(f.read_text())]
     assert hits == [], hits
+
+
+@pytest.fixture
+def short_cm(tmp_path):
+    """A socket folder short enough for the wrapper to keep (its limit is 45), removed afterwards."""
+    import shutil
+    import tempfile
+    cm = pathlib.Path(tempfile.mkdtemp(prefix="c", dir="/tmp"))
+    yield cm
+    shutil.rmtree(cm, ignore_errors=True)
+
+
+def _spawn_wrappers(tmp_path, cm, n, args=("box-a", "true"), **extra):
+    """n parallel wrapper calls sharing one home, socket folder, log and stub; returns their exit codes and stderr."""
+    import subprocess
+    w, e = _wrapper_env(tmp_path, FAKE_MASTER=tmp_path / "master", TTP_SSH_CM_DIR=cm, **extra)
+    procs = [subprocess.Popen([str(w), *args], env=e, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+             for _ in range(n)]
+    out = [(p.wait(timeout=30), p.stderr.read()) for p in procs]
+    log = tmp_path / "log"
+    return out, (log.read_text().splitlines() if log.exists() else [])
+
+
+def _opens(log):
+    return [x for x in log if " -fN " in f" {x} "]
+
+
+def test_parallel_ssh_wrapper_calls_open_one_master_and_the_rest_reuse_it(tmp_path, short_cm):
+    out, log = _spawn_wrappers(tmp_path, short_cm, 20, FAKE_OPEN_DELAY=0.5)
+    assert [rc for rc, _ in out] == [0] * 20
+    assert len(_opens(log)) == 1 and " -fN " in f" {log[0]} "     # the open is first: nothing ran beside it
+    assert len(log) == 21                                          # 20 commands and the one open
+
+
+_REFUSED = "kex_exchange_identification: read: Connection reset by peer"
+
+
+def _record(tmp_path):
+    f = tmp_path / "home" / ".tt-project" / "ssh-backoff" / "box-a"
+    return f.read_text().split() if f.exists() else None
+
+
+def test_a_refused_connection_start_backs_off_for_every_caller_and_doubles_per_step(tmp_path, short_cm):
+    import time
+    refused = dict(FAKE_RC=255, FAKE_OPEN_ERR=_REFUSED, FAKE_OPEN_DELAY=0.3)
+    out, log = _spawn_wrappers(tmp_path, short_cm, 20, **refused)
+    assert [rc for rc, _ in out] == [255] * 20 and len(log) == 1 and len(_opens(log)) == 1
+    until, step = _record(tmp_path)
+    assert step == "60" and 0 < int(until) - time.time() <= 60
+    assert all("box-a" in err for _, err in out)                    # each caller's stderr names the alias
+    out, log2 = _spawn_wrappers(tmp_path, short_cm, 5, **refused)   # during the backoff: no start reaches ssh
+    assert [rc for rc, _ in out] == [255] * 5 and log2 == log
+    rec = tmp_path / "home" / ".tt-project" / "ssh-backoff" / "box-a"
+    for prev, step in ((60, "120"), (120, "240"), (240, "480"), (480, "900"), (900, "900")):   # one start per step
+        rec.write_text(f"1 {prev}\n")
+        out, log2 = _spawn_wrappers(tmp_path, short_cm, 20, **refused)
+        assert [rc for rc, _ in out] == [255] * 20 and len(_opens(log2)) == len(_opens(log)) + 1
+        assert _record(tmp_path)[1] == step
+        log = log2
+    rec.write_text("1 900\n")                                       # a success clears the record
+    out, log2 = _spawn_wrappers(tmp_path, short_cm, 20, FAKE_OPEN_DELAY=0.3)
+    assert [rc for rc, _ in out] == [0] * 20 and _record(tmp_path) is None and (tmp_path / "master").exists()
+
+
+def test_a_start_that_fails_without_a_refusal_line_starts_no_backoff(tmp_path, short_cm):
+    out, log = _spawn_wrappers(tmp_path, short_cm, 3, FAKE_RC=255, FAKE_OPEN_ERR="Permission denied (publickey).")
+    assert [rc for rc, _ in out] == [255] * 3 and _record(tmp_path) is None
+    assert len(_opens(log)) == 3 and all("Permission denied" in err for _, err in out)   # each is ssh's own answer
+
+
+def test_a_backoff_record_is_per_destination_and_survives_the_socket_folder_cleanup(tmp_path, short_cm):
+    out, log = _spawn_wrappers(tmp_path, short_cm, 1, FAKE_RC=255, FAKE_OPEN_ERR=_REFUSED)
+    out, log = _spawn_wrappers(tmp_path, short_cm, 1, args=("box-b", "true"), FAKE_RC=255, FAKE_OPEN_ERR=_REFUSED)
+    assert len(_opens(log)) == 2 and out[0][0] == 255              # box-b was started although box-a is backing off
+    assert (short_cm / "box-a.lock").exists() and _record(tmp_path) is not None

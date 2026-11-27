@@ -2593,8 +2593,14 @@ the pick order, so it takes the first starts. A resumed resource ramps only its 
   runs the real ssh with OpenSSH multiplexing (ControlMaster=auto, ControlPersist=600) and keeps
   the sockets in `~/.tt-project/cm` (mode 700). Your ssh folder and config are never read or
   changed, and `-F`, ProxyJump and BatchMode work as before. A call that sets its own sharing or
-  forwards ports is left as it is, and a shared connection that fails before the command starts
-  falls back to a direct one (OpenSSH's own). Turn it off with `ttp config <name> ssh.reuse false`.
+  forwards ports is left as it is. Hosts limit connection starts (sshd MaxStartups), so no call opens
+  a second connection: while no shared connection is up, calls to a host queue on one lock and the
+  first opens it. A start refused by the host (Exceeded MaxStartups, Connection reset, Connection
+  closed by remote host, banner exchange timeout) puts that host in backoff for every project on the
+  machine: calls to it fail at once with exit 255 and one line naming the retry time, then one call
+  tries again after 1, 2, 4, 8, then 15 minutes, and the first success clears it. The record is
+  `~/.tt-project/ssh-backoff/<host>` (`<until epoch> <step seconds>`). Turn sharing off with
+  `ttp config <name> ssh.reuse false`.
 - Each machine in `ttp machines` gets a harmless `ssh <alias> true` at most every 20 minutes
   (`ssh.reach_probe_s`). The answer and its time are kept for every project on the host and shown in
   the coordinator's digest. A reply or notify saying a machine can't be reached is marked false when
