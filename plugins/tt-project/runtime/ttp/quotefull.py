@@ -22,7 +22,7 @@ import re
 
 from .pointers import _has_content
 
-_EARLIER = r"\b(?:in|from|of)\s+(?:my|the|our)\s+(?:earlier|previous|prior|last)\s+messages?\b"
+_EARLIER = r"\b(?:in|from|of|see)\s+(?:my|the|our)\s+(?:earlier|previous|prior|last)\s+messages?\b"
 _POINT_BACK = re.compile(
     rf"{_EARLIER}|\bsee above\b|\bmentioned above\b"
     r"|\bdrafts?\s+above\b|\bas\s+drafted\b|\bthe\s+drafts?\s+(?:I|we)\s+(?:sent|posted|shared|wrote)\b",
@@ -32,7 +32,7 @@ _STATE = r"ready\s+to\s+send|still\s+open|still\s+pending|pending\s+your"
 _SPAN = r"(?:(?!,\s*(?:and|but|so|while)\b)[^.;:\n]){0,120}"   # one clause: no . ; : , and/but or line break
 _STATUS_PHRASE = re.compile(   # the item is the subject; only 'pending your <item>' names it after
     rf"\b(?:(?:{_ITEM})\b{_SPAN}\b(?:{_STATE})\b|pending\s+your\s+(?:{_ITEM})\b)", re.I)
-_NEGATED = re.compile(r"\b(?:no|none|nothing|not|zero|0|neither|nor)\b", re.I)
+_NEGATED = re.compile(r"\b(?:no|none|nothing|not|zero|neither|nor)\b|(?<![\w.])0(?![\w.])", re.I)
 _OPENS = re.compile(r"(?:^|[\s(\[])['\"`‘“][^'\"`’”\n]{0,40}$")   # a quote mark opening a span, not an apostrophe
 _CLOSES = re.compile(r"^[^'\"`’”\n]{0,40}['\"`’”](?!\w)")
 _ASK_LINE = re.compile(r"^\s*- ask\s+\d+:", re.M)   # pendingask's expansion: the text of asks, nothing else
@@ -47,7 +47,8 @@ def backrefs(text: str, later: list[str] | tuple = ()) -> list[str]:
     tail = "\n".join(t or "" for t in later)
     found = [(m, True) for m in _POINT_BACK.finditer(text)] + [(m, False) for m in _STATUS_PHRASE.finditer(text)]
     for m, back in sorted(found, key=lambda f: f[0].start()):
-        clause = (text[max(text.rfind(c, 0, m.start()) for c in ".;:,\n") + 1:m.start()]   # an aside ', not sent yet,' never negates
+        cut = max((x.end() for x in re.finditer(r"[.;:,](?=\s|$)|\n", text[:m.start()])), default=0)   # not 'v1.0'
+        clause = (text[cut:m.start()]   # an aside ', not sent yet,' never negates
                   + re.sub(r",[^,]*,", " ", m.group(0)))
         if (not back and _NEGATED.search(clause)) or (   # named as an example: 'see above' in quotes
                 _OPENS.search(text[:m.start()]) and _CLOSES.search(text[m.end():])):
@@ -59,7 +60,7 @@ def backrefs(text: str, later: list[str] | tuple = ()) -> list[str]:
         quoted = _QUOTED.search(text[m.end():] + "\n" + tail) or (
             not re.fullmatch(_EARLIER, m.group(0), re.I) and _QUOTED.search(text[:m.start()])) or (
             item and item.group(0).lower().startswith(("ask", "question")) and _ASK_LINE.search(text))
-        if quoted or (line_end.endswith(":") and _has_content(after)) or re.match(r":\s*(?:none|nothing|no)\b", line_end, re.I):
+        if quoted or (line_end.endswith(":") and _has_content(after)) or re.match(r":\s*(?:none|nothing|no|0)\b", line_end, re.I):
             continue
         p = " ".join(m.group(0).split()) if back else \
             f"the {item.group(0).lower()} named as pending, without its text"
