@@ -311,26 +311,26 @@ def overlap_check(daemon, gh) -> None:
     files = {k: fs for k in own if (fs := _pr_files(db, gh, k, own[k].get("head"), str(daemon.p.root)))}
     _host_write(daemon, {k: {"head": own[k].get("head"), "files": fs} for k, fs in files.items()})
     known = _host_prs(time.time())
-    marks = dict(db.kv(OVERLAP_KEY, {}) or {})
-    had = set(marks)
+    had = set(db.kv(OVERLAP_KEY, {}) or {})
+    pairs = []   # (a, b, shared files) of every overlapping pair this project has a say in
     keys = sorted(known)
     for i, a in enumerate(keys):
         for b in keys[i + 1:]:
-            if (a not in own and b not in own) or a.split("#")[0] != b.split("#")[0]:
-                continue   # a pair this project has no say in, or another repo's two PRs
-            shared = sorted(set(known[a]) & set(known[b]))
-            pair = f"{a}|{b}"
-            marks.pop(pair, None)
-            if not shared:
+            if a not in own and b not in own:
+                continue   # a pair between two other projects: their sweeps report it
+            if a.split("#")[0] != b.split("#")[0]:
                 continue
-            marks[pair] = 1
-            if pair in had:
-                continue   # once per pair while the overlap stands
-            shown = ", ".join(shared[:5]) + (f" and {len(shared) - 5} more" if len(shared) > 5 else "")
-            _event(daemon, "pr_overlap",
-                   f"PRs {_link(a)} and {_link(b)} change the same files ({shown}): the projects behind "
-                   "them must coordinate - one carries the change and the version bump, the other rebases.", None)
-    db.set_kv(OVERLAP_KEY, marks)
+            shared = sorted(set(known[a]) & set(known[b]))
+            if shared:
+                pairs.append((a, b, shared))
+    db.set_kv(OVERLAP_KEY, {f"{a}|{b}": 1 for a, b, _ in pairs})   # a pair that stops overlapping is told again when it returns
+    for a, b, shared in pairs:
+        if f"{a}|{b}" in had:
+            continue   # once per pair while the overlap stands
+        shown = ", ".join(shared[:5]) + (f" and {len(shared) - 5} more" if len(shared) > 5 else "")
+        _event(daemon, "pr_overlap",
+               f"PRs {_link(a)} and {_link(b)} change the same files ({shown}): the projects behind "
+               "them must coordinate - one carries the change and the version bump, the other rebases.", None)
 
 
 def _event(daemon, kind: str, text: str, task) -> None:
