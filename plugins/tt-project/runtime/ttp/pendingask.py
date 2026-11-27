@@ -56,10 +56,21 @@ def quoted(text: str, ask: dict) -> bool:
 def _match(text: str, asks: list[dict]) -> list[dict]:
     """The open asks a reference-free 'waiting on you' most likely means: the only one open, else those
     sharing at least two content words with the text."""
-    if len(asks) == 1:
-        return asks
+    return asks if len(asks) == 1 else about(text, asks)
+
+
+def about(text: str, asks: list[dict]) -> list[dict]:
+    """The asks sharing at least two content words with `text`."""
     said = reask.words(text)
     return [a for a in asks if len(said & reask.words(a.get("text") or "")) >= 2]
+
+
+def appended(text: str) -> tuple[int, list[dict]]:
+    """(where the block `expand` appends starts, the asks in it); (len(text), []) with none at the end."""
+    m = re.search(re.escape(HEADER) + r"((?:\n- ask \d+: [^\n]*)+)\Z", text)
+    if not m:
+        return len(text), []
+    return m.start(), [{"id": int(i), "text": t} for i, t in re.findall(r"^- ask (\d+): (.*)$", m.group(1), re.M)]
 
 
 def expand(text: str, open_asks: list[dict], what: str = "reply") -> tuple[str, list[str]]:

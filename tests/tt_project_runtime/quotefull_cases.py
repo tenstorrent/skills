@@ -164,3 +164,14 @@ def test_an_ask_matched_by_its_words_and_appended_in_full_is_not_refused():
     assert quotefull.backrefs(expanded) == []
     # a header with no appended ask line clears nothing
     assert quotefull.backrefs(text + pendingask.HEADER) != []
+    # an ask by its words that is not the one appended is still refused
+    budget = {"id": 14, "text": "Raise the budget cap for the soak?"}
+    other, _ = pendingask.expand("Ask 12 is still open. The ask about the vendor contract is still open too.",
+                                 asks + [budget])
+    assert quotefull.backrefs(other) == ["the ask named as pending, without its text"]
+    # only the block expand appends at the very end counts: a header written earlier hides nothing
+    early = "Status below." + pendingask.HEADER + "\n- ask 12: Reboot?\n- drafts in my earlier messages, ready to send"
+    assert quotefull.backrefs(early) != []
+    assert quotefull.backrefs(pendingask.expand(early, asks)[0]) != []
+    made_up = "The ask about the vendor contract is still open." + pendingask.HEADER + "\n- ask 99: x"
+    assert quotefull.backrefs(made_up) != []
