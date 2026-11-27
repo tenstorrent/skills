@@ -10,10 +10,11 @@ import time
 from pathlib import Path
 from typing import Callable
 
-from . import batchrun
+from . import batchrun, db as dbmod
 
 KEY = "rereaped"   # kv: run id -> when its quarantined end was re-read; each run once
-WINDOW_S = 7 * 86400   # sweep re-reads runs quarantined this recently
+dbmod.DICT_KV.add(KEY)
+WINDOW_S = 7 * 86400   # sweep reads the quarantines of this long back
 PER_TICK = 2
 REF = "reap-quarantine:"
 
@@ -64,12 +65,19 @@ def reread(p, run_id: int) -> str:
         db.x("UPDATE events SET status='handled' WHERE kind='task_failed' AND task=? AND status='queued'", (r["task"],))
         marks = db.kv(REAP_KEY) or {}
         db.set_kv(REAP_KEY, {**marks, str(run_id): {"pid": 0, "started": 0, "lean": False, "at": now}})
-        db.set_kv(KEY, {**(db.kv(KEY) or {}), str(run_id): now})
+        kept = {k: v for k, v in (db.kv(KEY) or {}).items() if v >= now - WINDOW_S}   # the sweep never looks further back
+        db.set_kv(KEY, {**kept, str(run_id): now})
     return ""
 
 
+def _unhandled(db, tid: int) -> bool:
+    """The abandon's task_failed event for task `tid` is still queued: nobody acted on the failure."""
+    return bool(db.one("SELECT 1 FROM events WHERE kind='task_failed' AND task=? AND status='queued'", (tid,)))
+
+
 def sweep(p, log: Callable[[object, str], None]) -> None:
-    """Re-read, at most PER_TICK a tick, the runs quarantined within WINDOW_S that can be."""
+    """Re-read, at most PER_TICK a tick, the quarantined runs that can be and whose failure nobody has
+    acted on yet (its task_failed event still queued). Older ones are re-read only by `ttp task <p> reread`."""
     since, done = time.time() - WINDOW_S, 0
     for m in p.db.q("SELECT DISTINCT ref FROM messages WHERE direction='out' AND ts>=? AND ref LIKE ?",
                     (since, f"{REF}%")):
@@ -77,7 +85,8 @@ def sweep(p, log: Callable[[object, str], None]) -> None:
         if done >= PER_TICK:
             break
         try:   # a re-read never holds up reaping
-            if not run_id.isdigit() or check(p, int(run_id))[0] is None:
+            r = check(p, int(run_id))[0] if run_id.isdigit() else None
+            if r is None or not _unhandled(p.db, r["task"]):
                 continue
             done += 1
             why = reread(p, int(run_id))

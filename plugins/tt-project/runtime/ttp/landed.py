@@ -1022,8 +1022,9 @@ def _record_branchless(p, tid: int, sha: str, ref: str, repos: list[Path]) -> st
     return f"task #{tid}: no branch; recorded as superseded by {full[:10]} ({words})"
 
 
-# equivalent's bounds: how many of the branch's own commits and how many bytes of diff it compares,
-# and how long it may take in all. Past one it has no answer (None): never "landed".
+# equivalent's bounds: how many of the branch's own commits it compares, how many bytes of diff it
+# parses (git's own work is bounded by the commit cap and the time budget) and how long it may take in
+# all. Past one it has no answer (None): never "landed".
 EQUIV_MAX_OWN = 200
 EQUIV_MAX_BYTES = 8_000_000
 EQUIV_BUDGET_S = 20.0
