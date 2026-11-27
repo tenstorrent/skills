@@ -467,6 +467,23 @@ def test_eta_outside_work_wait_uses_a_measured_eta_with_its_basis(env):
         assert e["end"] is None and "no measured finish yet" in e["why"], bad
 
 
+def test_eta_a_measured_outside_wait_without_run_history_names_no_measured_run(env):
+    """A waiting task with a measured outside eta but no run history for its kind keeps the base
+    answer: 'no measured <kind> run yet'. Only a detached-jobs wait may estimate without one."""
+    from ttp import eta
+    p = make(env)
+    now = time.time()
+    probe = "ssh box \"squeue -h -j 12 | grep -q . && exit 1 || exit 0\""
+    t = _eta_waiting(p, now, retry_when=probe, eta=now + 7200, eta_basis="the Slurm job's state")
+    e = eta.estimate(p.db, t, now)
+    assert e["end"] is None and "no measured work run yet" in e["why"], e
+    # a detached-jobs wait with no run history still estimates from its jobs' medians.
+    _jobs_registry(p, [("load", now - 86400, "ended", now - 86400 + 600)])
+    t2 = _waiting_jobs_task(p, now, ["load-2"])
+    e2 = eta.estimate(p.db, t2, now)
+    assert e2["end"] == pytest.approx(now + 600 - 300), e2
+
+
 def _eta_cell_history(p, now, per_cell=100, n=6, kind="work"):
     """A done `kind` task that ran `n` cells in `n * per_cell` s of worker time."""
     names = ", ".join(f"c{i}" for i in range(n))
@@ -1079,7 +1096,6 @@ def test_eta_detached_jobs_estimate_from_measured_job_history(env):
     assert e["p90_end"] == pytest.approx(now + (600 - 300) + 0 + (5040 - 300)), e["p90_end"]   # the p80 sum
     h = etajobs.job_history(p.state, p.db, now)
     assert sorted(h["job"]) == ["full", "load", "plain"] and len(h["job"]["full"]) == 5
-    assert h["startup"] == [100.0] + [120.0] * 5   # the waiting task's own run, then the five past runs
     assert "load 5m" in eta.text(e, p, now) and "full 25m" in eta.text(e, p, now)
 
 
@@ -1137,6 +1153,21 @@ def test_eta_detached_jobs_queue_counts_the_running_job_and_the_queued_ahead(env
     e = eta.estimate(p.db, t, now)
     assert dict(e["legs"])["queue"] == pytest.approx((600 - 300) + 600), e["legs"]
     assert eta.estimate(p.db, mid, now)["legs"][-1] == ("queue", pytest.approx(600 - 300))
+    assert e["end"] == pytest.approx(now + sum(v for _, v in e["legs"]))
+
+
+def test_eta_detached_jobs_all_queued_legs_are_the_jobs_and_the_queue_only(env):
+    """A task whose jobs are all queued gets its jobs' medians and its queue wait only: a registry
+    entry exists, so its start-up wait is over and no start-up leg is added."""
+    from ttp import eta
+    p = make(env)
+    now = time.time()
+    _jobs_registry(p, [("load", now - 86400, "ended", now - 86400 + 600)])
+    _waiting_jobs_task(p, now, ["load"])                   # its job runs, 300 s in
+    t = _waiting_jobs_task(p, now, ["load-2"], probe="load2", queued=True)
+    e = eta.estimate(p.db, t, now)
+    assert [k for k, _ in e["legs"]] == ["load", "queue"], e["legs"]
+    assert dict(e["legs"])["queue"] == pytest.approx(600 - 300), e["legs"]
     assert e["end"] == pytest.approx(now + sum(v for _, v in e["legs"]))
 
 
@@ -1220,7 +1251,7 @@ def test_eta_history_shadow_uses_the_measured_job_medians(env):
     now = time.time()
     _jobs_registry(p, [("load", now - 86400, "ended", now - 86400 + 600)])
     t = _waiting_jobs_task(p, now, ["load-2"])
-    he = etaledger.hist_end(p.db, f"t{t}", now, None, etajobs.job_history(p.state, p.db, now))
+    he = etaledger.hist_end(p.db, f"t{t}", now, None, [etajobs.job_history(p.state, p.db, now)])
     assert he == pytest.approx(now + 600 - 300)
 
 def test_eta_detached_jobs_shadow_with_all_jobs_ended_is_the_normal_shadow(env):
@@ -1240,7 +1271,7 @@ def test_eta_detached_jobs_shadow_with_all_jobs_ended_is_the_normal_shadow(env):
         {"name": "load", "rc": str(d / "load.rc"), "started": now - 600, "status": "ended",
          "ended": now - 100, "owner": {"task": tid}}]))
     he = etaledger.hist_end(p.db, f"t{tid}", now, eta.history(p.db, now),
-                            etajobs.job_history(p.state, p.db, now))
+                            [etajobs.job_history(p.state, p.db, now)])
     # median wait 300; the run median is 960 (600, 720, 1200, 1800: the registry task's own sample
     # is one of them), never the jobs' zero-left medians a missing guard would give (now).
     assert he == pytest.approx(now + 300 + 960, abs=1.0), he   # abs: epoch values, no rel slack

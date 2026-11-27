@@ -166,7 +166,7 @@ def _hist_on(where) -> bool:
     return costlevers.lever_on(where, "eta_history")
 
 
-def hist_end(db, ref: str, now: float, h: dict | None = None, jh: dict | None = None,
+def hist_end(db, ref: str, now: float, h: dict | None = None, jh: list | None = None,
             cache: dict | None = None) -> float | None:
     """The finish the measured history gives a task ref (`t12`) at `now`: the median first-start wait, plus
     the median run time of its kind and tier (else of its kind) times the mean runs a done task of that
@@ -175,7 +175,10 @@ def hist_end(db, ref: str, now: float, h: dict | None = None, jh: dict | None = 
     latest of its live owner tasks' ends (obligations.live_owner_ids, so owners kept only in the promise
     count and a cancelled or superseded one does not), a finished owner counting `now`; None with no owner
     that gives one.
-    `h` is eta.history's result, read once per caller."""
+    `h` is eta.history's result, read once per caller. `jh` is a one-slot holder for the job history
+    (etajobs.job_history), loaded only when the task is no code task and has registry entries, the
+    same lazy read as _Est.jobs."""
+
     if ref.startswith("o"):
         from . import eta, obligations
         o = obligations.get(db, ref)
@@ -194,9 +197,12 @@ def hist_end(db, ref: str, now: float, h: dict | None = None, jh: dict | None = 
     if not t:
         return None
     from . import etajobs
-    if t["kind"] != "code" and jh is not None and (jf := etajobs.job_finish(db, t, jh, now, cache)) \
-            and jf.get("open") and jf.get("end") is not None:
-        return jf["end"]   # a task that runs detached jobs: its shadow is the jobs' own medians
+    if t["kind"] != "code" and jh is not None and etajobs.job_entries(db, t["id"], cache):
+        if jh[0] is None:
+            jh[0] = etajobs.job_history(Path(db.path).parent, db, now)
+        if (jf := etajobs.job_finish(db, t, jh[0], now, cache)) and jf.get("open") \
+                and jf.get("end") is not None:
+            return jf["end"]   # a task that runs detached jobs: its shadow is the jobs' own medians
     from . import eta
     h = eta.history(db, now) if h is None else h
     kt = (t["kind"], t.get("tier"))
@@ -229,7 +235,7 @@ def record(db, where, items: list[tuple[str, str, dict]], now: float, src: str =
             last[r["ref"]] = r
     rows = []
     hist = None
-    jhist = None
+    jhist = [None]   # holder for the job history: hist_end loads it on first use
     entries: dict = {}   # etajobs.entries per task: one registry read per task
     shadow_on = _hist_on(where)
     for ref, kind, e in items:
@@ -248,9 +254,6 @@ def record(db, where, items: list[tuple[str, str, dict]], now: float, src: str =
                 if hist is None:
                     from . import eta
                     hist = eta.history(db, now)
-                if jhist is None and _shadow_jobs(db, ref, entries):
-                    from . import etajobs
-                    jhist = etajobs.job_history(Path(db.path).parent, db, now)
                 if (he := hist_end(db, ref, now, hist, jhist, entries)) is not None:
                     row["hist"] = round(he, 1)
             except Exception:   # a shadow never costs the ETA row
@@ -260,19 +263,6 @@ def record(db, where, items: list[tuple[str, str, dict]], now: float, src: str =
     _append(db, rows)
     return len(rows)
 
-
-def _shadow_jobs(db, ref: str, cache: dict) -> bool:
-    """Whether `ref`'s shadow can use the job medians: a non-code task (itself, or a promise's live
-    owners) with registry entries; only then is the job history worth loading."""
-    from . import etajobs, obligations
-    if ref[:1] == "t" and ref[1:].isdigit():
-        ids = [int(ref[1:])]
-    elif ref[:1] == "o" and (o := obligations.get(db, ref)):
-        ids = obligations.live_owner_ids(db, o)
-    else:
-        return False
-    return any((t := db.task(i)) and t["kind"] != "code" and etajobs.job_entries(db, i, cache)
-               for i in ids)
 
 
 def _rowless(db) -> list[dict]:

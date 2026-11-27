@@ -4,8 +4,7 @@
 
 history() reads the runs the db knows in the window and their detach registries
 (state/runs/<id>/detached.json): every ended job's duration by normalised name (a trailing run word or
-id is dropped, so 'load-run2', 'load2' and 'load' are one job) and each run's start-up wait (its
-start to its first job). finish() gives a task's finish from its own registry entries
+id is dropped, so 'load-run2', 'load2' and 'load' are one job). finish() gives a task's finish from its own registry entries
 (jobstop.task_jobs, so a task that continues another also reads its jobs): each job's time left is
 the quantile of its name's samples less what has already elapsed, plus the queue wait behind
 another open task's jobs of the same name (its running one and those queued ahead of ours). A job
@@ -31,10 +30,9 @@ def normal(name) -> str:
 
 
 def job_history(state, db, now: float | None = None) -> dict:
-    """The window's measured job history: {"job": {normalised name: [durations]}, "startup": [each
-    run's wait from its start to its first detached job]}."""
+    """The window's measured job history: {"job": {normalised name: [durations]}}."""
     now = time.time() if now is None else now
-    h: dict = {"job": {}, "startup": []}
+    h: dict = {"job": {}}
     try:
         rows = db.q("SELECT id, started, dir FROM runs WHERE started>? AND role!='coordinator' "
                     "ORDER BY id DESC LIMIT ?", (now - WINDOW_S, ROWS))
@@ -51,7 +49,6 @@ def job_history(state, db, now: float | None = None) -> dict:
             continue
         if not isinstance(jobs, list):
             continue
-        first = None
         for j in jobs:
             if not isinstance(j, dict):
                 continue
@@ -59,10 +56,6 @@ def job_history(state, db, now: float | None = None) -> dict:
             if j.get("status") == "ended" and all(isinstance(x, (int, float)) and not isinstance(x, bool)
                                                   for x in (s, e)) and float(e) > float(s) > 0:
                 h["job"].setdefault(normal(j.get("name")), []).append(float(e) - float(s))
-            if isinstance(s, (int, float)) and not isinstance(s, bool) and float(s) > 0:
-                first = float(s) if first is None else min(first, float(s))
-        if isinstance(r["started"], (int, float)) and first is not None and first > float(r["started"]):
-            h["startup"].append(first - float(r["started"]))
     return h
 
 
@@ -103,12 +96,12 @@ def job_finish(db, t: dict, h: dict, now: float, cache: dict | None = None) -> d
     """The measured finish of task `t`'s detached jobs: {"end": the median (p50) finish,
     "conservative": the p80 one, "legs": [(name, seconds)], "why"}; None when the task has no
     registry entries. Legs are one per still-unfinished job, "queue" for the wait behind another open
-    task's running job of the same name, "startup" while no job has started yet."""
+    task's running job of the same name."""
     from .eta import pct
     ents = job_entries(db, t["id"], cache)
     if not ents:
         return None
-    legs, hi, why, started, own = [], [], None, False, []
+    legs, hi, why, own = [], [], None, []
     for e in ents:
         name = normal(e.get("name"))
         xs = (h.get("job") or {}).get(name) or []
@@ -121,16 +114,12 @@ def job_finish(db, t: dict, h: dict, now: float, cache: dict | None = None) -> d
         legs.append((name, left))
         l80 = job_left(e, xs, now, P80)
         hi.append(l80 if l80 is not None else left)
-        started = started or e.get("status") not in ("queued",)
     if why:
         return {"end": None, "conservative": None, "legs": [], "why": why}
     wait = queue_wait(db, t["id"], own, h, now, cache)
     if wait:
         legs.append(("queue", wait))
         hi.append(wait)
-    if not started and (s := pct(h.get("startup") or [], P50)) is not None:
-        legs.insert(0, ("startup", s))
-        hi.insert(0, s)
     open_jobs = sum(1 for e in ents if e.get("status") not in ("ended", "died"))
     return {"end": now + sum(x for _, x in legs), "conservative": now + sum(hi), "legs": legs,
             "why": None, "open": open_jobs}

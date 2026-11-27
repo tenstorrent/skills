@@ -670,7 +670,7 @@ class _Est:
             if ow and ow["at"] is None:
                 return self._gated(tid, f"#{tid} waits on its own checks: no measured finish yet (no completed checks run)"
                                    if ow["own"] else f"#{tid} waits on outside work: no measured finish yet", path)
-            if not runs and not (ow and ow["follows"]) and not (ow and ow["at"]):
+            if not runs and not (ow and ow["follows"]) and not (ow and ow.get("label") == "detached jobs"):
                 return {**self._none(tid, f"no measured {t['kind']} run yet"), "path": path}
             if ow:   # its hand-off's measured eta; a median run after it unless an on_pass_cmd ends the task
                 if ow.get("label") == "detached jobs":
@@ -693,7 +693,7 @@ class _Est:
                                 "ORDER BY id DESC LIMIT 1", (tid,))
                 left, over = self._left(runs, now - float(r["started"])) if r and r["started"] else (self._m(runs), False)
                 if jf and jf.get("end") is not None and jf["end"] - now > (left or 0) * lx:
-                    legs.extend((n if n in ("queue", "startup") else f"job {n}", s) for n, s in jf["legs"])
+                    legs.extend((n if n == "queue" else f"job {n}", s) for n, s in jf["legs"])
                     job_legs = True
                 else:
                     legs.append(("run", left * lx))
