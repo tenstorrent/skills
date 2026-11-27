@@ -108,11 +108,11 @@ def test_dispatch_mute_line_keeps_the_owner_past_a_long_probe_and_persisting_age
     """Dispatch clips each muted-observation line; the owner comes before the end probe and ages, so it stays."""
     from ttp import coordinator as coord, screen as scr
     p, t0 = make(env), time.time()
-    scr.mute(p.db, "watcher:check-hosts", "env:check-host:box-a", 12, owner="#10412", now=t0 - 7200,
+    scr.mute(p.db, "watcher:check-hosts", "env:check-host:box-a", 12, owner="#77", now=t0 - 7200,
              end_when="ssh box-a true && test -e /var/run/check-host-ready || exit 1", why="the host is rebuilt")
     scr.count_muted(p.db, "watcher:check-hosts", "env:check-host:box-a failed", "normal", now=t0 - 7200)
     [line] = [x for x in coord.digest(p, {}, [], []).splitlines() if "env:check-host:box-a" in x]
-    assert "persisting" in scr.mute_line(scr.mutes(p.db)[0], t0) and "owner task #10412" in line, line
+    assert "persisting" in scr.mute_line(scr.mutes(p.db)[0], t0) and "owner task #77" in line, line
 
 
 def test_ttp_mute_update_round_trip_keeps_the_end(env, capsys, monkeypatch):
