@@ -8,7 +8,7 @@ _DRAFTS = ("\n\n> Draft for <name>: the release notes in full, ready to send.\n"
            "> Draft for <other name>: the reply to the vendor in full, ready to send.")
 
 
-def _out(p, kind="reply"):
+def _sent(p, kind="reply"):
     return [m["text"] for m in p.db.q("SELECT text FROM messages WHERE direction='out' AND kind=? ORDER BY id",
                                       (kind,))]
 
@@ -18,9 +18,9 @@ def test_todays_miss_is_refused_and_with_the_drafts_quoted_it_passes(env):
     p = make(env)
     problems = coord.apply(p, [{"type": "reply", "chat": "c1", "text": _MISS}], turn=1)
     assert len(problems) == 1 and "reply rejected" in problems[0] and "earlier messages" in problems[0], problems
-    assert "never point to earlier messages" in problems[0] and _out(p) == [], problems
+    assert "never point to earlier messages" in problems[0] and _sent(p) == [], problems
     problems = coord.apply(p, [{"type": "reply", "chat": "c1", "text": _MISS + _DRAFTS}], turn=2)
-    assert problems == [] and _out(p) and "Draft for <name>" in _out(p)[0], problems
+    assert problems == [] and _sent(p) and "Draft for <name>" in _sent(p)[0], problems
 
 
 def test_an_ask_named_by_id_is_expanded_not_refused(env):
@@ -30,12 +30,12 @@ def test_an_ask_named_by_id_is_expanded_not_refused(env):
                     chat=None, kind="ask", severity="high")
     p.db.x("UPDATE messages SET ref='blocking:restriction' WHERE id=?", (ask,))
     problems = coord.apply(p, [{"type": "reply", "chat": "c1", "text": f"Ask {ask} is still open."}], turn=1)
-    (stored,) = _out(p)
+    (stored,) = _sent(p)
     assert problems == [] and stored.startswith(f"Ask {ask} is still open.") and "My recommendation: B" in stored
     problems = coord.apply(p, [{"type": "notify", "severity": "normal",
                                 "text": "The draft I sent is still pending."}], turn=2)
     assert len(problems) == 1 and "notify rejected" in problems[0], problems
-    assert len(_out(p)) == 1 and not _out(p, "alert")
+    assert len(_sent(p)) == 1 and not _sent(p, "alert")
 
 
 def test_a_plain_status_reply_passes(env):
@@ -43,7 +43,7 @@ def test_a_plain_status_reply_passes(env):
     p = make(env)
     problems = coord.apply(p, [{"type": "reply", "chat": "c1",
                                 "text": "All three tasks landed; budget at 40% of the daily cap."}], turn=1)
-    assert problems == [] and len(_out(p)) == 1
+    assert problems == [] and len(_sent(p)) == 1
 
 
 def test_backrefs_finds_each_back_reference_once():
@@ -69,9 +69,9 @@ def test_urgent_reply_refuses_a_back_reference(env, monkeypatch, capsys):
     msgurgent.tick(p, p.config(), now=now + 1)
     with pytest.raises(SystemExit):
         cli.main(["urgent-reply", "c1", _MISS])
-    assert "urgent reply rejected" in capsys.readouterr().err and _out(p) == []
+    assert "urgent reply rejected" in capsys.readouterr().err and _sent(p) == []
     cli.main(["urgent-reply", "c1", "Found it: the encoder died; restarting it now."])
-    assert "restarting it now" in _out(p)[-1]
+    assert "restarting it now" in _sent(p)[-1]
 
 
 def test_an_ask_rethink_event_carries_the_whole_question():
