@@ -791,9 +791,9 @@ def check(p, c: dict, cache: dict) -> tuple[str, str]:
 def _own_landing(p, c: dict, repo, cache: dict) -> tuple[str, str] | None:
     """A claimed commit the remote lacks, confirmed as its task's landing: a push record of the task
     that pushed that commit as its head under another sha (a rebase) now on the claim's target, else
-    the task's landing found as `ttp landed --task` finds it, when the target is the push branch
-    (local refs only: the tracking ref verify just fetched; another branch's may be stale). None
-    when neither holds."""
+    the commit itself or a rebased copy of it on the push branch, when that is the target (local refs
+    only: the tracking ref verify just fetched; another branch's may be stale). The task's other
+    landings are no evidence for this commit. None when neither holds."""
     from . import landed
     sha = c["sha"]
     for _, m in _markers(p, c["task"]):
@@ -805,10 +805,10 @@ def _own_landing(p, c: dict, repo, cache: dict) -> tuple[str, str] | None:
     try:
         if short_ref(c["remote"], c["ref"]) != landed._push_ref(p, Path(repo)):
             return None
-        rc, why = landed.check(p, Path(repo), tid=int(c["task"]), fetch=False)
+        tip = landed.commits_sha(p, [sha])
     except Exception:
         return None
-    return (CONFIRMED, f"its task's landing: {why}") if rc == 0 else None
+    return (CONFIRMED, f"{sha[:12]} or a rebased copy of it is on the push branch at {tip[:12]}") if tip else None
 
 
 def check_all(p, cs: list[dict], cache: dict | None = None) -> tuple[str, str, list[tuple[dict, str, str]]]:

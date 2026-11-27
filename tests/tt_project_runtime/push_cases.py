@@ -12883,9 +12883,24 @@ def test_a_claimed_head_its_push_record_maps_to_a_pushed_sha_on_the_target_is_co
     assert state == pushclaim.CONFIRMED and pushed[:12] in why and head[:12] in why, why
 
 
-def test_a_claimed_head_with_no_push_record_and_not_on_the_remote_is_still_missing(env, monkeypatch):
+def test_a_claimed_head_with_no_push_record_is_confirmed_by_its_rebased_copy_on_the_push_branch(env, monkeypatch):
     from ttp import pushclaim
-    head, _, (state, why, _) = _rebased_claim(env, monkeypatch, record=False)
+    head, pushed, (state, why, _) = _rebased_claim(env, monkeypatch, record=False)
+    assert state == pushclaim.CONFIRMED and "rebased copy" in why and pushed[:12] in why, why
+
+
+def test_a_claimed_commit_never_pushed_stays_missing_though_its_task_landed_other_work(env, monkeypatch):
+    """Another commit of the same task on the push branch is no evidence for the one claimed."""
+    from ttp import pushclaim
+    p, repo, origin, _ = _push_setup(env, monkeypatch, ["true"])
+    tid = p.db.add_task("t", "s", kind="code", origin="user", branch="work")
+    _commit(repo, "a.txt", "a\n")
+    _git_out(repo, "push", "-q", "origin", "HEAD:refs/heads/proj")
+    _git_out(repo, "fetch", "-q", "origin")
+    _commit(repo, "b.txt", "b\n")
+    head = _git_out(repo, "rev-parse", "HEAD")
+    cs = pushclaim.claims(p, p.db.task(tid), {"summary": f"pushed {head[:10]} to origin/proj"}, {"id": 7})
+    state, why, _ = pushclaim.check_all(p, cs)
     assert state == pushclaim.MISSING and f"{head[:12]} is not on origin/proj" in why, why
 
 
