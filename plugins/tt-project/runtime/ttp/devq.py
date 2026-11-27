@@ -805,7 +805,7 @@ def disk_full(cfg: dict, d: Path) -> str:
     return ""
 
 
-def _readable_why(path: str, timeout: float = READABLE_TIMEOUT_S) -> str:
+def _readable(path: str, timeout: float = READABLE_TIMEOUT_S) -> str:
     """"" if `path` can be read here, else why. Asked in a child, so a hung mount costs `timeout`."""
     try:
         p = subprocess.Popen(["/bin/sh", "-c", 'test -r "$1"', "sh", path], stdin=subprocess.DEVNULL,
@@ -842,7 +842,7 @@ def guard(d: Path, cfg: dict, spec: dict) -> tuple:
     base = spec.get("workdir") or str(Path.home())
     for path in spec.get("inputs") or []:
         full_path = os.path.join(base, os.path.expanduser(str(path)))
-        why = _readable_why(full_path)
+        why = _readable(full_path)
         if why:
             errors.append(f"input {path}: {why} on this host")
     cold, limit = float(spec.get("cold_start_s") or 0), job_limit(spec, cfg)
