@@ -1804,6 +1804,58 @@ def test_gh_workstation_reads_runs_and_edits_labels_and_comments_only_on_its_own
     assert got["rc"] == 0 and ws_calls.read_text().splitlines()[len(calls):] == ["api repos/acme/widgets/issues/3/comments"]
 
 
+def test_gh_publish_with_a_lease_replaces_its_branch_only_at_the_old_sha_and_only_under_rebase_replace_lease(
+        env, monkeypatch, tmp_path):
+    """`git-publish <repo> <ttp/ branch> <sha> --lease=<old sha>` passes the allowlist with full shas only; the
+    box queues it only under delivery.rebase_replace lease (else the refusal names the setting); the workstation
+    replaces the branch with --force-with-lease, so a stale old sha leaves it as it is, and a publish without a
+    lease still never replaces it."""
+    import subprocess
+    from ttp import ghqueue, project
+    p, _repo, _origin, _other = _push_setup(env, monkeypatch, ["true"])
+    old, new = "a" * 40, "b" * 40
+    bundle = b"# v2 git bundle\n" + new.encode() + b" refs/heads/x\n\n"
+    sent = [ghqueue.PUBLISH, "acme/widgets", "ttp/t7-x", new, ghqueue.LEASE + old]
+    assert ghqueue.allowed(sent, bundle) == ""
+    for bad in ([*sent[:4], "--lease=HEAD"], [*sent[:4], "--lease="], [*sent[:4], "--force"], [*sent, "--lease=" + old],
+                [*sent[:2], "main", *sent[3:]]):
+        assert ghqueue.allowed(bad, bundle), bad
+    monkeypatch.setattr(project, "here", lambda cwd=None: p)
+    assert "delivery.rebase_replace lease" in ghqueue.lease_problem(sent, None)
+    assert ghqueue.lease_problem(sent[:4], None) == ""
+    p.set_config("delivery.rebase_replace", "lease")
+    assert ghqueue.lease_problem(sent, None) == ""
+
+    git = ["git", "-c", "user.name=t", "-c", "user.email=t@example.com", "-c", "init.defaultBranch=main"]
+    bare, work = tmp_path / "origin.git", tmp_path / "work"
+    subprocess.run([*git, "init", "-q", "--bare", str(bare)], check=True)
+    subprocess.run([*git, "init", "-q", str(work)], check=True)
+
+    def commit(msg: str) -> str:
+        subprocess.run([*git, "-C", str(work), "checkout", "-q", "--orphan", msg], check=True)
+        subprocess.run([*git, "-C", str(work), "commit", "-q", "--allow-empty", "-m", msg], check=True)
+        return subprocess.run(["git", "-C", str(work), "rev-parse", "HEAD"], capture_output=True, text=True).stdout.strip()
+
+    def bundled(ref: str) -> bytes:
+        subprocess.run(["git", "-C", str(work), "bundle", "create", "-q", str(tmp_path / "b"), ref], check=True)
+        return (tmp_path / "b").read_bytes()
+    first, second, third = commit("first"), commit("second"), commit("third")
+    subprocess.run(["git", "-C", str(work), "push", "-q", str(bare), "first:refs/heads/ttp/t7-x"], check=True)
+    gh = tmp_path / "gh"
+    gh.write_text('#!/bin/sh\ncase "$*" in "api repos/acme/widgets --jq .default_branch") echo main;; *) exit 1;; esac\n')
+    gh.chmod(0o755)
+    monkeypatch.setattr(ghqueue, "GIT_URL", f"file://{bare}")
+
+    def tip() -> str:
+        return subprocess.run(["git", "-C", str(bare), "rev-parse", "ttp/t7-x"], capture_output=True, text=True).stdout.strip()
+    rc, _said = ghqueue.publish_here(str(gh), [ghqueue.PUBLISH, "acme/widgets", "ttp/t7-x", second], bundled("second"))
+    assert rc and tip() == first   # no lease: never a replace
+    rc, said = ghqueue.publish_here(str(gh), [*sent[:3], second, ghqueue.LEASE + first], bundled("second"))
+    assert rc == 0 and tip() == second, said
+    rc, _said = ghqueue.publish_here(str(gh), [*sent[:3], third, ghqueue.LEASE + first], bundled("third"))
+    assert rc and tip() == second   # a stale lease leaves the branch as it is
+
+
 def test_gh_workflow_run_takes_up_to_eight_plain_inputs_and_nothing_else_on_both_ends_of_the_route(env, monkeypatch):
     """`-f key=value` inputs pass the shared allowlist (the box's queue and the workstation's pull both apply
     it); a bad key or value, -F, --raw-field, --json, an @file value, a ninth input and a bare -f are refused,

@@ -3849,7 +3849,7 @@ def _cmd_push(a, push) -> None:
         sys.exit(push.cancel(p, Path(a.cancel)))
     if a.publish or a.retire:
         from . import ghqueue
-        sys.exit(ghqueue.publish(a.publish, os.getcwd()) if a.publish else ghqueue.retire(a.retire, os.getcwd()))
+        sys.exit(ghqueue.publish(a.publish, os.getcwd(), lease=a.lease or "") if a.publish else ghqueue.retire(a.retire, os.getcwd()))
     if a.move_tag:
         from . import channeltag
         sys.exit(channeltag.move(p, Path.cwd(), *a.move_tag, say=lambda s: print(s, file=sys.stderr)))
@@ -16991,6 +16991,9 @@ def ttp_parser():
                    help="delivery.gh_route \"workstation\": queue BRANCH's new commits (a git bundle) for the "
                         "workstation to push with its own login: a new branch or a fast-forward of the project's own "
                         "ttp/ (or granted) branch, never main, master or the default branch; rerun for the pushed sha")
+    s.add_argument("--lease", metavar="OLD_SHA",
+                   help="with --publish: replace the branch only while it is at OLD_SHA (a rebase; only under "
+                        "delivery.rebase_replace lease)")
     s.add_argument("--retire", metavar="BRANCH",
                    help="delivery.gh_route \"workstation\": delete a branch this project pushed, once no open PR, "
                         "task or worktree uses it; its tip is saved first (refs/ttp-private/retired/BRANCH and a "

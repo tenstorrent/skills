@@ -73,6 +73,7 @@ _PROTECTED = {"main", "master"}
 _PREFIX = re.compile(r"[A-Za-z0-9_.-]+/")   # a granted branch prefix (delivery / bridge gh_branch_prefixes)
 PUBLISH = "git-publish"    # the queue's own call: push one branch from a git bundle (`ttp push --publish`)
 PUBLISH_MAX = 2 << 20      # a publish's bundle cap (bytes)
+LEASE = "--lease="         # a publish's optional last word: replace the branch only while it is at this old sha
 PUBLISHED = "published-branches.jsonl"   # each publish's pushed sha, kept past prune (`ttp push --retire` reads it)
 GIT_URL = "https://github.com/{repo}.git"
 _BUNDLE = re.compile(rb"# v[23] git bundle\n")
@@ -353,13 +354,16 @@ def branch_problem(branch, prefixes=()) -> str:
 
 
 def _publish(argv: list[str], stdin: bytes, prefixes=()) -> str:
-    """Why `git-publish <owner/repo> <branch> <sha>` (stdin: a git bundle holding <sha>) is refused, or ""."""
-    if len(argv) != 4 or not _REPO.fullmatch(argv[1]) or set(argv[1].split("/")) & {".", ".."}:
+    """Why `git-publish <owner/repo> <branch> <sha> [--lease=<old sha>]` (stdin: a git bundle holding <sha>)
+    is refused, or ""."""
+    if len(argv) not in (4, 5) or not _REPO.fullmatch(argv[1]) or set(argv[1].split("/")) & {".", ".."}:
         return f"`{PUBLISH}` names <owner>/<repo> <branch> <sha>"
     if why := branch_problem(argv[2], prefixes):
         return f"a publish names {why}"
     if not _SHA.fullmatch(argv[3]):
         return "a publish names its commit by the full sha"
+    if argv[4:] and not (argv[4].startswith(LEASE) and _SHA.fullmatch(argv[4][len(LEASE):])):
+        return f"a publish's lease names the branch's old commit by the full sha ({LEASE}<sha>)"
     if not _BUNDLE.match(stdin or b"") or len(stdin) > PUBLISH_MAX:
         return f"a publish carries one git bundle of at most {PUBLISH_MAX >> 20} MiB"
     return ""
@@ -581,10 +585,24 @@ def enqueue(args: list[str], input: bytes | None = None, cwd: str | None = None,
         return HELD_RC
     repo = repo_of(cwd)
     sent, data = _with_repo(sent, repo), data or b""
-    if why := allowed(sent, data, prefixes):
+    if why := allowed(sent, data, prefixes) or lease_problem(sent, cwd):
         print(f"gh (tt-project): refused: {why} ({SETTING} is {WORKSTATION}).", file=sys.stderr)
         return 1
     return _queued(sent, data, repo, cwd, home, f"gh {' '.join(args[:2])}", key)
+
+
+def lease_problem(sent: list[str], cwd: str | None) -> str:
+    """Why this project must not queue `sent`, a publish that replaces its branch (--lease), or "": only
+    under its delivery.rebase_replace `lease`."""
+    if sent[:1] != [PUBLISH] or len(sent) < 5:
+        return ""
+    from .project import here, rebase_replace
+    try:
+        p = here(cwd)
+        lease = p is not None and rebase_replace(p.config()) == "lease"
+    except Exception:
+        lease = False
+    return "" if lease else "a publish that replaces its branch (--lease) runs only under delivery.rebase_replace lease"
 
 
 def _key(repo: str, sent: list[str], data: bytes) -> str:
@@ -712,8 +730,10 @@ def publish_here(gh: str, argv: list[str], bundle: bytes) -> tuple[int, str]:
     """Push a `git-publish`'s commit to its branch with this computer's own login (gh as git's helper for
     github.com): in a scratch repo, fetch the bundle's prerequisites (commits the remote already has),
     unbundle, then `git push <url> <sha>:refs/heads/<branch>`, with no `+`, so only a new branch or a
-    fast-forward, never a delete; never the repo's default branch. (rc, what happened)."""
+    fast-forward, never a delete; with a lease, --force-with-lease on the old sha, so it replaces the branch
+    only while the branch is still there; never the repo's default branch. (rc, what happened)."""
     repo, branch, sha = argv[1:4]
+    lease = [f"--force-with-lease=refs/heads/{branch}:{argv[4][len(LEASE):]}"] if argv[4:] else []
     default = _default_branch(gh, repo)
     if not default or branch == default:
         return 1, ("refused on the workstation: " + (f"`{branch}` is the repo's default branch" if default else
@@ -729,7 +749,7 @@ def publish_here(gh: str, argv: list[str], bundle: bytes) -> tuple[int, str]:
         for step in (["git", "init", "-q", "--bare", f"{t}/r"],
                      *([[*git, "fetch", "-q", "--depth=1", url, *prereq]] if prereq else []),
                      [*git, "bundle", "unbundle", f"{t}/b.bundle"], [*git, "cat-file", "-e", f"{sha}^{{commit}}"],
-                     [*git, "push", "-q", url, f"{sha}:refs/heads/{branch}"]):
+                     [*git, "push", "-q", *lease, url, f"{sha}:refs/heads/{branch}"]):
             name = next(x for x in step[1:] if x in ("init", "fetch", "bundle", "cat-file", "push"))
             try:
                 p = subprocess.run(step, capture_output=True, timeout=4 * GH_TIMEOUT_S, env=env, stdin=subprocess.DEVNULL)
@@ -891,10 +911,11 @@ def _branch_call(cwd: str | None, branch: str, local: bool = False) -> tuple[str
     return branch_problem(branch, grants), repo, grants, p
 
 
-def publish(branch: str, cwd: str | None = None, home=None) -> int:
+def publish(branch: str, cwd: str | None = None, home=None, lease: str = "") -> int:
     """`ttp push --publish <branch>`: queue the branch's commits that origin's refs here do not hold, as a git
-    bundle, for the workstation to push with its own login (a new branch or a fast-forward). The answer,
-    once in, names the pushed sha (rerun the same call); HELD_RC until then."""
+    bundle, for the workstation to push with its own login (a new branch or a fast-forward; `lease`, the
+    branch's old sha: a replace, only under delivery.rebase_replace lease). The answer, once in, names the
+    pushed sha (rerun the same call); HELD_RC until then."""
     from . import prsize
     why, repo, grants, p = _branch_call(cwd, branch)
     if not why and (budget := prsize.budget_gate(p, None, branch)):
@@ -914,8 +935,8 @@ def publish(branch: str, cwd: str | None = None, home=None) -> int:
                   f"({b.stderr.decode('utf-8', 'replace').strip()[-300:]}).", file=sys.stderr)
             return 1
         data = (Path(t) / "b.bundle").read_bytes()
-    sent = [PUBLISH, repo, branch, sha]
-    if why := allowed(sent, data, grants):
+    sent = [PUBLISH, repo, branch, sha, *([LEASE + lease] if lease else [])]
+    if why := allowed(sent, data, grants) or lease_problem(sent, cwd):
         print(f"ttp push --publish: refused: {why}.", file=sys.stderr)
         return 1
     return _queued(sent, data, repo, cwd, home, f"git push {branch} ({sha[:12]})")
