@@ -22,7 +22,8 @@ so an idle project's digest does not grow. Each reuses a signal the harness alre
 - recurring: a correction (correction.py) of the same class as an earlier one that got a class-fix task:
   the mistake the project recorded a fix for happened again. Only a correction said (its message's ts)
   after that fix task closed, or while it is open after it was created, counts; one a harness or
-  upstream: task added since cites (`correction|msg|message #<id>`) already has its own fix.
+  upstream: task added since cites (`correction|msg|message #<id>`) already has its own fix, as does one
+  whose own record answers it (correction.own_fix: a done fix task, or 'not a correction').
   A cancelled fix task whose class's later fix is recorded (`ttp task superseded <id> <task|sha>`) and
   still done counts as fixed.
 - report_only: a correction whose only follow-up is report-only: every enabled schedule citing it
@@ -227,6 +228,22 @@ def rule_clash(db: DB, at: float, now: float) -> list[dict]:
     return out
 
 
+def with_own(db: DB, cfg: dict | None, pushes: Path | None, base: tuple[list[str], str],
+             now: float | None = None, warn=None) -> tuple[list[str], str]:
+    """course.digest_lines' (lines, identity) `base` with this module's lines and the correction and causefix
+    lines added under its header: the coordinator's digest and `ttp course` both print these."""
+    from . import causefix, correction, course
+    out, ident = base
+    own, own_id = lines(db, cfg, pushes, now, warn)
+    if own:
+        out, ident = (out or [course.HEADER]) + own, ident + "\n" + own_id
+    if missed := correction.digest_lines(db, now):
+        out, ident = (out or [course.HEADER]) + missed, ident + "\ncorrection:" + missed[0].split(" pointed out")[0]
+    if unfixed := causefix.digest_lines(db, now):
+        out, ident = (out or [course.HEADER]) + unfixed, ident + "\ncausefix:" + unfixed[0].split(" | ")[0]
+    return out, ident
+
+
 def recurring(db: DB, at: float) -> list[dict]:
     if not at:
         return []
@@ -251,9 +268,10 @@ def recurring(db: DB, at: float) -> list[dict]:
         ts = said.get(int(later["msg"]), float(later.get("ts") or 0))   # when the user said it
         if cls and _cited_fix(db, int(later["msg"]), min(ts, float(later.get("ts") or 0))):
             continue
+        own = correction.own_fix(db, later)   # its own answer, as the correction lines read it
         for prior in recs[:i]:
             fix = str(prior.get("fix") or "")
-            if not fix.startswith("#") or later["msg"] in seen:
+            if not fix.startswith("#") or later["msg"] in seen or own and own != fix:
                 continue
             shared, direct = cls & correction._specific(prior.get("class")), {f"msg#{prior['msg']}"} & cls
             same = (shared and live(later, live(prior, shared))) or (direct and live(later, direct))

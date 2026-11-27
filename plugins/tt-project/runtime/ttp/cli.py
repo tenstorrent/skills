@@ -2765,11 +2765,12 @@ def cmd_slop(a) -> None:
 
 def cmd_course(a) -> None:
     """Read-only: the Course check's lines with every costly task listed (the digest shows COSTLY_SHOWN)."""
-    from . import course
+    from . import course, coursecheck, push
     p = need(a.name, sys.argv[1:]) if a.name else here()
     if not p:
         die("no tt-project project here; name one: `ttp course <name>`")
-    lines = course.digest_lines(p.db, p.config(), costly_cap=None)[0]
+    lines = coursecheck.with_own(p.db, p.config(), p.state / push.DETACHED,
+                                 course.digest_lines(p.db, p.config(), costly_cap=None))[0]
     print("\n".join(lines) if lines else "Course check: nothing trips")
 
 

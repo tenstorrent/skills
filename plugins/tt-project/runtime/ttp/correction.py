@@ -487,6 +487,21 @@ def link_fix(p, tid: int, target: str, repo: str | None = None) -> str:
     raise ValueError(f"not recorded: no commit {t} in {', '.join(str(r) for r in roots)}")
 
 
+def own_fix(db: DB, rec: dict) -> str:
+    """Correction `rec`'s own recorded answer (its `fix`, set by settle or relink): 'not' (not a correction),
+    or its fix task '#<id>' once done (a cancelled one: the later fix it was relinked to); else ''. A reason
+    ('none') or a fix still open is no fix yet."""
+    fix = str(rec.get("fix") or "")
+    if fix == "not":
+        return fix
+    task = db.task(int(fix[1:])) if fix[:1] == "#" and fix[1:].isdigit() else None
+    if not task:
+        return ""
+    if task.get("status") == "done":
+        return fix
+    return fixed_by(db, int(fix[1:])) if task.get("status") == "cancelled" else ""
+
+
 def fixed_by(db: DB, tid: int) -> str:
     """The recorded later fix of cancelled fix task `tid` while it holds ('#<id>' of a task still done,
     or a commit sha), else ''."""

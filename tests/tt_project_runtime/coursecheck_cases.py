@@ -773,3 +773,47 @@ def test_course_self_review_plan_follow_ups_clear_once_dropped(env):
     assert [x for x in _cc(p, now)[0] if "ended with 1 follow-up under" in x], "one left undropped still counts"
     unstarted.drop_followup(p.db, ids[1], "not needed for the order")
     assert not [x for x in _cc(p, now)[0] if "follow-ups unqueued" in x]
+
+
+def _cc_recurring(p, now):
+    """Correction B of the class of A, whose done harness fix T was in place before B was said: (A, B, T)."""
+    from ttp import correction
+    t = p.db.add_task("harness: catch the missed widgets case", "s", kind="harness", origin="coordinator")
+    p.db.x("UPDATE tasks SET status='done', created=?, updated=? WHERE id=?", (now - 5000, now - 3000, t))
+    a = _cc_msg(p, "in", "user", "You missed the widgets case", now - 7200)
+    b = _cc_msg(p, "in", "user", "You missed the widgets case again", now - 120)
+    p.db.set_kv(correction.KEY, [
+        {"msg": a, "ts": now - 7100, "why": "phrase", "class": ["#42"], "fix": f"#{t}", "shown": True},
+        {"msg": b, "ts": now - 60, "why": "phrase", "class": ["#42"], "fix": "reason", "shown": True}])
+    return a, b, t
+
+
+def test_recurring_skips_a_correction_whose_own_record_names_a_done_fix_or_not_a_correction(env):
+    """The recurring line reads the later correction's own recorded fix: a done fix task of its own, or
+    'not a correction', ends it; a reason, a fix still open or the very fix that did not hold keeps it."""
+    from ttp import correction
+    p = make(env)
+    now = time.time()
+    _, b, t = _cc_recurring(p, now)
+    u = p.db.add_task("harness: catch the widgets case for good", "s", kind="harness", origin="coordinator")
+
+    def line(fix):
+        recs = p.db.kv(correction.KEY)
+        recs[1]["fix"] = fix
+        p.db.set_kv(correction.KEY, recs)
+        return [x for x in _cc(p, now)[0] if "recurring mistake" in x]
+    for fix in ("reason", f"#{u}", f"#{t}"):
+        assert len(line(fix)) == 1 and f"correction #{b} repeats" in line(fix)[0], fix
+    p.db.x("UPDATE tasks SET status='done' WHERE id=?", (u,))
+    assert line(f"#{u}") == [] and line("not") == []
+    assert len(line(f"#{t}")) == 1
+
+
+def test_ttp_course_prints_the_course_self_review_lines(env, capsys):
+    """`ttp course` prints the same Course check lines as the digest, its self-review lines included."""
+    from ttp import cli
+    p = make(env)
+    _cc_recurring(p, time.time())
+    cli.main(["course", p.name])
+    out = capsys.readouterr().out
+    assert "- recurring mistake: correction #" in out and out.startswith("## Course check"), out

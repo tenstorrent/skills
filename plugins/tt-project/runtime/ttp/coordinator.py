@@ -1580,18 +1580,9 @@ def digest_parts(p: Project, gates: dict, event_ids: list[int], msg_ids: list[in
     section("coverage", responsibilities.digest_lines(db))
     section("blocker_sweep", sweep.digest_lines(db, event_ids, now, p.config()))
     section(rulecite.SECTION, safe_eta(lambda: rulecite.index_lines(p, now), []))
-    course_lines, course_id = course.digest_lines(db, p.config(), now)
     from .daemon import log   # daemon imports this module
-    own, own_id = coursecheck.lines(db, p.config(), p.state / push.DETACHED, now, lambda m: log(p, m))
-    if own:
-        course_lines = (course_lines or [course.HEADER]) + own
-        course_id += "\n" + own_id
-    if missed := correction.digest_lines(db, now):
-        course_lines = (course_lines or [course.HEADER]) + missed
-        course_id += "\ncorrection:" + missed[0].split(" pointed out")[0]
-    if unfixed := causefix.digest_lines(db, now):
-        course_lines = (course_lines or [course.HEADER]) + unfixed
-        course_id += "\ncausefix:" + unfixed[0].split(" | ")[0]
+    course_lines, course_id = coursecheck.with_own(db, p.config(), p.state / push.DETACHED,
+                                                   course.digest_lines(db, p.config(), now), now, lambda m: log(p, m))
     if long_due := safe_eta(lambda: eta.course_lines(db, p.config(), now), ([], [])):
         if long_due[0]:
             course_lines = (course_lines or [course.HEADER]) + long_due[0]
