@@ -124,11 +124,13 @@ def missing_words(missing: list[str]) -> str:
     return " and ".join(f"#{r}" for r in missing)
 
 
-def _git(repo: Path, *args: str, timeout: float = 30) -> subprocess.CompletedProcess:
+def _git(repo: Path, *args: str, timeout: float = 30, local: bool = False) -> subprocess.CompletedProcess:
+    """`local`: a content read that never fetches a partial clone's missing blobs (gitmemo.no_lazy_env)."""
     t = gitmemo.timeout(timeout, args)
+    env = {**os.environ, "GIT_TERMINAL_PROMPT": "0"}
     run = lambda: gitcache.run(repo, args, lambda: gitmemo.run(   # noqa: E731
         ["git", "-C", str(repo), *args], text=True, capture_output=True, timeout=t, stdin=subprocess.DEVNULL,
-        env={**os.environ, "GIT_TERMINAL_PROMPT": "0"}), t)
+        env=gitmemo.no_lazy_env(env) if local else env), t)
     return repoid.read(repo, args, run) if repoid.identity(args) else run()
 
 
@@ -1042,7 +1044,7 @@ def _keys(repo: Path, args: list[str], skip: list[str], timeout: float = 60,
     that change only `skip` paths are left out. _OverBound when the diff is past EQUIV_MAX_BYTES or git
     listed more than `limit` commits (counted before commits with no key are dropped)."""
     out = _git(repo, "log", "--reverse", "--no-merges", "-p", "-U0", "--no-renames", "--no-color",
-               "--format=%x00%H", *args, "--", ".", *(f":(exclude){x}" for x in skip), timeout=timeout)
+               "--format=%x00%H", *args, "--", ".", *(f":(exclude){x}" for x in skip), timeout=timeout, local=True)
     if out.returncode != 0:
         return []
     if len(out.stdout) > EQUIV_MAX_BYTES:
@@ -1126,7 +1128,7 @@ def equivalent(p, branch: str, bump=None) -> tuple[str, str] | None:
             if spent():
                 return None
             whole = _git(repo, "diff", "-U0", "--no-renames", "--no-color", base, head, "--", ".",
-                         *(f":(exclude){x}" for x in skip), timeout=left())
+                         *(f":(exclude){x}" for x in skip), timeout=left(), local=True)
             if len(whole.stdout) > EQUIV_MAX_BYTES:
                 return None
     except _OverBound:
@@ -1288,8 +1290,8 @@ def _holds_part(repo: Path, head: str, sha: str) -> bool:
     mb = _git(repo, "merge-base", head, sha).stdout.strip()
     added = held = 0
     for f in _git(repo, "diff", "--name-only", mb, head, "--", ".", *_BOOKKEEPING).stdout.split() if mb else []:
-        have = {x.strip() for x in _git(repo, "show", f"{sha}:{f}").stdout.splitlines()}
-        for x in _git(repo, "diff", "-U0", mb, head, "--", f).stdout.splitlines():
+        have = {x.strip() for x in _git(repo, "show", f"{sha}:{f}", local=True).stdout.splitlines()}
+        for x in _git(repo, "diff", "-U0", mb, head, "--", f, local=True).stdout.splitlines():
             if x.startswith("+") and not x.startswith("+++") and len(x.strip()) > 12:
                 added, held = added + 1, held + (x[1:].strip() in have)
     return 2 * held >= added

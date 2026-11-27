@@ -439,3 +439,25 @@ def test_ttp_slop_and_the_deslop_pass_scan_the_repos_a_plain_folder_project_name
     (t,) = _deslop_tasks(p)
     assert f"--repo {code.resolve()}" in t["spec"]
     assert p.db.kv(deslop.KEY)["passes"][-1]["repo"] == str(code.resolve())
+
+
+def test_blob_reads_in_a_blob_less_partial_clone_never_fetch_one_blob_at_a_time(tmp_path):
+    from ttp import gitmemo, landed, slop
+    src = _slop_repo(tmp_path, {f"m{i}.py": f"X{i} = {i}\n" for i in range(4)})
+    head = _git_out(src, "rev-parse", "HEAD")
+    bare = tmp_path / "bare.git"
+    subprocess.run(["git", "clone", "-q", "--bare", str(src), str(bare)], check=True)
+    _git_out(bare, "config", "uploadpack.allowFilter", "true")
+    clone = tmp_path / "clone"
+    subprocess.run(["git", "clone", "-q", "--no-checkout", "--filter=blob:none", f"file://{bare}", str(clone)],
+                   check=True)
+    packs = lambda: sorted((clone / ".git" / "objects" / "pack").glob("*.promisor"))   # noqa: E731
+    before = packs()
+    assert slop.read_tree(clone, "HEAD") == []                  # every blob missing: nothing to scan
+    assert landed._git(clone, "show", f"{head}:m0.py", local=True).returncode != 0
+    assert landed._keys(clone, ["-1", head], []) == []
+    assert packs() == before                                    # no lazy fetch left a pack behind
+    assert landed._git(clone, "show", f"{head}:m0.py").stdout == "X0 = 0\n"   # a plain read still fetches
+    assert len(packs()) == len(before) + 1
+    env = gitmemo.no_lazy_env({"GIT_CONFIG_COUNT": "1", "GIT_CONFIG_KEY_0": "a.b", "GIT_CONFIG_VALUE_0": "c"})
+    assert (env["GIT_CONFIG_COUNT"], env["GIT_CONFIG_KEY_0"], env["GIT_CONFIG_KEY_1"]) == ("2", "a.b", "protocol.allow")

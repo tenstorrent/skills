@@ -13608,9 +13608,9 @@ def _landed_spy(monkeypatch):
         seen["fetches"] += bool(fetch)
         return real_tip(repo, onto, fetch)
 
-    def git(repo, *args, timeout=30):
+    def git(repo, *args, timeout=30, **kw):
         seen["fetches"] += args[0] == "fetch"
-        return real_git(repo, *args, timeout=timeout)
+        return real_git(repo, *args, timeout=timeout, **kw)
 
     def check(*a, **k):
         raise AssertionError("landed.check may fetch: the audit's re-check reads local refs only")
@@ -23551,11 +23551,11 @@ def test_landed_equivalent_does_not_rerun_a_timed_out_scan_until_a_head_moves(en
     _git_out(repo, "fetch", "-q", "origin")
     git, logs, fail = landed._git, [], [subprocess.TimeoutExpired(["git", "log"], 60)]
 
-    def slow(repo, *args, timeout=30):
+    def slow(repo, *args, timeout=30, **kw):
         if args[0] == "log":
             logs.append(args)
             raise fail[0]
-        return git(repo, *args, timeout=timeout)
+        return git(repo, *args, timeout=timeout, **kw)
 
     monkeypatch.setattr(landed, "_git", slow)
     for _ in range(2):

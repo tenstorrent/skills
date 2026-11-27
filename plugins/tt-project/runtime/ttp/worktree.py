@@ -2646,7 +2646,7 @@ def _resolve(p: Project | None, names: list[str], root: Path | None = None) -> d
     try:
         out = gitmemo.run(["git", "-C", str(root or p.root), "cat-file", "--batch-check=%(objectname) %(objecttype)"],
                           input="".join(f"{n}^{{commit}}\n" for n in names), capture_output=True, text=True,
-                          timeout=120, read=True)
+                          timeout=120, read=True, env=gitmemo.no_lazy_env())
     except subprocess.TimeoutExpired:
         return {}
     lines = (out.stdout or "").splitlines() if out.returncode == 0 else []
@@ -2665,7 +2665,7 @@ def branch_heads(p: Project, branches: list[str]) -> dict[str, str] | None:
     try:
         out = gitmemo.run(["git", "-C", str(p.root), "cat-file", "--batch-check=%(objectname) %(objecttype)"],
                           input="".join(f"{b}^{{commit}}\n" for b in names), capture_output=True, text=True,
-                          timeout=120, read=True)
+                          timeout=120, read=True, env=gitmemo.no_lazy_env())
     except subprocess.TimeoutExpired:
         return None
     lines = (out.stdout or "").splitlines() if out.returncode == 0 else []

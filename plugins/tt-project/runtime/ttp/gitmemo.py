@@ -43,6 +43,7 @@ from __future__ import annotations
 import contextlib
 import contextvars
 import itertools
+import os
 import subprocess
 import time
 from pathlib import Path
@@ -314,6 +315,22 @@ def _spawn(argv, t: float | None, kw: dict) -> subprocess.CompletedProcess:
             return subprocess.run(argv, timeout=t, **kw)
     finally:
         _own.reset(token)
+
+
+def no_lazy_env(base: dict[str, str] | None = None) -> dict[str, str]:
+    """`base` (default this process's environment) for a git read that never fetches a partial clone's
+    missing objects: each one fetched alone leaves a promisor pack and a network round trip behind.
+    GIT_NO_LAZY_FETCH stops it from git 2.44; an older git is stopped by protocol.allow=never, which
+    refuses every transport. A missing object then reads as missing."""
+    env = dict(os.environ if base is None else base)
+    try:
+        n = int(env.get("GIT_CONFIG_COUNT") or 0)
+    except ValueError:
+        n = -1
+    if n >= 0:
+        env.update({f"GIT_CONFIG_KEY_{n}": "protocol.allow", f"GIT_CONFIG_VALUE_{n}": "never",
+                    "GIT_CONFIG_COUNT": str(n + 1)})
+    return {**env, "GIT_NO_LAZY_FETCH": "1"}
 
 
 def popen(argv: list, **kw) -> subprocess.Popen:

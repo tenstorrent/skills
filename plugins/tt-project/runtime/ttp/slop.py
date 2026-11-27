@@ -401,9 +401,11 @@ def _excluded(path: str, globs: list[str]) -> bool:
 
 def _batch_texts(root, blobs: list[str]):
     """The texts of `blobs`, streamed from one `git cat-file --batch` process: a request is written
-    only after the previous answer is read, so neither pipe ever fills. A missing object yields None."""
+    only after the previous answer is read, so neither pipe ever fills. A missing object yields None,
+    a partial clone's unfetched blob too: it is never fetched one at a time."""
     p = gitmemo.popen(["git", "-C", str(root), "cat-file", "--batch"],
-                      stdin=subprocess.PIPE, stdout=subprocess.PIPE)
+                      stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                      env=gitmemo.no_lazy_env())
     try:
         for blob in blobs:
             p.stdin.write(f"{blob}\n".encode())
