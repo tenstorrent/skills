@@ -41,7 +41,11 @@ answers are regressed on our uncached and cached tokens; only when the cached to
 small (upper bound under LIFT_MAX_WEIGHT, on at least LIFT_MIN_ROWS readings and LIFT_MIN_CACHED cached
 tokens, its standard error under LIFT_MAX_ERR; a noisier set of readings keeps collecting, never votes no;
 the fit also takes a charge that shows in the next reading) in LIFT_VOTES evaluations in a row on fresh readings, LIFT_EVERY_S apart, does it lift, once, kept
-in the file. The account setting providers.chat.quota_cap_lift: auto (default), on (lifted now) or off (never).
+in the file. A degenerate evaluation never votes and resets the count: a standard error under LIFT_MIN_ERR (a
+perfect fit means the readings carry no information), fewer than LIFT_MIN_MOVING readings with a drop, drops
+that barely vary (LIFT_MIN_SPREAD), or our own tokens under LIFT_MIN_SHARE of the org's total drop (others
+drive the readings, so the fit cannot tell our weight). A quota 429 while lifted, in a UTC hour where our own
+use already passed the cap, re-arms the cap (the daemon notifies it once). The account setting providers.chat.quota_cap_lift: auto (default), on (lifted now) or off (never).
 """
 from __future__ import annotations
 
@@ -81,6 +85,10 @@ LIFT_VOTES = 3                      # passing evaluations in a row before the ca
 LIFT_MIN_ROWS = 40
 LIFT_MAX_ERR = 0.2                  # an evaluation votes only once the weight's standard error is under this
 LIFT_MIN_CACHED = 10_000_000        # cached tokens of ours inside an evaluation's rows: else it had no power
+LIFT_MIN_ERR = 0.01                 # a standard error under this is a degenerate fit (flat or exact readings), no vote
+LIFT_MIN_MOVING = 20                # readings with a nonzero drop an evaluation needs
+LIFT_MIN_SPREAD = 1000              # tokens: the drops' standard deviation under this is flat readings, no vote
+LIFT_MIN_SHARE = 0.3                # our tokens over the org's total drop: under this others drive the readings
 LIFT_MAX_WEIGHT = 0.5               # the cached tokens' weight, 2 standard errors up, must be under this
 
 
@@ -255,6 +263,16 @@ def _fit(rows: list) -> tuple[float, float] | None:
     return beta[2] + beta[4], math.sqrt(var)
 
 
+def _flat_or_not_ours(rows: list) -> bool:
+    """Whether the rows' drops are too flat, or too little of them ours, for the fit to tell our weight."""
+    drops = [r[4] for r in rows]
+    mean = sum(drops) / len(drops)
+    spread = math.sqrt(sum((d - mean) ** 2 for d in drops) / len(drops))
+    total = sum(d for d in drops if d > 0)
+    return (sum(d > 0 for d in drops) < LIFT_MIN_MOVING or spread < LIFT_MIN_SPREAD or
+            sum(r[2] + r[3] for r in rows) < LIFT_MIN_SHARE * total)
+
+
 def _judge(st: dict, now: float, mode: str | None = None) -> None:
     """One evaluation of whether cached tokens still count (the module doc), at most every LIFT_EVERY_S and
     only on the rows taken since the last one, so each vote is fresh evidence."""
@@ -268,6 +286,10 @@ def _judge(st: dict, now: float, mode: str | None = None) -> None:
         return
     got = _fit(rows)
     if not got or got[1] > LIFT_MAX_ERR:   # too noisy to tell yet: keep collecting
+        return
+    if got[1] < LIFT_MIN_ERR or _flat_or_not_ours(rows):   # a degenerate fit tells nothing: no vote, start over
+        if lift.get("votes"):
+            st["lift"] = {**lift, "votes": 0}
         return
     ok = got[0] + 2 * got[1] < LIFT_MAX_WEIGHT
     votes = int(lift.get("votes") or 0) + 1 if ok else 0
@@ -315,6 +337,21 @@ def lift_notice(key: str, now: float | None = None) -> str:
             f"Force it back with `ttp config --account {LIFT_KEY} off`.")
 
 
+def rearm_notice(key: str, now: float | None = None) -> str:
+    """Once, the text saying a quota 429 re-armed the lifted cap (the daemon notifies it); '' otherwise."""
+    now = time.time() if now is None else now
+    with _locked(key) as path:
+        st = _read(path)
+        lift = st.get("lift") or {}
+        if not lift.get("rearmed") or lift.get("rearm_told"):
+            return ""
+        st["lift"] = {**lift, "rearm_told": now}
+        _write(path, st)
+    return ("GLM hourly cap re-armed: the org quota refused us while the cap was lifted and our own use was past "
+            f"the cap. The lift is cleared; it is judged again from fresh readings. Keep it off with "
+            f"`ttp config --account {LIFT_KEY} off`.")
+
+
 def parse(detail: str, headers=None) -> dict:
     """The numbers a quota 429 gives: {limit, used, reset (epoch), window_s}, each only when present."""
     out: dict = {}
@@ -360,6 +397,9 @@ def sync(key: str, got: dict, window_s: float = 3600, now: float | None = None, 
         if "used" in got:
             st["used"] = max(ours, int(got["used"]))
         if spent:
+            if lift_mode() == "auto" and (st.get("lift") or {}).get("lifted") and cap_setting() > 0 and \
+                    int(((st.get("hours") or {}).get(str(int(now - now % HOUR_S))) or [0])[0]) >= cap_setting():
+                st["lift"] = {"votes": 0, "at": now, "lifted": 0, "rearmed": now, "told": 0}   # the org refused us
             if not int(got.get("limit") or 0) and ours > 0:
                 st["observed"] = [o for o in (st.get("observed") or []) if float(o[0]) > now - OBSERVED_KEEP_S] + \
                     [[now, ours]]
