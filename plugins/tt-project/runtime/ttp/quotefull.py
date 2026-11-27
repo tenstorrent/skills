@@ -47,7 +47,7 @@ def backrefs(text: str, later: list[str] | tuple = ()) -> list[str]:
     tail = "\n".join(t or "" for t in later)
     found = [(m, True) for m in _POINT_BACK.finditer(text)] + [(m, False) for m in _STATUS_PHRASE.finditer(text)]
     for m, back in sorted(found, key=lambda f: f[0].start()):
-        clause = text[max(text.rfind(c, 0, m.start()) for c in ".;:\n") + 1:m.end()]
+        clause = text[max(text.rfind(c, 0, m.start()) for c in ".;:,\n") + 1:m.end()]
         if (not back and _NEGATED.search(clause)) or (   # named as an example: 'see above' in quotes
                 _OPENS.search(text[:m.start()]) and _CLOSES.search(text[m.end():])):
             continue

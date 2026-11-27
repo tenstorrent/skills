@@ -68,7 +68,8 @@ def test_a_plain_line_or_list_item_after_the_phrase_is_not_its_text_and_plain_st
     assert quotefull.backrefs("A line that points back ('drafts in my earlier messages', 'see above') is refused.") == []
     assert quotefull.backrefs("Here's where we are: drafts in my earlier messages aren't sent yet.") != []
     assert quotefull.backrefs(_MISS + " Ask 12 is still open.\n\nStill open, in full:\n- ask 12: Reboot now?") != []
-    for plain in ("No asks are still open.", "Task #14 is still open and has two questions from the vendor.",
+    assert quotefull.backrefs("No rush, the drafts for <name> and <name> are ready to send.") != []
+    for plain in ("No asks are still open.", "Neither draft is ready to send.", "Task #14 is still open and has two questions from the vendor.",
                   "Bug #3 is still open, and the request to the vendor went out.", "I am ready to send the reminder at 9.",
                   "Drafts ready to send: none.", "The command finished. The PR is pending review.",
                   "I will ask the vendor. Task #14 is pending a worker."):
