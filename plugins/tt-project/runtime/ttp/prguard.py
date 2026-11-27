@@ -990,7 +990,7 @@ def check(args: list[str], real: str, db=None, stdin_text: str | None = None, _d
             return why
     if cmd in ("pr", "issue", "workflow", "api") and rest and db is not None:   # PR babysitting: dispatch, labels, no-post PRs (prbabysit)
         from . import prbabysit
-        if why := prbabysit.guard(args, real, db, _project_config() if cfg is None else cfg):
+        if why := prbabysit.guard(args, real, db, _project_config() if cfg is None else cfg, stdin_text):
             return why
     if cmd == "pr" and rest:
         sub, more = rest[0], rest[1:]

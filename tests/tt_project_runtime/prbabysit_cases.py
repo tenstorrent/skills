@@ -79,13 +79,21 @@ def test_prbabysit_skipped_and_never_run_workflows_give_pr_ci_not_run_once(env, 
         {"name": "validate", "workflowName": "ci", "status": "COMPLETED", "conclusion": "SUCCESS"},
         {"name": "build", "checkSuite": {"workflowRun": {"workflow": {"name": "Heavy"}}}, "status": "COMPLETED",
          "conclusion": "SKIPPED"}])
-    p, d, _ = _pb_run(env, monkeypatch, pr)
+    p, d, _ = _pb_run(env, monkeypatch, pr, cfg={"pr_babysit.dispatch": {"acme/widgets": ["nightly.yml"]}})
     watchers.watch_prs(d)
     watchers.watch_prs(d)
     ev = [t for k, t in _pb_events(p) if k == "pr_ci_not_run"]
     assert len(ev) == 1, ev
     assert "Heavy (trigger: label run-heavy)" in ev[0] and "Nightly (trigger: workflow_dispatch)" in ev[0], ev
     assert "ci (" not in ev[0], "a workflow that ran is not listed"
+
+
+def test_prbabysit_a_never_run_manual_workflow_is_listed_only_when_dispatch_names_it(env, monkeypatch):
+    from ttp import watchers
+    _pb_gh(monkeypatch)
+    p, d, _ = _pb_run(env, monkeypatch, _pb_pr())
+    watchers.watch_prs(d)
+    assert [t for k, t in _pb_events(p) if k == "pr_ci_not_run"] == [], "nothing is dispatchable: nothing to report"
 
 
 def test_prbabysit_idle_past_idle_h_gives_pr_idle_once_with_the_reviewers(env, monkeypatch):
@@ -282,4 +290,24 @@ def test_prbabysit_guard_covers_gh_api_writes_to_a_no_post_pr_and_workflow_dispa
     assert "no_post_prs" in _pb_why(p, cfg, *api, "graphql", "-f", "query=mutation{addComment}")
     assert "gh workflow run" in _pb_why(p, cfg, *api, "repos/acme/widgets/actions/workflows/heavy.yml/dispatches")
     assert _pb_why(p, cfg, "api", "repos/acme/widgets/issues/7/comments") is None   # a read
+    assert _pb_why(p, cfg, "api", "graphql", "-f", "query={viewer{login}}") is None   # a graphql read
     assert _pb_why(p, cfg, *api, "repos/acme/widgets/issues/9/labels") is None   # another PR
+
+
+def test_prbabysit_a_workflow_read_not_answered_is_asked_again_next_sweep_and_kept_by_blob(env, monkeypatch):
+    from ttp import watchers
+    calls = _pb_gh(monkeypatch)
+    real = watchers._gh
+    gone = {"on": True}
+    monkeypatch.setattr(watchers, "_gh", lambda a, c: None if gone["on"] and a[:1] == ["api"] else real(a, c))
+    p, d, _ = _pb_run(env, monkeypatch, _pb_pr(statusCheckRollup=[
+        {"name": "build", "checkSuite": {"workflowRun": {"workflow": {"name": "Heavy"}}}, "status": "COMPLETED",
+         "conclusion": "SKIPPED"}]))
+    watchers.watch_prs(d)
+    assert not p.db.kv("pr_workflows"), "an unanswered read caches nothing"
+    gone["on"] = False
+    watchers.watch_prs(d)
+    assert len(p.db.kv("pr_workflows")) == len(_PB_FLOWS)
+    n = len(calls)
+    watchers.watch_prs(d)
+    assert [c for c in calls[n:] if "/contents/.github/workflows/" in c[1]] == [], "each file is read once per blob"

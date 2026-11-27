@@ -1684,7 +1684,8 @@ def test_pr_watch_stops_reading_merged_and_closed_prs(env, monkeypatch):
     assert p.db.one("SELECT COUNT(*) n FROM events WHERE kind='pr_changed' AND text LIKE '%MERGED%'")["n"] == 1
     calls.clear()
     assert watchers.watch_prs(d).startswith("ok (1 PRs")
-    assert calls == [urls[0], "number=1"], "merged and closed PRs are not read again"
+    assert [c for c in calls if "/contents/" not in c] == [urls[0], "number=1"], "merged and closed PRs are not read again"
+    assert not [c for c in calls if "/pull/2" in c or "/pull/3" in c]
 
 
 def test_pr_watch_logs_each_gh_calls_duration_and_what_a_cut_run_skipped(env, monkeypatch):

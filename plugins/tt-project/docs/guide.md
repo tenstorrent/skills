@@ -4097,8 +4097,8 @@ the pick order, so it takes the first starts. A resumed resource ramps only its 
   route). The sweep itself posts nothing and dispatches nothing; the coordinator's duty is to act on what
   it reports (fix tasks on the PR's branch, dispatch, rebase, ping), through the workers' `gh` guard. A non-draft PR gets `pr_findings` for failed checks and
   unanswered comments as a draft does. `pr_ci_not_run` lists checks skipped, or workflows that need a
-  manual or label trigger and never ran on the head, each with its trigger (read from the repo's workflows
-  at the head). `pr_idle` fires once per idle stretch past `pr_babysit.idle_h` (24) hours without commit,
+  manual or label trigger, never ran on the head and are listed in `pr_babysit.dispatch`, each with its trigger
+  (read from the repo's workflows at the head). `pr_idle` fires once per idle stretch past `pr_babysit.idle_h` (24) hours without commit,
   review, comment or check activity, naming the requested reviewers. Status changes since the last
   sweep (out of draft, review approved or changes requested, CI red or green, merged or closed, a new
   conflict) are one chat line per PR with its link, once per change: a review approved and red CI on a ready PR
