@@ -480,6 +480,7 @@ def test_eta_a_measured_outside_wait_without_run_history_names_no_measured_run(e
     # a detached-jobs wait with no run history still estimates from its jobs' medians.
     _jobs_registry(p, [("load", now - 86400, "ended", now - 86400 + 600)])
     t2 = _waiting_jobs_task(p, now, ["load-2"], on_pass_cmd=None)
+    p.db.update_task(t2, kind="question")   # no run of its kind in the history
     e2 = eta.estimate(p.db, t2, now)
     assert e2["end"] == pytest.approx(now + 600 - 300), e2
 
