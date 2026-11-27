@@ -143,7 +143,7 @@ def test_prbabysit_red_ci_on_a_ready_pr_posts_at_once_and_green_joins_the_digest
 def test_prbabysit_exit_75_gives_no_event(env, monkeypatch):
     from ttp import watchers
     answer, calls = _stub_gh(env, monkeypatch, rc=75, err="queued for the workstation")
-    p, d, lines = _pb_run(env, monkeypatch, _pb_pr())
+    p, d, lines = _pb_run(env, monkeypatch, _pb_pr(), cfg={"pr_babysit.dispatch": {"acme/widgets": ["nightly.yml"]}})
     watchers.watch_prs(d)
     assert _gh_calls(calls), "the stub gh was asked"
     assert [k for k, _ in _pb_events(p) if k in ("pr_ci_not_run", "pr_idle")] == [] and lines == []
@@ -170,6 +170,10 @@ def test_prbabysit_defaults_and_extra_prs_enter_the_watch_even_while_gh_is_logge
         t["pr_url"] for t in order) or None)
     watchers.watch_prs(d)
     assert seen == ["https://github.com/acme/widgets/pull/9"], seen
+    p.db.set_kv("pr_purview", {"at": time.time(), "prs": {"https://github.com/acme/widgets/pull/5": {"branch": "b"}}})
+    seen.clear()
+    watchers.watch_prs(d)   # a recorded purview PR is read too, and a known record does not stop the run
+    assert set(seen) == {"https://github.com/acme/widgets/pull/5", "https://github.com/acme/widgets/pull/9"}, seen
 
 
 def test_prbabysit_an_idle_purview_pr_is_read_every_sweep_not_daily(env, monkeypatch):
@@ -291,7 +295,9 @@ def test_prbabysit_guard_covers_gh_api_writes_to_a_no_post_pr_and_workflow_dispa
     assert "gh workflow run" in _pb_why(p, cfg, *api, "repos/acme/widgets/actions/workflows/heavy.yml/dispatches")
     assert _pb_why(p, cfg, "api", "repos/acme/widgets/issues/7/comments") is None   # a read
     assert _pb_why(p, cfg, "api", "graphql", "-f", "query={viewer{login}}") is None   # a graphql read
-    assert _pb_why(p, cfg, *api, "repos/acme/widgets/issues/9/labels") is None   # another PR
+    assert "gh pr edit" in _pb_why(p, cfg, *api, "repos/acme/widgets/issues/9/labels", "-f", "labels[]=run-heavy")
+    assert "gh pr edit" in _pb_why(p, cfg, *api, "graphql", "-f", "query=mutation{addLabelsToLabelable}")
+    assert _pb_why(p, cfg, *api, "repos/acme/widgets/issues/9/assignees") is None   # another PR
 
 
 def test_prbabysit_a_workflow_read_not_answered_is_asked_again_next_sweep_and_kept_by_blob(env, monkeypatch):
@@ -339,3 +345,13 @@ def test_prbabysit_pending_checks_hold_back_only_the_never_run_list_and_a_mergea
     ev = [k for k, _ in _pb_events(p)]
     assert "pr_idle" in ev and "pr_ci_not_run" not in ev, ev
     assert [x for x, _ in lines].count(f"[acme/widgets#7]({_PB_URL}): has a merge conflict") == 1, lines
+
+
+def test_prbabysit_dispatch_keys_match_any_case_and_a_nameless_workflow_is_named_by_its_path(env, monkeypatch):
+    from ttp import prbabysit, watchers
+    assert prbabysit.settings({"pr_babysit": {"dispatch": {"Acme/Widgets": ["x"]}}})["dispatch"] == {"acme/widgets": ["x"]}
+    assert prbabysit.workflow_info(".github/workflows/h.yml", "on:\n  workflow_dispatch:\n")["name"] == ".github/workflows/h.yml"
+    _pb_gh(monkeypatch)
+    p, d, _ = _pb_run(env, monkeypatch, _pb_pr(), cfg={"pr_babysit.dispatch": {"Acme/Widgets": ["nightly.yml"]}})
+    watchers.watch_prs(d)
+    assert [t for k, t in _pb_events(p) if k == "pr_ci_not_run" and "Nightly" in t], _pb_events(p)

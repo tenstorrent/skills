@@ -30,7 +30,8 @@ PING = "This PR has had no activity for a day: a review or a reply would unblock
 
 
 def settings(cfg: dict | None) -> dict:
-    return {**DEFAULTS, **((cfg or {}).get("pr_babysit") or {})}
+    out = {**DEFAULTS, **((cfg or {}).get("pr_babysit") or {})}
+    return {**out, "dispatch": {str(k).lower(): v for k, v in (out.get("dispatch") or {}).items()}}
 
 
 def owned(db) -> dict[str, str]:
@@ -74,7 +75,7 @@ def guard(args: list[str], real: str, db, cfg: dict, stdin_text: str | None = No
             return f"refused: {ref!r} is not the head of an open PR this project owns in {repo}"
         if key.lower() in no_post:
             return f"refused: {key} is in pr_babysit.no_post_prs: nothing is dispatched or posted on it"
-        if what not in cfg_["dispatch"].get(repo, []):
+        if what not in cfg_["dispatch"].get(repo.lower(), []):
             return f"refused: workflow {what!r} is not listed for {repo} in pr_babysit.dispatch"
         return None
     if cmd == "api":   # the same refusals when a write goes through the REST or GraphQL endpoint
@@ -82,6 +83,8 @@ def guard(args: list[str], real: str, db, cfg: dict, stdin_text: str | None = No
         m = re.match(r"repos/([^/]+/[^/]+)/(?:issues|pulls)/(\d+)", endpoint, re.I)
         if method != "GET" and re.search(r"/actions/workflows/[^/]+/dispatches$", endpoint, re.I):
             return "refused: dispatch a workflow with `gh workflow run <name> --ref <the PR's head>`"
+        if method != "GET" and (re.search(r"/(?:issues|pulls)/\d+/labels", endpoint, re.I) or "addLabelsToLabelable" in prguard._api_text(args[1:], stdin_text)):
+            return "refused: add a label with `gh pr edit <N> --add-label <label>` on an owned PR"
         mutation = endpoint.strip("/").lower() == "graphql" and prbody.GQL_MUTATION_RE.search(prguard._api_text(args[1:], stdin_text))
         if method != "GET" and (m and f"{m[1]}#{m[2]}".lower() in no_post or no_post and mutation):
             return ("refused: a write on a PR in pr_babysit.no_post_prs, or a GraphQL mutation whose target cannot be "
@@ -100,7 +103,7 @@ def guard(args: list[str], real: str, db, cfg: dict, stdin_text: str | None = No
     for label in labels:
         if not (cmd == "pr" and sub == "edit" and key in (owned(db) if db else {})):
             return f"refused: a label goes only on an open PR this project owns ({key})"
-        if f"label:{label}" not in cfg_["dispatch"].get(key.split("#")[0], []):
+        if f"label:{label}" not in cfg_["dispatch"].get(key.split("#")[0].lower(), []):
             return f"refused: label {label!r} is not listed for {key.split('#')[0]} in pr_babysit.dispatch"
     return None
 
@@ -125,7 +128,7 @@ def workflow_info(path: str, text: str) -> dict:
         labels += re.findall(r"contains\([^()]*labels[^()]*,\s*['\"]([^'\"]+)['\"]", text)
     trigger = " or ".join(["workflow_dispatch"] * dispatch + [f"label {x}" for x in dict.fromkeys(labels)]) or "none"
     manual = (labels and not re.search(r"opened|synchronize", block)) or (dispatch and not re.search(r"pull_request|push", block))
-    return {"name": (name.group(1).strip("'\"") if name else path.rsplit("/", 1)[-1].rsplit(".", 1)[0]),
+    return {"name": (name.group(1).strip("'\"") if name else path),
             "file": path.rsplit("/", 1)[-1], "manual": bool(manual), "trigger": trigger, "labels": list(dict.fromkeys(labels))}
 
 
@@ -166,7 +169,9 @@ def _not_run(daemon, pr: dict, key: str, gh, now: float, pending: bool) -> str:
     `pr_babysit.dispatch` lists, by file, name or label, that never ran on the head."""
     sha, repo = pr.get("headRefOid"), key.split("#")[0]
     checks = pr.get("statusCheckRollup") or []
-    flows = _flows(daemon.p.db, gh, repo, sha, str(daemon.p.root), now) if sha else None
+    listed = settings(getattr(daemon, "cfg", None))["dispatch"].get(repo, [])
+    skip = any((c.get("conclusion") or "").upper() == "SKIPPED" for c in checks)
+    flows = _flows(daemon.p.db, gh, repo, sha, str(daemon.p.root), now) if sha and (skip or listed) else None
     if flows is None:
         return ""
     by_name = {f["name"]: f["trigger"] for f in flows}
@@ -174,7 +179,6 @@ def _not_run(daemon, pr: dict, key: str, gh, now: float, pending: bool) -> str:
     ran_ok = {_workflow(c) for c in checks if (c.get("conclusion") or "").upper() != "SKIPPED"}
     skipped = {_workflow(c) or c.get("name") or "?" for c in checks if (c.get("conclusion") or "").upper() == "SKIPPED"}
     todo = {n: by_name.get(n, "none") for n in skipped - ran_ok}
-    listed = settings(getattr(daemon, "cfg", None))["dispatch"].get(repo, [])
     named = not checks or any(ran - {""})   # a read that names no workflow cannot say which never ran
     todo.update({f["name"]: f["trigger"] for f in flows if f["manual"] and f["name"] not in ran and named and not pending
                  and (f["file"] in listed or f["name"] in listed or any(f"label:{x}" in listed for x in f.get("labels", [])))})
