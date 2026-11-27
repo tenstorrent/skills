@@ -166,7 +166,7 @@ def parse(data: dict) -> dict:
                     raise BadConfig(f"box {box} agent {an}: each forward entry is an object")
                 hn = _name(h.get("name"), f"box {box} agent {an}: host")
                 target = h.get("target") or hn
-                if not isinstance(target, str) or target.startswith("-") or re.search(r"[\s:/@]", target):
+                if not isinstance(target, str) or target.startswith("-") or re.search(r"[\s:/@%=]", target):
                     raise BadConfig(f"box {box} host {hn}: target {target!r} is a host name or address (its ssh port 22 is forwarded)")
                 port = _port(h.get("port"), f"box {box} host {hn}: port")
                 if port in ports and not (h.get("adopt") and ports[port] == target):

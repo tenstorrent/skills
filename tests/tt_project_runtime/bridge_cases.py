@@ -75,6 +75,17 @@ def test_bridge_hold_check_keeps_a_held_host_refused():
                           "forward": [{"name": "h", "target": "h.example.com", "port": 2301}]}}}}})
 
 
+def test_bridge_target_is_a_plain_host_name():
+    # cells: percent-target, equals-target
+    from ttp import bridge
+    for bad in ("h%vpn0", "a=b"):
+        with pytest.raises(bridge.BadConfig, match="target"):
+            box = {"login": {}, "agents": {"a": {"agent": "env", "forward": [{"name": "h", "target": bad, "port": 2301}]}}}
+            bridge.parse({"boxes": {"b": box}})
+    ok = {"login": {}, "agents": {"a": {"agent": "env", "forward": [{"name": "h", "target": "h.example.com", "port": 2301}]}}}
+    assert bridge.parse({"boxes": {"b": ok}})["boxes"]["b"]["agents"]["a"]["forward"][0]["target"] == "h.example.com"
+
+
 def test_bridge_config_refuses_unsafe_or_ambiguous_entries():
     import pytest
     from ttp import bridge
