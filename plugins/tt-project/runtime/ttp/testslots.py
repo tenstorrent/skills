@@ -83,6 +83,7 @@ from __future__ import annotations
 
 import collections
 import contextlib
+import contextvars
 import fcntl
 import hashlib
 import json
@@ -994,15 +995,60 @@ def _suite_resource(project_name: str, repo: str = "") -> str:
     return suite_base(project_name, repo)
 
 
+_LISTING: contextvars.ContextVar = contextvars.ContextVar("slot_listing", default=None)
+_LANE_NAME = re.compile(r"(.+?)(-x)?\.(\d+)\.lock")
+
+
+@contextlib.contextmanager
+def one_listing():
+    """Inside it every lane lookup reads one listing of the slot folder, taken on first use, not one per
+    base: a status build asks about hundreds of bases. Use it for one top-level call only; a new call lists
+    again. Also a decorator (`@one_listing()`)."""
+    if _LISTING.get() is not None:
+        yield
+        return
+    token = _LISTING.set({})
+    try:
+        yield
+    finally:
+        _LISTING.reset(token)
+
+
+def _slot_names() -> list[str]:
+    """The file names in the slot folder now (the one_listing's, when inside it); [] if it cannot be read."""
+    held = _LISTING.get()
+    if held is not None and "names" in held:
+        return held["names"]
+    try:
+        names = [x.name for x in checkcap.slot_dir().iterdir()]
+    except OSError:
+        names = []
+    if held is not None:
+        held["names"] = names
+    return names
+
+
+def _lane_index() -> dict[str, list[str]]:
+    """Inside one_listing: each base's lane file names, its numbered lanes then its overflow lanes."""
+    held = _LISTING.get()
+    if "index" not in held:
+        keyed: dict[str, list] = {}
+        for n in _slot_names():
+            if m := _LANE_NAME.fullmatch(n):
+                keyed.setdefault(m.group(1), []).append((m.group(2) is not None, int(m.group(3)), n))
+        held["index"] = {b: [t[2] for t in sorted(v)] for b, v in keyed.items()}
+    return held["index"]
+
+
 def _lanes_of(base: str) -> list:
     """Every lane file of `base` there is now: its numbered lanes, then its overflow lanes."""
-    d = checkcap.slot_dir()
-    pat = re.compile(re.escape(base) + r"(?:-x)?\.(\d+)\.lock")
-    try:
-        found = [x for x in d.iterdir() if pat.fullmatch(x.name)]
-    except OSError:
-        return []
-    return sorted(found, key=lambda x: (x.name.startswith(base + "-x"), int(pat.fullmatch(x.name).group(1))))
+    if _LISTING.get() is not None:
+        found = _lane_index().get(base, [])
+    else:
+        pat = re.compile(re.escape(base) + r"(?:-x)?\.(\d+)\.lock")
+        found = [n for n in _slot_names() if pat.fullmatch(n)]
+        found.sort(key=lambda n: (n.startswith(base + "-x"), int(pat.fullmatch(n).group(1))))
+    return [checkcap.slot_dir() / n for n in found]
 
 
 def suite_bases(project_name: str) -> list[str]:
@@ -1010,11 +1056,8 @@ def suite_bases(project_name: str) -> list[str]:
     its checklane.wrap_key), that has lanes or waiters."""
     pre = f"{SUITE}.{locks.group_id(project_name)}"
     pat = re.compile(re.escape(pre) + r"(\.w?[0-9a-f]{12})?(?:-x)?(?:\.\d+\.lock|\.queue)")
-    try:
-        names = [x.name for x in checkcap.slot_dir().iterdir()]
-    except OSError:
-        return []
-    return sorted({pre + (m.group(1) or "") for n in names if (m := pat.fullmatch(n))})
+    return sorted({pre + (m.group(1) or "") for n in _slot_names()
+                   if (m := pat.fullmatch(n))})
 
 
 def lane_paths(project_name: str, n: int | None = None, repo: str = "", overflow: bool = False) -> list:
@@ -1023,7 +1066,8 @@ def lane_paths(project_name: str, n: int | None = None, repo: str = "", overflow
     for a cheaper waiter past checks.max_wait_s)."""
     from . import checklane
     if repo is None:
-        return [x for b in suite_bases(project_name) for x in _lanes_of(b)]
+        with one_listing():
+            return [x for b in suite_bases(project_name) for x in _lanes_of(b)]
     base = suite_base(project_name, repo)
     if n is None:
         return _lanes_of(base)

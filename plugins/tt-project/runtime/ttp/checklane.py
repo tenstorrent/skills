@@ -1278,6 +1278,7 @@ def _run_of(text: str) -> str:
     return m.group(1) if m else ""
 
 
+@testslots.one_listing()
 def lane_status(project_name: str, now: float | None = None, cfg: dict | None = None,
                 names: dict | None = None, db=None) -> list[dict]:
     """`ttp checks status`: per lane (a repository's or a wrapper lock's) with a holder or a waiter, its
@@ -1319,7 +1320,7 @@ def lane_status(project_name: str, now: float | None = None, cfg: dict | None = 
             # Parked outside the host queue for its test slots (_parked): a waiter that keeps its lane.
             lanes[-1]["parked"] = running is None and lanes[-1]["waits_on"].startswith(testslots.PARKED_WAITS)
         q = testslots.suite_order(project_name, _live_tickets(base), now, age=age)
-        on = _lane_waits_on(project_name, base, key, q, cfg, labels[key])
+        on = _lane_waits_on(project_name, base, key, q, cfg, labels[key]) if q else []
         waiters = []
         for i, t in enumerate(q):
             m = re.match(r"\d+(?:\.\d+)?-(\d+)", t.name)
@@ -1374,6 +1375,7 @@ def _rule(r: dict, cfg: dict | None) -> str:
     return slots_note(cfg, len([h for h in r["lanes"] if not h["overflow"]]))
 
 
+@testslots.one_listing()
 def lane_lines(project_name: str, cfg: dict | None = None, now: float | None = None) -> list[str]:
     """`ttp status` and the web app's feed: one line per checks lane with a holder or a waiter (lane_status):
     its label, who runs and for how long against the wall-time cap, who holds a lane but is not running

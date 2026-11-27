@@ -379,15 +379,20 @@ def below_suggestion(db: DB) -> list[str]:
 def with_costs(db: DB, home: str | None = None) -> list[dict]:
     """Schedules annotated with their last-7-day cost and `at` time, for the web app's recurring pane."""
     rows = db.q("SELECT * FROM schedules ORDER BY name")
-    week = time.time() - 7 * 86400
+    now = time.time()
+    spent = {r["source"]: float(r["s"]) for r in db.q(
+        "SELECT source, COALESCE(SUM(usd),0) s FROM ledger WHERE ts>=? AND source LIKE 'schedule:%' GROUP BY source",
+        (now - 7 * 86400,))}
+    kept: dict[str, list] = {}   # the skip history of every schedule, newest first, read once
+    for e in db.q("SELECT ts, text reason, source FROM events WHERE kind=? ORDER BY id DESC", (SKIP_KIND,)):
+        kept.setdefault(e["source"], []).append({"ts": e["ts"], "reason": e["reason"]})
     for r in rows:
-        c = db.one("SELECT COALESCE(SUM(usd),0) s, COUNT(*) n FROM ledger WHERE ts>=? AND source=?",
-                   (week, f"schedule:{r['name']}"))
-        r["cost_7d"] = round(float(c["s"]), 2)
+        mine = kept.get(f"schedule-skip:{r['name']}", [])
+        r["cost_7d"] = round(spent.get(f"schedule:{r['name']}", 0.0), 2)
         r["payload"] = json.loads(r["payload"] or "{}")
         r["at_text"] = at_text(r, home)
-        r["skips"] = skips(db, r["name"], 5)
-        r["skips_24h"] = len(skips(db, r["name"], SKIP_KEEP, time.time() - 86400))
+        r["skips"] = mine[:5]
+        r["skips_24h"] = len([e for e in mine[:SKIP_KEEP] if e["ts"] >= now - 86400])
     return rows
 
 

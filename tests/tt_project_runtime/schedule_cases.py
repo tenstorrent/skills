@@ -745,8 +745,14 @@ def test_the_skip_history_survives_a_daemon_restart_is_capped_and_shown(env, cap
     assert len(shown) == 10 and shown[0]["reason"].endswith(f"empty {sched.SKIP_KEEP + 4}")
     cli.main(["schedules", p.name])
     assert f"({sched.SKIP_KEEP} skip(s) in 24 h)" in capsys.readouterr().out
-    row = next(r for r in sched.with_costs(p.db) if r["name"] == "filler")
+    for ago, usd, src in ((3600, 0.5, "schedule:filler"), (86400, 0.25, "schedule:filler"),
+                          (9 * 86400, 9.0, "schedule:filler"), (3600, 7.0, "schedule:other"), (3600, 1.0, "task:3")):
+        p.db.x("INSERT INTO ledger(ts,provider,source,usd) VALUES(?,?,?,?)", (time.time() - ago, "claude", src, usd))
+    rows = {r["name"]: r for r in sched.with_costs(p.db)}
+    row = rows["filler"]
     assert row["skips_24h"] == sched.SKIP_KEEP and len(row["skips"]) == 5
+    assert [x["reason"] for x in row["skips"]] == [x["reason"] for x in sched.skips(p.db, "filler", 5)]
+    assert row["cost_7d"] == 0.75, "only its own spend of the last 7 days"
 
 
 def test_schedule_skip_records_leave_the_quiet_gate_settling_all_held_idle_wakes(env):

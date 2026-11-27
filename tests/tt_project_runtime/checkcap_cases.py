@@ -13308,3 +13308,90 @@ def test_a_spill_rerun_whose_remote_part_took_18_min_books_no_slot_wait_here(env
     (row,) = checkcap.grant_records(now)
     assert row["since"] == pytest.approx(arrived, abs=0.01) and row["waited_s"] < 1, row
     assert throughput.host_shares(now=now)["projects"]["proj-spill"]["wait_s"] < 1
+
+
+def _crowded_slot_folder(monkeypatch, n_bases=12):
+    """A slot folder of many bases: held lanes (several, one an overflow), queue-only bases of the project and
+    another project's lanes, all through the real writers. Returns the grants and tickets to release."""
+    from ttp import checkcap, locks, testslots
+    _lane_env(monkeypatch)
+    held, tickets = [], []
+    for i in range(n_bases):
+        repo = f"{i:012x}"
+        for _ in range(1 + i % 3):   # 1-3 numbered lanes of 3
+            held.append(testslots.suite_hold("pa", repo=repo, slots=3, priority=2, name=f"r{i}", wait_s=5))
+        if i % 4 == 0:
+            tickets.append(locks.enqueue(checkcap.slot_dir(), testslots.suite_base("pa", repo), "task #5 pa: x",
+                                         time.time(), priority=2))
+    for i in range(n_bases, n_bases + 5):   # bases with only a ticket, no holder
+        tickets.append(locks.enqueue(checkcap.slot_dir(), testslots.suite_base("pa", f"{i:012x}"), "task #6 pa: x",
+                                     time.time(), priority=2))
+    held.append(testslots.suite_hold("pb", repo=_LANE_REPO, slots=1, priority=2, name="other", wait_s=5))
+    return held, tickets
+
+
+def _count_listings(monkeypatch):
+    from ttp import checkcap
+    calls = []
+    real = Path.iterdir
+    monkeypatch.setattr(Path, "iterdir", lambda self: (self == checkcap.slot_dir() and calls.append(self)) or real(self))
+    return calls
+
+
+def test_lane_lookups_list_the_slot_folder_once_per_call_and_return_what_per_base_listing_did(env, monkeypatch):
+    """cells: lane_paths_one_listing, suite_bases_one_listing, project_held_one_listing. Many bases and lanes:
+    each call reads the folder once, however many bases it covers, and returns the same files in the same order."""
+    import re
+    from ttp import checkcap, locks, testslots
+    held, tickets = _crowded_slot_folder(monkeypatch)
+    try:
+        d = checkcap.slot_dir()
+        gid = re.escape(locks.group_id("pa"))
+        names = sorted(x.name for x in d.iterdir())
+        bases = sorted({m.group(1) for n in names if (m := re.fullmatch(rf"(test-suite\.{gid}(?:\.\w{{12}})?)(?:-x)?(?:\.\d+\.lock|\.queue)", n))})
+        assert len(bases) > 12, bases
+
+        def lanes_of(b):   # the numbered lanes, then the overflow lanes, each by number
+            key = lambda n: (n.startswith(b + "-x"), int(n.rsplit(".", 2)[1]))
+            return [d / n for n in sorted((n for n in names if re.fullmatch(re.escape(b) + r"(?:-x)?\.\d+\.lock", n)), key=key)]
+        expect = [x for b in bases for x in lanes_of(b)]
+        assert len(expect) >= 20
+        calls = _count_listings(monkeypatch)
+        assert testslots.suite_bases("pa") == bases and len(calls) == 1, len(calls)
+        calls.clear()
+        assert testslots.lane_paths("pa", repo=None) == expect and len(calls) == 1, len(calls)
+        calls.clear()
+        got = testslots.project_held("pa")
+        assert len(calls) == 1, len(calls)
+        assert got == [x for x in expect if locks._slot_labels([x]) and not testslots._pending(x)] and got
+    finally:
+        for g in held:
+            g.close()
+        for t in tickets:
+            locks.dequeue(t)
+
+
+def test_lane_status_lists_the_folder_once_and_looks_up_no_waits_for_a_base_with_no_waiter(env, monkeypatch):
+    """cells: lane_status_one_listing, lane_status_no_waiter_no_lookup. lane_status reads the slot folder a
+    bounded number of times, not once per base, and asks what waiters wait on only for a base that has some."""
+    from ttp import checkcap, checklane, locks
+    p = make(env)
+    held, tickets = _crowded_slot_folder(monkeypatch)
+    asked = []
+    real = checklane._lane_waits_on
+    monkeypatch.setattr(checklane, "_lane_waits_on", lambda pn, base, key, q, *a: asked.append((base, len(q))) or real(pn, base, key, q, *a))
+    calls = _count_listings(monkeypatch)
+    try:
+        rows = checklane.lane_status("pa", cfg=p.config())
+        assert len(rows) > 12, len(rows)
+        assert len(calls) <= 3, len(calls)
+        assert asked and all(n > 0 for _, n in asked) and len(asked) < len(rows), asked
+        again = checklane.lane_status("pa", cfg=p.config())
+        assert len(calls) <= 6, "a new top-level call lists again, once"
+        shape = lambda rs: [(r["id"], len(r["lanes"]), len(r["waiters"])) for r in rs]
+        assert shape(again) == shape(rows)
+    finally:
+        for g in held:
+            g.close()
+        for t in tickets:
+            locks.dequeue(t)
