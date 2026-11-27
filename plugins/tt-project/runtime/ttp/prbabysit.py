@@ -310,7 +310,7 @@ def overlap_check(daemon, gh) -> None:
     db = daemon.p.db
     own = {k: v for k, v in (db.kv(KEY, {}) or {}).items() if v.get("open") and "#" in k}
     files = {k: fs for k in own if (fs := _pr_files(db, gh, k, own[k].get("head"), str(daemon.p.root)))}
-    if files:   # a blind sweep (no answer) keeps the last record instead of blanking the entry
+    if files or not own:   # a sweep with no answer keeps the last record; no open PR left clears it
         _host_write(daemon, {k: {"head": own[k].get("head"), "files": fs} for k, fs in files.items()})
     known = _host_prs(time.time())
     had = set(db.kv(OVERLAP_KEY, {}) or {})
@@ -351,9 +351,8 @@ def _pr_link(key: str) -> str:
 
 def _pr_files(db, gh, key: str, head, cwd: str) -> list[str] | None:
     """The PR's changed file names (first 100: a PR touching more files is rare, and its overlap
-    with another PR would show in the first page), cached by its head: None while the read has no
-    answer. A PR whose head is unknown is read but not cached, so a new head is never judged by the
-    old files."""
+    with another PR would show in the first page), cached by its head. While the read has no
+    answer the cached files stand (None with none); a PR whose head is unknown is read but not cached."""
     cache = db.kv(FILES_KEY, {}) or {}
     hit = cache.get(key)
     if head and hit and hit.get("head") == head and hit.get("files"):
@@ -361,7 +360,7 @@ def _pr_files(db, gh, key: str, head, cwd: str) -> list[str] | None:
     repo, n = key.split("#")
     rows = gh(["api", f"repos/{repo}/pulls/{n}/files?per_page=100"], cwd)
     if not isinstance(rows, list):
-        return None
+        return hit.get("files") if hit else None
     out = sorted({str(r.get("filename")) for r in rows if isinstance(r, dict) and r.get("filename")})
     if out and head:
         db.set_kv(FILES_KEY, {k: v for k, v in {**cache, key: {"head": head, "files": out}}.items()

@@ -470,3 +470,41 @@ def test_prbabysit_a_pair_with_another_project_pr_and_a_disjoint_pair_give_no_ev
     assert len(ev) == 1 and "acme/widgets#55" in ev[0] and "#46" in ev[0] and "b.py" in ev[0], ev
     assert not any("#47" in t for t in ev), "disjoint files: no pair"
     assert "overlap2" in (ghauth._home(None) / prbabysit.HOST_FILE).read_text()
+
+
+def test_ghroute_mark_keeps_each_routes_answer_under_the_state_lock_and_survives_a_corrupt_file(env, monkeypatch):
+    from ttp import ghauth, ghroute
+    held = []
+    real = ghauth._locked
+    monkeypatch.setattr(ghauth, "_locked", lambda home, fn, block, lock=ghauth.LOCK: held.append(lock) or real(home, fn, block, lock))
+    ghroute.mark(True, via="box1")
+    ghroute.mark(False, via="box2")
+    assert held == [ghroute.STATE + ".lock"] * 2, "each write takes the route state's own lock"
+    assert ghroute.last_answer("box1")["ok"] is True and ghroute.last_answer("box2")["ok"] is False
+    path = ghauth._home(None) / ghroute.STATE
+    for bad in ('{"via": "box1"}', '{"box1": 5, "via": ""}', '{"box1": {"ok": true, "at": "soon"}}', "[1]", "{"):
+        path.write_text(bad)
+        ghroute.mark(True, via="box3")   # never raises into the gh call path
+        assert ghroute.last_answer("box3")["ok"] is True, bad
+        assert ghroute.works(via="box1") is False, bad
+        path.write_text(bad)
+        assert ghroute.works() is False, bad
+
+
+def test_prbabysit_an_unread_pr_keeps_its_cached_files_in_the_host_record_and_a_project_with_no_open_pr_clears_it(env):
+    from ttp import prbabysit
+    from ttp.daemon import Daemon
+    p = make(env, "overlap3")
+    p.db.set_kv("pr_babysit", {"acme/widgets#7": {"open": True, "branch": "b", "head": "h7"},
+                                "acme/widgets#5": {"open": True, "branch": "b", "head": "h5"}})
+    both = {"5": [{"filename": "a.py"}], "7": [{"filename": "c.py"}]}
+    prbabysit.overlap_check(Daemon(p.base), _pb_files_gh(both)[0])
+    # #5 gets a new head and its read gets no answer while #7 answers: #5 keeps its last files
+    p.db.set_kv("pr_babysit", {"acme/widgets#7": {"open": True, "branch": "b", "head": "h7"},
+                                "acme/widgets#5": {"open": True, "branch": "b", "head": "h5b"}})
+    prbabysit.overlap_check(Daemon(p.base), _pb_files_gh({"7": both["7"]})[0])
+    prs = prbabysit._host_prs(time.time())
+    assert prs.get("acme/widgets#5") == ["a.py"] and prs.get("acme/widgets#7") == ["c.py"], prs
+    p.db.set_kv("pr_babysit", {"acme/widgets#7": {"open": False}, "acme/widgets#5": {"open": False}})
+    prbabysit.overlap_check(Daemon(p.base), _pb_files_gh({})[0])
+    assert prbabysit._host_prs(time.time()) == {}, "closed PRs leave the record other projects read"

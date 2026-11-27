@@ -284,9 +284,13 @@ def mark(ok: bool, home=None, via: str = "") -> None:
     """Record the route's last answer, host-wide (STATE), for the gh-auth alert: `via` names the route
     that answered (an ssh alias, or WORKSTATION for the queue), so it counts only for that route and
     one project's route answering says nothing about another's."""
+    from . import ghauth
     from .project import write_json
-    try:
+
+    def put():
         write_json(_state_path(home), {**_state_read(home), via: {"ok": ok, "at": time.time()}}, 0o600)
+    try:
+        ghauth._locked(home, put, block=True, lock=STATE + ".lock")
     except OSError:
         pass
 
@@ -297,9 +301,12 @@ def _state_path(home) -> "os.PathLike":
 
 
 def _state_read(home=None) -> dict:
-    """STATE's records, by route: a flat record (pre-per-route) counts for the route it names."""
-    st = last_answer(home)
-    return {st["via"]: {k: st[k] for k in ("ok", "at")}} if st.get("via") else {k: v for k, v in st.items() if k != "via"}
+    """STATE's records, by route: a flat record (pre-per-route) counts for the route it names; anything
+    else unreadable in the file is no record."""
+    st = last_answer(home=home)
+    if st.get("via"):
+        return {st["via"]: {"ok": st.get("ok"), "at": st.get("at")}}
+    return {k: v for k, v in st.items() if isinstance(v, dict)}
 
 
 def seen(rc: int, via: str = "") -> None:
@@ -327,16 +334,22 @@ def last_answer(via: str | None = None, home=None) -> dict:
     return {"via": via, **rec} if isinstance(rec, dict) else {}
 
 
+def _fresh(rec: dict, within_s: float) -> bool:
+    try:
+        return rec.get("ok") is True and time.time() - float(rec.get("at") or 0) < within_s
+    except (TypeError, ValueError):
+        return False
+
+
 def works(home=None, within_s: float = 3600, via: str | None = None) -> bool:
     """Whether a routed gh call succeeded here within `within_s` and none failed since; with `via`, only
     a call over that route counts (another project's route or the workstation queue answering is no
     route of this project's working)."""
     if via is not None:
-        r = last_answer(via, home)
-        return r.get("ok") is True and time.time() - float(r.get("at") or 0) < within_s
-    st = last_answer(home)   # the whole record: every route's last answer
+        return _fresh(last_answer(via, home), within_s)
+    st = last_answer(home=home)   # the whole record: every route's last answer
     recs = [st] if st.get("via") else [v for v in st.values() if isinstance(v, dict)]
-    return any(r.get("ok") is True and time.time() - float(r.get("at") or 0) < within_s for r in recs)
+    return any(_fresh(r, within_s) for r in recs)
 
 
 def live(cfg: dict | None = None, cwd: str | None = None) -> bool:
