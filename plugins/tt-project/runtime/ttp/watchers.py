@@ -890,9 +890,11 @@ def watch_prs(daemon, payload: dict | None = None) -> str:
             _check_unapproved(daemon, t, pr, sig, before, flagged, drafts)
         stale = body_stale(pr, bodies, heads, time.time()) if sig.get("draft") is True else ""
         failing_base = _base_failing(pr, base_cache, root, time.time()) if sig["failing"] else set()
-        _check_findings(daemon, t, pr, sig, findings, data, stale=stale, failing_base=failing_base)
-        if prbabysit.settings(getattr(daemon, "cfg", None))["enabled"]:
+        swept = prbabysit.settings(getattr(daemon, "cfg", None))["enabled"]
+        if swept:   # first: what ran on the head decides whether CI counts as green
             prbabysit.sweep(daemon, t, pr, sig, _gh)
+        _check_findings(daemon, t, pr, sig, findings, data, stale=stale, failing_base=failing_base,
+                        unrun=prbabysit.unrun(db, key, pr.get("headRefOid") or "") if swept else "")
         old = seen.get(t["pr_url"])
         if t.get("purview"):   # only its findings are news: no pr_changed for a PR no task opened
             seen[t["pr_url"]] = sig
@@ -1096,12 +1098,13 @@ def bot_open(data: dict) -> list[str]:
 
 
 def _check_findings(daemon, t: dict, pr: dict, sig: dict, findings: dict, data: dict | None, *,
-                    stale: str = "", failing_base: set | None = None) -> None:
+                    stale: str = "", failing_base: set | None = None, unrun: str | None = "") -> None:
     """Record an open PR's findings and tell the coordinator when they change: CI failing or bot
     review comments open is work (a fix task); CI green with every bot comment fixed or answered is
     when it may ask the user for a review. `data` is the PR's BOT_QUERY answer (None: unread).
     A draft's finish line also needs every person's review thread answered and its description
-    current (`stale`: why not); a check failing on its base too (`failing_base`) does not hold it.
+    current (`stale`: why not); a check failing on its base too (`failing_base`) does not hold it. A
+    skipped or never-run workflow on the head (`unrun`; None: unknown) is no pass: it holds the clean report.
     Each draft is `ready`, `finishing` (an open task owns its findings) or `stalled` (none does: one
     high event once it stays so a day)."""
     db, url = daemon.p.db, pr.get("url") or t["pr_url"]
@@ -1134,8 +1137,8 @@ def _check_findings(daemon, t: dict, pr: dict, sig: dict, findings: dict, data: 
     if rec["pending"]:
         return
     dirty = bool(rec["failing"] or rec["bot_open"] or stale or humans)
-    if not dirty and data is None:
-        return   # bot comments unread: never clean on that, the next real read decides (notified kept)
+    if not dirty and (data is None or unrun != "" or sig["checks"] == "none" and pr.get("statusCheckRollup")):
+        return   # bot comments or what ran unread, or checks only skipped: never clean on that (notified kept)
     what = "; ".join([*(["CI failing: " + ", ".join(rec["failing"])] if rec["failing"] else []),
                       *([f"{len(bots)} bot review comment(s) neither fixed nor answered: "
                          + ", ".join(bots[:5])] if bots else []),

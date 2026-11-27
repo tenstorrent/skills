@@ -2232,7 +2232,7 @@ def test_pr_watch_batched_reads_find_what_per_pr_reads_find(env, monkeypatch):
     """Mixed PRs over two polls (draft or ready, CI failing, bot findings open or resolved, an inline-only
     wrapper review, a null review decision, a merge, a PR gone, over 100 comments): the batched read records
     the same signatures, findings and events as per-PR gh reads."""
-    from ttp import prguard, watchers
+    from ttp import prbabysit, prguard, watchers
     from ttp.daemon import Daemon
     many = [("dev2", f"note {i}") for i in range(130)]
     first = {1: _gql_node(1),
@@ -2251,7 +2251,7 @@ def test_pr_watch_batched_reads_find_what_per_pr_reads_find(env, monkeypatch):
            ("t", "code", "done", "https://github.com/acme/widgets/pull/7", time.time()))   # gone on GitHub
     top += 1
     keys = ("pr_signatures", prguard.UNAPPROVED_KEY, prguard.FINDINGS_KEY, prguard.HEADS_KEY,
-            prguard.DRAFT_SEEN_KEY, watchers.PR_TRIED_KEY, prguard.PREDATES_KEY, prguard.APPROVALS_KEY)
+            prguard.DRAFT_SEEN_KEY, watchers.PR_TRIED_KEY, prguard.PREDATES_KEY, prguard.APPROVALS_KEY, prbabysit.KEY)
     got = []
     for batched in (False, True):
         p.db.x(f"DELETE FROM kv WHERE key IN ({','.join('?' * len(keys))})", keys)

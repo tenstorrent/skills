@@ -15,6 +15,7 @@ def _pb_pr(**over):
           "url": _PB_URL, "title": "t", "author": {"login": "bot-owner"}, "headRefOid": "a" * 40,
           "headRefName": "ttp/x", "baseRefName": "main", "body": "", "comments": [], "reviews": [],
           "updatedAt": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), "reviewRequests": [],
+          "createdAt": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
           "statusCheckRollup": [{"name": "validate", "workflowName": "ci", "status": "COMPLETED",
                                  "conclusion": "SUCCESS"}]}
     return {**pr, **over}
@@ -100,7 +101,7 @@ def test_prbabysit_idle_past_idle_h_gives_pr_idle_once_with_the_reviewers(env, m
     from ttp import watchers
     _pb_gh(monkeypatch)
     old = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() - 50 * 3600))
-    pr = _pb_pr(updatedAt=old, reviewRequests=[{"__typename": "User", "login": "rev1"}, {"name": "core"}],
+    pr = _pb_pr(createdAt=old, reviewRequests=[{"__typename": "User", "login": "rev1"}, {"name": "core"}],
                 statusCheckRollup=[{"name": "validate", "workflowName": "ci", "status": "COMPLETED",
                                     "conclusion": "SUCCESS", "completedAt": old}])
     p, d, _ = _pb_run(env, monkeypatch, pr)
@@ -108,10 +109,19 @@ def test_prbabysit_idle_past_idle_h_gives_pr_idle_once_with_the_reviewers(env, m
     watchers.watch_prs(d)
     ev = [t for k, t in _pb_events(p) if k == "pr_idle"]
     assert len(ev) == 1 and "idle for 50 h" in ev[0] and "rev1, core" in ev[0], ev
-    monkeypatch.setattr(watchers, "_read_prs", lambda order, root, w, t: {
-        x["pr_url"]: {"pr": _pb_pr(), "data": None, "cut": None, "calls": []} for x in order})
-    watchers.watch_prs(d)
-    assert len([1 for k, _ in _pb_events(p) if k == "pr_idle"]) == 1, "fresh activity raises nothing more"
+    fresh = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    bots = {**pr, "updatedAt": fresh, "comments": [
+        {"author": {"login": "ci[bot]"}, "body": "coverage", "createdAt": fresh},
+        {"author": {"login": "bot-owner"}, "body": f"ping {watchers.TTP_MARKER}", "createdAt": fresh}],
+        "statusCheckRollup": [{**pr["statusCheckRollup"][0], "completedAt": fresh}]}
+    person = {**bots, "comments": [{"author": {"login": "rev1"}, "body": "looking", "createdAt": fresh}]}
+    for later in (bots, person):
+        monkeypatch.setattr(watchers, "_read_prs", lambda order, root, w, t, later=later: {
+            x["pr_url"]: {"pr": dict(later), "data": None, "cut": None, "calls": []} for x in order})
+        watchers.watch_prs(d)
+        assert len([1 for k, _ in _pb_events(p) if k == "pr_idle"]) == 1, "the same quiet period is told once"
+    rec = p.db.kv("pr_babysit")["acme/widgets#7"]
+    assert rec["idle"] == pytest.approx(time.time() - 50 * 3600, abs=60), "bots, checks and the ping reset nothing"
 
 
 def test_prbabysit_a_status_change_posts_one_chat_line_and_an_unchanged_sweep_none(env, monkeypatch):
@@ -153,7 +163,7 @@ def test_prbabysit_disabled_runs_nothing(env, monkeypatch):
     from ttp import watchers
     calls = _pb_gh(monkeypatch)
     old = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() - 90 * 3600))
-    p, d, lines = _pb_run(env, monkeypatch, _pb_pr(updatedAt=old, isDraft=True), cfg={"pr_babysit.enabled": False})
+    p, d, lines = _pb_run(env, monkeypatch, _pb_pr(createdAt=old, isDraft=True), cfg={"pr_babysit.enabled": False})
     watchers.watch_prs(d)
     assert calls == [] and lines == [] and not p.db.kv("pr_babysit")
     assert not [k for k, _ in _pb_events(p) if k in ("pr_ci_not_run", "pr_idle")]
@@ -285,7 +295,7 @@ def test_prbabysit_new_settings_default(env):
 def test_prbabysit_pr_idle_text_names_the_ping_unless_the_pr_is_no_post(env, monkeypatch, cfg, want, absent):
     from ttp import watchers
     old = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() - 50 * 3600))
-    pr = _pb_pr(updatedAt=old, reviewRequests=[{"__typename": "User", "login": "rev1"}],
+    pr = _pb_pr(createdAt=old, reviewRequests=[{"__typename": "User", "login": "rev1"}],
                 statusCheckRollup=[{"name": "validate", "workflowName": "ci", "status": "COMPLETED",
                                     "conclusion": "SUCCESS", "completedAt": old}])
     _pb_gh(monkeypatch)
@@ -357,7 +367,7 @@ def test_prbabysit_pending_checks_hold_back_only_the_never_run_list_and_a_mergea
     old = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() - 50 * 3600))
     p, d, lines = _pb_run(env, monkeypatch, _pb_pr(), cfg={"pr_babysit.dispatch": {"acme/widgets": ["heavy.yml"]}})
     sig = lambda m, checks="pending": {"state": "OPEN", "draft": False, "decision": "", "mergeable": m, "checks": checks}
-    pr = _pb_pr(updatedAt=old, reviewRequests=[{"login": "rev1"}], statusCheckRollup=[
+    pr = _pb_pr(createdAt=old, reviewRequests=[{"login": "rev1"}], statusCheckRollup=[
         {"name": "x", "workflowName": "ci", "status": "IN_PROGRESS", "conclusion": ""}])
     for m in ("MERGEABLE", "CONFLICTING", "UNKNOWN", "CONFLICTING"):
         prbabysit.sweep(d, {"id": None, "pr_url": _PB_URL}, pr, sig(m), lambda a, c: None)
@@ -519,3 +529,53 @@ def test_prbabysit_an_unread_pr_keeps_its_cached_files_in_the_host_record_and_a_
     for bad in ('{"other": 5}', '{"other": {"at": %d, "prs": [1]}}', '{"other": {"at": %d, "prs": {"a#1": 5}}}'):
         (ghauth._home(None) / prbabysit.HOST_FILE).write_text(bad.replace("%d", str(int(time.time()))))
         assert prbabysit._host_prs(time.time()) == {}, bad
+
+
+def test_prbabysit_guard_never_dispatches_a_run_already_queued_or_running_on_the_head(env, tmp_path):
+    """A live run of the workflow on exactly the PR's head covers its jobs: a push or PR event run (no inputs),
+    or a dispatch run created after this project's own receipt. Another head, a finished run, a dispatch with no
+    receipt (inputs not proven equal) or an unreadable run list do not count."""
+    from ttp import prguard
+    p, cfg = _pb_guarded(env)
+    head = "a" * 40
+    p.db.set_kv("pr_babysit", {"acme/widgets#7": {"branch": "ttp/x", "open": True, "head": head}})
+    runs, gh = tmp_path / "runs.json", tmp_path / "gh"
+    gh.write_text(f"#!/bin/sh\ncat {runs}\n")
+    gh.chmod(0o755)
+    later = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() + 5))
+    why = lambda: prguard.check(["workflow", "run", "heavy.yml", "-R", "acme/widgets", "--ref", "ttp/x"],
+                                str(gh), db=p.db, cfg=cfg)
+    run = lambda **kw: json.dumps([{"databaseId": 41, "headSha": head, "status": "queued", "event": "pull_request",
+                                    "createdAt": later, **kw}])
+    for other in (run(event="workflow_dispatch"), run(headSha="b" * 40), run(status="completed"), "not json"):
+        runs.write_text(other)
+        assert why() is None, other
+    assert list(p.db.kv("pr_dispatched", {})) == [f"acme/widgets heavy.yml {head}"], "an allowed dispatch leaves its receipt"
+    for live in (run(), run(status="in_progress"), run(event="workflow_dispatch")):
+        runs.write_text(live)
+        assert "run 41 of heavy.yml is already queued or running" in (why() or ""), live
+
+
+def test_prbabysit_a_skipped_or_never_run_workflow_or_an_unread_one_holds_the_clean_report(env, monkeypatch):
+    from ttp import watchers
+    _pb_gh(monkeypatch)
+    ok = {"name": "validate", "workflowName": "ci", "status": "COMPLETED", "conclusion": "SUCCESS"}
+    heavy = {"name": "build", "workflowName": "Heavy", "status": "COMPLETED", "conclusion": "SKIPPED"}
+    p, d, _ = _pb_run(env, monkeypatch, _pb_pr())
+    clean = lambda: [t for k, t in _pb_events(p) if k == "pr_clean"]
+
+    def read(*checks, head="a" * 40):
+        monkeypatch.setattr(watchers, "_read_prs", lambda order, root, w, t: {x["pr_url"]: {
+            "pr": _pb_pr(statusCheckRollup=list(checks), headRefOid=head), "data": {"data": {}}, "cut": None,
+            "calls": []} for x in order})
+        watchers.watch_prs(d)
+    read({**ok, "conclusion": "FAILURE"}, head="0" * 40)   # told it has findings: a clean head after it is news
+    read(ok, heavy)
+    read(heavy, head="b" * 40)
+    assert clean() == [], "a skipped workflow is no pass"
+    monkeypatch.setattr(watchers, "_gh", lambda a, c: None)
+    read(ok, heavy, head="d" * 40)
+    assert clean() == [], "what ran is unknown while the workflow files are unread"
+    _pb_gh(monkeypatch)
+    read(ok, {**heavy, "conclusion": "SUCCESS"}, head="e" * 40)
+    assert len(clean()) == 1, "every workflow ran on the head: clean"
