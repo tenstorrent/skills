@@ -35,6 +35,7 @@ from .budget import task_default_usd
 
 KIND = "task_budget_topup"
 SETTING = "urgent_topup"   # budget.urgent_topup
+BUDGET_HELD = "task budget exhausted"   # the blocked_reason of a task held on its spent budget (Daemon._dispatch)
 SPENT_LEFT = 0.05          # a task with this much or less left has spent its budget (_start_hold)
 
 

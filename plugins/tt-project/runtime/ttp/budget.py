@@ -129,6 +129,27 @@ def user_held(g: Gate | dict) -> list[str]:
     return [r for r in d.get("reasons") or [] if red_class(r) in USER_CLEARS]
 
 
+def cap_limiting(gates: dict, b: dict, now: float) -> list[str]:
+    """The dollar caps that limit work now, from the saved gates (dicts by provider) and the budget
+    settings `b`: a red only the user clears (user_held), a project cap at its yellow share or more, or
+    a project daily or global daily cap projected to be reached before its reset (spendproj.reaches).
+    [] when none does."""
+    out = []
+    for prov, g in sorted((gates or {}).items()):
+        n = (g or {}).get("numbers") or {}
+        if user_held(g):
+            out.append(f"{prov}: {'; '.join(user_held(g))}")
+        elif float(n.get("cap_ratio") or 0) >= yellow_ratio(b):
+            out.append(f"{prov}: {float(n['cap_ratio']):.0%} of a project cap used")
+        elif spendproj.reaches(float(n.get("spent_today", n.get("spent_24h", 0)) or 0), n.get("daily_cap"),
+                               n.get("per_h"), n.get("day_end"), now):
+            out.append(f"{prov}: the daily cap is reached before its reset")
+        elif spendproj.reaches(float(n.get("global_today") or 0), n.get("global_cap"), n.get("global_per_h"),
+                               n.get("global_resets_at"), now):
+            out.append(f"{prov}: the global daily cap is reached before its reset")
+    return out
+
+
 def red_share(g: Gate, cls: str) -> float | None:
     """How far a red class's measured value is toward its limit (1 = at it), None when not measured."""
     n = g.numbers or {}

@@ -144,19 +144,33 @@ def hold(db, task: dict, why: str) -> None:
                   f"{why}. Nothing ran.", "queued", task["id"]))
 
 
+def _all_dropped(db, task_id: int) -> list[str]:
+    """The ids of the obligations `task_id` owns when it owns some and every one was dropped; else []."""
+    from . import obligations
+    owned = [o for o in obligations.items(db) if int(task_id) in obligations._owner_ids(o)]
+    return [o["id"] for o in owned] if owned and all(o.get("dropped") for o in owned) else []
+
+
 def stop_reason(db, task: dict, started: float) -> str:
     """Why running `task` (its run started at `started`) is superseded ('' while it is not)."""
-    from . import obligations
     if row := db.one("SELECT sha FROM task_superseded WHERE task=? AND ts>=? ORDER BY ts DESC LIMIT 1",
                      (task["id"], started)):   # an older record predates this run (a requeue after it)
         return f"its change landed through another commit ({row['sha'][:12]})"
     for t in db.q("SELECT * FROM tasks WHERE id>? AND kind!='review' AND COALESCE(created,0)>? "
                   "AND labels LIKE ?", (task["id"], started, f'%"continues:{int(task["id"])}"%')):
         return f"#{t['id']} {t['title'][:120]} continues it"
-    owned = [o for o in obligations.items(db) if int(task["id"]) in obligations._owner_ids(o)]
-    if owned and all(o.get("dropped") for o in owned):
-        return "every obligation it owns was dropped (" + ", ".join(o["id"] for o in owned) + ")"
+    if dropped := _all_dropped(db, task["id"]):
+        return f"every obligation it owns was dropped ({', '.join(dropped)})"
     return ""
+
+
+def dropped_owner(db, task_id: int) -> str:
+    """Why `ttp task requeue` leaves a task whose every obligation was dropped as it is ('' otherwise):
+    stop_superseded would only stop it again once it runs."""
+    if not (dropped := _all_dropped(db, task_id)):
+        return ""
+    return (f"every obligation task #{task_id} owns was dropped ({', '.join(dropped)}), so it "
+            f"would be stopped again once it runs: task_add with continues: {task_id} and an open obligation key")
 
 
 def stop_superseded(db) -> list[int]:

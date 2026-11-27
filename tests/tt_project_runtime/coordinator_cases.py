@@ -24387,3 +24387,38 @@ def test_a_deferred_task_update_on_ask_new_waits_on_the_ask_its_turn_sent(env, m
     assert coord.apply(p, [upd]) == []   # no ask_user in its batch: the hold is dropped, noted
     assert any("waits_on ask:new, but the batch sends no ask_user" in n for n in p.db.kv(coord.NOTES_KEY, []))
     assert all("waits_on" not in x["action"] for x in actdefer.pending(p.db)), "deferred onto nothing"
+
+
+def test_a_spend_ask_goes_out_only_while_a_dollar_cap_limits_and_never_about_a_task_budget(env):
+    """A `spend` or `funds` ask is the coordinator's own call while the saved budget gates show no dollar
+    cap limiting (refused, naming that route); it goes out while a cap is reached or projected to be
+    reached before its reset. An ask about a task held on its own spent budget is refused with the
+    task_update budget_usd route, whatever the caps."""
+    from ttp import coordinator as coord, topup
+    p = make(env)
+    now = time.time()
+    p.set_config("budget.daily_usd", 100)
+    calm = {"level": "green", "allow_new_work": True, "reasons": [],
+            "numbers": {"daily_cap": 100, "spent_today": 10, "per_h": 1, "day_end": now + 5 * 3600, "cap_ratio": 0.1}}
+    held = {"level": "red", "allow_new_work": False, "reasons": ["cap reached: $100.00/today of $100"],
+            "numbers": {"daily_cap": 100, "spent_today": 100, "cap_ratio": 1.0}}
+    racing = {**calm, "numbers": {**calm["numbers"], "spent_today": 30, "per_h": 20, "cap_ratio": 0.3}}
+    ask = dict(severity="high", recommendation="wait")
+    p.db.set_kv("gates", {"claude": calm})
+    for blocking in ("spend", "funds"):
+        problems, m = _ask(p, "Should the project keep spending on the soak today?", blocking=blocking, **ask)
+        assert m is None and "no cap is limiting: decide it yourself" in problems[0], problems
+    for gate, n in ((held, 1), (racing, 2)):   # reached, or reached at this rate before its reset
+        p.db.set_kv("gates", {"claude": calm, "codex": gate})
+        problems, m = _ask(p, f"The daily dollar cap limits work ({n}): raise budget.daily_usd?",
+                           blocking="spend", **ask)
+        assert m is not None and not problems, problems
+        p.db.x("UPDATE messages SET handled=1 WHERE kind='ask'")
+    tid = p.db.add_task("soak the board", "s", kind="work")
+    p.db.update_task(tid, status="blocked", blocked_reason=topup.BUDGET_HELD)
+    problems, m = _ask(p, f"Task #{tid} used its budget: may it spend more?", blocking="spend", **ask)
+    assert "raise the task budget with task_update budget_usd" in problems[0] and f"#{tid}" in problems[0]
+    assert m["text"].startswith("The daily dollar cap limits work (2)"), "no new ask was sent"
+    p.db.set_kv("gates", {})   # nothing measured yet: the ask goes out
+    problems, m = _ask(p, "Should the project keep spending on the soak today?", blocking="spend", **ask)
+    assert m is not None and not problems and "keep spending" in m["text"], problems

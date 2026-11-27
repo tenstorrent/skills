@@ -61,6 +61,18 @@ def split_rate(prev, spent: float, estimated: float, now: float, start: float | 
     return got, (None if per_h is None and est_h is None else (per_h or 0.0) + (est_h or 0.0))
 
 
+def reaches(spent: float, cap: float, per_h: float | None, reset_at: float | None, now: float) -> bool:
+    """Whether a set `cap` is reached, or is projected to be reached from `spent` at `per_h` dollars an
+    hour before its next reset `reset_at` (line's projection). False for an unset cap (0), or with no
+    rate or reset time to project from."""
+    cap = float(cap or 0)
+    if cap <= 0:
+        return False
+    if spent >= cap:
+        return True
+    return bool(per_h and per_h > 0 and reset_at and now + (cap - spent) / per_h * HOUR < reset_at)
+
+
 def line(spent: float, cap: float, per_h: float | None, reset_at: float | None, now: float, where) -> str:
     """When `cap` is reached from `spent` at `per_h` dollars an hour, against its next reset
     `reset_at`, with times in the zone of `where` (a zone name, Project or settings). "" for an unset
@@ -79,7 +91,7 @@ def line(spent: float, cap: float, per_h: float | None, reset_at: float | None, 
         return f"{at}: reset time unknown (rolling 24 h), no projection"
     if per_h <= 0:
         return f"{at}: not reached before {reset}"
-    reach = now + (cap - spent) / per_h * HOUR
-    if reach >= reset_at:
+    if not reaches(spent, cap, per_h, reset_at, now):
         return f"{at}: not reached before {reset}"
+    reach = now + (cap - spent) / per_h * HOUR
     return f"{at}: reaches the cap at {timefmt.short(reach, where, now)}, before {reset}"

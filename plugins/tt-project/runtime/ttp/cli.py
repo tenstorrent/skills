@@ -11874,7 +11874,8 @@ def cmd_task(a) -> None:
         if not a.title.strip().isdigit():
             die(f"requeue needs a task id, not {a.title!r}")
         tid = int(a.title)
-        why = p.db.requeue(tid, force=bool(a.force))
+        from . import supersede
+        why = supersede.dropped_owner(p.db, tid) or p.db.requeue(tid, force=bool(a.force))
         if why:
             die(why)
         nb = (p.db.task(tid) or {}).get("not_before")

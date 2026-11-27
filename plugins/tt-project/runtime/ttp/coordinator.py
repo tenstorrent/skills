@@ -3888,6 +3888,9 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                 why = _needless_ask(a, text)
                 if why:
                     raise ValueError(f"ask_user rejected: {why}")
+                if why := _spend_ask(db, cfg, a, f"{text} {least} {a.get('recommendation') or ''}"):
+                    _count_refusal(db, key, "spend ask", text)
+                    raise ValueError(f"ask_user rejected: {why}")
                 why = _untried_host_ask(p, a, text)
                 if why:
                     _count_refusal(db, key, "untried host", text)
@@ -7848,6 +7851,26 @@ def _needless_ask(a: dict, text: str) -> str:
     if a.get("blocking") in ("restriction", "irreversible") and _calls_undoable(f"{text} {rec}"):
         return ("you recommend yes to a step you call reversible: a known, safe, reversible fix is yours. Do it "
                 "(task_add or the action), memory_add the decision and notify at severity low")
+    return ""
+
+
+def _spend_ask(db, cfg: dict, a: dict, words: str) -> str:
+    """Why a `spend` or `funds` ask is the coordinator's own call, or "", from structured state only: a
+    task it names (`#<id>`) that is held on its own spent budget (per-task budgets are the coordinator's
+    setting), or saved budget gates showing no dollar cap limiting (budget.cap_limiting). Without saved
+    gates nothing is known, so the ask goes out."""
+    if a.get("blocking") not in ("spend", "funds"):
+        return ""
+    for tid in dict.fromkeys(int(i) for i in re.findall(r"#(\d+)", words)):
+        t = db.task(tid)
+        if t and t["status"] == "blocked" and t.get("blocked_reason") == topup.BUDGET_HELD:
+            return (f"task #{tid}'s budget is your own setting, not a dollar cap: raise the task budget with "
+                    f"task_update budget_usd (user-ordered and urgent tasks never wait on it)")
+    gates = db.kv("gates", {}) or {}
+    if gates and not bud.cap_limiting(gates, cfg.get("budget") or {}, time.time()):
+        return ("no cap is limiting: decide it yourself. The budget gate is green on every dollar cap and none "
+                "is projected to be reached before its reset; a dollar-cap ask goes out while the gate shows "
+                "that cap limiting")
     return ""
 
 

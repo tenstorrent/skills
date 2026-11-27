@@ -3162,3 +3162,26 @@ def test_runs_preempted_for_urgent_work_do_not_count_toward_the_task_run_cap(env
            (tid, t0 + 570, t0 + 580))
     rows, _ = runcap.runs(p.db, tid)
     assert [r["status"] for r in rows] == ["shutdown", "failed"], rows
+
+
+def test_a_requeue_of_a_task_whose_every_obligation_was_dropped_names_the_continues_route(env, capsys):
+    """A requeue, forced or not, leaves a task whose every owned obligation was dropped as it is (it would
+    only be stopped again once it runs) and names the route: task_add with continues and an open
+    obligation key. A task that still owns an open obligation, or owns none, requeues as before."""
+    from ttp import cli, obligations
+    p = make(env)
+    now = time.time()
+    gone, mixed, plain = (p.db.add_task(f"work {n}", "s", kind="code", status="cancelled") for n in "abc")
+    st = obligations._load(p.db)
+    st["items"]["o1"] = {"id": "o1", "text": "x", "owners": [str(gone), str(mixed)], "receipt": None,
+                         "dropped": {"at": now, "by": "coordinator", "why": "superseded"}}
+    st["items"]["o2"] = {"id": "o2", "text": "y", "owners": [str(mixed)], "receipt": None}
+    p.db.set_kv(obligations.KV, st)
+    with pytest.raises(SystemExit):
+        cli.main(["task", "demo", "requeue", str(gone), "--force"])
+    err = capsys.readouterr().err
+    assert f"task_add with continues: {gone} and an open obligation key" in err and "(o1)" in err, err
+    assert p.db.task(gone)["status"] == "cancelled"
+    for tid in (mixed, plain):
+        cli.main(["task", "demo", "requeue", str(tid), "--force"])
+        assert p.db.task(tid)["status"] == "queued", tid
