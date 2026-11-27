@@ -29,9 +29,10 @@ and 8081 for the WebSocket — to the same ports on the remote loopback interfac
 Forwarding only 8080 gives a page that loads and never connects.
 
 The viewer outlives the run. Newer tt-metal has `--no-web-server` /
-`TRACY_NO_WEB_SERVER=1` to keep it off; at the pinned revision (see `SKILL.md`)
-neither exists — headless runs get the same effect by skipping `python -m tracy`
-and capturing with `tracy-capture` (§3) or `TT_METAL_DEVICE_PROFILER=1` (§1).
+`TRACY_NO_WEB_SERVER=1` to keep it off; the 058b93d pin lacks both (the newer
+multipass pin has them) — headless runs get the same effect by skipping
+`python -m tracy` and capturing with `tracy-capture` (§3) or
+`TT_METAL_DEVICE_PROFILER=1` (§1).
 
 ## 3. `tracy-capture`
 
