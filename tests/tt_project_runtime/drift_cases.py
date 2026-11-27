@@ -157,13 +157,17 @@ def test_drift_pace_nothing_committed_judges_this_run_not_earlier_runs_work():
     now = time.time()
     spend = lambda run, task: {"run_usd": run * 8, "task_usd": task * 8, "budget_usd": 8.0, "share": task}  # noqa: E731
     wall = {"elapsed_s": 1, "limit_s": 2, "share": 0.9}
-    git = {"head": "h", "committed": []}   # what this run's checkout shows: earlier runs' commits made
-    # elsewhere (harness repo, a commit helper on the root's branch) are not in it
-    early = _dr_flags(_dr_entry(now, spend=spend(0.02, 0.82), wall=wall, git=git), now)
-    assert "pace" not in early, "a continuation one minute in, task spend high, work committed earlier"
-    assert "pace" in _dr_flags(_dr_entry(now, spend=spend(0.82, 0.82), wall=wall, git=git), now), "never committed"
-    assert "pace" in _dr_flags(_dr_entry(now, spend=spend(0.81, 0.95), wall=wall, git=git), now), \
-        "a continuation that itself overspends with nothing new"
+    git = lambda c: {"head": "h", "committed": c}  # noqa: E731
+    flags = lambda spent, g, **kw: _dr_flags(_dr_entry(now, spend=spent, wall=wall, git=g, **kw), now)  # noqa: E731
+    # a continuation one minute in with the task's spend high; its work was committed in an earlier run,
+    # on the task branch or elsewhere (a harness repo, a commit helper on the root's branch)
+    assert "pace" not in flags(spend(0.02, 0.82), git([]))
+    assert "pace" not in flags(spend(0.02, 0.82), git(["a.py"]), drift={"base_files": ["a.py"]})
+    assert "pace" in flags(spend(0.82, 0.82), git([])), "never committed"
+    assert "pace" in flags(spend(0.45, 0.9), git([])), "most of what was left, nothing committed in any run"
+    assert "pace" in flags(spend(0.45, 0.9), git(["a.py"]), drift={"base_files": ["a.py"]}), \
+        "a continuation that itself spends most of what it started with and adds nothing new"
+    assert "pace" not in flags(spend(0.45, 0.9), git(["a.py", "b.py"]), drift={"base_files": ["a.py"]}), "new work"
 
 
 def _dr_project(env, tmp_path, quiet=True, **cost):

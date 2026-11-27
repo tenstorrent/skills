@@ -14,8 +14,8 @@ Flags, each with its threshold under coordinator.drift.<name> (0 turns that flag
   or detach wait is pending, and the run's own detached checks are neither queued nor running (they
   count as activity: the run is waiting on them) (the runner's stall_s still ends a stalled run later);
 - pace (1.5): past PACE_FLOOR of the budget, the run's share of the task budget is over this times the
-  share of its wall limit used; or this run alone has spent over PACE_NO_COMMIT of the budget with no commit (earlier runs'
-  spend and their commits, wherever made, are not this run's to answer for).
+  share of its wall limit used; or this run has spent over PACE_NO_COMMIT of the budget it started with and added no commit
+  to its branch (earlier runs' spend and commits are not this run's to answer for).
 
 Ladder, once per flag per run: 1) an update in the run's steer.md naming the evidence; 2) still flagged
 raise_s (600) later and no `ttp note` since the update, one ride-along `worker_drift` event to the
@@ -143,13 +143,15 @@ def detect(e: dict, s: dict, named: list[str], waiting: bool, now: float,
     sp, wall = e.get("spend") or {}, e.get("wall") or {}
     budget = sp.get("budget_usd")
     if s["pace"] > 0 and budget:
-        run_share = float(sp.get("run_usd") or 0) / budget
-        wall_share = wall.get("share")
-        committed = (e.get("git") or {}).get("committed") if e.get("git") else None
+        run_usd = float(sp.get("run_usd") or 0)
+        run_share, wall_share = run_usd / budget, wall.get("share")
+        left = budget - (float(sp.get("task_usd") or 0) - run_usd)   # the budget this run started with
+        git = e.get("git") or {}
+        new = set(git.get("committed") or []) - set((e.get("drift") or {}).get("base_files") or [])
         if wall_share is not None and run_share >= PACE_FLOOR and run_share > s["pace"] * wall_share:
             flags["pace"] = f"{run_share:.0%} of the budget spent in {wall_share:.0%} of the wall limit"
-        elif run_share > PACE_NO_COMMIT and committed == []:   # this run's spend against this run's commits
-            flags["pace"] = f"{run_share:.0%} of the budget spent and nothing committed"
+        elif git and not new and left > 0 and run_usd / left > PACE_NO_COMMIT:   # only this run's spend and output
+            flags["pace"] = f"{run_usd / left:.0%} of the budget it started with spent and nothing new committed"
     return flags
 
 
