@@ -756,10 +756,8 @@ def update_mute(db: DB, source: str, match: str, *, owner: Any = None, why: Any 
         if probe and probe != m.get("end_when"):
             m["end_when"] = probe
             m.pop("probe_broken", None)
-        if m.get("throughput") and (why is not None or probe):   # as throughmute.vet derives it from these
-            tid = throughmute.open_task(db, m["why"])
-            if tid is not None or m.get("end_when"):
-                m["throughput"]["owner"] = {"task": tid} if tid is not None else {"probe": m["end_when"]}
+        if m.get("throughput") and (why is not None or probe):
+            m["throughput"]["owner"] = throughmute.derive_owner(db, str(m.get("why") or ""), m.get("end_when") or "")
         if esc is not None and esc != float(m.get("escalate_after_h", MUTE_ESCALATE_H)):
             m["escalate_after_h"], m["armed_at"] = esc, now
             m["conds"] = {k: ({**c, "first_at": now, "escalated": False} if c.get("escalated") else c)
@@ -1094,11 +1092,11 @@ def mute_line(m: dict, now: float | None = None, where: Any = None) -> str:
     esc = float(m.get("escalate_after_h", MUTE_ESCALATE_H))
     owner = throughmute.owner_text(m)
     owner = "its end probe" if owner.startswith("probe ") else owner
-    return (f"{m['source']} {m['match']!r} below {m['below']}: {seen}; "
+    return (f"{m['source']} {m['match']!r} below {m['below']}: {seen}; owner {owner}; "   # before the long parts dispatch clips
             + (f"persisting {', '.join(ages)}; " if ages else "")
             + (f"asks after {_h(esc * 3600)} h; " if esc > 0 else "never asks; ")
             + f"ends in {max(0.0, (float(m['until']) - now) / 3600):.1f} h" + mute_probe(m)
-            + throughmute.rate_text(m, now) + f"; owner {owner}" + (f" ({m['why']})" if m.get("why") else ""))
+            + throughmute.rate_text(m, now) + (f" ({m['why']})" if m.get("why") else ""))
 
 
 def mute_probe(m: dict) -> str:

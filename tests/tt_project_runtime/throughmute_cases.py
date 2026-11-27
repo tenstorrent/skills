@@ -47,6 +47,9 @@ def test_tmute_two_candidate_owners_or_one_this_batch_adds_leave_the_coordinator
     assert scr.update_mute(p.db, "checks", "env:check-host:box-a", why=f"task #{fix} rebuilds it")
     line = [x for x in tm.review_lines(p.db) if "env:check-host:box-a" in x][0]
     assert f"owner task #{fix}," in line and "coordinator" not in line, line
+    p.db.update_task(fix, status="done")   # a new why naming no open task, and no probe: the coordinator again
+    m = scr.update_mute(p.db, "checks", "env:check-host:box-a", why="the rebuild finished; watching the rate")
+    assert "coordinator" in m["throughput"]["owner"], m
 
 
 def _escalated_mute(p, t0):
@@ -93,12 +96,23 @@ def test_a_mute_shows_its_structured_owner_else_the_first_task_its_why_names(env
     scr.mute(p.db, "watcher:fan", "fan slow", 12, why="known", owner="#8 other-project")
     scr.mute(p.db, "watcher:psu", "psu warm", 12, why="known")
     line = {m["source"]: scr.mute_line(m) for m in scr.mutes(p.db)}
-    assert "owner task #42 (" in line["watcher:hw"], line
+    assert "owner task #42;" in line["watcher:hw"], line
     assert "owner task #8 of project other-project" in line["watcher:fan"], line
     assert "owner none" in line["watcher:psu"], line
     review = "\n".join(tm.review_lines(p.db))
     assert "'tray dropped': 0 matched" in review and "owner task #42," in review, review
     assert "owner task #8 of project other-project," in review and "owner none" in review, review
+
+
+def test_dispatch_mute_line_keeps_the_owner_past_a_long_probe_and_persisting_ages(env):
+    """Dispatch clips each muted-observation line; the owner comes before the end probe and ages, so it stays."""
+    from ttp import coordinator as coord, screen as scr
+    p, t0 = make(env), time.time()
+    scr.mute(p.db, "watcher:check-hosts", "env:check-host:box-a", 12, owner="#10412", now=t0 - 7200,
+             end_when="ssh box-a true && test -e /var/run/check-host-ready || exit 1", why="the host is rebuilt")
+    scr.count_muted(p.db, "watcher:check-hosts", "env:check-host:box-a failed", "normal", now=t0 - 7200)
+    [line] = [x for x in coord.digest(p, {}, [], []).splitlines() if "env:check-host:box-a" in x]
+    assert "persisting" in scr.mute_line(scr.mutes(p.db)[0], t0) and "owner task #10412" in line, line
 
 
 def test_ttp_mute_update_round_trip_keeps_the_end(env, capsys, monkeypatch):

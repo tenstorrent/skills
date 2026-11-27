@@ -132,6 +132,19 @@ def move_owner(db, m, tid):
         db.set_kv(MUTES_KEY, active)
 
 
+def derive_owner(db: Any, why: str, probe: str) -> dict:
+    """A throughput-class mute's owner from its `why` and end probe: the open task the why names, else the
+    probe, else an outside party the why names, else the coordinator (its review lines show that)."""
+    if (tid := open_task(db, why)) is not None:
+        return {"task": tid}
+    if probe:
+        return {"probe": probe}
+    if OUTSIDE_RE.search(why):
+        return {"outside": why[:200]}
+    named = ", ".join(f"#{t}" for t in dict.fromkeys(TASK_RE.findall(why)))
+    return {"coordinator": (f"{named} is not an open task; " if named else "") + (why[:200] or "no why given")}
+
+
 def vet(db: Any, source: Any, match: Any, why: Any, end_when: Any, cfg: dict | None = None,
         now: float | None = None) -> dict | None:
     """None when a mute of `source`/`match` is not throughput-class; else its owner and longest life,
@@ -149,15 +162,7 @@ def vet(db: Any, source: Any, match: Any, why: Any, end_when: Any, cfg: dict | N
     if not is_class(source, match, _texts(db, source, match, old, now)):
         return None
     probe = (end_when.strip() if isinstance(end_when, str) else "") or (old or {}).get("end_when") or ""
-    if (tid := open_task(db, why)) is not None:
-        owner: dict = {"task": tid}
-    elif probe:
-        owner = {"probe": probe}
-    elif OUTSIDE_RE.search(why):
-        owner = {"outside": why[:200]}
-    else:   # no owner named: the coordinator owns it, and its review lines show that
-        named = ", ".join(f"#{t}" for t in dict.fromkeys(TASK_RE.findall(why)))
-        owner = {"coordinator": (f"{named} is not an open task; " if named else "") + (why[:200] or "no why given")}
+    owner = derive_owner(db, why, probe)
     if old and old.get("throughput") and " ".join(why.lower().split()) == " ".join(str(old.get("why") or "").lower().split()):
         raise ValueError(f"observation_mute needs fresh evidence: renewing the throughput-class mute of {source} {match!r} "
                          f"needs fresh evidence in `why` (its count, rate or owner's state now), not the same reason")
