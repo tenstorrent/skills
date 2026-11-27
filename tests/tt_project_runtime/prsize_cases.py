@@ -280,3 +280,18 @@ def test_a_stacked_pr_is_sized_from_its_own_base_branch_not_the_default_branch(e
     assert prsize.cumulative_stat(p, "feature/x", "no-such-base")["adds"] == 5110
     assert prsize.budget_gate(p, None, "feature/x") == ""
     assert push.own_target(p, p.root)[1] == "feature/x"
+
+
+def test_the_review_block_measures_the_reviewed_head_not_a_stale_local_pr_branch(env, monkeypatch):
+    """A local copy of the PR's branch that is behind the change's head cannot understate the PR:
+    the block is sized from the head under review."""
+    from ttp import prsize
+    p, t = _over_budget_pr(env, monkeypatch)
+    stale = _git_out(p.root, "rev-parse", "origin/HEAD")
+    (p.root / "more.py").write_text("".join(f"{i}\n" for i in range(10)))
+    _git_out(p.root, "add", ".")
+    _git_out(p.root, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "more")
+    head = _git_out(p.root, "rev-parse", "HEAD")
+    _git_out(p.root, "update-ref", "refs/heads/feature/x", stale)
+    text = "\n".join(prsize.review_prompt_lines(p, p.db.task(t), "feature/x", head))
+    assert "+5110/-0" in text, text
