@@ -4144,7 +4144,7 @@ the pick order, so it takes the first starts. A resumed resource ramps only its 
   conflict) are one chat line per PR with its link, once per change: a review approved and red CI on a ready PR
   post at once, the rest join the digest. A gh call that is not answered yet (exit 75) gives nothing.
   The workers' `gh` guard (the same wrapper on every provider) lets a worker, on an open PR the project
-  owns, run `gh workflow run <workflow> --ref <the PR's head>` (no inputs) and `gh pr edit N --add-label L`
+  owns, run `gh workflow run <workflow> --ref <the PR's head>` (up to 8 plain `-f key=value` inputs) and `gh pr edit N --add-label L`
   only as `pr_babysit.dispatch` lists them for the repo (`{"owner/repo": ["<workflow>", "label:<name>"]}`,
   empty by default), and post a reviewer ping comment that ends with the AI tag. Reviewer requests, `gh pr
   ready` without the user's recorded yes and merges outside `delivery.auto_merge_repos` stay refused. `pr_idle`

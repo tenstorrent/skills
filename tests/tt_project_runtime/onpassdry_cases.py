@@ -365,6 +365,9 @@ def test_the_dry_run_check_reads_programs_scripts_and_variables_without_running_
         assert "on_pass_cmd or a `then` entry" in onpassdry.handback_text(got)
     assert not onpassdry.check("test -f checks.rc", tmp_path, e, False, 30).get("only_tests")
     assert onpassdry.check("test -f checks.rc", tmp_path, e, True, 30, ends=False)["verdict"] == "ok"
+    # A command that writes no result is fine while a later `then` stage follows, and refused on the final stage.
+    for ends, want in ((False, "ok"), (True, onpassdry.NO_RESULT)):
+        assert onpassdry.check("bash plain.sh", tmp_path, e, False, 30, ends=ends)["verdict"] == want, ends
     # A check that runs out of time is inconclusive, never a crash.
     assert onpassdry.check("bash missing.sh", tmp_path, e, False, 0)["verdict"] == "inconclusive"
 

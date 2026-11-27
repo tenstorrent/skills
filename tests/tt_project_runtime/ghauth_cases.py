@@ -1705,15 +1705,14 @@ def test_gh_pull_answers_a_raising_entry_with_an_error_and_the_loop_goes_on(env,
 def test_gh_workstation_runs_a_workflow_and_adds_a_label_only_on_its_own_open_prs_head(env, monkeypatch):
     """`workflow run <name> --ref <branch> --repo <r>` (no inputs) and `pr edit N --add-label L` pass the
     allowlist; the workstation then reads the open PR on that branch and its own login, and runs only when
-    its gh user opened it and the ref is not the default branch. Inputs, other options and a bare form fail."""
+    its gh user opened it and the ref is not the default branch. Other options and a bare form fail."""
     from ttp import ghqueue
     _cfg, _repo, _gh, ws_calls = _workstation(env, monkeypatch)
     for ok in (["workflow", "run", "heavy.yml", "--ref", "ttp/x", "-R", "acme/widgets"],
                ["workflow", "run", "heavy.yml", "--ref=ttp/x", "--repo=acme/widgets"],
                ["pr", "edit", "3", "--add-label", "run-heavy", "-R", "acme/widgets"]):
         assert ghqueue.allowed(ok) == "", ok
-    for bad in (["workflow", "run", "heavy.yml", "--ref", "ttp/x", "-R", "acme/widgets", "-f", "a=b"],
-                ["workflow", "run", "heavy.yml", "--ref", "ttp/x"], ["workflow", "run", "-R", "acme/widgets"],
+    for bad in (["workflow", "run", "heavy.yml", "--ref", "ttp/x"], ["workflow", "run", "-R", "acme/widgets"],
                 ["workflow", "run", "heavy.yml", "--repo", "acme/widgets"],
                 ["workflow", "run", "a.yml", "b.yml", "--ref", "x", "-R", "acme/widgets"],
                 ["workflow", "enable", "heavy.yml"], ["workflow", "disable", "heavy.yml"],
@@ -1747,6 +1746,71 @@ def test_gh_workstation_runs_a_workflow_and_adds_a_label_only_on_its_own_open_pr
         got = ghqueue.answer({"key": "c" * 32, "argv": label, "stdin": ""}, str(stub))
         assert (refused in got["stderr"] and got["rc"] == 1) if refused else (got["rc"] == 0 and not got["stderr"]), got
     assert sum(c.startswith("pr edit") for c in ws_calls.read_text().splitlines()) == 1
+
+
+def test_gh_workflow_run_takes_up_to_eight_plain_inputs_and_nothing_else_on_both_ends_of_the_route(env, monkeypatch):
+    """`-f key=value` inputs pass the shared allowlist (the box's queue and the workstation's pull both apply
+    it); a bad key or value, -F, --raw-field, --json, an @file value, a ninth input and a bare -f are refused,
+    and the workstation still runs only on the head of an open PR its own gh user opened."""
+    from ttp import ghqueue
+    _cfg, _repo, _gh, ws_calls = _workstation(env, monkeypatch)
+    run = ["workflow", "run", "heavy.yml", "--ref", "ttp/x", "-R", "acme/widgets"]
+    for inputs in (["-f", "mode=full"], ["-f", "a=b", "-f", "c=d"], ["-f", "empty="], ["-f", "ref=ttp/x@1.2,3:4+5=6"],
+                   [x for i in range(8) for x in ("-f", f"k{i}=v")]):
+        assert ghqueue.allowed([*run, *inputs]) == "", inputs
+        assert ghqueue.allowed([*run[:5], *inputs, *run[5:]]) == "", inputs
+    for inputs in (["-f", "bad key=v"], ["-f", "=v"], ["-f", "k"], ["-f"], ["-f", "k=a b"], ["-f", "k=$(id)"],
+                   ["-f", 'k="x"'], ["-f", "k=@/etc/passwd"], ["-f", "k=" + "v" * 129], ["-f", "k" * 65 + "=v"],
+                   ["-F", "k=v"], ["-F", "k=@file"], ["--raw-field", "k=v"], ["--field", "k=v"], ["--json"], ["-fk=v"],
+                   ["-f", "k=v", "-f", "k2"], [x for i in range(9) for x in ("-f", f"k{i}=v")]):
+        assert ghqueue.allowed([*run, *inputs]), inputs
+    assert "at most 8 inputs" in ghqueue.allowed([*run, *[x for i in range(9) for x in ("-f", f"k{i}=v")]])
+    assert ghqueue.allowed([*run, "-f", "k=v"], b"stdin") == "" and ghqueue.allowed([*run, "--json"], b"{}")
+    ws = ws_calls.parent
+    stub = ws / "gh-inputs"
+    stub.write_text("#!/bin/sh\n"
+                    f'printf "%s\\n" "$*" >> "{ws_calls}"\n'
+                    f'case "$1 $2" in "pr list") cat "{ws / "prs.json"}";; "api user") echo me;;\n'
+                    ' "api repos/acme/widgets") echo main;; *) echo "ws: $*";; esac\n')
+    stub.chmod(0o755)
+    for login, refused in (("someone-else", "someone else's"), ("ME", "")):
+        (ws / "prs.json").write_text(json.dumps([{"author": {"login": login}, "headRefName": "ttp/x"}]))
+        got = ghqueue.answer({"key": "e" * 32, "argv": [*run, "-f", "mode=full"], "stdin": ""}, str(stub))
+        assert (refused in got["stderr"] and got["rc"] == 1) if refused else (got["rc"] == 0 and not got["stderr"]), got
+    assert [c for c in ws_calls.read_text().splitlines() if c.startswith("workflow run")] == [
+        "workflow run heavy.yml --ref ttp/x -R acme/widgets -f mode=full"]
+
+
+def test_gh_a_bridge_that_lacks_a_call_the_box_allows_is_named_as_an_older_release_with_the_update_step(env, monkeypatch, capsys):
+    """An old bridge answers a call this box's allowlist has with the generic not-on-the-allowlist refusal: the box
+    says the workstation runs an older release (its version when the answer carries one) and to run `ttp setup`
+    there. A refusal of a call this box refuses too, and any other refusal, stay as they came."""
+    from ttp import ghqueue
+    _cfg, _repo, _gh, _calls = _workstation(env, monkeypatch)
+    run = ["workflow", "run", "heavy.yml", "--ref", "ttp/x", "--repo", "acme/widgets", "-f", "mode=full"]
+    generic = "refused on the workstation: `gh workflow run` is not on the workstation's allowlist"
+    key = ghqueue._key("acme/widgets", run, b"")
+    d = ghqueue.outbox()
+    d.mkdir(parents=True, exist_ok=True)
+    # The answer a current bridge sends carries its version, and put() keeps it.
+    (d / f"{key}.taken").write_text(json.dumps({"argv": run, "write": True}))
+    assert ghqueue.put([{"key": key, "rc": 1, "stderr": generic, "version": "0.1.50"}]) == 1
+    assert json.loads((d / f"{key}.done").read_text())["bridge_version"] == "0.1.50"
+    capsys.readouterr()
+    assert ghqueue._queued(run, b"", "acme/widgets", None, None, "gh workflow run") == 1
+    err = capsys.readouterr().err
+    assert "older release (0.1.50)" in err and "without `gh workflow run`" in err and "`ttp setup` on the workstation" in err, err
+    # An older bridge's answer has no version; a refusal that is not the generic one is untouched.
+    for stderr, want in ((generic, "it reports no version"), ("refused on the workstation: not the head of an open PR", "")):
+        (d / f"{key}.done").write_text(json.dumps({"rc": 1, "write": True, "stderr": stderr, "at": time.time()}))
+        ghqueue._queued(run, b"", "acme/widgets", None, None, "gh workflow run")
+        err = capsys.readouterr().err
+        assert (want in err and "older release" in err) if want else err == stderr, err
+    # A call this box does not allow either keeps the bridge's own words.
+    bad = ["workflow", "enable", "heavy.yml", "--repo", "acme/widgets"]
+    (d / f"{ghqueue._key('acme/widgets', bad, b'')}.done").write_text(json.dumps({"rc": 1, "stderr": generic, "at": time.time()}))
+    ghqueue._queued(bad, b"", "acme/widgets", None, None, "gh workflow enable")
+    assert capsys.readouterr().err == generic
 
 
 def test_ci_wait_on_a_sha_finds_its_run_past_the_newest_page_and_never_calls_a_full_window_absent(env, monkeypatch):

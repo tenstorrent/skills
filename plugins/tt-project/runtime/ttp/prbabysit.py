@@ -93,18 +93,18 @@ def guard(args: list[str], real: str, db, cfg: dict, stdin_text: str | None = No
     """Why `gh args` must not run for this project's PR babysitting rules, or None: a PR in
     pr_babysit.no_post_prs gets no post, edit or dispatch; a workflow dispatch (`workflow run <name> --ref
     <head>`) or a label (`pr edit N --add-label L`) goes only on an open PR the project owns and only as
-    pr_babysit.dispatch lists it for the repo ('<workflow>' or 'label:<name>'); a dispatch carries no inputs,
-    and never repeats a run of that workflow already queued or running on the PR's head (_live_run)."""
+    pr_babysit.dispatch lists it for the repo ('<workflow>' or 'label:<name>'); a dispatch carries only plain
+    `-f key=value` inputs, and never repeats a run of that workflow already queued or running on the PR's head (_live_run)."""
     from . import prbody, prguard
     cmd, sub, more = args[0], (args[1] if len(args) > 1 else ""), args[2:]
     cfg_ = settings(cfg)
     no_post = {k.lower() for k in cfg_["no_post_prs"]}
     if cmd == "workflow" and sub == "run":
         from . import ghqueue
-        pos, opts, bad = ghqueue._parse(more, ghqueue._DISPATCH_FLAGS)
+        pos, opts, bad = ghqueue.parse_dispatch(more)
         if bad or len(pos) != 1 or len(opts.get("--ref", [])) != 1 or any(len(v) > 1 for v in opts.values()):
             return ("refused: `gh workflow run` runs one named workflow with --ref <the PR's head branch>, and "
-                    f"no inputs or other options ({bad or 'form'})")
+                    f"no inputs but plain -f key=value, and no other options ({bad or 'form'})")
         repo = (opts.get("--repo") or [prguard._gh(real, "repo", "view", "--json", "nameWithOwner", "-q",
                                                    ".nameWithOwner").strip()])[0]
         ref, what = opts["--ref"][0], pos[0]

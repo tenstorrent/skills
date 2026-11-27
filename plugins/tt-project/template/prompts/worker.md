@@ -240,7 +240,7 @@ No `result.json`, no credit.
   `$TTP_RESULT` (else `on_pass`) ends the task; anything else wakes it with the output tail. It may use `ttp note` (also `--to`), nothing else that needs a run, and
   never acts as the user. Make it safe to run twice. A checks pass alone: `ttp checks --result <run dir> --passed`.
   A known sequence of waits (checks, then `landed:#<id>`): list the later ones in `then` (up to 4,
-  each may add `on_pass_cmd`, `retry_after_s`); the daemon moves through them model-free.
+  each may add `on_pass_cmd`, `retry_after_s`; one before the last needs no result, exit 0 moves on); the daemon moves through them model-free.
   An exit-0 probe's `probe_match` (`pass`/`fail`/`wait` substrings) and `on_pass` (`{probe_out}` ok) settle clear hits model-free.
 <!-- ttp:if remote -->
   For a job on another machine (a device job uses a listed device runner instead), start its driver there with `ttp detach --remote <ssh alias> <name> -- <command...>`

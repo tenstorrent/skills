@@ -29,7 +29,7 @@ import tempfile
 import time
 from pathlib import Path
 
-from . import aitag
+from . import __version__, aitag
 from .ghroute import HELD_RC, SETTING, WORKSTATION, _with_repo, is_write, local_inputs, mark, repo_of
 
 OUTBOX = "gh-outbox"
@@ -139,12 +139,39 @@ def _upkeep(argv: list[str], stdin: bytes) -> str:
     return ""
 
 
+_INPUT_KEY = re.compile(r"[A-Za-z0-9_-]{1,64}")
+_INPUT_VAL = re.compile(r"[A-Za-z0-9._,:/@+=-]{0,128}")
+INPUTS_MAX = 8
+
+
+def _inputs(rest: list[str]) -> tuple[list[str], str]:
+    """(`rest` without its `-f key=value` workflow inputs, why one is refused or ""): plain tokens only."""
+    out, found, i = [], 0, 0
+    while i < len(rest):
+        if rest[i] != "-f":
+            out.append(rest[i])
+            i += 1
+            continue
+        key, eq, val = (rest[i + 1] if i + 1 < len(rest) else "").partition("=")
+        found += 1
+        if not eq or not _INPUT_KEY.fullmatch(key) or not _INPUT_VAL.fullmatch(val) or val.startswith("@"):
+            return out, "an input is `-f key=value` with a plain key and a plain value (no spaces, quotes or @file)"
+        i += 2
+    return out, f"at most {INPUTS_MAX} inputs" if found > INPUTS_MAX else ""
+
+
+def parse_dispatch(rest: list[str]) -> tuple[list[str], dict[str, list[str]], str]:
+    """_parse() of `gh workflow run`'s words after `workflow run`, its plain `-f key=value` inputs taken out."""
+    rest, why = _inputs(rest)
+    return _parse(rest, _DISPATCH_FLAGS) if not why else ([], {}, why)
+
+
 def _dispatch(argv: list[str]) -> tuple[str, str, str]:
     """(why `gh workflow run argv` is refused or "", the repo, the ref): one workflow name, --ref and
-    --repo, no inputs."""
-    pos, opts, why = _parse(argv[2:], _DISPATCH_FLAGS)
+    --repo, and up to INPUTS_MAX plain `-f key=value` inputs; nothing else."""
+    pos, opts, why = parse_dispatch(argv[2:])
     if why or len(pos) != 1 or "--ref" not in opts or "--repo" not in opts:
-        return f"`gh workflow run` takes one workflow, --ref and --repo, no inputs ({why or 'form'})", "", ""
+        return (f"`gh workflow run` takes one workflow, --ref, --repo and plain -f inputs ({why or 'form'})"), "", ""
     return "", opts["--repo"][0], opts["--ref"][0]
 
 
@@ -416,7 +443,7 @@ def allowed(argv, stdin: bytes = b"", prefixes=()) -> str:
     of the title or body only and `pr close` (the workstation also checks the PR is its own draft), each
     post, body or comment ending with the AI-authorship tag, and `repo fork <owner>/<repo> --fork-name
     <name> --clone=false` (the workstation also checks <its gh user>/<name> does not exist yet), `workflow run
-    <name> --ref <branch> --repo <r>` and `pr edit --add-label` (the workstation also checks the PR is its own open one), `run rerun
+    <name> --ref <branch> --repo <r>` with up to 8 plain `-f key=value` inputs and `pr edit --add-label` (the workstation also checks the PR is its own open one), `run rerun
     <id>` with an optional --failed (the workstation also checks the run is on its own open draft PR's
     head, never the default branch), and the
     queue's own `git-publish` of one such branch (a new branch or a fast-forward); `prefixes` grants branch
@@ -456,7 +483,7 @@ def allowed(argv, stdin: bytes = b"", prefixes=()) -> str:
     if pair == ("workflow", "run"):
         return _dispatch(argv)[0]
     if pair not in _POSTS:
-        return f"`gh {' '.join(argv[:2])}` is not on the workstation's allowlist"
+        return f"`gh {' '.join(argv[:2])}` {NOT_LISTED}"
     if pair == ("pr", "create") and not any(a in ("--draft", "-d") for a in argv):
         return "`gh pr create` runs only with --draft"
     body = _body(argv, stdin)
@@ -534,6 +561,22 @@ def _key(repo: str, sent: list[str], data: bytes) -> str:
     return hashlib.sha256(json.dumps([repo, sent, base64.b64encode(data).decode()]).encode()).hexdigest()[:32]
 
 
+NOT_LISTED = "is not on the workstation's allowlist"
+
+
+def _gap(sent: list[str], data: bytes, got: dict) -> str:
+    """The stored answer's stderr, with an old bridge's generic not-on-the-allowlist refusal of a call this
+    host's own allowlist has made plain: the workstation runs an older release, and how to update it."""
+    err = str(got.get("stderr") or "")
+    if not err.rstrip().endswith(NOT_LISTED) or allowed(sent, data):
+        return err
+    ver = got.get("bridge_version")
+    said = ver if isinstance(ver, str) and ver else "it reports no version"
+    return (f"refused on the workstation: its bridge runs an older release ({said}) "
+            f"without `gh {' '.join(sent[:2])}`; run `ttp setup` on the workstation (it installs the current release and "
+            f"restarts the gh-pull service), then retry (this host runs {__version__})\n")
+
+
 def _queued(sent: list[str], data: bytes, repo: str, cwd: str | None, home, what: str, key: str = "") -> int:
     """The answer to an allowed call if it is in (its output on ours), else the call queued once (HELD_RC)."""
     key = key or _key(repo, sent, data)
@@ -543,7 +586,7 @@ def _queued(sent: list[str], data: bytes, repo: str, cwd: str | None, home, what
     done = d / f"{key}.done"
     if (got := _load(done)) is not None:
         sys.stdout.write(str(got.get("stdout") or ""))
-        sys.stderr.write(str(got.get("stderr") or ""))
+        sys.stderr.write(_gap(sent, data, got))
         if not got.get("write"):
             done.unlink(missing_ok=True)   # a read is answered once; the next one asks again
         mark(True, via=WORKSTATION)
@@ -611,7 +654,7 @@ def put(results, home=None) -> int:
         rc = r.get("rc")
         done = {"rc": rc if isinstance(rc, int) else 1, "write": bool(v.get("write")),
                 "stdout": str(r.get("stdout") or "")[:OUT_MAX], "stderr": str(r.get("stderr") or "")[:OUT_MAX],
-                "at": time.time()}
+                "at": time.time(), "bridge_version": str(r.get("version") or "")[:40]}
         tip = r.get("tip")
         argv = v.get("argv") if isinstance(v.get("argv"), list) and v.get("argv") else [""]
         if argv[0] == PUBLISH and len(argv) == 4 and done["rc"] == 0 and r.get("pushed") == argv[3]:
@@ -761,7 +804,7 @@ def pull(box: str, gh: str | None = None, prefixes=(), policy_cmd: str = "") -> 
         entries = json.loads(r.stdout or "[]")
     except ValueError:
         return f"{box}: the gh queue's answer is not JSON"
-    results = [a for e in (entries if isinstance(entries, list) else [])
+    results = [{**a, "version": __version__} for e in (entries if isinstance(entries, list) else [])
                if isinstance(e, dict) and (a := _answer_or_error(e, gh, prefixes, policy_cmd))]
     if not results:
         return f"{box}: no gh calls queued"

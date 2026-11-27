@@ -26,7 +26,8 @@ without recording done once its probe passes. Nothing in it, a script it names o
 mentions TTP_RESULT, it starts no `ttp` and no `python -m` module (either may write it), and its
 retry_when is no `ttp checks --result` wait whose on_pass is the fallback. Nor a command that only tests
 (each program it starts is in TESTS: `test -f <file>`, `true`) where that fallback ends the task: it runs no
-step, so any step its hand-off left in prose would never run; handed back the same way. A command that sets
+step, so any step its hand-off left in prose would never run; handed back the same way. Both only where no `then` stage
+follows: with one, a command that writes nothing is fine, the daemon moves on to that stage. A command that sets
 TTP_RESULT itself is refused the same way: the daemon reads only the $TTP_RESULT it sets.
 ENV is never set by the daemon now; set by hand, `ttp note`, `notify`, `push` and `land` do nothing
 under it and `ttp lock`, `devq submit|start|clear` and a starting `detach` are refused (cli.dry_run_stub)."""
@@ -205,7 +206,8 @@ def check(cmd: str, cwd: Path, env: dict, fallback: bool, timeout: float, ends: 
     """Validate `cmd` for its run once its probe passes, without running it (module docstring):
     {cmd, rc: None, verdict ('ok', CRASH, NO_RESULT or 'inconclusive'), why, output, checked, took_s}.
     `fallback`: its hand-off's on_pass (done or needs_review) is recorded when the command writes nothing, so
-    one that only tests (TESTS) is refused: it runs no step, unless a `then` stage follows (`ends` False)."""
+    one that only tests (TESTS) is refused: it runs no step. A command that writes no result is refused too.
+    Both are accepted when a `then` stage follows (`ends` False): the daemon moves on to that stage on exit 0."""
     started = time.monotonic()
     problems, checked, reads, unknown, progs = [], [], [], False, []
 
@@ -316,7 +318,7 @@ def check(cmd: str, cwd: Path, env: dict, fallback: bool, timeout: float, ends: 
         out.update(verdict=NO_RESULT, only_tests=True,
                    why=("it only tests, so it runs no step: once its probe passes your on_pass ends the task and "
                         "any step it names only in words (a push, a tag move, a check of their outcome) never runs"))
-    elif not (fallback or unknown or mentions(cmd, cwd, "TTP_RESULT", reads)):
+    elif ends and not (fallback or unknown or mentions(cmd, cwd, "TTP_RESULT", reads)):
         out.update(verdict=NO_RESULT, why=("nothing in it, or a script or program it names, writes a hand-off to "
                                            "$TTP_RESULT, so once its probe passes it would wake a model run instead "
                                            "of recording done"))

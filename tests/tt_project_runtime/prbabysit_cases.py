@@ -250,9 +250,10 @@ def test_prbabysit_guard_lets_a_listed_workflow_run_on_an_owned_prs_head_and_not
     assert "not the head of an open PR this project owns" in _pb_why(
         p, cfg, "workflow", "run", "heavy.yml", "-R", "acme/other", "--ref", "ttp/x")
     assert "not listed" in _pb_why(p, cfg, "workflow", "run", "nightly.yml", "-R", "acme/widgets", "--ref", "ttp/x")
-    for extra in (["-f", "a=b"], ["-F", "a=b"], ["--raw-field", "a=b"], ["--json"], ["--ref", "main"]):
-        assert "no inputs or other options" in _pb_why(p, cfg, *run, "--ref", "ttp/x", *extra), extra
-    assert "no inputs or other options" in _pb_why(p, cfg, "workflow", "run", "-R", "acme/widgets", "--ref", "ttp/x")
+    for extra in (["-f", "a b"], ["-F", "a=b"], ["--raw-field", "a=b"], ["--json"], ["--ref", "main"]):
+        assert "no inputs but plain -f" in _pb_why(p, cfg, *run, "--ref", "ttp/x", *extra), extra
+    assert "no inputs but plain -f" in _pb_why(p, cfg, "workflow", "run", "-R", "acme/widgets", "--ref", "ttp/x")
+    assert _pb_why(p, cfg, *run, "--ref", "ttp/x", "-f", "mode=full") is None
 
 
 def test_prbabysit_guard_adds_only_a_listed_label_to_an_owned_pr_and_never_a_reviewer(env):
