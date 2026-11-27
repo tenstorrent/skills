@@ -491,7 +491,15 @@ coordinator with that evidence.
   repo for a day; `norm unknown` when the gh route cannot answer), and the lane's verdict covers
   whether the PR as a whole still does what its title and description say with the least code, not
   only whether the commit under review is clean. Both reads are anonymous (ghanon), so a private
-  repository's PR gets no PR block: its facts cannot be read without a login.
+  repository's PR gets no PR block: its facts cannot be read without a login. A PR also has a
+  size budget: `review.pr_budget_lines` when set, else the repo norm's p90, else 800 added
+  non-test lines (0 turns the gate off). Once a PR's cumulative diff passes its budget, every
+  route that updates its branch (a `pr_branch` push with `ttp push --own`, and the gh route's
+  `ttp push --publish`) refuses further commits and raises one keyed event naming the PR, its
+  size, the norm and the budget. The gate lifts when a plan is recorded with
+  `ttp pr plan <owner/repo#N> --budget <lines> --msg <chat message id>` (the coordinator posts
+  the plan to the user's chat first; `--msg` names that message), which sets the PR's budget to
+  the plan's.
 - A review judges the diff plus the gate results that already exist for the head it reviews, and
   never starts or waits on a repeat of a test that passed on that head: a further test it wants is a
   finding, and its verdict still goes out. Only the required checks (the suite and any smoke test)
