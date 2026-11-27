@@ -72,7 +72,7 @@ def test_a_plain_line_or_list_item_after_the_phrase_is_not_its_text_and_plain_st
     assert quotefull.backrefs("The draft for <name>, not sent yet, is ready to send.") != []
     assert quotefull.backrefs("Drafts: see my last message.") != []
     assert quotefull.backrefs("The v1.0 draft is ready to send.") != []
-    for plain in ("No asks are still open.", "Asks still open: 0.", "0 asks, 0 drafts still open.", "No asks, requests, or drafts are still open.", "Neither draft is ready to send.", "Task #14 is still open and has two questions from the vendor.",
+    for plain in ("The command `ttp approve 12 --force` is still pending.", "No asks are still open.", "Asks still open: 0.", "0 asks, 0 drafts still open.", "No asks, requests, or drafts are still open.", "Neither draft is ready to send.", "Task #14 is still open and has two questions from the vendor.",
                   "Bug #3 is still open, and the request to the vendor went out.", "I am ready to send the reminder at 9.",
                   "Drafts ready to send: none.", "The command finished. The PR is pending review.",
                   "I will ask the vendor. Task #14 is pending a worker."):

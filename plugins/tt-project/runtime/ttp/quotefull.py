@@ -4,18 +4,19 @@
 'drafts in my earlier messages, ready to send' points the reader back instead of repeating the
 drafts, so the harness refuses it model-free.
 
-`backrefs` finds the phrases that stand in for content: an explicit back-reference ('see above',
-'in my earlier messages', 'drafts above', 'as drafted earlier', 'the draft I sent'), and an item
-word (draft/ask/request/command) that is the subject of 'ready to send', 'still open' or 'still
-pending' in the same clause, not negated, or follows 'pending your'. A phrase is fine only when the message itself
-carries the content: quoted material (a blockquote, a fenced block, a quoted span of 30+ chars, or,
-for an ask, the '- ask <id>:' lines pendingask appends) after it or in the message's later
-numbered parts (before it too, unless it points to earlier messages), or, when the phrase's line
-ends in ':', non-empty lines after it. A passing line or list item with plain lines after it is
-not its text; a phrase inside a short quoted span is only named. `refused` turns the findings into a coordinator reply or notify
-rejection. Daemon-built lines were audited and carry their pending item's full text: ask reminders
-quote the question (coordinator.defaults, askrethink.text), `ttp status` shows each open ask whole
-(cli.status_text) and worker notifies carry their body (daemon.relay_worker_notifies)."""
+`backrefs` finds the phrases that stand in for content: an explicit back-reference ('see above', 'in
+my earlier messages', 'drafts above', 'as drafted earlier', 'the draft I sent'), and an item word
+(draft/ask/request/command) that is the subject of 'ready to send', 'still open' or 'still pending'
+in the same clause, not negated, or follows 'pending your'. A phrase is fine only when the message
+itself carries the content: quoted material (a blockquote, a fenced block, an inline code span, a
+quoted span of 30+ chars, or, for an ask, the '- ask <id>:' lines pendingask appends) in or after it
+or in the message's later numbered parts (before it too, unless it points to earlier messages), or,
+when the phrase's line ends in ':', non-empty lines after it. A passing line or list item with plain
+lines after it is not its text; a phrase inside a short quoted span is only named. `refused` turns
+the findings into a coordinator reply or notify rejection. Daemon-built lines were audited and carry
+their pending item's full text: ask reminders quote the question (coordinator.defaults,
+askrethink.text), `ttp status` shows each open ask whole (cli.status_text) and worker notifies carry
+their body (daemon.relay_worker_notifies)."""
 from __future__ import annotations
 
 import re
@@ -27,7 +28,7 @@ _POINT_BACK = re.compile(
     rf"{_EARLIER}|\bsee above\b|\bmentioned above\b"
     r"|\bdrafts?\s+above\b|\bas\s+drafted\b|\bthe\s+drafts?\s+(?:I|we)\s+(?:sent|posted|shared|wrote)\b",
     re.I)
-_ITEM = r"asks?|requests?|commands?|drafts?|questions?|reminders?|instructions?"
+_ITEM = r"asks?|requests?|commands?|drafts?|questions?"
 _STATE = r"ready\s+to\s+send|still\s+open|still\s+pending|pending\s+your"
 _SPAN = r"(?:(?!,\s*(?:and|but|so|while)\b)[^.;:\n]){0,120}"   # one clause: no . ; : , and/but or line break
 _STATUS_PHRASE = re.compile(   # the item is the subject; only 'pending your <item>' names it after
@@ -36,7 +37,7 @@ _NEGATED = re.compile(r"\b(?:no|none|nothing|not|zero|neither|nor)\b|(?<![\w.])0
 _OPENS = re.compile(r"(?:^|[\s(\[])['\"`‘“][^'\"`’”\n]{0,40}$")   # a quote mark opening a span, not an apostrophe
 _CLOSES = re.compile(r"^[^'\"`’”\n]{0,40}['\"`’”](?!\w)")
 _ASK_LINE = re.compile(r"^\s*- ask\s+\d+:", re.M)   # pendingask's expansion: the text of asks, nothing else
-_QUOTED = re.compile(r"^\s*>|^```|\"[^\"]{30,}\"|“[^”]{30,}”", re.M)
+_QUOTED = re.compile(r"^\s*>|^```|`[^`\n]+`|\"[^\"]{30,}\"|“[^”]{30,}”", re.M)
 
 
 def backrefs(text: str, later: list[str] | tuple = ()) -> list[str]:
@@ -57,10 +58,11 @@ def backrefs(text: str, later: list[str] | tuple = ()) -> list[str]:
         line_end = text[m.end():eol if eol >= 0 else len(text)].rstrip()
         after = text[eol + 1 if eol >= 0 else len(text):] + "\n" + tail
         item = re.search(_ITEM, m.group(0), re.I)
-        quoted = _QUOTED.search(text[m.end():] + "\n" + tail) or (
+        quoted = _QUOTED.search(text[m.start():] + "\n" + tail) or (
             not re.fullmatch(_EARLIER, m.group(0), re.I) and _QUOTED.search(text[:m.start()])) or (
             item and item.group(0).lower().startswith(("ask", "question")) and _ASK_LINE.search(text))
-        if quoted or (line_end.endswith(":") and _has_content(after)) or re.match(r":\s*(?:none|nothing|no|0)\b", line_end, re.I):
+        if (quoted or (line_end.endswith(":") and _has_content(after))
+                or re.match(r":\s*(?:none|nothing|no|0)\b", line_end, re.I)):
             continue
         p = " ".join(m.group(0).split()) if back else \
             f"the {item.group(0).lower()} named as pending, without its text"
