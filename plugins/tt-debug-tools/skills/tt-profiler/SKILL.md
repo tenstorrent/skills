@@ -39,7 +39,8 @@ for it.
 
 On Blackhole, the [streaming profiler](https://github.com/tenstorrent/tt-metal/blob/main/tt_metal/tools/profiler/STREAMING_PROFILER_DETAILED.md)
 (`TT_METAL_STREAMING_PROFILER=1`, output via `TT_METAL_STREAMING_PROFILER_OPS_CSV` / `_ZONE_CSV`) drains continuously.
-It cannot run under `python -m tracy -p`: `-p` sets `TT_METAL_DEVICE_PROFILER=1`,
+It cannot run under `python -m tracy` with device profiling on (the default;
+`--no-device` turns it off): tracy then sets `TT_METAL_DEVICE_PROFILER=1`,
 and setting both is a fatal error at startup.
 
 ## When to invoke
