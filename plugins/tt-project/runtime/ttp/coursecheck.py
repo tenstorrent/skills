@@ -33,6 +33,10 @@ so an idle project's digest does not grow. Each reuses a signal the harness alre
 
 - old_orders: a blocked task, a deferred task or an open ask citing an old user order whose reason is over,
   unknown or unchecked (oldorders.py, its last scan): the order may be read literally after its cause ended.
+- plan_followups: a done `plan` or `question` task whose handed-off follow-ups a turn has seen (unstarted.open_followups)
+  while an urgent user order is open (an open obligation recorded from a user message with a priority 1 or
+  `urgent:` owner, done ones included): one line per task until a later task takes one up (its title, or a spec
+  quoting it or citing `#<task>`), one is folded, or every one is dropped (drop-followup).
 
 `coordinator.course_check` keys of the same names set the thresholds (0 turns one off)."""
 from __future__ import annotations
@@ -41,14 +45,15 @@ import json
 import re
 from pathlib import Path
 
-from .db import DB, TERMINAL_TASK_STATES
+from .db import DB, TERMINAL_TASK_STATES, load_result
 
 MAX_LINES = 6
 WINDOW_S = 3 * 86400        # wait_stale events and rule-citing asks this recent
 RACE_S = 2 * 86400          # push markers this recent
 RULE_WORDS = 3
 MAX_MARKERS = 400           # newest push markers read; each is a small JSON file
-DEFAULTS = {"missed_deadlines": 2, "same_wait": 2, "self_races": 2, "rule_clash": 1, "recurring": 1, "old_orders": 1}
+DEFAULTS = {"missed_deadlines": 2, "same_wait": 2, "self_races": 2, "rule_clash": 1, "recurring": 1, "old_orders": 1,
+            "plan_followups": 1}
 _RULE = re.compile(r"\b(restrictions?|charter|polic(?:y|ies)|rules?|forbid\w*|prohibit\w*|not allowed)\b", re.I)
 
 
@@ -338,6 +343,41 @@ def old_order_holds(db: DB, on: float) -> list[dict]:
     return oldorders.held(db)
 
 
+def plan_followups(db: DB, on: float, now: float) -> list[dict]:
+    if not on:
+        return []
+    from . import obligations, unstarted, urgent
+    by: dict[int, list] = {}
+    for f in unstarted.open_followups(db, now):
+        by.setdefault(f["task"], []).append(f)
+    plans = [db.task(t) or {} for t in by]
+    plans = [t for t in plans if t.get("kind") in ("plan", "question") and t.get("status") == "done"]
+    if not plans:
+        return []
+    def owners(o: dict) -> set[int]:   # an order's owners are its promise's tasks (obligations._kept)
+        return {int(t) for t in [*(o.get("owners") or {}), *(o["promise"].get("tasks") or [])] if str(t).isdigit()}
+    orders = [o for o in obligations.items(db) if not (o.get("receipt") or o.get("dropped"))
+              and (o.get("promise") or {}).get("order") is not None
+              and any(urgent.is_urgent(db.task(t)) for t in owners(o))]
+    out = []
+    for t in plans if orders else []:
+        tid = t["id"]
+        later = db.q("SELECT id, title, spec FROM tasks WHERE id>?", (tid,))
+        fups = load_result(t.get("result")).get("followups")
+        titles = [str(f["title"]).strip() for f in fups if isinstance(f, dict) and f.get("title")] \
+            if isinstance(fups, list) else []
+        cite = re.compile(rf"#{tid}\b")
+        if (any(unstarted._taken_by(later, x) for x in titles)
+                or any(cite.search(f"{r['title']} {r['spec']}") for r in later)
+                or db.one("SELECT 1 FROM events WHERE task=? AND kind='followup_proposed' "
+                          "AND text LIKE '%(folded into #%'", (tid,))):
+            continue
+        o = next((o for o in orders if tid in owners(o)), orders[0])
+        out.append({"task": tid, "kind": t["kind"], "n": len(by[tid]), "order": o["id"],
+                    "msg": o["promise"]["order"]})
+    return out
+
+
 def lines(db: DB, cfg: dict | None, pushes: Path | None = None, now: float | None = None,
           warn=None) -> tuple[list[str], str]:
     """Course check lines (no header; [] when none fires) and their identity for collapsing. A detector
@@ -405,6 +445,12 @@ def lines(db: DB, cfg: dict | None, pushes: Path | None = None, now: float | Non
                        f"{': ' + r['reason'] if r['reason'] else ''}) | re-read it by intent: if its reason is gone, "
                        "retire it (`memory_forget` or the obligation, with a `why`) and lift the hold this turn")
             ident.append(f"old_order:{r['key']}:{h}")
+    for r in safe(plan_followups, db, s["plan_followups"], now):
+        out.append(f"- follow-ups unqueued: {r['kind']} #{r['task']} ended with {r['n']} follow-up"
+                   f"{'s' if r['n'] > 1 else ''} under urgent order {r['order']} (user msg #{r['msg']}); none queued | "
+                   f"add them now (task_add, spec `from {r['kind']} #{r['task']}`) or drop each with its why "
+                   "(drop-followup, the Open follow-ups list)")
+        ident.append(f"plan_followups:{r['task']}")
     for line, ident_ in safe(stalegates.course_lines, db, cfg or {}, now):
         out.append(line)
         ident.append(ident_)

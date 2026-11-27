@@ -665,3 +665,57 @@ def test_a_plain_order_sharing_only_a_model_name_and_two_words_with_an_earlier_c
     assert correction.flag(p.db, p.config(), rows(order), now) == {}
     again = _cc_msg(p, "in", "user", "Name the test writer, Opus; and keep it", now - 30)
     assert correction.flag(p.db, p.config(), rows(again), now) == {again: f"repeats #{old}"}
+
+
+def _cc_plan_with_followups(p, n=7, urgent_order=True):
+    """A done plan whose n follow-ups a turn has seen, under a user order owned by a priority 1 (or 3) task."""
+    from ttp import obligations as ob
+    owner = p.db.add_task("speed up the nightly run", "s", kind="work", origin="coordinator",
+                          priority=1 if urgent_order else 3)
+    plan = p.db.add_task("plan the speed-up", "s", kind="plan", origin="coordinator")
+    fups = [{"title": f"Speed up step {i} of the nightly run", "spec": "x"} for i in range(n)]
+    p.db.update_task(plan, status="done", result=json.dumps({"status": "done", "followups": fups}))
+    now = time.time()
+    ids = [p.db.x("INSERT INTO events(ts,source,kind,severity,text,status,task) VALUES(?,?,?,?,?,?,?)",
+                  (now, f"task:{plan}", "followup_proposed", "normal", f"proposed follow-up: {f['title']} — x",
+                   "handled", plan)) for f in fups]
+    mid = _cc_msg(p, "in", "user", "make the nightly run faster", now - 600)
+    oid = ob.add_order(p, "make the nightly run faster", mid, [owner], action_class="change", now=now).split()[1]
+    return plan, ids, oid, now
+
+
+def test_course_self_review_flags_a_plans_follow_ups_left_unqueued_under_an_urgent_order(env):
+    p = make(env)
+    plan, _, oid, now = _cc_plan_with_followups(p)
+    lines, ident = _cc(p, now)
+    hits = [x for x in lines if "follow-ups unqueued" in x]
+    assert hits == [x for x in lines if f"plan #{plan} ended with 7 follow-ups under urgent order {oid}" in x
+                    and "none queued" in x], lines
+    assert len(hits) == 1 and f"plan_followups:{plan}" in ident, "one line per plan, never one per follow-up"
+
+
+def test_course_self_review_plan_follow_ups_clear_once_one_is_queued(env):
+    p = make(env)
+    plan, _, _, now = _cc_plan_with_followups(p)
+    taken = p.db.add_task("Speed up step 3 of the nightly run", "s", kind="code", origin="coordinator")
+    assert not [x for x in _cc(p, now)[0] if "follow-ups unqueued" in x]
+    p.db.update_task(taken, title="Cache the nightly inputs")
+    assert [x for x in _cc(p, now)[0] if "follow-ups unqueued" in x]
+    p.db.update_task(taken, spec=f"from plan #{plan}: the cache step")
+    assert not [x for x in _cc(p, now)[0] if "follow-ups unqueued" in x], "a task citing the plan clears it"
+
+
+def test_course_self_review_plan_follow_ups_need_an_urgent_order(env):
+    p = make(env)
+    _, _, _, now = _cc_plan_with_followups(p, urgent_order=False)
+    assert not [x for x in _cc(p, now)[0] if "follow-ups unqueued" in x]
+
+
+def test_course_self_review_plan_follow_ups_clear_once_dropped(env):
+    from ttp import unstarted
+    p = make(env)
+    _, ids, _, now = _cc_plan_with_followups(p, n=2)
+    unstarted.drop_followup(p.db, ids[0], "done by the plan itself")
+    assert [x for x in _cc(p, now)[0] if "ended with 1 follow-up under" in x], "one left undropped still counts"
+    unstarted.drop_followup(p.db, ids[1], "not needed for the order")
+    assert not [x for x in _cc(p, now)[0] if "follow-ups unqueued" in x]
