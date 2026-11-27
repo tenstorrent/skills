@@ -1241,7 +1241,9 @@ def test_eta_detached_jobs_shadow_with_all_jobs_ended_is_the_normal_shadow(env):
          "ended": now - 100, "owner": {"task": tid}}]))
     he = etaledger.hist_end(p.db, f"t{tid}", now, eta.history(p.db, now),
                             etajobs.job_history(p.state, p.db, now))
-    assert he == pytest.approx(now + 300 + 1200, abs=1.0), he   # abs: epoch values, no rel slack
+    # median wait 300; the run median is 960 (600, 720, 1200, 1800: the registry task's own sample
+    # is one of them), never the jobs' zero-left medians a missing guard would give (now).
+    assert he == pytest.approx(now + 300 + 960, abs=1.0), he   # abs: epoch values, no rel slack
 
 
 
