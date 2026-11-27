@@ -26,5 +26,5 @@ MUST run after every install or refresh. A failed import means the install faile
 
 ```bash
 "$TT_METAL_HOME/python_env/bin/python" -c \
-  'import ttnn, vllm, vllm_tt_plugin; print(vllm.__version__, vllm_tt_plugin.__file__)'
+  'import ttnn, vllm, vllm_tt_plugin; print(vllm.__version__, vllm_tt_plugin.__version__, vllm_tt_plugin.__file__)'
 ```
