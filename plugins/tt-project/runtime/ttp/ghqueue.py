@@ -562,19 +562,22 @@ def _key(repo: str, sent: list[str], data: bytes) -> str:
 
 
 NOT_LISTED = "is not on the workstation's allowlist"
+NO_INPUTS = "takes one workflow, --ref and --repo, no inputs"   # an older release's refusal of `-f` inputs
 
 
-def _gap(sent: list[str], data: bytes, got: dict) -> str:
-    """The stored answer's stderr, with an old bridge's generic not-on-the-allowlist refusal of a call this
-    host's own allowlist has made plain: the workstation runs an older release, and how to update it."""
+def _older_bridge(sent: list[str], data: bytes, got: dict) -> str:
+    """The stored answer's stderr, with an old bridge's refusal of a call this host's own allowlist has (the
+    generic not-on-the-allowlist one, or the old no-inputs one) made plain: the workstation runs an older
+    release, and how to update it."""
     err = str(got.get("stderr") or "")
-    if not err.rstrip().endswith(NOT_LISTED) or allowed(sent, data):
+    if not (err.rstrip().endswith(NOT_LISTED) or NO_INPUTS in err) or allowed(sent, data):
         return err
     ver = got.get("bridge_version")
     said = ver if isinstance(ver, str) and ver else "it reports no version"
-    return (f"refused on the workstation: its bridge runs an older release ({said}) "
-            f"without `gh {' '.join(sent[:2])}`; run `ttp setup` on the workstation (it installs the current release and "
-            f"restarts the gh-pull service), then retry (this host runs {__version__})\n")
+    return (f"refused on the workstation: its bridge runs an older release ({said}) that does not take "
+            f"`gh {' '.join(sent[:2])}` like this; update tt-project on the workstation (rerun its install line, "
+            f"docs/install.md, Update: it runs `ttp setup` from the new release, which restarts the gh-pull "
+            f"service), then retry (this host runs {__version__})\n")
 
 
 def _queued(sent: list[str], data: bytes, repo: str, cwd: str | None, home, what: str, key: str = "") -> int:
@@ -586,7 +589,7 @@ def _queued(sent: list[str], data: bytes, repo: str, cwd: str | None, home, what
     done = d / f"{key}.done"
     if (got := _load(done)) is not None:
         sys.stdout.write(str(got.get("stdout") or ""))
-        sys.stderr.write(_gap(sent, data, got))
+        sys.stderr.write(_older_bridge(sent, data, got))
         if not got.get("write"):
             done.unlink(missing_ok=True)   # a read is answered once; the next one asks again
         mark(True, via=WORKSTATION)

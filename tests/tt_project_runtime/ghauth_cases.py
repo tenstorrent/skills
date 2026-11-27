@@ -1703,7 +1703,7 @@ def test_gh_pull_answers_a_raising_entry_with_an_error_and_the_loop_goes_on(env,
 
 
 def test_gh_workstation_runs_a_workflow_and_adds_a_label_only_on_its_own_open_prs_head(env, monkeypatch):
-    """`workflow run <name> --ref <branch> --repo <r>` (no inputs) and `pr edit N --add-label L` pass the
+    """`workflow run <name> --ref <branch> --repo <r>` (up to 8 plain inputs) and `pr edit N --add-label L` pass the
     allowlist; the workstation then reads the open PR on that branch and its own login, and runs only when
     its gh user opened it and the ref is not the default branch. Other options and a bare form fail."""
     from ttp import ghqueue
@@ -1783,8 +1783,8 @@ def test_gh_workflow_run_takes_up_to_eight_plain_inputs_and_nothing_else_on_both
 
 def test_gh_a_bridge_that_lacks_a_call_the_box_allows_is_named_as_an_older_release_with_the_update_step(env, monkeypatch, capsys):
     """An old bridge answers a call this box's allowlist has with the generic not-on-the-allowlist refusal: the box
-    says the workstation runs an older release (its version when the answer carries one) and to run `ttp setup`
-    there. A refusal of a call this box refuses too, and any other refusal, stay as they came."""
+    says the workstation runs an older release (its version when the answer carries one) and to update it with
+    the install line. A refusal of a call this box refuses too, and any other refusal, stay as they came."""
     from ttp import ghqueue
     _cfg, _repo, _gh, _calls = _workstation(env, monkeypatch)
     run = ["workflow", "run", "heavy.yml", "--ref", "ttp/x", "--repo", "acme/widgets", "-f", "mode=full"]
@@ -1799,13 +1799,17 @@ def test_gh_a_bridge_that_lacks_a_call_the_box_allows_is_named_as_an_older_relea
     capsys.readouterr()
     assert ghqueue._queued(run, b"", "acme/widgets", None, None, "gh workflow run") == 1
     err = capsys.readouterr().err
-    assert "older release (0.1.50)" in err and "without `gh workflow run`" in err and "`ttp setup` on the workstation" in err, err
+    assert "older release (0.1.50)" in err and "does not take `gh workflow run`" in err and "install line" in err and "`ttp setup`" in err, err
     # An older bridge's answer has no version; a refusal that is not the generic one is untouched.
     for stderr, want in ((generic, "it reports no version"), ("refused on the workstation: not the head of an open PR", "")):
         (d / f"{key}.done").write_text(json.dumps({"rc": 1, "write": True, "stderr": stderr, "at": time.time()}))
         ghqueue._queued(run, b"", "acme/widgets", None, None, "gh workflow run")
         err = capsys.readouterr().err
         assert (want in err and "older release" in err) if want else err == stderr, err
+    old = "refused on the workstation: `gh workflow run` takes one workflow, --ref and --repo, no inputs (`-f` is not allowed)"
+    (d / f"{key}.done").write_text(json.dumps({"rc": 1, "write": True, "stderr": old, "at": time.time()}))
+    ghqueue._queued(run, b"", "acme/widgets", None, None, "gh workflow run")
+    assert "older release (it reports no version)" in capsys.readouterr().err
     # A call this box does not allow either keeps the bridge's own words.
     bad = ["workflow", "enable", "heavy.yml", "--repo", "acme/widgets"]
     (d / f"{ghqueue._key('acme/widgets', bad, b'')}.done").write_text(json.dumps({"rc": 1, "stderr": generic, "at": time.time()}))
