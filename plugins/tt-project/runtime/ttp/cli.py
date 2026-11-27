@@ -758,6 +758,11 @@ def source_commit() -> str:
 # enclosing repository's pytest config and conftest.py (pytest stops looking at the first config).
 HARNESS_ROOT_FILES = ("pytest.ini",)
 HARNESS_GITIGNORE = ("__pycache__/", "*.pyc", "tmp/")     # tmp/: scratch (test temp dirs, even git repos) kept out of commits
+
+
+def _gitignore_text(names) -> str:
+    """The .gitignore body for a list of ignore lines: one line each, in order."""
+    return "".join(f"{n}\n" for n in names)
 # Files that hold a pytest config at a directory's root, and the section that makes them one
 _PYTEST_CONFIGS = {"pytest.ini": "", ".pytest.ini": "", "pytest.toml": "", ".pytest.toml": "",
                    "pyproject.toml": "[tool.pytest", "tox.ini": "[pytest]", "setup.cfg": "[tool:pytest]"}
@@ -794,7 +799,7 @@ def _new_harness(p: Project, template: Path) -> None:
         f.chmod(EXEC_MODE)
     for f in HARNESS_ROOT_FILES:
         replace_copy(template / f, p.harness / f)
-    durable_write(p.harness / ".gitignore", "".join(f"{n}\n" for n in HARNESS_GITIGNORE), sync=False)
+    durable_write(p.harness / ".gitignore", _gitignore_text(HARNESS_GITIGNORE), sync=False)
     subprocess.run(["git", "init", "-q", "-b", "upstream", str(p.harness)], check=True)
     _git(p.harness, "add", "-A")
     _git(p.harness, "-c", "user.name=tt-project", "-c", "user.email=tt-project@localhost", "commit", "-q",
@@ -15323,7 +15328,7 @@ def _merge_gitignore(h: Path) -> None:
     path = h / ".gitignore"
     have = path.read_text().splitlines() if path.exists() else []
     if missing := [n for n in HARNESS_GITIGNORE if n not in have]:
-        durable_write(path, "".join(f"{n}\n" for n in have + missing), sync=False)
+        durable_write(path, _gitignore_text(have + missing), sync=False)
 
 
 def _name_left_out(embedded: set[str]) -> None:

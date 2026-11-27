@@ -184,7 +184,7 @@ def test_a_new_project_writes_no_harness_file_in_place(env, monkeypatch):
     p = cli.bootstrap(env["repo"], "atomicharness", MAKE_BRIEF, "fake")
     assert harness and in_place == [], in_place
     # the template is the one source of the ignore list; a harness never grows or shrinks it
-    assert (p.harness / ".gitignore").read_text() == "".join(f"{n}\n" for n in cli.HARNESS_GITIGNORE)
+    assert (p.harness / ".gitignore").read_text() == cli._gitignore_text(cli.HARNESS_GITIGNORE)
     assert (p.harness / "pytest.ini").is_file()
     assert (p.harness / "runtime" / "ttp" / cli.SOURCE_FILE).read_text().strip()
 
