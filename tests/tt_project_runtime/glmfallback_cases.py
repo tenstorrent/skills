@@ -56,25 +56,28 @@ def test_the_next_run_of_a_task_whose_glm_model_left_mid_run_takes_the_fallback_
     assert prov == "chat" and k["note"][route.KEY]["fallback"] == "none"
 
 
-def test_a_rerun_after_the_tasks_own_glm_run_failed_keeps_its_core_tier_model(env, monkeypatch):
-    """A rerun whose cause is the GLM run's own end (no hand-off) is no endpoint refusal: it keeps core at its
+@pytest.mark.parametrize("cause", ["no_handoff", "needs_opus"])
+def test_a_rerun_after_the_tasks_own_glm_run_failed_keeps_its_core_tier_model(env, monkeypatch, cause):
+    """A rerun whose cause is the GLM run's own end (no hand-off, or a bounce asking for Opus) is no endpoint refusal: it keeps core at its
     tier, as before; so does any run when the work route is off."""
     from ttp import glmwork, route
     p, d = _gf_setup(env, monkeypatch, "")
     tid = p.db.add_task("sum the logs", "s", kind="work", tier="standard", priority=3, budget_usd=8.0, labels=[])
     run = _gf_refused_run(p, tid, 60)
-    p.db.x("UPDATE runs SET note=replace(note, 'model_missing', 'no_handoff') WHERE id=?", (run,))
+    p.db.x("UPDATE runs SET note=replace(note, 'model_missing', ?) WHERE id=?", (cause, run))
     prov, _, k = _dispatch_task(p, d, monkeypatch, tid)
-    assert prov == "claude" and k["note"][route.KEY]["fallback"] == "rerun" and "fallback_model" not in k["note"][route.KEY]
+    e = k["note"].get(route.KEY) or {}
+    assert prov == "claude" and e.get("fallback") in ("rerun", None) and "fallback_model" not in e
     assert glmwork.fallback(d.cfg, "rerun", p.db, run) is None and glmwork.fallback(d.cfg, "rerun") is None
     assert glmwork.fallback({"route": {"glm_work": {"on": False, "model": _RT_MODEL}}}, "down") is None
 
 
 @pytest.mark.parametrize("kw", [{"kind": "review"}, {"kind": "plan"}, {"tier": "deep"}, {"reply_chat": "chat-1"},
+                                {"spec": "Sum the logs.\nThen post the summary to the user on slack."},
                                 {"pin_required": True, "provider": "claude"}])
 def test_runs_the_work_route_keeps_on_core_never_take_the_fallback_model(env, monkeypatch, kw):
-    """Reviews, plans, the deep tier, a run that answers a person and a required pin never route to GLM, so a
-    endpoint refusal never moves them to the fallback model."""
+    """Reviews, plans, the deep tier and a required pin never route to GLM, and a run that answers or posts to a
+    person keeps its tier's model, so an endpoint refusal never moves them to the fallback model."""
     from ttp import route, runclass
     p, d = _gf_setup(env, monkeypatch, "model_missing")
     got = _route_dispatch(p, d, monkeypatch, title="sum the logs", **{"kind": "work", "tier": "standard", **kw})

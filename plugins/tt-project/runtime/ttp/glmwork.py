@@ -31,7 +31,8 @@ HOLDOUT_HELD = 0.05                 # once its wave gate says its quality holds
 FALLBACK = {"provider": "claude", "model": "sonnet", "effort": "high"}
 # Reasons a routed run starts on core (the route entry's `fallback`, route.REASONS) that take the fallback model:
 # the endpoint refused or is cooling down after a fault (route.FAULTS), had no room in time, or its token quota
-# is short (paced, glmquota.py). A rerun after the task's own routed run failed and an escalation keep their core model.
+# is short (paced, glmquota.py). A rerun after the endpoint refused the task's model mid-run takes it too; a rerun
+# after the task's own routed run failed and an escalation keep their core model.
 FALLBACK_ON = ("down", "error", "rate_limit", "quota", "auth", "malformed", "model_missing", "busy", "slots",
                "busy_wait_expired", "paced")
 
@@ -385,9 +386,10 @@ def fallback(cfg: dict, why: str, db=None, after: int | None = None, task: dict 
     """The model a glm_work run that cannot start on the endpoint (`why`, the route entry's fallback) takes on
     core: {"provider", "model", "effort"}, or None when `why` is no endpoint refusal (it starts on core as is).
     A `rerun` after the task's own run (`after`) was refused its model mid-run is that refusal. A task that
-    answers a chat keeps its tier's model: the fallback run's own text would reach the person."""
-    s = settings(cfg)
-    if not s or (task or {}).get("reply_chat"):
+    answers a chat or is told to post to a person (PERSON) keeps its tier's model: the fallback run's own text
+    would reach the person."""
+    s, task = settings(cfg), task or {}
+    if not s or task.get("reply_chat") or PERSON.search(f"{task.get('title') or ''}\n{task.get('spec') or ''}"):
         return None
     if why == "rerun" and db is not None and after:
         from . import route
