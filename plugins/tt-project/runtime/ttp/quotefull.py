@@ -38,18 +38,22 @@ _STATUS_PHRASE = re.compile(   # an item that awaits the user; 'pending your <it
 _NEGATED = re.compile(r"\b(?:no|none|nothing|not|zero|neither|nor)\b|(?<![\w.])0(?![\w.])", re.I)
 _OPENS = re.compile(r"(?:^|[\s(\[])['\"`‘“][^'\"`’”\n]{0,40}$")   # a quote mark opening a span, not an apostrophe
 _CLOSES = re.compile(r"^[^'\"`’”\n]{0,40}['\"`’”](?!\w)")
-_QUOTED = re.compile(r"^\s*>|^```|`[^`\n]+`|\"[^\"]{30,}\"|“[^”]{30,}”", re.M)
+_BLOCK = r"^\s*>|^```|\"[^\"]{30,}\"|“[^”]{30,}”"   # quoted text a back-reference accepts
+_BLOCKS = re.compile(_BLOCK, re.M)
+_QUOTED = re.compile(_BLOCK + r"|`[^`\n]+`", re.M)
 _STOP = re.compile(r"[.;!?](?=\s|$)|\n")
 
 
-def _attached(text: str, start: int, after: str, ids: list[str]) -> bool:
+def _attached(text: str, start: int, after: str, ids: list[str], back: bool) -> bool:
     """Whether quoted text belongs to the phrase at `start`: in its own sentence, as the first lines
-    after it, or (an ask) its '- ask <id>:' line."""
-    q = _QUOTED.search(text, start)
+    after it, or (an ask) its '- ask <id>:' line. A back-reference takes no inline code span: a
+    command is not the earlier text."""
+    quoted = _BLOCKS if back else _QUOTED
+    q = quoted.search(text, start)
     if q and not _STOP.search(text[start:q.start()]):
         return True
     first = next((ln for ln in after.splitlines() if ln.strip() and not re.fullmatch(r"\s*\(\d+/\d+\)\s*", ln)), "")
-    return bool(_QUOTED.search(first)) or bool(
+    return bool(quoted.search(first)) or bool(
         ids and all(re.search(rf"^\s*- ask\s+{i}:", text, re.M) for i in ids))
 
 
@@ -72,7 +76,7 @@ def backrefs(text: str, later: list[str] | tuple = ()) -> list[str]:
         after = text[eol + 1 if eol >= 0 else len(text):] + "\n" + tail
         item = re.search(_ITEM, m.group(0), re.I)
         ids = re.findall(r"\b\d+\b", m.group(0)) if item and item.group(0).lower().startswith("ask") else []
-        if (_attached(text, m.start(), after, ids) or (line_end.endswith(":") and has_content(after))
+        if (_attached(text, m.start(), after, ids, back) or (line_end.endswith(":") and has_content(after))
                 or (not back and re.match(r":\s*\S", line_end))):
             continue
         p = " ".join(m.group(0).split()) if back else \

@@ -112,10 +112,11 @@ def test_quoted_text_elsewhere_in_the_message_does_not_clear_a_pending_item():
     from ttp import quotefull
     for miss in (_MISS + " Task 12 landed on `main`.", "Ran `ttp status`; the draft for <name> is ready to send.",
                  "`ttp status` is fine. " + _MISS, "> a long quoted line\n" + _MISS + "\nBudget at 40%.",
-                 "Ask 12 is still open.\n- ask 13: Other?"):
+                 "Ask 12 is still open.\n- ask 13: Other?", "Drafts in my earlier messages, ready to send: `ttp approve 12`",
+                 "Apologies to A and B: drafts in my earlier messages, ready to send. Task 12 landed on `main`."):
         assert quotefull.backrefs(miss) != [], miss
     assert any("earlier messages" in b for b in quotefull.backrefs(_MISS + " Ran `ttp status`."))
-    for ok in (_MISS + _DRAFTS, "Drafts in my earlier messages, ready to send: `ttp approve 12`", "Ask 12 is still open.\n- ask 12: Reboot?",
+    for ok in (_MISS + _DRAFTS, _MISS + _DRAFTS + " Ran `ttp status`.", "Ask 12 is still open.\n- ask 12: Reboot?",
                "The draft for <name> is ready to send: `ttp approve 12`.", "Ask 14 is still open: approve the raise."):
         assert quotefull.backrefs(ok) == [], ok
 
