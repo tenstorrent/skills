@@ -32,7 +32,7 @@ _STATE = r"ready\s+to\s+send|still\s+open|still\s+pending|pending\s+your"
 _SPAN = r"(?:(?!,\s*(?:and|but|so|while)\b)[^.;:\n]){0,120}"   # one clause: no . ; : , and/but or line break
 _STATUS_PHRASE = re.compile(   # the item is the subject; only 'pending your <item>' names it after
     rf"\b(?:(?:{_ITEM})\b{_SPAN}\b(?:{_STATE})\b|pending\s+your\s+(?:{_ITEM})\b)", re.I)
-_NEGATED = re.compile(r"\b(?:no|none|nothing|not|zero|neither|nor)\b", re.I)
+_NEGATED = re.compile(r"\b(?:no|none|nothing|not|zero|0|neither|nor)\b", re.I)
 _OPENS = re.compile(r"(?:^|[\s(\[])['\"`‘“][^'\"`’”\n]{0,40}$")   # a quote mark opening a span, not an apostrophe
 _CLOSES = re.compile(r"^[^'\"`’”\n]{0,40}['\"`’”](?!\w)")
 _ASK_LINE = re.compile(r"^\s*- ask\s+\d+:", re.M)   # pendingask's expansion: the text of asks, nothing else
@@ -47,7 +47,8 @@ def backrefs(text: str, later: list[str] | tuple = ()) -> list[str]:
     tail = "\n".join(t or "" for t in later)
     found = [(m, True) for m in _POINT_BACK.finditer(text)] + [(m, False) for m in _STATUS_PHRASE.finditer(text)]
     for m, back in sorted(found, key=lambda f: f[0].start()):
-        clause = text[max(text.rfind(c, 0, m.start()) for c in ".;:,\n") + 1:m.end()]
+        clause = (text[max(text.rfind(c, 0, m.start()) for c in ".;:,\n") + 1:m.start()]   # an aside ', not sent yet,' never negates
+                  + re.sub(r",[^,]*,", " ", m.group(0)))
         if (not back and _NEGATED.search(clause)) or (   # named as an example: 'see above' in quotes
                 _OPENS.search(text[:m.start()]) and _CLOSES.search(text[m.end():])):
             continue
