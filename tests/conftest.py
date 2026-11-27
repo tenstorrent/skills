@@ -451,13 +451,12 @@ def tmp_path(request, tmp_path):
         return
     import shutil
     import tempfile
-    # The RAM disk is the last resort: the guard counts it as scratch, which the glm guard's escape cases cannot use.
-    for root in (os.environ.get("XDG_RUNTIME_DIR", ""), f"/run/user/{os.getuid()}", TMPFS):
-        if root and os.access(root, os.W_OK | os.X_OK) and (root == TMPFS or _away_from_tmp(Path(root, "x"))):
+    for root in (os.environ.get("XDG_RUNTIME_DIR", ""), f"/run/user/{os.getuid()}"):
+        if root and os.access(root, os.W_OK | os.X_OK) and _away_from_tmp(Path(root, "x")):
             break
     else:
-        pytest.fail("away_from_tmp needs a writable folder outside /tmp with no pytest file above it "
-                    f"($XDG_RUNTIME_DIR, {TMPFS})")
+        pytest.fail("away_from_tmp needs a writable runtime folder outside the guard's temp roots with no pytest "
+                    f"file above it ($XDG_RUNTIME_DIR or /run/user/{os.getuid()})")
     own = tempfile.mkdtemp(prefix="ttp-away-", dir=root)
     try:
         yield Path(os.path.realpath(own))
