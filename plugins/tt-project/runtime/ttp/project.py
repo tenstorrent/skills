@@ -3420,8 +3420,7 @@ _RUN_TMP = re.compile(r"^(.*/state/runs/\d+/tmp)(/|$)")   # a worker run's own s
 
 def run_tmp_refusal(entry: dict) -> str | None:
     """Why `entry` may not be registered, else None: a project folder inside a run's own tmp folder is scratch
-    that vanishes with the run, so it must not land in a registry outside that tmp (a debug run once left a stray
-    row in the real registry that way). A registry under the same tmp folder (a test's TTP_HOME) is fine."""
+    that vanishes with the run, so it must not land in a registry outside that tmp. A registry under the same tmp folder (a test's TTP_HOME) is fine."""
     m = _RUN_TMP.match(os.path.realpath(str(entry.get("dir") or "")))
     if m and not (os.path.realpath(str(HOME_DIR)) + "/").startswith(m.group(1) + "/"):
         return f"{entry['dir']} is inside a run's own tmp folder, but the registry {registry_path()} is not: use a TTP_HOME inside that tmp folder"

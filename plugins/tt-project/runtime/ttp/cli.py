@@ -611,9 +611,9 @@ def resolve(name: str, full: bool = False) -> tuple[Project | None, dict | None]
     cap = None if full else _env_s("TTP_CHATLOG_SEARCH_S", 10)
     hits = search_transcripts(name) if cap is None else search_transcripts(name, cap_s=cap)
     for hit in hits:
+        if run_tmp_refusal({"dir": hit["dir"]}):   # a scratch project of a run: the next hit may be real
+            continue
         if hit["host"] == hostname() and Project(hit["dir"]).exists():
-            if run_tmp_refusal({"dir": hit["dir"]}):   # a scratch project of a run: the next hit may be real
-                continue
             register(name, {"host": hostname(), "dir": str(Project(hit["dir"]).root)})
             _found_in_chat_log(name, hostname(), str(Project(hit["dir"]).root), hit["seen_in"])
             return Project(hit["dir"]), None
@@ -973,8 +973,11 @@ def scratch_dir(name: str) -> Path:
 def new_refusal(name: str, root: Path) -> str:
     """Why `ttp new <name>` at `root` is refused, else '': a project inside another project's folder (a scratch
     project made in a worktree or a harness) shares its parents with that project, and its remove or stop could
-    resolve to it; a name registered here for another folder that still holds that project would be taken over."""
+    resolve to it; a name registered here for another folder that still holds that project would be taken over;
+    a folder register() would refuse (inside a run's tmp folder) is refused here, before bootstrap writes it."""
     root = root.resolve()
+    if why := run_tmp_refusal({"dir": str(root)}):
+        return why
     inside = next((Project(d) for d in root.parents if Project(d).exists()), None)
     if inside is None:
         for other, entry in load_registry().get("projects", {}).items():

@@ -400,3 +400,24 @@ def test_adopt_into_a_registry_outside_a_runs_tmp_folder_is_refused_cleanly(env,
     with pytest.raises(SystemExit) as e:
         cli.main(["adopt", "demo", "--dir", str(scratch)])
     assert e.value.code != 0 and "not registering 'demo'" in capsys.readouterr().err
+
+
+def test_new_refuses_a_run_tmp_folder_before_writing_anything(env, monkeypatch, capsys):
+    import pytest
+    from ttp import cli, project
+    monkeypatch.setattr(project, "HOME_DIR", env["tmp"] / "real-home")
+    scratch = env["tmp"] / "state" / "runs" / "9" / "tmp" / "demo"
+    with pytest.raises(SystemExit) as e:
+        cli.main(["new", "demo", "--dir", str(scratch), "--no-service", "--provider", "fake"])
+    assert e.value.code == 2 and "TTP_HOME inside that tmp folder" in capsys.readouterr().err
+    assert not scratch.exists() and not (env["tmp"] / "real-home" / "registry.json").exists()
+
+
+def test_name_lookup_skips_a_remote_chat_log_hit_inside_a_run_tmp_folder(env, monkeypatch):
+    from ttp import cli, project
+    monkeypatch.setattr(project, "HOME_DIR", env["tmp"] / "real-home")
+    hits = [{"host": "elsewhere", "dir": str(env["tmp"] / "state" / "runs" / "4" / "tmp" / "demo"), "seen_in": "a", "mtime": 2},
+            {"host": "elsewhere", "dir": "/srv/demo", "seen_in": "b", "mtime": 1}]
+    monkeypatch.setattr(cli, "search_transcripts", lambda name, cap_s=None: hits)
+    p, entry = cli.resolve("demo")
+    assert p is None and entry["dir"] == "/srv/demo"
