@@ -281,7 +281,7 @@ def route_check(daemon) -> None:
     once the route answers (its answer moves the silence window)."""
     from . import ghroute
     alias = ghroute.route(getattr(daemon, "cfg", None), str(daemon.p.root))
-    st = {} if ghroute.local_ok() or not alias else ghroute.last_answer()
+    st = {} if ghroute.local_ok() or not alias else ghroute.last_answer(alias)
     db, now = daemon.p.db, time.time()
     if st.get("via") != alias or st.get("ok") is not True or not st.get("at"):
         db.set_kv(ROUTE_KEY, {})   # a route that never answered, or one failing every call: the
@@ -310,7 +310,8 @@ def overlap_check(daemon, gh) -> None:
     db = daemon.p.db
     own = {k: v for k, v in (db.kv(KEY, {}) or {}).items() if v.get("open")}
     files = {k: fs for k in own if (fs := _pr_files(db, gh, k, own[k].get("head"), str(daemon.p.root)))}
-    _host_write(daemon, {k: {"head": own[k].get("head"), "files": fs} for k, fs in files.items()})
+    if files:   # a blind sweep (no answer) keeps the last record instead of blanking the entry
+        _host_write(daemon, {k: {"head": own[k].get("head"), "files": fs} for k, fs in files.items()})
     known = _host_prs(time.time())
     had = set(db.kv(OVERLAP_KEY, {}) or {})
     pairs = []   # (a, b, shared files) of every overlapping pair this project has a say in

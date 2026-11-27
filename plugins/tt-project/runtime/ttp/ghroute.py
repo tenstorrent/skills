@@ -282,15 +282,24 @@ def _answered(rc: int) -> bool:
 
 def mark(ok: bool, home=None, via: str = "") -> None:
     """Record the route's last answer, host-wide (STATE), for the gh-auth alert: `via` names the route
-    that answered (an ssh alias, or WORKSTATION for the queue), so it counts only for that route."""
-    from . import ghauth
+    that answered (an ssh alias, or WORKSTATION for the queue), so it counts only for that route and
+    one project's route answering says nothing about another's."""
+    from .project import write_json
     try:
-        from .project import write_json
-        f = ghauth._home(home) / STATE
-        f.parent.mkdir(parents=True, exist_ok=True)
-        write_json(f, {"ok": ok, "at": time.time(), "via": via}, 0o600)
+        write_json(_state_path(home), {**_state_read(home), via: {"ok": ok, "at": time.time()}}, 0o600)
     except OSError:
         pass
+
+
+def _state_path(home) -> "os.PathLike":
+    from . import ghauth
+    return ghauth._home(home) / STATE
+
+
+def _state_read(home=None) -> dict:
+    """STATE's records, by route: a flat record (pre-per-route) counts for the route it names."""
+    st = last_answer(home)
+    return {st["via"]: {k: st[k] for k in ("ok", "at")}} if st.get("via") else {k: v for k, v in st.items() if k != "via"}
 
 
 def seen(rc: int, via: str = "") -> None:
@@ -300,23 +309,34 @@ def seen(rc: int, via: str = "") -> None:
         mark(_answered(rc), via=via)
 
 
-def last_answer(home=None) -> dict:
-    """The route's last recorded answer ({"ok", "at", "via"}), or {} when it has none."""
+def last_answer(via: str | None = None, home=None) -> dict:
+    """The record of one route's last answer ({"ok", "at", "via"}), or {} when it has none. With no
+    `via`, the file's single record whatever its route: the host-wide gh-auth read."""
     from . import ghauth
     try:
         st = json.loads((ghauth._home(home) / STATE).read_text())
     except (OSError, ValueError):
         return {}
-    return st if isinstance(st, dict) else {}
+    if not isinstance(st, dict):
+        return {}
+    if via is None:
+        return st
+    rec = st.get(via)
+    if not isinstance(rec, dict) and "via" in st:   # a pre-per-route record: flat, its own route only
+        rec = {k: st[k] for k in ("ok", "at")} if st.get("via") == via else None
+    return {"via": via, **rec} if isinstance(rec, dict) else {}
 
 
 def works(home=None, within_s: float = 3600, via: str | None = None) -> bool:
     """Whether a routed gh call succeeded here within `within_s` and none failed since; with `via`, only
     a call over that route counts (another project's route or the workstation queue answering is no
     route of this project's working)."""
-    st = last_answer(home)
-    return (st.get("ok") is True and time.time() - float(st.get("at") or 0) < within_s
-            and (via is None or st.get("via") == via))
+    if via is not None:
+        r = last_answer(via, home)
+        return r.get("ok") is True and time.time() - float(r.get("at") or 0) < within_s
+    st = last_answer(home)   # the whole record: every route's last answer
+    recs = [st] if st.get("via") else [v for v in st.values() if isinstance(v, dict)]
+    return any(r.get("ok") is True and time.time() - float(r.get("at") or 0) < within_s for r in recs)
 
 
 def live(cfg: dict | None = None, cwd: str | None = None) -> bool:
