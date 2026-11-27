@@ -7264,31 +7264,16 @@ def _checks_public_scan(p: Project | None, top: str, head: str, d: dict, target:
         return ""
 
 
-def _checks_continued_fork(p: Project, top: str, task: dict) -> str:
-    """The fork point recorded anywhere in the chain of tasks `task` continues (continues:<id>
-    labels): a continuing task inherits its lineage's fork point even when its own was never
-    recorded (the older task's worktree made before it, or its ref pruned with that worktree)."""
-    from . import db, worktree
-    seen: set[int] = set()
-    row: dict | None = task
-    while row and (cid := db.continues_id(row)) and cid not in seen:
-        seen.add(cid)
-        if fork := worktree.fork_point(Path(top), cid):
-            return fork
-        row = p.db.task(cid)
-    return ""
-
-
 def _checks_judge_base(p: Project, top: str, head: str, base: str) -> tuple[str, str]:
     """The commit the tests gate reruns failing tests on as the base of `head`, and why: the commit
     the head was built on. Its candidates, each only when it is an ancestor of the head: the fork point
     recorded when the task's worktree was made (worktree.fork_point, by TTP_TASK), or, for a task
     that continues another and has none of its own, the fork point recorded anywhere in the chain it
     continues; the head's merge base with the branch the task is stacked on (its pr_branch or
-    rebases branch, local then origin), these only for a task with a worktree of its own (not a
-    review or harness task); for that same continuing task with no fork point anywhere in its chain,
-    its merge base with the configured base (delivery.base_ref); else its merge base with `base`, the
-    push branch tip (as before: may be the head itself). The first of them wins, unless a later one
+    rebases branch, local then origin), these only for a task with a worktree of its own (a review
+    judges as the task it reviews; a harness task has none); for a continuing task with no fork point
+    anywhere in its chain, its merge base with delivery.base_ref when set; its merge base with `base`,
+    the push branch tip (as before: may be the head itself). The first of them wins, unless a later one
     descends from it (the head merged or was rebased onto a newer tip): then the newest. ("", why)
     when none is known: no base rerun."""
     from . import db, worktree
@@ -7310,10 +7295,10 @@ def _checks_judge_base(p: Project, top: str, head: str, base: str) -> tuple[str,
         # A review judges the change it reviews: its base is its subject's (the reviewed task's
         # fork point or continued chain), the same rule as any task of its own.
         task = p.db.task(subject) or task
-    from_push_branch = True   # a continuing task with no fork point anywhere is judged on its own base, not the push branch
     if task and task.get("kind") not in worktree.NEVER_OWN_KINDS:   # a review runs in the change's tree
         fork = worktree.fork_point(Path(top), task["id"])
-        inherited = "" if fork else _checks_continued_fork(p, top, task)
+        inherited = "" if fork else next((f for i in worktree.lineage(p, task) if i != task["id"]
+                                          and (f := worktree.fork_point(Path(top), i))), "")
         for cand, why in ((fork, f"the fork point recorded when task #{task['id']}'s worktree was made"),
                           (inherited, "the fork point the task it continues recorded")):
             if cand and under(cand):
@@ -7324,14 +7309,12 @@ def _checks_judge_base(p: Project, top: str, head: str, base: str) -> tuple[str,
             for ref in (f"refs/heads/{b}", f"refs/remotes/origin/{b}"):
                 if under(m := mb(ref)):
                     cands.append((m, f"its merge base with {ref.removeprefix('refs/')}, the branch it is stacked on"))
-        if db.continues_id(task) and not fork and not inherited:
-            # A task that continues another was built on its lineage's branch, not the push branch:
-            # its base is the configured base it branched from, never the push-branch merge base.
-            from_push_branch = False
-            if ref := worktree.named_base(p):
-                if under(m := mb(ref)):
-                    cands.append((m, f"its merge base with {ref}, the branch code tasks branch from"))
-    if from_push_branch and base and (m := mb(base)) and (m == head or under(m)):
+        if db.continues_id(task) and not fork and not inherited \
+                and (ref := (p.config().get("delivery") or {}).get("base_ref")) and under(m := mb(ref)):
+            # A continuing task with no fork point anywhere was built on the configured base, whose
+            # merge base is newer than the push branch's when the push branch lacks the base's commits.
+            cands.append((m, f"its merge base with {ref}, the branch code tasks branch from"))
+    if base and (m := mb(base)) and (m == head or under(m)):
         cands.append((m, "its merge base with the push branch"))
     if not cands:
         return "", "; ".join(notes + ["no base known: no base rerun"])
