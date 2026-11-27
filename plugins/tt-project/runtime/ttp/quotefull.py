@@ -49,16 +49,15 @@ _BARE = re.compile(_EARLIER.replace("|see", ""), re.I)   # points back only with
 _PENDING = re.compile(rf"\b{_ITEM}|{_AWAITS}", re.I)
 
 
-def _attached(text: str, start: int, after: str, back: bool, colon: bool) -> bool:
+def _attached(text: str, start: int, after: str, back: bool) -> bool:
     """Whether quoted text belongs to the phrase at `start`: in its own sentence, or as the first line
-    after it (a block or long quote; a code span only as the whole line or after a closing ':'). A
+    after it (a block or long quote; a code span only as the whole line). A
     back-reference takes no inline code span: a command is not the earlier text."""
     q = (_BLOCKS if back else _QUOTED).search(text, start)
     if q and not _STOP.search(text[start:q.start()]):
         return True
     first = next((ln for ln in after.splitlines() if ln.strip() and not part_of(ln)), "")
-    return bool(_BLOCKS.search(first) or (not back and (
-        re.fullmatch(r"\s*`[^`\n]+`\s*", first) or (colon and _QUOTED.search(first)))))
+    return bool(_BLOCKS.search(first) or (not back and re.fullmatch(r"\s*`[^`\n]+`\s*", first)))
 
 
 def backrefs(text: str, later: list[str] | tuple = ()) -> list[str]:
@@ -86,7 +85,7 @@ def backrefs(text: str, later: list[str] | tuple = ()) -> list[str]:
             hi = _STOP.search(text, m.end())
             if not _PENDING.search(text[lo:hi.start() if hi else len(text)]) and not line_end.endswith(":"):
                 continue
-        if (_attached(text, m.start(), after, back, line_end.endswith(":")) or (not back and line_end.endswith(":") and has_content(after))
+        if (_attached(text, m.start(), after, back) or (not back and line_end.endswith(":") and has_content(after))
                 or (not back and re.match(r":\s*\S", line_end))):
             continue
         p = " ".join(m.group(0).split()) if back else \
