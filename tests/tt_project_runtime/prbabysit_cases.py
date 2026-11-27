@@ -722,6 +722,9 @@ def test_prbabysit_a_persons_thread_is_answered_by_the_pr_author_or_a_run_replyi
         == [url], "the person asking again after the answer reopens it"
     assert watchers.human_open(_pb_top_graph(threads=[[ask, (author, "Reused.")]], author="")) == [url], \
         "with the PR author unknown only the runs' marked reply answers"
+    assert watchers.human_open(_pb_top_graph(threads=[[(author, "Rename this before release.")]])) == [url], \
+        "a thread the PR author starts stays open until someone replies"
+    assert watchers.human_open(_pb_top_graph(threads=[[(author, "Context for reviewers <!-- ttp -->")]])) == []
 
 
 def test_prbabysit_a_not_run_condition_that_returns_on_the_same_head_alerts_again_and_a_text_change_does_not(env, monkeypatch):

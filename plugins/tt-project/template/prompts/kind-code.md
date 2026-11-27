@@ -96,5 +96,6 @@
 - Description: 2-3 sentences of why, then the change and its tests; no run, task or review ids
   (`gh` refuses them). Keep it and your PR comments current.
 - Every PR comment or review you post ends with the hidden line `<!-- ttp -->`, so the PR watcher
-  skips it.
+  skips it. Answer a bot's top-level comment by quoting it (a `>` line of its words) or linking its
+  URL: the watcher counts nothing else as an answer to it.
 - NEVER merge, unless the charter lists this repo for auto-merge.

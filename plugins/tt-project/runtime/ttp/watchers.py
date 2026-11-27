@@ -259,14 +259,17 @@ def body_stale(pr: dict, bodies: dict, heads: dict, now: float) -> str:
 
 def human_open(data: dict | None) -> list[str]:
     """URLs of review threads a person started that are unresolved, not outdated and not answered: the
-    last person to post in the thread is neither the PR's author nor a run (the hidden line <!-- ttp -->).
-    A bot posting after the answer does not reopen it; the person asking again does."""
+    last person to post in the thread is neither a run (the hidden line <!-- ttp -->) nor the PR's author
+    replying. A thread the PR's author starts is open until someone replies (runs may share the author's
+    gh account). A bot posting after the answer does not reopen it; the person asking again does."""
     pr = (((data or {}).get("data") or {}).get("repository") or {}).get("pullRequest") or {}
     out = []
     for th in (pr.get("reviewThreads") or {}).get("nodes") or []:
         cs = (th.get("comments") or {}).get("nodes") or []
+        people = [c for c in cs if not _is_bot(c.get("author"))]
         if (cs and not _is_bot(cs[0].get("author")) and not th.get("isResolved") and not th.get("isOutdated")
-                and not _own([c for c in cs if not _is_bot(c.get("author"))][-1], pr)):
+                and not (TTP_MARKER in str(people[-1].get("body") or "")
+                         or len(people) > 1 and _own(people[-1], pr))):
             out.append(cs[0].get("url") or "?")
     return out
 
