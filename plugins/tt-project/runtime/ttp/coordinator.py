@@ -147,6 +147,7 @@ from . import wakecost
 from . import spans
 from . import coordtools
 from . import pointers
+from . import quotefull
 from . import ctxblock
 from . import overlap as file_overlap   # apply() has a local `overlap`
 from . import screen as scr
@@ -3049,6 +3050,8 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                                             batch_tasks, notes)
                 a["text"] = _wakemode_checked(p, a["text"], notes)
                 a["text"] = _pending_checked(p, a["text"], notes, "reply")
+                if why := quotefull.refused(a["text"], "reply"):
+                    raise ValueError(why)
                 a["text"], false = _claims_checked(p, a, notes)
                 a["text"] = _deploy_checked(p, a["text"], notes, a.get("claims"))
                 if (text := chatdigest.checked(db, cfg, a["text"], a, chat, notes, twins=(dup := []))) is None:
@@ -3987,6 +3990,8 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                 a["text"] = _onhost_checked(p, a["text"], None, a, order[k + 1:], batch_tasks, notes)
                 a["text"] = _wakemode_checked(p, a["text"], notes)
                 a["text"] = _pending_checked(p, a["text"], notes, "notify")
+                if why := quotefull.refused(a["text"], "notify"):
+                    raise ValueError(why)
                 a["text"], false = _claims_checked(p, a, notes)
                 a["text"] = _deploy_checked(p, a["text"], notes, a.get("claims"))
                 if (text := chatdigest.checked(db, cfg, a["text"], a, None, notes)) is None:

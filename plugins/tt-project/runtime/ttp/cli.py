@@ -3294,6 +3294,10 @@ def cmd_urgent_reply(a) -> None:
         die("ttp urgent-reply: the text is empty")
     if why := msgparts.too_long(text, "ttp urgent-reply"):
         die(why)
+    from . import pendingask, quotefull, waits
+    text, _ = pendingask.expand(text, waits.open_asks(p.db), "urgent reply")
+    if why := quotefull.refused(text, "urgent reply"):
+        die(why)
     ids = msgparts.post(p.db, text, chat=chat, kind="reply", severity="normal")
     print(f"posted ({', '.join(f'#{i}' for i in ids)})")
 
