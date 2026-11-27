@@ -10,22 +10,24 @@
 # is too long for a socket path (104 bytes with its NUL on macOS: <dir>/ + 40 for %C + a 17-character
 # suffix ssh adds while it binds leaves 45 for <dir>).
 # The backoff and lock key is the destination with characters outside ASCII letters, digits and ._@- replaced by _.
-# The user's~/.ssh is never read or written here; -F, ProxyJump and BatchMode pass through.
+# The user's ssh config folder is never read or written here; -F, ProxyJump and BatchMode pass through.
 # Left as is: TTP_SSH_REUSE=0 (config ssh.reuse off); a call that sets its own sharing (-S, -M, -O,
 # ControlMaster, ControlPath) or forwards ports or stdio (-L -R -D -W -w -N -f: a forward added to a
 # shared connection would outlive the command); -v (a verbose master keeps the caller's stderr open for
 # its 10 minutes, so a captured call would hang); -G, -V, -Q. OpenSSH also reads options given after
 # the destination, up to the remote command (ssh box -p 2222 cmd): those get the same reading, and a call
-# with any of them runs with the mux options but opens no master itself, since a master opened from the
-# words up to the destination would drop them. The remote command's own words are never read.
+# with any of them runs with the mux options but opens no -fN master under the lock, since a master opened
+# from the words up to the destination would drop them (ControlMaster=auto can still make that call a
+# master itself). The remote command's own words are never read.
 # The real ssh replaces this script (exec) for the command itself, so the caller's pid is ssh's own: a
 # kill of the caller (SIGTERM, a timeout's SIGKILL) stops ssh and its remote command, never only the
 # wrapper. A file in the folder that is no socket (ssh would then run unshared on every call) is removed
 # before ssh starts.
 # Hosts limit connection starts (sshd MaxStartups), so no call opens a second connection: while no master
-# is up for the destination, calls queue on one flock (<dir>/<destination>.lock, skipped where there is no
-# flock) and the first opens the master (ssh -fN, command-less, lock not inherited); the rest find it up
-# and reuse it. A start that ends 255 with a refusal line (Exceeded MaxStartups, Connection reset,
+# is up for the destination, calls queue on one flock (<dir>/<destination>.lock; where there is none, a mkdir lock,
+# <destination>.lockd holding the holder's pid, taken over once that pid is gone, or after 30 s with no pid
+# file) and the first opens the master (ssh -fN, command-less, lock not inherited); the rest find it up
+# and reuse it. A killed call removes its temp files; the folder cleanup drops those of a dead pid. A start that ends 255 with a refusal line (Exceeded MaxStartups, Connection reset,
 # Connection closed by remote host, banner exchange, kex_exchange_identification) writes the backoff
 # record <tt-project home>/ssh-backoff/<destination> ("<until epoch> <step seconds>", destination with
 # characters outside A-Za-z0-9._@- as _; the home is $TTP_HOME, else ~/.tt-project), shared by every
@@ -122,7 +124,13 @@ fi
 mux="-o ControlMaster=auto -o ControlPath=$dir/%C -o ControlPersist=600 -o ServerAliveInterval=15 -o ServerAliveCountMax=3"
 set +f
 for f in "$dir"/* "$dir"/.[!.]*; do
-    case $f in *.lock|*.err|*.fail*) continue ;; esac
+    case $f in
+    *.lock|*.fail) continue ;;
+    *.err|*.fail.*) p=${f##*.}
+        [ "$p" != err ] || { p=${f%.err}; p=${p##*.}; }
+        case $p in ''|*[!0-9]*) ;; *) kill -0 "$p" 2>/dev/null || rm -f "$f" ;; esac
+        continue ;;
+    esac
     [ -e "$f" ] || [ -L "$f" ] || continue
     { [ -S "$f" ] && ! [ -L "$f" ]; } || [ -d "$f" ] || rm -f "$f"
 done
@@ -146,8 +154,12 @@ if [ -n "$dest" ]; then
         k=$1; shift; j=$k; err=$dir/$key.$$.err
         while [ $j -gt 0 ]; do set -- "$@" "$1"; shift; j=$((j - 1)); done
         shift $(($# - k))
-        "$real" $mux -fN "$@" </dev/null >/dev/null 2>"$err" 9>&-
+        # In the background so a kill of this call is handled at once, not after the start ends.
+        "$real" $mux -fN "$@" </dev/null >/dev/null 2>"$err" 9>&- &
+        cpid=$!
+        wait $cpid
         rc=$?
+        cpid=
         cat "$err" >&2
         if [ $rc -eq 0 ]; then rm -f "$err" "$failf"; [ ! -e "$rec" ] || rm -f "$rec"; return 0; fi
         if [ $rc -eq 255 ] && grep -qiE 'Exceeded MaxStartups|Connection reset|Connection closed by remote host|banner exchange|kex_exchange_identification' "$err"; then
@@ -165,16 +177,43 @@ if [ -n "$dest" ]; then
         unlock
         exit $rc
     }
-    # Without flock (macOS) a mkdir lock stands in, taken over after 30 s so a killed holder never wedges it.
+    # Without flock (macOS) a mkdir lock stands in. Its folder holds the holder's pid; a waiter takes the
+    # lock over once that pid is gone, or, with no pid file seen for 30 s, once the holder cannot have
+    # written it, so a killed holder never wedges it and a slow one never loses it.
     lock() {
-        if command -v flock >/dev/null 2>&1; then exec 9>"$dir/$key.lock"; flock 9; return; fi
-        i=0
-        until mkdir "$dir/$key.lockd" 2>/dev/null; do
-            i=$((i + 1)); [ $i -le 300 ] || { rmdir "$dir/$key.lockd" 2>/dev/null; i=0; }
-            sleep 0.1
-        done
+        if command -v flock >/dev/null 2>&1; then
+            exec 9>"$dir/$key.lock"; flock 9
+        else
+            ld=$dir/$key.lockd; j=0
+            until mkdir "$ld" 2>/dev/null; do
+                hp=; read -r hp 2>/dev/null < "$ld/pid"
+                if [ -n "$hp" ]; then
+                    j=0
+                    ! kill -0 "$hp" 2>/dev/null || { sleep 0.1; continue; }
+                else
+                    j=$((j + 1)); [ $j -gt 300 ] || { sleep 0.1; continue; }
+                fi
+                [ "$(cat "$ld/pid" 2>/dev/null)" != "$hp" ] || { rm -f "$ld/pid"; rmdir "$ld" 2>/dev/null; }
+                j=0
+            done
+            echo $$ > "$ld/pid"
+        fi
+        held=1
+        trap 'exit 130' INT
+        trap 'exit 143' TERM
+        trap cleanup EXIT
     }
-    unlock() { exec 9>&-; rmdir "$dir/$key.lockd" 2>/dev/null; }
+    unlock() {
+        [ -n "$held" ] || return 0
+        held=; exec 9>&-
+        rm -f "$dir/$key.lockd/pid"; rmdir "$dir/$key.lockd" 2>/dev/null
+    }
+    # A killed call leaves no temp file, no lock and no start of its own behind.
+    cleanup() {
+        [ -z "$cpid" ] || kill "$cpid" 2>/dev/null
+        rm -f "$dir/$key.$$.err" "$failf.$$"
+        unlock
+    }
     if [ -n "$post" ]; then
         ! backing || exit 255
     elif up "$@"; then

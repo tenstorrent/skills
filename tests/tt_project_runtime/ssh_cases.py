@@ -879,7 +879,9 @@ def test_a_backoff_record_is_per_destination_and_survives_the_socket_folder_clea
     assert (short_cm / "box-a.lock").exists() and _backoff_rec(tmp_path) is not None
 
 
-def test_parallel_ssh_wrapper_calls_open_one_master_on_a_host_without_flock(tmp_path, short_cm):
+def _no_flock_env(tmp_path, short_cm, fast_poll=False, **extra):
+    """The wrapper and its environment on a host without flock; fast_poll shrinks the lock's 0.1 s poll to 2 ms."""
+    import shutil
     import subprocess
     nof = tmp_path / "noflock"
     nof.mkdir()
@@ -887,10 +889,90 @@ def test_parallel_ssh_wrapper_calls_open_one_master_on_a_host_without_flock(tmp_
         for f in pathlib.Path(d).iterdir():
             if f.name != "flock" and not (nof / f.name).is_symlink():
                 (nof / f.name).symlink_to(f)
-    w, e = _wrapper_env(tmp_path, FAKE_MASTER=tmp_path / "master", TTP_SSH_CM_DIR=short_cm, FAKE_OPEN_DELAY=0.5)
+    w, e = _wrapper_env(tmp_path, FAKE_MASTER=tmp_path / "master", TTP_SSH_CM_DIR=short_cm, **extra)
     e["PATH"] = f"{w.parent}:{tmp_path / 'rbin'}:{nof}"
+    if fast_poll:
+        fast = tmp_path / "fast"
+        fast.mkdir()
+        (fast / "sleep").write_text(f'#!/bin/sh\n[ "$1" = 0.1 ] && set -- 0.002\nexec {shutil.which("sleep")} "$@"\n')
+        (fast / "sleep").chmod(0o755)
+        e["PATH"] = f"{fast}:{e['PATH']}"
     assert subprocess.run(["sh", "-c", "command -v flock"], env=e).returncode != 0
+    return w, e
+
+
+def _dead_pid():
+    import subprocess
+    p = subprocess.Popen(["true"])
+    p.wait()
+    return p.pid
+
+
+def test_parallel_ssh_wrapper_calls_open_one_master_on_a_host_without_flock(tmp_path, short_cm):
+    import subprocess
+    w, e = _no_flock_env(tmp_path, short_cm, FAKE_OPEN_DELAY=0.5)
     procs = [subprocess.Popen([str(w), "box-a", "true"], env=e, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
              for _ in range(8)]
     assert [p.wait(timeout=30) for p in procs] == [0] * 8
     assert len(_opens((tmp_path / "log").read_text().splitlines())) == 1 and not (short_cm / "box-a.lockd").exists()
+
+
+def test_a_mkdir_lock_whose_holder_is_dead_is_taken_over_at_once(tmp_path, short_cm):
+    import subprocess
+    w, e = _no_flock_env(tmp_path, short_cm)
+    (short_cm / "box-a.lockd").mkdir()
+    (short_cm / "box-a.lockd" / "pid").write_text(f"{_dead_pid()}\n")
+    r = subprocess.run([str(w), "box-a", "true"], env=e, timeout=10)
+    assert r.returncode == 0 and len(_opens((tmp_path / "log").read_text().splitlines())) == 1
+    assert not (short_cm / "box-a.lockd").exists()
+
+
+def test_a_mkdir_lock_is_kept_while_its_holder_runs_however_long_it_takes(tmp_path, short_cm):
+    """The first call holds the lock through a 6 s start; with a 2 ms poll the second waits through well over
+    300 polls (the old 30 s takeover) and must still not open a second master beside it."""
+    import subprocess
+    import time
+    w, e = _no_flock_env(tmp_path, short_cm, fast_poll=True, FAKE_OPEN_DELAY=6)
+    first = second = subprocess.Popen([str(w), "box-a", "true"], env=e)
+    try:
+        end = time.monotonic() + 10
+        while not (short_cm / "box-a.lockd").exists() and time.monotonic() < end:
+            time.sleep(0.02)
+        second = subprocess.Popen([str(w), "box-a", "true"], env=e)
+        assert first.wait(timeout=30) == 0 and second.wait(timeout=30) == 0
+    finally:
+        for p in (first, second):
+            if p.poll() is None:
+                p.kill()
+    assert len(_opens((tmp_path / "log").read_text().splitlines())) == 1
+
+
+def test_a_killed_ssh_wrapper_leaves_no_temp_file_lock_or_start_behind(tmp_path, short_cm):
+    import signal
+    import subprocess
+    import time
+    w, e = _wrapper_env(tmp_path, FAKE_MASTER=tmp_path / "master", TTP_SSH_CM_DIR=short_cm, FAKE_OPEN_DELAY=5)
+    proc = subprocess.Popen([str(w), "box-a", "true"], env=e)
+    try:
+        end = time.monotonic() + 10
+        while not list(short_cm.glob("box-a.*.err")) and time.monotonic() < end:
+            time.sleep(0.02)
+        assert list(short_cm.glob("box-a.*.err"))                  # killed in the middle of its start
+        proc.send_signal(signal.SIGTERM)
+        assert proc.wait(timeout=2) != 0
+    finally:
+        proc.kill()
+        proc.wait()
+    assert not [f.name for f in short_cm.iterdir() if f.name.endswith(".err") or ".fail." in f.name]
+
+
+def test_the_socket_folder_cleanup_drops_temp_files_of_a_dead_pid_and_keeps_a_live_ones(tmp_path, short_cm):
+    import os
+    import subprocess
+    w, e = _wrapper_env(tmp_path, TTP_SSH_CM_DIR=short_cm)
+    dead, live = _dead_pid(), os.getpid()
+    names = [f"box-a.{dead}.err", f"box-a.fail.{dead}", f"box-a.{live}.err", f"box-a.fail.{live}", "box-a.fail"]
+    for n in names:
+        (short_cm / n).write_text("x\n")
+    assert subprocess.run([str(w), "box-a", "true"], env=e, timeout=10).returncode == 0
+    assert sorted(f.name for f in short_cm.iterdir()) == sorted(names[2:])
