@@ -23598,13 +23598,29 @@ def _relanded_change(env, monkeypatch, n, behind=0):
     return p, branch, _git_out(path, "rev-parse", "HEAD"), relanded
 
 
-def test_landed_equivalent_with_a_push_branch_far_behind_still_finds_the_change_in_time(env, monkeypatch):
+def test_landed_equivalent_with_the_change_beyond_the_push_branch_scan_has_no_answer_in_time(env, monkeypatch):
     from ttp import landed
     p, branch, head, relanded = _relanded_change(env, monkeypatch, 2, behind=2100)
     start = time.monotonic()
     found = landed.equivalent(p, branch, None)
     assert time.monotonic() - start < 10
     assert found is None   # the 500 newest commits do not reach it: no answer, never landed
+
+
+def test_landed_equivalent_of_a_task_branch_thousands_of_commits_ahead_has_no_answer_in_time(env, monkeypatch):
+    from ttp import landed
+    p, repo, origin, other = _push_setup(env, monkeypatch, ["true"])
+    tid, path, branch = _code_task(p, "long branch", status="review")
+    stream = [f"commit refs/heads/{branch}\ncommitter t <t@t> {1_700_000_000 + i} +0000\ndata 1\nx\n"
+              + (f"from {_git_out(path, 'rev-parse', 'HEAD')}\n" if i == 0 else "") + f"M 644 inline own/{i}.txt\ndata 2\nx\n\n"
+              for i in range(2100)]
+    subprocess.run(["git", "-C", str(path), "fast-import", "--quiet", "--force"], input="".join(stream), text=True, check=True)
+    _git_out(path, "reset", "-q", "--hard", branch)
+    _git_out(other, "push", "-q", "origin", "HEAD:proj")
+    _git_out(repo, "fetch", "-q", "origin")
+    start = time.monotonic()
+    assert landed.equivalent(p, branch, None) is None
+    assert time.monotonic() - start < 10
 
 
 def test_landed_equivalent_over_its_commit_bound_has_no_answer_never_landed(env, monkeypatch):
