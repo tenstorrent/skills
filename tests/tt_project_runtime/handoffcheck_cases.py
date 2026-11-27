@@ -783,6 +783,48 @@ def test_the_new_test_check_still_wants_a_base_failing_run_for_a_continued_tasks
     assert handoffcheck.verdict(p, {}, new, {"status": "done", "self_check": ran}, None) == {}
 
 
+def test_the_new_test_check_passes_a_branch_started_on_a_newer_base_with_no_commit_of_its_own(env):
+    """A branch whose spec started it on a head of the remote's main, newer than its recorded fork and than
+    the stale local main, adds no commit of its own: the tests that head added are not the task's."""
+    from ttp import handoffcheck
+    p, git, commit = _scope_repo(env)
+    main = git("rev-parse", "--abbrev-ref", "HEAD")
+    fork = git("rev-parse", "HEAD")
+    git("checkout", "-q", "-b", "upstream-main")
+    newer = commit("tests/test_from_main.py", "def test_main_one():\n    assert True\n")
+    git("update-ref", "refs/remotes/origin/main", newer)
+    git("branch", "ttp/spec-start")
+    git("checkout", "-q", main)
+    git("branch", "-D", "upstream-main")
+    task = _scope_task(p, "ttp/spec-start", fork)
+    assert handoffcheck.verdict(p, {}, task, {"status": "done"}, None) == {}
+
+
+def test_the_new_test_check_skips_the_remotes_main_merged_over_a_stale_local_main(env):
+    """Local main is behind the remote's main and the branch merged the remote's: the tests that brought in
+    are not the task's; a test the branch's own commit adds still owes a base-failing run."""
+    from ttp import handoffcheck
+    p, git, commit = _scope_repo(env)
+    main = git("rev-parse", "--abbrev-ref", "HEAD")
+    fork = git("rev-parse", "HEAD")
+    git("checkout", "-q", "-b", "upstream-main")
+    newer = commit("tests/test_from_main.py", "def test_main_one():\n    assert True\n")
+    git("update-ref", "refs/remotes/origin/main", newer)
+    git("checkout", "-q", "-b", "ttp/stale-main", fork)
+    commit("src_stale.py", "x = 1\n")
+    git("merge", "-q", "--no-edit", "origin/main")
+    git("checkout", "-q", main)
+    git("branch", "-D", "upstream-main")
+    task = _scope_task(p, "ttp/stale-main", fork)
+    assert handoffcheck.verdict(p, {}, task, {"status": "done"}, None) == {}
+    git("checkout", "-q", "ttp/stale-main")
+    commit("tests/test_mine.py", "def test_mine_one():\n    assert True\n")
+    git("checkout", "-q", main)
+    got = handoffcheck.verdict(p, {}, task, {"status": "done"}, None)
+    assert got["failed"]["name"] == handoffcheck.CODE_CHECK, got
+    assert "test_mine_one" in got["failed"]["output"] and "test_main_one" not in got["failed"]["output"], got
+
+
 def test_the_stop_hook_refuses_a_code_hand_off_adding_a_test_with_no_base_failing_run(env, monkeypatch):
     """With no project checks configured at all, the Stop hook still refuses a code hand-off whose new
     test shows no run failing on the base, and lets it through once the run line is in self_check."""

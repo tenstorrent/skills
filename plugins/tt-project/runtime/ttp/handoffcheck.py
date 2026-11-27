@@ -27,7 +27,7 @@ gate. A check sees AT_ENV=stop there, with the run's own variables (RUN_VARS) le
 
 A code task's hand-off also meets one built-in check (builtin_check, no setting): it must show a run line
 of its new tests failing on the base commit (new_test_gap), whatever ran it, counting only the tests its own
-commits add (_own_tests: never those unchanged in the accepted head it continues or in base it merged in); a run on the GLM model is checked
+commits add (_own_tests: never those a known base or the accepted head it continues already reaches); a run on the GLM model is checked
 further: its branch's added test lines must not name the real /tmp, /home, ~ or Path.home()
 (glm_test_hygiene), its added comments and docstrings must state the rule and never tell what happened
 (slop.new_noisy), and its hand-off must name each numbered spec step (handoff_gaps). A failure sends back like a project check, under
@@ -233,31 +233,30 @@ def _branch_diff(p: Project, task: dict):
 
 
 def _own_tests(p: Project, task: dict, root: Path, head: str, fork: str) -> set | None:
-    """The (path, test) pairs the task's own commits add: those its diff from every scope base adds, where a
-    scope base is the accepted head it continues (worktree.continued_head, unless it shares this task's branch)
-    and the base branch it merged in (merge-base with worktree.resolve_base), each an ancestor of head other
-    than the fork. A definition unchanged there is inherited. None (count all) when there is no such base or
-    git cannot tell."""
+    """The (path, test) pairs the task's own commits add: those of its non-merge commits that no known base
+    reaches (`git log <head> --not <bases>`). The bases are the recorded fork, the resolved base, the remote's
+    default branch, main, master, the push branch, delivery.base_ref and worktree.shared_branches (each local and
+    on origin) and the accepted head it continues (worktree.continued_head, unless it shares this task's branch).
+    A test a base holds is inherited, whether a merge brought it or the branch started past the fork. None
+    (count all) when git cannot tell."""
     from . import worktree
-    git = lambda *a: subprocess.run(["git", "-C", str(root), *a], capture_output=True, text=True,   # noqa: E731
-                                    timeout=DEFAULT_TIMEOUT_S)
+    git = lambda *a, **k: subprocess.run(["git", "-C", str(root), *a], capture_output=True, text=True,   # noqa: E731
+                                         timeout=DEFAULT_TIMEOUT_S, **k)
     try:
         old = p.db.task(worktree.continues_id(task)) if worktree.continues_id(task) else None
         accepted = worktree.continued_head(p, task) if old and old.get("branch") != task.get("branch") else None
         try:
             main = worktree.resolve_base(p)
-        except RuntimeError:   # no base branch here: the accepted head alone still scopes it
+        except RuntimeError:   # no base branch here: the other bases still scope it
             main = ""
-        merged = git("merge-base", main, head).stdout.strip() if main else ""
-        own = None
-        for base in dict.fromkeys(b for b in (accepted, merged) if b):
-            if git("rev-parse", base).stdout.strip() == git("rev-parse", fork).stdout.strip() \
-                    or git("merge-base", "--is-ancestor", base, head).returncode != 0:
-                continue
-            got = git("diff", "--no-color", "--no-ext-diff", "-U0", base, head)
-            if got.returncode == 0:
-                own = set(_new_tests(got.stdout)) if own is None else own & set(_new_tests(got.stdout))
-        return own
+        names = [n for b in sorted(worktree._shared_branches(p)) for n in (b, f"origin/{b}")]
+        cands = list(dict.fromkeys(c for c in (fork, accepted, main, "origin/HEAD", *names) if c))
+        found = git("cat-file", "--batch-check=%(objectname)", input="".join(f"{c}^{{commit}}\n" for c in cands))
+        bases = [line for line in found.stdout.splitlines() if line and " " not in line]   # "<name> missing"
+        if found.returncode != 0 or not bases:
+            return None
+        got = git("log", "-p", "--no-merges", "--no-color", "--no-ext-diff", "-U0", "--format=", head, "--not", *bases)
+        return set(_new_tests(got.stdout)) if got.returncode == 0 else None
     except (OSError, RuntimeError, subprocess.SubprocessError):   # git cannot tell: every new test counts
         return None
 
