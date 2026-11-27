@@ -1,11 +1,11 @@
 """Two checks on how the coordinator reads a user's or relayed message.
 
-`line`: a relayed order that names a model is compared with the model pins on record (memory entries of
+`pin_line`: a relayed order that names a model is compared with the model pins on record (memory entries of
 kind preference, decision or restriction, the config's tier models and the route settings' models), and a
 name no pin holds gets one digest line, so the coordinator sees the clash before it acts on the order.
 
-`order`: a message that is only a stop order or added scope, with nothing contradicting a fact, status or
-figure the project stated, is an order and no correction (correction.answers reads it).
+`opens_order`: a clause that opens a stop order or added scope (correction.answers reads it: a message with
+such a clause and nothing contradicting a fact, status or figure the project stated is an order, no correction).
 """
 from __future__ import annotations
 
@@ -18,8 +18,6 @@ FAMILIES = frozenset("opus sonnet haiku fable codex gemini composer glm gpt".spl
 _STOP = ("stop", "don't", "do not", "dont", "never", "halt", "pause", "cancel", "hold off", "no more")
 _ADD = ("also", "and also", "additionally", "in addition", "plus", "add", "now also", "one more", "as well")
 _LEAD = re.compile(r"^\W*(?:(?:no|nope|ok|okay|and|but|please|pls)\b\W*)+", re.I)
-_AMBIGUOUS = ("no, ", "nope", "actually,")   # a bare rejection may open an order ('no, stop that')
-_CLAUSE = re.compile(r"(?<=[?!;\n])|\.(?:\s+|$)")
 
 
 def _toks(name: str) -> list[str]:
@@ -65,11 +63,16 @@ def pins(p) -> list[tuple[str, str]]:
 
 def pin_line(p, text: str) -> str:
     """'relayed order names <model>; pin on record is <model> (<where>)' for the first model `text` names
-    that no pin on record holds, or '' (no model named, no pin on record, or every name matches a pin)."""
+    that no pin on record holds, or '' (no model named, no pin on record, or every name matches a pin). A
+    'name-4'-shaped word counts as a model only in a known family or the family of a pin on record (`step-4` is no model)."""
     held = pins(p)
     if not held:
         return ""
-    for name in model_names(text, relay.pin_terms(p.config())):
+    terms = relay.pin_terms(p.config())
+    families = {_model_family(pin) for pin, _ in held}
+    for name in model_names(text, terms):
+        if name not in terms and _model_family(name) not in FAMILIES | families:
+            continue
         if any(_is_pin(name, pin) for pin, _ in held):
             continue
         pin, where = next((x for x in held if _model_family(x[0]) == _model_family(name)), held[0])
@@ -77,19 +80,7 @@ def pin_line(p, text: str) -> str:
     return ""
 
 
-def is_order(text: str) -> bool:
-    """Whether `text` is a stop order or added scope and contradicts nothing the project stated: some clause
-    opens with a stop or add word (after a bare 'no' or 'and'), and none holds a rejection of earlier output
-    (correction.REJECTS besides the bare ones, or a clause that is only 'no')."""
-    from . import correction
-    factual = tuple(x for x in correction.REJECTS if x not in _AMBIGUOUS)
-    found = False
-    for part in _CLAUSE.split(str(text or "").replace("’", "'")):
-        low = " ".join(part.lower().split())
-        if not low or low.endswith("?"):
-            continue
-        if re.fullmatch(r"(no|nope|wrong)\W*", low) or any(x in low + " " for x in factual):
-            return False
-        rest = _LEAD.sub("", low)
-        found = found or any(rest == w or rest.startswith(w + " ") for w in _STOP + _ADD)
-    return found
+def opens_order(clause: str) -> bool:
+    """Whether the lowercase `clause` opens with a stop or add word (after a bare 'no' or 'and')."""
+    rest = _LEAD.sub("", clause)
+    return any(rest == w or rest.startswith(w + " ") for w in _STOP + _ADD)

@@ -43,6 +43,7 @@ import json
 import re
 import time
 
+from . import relaypin
 from .db import DB
 
 KEY = "corrections"   # kv: [{"msg", "ts", "why", "fix", "shown"}], newest last
@@ -116,7 +117,7 @@ _CLAUSE = re.compile(r"(?<=[?!;\n])|\.(?:\s+|$)")   # a dot inside a key or vers
 # correction by arriving during an open stall: a new instruction or a question there is not one.
 REJECTS = ("that's wrong", "that is wrong", "is wrong", "was wrong", "not true", "not what i", "not right",
            "incorrect", "that's not", "that is not", "you said", "you claimed", "you reported", "you wrote",
-           "but you", "no, ", "nope", "actually,")
+           "but you", "no, ", "nope", "actually,")   # the last three are soft: 'no, stop that' may open an order
 QUOTE_WORDS = 3
 # A routine report (`report`): every line only states what happened, machine-shaped, and names a commit:
 # a push acknowledgment ('pushed <sha> to <branch> (fast-forward of <sha>; ...)', 'ttp push: not
@@ -526,14 +527,19 @@ def open_stall(db: DB, cfg: dict | None, now: float | None = None) -> str:
     return ""
 
 
+def _rejects(low: str, phrases) -> bool:
+    """A clause that is only 'no', or holds one of `phrases`."""
+    return bool(re.fullmatch(r"(no|nope|wrong)\W*", low) or any(x in low + " " for x in phrases))
+
+
 def answers(db: DB, m: dict, now: float | None = None) -> str:
     """How message `m` answers or rejects earlier output ('quotes earlier output', 'contradicts it'),
     or '' for a new instruction, a question or anything else."""
     now = time.time() if now is None else now
     text = str(m.get("text") or "").replace("’", "'")
-    from . import relaypin
-    if relaypin.is_order(text):   # a stop order or added scope is an order, not a correction
-        return ""
+    clauses = [low for part in _CLAUSE.split(text) if (low := " ".join(part.lower().split())) and not low.endswith("?")]
+    if any(relaypin.opens_order(x) for x in clauses) and not any(_rejects(x, REJECTS[:-3]) for x in clauses):
+        return ""   # a stop order or added scope, contradicting nothing stated: an order, not a correction
     if any(line.lstrip().startswith(">") for line in text.splitlines()):
         return "quotes earlier output"
     spans = [_same(a or b) for a, b in _QUOTED.findall(text)]
@@ -544,13 +550,7 @@ def answers(db: DB, m: dict, now: float | None = None) -> str:
         said = [_same(r["text"]) for r in outs]
         if any(x in o for x in spans for o in said):
             return "quotes earlier output"
-    for part in _CLAUSE.split(text):
-        low = " ".join(part.lower().split())
-        if not low or low.endswith("?"):
-            continue
-        if re.fullmatch(r"(no|nope|wrong)\W*", low) or any(x in low + " " for x in REJECTS):
-            return "contradicts it"
-    return ""
+    return "contradicts it" if any(_rejects(low, REJECTS) for low in clauses) else ""
 
 
 def flag(db: DB, cfg: dict | None, msgs: list[dict], now: float | None = None) -> dict[int, str]:

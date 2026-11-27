@@ -30,17 +30,18 @@ def test_a_relayed_order_naming_the_pinned_model_or_none_or_with_no_pin_gets_no_
     assert relaypin.pin_line(p, "Use acme-large-4 for the batch.") == ""
     assert relaypin.pin_line(p, "Run the checks again tonight.") == ""
     assert relaypin.pin_line(_pins(), "Run the reviews on sonnet-5-5.") == ""
+    assert relaypin.pin_line(p, "Rerun step-4 on box-2 tonight.") == ""    # a 'name-N' word of no pinned family
 
 
 def test_the_digest_shows_the_pin_line_under_a_relayed_message_only(env):
     from ttp import coordinator as coord
     p = make(env)
     p.add_memory("Reviews are pinned to opus-5-5.", kind="decision")
-    relayed = p.db.post("in", "Run the reviews on zeta-9 from now on.", chat="c1", provenance="cli-peer",
+    relayed = p.db.post("in", "Run the reviews on opus-6 from now on.", chat="c1", provenance="cli-peer",
                         context="Sent by the relayer for the user.")
-    direct = p.db.post("in", "Run the reviews on zeta-9 from now on.", chat="c2", provenance="slack")
+    direct = p.db.post("in", "Run the reviews on opus-6 from now on.", chat="c2", provenance="slack")
     digest = coord.digest(p, {}, [], [relayed])
-    assert "  relayed order names zeta-9; pin on record is opus-5-5 (memory [" in digest
+    assert "  relayed order names opus-6; pin on record is opus-5-5 (memory [" in digest
     assert "relayed order names" not in coord.digest(p, {}, [], [direct])
 
 
