@@ -1076,6 +1076,8 @@ def _run(host: Any, name: str, spec: dict, now: float) -> tuple[str, float | Non
                                   "hold_since", "hold_clear_since", "known_key", "known_since", "known_ended")
                if k in st}   # a flapping fault keeps its end
         _save(db, name, {**nxt, "status": "healthy"})
+        if st.get("unknown_told"):   # once per told stretch: the marker is not kept above
+            _tell_recovered(host, name, spec, st, now)
         t = db.task(int(st["task"])) if st.get("task") else None
         if t is not None and t["status"] == "queued":   # a running one is left to finish
             db.update_task(t["id"], status="cancelled", blocked_reason="check recovered before the fix ran")
@@ -1440,11 +1442,11 @@ def _log(host: Any, msg: str) -> None:
         pass
 
 
-def _observe(db: Any, fp: str, text: str, now: float) -> None:
-    """Queue one high observation for the coordinator under `fp`, unless one is already there."""
+def _observe(db: Any, fp: str, text: str, now: float, severity: str = "high") -> None:
+    """Queue one observation for the coordinator under `fp`, unless one is already there."""
     if not db.one("SELECT id FROM events WHERE fingerprint=?", (fp,)):
         db.x("INSERT INTO events(ts,source,kind,fingerprint,severity,text,status) VALUES(?,?,?,?,?,?,?)",
-             (now, "daemon", "observation", fp, "high", text, "queued"))
+             (now, "daemon", "observation", fp, severity, text, "queued"))
 
 
 def _tell_unknown(host: Any, name: str, spec: dict, st: dict, rc: int, out: str, now: float) -> str:
@@ -1466,6 +1468,25 @@ def _tell_unknown(host: Any, name: str, spec: dict, st: dict, rc: int, out: str,
         return "coordinator told"
     host.alert(f"heal-unknown:{name}", text, "normal", every_s=0)
     return "user told"
+
+
+def _tell_recovered(host: Any, name: str, spec: dict, st: dict, now: float) -> None:
+    """The first healthy result after _tell_unknown told someone: one low line to the same target."""
+    since = float(st.get("unknown_since") or st["unknown_told"])
+    text = f"Heal check {name} is healthy again after {(now - since) / 60:.0f} min unknown."
+    if st.get("paged_unknown") and spec.get("to") is not None:
+        from . import upstream
+        target, _ = pageto.resolve(spec["to"], machine_of(spec))
+        if target and target != host.p.name:
+            got = upstream.send(host.p.name, None, target, text.replace(f"{name} ", f"{name} of project {host.p.name} ", 1),
+                                "low", now=now, sender="daemon")
+            if got in ("sent", "duplicate"):
+                return
+            _log(host, f"heal check {name}: note to {target}: {got}; told here instead")
+    if escalate_to(host, spec) == "coordinator":
+        _observe(host.p.db, f"{STATE_KEY}{name}:healthy:{since:.0f}", text, now, "low")
+    else:
+        host.p.db.post("out", text, chat=None, kind="info", severity="low", ref=STATE_KEY + name)
 
 
 def _pause_of(host: Any, res: str) -> dict:

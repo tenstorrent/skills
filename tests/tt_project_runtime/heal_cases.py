@@ -735,6 +735,8 @@ def test_heal_unknown_check_without_outage_escalates_once_per_stretch_past_its_c
         assert status == f"ok (unknown, rc 75; {escalate} told)", status
         heal.run(d, "svc", dark, start + 180 * 60)   # the same stretch: nothing more
         msgs, events = _heal_told(p)
+        msgs = [m for m in msgs if m["kind"] == "alert"]   # less each "healthy again" line
+        events = [e for e in events if ":unknown:" in e["fingerprint"]]
         if escalate == "user":
             assert events == [] and [(m["kind"], m["severity"], m["ref"]) for m in msgs] == \
                 [("alert", "normal", "heal-unknown:svc")] * n
@@ -758,6 +760,34 @@ def test_heal_unknown_check_without_outage_escalates_once_per_stretch_past_its_c
     assert "unknown_told" not in heal.state(p.db, "svc")
     assert heal.run(d, "svc", dark, now + 401 * 60)[0] == "ok (unknown, rc 75)"
     stretch(now + 401 * 60, 3)
+
+
+@pytest.mark.parametrize("escalate", ["user", "coordinator"])
+def test_heal_told_unknown_stretch_ends_with_one_low_healthy_again_line_to_the_same_target(env, escalate):
+    from ttp import heal
+    p, d, up = _heal_setup(env, grace_s=300, unknown_cap_s=600, escalate=escalate)
+    spec, now = _heal_spec(p), time.time()
+    dark = dict(spec, check="exit 75")
+
+    def again():
+        msgs, events = _heal_told(p)
+        return ([(m["severity"], m["text"]) for m in msgs if m["kind"] == "info"],
+                [(e["severity"], e["text"]) for e in events if ":healthy:" in e["fingerprint"]])
+
+    # An unknown stretch that was never told: its end says nothing.
+    heal.run(d, "svc", dark, now)
+    up.touch()
+    assert heal.run(d, "svc", spec, now + 300) == ("ok (healthy)", None) and again() == ([], [])
+    # A told one: one low line on the first healthy result, none on the next.
+    up.unlink()
+    heal.run(d, "svc", dark, now + 1000)
+    assert "told" in heal.run(d, "svc", dark, now + 1700)[0]
+    up.touch()
+    for t in (now + 2200, now + 2500):
+        assert heal.run(d, "svc", spec, t) == ("ok (healthy)", None)
+    line = [("low", "Heal check svc is healthy again after 20 min unknown.")]
+    assert again() == ((line, []) if escalate == "user" else ([], line))
+    assert "unknown_told" not in heal.state(p.db, "svc")
 
 
 def test_heal_check_marks_a_known_owned_state_with_one_output_line():
