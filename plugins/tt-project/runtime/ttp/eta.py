@@ -355,9 +355,9 @@ class _Est:
         self._gates = None
         self._owners = None
         self._reports = None
-        self._jobhist = jobhist        # etajobs.history, shared with the p90 walk
+        self._jobhist = jobhist        # etajobs.job_history, shared with the p90 walk
         self._jobs: dict[int, dict | None] = {}
-        self._entries: dict[int, list] = {}   # etajobs.entries per task: one registry read per task
+        self._entries: dict[int, list] = {}   # etajobs.job_entries per task: one registry read per task
 
     def _m(self, xs: list[float]) -> float | None:
         """The leg statistic of samples `xs`: their q-quantile (the median at q=0.5)."""
@@ -389,7 +389,7 @@ class _Est:
         return None if e["why"] or not e.get("end") else e
 
     def jobs(self, t: dict) -> dict | None:
-        """The task's detached jobs' measured finish (etajobs.finish): median job times from this
+        """The task's detached jobs' measured finish (etajobs.job_finish): median job times from this
         project's history, never a padded allowance. Memoized per task; the job history is read once."""
         if t["id"] not in self._jobs:
             from . import etajobs

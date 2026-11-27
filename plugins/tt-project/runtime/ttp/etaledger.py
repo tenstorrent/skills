@@ -235,7 +235,7 @@ def record(db, where, items: list[tuple[str, str, dict]], now: float, src: str =
     rows = []
     hist = None
     jhist = [None]   # holder for the job history: hist_end loads it on first use
-    entries: dict = {}   # etajobs.entries per task: one registry read per task
+    entries: dict = {}   # etajobs.job_entries per task: one registry read per task
     shadow_on = _hist_on(where)
     for ref, kind, e in items:
         if not rowable(e, now):

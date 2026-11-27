@@ -34,7 +34,7 @@ def job_history(state, db, now: float | None = None) -> dict:
     now = time.time() if now is None else now
     h: dict = {"job": {}}
     try:
-        rows = db.q("SELECT id, started, dir FROM runs WHERE started>? AND role!='coordinator' "
+        rows = db.q("SELECT id, dir FROM runs WHERE started>? AND role!='coordinator' "
                     "ORDER BY id DESC LIMIT ?", (now - WINDOW_S, ROWS))
     except Exception:
         return h
@@ -97,7 +97,6 @@ def job_finish(db, t: dict, h: dict, now: float, cache: dict | None = None) -> d
     "conservative": the p80 one, "legs": [(name, seconds)], "why"}; None when the task has no
     registry entries. Legs are one per still-unfinished job, "queue" for the wait behind another open
     task's running job of the same name."""
-    from .eta import pct
     ents = job_entries(db, t["id"], cache)
     if not ents:
         return None
