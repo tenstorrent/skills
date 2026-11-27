@@ -346,7 +346,7 @@ def power_refusal(cmd: str, routes=("broker",)) -> str | None:
     for x in _words(cmd):
         if x is None:
             if re.search(r"\bipmitool\b.*\b(?:power\s+(?!status)|raw\b)|\btt-smi\b.*(?:\s-r\b|--reset|glx_reset)",
-                         hook._split(cmd)[0]):
+                         hook._split(cmd)[0] + "\n" + _substituted_bodies(cmd)):
                 return why + cmd[:120]
             continue
         w = x[0]
@@ -377,7 +377,7 @@ def direct_tool(cmd: str, routes=("broker",), tools=tuple(DEFAULTS["device_tools
     for x in _words(cmd):
         if x is None:
             try:
-                text = hook._split(cmd)[1]   # what to scan: heredoc bodies a program does not only write
+                text = hook._split(cmd)[1] + "\n" + _substituted_bodies(cmd)   # bodies a program does not only write, and any a shell expands
             except Exception:
                 text = cmd
             if any(re.search(r"(?<![\w.-])" + re.escape(t) + r"(?![\w-])", text) for t in names):

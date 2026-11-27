@@ -183,6 +183,10 @@ def test_a_substitution_in_an_unquoted_heredoc_body_is_a_hidden_command(tmp_path
     for live in ("cat <<EOF\n`reboot`\nEOF", "cat <<EOF\n$(reboot)\nEOF", "cat <<-EOF\n\t`reboot`\n\tEOF"):
         assert deviceplan.risky(live), "the shell runs the substitution whatever reads the body: " + live
         assert glmguard.shell_refusal(live, str(tmp_path)), live
+    for live in ("cat <<EOF\n`ipmitool raw 0x0 0x2`\nEOF", "cat <<EOF\n`tt-smi -r 0`\nEOF"):
+        assert deviceplan.power_refusal(live), "a raw power call in a substitution is refused: " + live
+    assert deviceplan.direct_tool("cat <<EOF\n`run_cluster_validation`\nEOF"), "a device tool in a substitution"
+    assert not deviceplan.direct_tool("cat <<'EOF'\n`run_cluster_validation`\nEOF"), "quoted: only text"
     for text in ("cat <<'EOF'\n`reboot`\nEOF", 'cat <<"EOF"\n$(reboot)\nEOF', "cat <<EOF\n\\`reboot\\`\nEOF",
                  "cat <<EOF\nthe reboot plan\nEOF"):
         assert not deviceplan.risky(text), "a quoted delimiter or escaped text runs nothing: " + text

@@ -269,6 +269,7 @@ def test_outside_writes_skips_regex_text_ssh_remote_commands_and_saved_tool_outp
     writes = lambda c: {p for p, (cls, _) in sidefx.classify_paths(c, h, str(wt), str(rd)).items() if cls == "write"}
     assert not writes("awk 'NR>=2 && /\\<later\\>/ {print NR\": \"$0}' f | head") and not writes("awk '{print $0 \" > \" NR}' f")
     assert writes("awk '/a>b/ {print > \"/etc/m\"}' f") == {"/etc/m"}
+    assert writes("awk '{ y = /\"/; print > \"/etc/x\" }' f") == {"/etc/x"}, "a quote inside a regex literal opens no string"
     assert found("rm /tmp/my\\ dir/f") == {"/tmp/my\\"}   # an escaped space is no regex escape
     assert found("echo hi 2>&1 > /tmp/s") == {"/tmp/s"} and found("echo 'unclosed > /tmp/u") == {"/tmp/u"}
 

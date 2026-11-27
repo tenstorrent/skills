@@ -271,15 +271,13 @@ def _awk_text(prog: str) -> str:
     out, i, n = [], 0, len(prog)
     while i < n:
         c = prog[i]
-        if c == '"' or (c == "/" and re.search(r"(?:^|[(!,~;{&|\n])\s*$", prog[:i])):
+        if c == "/" and (m := REGEX_LITERAL_RE.match(prog, i)):   # a regex literal, as _blank reads one
+            i = m.end()
+        elif c == '"':
             j = i + 1
             while j < n and prog[j] != c:
                 j += 2 if prog[j] == "\\" else 1
-            lit = prog[i:j + 1]
-            if c == '"' and re.search(r"(?:>>?|\|)\s*$", prog[:i]):
-                out.append(lit)
-            elif c == '"':
-                out.append('""')
+            out.append(prog[i:j + 1] if re.search(r"(?:>>?|\|)\s*$", prog[:i]) else '""')
             i = j + 1
         else:
             out.append(c)
