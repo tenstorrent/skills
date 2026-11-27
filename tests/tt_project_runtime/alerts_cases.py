@@ -197,7 +197,7 @@ def test_a_logout_is_one_alert_per_machine_reminded_at_15_minutes_1_4_and_12_hou
 
 
 def test_a_logout_with_work_waiting_alerts_once_at_15_minutes_with_the_step_across_a_restart(env, monkeypatch):
-    from ttp import alerts
+    from ttp import alerts, cli
     from ttp.daemon import Daemon
     p = make(env)
     monkeypatch.setattr(alerts, "owner_alive", lambda owner: True)
@@ -209,7 +209,7 @@ def test_a_logout_with_work_waiting_alerts_once_at_15_minutes_with_the_step_acro
     d.open_breaker("fake", "logged out")
     d.alert("auth:fake", "fake is logged out", "high")
     p.db.add_task("queued work", "")
-    told = lambda: [m["text"] for m in p.db.unread_for_chat("c1", 0) if m["text"] != "fake is logged out"]
+    told = lambda: [m["text"] for m in p.db.unread_for_chat("c1", 0) if "still logged out" in m["text"]]
     clock["t"] = start + 14 * 60
     d._logout_round = 0.0
     d.remind_logouts()
@@ -227,7 +227,11 @@ def test_a_logout_with_work_waiting_alerts_once_at_15_minutes_with_the_step_acro
         restarted.remind_logouts()
     assert len(told()) == 1, "a restart sent the alert again"
     # Logged in again: the hold clears and no later reminder comes.
+    p.db.x("UPDATE tasks SET blocked_reason='held: logged out (fake); it starts once a login check passes'")
+    assert "held: logged out" in cli.status_text(p)
     restarted._close_breaker("fake", alerts.breaker(p.db, "fake"), "login check passed")
+    restarted.sweep_alerts()
+    assert "held: logged out" not in cli.status_text(p), "the hold line stayed after the login came back"
     clock["t"] = start + 2 * 3600
     restarted._logout_round = 0.0
     restarted.remind_logouts()

@@ -90,7 +90,7 @@
   the failing check; a prolonged whole-box outage still escalates. Acknowledge a keyed alert with
   `ttp alerts <name> --ack <id> --why "<reason>"` when the user already knows: a live one moves to the feed and stays quiet until it clears.
 - A logout is one alert per machine and provider, however many projects wait on it, reminded after
-  1 h, 4 h and 12 h, then daily, with the waiting projects, queued tasks and high events.
+  15 min, 1 h, 4 h and 12 h, then daily, with the waiting projects, queued tasks, high events and the re-login step. `ttp status` shows the step beside "held: logged out".
 - While the coordinator cannot run (logged out, paused, budget red, repeated failures) for 30 min,
   the daemon sends new high conditions that persisted 2 h to the chat itself: one line each, at
   most one message an hour.

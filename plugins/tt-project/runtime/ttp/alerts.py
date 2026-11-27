@@ -26,7 +26,7 @@ folder, and the others post theirs on the `quiet` channel, shown in the web app 
 but never sent to a chat, Slack or the desktop.
 
 A logout is the exception to the one daily reminder: every project waiting on the logged-out CLI
-reports itself into the claim (machine_round), and the claimer reminds the chats (first after 15 minutes) at LOGOUT_REMIND_S
+reports itself into the claim (machine_round), and the claimer reminds the chats at LOGOUT_REMIND_S
 with how many projects, queued tasks and high events wait, whichever project holds the claim then.
 
 Page severity of daemon events that need no user decision, so they wake the coordinator only when it matters.
