@@ -1034,19 +1034,24 @@ class _OverBound(Exception):
     """A comparison past EQUIV_MAX_OWN commits, EQUIV_MAX_BYTES bytes or EQUIV_BUDGET_S seconds."""
 
 
-def _keys(repo: Path, args: list[str], skip: list[str], timeout: float = 60) -> list[tuple[str, str]]:
+def _keys(repo: Path, args: list[str], skip: list[str], timeout: float = 60,
+          limit: int | None = None) -> list[tuple[str, str]]:
     """[(commit, key)] of `git log <args>`, oldest first: the key is a hash of each file's added and
     removed lines (no context, no line numbers), with the `skip` paths left out. A rebase that moved
     the context or took the version files keeps the key; git's patch-id does not. Merges and commits
-    that change only `skip` paths are left out. _OverBound when the diff is past EQUIV_MAX_BYTES."""
+    that change only `skip` paths are left out. _OverBound when the diff is past EQUIV_MAX_BYTES or git
+    listed more than `limit` commits (counted before commits with no key are dropped)."""
     out = _git(repo, "log", "--reverse", "--no-merges", "-p", "-U0", "--no-renames", "--no-color",
                "--format=%x00%H", *args, "--", ".", *(f":(exclude){x}" for x in skip), timeout=timeout)
     if out.returncode != 0:
         return []
     if len(out.stdout) > EQUIV_MAX_BYTES:
         raise _OverBound
+    chunks = out.stdout.split("\0")[1:]
+    if limit is not None and len(chunks) > limit:
+        raise _OverBound
     keys = []
-    for chunk in out.stdout.split("\0")[1:]:
+    for chunk in chunks:
         sha, _, body = chunk.partition("\n")
         if key := _key_of(body):
             keys.append((sha.strip(), key))
@@ -1110,8 +1115,8 @@ def equivalent(p, branch: str, bump=None) -> tuple[str, str] | None:
     try:
         # Each side's own commits: a branch that merged upstream commits the push branch also has
         # (criss-cross history, whose merge base can be the old fork point) does not read them.
-        mine = _keys(repo, [f"--max-count={EQUIV_MAX_OWN + 1}", f"{tip}..{head}"], skip, left())
-        if len(mine) > EQUIV_MAX_OWN or spent():
+        mine = _keys(repo, [f"--max-count={EQUIV_MAX_OWN + 1}", f"{tip}..{head}"], skip, left(), EQUIV_MAX_OWN)
+        if spent():
             return None
         theirs: dict[str, str] = {}
         if mine:

@@ -23631,6 +23631,25 @@ def test_landed_equivalent_over_its_commit_bound_has_no_answer_never_landed(env,
     assert landed.equivalent(p, branch, None) is None
 
 
+def test_landed_equivalent_counts_a_keyless_commit_toward_its_commit_bound(env, monkeypatch):
+    from ttp import landed
+    p, repo, origin, other = _push_setup(env, monkeypatch, ["true"])
+    tid, path, branch = _code_task(p, "own change", status="review")
+    _commit(path, "own0.txt", "never re-landed\n")
+    (path / "blob.bin").write_bytes(b"\0\1\2")   # a binary change has no changed lines: no key
+    _git_out(path, "add", "blob.bin")
+    _git_out(path, "commit", "-qm", "binary only")
+    for i in (1, 2, 3):
+        _commit(path, f"own{i}.txt", f"change {i}\n")
+        (other / f"own{i}.txt").write_text(f"change {i}\n")
+        _git_out(other, "add", f"own{i}.txt")
+        _git_out(other, "commit", "-qm", f"re-land {i} under another task")
+    _git_out(other, "push", "-q", "origin", "HEAD:proj")
+    _git_out(repo, "fetch", "-q", "origin")
+    monkeypatch.setattr(landed, "EQUIV_MAX_OWN", 3)
+    assert landed.equivalent(p, branch, None) is None   # 5 commits listed: the oldest is never read
+
+
 def test_landed_equivalent_over_its_diff_bytes_bound_has_no_answer_never_landed(env, monkeypatch):
     from ttp import landed
     p, branch, head, relanded = _relanded_change(env, monkeypatch, 2)
