@@ -661,7 +661,7 @@ def _with_review_comments(pr: dict, data: dict | None) -> dict:
 def people(pr: dict) -> list[dict]:
     """The PR's comments and reviews by people: no bots, no runs' own posts, no empty reply wrappers."""
     return [c for c in (pr.get("comments") or []) + [r for r in pr.get("reviews") or [] if not _reply_wrapper(r, pr)]
-            if not ((c.get("author") or {}).get("login", "").endswith("[bot]")) and not _own(c, pr)]
+            if not _is_bot(c.get("author")) and not _own(c, pr)]
 
 
 def pr_signature(pr: dict) -> dict:

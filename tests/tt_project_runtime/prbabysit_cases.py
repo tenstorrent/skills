@@ -120,6 +120,7 @@ def test_prbabysit_idle_past_idle_h_gives_pr_idle_once_with_the_reviewers(env, m
     fresh = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
     bots = {**pr, "updatedAt": fresh, "comments": [
         {"author": {"login": "ci[bot]"}, "body": "coverage", "createdAt": fresh},
+        {"author": {"__typename": "Bot", "login": "copilot"}, "body": "summary", "createdAt": fresh},
         {"author": {"login": "bot-owner"}, "body": f"ping {watchers.TTP_MARKER}", "createdAt": fresh}],
         "reviews": [{"author": {"login": "runs"}, "state": "COMMENTED", "body": "", "submittedAt": fresh, "comments": {
             "totalCount": 1, "nodes": [{"author": {"login": "runs"}, "body": f"fixed {watchers.TTP_MARKER}"}]}}],
