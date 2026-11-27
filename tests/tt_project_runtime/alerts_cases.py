@@ -2448,8 +2448,9 @@ def test_a_batched_pr_null_for_a_reason_other_than_not_found_asks_gh_itself(env,
     gh.hidden = {2}
     assert watchers.watch_prs(Daemon(p.base)).startswith("ok (4 PRs, 3 changed)")
     assert set(p.db.kv("pr_signatures")) == {f"https://github.com/acme/widgets/pull/{i}" for i in range(1, 4)}
-    assert len(gh.calls) == 3, gh.calls   # the query, then PR 2's view and findings; PR 9 asks nothing more
-    assert "acme/widgets/pull/2" in gh.calls[1][2] and "number=2" in gh.calls[2]
+    reads = [c for c in gh.calls if not any("/files?" in x for x in c)]
+    assert len(reads) == 3, gh.calls   # the query, then PR 2's view and findings; PR 9 asks nothing more
+    assert "acme/widgets/pull/2" in reads[1][2] and "number=2" in reads[2]
 
 
 def test_pr_watch_batches_per_repo_in_chunks(env, monkeypatch):
