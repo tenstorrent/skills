@@ -1037,9 +1037,9 @@ def _jobs_registry(p, rows):
          "owner": {"task": tid}} for n, s, st, e in rows]))
 
 
-def _waiting_jobs_task(p, now, names, elapsed=300, probe="load", queued=False):
+def _waiting_jobs_task(p, now, names, elapsed=300, probe="load", queued=False, qstarted=None):
     """A waiting task hand-off whose registry holds its detached `names` (running, `elapsed` s in,
-    or queued) and whose probe waits on them."""
+    or queued; `qstarted`: the moment a queued job entered its queue) and whose probe waits on them."""
     tid = p.db.add_task("device work", "s", kind="work")
     rid = p.db.x("INSERT INTO runs(task, role, started, status, dir) VALUES(?,?,?,?,?)",
                  (tid, "worker", now - elapsed - 100, "running", ""))
@@ -1047,7 +1047,8 @@ def _waiting_jobs_task(p, now, names, elapsed=300, probe="load", queued=False):
     (p.state / "runs" / d.name).mkdir(parents=True, exist_ok=True)
     p.db.x("UPDATE runs SET dir=? WHERE id=?", (str(d), d.name))
     (d / "detached.json").write_text(json.dumps([
-        {"name": n, "rc": str(d / f"{n}.rc"), "started": 0 if queued else now - elapsed,
+        {"name": n, "rc": str(d / f"{n}.rc"),
+         "started": (qstarted if qstarted is not None else 0) if queued else now - elapsed,
          "status": "queued" if queued else "running", "owner": {"task": tid}} for n in names]))
     p.db.update_task(tid, status="waiting", result=json.dumps(
         {"status": "waiting", "summary": "s", "on_pass_cmd": "true",
@@ -1110,6 +1111,59 @@ def test_eta_detached_jobs_count_the_queue_position(env):
 
 
 
+def test_eta_detached_jobs_each_running_their_own_job_never_queue(env):
+    """Two open tasks each running a same-named job: neither waits behind the other, so no queue leg."""
+    from ttp import eta
+    p = make(env)
+    now = time.time()
+    _jobs_registry(p, [("load", now - 86400, "ended", now - 86400 + 600)])   # median 600 s
+    other = _waiting_jobs_task(p, now, ["load"])      # its job runs, 300 s in
+    t = _waiting_jobs_task(p, now, ["load"], elapsed=100, probe="load2")
+    for tid in (t, other):
+        e = eta.estimate(p.db, tid, now)
+        assert [k for k, _ in e["legs"]] == ["load"] and dict(e["legs"])["load"] == pytest.approx(600 - 300 if tid == other else 600 - 100)
+
+
+def test_eta_detached_jobs_queue_counts_the_running_job_and_the_queued_ahead(env):
+    """A task third in line waits for the running same-name job plus the median of the job queued
+    ahead of it; the task queued between waits for the running one only."""
+    from ttp import eta
+    p = make(env)
+    now = time.time()
+    _jobs_registry(p, [("load", now - 86400, "ended", now - 86400 + 600)])   # median 600 s
+    _waiting_jobs_task(p, now, ["load"])                                          # running, 300 s in
+    mid = _waiting_jobs_task(p, now, ["load"], queued=True, qstarted=now - 500)
+    t = _waiting_jobs_task(p, now, ["load"], probe="load3", queued=True, qstarted=now - 100)
+    e = eta.estimate(p.db, t, now)
+    assert dict(e["legs"])["queue"] == pytest.approx((600 - 300) + 600), e["legs"]
+    assert eta.estimate(p.db, mid, now)["legs"][-1] == ("queue", pytest.approx(600 - 300))
+    assert e["end"] == pytest.approx(now + sum(v for _, v in e["legs"]))
+
+
+def test_eta_detached_jobs_note_only_when_the_jobs_are_the_likely_time(env):
+    """`ttp eta`'s "detached-job history" note appears only when the likely time came from the jobs,
+    not when the kind's median run is the longer estimate and only the conservative time did."""
+    from ttp import eta
+    p = make(env)
+    now = time.time()
+    _jobs_registry(p, [("load", now - 86400, "ended", now - 86400 + 600)])
+    _waiting_jobs_task(p, now, ["load-2"])                    # a waiting task: the jobs are the estimate
+    t = _waiting_jobs_task(p, now, ["load-2"], probe="load2")
+    assert "detached-job history" in eta.text(eta.estimate(p.db, t, now), p, now)
+    _eta_history(p, now, runs=(3000,))                         # its kind's median run outlasts the job
+    tid = p.db.add_task("device work", "s", kind="work", status="running")
+    rid = p.db.x("INSERT INTO runs(task, role, started, status, dir) VALUES(?, 'worker', ?, 'running', '')",
+                 (tid, now - 100))
+    d = p.state / "runs" / str(rid)
+    (p.state / "runs" / d.name).mkdir(parents=True, exist_ok=True)
+    p.db.x("UPDATE runs SET dir=? WHERE id=?", (str(d), rid))
+    (d / "detached.json").write_text(json.dumps([
+        {"name": "load", "rc": str(d / "load.rc"), "started": now - 300, "status": "running",
+         "owner": {"task": tid}}]))
+    e = eta.estimate(p.db, tid, now)
+    assert "run" in [k for k, _ in e["legs"]] and e.get("job_cons") and "detached-job history" not in eta.text(e, p, now)
+
+
 def test_eta_a_promise_on_a_detached_jobs_task_shows_the_measured_estimate(env):
     """The digest's promise line carries the measured estimate beside a promise whose owner task
     runs detached jobs, so padding is visible."""
@@ -1168,5 +1222,26 @@ def test_eta_history_shadow_uses_the_measured_job_medians(env):
     t = _waiting_jobs_task(p, now, ["load-2"])
     he = etaledger.hist_end(p.db, f"t{t}", now, None, etajobs.job_history(p.state, p.db, now))
     assert he == pytest.approx(now + 600 - 300)
+
+def test_eta_detached_jobs_shadow_with_all_jobs_ended_is_the_normal_shadow(env):
+    """A task whose detached jobs have all ended gets the normal kind-median shadow, not "now"."""
+    from ttp import etajobs, etaledger, eta
+    p = make(env)
+    now = time.time()
+    _jobs_registry(p, [("load", now - 86400, "ended", now - 86400 + 600)])
+    _eta_history(p, now)                                   # median wait 300, median run 1200
+    tid = p.db.add_task("device work", "s", kind="work")
+    rid = p.db.x("INSERT INTO runs(task, role, started, status, dir) VALUES(?,?,?,?,?)",
+                 (tid, "worker", now - 700, "ended", ""))
+    d = p.state / "runs" / str(rid)
+    (p.state / "runs" / d.name).mkdir(parents=True, exist_ok=True)
+    p.db.x("UPDATE runs SET dir=? WHERE id=?", (str(d), rid))
+    (d / "detached.json").write_text(json.dumps([
+        {"name": "load", "rc": str(d / "load.rc"), "started": now - 600, "status": "ended",
+         "ended": now - 100, "owner": {"task": tid}}]))
+    he = etaledger.hist_end(p.db, f"t{tid}", now, eta.history(p.db, now),
+                            etajobs.job_history(p.state, p.db, now))
+    assert he == pytest.approx(now + 300 + 1200, abs=1.0), he   # abs: epoch values, no rel slack
+
 
 

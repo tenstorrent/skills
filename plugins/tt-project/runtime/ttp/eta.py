@@ -593,6 +593,7 @@ class _Est:
                     "overrun": over}
         legs, path, over, notes, deferred = [], [tid], False, [], None
         jf = self.jobs(t)
+        job_legs = False   # set when the likely legs are the detached jobs' own times
         start = now
         begin = None
         if st == "review":
@@ -670,6 +671,7 @@ class _Est:
             if ow:   # its hand-off's measured eta; a median run after it unless an on_pass_cmd ends the task
                 if ow.get("label") == "detached jobs":
                     legs.extend(jf["legs"])   # each job's measured time, the queue wait spelled out
+                    job_legs = True
                 else:
                     legs.append((ow.get("label") or ("own checks" if ow["own"] else "outside work"),
                                  max(0.0, ow["at"] - start)))
@@ -688,6 +690,7 @@ class _Est:
                 left, over = self._left(runs, now - float(r["started"])) if r and r["started"] else (self._m(runs), False)
                 if jf and jf.get("end") is not None and jf["end"] - now > (left or 0) * lx:
                     legs.extend((n if n in ("queue", "startup") else f"job {n}", s) for n, s in jf["legs"])
+                    job_legs = True
                 else:
                     legs.append(("run", left * lx))
             else:
@@ -725,7 +728,8 @@ class _Est:
             end += legs[-1][1]
         return {"done": done, "end": end, "path": path, "legs": legs, "why": None, "overrun": over, "start": begin,
                 "notes": notes, "deferred": deferred,
-                **({"job_cons": jf["conservative"]} if jf and jf.get("end") is not None else {})}
+                **({"job_cons": jf["conservative"]} if jf and jf.get("end") is not None else {}),
+                **({"job_legs": True} if job_legs else {})}
 
 
 def with_p90(est: _Est, e: dict, tid: int) -> dict:
@@ -847,7 +851,7 @@ def text(e: dict, where, now: float | None = None) -> str:
     return field(e, where, now) + (f"; legs of #{e['path'][0]}: {legs}" if legs else "") + (
         f"; adjusted: {notes}" if notes else "") + (
         "; likely = medians (p50) and conservative = p80 of this project's detached-job history by name"
-        if e.get("job_cons") else
+        if e.get("job_legs") else
         "; likely = medians (p50) and conservative = p90 of this project's last 14 days, by kind and size"
         if not e["why"] else "")
 

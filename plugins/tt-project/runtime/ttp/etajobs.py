@@ -7,9 +7,9 @@ history() reads the runs the db knows in the window and their detach registries
 id is dropped, so 'load-run2', 'load2' and 'load' are one job) and each run's start-up wait (its
 start to its first job). finish() gives a task's finish from its own registry entries
 (jobstop.task_jobs, so a task that continues another also reads its jobs): each job's time left is
-the quantile of its name's samples less what has already elapsed, plus the queue wait behind another
-open task's still-running job of the same name. A job name with no sample gives no estimate, never a
-padded default; the estimate says why.
+the quantile of its name's samples less what has already elapsed, plus the queue wait behind
+another open task's jobs of the same name (its running one and those queued ahead of ours). A job
+name with no sample gives no estimate, never a padded default; the estimate says why.
 """
 from __future__ import annotations
 
@@ -79,6 +79,11 @@ def job_entries(db, tid: int, cache: dict | None = None) -> list[dict]:
     return got
 
 
+def _is_queued(e: dict) -> bool:
+    """A job the daemon has not started: recorded queued, or with no start time yet."""
+    return e.get("status") == "queued" or not e.get("started")
+
+
 def job_left(e: dict, xs: list, now: float, q: float) -> float | None:
     """A job's time left at quantile `q` of its name's samples: 0 once it ended, the full sample
     while it is queued, the sample less what has elapsed while it runs; None with no sample."""
@@ -89,7 +94,7 @@ def job_left(e: dict, xs: list, now: float, q: float) -> float | None:
     m = pct(xs, q)
     if m is None:
         return None
-    if e.get("status") == "queued" or not e.get("started"):
+    if _is_queued(e):
         return m
     return max(0.0, m - (now - float(e["started"])))
 
@@ -103,7 +108,7 @@ def job_finish(db, t: dict, h: dict, now: float, cache: dict | None = None) -> d
     ents = job_entries(db, t["id"], cache)
     if not ents:
         return None
-    legs, hi, why, started = [], [], None, False
+    legs, hi, why, started, own = [], [], None, False, []
     for e in ents:
         name = normal(e.get("name"))
         xs = (h.get("job") or {}).get(name) or []
@@ -111,13 +116,15 @@ def job_finish(db, t: dict, h: dict, now: float, cache: dict | None = None) -> d
         if left is None:
             why = f"no measured {name} job run yet"
             continue
+        if _is_queued(e):
+            own.append((name, float(e.get("started") or 0)))   # when it entered its queue
         legs.append((name, left))
         l80 = job_left(e, xs, now, P80)
         hi.append(l80 if l80 is not None else left)
         started = started or e.get("status") not in ("queued",)
     if why:
         return {"end": None, "conservative": None, "legs": [], "why": why}
-    wait = queue_wait(db, t["id"], {n for n, _ in legs}, h, now, cache)
+    wait = queue_wait(db, t["id"], own, h, now, cache)
     if wait:
         legs.append(("queue", wait))
         hi.append(wait)
@@ -129,18 +136,28 @@ def job_finish(db, t: dict, h: dict, now: float, cache: dict | None = None) -> d
             "why": None, "open": open_jobs}
 
 
-def queue_wait(db, tid: int, names: set, h: dict, now: float, cache: dict | None = None) -> float:
-    """The wait of a task queued behind another open task's still-running job of one of `names`: the
-    longest median time left of those jobs (one device at a time: the task waits for it to end)."""
+def queue_wait(db, tid: int, own: list, h: dict, now: float, cache: dict | None = None) -> float:
+    """The wait of a task's own queued jobs (`own`: (name, when it was queued) pairs) behind other open
+    tasks' jobs of the same name: each waits for the running same-name job with the longest time left,
+    plus the median of every same-name job queued ahead of it. The longest of those waits; 0 with
+    nothing ahead, and none when the task's own job of that name is already running."""
     from .eta import pct
     best = 0.0
-    for r in db.q("SELECT id FROM tasks WHERE status='waiting'"):
-        if r["id"] == tid:
-            continue
-        for e in job_entries(db, r["id"], cache):
-            if normal(e.get("name")) in names and e.get("status") not in ("ended", "died", "queued"):
-                xs = (h.get("job") or {}).get(normal(e.get("name"))) or []
-                m = pct(xs, P50)
-                if m is not None and e.get("started"):
-                    best = max(best, m - (now - float(e["started"])))
-    return max(0.0, best)
+    for name, when in own:
+        wait, run_left = 0.0, 0.0
+        for r in db.q("SELECT id FROM tasks WHERE status IN ('running','waiting')"):
+            if r["id"] == tid:
+                continue   # its own running job of the name holds the device: no queue
+            for e in job_entries(db, r["id"], cache):
+                if normal(e.get("name")) != name or e.get("status") in ("ended", "died"):
+                    continue
+                m = pct((h.get("job") or {}).get(name) or [], P50)
+                if m is None:
+                    continue
+                if _is_queued(e):
+                    if float(e.get("started") or 0) < when:   # queued ahead of ours
+                        wait += m
+                elif e.get("started"):
+                    run_left = max(run_left, m - (now - float(e["started"])))
+        best = max(best, wait + max(0.0, run_left))
+    return best

@@ -166,7 +166,8 @@ def _hist_on(where) -> bool:
     return costlevers.lever_on(where, "eta_history")
 
 
-def hist_end(db, ref: str, now: float, h: dict | None = None, jh: dict | None = None) -> float | None:
+def hist_end(db, ref: str, now: float, h: dict | None = None, jh: dict | None = None,
+            cache: dict | None = None) -> float | None:
     """The finish the measured history gives a task ref (`t12`) at `now`: the median first-start wait, plus
     the median run time of its kind and tier (else of its kind) times the mean runs a done task of that
     kind and tier took (retries), plus for a code task the median review and the median landing (the push
@@ -183,7 +184,8 @@ def hist_end(db, ref: str, now: float, h: dict | None = None, jh: dict | None = 
         ends = []
         for tid in owners:
             t = db.task(tid)
-            ends.append(now if t and t["status"] in obligations.CLOSED else hist_end(db, f"t{tid}", now, h, jh))
+            ends.append(now if t and t["status"] in obligations.CLOSED
+                        else hist_end(db, f"t{tid}", now, h, jh, cache))
         ends = [e for e in ends if e is not None]
         return max(ends) if ends else None
     if not (ref.startswith("t") and ref[1:].isdigit()):
@@ -192,8 +194,8 @@ def hist_end(db, ref: str, now: float, h: dict | None = None, jh: dict | None = 
     if not t:
         return None
     from . import etajobs
-    if t["kind"] != "code" and jh is not None and (jf := etajobs.job_finish(db, t, jh, now)) \
-            and jf.get("end") is not None:
+    if t["kind"] != "code" and jh is not None and (jf := etajobs.job_finish(db, t, jh, now, cache)) \
+            and jf.get("open") and jf.get("end") is not None:
         return jf["end"]   # a task that runs detached jobs: its shadow is the jobs' own medians
     from . import eta
     h = eta.history(db, now) if h is None else h
@@ -228,6 +230,7 @@ def record(db, where, items: list[tuple[str, str, dict]], now: float, src: str =
     rows = []
     hist = None
     jhist = None
+    entries: dict = {}   # etajobs.entries per task: one registry read per task
     shadow_on = _hist_on(where)
     for ref, kind, e in items:
         if not rowable(e, now):
@@ -243,10 +246,12 @@ def record(db, where, items: list[tuple[str, str, dict]], now: float, src: str =
         if shadow_on:
             try:
                 if hist is None:
-                    from . import eta, etajobs
+                    from . import eta
                     hist = eta.history(db, now)
+                if jhist is None and _shadow_jobs(db, ref, entries):
+                    from . import etajobs
                     jhist = etajobs.job_history(Path(db.path).parent, db, now)
-                if (he := hist_end(db, ref, now, hist, jhist)) is not None:
+                if (he := hist_end(db, ref, now, hist, jhist, entries)) is not None:
                     row["hist"] = round(he, 1)
             except Exception:   # a shadow never costs the ETA row
                 pass
@@ -254,6 +259,20 @@ def record(db, where, items: list[tuple[str, str, dict]], now: float, src: str =
         last[ref] = row
     _append(db, rows)
     return len(rows)
+
+
+def _shadow_jobs(db, ref: str, cache: dict) -> bool:
+    """Whether `ref`'s shadow can use the job medians: a non-code task (itself, or a promise's live
+    owners) with registry entries; only then is the job history worth loading."""
+    from . import etajobs, obligations
+    if ref[:1] == "t" and ref[1:].isdigit():
+        ids = [int(ref[1:])]
+    elif ref[:1] == "o" and (o := obligations.get(db, ref)):
+        ids = obligations.live_owner_ids(db, o)
+    else:
+        return False
+    return any((t := db.task(i)) and t["kind"] != "code" and etajobs.job_entries(db, i, cache)
+               for i in ids)
 
 
 def _rowless(db) -> list[dict]:
