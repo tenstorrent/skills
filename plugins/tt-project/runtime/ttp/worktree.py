@@ -467,7 +467,7 @@ def _other_branch(p: Project, task: dict, path: Path, there: str, branch: str) -
                    f"of this task's own, so the task now works on it", adopted=there, was=branch)
         return there
     why = inspect(path)["why"] or ""
-    if why.startswith("has submodules"):
+    if why.startswith(("has submodules", "submodule ")):
         raise WorkspaceStuck(f"worktree {path} left as it is: it is on branch {there}, not {branch}, and {why}")
     held = next((r["path"] for r in _records(p).values()
                  if r["branch"] == branch and Path(r["path"]).resolve() != path.resolve()), None)
@@ -1357,7 +1357,12 @@ def remove_path(repo: Path, path: Path, force: bool = False) -> None:
     The harness's own keep lock (keep) is lifted just before; any other lock makes git refuse."""
     if path.exists():
         unkeep(path)
-        _git(repo, "worktree", "remove", *(["--force"] if force else []), str(path))
+        try:
+            _git(repo, "worktree", "remove", *(["--force"] if force else []), str(path))
+        except RuntimeError as e:   # git refuses any worktree with submodules: inspect found theirs safe to lose
+            if force or "submodules" not in str(e) or inspect(path)["why"]:
+                raise
+            _git(repo, "worktree", "remove", "--force", str(path))
     _git(repo, "worktree", "prune", check=False)
 
 
@@ -1648,7 +1653,7 @@ def _sweep_stray(p: Project, w: dict, open_tasks: list[dict], now: float, older_
     if not _git(path, "for-each-ref", "--count=1", "--contains", "HEAD", "refs/remotes", check=False).strip():
         return {**res, "why": "its HEAD is on no remote branch"}
     info = inspect(path)
-    if info["why"] and not info["dirty"]:   # submodules, or git failed
+    if info["why"] and not info["dirty"]:   # a submodule's work, or git failed
         return {**res, "why": info["why"]}
     tracked = [f for f in _git(path, "diff", "HEAD", "--name-only", "-z", check=False).split("\0") if f]
     untracked = [f for f in _git(path, "ls-files", "--others", "--exclude-standard", "-z", check=False).split("\0") if f]
@@ -1688,15 +1693,15 @@ def _sweep_stray(p: Project, w: dict, open_tasks: list[dict], now: float, older_
 
 
 def keep_reason(path: Path) -> str | None:
-    """Why this worktree must stay, or None when removing it loses nothing: no submodules set up in
-    it, no uncommitted or untracked files, and its HEAD is on a local or remote branch (the task's
+    """Why this worktree must stay, or None when removing it loses nothing: each submodule clean with its
+    HEAD recorded or on a remote branch, no uncommitted or untracked files, and its HEAD is on a local or remote branch (the task's
     own branch is never deleted, so its commits stay reachable)."""
     return inspect(path)["why"]
 
 
 def inspect(path: Path) -> dict:
     """keep_reason with what lies behind it: `why` (None: nothing to lose), `dirty` "untracked" (the
-    only dirty entries are untracked files, `untracked` lists them, HEAD is on a branch, no submodules)
+    only dirty entries are untracked files, `untracked` lists them, HEAD is on a branch, submodules safe)
     or "tracked" (modified tracked files, `tracked` lists their paths, `fingerprint` hashes the
     status and diff), else None."""
     import hashlib
@@ -1706,19 +1711,29 @@ def inspect(path: Path) -> dict:
         return gitmemo.run(["git", "-C", str(path), *args], capture_output=True, text=text,
                            timeout=300, read=True)
     out = {"why": None, "dirty": None}
-    # A submodule's repository lives in the worktree's own git directory (modules/), so commits made
-    # in it exist nowhere else and removing the worktree would delete them. Such a worktree stays.
-    gd = git("rev-parse", "--absolute-git-dir")
+    # A submodule's repository lives in the worktree's own git directory (modules/), so its changes and
+    # commits may exist nowhere else. The worktree stays unless each submodule is clean and its HEAD is
+    # kept elsewhere: on one of its remote branches, or the recorded commit and in the main checkout's
+    # copy of that submodule (a recorded commit the task made in the worktree is in neither).
+    gd = git("rev-parse", "--absolute-git-dir", "--git-common-dir")
     if gd.returncode != 0:
         return {**out, "why": "git rev-parse failed"}
-    modules = Path(gd.stdout.strip()) / "modules"
-    subs = git("submodule", "status")
+    own, common = gd.stdout.splitlines()[:2]
+    modules = Path(own) / "modules"
+    subs = git("submodule", "status", "--recursive")
     if subs.returncode != 0:
         return {**out, "why": "git submodule status failed"}
-    inited = [ln.split()[1] for ln in subs.stdout.splitlines() if ln.strip() and not ln.startswith("-")]
-    if inited or (modules.is_dir() and any(modules.iterdir())):
-        return {**out, "why": "has submodules set up (" + (", ".join(inited[:3]) or "modules/") + "); their commits "
-                "may exist only here, so it is never removed automatically"}
+    inited = [(ln[0], ln[1:].split()[1]) for ln in subs.stdout.splitlines() if ln.strip() and ln[0] != "-"]
+    dirs = [Path(r.stdout.strip()) for _, sub in inited
+            if (r := git("-C", sub, "rev-parse", "--absolute-git-dir")).returncode == 0]
+    if modules.is_dir() and any(not any(m == d or m in d.parents for d in dirs) for m in modules.iterdir()):
+        return {**out, "why": "has submodules set up (modules/) that are not checked out; their commits may "
+                "exist only here, so it is never removed automatically"}
+    for (mark, sub), d in zip(inited, dirs):
+        main = (path / common).resolve() / "modules" / d.relative_to(modules) if modules in d.parents else None
+        why = _submodule_loss(path / sub, mark, main) if len(dirs) == len(inited) else "could not be read"
+        if why:
+            return {**out, "why": f"submodule {sub} {why}"}
     st = git("status", "--porcelain", "--untracked-files=normal", "--ignore-submodules=none")
     if st.returncode != 0:
         return {**out, "why": "git status failed"}
@@ -1741,6 +1756,28 @@ def inspect(path: Path) -> dict:
     if files.returncode != 0:
         return {**out, "why": why}
     return {**out, "why": why, "dirty": "untracked", "untracked": [e for e in files.stdout.split("\0") if e]}
+
+
+def _submodule_loss(sub: Path, mark: str, main: Path | None) -> str | None:
+    """What removing the worktree would lose of the submodule checked out at `sub` (`mark`: its
+    `git submodule status` flag, " " when HEAD is the recorded commit; `main`: the main checkout's
+    repository of it), or None when nothing: it is clean and its HEAD is on one of its remote
+    branches, or is the recorded commit and `main` has it too."""
+    def git(*args: str) -> subprocess.CompletedProcess:
+        return gitmemo.run(["git", "-C", str(sub), *args], capture_output=True, text=True, timeout=300, read=True)
+    st = git("status", "--porcelain", "--untracked-files=normal", "--ignore-submodules=all")
+    if st.returncode != 0:
+        return "could not be read (git status failed)"
+    if st.stdout.strip():
+        return f"has uncommitted changes, e.g. {st.stdout.splitlines()[0][3:].strip()[:80]}"
+    held = git("for-each-ref", "--count=1", "--contains", "HEAD", "--format=%(refname)", "refs/remotes")
+    if held.returncode == 0 and held.stdout.strip():
+        return None
+    if mark == " " and main is not None and main.is_dir() and gitmemo.run(
+            ["git", f"--git-dir={main}", "cat-file", "-e", git("rev-parse", "HEAD").stdout.strip() + "^{commit}"],
+            capture_output=True, timeout=60, read=True, env=gitmemo.no_lazy_env()).returncode == 0:
+        return None
+    return "has commits on none of its remote branches and not in the main checkout's copy of it"
 
 
 def move_leftovers(path: Path, rels: list[str], dest: Path) -> int:

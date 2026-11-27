@@ -13489,7 +13489,7 @@ def test_a_worktree_with_submodule_commits_is_never_removed(env, monkeypatch):
     d = Daemon(p.base)
     d.prune_worktrees()
     assert path.exists() and _git_out(path / "sub", "rev-parse", "HEAD") == sub_head, "submodule commits were lost"
-    assert "submodules" in p.db.kv("worktrees_kept")[str(tid)]
+    assert "submodule sub " in p.db.kv("worktrees_kept")[str(tid)]
     # A submodule that was never set up in the worktree holds nothing.
     t2, plain, _ = _code_task(p, "no submodule work")
     d.prune_worktrees(every_s=0)

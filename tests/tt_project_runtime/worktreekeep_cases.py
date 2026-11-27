@@ -312,3 +312,73 @@ def test_a_hung_git_keeps_its_worktree_and_the_daemon_sweep_stops_at_its_budget(
     assert "timed out" in res[first]["why"] and not res[first].get("deferred")   # kept, never taken as clean
     assert res[second].get("deferred") and res[second]["why"]   # past the budget: left for the next sweep
     assert a.exists() and b.exists()
+
+
+def _wk_submodule_worktree(tmp_path):
+    """A superproject with one submodule `lib`, and a worktree `wt` of it with `lib` checked out."""
+    ident = ("-c", "user.name=t", "-c", "user.email=t@t", "-c", "protocol.file.allow=always")
+    lib, top = tmp_path / "lib", tmp_path / "top"
+    for repo in (lib, top):
+        repo.mkdir()
+        _git_out(repo, "init", "-q", "-b", "main")
+        (repo / "f.txt").write_text(repo.name)
+        _git_out(repo, "add", ".")
+        _git_out(repo, *ident, "commit", "-qm", "base")
+    _git_out(top, *ident, "submodule", "add", "-q", str(lib), "lib")
+    _git_out(top, *ident, "commit", "-qm", "add lib")
+    wt = tmp_path / "wt"
+    _git_out(top, "worktree", "add", "-q", "-b", "task", str(wt))
+    _git_out(wt, *ident, "submodule", "update", "-q", "--init")
+    return top, wt, ident
+
+
+def test_a_worktree_whose_submodules_are_clean_and_recorded_or_pushed_is_removed(tmp_path):
+    from ttp import worktree
+    top, wt, ident = _wk_submodule_worktree(tmp_path)
+    assert worktree.inspect(wt)["why"] is None
+    # a commit of the submodule's own already on its remote, recorded by the superproject: nothing to lose
+    (wt / "lib" / "g.txt").write_text("g")
+    _git_out(wt / "lib", "add", ".")
+    _git_out(wt / "lib", *ident, "commit", "-qm", "g")
+    _git_out(wt / "lib", "push", "-q", "origin", "HEAD:refs/heads/side")
+    _git_out(wt / "lib", "fetch", "-q", "origin")
+    _git_out(wt, "add", "lib")
+    _git_out(wt, *ident, "commit", "-qm", "bump lib")
+    _git_out(wt, "update-ref", "refs/remotes/origin/task", "HEAD")
+    assert worktree.keep_reason(wt) is None
+    # the submodule's HEAD moved on to a pushed commit the superproject does not record: still nothing to lose
+    (wt / "lib" / "h.txt").write_text("h")
+    _git_out(wt / "lib", "add", ".")
+    _git_out(wt / "lib", *ident, "commit", "-qm", "h")
+    _git_out(wt / "lib", "push", "-q", "origin", "HEAD:refs/heads/side2")
+    _git_out(wt / "lib", "fetch", "-q", "origin")
+    assert worktree.inspect(wt)["dirty"] == "tracked"            # the gitlink change is the superproject's own
+    _git_out(wt, "checkout", "-q", "--", ".")
+    _git_out(wt / "lib", "checkout", "-q", "--detach", "HEAD~1")
+    assert worktree.keep_reason(wt) is None
+    worktree.remove_path(top, wt)                                 # git refuses submodules; the check stands in
+    assert not wt.exists()
+
+
+def test_a_worktree_whose_submodule_has_changes_or_unpushed_commits_stays_naming_it(tmp_path):
+    from ttp import worktree
+    top, wt, ident = _wk_submodule_worktree(tmp_path)
+    (wt / "lib" / "new.txt").write_text("only here")
+    why = worktree.keep_reason(wt)
+    assert why.startswith("submodule lib has uncommitted changes") and "new.txt" in why
+    (wt / "lib" / "new.txt").unlink()
+    (wt / "lib" / "f.txt").write_text("edited")
+    assert worktree.keep_reason(wt).startswith("submodule lib has uncommitted changes")
+    _git_out(wt / "lib", *ident, "commit", "-qam", "local only")
+    _git_out(wt, "add", "lib")
+    _git_out(wt, *ident, "commit", "-qm", "record it")           # recorded, but on none of lib's remote branches
+    assert "submodule lib has commits on none of its remote branches" in worktree.keep_reason(wt)
+    _git_out(top / "lib", "fetch", "-q", str(wt / "lib"), "HEAD")  # the main checkout's copy has it now
+    assert worktree.keep_reason(wt) is None
+    _git_out(wt / "lib", "checkout", "-q", "--detach", "HEAD")
+    _git_out(wt / "lib", *ident, "commit", "-q", "--allow-empty", "-m", "one more")
+    _git_out(wt, "checkout", "-q", "--", ".")
+    assert "submodule lib has commits on none of its remote branches" in worktree.keep_reason(wt)
+    with pytest.raises(RuntimeError, match="submodules"):
+        worktree.remove_path(top, wt)
+    assert (wt / "lib" / ".git").exists()

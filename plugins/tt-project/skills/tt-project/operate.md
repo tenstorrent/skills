@@ -315,8 +315,8 @@ Every project cuts its queue times with the resources its charter allows (the te
   `worktree_uncommitted`); `ttp status` counts them and the web app lists them in the feed. Under the
   disk guard, and with `ttp prune --patch-tracked`, a done or cancelled task's tracked changes are
   saved instead as `tracked.patch` (checked to apply to its head; `git apply` restores them) and the
-  worktree goes. Any other dirty worktree is kept and listed, and so is one with submodules set up
-  (their commits may exist only there). A stale "initializing" lock (an unfinished `git worktree
+  worktree goes. Any other dirty worktree is kept and listed, and so is one with a submodule that
+  has changes or a HEAD on none of its remote branches (its commits may exist only there). A stale "initializing" lock (an unfinished `git worktree
   add`) is cleared; any other lock, or a process running in the worktree, keeps it. Every task
   worktree carries the harness's own keep lock from its first run (or the first sweep that sees it)
   until the sweep removes it, so no `git worktree prune` run where its folder is out of view deletes its git record; that lock never keeps it. A worktree is

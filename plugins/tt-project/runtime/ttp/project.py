@@ -534,7 +534,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
     # at or above the disk's size); null, or a machine's own threshold, resumes at 1.2 times the
     # threshold. Finished tasks'
     # worktrees lose their cache_dirs (null = the built-in list) and are removed once clean with
-    # HEAD on a branch and no submodules set up, at least an hour after the task ended, or
+    # HEAD on a branch and each submodule clean and kept elsewhere, at least an hour after the task ended, or
     # worktree_retention_days after it (0 = never tidy). One whose only dirty entries are untracked
     # files totalling at most worktree_leftovers_max_mb (0 = never) has them moved to its last run's
     # worktree-leftovers/ first. Branches are never deleted. A task worktree remade on its own branch
