@@ -23,7 +23,6 @@ an error) gives no event: the next sweep asks again.
 from __future__ import annotations
 
 import base64
-import json
 import re
 import time
 from datetime import datetime
@@ -31,7 +30,7 @@ from datetime import datetime
 from . import project
 
 KEY = "pr_babysit"           # {pr_key: {"told": {condition: value}, "idle": mark, "notrun": mark, "branch", "open", "head"}}
-FLOWS_KEY = "pr_workflows"   # {"owner/repo:path:blob": {"at": ts, "info": {"name", "file", "manual", "trigger", "labels"}}
+FLOWS_KEY = "pr_workflows"   # {"owner/repo:path:blob": {"at": ts, "info": {"name", "file", "manual", "trigger", "labels"}}}
 READ_S = 900                 # a PR no task opened is read this often while the sweep is on
 ROUTE_SILENT_S = 24 * 3600   # a route silent longer than this makes the sweep raise pr_route_silent
 ROUTE_KEY = "pr_route"       # kv: {"via", "at"} of the silence already told
@@ -280,7 +279,7 @@ def route_check(daemon) -> None:
     alias = ghroute.route(getattr(daemon, "cfg", None), str(daemon.p.root))
     st = {} if ghroute.local_ok() or not alias else ghroute.last_answer(alias)
     db, now = daemon.p.db, time.time()
-    if st.get("via") != alias or st.get("ok") is not True or not st.get("at"):
+    if st.get("ok") is not True or not st.get("at"):
         db.set_kv(ROUTE_KEY, {})   # a route that never answered, or one failing every call: the
         return                      # gh-auth condition covers a route that answers with failures
     silent, told = now - float(st["at"]), {"via": alias, "at": float(st["at"])}
@@ -292,7 +291,7 @@ def route_check(daemon) -> None:
         return   # this silence is already told
     db.set_kv(ROUTE_KEY, told)
     step = (f"run `ttp bridge gh-pull` on your workstation to drain the gh queue"
-            if alias.lower() == ghroute.WORKSTATION else
+            if alias == ghroute.WORKSTATION else
             f"bring the machine behind ssh alias {alias!r} back, or fix delivery.gh_route")
     text = (f"PR watch is blind: the gh route {alias!r} PRs are read through has not answered for "
             f"{silent / 3600:.0f} h. {step}.")
@@ -387,11 +386,8 @@ def _host_write(daemon, prs: dict) -> None:
 
 def _host_read() -> dict:
     from . import ghauth
-    try:
-        rec = json.loads((ghauth._home(None) / HOST_FILE).read_text())
-    except (OSError, ValueError):
-        return {}
-    return {k: v for k, v in rec.items() if isinstance(v, dict)} if isinstance(rec, dict) else {}
+    from .util import read_dict
+    return {k: v for k, v in read_dict(ghauth._home(None) / HOST_FILE).items() if isinstance(v, dict)}
 
 
 def _host_prs(now: float) -> dict[str, list[str]]:
@@ -400,6 +396,8 @@ def _host_prs(now: float) -> dict[str, list[str]]:
     for v in _host_read().values():
         if now - float(v.get("at") or 0) > HOST_STALE_S:
             continue
-        for k, pv in (v.get("prs") or {}).items():
-            out[k] = list(pv.get("files") or [])
+        prs = v.get("prs")
+        for k, pv in (prs.items() if isinstance(prs, dict) else ()):
+            if isinstance(pv, dict):
+                out[k] = list(pv.get("files") or [])
     return out

@@ -20,7 +20,6 @@ or token is kept. Nobody is ever asked to log gh in there.
 """
 from __future__ import annotations
 
-import json
 import os
 import re
 import shlex
@@ -303,13 +302,8 @@ def _state_path(home) -> "os.PathLike":
 def _state_read(home=None) -> dict:
     """STATE's records, by route: a flat record (pre-per-route) counts for the route it names; anything
     else unreadable in the file is no record."""
-    from . import ghauth
-    try:
-        st = json.loads((ghauth._home(home) / STATE).read_text())
-    except (OSError, ValueError):
-        return {}
-    if not isinstance(st, dict):
-        return {}
+    from .util import read_dict
+    st = read_dict(_state_path(home))
     if "via" in st:
         via = st["via"]
         return {via: {"ok": st.get("ok"), "at": st.get("at")}} if isinstance(via, str) and via else {}

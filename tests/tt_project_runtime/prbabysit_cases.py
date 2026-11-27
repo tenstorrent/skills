@@ -516,5 +516,6 @@ def test_prbabysit_an_unread_pr_keeps_its_cached_files_in_the_host_record_and_a_
     p.db.set_kv("pr_babysit", {"acme/widgets#7": {"open": False}, "acme/widgets#5": {"open": False}})
     prbabysit.overlap_check(Daemon(p.base), _pb_files_gh({})[0])
     assert prbabysit._host_prs(time.time()) == {}, "closed PRs leave the record other projects read"
-    (ghauth._home(None) / prbabysit.HOST_FILE).write_text('{"other": 5}')
-    assert prbabysit._host_prs(time.time()) == {}, "a bad entry in the host record is no record"
+    for bad in ('{"other": 5}', '{"other": {"at": %d, "prs": [1]}}', '{"other": {"at": %d, "prs": {"a#1": 5}}}'):
+        (ghauth._home(None) / prbabysit.HOST_FILE).write_text(bad.replace("%d", str(int(time.time()))))
+        assert prbabysit._host_prs(time.time()) == {}, bad
