@@ -1747,3 +1747,32 @@ def test_gh_workstation_runs_a_workflow_and_adds_a_label_only_on_its_own_open_pr
         got = ghqueue.answer({"key": "c" * 32, "argv": label, "stdin": ""}, str(stub))
         assert (refused in got["stderr"] and got["rc"] == 1) if refused else (got["rc"] == 0 and not got["stderr"]), got
     assert sum(c.startswith("pr edit") for c in ws_calls.read_text().splitlines()) == 1
+
+
+def test_ci_wait_on_a_sha_finds_its_run_past_the_newest_page_and_never_calls_a_full_window_absent(env, monkeypatch):
+    """`ttp ci --sha` on a busy repository: GitHub filters by the commit, a gh without that filter reads a
+    bounded window, and a full window without the commit is an incomplete read, not "no run yet"."""
+    from ttp import ciwait
+    sha = "c" * 40
+    mine = {"databaseId": 7, "status": "completed", "conclusion": "success", "headSha": sha,
+            "workflowName": "CI", "url": "u/7", "createdAt": "2026-01-01T00:00:00Z"}
+    other = [{"databaseId": 100 + i, "status": "completed", "conclusion": "success", "headSha": f"{i:040x}",
+              "workflowName": "CI", "url": f"u/{100 + i}", "createdAt": "2026-01-02T00:00:00Z"} for i in range(250)]
+    runs, filtered, calls = [*other[:49], mine, *other[49:]], [True], []
+
+    def gh(args):
+        calls.append(args)
+        if "--commit" in args:   # GitHub's head_sha filter, or None for a gh without it
+            return [r for r in runs if r["headSha"] == args[args.index("--commit") + 1]] if filtered[0] else None
+        return runs[:int(args[args.index("--limit") + 1])]
+    monkeypatch.setattr(ciwait, "_gh", gh)
+    assert ciwait.probe(repo="o/r", sha=sha) == (0, ["done: CI success u/7"])
+    assert len(calls) == 1 and "--commit" in calls[0], calls
+    filtered[0] = False
+    assert ciwait.probe(repo="o/r", sha=sha) == (0, ["done: CI success u/7"]), "found past the newest 30"
+    assert ciwait.probe(repo="o/r", sha=sha[:12]) == (0, ["done: CI success u/7"]), "a short sha reads the window"
+    runs.remove(mine)
+    rc, lines = ciwait.probe(repo="o/r", sha=sha)
+    assert rc == 75 and "incomplete" in lines[0] and "no run yet" not in lines[0], (rc, lines)
+    del runs[10:]
+    assert ciwait.probe(repo="o/r", sha=sha) == (1, ["waiting: no run yet"]), "a short list read in full"

@@ -26,6 +26,7 @@ FLOOR_MIN = 10.0     # a job is never called hung before this, however short it 
 DEFAULT_MIN = 90.0   # the limit when no finished run of the workflow is known
 HISTORY_RUNS = 3     # successful runs per workflow whose jobs make the median
 RUN_FIELDS = "databaseId,status,conclusion,headSha,workflowName,url,createdAt"
+LIST_CAP = 200   # runs read when GitHub cannot filter by the commit
 
 
 class LoggedOut(Exception):
@@ -213,12 +214,18 @@ def _probe(repo, branch, sha, workflow, run, hang, **kw) -> tuple[int, list[str]
             return 75, [f"not yet: gh could not read run {run}"]
         runs, branch = [one], branch or one.get("headBranch")
     else:
-        args = ["run", "list", *_repo(repo), "--limit", "30", "--json", RUN_FIELDS]
+        args = ["run", "list", *_repo(repo), "--json", RUN_FIELDS]
         args += ["--branch", branch] if branch else []
         args += ["--workflow", workflow] if workflow else []
-        listed = _gh(args)
+        # A full sha is filtered by GitHub (head_sha); a short one, or a gh without --commit, reads the
+        # newest runs, and a full window without the commit says so rather than "no run yet".
+        listed = _gh(args + ["--limit", str(LIST_CAP), "--commit", sha]) if len(sha or "") == 40 else None
         if listed is None:
-            return 75, ["not yet: gh could not list runs"]
+            listed = _gh(args + ["--limit", str(LIST_CAP if sha else 30)])
+            if listed is None:
+                return 75, ["not yet: gh could not list runs"]
+            if sha and len(listed) >= LIST_CAP and not targets(listed, sha):
+                return 75, [f"not yet: no run of {sha[:12]} among the newest {LIST_CAP}: the read was incomplete"]
         runs = targets(listed, sha)
     meds: tuple[dict, dict] = ({}, {})
     live = [r for r in runs if (r.get("status") or "") != "completed"]
