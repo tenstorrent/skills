@@ -58,6 +58,11 @@ def _pb_run(env, monkeypatch, pr, cfg=None, task=True, name="demo"):
     return p, d, lines
 
 
+def _pb_quiet(p, hours=50):
+    """The sweep has seen the PR's head, last changed `hours` ago (a first sighting is only the baseline)."""
+    p.db.set_kv("pr_babysit", {"acme/widgets#7": {"head": "a" * 40, "head_at": time.time() - hours * 3600}})
+
+
 def _pb_events(p):
     return [(r["kind"], r["text"]) for r in p.db.q("SELECT kind, text FROM events WHERE source='pr'")]
 
@@ -106,6 +111,9 @@ def test_prbabysit_idle_past_idle_h_gives_pr_idle_once_with_the_reviewers(env, m
                                     "conclusion": "SUCCESS", "completedAt": old}])
     p, d, _ = _pb_run(env, monkeypatch, pr)
     watchers.watch_prs(d)
+    assert [k for k, _ in _pb_events(p) if k == "pr_idle"] == [], "a first sighting is the baseline: its head may be new"
+    _pb_quiet(p)
+    watchers.watch_prs(d)
     watchers.watch_prs(d)
     ev = [t for k, t in _pb_events(p) if k == "pr_idle"]
     assert len(ev) == 1 and "idle for 50 h" in ev[0] and "rev1, core" in ev[0], ev
@@ -113,6 +121,8 @@ def test_prbabysit_idle_past_idle_h_gives_pr_idle_once_with_the_reviewers(env, m
     bots = {**pr, "updatedAt": fresh, "comments": [
         {"author": {"login": "ci[bot]"}, "body": "coverage", "createdAt": fresh},
         {"author": {"login": "bot-owner"}, "body": f"ping {watchers.TTP_MARKER}", "createdAt": fresh}],
+        "reviews": [{"author": {"login": "runs"}, "state": "COMMENTED", "body": "", "submittedAt": fresh, "comments": {
+            "totalCount": 1, "nodes": [{"author": {"login": "runs"}, "body": f"fixed {watchers.TTP_MARKER}"}]}}],
         "statusCheckRollup": [{**pr["statusCheckRollup"][0], "completedAt": fresh}]}
     person = {**bots, "comments": [{"author": {"login": "rev1"}, "body": "looking", "createdAt": fresh}]}
     for later in (bots, person):
@@ -121,7 +131,11 @@ def test_prbabysit_idle_past_idle_h_gives_pr_idle_once_with_the_reviewers(env, m
         watchers.watch_prs(d)
         assert len([1 for k, _ in _pb_events(p) if k == "pr_idle"]) == 1, "the same quiet period is told once"
     rec = p.db.kv("pr_babysit")["acme/widgets#7"]
-    assert rec["idle"] == pytest.approx(time.time() - 50 * 3600, abs=60), "bots, checks and the ping reset nothing"
+    assert rec["idle"] == pytest.approx(time.time() - 50 * 3600, abs=60), "bots, checks, reply wrappers and the ping reset nothing"
+    monkeypatch.setattr(watchers, "_read_prs", lambda order, root, w, t: {
+        x["pr_url"]: {"pr": {**pr, "headRefOid": "b" * 40}, "data": None, "cut": None, "calls": []} for x in order})
+    watchers.watch_prs(d)
+    assert p.db.kv("pr_babysit")["acme/widgets#7"]["head_at"] == pytest.approx(time.time(), abs=60), "a new head is activity"
 
 
 def test_prbabysit_a_status_change_posts_one_chat_line_and_an_unchanged_sweep_none(env, monkeypatch):
@@ -300,6 +314,7 @@ def test_prbabysit_pr_idle_text_names_the_ping_unless_the_pr_is_no_post(env, mon
                                     "conclusion": "SUCCESS", "completedAt": old}])
     _pb_gh(monkeypatch)
     p, d, _ = _pb_run(env, monkeypatch, pr, cfg=cfg)
+    _pb_quiet(p)
     watchers.watch_prs(d)
     text = [t for k, t in _pb_events(p) if k == "pr_idle"]
     assert len(text) == 1 and want in text[0] and absent not in text[0], text
@@ -369,6 +384,7 @@ def test_prbabysit_pending_checks_hold_back_only_the_never_run_list_and_a_mergea
     sig = lambda m, checks="pending": {"state": "OPEN", "draft": False, "decision": "", "mergeable": m, "checks": checks}
     pr = _pb_pr(createdAt=old, reviewRequests=[{"login": "rev1"}], statusCheckRollup=[
         {"name": "x", "workflowName": "ci", "status": "IN_PROGRESS", "conclusion": ""}])
+    _pb_quiet(p)
     for m in ("MERGEABLE", "CONFLICTING", "UNKNOWN", "CONFLICTING"):
         prbabysit.sweep(d, {"id": None, "pr_url": _PB_URL}, pr, sig(m), lambda a, c: None)
     ev = [k for k, _ in _pb_events(p)]
@@ -538,9 +554,9 @@ def test_prbabysit_guard_never_dispatches_a_run_already_queued_or_running_on_the
     from ttp import prguard
     p, cfg = _pb_guarded(env)
     head = "a" * 40
-    p.db.set_kv("pr_babysit", {"acme/widgets#7": {"branch": "ttp/x", "open": True, "head": head}})
-    runs, gh = tmp_path / "runs.json", tmp_path / "gh"
-    gh.write_text(f"#!/bin/sh\ncat {runs}\n")
+    p.db.set_kv("pr_babysit", {"acme/widgets#7": {"branch": "ttp/x", "open": True, "head": "c" * 40}})
+    runs, gh = tmp_path / "runs.json", tmp_path / "gh"   # the sweep's head is stale: the branch tip decides
+    gh.write_text(f"#!/bin/sh\n[ \"$1\" = api ] && echo {head} || cat {runs}\n")
     gh.chmod(0o755)
     later = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() + 5))
     why = lambda: prguard.check(["workflow", "run", "heavy.yml", "-R", "acme/widgets", "--ref", "ttp/x"],
@@ -556,12 +572,12 @@ def test_prbabysit_guard_never_dispatches_a_run_already_queued_or_running_on_the
         assert "run 41 of heavy.yml is already queued or running" in (why() or ""), live
 
 
-def test_prbabysit_a_skipped_or_never_run_workflow_or_an_unread_one_holds_the_clean_report(env, monkeypatch):
+def test_prbabysit_a_skipped_or_never_run_listed_workflow_or_an_unread_one_holds_the_clean_report(env, monkeypatch):
     from ttp import watchers
     _pb_gh(monkeypatch)
     ok = {"name": "validate", "workflowName": "ci", "status": "COMPLETED", "conclusion": "SUCCESS"}
     heavy = {"name": "build", "workflowName": "Heavy", "status": "COMPLETED", "conclusion": "SKIPPED"}
-    p, d, _ = _pb_run(env, monkeypatch, _pb_pr())
+    p, d, _ = _pb_run(env, monkeypatch, _pb_pr(), cfg={"pr_babysit.dispatch": {"acme/widgets": ["label:run-heavy"]}})
     clean = lambda: [t for k, t in _pb_events(p) if k == "pr_clean"]
 
     def read(*checks, head="a" * 40):

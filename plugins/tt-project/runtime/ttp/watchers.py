@@ -658,6 +658,12 @@ def _with_review_comments(pr: dict, data: dict | None) -> dict:
                               for r in pr.get("reviews") or []]}
 
 
+def people(pr: dict) -> list[dict]:
+    """The PR's comments and reviews by people: no bots, no runs' own posts, no empty reply wrappers."""
+    return [c for c in (pr.get("comments") or []) + [r for r in pr.get("reviews") or [] if not _reply_wrapper(r, pr)]
+            if not ((c.get("author") or {}).get("login", "").endswith("[bot]")) and not _own(c, pr)]
+
+
 def pr_signature(pr: dict) -> dict:
     checks = pr.get("statusCheckRollup") or []
     states = sorted({(c.get("conclusion") or c.get("state") or c.get("status") or "").upper() for c in checks})
@@ -666,9 +672,7 @@ def pr_signature(pr: dict) -> dict:
                                                                                  "CANCELLED", "ACTION_REQUIRED"))
     pending = any((c.get("status") or c.get("state") or "").upper() in ("IN_PROGRESS", "QUEUED", "PENDING")
                   for c in checks)
-    reviews = [r for r in pr.get("reviews") or [] if not _reply_wrapper(r, pr)]
-    human = [c for c in (pr.get("comments") or []) + reviews
-             if not ((c.get("author") or {}).get("login", "").endswith("[bot]")) and not _own(c, pr)]
+    human = people(pr)
     activity = hashlib.sha1(json.dumps([(c.get("author") or {}).get("login", "") + str(c.get("body", ""))[:200]
                                         + str(c.get("state", "")) for c in human]).encode()).hexdigest()[:12]
     return {"state": pr.get("state"), "draft": pr.get("isDraft"), "decision": pr.get("reviewDecision"),
@@ -890,11 +894,9 @@ def watch_prs(daemon, payload: dict | None = None) -> str:
             _check_unapproved(daemon, t, pr, sig, before, flagged, drafts)
         stale = body_stale(pr, bodies, heads, time.time()) if sig.get("draft") is True else ""
         failing_base = _base_failing(pr, base_cache, root, time.time()) if sig["failing"] else set()
-        swept = prbabysit.settings(getattr(daemon, "cfg", None))["enabled"]
-        if swept:   # first: what ran on the head decides whether CI counts as green
-            prbabysit.sweep(daemon, t, pr, sig, _gh)
-        _check_findings(daemon, t, pr, sig, findings, data, stale=stale, failing_base=failing_base,
-                        unrun=prbabysit.unrun(db, key, pr.get("headRefOid") or "") if swept else "")
+        unrun = (prbabysit.sweep(daemon, t, pr, sig, _gh)   # first: what ran on the head decides whether CI is green
+                 if prbabysit.settings(getattr(daemon, "cfg", None))["enabled"] else "")
+        _check_findings(daemon, t, pr, sig, findings, data, stale=stale, failing_base=failing_base, unrun=unrun)
         old = seen.get(t["pr_url"])
         if t.get("purview"):   # only its findings are news: no pr_changed for a PR no task opened
             seen[t["pr_url"]] = sig
