@@ -5171,15 +5171,20 @@ def _host_verdict(cmd: Any, rc: int, repo: Path, text: str, say: Callable[[str],
     return None
 
 
-def _gated(cmd: Any) -> bool:
-    """Whether the tests gate (_tests_gate) may judge check `cmd`: a local check that runs
-    pytest once (pushpass.resumable), or a script whose pytest runs are not known (no `"pytest"` key, no pytest
-    in its words): its output tells, and its reruns select by the select plugin in PYTEST_ADDOPTS."""
-    if remote_host(cmd):
-        return False
+def judgeable_cmd(cmd: Any) -> bool:
+    """Whether a check command's failing pytest ids can be read from its own output and its reruns
+    can select them: it runs pytest exactly once (pushpass.resumable), or its pytest runs are not
+    known (no `"pytest"` key, no pytest in its words): a script that says what failed itself, and
+    whose reruns select by the select plugin in PYTEST_ADDOPTS."""
     said = getattr(cmd, "pytest", None)
     return pushpass.resumable(cmd) or (said is None and pytest_runs(cmd) == 0
                                        and not any(w in cmd for w in pushpass._OWN_ENV))
+
+
+def _gated(cmd: Any) -> bool:
+    """Whether the tests gate (_tests_gate) may judge check `cmd`: a local check of a judgeable
+    kind (judgeable_cmd)."""
+    return not remote_host(cmd) and judgeable_cmd(cmd)
 
 
 def _tests_gate(cmd: Any, repo: Path, env: dict, say: Callable[[str], None], head: str, target: str, seen: dict,

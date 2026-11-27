@@ -7264,16 +7264,34 @@ def _checks_public_scan(p: Project | None, top: str, head: str, d: dict, target:
         return ""
 
 
+def _checks_continued_fork(p: Project, top: str, task: dict) -> str:
+    """The fork point recorded anywhere in the chain of tasks `task` continues (continues:<id>
+    labels): a continuing task inherits its lineage's fork point even when its own was never
+    recorded (the older task's worktree made before it, or its ref pruned with that worktree)."""
+    from . import db, worktree
+    seen: set[int] = set()
+    row: dict | None = task
+    while row and (cid := db.continues_id(row)) and cid not in seen:
+        seen.add(cid)
+        if fork := worktree.fork_point(Path(top), cid):
+            return fork
+        row = p.db.task(cid)
+    return ""
+
+
 def _checks_judge_base(p: Project, top: str, head: str, base: str) -> tuple[str, str]:
     """The commit the tests gate reruns failing tests on as the base of `head`, and why: the commit
     the head was built on. Its candidates, each only when it is an ancestor of the head: the fork point
-    recorded when the task's worktree was made (worktree.fork_point, by TTP_TASK); the head's merge
-    base with the branch the task is stacked on (its pr_branch or rebases branch, local then origin),
-    these two only for a task with a worktree of its own (not a review or harness task);
-    its merge base with `base`, the push branch tip (as before: may be the head itself). The first of
-    them wins, unless a later one descends from it (the head merged or was rebased onto a newer tip):
-    then the newest. ("", why) when none is known: no base rerun."""
-    from . import worktree
+    recorded when the task's worktree was made (worktree.fork_point, by TTP_TASK), or, for a task
+    that continues another and has none of its own, the fork point recorded anywhere in the chain it
+    continues; the head's merge base with the branch the task is stacked on (its pr_branch or
+    rebases branch, local then origin), these only for a task with a worktree of its own (not a
+    review or harness task); for that same continuing task with no fork point anywhere in its chain,
+    its merge base with the configured base (delivery.base_ref); else its merge base with `base`, the
+    push branch tip (as before: may be the head itself). The first of them wins, unless a later one
+    descends from it (the head merged or was rebased onto a newer tip): then the newest. ("", why)
+    when none is known: no base rerun."""
+    from . import db, worktree
 
     def git(*args: str):
         return gitmemo.run(["git", "-C", top, *args], capture_output=True, text=True)
@@ -7288,17 +7306,32 @@ def _checks_judge_base(p: Project, top: str, head: str, base: str) -> tuple[str,
     cands, notes = [], []
     tid = os.environ.get("TTP_TASK") or ""
     task = p.db.task(int(tid)) if tid.isdigit() else None
+    if task and task.get("kind") in worktree.NEVER_OWN_KINDS and (subject := db.review_subject(task)):
+        # A review judges the change it reviews: its base is its subject's (the reviewed task's
+        # fork point or continued chain), the same rule as any task of its own.
+        task = p.db.task(subject) or task
+    from_push_branch = True   # a continuing task with no fork point anywhere is judged on its own base, not the push branch
     if task and task.get("kind") not in worktree.NEVER_OWN_KINDS:   # a review runs in the change's tree
-        if fork := worktree.fork_point(Path(top), task["id"]):
-            if under(fork):
-                cands.append((fork, f"the fork point recorded when task #{task['id']}'s worktree was made"))
-            else:
-                notes.append(f"its recorded fork point {fork[:12]} is not an ancestor of the head (rebased away)")
+        fork = worktree.fork_point(Path(top), task["id"])
+        inherited = "" if fork else _checks_continued_fork(p, top, task)
+        for cand, why in ((fork, f"the fork point recorded when task #{task['id']}'s worktree was made"),
+                          (inherited, "the fork point the task it continues recorded")):
+            if cand and under(cand):
+                cands.append((cand, why))
+            elif cand:
+                notes.append(f"its recorded fork point {cand[:12]} is not an ancestor of the head (rebased away)")
         if b := (worktree.delivery_branch(task) or ("", False))[0]:
             for ref in (f"refs/heads/{b}", f"refs/remotes/origin/{b}"):
                 if under(m := mb(ref)):
                     cands.append((m, f"its merge base with {ref.removeprefix('refs/')}, the branch it is stacked on"))
-    if base and (m := mb(base)) and (m == head or under(m)):
+        if db.continues_id(task) and not fork and not inherited:
+            # A task that continues another was built on its lineage's branch, not the push branch:
+            # its base is the configured base it branched from, never the push-branch merge base.
+            from_push_branch = False
+            if ref := worktree.named_base(p):
+                if under(m := mb(ref)):
+                    cands.append((m, f"its merge base with {ref}, the branch code tasks branch from"))
+    if from_push_branch and base and (m := mb(base)) and (m == head or under(m)):
         cands.append((m, "its merge base with the push branch"))
     if not cands:
         return "", "; ".join(notes + ["no base known: no base rerun"])
@@ -7522,10 +7555,19 @@ def _checks_judge(a, p: Project | None, c, rc: int, output: str, cwd: str, env: 
     shipped along (remotecheck), and its base results are that host's. A blocking verdict with ids proven
     new (gatejudge.proven) is appended to `proven` and saved for the head's tree (gatejudge.save_new); one
     the reruns could not tell leaves the failure as it was. Never for a release check
-    (`--release`), a harness run or a command that is not one plain pytest run."""
-    from . import cleantree, gatejudge, push, pushpass, worktree
-    if not p or getattr(a, "release", False) or getattr(a, "purpose", None) not in (None, "candidate") \
-            or not pushpass.resumable(c):
+    (`--release`), a harness run or a command of a kind that cannot be judged (push.judgeable_cmd,
+    the rule the push gate's _gated uses)."""
+    from . import cleantree, gatejudge, push, worktree
+    if not p or getattr(a, "release", False) or getattr(a, "purpose", None) not in (None, "candidate"):
+        return None
+    if not push.judgeable_cmd(c):
+        if ids := gatejudge.judgeable(rc, output, p.config()):
+            # Never skip a judgement silently: say the failures stood unjudged, and how a check that
+            # is one pytest run can be marked so it is judged.
+            line = (f"{c}: {len(ids)} failing test(s) not judged against the base: the check is not one plain "
+                    'pytest run; set its "pytest": true key if it is one')
+            print(f"ttp checks: {line}", flush=True)
+            out.write(f"ttp checks: {line}\n")
         return None
     remote = push.remote_host(c)
     cfg = p.config()

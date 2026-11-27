@@ -353,12 +353,14 @@ def test_gate_excused_pass_never_counts_for_a_release_or_whole_suite_check():
     assert not gatejudge.counts_as_passed({"passed": False}, release=False)
 
 
-def _gate_repo(env, tmp_path, monkeypatch, base_body: str, head_body: str):
+def _gate_repo(env, tmp_path, monkeypatch, base_body: str, head_body: str, files: dict | None = None):
     # A repo whose base has tests/test_gate.py with `base_body` and whose head writes `head_body` there.
     from ttp import cli
     p, repo, run, git = _checks_repo(env, tmp_path, monkeypatch)
     (repo / "tests").mkdir()
     (repo / "tests" / "test_gate.py").write_text(base_body)
+    for name, text in (files or {}).items():
+        (repo / name).write_text(text)
     (repo / "b.txt").write_text("base\n")
     subprocess.run([*git, "add", "-A"], check=True)
     subprocess.run([*git, "commit", "-qm", "base"], check=True)
@@ -395,6 +397,39 @@ def test_ttp_checks_lets_a_failure_on_base_and_head_land_but_records_no_pass(env
         cli.main(["checks", "--release", "--", _FAIL])
     assert e.value.code == 1
     assert not json.loads((run / "checks.json").read_text())["passed"]
+
+
+_GATE_SH = "#!/bin/sh\nexec python3 -m pytest -q tests/\n"
+_SCRIPT = "sh gate.sh"
+
+
+def test_ttp_checks_judges_a_script_check_that_is_not_a_pytest_run(env, tmp_path, monkeypatch, capsys):
+    """A check with no pytest word and no "pytest" key is judged the same way a plain pytest run is:
+    its failing ids rerun on the base, and a failure that is on the base too does not fail the run.
+    Before, such a check was never judged: its failures always failed `ttp checks`."""
+    from ttp import cli, push
+    p, run = _gate_repo(env, tmp_path, monkeypatch, _PRE, _PRE + "\n\ndef helper():\n    return 1\n",
+                        {"gate.sh": _GATE_SH})
+    assert push.judgeable_cmd(_SCRIPT) and push._gated(_SCRIPT), "the push gate's own rule admits it"
+    cli.main(["checks", "--", _SCRIPT])
+    out = capsys.readouterr().out
+    assert "failing on both: pre-existing on the base" in out and "tests/test_gate.py::test_pre" in out
+    assert "LANDING ONLY" in out
+    log = (run / "checks.log").read_text()
+    assert "(rerun on the base" in log
+    rec = json.loads((run / "checks.json").read_text())
+    assert rec["passed"] and rec["excused"][0]["pre_existing"] == ["tests/test_gate.py::test_pre"]
+
+
+def test_ttp_checks_still_fails_a_script_check_failure_new_on_the_head(env, tmp_path, monkeypatch, capsys):
+    from ttp import cli
+    base = "def test_ok():\n    pass\n\n\ndef test_x():\n    pass\n"
+    head = base.replace("def test_x():\n    pass", "def test_x():\n    assert False")
+    _gate_repo(env, tmp_path, monkeypatch, base, head, {"gate.sh": _GATE_SH})
+    with pytest.raises(SystemExit) as e:
+        cli.main(["checks", "--", _SCRIPT])
+    assert e.value.code == 1
+    assert "new on this head" in capsys.readouterr().out
 
 
 def test_ttp_checks_blocks_a_failure_new_on_the_head(env, tmp_path, monkeypatch, capsys):
@@ -861,6 +896,73 @@ def test_ttp_checks_judges_a_plain_head_against_the_push_branch_as_before(env, t
     out = capsys.readouterr().out
     assert f"base {newer[:12]}: its merge base with the push branch (newer than {tip[:12]}" in out, out
     assert "pre-existing on the base" in out and "LANDING ONLY" in out
+
+
+@pytest.mark.parametrize("how", ["chain_fork", "base_ref"])
+def test_ttp_checks_judges_a_continued_task_on_its_lineage_not_the_push_branch(
+        env, tmp_path, monkeypatch, capsys, how):
+    """A task that continues another and has no fork point of its own is judged on the branch it was
+    built on: the fork point recorded anywhere in the chain it continues, else the configured base
+    (delivery.base_ref) it branched from, never the push-branch merge base, which lacks the base
+    branch's failing commit and would call a pre-existing failure new."""
+    from ttp import cli, worktree
+    p, run, git, commit, tid, tip = _stacked_repo(env, tmp_path, monkeypatch)
+    old = p.db.add_task("part one", "s", kind="code")
+    subprocess.run([*git, "checkout", "-qb", "feature/base"], check=True)
+    built_on = commit(_GATE_BAD, "the base branch")
+    if how == "chain_fork":
+        worktree.record_fork_point(Path.cwd(), old, built_on)
+    else:
+        p.set_config("delivery.base_ref", "feature/base")
+    subprocess.run([*git, "checkout", "-qb", "ttp/t1-demo"], check=True)
+    commit(_GATE_BAD + "\n\ndef helper():\n    return 1\n", "the change")
+    p.db.update_task(tid, labels=[f"continues:{old}"])
+    cli.main(["checks", "--", _FAIL])
+    out = capsys.readouterr().out
+    why = "the fork point the task it continues recorded" if how == "chain_fork" \
+        else "its merge base with feature/base, the branch code tasks branch from"
+    assert f"base {built_on[:12]}: {why}" in out, out
+    assert "merge base with the push branch" not in out, "a continuing task is never judged on the push branch"
+    assert "pre-existing on the base" in out and "tests/test_gate.py::test_x" in out and "LANDING ONLY" in out
+    rec = json.loads((run / "checks.json").read_text())
+    assert rec["passed"] and rec["excused"][0]["base"] == built_on
+    assert tip != built_on
+
+
+_TWO_RUNS = "python3 -m pytest -p no:cacheprovider tests/ && python3 -m pytest -p no:cacheprovider tests/"
+
+
+def test_ttp_checks_says_which_failures_were_not_judged_against_the_base(env, tmp_path, monkeypatch, capsys):
+    """A failed check whose ids can be read but whose kind cannot be rerun (two pytest runs) never
+    judges silently: one line says the failures were not judged against the base and names the
+    "pytest": true key that marks a check that is one pytest run."""
+    from ttp import cli
+    _gate_repo(env, tmp_path, monkeypatch, _PRE, _PRE)
+    with pytest.raises(SystemExit) as e:
+        cli.main(["checks", "--", _TWO_RUNS])
+    assert e.value.code == 1
+    out = capsys.readouterr().out
+    assert "not judged against the base" in out and '"pytest": true' in out, out
+
+
+def test_ttp_checks_judges_a_review_on_the_reviewed_tasks_fork_point(env, tmp_path, monkeypatch, capsys):
+    """A review runs in the change's worktree but judges on the reviewed task's base: its recorded
+    fork point (or its continued chain's), never the push-branch merge base a stale branch would give."""
+    from ttp import cli, worktree
+    p, run, git, commit, tid, tip = _stacked_repo(env, tmp_path, monkeypatch)
+    subprocess.run([*git, "checkout", "-qb", "merge/demo-batch"], check=True)
+    commit(None, "batch 1")
+    built_on = commit(_GATE_BAD, "batch 2")
+    worktree.record_fork_point(Path.cwd(), tid, built_on)
+    subprocess.run([*git, "checkout", "-qb", "ttp/t1-demo"], check=True)
+    commit(_GATE_BAD + "\n\ndef helper():\n    return 1\n", "the change")
+    review = p.db.add_task("Review", "s", kind="review", labels=[f"auto_review:{tid}"])
+    monkeypatch.setenv("TTP_TASK", str(review))
+    cli.main(["checks", "--", _FAIL])
+    out = capsys.readouterr().out
+    assert f"base {built_on[:12]}: the fork point recorded when task #{tid}'s worktree was made" in out, out
+    assert "pre-existing on the base" in out and "LANDING ONLY" in out
+    assert tip != built_on
 
 
 def test_ttp_checks_falls_back_to_the_merge_base_when_the_fork_point_was_rebased_away(
