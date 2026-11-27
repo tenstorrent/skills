@@ -6700,7 +6700,7 @@ def test_a_holder_waiting_for_test_slots_says_so_and_is_no_likely_hang(env, tmp_
         g.close()
 
 
-def test_the_host_checks_cap_prices_a_check_at_one_runs_measured_cores(monkeypatch):
+def test_the_host_checks_cap_prices_a_check_at_one_runs_measured_cores(env, monkeypatch):
     """checkcap.default_limit fits the spare cores at one run's cores (checklane.run_cores, as the lanes
     count them), not at a fixed 4; with the test pool off it keeps CHECK_LOAD."""
     from ttp import checkcap, checklane, testslots
@@ -13510,3 +13510,25 @@ def test_unreadable_process_stats_keep_the_aggregate_reading(env, tmp_path, monk
     _fake_procs(monkeypatch, tmp_path, {50: (1, 19, 100, 300)})
     hostcpu._LAST["at"] = hostcpu._LAST["at"][:4]
     assert checkcap.free_cores() == 1.0, "no pass at the window's start: the aggregate"
+
+
+def test_running_checks_do_not_shrink_the_cap_they_hold(env, monkeypatch):
+    """default_limit counts the checks running now as part of the cap, not as load that shrinks it: three
+    running checks of 8 cores on an otherwise idle 32-core host keep a cap of 4 (32 // 8), never more; a
+    host truly full besides them keeps the cap at the running three, and the live-cores gate refuses."""
+    from ttp import checkcap
+    monkeypatch.delenv("TTP_CHECKS_HOST_MAX", raising=False)
+    monkeypatch.setattr(checkcap, "cores", lambda: 32)
+    monkeypatch.setattr(checkcap, "check_load", lambda: 8.0)
+    monkeypatch.setattr(checkcap, "default_range", lambda: (1, 8))
+    monkeypatch.setattr(checkcap, "held_since", lambda paths: [0.0] * 3)
+    monkeypatch.setattr(checkcap, "_load", lambda: 24.0)
+    assert checkcap.default_limit() == 4, "the 3 running checks' 24 cores are theirs: 32 // 8"
+    monkeypatch.setattr(checkcap, "_load", lambda: 0.0)
+    assert checkcap.default_limit() == 4, "never above 32 // 8"
+    monkeypatch.setattr(checkcap, "_load", lambda: 32.0)
+    monkeypatch.setattr(checkcap, "free_cores", lambda: 0.0)
+    monkeypatch.setattr(checkcap, "sustain_s", lambda: 0)
+    monkeypatch.setattr(checkcap, "live_cores_on", lambda: True)
+    assert checkcap.default_limit() == 3, "8 foreign busy cores leave room for the 3 running only"
+    assert checkcap.cores_short([checkcap.slot_dir() / "checks.0.lock"]).startswith("0 of 32 cores free now")

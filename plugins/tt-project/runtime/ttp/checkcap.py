@@ -345,10 +345,13 @@ def measured_cores(now: float | None = None) -> float | None:
 
 def default_limit() -> int:
     """The cap with no checks.host_max: the checks the cores left over the CPU demand (_load()) hold
-    at check_load() each, within default_range(). An unreadable reading gives the floor."""
+    at check_load() each, the checks running now among them (the demand less their price), at most
+    cores() // check_load(), within default_range(). An unreadable reading gives the floor."""
     floor, top = default_range()
-    fit = int(max(0.0, cores() - _load()) // check_load())
-    return min(top, max(floor, fit))
+    price = check_load()
+    running = len(held_since(paths(_demand_span() + extra_max())))
+    fit = int(max(0.0, cores() - max(0.0, _load() - running * price)) // price)
+    return min(top, max(floor, min(fit, int(cores() // price))))
 
 
 RAMP_S = 30.0   # a check or test worker granted this recently may not show in the busy cores yet
