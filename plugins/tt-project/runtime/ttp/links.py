@@ -10,8 +10,10 @@ GitHub repo; a path in the project's repo that exists at the pushed commit links
 at that commit, one on the project host to the web app's file view. A '#N' after 'task', 'run',
 'review' or 'ask' (a list such as 'tasks #N, #M and #K' too) links to the web app's page for it. A
 chat message's '#N' ('Re #N', 'msg #N', 'user msg #N') never links: message and task ids overlap. A
-bare '#N' links as a task only when no message has that id; one naming nothing is labelled. Existing URLs,
-markdown links, code spans and code fences are left alone, so a second pass links nothing twice.
+bare '#N' links as a task only when no message has that id; one naming nothing stays as written, as
+does a '#N' inside a longer token (a branch name, path or URL fragment) or right after a repository
+name or GitHub word ('tt-metal #12', 'PR #12'). Existing URLs, markdown links, code spans, code
+fences and command lines are left alone, so a second pass links nothing twice.
 Stored records stay raw; callers linkify only at the outgoing boundary (the listener's line, the
 web app's message list and asks, `ttp status`).
 """
@@ -26,24 +28,31 @@ from urllib.parse import quote
 
 MD, TEXT = "md", "text"   # markdown [text](url) for chats, relays and the web app; 'text (url)' elsewhere
 
-# Segments never linkified: code fences, code spans, markdown links, bare URLs, and 'word (url)'.
-# The last two cover what an earlier pass of this same linkifier wrote in either shape, so a second
-# pass links nothing twice.
+# Segments never linkified: code fences, code spans, markdown links, bare URLs, 'word (url)' and
+# command lines (a line starting with a shell command, after indentation or a '$ ' prompt). The
+# 'word (url)' shape covers what an earlier pass of this same linkifier wrote, so a second pass links
+# nothing twice.
+COMMANDS = "gh|git|ttp|ssh|sudo|python3?|curl|bash|cd|rm|cp|mv|pytest|make"
 PROTECTED = re.compile(
-    r"```.*?```|`[^`\n]*`|\[[^\]]*\]\([^)]*\)|https?://\S+|\S+ \(https?://[^)\s]+\)"
-    r"|#\d+ \(unresolved reference\)", re.S)
+    r"```.*?```|~~~.*?~~~|`[^`\n]*`|\[[^\]]*\]\([^)]*\)|https?://\S+|\S+ \(https?://[^)\s]+\)"
+    rf"|^[ \t]*(?:(?:[-*]|\d+\.) )?(?:\$ )?(?:{COMMANDS})\b[^\n]*", re.S | re.M)
+# A '#N' is a whole ref only when no word, '-', '/', '=', '@' or '.word' touches it: otherwise it
+# is part of a longer token (a branch name, path or URL fragment).
+BEFORE = r"(?<![\w/=@-])"
+AFTER = r"(?![\w/=@-]|\.\w)"
 # owner/repo#N or repo#N.
-REF = r"(?<![\w/.-])(?P<rname>[A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.-]+)?)(?<!\.)#(?P<rnum>\d+)\b"
+REF = r"(?<![\w/.-])(?P<rname>[A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.-]+)?)(?<!\.)#(?P<rnum>\d+)" + AFTER
 # 'PR/pull request/issue #N': no repo named, so a repo is picked only when the project has one.
-PR_PHRASE = r"(?i:\b(?:PRs?|pull requests?|issues?)\s*:?\s*)(?P<pnum>#\d+\b)"
+PR_PHRASE = r"(?i:\b(?:PRs?|pull(?: requests?)?|issues?)\s*:?\s*)(?P<pnum>#\d+)" + AFTER
 # A tt-project id: bare '#N', or with its kind word ('task #N', 'run 20240', 'review #N', 'ask #N',
 # 'tasks #N, #M and #K': a list's ids share its word). Resolution (cfg's ref_url) decides whether it
 # links; 'review' names the review task, 'ask' its message row. 'Re'/'msg'/'message' name a chat
 # message and stay plain. Without the '#' a kind word takes only a 3+ digit id: 'run 4 at a time'
 # and 'task 2 of 5' are counts.
-ID_REF = (r"(?i:(?:\b(?P<ikind>tasks?|runs?|reviews?|asks?|msgs?|messages?|re)\b\s*:?\s*)?(?<![\w/])"
-          r"#(?P<inum>\d+)\b(?P<ilist>(?:\s*,\s*(?:and\s+|or\s+)?#\d+\b|\s+(?:and|or|&)\s+#\d+\b)*)"
-          r"|\b(?P<kkind>task|run|review)\s+(?P<knum>\d{3,})\b)")
+ID_REF = (r"(?i:(?:\b(?P<ikind>tasks?|runs?|reviews?|asks?|msgs?|messages?|re)\b\s*:?\s*)?" + BEFORE +
+          r"#(?P<inum>\d+)" + AFTER + r"(?P<ilist>(?:\s*,\s*(?:and\s+|or\s+)?#\d+" + AFTER
+          + r"|\s+(?:and|or|&)\s+#\d+" + AFTER + r")*)"
+          r"|\b(?P<kkind>task|run|review)\s+(?P<knum>\d{3,})" + AFTER + r")")
 ID_REF_RE = re.compile(ID_REF)
 KIND = {"task": "task", "run": "run", "review": "task", "ask": "msg"}
 TABLES = {"task": "tasks", "run": "runs", "msg": "messages"}   # where each kind of id lives
@@ -78,6 +87,18 @@ def _fmt(text: str, url: str, fmt: str) -> str:
     return f"[{text}]({url})" if fmt == MD else f"{text} ({url})"
 
 
+def _github_named(cfg: dict):
+    """A test of the text before a bare '#N': whether its last word names a configured repo (or is
+    owner/repo), which makes the '#N' a GitHub ref and never one of our ids."""
+    repos = {str(k).lower(): v for k, v in (cfg.get("repos") or {}).items()}
+    names = set(repos) | {str(v).rsplit("/", 1)[-1].lower() for v in [*repos.values(), cfg.get("single_repo")] if v}
+
+    def named(before: str) -> bool:
+        w = re.search(r"([\w./-]+)\s+$", before)
+        return bool(w and (w.group(1).lower() in names or "/" in w.group(1)))
+    return named
+
+
 def linkify(text: str, cfg: dict, fmt: str = MD) -> str:
     """`text` with every reference `cfg` can resolve turned into a link of `fmt` shape. Pure: cfg is
     plain values plus `file_url(path) -> url | None` and `is_file(path) -> bool` (a project file even
@@ -87,15 +108,13 @@ def linkify(text: str, cfg: dict, fmt: str = MD) -> str:
     single = str(cfg.get("single_repo") or "")
     file_url = cfg.get("file_url")
     ref = cfg.get("ref_url")
-    ok = cfg.get("ref_ok")
+    github_named = _github_named(cfg)
 
     def id_link(text_: str, n: int, kind: str) -> str:
         url = ref(n, kind) if ref else None
         if url:
             return _fmt(text_, url, fmt)
-        if kind or ref is None or (ok and ok(n, "msg")):
-            return text_   # a kinded id keeps its own label; a bare message id is plain text
-        return f"{text_} (unresolved reference)"   # a bare id naming nothing is never left bare
+        return text_   # an id naming nothing, or a chat message's, stays exactly as written
 
     def one(m: re.Match) -> str:
         g = m.groupdict()   # whichever alternative matched, None for the absent groups
@@ -113,6 +132,8 @@ def linkify(text: str, cfg: dict, fmt: str = MD) -> str:
             ilist = g.get("ilist") or ""
             head = m.group(0)[:len(m.group(0)) - len(ilist)]
             kind = _kind(word)
+            if not word and github_named(m.string[:m.start()]):
+                return m.group(0)   # 'tt-metal #12', 'skills #12': a GitHub ref, never one of our ids
 
             def item(x: re.Match) -> str:   # a list id not of its word's kind reads as a bare id,
                 url = ref(int(x.group(1)), kind) if ref else None   # as a second pass would read it
@@ -142,12 +163,17 @@ def problems(text: str, cfg: dict) -> list[str]:
     if not cfg.get("jira_base") and alts:
         for m in re.finditer(r"(?<![A-Za-z0-9])(" + alts + r")-\d+\b", text):
             out.append(f"{m.group(0)}: set links.jira_base to link it")
-    taken: list[tuple[int, int]] = []   # spans a plain '#N' or path must not be re-read from
+    named = _github_named(cfg)
+    taken: list[tuple[int, int]] = [m.span() for m in PROTECTED.finditer(text)]   # never linked, never reported
     for m in re.finditer(REF, text):
+        if any(a <= m.start() < b for a, b in taken):
+            continue
         if "/" not in m.group("rname") and not (cfg.get("repos") or {}).get(m.group("rname").lower()):
             out.append(f"{m.group(0)} names no configured repo (links.repos)")
         taken.append(m.span())
     for m in re.finditer(PR_PHRASE, text):
+        if any(a <= m.start() < b for a, b in taken):
+            continue
         if not cfg.get("single_repo"):
             out.append(f"{m.group(0).strip()}: no single GitHub repo to link it to")
         taken.append(m.span())
@@ -163,7 +189,7 @@ def problems(text: str, cfg: dict) -> list[str]:
             continue
         taken.append(m.span())
         word = (m.group("ikind") or m.group("kkind") or "").lower()
-        if word in PLAIN:
+        if word in PLAIN or (not word and named(text[:m.start()])):
             continue   # a chat message id is left plain on purpose
         ids = [int(m.group("inum") or m.group("knum"))] + [int(x) for x in re.findall(r"#(\d+)", m.group("ilist") or "")]
         for i, n in enumerate(ids):

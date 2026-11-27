@@ -32,15 +32,44 @@ def test_linkify_links_pr_words_only_with_one_repo_and_a_number_is_an_id_link():
         out = links.linkify(text, CFG)
         assert f"&{kind}=5" in out and f"[{text}]" in out, (text, out)
     assert links.linkify("run 5", CFG) == "run 5"   # without '#', a short number is a count
-    # one that resolves to nothing is labelled, never left bare and never given a guessed repo
-    assert links.linkify("see #1234", CFG) == "see #1234 (unresolved reference)"
-    assert links.linkify("task #4", CFG) == "task #4"      # kinded and unresolved: its kind labels it
+    # one that resolves to nothing stays exactly as written, never given a guessed repo
+    assert links.linkify("see #1234", CFG) == "see #1234"
+    assert links.linkify("task #4", CFG) == "task #4"
     assert links.linkify("plain text with no reference", CFG) == "plain text with no reference"
     # no resolver: the caller promised nothing about ids, so nothing changes
     assert links.linkify("see #5", {k: v for k, v in CFG.items() if k != "ref_url"}) == "see #5"
     # a second pass adds nothing
     once = links.linkify("task #5 needs a look", CFG)
     assert links.linkify(once, CFG) == once
+
+
+def test_unresolved_refs_and_code_are_never_rewritten():
+    from ttp import links
+    cfg = {**CFG, "repos": {"smi": "example-org/example-smi"}, "ref_url": lambda n, kind: f"http://w/#task={n}"
+           if kind in ("", "task") and n in (5, 55) else None}
+    same = (
+        "Superseded by #66874 and #64844",                       # unresolved: as written
+        "branch sample-repo #0-hc2-tests-integration",           # a repo name right before the ref
+        'gh pr close 12 -c "Superseded by #5 in favour of #66874"',   # an unfenced command line
+        "  $ git log --grep '#5'",                                # a prompt and indentation
+        "run `ttp status #5` then",                              # an inline code span
+        "```\ntask #5 and #66874\n```",                          # a fenced block
+        "~~~\nbump #5\n~~~",
+        "fix-#5-then and sample-#7-x and #5-hc2-tests",          # a branch-name token
+        "see docs/#5/notes and a=#5 and b@#5",                   # a path and key=value tokens
+        "open http://w/#task=5 now",                             # a URL fragment
+        "example-smi #55, smi #55 and PR #55 and pull #55",      # GitHub refs: never our task page
+        'gh pr close 1 -R o/r -c "Superseded by #66874"',        # a command with a repo flag
+        "- gh pr close 1 -c \"by #5\"",                            # a command inside a list item
+    )
+    for text in same:
+        assert links.linkify(text, cfg) == text, text
+        assert links.linkify(links.linkify(text, cfg), cfg) == text
+    assert links.linkify("see the follow-up #5", cfg) == "see the follow-up [#5](http://w/#task=5)"
+    assert links.linkify("PR #12-fix", {**cfg, "single_repo": "o/r"}) == "PR #12-fix"
+    assert links.problems("run `gh pr close #66874` or example-smi #66874", cfg) == []
+    assert links.linkify("then task #5 and #55 done, see #66874", cfg) == (
+        "then [task #5](http://w/#task=5) and [#55](http://w/#task=55) done, see #66874")
 
 
 def test_message_ids_never_become_task_links():
@@ -59,7 +88,7 @@ def test_message_ids_never_become_task_links():
     assert links.problems("Re #4311, see #4311 and tasks #9675, #9707", cfg) == []
     assert "#99" in " ".join(links.problems("tasks #9675 and #99", cfg))
     once = links.linkify("tasks #9675 and #99, run #1 and #9733", cfg)   # a list id not of its word's kind
-    assert "#99 (unresolved reference)" in once and "[#9733](http://w/#task=9733)" in once, once
+    assert "and #99," in once and "[#9733](http://w/#task=9733)" in once, once
     assert links.linkify(once, cfg) == once                              # reads the same on a second pass
 
 
@@ -206,7 +235,7 @@ def test_the_web_app_linkifies_its_messages_and_asks(env):
         _stop_web_apps(srv)
 
 
-def test_ids_link_to_their_web_app_page_and_unresolved_ones_get_labelled(env):
+def test_ids_link_to_their_web_app_page_and_unresolved_ones_stay_as_written(env):
     p = make(env)
     p.db.set_kv("web", {"port": 8123})    # a web app link exists: id references can resolve
     task = p.db.x("INSERT INTO tasks(created,title,spec) VALUES(?,?,?)", (0, "t", ""))
@@ -218,8 +247,7 @@ def test_ids_link_to_their_web_app_page_and_unresolved_ones_get_labelled(env):
     assert "run 777" in out and "#run=777" in out, out                   # a run id
     assert f"ask #{msg}" in out and f"#msg={msg}" in out, out            # an ask: its message page
     assert f"[review #{task}](http://127.0.0.1:8123/#task={task})" in out, out  # a review names its task
-    assert "#4 (unresolved reference)" in out, out                       # an id that matches nothing
-    assert "(unresolved" not in links.for_user(p, f"task #{task}")          # resolution is not labelling
+    assert out.startswith("#4 or "), out                                 # an id that matches nothing stays
     p.set_config("links.web_base", "https://example.org/app")
     assert f"https://example.org/app/#task={task}" in links.for_user(p, f"task #{task}")
     assert links.problems("#4 needs a look", links.config(p)) and links.problems(f"task #{task} done", links.config(p)) == []
