@@ -30,7 +30,7 @@ from datetime import datetime
 
 from . import project
 
-KEY = "pr_babysit"           # {pr_key: {"told": {condition: value}, "idle": mark, "notrun": mark, "unrun": [head, text],
+KEY = "pr_babysit"           # {pr_key: {"told": {condition: value}, "idle": mark, "notrun": [head, names], "unrun": [head, text],
                             #  "branch", "open", "head", "head_at"}}
 SENT_KEY = "pr_dispatched"   # kv: {"owner/repo workflow head": ts} of the dispatches the guard let through
 LIVE = ("queued", "in_progress", "waiting", "requested", "pending")   # a run in one of these covers its jobs
@@ -227,16 +227,17 @@ def _listed(f: dict | None, listed) -> bool:
     return bool(f) and (f["file"] in listed or f["name"] in listed or any(f"label:{x}" in listed for x in f.get("labels", [])))
 
 
-def _not_run(daemon, pr: dict, key: str, gh, now: float, pending: bool) -> tuple[str, str] | None:
+def _not_run(daemon, pr: dict, key: str, gh, now: float, pending: bool) -> tuple[str, str, list] | None:
     """The `pr_ci_not_run` text: workflows with only skipped checks, and (once nothing is pending) manual workflows
     `pr_babysit.dispatch` lists, by file, name or label, that never ran on the head; then the same text for the
-    listed ones alone, which hold CI green. None: the workflow files could not be read, so what ran is unknown."""
+    listed ones alone, which hold CI green; then the names of all of them, which the alert is keyed on. None: the
+    workflow files could not be read, so what ran is unknown."""
     sha, repo = pr.get("headRefOid"), key.split("#")[0]
     checks = pr.get("statusCheckRollup") or []
     listed = settings(getattr(daemon, "cfg", None))["dispatch"].get(repo, [])
     skip = any((c.get("conclusion") or "").upper() == "SKIPPED" for c in checks)
     if not (sha and (skip or listed)):
-        return "", ""
+        return "", "", []
     flows = _flows(daemon.p.db, gh, repo, sha, str(daemon.p.root), now)
     if flows is None:
         return None
@@ -249,7 +250,7 @@ def _not_run(daemon, pr: dict, key: str, gh, now: float, pending: bool) -> tuple
     todo.update({f["name"]: f for f in flows if f["manual"] and f["name"] not in ran and named and not pending and _listed(f, listed)})
     text = lambda held: "; ".join(f"{n} ({f['file'] + ', trigger: ' + f['trigger'] if f else 'trigger: none'})"
                                   for n, f in sorted(todo.items(), key=lambda x: x[0]) if not held or _listed(f, listed))
-    return text(False), text(True)
+    return text(False), text(True), sorted(todo)
 
 
 def _told(daemon, state: dict, key: str, url: str, sig: dict, ready: bool, unrun) -> None:
@@ -292,7 +293,8 @@ def sweep(daemon, t: dict, pr: dict, sig: dict, gh) -> str | None:
     allstate = dict(db.kv(KEY, {}) or {})
     state = allstate.setdefault(key, {})
     head = pr.get("headRefOid") or ""
-    text, held = (_not_run(daemon, pr, key, gh, now, sig["checks"] == "pending") if sig["state"] == "OPEN" else ("", "")) or (None, None)
+    text, held, names = (_not_run(daemon, pr, key, gh, now, sig["checks"] == "pending") if sig["state"] == "OPEN"
+                         else ("", "", [])) or (None, None, None)
     if held is not None or (state.get("unrun") or [""])[0] != head:   # an unread answer keeps what was known
         state["unrun"] = [head, held]
     _told(daemon, state, key, url, sig, pr.get("isDraft") is False, state["unrun"][1])
@@ -303,7 +305,9 @@ def sweep(daemon, t: dict, pr: dict, sig: dict, gh) -> str | None:
         state["head"] = head   # overlap_check caches the changed files by it
     events = []
     if sig["state"] == "OPEN":
-        if text and state.get("notrun") != (mark := f"{pr.get('headRefOid')} {text}"):
+        if text == "" and sig["checks"] != "pending":   # covered: the same workflows skipped again alert again
+            state.pop("notrun", None)
+        elif text and state.get("notrun") != (mark := [head, names]):   # new wording of one condition: no alert
             state["notrun"] = mark
             events.append(("pr_ci_not_run", f"PR {url}: checks skipped or never run on the head: {text}. Dispatch "
                            "or label what this change needs (the project's own PRs only)."))

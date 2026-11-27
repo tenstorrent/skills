@@ -677,3 +677,86 @@ def test_prbabysit_a_done_task_with_no_open_publication_queues_the_fix_as_before
     assert len(p.db.q("SELECT id FROM tasks WHERE title LIKE 'Fix PR findings%'")) == 1
     rec = p.db.kv("pr_findings")["acme/widgets#7"]
     assert "prereq" not in rec and rec["owner"] == 2, rec
+
+
+_PB_BOT, _PB_DEV = {"__typename": "Bot", "login": "scan-bot"}, {"__typename": "User", "login": "dev"}
+_PB_FIND = _PB_URL + "#issuecomment-11"
+
+
+def _pb_top_graph(*replies, threads=(), author="bot-owner"):
+    """A BOT_QUERY answer: one bot top-level finding, then each of `replies` (author, body) as a later top-level
+    comment; `threads` are review threads given as lists of (author, body)."""
+    cs = [{"author": _PB_BOT, "body": "Possible SQL injection in `query_user`: the id is formatted into the string.",
+           "createdAt": "2026-01-02T00:00:00Z", "url": _PB_FIND}]
+    cs += [{"author": a, "body": b, "createdAt": f"2026-01-03T00:00:0{i}Z", "url": f"{_PB_URL}#issuecomment-2{i}"}
+           for i, (a, b) in enumerate(replies)]
+    ths = [{"isResolved": False, "isOutdated": False, "path": "src/app.py", "comments": {"nodes": [
+        {"author": a, "body": b, "url": f"{_PB_URL}#discussion_r{i}{j}"} for j, (a, b) in enumerate(th)]}}
+        for i, th in enumerate(threads)]
+    return {"data": {"repository": {"pullRequest": {"author": {"login": author}, "comments": {"nodes": cs},
+                                                    "reviews": {"nodes": []}, "reviewThreads": {"nodes": ths}}}}}
+
+
+def test_prbabysit_a_bot_finding_is_answered_only_by_a_comment_that_links_or_quotes_it():
+    from ttp import watchers
+    assert watchers.bot_open(_pb_top_graph((_PB_DEV, "Rebased on main, CI should rerun."))) == [_PB_FIND], \
+        "an unrelated later comment from a person leaves the finding open"
+    assert watchers.bot_open(_pb_top_graph((_PB_DEV, f"Fixed in the next commit ([finding]({_PB_FIND}))."))) == []
+    assert watchers.bot_open(_pb_top_graph((_PB_DEV, "> Possible SQL injection in `query_user`\n\nNow a bound "
+                                                     "parameter."))) == [], "a quote of the finding answers it"
+    assert watchers.bot_open(_pb_top_graph((_PB_DEV, "> ok\n\nthanks"))) == [_PB_FIND], "a short quote names nothing"
+    assert watchers.bot_open(_pb_top_graph((_PB_DEV, f"See {_PB_FIND}1 instead."))) == [_PB_FIND], \
+        "a link to another comment whose id only starts the same is not a link to it"
+    assert _PB_FIND in watchers.bot_open(_pb_top_graph((_PB_BOT, f"Summary: {_PB_FIND}"))), "a bot's own link"
+
+
+def test_prbabysit_a_persons_thread_is_answered_by_the_pr_author_or_a_run_replying_after_it():
+    from ttp import watchers
+    ask, author = (_PB_DEV, "Why a new helper here?"), {"__typename": "User", "login": "bot-owner"}
+    url = f"{_PB_URL}#discussion_r00"
+    assert watchers.human_open(_pb_top_graph(threads=[[ask, (author, "It is reused by the loader.")]])) == []
+    assert watchers.human_open(_pb_top_graph(threads=[[ask, (_PB_DEV, "Answered <!-- ttp -->"),
+                                                      (_PB_BOT, "Coverage unchanged.")]])) == [], \
+        "a bot posting after the answer does not reopen the thread"
+    assert watchers.human_open(_pb_top_graph(threads=[[ask, (author, "Reused."), (_PB_DEV, "Still unclear.")]])) \
+        == [url], "the person asking again after the answer reopens it"
+    assert watchers.human_open(_pb_top_graph(threads=[[ask, (author, "Reused.")]], author="")) == [url], \
+        "with the PR author unknown only the runs' marked reply answers"
+
+
+def test_prbabysit_a_not_run_condition_that_returns_on_the_same_head_alerts_again_and_a_text_change_does_not(env, monkeypatch):
+    from ttp import watchers
+    _pb_gh(monkeypatch)
+    ok = {"name": "validate", "workflowName": "ci", "status": "COMPLETED", "conclusion": "SUCCESS"}
+    skip = {"name": "build", "checkSuite": {"workflowRun": {"workflow": {"name": "Heavy"}}}, "status": "COMPLETED",
+            "conclusion": "SKIPPED"}
+    reads = [[ok, skip], [ok], [ok, skip]]
+    p, d, _ = _pb_run(env, monkeypatch, _pb_pr())
+    monkeypatch.setattr(watchers, "_read_prs", lambda order, root, w, t: {x["pr_url"]: {
+        "pr": _pb_pr(statusCheckRollup=reads[0]), "data": None, "cut": None, "calls": ["pr view"]} for x in order})
+    for _ in range(3):
+        watchers.watch_prs(d)
+        reads.pop(0)
+    assert len([t for k, t in _pb_events(p) if k == "pr_ci_not_run"]) == 2, "skipped, covered, skipped again: two alerts"
+    flows = {**_PB_FLOWS, ".github/workflows/heavy.yml": _PB_FLOWS[".github/workflows/heavy.yml"].replace(
+        "run-heavy", "heavy-ci")}
+    _pb_gh(monkeypatch, flows)
+    reads = [[ok, skip]]
+    p.db.set_kv("pr_workflows", {})
+    watchers.watch_prs(d)
+    assert len([t for k, t in _pb_events(p) if k == "pr_ci_not_run"]) == 2, "the same workflows, new wording: no alert"
+
+
+def test_prbabysit_a_never_run_workflow_hidden_while_checks_are_pending_does_not_alert_again(env, monkeypatch):
+    from ttp import watchers
+    _pb_gh(monkeypatch)
+    ok = {"name": "validate", "workflowName": "ci", "status": "COMPLETED", "conclusion": "SUCCESS"}
+    rerun = {"name": "lint", "workflowName": "ci", "status": "IN_PROGRESS", "conclusion": ""}
+    reads = [[ok], [ok, rerun], [ok]]
+    p, d, _ = _pb_run(env, monkeypatch, _pb_pr(), cfg={"pr_babysit.dispatch": {"acme/widgets": ["nightly.yml"]}})
+    monkeypatch.setattr(watchers, "_read_prs", lambda order, root, w, t: {x["pr_url"]: {
+        "pr": _pb_pr(statusCheckRollup=reads[0]), "data": None, "cut": None, "calls": ["pr view"]} for x in order})
+    for _ in range(3):
+        watchers.watch_prs(d)
+        reads.pop(0)
+    assert len([t for k, t in _pb_events(p) if k == "pr_ci_not_run"]) == 1, "a pending re-run covers nothing"

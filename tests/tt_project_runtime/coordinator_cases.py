@@ -13033,13 +13033,14 @@ def test_pr_watch_turns_ci_failures_and_bot_comments_into_work_before_the_review
     assert len(clean) == 1 and "ask the user for a draft review" in clean[0]
     assert ask() == []
     assert prguard.findings_problem(p.db, "Other PR acme/widgets#8") is None
-    # A bot's top-level comment counts until a person comments after it.
+    # A bot's top-level comment counts until a person's comment quotes or links it.
     graph["data"]["repository"]["pullRequest"]["comments"]["nodes"] = [
-        {"author": bot, "createdAt": "2026-01-02T00:00:00Z", "url": "c1"},
+        {"author": bot, "createdAt": "2026-01-02T00:00:00Z", "url": "c1", "body": "Coverage dropped below the gate."},
         {"author": human, "createdAt": "2026-01-01T00:00:00Z", "url": "c0"}]
     assert watchers.bot_open(graph) == ["c1"]
     graph["data"]["repository"]["pullRequest"]["comments"]["nodes"].append(
-        {"author": human, "createdAt": "2026-01-03T00:00:00Z", "url": "c2"})
+        {"author": human, "createdAt": "2026-01-03T00:00:00Z", "url": "c2",
+         "body": "> Coverage dropped below the gate.\n\nExpected: the new code is generated."})
     assert watchers.bot_open(graph) == []
 
 
@@ -13113,7 +13114,8 @@ def test_pr_watch_counts_a_bots_reposted_finding_once_and_skips_empty_review_wra
     # A bot's top-level re-post after a person answered the first one is a repeat; a new one is not.
     tops = graph["data"]["repository"]["pullRequest"]["comments"]["nodes"]
     tops += [{**post(7, "aaa1111", "Coverage dropped."), "createdAt": "2026-01-01T00:00:00Z"},
-             {"author": human, "createdAt": "2026-01-02T00:00:00Z", "url": "h1", "body": "Expected."},
+             {"author": human, "createdAt": "2026-01-02T00:00:00Z", "url": "h1",
+              "body": "> **Coverage dropped.** in commit aaa1111\n\nExpected."},
              {**post(8, "bbb2222", "Coverage dropped."), "createdAt": "2026-01-03T00:00:00Z"},
              {**post(9, "bbb2222", "License header missing."), "createdAt": "2026-01-03T00:00:00Z"}]
     assert watchers.bot_open(graph) == ["r5", "r6", "r9"]

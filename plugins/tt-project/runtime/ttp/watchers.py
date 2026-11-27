@@ -258,14 +258,15 @@ def body_stale(pr: dict, bodies: dict, heads: dict, now: float) -> str:
 
 
 def human_open(data: dict | None) -> list[str]:
-    """URLs of review threads a person started that are unresolved, not outdated and not answered by a
-    run (a reply carrying the hidden line <!-- ttp -->)."""
+    """URLs of review threads a person started that are unresolved, not outdated and not answered: the
+    last person to post in the thread is neither the PR's author nor a run (the hidden line <!-- ttp -->).
+    A bot posting after the answer does not reopen it; the person asking again does."""
     pr = (((data or {}).get("data") or {}).get("repository") or {}).get("pullRequest") or {}
     out = []
     for th in (pr.get("reviewThreads") or {}).get("nodes") or []:
         cs = (th.get("comments") or {}).get("nodes") or []
         if (cs and not _is_bot(cs[0].get("author")) and not th.get("isResolved") and not th.get("isOutdated")
-                and "<!-- ttp -->" not in str(cs[-1].get("body") or "")):
+                and not _own([c for c in cs if not _is_bot(c.get("author"))][-1], pr)):
             out.append(cs[0].get("url") or "?")
     return out
 
@@ -486,7 +487,7 @@ def _views(node: dict, nodes: dict) -> tuple[dict, dict]:
             "reviewRequests": [x["requestedReviewer"] for x in (node.get("reviewRequests") or {}).get("nodes") or []
                                if x.get("requestedReviewer")],
             "headDate": _at(node, ("commits", "nodes", -1, "commit", "committedDate"))}
-    data = {"data": {"repository": {"pullRequest": {
+    data = {"data": {"repository": {"pullRequest": {"author": node.get("author"),
         "comments": {"nodes": nodes["comments"][-100:]}, "reviews": {"nodes": reviews[-100:]},
         "reviewThreads": node.get("reviewThreads") or {"nodes": []}}}}}
     return view, data
@@ -1031,7 +1032,7 @@ def _check_unapproved(daemon, t: dict, pr: dict, sig: dict, before: set, flagged
 
 
 BOT_QUERY = ("query($owner:String!,$name:String!,$number:Int!){repository(owner:$owner,name:$name){"
-             "pullRequest(number:$number){"
+             "pullRequest(number:$number){author{login} "
              "comments(last:100){nodes{author{__typename login} body createdAt url}}"
              "reviews(last:100){nodes{id author{__typename login} state body submittedAt url "
              "comments(first:50){totalCount nodes{author{__typename login} body}}}}"
@@ -1084,8 +1085,9 @@ def _repeats_answered(review: dict, threads: dict[str, bool]) -> bool:
 def bot_findings(data: dict) -> list[tuple[str, str]]:
     """(finding_key, URL) of bot review findings on a PR that are neither fixed nor answered: a review
     thread a bot started that is unresolved, not outdated and has no reply from a person; a bot's
-    top-level comment, or review asking for changes, with no comment from a person after it (a review
-    whose summary only repeats its answered or resolved threads has their disposition). A bot
+    top-level comment, or review asking for changes, that no person's post links to or quotes
+    (_links_or_quotes; an unrelated later comment answers nothing, and a review whose summary only repeats
+    its answered or resolved threads has their disposition). A bot
     re-posting a finding (same key) is one finding, listed once; once any post of it was answered
     (or its thread resolved), its re-posts are not open work."""
     pr = (((data or {}).get("data") or {}).get("repository") or {}).get("pullRequest") or {}
@@ -1100,13 +1102,14 @@ def bot_findings(data: dict) -> list[tuple[str, str]]:
             t = _finding_text(str(cs[0].get("body") or ""))
             threads[t] = threads.get(t, False) or answered
     comments = (pr.get("comments") or {}).get("nodes") or []
-    human_times = sorted(c.get("createdAt") or "" for c in comments if not _is_bot(c.get("author")))
-    last_human = human_times[-1] if human_times else ""
-    tops = [(c.get("createdAt") or "", c) for c in comments if _is_bot(c.get("author"))]
-    tops += [(r.get("submittedAt") or "", r) for r in (pr.get("reviews") or {}).get("nodes") or []
-             if _is_bot(r.get("author")) and r.get("state") == "CHANGES_REQUESTED"]
-    for ts, c in tops:
-        done = ts <= last_human or _repeats_answered(c, threads)
+    reviews = (pr.get("reviews") or {}).get("nodes") or []
+    posts = comments + reviews + [c for th in (pr.get("reviewThreads") or {}).get("nodes") or []
+                                  for c in (th.get("comments") or {}).get("nodes") or []]
+    replies = [str(c.get("body") or "") for c in posts if not _is_bot(c.get("author"))]
+    tops = [c for c in comments if _is_bot(c.get("author"))]
+    tops += [r for r in reviews if _is_bot(r.get("author")) and r.get("state") == "CHANGES_REQUESTED"]
+    for c in tops:
+        done = any(_links_or_quotes(body, c) for body in replies) or _repeats_answered(c, threads)
         items.append((finding_key(c), c.get("url") or "?", done, not done))
     answered = {k for k, _, a, _ in items if a}
     out, seen = [], set()
@@ -1115,6 +1118,20 @@ def bot_findings(data: dict) -> list[tuple[str, str]]:
             seen.add(k)
             out.append((k, u))
     return out
+
+
+QUOTE_MIN_CHARS = 20   # a shorter partial quote ("> fixed") could match any finding
+
+
+def _links_or_quotes(body: str, finding: dict) -> bool:
+    """Whether a post links to the finding (its exact URL) or quotes it: a `>` line whose words are in the
+    finding's and are the whole of them or at least QUOTE_MIN_CHARS long."""
+    url = str(finding.get("url") or "")
+    if url and url in {u.rstrip(").,;:>]'\"") for u in _URL_RE.findall(body)}:
+        return True
+    text = _finding_text(str(finding.get("body") or ""))
+    quotes = (_finding_text(line.lstrip()[1:]) for line in body.splitlines() if line.lstrip().startswith(">"))
+    return any(q and q in text and (q == text or len(q) >= QUOTE_MIN_CHARS) for q in quotes)
 
 
 def bot_open(data: dict) -> list[str]:

@@ -1790,7 +1790,7 @@ MIXED_PRS = {   # number: (view answer extras, BOT_QUERY pullRequest)
     4: ({"isDraft": True, "statusCheckRollup": [{"name": "build", "conclusion": "SUCCESS", "status": "COMPLETED"}]},
         {"comments": {"nodes": [
             {"author": {"login": "lint[bot]"}, "body": "style nit", "url": "u4", "createdAt": "2026-01-01"},
-            {"author": {"login": "someone"}, "body": "done", "url": "u4b", "createdAt": "2026-01-02"}]}}),
+            {"author": {"login": "someone"}, "body": "> style nit\n\ndone", "url": "u4b", "createdAt": "2026-01-02"}]}}),
 }
 
 
