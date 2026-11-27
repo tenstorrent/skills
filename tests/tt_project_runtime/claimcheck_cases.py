@@ -409,12 +409,17 @@ def test_a_machine_with_a_reach_cmd_is_probed_by_that_command_and_never_by_ssh(e
         machines.add(h)
     p.set_config("ssh.reach_cmd", {"box-a": "exit 0", "box-b": "exit 3"})
     via = reach.cmds(p)
-    assert via == {"box-a": "exit 0", "box-b": "exit 3"}
+    assert {a: c.split(" && ", 1)[1] for a, c in via.items()} == {"box-a": "exit 0", "box-b": "exit 3"}
     reach.probe(["box-a", "box-b"], None, via)
     assert {a: r["ok"] for a, r in reach.read().items()} == {"box-a": True, "box-b": False}
     assert not log.exists(), "the stub ssh was never called"
     reach.probe(["box-a"], None, {})   # with no command for it, the ssh probe runs
     assert log.exists()
+    (p.root / "probe.sh").write_text("exit 0\n")   # a relative path resolves from the project root, not the daemon's cwd
+    p.set_config("ssh.reach_cmd", {"box-a": "sh probe.sh"})
+    monkeypatch.chdir(tmp_path)
+    reach.probe(["box-a"], None, reach.cmds(p))
+    assert reach.read()["box-a"]["ok"] is True
 
 
 def test_a_machine_backing_off_after_a_refused_start_is_not_probed_and_reads_as_backing_off(env, tmp_path, monkeypatch):

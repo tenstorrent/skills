@@ -2751,6 +2751,12 @@ def test_an_outage_names_the_tunnel_only_when_its_port_refuses_else_the_far_host
         assert "box-a" in m["text"] and "appears down" in m["text"] and "VPN" not in m["text"], m["text"]
 
 
+def test_a_remote_command_saying_connection_reset_by_peer_is_not_an_ssh_failure():
+    from ttp import netwait
+    assert not netwait.ssh_failed("curl: (56) Connection reset by peer")
+    assert netwait.ssh_failed("Connection reset by 127.0.0.1 port 2222")
+
+
 def test_network_outage_on_a_tunnel_route_that_comes_back_before_the_threshold_never_pages(env, monkeypatch):
     from ttp import alerts
     p, d, tids, now, check = _net_setup(env, monkeypatch, probe=TUNNEL_PROBE, out=TUNNEL_OUT,

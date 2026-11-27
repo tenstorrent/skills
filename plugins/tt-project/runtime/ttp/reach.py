@@ -17,6 +17,7 @@ import fcntl
 import json
 import os
 import re
+import shlex
 import subprocess
 import time
 
@@ -73,9 +74,10 @@ def due(now: float, every_s: float = PROBE_S) -> list[str]:
 
 
 def cmds(p) -> dict[str, str]:
-    """ssh.reach_cmd: {alias: shell command} run in place of the ssh probe."""
+    """ssh.reach_cmd: {alias: shell command} run in place of the ssh probe, from the project root."""
     got = ((p.config().get("ssh") or {}).get("reach_cmd") if p else None) or {}
-    return {str(a): str(c) for a, c in got.items() if str(c).strip()} if isinstance(got, dict) else {}
+    return {str(a): f"cd {shlex.quote(str(p.root))} && {c}" for a, c in got.items() if str(c).strip()} \
+        if isinstance(got, dict) else {}
 
 
 def _run(cmd: str, env: dict | None) -> bool:

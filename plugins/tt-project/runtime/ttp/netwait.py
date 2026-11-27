@@ -82,10 +82,10 @@ _OFFLINE = re.compile(r"[Cc]ould not resolve hostname|Name or service not known|
 # ssh's own errors before any session: the probe never reached its host, whatever exit code it mapped this to
 _SSH_FAIL = re.compile(r"ssh: connect to host|ssh: [Cc]ould not resolve hostname|kex_exchange_identification|"
                        r"Connection (?:timed out|refused) during banner exchange|"
-                       r"ssh_exchange_identification|Connection closed by \S+ port \d+|Connection reset by")
+                       r"ssh_exchange_identification|Connection (?:closed|reset) by \S+ port \d+")
 # The connection was made and then ended or went silent: whatever answered (a tunnel's far end included) is up, the far host is the cause.
 _FAR_SIDE = re.compile(r"kex_exchange_identification|banner exchange|ssh_exchange_identification|"
-                       r"Connection (?:closed|reset) by")
+                       r"Connection (?:closed|reset) by \S+ port \d+")
 # SMBIOS chassis types of a laptop or desktop (desktop, low profile, mini tower, portable, laptop,
 # notebook, hand held, all in one, sub notebook, space-saving, lunch box, tablet, convertible,
 # detachable, mini PC, stick PC); servers (main server chassis, rack mount, blade, ...) are not.
