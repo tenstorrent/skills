@@ -818,3 +818,20 @@ def test_a_backoff_record_is_per_destination_and_survives_the_socket_folder_clea
     out, log = _spawn_wrappers(tmp_path, short_cm, 1, args=("box-b", "true"), FAKE_RC=255, FAKE_OPEN_ERR=_REFUSED)
     assert len(_opens(log)) == 2 and out[0][0] == 255              # box-b was started although box-a is backing off
     assert (short_cm / "box-a.lock").exists() and _record(tmp_path) is not None
+
+
+def test_parallel_ssh_wrapper_calls_open_one_master_on_a_host_without_flock(tmp_path, short_cm):
+    import subprocess
+    nof = tmp_path / "noflock"
+    nof.mkdir()
+    for d in ("/usr/bin", "/bin"):
+        for f in pathlib.Path(d).iterdir():
+            if f.name != "flock" and not (nof / f.name).is_symlink():
+                (nof / f.name).symlink_to(f)
+    w, e = _wrapper_env(tmp_path, FAKE_MASTER=tmp_path / "master", TTP_SSH_CM_DIR=short_cm, FAKE_OPEN_DELAY=0.5)
+    e["PATH"] = f"{w.parent}:{tmp_path / 'rbin'}:{nof}"
+    assert subprocess.run(["sh", "-c", "command -v flock"], env=e).returncode != 0
+    procs = [subprocess.Popen([str(w), "box-a", "true"], env=e, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+             for _ in range(8)]
+    assert [p.wait(timeout=30) for p in procs] == [0] * 8
+    assert len(_opens((tmp_path / "log").read_text().splitlines())) == 1 and not (short_cm / "box-a.lockd").exists()

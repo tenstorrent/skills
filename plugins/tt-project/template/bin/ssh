@@ -9,7 +9,8 @@
 # <dir> is $TTP_SSH_CM_DIR, else ~/.tt-project/cm (mode 700), else /tmp/ttp-cm-<uid> when the home path
 # is too long for a socket path (104 bytes with its NUL on macOS: <dir>/ + 40 for %C + a 17-character
 # suffix ssh adds while it binds leaves 45 for <dir>).
-# The user's ~/.ssh is never read or written here; -F, ProxyJump and BatchMode pass through.
+# The backoff and lock key is the destination with characters outside ASCII letters, digits and ._@- replaced by _.
+# The user's~/.ssh is never read or written here; -F, ProxyJump and BatchMode pass through.
 # Left as is: TTP_SSH_REUSE=0 (config ssh.reuse off); a call that sets its own sharing (-S, -M, -O,
 # ControlMaster, ControlPath) or forwards ports or stdio (-L -R -D -W -w -N -f: a forward added to a
 # shared connection would outlive the command); -v (a verbose master keeps the caller's stderr open for
@@ -136,7 +137,7 @@ if [ -n "$dest" ]; then
         "$real" $mux -fN "$@" </dev/null >/dev/null 2>"$err" 9>&-
         rc=$?
         cat "$err" >&2
-        if [ $rc -eq 0 ]; then rm -f "$err" "$rec"; return 0; fi
+        if [ $rc -eq 0 ]; then rm -f "$err"; [ ! -e "$rec" ] || rm -f "$rec"; return 0; fi
         if [ $rc -eq 255 ] && grep -qiE 'Exceeded MaxStartups|Connection reset|Connection closed by remote host|banner exchange|kex_exchange_identification' "$err"; then
             step=60
             if read -r _ prev 2>/dev/null < "$rec" && [ "$prev" -ge 60 ] 2>/dev/null; then
@@ -147,15 +148,26 @@ if [ -n "$dest" ]; then
             rc=255
         fi
         rm -f "$err"
+        unlock
         exit $rc
     }
+    # Without flock (macOS) a mkdir lock stands in, taken over after 30 s so a killed holder never wedges it.
+    lock() {
+        if command -v flock >/dev/null 2>&1; then exec 9>"$dir/$key.lock"; flock 9; return; fi
+        i=0
+        until mkdir "$dir/$key.lockd" 2>/dev/null; do
+            i=$((i + 1)); [ $i -le 300 ] || { rmdir "$dir/$key.lockd" 2>/dev/null; i=0; }
+            sleep 0.1
+        done
+    }
+    unlock() { exec 9>&-; rmdir "$dir/$key.lockd" 2>/dev/null; }
     if up "$@"; then
-        rm -f "$rec"
+        [ ! -e "$rec" ] || rm -f "$rec"
     else
         ! backing || exit 255
-        ! command -v flock >/dev/null 2>&1 || { exec 9>"$dir/$key.lock"; flock 9; }
-        if up "$@"; then rm -f "$rec"; else ! backing || exit 255; open_master $n "$@"; fi
-        exec 9>&-
+        lock
+        if up "$@"; then [ ! -e "$rec" ] || rm -f "$rec"; else ! backing || { unlock; exit 255; }; open_master $n "$@"; fi
+        unlock
     fi
 fi
 exec "$real" $mux "$@"
