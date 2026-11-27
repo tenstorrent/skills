@@ -426,6 +426,56 @@ def _sudo_fenced():
     yield
 
 
+# Files above a folder that make pytest pick up a conftest.py or take that folder as its rootdir.
+_PYTEST_FILES = ("conftest.py", "pytest.ini", ".pytest.ini", "tox.ini", "setup.cfg", "pyproject.toml", "setup.py")
+
+
+def _away_from_tmp(path: Path) -> bool:
+    """`path` is outside /tmp and /var/tmp (where a GLM run may always write) and no folder above it holds a
+    file pytest would pick up (_PYTEST_FILES)."""
+    real = Path(os.path.realpath(path))
+    skip = {Path(p) for t in ("/tmp", "/var/tmp") for p in (t, os.path.realpath(t))}
+    return not any(d in skip for d in (real, *real.parents)) and not any(
+        (d / f).is_file() for d in real.parents for f in _PYTEST_FILES)
+
+
+@pytest.fixture
+def tmp_path(request, tmp_path):
+    """pytest's tmp_path; for a test marked away_from_tmp, a fresh folder that is not under /tmp or
+    /var/tmp and has no pytest file above it (_away_from_tmp), made on the RAM disk or the runtime folder
+    when pytest's own temp root (a `ttp checks` TMPDIR, say) is under /tmp: the checks that treat /tmp as
+    inside a worktree and those that look for a project root above one then see what they see anywhere."""
+    if request.node.get_closest_marker("away_from_tmp") is None or _away_from_tmp(tmp_path):
+        yield tmp_path
+        return
+    import shutil
+    import tempfile
+    for root in (TMPFS, os.environ.get("XDG_RUNTIME_DIR", "")):
+        if root and os.access(root, os.W_OK | os.X_OK) and _away_from_tmp(Path(root, "x")):
+            break
+    else:
+        pytest.fail("away_from_tmp needs a writable folder outside /tmp with no pytest file above it "
+                    f"({TMPFS}, $XDG_RUNTIME_DIR)")
+    own = tempfile.mkdtemp(prefix="ttp-away-", dir=root)
+    try:
+        yield Path(os.path.realpath(own))
+    finally:
+        shutil.rmtree(own, ignore_errors=True)
+
+
+@pytest.fixture
+def own_tempdir(tmp_path, monkeypatch):
+    """The system temp folder (TMPDIR and tempfile's cached choice) is a folder in tmp_path for this test, so
+    a clean checkout or scratch folder the code under test makes there is where the test's own files are."""
+    import tempfile
+    d = tmp_path / "systmp"
+    d.mkdir()
+    for var in ("TMPDIR", "TMP", "TEMP"):
+        monkeypatch.setenv(var, str(d))
+    monkeypatch.setattr(tempfile, "tempdir", str(d))
+    return d
+
+
 @pytest.fixture(autouse=True)
 def _temp_home(tmp_path_factory, monkeypatch):
     """Points HOME (and the XDG and agent config folders) at a fresh temp folder for this test, and
@@ -932,6 +982,8 @@ def pytest_collection_modifyitems(config, items):
 @pytest.hookimpl(trylast=True)   # after pytest's own tmpdir plugin made the factory _use_tmpfs patches
 def pytest_configure(config):
     config.addinivalue_line("markers", f"{SMOKE_MARK}: in the smoke suite a landing waits for ({SMOKE_LIST.name})")
+    config.addinivalue_line("markers", "away_from_tmp: tmp_path is a folder outside /tmp and /var/tmp with no "
+                                       "pytest file above it, wherever pytest's own temp root is")
     config._ttp_started = time.monotonic()
     _use_tmpfs(config)
     try:   # the real stderr: capture is suspended here, as for pytest's own faulthandler plugin

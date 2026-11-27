@@ -816,6 +816,7 @@ def test_glm_guard_refuses_every_real_edit_of_the_runs_identity(cmd, tmp_path):
     assert glmguard.shell_refusal(cmd, str(wt), str(rd), {"TTP_PROJECT": str(tmp_path / "proj"), **_GG_RUN_ENV}), cmd
 
 
+@pytest.mark.away_from_tmp
 def test_glm_guard_refuses_a_file_write_outside_the_worktree_and_any_connector_tool(tmp_path):
     from ttp import glmguard
     wt, rd = _gg_run(tmp_path)
@@ -833,6 +834,7 @@ def test_glm_guard_refuses_a_file_write_outside_the_worktree_and_any_connector_t
     assert ask("Bash", {"command": "ttp note hi"}) is None and ask("Bash", {"command": "ttp note --to x hi"})
 
 
+@pytest.mark.away_from_tmp
 def test_glm_guard_keeps_the_folder_a_run_started_in_as_a_write_root_after_its_shell_cd_elsewhere(tmp_path):
     """A run that started in its worktree and `cd`ed to a sibling folder still edits its worktree (an Edit there
     was refused as outside it); a write outside both stays refused, and the daemon marks the start folder."""
@@ -963,6 +965,7 @@ def test_the_readers_that_may_name_the_guards_files_have_no_output_file_form():
 @_pytest.mark.parametrize("cmd", [
     "git diff > /tmp/daemon_diff.txt", "cp src/a.py /tmp/a.orig.py", "echo x > /tmp/x", "TMPDIR=/tmp; cp a $TMPDIR/x",
     "export TMPDIR=/var/tmp && echo x > $TMPDIR/y"])
+@pytest.mark.away_from_tmp
 def test_glm_guard_lets_a_run_write_to_tmp_and_to_a_tmpdir_the_command_set_itself(cmd, tmp_path, monkeypatch):
     """cell scratch_tmp_open: a new file in /tmp or /var/tmp harms nobody; /tmp itself,
     a glob there, an unset TMP and an escape out of the scratch folder stay refused."""
@@ -978,6 +981,7 @@ def test_glm_guard_lets_a_run_write_to_tmp_and_to_a_tmpdir_the_command_set_itsel
                                           or ""), c
 
 
+@pytest.mark.away_from_tmp
 def test_glm_guard_reads_a_naming_that_keeps_tmpdir_as_no_set(tmp_path, monkeypatch):
     """cell scratch_keep: echoing `TMPDIR=$TMPDIR`, `TMPDIR="${TMPDIR:-x}"` and a Python read leave the run's own
     scratch folder its own; a set, an unset or a TMPDIR outside the run stays refused."""
@@ -3077,6 +3081,7 @@ def test_a_glm_run_runs_a_hidden_program_name_or_eval_once_its_expansion_is_judg
     ("eval \"$(printf 'rm -rf /srv/x')\"", ""),
     ("P=$(printf echo); $P \"$GITHUB_TOKEN\"", "secret"),               # a secret printed
     ("echo $(printenv GITHUB_TOKEN) | $(printf cat)", "secret")])
+@pytest.mark.away_from_tmp
 def test_a_glm_run_stops_a_hidden_command_once_its_expansion_shows_harm(cmd, harm, monkeypatch, tmp_path):
     from ttp import glmguard
     monkeypatch.setenv("GITHUB_TOKEN", "not-a-real-secret")
@@ -3151,6 +3156,7 @@ def test_staging_never_changes_a_heredoc_command(cmd, monkeypatch, tmp_path):
     ("echo a; false &&\nT=bash; echo x | $T", glmguard_hidden),             # the same, over two lines
     ("echo a; echo x |\nT=bash; echo y | $T", glmguard_hidden),
     ("echo a; T=X=bash; echo x | $T", glmguard_hidden)])                     # a value that reads as a setting
+@pytest.mark.away_from_tmp
 def test_a_variable_written_out_still_stops_harm(cmd, harm, monkeypatch, tmp_path):
     _fresh_home(monkeypatch, tmp_path)
     monkeypatch.setenv("GITHUB_TOKEN", "not-a-real-secret")

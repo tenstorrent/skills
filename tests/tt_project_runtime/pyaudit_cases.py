@@ -97,6 +97,7 @@ def test_pyaudit_allows_ordinary_work(env, cred_home):
     assert r.stdout.strip() == "ok"
 
 
+@pytest.mark.away_from_tmp
 def test_pyaudit_glm_run_writes_only_in_its_roots(env, cred_home):
     e = _pa_env(cred_home, glm=True)
     assert "glm" in json.loads(e["TTP_PYAUDIT_POLICY"])

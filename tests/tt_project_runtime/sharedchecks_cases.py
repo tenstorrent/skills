@@ -866,6 +866,7 @@ def test_the_tip_rerun_runs_only_the_failing_ids_in_its_own_worktree_and_removes
     assert str(d._tip_dir(key)) not in wts
 
 
+@pytest.mark.away_from_tmp
 def test_the_tip_rerun_runs_its_tests_niced(env, monkeypatch):
     # Push-branch test code run by the daemon runs as a check (push.check_argv), niced like workers.
     from ttp import daemon as dmod, sharedchecks, worktree

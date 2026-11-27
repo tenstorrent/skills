@@ -6692,6 +6692,7 @@ def test_if_exists_with_a_trailing_slash_or_leading_dot_slash_still_matches(env,
     assert [push.skip_reason(repo, "HEAD", c) for c in checks] == [None, None]
 
 
+@pytest.mark.away_from_tmp
 def test_check_commands_run_bare_pytest_with_the_repositorys_venv(tmp_path):
     from ttp import push
     repo, py = _venv_repo(tmp_path)
@@ -6769,6 +6770,7 @@ def test_a_checks_pytest_key_says_whether_it_is_one_pytest_run():
     assert bad.pytest is None and not pushpass.resumable(bad)
 
 
+@pytest.mark.away_from_tmp
 def test_a_wrapped_pytest_run_gets_the_venv_and_worktree_flags_where_it_stands(tmp_path):
     """venv_cmd changes a pytest run behind a launcher's `--` where it stands: the launcher's own words
     are unchanged, a bare run gets the venv python, one naming its python keeps it, and in a nested
@@ -6826,6 +6828,7 @@ def _nested_worktree(tmp_path):
     return root, wt, shim
 
 
+@pytest.mark.away_from_tmp
 def test_pytest_in_a_nested_worktree_imports_the_worktrees_package(env, tmp_path, monkeypatch):
     from ttp import cli, push
     root, wt, shim = _nested_worktree(tmp_path)
@@ -6854,6 +6857,7 @@ def test_pytest_in_a_nested_worktree_imports_the_worktrees_package(env, tmp_path
     assert rec["passed"] is True and rec["commands"] == [cmd], (run / "checks.log").read_text()
 
 
+@pytest.mark.away_from_tmp
 def test_check_commands_run_wrapped_pytest_with_the_venv(tmp_path):
     from ttp import push
     repo, py = _venv_repo(tmp_path)
@@ -6881,6 +6885,7 @@ def _editable(venv: Path, kind: str, src: Path) -> None:
 
 
 @pytest.mark.parametrize("kind", ["direct_url", "finder", "pth"])
+@pytest.mark.away_from_tmp
 def test_a_worktree_skips_the_main_checkouts_venv_with_an_editable_install_of_it(tmp_path, kind):
     from ttp import push
     repo, py = _venv_repo(tmp_path)
@@ -8967,6 +8972,7 @@ def test_ttp_checks_drops_an_extra_pytest_run_of_paths_inside_a_project_pytest_p
     assert cli._extra_checks(["pytest -q tests/sub"], own, "", t) == ([], ["pytest -q tests/sub"])
 
 
+@pytest.mark.away_from_tmp
 def test_ttp_checks_drops_an_extra_pytest_run_inside_a_project_pytest_run_behind_launchers(tmp_path, monkeypatch):
     """A project check that runs pytest behind launchers' `--` (a throttle, a sharder) with the venv python
     covers an extra `PYTHONPATH=. python3 -m pytest --rootdir=. --confcutdir=. -q <file>` inside its paths
@@ -9398,7 +9404,8 @@ def _recording_venv(path, ran):
     return venv
 
 
-def test_ttp_checks_runs_an_extra_pytest_once_and_in_the_projects_venv(env, tmp_path, monkeypatch, capsys):
+@pytest.mark.away_from_tmp
+def test_ttp_checks_runs_an_extra_pytest_once_and_in_the_projects_venv(own_tempdir, env, tmp_path, monkeypatch, capsys):
     """Replays `ttp checks -- 'pytest -q --no-device-tests'` beside a project check that already runs
     it: it ran twice, the second time with the pytest on PATH, whose python lacked the project's
     packages, so it failed at import after the first run passed."""
@@ -9711,6 +9718,7 @@ def test_ttp_checks_names_the_project_check_an_extra_in_another_spelling_repeats
     assert f"not running {extra!r} after `--` again: delivery.push_checks already runs it as {check!r}" in out
 
 
+@pytest.mark.away_from_tmp
 def test_ttp_checks_warns_of_a_broken_venv_with_the_command_that_makes_it_again(env, tmp_path, monkeypatch, capsys):
     """A project-root .venv link to a venv made on another OS (its python points at an interpreter
     missing here) leaves the checks without its packages: ttp checks says so and how to rebuild it."""
@@ -14313,7 +14321,8 @@ def test_two_tasks_hitting_one_runner_fault_raise_one_observation(env, tmp_path,
     assert p.db.kv("env_faults")["env:missing-runner:pytest"]["tasks"] == ["11", "12"]
 
 
-def test_ttp_checks_with_its_runner_present_runs_as_before_and_records_no_fault(env, tmp_path, monkeypatch):
+@pytest.mark.away_from_tmp
+def test_ttp_checks_with_its_runner_present_runs_as_before_and_records_no_fault(own_tempdir, env, tmp_path, monkeypatch):
     """(c) A healthy runner: the check runs once, passes, no kv entry and no event."""
     from ttp import cli, envfault
     p, repo, run, git = _checks_repo(env, tmp_path, monkeypatch)
@@ -20578,6 +20587,7 @@ def test_after_push_runs_in_a_scratch_clone_with_the_repos_refs_hooks_and_links_
     assert not [x for x in os.listdir(common / "worktrees") if x.startswith("after_push")]
 
 
+@pytest.mark.away_from_tmp
 def test_a_scratch_clone_finds_its_source_repositorys_venv_and_a_plain_shared_clone_does_not(tmp_path):
     """A bare `pytest` in ttp checks' clean checkout runs with the repository's venv (push.venv_cmd), found
     through a linked worktree's main checkout before: a scratch clone names its source the same way. A

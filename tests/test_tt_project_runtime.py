@@ -27993,7 +27993,8 @@ def _venv_repo(tmp_path, name="work", pytest_too=True):
     return repo, py
 
 
-def test_ttp_checks_runs_a_bare_pytest_with_the_venv(env, tmp_path, monkeypatch, capsys):
+@pytest.mark.away_from_tmp
+def test_ttp_checks_runs_a_bare_pytest_with_the_venv(own_tempdir, env, tmp_path, monkeypatch, capsys):
     from ttp import cli
     p = make(env)
     repo, _ = _venv_repo(tmp_path)
@@ -39043,7 +39044,8 @@ def test_the_socket_probe_survives_a_tmpdir_past_the_unix_socket_path_limit(tmp_
 
 
 @pytest.mark.parametrize("jobs", [1, 2])
-def test_checks_isolate_run_local_tmpdir_from_enclosing_git_and_project(env, tmp_path, monkeypatch, jobs):
+@pytest.mark.away_from_tmp
+def test_checks_isolate_run_local_tmpdir_from_enclosing_git_and_project(own_tempdir, env, tmp_path, monkeypatch, jobs):
     from ttp import cli
     p, _, run, _ = _checks_repo(env, tmp_path, monkeypatch)
     nested_tmp = p.runs / "test-run" / "tmp"
@@ -46218,6 +46220,15 @@ def _bind_deep_socket(tmp):
     deep.mkdir(parents=True)
     with socket.socket(socket.AF_UNIX) as s:
         s.bind(str(deep / 's.sock'))
+
+
+@pytest.mark.away_from_tmp
+def test_an_away_from_tmp_test_gets_a_folder_outside_tmp_with_no_pytest_file_above_it(tmp_path):
+    real = Path(os.path.realpath(tmp_path))
+    assert not any(d in {Path("/tmp"), Path("/var/tmp"), Path(os.path.realpath("/tmp"))} for d in (real, *real.parents))
+    assert not [d for d in real.parents for f in ("conftest.py", "pytest.ini", "tox.ini", "setup.cfg", "pyproject.toml",
+                                                   "setup.py") if (d / f).is_file()]
+    assert tmp_path.is_dir()
 
 
 def test_short_tmp_root_is_short_in_production(env, monkeypatch):
