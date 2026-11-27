@@ -83,8 +83,7 @@ def guard(args: list[str], real: str, db, cfg: dict, stdin_text: str | None = No
         m = re.match(r"repos/([^/]+/[^/]+)/(?:issues|pulls)/(\d+)", endpoint, re.I)
         if method != "GET" and re.search(r"/actions/workflows/[^/]+/dispatches$", endpoint, re.I):
             return "refused: dispatch a workflow with `gh workflow run <name> --ref <the PR's head>`"
-        if method != "GET" and (re.search(r"/(?:issues|pulls)/\d+/labels", endpoint, re.I) or re.search(
-                r"(?:^|[\s&{,])\"?labels(?:\[\])?\"?\s*[=:]|labelIds|addLabelsToLabelable", prguard._api_text(args[1:], stdin_text))):
+        if method != "GET" and (re.search(r"/(?:issues|pulls)/\d+/labels", endpoint, re.I) or _sets_labels(args[1:], stdin_text)):
             return "refused: add a label with `gh pr edit <N> --add-label <label>` on an owned PR"
         mutation = endpoint.strip("/").lower() == "graphql" and prbody.GQL_MUTATION_RE.search(prguard._api_text(args[1:], stdin_text))
         if method != "GET" and (m and f"{m[1]}#{m[2]}".lower() in no_post or no_post and mutation):
@@ -111,6 +110,17 @@ def guard(args: list[str], real: str, db, cfg: dict, stdin_text: str | None = No
     return None
 
 
+def _sets_labels(args: list[str], stdin_text: str | None) -> bool:
+    """A `gh api` write that sets labels: a `labels` field name, a `labels` key in an --input body, or a GraphQL label
+    mutation. Field values (a comment's words) are not read."""
+    from . import prguard
+    keys = [v.partition("=")[0].split("[")[0] for v in prguard._opts(args, ("-f", "-F", "--field", "--raw-field"))]
+    body = prguard._api_text([x for v in prguard._opts(args, ("--input",)) for x in ("--input", v)], stdin_text)
+    return "labels" in keys or bool(re.search(r"\"labels\"\s*:", body)) or any(
+        re.search(r"labelIds|addLabelsToLabelable", v.partition("=")[2]) for v in prguard._opts(args, ("-f", "-F", "--field", "--raw-field"))
+        if v.partition("=")[0] == "query")
+
+
 def _ts(s) -> float:
     try:
         return datetime.fromisoformat(str(s).replace("Z", "+00:00")).timestamp()
@@ -121,7 +131,7 @@ def _ts(s) -> float:
 def workflow_info(path: str, text: str) -> dict:
     """{"name", "file", "manual", "trigger", "labels"} of one workflow file, without a YAML parser: its `on:` block is the
     lines up to the next top-level key. `manual`: it runs only by dispatch or by a label."""
-    name = re.search(r"^name:\s*(.+?)\s*$", text, re.M)
+    name = re.search(r"^name:\s*(.+?)\s*(?:\s#.*)?$", text, re.M)
     block = re.search(r"^(?:on|'on'|\"on\"):(.*(?:\n(?:[ \t].*|#.*|\s*))*)", text, re.M)
     block = block.group(1) if block else ""
     dispatch = "workflow_dispatch" in block

@@ -304,6 +304,7 @@ def test_prbabysit_guard_covers_gh_api_writes_to_a_no_post_pr_and_workflow_dispa
     assert "gh pr edit" in _pb_why(p, cfg, *api, "graphql", "-f", "query=mutation{updatePullRequest(input:{labelIds:[1]}){x}}")
     assert "gh pr edit" in _pb_why(p, cfg, "pr", "create", "--label", "run-heavy")
     assert _pb_why(p, cfg, *patch, "repos/acme/widgets/issues/9", "-f", "title=x") is None   # another PR, no label
+    assert _pb_why(p, cfg, *api, "repos/acme/widgets/pulls/9/comments/5/replies", "-f", "body=CI labels: run-heavy\n[Authored by AI]") is None
     assert "no_post_prs" in _pb_why(p, cfg, "pr", "update-branch", "7", "-R", "Acme/Widgets")
 
 
@@ -358,6 +359,7 @@ def test_prbabysit_dispatch_keys_match_any_case_and_a_nameless_workflow_is_named
     from ttp import prbabysit, watchers
     assert prbabysit.settings({"pr_babysit": {"dispatch": {"Acme/Widgets": ["x"]}}})["dispatch"] == {"acme/widgets": ["x"]}
     assert prbabysit.workflow_info(".github/workflows/h.yml", "on:\n  workflow_dispatch:\n")["name"] == ".github/workflows/h.yml"
+    assert prbabysit.workflow_info("h.yml", "name: Build  # main build\non:\n  workflow_dispatch:\n")["name"] == "Build"
     _pb_gh(monkeypatch)
     p, d, _ = _pb_run(env, monkeypatch, _pb_pr(), cfg={"pr_babysit.dispatch": {"Acme/Widgets": ["nightly.yml"]}})
     watchers.watch_prs(d)
