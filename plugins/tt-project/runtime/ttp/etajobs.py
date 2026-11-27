@@ -143,12 +143,13 @@ def queue_wait(db, tid: int, own: list, h: dict, now: float, cache: dict | None 
     nothing ahead, and none when the task's own job of that name is already running."""
     from .eta import pct
     best = 0.0
+    rows = [r["id"] for r in db.q("SELECT id FROM tasks WHERE status IN ('running','waiting')")]
     for name, when in own:
         wait, run_left = 0.0, 0.0
-        for r in db.q("SELECT id FROM tasks WHERE status IN ('running','waiting')"):
-            if r["id"] == tid:
+        for rid in rows:
+            if rid == tid:
                 continue   # its own running job of the name holds the device: no queue
-            for e in job_entries(db, r["id"], cache):
+            for e in job_entries(db, rid, cache):
                 if normal(e.get("name")) != name or e.get("status") in ("ended", "died"):
                     continue
                 m = pct((h.get("job") or {}).get(name) or [], P50)

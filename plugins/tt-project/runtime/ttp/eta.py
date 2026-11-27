@@ -393,12 +393,15 @@ class _Est:
         project's history, never a padded allowance. Memoized per task; the job history is read once."""
         if t["id"] not in self._jobs:
             from . import etajobs
-            if self._jobhist is None:
-                self._jobhist = etajobs.job_history(Path(self.db.path).parent, self.db, self.now)
-            try:
-                self._jobs[t["id"]] = etajobs.job_finish(self.db, t, self._jobhist, self.now, self._entries)
-            except Exception:
-                self._jobs[t["id"]] = None
+            if not etajobs.job_entries(self.db, t["id"], self._entries):
+                self._jobs[t["id"]] = None   # no registry entries: no history scan either
+            else:
+                if self._jobhist is None:
+                    self._jobhist = etajobs.job_history(Path(self.db.path).parent, self.db, self.now)
+                try:
+                    self._jobs[t["id"]] = etajobs.job_finish(self.db, t, self._jobhist, self.now, self._entries)
+                except Exception:
+                    self._jobs[t["id"]] = None
         return self._jobs[t["id"]]
 
     def reports(self) -> list[dict]:
