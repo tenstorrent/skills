@@ -86,7 +86,7 @@ _PENDING_RE = re.compile(r"\b(?:acknowledg\w*|ack(?:ed|s)?|received|noted|will|g
 _CLOSED_STATUS = re.compile(r"^(?:closed|declined|withdrawn)\b", re.I)
 _CLOSED_RE = re.compile(r"\b(?:(?:closed|closes|closing|declined|declines|declining|withdrawn|withdrew|withdraws|"
                         r"withdrawing) (?:(?:the|this|that|your|my) )?(?:\w+ )?request|"
-                        r"request (?:is |was |has been )?(?:closed|declined|withdrawn))\b", re.I)
+                        r"request (?:\([\w-]+\) )?(?:is |was |has been )?(?:closed|declined|withdrawn))\b", re.I)
 _TO_COME_RE = re.compile(r"\b(?:follows?|to come|yet|first|queued|once|later|soon|pending|in progress|under ?way|"
                          r"now|would|will(?! not| never))\b|'ll\b", re.I)
 _NO_RUN_RE = re.compile(r"\s*,?\s*(?:\w+\s+){0,3}?without (?:a |any )?(?:run|result|measurement)s?\b", re.I)

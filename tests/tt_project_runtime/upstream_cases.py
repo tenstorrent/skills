@@ -1673,6 +1673,12 @@ def test_ack_wait_terminal_counts_a_reply_closing_the_request_without_a_run_but_
         got = json.loads(out.read_text())
         assert got["status"] == "needs_review" and got["metrics"]["reply_closed"] is True, (status, got)
         assert "closed without a result" in got["summary"] and "without a run" in got["summary"]
+    # the saved closure line names the request by its id in parentheses
+    named = f"{p.name}: your warm start timing request ({fp}) is closed without a run"
+    assert upstream.send("peer", 2, p.name, named) == "sent"
+    assert _ack_wait(cli, *probe[:-1], "--after", upstream.note_id(p.name, reply), "--terminal") == 0, \
+        capsys.readouterr().out
+    assert ackwait.closed(named) and not ackwait.closed(f"your request ({fp}) is not closed without a run")
     for text in ("Declined the request: no budget for it.", "status: withdrawn",
                  "The request was closed without a result.",
                  "Withdrawing your request: the fix landed elsewhere."):
