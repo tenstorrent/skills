@@ -213,3 +213,6 @@ def test_an_item_reported_as_sent_out_is_not_pending():
     assert quotefull.backrefs("The request was sent, please confirm it went out.") == []
     assert quotefull.backrefs("The request sent yesterday is still pending your review.") != []
     assert quotefull.backrefs("The ask was sent, please reply.") != []   # a sent ask is still pending
+    # with the open asks known, a fabricated id is refused: there is no such pending item
+    assert quotefull.backrefs("Ask 12 is still open.", (), []) != []
+    assert quotefull.backrefs("Ask 12 is still open.") == []   # no open-ask knowledge: pendingask owns the id

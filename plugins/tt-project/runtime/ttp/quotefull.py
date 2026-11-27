@@ -67,15 +67,16 @@ def _attached(text: str, start: int, after: str, back: bool) -> bool:
     return bool(_BLOCKS.search(first) or (not back and re.fullmatch(r"\s*`[^`\n]+`\s*", first)))
 
 
-def backrefs(text: str, later: list[str] | tuple = (), open_asks: list[dict] | tuple = ()) -> list[str]:
+def backrefs(text: str, later: list[str] | tuple = (), open_asks: list[dict] | tuple | None = None) -> list[str]:
     """The phrases standing in for a pending item's content, each once, in order; [] for a plain
     status message that names nothing pending (`later`: the text's later numbered parts; `open_asks`:
-    those pendingask.expand, run first, could match by their words)."""
+    those pendingask.expand, run first, could match by their words; None when the caller cannot say
+    which asks are open, in which case an id named is pendingask's to have carried)."""
     out: list[str] = []
     text = str(text or "")
     tail = "\n".join(t or "" for t in later)
     head, added = pendingask.appended(text)
-    by_id = {int(a["id"]): a for a in open_asks}
+    by_id = None if open_asks is None else {int(a["id"]): a for a in open_asks}
     found = [(m, True) for m in _POINT_BACK.finditer(text)] + [(m, False) for m in _STATUS_PHRASE.finditer(text)]
     for m, back in sorted(found, key=lambda f: f[0].start()):
         if m.start() >= head:   # an appended ask's own words are its text, not a pointer
@@ -96,11 +97,11 @@ def backrefs(text: str, later: list[str] | tuple = (), open_asks: list[dict] | t
         hi = _STOP.search(text, m.end())
         if not back and not _NON_ASK.search(m.group(0)) and (
                 # an ask named by id: pendingask.expand, run first, appended it or saw it quoted
-                (ids := pendingask.refs(m.group(0))) and (not by_id or all(
+                (ids := pendingask.refs(m.group(0))) and (by_id is None or all(
                     i in added or (i in by_id and pendingask.quoted(text[:head], by_id[i])) for i in ids))
                 or item and item.group(0).lower() in ("ask", "asks")   # ... or matched by its words, as expand does
-                and (hit := pendingask.match(text[lo:hi.start() if hi else head], list(open_asks))
-                     or pendingask.match(text[:head], list(open_asks)))
+                and (hit := pendingask.match(text[lo:hi.start() if hi else head], list(open_asks or ()))
+                     or pendingask.match(text[:head], list(open_asks or ())))
                 and all(int(a["id"]) in added or pendingask.quoted(text[:head], a) for a in hit)):
             continue
         if back and _BARE.fullmatch(m.group(0)):   # 'in my earlier message I said ...' with nothing pending
@@ -116,7 +117,7 @@ def backrefs(text: str, later: list[str] | tuple = (), open_asks: list[dict] | t
     return out
 
 
-def refused(text: str, what: str, later: list[str] | tuple = (), open_asks: list[dict] | tuple = ()) -> str:
+def refused(text: str, what: str, later: list[str] | tuple = (), open_asks: list[dict] | tuple | None = None) -> str:
     """Why a coordinator `what` (reply, notify, urgent reply) is refused for pointing back at a
     pending item instead of quoting it, else ''."""
     gone = backrefs(text, later, open_asks)
