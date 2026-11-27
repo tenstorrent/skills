@@ -46226,8 +46226,8 @@ def _bind_deep_socket(tmp):
 def test_an_away_from_tmp_test_gets_a_folder_outside_tmp_with_no_pytest_file_above_it(tmp_path):
     real = Path(os.path.realpath(tmp_path))
     assert not any(d in {Path("/tmp"), Path("/var/tmp"), Path(os.path.realpath("/tmp"))} for d in (real, *real.parents))
-    assert not [d for d in real.parents for f in ("conftest.py", "pytest.ini", "tox.ini", "setup.cfg", "pyproject.toml",
-                                                   "setup.py") if (d / f).is_file()]
+    assert not [d for d in real.parents for f in ("conftest.py", "pytest.ini", ".pytest.ini", "tox.ini", "setup.cfg",
+                                                   "pyproject.toml", "setup.py") if (d / f).is_file()]
     assert tmp_path.is_dir()
 
 
