@@ -737,6 +737,30 @@ def test_ttp_push_scans_the_outgoing_history_first_and_runs_no_check_on_a_leak(e
     assert ran.exists() and any("leak scan: the outgoing commits hold no secret shape" in m for m in said), said
 
 
+def test_push_leak_scan_stops_at_commits_the_remote_already_has(env, tmp_path, monkeypatch):
+    """A merge bringing in a commit the remote already has (another developer's, holding a key-like
+    line) is not refused by the leak scan, which skips what the remote holds; a new local commit with
+    the same shape still is, and with no remote named the whole of tip..HEAD is scanned as before."""
+    from ttp import push
+    p, repo, _ = _push_run(env, tmp_path, monkeypatch)
+    monkeypatch.setenv("TTP_RUN_DIR", str(tmp_path / "run"))
+    tip = _git_out(repo, "rev-parse", "main")
+    _git_out(repo, "checkout", "-q", "-B", "theirs", "main")
+    _commit(repo, "theirs.txt", f"key = {_OUT_SHAPE}\n")
+    _git_out(repo, "push", "-q", "origin", "theirs:proj")
+    _git_out(repo, "checkout", "-q", "-B", "work", "main")
+    _commit(repo, "ok.txt", "fine\n")
+    _git_out(repo, "merge", "-q", "--no-ff", "-m", "merge theirs", "theirs")
+    said: list[str] = []
+    assert push.leak_step(repo, tip, said.append, "origin") is None, said
+    assert any("hold no secret shape" in m for m in said), said
+    assert push.leak_step(repo, tip, said.append) is not None
+    _commit(repo, "mine.txt", f"key = {_OUT_SHAPE}\n")
+    said.clear()
+    why = push.leak_step(repo, tip, said.append, "origin")
+    assert why and "GitHub token shape" in why and _OUT_SHAPE not in why, (why, said)
+
+
 def _public_repo(tmp_path, monkeypatch):
     """A repository whose base commit names `zz-sharedbox` in another plugin, with two made-up machines
     registered (`zz-fakebox7` at a made-up domain and `zz-sharedbox`): (repo, base sha)."""
@@ -896,6 +920,45 @@ def test_ttp_checks_runs_the_push_scan_on_a_code_tasks_commits_before_its_checks
     p.set_config("delivery.public_scan_paths", [])
     cli.main(["checks", "--fresh", "--", *check])
     assert ran.exists()
+
+
+def test_ttp_checks_push_scan_skips_a_merged_commit_the_remote_already_has(env, tmp_path, monkeypatch, capsys):
+    """`ttp checks` of a code task whose branch merges a commit already on the push remote (holding a
+    key-like line) runs its checks: that commit is not the change's; a new commit of its own with the
+    same shape still fails before any check runs."""
+    from ttp import cli
+    p, repo, run, git = _checks_repo(env, tmp_path, monkeypatch)
+    trunk = subprocess.run([*git, "rev-parse", "--abbrev-ref", "HEAD"], capture_output=True, text=True).stdout.strip()
+    origin = tmp_path / "scan-origin.git"
+    subprocess.run(["git", "init", "-q", "--bare", str(origin)], check=True)
+    subprocess.run([*git, "remote", "add", "origin", str(origin)], check=True)
+    p.set_config("delivery.push_branch", trunk)
+    tid = p.db.add_task("scan", kind="code", spec="Change something.")
+    monkeypatch.setenv("TTP_TASK", str(tid))
+
+    def commit(path, text):
+        (repo / path).write_text(text)
+        subprocess.run([*git, "add", path], check=True)
+        subprocess.run([*git, "commit", "-qm", f"edit {path}"], check=True)
+
+    subprocess.run([*git, "checkout", "-q", "-b", "theirs"], check=True)
+    commit("theirs.txt", f"key = {_OUT_SHAPE}\n")
+    subprocess.run([*git, "push", "-q", "origin", "theirs", f"{trunk}:{trunk}"], check=True)
+    subprocess.run([*git, "checkout", "-q", "-b", f"ttp/t{tid}-scan", trunk], check=True)
+    commit("ok.txt", "fine\n")
+    subprocess.run([*git, "merge", "-q", "--no-ff", "-m", "merge theirs", "theirs"], check=True)
+    ran = tmp_path / "ran"
+    check = ["sh", "-c", f"echo x >> {ran}"]
+    cli.main(["checks", "--", *check])
+    assert ran.exists(), capsys.readouterr()
+    ran.unlink()
+    (run / "checks.json").unlink()
+    commit("mine.txt", f"key = {_OUT_SHAPE}\n")
+    with pytest.raises(SystemExit) as stop:
+        cli.main(["checks", "--", *check])
+    err = capsys.readouterr().err
+    assert stop.value.code == 1 and "GitHub token shape" in err and _OUT_SHAPE not in err, err
+    assert not ran.exists()
 
 
 def test_detached_ttp_checks_scans_in_the_checks_not_in_the_launcher_its_caller_waits_on(env, tmp_path,

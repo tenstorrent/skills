@@ -4639,20 +4639,23 @@ def _land_squashed(repo: Path, tip: str, upstream: str, say: Callable[[str], Non
     return True
 
 
-def leak_step(repo: Path, tip: str, say: Callable[[str], None]) -> str | None:
-    """The secret-shape scan of what this push sends (tip..HEAD), run as its own first step, before the
-    rebase and the checks: a literal in the outgoing history fails in seconds, not after the smoke run
-    when the pre-push hook refuses it. A scan that cannot run is said and left to that hook."""
+def leak_step(repo: Path, tip: str, say: Callable[[str], None], remote: str = "") -> str | None:
+    """The secret-shape scan of what this push sends (tip..HEAD, less what `remote` already has), run as
+    its own first step, before the rebase and the checks: a literal in the outgoing history fails in
+    seconds, not after the smoke run when the pre-push hook refuses it. A scan that cannot run is said
+    and left to that hook."""
     started = time.time()
     p = outscan._project()
+    stops = remote_stops(repo, remote, say)
     try:
-        why = outscan.history_problem(repo, tip, "HEAD", p)
+        why = outscan.history_problem(repo, tip, "HEAD", p, stops)
     except Exception as e:
         say(f"leak scan of the outgoing commits could not run ({type(e).__name__}: {str(e)[:200]}); "
             "the pre-push hook still scans them")
         why = None
     try:   # no hook backs the public scan: one that cannot run refuses
-        why = why or outscan.public_problem(repo, tip, "HEAD", (p.config().get("delivery") or {}) if p else {}, p)
+        why = why or outscan.public_problem(repo, tip, "HEAD", (p.config().get("delivery") or {}) if p else {}, p,
+                                            stops)
     except Exception as e:
         why = f"public scan of the outgoing commits could not run ({type(e).__name__}: {str(e)[:200]}); not pushing"
     if why:
@@ -4660,6 +4663,19 @@ def leak_step(repo: Path, tip: str, say: Callable[[str], None]) -> str | None:
         return why
     say(f"leak scan: the outgoing commits hold no secret shape ({time.time() - started:.1f}s)")
     return None
+
+
+def remote_stops(repo: Path, remote: str, say: Callable[[str], None]) -> list[str]:
+    """outscan.remote_has: the commits `remote` already has, which the leak scans stop at; [] (scan all
+    of base..head, as before) when there is no remote or it cannot be listed."""
+    if not remote:
+        return []
+    try:
+        return outscan.remote_has(repo, remote)
+    except Exception as e:
+        say(f"leak scan: could not list what {remote} already has ({type(e).__name__}: {str(e)[:200]}); "
+            "scanning every outgoing commit")
+        return []
 
 
 def _rounds(repo: Path, remote: str, branch: str, checks: list[str], rounds: int,
@@ -4688,7 +4704,7 @@ def _rounds(repo: Path, remote: str, branch: str, checks: list[str], rounds: int
         if bad := excluded(repo, tip, "HEAD", exclude or []):
             say(excluded_refusal(bad, upstream))
             return REFUSED
-        if rnd == 1 and (leak := leak_step(repo, tip, say)):
+        if rnd == 1 and (leak := leak_step(repo, tip, say, remote)):
             say(f"{leak}; not pushing")
             return CHECKS_FAILED
         if (r := _rebase_round(repo, remote, branch, tip, keep, landed or {}, say)) is not None:

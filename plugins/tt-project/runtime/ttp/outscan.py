@@ -420,11 +420,11 @@ def _prefetch(revs: str) -> None:
         return
 
 
-def _remote_refs(url: str) -> dict[str, str]:
+def _remote_refs(url: str, cwd: str | None = None) -> dict[str, str]:
     """{ref: object} the remote at `url` advertises (a tag's peeled object as `<tag>^{}`). Read from the
     remote itself, not from remote-tracking refs a run can set to anything. Raises ValueError when it
     cannot be listed."""
-    r = subprocess.run(["git", "ls-remote", url], capture_output=True, text=True, errors="replace",
+    r = subprocess.run(["git", "ls-remote", url], capture_output=True, text=True, errors="replace", cwd=cwd,
                        timeout=LS_REMOTE_S, stdin=subprocess.DEVNULL, env={**os.environ, **_LOOKUP_ENV})
     if r.returncode:
         raise ValueError(f"could not list what the remote has (git ls-remote exited {r.returncode})")
@@ -445,13 +445,13 @@ def _stops(refs: dict[str, str], lines: list[str]) -> set[str]:
     return out & set(refs.values())   # only what the remote itself says it has
 
 
-def _types(shas: set[str]) -> dict[str, str]:
+def _types(shas: set[str], cwd: str | None = None) -> dict[str, str]:
     """{object: type} of the `shas` this repository has: one `cat-file --batch-check`, its timeout
     scaled with the count; a timeout raises (the push fails closed)."""
     if not shas:
         return {}
     try:
-        out = _git("cat-file", "--batch-check", input="\n".join(sorted(shas)) + "\n",
+        out = _git("cat-file", "--batch-check", input="\n".join(sorted(shas)) + "\n", cwd=cwd,
                    timeout=GIT_S + len(shas) / 100).stdout
     except subprocess.TimeoutExpired:
         raise ValueError(f"could not read the types of the remote's {len(shas)} tips in time") from None
@@ -534,11 +534,25 @@ REWRITE_TIP = (" (git rebase, or git filter-branch -d with a scratch dir outside
                "afterwards: its default .git-rewrite stays in the worktree)")
 
 
-def history_problem(repo, base: str, head: str = "HEAD", p=None) -> str | None:
-    """Why the commits `base..head` of `repo` must not be pushed: the same scan pre_push runs (a commit
-    message, an added line or a file path holds a leak), read locally, so `ttp push` can refuse in
-    seconds before its checks run. Raises ValueError when they cannot be read."""
-    return _log_problem(f"{head}\n^{base}\n", matcher(p), cwd=str(repo), what="ttp push")
+def remote_has(repo, remote: str) -> list[str]:
+    """The commits of `repo` that the remote `remote` itself says it has (_stops: its HEAD and branch
+    tips, read with ls-remote, never from remote-tracking refs): a scan of what goes there stops at them,
+    as pre_push does, so a merge bringing in the remote's own commits is not refused for them. [] when
+    the repository has no such remote; raises ValueError when the remote cannot be listed."""
+    url = _git("remote", "get-url", remote, cwd=str(repo)).stdout.strip()
+    if not url:
+        return []
+    stops = _stops(_remote_refs(url, cwd=str(repo)), [])
+    return sorted(h for h, kind in _types(stops, cwd=str(repo)).items() if kind == "commit")
+
+
+def history_problem(repo, base: str, head: str = "HEAD", p=None, stops=()) -> str | None:
+    """Why the commits `base..head` of `repo`, less those reachable from `stops` (remote_has), must not
+    be pushed: the same scan pre_push runs (a commit message, an added line or a file path holds a leak),
+    read locally, so `ttp push` can refuse in seconds before its checks run. Raises ValueError when they
+    cannot be read."""
+    return _log_problem(f"{head}\n^{base}\n" + "".join(f"^{s}\n" for s in stops), matcher(p), cwd=str(repo),
+                        what="ttp push")
 
 
 PUBLIC_KEY = "public_scan_paths"   # delivery.<key>: repo globs a public repository publishes; unset: off
@@ -636,8 +650,10 @@ def _py_prose(text: str) -> dict[int, str] | None:
     return prose
 
 
-def public_problem(repo, base: str, head: str = "HEAD", delivery: dict | None = None, p=None) -> str | None:
-    """Why the commits `base..head` of `repo` must not go to a public repository, or None: an added line
+def public_problem(repo, base: str, head: str = "HEAD", delivery: dict | None = None, p=None,
+                   stops=()) -> str | None:
+    """Why the commits `base..head` of `repo`, less those reachable from `stops` (remote_has: the
+    remote's own, already public), must not go to a public repository, or None: an added line
     under delivery.public_scan_paths (repo globs; unset: off) names a local-state term (local_terms)
     that nothing else in the repository names, or cites a user's chat message or a task (PROVENANCE; in
     Python only in comments and docstrings).
@@ -650,7 +666,8 @@ def public_problem(repo, base: str, head: str = "HEAD", delivery: dict | None = 
     rx = _term_rx(terms)
     allowed: dict[str, bool] = {}
     proc = subprocess.run(["git", "log", "-p", "-U0", "--root", "--cc", "--text", "--no-renames", "--no-color",
-                           "--no-ext-diff", "--no-textconv", "--format=%x00commit %h", f"{base}..{head}"],
+                           "--no-ext-diff", "--no-textconv", "--format=%x00commit %h", f"{base}..{head}",
+                           *(f"^{s}" for s in stops), "--"],
                           capture_output=True, text=True, errors="replace", cwd=str(repo),
                           env={**os.environ, **_GIT_ENV})
     if proc.returncode:

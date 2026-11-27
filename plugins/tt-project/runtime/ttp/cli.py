@@ -7211,13 +7211,16 @@ def _checks_public_scan(p: Project | None, top: str, head: str, d: dict) -> str:
     base = _checks_base(p, Path(top), [])
     if not base:
         return ""
-    from . import outscan
+    from . import outscan, push
     try:
         fork = subprocess.run(["git", "-C", top, "merge-base", base, head], capture_output=True, text=True)
         if fork.returncode or not fork.stdout.strip() or fork.stdout.strip() == head:
             return ""
         fork = fork.stdout.strip()
-        return outscan.history_problem(Path(top), fork, head, p) or outscan.public_problem(Path(top), fork, head, d, p) or ""
+        stops = push.remote_stops(Path(top), push.target(p, Path(top))[0],
+                                  lambda m: print(f"ttp checks: {m}", flush=True))
+        return (outscan.history_problem(Path(top), fork, head, p, stops)
+                or outscan.public_problem(Path(top), fork, head, d, p, stops) or "")
     except Exception as e:
         print(f"ttp checks: the push scan of the change's commits could not run ({type(e).__name__}: "
               f"{str(e)[:200]}); the push queue still runs it", flush=True)
