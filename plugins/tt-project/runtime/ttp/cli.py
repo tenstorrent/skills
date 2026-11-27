@@ -17553,7 +17553,7 @@ def ttp_parser():
     s.set_defaults(fn=cmd_retire_tip)
 
     s = sub.add_parser("pr", help="a PR's size plan: the budget that lifts the PR size gate")
-    ps = s.add_subparsers(dest="action", required=True)
+    ps = s.add_subparsers(dest="action", required=True, help="what to do")
     m = ps.add_parser("plan", help="record the PR size budget a plan grants (the plan goes to the "
                                     "user's chat first; --msg names that chat message)")
     m.add_argument("pr", help="the PR (owner/repo#N or its URL)")
