@@ -686,12 +686,14 @@ def _cc_plan_with_followups(p, n=7, urgent_order=True):
 
 def test_course_self_review_flags_a_plans_follow_ups_left_unqueued_under_an_urgent_order(env):
     p = make(env)
-    plan, _, oid, now = _cc_plan_with_followups(p)
+    plan, ids, oid, now = _cc_plan_with_followups(p)
     lines, ident = _cc(p, now)
     hits = [x for x in lines if "follow-ups unqueued" in x]
     assert hits == [x for x in lines if f"plan #{plan} ended with 7 follow-ups under urgent order {oid}" in x
                     and "none queued" in x], lines
     assert len(hits) == 1 and f"plan_followups:{plan}" in ident, "one line per plan, never one per follow-up"
+    p.db.x("UPDATE events SET text='proposed follow-up (folded into #1: same file): x' WHERE id=?", (ids[0],))
+    assert [x for x in _cc(p, now)[0] if f"plan #{plan} ended with 6 follow-ups" in x], "the rest stay unqueued"
 
 
 def test_course_self_review_plan_follow_ups_clear_once_one_is_queued(env):

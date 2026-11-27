@@ -34,9 +34,9 @@ so an idle project's digest does not grow. Each reuses a signal the harness alre
 - old_orders: a blocked task, a deferred task or an open ask citing an old user order whose reason is over,
   unknown or unchecked (oldorders.py, its last scan): the order may be read literally after its cause ended.
 - plan_followups: a done `plan` or `question` task whose handed-off follow-ups a turn has seen (unstarted.open_followups)
-  while an urgent user order is open (an open obligation recorded from a user message with a priority 1 or
-  `urgent:` owner, done ones included): one line per task until a later task takes one up (its title, or a spec
-  quoting it or citing `#<task>`), one is folded, or every one is dropped (drop-followup).
+  while an urgent user order is open (an open order with a live priority 1 or `urgent:` owner, eta._urgent_owner):
+  one line per task until a later task takes one up (its title, or a spec quoting it or citing `#<task>`),
+  every one is dropped (drop-followup), or they leave the Open follow-ups list after unstarted.MAX_AGE_S.
 
 `coordinator.course_check` keys of the same names set the thresholds (0 turns one off)."""
 from __future__ import annotations
@@ -346,7 +346,7 @@ def old_order_holds(db: DB, on: float) -> list[dict]:
 def plan_followups(db: DB, on: float, now: float) -> list[dict]:
     if not on:
         return []
-    from . import obligations, unstarted, urgent
+    from . import eta, obligations, unstarted
     by: dict[int, list] = {}
     for f in unstarted.open_followups(db, now):
         by.setdefault(f["task"], []).append(f)
@@ -354,25 +354,22 @@ def plan_followups(db: DB, on: float, now: float) -> list[dict]:
     plans = [t for t in plans if t.get("kind") in ("plan", "question") and t.get("status") == "done"]
     if not plans:
         return []
-    def owners(o: dict) -> set[int]:   # an order's owners are its promise's tasks (obligations._kept)
-        return {int(t) for t in [*(o.get("owners") or {}), *(o["promise"].get("tasks") or [])] if str(t).isdigit()}
-    orders = [o for o in obligations.items(db) if not (o.get("receipt") or o.get("dropped"))
-              and (o.get("promise") or {}).get("order") is not None
-              and any(urgent.is_urgent(db.task(t)) for t in owners(o))]
+    orders = [o for o in obligations.items(db) if obligations._open(o)
+              and (o.get("promise") or {}).get("order") is not None and eta._urgent_owner(db, o)]
+    if not orders:
+        return []
     out = []
-    for t in plans if orders else []:
+    for t in plans:
         tid = t["id"]
         later = db.q("SELECT id, title, spec FROM tasks WHERE id>?", (tid,))
         fups = load_result(t.get("result")).get("followups")
-        titles = [str(f["title"]).strip() for f in fups if isinstance(f, dict) and f.get("title")] \
-            if isinstance(fups, list) else []
+        titles = [str(f["title"]).strip() for f in fups if isinstance(f, dict) and f.get("title")
+                  and not re.match(r"(?i)\s*(continue|upstream)\s*:", str(f["title"]))] if isinstance(fups, list) else []
         cite = re.compile(rf"#{tid}\b")
-        if (any(unstarted._taken_by(later, x) for x in titles)
-                or any(cite.search(f"{r['title']} {r['spec']}") for r in later)
-                or db.one("SELECT 1 FROM events WHERE task=? AND kind='followup_proposed' "
-                          "AND text LIKE '%(folded into #%'", (tid,))):
+        if any(unstarted._taken_by(later, x) for x in titles) or any(cite.search(f"{r['title']} {r['spec']}")
+                                                                      for r in later):
             continue
-        o = next((o for o in orders if tid in owners(o)), orders[0])
+        o = next((o for o in orders if tid in obligations._owner_ids(o)), orders[0])
         out.append({"task": tid, "kind": t["kind"], "n": len(by[tid]), "order": o["id"],
                     "msg": o["promise"]["order"]})
     return out
