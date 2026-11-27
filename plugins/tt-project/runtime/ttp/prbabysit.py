@@ -46,7 +46,7 @@ def _target(real: str, more: list[str]) -> str:
                                       "-F", "--body-file", "-c", "--comment", "-m", "--message"))
     repo = (prguard._opts(more, ("-R", "--repo")) or [None])[-1]
     if pos[:1] and pos[0].isdigit() and repo:
-        return f"{repo}#{pos[0]}"
+        return f"{repo}#{pos[0]}".lower()
     out = pos[0] if pos[:1] and pos[0].startswith("http") else prguard._gh(
         real, "pr", "view", *pos[:1], *(["-R", repo] if repo else []), "--json", "url", "-q", ".url")
     return prguard.pr_key(out) or ""
@@ -83,14 +83,17 @@ def guard(args: list[str], real: str, db, cfg: dict, stdin_text: str | None = No
         m = re.match(r"repos/([^/]+/[^/]+)/(?:issues|pulls)/(\d+)", endpoint, re.I)
         if method != "GET" and re.search(r"/actions/workflows/[^/]+/dispatches$", endpoint, re.I):
             return "refused: dispatch a workflow with `gh workflow run <name> --ref <the PR's head>`"
-        if method != "GET" and (re.search(r"/(?:issues|pulls)/\d+/labels", endpoint, re.I) or "addLabelsToLabelable" in prguard._api_text(args[1:], stdin_text)):
+        if method != "GET" and (re.search(r"/(?:issues|pulls)/\d+/labels", endpoint, re.I) or re.search(
+                r"(?:^|[\s&{,])\"?labels(?:\[\])?\"?\s*[=:]|labelIds|addLabelsToLabelable", prguard._api_text(args[1:], stdin_text))):
             return "refused: add a label with `gh pr edit <N> --add-label <label>` on an owned PR"
         mutation = endpoint.strip("/").lower() == "graphql" and prbody.GQL_MUTATION_RE.search(prguard._api_text(args[1:], stdin_text))
         if method != "GET" and (m and f"{m[1]}#{m[2]}".lower() in no_post or no_post and mutation):
             return ("refused: a write on a PR in pr_babysit.no_post_prs, or a GraphQL mutation whose target cannot be "
                     "checked while any PR is listed there: fix it by local commits and tell the user")
         return None
-    if cmd not in ("pr", "issue") or sub not in ("comment", "edit", "review", "close", "reopen", "ready", "merge"):
+    if cmd in ("pr", "issue") and sub == "create" and prguard._opts(more, ("-l", "--label")):
+        return "refused: a label goes on an owned PR with `gh pr edit <N> --add-label <label>`, listed in pr_babysit.dispatch"
+    if cmd not in ("pr", "issue") or sub not in ("comment", "edit", "review", "close", "reopen", "ready", "merge", "update-branch"):
         return None
     labels = [x for v in prguard._opts(more, ("--add-label",)) for x in v.split(",")]
     if not no_post and not labels:
@@ -135,7 +138,7 @@ def workflow_info(path: str, text: str) -> dict:
 def _flows(db, gh, repo: str, sha: str, cwd: str, now: float) -> list[dict] | None:
     """The repo's workflows at `sha`: the folder listing is kept by sha and each file's reading by its blob, so a
     call not answered yet (route: exit 75) is the only one repeated next sweep. None while any answer is missing."""
-    cache = {k: v for k, v in (db.kv(FLOWS_KEY, {}) or {}).items() if now - float(v.get("at") or 0) < 7 * 86400}
+    cache = {k: v for k, v in (db.kv(FLOWS_KEY, {}) or {}).items() if now - float(v.get("at") or 0) < (86400 if "list" in v else 7 * 86400)}
     lk = f"{repo}@{sha}"
     listing = (cache.get(lk) or {}).get("list")
     if listing is None:
@@ -174,15 +177,15 @@ def _not_run(daemon, pr: dict, key: str, gh, now: float, pending: bool) -> str:
     flows = _flows(daemon.p.db, gh, repo, sha, str(daemon.p.root), now) if sha and (skip or listed) else None
     if flows is None:
         return ""
-    by_name = {f["name"]: f["trigger"] for f in flows}
+    by_name = {f["name"]: f"{f['file']}, trigger: {f['trigger']}" for f in flows}
     ran = {_workflow(c) for c in checks}
     ran_ok = {_workflow(c) for c in checks if (c.get("conclusion") or "").upper() != "SKIPPED"}
     skipped = {_workflow(c) or c.get("name") or "?" for c in checks if (c.get("conclusion") or "").upper() == "SKIPPED"}
-    todo = {n: by_name.get(n, "none") for n in skipped - ran_ok}
+    todo = {n: by_name.get(n, "trigger: none") for n in skipped - ran_ok}
     named = not checks or any(ran - {""})   # a read that names no workflow cannot say which never ran
-    todo.update({f["name"]: f["trigger"] for f in flows if f["manual"] and f["name"] not in ran and named and not pending
+    todo.update({f["name"]: f"{f['file']}, trigger: {f['trigger']}" for f in flows if f["manual"] and f["name"] not in ran and named and not pending
                  and (f["file"] in listed or f["name"] in listed or any(f"label:{x}" in listed for x in f.get("labels", [])))})
-    return "; ".join(f"{n} (trigger: {t})" for n, t in sorted(todo.items()))
+    return "; ".join(f"{n} ({t})" for n, t in sorted(todo.items()))
 
 
 def _told(daemon, state: dict, key: str, url: str, sig: dict, ready: bool) -> None:

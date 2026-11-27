@@ -84,7 +84,7 @@ def test_prbabysit_skipped_and_never_run_workflows_give_pr_ci_not_run_once(env, 
     watchers.watch_prs(d)
     ev = [t for k, t in _pb_events(p) if k == "pr_ci_not_run"]
     assert len(ev) == 1, ev
-    assert "Heavy (trigger: label run-heavy)" in ev[0] and "Nightly (trigger: workflow_dispatch)" in ev[0], ev
+    assert "Heavy (heavy.yml, trigger: label run-heavy)" in ev[0] and "Nightly (nightly.yml, trigger: workflow_dispatch)" in ev[0], ev
     assert "ci (" not in ev[0], "a workflow that ran is not listed"
 
 
@@ -298,6 +298,13 @@ def test_prbabysit_guard_covers_gh_api_writes_to_a_no_post_pr_and_workflow_dispa
     assert "gh pr edit" in _pb_why(p, cfg, *api, "repos/acme/widgets/issues/9/labels", "-f", "labels[]=run-heavy")
     assert "gh pr edit" in _pb_why(p, cfg, *api, "graphql", "-f", "query=mutation{addLabelsToLabelable}")
     assert _pb_why(p, cfg, *api, "repos/acme/widgets/issues/9/assignees") is None   # another PR
+    patch = ("api", "-X", "PATCH")
+    assert "gh pr edit" in _pb_why(p, cfg, *patch, "repos/acme/widgets/issues/9", "-f", "labels[]=run-heavy")
+    assert "gh pr edit" in _pb_why(p, cfg, *patch, "repos/acme/widgets/issues/9", "-f", "labels=run-heavy")
+    assert "gh pr edit" in _pb_why(p, cfg, *api, "graphql", "-f", "query=mutation{updatePullRequest(input:{labelIds:[1]}){x}}")
+    assert "gh pr edit" in _pb_why(p, cfg, "pr", "create", "--label", "run-heavy")
+    assert _pb_why(p, cfg, *patch, "repos/acme/widgets/issues/9", "-f", "title=x") is None   # another PR, no label
+    assert "no_post_prs" in _pb_why(p, cfg, "pr", "update-branch", "7", "-R", "Acme/Widgets")
 
 
 def test_prbabysit_a_workflow_read_not_answered_is_asked_again_next_sweep_and_kept_by_blob(env, monkeypatch):
@@ -328,7 +335,7 @@ def test_prbabysit_a_skipped_job_of_a_workflow_that_ran_is_not_not_run_and_a_lab
     p, d, _ = _pb_run(env, monkeypatch, pr, cfg={"pr_babysit.dispatch": {"acme/widgets": ["label:run-heavy"]}})
     watchers.watch_prs(d)
     ev = [t for k, t in _pb_events(p) if k == "pr_ci_not_run"]
-    assert len(ev) == 1 and "Heavy (trigger: label run-heavy)" in ev[0] and "ci (" not in ev[0], ev
+    assert len(ev) == 1 and "Heavy (heavy.yml, trigger: label run-heavy)" in ev[0] and "ci (" not in ev[0], ev
     assert "Nightly" not in ev[0], "only what dispatch lists"
 
 
