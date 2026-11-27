@@ -21,8 +21,10 @@ python -m tracy -p -r --profiler-capture-perf-counters all --perf-counter-multip
 
 `fpu` captures the FPU, SFPU and Math counters in one pass; there is no `sfpu`
 group. All columns blank means no counters were captured: re-run with `fpu`.
-`all` needs `--perf-counter-multipass`, which replays the workload once per
-pass, so every pass must run the same ops.
+`all` expands to `fpu, pack, unpack, instrn` plus the architecture's `l1_*`
+banks; the extra L1 banks are what need `--perf-counter-multipass` (one L1
+bank per pass), which replays the workload once per pass, so every pass must
+run the same ops.
 
 Counters are latched per kernel zone, not sampled over time.
 
@@ -34,5 +36,5 @@ Counters are latched per kernel zone, not sampled over time.
 | `Avg SFPU util on full grid (%)` | Vector / special-function unit | activations, `exp`/`recip`/`sqrt`/`gelu`, eltwise, softmax |
 | `Avg Math util on full grid (%)` | Math thread (TRISC1) | all math instructions |
 
-Each is busy cycles ÷ kernel cycles × 100, averaged over the cores that
-reported.
+Each is busy cycles ÷ kernel cycles × 100. The denominator is the full grid:
+idle cores count as zero, so a partially active grid reads low here.
