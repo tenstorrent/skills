@@ -5544,3 +5544,76 @@ def test_topup_covers_obligation_owners_and_review_hops_of_eligible_tasks(env):
     assert not topup.eligible(p.db.task(plain), p.db) and not topup.eligible(p.db.task(other), p.db)
     assert topup.eligible(p.db.task(owner), p.db)
     assert topup.eligible(p.db.task(hop), p.db) and topup.eligible(p.db.task(fix), p.db)
+
+
+def test_a_forked_run_with_little_budget_left_is_raised_once_by_the_shortfall_within_the_dollar_caps(env, monkeypatch, tmp_path):
+    """A forked run pays for the coordinator's copied session on its first call: dispatch raises a task
+    whose budget left minus that estimate is under forkroom.FLOOR_USD by the shortfall, once, with one
+    handled event; an ample budget is unchanged, and the raise stays within what the dollar caps leave."""
+    from types import SimpleNamespace
+    from ttp import budget as bud, coordsession, ctxfork, forkroom
+    from ttp.providers import claude as claude_mod
+    p = make(env)
+    cfg = p.config()
+    monkeypatch.setenv("TTP_TEST_WORKER_CONTEXT", "fork")
+    monkeypatch.setattr(claude_mod, "_FLAGS", {"--resume": True, "--session-id": True})
+    monkeypatch.setattr(ctxfork, "coord_model", lambda p: "opus")   # the standard tier's
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path))
+    transcript = tmp_path / "projects" / re.sub(r"[^a-zA-Z0-9]", "-", str(p.base)) / "s1.jsonl"
+    transcript.parent.mkdir(parents=True)
+    transcript.write_text("{}\n")
+    p.db.set_kv(coordsession.KEY, {"id": "s1", "provider": "claude", "context_tokens": 80_000})
+    est, basis = forkroom.estimate(p.db, cfg, "claude", None)
+    assert basis == "session size" and est == round(bud.estimate_cost(p.db, cfg, "claude", "", {"cache_write": 80_000}), 2)
+    p.db.x("INSERT INTO runs(task,role,provider,status,started,note) VALUES(NULL,'worker','claude','ok',?,?)",
+           (time.time(), json.dumps({"coord_context": {"how": "fork"},
+                                     "cache_telemetry": {"first_context": 120_000, "first_cache_read": 20_000}})))
+    est, basis = forkroom.estimate(p.db, cfg, "claude", None)
+    assert basis == "history" and est == round(bud.estimate_cost(
+        p.db, cfg, "claude", "", {"cache_read": 20_000, "cache_write": 100_000}), 2) and est > 0
+
+    def task(budget, spent):
+        tid = p.db.add_task(f"t{budget}", "s", kind="code", tier="standard", budget_usd=budget)
+        p.db.update_task(tid, spent_usd=spent)
+        return dict(p.db.task(tid))
+
+    small = task(5.0, 4.0)
+    got = forkroom.fit(p, cfg, small, "claude")
+    after = round(5.0 + forkroom.floor(5.0, est) - (1.0 - est), 2)
+    assert got["budget_usd"] == after == p.db.task(small["id"])["budget_usd"]
+    (ev,) = p.db.q("SELECT * FROM events WHERE kind=? AND task=?", (forkroom.KIND, small["id"]))
+    assert ev["status"] == "handled" and f"#{small['id']}" in ev["text"] and f"${est:.2f}" in ev["text"] \
+        and f"${after:.2f}" in ev["text"]
+    assert forkroom.fit(p, cfg, got, "claude") == got   # once
+    ample = task(40.0, 0.0)
+    assert forkroom.fit(p, cfg, ample, "claude") == ample
+    assert not p.db.q("SELECT id FROM events WHERE kind=? AND task=?", (forkroom.KIND, ample["id"]))
+    # The dollar caps leave $2.50: the start commits the $1 left, so the raise is at most $1.50.
+    capped = task(5.0, 4.0)
+    gate = SimpleNamespace(numbers={"daily_cap": 10.0, "spent_today": 7.5})
+    assert forkroom.fit(p, cfg, capped, "claude", gate)["budget_usd"] == 6.5 < after
+    full = task(5.0, 4.0)
+    gate = SimpleNamespace(numbers={"daily_cap": 10.0, "spent_today": 9.5})
+    assert forkroom.fit(p, cfg, full, "claude", gate) == full   # no room: never past the cap
+    # Runs that start from the disk block, not a fork, pay no copy: a blind review, a provider that
+    # cannot resume the coordinator's session.
+    blind = {**task(5.0, 4.0), "labels": '["blind_review"]'}
+    assert forkroom.fit(p, cfg, blind, "claude") == blind
+    other = task(5.0, 4.0)
+    assert forkroom.fit(p, cfg, other, "cursor") == other
+    light = task(5.0, 4.0)   # its tier's model is not the coordinator's: it copies the last turns only
+    p.db.update_task(light["id"], tier="light")
+    tail = ctxfork._other_model_tail(p, cfg, claude_mod.Claude(), "sonnet")
+    small_est = round(bud.estimate_cost(p.db, cfg, "claude", "sonnet", {"cache_write": tail}), 2)
+    assert 0 < small_est < est and forkroom.fit(p, cfg, dict(p.db.task(light["id"])), "claude")["budget_usd"] \
+        == round(5.0 + forkroom.FLOOR_USD - (1.0 - small_est), 2)
+    fresh = task(2.0, 0.0)   # a small budget keeps a small floor: half of it is left past the copy
+    p.db.update_task(fresh["id"], tier="light")
+    fresh = dict(p.db.task(fresh["id"]))
+    assert forkroom.fit(p, cfg, fresh, "claude") == fresh
+    # $6.16 left and a $2.67 first call: the $3.49 past it read the copy too few times to do any work.
+    assert forkroom.floor(10.0, 2.67) == 5.34 > 6.16 - 2.67
+    stale = task(5.0, 4.0)   # a session too old to fork
+    assert forkroom.fit(p, cfg, stale, "claude", now=time.time() + 13 * 3600) == stale
+    monkeypatch.setenv("TTP_TEST_WORKER_CONTEXT", "off")
+    assert forkroom.fit(p, cfg, task(5.0, 4.0), "claude")["budget_usd"] == 5.0   # no fork, no raise

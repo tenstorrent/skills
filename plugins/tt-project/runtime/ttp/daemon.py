@@ -95,6 +95,7 @@ from . import gatejudge
 from . import urgentfup
 from . import fupfold
 from . import topup
+from . import forkroom
 from . import cursortiers
 from . import ctxfork
 from . import credwatch
@@ -13405,6 +13406,7 @@ class Daemon:
                     db.update_task(task["id"], blocked_reason=held)
                 fate[task["id"]] = "hold"
                 continue
+            task = forkroom.fit(self.p, self.cfg, task, provider, self.gates.get(provider), now)   # within the dollar caps
             why = self._start_hold(task, provider, ctx, reserve=True)
             fate[task["id"]] = "full" if why == "gate" and task["id"] in ctx["full"] else SLOT_HELD_BY.get(why, "other")
             if why == "held":
