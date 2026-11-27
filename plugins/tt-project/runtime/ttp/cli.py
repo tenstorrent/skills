@@ -15340,10 +15340,9 @@ def _stage_all(h: Path, names) -> None:
     plain = sorted(n for n in untracked if not n.endswith("/") and os.path.lexists(h / n))
     if not plain:
         return
-    fd, name = tempfile.mkstemp(prefix="ttp-add-")
-    spec = Path(name)
-    with os.fdopen(fd, "w") as f:
-        f.write("\0".join(plain) + "\0")
+    scratch = Path(tempfile.mkdtemp(prefix="ttp-add-"))
+    spec = scratch / "paths"
+    durable_write(spec, "\0".join(plain) + "\0", sync=False)
     try:
         _git(h, "--literal-pathspecs", "add", "--pathspec-from-file", str(spec), "--pathspec-file-nul")
     except subprocess.CalledProcessError:
@@ -15354,7 +15353,7 @@ def _stage_all(h: Path, names) -> None:
                 if os.path.lexists(h / n):
                     raise
     finally:
-        spec.unlink(missing_ok=True)
+        shutil.rmtree(scratch, ignore_errors=True)
 
 
 def _commit_local_changes(p: Project, ident: list[str]) -> list[str]:
