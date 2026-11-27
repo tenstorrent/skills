@@ -1029,26 +1029,23 @@ def _slot_names() -> list[str]:
 
 
 def _lane_index() -> dict[str, list[str]]:
-    """Inside one_listing: each base's lane file names, its numbered lanes then its overflow lanes."""
+    """Each base's lane file names, its numbered lanes then its overflow lanes (kept in one_listing)."""
     held = _LISTING.get()
-    if "index" not in held:
-        keyed: dict[str, list] = {}
-        for n in _slot_names():
-            if m := _LANE_NAME.fullmatch(n):
-                keyed.setdefault(m.group(1), []).append((m.group(2) is not None, int(m.group(3)), n))
-        held["index"] = {b: [t[2] for t in sorted(v)] for b, v in keyed.items()}
-    return held["index"]
+    if held is not None and "index" in held:
+        return held["index"]
+    keyed: dict[str, list] = {}
+    for n in _slot_names():
+        if m := _LANE_NAME.fullmatch(n):
+            keyed.setdefault(m.group(1), []).append((m.group(2) is not None, int(m.group(3)), n))
+    index = {b: [t[2] for t in sorted(v)] for b, v in keyed.items()}
+    if held is not None:
+        held["index"] = index
+    return index
 
 
 def _lanes_of(base: str) -> list:
     """Every lane file of `base` there is now: its numbered lanes, then its overflow lanes."""
-    if _LISTING.get() is not None:
-        found = _lane_index().get(base, [])
-    else:
-        pat = re.compile(re.escape(base) + r"(?:-x)?\.(\d+)\.lock")
-        found = [n for n in _slot_names() if pat.fullmatch(n)]
-        found.sort(key=lambda n: (n.startswith(base + "-x"), int(pat.fullmatch(n).group(1))))
-    return [checkcap.slot_dir() / n for n in found]
+    return [checkcap.slot_dir() / n for n in _lane_index().get(base, [])]
 
 
 def suite_bases(project_name: str) -> list[str]:

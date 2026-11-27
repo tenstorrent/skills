@@ -448,12 +448,13 @@ def _lane_waits_on(project_name: str, base: str, key: str, q: list, cfg: dict | 
     if held >= n:
         return [label for _ in q]
     cap = project_cap(cfg)
-    if cap > 0 and len(testslots.project_held(project_name)) >= cap:
+    used = len(testslots.project_held(project_name)) if cap > 0 else 0
+    if cap > 0 and used >= cap:
         return [CAP_LABEL for _ in q]
     # Only the first waiters, as many as there are free lanes, can start now: the rest wait for those to
     # take their lanes (several local full checks run side by side up to the free lanes and the cap).
     free, rest = n - held, label
-    if cap > 0 and (room := cap - len(testslots.project_held(project_name))) < free:
+    if cap > 0 and (room := cap - used) < free:
         free, rest = room, CAP_LABEL
     on = _host_gate(project_name) or "nothing (about to start)"
     return [on if i < free else rest for i in range(len(q))]
@@ -1026,6 +1027,7 @@ def waiter_text(w: dict, since: float, cfg: dict | None = None, now: float | Non
     return f"a run with no task ({' '.join(bits[:3])}, {bits[3]})"
 
 
+@testslots.one_listing()
 def waits(project_name: str, cfg: dict | None, now: float | None = None, over_s: float = 0.0) -> list[dict]:
     """The project's waiters for a lane that have waited over `over_s`, in queue order (the aging step
     of `cfg`, checks.priority_age_s — the order the lanes grant): task, waited_s, since (arrival),

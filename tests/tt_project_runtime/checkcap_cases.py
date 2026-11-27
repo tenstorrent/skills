@@ -13395,3 +13395,21 @@ def test_lane_status_lists_the_folder_once_and_looks_up_no_waits_for_a_base_with
             g.close()
         for t in tickets:
             locks.dequeue(t)
+
+
+def test_waits_lists_the_folder_a_bounded_number_of_times_not_once_per_waiting_base(env, monkeypatch):
+    """cells: waits_one_listing. Held bases with waiters (the daemon's wait events, the status page): the
+    folder is read a small constant number of times per call, however many bases wait."""
+    from ttp import checklane, locks
+    p = make(env)
+    held, tickets = _crowded_slot_folder(monkeypatch)
+    calls = _count_listings(monkeypatch)
+    try:
+        rows = checklane.waits("pa", p.config())
+        assert len(rows) >= 3, rows
+        assert len(calls) <= 3, len(calls)
+    finally:
+        for g in held:
+            g.close()
+        for t in tickets:
+            locks.dequeue(t)
