@@ -112,8 +112,10 @@ def test_quoted_text_elsewhere_in_the_message_does_not_clear_a_pending_item():
     from ttp import quotefull
     for miss in (_MISS + " Task 12 landed on `main`.", "Ran `ttp status`; the draft for <name> is ready to send.",
                  "`ttp status` is fine. " + _MISS, "> a long quoted line\n" + _MISS + "\nBudget at 40%.",
-                 "Ask 12 is still open.\n- ask 13: Other?", "Drafts in my earlier messages, ready to send: `ttp approve 12`",
-                 "Apologies to A and B: drafts in my earlier messages, ready to send. Task 12 landed on `main`."):
+                 "The ask is still open.\n- ask 13: Other?", "Drafts in my earlier messages, ready to send: `ttp approve 12`",
+                 "Apologies to A and B: drafts in my earlier messages, ready to send. Task 12 landed on `main`.",
+                 "Open items:\n- the draft for <name>, ready to send\n- task #12 landed on `main`",
+                 "The draft for A is ready to send.\nTask 12 landed on `main`."):
         assert quotefull.backrefs(miss) != [], miss
     assert any("earlier messages" in b for b in quotefull.backrefs(_MISS + " Ran `ttp status`."))
     for ok in (_MISS + _DRAFTS, _MISS + _DRAFTS + " Ran `ttp status`.", "Ask 12 is still open.\n- ask 12: Reboot?",
@@ -135,15 +137,18 @@ def test_plain_pull_request_and_command_status_passes():
     assert quotefull.backrefs("Please run the command for you to approve.") != []
 
 
-def test_an_earlier_message_pointer_needs_a_pending_item_and_an_ask_quoted_in_full_passes():
+def test_an_earlier_message_pointer_needs_a_pending_item_and_an_ask_named_by_id_is_left_to_pendingask():
     from ttp import quotefull
     for miss in ("See above:\nTask 12 landed.", _MISS[:-1] + ":\nTask 12 landed.",
                  "Drafts in my earlier messages, ready to send. Ran:\n`ttp status`",
-                 "Ask 12 is still open. Task 9 landed.", "Ask 12 is still open.\n- ask 13: Other?"):
+                 "The drafts for A and B are ready. See my earlier messages.",
+                 "Two drafts are waiting on you. See my earlier messages.", "Apologies to A and B. See my earlier messages."):
         assert quotefull.backrefs(miss) != [], miss
     for ok in ("In my earlier message I said the board was down; it is back up.",
                "As in my previous message, the board is back up.", "See above in the log: CI is green.",
                "Ask 12 from 3 days ago is still open.\n- ask 12: Reboot?",
                "Ask 12 for board 2 is still pending.\n- ask 12: Reboot?",
-               "Ask 12 is still open. Reboot the board now or after the soak? Recommendation: after the soak"):
+               "Ask 12 is still open. Reboot the board now or after the soak? Recommendation: after the soak",
+               "Ask 12 (Reboot the board now or after the soak?) is still open.",
+               "The draft for A is ready to send.\n`ttp approve 12`"):
         assert quotefull.backrefs(ok) == [], ok

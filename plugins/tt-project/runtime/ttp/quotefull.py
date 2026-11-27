@@ -10,10 +10,12 @@ my earlier messages', 'drafts above', 'as drafted earlier', 'the draft I sent'),
 'please run' and the like after it; 'still open' or 'still pending' after an ask) in the same clause, not negated.
 A pull request, a PR or a draft PR is no such item. A phrase is fine only when the text is attached
 to it: quoted material (a blockquote, a fenced block, an inline code span, a quoted span of 30+
-chars) later in its own sentence or as the first lines after it (or in the message's later numbered
-parts), the '- ask <id>:' line pendingask appends for that ask, or, for a status phrase, text after a
-colon on its line; when the line ends in ':', non-empty lines after it. Quoted text elsewhere in
-the message never counts. A phrase inside a short quoted span is only named. `refused` turns
+chars) later in its own sentence or as the first line after it (or in the message's later numbered
+parts; a code span there only as the whole line or after a closing ':'), or, for a status phrase,
+text after a colon on its line, or non-empty lines after a closing ':'. Quoted text elsewhere in
+the message never counts. An ask named by id is pendingask's: it runs first and appends the ask in
+full unless the text already quotes it. 'In my earlier message' counts only with a pending item in
+its sentence. A phrase inside a short quoted span is only named. `refused` turns
 the findings into a coordinator reply or notify rejection. Daemon-built lines were audited and carry
 their pending item's full text: ask reminders quote the question (coordinator.defaults,
 askrethink.text), `ttp status` shows each open ask whole (cli.status_text) and worker notifies carry
@@ -43,24 +45,20 @@ _BLOCK = r"^\s*>|^```|\"[^\"]{30,}\"|“[^”]{30,}”"   # quoted text a back-r
 _BLOCKS = re.compile(_BLOCK, re.M)
 _QUOTED = re.compile(_BLOCK + r"|`[^`\n]+`", re.M)
 _STOP = re.compile(r"[.;!?](?=\s|$)|\n")
-_BARE = re.compile(_EARLIER, re.I)   # points back only with a pending item in its sentence
+_BARE = re.compile(_EARLIER.replace("|see", ""), re.I)   # points back only with a pending item in its sentence
 _PENDING = re.compile(rf"\b{_ITEM}|{_AWAITS}", re.I)
 
 
-def _attached(text: str, start: int, after: str, ids: list[int], back: bool) -> bool:
-    """Whether quoted text belongs to the phrase at `start`: in its own sentence, as the first lines
-    after it, or (an ask) its '- ask <id>:' line. A back-reference takes no inline code span: a
-    command is not the earlier text."""
-    quoted = _BLOCKS if back else _QUOTED
-    q = quoted.search(text, start)
+def _attached(text: str, start: int, after: str, back: bool, colon: bool) -> bool:
+    """Whether quoted text belongs to the phrase at `start`: in its own sentence, or as the first line
+    after it (a block or long quote; a code span only as the whole line or after a closing ':'). A
+    back-reference takes no inline code span: a command is not the earlier text."""
+    q = (_BLOCKS if back else _QUOTED).search(text, start)
     if q and not _STOP.search(text[start:q.start()]):
         return True
     first = next((ln for ln in after.splitlines() if ln.strip() and not part_of(ln)), "")
-    if quoted.search(first) or (ids and all(re.search(rf"^\s*- ask\s+{i}:", text, re.M) for i in ids)):
-        return True
-    # an ask quoted in full (pendingask.expand appended nothing): its question follows in the next sentence
-    nxt = re.split(r"(?<=[.!?])\s+|\n", text[start:].split("\n\n")[0], maxsplit=1)
-    return bool(ids and len(nxt) > 1 and "?" in nxt[1] and not re.match(r"\s*- ask\s+\d+:", nxt[1]))
+    return bool(_BLOCKS.search(first) or (not back and (
+        re.fullmatch(r"\s*`[^`\n]+`\s*", first) or (colon and _QUOTED.search(first)))))
 
 
 def backrefs(text: str, later: list[str] | tuple = ()) -> list[str]:
@@ -81,13 +79,14 @@ def backrefs(text: str, later: list[str] | tuple = ()) -> list[str]:
         line_end = text[m.end():eol if eol >= 0 else len(text)].rstrip()
         after = text[eol + 1 if eol >= 0 else len(text):] + "\n" + tail
         item = re.search(_ITEM, m.group(0), re.I)
-        ids = pendingask.refs(m.group(0))
+        if not back and pendingask.refs(m.group(0)):   # pendingask.expand, run first, appended it or saw it quoted
+            continue
         if back and _BARE.fullmatch(m.group(0)):   # 'in my earlier message I said ...' with nothing pending
             lo = max((x.end() for x in _STOP.finditer(text[:m.start()])), default=0)
             hi = _STOP.search(text, m.end())
             if not _PENDING.search(text[lo:hi.start() if hi else len(text)]) and not line_end.endswith(":"):
                 continue
-        if (_attached(text, m.start(), after, ids, back) or (not back and line_end.endswith(":") and has_content(after))
+        if (_attached(text, m.start(), after, back, line_end.endswith(":")) or (not back and line_end.endswith(":") and has_content(after))
                 or (not back and re.match(r":\s*\S", line_end))):
             continue
         p = " ".join(m.group(0).split()) if back else \
