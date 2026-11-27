@@ -589,9 +589,10 @@ def _queued(sent: list[str], data: bytes, repo: str, cwd: str | None, home, what
     done = d / f"{key}.done"
     if (got := _load(done)) is not None:
         sys.stdout.write(str(got.get("stdout") or ""))
-        sys.stderr.write(_older_bridge(sent, data, got))
-        if not got.get("write"):
-            done.unlink(missing_ok=True)   # a read is answered once; the next one asks again
+        said = _older_bridge(sent, data, got)
+        sys.stderr.write(said)
+        if not got.get("write") or said != str(got.get("stderr") or ""):
+            done.unlink(missing_ok=True)   # a read is answered once; so is an old bridge's refusal, made before gh ran: the retry after the update asks again
         mark(True, via=WORKSTATION)
         return int(got.get("rc", 1)) if str(got.get("rc", 1)).lstrip("-").isdigit() else 1
     if not (d / f"{key}.q").exists() and not (d / f"{key}.taken").exists():

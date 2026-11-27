@@ -1806,6 +1806,18 @@ def test_gh_a_bridge_that_lacks_a_call_the_box_allows_is_named_as_an_older_relea
         ghqueue._queued(run, b"", "acme/widgets", None, None, "gh workflow run")
         err = capsys.readouterr().err
         assert (want in err and "older release" in err) if want else err == stderr, err
+    # The rewritten refusal came before gh ran, so the retry after the update queues the call again; a refusal
+    # that was not rewritten stays kept for a write, so a retried write never posts twice.
+    for stderr, queued in ((generic, True), ("refused on the workstation: not the head of an open PR", False)):
+        (d / f"{key}.done").write_text(json.dumps({"rc": 1, "write": True, "stderr": stderr, "at": time.time()}))
+        assert ghqueue._queued(run, b"", "acme/widgets", None, None, "gh workflow run") == 1
+        assert (d / f"{key}.done").exists() is not queued
+        capsys.readouterr()
+        assert (ghqueue._queued(run, b"", "acme/widgets", None, None, "gh workflow run") == ghqueue.HELD_RC) is queued
+        assert (d / f"{key}.q").exists() is queued
+        (d / f"{key}.q").unlink(missing_ok=True)
+        (d / f"{key}.done").unlink(missing_ok=True)
+        capsys.readouterr()
     old = "refused on the workstation: `gh workflow run` takes one workflow, --ref and --repo, no inputs (`-f` is not allowed)"
     (d / f"{key}.done").write_text(json.dumps({"rc": 1, "write": True, "stderr": old, "at": time.time()}))
     ghqueue._queued(run, b"", "acme/widgets", None, None, "gh workflow run")
