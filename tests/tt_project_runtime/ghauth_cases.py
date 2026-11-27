@@ -1119,6 +1119,67 @@ def test_anonymous_reads_hold_the_host_cap_and_githubs_last_calls(env, monkeypat
     assert len(asked) == 4, "a call went out with GitHub's last calls left"
 
 
+def test_a_task_run_stops_at_its_share_of_the_anonymous_budget_and_the_daemon_gets_the_rest(env, monkeypatch):
+    """A caller inside a task run spends at most its share of the host cap an hour (a refusal is the
+    usual Spent); the daemon, outside any run, still gets the rest for pr-watch."""
+    from ttp import ghanon
+    asked = _anon_github(env, monkeypatch, {f"/x/{i}": (200, {"i": i}, {}) for i in range(6)})
+    monkeypatch.setenv("TTP_TASK_ID", "7")
+    assert [ghanon.get(f"x/{i}", 60, cap=4) for i in range(2)] == [{"i": 0}, {"i": 1}]
+    with pytest.raises(ghanon.Spent, match="budget spent"):
+        ghanon.get("x/2", 60, cap=4)
+    monkeypatch.delenv("TTP_TASK_ID")
+    monkeypatch.setenv("TTP_RUN_DIR", str(env["tmp"]))
+    with pytest.raises(ghanon.Spent):
+        ghanon.get("x/2", 60, cap=4)
+    monkeypatch.delenv("TTP_RUN_DIR")
+    assert [ghanon.get(f"x/{i}", 60, cap=4) for i in (2, 3)] == [{"i": 2}, {"i": 3}]
+    with pytest.raises(ghanon.Spent):
+        ghanon.get("x/4", 60, cap=4)
+    assert len(asked) == 4
+
+
+def test_the_task_runs_share_of_the_anonymous_budget_is_a_setting(env, monkeypatch):
+    """watchers.gh_anon_task_share sets a task run's part of the cap; 0 leaves it all to the daemon."""
+    from ttp import aitag, ghanon
+    _anon_github(env, monkeypatch, {f"/x/{i}": (200, {"i": i}, {}) for i in range(4)})
+    monkeypatch.setenv("TTP_TASK_ID", "7")
+    share = {"watchers": {"gh_anon_task_share": 0.25}}
+    monkeypatch.setattr(aitag, "project_config", lambda: share)
+    assert ghanon.get("x/0", 60, cap=8) == {"i": 0} and ghanon.get("x/1", 60, cap=8) == {"i": 1}
+    with pytest.raises(ghanon.Spent):
+        ghanon.get("x/2", 60, cap=8)
+    share["watchers"]["gh_anon_task_share"] = 0
+    with pytest.raises(ghanon.Spent):
+        ghanon.get("x/3", 60, cap=100)
+
+
+def test_pr_watch_reads_heads_by_ls_remote_once_the_anonymous_budget_is_spent(env, monkeypatch):
+    """With the API budget spent, each watched PR's head is still read by `git ls-remote`: a pushed
+    commit moves the head an approval binds to and raises pr_changed; the PR shows as head read only."""
+    from ttp import ghanon, prguard, watchers
+    from ttp.daemon import Daemon
+    url, _ = _anon_pr(env, monkeypatch, {"check_runs": []}, [])
+    p = make(env)
+    p.db.x("INSERT INTO tasks(title,kind,status,pr_url,created) VALUES('t','code','waiting',?,?)", (url, time.time()))
+    key = prguard.pr_key(url)
+    p.db.set_kv(prguard.HEADS_KEY, {key: {"sha": "0" * 40, "seen": 1.0}})
+
+    def spent(*a, **k):
+        raise ghanon.Spent("anonymous GitHub budget spent (30 calls an hour from this host) and no cached answer")
+    monkeypatch.setattr(ghanon, "pr_view", spent)
+    asked = []
+    monkeypatch.setattr(ghanon, "ls_remote", lambda u, ref, timeout: asked.append(ref) or ("b" * 40, ""))
+    status = watchers.watch_prs(Daemon(p.base))
+    assert "0 of 1 PRs read anonymously, 1 head read only" in status and "budget spent" in status, status
+    assert asked == ["refs/pull/3/head"]
+    assert p.db.kv(prguard.HEADS_KEY)[key]["sha"] == "b" * 40
+    texts = [r["text"] for r in p.db.q("SELECT text FROM events WHERE kind='pr_changed'")]
+    assert len(texts) == 1 and "head read only" in texts[0], texts
+    watchers.watch_prs(Daemon(p.base))
+    assert p.db.q("SELECT COUNT(*) n FROM events WHERE kind='pr_changed'")[0]["n"] == 1, "an unchanged head is not news"
+
+
 def test_no_login_hint_while_gh_is_logged_out_and_a_private_repo_is_observed_once(env, monkeypatch):
     """A logged-out lab host is never told to log in: pr-watch and `ttp ci` say what is limited and name the
     route setting; a private repo gets one observation under a stable key."""

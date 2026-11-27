@@ -743,15 +743,17 @@ def _read_prs(order: list[dict], root: str, workers: int, pr_timeout: float) -> 
     return results
 
 
-def _read_anon(daemon, order: list[dict], results: dict[str, dict]) -> tuple[int, set[str], str]:
+def _read_anon(daemon, order: list[dict], results: dict[str, dict]) -> tuple[int, set[str], str, int]:
     """Read anonymously (ghanon) each PR of `order` gh did not read, into `results`, before the run's
     deadline. No GraphQL, so bot findings keep their last value (data None). Each repo it cannot read is
-    observed once under a stable key. Returns (PRs read anonymously, repos unreadable, why it stopped)."""
+    observed once under a stable key. Once the budget is spent, each PR left gets its head alone by
+    `git ls-remote` (no API call; its result has `head`). Returns (PRs read anonymously, repos
+    unreadable, why it stopped, heads read only)."""
     from . import ghanon
     cfg = (getattr(daemon, "cfg", None) or {}).get("watchers") or {}
     raw = cfg.get("gh_anon_cap", ghanon.CAP)
     cap = int(raw) if isinstance(raw, (int, float)) and not isinstance(raw, bool) and raw >= 0 else ghanon.CAP
-    n, unread, spent = 0, set(), ""
+    n, unread, spent, heads = 0, set(), "", 0
     for t in order:
         r = results.get(t["pr_url"])
         if r is not None and r["pr"] is not None:
@@ -762,6 +764,8 @@ def _read_anon(daemon, order: list[dict], results: dict[str, dict]) -> tuple[int
         repo, number = key.split("#")
         t0 = _now()
         try:
+            if spent:
+                raise ghanon.Spent(spent)
             pr = ghanon.pr_view(repo, int(number), cap=cap)
         except ghanon.Unreadable as e:
             if repo not in unread:
@@ -772,13 +776,18 @@ def _read_anon(daemon, order: list[dict], results: dict[str, dict]) -> tuple[int
             continue
         except ghanon.Spent as e:
             spent = str(e)
-            break
+            sha = ghanon.head_sha(repo, f"refs/pull/{number}/head")
+            if sha:
+                results[t["pr_url"]] = {"pr": None, "data": None, "head": sha, "cut": None,
+                                        "calls": ["anonymous: head read only"]}
+                heads += 1
+            continue
         except OSError as e:
             results[t["pr_url"]] = {"pr": None, "data": None, "calls": [f"anonymous: {e}"[:120]], "cut": None}
             continue
         results[t["pr_url"]] = {"pr": pr, "data": None, "calls": [f"anonymous {_now() - t0:.1f} s"], "cut": None}
         n += 1
-    return n, unread, spent
+    return n, unread, spent, heads
 
 
 def _log(daemon, msg: str) -> None:
@@ -864,6 +873,13 @@ def watch_prs(daemon, payload: dict | None = None) -> str:
         tried[t["pr_url"]] = stint   # a PR that timed out on its own waits behind the others
         if pr is None:
             read += not r["cut"]   # gh answered with an error: read, nothing to report
+            key = prguard.pr_key(t["pr_url"])
+            if r.get("head") and key and (heads.get(key) or {}).get("sha") not in (None, r["head"]) \
+                    and not t.get("purview"):   # the budget is spent, yet a pushed commit is still news
+                heads[key] = {"sha": r["head"], "seen": time.time()}
+                db.x("INSERT INTO events(ts,source,kind,severity,text,status,task) VALUES(?,?,?,?,?,?,?)",
+                     (time.time(), "pr", "pr_changed", "normal", f"PR for task #{t['id']} ({t['pr_url']}): "
+                      f"head → {r['head'][:12]} (head read only)", "queued", t["id"]))
             continue
         read += 1
         key = prguard.pr_key(pr.get("url") or t["pr_url"])
@@ -936,12 +952,13 @@ def watch_prs(daemon, payload: dict | None = None) -> str:
     if anon is not None:   # the host-wide gh login check (ghauth) is asked to look now and alerts once
         if auth:
             ghauth.nudge()
-        n, unread, spent = anon
+        n, unread, spent, head_only = anon
         why = f" ({ghroute.quiet(auth[0])})" if auth else ""
         if all((results.get(t["pr_url"]) or {}).get("pr") is not None for t in order):
             return f"ok ({len(order)} PRs read anonymously while gh is logged out, {changed} changed{unapproved})"
         return (f"error: degraded: gh has no login on this host{why} and {ghroute.SETTING} "
                 f"{ghroute.how(cwd=str(daemon.p.base))}: {n} of {len(order)} PRs read anonymously"
+                + (f", {head_only} head read only" if head_only else "")
                 + (f", not readable without a login: {', '.join(sorted(unread))}" if unread else "")
                 + (f"; {spent}" if spent else "")
                 + f"; {ghroute.SETTING} (an ssh alias where gh is logged in) routes the rest")

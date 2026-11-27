@@ -11,7 +11,9 @@ Anonymous calls are limited per IP (60 an hour), shared with every process on th
   sha-pinned read (check runs once all are done; comments and reviews per PR update time) 30 days, a 404 6 h;
 - the PR's head is resolved to a sha with `git ls-remote` (no API call), so its check runs are read by sha;
 - at most `cap` calls (`watchers.gh_anon_cap`, default 30) go out per rolling hour, and none while GitHub's
-  own X-RateLimit-Remaining is FLOOR or less before its reset. Over either, an answer up to STALE_S old is
+  own X-RateLimit-Remaining is FLOOR or less before its reset. A task run (TTP_TASK, TTP_TASK_ID or
+  TTP_RUN_DIR set) stops at its share of the cap (`watchers.gh_anon_task_share`), so a polling task never
+  spends what the daemon's pr-watch needs. Over either, an answer up to STALE_S old is
   served; with none, Spent is raised.
 A repository it cannot read (private, gone) raises Unreadable. TTP_GH_ANON_API (tests) sets the API base.
 """
@@ -30,6 +32,7 @@ from pathlib import Path
 
 DIR = "gh-anon"
 CAP = 30             # anonymous calls per rolling hour from this host (`watchers.gh_anon_cap`)
+TASK_SHARE = 0.5     # the part of it a task run may spend (`watchers.gh_anon_task_share`); the daemon gets all
 FLOOR = 5            # GitHub's last few anonymous calls of its hour are never spent
 STALE_S = 6 * 3600   # what a spent budget may still serve
 TTL_OPEN = 25 * 60
@@ -114,6 +117,16 @@ def _note_limit(d: Path, headers) -> None:
     _budget(d, lambda b: b.update(remaining=rem, reset=reset))
 
 
+def _cap_here(cap: int) -> int:
+    """`cap` for the daemon; a task run's share of it."""
+    if not any(os.environ.get(v) for v in ("TTP_TASK", "TTP_TASK_ID", "TTP_RUN_DIR")):
+        return cap
+    from . import aitag
+    raw = (aitag.project_config().get("watchers") or {}).get("gh_anon_task_share", TASK_SHARE)
+    ok = isinstance(raw, (int, float)) and not isinstance(raw, bool) and 0 <= raw <= 1
+    return int(cap * (raw if ok else TASK_SHARE))
+
+
 def get(path: str, ttl: float, home: Path | None = None, cap: int = CAP, key: str | None = None):
     """The JSON body of a GET of `path` (under the API base), from the cache while fresh enough. `key`
     names the cache entry (default: the URL), so a caller can pin it to a sha or an update time."""
@@ -122,6 +135,7 @@ def get(path: str, ttl: float, home: Path | None = None, cap: int = CAP, key: st
     e = _cached(d, key, ttl)
     if e is not None and e["status"] == 404 and time.time() - float(e["t"]) > TTL_404:
         e = None
+    cap = _cap_here(cap)
     if e is None and not _take(d, cap):
         e = _cached(d, key, STALE_S)
         if e is None:

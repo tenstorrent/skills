@@ -587,10 +587,11 @@ DEFAULT_CONFIG: dict[str, Any] = {
     # however many tasks name it; with no deadline_s in its payload, its deadline grows with the PR count
     # (up to 300 s). A schedule's payload may set any of them for itself.
     # gh_anon_cap: anonymous GitHub calls an hour from this host while gh is logged out (ghanon; 0: none).
+    # gh_anon_task_share: the part of gh_anon_cap a task run may spend; the daemon's pr-watch keeps the rest.
     # purview_extra: PR URLs, owner/repo#N, or owner/repo names whose open PRs on the project's branches it also watches,
     # beyond those its own records find (the push branch, its tasks' branches and PRs). Shipped empty.
     "watchers": {"deadline_s": 90, "gh_timeout_s": 20, "pr_workers": 4, "pr_timeout_s": 60, "gh_anon_cap": 30,
-                 "purview_extra": []},
+                 "gh_anon_task_share": 0.5, "purview_extra": []},
     # pr_babysit: the model-free sweep of every open PR the project owns, draft or not (prbabysit): events
     # pr_ci_not_run and pr_idle, and a chat line per status change. idle_h: quiet hours before pr_idle.
     # dispatch: {'owner/repo': [workflow names or 'label:<name>']} the guard lets a worker dispatch or label on
