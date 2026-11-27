@@ -6,13 +6,14 @@ drafts, so the harness refuses it model-free.
 
 `backrefs` finds the phrases that stand in for content: an explicit back-reference ('see above', 'in
 my earlier messages', 'drafts above', 'as drafted earlier', 'the draft I sent'), and an item word
-(draft/ask/request/command) that is the subject of 'ready to send', 'still open' or 'still pending'
-in the same clause, not negated, or follows 'pending your'. A phrase is fine only when the message
-itself carries the content: quoted material (a blockquote, a fenced block, an inline code span, a
-quoted span of 30+ chars, or, for an ask, the '- ask <id>:' lines pendingask appends) in or after it
-or in the message's later numbered parts (before it too, unless it points to earlier messages), or,
-when the phrase's line ends in ':', non-empty lines after it. A passing line or list item with plain
-lines after it is not its text; a phrase inside a short quoted span is only named. `refused` turns
+(draft/ask/request/command) that awaits the user ('ready to send', 'pending your', 'for you to',
+'please run' after it; 'still open' or 'still pending' after an ask) in the same clause, not negated.
+A pull request, a PR or a draft PR is no such item. A phrase is fine only when the text is attached
+to it: quoted material (a blockquote, a fenced block, an inline code span, a quoted span of 30+
+chars) later in its own sentence or as the first lines after it (or in the message's later numbered
+parts), the '- ask <id>:' line pendingask appends for that ask, or, for a status phrase, text after a
+colon on its line; when the line ends in ':', non-empty lines after it. Quoted text elsewhere in
+the message never counts. A phrase inside a short quoted span is only named. `refused` turns
 the findings into a coordinator reply or notify rejection. Daemon-built lines were audited and carry
 their pending item's full text: ask reminders quote the question (coordinator.defaults,
 askrethink.text), `ttp status` shows each open ask whole (cli.status_text) and worker notifies carry
@@ -21,23 +22,35 @@ from __future__ import annotations
 
 import re
 
-from .pointers import _has_content
+from .pointers import has_content
 
 _EARLIER = r"\b(?:in|from|of|see)\s+(?:my|the|our)\s+(?:earlier|previous|prior|last)\s+messages?\b"
 _POINT_BACK = re.compile(
-    rf"{_EARLIER}|\bsee above\b|\bmentioned above\b"
-    r"|\bdrafts?\s+above\b|\bas\s+drafted\b|\bthe\s+drafts?\s+(?:I|we)\s+(?:sent|posted|shared|wrote)\b",
+    rf"{_EARLIER}|\bsee above\b|\bdrafts?\s+above\b|\bas\s+drafted\s+(?:earlier|before|above)\b"
+    r"|\bthe\s+drafts?\s+(?:I|we)\s+(?:sent|posted|shared|wrote)\b",
     re.I)
-_ITEM = r"asks?|requests?|commands?|drafts?|questions?"
-_STATE = r"ready\s+to\s+send|still\s+open|still\s+pending|pending\s+your"
 _SPAN = r"(?:(?!,\s*(?:and|but|so|while)\b)[^.;:\n]){0,120}"   # one clause: no . ; : , and/but or line break
-_STATUS_PHRASE = re.compile(   # the item is the subject; only 'pending your <item>' names it after
-    rf"\b(?:(?:{_ITEM})\b{_SPAN}\b(?:{_STATE})\b|pending\s+your\s+(?:{_ITEM})\b)", re.I)
+_ITEM = r"(?<!pull\s)(?<!PR\s)(?<!\()(?:asks?|requests?|commands?|drafts?|questions?)\b(?!\s+PRs?\b|\s+pull\s+request|\s*\))"
+_AWAITS = r"ready\s+to\s+send|pending\s+your|(?:for\s+you\s+to|please)\s+\w+"
+_STATUS_PHRASE = re.compile(   # an item that awaits the user; 'pending your <item>' names it after
+    rf"\b(?:{_ITEM}{_SPAN}\b(?:{_AWAITS})|(?<!pull\s)asks?\b{_SPAN}\bstill\s+(?:open|pending)\b"
+    rf"|pending\s+your\s+{_ITEM})", re.I)
 _NEGATED = re.compile(r"\b(?:no|none|nothing|not|zero|neither|nor)\b|(?<![\w.])0(?![\w.])", re.I)
 _OPENS = re.compile(r"(?:^|[\s(\[])['\"`‘“][^'\"`’”\n]{0,40}$")   # a quote mark opening a span, not an apostrophe
 _CLOSES = re.compile(r"^[^'\"`’”\n]{0,40}['\"`’”](?!\w)")
-_ASK_LINE = re.compile(r"^\s*- ask\s+\d+:", re.M)   # pendingask's expansion: the text of asks, nothing else
 _QUOTED = re.compile(r"^\s*>|^```|`[^`\n]+`|\"[^\"]{30,}\"|“[^”]{30,}”", re.M)
+_STOP = re.compile(r"[.;!?](?=\s|$)|\n")
+
+
+def _attached(text: str, start: int, after: str, ids: list[str]) -> bool:
+    """Whether quoted text belongs to the phrase at `start`: in its own sentence, as the first lines
+    after it, or (an ask) its '- ask <id>:' line."""
+    q = _QUOTED.search(text, start)
+    if q and not _STOP.search(text[start:q.start()]):
+        return True
+    first = next((ln for ln in after.splitlines() if ln.strip() and not re.fullmatch(r"\s*\(\d+/\d+\)\s*", ln)), "")
+    return bool(_QUOTED.search(first)) or bool(
+        ids and all(re.search(rf"^\s*- ask\s+{i}:", text, re.M) for i in ids))
 
 
 def backrefs(text: str, later: list[str] | tuple = ()) -> list[str]:
@@ -58,11 +71,9 @@ def backrefs(text: str, later: list[str] | tuple = ()) -> list[str]:
         line_end = text[m.end():eol if eol >= 0 else len(text)].rstrip()
         after = text[eol + 1 if eol >= 0 else len(text):] + "\n" + tail
         item = re.search(_ITEM, m.group(0), re.I)
-        quoted = _QUOTED.search(text[m.start():] + "\n" + tail) or (
-            not re.fullmatch(_EARLIER, m.group(0), re.I) and _QUOTED.search(text[:m.start()])) or (
-            item and item.group(0).lower().startswith(("ask", "question")) and _ASK_LINE.search(text))
-        if (quoted or (line_end.endswith(":") and _has_content(after))
-                or re.match(r":\s*(?:none|nothing|no|0)\b", line_end, re.I)):
+        ids = re.findall(r"\b\d+\b", m.group(0)) if item and item.group(0).lower().startswith("ask") else []
+        if (_attached(text, m.start(), after, ids) or (line_end.endswith(":") and has_content(after))
+                or (not back and re.match(r":\s*\S", line_end))):
             continue
         p = " ".join(m.group(0).split()) if back else \
             f"the {item.group(0).lower()} named as pending, without its text"

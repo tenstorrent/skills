@@ -13,7 +13,7 @@ def _sent(p, kind="reply"):
                                       (kind,))]
 
 
-def test_todays_miss_is_refused_and_with_the_drafts_quoted_it_passes(env):
+def test_a_back_reference_is_refused_and_with_the_drafts_quoted_it_passes(env):
     from ttp import coordinator as coord
     p = make(env)
     problems = coord.apply(p, [{"type": "reply", "chat": "c1", "text": _MISS}], turn=1)
@@ -50,7 +50,7 @@ def test_backrefs_finds_each_back_reference_once():
     from ttp import quotefull
     assert quotefull.backrefs(_MISS) == ["the drafts named as pending, without its text", "in my earlier messages"]
     assert quotefull.backrefs("See above for the request.") == ["See above"]
-    assert quotefull.backrefs("As drafted earlier, it went out.") == ["As drafted"]
+    assert quotefull.backrefs("As drafted earlier, it went out.") == ["As drafted earlier"]
     assert quotefull.backrefs("The draft I sent is ready to send.") == ["The draft I sent",
                                                                         "the draft named as pending, without its text"]
     assert quotefull.backrefs("Two requests are pending your review.") != []
@@ -106,3 +106,28 @@ def test_an_ask_rethink_event_carries_the_whole_question():
     from ttp import askrethink
     question = "Reboot the board?\nOptions: A) now, B) after the soak. " + "Detail. " * 60 + "My recommendation: B"
     assert "My recommendation: B" in askrethink.text(7, [1], 3.0, question, "human")
+
+
+def test_quoted_text_elsewhere_in_the_message_does_not_clear_a_pending_item():
+    from ttp import quotefull
+    for miss in (_MISS + " Task 12 landed on `main`.", "Ran `ttp status`; the draft for <name> is ready to send.",
+                 "`ttp status` is fine. " + _MISS, "> a long quoted line\n" + _MISS + "\nBudget at 40%.",
+                 "Ask 12 is still open.\n- ask 13: Other?"):
+        assert quotefull.backrefs(miss) != [], miss
+    assert any("earlier messages" in b for b in quotefull.backrefs(_MISS + " Ran `ttp status`."))
+    for ok in (_MISS + _DRAFTS, "Drafts in my earlier messages, ready to send: `ttp approve 12`", "Ask 12 is still open.\n- ask 12: Reboot?",
+               "The draft for <name> is ready to send: `ttp approve 12`.", "Ask 14 is still open: approve the raise."):
+        assert quotefull.backrefs(ok) == [], ok
+
+
+def test_plain_pull_request_and_command_status_passes():
+    from ttp import quotefull
+    for plain in ("Pull request 55 is still open.", "The tt-profiler pull request is still open as a draft.",
+                  "PR 55 (draft) is still open.", "The draft PR is still open; CI is green.",
+                  "The draft PR for tt-profiler is ready to send to review.",
+                  "The command is still pending on the box; it ends at 21:00.",
+                  "Two questions are still open in the design doc.",
+                  "The plan, as drafted by the planner, has 3 parts.", "This rule was mentioned above in the charter.",
+                  "Request still open: please approve the budget raise."):
+        assert quotefull.backrefs(plain) == [], plain
+    assert quotefull.backrefs("Please run the command for you to approve.") != []
