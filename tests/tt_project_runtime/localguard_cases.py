@@ -387,3 +387,50 @@ def test_asks_tools_reads_each_listed_guard_without_running_it(tmp_path):
     for listed, asks in ((["shell.py"], False), (["runs.py"], False), (["shell.py", "tools.py"], True),
                          (["star.py"], True), (["broken.py"], True), (["missing.py"], True)):
         assert localguard.asks_tools({"guards": {"local": listed}}, h) is asks, listed
+
+
+def _scratch_repos(h):
+    """An untracked embedded repo with no commit inside tmp/, one with a commit outside it, a plain file."""
+    for rel in ("tmp/t/job.x1/head", "nested"):
+        (h / rel).mkdir(parents=True)
+        _git_out(h / rel, "init", "-q")
+    _git_out(h / "nested", "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "--allow-empty", "-m", "n")
+    (h / "notes.txt").write_text("plain\n")
+
+
+def test_an_upgrade_commits_local_changes_past_untracked_embedded_repos_and_ignores_tmp(env, capsys):
+    p = make(env)
+    from ttp import cli
+    (p.harness / ".gitignore").write_text("__pycache__/\n*.pyc\n")   # a harness made before tmp/ was ignored
+    _scratch_repos(p.harness)
+    pj = p.harness / "pytest.ini"
+    pj.write_text(pj.read_text() + "\n# local\n")
+    cli._commit_local_changes(p, ["-c", "user.name=t", "-c", "user.email=t@t"])
+    tree = set(_git_out(p.harness, "ls-tree", "-r", "--name-only", "HEAD").split("\n"))
+    assert "notes.txt" in tree and "# local" in _git_out(p.harness, "show", "HEAD:pytest.ini")
+    assert not any(n.startswith(("nested", "tmp")) for n in tree), "no embedded repo added, as a gitlink or at all"
+    assert "tmp/" in (p.harness / ".gitignore").read_text().splitlines(), "existing harness gets the line"
+    assert "nested/" in capsys.readouterr().out, "the output names what was left out"
+    assert not _git_out(p.harness, "status", "--porcelain", "--ignored=no").replace("?? nested/", "").strip()
+
+
+def test_an_upgrade_local_commit_skips_a_file_removed_while_it_is_added_and_fails_on_a_real_error(env, monkeypatch):
+    p = make(env)
+    from ttp import cli
+    (p.harness / "gone.txt").write_text("x\n")
+    (p.harness / "kept.txt").write_text("y\n")
+    real = cli._git
+
+    def vanishing(cwd, *args):
+        if "--pathspec-from-file" in args:
+            (p.harness / "gone.txt").unlink()      # the directory listing was taken; the file goes before the add
+        return real(cwd, *args)
+    monkeypatch.setattr(cli, "_git", vanishing)
+    cli._commit_local_changes(p, ["-c", "user.name=t", "-c", "user.email=t@t"])
+    tree = _git_out(p.harness, "ls-tree", "-r", "--name-only", "HEAD").split("\n")
+    assert "kept.txt" in tree and "gone.txt" not in tree
+    monkeypatch.setattr(cli, "_git", real)
+    (p.harness / "later.txt").write_text("z\n")
+    (p.harness / ".git" / "index.lock").write_text("")      # a held index lock is a real failure
+    with pytest.raises(subprocess.CalledProcessError):
+        cli._commit_local_changes(p, ["-c", "user.name=t", "-c", "user.email=t@t"])
