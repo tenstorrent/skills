@@ -115,9 +115,11 @@ _CLAUSE = re.compile(r"(?<=[?!;\n])|\.(?:\s+|$)")   # a dot inside a key or vers
 # QUOTE_WORDS+ words an outbound message of the last REPEAT_S had) or contradicts it (REJECTS in a
 # clause that is not a question, or a clause that is only 'no'). Only such a message counts as a
 # correction by arriving during an open stall: a new instruction or a question there is not one.
-REJECTS = ("that's wrong", "that is wrong", "is wrong", "was wrong", "not true", "not what i", "not right",
-           "incorrect", "that's not", "that is not", "you said", "you claimed", "you reported", "you wrote",
-           "but you", "no, ", "nope", "actually,")   # the last three are soft: 'no, stop that' may open an order
+SOFT_REJECTS = ("no, ", "nope", "actually,")   # 'no, stop that' may open an order
+STRONG_REJECTS = ("that's wrong", "that is wrong", "is wrong", "was wrong", "not true", "not what i", "not right",
+                  "incorrect", "that's not", "that is not", "you said", "you claimed", "you reported", "you wrote",
+                  "but you")
+REJECTS = STRONG_REJECTS + SOFT_REJECTS
 QUOTE_WORDS = 3
 # A routine report (`report`): every line only states what happened, machine-shaped, and names a commit:
 # a push acknowledgment ('pushed <sha> to <branch> (fast-forward of <sha>; ...)', 'ttp push: not
@@ -539,7 +541,7 @@ def answers(db: DB, m: dict, now: float | None = None) -> str:
     text = str(m.get("text") or "").replace("’", "'")
     clauses = [low for part in _CLAUSE.split(text) if (low := " ".join(part.lower().split())) and not low.endswith("?")]
     if any(relaypin.opens_order(x) for x in clauses) and not any(
-            _rejects(x, REJECTS[:-3] if relaypin.opens_order(x) else REJECTS) for x in clauses):
+            _rejects(x, STRONG_REJECTS if relaypin.opens_order(x) else REJECTS) for x in clauses):
         return ""   # a stop order or added scope, contradicting nothing stated: an order, not a correction
     if any(line.lstrip().startswith(">") for line in text.splitlines()):
         return "quotes earlier output"

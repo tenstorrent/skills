@@ -56,8 +56,18 @@ def test_a_stop_order_or_added_scope_is_no_correction_but_a_contradiction_still_
         "Also run the checks on the new host.",
         "> The build passed on every box\nAdd the timing numbers too.")]
     assert correction.flag(p.db, p.config(), _rows(p, *orders)) == {}
+    quoting = p.db.post("in", "Stop the runs. You said it passed on every box.", chat="c1")
     wrong = p.db.post("in", "That's wrong. Two boxes never ran it, stop saying it passed.", chat="c1")
     nope = p.db.post("in", "No, that is not what I asked for.", chat="c1")
     later = p.db.post("in", "Stop the runs. No, the build failed on box 2.", chat="c1")
-    assert correction.flag(p.db, p.config(), _rows(p, wrong, nope, later)) == {
-        wrong: "open stall: contradicts it", nope: "open stall: contradicts it", later: "open stall: contradicts it"}
+    assert correction.flag(p.db, p.config(), _rows(p, quoting, wrong, nope, later)) == {
+        quoting: "open stall: contradicts it", wrong: "open stall: contradicts it",
+        nope: "open stall: contradicts it", later: "open stall: contradicts it"}
+
+
+def test_no_more_and_and_also_open_an_order_as_written():
+    from ttp import relaypin
+    assert relaypin.opens_order("no more runs tonight")
+    assert relaypin.opens_order("and also check the log")
+    assert relaypin.opens_order("no, stop that")
+    assert not relaypin.opens_order("no one ran it")

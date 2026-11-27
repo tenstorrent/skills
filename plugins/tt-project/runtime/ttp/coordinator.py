@@ -131,6 +131,7 @@ from . import (   # one name per line: two changes adding names merge without a 
     yesask,
 )
 from . import untrusted
+from . import msgwake
 from . import branchcap
 from . import urgent
 from . import msgurgent
@@ -1821,7 +1822,7 @@ def digest_parts(p: Project, gates: dict, event_ids: list[int], msg_ids: list[in
                              f"{spans.wrap(m['context'], 'relayer context', tag)}")
             else:
                 lines.append(f"{head} {m['text']}")
-            if (m["context"] or "").strip() or prov in ("cli-peer", "cli-legacy"):   # relayed
+            if (m["context"] or "").strip() or prov in msgwake.RELAYED:   # relayed
                 if pin := relaypin.pin_line(p, m["text"] + (f"\n{m['context']}" if agent else "")):
                     lines.append(f"  {pin}")
     folded = fold_events(events, tag)

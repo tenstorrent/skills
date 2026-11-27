@@ -16,7 +16,7 @@ from . import relay
 KINDS = ("preference", "decision", "restriction")   # memory kinds that record a pin
 FAMILIES = frozenset("opus sonnet haiku fable codex gemini composer glm gpt".split())
 _STOP = ("stop", "don't", "do not", "dont", "never", "halt", "pause", "cancel", "hold off", "no more")
-_ADD = ("also", "and also", "additionally", "in addition", "plus", "add", "now also", "one more", "as well")
+_ADD = ("also", "additionally", "in addition", "plus", "add", "now also", "one more", "as well")
 _LEAD = re.compile(r"^\W*(?:(?:no|nope|ok|okay|and|but|please|pls)\b\W*)+", re.I)
 
 
@@ -81,6 +81,6 @@ def pin_line(p, text: str) -> str:
 
 
 def opens_order(clause: str) -> bool:
-    """Whether the lowercase `clause` opens with a stop or add word (after a bare 'no' or 'and')."""
-    rest = _LEAD.sub("", clause)
-    return any(rest == w or rest.startswith(w + " ") for w in _STOP + _ADD)
+    """Whether the lowercase `clause` opens with a stop or add word, as written ('no more', 'and also') or after
+    a bare 'no' or 'and' ('no, stop')."""
+    return any(x == w or x.startswith(w + " ") for x in (clause, _LEAD.sub("", clause)) for w in _STOP + _ADD)
