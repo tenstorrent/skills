@@ -538,7 +538,8 @@ def answers(db: DB, m: dict, now: float | None = None) -> str:
     now = time.time() if now is None else now
     text = str(m.get("text") or "").replace("’", "'")
     clauses = [low for part in _CLAUSE.split(text) if (low := " ".join(part.lower().split())) and not low.endswith("?")]
-    if any(relaypin.opens_order(x) for x in clauses) and not any(_rejects(x, REJECTS[:-3]) for x in clauses):
+    if any(relaypin.opens_order(x) for x in clauses) and not any(
+            _rejects(x, REJECTS[:-3] if relaypin.opens_order(x) else REJECTS) for x in clauses):
         return ""   # a stop order or added scope, contradicting nothing stated: an order, not a correction
     if any(line.lstrip().startswith(">") for line in text.splitlines()):
         return "quotes earlier output"

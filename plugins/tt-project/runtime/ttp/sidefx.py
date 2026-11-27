@@ -271,8 +271,8 @@ def _awk_text(prog: str) -> str:
     out, i, n = [], 0, len(prog)
     while i < n:
         c = prog[i]
-        if c == "/" and (m := REGEX_LITERAL_RE.match(prog, i)):   # a regex literal, as _blank reads one
-            i = m.end()
+        if c == "/" and not re.search(r"[\w)\]$]\s*$", prog[:i]) and (m := REGEX_LITERAL_RE.match(prog, i)):
+            i = m.end()   # a regex literal, as _blank reads one; after a name, number or `)` the slash divides
         elif c == '"':
             j = i + 1
             while j < n and prog[j] != c:

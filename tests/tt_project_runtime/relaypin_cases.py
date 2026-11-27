@@ -58,5 +58,6 @@ def test_a_stop_order_or_added_scope_is_no_correction_but_a_contradiction_still_
     assert correction.flag(p.db, p.config(), _rows(p, *orders)) == {}
     wrong = p.db.post("in", "That's wrong. Two boxes never ran it, stop saying it passed.", chat="c1")
     nope = p.db.post("in", "No, that is not what I asked for.", chat="c1")
-    assert correction.flag(p.db, p.config(), _rows(p, wrong, nope)) == {
-        wrong: "open stall: contradicts it", nope: "open stall: contradicts it"}
+    later = p.db.post("in", "Stop the runs. No, the build failed on box 2.", chat="c1")
+    assert correction.flag(p.db, p.config(), _rows(p, wrong, nope, later)) == {
+        wrong: "open stall: contradicts it", nope: "open stall: contradicts it", later: "open stall: contradicts it"}
