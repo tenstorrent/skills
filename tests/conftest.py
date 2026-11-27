@@ -431,10 +431,11 @@ _PYTEST_FILES = ("conftest.py", "pytest.ini", ".pytest.ini", "tox.ini", "setup.c
 
 
 def _away_from_tmp(path: Path) -> bool:
-    """`path` is outside /tmp and /var/tmp (where a GLM run may always write) and no folder above it holds a
-    file pytest would pick up (_PYTEST_FILES)."""
+    """`path` is outside the temp folders a GLM run may always write (glmguard._TMP) and no folder above it
+    holds a file pytest would pick up (_PYTEST_FILES)."""
+    from ttp import glmguard
     real = Path(os.path.realpath(path))
-    skip = {Path(p) for t in ("/tmp", "/var/tmp") for p in (t, os.path.realpath(t))}
+    skip = {Path(p) for t in glmguard._TMP for p in (t, os.path.realpath(t))}
     return not any(d in skip for d in (real, *real.parents)) and not any(
         (d / f).is_file() for d in real.parents for f in _PYTEST_FILES)
 
@@ -442,20 +443,18 @@ def _away_from_tmp(path: Path) -> bool:
 @pytest.fixture
 def tmp_path(request, tmp_path):
     """pytest's tmp_path; for a test marked away_from_tmp, a fresh folder that is not under /tmp or
-    /var/tmp and has no pytest file above it (_away_from_tmp), made on the RAM disk or the runtime folder
-    when pytest's own temp root (a `ttp checks` TMPDIR, say) is under /tmp: the checks that treat /tmp as
+    /var/tmp or /dev/shm and has no pytest file above it (_away_from_tmp), made in the runtime folder
+    when pytest's own temp root (a `ttp checks` TMPDIR, say) is under one of them: the checks that treat /tmp as
     inside a worktree and those that look for a project root above one then see what they see anywhere."""
     if request.node.get_closest_marker("away_from_tmp") is None or _away_from_tmp(tmp_path):
         yield tmp_path
         return
     import shutil
     import tempfile
-    for root in (TMPFS, os.environ.get("XDG_RUNTIME_DIR", "")):
-        if root and os.access(root, os.W_OK | os.X_OK) and _away_from_tmp(Path(root, "x")):
-            break
-    else:
-        pytest.fail("away_from_tmp needs a writable folder outside /tmp with no pytest file above it "
-                    f"({TMPFS}, $XDG_RUNTIME_DIR)")
+    root = os.environ.get("XDG_RUNTIME_DIR", "")
+    if not (root and os.access(root, os.W_OK | os.X_OK) and _away_from_tmp(Path(root, "x"))):
+        pytest.fail("away_from_tmp needs a writable $XDG_RUNTIME_DIR outside /tmp and /dev/shm with no pytest "
+                    "file above it")
     own = tempfile.mkdtemp(prefix="ttp-away-", dir=root)
     try:
         yield Path(os.path.realpath(own))

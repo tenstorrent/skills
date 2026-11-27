@@ -1120,6 +1120,7 @@ def test_test_slots_one_project_holds_at_most_its_budget_and_never_blocks_the_ot
     monkeypatch.setenv("TTP_TEST_POOL", "8")
     monkeypatch.setenv("TTP_TEST_RUN_MAX", "2")
     monkeypatch.setenv("TTP_TEST_POLL_S", "0.05")
+    monkeypatch.setenv("TTP_TEST_PROJECT_WORKERS", "0")   # the budget's own rules: the host's load sets no worker ceiling
     assert testslots.project_max() == 8, "default: the runs the pool fits x a run's grant, within the pool"
     monkeypatch.setenv("TTP_TEST_PROJECT_MAX", "2")
     assert testslots.project_max() == 4, "2 checks at once x a run's grant, within the pool"

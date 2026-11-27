@@ -2342,6 +2342,7 @@ def test_glm_guard_lets_a_command_restate_an_identity_it_already_has_and_refuses
     assert ok or glmguard.classify(why)[1] == glmguard.HARMFUL
 
 
+@_pytest.mark.away_from_tmp
 def test_glm_guard_lets_a_run_write_in_the_work_folders_its_spec_names_and_no_project_folder(tmp_path, monkeypatch):
     from ttp import glmenv, glmguard
     home = tmp_path / "home"
@@ -2714,6 +2715,7 @@ def _gg_login_home(monkeypatch, tmp_path):
     return home, lambda c: glmguard.shell_refusal(c, str(wt), str(rd), dict(os.environ))
 
 
+@_pytest.mark.away_from_tmp
 def test_glm_guard_refuses_deleting_or_moving_a_folder_that_holds_a_login_file_and_lets_a_plain_home_file_through(
         monkeypatch, tmp_path):
     """Removing or moving the folder of an agent login file, or the parent of one (a
@@ -2733,6 +2735,7 @@ def test_glm_guard_refuses_deleting_or_moving_a_folder_that_holds_a_login_file_a
         assert ask(c) is None, c
 
 
+@_pytest.mark.away_from_tmp
 def test_glm_guard_refuses_the_agents_config_folders_in_home_and_lets_other_home_files_through(monkeypatch, tmp_path):
     """The agents' config (hook settings, installed plugins and their hooks, Codex's config) and the home's other
     config files (hidden home entries, sidefx.home_entry) are protected harness files: a write there, or a removal of a folder holding
@@ -2764,6 +2767,7 @@ def test_glm_guard_refuses_a_sudo_write_to_tmp_like_every_other_root_write(monke
     assert ask(f"echo x | tee {name}") is None, "the same write as the run's own user stays open"
 
 
+@_pytest.mark.away_from_tmp
 def test_glm_guard_rm_of_nothing_or_an_unread_glob_is_a_redirect_and_a_real_delete_harmful(tmp_path):
     from ttp import glmguard
     real = tmp_path / "f.txt"
@@ -3244,12 +3248,15 @@ def _glm_tmp_tops_leave_the_test_base_temp(tmp_path_factory, monkeypatch):
     ("rm -rf ${{TTP_RUN_DIR?need}}/tmp/x", True),
     ("rm -rf /dev/shm", False), ("rm -rf /dev/shm/../etc", False), ("rm -rf ${{TTP_RUN_DIR:?}}/../../../../../../../etc/x", False),
     ("echo x > /dev/shm/../etc/x", False), ("echo x > /dev/null/../x", False)])
+@_pytest.mark.away_from_tmp
 def test_a_glm_run_uses_dev_shm_like_tmp_and_reads_a_checked_run_dir_expansion(cmd, allowed, monkeypatch, tmp_path):
     """cells: shm_and_checked_expansion. A new /dev/shm entry is scratch like one in /tmp (the top itself and a
     `..` out of it are not), and `${TTP_RUN_DIR:?}` names the run folder where it is set, else the shell stops."""
     from ttp import glmguard
     monkeypatch.setattr(glmguard, "_TMP", ("/tmp", "/var/tmp", "/dev/shm"))
     wt, rd = _glm_run_env(monkeypatch, tmp_path)
+    (tmp_path / "home").mkdir()   # the session's own HOME sits in the base temp, which a records or ttp-<uid> folder may hold
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
     cmd = cmd.format(n=f"{os.getpid()}-{tmp_path.name}", uid=os.getuid())
     assert bool(glmguard.shell_refusal(cmd, str(wt), str(rd), env=dict(os.environ))) != allowed
 
