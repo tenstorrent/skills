@@ -158,7 +158,7 @@ def budget_of(p, repo: str) -> int:
 
 def plan_budget(db, key: str) -> int | None:
     """The budget a recorded plan lifted the PR size gate to for `key` ("owner/repo#N"), else None."""
-    row = (db.kv(PLAN_KEY, {}) or {}).get(key.lower()) or {}
+    row = db.kv_dict(PLAN_KEY)[0].get(key.lower()) or {}
     try:
         return int(row["budget"])
     except (KeyError, TypeError, ValueError):
@@ -168,7 +168,7 @@ def plan_budget(db, key: str) -> int | None:
 def record_plan(db, key: str, budget: int, msg: str) -> None:
     """Record a PR size plan (`ttp pr plan`): the new budget that lifts the gate for `key`
     ("owner/repo#N"), with the chat message id of the plan the coordinator posted to the user."""
-    plans = db.kv(PLAN_KEY, {}) or {}
+    plans = db.kv_dict(PLAN_KEY)[0]
     plans[key.lower()] = {"budget": int(budget), "msg": str(msg or ""), "at": time.time()}
     db.set_kv(PLAN_KEY, plans)
 
@@ -191,18 +191,19 @@ def _budget_event(p, pr: dict, size: int, budget: int) -> None:
            (time.time(), "pr", BUDGET_EVENT, fp, "normal", text, "queued"))
 
 
-def budget_gate(p, task: dict | None, branch: str) -> str:
+def budget_gate(p, task: dict | None, branch: str, ref: str = "") -> str:
     """Why a push onto `branch` is refused ("" when it is not): its open PR's cumulative added
     non-test lines are past the budget (review.pr_budget_lines, else the repo norm's p90, else
     DEFAULT_BUDGET; a recorded plan's budget lifts the gate). Raises one keyed event naming the
-    PR, its size, the norm and the budget the first time a budget is passed."""
+    PR, its size, the norm and the budget the first time a budget is passed. `ref` is what the push
+    would leave on the branch (default: the branch itself)."""
     if p is None or not branch:
         return ""
     try:
         pr = open_pr(p, task or {}, branch)
         if not pr or pr["branch"] != branch:
             return ""
-        st = cumulative_stat(p, branch)
+        st = cumulative_stat(p, ref or branch)
         if not st:
             return ""
         budget = plan_budget(p.db, f"{pr['repo']}#{pr['number']}")

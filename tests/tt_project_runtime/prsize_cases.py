@@ -232,3 +232,16 @@ def test_the_gh_route_publish_path_refuses_an_over_budget_pr_branch(env, monkeyp
     monkeypatch.setattr("ttp.ghqueue._branch_call", lambda *a, **k: ("", "acme/widgets", [], p))
     assert ghqueue.publish("feature/x", cwd=str(p.root)) == 1
     assert p.db.one("SELECT 1 FROM events WHERE kind='pr_size_budget'")
+
+
+def test_the_budget_gate_sizes_what_the_push_leaves_on_the_branch_not_a_stale_local_ref(env, monkeypatch):
+    """A stale local copy of the PR branch cannot hide the size: the gate measures the
+    commit being pushed. A plan store holding something that is not an object still records and reads."""
+    from ttp import push, prsize
+    p, _t = _over_budget_pr(env, monkeypatch)
+    _git_out(p.root, "update-ref", "refs/heads/feature/x", _git_out(p.root, "rev-parse", "origin/HEAD"))
+    p.db.set_kv(prsize.PLAN_KEY, None)
+    with pytest.raises(ValueError, match="over its size budget"):
+        push.own_target(p, p.root)
+    prsize.record_plan(p.db, "acme/widgets#7", 9000, "1")
+    assert prsize.plan_budget(p.db, "acme/widgets#7") == 9000

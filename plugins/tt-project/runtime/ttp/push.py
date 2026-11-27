@@ -2317,7 +2317,8 @@ def own_target(p: Project, repo: Path) -> tuple[str, str]:
     if (key := next((k for k, b in prbabysit.owned(p.db).items() if b == branch and k.lower() in no_post), "")):
         raise ValueError(f"{key} is in pr_babysit.no_post_prs: its branch {branch} is not pushed. Commit locally "
                          f"and tell the user; they push it")
-    if why := prsize.budget_gate(p, _task_row(p, task), branch):
+    head = _git(repo, "rev-parse", "--verify", "-q", "HEAD^{commit}").stdout.strip()
+    if why := prsize.budget_gate(p, _task_row(p, task), branch, head):
         raise ValueError(why)
     return remote, branch
 
