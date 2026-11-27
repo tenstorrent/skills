@@ -7,7 +7,7 @@ drafts, so the harness refuses it model-free.
 `backrefs` finds the phrases that stand in for content: an explicit back-reference ('see above', 'in
 my earlier messages', 'drafts above', 'as drafted earlier', 'the draft I sent'), and an item word
 (draft/ask/request/command) that awaits the user ('ready to send', 'pending your', 'for you to',
-'please run' after it; 'still open' or 'still pending' after an ask) in the same clause, not negated.
+'please run' and the like after it; 'still open' or 'still pending' after an ask) in the same clause, not negated.
 A pull request, a PR or a draft PR is no such item. A phrase is fine only when the text is attached
 to it: quoted material (a blockquote, a fenced block, an inline code span, a quoted span of 30+
 chars) later in its own sentence or as the first lines after it (or in the message's later numbered
@@ -31,7 +31,7 @@ _POINT_BACK = re.compile(
     re.I)
 _SPAN = r"(?:(?!,\s*(?:and|but|so|while)\b)[^.;:\n]){0,120}"   # one clause: no . ; : , and/but or line break
 _ITEM = r"(?<!pull\s)(?<!PR\s)(?<!\()(?:asks?|requests?|commands?|drafts?|questions?)\b(?!\s+PRs?\b|\s+pull\s+request|\s*\))"
-_AWAITS = r"ready\s+to\s+send|pending\s+your|(?:for\s+you\s+to|please)\s+\w+"
+_AWAITS = r"ready\s+to\s+send|pending\s+your|(?:for\s+you\s+to|please)\s+(?:run|approve|review|reply|answer|confirm|decide)\b"
 _STATUS_PHRASE = re.compile(   # an item that awaits the user; 'pending your <item>' names it after
     rf"\b(?:{_ITEM}{_SPAN}\b(?:{_AWAITS})|(?<!pull\s)asks?\b{_SPAN}\bstill\s+(?:open|pending)\b"
     rf"|pending\s+your\s+{_ITEM})", re.I)

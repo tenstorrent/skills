@@ -128,6 +128,7 @@ def test_plain_pull_request_and_command_status_passes():
                   "The command is still pending on the box; it ends at 21:00.",
                   "Two questions are still open in the design doc.",
                   "The plan, as drafted by the planner, has 3 parts.", "This rule was mentioned above in the charter.",
-                  "Request still open: please approve the budget raise."):
+                  "Request still open: please approve the budget raise.",
+                  "Every draft written for you to post carries the tag; the ask for the tag went out."):
         assert quotefull.backrefs(plain) == [], plain
     assert quotefull.backrefs("Please run the command for you to approve.") != []
