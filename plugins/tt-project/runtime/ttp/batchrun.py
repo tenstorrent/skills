@@ -12,8 +12,8 @@ deep and user-deep work), related or not, and queued tasks that wait only on the
 (after them). Tasks naming files the lead's spec names come first (overlap.spec_paths), then by
 priority; a task whose files a running task on another branch holds is left out; a member that depends
 on another comes after it. The lead is whatever dispatch picked first (an urgent one leads): it never
-waits for a batch to fill. An urgent (priority 1) task joins only an urgent lead's run, never a lower
-one's. A batch runs its shared steps once, after every member's commit: one focused test
+waits for a batch to fill. An urgent task (alerts.urgent: priority 1, an `urgent:` line or an open
+obligation) shares a run only with urgent tasks, and a routine one only with routine ones. A batch runs its shared steps once, after every member's commit: one focused test
 gate, one device smoke and, where it delivers outside the push queue, one landing request (a PR or a
 push request) carrying every member's commits (prompt_block). Off with `dispatch.batch` false.
 
@@ -45,6 +45,7 @@ import re
 import time
 from pathlib import Path
 
+from . import alerts
 from .db import dump_result, load_result
 from .util import task_labels
 
@@ -192,8 +193,6 @@ def eligible(lead: dict, t: dict) -> bool:
         return False
     if own_branch(t):
         return False
-    if (t.get("priority") or 3) <= 1 and (lead.get("priority") or 3) > 1:
-        return False   # urgent work never waits behind a lower lead; urgent siblings share one run (user 11-12)
     if t.get("budget_usd") and float(t.get("spent_usd") or 0) >= float(t["budget_usd"]):
         return False
     return all(not t.get(k) or t.get(k) == lead.get(k) for k in ("provider", "model"))
@@ -220,14 +219,15 @@ def pick(p, cfg: dict, lead: dict, ready: list[dict], inflight: list[dict] | Non
     if n <= 0:
         return []
     mine = _paths(p, lead)
+    lead_urgent = alerts.urgent(p.db, lead)
     held: set[str] = set()
     for t in inflight or []:
         if t["id"] != lead["id"] and (t.get("branch") or "") != (lead.get("branch") or ""):
             held |= _paths(p, t)
     cands = []
     for t in ready:
-        if not eligible(lead, t):
-            continue
+        if not eligible(lead, t) or alerts.urgent(p.db, t) != lead_urgent:
+            continue   # urgent work shares a run only with urgent work, never with routine tasks
         ps = _paths(p, t)
         if ps & held:
             continue

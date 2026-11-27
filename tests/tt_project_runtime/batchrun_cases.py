@@ -58,7 +58,7 @@ def test_batch_pick_leaves_out_resourced_deep_pinned_and_held(env):
     assert [t["id"] for t in got] == [ok["id"]]
     # User 11-12: urgent siblings queued together share an urgent lead's run (one branch, review, checks).
     urgent_lead = dict(lead, priority=1)
-    assert [t["id"] for t in batchrun.pick(p, p.config(), urgent_lead, [urgent, ok])] == [912, ok["id"]]
+    assert [t["id"] for t in batchrun.pick(p, p.config(), urgent_lead, [urgent, ok])] == [912]
     # A deep lead takes deep (and user_deep) work too; the default takes up to 20.
     deep_lead = dict(lead, tier="deep")
     assert {t["id"] for t in batchrun.pick(p, p.config(), deep_lead, [deep, user_deep, ok])} == {900, 902, ok["id"]}
@@ -85,6 +85,24 @@ def test_batch_pick_leaves_out_resourced_deep_pinned_and_held(env):
     assert batchrun.pick(p, p.config(), lead, [near], inflight=[busy]) == []
     assert [t["id"] for t in batchrun.pick(p, p.config(), dict(lead, branch="ttp/t911"), [near],
                                            inflight=[busy])] == [910]
+
+
+def test_batch_pick_keeps_urgent_and_routine_work_in_separate_runs(env, monkeypatch):
+    from ttp import batchrun, obligations
+    p = make(env)
+    _, base = _batch_tasks(p, 2)
+    row = lambda i, **kw: dict(base, id=i, **kw)
+    ids = lambda got: [t["id"] for t in got]
+    p1, p1b = row(1, priority=1), row(2, priority=1)
+    flagged = row(3, priority=2, spec="urgent: user asked\nFix it.")
+    owned = row(4, priority=2)
+    p2, p3, p3b, p3c = row(5, priority=2), row(6, priority=3), row(7, priority=3), row(8, priority=3)
+    monkeypatch.setattr(obligations, "owned_open", lambda db, tid: ["o1"] if tid == 4 else [])
+    # (a) an urgent lead takes no routine task; (b) urgent tasks, whatever makes them urgent, share its run.
+    assert ids(batchrun.pick(p, p.config(), p1, [p2, p3, p1b, flagged, owned])) == [2, 3, 4]
+    assert batchrun.pick(p, p.config(), p1, [p2, p3]) == []
+    # A routine lead takes no urgent task; (c) routine tasks batch as before.
+    assert ids(batchrun.pick(p, p.config(), p3, [p1, flagged, owned, p2, p3b, p3c])) == [5, 7, 8]
 
 
 def test_batch_pick_takes_members_whose_resources_the_lead_holds(env):
@@ -135,7 +153,7 @@ def test_batch_run_shares_one_worktree_and_branch(env, monkeypatch):
     d, started = _batch_daemon(p, monkeypatch)
     urgent = p.db.add_task("urgent fix", "Fix now.", kind="code", tier="standard", origin="user", priority=1,
                            budget_usd=8.0)
-    mates = [t["id"] for t in _batch_tasks(p, 2, budget_usd=4.0)]
+    mates = [t["id"] for t in _batch_tasks(p, 2, budget_usd=4.0, priority=1)]
     deep = p.db.add_task("big redesign", "Redo it.", kind="code", tier="deep", origin="coordinator")
     d.dispatch()
     lead_runs = [(a, k) for a, k in started if k["task"]["id"] == urgent]
@@ -160,6 +178,32 @@ def test_batch_run_shares_one_worktree_and_branch(env, monkeypatch):
     assert all(p.db.task(m)["status"] == "running" for m in mates)
     # A wake of the lead never forms a second batch.
     assert d._batch_members(p.db.task(urgent), [p.db.task(deep)], set(), {}) == []
+
+
+def test_urgent_task_and_a_ready_routine_task_start_two_runs(env, monkeypatch):
+    from ttp import batchrun
+    p = make(env)
+    d, started = _batch_daemon(p, monkeypatch)
+    urgent = p.db.add_task("urgent fix", "Fix now.", kind="code", tier="standard", origin="user", priority=1)
+    routine = p.db.add_task("routine fix", "Tidy up.", kind="code", tier="standard", origin="coordinator",
+                            priority=2)
+    d.dispatch()
+    assert sorted(k["task"]["id"] for _, k in started) == [urgent, routine]
+    assert batchrun.view(p.db, urgent) is None and batchrun.members_of(p.db, routine) is None
+
+
+def test_urgent_batch_run_never_pulls_in_a_routine_task_that_became_ready(env, monkeypatch):
+    from ttp import batchrun
+    p = make(env)
+    d, started = _batch_daemon(p, monkeypatch)
+    lead = p.db.add_task("urgent fix", "Fix now.", kind="code", tier="standard", origin="user", priority=1)
+    mate = p.db.add_task("urgent mate", "Fix too.", kind="code", tier="standard", origin="user", priority=1)
+    d.dispatch()
+    assert batchrun.view(p.db, lead) == {"id": f"b{lead}", "members": [mate]}
+    late = p.db.add_task("routine fix", "Tidy up.", kind="code", tier="standard", origin="coordinator", priority=2)
+    # The urgent lead's run is live: a task that became ready since is never added to it.
+    assert d._batch_members(p.db.task(lead), [p.db.task(late)], set(), {}) == []
+    assert batchrun.view(p.db, lead) == {"id": f"b{lead}", "members": [mate]}
 
 
 def test_batch_settle_isolates_failed_and_blocked_members(env, monkeypatch):
