@@ -191,6 +191,10 @@ def hist_end(db, ref: str, now: float, h: dict | None = None) -> float | None:
     t = db.task(int(ref[1:]))
     if not t:
         return None
+    from . import eta, etajobs
+    jh = etajobs.history(Path(db.path).parent, db, now)
+    if (jf := etajobs.finish(db, t, jh, now)) and jf.get("end") is not None:
+        return jf["end"]
     from . import eta
     h = eta.history(db, now) if h is None else h
     kt = (t["kind"], t.get("tier"))

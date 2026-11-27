@@ -337,7 +337,7 @@ AUTO = object()
 
 class _Est:
     def __init__(self, db, now: float, hist: dict | None = None, core: str | None = None,
-                 delivery: dict | None = None, q: float = 0.5, load=AUTO, depth=AUTO):
+                 delivery: dict | None = None, q: float = 0.5, load=AUTO, depth=AUTO, jobhist=None):
         """`q`: the quantile of every measured leg (0.5, the median: the likely time; 0.9: the conservative
         one). `load`: this host's load per core (AUTO: read it, None: no adjustment); `depth`: (queued,
         running) workers (AUTO: counted from the database)."""
@@ -355,6 +355,8 @@ class _Est:
         self._gates = None
         self._owners = None
         self._reports = None
+        self._jobhist = jobhist        # etajobs.history, shared with the p90 walk
+        self._jobs: dict[int, dict | None] = {}
 
     def _m(self, xs: list[float]) -> float | None:
         """The leg statistic of samples `xs`: their q-quantile (the median at q=0.5)."""
@@ -380,9 +382,22 @@ class _Est:
         when it has no estimate)."""
         if self._hi is None:
             self._hi = _Est(self.db, self.now, self.h, self.core, self.delivery, P90, self.load,
-                            self._depth_in)
+                            self._depth_in, self._jobhist)
         e = self._hi.task(int(tid))
         return None if e["why"] or not e.get("end") else e
+
+    def jobs(self, t: dict) -> dict | None:
+        """The task's detached jobs' measured finish (etajobs.finish): median job times from this
+        project's history, never a padded allowance. Memoized per task; the job history is read once."""
+        if t["id"] not in self._jobs:
+            from . import etajobs
+            if self._jobhist is None:
+                self._jobhist = etajobs.history(Path(self.db.path).parent, self.db, self.now)
+            try:
+                self._jobs[t["id"]] = etajobs.finish(self.db, t, self._jobhist, self.now)
+            except Exception:
+                self._jobs[t["id"]] = None
+        return self._jobs[t["id"]]
 
     def reports(self) -> list[dict]:
         """The project's `ttp progress report` lines (read once per estimate; none when unreadable)."""
@@ -575,6 +590,7 @@ class _Est:
             return {"done": now, "end": now + left, "path": [tid], "legs": [("landing", left)], "why": None,
                     "overrun": over}
         legs, path, over, notes, deferred = [], [tid], False, [], None
+        jf = self.jobs(t)
         start = now
         begin = None
         if st == "review":
@@ -632,6 +648,11 @@ class _Est:
             if lx > 1.0:
                 notes.append(f"host load x{lx:.2f}")
             ow = outside_wait(t, now, self.reports, Path(self.db.path).parent) if st != "running" else None
+            jf = self.jobs(t)
+            if ow and ow["at"] is None and jf and jf.get("end") is not None:
+                ow = {**ow, "at": jf["end"], "label": "detached jobs"}   # measured, never padded
+            elif ow and ow["at"] is None and jf and jf.get("why"):
+                return self._gated(tid, f"#{tid} waits on its detached jobs: {jf['why']}", path)
             lj = long_job(t) if not ow else None
             if lj is not None:   # a bench or other long job: its cells at the measured per-cell time, never the kind's median
                 if (cell := self.cell_run(t)[0]) is None:
@@ -643,23 +664,31 @@ class _Est:
             if ow and ow["at"] is None:
                 return self._gated(tid, f"#{tid} waits on its own checks: no measured finish yet (no completed checks run)"
                                    if ow["own"] else f"#{tid} waits on outside work: no measured finish yet", path)
-            if not runs and not (ow and ow["follows"]):
+            if not runs and not (ow and ow["follows"]) and not (ow and ow["at"]):
                 return {**self._none(tid, f"no measured {t['kind']} run yet"), "path": path}
             if ow:   # its hand-off's measured eta; a median run after it unless an on_pass_cmd ends the task
-                leg = "own checks" if ow["own"] else "outside work"
-                legs.append((leg, max(0.0, ow["at"] - start)))
+                if ow.get("label") == "detached jobs":
+                    legs.extend(jf["legs"])   # each job's measured time, the queue wait spelled out
+                else:
+                    legs.append((ow.get("label") or ("own checks" if ow["own"] else "outside work"),
+                                 max(0.0, ow["at"] - start)))
                 if not ow["follows"]:
                     if hold := self._held(t):
                         if hold[0] is None:
                             return {**self._held_none(tid, hold[1]), "path": path}
-                        legs[-1] = (leg, max(legs[-1][1], hold[0] - start))
-                    begin = start + legs[-1][1]
-                    legs.append(("run", self._m(runs) * lx))
+                        if (extra := hold[0] - ow["at"]) > 0:
+                            legs.append(("spend gate", extra))
+                    begin = max(start + sum(x for _, x in legs), ow["at"])
+                    if (m := self._m(runs)) is not None:
+                        legs.append(("run", m * lx))
             elif st == "running":
                 r = self.db.one("SELECT started FROM runs WHERE task=? AND status='running' AND role!='coordinator' "
                                 "ORDER BY id DESC LIMIT 1", (tid,))
                 left, over = self._left(runs, now - float(r["started"])) if r and r["started"] else (self._m(runs), False)
-                legs.append(("run", left * lx))
+                if jf and jf.get("end") is not None and jf["end"] - now > left * lx:
+                    legs.extend((n if n in ("queue", "startup") else f"job {n}", s) for n, s in jf["legs"])
+                else:
+                    legs.append(("run", left * lx))
             else:
                 nb = max(float(t.get("not_before") or 0), tg or 0)   # a clock start_when: its time
                 # The planned start covers the dependency only when it is later as the correction shows both;
@@ -694,7 +723,8 @@ class _Est:
             legs.append(("landing", self._m(self.h["land"])))
             end += legs[-1][1]
         return {"done": done, "end": end, "path": path, "legs": legs, "why": None, "overrun": over, "start": begin,
-                "notes": notes, "deferred": deferred}
+                "notes": notes, "deferred": deferred,
+                **({"job_cons": jf["conservative"]} if jf and jf.get("end") is not None else {})}
 
 
 def with_p90(est: _Est, e: dict, tid: int) -> dict:
@@ -703,7 +733,10 @@ def with_p90(est: _Est, e: dict, tid: int) -> dict:
     estimate or no p90."""
     if e.get("why") or not e.get("end") or (p90 := est.p90(tid)) is None:
         return e
-    return {**e, "p90_end": max(p90["end"], e["end"]), "p90_deferred": p90.get("deferred")}
+    hi = max(p90["end"], e["end"])
+    if jc := e.get("job_cons"):
+        hi = max(hi, jc)   # the jobs' own p80 sum is the conservative time the spec asks for
+    return {**e, "p90_end": hi, "p90_deferred": p90.get("deferred")}
 
 
 def corrected(db, e: dict, now: float) -> dict:

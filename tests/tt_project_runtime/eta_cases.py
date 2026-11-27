@@ -1020,3 +1020,109 @@ def test_eta_field_dates_a_time_a_week_away():
     assert "conservative Sat 04:00 UTC" in eta.field({**e, "conservative": now + 12 * 3600 + 86400}, "UTC", now)
     line = eta.field({**e, "conservative": now + 6.5 * 86400}, "UTC", now)
     assert "conservative 2026-12-03 04:00 UTC" in line, line
+
+
+
+def _jobs_registry(p, rows):
+    """A done task whose registry (state/runs/<id>/detached.json) records `rows`: (name, started,
+    status, ended) entries of its detached jobs; the runs row points at the registry folder."""
+    tid = p.db.add_task("past device work", "s", kind="work", status="done")
+    rid = p.db.x("INSERT INTO runs(task, role, started, ended, status, dir) VALUES(?,?,?,?,?,?)",
+                 (tid, "worker", min(r[1] for r in rows) - 120, rows[-1][3] or rows[-1][1] + 1, "ok", ""))
+    d = p.state / "runs" / str(rid)
+    d.mkdir(parents=True, exist_ok=True)
+    p.db.x("UPDATE runs SET dir=? WHERE id=?", (str(d), rid))
+    (d / "detached.json").write_text(json.dumps([
+        {"name": n, "rc": str(d / f"{n}.rc"), "started": s, "status": st, "ended": e,
+         "owner": {"task": tid}} for n, s, st, e in rows]))
+
+
+def _waiting_jobs_task(p, now, names, elapsed=300, probe="load", queued=False):
+    """A waiting task hand-off whose registry holds its detached `names` (running, `elapsed` s in,
+    or queued) and whose probe waits on them."""
+    tid = p.db.add_task("device work", "s", kind="work")
+    rid = p.db.x("INSERT INTO runs(task, role, started, status, dir) VALUES(?,?,?,?,?)",
+                 (tid, "worker", now - elapsed - 100, "running", ""))
+    d = p.state / "runs" / str(rid)
+    (p.state / "runs" / d.name).mkdir(parents=True, exist_ok=True)
+    p.db.x("UPDATE runs SET dir=? WHERE id=?", (str(d), d.name))
+    (d / "detached.json").write_text(json.dumps([
+        {"name": n, "rc": str(d / f"{n}.rc"), "started": 0 if queued else now - elapsed,
+         "status": "queued" if queued else "running", "owner": {"task": tid}} for n in names]))
+    p.db.update_task(tid, status="waiting", result=json.dumps(
+        {"status": "waiting", "summary": "s", "on_pass_cmd": "true",
+         "retry_when": f"ttp detach --check {probe}", "waiting_since": now}))
+    return tid
+
+
+def test_eta_detached_jobs_estimate_from_measured_job_history(env):
+    """A task that runs detached jobs gets its ETA from the medians of same-named jobs in this
+    project's history (names normalised by dropping a trailing run word or id), never a padded
+    allowance; likely = the median sum, conservative = the p80 sum."""
+    from ttp import eta, etajobs
+    p = make(env)
+    now = time.time()
+    # Five past runs of three job names, one outlier: the median never follows the outlier.
+    full = [1800, 1800, 1800, 1800, 18000]
+    for i in range(5):
+        t0 = now - 86400 - i * 100
+        _jobs_registry(p, [("load", t0 + 120, "ended", t0 + 720),      # 600 s
+                           ("plain", t0 + 720, "ended", t0 + 1020),    # 300 s
+                           ("full-run1", t0 + 1020, "ended", t0 + 1020 + full[i])])
+    # The task under estimate: three running jobs, 300 s in, named with suffixes that normalise.
+    t = _waiting_jobs_task(p, now, ["load-2", "plain", "full-run3"])
+    e = eta.estimate(p.db, t, now)
+    # medians 600 + 300 + 1800 less the 300 s elapsed; the startup median never lands (jobs run).
+    assert e["end"] == pytest.approx(now + (600 - 300) + (300 - 300) + (1800 - 300)), e["legs"]
+    assert [k for k, _ in e["legs"]] == ["load", "plain", "full"]
+    assert e["p90_end"] == pytest.approx(now + (600 - 300) + 0 + (5040 - 300)), e["p90_end"]   # the p80 sum
+    h = etajobs.history(p.state, p.db, now)
+    assert sorted(h["job"]) == ["full", "load", "plain"] and len(h["job"]["full"]) == 5
+    assert h["startup"] == [100.0] + [120.0] * 5   # the waiting task's own run, then the five past runs
+    assert "load 5m" in eta.text(e, p, now) and "full 25m" in eta.text(e, p, now)
+
+
+def test_eta_detached_jobs_with_no_history_says_so(env):
+    """A job name with no sample gives no estimate and says so, never a padded default."""
+    from ttp import eta
+    p = make(env)
+    now = time.time()
+    t = _waiting_jobs_task(p, now, ["sweep"])
+    e = eta.estimate(p.db, t, now)
+    assert e["end"] is None and "no measured sweep job run yet" in e["why"]
+    assert "no estimate" in eta.field(e, p, now) and "no measured sweep job run yet" in eta.field(e, p, now)
+
+
+def test_eta_detached_jobs_count_the_queue_position(env):
+    """A task queued behind another open task's still-running job of the same name waits for it."""
+    from ttp import eta
+    p = make(env)
+    now = time.time()
+    _jobs_registry(p, [("load", now - 86400, "ended", now - 86400 + 600)])
+    ahead = _waiting_jobs_task(p, now, ["load"])            # its job runs, 300 s in
+    t = _waiting_jobs_task(p, now, ["load-2"], probe="load-2", queued=True)
+    e = eta.estimate(p.db, t, now)
+    # its own job's median (queued, not started) plus the wait for the running job ahead of it.
+    assert dict(e["legs"])["queue"] == pytest.approx(600 - 300), e["legs"]
+    assert eta.estimate(p.db, ahead, now)["end"] == pytest.approx(now + 600 - 300)
+    assert e["end"] == pytest.approx(now + sum(v for _, v in e["legs"]))
+
+
+
+
+def test_eta_a_promise_on_a_detached_jobs_task_shows_the_measured_estimate(env):
+    """The digest's promise line carries the measured estimate beside a promise whose owner task
+    runs detached jobs, so padding is visible."""
+    from ttp import eta, obligations as ob
+    p = make(env)
+    now = time.time()
+    _jobs_registry(p, [("load", now - 86400, "ended", now - 86400 + 600)])
+    t = _waiting_jobs_task(p, now, ["load-2"])
+    o = _eta_promise(p, t, "c1", "I'll post the tray-test result here.", now)
+    line = next(ln for ln in ob.promise_lines(p.db, now, p) if o["id"] in ln)
+    assert "measured finish" in line and time.strftime("%H:%M", time.localtime(eta.estimate(p.db, t, now)["end"])) in line
+    # a promise on a task with no detached jobs carries none.
+    plain = p.db.add_task("plain work", "s", kind="work", status="queued")
+    o2 = _eta_promise(p, plain, "c1", "I'll post it here.", now)
+    line2 = next(ln for ln in ob.promise_lines(p.db, now, p) if o2["id"] in ln)
+    assert "measured finish" not in line2
