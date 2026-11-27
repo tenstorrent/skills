@@ -22,16 +22,34 @@ shift
 [ -n "$FAKE_SSH_ARGS" ] && echo "$all" >> "$FAKE_SSH_ARGS"
 unset GIT_DIR GIT_WORK_TREE   # a real host never gets this side's git variables
 if [ "$host" = down ]; then echo "ssh: connect to host down port 22: Connection refused" >&2; exit 255; fi
+# A script fed on stdin (remotecheck._ssh_fed): read here up to its end line, so the matches below see it, then
+# fed to the real loader again (run), the rest of stdin after it.
+fed= end=
+case "$1" in *ttp-script-end:*)
+  end=$(printf '%s' "$1" | sed -n 's/.*\(ttp-script-end:[0-9a-f]*\).*/\1/p')
+  fed=$(while IFS= read -r l; do [ "$l" = "$end" ] && break; printf '%s\n' "$l"; done);;
+esac
+# Like ssh, it ends when the command does, with stdin still open: a pipe from cat would wait for stdin's end.
+run() {
+  [ -n "$end" ] || { sh -c "$1"; return; }
+  q=$(mktemp -d) && mkfifo "$q/in"
+  exec 4<&0   # a background list's own stdin is /dev/null
+  { printf '%s\n%s\n' "$fed" "$end"; exec cat <&4; } > "$q/in" 2>/dev/null &
+  feeder=$!
+  exec 4<&-
+  sh -c "$1" < "$q/in"; rc=$?
+  kill "$feeder" 2>/dev/null; rm -rf "$q"; return $rc
+}
 [ -n "$FAKE_REMOTE_TMP" ] && export TMPDIR="$FAKE_REMOTE_TMP" TTP_HOME="$FAKE_REMOTE_TMP/../host-home"
 if [ -n "$FAKE_SSH_NOGIT" ]; then
   mkdir -p "$FAKE_REMOTE_TMP/../nogit" && printf '#!/bin/sh\nexit 127\n' > "$FAKE_REMOTE_TMP/../nogit/git"
   chmod +x "$FAKE_REMOTE_TMP/../nogit/git" && export PATH="$FAKE_REMOTE_TMP/../nogit:$PATH"
 fi
 if [ -n "$FAKE_SSH_SLOW" ]; then
-  [ -z "$FAKE_SSH_SLOW_HOST" ] || [ "$host" = "$FAKE_SSH_SLOW_HOST" ] && case "$1" in *"${FAKE_SSH_SLOW%:*}"*) sleep "${FAKE_SSH_SLOW##*:}";; esac
+  [ -z "$FAKE_SSH_SLOW_HOST" ] || [ "$host" = "$FAKE_SSH_SLOW_HOST" ] && case "$1$fed" in *"${FAKE_SSH_SLOW%:*}"*) sleep "${FAKE_SSH_SLOW##*:}";; esac
 fi
 if [ -n "$FAKE_SSH_MUX" ]; then
-  case "$1" in *"${FAKE_SSH_MUX_ON:-ttp-remote-rc}"*)
+  case "$1$fed" in *"${FAKE_SSH_MUX_ON:-ttp-remote-rc}"*)
     case "$all" in *ControlPath=none*) echo direct >> "$FAKE_SSH_MUX.log";; *) echo shared >> "$FAKE_SSH_MUX.log";; esac
     left=$(cat "$FAKE_SSH_MUX")
     if [ "$left" = always ] || [ "$left" -gt 0 ]; then
@@ -45,7 +63,7 @@ fi
 # FAKE_SSH_DENY=<file> holding a count (or "always"): the first login (a script making the temp dir) is refused
 # a key while the count lasts, as when a forwarded agent does not answer; <file>.log gets "shared" or "direct".
 if [ -n "$FAKE_SSH_DENY" ]; then
-  case "$1" in *mktemp*)
+  case "$1$fed" in *mktemp*)
     case "$all" in *ControlPath=none*) echo direct >> "$FAKE_SSH_DENY.log";; *) echo shared >> "$FAKE_SSH_DENY.log";; esac
     left=$(cat "$FAKE_SSH_DENY")
     if [ "$left" = always ] || [ "$left" -gt 0 ]; then
@@ -61,10 +79,11 @@ fi
 d=$(dirname "$0")
 set -- "$(printf '%s' "$1" | sed -e "s#/proc/loadavg#${FAKE_SSH_LOADAVG:-$d/idle.loadavg}#g" -e "s#/proc/stat#$d/idle.stat#g")"
 # FAKE_SSH_SLOW=<host>: the tree copy to that host never ends (a stalled link).
-[ "$host" = "${FAKE_SSH_SLOW:-@none@}" ] && case "$1" in *"tar -xf -"*) exec sleep 5;; esac
-case "$1" in *"${FAKE_SSH_FAIL:-@none@}"*) echo "ssh: connection to $host lost" >&2; exit 255;; esac
-case "$1" in *"${FAKE_SSH_DROP:-@none@}"*) sh -c "$1" | sed '/ttp-remote-rc:/d'; exit 255;; esac
-exec sh -c "$1"
+[ "$host" = "${FAKE_SSH_SLOW:-@none@}" ] && case "$1$fed" in *"tar -xf -"*) exec sleep 5;; esac
+case "$1$fed" in *"${FAKE_SSH_FAIL:-@none@}"*) echo "ssh: connection to $host lost" >&2; exit 255;; esac
+case "$1$fed" in *"${FAKE_SSH_DROP:-@none@}"*) run "$1" | sed '/ttp-remote-rc:/d'; exit 255;; esac
+[ -n "$end" ] || exec sh -c "$1"
+run "$1"
 '''
 
 
@@ -5935,3 +5954,28 @@ def test_every_ssh_a_check_host_run_starts_gets_the_real_home_while_the_process_
     for bad in ("relative/home", f"{real}\nx", str(scratch)):
         monkeypatch.setenv(scratchhome.REAL_HOME_ENV, bad)
         assert remotecheck._ssh("h", "true")[0] == "ssh", bad
+
+
+def test_a_script_fed_on_ssh_s_stdin_runs_whole_keeps_stdin_as_its_stop_signal_and_a_cut_one_runs_nothing(tmp_path):
+    """remotecheck._ssh_fed's loader, under each sh there is: the script runs as written (a here-document, its
+    exit code), stdin still open behind it ends it when it closes, and a stream cut before the end line runs
+    nothing (97)."""
+    from ttp import remotecheck
+    script = ('cat > "$TMPDIR/out" <<EOT\nhome $HOME\nEOT\n'
+              'exec 3<&0; (cat <&3 >/dev/null; echo stopped >> "$TMPDIR/out") & wait; exit 7')
+    for sh in [s for s in ("sh", "dash", "bash") if shutil.which(s)]:
+        argv, fed = remotecheck._ssh_fed("h", script)
+        assert fed not in argv[-1] and "exit 7" not in argv[-1]
+        loader = shlex.split(argv[-1])[2]   # the argv's `sh -c <loader>`, run here by `sh`
+        env = dict(os.environ, TMPDIR=str(tmp_path), HOME="/h")
+        p = subprocess.Popen([sh, "-c", loader], stdin=subprocess.PIPE, env=env)
+        p.stdin.write(fed.encode())
+        p.stdin.flush()
+        time.sleep(0.3)
+        assert p.poll() is None, sh   # stdin open: still running
+        p.stdin.close()
+        assert p.wait(timeout=10) == 7, sh
+        assert (tmp_path / "out").read_text() == "home /h\nstopped\n", sh
+        (tmp_path / "out").unlink()
+        cut = subprocess.run([sh, "-c", loader], input=fed.rsplit(remotecheck.FED_END, 1)[0], text=True, env=env)
+        assert cut.returncode == 97 and not (tmp_path / "out").exists(), sh

@@ -143,8 +143,8 @@ def orphans(out: str, grace_s: float = GRACE_S, alive=owner_alive) -> list[str]:
 def _run(host: str, script: str) -> tuple[int, str]:
     from . import remotecheck
     try:
-        r = subprocess.run(remotecheck._ssh(host, script), stdin=subprocess.DEVNULL, capture_output=True,
-                           text=True, timeout=SSH_TIMEOUT_S)
+        argv, fed = remotecheck._ssh_fed(host, script)   # a reap's kills by group, which a run's guard refuses in argv
+        r = subprocess.run(argv, input=fed, capture_output=True, text=True, timeout=SSH_TIMEOUT_S)
     except (OSError, subprocess.SubprocessError) as e:
         return 255, str(e)
     return r.returncode, r.stdout

@@ -171,6 +171,21 @@ def _ssh(host: str, script: str, direct: bool = False, compress: bool = False) -
             host, f"sh -c {shlex.quote(script)}"]
 
 
+FED_END = "ttp-script-end:"
+
+
+def _ssh_fed(host: str, script: str, direct: bool = False) -> tuple[list[str], str]:
+    """(argv, stdin text) for `script` sent on ssh's stdin, not in its command line: the host's sh reads it up
+    to a random end line one byte at a time (read never takes more than its line from a pipe), then runs it,
+    so stdin, kept open, still stops it when it ends (_run_script's watcher). The harness's own scripts name
+    credential stores and kill process groups on the host, which a run's guard reads as its own reads and
+    kills here; stdin it never judges. A stream that ends before the end line runs nothing (exit 97)."""
+    end = FED_END + secrets.token_hex(8)
+    loader = (f's=$(while IFS= read -r l; do [ "$l" = {end} ] && exit 0; printf "%s\\n" "$l"; done; exit 1) '
+              '|| exit 97; eval "$s"')
+    return _ssh(host, loader, direct), script.rstrip("\n") + f"\n{end}\n"
+
+
 def paused(host: str, where: str | Path | None = None) -> str:
     """paused_in for check host `host` in the project the check runs in (project.here, from `where` else this
     folder); with none, or one it cannot read, nothing is paused."""
@@ -1019,9 +1034,14 @@ def _attempt(host, top, head, env, extra, cmd, mark, wrap, wait) -> tuple[int, s
         if not _TOLD.get("prio"):   # the priority it runs at there, with its settings: once per run, not per retry
             _say(testslots.priority_line(cfg, host))
             _TOLD["prio"] = True
-        # stdin stays open and unwritten: its end on the host (we stopped, died or lost ssh) stops the command.
-        proc = subprocess.Popen(_ssh(host, script, direct), stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                                stderr=subprocess.STDOUT)
+        # stdin stays open after the script: its end on the host (we stopped, died or lost ssh) stops the command.
+        argv, fed = _ssh_fed(host, script, direct)
+        proc = subprocess.Popen(argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+        try:
+            proc.stdin.write(fed.encode())
+            proc.stdin.flush()
+        except OSError:   # ssh already gone: what it printed says why
+            pass
         rc, held, no_wrap, refused, wrap_refused, timing = None, b"", False, False, False, False
         started = not wrap   # behind a wrapper: once the command printed the WRAP_STARTED marker
         out = sys.stdout.buffer
@@ -1098,9 +1118,8 @@ def _attempt(host, top, head, env, extra, cmd, mark, wrap, wait) -> tuple[int, s
                 # Not a bare `rm -rf`: a run whose ssh broke goes on there with its folder gone, owned by
                 # nothing. Its own process groups are stopped first, then the folder goes.
                 from . import orphanchecks
-                subprocess.run(_ssh(host, (f"{_mirror_cleanup(*cleanup_ref)}\n" if cleanup_ref else "")
-                                    + orphanchecks.reap_script([tmp], STOP_GRACE_S), direct),
-                               stdin=subprocess.DEVNULL,
-                               capture_output=True, timeout=CLEANUP_TIMEOUT_S)
+                argv, fed = _ssh_fed(host, (f"{_mirror_cleanup(*cleanup_ref)}\n" if cleanup_ref else "")
+                                     + orphanchecks.reap_script([tmp], STOP_GRACE_S), direct)
+                subprocess.run(argv, input=fed.encode(), capture_output=True, timeout=CLEANUP_TIMEOUT_S)
             except (OSError, subprocess.SubprocessError):
                 _say(f"could not remove {tmp} on {host}")

@@ -177,3 +177,42 @@ def test_pyaudit_judges_the_computed_paths_the_static_proof_leaves_to_it(env, cr
     assert not (cred_home.home / ".tt-project" / "x").exists()
     r = _pa_run(e, "p=''.join(['ok', '2.txt']); open(p,'w').write('x')", cred_home.work)
     assert r.returncode == 0 and (cred_home.work / "ok2.txt").exists(), r.stderr
+
+
+def test_pyaudit_passes_the_remote_checks_own_ssh_and_still_refuses_credential_reads(env, cred_home):
+    """A spilled check's ssh from a run: its script (the scratch HOME's list of credential stores it keeps out,
+    its kill of the check's process group) and its cleanup's reap, which the guard refused in ssh's command
+    line, go on stdin and pass; a credential read over ssh, or gh's token, is still refused."""
+    stubs = cred_home.work / "bin"
+    stubs.mkdir()
+    for name, body in (("ssh", "cat >/dev/null; echo fed"), ("gh", "echo token")):
+        (stubs / name).write_text(f"#!/bin/sh\n{body}\n")
+        (stubs / name).chmod(0o755)
+    scratch = cred_home.work / "scratch-home"
+    scratch.mkdir()
+    e = _pa_env(cred_home)
+    e.update(PATH=f"{stubs}:{e['PATH']}", HOME=str(scratch), TTP_REAL_HOME=str(cred_home.home),
+             TTP_CHECKS_HOME_FILES='[".gitconfig"]')
+    code = """if 1:
+        import subprocess
+        from ttp import orphanchecks, remotecheck as rc, scratchhome
+        q = '/tmp/ttp-check.AAAAAAAA'
+        script = rc._run_script(q, rc.exports({}) + scratchhome.remote_lines(rc.ENV_DIR, 'exit 95'), 'true', 'M:')
+        assert '.git-credentials' in script and 'kill -TERM' in script
+        for s in (script, orphanchecks.reap_script([q], 5)):
+            try:
+                subprocess.run(rc._ssh('spill', s))
+                raise SystemExit('in the command line: passed')
+            except PermissionError:
+                pass
+            argv, fed = rc._ssh_fed('spill', s)
+            r = subprocess.run(argv, input=fed, capture_output=True, text=True)
+            assert r.returncode == 0 and r.stdout == 'fed\\n', r
+        print('ok')"""
+    r = _pa_run(e, code, cred_home.work)
+    assert r.returncode == 0 and r.stdout == "ok\n", r.stderr[-800:]
+    for argv in (["ssh", "spill", "cat", "~/" + "." + "ssh/id_" + "ed25519"], ["gh", "auth", "token"]):
+        r = _pa_run(e, f"import subprocess; print(subprocess.run({argv!r}, capture_output=True, text=True).stdout)",
+                    cred_home.work)
+        assert r.returncode != 0 and "tt-project guard" in r.stderr and "fed" not in r.stdout, (argv, r.stderr[-400:])
+        assert "token" not in r.stdout
