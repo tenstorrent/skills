@@ -69,6 +69,12 @@ _ATTACH = _FILLER | {"on", "in", "for", "at"}
 _CLAUSE = re.compile(r"(?i)[,;]|\s(?:and|but)\s")
 _SPLIT = re.compile(r"((?<=[.!?;])[ \t]+|\n)")
 _WORD = re.compile(r"[a-z0-9]{3,}")
+# What makes a claim verb a word in code, not a claim (claim_word): a dotted identifier, a path, a branch
+# name or an option around it ('landed.check', 'ttp/t1-landed-x', '--landed'), a 'ttp' command before it, a
+# shell prompt opening its line, or a determiner before it ('the landed module': an adjective).
+_IN_TOKEN_BEFORE = re.compile(r"[./_@=:~-]$")
+_IN_TOKEN_AFTER = re.compile(r"^(?:[/_(=@-]|[.:][\w/])")
+_NO_CLAIM_BEFORE = re.compile(r"(?i)(?:^\s*\$\s.*|\bttp\s+|\b(?:the|a|an|its|our|their|whose|each|every)\s+)$")
 _REACH = re.compile(r"(?i)\b(?:unreachable|not reachable|(?:can(?:no|['’])t|could(?: not|n['’]t)|unable to) (?:be )?reach(?:ed)?|"
                     r"no route to)\b")
 
@@ -103,9 +109,18 @@ def _judge_reach(p, sentence: str, claims: list, now: float) -> tuple[str, str]:
     return reach.judge(p, sentence, now)
 
 
+def claim_word(text: str, start: int, end: int) -> bool:
+    """Whether the verb at text[start:end] is a word of prose a claim can rest on: not inside a backtick
+    span or a command line, not part of an identifier, path or branch name, not an adjective after a
+    determiner. False when unsure, so a claim check leaves the text as written."""
+    line = text[text.rfind("\n", 0, start) + 1:start]
+    return not (text.count("`", 0, start) % 2 or _IN_TOKEN_BEFORE.search(text[max(0, start - 1):start])
+                or _IN_TOKEN_AFTER.search(text[end:end + 2]) or _NO_CLAIM_BEFORE.search(line))
+
+
 def _verbs(s: str) -> list:
     """The unhedged claim verb matches of `s` (backticked code already blanked)."""
-    return [m for m in _VERB.finditer(s) if not _HEDGE.search(s[:m.start()])]
+    return [m for m in _VERB.finditer(s) if not _HEDGE.search(s[:m.start()]) and claim_word(s, m.start(), m.end())]
 
 
 def _bound(sentence: str) -> list[tuple[str, int, str | None]]:

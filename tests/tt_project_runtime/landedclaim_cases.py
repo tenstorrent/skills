@@ -704,3 +704,22 @@ def test_a_revert_checked_again_on_the_same_tip_reads_no_patch_ids_again(env, mo
     n = sum("patch-id" in c for c in calls)
     assert n and landed._undone(repo, log, r, x, tip) == first is False
     assert sum("patch-id" in c for c in calls) == n
+
+
+def test_a_landed_word_in_code_a_name_or_an_adjective_is_no_claim(env, monkeypatch):
+    """'landed' as a dotted identifier, an adjective after a determiner, inside a code span, a branch
+    name or a command line claims no landing: the sentence stays as written, and the claim check
+    finds no claim verb in it. A plain claim beside them is still checked."""
+    from ttp import claimcheck, pushclaim
+    p, repo, head = _claim_replay_setup(env, monkeypatch, landed=False)
+    for text in ("The change reads the landed module's own commits_sha.",
+                 "The fix applies the same on_branch rule landed.check uses.",
+                 "The fix keeps the overlap path apart: landed.check(tid) is not used.",
+                 "The fix calls `landed` and `ttp push --landed` there.",
+                 "The change is on ttp/t1-landed-x now.",
+                 "The fix is checked with ttp landed --task 5.",
+                 "$ git commit -m 'the change landed'"):
+        assert pushclaim.correct_landed_claims(p, text, p.root, head) == text, text
+        assert claimcheck.detect(text) == [], text
+    fixed = pushclaim.correct_landed_claims(p, "The fix uses landed.check. The fix landed.", p.root, head)
+    assert fixed.startswith("The fix uses landed.check. The fix not landed") and head[:12] in fixed, fixed

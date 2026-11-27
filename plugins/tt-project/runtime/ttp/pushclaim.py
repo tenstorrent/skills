@@ -236,8 +236,9 @@ def landed_claims(p, text: str, repo) -> list[tuple[int, int, str, tuple]]:
     for m in _LANDED_VERB.finditer(text or ""):
         lo = max(text.rfind(c, 0, m.start()) for c in ".!?\n") + 1
         if _NEGATED.search(text[max(0, m.start() - NEG_WINDOW):m.start()]) \
-                or claimcheck._TASK.search(text[lo:m.start()]) or claimcheck._RUN.search(text[lo:m.start()]):
-            continue   # hedged, negated, or about another task or run
+                or claimcheck._TASK.search(text[lo:m.start()]) or claimcheck._RUN.search(text[lo:m.start()]) \
+                or not claimcheck.claim_word(text, m.start(), m.end()):
+            continue   # hedged, negated, about another task or run, or a word in code or a name
         if any(m.start() < e and s < m.end() for s, e in taken):
             continue
         # the sentence must name the run's own work as what landed ("the change landed", "landed
@@ -317,11 +318,12 @@ def reply_footer(p, text: str, repo, running: dict | None = None, extra=()) -> s
     at all: a project whose repository lacks the running commit (another repo's release), and a
     landed word where no push branch is set. Accepted gap: with both a live and a landed word,
     every commit is held to the running release."""
-    from . import landed
+    from . import claimcheck, landed
     text, items = text or "", list(extra)
-    def claimed(m):   # neither negated nor hedged inside the match or just before it
+    def claimed(m):   # neither negated nor hedged inside the match or just before it, nor a word in code
         return not (re.search(r"\b(?:not|never|n't)\b", m.group(0))
-                    or _NEGATED.search(text[max(0, m.start() - NEG_WINDOW):m.start()]))
+                    or _NEGATED.search(text[max(0, m.start() - NEG_WINDOW):m.start()])
+                    or not claimcheck.claim_word(text, m.start(), m.end()))
     live = any(map(claimed, _LIVE_CLAIM.finditer(text)))
     said = live or any(map(claimed, _LANDED_VERB.finditer(text)))
     target = _default(p, repo) if said and not live else None
