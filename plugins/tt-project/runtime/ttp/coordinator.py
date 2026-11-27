@@ -2809,6 +2809,7 @@ def _pending_checked(p: Project, text: str, notes: list, what: str) -> tuple[str
         text, why = pendingask.expand(text, asks, what)
         notes += why
     except Exception as e:
+        asks = None   # a fault in the lookup or the expand leaves the asks unknown, never a refusal
         notes.append(f"pendingask: the open-ask check failed ({type(e).__name__}: {e}); the message went unchecked")
     return text, asks
 

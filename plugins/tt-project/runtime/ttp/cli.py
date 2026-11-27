@@ -3303,6 +3303,7 @@ def cmd_urgent_reply(a) -> None:
         asks = waits.open_asks(p.db)
         text, _ = pendingask.expand(text, asks, "urgent reply")
     except Exception as e:
+        asks = None   # a fault in the lookup or the expand leaves the asks unknown, never a refusal
         print(f"ttp urgent-reply: open asks not expanded ({type(e).__name__}: {e})", file=sys.stderr)
     if why := quotefull.refused(text, "urgent reply", (), asks):
         die(why)
