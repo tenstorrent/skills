@@ -4132,7 +4132,7 @@ the pick order, so it takes the first starts. A resumed resource ramps only its 
   `pr_babysit.no_post_prs` (`owner/repo#N`) gets no comment, edit, dispatch or `ttp push --own`: the
   project fixes and answers it by local commits and tells the user, who pushes. A done task whose
   repair is not on the PR yet (none of its hand-off's commits is the head, and the head has not moved
-  since it finished) keeps the PR's findings while that publication step is open: pr-watch names the
+  since it started) keeps the PR's findings while that publication step is open: pr-watch names the
   step once and queues no second fix. A bot review whose summary only repeats inline threads already
   answered or resolved has their disposition; a summary with text of its own is still a finding. Through the gh route the
   workstation runs a dispatch or label only on an open PR its own gh user opened.

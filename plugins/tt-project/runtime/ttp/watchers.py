@@ -1173,12 +1173,9 @@ def _check_findings(daemon, t: dict, pr: dict, sig: dict, findings: dict, data: 
     who = f"PR for task #{t['id']}" if t["id"] else "PR on a branch this project works on (no task of it opened it)"
     # Open findings always have one owner: an open task on the PR, else a fix task the daemon queues
     # once the task that delivered it is done (Daemon.pr_findings_owner). pr-watch only reports them.
-    # A done repair not yet published keeps them while that step is open: no second fix (prbabysit).
-    held = prbabysit.unpublished_repair(daemon, key, rec, pr.get("headRefOid") or "") if dirty else None
-    if held:
-        rec["prereq"] = held[1]
-    owner, made = (held[0], False) if held else daemon.pr_findings_owner(key, rec, what) \
-        if dirty and hasattr(daemon, "pr_findings_owner") else (None, False)
+    owner, made = daemon.pr_findings_owner(key, rec, what) if dirty and hasattr(daemon, "pr_findings_owner") \
+        else (None, False)
+    held = rec.get("prereq")   # a done repair whose publication is open keeps them (prbabysit.unpublished_repair)
     lost = dirty and not owner and rec["owner"] is not None
     rec["owner"] = owner["id"] if owner else None
     now = time.time()
@@ -1215,7 +1212,7 @@ def _check_findings(daemon, t: dict, pr: dict, sig: dict, findings: dict, data: 
         status = "handled"
     elif held:
         text = (f"{who} ({url}) has open findings: {what}. Done task #{owner['id']} repaired them, but "
-                f"{held[1]}. It keeps them until then: queue no second fix. Do not ask the user to review "
+                f"{held}. It keeps them until then: queue no second fix. Do not ask the user to review "
                 "it until pr-watch reports it clean.")
     elif owner:
         text = (f"{who} ({url}) has open findings: {what}. Open task #{owner['id']} "

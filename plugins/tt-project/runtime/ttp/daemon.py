@@ -44,6 +44,7 @@ from . import (   # one name per line: two changes adding names merge without a 
     glmassist,
     glmquota,
     handback,
+    prbabysit,
     precheckbind,
 )
 from . import rolerestore
@@ -22444,6 +22445,7 @@ class Daemon:
         # queued beside it would be a second owner (and a failed review queues its own fix).
         if src and (stack := self._open_stack(src["id"])):
             return stack[0], False
+        if (held := prbabysit.unpublished_repair(self, key, rec)): return held, False   # its publication is open
         rounds = db.one("SELECT COUNT(*) n FROM tasks WHERE labels LIKE ?", (f'%"pr_fix:{key}"%',))["n"]
         if rounds >= PR_FIX_ROUNDS or coord.next_task_slot(db, coord.task_cap(self.cfg)) is not None:
             return None, False

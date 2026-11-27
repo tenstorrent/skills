@@ -385,27 +385,28 @@ def overlap_check(daemon, gh) -> None:
     db.set_kv(OVERLAP_KEY, {f"{a}|{b}": 1 for a, b, _ in pairs})   # a pair that stops overlapping is told again when it returns
 
 
-def unpublished_repair(daemon, key: str, rec: dict, head: str) -> tuple[dict, str] | None:
+def unpublished_repair(daemon, key: str, rec: dict) -> dict | None:
     """The done task whose repair of PR `key`'s open findings (pr-watch's record `rec`) is not on the PR
-    yet, and the step still open that publishes it: none of its hand-off's commits is the PR's head
-    (`head`) and the PR had no new commit since it finished. That task keeps the findings until the step
-    is taken (on a no-post PR, by the user), so no second fix is queued. None: no such repair."""
+    yet: none of its hand-off's commits is the head the sweep last saw, and that head is older than the
+    task. It keeps the findings while the step that publishes it is open (on a no-post PR, the user's
+    push), so no second fix is queued; the step goes in `rec["prereq"]`. None: no such repair."""
     from .batchrun import _shas
     from .db import load_result
     db = daemon.p.db
-    since = float(((db.kv(KEY, {}) or {}).get(key) or {}).get("head_at") or 0)
+    state = (db.kv(KEY, {}) or {}).get(key) or {}
+    head, since = str(state.get("head") or ""), float(state.get("head_at") or 0)
     last = db.one("SELECT id FROM tasks WHERE labels LIKE ? ORDER BY id DESC LIMIT 1", (f'%"pr_fix:{key}"%',))
     for tid in dict.fromkeys(i for i in (rec.get("owner"), last and last["id"], rec.get("task")) if i):
         t = db.task(int(tid))
         mine = _shas(load_result(t["result"]).get("commits")) if t and t["status"] == "done" else []
-        if not (head and since and mine) or float(t["updated"] or 0) < since \
-                or any(head.startswith(c) or c.startswith(head) for c in mine):
-            continue
+        if not (head and since and mine) or since >= float(t["created"] or 0) or any(head.startswith(c) for c in mine):
+            continue   # a head that moved after the task started may hold its work: the usual owner decides
         where = f"onto the PR's branch {rec.get('branch')}" if rec.get("branch") else "onto the PR"
         quiet = key.lower() in {k.lower() for k in settings(getattr(daemon, "cfg", None))["no_post_prs"]}
-        return t, (f"its commit {mine[-1][:12]} is not on the PR yet: "
-                   + (f"the user publishes it {where} (a no-post PR: the project pushes nothing to it)" if quiet
-                      else f"publish it {where}"))
+        rec["prereq"] = (f"its commit {mine[-1][:12]} is not on the PR yet: "
+                         + (f"the user publishes it {where} (a no-post PR: the project pushes nothing to it)"
+                            if quiet else f"publish it {where}"))
+        return t
     return None
 
 
