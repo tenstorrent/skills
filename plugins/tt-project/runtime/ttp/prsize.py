@@ -6,9 +6,11 @@ A change that delivers onto an open PR's branch is judged on the PR's cumulative
 merge base, not on this task's commits alone: a PR can grow far past its purpose one reviewed
 commit at a time. The budget gate (budget_gate) refuses a push onto a branch whose open PR
 is past its size budget, raising one keyed event so the coordinator posts a plan; a recorded
-plan (record_plan, the `ttp pr plan` CLI) lifts the gate. review_prompt_lines builds the block the review prompt carries: the PR's whole diffstat
-(lines added and removed, split into code, tests, docs and generated files), the repo's norm (median
-and p90 added lines of its recently merged PRs, read anonymously through the gh route and cached per
+plan (record_plan, the `ttp pr plan` CLI) lifts the gate.
+
+review_prompt_lines builds the block the review prompt carries: the PR's whole diffstat (lines
+added and removed, split into code, tests, docs and generated files), the repo's norm (median and
+p90 added lines of its recently merged PRs, read anonymously through the gh route and cached per
 repo for a day; 'norm unknown' when the route cannot answer) and the ponytail lane's duty to judge
 the PR as a whole. Nothing is added when the change heads no open PR."""
 from __future__ import annotations
