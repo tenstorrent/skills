@@ -43,6 +43,10 @@ def test_tmute_two_candidate_owners_or_one_this_batch_adds_leave_the_coordinator
     from ttp import throughmute as tm
     line = [x for x in tm.review_lines(p.db) if "env:check-host:box-a" in x][0]
     assert "owner the coordinator" in line and "PROBLEM" not in line, line
+    fix = p.db.add_task("Rebuild the check host")   # a later why naming an open task: it owns the mute now
+    assert scr.update_mute(p.db, "checks", "env:check-host:box-a", why=f"task #{fix} rebuilds it")
+    line = [x for x in tm.review_lines(p.db) if "env:check-host:box-a" in x][0]
+    assert f"owner task #{fix}," in line and "coordinator" not in line, line
 
 
 def _escalated_mute(p, t0):
@@ -128,6 +132,6 @@ def test_observation_mute_accepts_a_valid_owner_and_refuses_a_malformed_one(env)
         got = coord.apply(p, [{**act, "match": "fan slow", "owner": bad}])
         assert len(got) == 1 and "`owner`" in got[0], (bad, got)
     assert [m["match"] for m in scr.mutes(p.db)] == ["tray dropped"]
-    assert scr.mute_owner({"task": 3}) == {"task": 3} and scr.mute_owner(None) is None
+    assert scr.mute_owner(None) is None
     with pytest.raises(ValueError):
-        scr.mute_owner({"task": 3, "who": "x"})
+        scr.mute_owner({"task": 3})

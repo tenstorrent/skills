@@ -710,23 +710,16 @@ _OWNER_PROJECT = re.compile(r"[A-Za-z][A-Za-z0-9._-]{0,63}")
 
 
 def mute_owner(value: Any) -> dict | None:
-    """A mute's recovery owner from `#<task>`, a project name, or both ('#12 other-project'), or a dict
-    {"task": int, "project": str}: {"task"?, "project"?}; None when not given. Raises ValueError otherwise."""
-    if value in (None, "", {}):
+    """A mute's recovery owner from `#<task>`, a project name, or both ('#12 other-project'):
+    {"task"?, "project"?}; None when not given. Raises ValueError otherwise."""
+    if value in (None, ""):
         return None
     bad = ValueError(f"observation_mute `owner` must be `#<task id>`, a project name, or both "
                      f"(e.g. '#12 other-project'); got {value!r}")
-    if isinstance(value, dict):
-        if set(value) - {"task", "project"}:
-            raise bad
-        parts = ([f"#{value['task']}"] if value.get("task") not in (None, "") else []) \
-            + ([str(value["project"])] if value.get("project") else [])
-    elif isinstance(value, str):
-        parts = value.replace(",", " ").split()
-    else:
+    if not isinstance(value, str):
         raise bad
     out: dict = {}
-    for tok in parts:
+    for tok in value.replace(",", " ").split():
         if re.fullmatch(r"#\d{1,9}", tok) and "task" not in out:
             out["task"] = int(tok[1:])
         elif _OWNER_PROJECT.fullmatch(tok) and "project" not in out:
@@ -763,6 +756,10 @@ def update_mute(db: DB, source: str, match: str, *, owner: Any = None, why: Any 
         if probe and probe != m.get("end_when"):
             m["end_when"] = probe
             m.pop("probe_broken", None)
+        if m.get("throughput") and (why is not None or probe):   # as throughmute.vet derives it from these
+            tid = throughmute.open_task(db, m["why"])
+            if tid is not None or m.get("end_when"):
+                m["throughput"]["owner"] = {"task": tid} if tid is not None else {"probe": m["end_when"]}
         if esc is not None and esc != float(m.get("escalate_after_h", MUTE_ESCALATE_H)):
             m["escalate_after_h"], m["armed_at"] = esc, now
             m["conds"] = {k: ({**c, "first_at": now, "escalated": False} if c.get("escalated") else c)

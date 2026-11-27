@@ -12509,7 +12509,7 @@ def cmd_mute(a) -> None:
             print(screen.mute_line(m, where=p))
         return
     if a.action == "update":
-        if a.owner is None and a.why is None and a.end_when is None:
+        if not (a.owner or a.why or a.end_when):
             die("ttp mute update needs --owner, --why or --end-when")
         try:
             m = screen.update_mute(p.db, a.source, a.match, owner=a.owner, why=a.why, end_when=a.end_when)

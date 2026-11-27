@@ -271,11 +271,8 @@ def review_lines(db: Any, now: float | None = None, where: Any = None) -> list[s
     out = []
     for m in mutes(db, now):
         cls = marked(m)
-        o = m.get("owner") or (m.get("throughput") or {}).get("owner") or {}
-        stored = bool(o) and not m.get("owner")
-        if cls and not o:
-            o = match_owner(db, m.get("match")) or {}   # the match itself may name its owner task
-        o = o or shown_owner(m)
+        stored = bool((m.get("throughput") or {}).get("owner")) and not m.get("owner")
+        o = shown_owner(m) if m.get("owner") or stored or not cls else (match_owner(db, m.get("match")) or shown_owner(m))
         problem = ""
         if cls and "task" in o and "project" not in o:   # another project's task is not in this db
             row = db.one("SELECT status FROM tasks WHERE id=?", (int(o["task"]),))
