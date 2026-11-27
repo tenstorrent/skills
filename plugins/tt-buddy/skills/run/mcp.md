@@ -82,7 +82,7 @@ Mode-agnostic rows: `execution.md` § Failure handling.
 - Every install runs a health gate between jobs.
 - The gate probes the device and resets until healthy.
 - Reset steps depend on platform and privileges.
-- The broker kills jobs on timeout or 300s silence.
+- The broker kills jobs on timeout or 300s silence; a job quiet by design for longer sets `hung_silence_sec` (60–3600) at submit.
 - Queue held: the gate is recovering. Wait.
 - Confirm: `tt_device_queue_status` shows the queue not held.
 

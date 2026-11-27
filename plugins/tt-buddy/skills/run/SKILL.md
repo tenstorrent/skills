@@ -53,6 +53,7 @@ detect workspace → load recipe → research target → route → execute → r
 ## Long-run watchdog
 
 - **Compile is not a wedge.** New log lines and growing caches are progress. Cold JIT and trace capture can run for minutes: NEVER kill them.
+- The backend reaps a job with neither output nor storage I/O after 300 s, independently of `timeout_sec`. For a job quiet by design longer than that (weight conversion, cold JIT), pass `hung_silence_sec` (60–3600) at submit.
 - Wedge: output flat for minutes past the job-timeout envelope. The envelope comes from history (`tt-buddy:note`, `tt-buddy:learn`), not a guess.
 - Past the envelope with flat output: follow `recovery.md`.
 - Layer details: `execution.md` § Job-timeout envelope, `recovery.md` § Detect the wedge early.

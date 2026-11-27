@@ -184,10 +184,13 @@ def test_lock_does_not_trust_mkdir_exit_status(tmp_path):
             second.wait(timeout=1)
         except subprocess.TimeoutExpired:
             pass
-        assert second.poll() is None, f"second writer did not wait for the lock: {second.stderr.read()}"
+        assert second.poll() is None, "second writer did not wait for the lock"
         release.touch()
+        # stderr is read only after the writer exited: reading a live writer's
+        # stderr blocks until it exits, and it exits when the lock is released.
         assert first.wait(timeout=10) == 0, first.stderr.read()
         assert second.wait(timeout=10) == 0, second.stderr.read()
+        assert _subjects(notes)[0] == "topic: second", "second writer lost the race for the lock"
     finally:
         release.touch()
         for writer in (first, second):
