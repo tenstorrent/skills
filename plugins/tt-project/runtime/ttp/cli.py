@@ -4690,6 +4690,8 @@ def _cmd_checks(a) -> None:
     if not top or not head:
         die("ttp checks: run it in the change's git worktree (or pass --worktree <path>)")
     print(checktree.line(head, top), flush=True)
+    if a.target and not _checks_base(p, Path(top), [], a.target):
+        die(f"ttp checks: --target {a.target} names no branch or commit here (fetch it first)")
     # The scan runs in the detached checks, not in their launcher: its caller (the daemon starting a
     # review's pre-checks) can wait for it holding the project's write turn, which the scan may need.
     if not getattr(a, "detach", False) and (why := _checks_public_scan(p, top, head, d, a.target)):
@@ -7176,35 +7178,38 @@ def _checks_tip_ref(p: Project | None, top: Path) -> str:
 
 def _checks_base(p: Project | None, top: Path, cmds: list, target: str = "") -> str:
     """What `ttp checks` compares `if_changed` scopes, the fast path and the public scan with: the
-    branch the change lands on, as last fetched. That is `target` (`--target`) when given, else the
-    task's own `pr_branch` while `delivery.own_push` is not off (`ttp push --own` lands it there), else
-    `delivery.push_branch`. In a repo with no git remote at all, the local branch; else "" (no project,
-    no target or no copy of it here), and then those checks run. A `target` naming no branch is
-    tried as any commit git can resolve."""
-    from . import project as projmod, push, worktree
+    branch the change lands on, as last fetched. That is `target` (`--target`; else any commit git
+    resolves) when given, else, while `delivery.own_push` is not off, the branch the running task (or
+    a code task the running review covers) delivers onto as `ttp push --own` finds it
+    (push.pr_branch_source) when a copy of it is here, else `delivery.push_branch`. In a repo with no
+    git remote at all, the local branch; else "" (no project, no target or no copy of it here), and
+    then those checks run."""
+    from . import project as projmod, push
     if not p:
         return ""
     remotes = subprocess.run(["git", "-C", str(top), "remote"], capture_output=True, text=True)
-    if not target and (tid := os.environ.get("TTP_TASK", "")).isdigit() \
-            and projmod.own_push(p.config()) != "off" and (t := p.db.task(int(tid))) \
-            and t.get("kind") not in worktree.NEVER_OWN_KINDS and (b := worktree.delivery_branch(t)) and b[0] \
-            and not b[1]:
-        target = b[0]
-    try:
-        remote, branch = push._split_target(target, remotes.stdout.split()) if target else push.target(p, top)
-    except ValueError:
-        return ""
 
     def rev(ref: str) -> str:
         r = subprocess.run(["git", "-C", str(top), "rev-parse", "--verify", "-q", ref + "^{commit}"],
                            capture_output=True, text=True)
         return r.stdout.strip() if r.returncode == 0 else ""
 
-    if base := rev(f"refs/remotes/{remote}/{branch}"):
-        return base
-    if remotes.returncode == 0 and not remotes.stdout.strip() and (base := rev(f"refs/heads/{branch}")):
-        return base
-    return rev(target) if target else ""
+    def tip(remote: str, branch: str) -> str:
+        if base := rev(f"refs/remotes/{remote}/{branch}"):
+            return base
+        return rev(f"refs/heads/{branch}") if remotes.returncode == 0 and not remotes.stdout.strip() else ""
+
+    if target:
+        return tip(*push._split_target(target, remotes.stdout.split())) or rev(target)
+    if (tid := os.environ.get("TTP_TASK", "")).isdigit() and projmod.own_push(p.config()) != "off":
+        rows = [push._task_row(p, tid), *push._reviewed_tasks(p, tid)]
+        for branch in dict.fromkeys(push.pr_branch_source(p, r)[1] for r in rows if r):
+            if branch and (base := tip(*push._split_target(branch, remotes.stdout.split()))):
+                return base
+    try:
+        return tip(*push.target(p, top))
+    except ValueError:
+        return ""
 
 
 def _checks_public_scan(p: Project | None, top: str, head: str, d: dict, target: str = "") -> str:
@@ -7879,7 +7884,8 @@ def _checks_detach(a, run_dir: Path, p: Project | None, top: str = "", head: str
             die("ttp checks: sandboxed detached checks need a project daemon; set TTP_PROJECT")
         detach.enqueue(p.state, rc, run_dir / CHECKS_OUT, [], top or os.getcwd(), env,
                        checks={"worktree": top, "head": head, "cmd": list(a.cmd), "fresh": bool(a.fresh),
-                               "full": bool(getattr(a, "full", False)), "need": need, **_harness_purpose(a)})
+                               "full": bool(getattr(a, "full", False)), "need": need, **_harness_purpose(a),
+                               **({"target": a.target} if getattr(a, "target", None) else {})})
         print("ttp checks: queued; the daemon starts them outside this command's sandbox")
     else:
         detach.withdraw(rc)   # a marker left without a request (no daemon to take it)

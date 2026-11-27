@@ -1331,7 +1331,7 @@ def tend(p: Project) -> None:
                 c = m["checks"]
                 lost(rc).unlink(missing_ok=True)
                 pid = _checks_start(Namespace(cmd=c["cmd"], fresh=c["fresh"], full=c.get("full", False),
-                                              purpose=c.get("purpose")), rc.parent, c["worktree"],
+                                              purpose=c.get("purpose"), target=c.get("target", "")), rc.parent, c["worktree"],
                                     c["head"], _job_env(m.get("env")), rid or "",
                                     c.get("need") if isinstance(c.get("need"), int) else None)
                 renice(pid, nice_level(p.config().get("runner"))[0])

@@ -7034,10 +7034,17 @@ def test_checks_judges_the_head_against_the_branch_it_lands_on(env, monkeypatch)
     assert cli._checks_base(p, repo, [], "nosuch") == ""
     assert push.applicable(repo, "HEAD", check, print, cli._checks_base(p, repo, [], "feat"))[0] == []
     tid = p.db.add_task("Stacked", "s", kind="code", origin="coordinator", labels=["pr_branch:feat"])
-    monkeypatch.setenv("TTP_TASK", str(tid))
+    fix = p.db.add_task("Fix it", "s", kind="code", origin="coordinator", labels=[f"continues:{tid}"])
+    review = p.db.add_task(f"Review #{fix}: fix it", "s", kind="review", origin="daemon")
+    gone = p.db.add_task("Gone", "s", kind="code", origin="coordinator", labels=["pr_branch:gone"])
     p.set_config("delivery.own_push", "on")
-    assert cli._checks_base(p, repo, []) == feat
+    for task in (tid, fix, review):   # its own pr_branch, the one it continues, the one a review covers
+        monkeypatch.setenv("TTP_TASK", str(task))
+        assert cli._checks_base(p, repo, []) == feat, task
     assert cli._checks_base(p, repo, [], "proj") == proj, "--target wins over the task's branch"
+    monkeypatch.setenv("TTP_TASK", str(gone))
+    assert cli._checks_base(p, repo, []) == proj, "a branch with no copy here falls back to the push branch"
+    monkeypatch.setenv("TTP_TASK", str(tid))
     p.set_config("delivery.own_push", "off")
     assert cli._checks_base(p, repo, []) == proj
 
@@ -7117,6 +7124,24 @@ def test_queued_checks_keep_full(env, tmp_path, monkeypatch, capsys):
     detach.tend(p)
     assert seen and "--full" in seen[-1], seen
     assert cli._read_checks_pid(run)["full"] is True
+    assert _wait_precheck(run) == "0"
+
+
+def test_queued_checks_keep_their_target_and_an_unknown_one_is_refused(env, tmp_path, monkeypatch, capsys):
+    from ttp import cli, detach, push
+    p, repo, run, git = _checks_repo(env, tmp_path, monkeypatch)
+    with pytest.raises(SystemExit):
+        cli.main(["checks", "--detach", "--target", "no-such-branch", "--", "true"])
+    assert "names no branch or commit here" in capsys.readouterr().err
+    monkeypatch.setattr(push, "_boxed", lambda: True)
+    cli.main(["checks", "--detach", "--target", "HEAD", "--", "true"])
+    assert "queued" in capsys.readouterr().out
+    q = next((p.state / detach.QUEUE).glob("*.json"))
+    assert json.loads(q.read_text())["checks"]["target"] == "HEAD"
+    monkeypatch.setattr(push, "_boxed", lambda: False)
+    seen = _record_checks_argv(monkeypatch)
+    detach.tend(p)
+    assert seen and seen[-1][seen[-1].index("--target") + 1] == "HEAD", seen
     assert _wait_precheck(run) == "0"
 
 
