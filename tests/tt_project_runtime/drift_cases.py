@@ -175,6 +175,31 @@ def test_drift_pace_nothing_committed_judges_this_run_not_earlier_runs_work():
         "a new commit this run, even on files an earlier run touched"
 
 
+def test_drift_check_remembers_the_branch_tip_it_first_saw_so_a_later_commit_clears_the_pace_flag(env, tmp_path):
+    from ttp import drift
+    p = make(env)
+    spend = {"run_usd": 3.6, "task_usd": 3.6, "budget_usd": 4.0, "share": 0.9}   # 90% of what it started with
+
+    def run(*heads):
+        t = p.db.add_task("t", "s", kind="code")
+        run_dir = tmp_path / f"r{t}"
+        run_dir.mkdir()
+        rid = p.db.x("INSERT INTO runs(task,role,provider,started,status,dir) VALUES(?,?,?,?,?,?)",
+                     (t, "worker", "claude", time.time(), "running", str(run_dir)))
+        now = time.time()
+        data = {"runs": {str(rid): _dr_entry(now, run=rid, task=t, spend=spend,
+                                             wall={"elapsed_s": 1, "limit_s": 2, "share": 0.9})}}
+        for i, head in enumerate(heads):
+            data["runs"][str(rid)]["git"] = {"head": head, "committed": []}
+            drift.check(p, p.config(), data, now + 60 * i)
+        return data["runs"][str(rid)]
+
+    e = run("h", "h2")
+    assert e["drift"]["base_head"] == "h" and "pace" not in e["flags"], "it committed since it was first seen"
+    e = run("h", "h")
+    assert e["drift"]["base_head"] == "h" and "pace" in e["flags"], "the tip never moved"
+
+
 def _dr_project(env, tmp_path, quiet=True, **cost):
     p = make(env)
     if not quiet:   # a ladder test that leaves the run idle for long stretches on purpose
