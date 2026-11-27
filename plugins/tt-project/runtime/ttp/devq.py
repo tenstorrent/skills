@@ -160,7 +160,7 @@ def config_problems(name: str, cfg) -> list:
             if not ok or (k == "netfs_prefixes" and any(x.rstrip("/") in ("", "~") for x in v)):
                 out.append(f"{where}.{k}: {v!r} is not a list of absolute paths (and not / or ~ itself)")
     if isinstance(cfg.get("disk_max_pct"), (int, float)) and cfg["disk_max_pct"] > PCT_MAX:
-        out.append(f"{where}.disk_max_pct: {cfg['disk_max_pct']} is above PCT_MAX")
+        out.append(f"{where}.disk_max_pct: {cfg['disk_max_pct']} is above {PCT_MAX}")
     for key in ("outside_user", "legacy_driver"):
         if isinstance(cfg.get(key), str) and cfg[key]:
             try:
