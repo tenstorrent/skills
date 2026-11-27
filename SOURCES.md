@@ -19,7 +19,7 @@ vendor from.
 | `tenstorrent/tt_ops_code_gen` | private | Static-analysis checklist, L1 footprint discipline, memory and precision references |
 | `tenstorrent/tt-metal` @ `agentic-research/fast-models-fast` | public | `.agents` skills: optimize, multichip, tracing, datatype-sweep, vllm-integration |
 | `tenstorrent/tt-metal` @ `main` | public | `tt_metal/tt-llk/.claude`: race audits and the SFPU perf audit; `.github/bug_checker/rules` |
-| `tenstorrent/vllm-tt-plugin` | public | `AGENTS.md` and `docs/` contracts behind `tt-vllm-serving-review` |
+| `tenstorrent/vllm-tt-plugin` | public | `AGENTS.md`: entry points and model-capability rules behind `tt-vllm-serving-review` |
 | Codex skill `tt-metal-pr-review` | — | PR-review checklist, TTNN dealloc and vLLM-DP false-positive guards |
 
 This repository uses [Apache-2.0](LICENSE). See [NOTICE](NOTICE) for third-party
@@ -125,7 +125,7 @@ Regenerate it after any re-vendor rather than editing by hand.
 | `tt-test-coverage-review` | `tenstorrent/tt-buddy` | `skills/code-review/reviewers/qa.md` | `ba9021417442` | ppetrovicTT |
 | `tt-test-coverage-review` | `tenstorrent/tt_ops_code_gen` | `skills/golden-tests/SKILL.md` | `e9c9417eee23` | mstaletovicTT, djordjenTT, dstoiljkovicTT |
 | `tt-vllm-serving-review` | `tenstorrent/tt-metal` | `.agents/skills/vllm-integration/SKILL.md` | `d58cb341c703` | yieldthought, tchedaTT |
-| `tt-vllm-serving-review` | `tenstorrent/vllm-tt-plugin` | `AGENTS.md`, `docs/` | `60c005893b43` | viktorpusTT, sanjaradylov |
+| `tt-vllm-serving-review` | `tenstorrent/vllm-tt-plugin` | `AGENTS.md` | `60c005893b43` | viktorpusTT, sanjaradylov |
 | `tt-vllm-serving-review` | `tenstorrent/tt-buddy` | `knowledge/recipes/vllm` | `ba9021417442` | ppetrovicTT, viktorpusTT |
 | `llk-perf-audit-review` | `tenstorrent/tt-metal` | `tt_metal/tt-llk/.claude/skills/perf-optimization-audit` | `ce91f33c0c71` | fvranicTT |
 | `llk-perf-audit-review` | `tenstorrent/tt-metal` | `tech_reports/Handling_Special_Value/special_values.md` | `ce91f33c0c71` | blozano-tt, ttmtrajkovic, jasondavies, ndivnicTT |
