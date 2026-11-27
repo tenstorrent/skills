@@ -164,7 +164,7 @@ def _purview_scope(daemon) -> tuple[set[str], set[str], set[str]]:
                 branches.add(lab[10:].strip())
         if (k := prguard.pr_key(t["pr_url"] or "")) and "#" in k:
             repos.add(k.split("#", 1)[0])
-    for x in [*((cfg.get("watchers") or {}).get("purview_extra") or []), *prbabysit.settings(cfg)["extra_prs"]]:
+    for x in (cfg.get("watchers") or {}).get("purview_extra") or []:
         x = str(x).strip()
         if m := re.fullmatch(r"([\w.-]+/[\w.-]+)#(\d+)", x):
             x = f"https://github.com/{m.group(1)}/pull/{m.group(2)}"

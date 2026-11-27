@@ -4093,8 +4093,8 @@ the pick order, so it takes the first starts. A resumed resource ramps only its 
   the user's yes, and human reviewers are never requested, whatever the setting.
 - PR babysitting sweep (`pr_babysit.enabled`, default true), read-only, run by pr-watch on every open PR the
   project owns, draft or not: one of its tasks opened it, its head is a branch the project pushed, or it is
-  in `pr_babysit.extra_prs` (`owner/repo#N`; read even while gh is logged out, anonymously or through the
-  route). The sweep itself posts nothing and dispatches nothing; the coordinator's duty is to act on what
+  in `watchers.purview_extra` (a PR URL or `owner/repo#N`; read even while gh is logged out, anonymously or
+  through the route). The sweep itself posts nothing and dispatches nothing; the coordinator's duty is to act on what
   it reports (fix tasks on the PR's branch, dispatch, rebase, ping), through the workers' `gh` guard. A non-draft PR gets `pr_findings` for failed checks and
   unanswered comments as a draft does. `pr_ci_not_run` lists checks skipped, or workflows that need a
   manual or label trigger, never ran on the head and are listed in `pr_babysit.dispatch`, each with its trigger
@@ -4108,7 +4108,7 @@ the pick order, so it takes the first starts. A resumed resource ramps only its 
   only as `pr_babysit.dispatch` lists them for the repo (`{"owner/repo": ["<workflow>", "label:<name>"]}`,
   empty by default), and post a reviewer ping comment that ends with the AI tag. Reviewer requests, `gh pr
   ready` without the user's recorded yes and merges outside `delivery.auto_merge_repos` stay refused. `pr_idle`
-  names the ping (once per quiet stretch) after `pr_babysit.ping_after_h` (24; 0: no ping). A PR in
+  names the ping (once per quiet stretch, with the idle report at `idle_h`). A PR in
   `pr_babysit.no_post_prs` (`owner/repo#N`) gets no comment, edit, dispatch or `ttp push --own`: the
   project fixes and answers it by local commits and tells the user, who pushes. Through the gh route the
   workstation runs a dispatch or label only on an open PR its own gh user opened.

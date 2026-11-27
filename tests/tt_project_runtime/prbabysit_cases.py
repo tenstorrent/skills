@@ -159,12 +159,11 @@ def test_prbabysit_disabled_runs_nothing(env, monkeypatch):
     assert not [k for k, _ in _pb_events(p) if k in ("pr_ci_not_run", "pr_idle")]
 
 
-def test_prbabysit_defaults_and_extra_prs_enter_the_watch_even_while_gh_is_logged_out(env, monkeypatch):
+def test_prbabysit_defaults_and_purview_extra_prs_enter_the_watch_even_while_gh_is_logged_out(env, monkeypatch):
     from ttp import prbabysit, watchers
-    assert prbabysit.settings({}) == {"enabled": True, "idle_h": 24, "extra_prs": [], "dispatch": {}, "ping_after_h": 24,
-                                       "no_post_prs": []}
+    assert prbabysit.settings({}) == {"enabled": True, "idle_h": 24, "dispatch": {}, "no_post_prs": []}
     _logged_out()
-    p, d, _ = _pb_run(env, monkeypatch, _pb_pr(), cfg={"pr_babysit.extra_prs": ["acme/widgets#9"]}, task=False)
+    p, d, _ = _pb_run(env, monkeypatch, _pb_pr(), cfg={"watchers.purview_extra": ["acme/widgets#9"]}, task=False)
     seen = []
     monkeypatch.setattr(watchers, "_read_anon", lambda daemon, order, results: seen.extend(
         t["pr_url"] for t in order) or None)
@@ -174,6 +173,18 @@ def test_prbabysit_defaults_and_extra_prs_enter_the_watch_even_while_gh_is_logge
     seen.clear()
     watchers.watch_prs(d)   # a recorded purview PR is read too, and a known record does not stop the run
     assert set(seen) == {"https://github.com/acme/widgets/pull/5", "https://github.com/acme/widgets/pull/9"}, seen
+
+
+def test_prbabysit_a_purview_extra_owner_repo_number_is_read_and_owned(env, monkeypatch):
+    from ttp import prbabysit, watchers
+    _pb_gh(monkeypatch)
+    p, d, _ = _pb_run(env, monkeypatch, _pb_pr(url="https://github.com/acme/widgets/pull/9", headRefName="b9"),
+                      cfg={"watchers.purview_extra": ["acme/widgets#9"]}, task=False)
+    url = "https://github.com/acme/widgets/pull/9"
+    assert url in watchers._purview_scope(d)[2]
+    p.db.set_kv("pr_purview", {"at": time.time(), "prs": {url: {"branch": "b9"}}})
+    watchers.watch_prs(d)
+    assert prbabysit.owned(p.db) == {"acme/widgets#9": "b9"}, p.db.kv("pr_babysit", {})
 
 
 def test_prbabysit_an_idle_purview_pr_is_read_every_sweep_not_daily(env, monkeypatch):
@@ -264,16 +275,14 @@ def test_prbabysit_no_post_prs_refuse_comments_edits_dispatch_and_the_push(env, 
 def test_prbabysit_new_settings_default(env):
     from ttp import prbabysit
     assert prbabysit.settings({}) == prbabysit.DEFAULTS and prbabysit.DEFAULTS["dispatch"] == {}
-    assert prbabysit.DEFAULTS["ping_after_h"] == 24 and prbabysit.DEFAULTS["no_post_prs"] == []
-    assert prbabysit.settings({"pr_babysit": {"ping_after_h": 0}})["ping_after_h"] == 0
+    assert prbabysit.DEFAULTS["no_post_prs"] == [] and "extra_prs" not in prbabysit.DEFAULTS
     assert make(env).config()["pr_babysit"] == prbabysit.DEFAULTS
 
 
 @pytest.mark.parametrize("cfg,want,absent", [
     ({}, "Ping them once", "No-post"),
-    ({"pr_babysit.ping_after_h": 0}, "rev1", "Ping them"),
     ({"pr_babysit.no_post_prs": ["acme/widgets#7"]}, "No-post PR: tell the user", "Ping them")])
-def test_prbabysit_pr_idle_text_follows_ping_after_h_and_no_post_prs(env, monkeypatch, cfg, want, absent):
+def test_prbabysit_pr_idle_text_names_the_ping_unless_the_pr_is_no_post(env, monkeypatch, cfg, want, absent):
     from ttp import watchers
     old = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() - 50 * 3600))
     pr = _pb_pr(updatedAt=old, reviewRequests=[{"__typename": "User", "login": "rev1"}],
@@ -284,6 +293,8 @@ def test_prbabysit_pr_idle_text_follows_ping_after_h_and_no_post_prs(env, monkey
     watchers.watch_prs(d)
     text = [t for k, t in _pb_events(p) if k == "pr_idle"]
     assert len(text) == 1 and want in text[0] and absent not in text[0], text
+    watchers.watch_prs(d)
+    assert len([k for k, _ in _pb_events(p) if k == "pr_idle"]) == 1, "the same quiet period is reported once"
 
 
 def test_prbabysit_guard_covers_gh_api_writes_to_a_no_post_pr_and_workflow_dispatches(env):

@@ -587,18 +587,16 @@ DEFAULT_CONFIG: dict[str, Any] = {
     # however many tasks name it; with no deadline_s in its payload, its deadline grows with the PR count
     # (up to 300 s). A schedule's payload may set any of them for itself.
     # gh_anon_cap: anonymous GitHub calls an hour from this host while gh is logged out (ghanon; 0: none).
-    # purview_extra: PR URLs, or owner/repo names whose open PRs on the project's branches it also watches,
+    # purview_extra: PR URLs, owner/repo#N, or owner/repo names whose open PRs on the project's branches it also watches,
     # beyond those its own records find (the push branch, its tasks' branches and PRs). Shipped empty.
     "watchers": {"deadline_s": 90, "gh_timeout_s": 20, "pr_workers": 4, "pr_timeout_s": 60, "gh_anon_cap": 30,
                  "purview_extra": []},
     # pr_babysit: the model-free sweep of every open PR the project owns, draft or not (prbabysit): events
     # pr_ci_not_run and pr_idle, and a chat line per status change. idle_h: quiet hours before pr_idle.
-    # extra_prs: 'owner/repo#N' PRs it owns though no record of its own names them.
     # dispatch: {'owner/repo': [workflow names or 'label:<name>']} the guard lets a worker dispatch or label on
-    # an owned PR. ping_after_h: quiet hours before pr_idle names a reviewer ping (0: none). no_post_prs:
-    # 'owner/repo#N' PRs that get no comment, edit, dispatch or push: fixes stay local commits.
-    "pr_babysit": {"enabled": True, "idle_h": 24, "extra_prs": [], "dispatch": {}, "ping_after_h": 24,
-                   "no_post_prs": []},
+    # an owned PR. no_post_prs: 'owner/repo#N' PRs that get no comment, edit, dispatch or push: fixes stay
+    # local commits. PRs to watch beyond its own records go in watchers.purview_extra (owner/repo#N too).
+    "pr_babysit": {"enabled": True, "idle_h": 24, "dispatch": {}, "no_post_prs": []},
     # credentials false: this project keeps no GitHub login here, so no alert suggests `gh auth login`.
     "gh": {"credentials": True},
     # Who hears of a heal check its self-fix task could not repair (a heal block's own `escalate`

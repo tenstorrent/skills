@@ -26,7 +26,7 @@ KEY = "pr_babysit"           # {pr_key: {"told": {condition: value}, "idle": mar
 FLOWS_KEY = "pr_workflows"   # {"owner/repo:path:blob": {"at": ts, "info": {"name", "file", "manual", "trigger", "labels"}}}
 READ_S = 900                 # a PR no task opened is read this often while the sweep is on
 DEFAULTS = project.DEFAULT_CONFIG["pr_babysit"]
-PING = "This PR has had no activity for a day: a review or a reply would unblock it. Thank you."
+PING = "This PR has had no recent activity: a review or a reply would unblock it. Thank you."
 
 
 def settings(cfg: dict | None) -> dict:
@@ -243,10 +243,9 @@ def sweep(daemon, t: dict, pr: dict, sig: dict, gh) -> None:
         hours = (now - last) / 3600 if last else 0
         who = [r.get("login") or r.get("name") for r in pr.get("reviewRequests") or []]
         quiet = key.lower() in {k.lower() for k in cfg["no_post_prs"]}
-        ping = "" if quiet or not who or not 0 < float(cfg["ping_after_h"]) <= hours else \
-            f" Ping them once (a comment ending with the AI tag): {PING!r}"   # the ping is activity: once per quiet period
-        if last and hours >= float(cfg["idle_h"]) and state.get("idle") != (mark := [last, bool(ping)]):   # again when the ping falls due
-            state["idle"] = mark
+        ping = "" if quiet or not who else f" Ping them once (a comment ending with the AI tag): {PING!r}"
+        if last and hours >= float(cfg["idle_h"]) and state.get("idle") != last:   # the ping is activity: once per quiet period
+            state["idle"] = last
             events.append(("pr_idle", f"PR {url} idle for {hours:.0f} h (no commit, review, comment or check "
                            f"activity). Requested reviewers: {', '.join(x for x in who if x) or 'none'}."
                            f"{' No-post PR: tell the user, post nothing.' if quiet else ''}{ping}"))
