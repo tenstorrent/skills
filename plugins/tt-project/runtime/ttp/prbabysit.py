@@ -295,7 +295,7 @@ def route_check(daemon) -> None:
         return   # this silence is already told
     db.set_kv(ROUTE_KEY, told)
     step = (f"run `ttp bridge gh-pull` on your workstation to drain the gh queue"
-            if alias == ghroute.WORKSTATION else
+            if alias.lower() == ghroute.WORKSTATION else
             f"bring the machine behind ssh alias {alias!r} back, or fix delivery.gh_route")
     text = (f"PR watch is blind: the gh route {alias!r} PRs are read through has not answered for "
             f"{silent / 3600:.0f} h. {step}.")
@@ -325,7 +325,6 @@ def overlap_check(daemon, gh) -> None:
             shared = sorted(set(known[a]) & set(known[b]))
             if shared:
                 pairs.append((a, b, shared))
-    db.set_kv(OVERLAP_KEY, {f"{a}|{b}": 1 for a, b, _ in pairs})   # a pair that stops overlapping is told again when it returns
     for a, b, shared in pairs:
         if f"{a}|{b}" in had:
             continue   # once per pair while the overlap stands
@@ -333,6 +332,8 @@ def overlap_check(daemon, gh) -> None:
         _post_event(daemon, "pr_overlap",
                f"PRs {_pr_link(a)} and {_pr_link(b)} change the same files ({shown}): the projects behind "
                "them must coordinate - one carries the change and the version bump, the other rebases.", None)
+    # the marks go down only once every event is posted: a failed post must not silence a pair
+    db.set_kv(OVERLAP_KEY, {f"{a}|{b}": 1 for a, b, _ in pairs})   # a pair that stops overlapping is told again when it returns
 
 
 def _post_event(daemon, kind: str, text: str, task) -> None:
