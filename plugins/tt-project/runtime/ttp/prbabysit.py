@@ -298,7 +298,7 @@ def route_check(daemon) -> None:
             f"bring the machine behind ssh alias {alias!r} back, or fix delivery.gh_route")
     text = (f"PR watch is blind: the gh route {alias!r} PRs are read through has not answered for "
             f"{silent / 3600:.0f} h. {step}.")
-    _event(daemon, "pr_route_silent", text, None)
+    _post_event(daemon, "pr_route_silent", text, None)
 
 
 def overlap_check(daemon, gh) -> None:
@@ -328,12 +328,12 @@ def overlap_check(daemon, gh) -> None:
         if f"{a}|{b}" in had:
             continue   # once per pair while the overlap stands
         shown = ", ".join(shared[:5]) + (f" and {len(shared) - 5} more" if len(shared) > 5 else "")
-        _event(daemon, "pr_overlap",
-               f"PRs {_link(a)} and {_link(b)} change the same files ({shown}): the projects behind "
+        _post_event(daemon, "pr_overlap",
+               f"PRs {_pr_link(a)} and {_pr_link(b)} change the same files ({shown}): the projects behind "
                "them must coordinate - one carries the change and the version bump, the other rebases.", None)
 
 
-def _event(daemon, kind: str, text: str, task) -> None:
+def _post_event(daemon, kind: str, text: str, task) -> None:
     from . import screen as scr
     db = daemon.p.db
     status = "muted" if scr.count_muted(db, "pr", text, "normal") else "queued"
@@ -341,7 +341,7 @@ def _event(daemon, kind: str, text: str, task) -> None:
          (time.time(), "pr", kind, "normal", text, status, task))
 
 
-def _link(key: str) -> str:
+def _pr_link(key: str) -> str:
     """`[owner/repo#N](url)` for a pr key."""
     return f"[{key}](https://github.com/{key.split('#')[0]}/pull/{key.split('#')[1]})"
 
