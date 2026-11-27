@@ -178,7 +178,6 @@ def hist_end(db, ref: str, now: float, h: dict | None = None, jh: list | None = 
     `h` is eta.history's result, read once per caller. `jh` is a one-slot holder for the job history
     (etajobs.job_history), loaded only when the task is no code task and has registry entries, the
     same lazy read as _Est.jobs."""
-
     if ref.startswith("o"):
         from . import eta, obligations
         o = obligations.get(db, ref)
