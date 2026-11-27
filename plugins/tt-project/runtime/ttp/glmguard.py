@@ -386,7 +386,7 @@ RULES = (
 )
 _DELETES = re.compile(r"\b(?:rm|rmdir|shred|unlink|truncate|chmod|chown|chgrp) target\b|\bmv source\b|\bdd of=|sed -i")
 _NEW_ONLY = re.compile(r"\b(?:mkdir|touch) target\b")
-_TMP = ("/tmp", "/var/tmp")
+_TMP = ("/tmp", "/var/tmp", "/dev/shm")
 
 
 def _local_rule(why: str) -> str:
@@ -641,8 +641,8 @@ def _open_write(path: str, home: str) -> bool:
     lands below (never on) the home folder or a shared temp dir (_TMP), with no glob or expansion, in or holding
     no hidden entry of the home, ~/bin or ~/Library/LaunchAgents (sidefx.home_entry: credentials, config, the
     agents' hook settings, shell startup files, ~/.local), protected path (pathguard.roots, credguard.read_refusal)
-    or the harness's folder (but for its work folders, HOME_WORK), not in another project's folder, and in nothing
-    another user owns."""
+    or the harness's folder (but for its work folders, HOME_WORK) or its `ttp-<uid>` scratch folder in a temp dir, not
+    in another project's folder, and in nothing another user owns."""
     from . import credguard, pathguard, project, sidefx
     tops = [os.path.normpath(t) for t in (home, *_TMP) if t and os.path.normpath(t) != "/"]
     spellings = {os.path.normpath(path), os.path.realpath(path)}
@@ -652,7 +652,7 @@ def _open_write(path: str, home: str) -> bool:
     if re.search(r"[*?\[{$`]", path) or not all(sidefx._inside(p, tops) and p not in tops for p in spellings) or any(
             pathguard._holds(p, pathguard.roots()) or any(sidefx.home_entry(p, h) for h in homes)
             or credguard.read_refusal(p, search=True, home=home) or _other_project(p)
-            or any(sidefx._inside(r, [p]) for r in harness)
+            or any(sidefx._inside(r, [p]) for r in harness) or sidefx._inside(p, [f"{t}/ttp-{os.getuid()}" for t in _TMP])
             or sidefx._inside(p, harness) and not sidefx._inside(p, work) for p in spellings):
         return False
     top = os.path.realpath(path)
@@ -1133,12 +1133,46 @@ def secret_in(text: str) -> str | None:
 _PY_C = re.compile(r'(^|[;&|(\n]|\b(?:do|then|else)\s)(\s*python[\d.]*\s+-c\s+)"((?:[^"\\`]|\\[^`])*)"')
 
 
+def _judge_loads(view: str, env) -> bool:
+    """The run-time judge (pyaudit) loads in a python started with `env`, and no `PYTHON*`, `env` or `unset` word of
+    `view` can drop it."""
+    from . import pyproof
+    return pyproof._audited(env) and not re.search(r"PYTHON\w*|(?<![\w./-])(?:env|unset)\s", view)
+
+
 def _audited_code(view: str, env) -> str:
     """`view` with each such python code blanked while the run-time judge loads in a python started with `env`."""
-    from . import pyproof
-    if not pyproof._audited(env) or re.search(r"PYTHON\w*|(?<![\w./-])(?:env|unset)\s", view):
+    if not _judge_loads(view, env):
         return view
     return _PY_C.sub(lambda m: m[0] if "$(" in m[3] else m[1] + m[2] + '"' + " " * len(m[3]) + '"', view)
+
+
+# the commands that may share a line with a python script a heredoc wrote: none of them runs the file as shell text
+_SCRIPT_LINE = GUARD_READERS | {"cd", "echo", "mkdir", "true"}
+
+
+def _python_script_body(cmd: str, lines: list[str], i: int, pos: int, env) -> bool:
+    """The quoted heredoc at `pos` of `lines[i]` is `cat > FILE <<'EOF'` (one file), the run-time judge loads, and
+    every command of the line is that `cat`, a plain reader, or a bare `python FILE` that keeps the judge (no path,
+    wrapper, assignment, substitution or function that could stand in for it): python code judged as it runs like
+    `python3 - <<'EOF'`, never shell text."""
+    from . import hook, pyproof
+    piece = hook._piece_at(lines[i], pos)[0]
+    words = hook._split(cmd)[0]
+    files = [os.path.basename(m[2]) for m in hook.REDIRECT_RE.finditer(piece)]
+    if not (hook.HEREDOC_RE.match(lines[i], pos)[2] and hook._first_word(piece) == "cat" and len(files) == 1
+            and _judge_loads(words, env)) or re.search(
+            r"(?:^|[\s;&|(])[A-Za-z_]\w*=|\w\s*\(\)|\b(?:sudo|doas|exec|su)\s|\$\(|`|[<>]\(", words + "\n".join(lines)):
+        return False
+    runs = 0
+    for argv in hook._all_segments(words):
+        if argv[0] in _SCRIPT_LINE:
+            continue
+        if not (re.fullmatch(r"python[\d.]*", argv[0]) and pyproof._keeps_site(argv)
+                and [os.path.basename(f) for f in hook._run_files(argv)] == files):
+            return False
+        runs += 1
+    return runs > 0
 
 
 def shell_refusal(cmd: str, cwd: str, run_dir: str = "", env=None, remote: bool = False, writes: bool = True,
@@ -1159,7 +1193,8 @@ def shell_refusal(cmd: str, cwd: str, run_dir: str = "", env=None, remote: bool 
     view = "\n".join([hook._split(cmd)[0]] + [
         ln for i, body, pos in bodies if not hook._data_body(lines, i, pos) and not (
             hook.HEREDOC_RE.match(lines[i], pos)[2]
-            and pathguard.INTERPRETER_RE.match(hook._first_word(hook._piece_at(lines[i], pos)[0])))
+            and pathguard.INTERPRETER_RE.match(hook._first_word(hook._piece_at(lines[i], pos)[0]))
+            or _python_script_body(cmd, lines, i, pos, e))
         for ln in body])
     # an identity set to the value it already has (`TTP_PROJECT=<this run's TTP_PROJECT> ttp ...`) edits nothing
     same = SAME_ID.sub(lambda m: " " * len(m[0]) if m[3] and m[3] == e.get(m[1]) else m[0], view)

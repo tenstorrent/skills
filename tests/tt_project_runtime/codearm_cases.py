@@ -3189,3 +3189,78 @@ def test_inline_python_code_with_an_expansion_runs_under_the_run_time_judge(cmd,
     assert glmguard.shell_refusal(cmd, str(tmp_path), "", env={})   # refused up front with no run-time judge
     kind, rc, text = _glm_staged(monkeypatch, tmp_path, cmd, run=allowed)
     assert (kind == "plain" and rc == 0 and text == "a\nb\n") if allowed else kind == "deny", text
+
+
+_HANDOFF = ("cat > $TMPDIR/hand.py <<'EOF'\nimport json\n"
+            "env = {'TTP_RUN_DIR': 'x'}   # a name set, in shell text\n"
+            "json.dump(env, open('result.json', 'w'))\nEOF\n")
+
+
+@_pytest.mark.parametrize("cmd,allowed", [
+    (_HANDOFF + "python3 $TMPDIR/hand.py", True),             # python source, judged as it runs
+    (_HANDOFF + "python3 -u $TMPDIR/hand.py | head -3", True),
+    (_HANDOFF + "python3 -I $TMPDIR/hand.py", False),         # -I drops the judge
+    (_HANDOFF + "bash $TMPDIR/hand.py", False),               # a shell would run it as shell text
+    (_HANDOFF + "cp $TMPDIR/hand.py $TMPDIR/hand.sh; python3 $TMPDIR/hand.py", False),
+    (_HANDOFF + "env PYTHONPATH= python3 $TMPDIR/hand.py", False),
+    (_HANDOFF + "python3 < $TMPDIR/hand.py; python3 $TMPDIR/hand.py", False),
+    (_HANDOFF + "python3 $TMPDIR/hand.py; bash $TMPDIR/hand.*", False),           # a glob or `find -exec` runs it as shell
+    (_HANDOFF + "python3 $TMPDIR/hand.py; find $TMPDIR -type f -exec bash {} \\;", False),
+    (_HANDOFF.replace("hand.py <<", "hand.py > $TMPDIR/b.sh <<") + "bash $TMPDIR/b.sh", False),   # a second file
+    (_HANDOFF + "sudo python3 $TMPDIR/hand.py", False), (_HANDOFF + "./python3 $TMPDIR/hand.py", False),
+    (_HANDOFF + "PATH=$TMPDIR:$PATH python3 $TMPDIR/hand.py", False),
+    (_HANDOFF + "(PATH=$TMPDIR:$PATH python3 $TMPDIR/hand.py)", False),   # a subshell's assignment too
+    (_HANDOFF + "BASH_ENV=$TMPDIR/hand.py python3 $TMPDIR/hand.py", False),
+    (_HANDOFF + 'python3 $TMPDIR/hand.py; echo "$(bash $TMPDIR/hand.py)"', False),   # a substitution runs it
+    (_HANDOFF + "python3 $TMPDIR/hand.py 2> >(bash $TMPDIR/hand.py)", False)])
+def test_a_python_script_written_by_a_heredoc_and_run_by_python_is_judged_as_it_runs(cmd, allowed, monkeypatch, tmp_path):
+    """cells: handoff_heredoc. The body of `cat > FILE <<'EOF'` that only `python FILE` runs is python code the
+    run-time judge watches, like `python3 - <<'EOF'`: a name in a string of it is no write target. Any other use of
+    the file keeps the body shell text, and no judge means no pass."""
+    from ttp import glmguard
+    wt, rd = _glm_run_env(monkeypatch, tmp_path)
+    monkeypatch.setenv("TMPDIR", str(rd / "tmp"))
+    _audited_env(monkeypatch, tmp_path)
+    assert bool(glmguard.shell_refusal(cmd, str(wt), str(rd), env=dict(os.environ))) != allowed
+    if allowed:
+        monkeypatch.delenv("PYTHONPATH")
+        monkeypatch.delenv("TTP_PYAUDIT_POLICY")
+        assert glmguard.shell_refusal(cmd, str(wt), str(rd), env=dict(os.environ))   # no judge: refused
+
+
+@_pytest.fixture(autouse=True)
+def _glm_tmp_tops_leave_the_test_base_temp(tmp_path_factory, monkeypatch):
+    """A shared temp top the tests' own folders sit in (/dev/shm on a RAM-disk suite) is no scratch for the guard's
+    cases: a path 'outside the worktree' stays outside. The /dev/shm cases put the tops back."""
+    from ttp import glmguard
+    base = str(tmp_path_factory.getbasetemp()) + "/"
+    monkeypatch.setattr(glmguard, "_TMP", tuple(t for t in glmguard._TMP if not base.startswith(t + "/")))
+
+
+@_pytest.mark.parametrize("cmd,allowed", [
+    ("mkdir /dev/shm/x-{n} && echo 1 > /dev/shm/x-{n}/a && rm -rf /dev/shm/x-{n}", True),
+    ('rm -rf "${{TTP_RUN_DIR:?}}"/tmp/x', True), ("rm -rf ${{HOME:?}}/work-{n}", True),
+    ("rm -rf /dev/shm/ttp-{uid}/x", False), ("echo x > /tmp/ttp-{uid}/y", False),
+    ("rm -rf ${{TTP_RUN_DIR?need}}/tmp/x", True),
+    ("rm -rf /dev/shm", False), ("rm -rf /dev/shm/../etc", False), ("rm -rf ${{TTP_RUN_DIR:?}}/../../../../../../../etc/x", False),
+    ("echo x > /dev/shm/../etc/x", False), ("echo x > /dev/null/../x", False)])
+def test_a_glm_run_uses_dev_shm_like_tmp_and_reads_a_checked_run_dir_expansion(cmd, allowed, monkeypatch, tmp_path):
+    """cells: shm_and_checked_expansion. A new /dev/shm entry is scratch like one in /tmp (the top itself and a
+    `..` out of it are not), and `${TTP_RUN_DIR:?}` names the run folder where it is set, else the shell stops."""
+    from ttp import glmguard
+    monkeypatch.setattr(glmguard, "_TMP", ("/tmp", "/var/tmp", "/dev/shm"))
+    wt, rd = _glm_run_env(monkeypatch, tmp_path)
+    cmd = cmd.format(n=f"{os.getpid()}-{tmp_path.name}", uid=os.getuid())
+    assert bool(glmguard.shell_refusal(cmd, str(wt), str(rd), env=dict(os.environ))) != allowed
+
+
+def test_a_glm_run_keeps_the_judge_out_of_an_env_dash_i_test_run_and_refuses_a_hidden_home_basetemp(monkeypatch, tmp_path):
+    """`env -i` drops the run-time judge from the tests' python, and a hidden home entry is outside the bar:
+    both stay refused."""
+    from ttp import glmguard
+    wt, rd = _glm_run_env(monkeypatch, tmp_path)
+    _audited_env(monkeypatch, tmp_path)
+    env = dict(os.environ)
+    assert glmguard.shell_refusal("env -i HOME=$HOME PATH=/usr/bin python3 -m pytest -q t.py", str(wt), str(rd), env=env)
+    assert glmguard.shell_refusal(f"python3 -m pytest -q --basetemp={Path.home()}/.zz t.py && rm -rf {Path.home()}/.zz",
+                                  str(wt), str(rd), env=env)

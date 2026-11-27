@@ -84,8 +84,9 @@ ASSIGN_RE = re.compile(r"[A-Za-z_]\w*=.*", re.S)
 
 def _expand(path: str, home: str, cwd: str, run_dir: str, base: str | None = None) -> str:
     p = path.strip("'\"")
-    p = re.sub(r"^\$\{?TTP_RUN_DIR\}?", run_dir, p)
-    p = re.sub(r"^\$\{?HOME\}?", home, p)
+    # `${NAME:?}` (`:?msg`) is the value where it is set, else the shell stops before it writes
+    p = re.sub(r"^\$(?:\{TTP_RUN_DIR(?::?\?[^}$`]*)?\}|\{?TTP_RUN_DIR\}?)", run_dir, p)
+    p = re.sub(r"^\$(?:\{HOME(?::?\?[^}$`]*)?\}|\{?HOME\}?)", home, p)
     if p == "~" or p.startswith("~/"):
         p = home + p[1:]
     if not p.startswith("/"):

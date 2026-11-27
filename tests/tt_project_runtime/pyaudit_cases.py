@@ -101,7 +101,7 @@ def test_pyaudit_allows_ordinary_work(env, cred_home):
 def test_pyaudit_glm_run_writes_only_in_its_roots(env, cred_home):
     e = _pa_env(cred_home, glm=True)
     assert "glm" in json.loads(e["TTP_PYAUDIT_POLICY"])
-    out = cred_home.run.parent / "elsewhere"
+    out = cred_home.home / ".elsewhere"   # a hidden home entry: a shared temp dir (a RAM-disk suite's) is open to a write
     out.mkdir()
     r = _pa_run(e, f"open({str(out / 'x')!r}, 'w')", cred_home.work)
     assert "outside its worktree" in r.stderr and not (out / "x").exists()
