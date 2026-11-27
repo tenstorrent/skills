@@ -23481,3 +23481,94 @@ def test_a_batch_rerun_of_a_check_that_sets_its_own_pythonpath_loads_the_select_
         assert "ImportError" not in tail and rc == 1 and _passed_failed(tail) == (0, 1), tail
     sel = gatejudge.select_env(["test_x.py::test_other"], clean)
     assert push.check_argv("PYTHONPATH= pytest", None, sel)[-1].split()[0].endswith(os.sep + "pytest_resume")
+
+
+def _upstream_merged_both_sides(env, monkeypatch, n):
+    """A push branch and a task branch that each merged the same `n` upstream commits, which forked
+    from before the task did: the two then have two merge bases (the task's fork point and the
+    upstream tip). The task's own change is re-landed under another commit on the push branch.
+    Returns (p, repo, branch, head, relanded)."""
+    p, repo, origin, other = _push_setup(env, monkeypatch, ["true"])
+    old = _git_out(other, "rev-parse", "HEAD")
+    _commit(other, "fork.txt", "the task forks here\n")
+    _git_out(other, "push", "-q", "origin", "HEAD:proj")
+    _git_out(repo, "fetch", "-q", "origin")
+    stream = []
+    for i in range(n):
+        body, msg = f"upstream {i}\n", f"upstream {i}"
+        stream.append(f"commit refs/heads/up\ncommitter t <t@t> {1_700_000_000 + i} +0000\n"
+                      f"data {len(msg)}\n{msg}\n" + (f"from {old}\n" if i == 0 else "")
+                      + f"M 644 inline up/{i}.txt\ndata {len(body)}\n{body}\n")
+    subprocess.run(["git", "-C", str(other), "fast-import", "--quiet"], input="".join(stream), text=True,
+                   check=True)
+    _git_out(other, "push", "-q", "origin", "up")
+    tid, path, branch = _code_task(p, "own change", status="review")
+    _commit(path, "own.txt", "the task's own change\n")
+    _git_out(path, "fetch", "-q", "origin", "up")
+    _git_out(path, "merge", "-q", "--no-edit", "FETCH_HEAD")
+    head = _git_out(path, "rev-parse", "HEAD")
+    _git_out(other, "merge", "-q", "--no-edit", "up")
+    (other / "own.txt").write_text("the task's own change\n")
+    _git_out(other, "add", "own.txt")
+    _git_out(other, "commit", "-qm", "re-land of the change under another task")
+    relanded = _git_out(other, "rev-parse", "HEAD")
+    _git_out(other, "push", "-q", "origin", "HEAD:proj")
+    _git_out(repo, "fetch", "-q", "origin")
+    return p, repo, branch, head, relanded
+
+
+def test_landed_equivalent_reads_only_the_task_own_commits_when_both_sides_merged_upstream(env, monkeypatch):
+    """A task branch that merged 300 upstream commits the push branch also merged: its keys come from
+    its own commit alone, not from the upstream ones a merge base at the fork point would add."""
+    from ttp import landed
+    p, repo, branch, head, relanded = _upstream_merged_both_sides(env, monkeypatch, 300)
+    scanned = []
+    keys = landed._keys
+
+    def spy(repo, args, skip):
+        out = keys(repo, args, skip)
+        scanned.append((args, out))
+        return out
+
+    monkeypatch.setattr(landed, "_keys", spy)
+    assert landed.equivalent(p, branch, None) == (relanded, head)
+    mine = scanned[0][1]
+    assert [sha for sha, _ in mine] == [_git_out(repo, "rev-parse", f"{head}^1")], "the task's own commit only"
+    assert len(scanned[1][1]) == 1, "the push branch's own commits only"
+
+
+def test_landed_equivalent_does_not_rerun_a_timed_out_scan_until_a_head_moves(env, monkeypatch):
+    """A scan that hit its time limit raises as before, but the same heads raise it again without
+    rerunning git; a moved branch head scans afresh. A call that never started (its tick's budget
+    spent) is not kept."""
+    from ttp import gitmemo, landed
+    p, repo, origin, other = _push_setup(env, monkeypatch, ["true"])
+    monkeypatch.setattr(landed, "_timed_out", {})
+    tid, path, branch = _code_task(p, "slow scan", status="review")
+    _commit(path, "slow.txt", "slow\n")
+    _commit(other, "neighbour.txt", "someone else\n")
+    _git_out(other, "push", "-q", "origin", "HEAD:proj")
+    _git_out(repo, "fetch", "-q", "origin")
+    git, logs, fail = landed._git, [], [subprocess.TimeoutExpired(["git", "log"], 60)]
+
+    def slow(repo, *args, timeout=30):
+        if args[0] == "log":
+            logs.append(args)
+            raise fail[0]
+        return git(repo, *args, timeout=timeout)
+
+    monkeypatch.setattr(landed, "_git", slow)
+    for _ in range(2):
+        with pytest.raises(subprocess.TimeoutExpired):
+            landed.equivalent(p, branch, None)
+    assert len(logs) == 1, "the same heads do not rerun the scan"
+    _commit(path, "more.txt", "more\n")
+    with pytest.raises(subprocess.TimeoutExpired):
+        landed.equivalent(p, branch, None)
+    assert len(logs) == 2, "a moved head reruns it"
+    _commit(path, "again.txt", "again\n")
+    fail[0] = gitmemo.Spent(["git", "log"], 25)
+    for _ in range(2):
+        with pytest.raises(subprocess.TimeoutExpired):
+            landed.equivalent(p, branch, None)
+    assert len(logs) == 4, "a call its budget never let start is not kept"

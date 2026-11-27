@@ -1058,6 +1058,11 @@ def _key_of(diff: str) -> str:
                           .encode()).hexdigest()
 
 
+# (repo, head, tip, skipped paths) -> the TimeoutExpired of a scan that hit its time limit: the same
+# heads raise it again without rerunning git; a moved head or tip scans afresh.
+_timed_out: dict[tuple, subprocess.TimeoutExpired] = {}
+
+
 def equivalent(p, branch: str, bump=None) -> tuple[str, str] | None:
     """(commit on the push branch, branch head) when `branch`'s change already landed there under
     other commits: each of its own commits, or its whole change at once (a squash), has the same
@@ -1082,12 +1087,25 @@ def equivalent(p, branch: str, bump=None) -> tuple[str, str] | None:
     except ValueError:
         cfg = None
     skip = (cfg["files"] + ([cfg["changeset_dir"]] if cfg["changeset_dir"] else [])) if cfg else []
-    mine = _keys(repo, [f"{base}..{head}"], skip)
+    seen = (str(repo), head, tip, tuple(skip))
+    if seen in _timed_out:
+        raise _timed_out[seen]
+    try:
+        # Each side's own commits: a branch that merged upstream commits the push branch also has
+        # (criss-cross history, whose merge base can be the old fork point) does not read them.
+        mine = _keys(repo, [f"{tip}..{head}"], skip)
+        theirs: dict[str, str] = {}
+        if mine:
+            for sha, key in _keys(repo, ["--max-count=500", f"{head}..{tip}"], skip):
+                theirs.setdefault(key, sha)
+    except subprocess.TimeoutExpired as e:
+        if not isinstance(e, gitmemo.Spent):
+            while len(_timed_out) >= 64:
+                _timed_out.pop(next(iter(_timed_out)))
+            _timed_out[seen] = e
+        raise
     if not mine:
         return None
-    theirs: dict[str, str] = {}
-    for sha, key in _keys(repo, ["--max-count=500", f"{base}..{tip}"], skip):
-        theirs.setdefault(key, sha)
     if all(key in theirs for _, key in mine):
         return theirs[mine[-1][1]], head
     whole = _git(repo, "diff", "-U0", "--no-renames", "--no-color", base, head, "--", ".",
