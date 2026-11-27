@@ -40,7 +40,8 @@ def _pr_record(d, repo: str, n: int) -> dict | None:
     title = str(d.get("title") or "")
     return {"repo": repo, "number": n, "url": str(d.get("html_url") or f"{repo}#{n}"),
             "title": title[:120] + ("…" if len(title) > 120 else ""),
-            "branch": str((d.get("head") or {}).get("ref") or "")}
+            "branch": str((d.get("head") or {}).get("ref") or ""),
+            "base": str((d.get("base") or {}).get("ref") or "")}
 
 
 def open_pr(p, task: dict, elsewhere: str) -> dict | None:
@@ -78,13 +79,16 @@ def file_bucket(path: str) -> str:
     return "code"
 
 
-def cumulative_stat(p, ref: str) -> dict | None:
-    """Branch `ref`'s cumulative diff against its merge base with its base branch (the remote's HEAD,
-    else the push branch): {adds, dels, files, base} and the same per category, or None when the
-    project's git cannot tell."""
+def cumulative_stat(p, ref: str, base_branch: str = "") -> dict | None:
+    """Branch `ref`'s cumulative diff against its merge base with its base branch (`base_branch` when
+    the PR names one, else the remote's HEAD, else the push branch): {adds, dels, files, base} and the
+    same per category, or None when `ref` is empty or the project's git cannot tell."""
     from . import worktree
+    if not ref:
+        return None
     push = str(((p.config().get("delivery") or {}).get("push_branch")) or "")
-    for base in ("origin/HEAD", *((f"origin/{push}",) if push else ())):
+    for base in (*((f"origin/{base_branch}",) if base_branch else ()), "origin/HEAD",
+                 *((f"origin/{push}",) if push else ())):
         try:
             rows = worktree._git(p.root, "diff", "--numstat", "--no-renames",
                                  f"{base}...{ref}").splitlines()
@@ -203,7 +207,7 @@ def budget_gate(p, task: dict | None, branch: str, ref: str = "") -> str:
         pr = open_pr(p, task or {}, branch)
         if not pr or pr["branch"] != branch:
             return ""
-        st = cumulative_stat(p, ref or branch)
+        st = cumulative_stat(p, ref or branch, pr["base"])
         if not st:
             return ""
         budget = plan_budget(p.db, f"{pr['repo']}#{pr['number']}")
@@ -250,8 +254,9 @@ def _review_prompt_lines(p, task: dict, elsewhere: str, head: str) -> list[str]:
         return []
     first = (f"PR {pr['url']} (\"{pr['title']}\") heads this change: judge the whole PR's cumulative "
              f"diff against its merge base, not only this change's own commits.")
-    for ref in (elsewhere, pr["branch"], head):
-        if st := cumulative_stat(p, ref):
+    # The reviewed head first: a local copy of the PR's branch may be behind the remote's.
+    for ref in (head, elsewhere, pr["branch"]):
+        if st := cumulative_stat(p, ref, pr["base"]):
             second = _stat_line(st, ref)
             break
     else:

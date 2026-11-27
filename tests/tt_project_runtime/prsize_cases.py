@@ -31,14 +31,15 @@ def _anon(env, monkeypatch, routes):
     return asked
 
 
-def _anon_pr_routes(closed, head=None, additions=None, repo="acme/widgets"):
+def _anon_pr_routes(closed, head=None, additions=None, repo="acme/widgets", base=None):
     """The stand-in's routes: the open PR headed by `head`, and closed PRs with `additions` details."""
     routes = {}
     if head:
         routes[f"/repos/{repo}/pulls?head={repo.split('/')[0]}:{head}&state=open&per_page=1"] = \
             (200, [{"number": 7, "state": "open", "title": "One big feature", "merged_at": None,
                     "html_url": f"https://github.com/{repo}/pull/7",
-                    "head": {"ref": head, "sha": "f" * 40}}])
+                    "head": {"ref": head, "sha": "f" * 40},
+                    **({"base": {"ref": base}} if base else {})}])
     routes[f"/repos/{repo}/pulls?state=closed&per_page=100&sort=updated&direction=desc"] = \
         (200, [{"number": n, "merged_at": "2026-01-01T00:00:00Z"} for n in closed])
     for n, adds in (additions or {}).items():
@@ -83,6 +84,7 @@ def test_a_task_that_opened_a_pr_is_judged_on_that_pr(env, monkeypatch):
     even when it carries no pr_branch: the block reads the PR by its number and state."""
     monkeypatch.delenv("TTP_TEST_PONYTAIL")
     p = make(env)
+    _git_out(p.root, "update-ref", "refs/remotes/origin/HEAD", _git_out(p.root, "rev-parse", "HEAD"))
     asked = _anon(env, monkeypatch, {
         "/repos/acme/widgets/pulls/7": (200, {"number": 7, "state": "open", "merged_at": None,
                                               "title": "One big feature",
@@ -99,6 +101,19 @@ def test_a_task_that_opened_a_pr_is_judged_on_that_pr(env, monkeypatch):
     assert "judge the whole PR's cumulative diff" in rev["spec"] and "acme/widgets/pull/7" in rev["spec"]
     assert "median 200, p90 300 added lines over 2 recent merges" in rev["spec"]
     assert "/repos/acme/widgets/pulls/7" in asked
+    assert "+5/-0 across 1 files" in rev["spec"], rev["spec"]   # the task's own head, not the checkout's
+
+
+def test_an_empty_ref_is_not_measured_as_the_checkouts_head(env):
+    """A ref of "" is no branch: git would read `origin/HEAD...` as `origin/HEAD...HEAD`."""
+    from ttp import prsize
+    p = make(env)
+    _git_out(p.root, "update-ref", "refs/remotes/origin/HEAD", _git_out(p.root, "rev-parse", "HEAD"))
+    (p.root / "app.py").write_text("x\n")
+    _git_out(p.root, "add", ".")
+    _git_out(p.root, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "work")
+    assert prsize.cumulative_stat(p, "HEAD")["adds"] == 1
+    assert prsize.cumulative_stat(p, "") is None
 
 
 def test_a_push_branch_delivery_heads_no_open_pr_and_gets_no_pr_block(env, monkeypatch):
@@ -158,7 +173,7 @@ def test_the_stat_splits_the_prs_cumulative_diff_into_code_tests_docs_and_genera
     assert prsize.cumulative_stat(p, "no-such-branch") is None
 
 
-def _over_budget_pr(env, monkeypatch, closed_adds=(700, 900)):
+def _over_budget_pr(env, monkeypatch, closed_adds=(700, 900), pr_base=None):
     """A project whose `feature/x` branch heads an open PR over its budget, and its task: the
     branch's cumulative diff is +5000 code, +100 tests; the repo norm comes from the closed PRs'
     added lines. Returns (p, task id), with TTP_TASK set to the task carrying the pr_branch."""
@@ -176,7 +191,8 @@ def _over_budget_pr(env, monkeypatch, closed_adds=(700, 900)):
     _git_out(p.root, "update-ref", "refs/heads/feature/x", "HEAD")
     nums = list(range(11, 11 + len(closed_adds)))
     _anon(env, monkeypatch, _anon_pr_routes(nums, head="feature/x",
-                                            additions={n: a for n, a in zip(nums, closed_adds)}))
+                                            additions={n: a for n, a in zip(nums, closed_adds)},
+                                            base=pr_base))
     monkeypatch.setattr("ttp.ghroute.repo_of", lambda cwd: "acme/widgets")
     t = p.db.add_task("Carry it", "s", kind="code", labels=["pr_branch:feature/x"])
     p.db.update_task(t, status="running", branch=f"ttp/t{t}-carry-it")
@@ -245,3 +261,22 @@ def test_the_budget_gate_sizes_what_the_push_leaves_on_the_branch_not_a_stale_lo
         push.own_target(p, p.root)
     prsize.record_plan(p.db, "acme/widgets#7", 9000, "1")
     assert prsize.plan_budget(p.db, "acme/widgets#7") == 9000
+
+
+def test_a_stacked_pr_is_sized_from_its_own_base_branch_not_the_default_branch(env, monkeypatch):
+    """A PR whose base is a feature branch with its own commits is sized from that branch's merge
+    base: against the default branch it would be over budget, from its base it is under."""
+    from ttp import push, prsize
+    p, _t = _over_budget_pr(env, monkeypatch, pr_base="feature/base")
+    big = _git_out(p.root, "rev-parse", "feature/x")
+    (p.root / "small.py").write_text("".join(f"{i}\n" for i in range(10)))
+    _git_out(p.root, "add", ".")
+    _git_out(p.root, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "the stacked work")
+    _git_out(p.root, "update-ref", "refs/heads/feature/x", "HEAD")
+    _git_out(p.root, "update-ref", "refs/remotes/origin/feature/base", big)
+    assert prsize.cumulative_stat(p, "feature/x")["adds"] == 5110    # from the default branch
+    st = prsize.cumulative_stat(p, "feature/x", "feature/base")
+    assert st["adds"] == 10 and st["base"] == "origin/feature/base", st
+    assert prsize.cumulative_stat(p, "feature/x", "no-such-base")["adds"] == 5110
+    assert prsize.budget_gate(p, None, "feature/x") == ""
+    assert push.own_target(p, p.root)[1] == "feature/x"
