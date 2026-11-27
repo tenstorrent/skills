@@ -377,11 +377,11 @@ def test_prbabysit_dispatch_keys_match_any_case_and_a_nameless_workflow_is_named
     assert [t for k, t in _pb_events(p) if k == "pr_ci_not_run" and "Nightly" in t], _pb_events(p)
 
 
-def _pb_route_state(alias: str, age_s: float) -> None:
+def _pb_route_state(alias: str, age_s: float, ok: bool = True) -> None:
     """The host-wide gh-route record: `alias` last answered `age_s` ago."""
     from ttp import ghauth, ghroute
     from ttp.project import write_json
-    write_json(ghauth._home(None) / ghroute.STATE, {"ok": True, "at": time.time() - age_s, "via": alias})
+    write_json(ghauth._home(None) / ghroute.STATE, {"ok": ok, "at": time.time() - age_s, "via": alias})
 
 
 def test_prbabysit_a_route_silent_past_24_h_gets_one_keyed_event_and_clears_when_it_answers(env):
@@ -404,6 +404,9 @@ def test_prbabysit_a_route_silent_past_24_h_gets_one_keyed_event_and_clears_when
     prbabysit.route_check(d)
     ev = [t for k, t in _pb_events(p) if k == "pr_route_silent"]
     assert len(ev) == 2 and "26 h" in ev[1], ev
+    _pb_route_state("box1", 0, ok=False)   # a route answering only with failures is still silent
+    prbabysit.route_check(d)
+    assert len([1 for k, _ in _pb_events(p) if k == "pr_route_silent"]) == 2, "a failing answer is no answer"
 
 
 def test_prbabysit_a_silent_workstation_queue_names_the_user_step(env):

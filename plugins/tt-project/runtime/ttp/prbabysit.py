@@ -279,13 +279,13 @@ def route_check(daemon) -> None:
     answered for over a day: the sweep is blind without saying so. Names the route, how long it has
     been silent and the user's own step to bring it back; fires once per silence and clears by itself
     once the route answers (its answer moves the silence window)."""
-    from . import ghroute, screen as scr
+    from . import ghroute
     alias = ghroute.route(getattr(daemon, "cfg", None), str(daemon.p.root))
     st = {} if ghroute.local_ok() or not alias else ghroute.last_answer()
     db, now = daemon.p.db, time.time()
-    if st.get("via") != alias or not st.get("at"):
-        db.set_kv(ROUTE_KEY, {})   # our route has never answered: the gh-auth condition covers that
-        return
+    if st.get("via") != alias or st.get("ok") is not True or not st.get("at"):
+        db.set_kv(ROUTE_KEY, {})   # a route that never answered, or one failing every call: the
+        return                      # gh-auth condition covers a route that answers with failures
     silent, told = now - float(st["at"]), {"via": alias, "at": float(st["at"])}
     if silent <= ROUTE_SILENT_S:
         if db.kv(ROUTE_KEY, {}):
@@ -348,8 +348,10 @@ def _pr_link(key: str) -> str:
 
 
 def _pr_files(db, gh, key: str, head, cwd: str) -> list[str] | None:
-    """The PR's changed file names, cached by its head: None while the read has no answer. A PR whose
-    head is unknown is read but not cached, so a new head is never judged by the old files."""
+    """The PR's changed file names (first 100: a PR touching more files is rare, and its overlap
+    with another PR would show in the first page), cached by its head: None while the read has no
+    answer. A PR whose head is unknown is read but not cached, so a new head is never judged by the
+    old files."""
     cache = db.kv(FILES_KEY, {}) or {}
     hit = cache.get(key)
     if head and hit and hit.get("head") == head and hit.get("files"):
