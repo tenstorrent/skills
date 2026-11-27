@@ -7004,6 +7004,44 @@ def test_checks_base_is_the_local_push_branch_only_in_a_repo_with_no_remote(env,
     assert cli._checks_base(None, repo, []) == ""
 
 
+def test_checks_judges_the_head_against_the_branch_it_lands_on(env, monkeypatch):
+    """A head stacked on another branch is judged against that branch: `--target` names it, and a task
+    whose `pr_branch` it lands on with `ttp push --own` uses it by itself. With delivery.own_push off
+    the task lands on the push branch, so that stays the base."""
+    from ttp import cli, push
+    for var, val in (("GIT_AUTHOR_NAME", "t"), ("GIT_AUTHOR_EMAIL", "t@t"),
+                     ("GIT_COMMITTER_NAME", "t"), ("GIT_COMMITTER_EMAIL", "t@t")):
+        monkeypatch.setenv(var, val)
+    p = make(env)
+    repo = env["repo"]
+    origin = env["tmp"] / "origin.git"
+    _bare_init(env, origin)
+    _remote_add(repo, origin)
+    p.set_config("delivery.push_branch", "proj")
+    proj = _git_out(repo, "rev-parse", "HEAD")
+    (repo / "src").mkdir()
+    _commit(repo, "src/x.py", "x\n")
+    feat = _git_out(repo, "rev-parse", "HEAD")
+    _git_out(repo, "push", "-q", "origin", f"{proj}:refs/heads/proj", f"{feat}:refs/heads/feat")
+    _git_out(repo, "fetch", "-q", "origin")
+    _commit(repo, "notes.txt", "notes\n")   # the head adds only notes on top of feat
+    check = push.check_list([SCOPED])
+    assert cli._checks_base(p, repo, []) == proj
+    assert push.applicable(repo, "HEAD", check, print, proj)[0] == check, "against proj, src/ changed"
+    assert cli._checks_base(p, repo, [], "feat") == feat
+    assert cli._checks_base(p, repo, [], "origin/feat") == feat
+    assert cli._checks_base(p, repo, [], feat) == feat, "any commit git resolves"
+    assert cli._checks_base(p, repo, [], "nosuch") == ""
+    assert push.applicable(repo, "HEAD", check, print, cli._checks_base(p, repo, [], "feat"))[0] == []
+    tid = p.db.add_task("Stacked", "s", kind="code", origin="coordinator", labels=["pr_branch:feat"])
+    monkeypatch.setenv("TTP_TASK", str(tid))
+    p.set_config("delivery.own_push", "on")
+    assert cli._checks_base(p, repo, []) == feat
+    assert cli._checks_base(p, repo, [], "proj") == proj, "--target wins over the task's branch"
+    p.set_config("delivery.own_push", "off")
+    assert cli._checks_base(p, repo, []) == proj
+
+
 def test_an_if_changed_check_fails_when_git_cannot_give_the_diff(env, monkeypatch, tmp_path):
     from ttp import push
     p, repo, origin, other = _push_setup(env, monkeypatch, [SCOPED])
@@ -11410,7 +11448,7 @@ def _derived_on_base(env, tmp_path, monkeypatch, head_seed: str):
     base = subprocess.run([*git, "rev-parse", "HEAD"], capture_output=True, text=True, check=True).stdout.strip()
     (repo / "tests" / "test_seed.py").write_text(head_seed)
     subprocess.run([*git, "commit", "-qam", "head"], check=True)
-    monkeypatch.setattr(cli, "_checks_base", lambda p, top, cmds: base)
+    monkeypatch.setattr(cli, "_checks_base", lambda p, top, cmds, target="": base)
     return p, started, base
 
 

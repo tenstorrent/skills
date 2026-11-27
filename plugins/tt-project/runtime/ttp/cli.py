@@ -4473,7 +4473,7 @@ def _prestage_skip(a, p: Project | None, top: str, head: str, tree: str, cmds: l
     from . import push
     if a.fresh:
         return ""
-    base = _checks_base(p, Path(top), cmds)
+    base = _checks_base(p, Path(top), cmds, a.target)
     try:
         todo, _ = push.applicable(Path(top), head, cmds, lambda m: None, base, candidate=purpose == "candidate")
     except push.ScopeError:
@@ -4575,6 +4575,7 @@ def _cmd_checks(a) -> None:
     from . import gatejudge
     from . import shorttmp
     spent0 = (time.monotonic(), os.times())   # wall_s, cpu_s in checks.json (ttp stats' CPU-hours per landing)
+    a.target = getattr(a, "target", None) or ""   # --target: the branch the head is judged against
     if getattr(a, "gap", None):
         from . import checkgaps
         p = here()
@@ -4691,7 +4692,7 @@ def _cmd_checks(a) -> None:
     print(checktree.line(head, top), flush=True)
     # The scan runs in the detached checks, not in their launcher: its caller (the daemon starting a
     # review's pre-checks) can wait for it holding the project's write turn, which the scan may need.
-    if not getattr(a, "detach", False) and (why := _checks_public_scan(p, top, head, d)):
+    if not getattr(a, "detach", False) and (why := _checks_public_scan(p, top, head, d, a.target)):
         die(f"ttp checks: {why}", 1)
     # A tree in the run's temporary folder is gone after the hand-off: detached checks would die with it.
     temp = checktree.temp_root(top, run_dir) if not getattr(a, "own_group", False) else ""
@@ -4725,9 +4726,9 @@ def _cmd_checks(a) -> None:
         not_run = [f"not run: candidate publication gate: {c}" for c in own if c.purpose == "candidate"]
         own = [c for c in own if c.purpose != "candidate"]
     elif harness_unset:
-        own = push.with_host(push.default_harness_checks(Path(top), _checks_base(p, Path(top), own), ""),
+        own = push.with_host(push.default_harness_checks(Path(top), _checks_base(p, Path(top), own, a.target), ""),
                              checks_host)
-    defaults = push.default_harness_checks(Path(top), _checks_base(p, Path(top), own)) if default_harness else []
+    defaults = push.default_harness_checks(Path(top), _checks_base(p, Path(top), own, a.target)) if default_harness else []
     if defaults:   # no configured harness plan: the built-in one qualifies the head
         own += defaults
         print(f"ttp checks: {source} has no purpose harness check; running the default harness plan "
@@ -4747,7 +4748,7 @@ def _cmd_checks(a) -> None:
         pyenv = runnerenv.ensure(lock)
     except runnerenv.Unavailable as e:
         print(f"ttp checks: not run: {e}", flush=True)
-        if lock is None or runnerenv.changed_by(top, cfg, _checks_base(p, Path(top), own), head):
+        if lock is None or runnerenv.changed_by(top, cfg, _checks_base(p, Path(top), own, a.target), head):
             sys.exit(1)
         from . import envfault
         fault = runnerenv.fault(lock, e)
@@ -4860,7 +4861,7 @@ def _cmd_checks(a) -> None:
                     elif checkprestage.run(pre, top, pre_env, say) if pre is not None else \
                             checkprestage.run_derived(p, ids, own, top, pre_env, say, run_dir,
                                                       base=_checks_judge_base(p, top, head,
-                                                                              _checks_base(p, Path(top), cmds))[0]):
+                                                                              _checks_base(p, Path(top), cmds, a.target))[0]):
                         sys.exit(1)
             _checks_detach(a, Path(run_dir), p, top, head, need=shorttmp.need(top, head, cmds))
         except OSError as e:
@@ -4892,7 +4893,7 @@ def _cmd_checks(a) -> None:
     proven_new = []   # the gate's verdicts with ids proven new (gatejudge.proven): the base passing them on that host
     fail_ids = []   # the failing check's pytest ids, when its output names them all (configwho.watch)
     run_wrap = None   # on a spill host, the digest of the checks.spill_wrap_cmd it ran behind (configwho.watch)
-    base = _checks_base(p, Path(top), cmds)
+    base = _checks_base(p, Path(top), cmds, a.target)
     (Path(run_dir) / "check_failure.json").unlink(missing_ok=True)
     (Path(run_dir) / slowtests.FILE).unlink(missing_ok=True)   # this run's slowest tests only
     start = log.stat().st_size if log.exists() else 0
@@ -7173,30 +7174,40 @@ def _checks_tip_ref(p: Project | None, top: Path) -> str:
     return f"refs/remotes/{remote}/{branch}"
 
 
-def _checks_base(p: Project | None, top: Path, cmds: list) -> str:
-    """What `ttp checks` compares `if_changed` scopes with: the push target as last fetched; in a repo
-    with no git remote at all, the local push branch; else "" (no project, no push target or no copy
-    of it here), and then those checks run."""
-    from . import push
+def _checks_base(p: Project | None, top: Path, cmds: list, target: str = "") -> str:
+    """What `ttp checks` compares `if_changed` scopes, the fast path and the public scan with: the
+    branch the change lands on, as last fetched. That is `target` (`--target`) when given, else the
+    task's own `pr_branch` while `delivery.own_push` is not off (`ttp push --own` lands it there), else
+    `delivery.push_branch`. In a repo with no git remote at all, the local branch; else "" (no project,
+    no target or no copy of it here), and then those checks run. A `target` naming no branch is
+    tried as any commit git can resolve."""
+    from . import project as projmod, push, worktree
     if not p:
         return ""
+    remotes = subprocess.run(["git", "-C", str(top), "remote"], capture_output=True, text=True)
+    if not target and (tid := os.environ.get("TTP_TASK", "")).isdigit() \
+            and projmod.own_push(p.config()) != "off" and (t := p.db.task(int(tid))) \
+            and t.get("kind") not in worktree.NEVER_OWN_KINDS and (b := worktree.delivery_branch(t)) and b[0] \
+            and not b[1]:
+        target = b[0]
     try:
-        remote, branch = push.target(p, top)
+        remote, branch = push._split_target(target, remotes.stdout.split()) if target else push.target(p, top)
     except ValueError:
         return ""
 
     def rev(ref: str) -> str:
-        r = subprocess.run(["git", "-C", str(top), "rev-parse", "--verify", "-q", ref],
+        r = subprocess.run(["git", "-C", str(top), "rev-parse", "--verify", "-q", ref + "^{commit}"],
                            capture_output=True, text=True)
         return r.stdout.strip() if r.returncode == 0 else ""
 
     if base := rev(f"refs/remotes/{remote}/{branch}"):
         return base
-    r = subprocess.run(["git", "-C", str(top), "remote"], capture_output=True, text=True)
-    return rev(f"refs/heads/{branch}") if r.returncode == 0 and not r.stdout.strip() else ""
+    if remotes.returncode == 0 and not remotes.stdout.strip() and (base := rev(f"refs/heads/{branch}")):
+        return base
+    return rev(target) if target else ""
 
 
-def _checks_public_scan(p: Project | None, top: str, head: str, d: dict) -> str:
+def _checks_public_scan(p: Project | None, top: str, head: str, d: dict, target: str = "") -> str:
     """Why a code task's commits must not reach the push branch, or "": the push queue's own scans
     (outscan.history_problem: a secret shape; outscan.public_problem: a local-state term or a chat-message
     or task reference under delivery.public_scan_paths) run here on the commits the head adds to the push
@@ -7208,7 +7219,7 @@ def _checks_public_scan(p: Project | None, top: str, head: str, d: dict) -> str:
     t = p.db.task(int(tid))
     if not t or t.get("kind") != "code":
         return ""
-    base = _checks_base(p, Path(top), [])
+    base = _checks_base(p, Path(top), [], target)
     if not base:
         return ""
     from . import outscan, push
@@ -7995,7 +8006,8 @@ def _checks_start(a, run_dir: Path, top: str, head: str, env: dict, req: str = "
                                       *(["--light"] if getattr(a, "light", False) else []),
                                       *(["--no-device"] if getattr(a, "no_device", False) else []),
                                       *(["--release"] if getattr(a, "release", False) else []),
-                                      *(["--purpose", a.purpose] if getattr(a, "purpose", None) else []), *a.cmd],
+                                      *(["--purpose", a.purpose] if getattr(a, "purpose", None) else []),
+                                      *(["--target", a.target] if getattr(a, "target", None) else []), *a.cmd],
                                      cwd=top or Path.cwd(), env=env, stdin=subprocess.PIPE, stdout=out,
                                      stderr=subprocess.STDOUT, start_new_session=True, pass_fds=(guard.fileno(),))
         try:
@@ -16863,6 +16875,8 @@ def ttp_parser():
                    help="harness: qualify a harness-preparation head with the purpose harness (else the default "
                         "harness plan) and untagged checks; "
                         "candidate gates are not run and the pass never counts for a PR or a push")
+    s.add_argument("--target", metavar="BRANCH",
+                   help="judge the head against BRANCH (remote/branch or branch), not the branch it lands on")
     s.add_argument("--worktree", metavar="PATH",
                    help="check the git worktree containing PATH instead of the one containing the current directory")
     s.add_argument("--detach", action="store_true",
