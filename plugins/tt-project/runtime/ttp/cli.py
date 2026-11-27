@@ -16038,6 +16038,12 @@ LOCAL_OPEN, LOCAL_CLOSE = "<!-- ttp:local -->", "<!-- /ttp:local -->"
 LOCAL_IMPORTS = "# --- project-local imports below ---"
 
 
+def _show_mode(tmp: Path, stage: int, f: str) -> str:
+    """The file mode git records for `f` at merge stage `stage` in worktree `tmp` ("120000" is a symlink), else ""."""
+    out = _git(tmp, "ls-files", "-s", "--", f)
+    return next((ln.split()[0] for ln in out.splitlines() if ln.split()[2] == str(stage)), "")
+
+
 def _settle_merge(tmp: Path, ident: list[str], files: list[str]) -> str:
     """Finish the stopped merge of upstream in worktree `tmp` without a model when no conflict needs
     judgment (batch.settle): both sides only added lines at one spot, they changed different lines,
@@ -16049,7 +16055,16 @@ def _settle_merge(tmp: Path, ident: list[str], files: list[str]) -> str:
     else names the files left (nothing is committed)."""
     from .batch import _show, settle
     left, kinds, blocks, imports = [], set(), [], []
+    own = [f for f in files if f.startswith("bin/") and _show_mode(tmp, 2, f) == "120000"]   # the project's links stay
+    for f in own:
+        _git(tmp, "checkout", "--ours", "--", f)
+        if f + "~upstream" in files:    # where git put the template's file, each type being kept somewhere
+            _git(tmp, "rm", "-q", "-f", "--cached", "--", f + "~upstream")
+            (tmp / (f + "~upstream")).unlink(missing_ok=True)
+    files = [f for f in files if not (f.endswith("~upstream") and f.removesuffix("~upstream") in own)]
     for f in files:
+        if f in own:
+            continue
         if settle(tmp, f, [], taken_in=True, hunks=True, superseded=True, near=True, kinds=kinds):
             continue
         sides = [_show(tmp, n, f) for n in (2, 1, 3)]
@@ -16076,6 +16091,10 @@ def _settle_merge(tmp: Path, ident: list[str], files: list[str]) -> str:
     _git(tmp, "add", "--", *files)
     _git(tmp, *ident, "commit", "-q", "--no-edit", "--no-verify")
     print("settled the template merge's conflicts, which needed no judgment: " + ", ".join(files))
+    if own:
+        print("kept this project's own link " + ", ".join(own) + " over the template's file: for bin/ssh, move "
+              "its checks to bin/ssh.local (run before the wrapper: exit 0 to allow, never start ssh there) or end "
+              "it with a call to bin/lib/ttp-ssh, so its ssh calls keep the connection sharing")
     if "superseded" in kinds:
         print("took upstream's version where it already makes the project's change; the project's own "
               "wording stays in the merge's first parent")

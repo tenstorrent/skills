@@ -2594,7 +2594,9 @@ the pick order, so it takes the first starts. A resumed resource ramps only its 
   that signs each new connection signs once per host, not once per command. The harness's `bin/ssh`
   runs the real ssh with OpenSSH multiplexing (ControlMaster=auto, ControlPersist=600) and keeps
   the sockets in `~/.tt-project/cm` (mode 700). Your ssh folder and config are never read or
-  changed, and `-F`, ProxyJump and BatchMode work as before. A call that sets its own sharing or
+  changed, and `-F`, ProxyJump and BatchMode work as before. The wrapper body is `bin/lib/ttp-ssh`; a
+  project's own check goes in an executable `bin/ssh.local`, run first with ssh's arguments (a non-zero
+  exit refuses the call), or a link replacing `bin/ssh` calls `bin/lib/ttp-ssh` itself. A call that sets its own sharing or
   forwards ports is left as it is. Hosts limit connection starts (sshd MaxStartups), so no call opens
   a second connection: while no shared connection is up, calls to a host queue on one lock and the
   first opens it. A start refused by the host (Exceeded MaxStartups, Connection reset, Connection

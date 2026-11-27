@@ -345,14 +345,21 @@ exit "${FAKE_RC:-0}"
 """
 
 
+def _copy_ssh_bin(dst):
+    """The template's ssh launcher and its library into folder `dst`."""
+    import shutil
+    src = RUNTIME.parent / "template" / "bin"
+    shutil.copytree(src / "lib", dst / "lib", dirs_exist_ok=True)
+    shutil.copy(src / "ssh", dst / "ssh")
+
+
 def _run_wrapper(tmp_path, args, **extra):
     import shutil
     import subprocess
     wbin, rbin, home = tmp_path / "wbin", tmp_path / "rbin", tmp_path / "home"
     for d in (wbin, rbin, home):
         d.mkdir(exist_ok=True)
-    shutil.copy(RUNTIME.parent / "template" / "bin" / "ssh", wbin / "ssh")
-    (wbin / "ssh").chmod(0o755)
+    _copy_ssh_bin(wbin)
     (rbin / "ssh").write_text(_FAKE_SSH)
     (rbin / "ssh").chmod(0o755)
     log = tmp_path / "log"
@@ -446,8 +453,7 @@ def _wrapper_env(tmp_path, **extra):
     wbin, rbin, home = tmp_path / "wbin", tmp_path / "rbin", tmp_path / "home"
     for d in (wbin, rbin, home):
         d.mkdir(exist_ok=True)
-    shutil.copy(RUNTIME.parent / "template" / "bin" / "ssh", wbin / "ssh")
-    (wbin / "ssh").chmod(0o755)
+    _copy_ssh_bin(wbin)
     (rbin / "ssh").write_text(_FAKE_SSH)
     (rbin / "ssh").chmod(0o755)
     return wbin / "ssh", {"PATH": f"{wbin}:{rbin}:/usr/bin:/bin", "HOME": str(home), "FAKE_LOG": str(tmp_path / "log"),
@@ -969,3 +975,85 @@ def test_the_socket_folder_cleanup_drops_temp_files_of_a_dead_pid_and_keeps_a_li
         (short_cm / n).write_text("x\n")
     assert subprocess.run([str(w), "box-a", "true"], env=e, timeout=10).returncode == 0
     assert sorted(f.name for f in short_cm.iterdir()) == sorted(names[2:])
+
+
+def _launcher_dir(tmp_path):
+    """A harness-like bin folder (the template's launcher and library) and a fake real ssh after it on PATH."""
+    import shutil
+    wbin, rbin = tmp_path / "wbin", tmp_path / "rbin"
+    for d in (wbin, rbin, tmp_path / "home"):
+        d.mkdir(exist_ok=True)
+    _copy_ssh_bin(wbin)
+    (rbin / "ssh").write_text(_FAKE_SSH)
+    (rbin / "ssh").chmod(0o755)
+    return wbin, {"PATH": f"{wbin}:{rbin}:/usr/bin:/bin", "HOME": str(tmp_path / "home"),
+                  "FAKE_LOG": str(tmp_path / "log"), "TMPDIR": str(tmp_path)}
+
+
+def test_the_ssh_launcher_runs_a_projects_ssh_local_check_before_the_wrapper(tmp_path):
+    import subprocess
+    wbin, env = _launcher_dir(tmp_path)
+    (wbin / "ssh.local").write_text(f'#!/bin/sh\necho "$@" > {tmp_path}/hook\n[ -e {tmp_path}/refuse ] && exit 7\nexit 0\n')
+    (wbin / "ssh.local").chmod(0o755)
+    run = lambda: subprocess.run([str(wbin / "ssh"), "host-a", "true"], env=env, capture_output=True, text=True, timeout=30)
+    assert run().returncode == 0
+    assert (tmp_path / "hook").read_text() == "host-a true\n"
+    assert "ControlMaster=auto" in (tmp_path / "log").read_text()        # the wrapper still ran after the check
+    (tmp_path / "log").unlink()
+    (tmp_path / "refuse").write_text("")
+    assert run().returncode == 7 and not (tmp_path / "log").exists()      # a refusing check stops the call
+
+
+def test_the_ssh_library_chains_from_a_projects_own_guard_in_the_bin_folder(tmp_path):
+    import subprocess
+    wbin, env = _launcher_dir(tmp_path)
+    (wbin / "ssh").unlink()
+    (wbin / "ssh").write_text('#!/bin/sh\nexec "${0%/*}/lib/ttp-ssh" "$@"\n')     # the project's guard, no marker
+    (wbin / "ssh").chmod(0o755)
+    r = subprocess.run([str(wbin / "ssh"), "host-a", "true"], env=env, capture_output=True, text=True, timeout=30)
+    assert r.returncode == 0 and "ControlMaster=auto" in (tmp_path / "log").read_text()   # real ssh, not the guard again
+
+
+def test_sshmux_leaves_ssh_to_a_projects_own_guard_in_bin_ssh(tmp_path, monkeypatch):
+    from ttp import sshmux
+    root = tmp_path / "harness"
+    (root / "runtime" / "ttp").mkdir(parents=True)
+    (root / "bin").mkdir()
+    _copy_ssh_bin(root / "bin")
+    (root / "bin" / "ssh").unlink()
+    (root / "bin" / "ssh").symlink_to("/bin/true")                         # the project's own guard
+    monkeypatch.setattr(sshmux, "__file__", str(root / "runtime" / "ttp" / "sshmux.py"))
+    assert sshmux.wrapper() is None                                         # PATH reaches the guard, never past it
+
+
+def test_an_upgrade_keeps_a_projects_symlinked_bin_ssh_without_a_conflict(tmp_path, capsys):
+    import subprocess
+    from ttp import cli
+    h = tmp_path / "h"
+    h.mkdir()
+    g = lambda *a: subprocess.run(["git", "-C", str(h), "-c", "user.name=t", "-c", "user.email=t@t", *a],
+                                  capture_output=True, text=True, check=True)
+    g("init", "-q", "-b", "upstream")
+    (h / "bin").mkdir()
+    (h / "bin" / "ssh").write_text("#!/bin/sh\n# tt-project ssh wrapper\nold\n")
+    g("add", "."), g("commit", "-q", "-m", "template")
+    g("branch", "main")
+    g("checkout", "-q", "main")
+    (h / "bin" / "ssh").unlink()
+    (h / "bin" / "ssh").symlink_to("guard")
+    (h / "bin" / "guard").write_text("#!/bin/sh\n")
+    g("add", "."), g("commit", "-q", "-m", "project guard")
+    g("checkout", "-q", "upstream")
+    (h / "bin" / "ssh").write_text("#!/bin/sh\n# tt-project ssh wrapper\nnew\n")
+    g("commit", "-qam", "template changes")
+    g("checkout", "-q", "main")
+    ident = ["-c", "user.name=t", "-c", "user.email=t@t"]
+    merge = subprocess.run(["git", "-C", str(h), *ident, "merge", "--no-edit", "upstream"], capture_output=True, text=True)
+    assert merge.returncode != 0                                            # git itself reports the type conflict
+    files = g("diff", "--name-only", "--diff-filter=U").stdout.split()
+    assert files == ["bin/ssh", "bin/ssh~upstream"]                         # where git put the template's file
+    assert cli._settle_merge(h, ident, files) == ""
+    assert (h / "bin" / "ssh").is_symlink() and os.readlink(h / "bin" / "ssh") == "guard"
+    out = capsys.readouterr().out
+    assert "bin/ssh.local" in out and "bin/lib/ttp-ssh" in out
+    assert g("status", "--porcelain").stdout == "" and not (h / "bin" / "ssh~upstream").exists()

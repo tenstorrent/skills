@@ -6760,6 +6760,7 @@ def test_setup_box_ird_e2e_ends_quickly_with_the_harness_ssh_wrapper_on_path(fak
     wbin = tmp_path / "harness-bin"
     wbin.mkdir()
     shutil.copy(PLUGIN / "template" / "bin" / "ssh", wbin / "ssh")
+    shutil.copytree(PLUGIN / "template" / "bin" / "lib", wbin / "lib")
     (wbin / "ssh").chmod(0o755)
     argv, env, _ = _e2e(fake_ird, tmp_path, include=False, wrapper=str(wbin))
     with open(env["REAL_SSH"], "rb") as f:
@@ -6779,6 +6780,7 @@ def test_the_ssh_wrapper_stops_when_the_ssh_it_runs_execs_it_again(tmp_path):
     wbin.mkdir()
     sbin.mkdir()
     shutil.copy(PLUGIN / "template" / "bin" / "ssh", wbin / "ssh")
+    shutil.copytree(PLUGIN / "template" / "bin" / "lib", wbin / "lib")
     (wbin / "ssh").chmod(0o755)
     (sbin / "ssh").write_text('#!/bin/sh\nexec ssh "$@"\n')
     (sbin / "ssh").chmod(0o755)

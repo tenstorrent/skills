@@ -1,0 +1,240 @@
+#!/bin/sh
+# SPDX-FileCopyrightText: © 2026 Tenstorrent USA, Inc.
+# SPDX-License-Identifier: Apache-2.0
+# tt-project ssh wrapper (the body; bin/ssh is the launcher that runs it): the real ssh further down PATH, sharing one connection per host (OpenSSH
+# multiplexing), so probes, checks and workers that ssh to the same host many times authenticate
+# once (an ssh agent signs once, not per command). Options added before the caller's, which wins on
+# none of them: ControlMaster=auto, ControlPath=<dir>/%C, ControlPersist=600, ServerAliveInterval=15,
+# ServerAliveCountMax=3 (a dead shared connection ends within a minute instead of hanging).
+# <dir> is $TTP_SSH_CM_DIR, else ~/.tt-project/cm (mode 700), else /tmp/ttp-cm-<uid> when the home path
+# is too long for a socket path (104 bytes with its NUL on macOS: <dir>/ + 40 for %C + a 17-character
+# suffix ssh adds while it binds leaves 45 for <dir>).
+# The backoff and lock key is the destination with characters outside ASCII letters, digits and ._@- replaced by _.
+# The user's ssh config folder is never read or written here; -F, ProxyJump and BatchMode pass through.
+# Left as is: TTP_SSH_REUSE=0 (config ssh.reuse off); a call that sets its own sharing (-S, -M, -O,
+# ControlMaster, ControlPath) or forwards ports or stdio (-L -R -D -W -w -N -f: a forward added to a
+# shared connection would outlive the command); -v (a verbose master keeps the caller's stderr open for
+# its 10 minutes, so a captured call would hang); -G, -V, -Q. OpenSSH also reads options given after
+# the destination, up to the remote command (ssh box -p 2222 cmd): those get the same reading, and a call
+# with any of them runs with the mux options but opens no -fN master under the lock, since a master opened
+# from the words up to the destination would drop them (ControlMaster=auto can still make that call a
+# master itself). The remote command's own words are never read.
+# The real ssh replaces this script (exec) for the command itself, so the caller's pid is ssh's own: a
+# kill of the caller (SIGTERM, a timeout's SIGKILL) stops ssh and its remote command, never only the
+# wrapper. A file in the folder that is no socket (ssh would then run unshared on every call) is removed
+# before ssh starts.
+# Hosts limit connection starts (sshd MaxStartups), so no call opens a second connection: while no master
+# is up for the destination, calls queue on one flock (<dir>/<destination>.lock; where there is none, a mkdir lock,
+# <destination>.lockd holding the holder's pid, taken over once that pid is gone, or after 30 s with no pid
+# file) and the first opens the master (ssh -fN, command-less, lock not inherited); the rest find it up
+# and reuse it. A killed call removes its temp files; the folder cleanup drops those of a dead pid. A start that ends 255 with a refusal line (Exceeded MaxStartups, Connection reset,
+# Connection closed by remote host, banner exchange, kex_exchange_identification) writes the backoff
+# record <tt-project home>/ssh-backoff/<destination> ("<until epoch> <step seconds>", destination with
+# characters outside A-Za-z0-9._@- as _; the home is $TTP_HOME, else ~/.tt-project), shared by every
+# project on the host. While now < until, calls to that destination fail at once with 255 and one stderr
+# line naming it and the retry time; after it, one call probes again. Steps double 60 120 240 480 900
+# (the cap) s; the first successful start clears the record. A start that fails with no refusal line
+# (host down, auth, host key) writes <dir>/<destination>.fail ("<epoch> <rc> <pid> <hash of the words up
+# to the destination>" then ssh's stderr, ssh's own message kept): callers with the same words queued
+# behind that start fail at once with its rc and stderr instead of each retrying the start; a call during
+# backoff with options after the destination fails the same way; a start that succeeds clears the record.
+# Re-entry (an "ssh" further down PATH that execs plain ssh, finding this script again in the same
+# process) ends with 125 and a message instead of looping: the pid is marked before every exec.
+set -f
+if [ "${TTP_SSH_WRAPPER_PID:-}" = "$$" ]; then
+    echo "tt-project ssh wrapper: re-entered from the ssh it ran (an ssh on PATH execs ssh again); not looping" >&2
+    exit 125
+fi
+TTP_SSH_WRAPPER_PID=$$
+export TTP_SSH_WRAPPER_PID
+real=
+bindir=${0%/*}/..
+ifs=$IFS
+IFS=:
+for d in $PATH; do
+    if [ -n "$d" ] && [ -x "$d/ssh" ] && ! [ "$d/ssh" -ef "$0" ] && ! [ "$d" -ef "$bindir" ]; then
+        first=
+        IFS= read -r first < "$d/ssh" 2>/dev/null
+        case $first in
+        '#!'*) ! grep -qsF '# tt-project ssh wrapper' "$d/ssh" || continue ;;
+        esac
+        real=$d/ssh
+        break
+    fi
+done
+IFS=$ifs
+if [ -z "$real" ]; then
+    for c in /usr/bin/ssh /usr/local/bin/ssh /opt/homebrew/bin/ssh; do
+        [ -x "$c" ] && { real=$c; break; }
+    done
+fi
+if [ -z "$real" ]; then
+    echo "ssh: not found on PATH" >&2
+    exit 127
+fi
+[ "${TTP_SSH_REUSE:-1}" = 0 ] && exec "$real" "$@"
+ctl() {
+    case $1 in
+    [Cc][Oo][Nn][Tt][Rr][Oo][Ll][Mm][Aa][Ss][Tt][Ee][Rr]*|[Cc][Oo][Nn][Tt][Rr][Oo][Ll][Pp][Aa][Tt][Hh]*) return 0 ;;
+    esac
+    return 1
+}
+# ssh's options, before and after the destination: the remote command's words are never read as ssh's.
+want=
+dest=
+post=
+nd=
+n=0
+for a in "$@"; do
+    n=$((n+1))
+    if [ -n "$want" ]; then
+        want=
+        ! ctl "$a" || exec "$real" "$@"
+        continue
+    fi
+    case $a in
+    --) break ;;
+    -?*) flags=${a#-}
+        while [ -n "$flags" ]; do
+            c=${flags%"${flags#?}"}
+            flags=${flags#?}
+            case $c in
+            [SMOLRDWwNfGVQv]) exec "$real" "$@" ;;
+            o) if [ -n "$flags" ]; then ! ctl "$flags" || exec "$real" "$@"; else want=1; fi
+               break ;;
+            [BbcEeFIiJlmPp]) [ -n "$flags" ] || want=0
+               break ;;
+            esac
+        done
+        [ "$want" = 0 ] && want=v
+        [ -n "$dest" ] && post=1 ;;
+    *) [ -z "$dest" ] || break
+       dest=$a; nd=$n ;;
+    esac
+done
+n=$nd
+dir=${TTP_SSH_CM_DIR:-${HOME:-/nonexistent}/.tt-project/cm}
+if [ ${#dir} -gt 45 ] || ! { [ -d "$dir" ] || mkdir -p -m 700 "$dir" 2>/dev/null; }; then
+    dir=/tmp/ttp-cm-$(id -u)
+    [ -d "$dir" ] || mkdir -m 700 "$dir" 2>/dev/null
+fi
+# Only a folder of this user's that no one else can write holds the sockets.
+if ! [ -d "$dir" ] || ! [ -O "$dir" ] || [ -L "$dir" ] || ! chmod 700 "$dir" 2>/dev/null; then
+    exec "$real" "$@"
+fi
+mux="-o ControlMaster=auto -o ControlPath=$dir/%C -o ControlPersist=600 -o ServerAliveInterval=15 -o ServerAliveCountMax=3"
+set +f
+for f in "$dir"/* "$dir"/.[!.]*; do
+    case $f in
+    *.lock|*.fail) continue ;;
+    *.err|*.fail.*) p=${f##*.}
+        [ "$p" != err ] || { p=${f%.err}; p=${p##*.}; }
+        case $p in ''|*[!0-9]*) ;; *) kill -0 "$p" 2>/dev/null || rm -f "$f" ;; esac
+        continue ;;
+    esac
+    [ -e "$f" ] || [ -L "$f" ] || continue
+    { [ -S "$f" ] && ! [ -L "$f" ]; } || [ -d "$f" ] || rm -f "$f"
+done
+set -f
+if [ -n "$dest" ]; then
+    thome=${TTP_HOME:-${HOME:-/nonexistent}/.tt-project}
+    key=$(printf %s "$dest" | tr -c 'A-Za-z0-9._@-' _)
+    rec=$thome/ssh-backoff/$key
+    failf=$dir/$key.fail
+    # 0 and the one-line refusal while the destination is in backoff.
+    backing() {
+        read -r until step 2>/dev/null < "$rec" || return 1
+        now=$(date +%s)
+        [ "$now" -lt "$until" ] 2>/dev/null || return 1
+        t=$(date -d "@$until" +%T 2>/dev/null || date -r "$until" +%T 2>/dev/null)
+        echo "ssh $dest: backing off after a refused connection start (the host limits them); retry at $t, in $((until - now))s" >&2
+    }
+    up() { "$real" $mux -O check "$@" >/dev/null 2>&1; }
+    # Opens the master with the first $1 args (through the destination), under the lock.
+    open_master() {
+        k=$1; shift; j=$k; err=$dir/$key.$$.err
+        while [ $j -gt 0 ]; do set -- "$@" "$1"; shift; j=$((j - 1)); done
+        shift $(($# - k))
+        # In the background so a kill of this call is handled at once, not after the start ends.
+        "$real" $mux -fN "$@" </dev/null >/dev/null 2>"$err" 9>&- &
+        cpid=$!
+        wait $cpid
+        rc=$?
+        cpid=
+        cat "$err" >&2
+        if [ $rc -eq 0 ]; then rm -f "$err" "$failf"; [ ! -e "$rec" ] || rm -f "$rec"; return 0; fi
+        if [ $rc -eq 255 ] && grep -qiE 'Exceeded MaxStartups|Connection reset|Connection closed by remote host|banner exchange|kex_exchange_identification' "$err"; then
+            step=60
+            if read -r _ prev 2>/dev/null < "$rec" && [ "$prev" -ge 60 ] 2>/dev/null; then
+                step=$((prev * 2)); [ $step -le 900 ] || step=900
+            fi
+            mkdir -p "$thome/ssh-backoff" && printf '%s %s\n' $(($(date +%s) + step)) $step > "$rec.$$" && mv -f "$rec.$$" "$rec"
+            backing
+            rc=255
+        else
+            { printf '%s %s %s %s\n' "$(date +%s)" "$rc" $$ "$sig"; cat "$err"; } >"$failf.$$" && mv -f "$failf.$$" "$failf"
+        fi
+        rm -f "$err"
+        unlock
+        exit $rc
+    }
+    # Without flock (macOS) a mkdir lock stands in. Its folder holds the holder's pid; a waiter takes the
+    # lock over once that pid is gone, or, with no pid file seen for 30 s, once the holder cannot have
+    # written it, so a killed holder never wedges it and a slow one never loses it.
+    lock() {
+        if command -v flock >/dev/null 2>&1; then
+            exec 9>"$dir/$key.lock"; flock 9
+        else
+            ld=$dir/$key.lockd; j=0
+            until mkdir "$ld" 2>/dev/null; do
+                hp=; read -r hp 2>/dev/null < "$ld/pid"
+                if [ -n "$hp" ]; then
+                    j=0
+                    ! kill -0 "$hp" 2>/dev/null || { sleep 0.1; continue; }
+                else
+                    j=$((j + 1)); [ $j -gt 300 ] || { sleep 0.1; continue; }
+                fi
+                [ "$(cat "$ld/pid" 2>/dev/null)" != "$hp" ] || { rm -f "$ld/pid"; rmdir "$ld" 2>/dev/null; }
+                j=0
+            done
+            echo $$ > "$ld/pid"
+        fi
+        held=1
+        trap 'exit 130' INT
+        trap 'exit 143' TERM
+        trap cleanup EXIT
+    }
+    unlock() {
+        [ -n "$held" ] || return 0
+        held=; exec 9>&-
+        rm -f "$dir/$key.lockd/pid"; rmdir "$dir/$key.lockd" 2>/dev/null
+    }
+    # A killed call leaves no temp file, no lock and no start of its own behind.
+    cleanup() {
+        [ -z "$cpid" ] || kill "$cpid" 2>/dev/null
+        rm -f "$dir/$key.$$.err" "$failf.$$"
+        unlock
+    }
+    if [ -n "$post" ]; then
+        ! backing || exit 255
+    elif up "$@"; then
+        [ ! -e "$rec" ] || rm -f "$rec"
+    else
+        ! backing || exit 255
+        sig=$(printf '%s\n' "$@" | head -n $n | cksum | tr ' ' _)
+        seen=$(head -n 1 "$failf" 2>/dev/null)
+        lock
+        if up "$@"; then [ ! -e "$rec" ] || rm -f "$rec"; else
+            ! backing || { unlock; exit 255; }
+            # A start with the same words that failed while this call was queued: fail with its rc and stderr.
+            fline=$(head -n 1 "$failf" 2>/dev/null)
+            case $fline in
+            "$seen") ;;
+            *" $sig") tail -n +2 "$failf" >&2; unlock; frc=${fline#* }; exit "${frc%% *}" ;;
+            esac
+            open_master $n "$@"
+        fi
+        unlock
+    fi
+fi
+exec "$real" $mux "$@"

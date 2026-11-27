@@ -38,7 +38,8 @@ def env(cfg: dict | None) -> dict[str, str]:
 
 def wrapper() -> str | None:
     """This runtime's ssh wrapper: the harness's bin/ssh beside a project's runtime copy, else the
-    plugin's template/bin/ssh; None when neither is one (an older harness)."""
+    plugin's template/bin/ssh; None when neither is one (an older harness, or a project's own guard in bin/ssh:
+    a bare ssh then reaches that guard through PATH, which chains to bin/lib/ttp-ssh)."""
     root = Path(__file__).resolve().parents[2]
     for c in (root / "bin" / "ssh", root / "template" / "bin" / "ssh"):
         try:
