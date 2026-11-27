@@ -648,7 +648,6 @@ class _Est:
             if lx > 1.0:
                 notes.append(f"host load x{lx:.2f}")
             ow = outside_wait(t, now, self.reports, Path(self.db.path).parent) if st != "running" else None
-            jf = self.jobs(t)
             if ow and ow["at"] is None and jf and jf.get("end") is not None:
                 ow = {**ow, "at": jf["end"], "label": "detached jobs"}   # measured, never padded
             elif ow and ow["at"] is None and jf and jf.get("why"):
@@ -676,7 +675,7 @@ class _Est:
                     if hold := self._held(t):
                         if hold[0] is None:
                             return {**self._held_none(tid, hold[1]), "path": path}
-                        if (extra := hold[0] - ow["at"]) > 0:
+                        if (extra := hold[0] - max(start, ow["at"])) > 0:
                             legs.append(("spend gate", extra))
                     begin = max(start + sum(x for _, x in legs), ow["at"])
                     if (m := self._m(runs)) is not None:

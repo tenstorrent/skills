@@ -1126,3 +1126,45 @@ def test_eta_a_promise_on_a_detached_jobs_task_shows_the_measured_estimate(env):
     o2 = _eta_promise(p, plain, "c1", "I'll post it here.", now)
     line2 = next(ln for ln in ob.promise_lines(p.db, now, p) if o2["id"] in ln)
     assert "measured finish" not in line2
+
+
+def test_eta_a_running_task_with_jobs_uses_the_jobs_measured_times(env):
+    """A running device task whose jobs run longer than its kind's median run gets the jobs' times."""
+    from ttp import eta
+    p = make(env)
+    now = time.time()
+    _jobs_registry(p, [("load", now - 86400, "ended", now - 86400 + 1800)])
+    _eta_history(p, now, kind="work", runs=(600,))     # its kind's median run: 600 s
+    tid = p.db.add_task("device work", "s", kind="work", status="running")
+    rid = p.db.x("INSERT INTO runs(task, role, started, status, dir) VALUES(?,?,?,?,?)",
+                 (tid, "worker", now - 60, "running", ""))
+    d = p.state / "runs" / str(rid)
+    (p.state / "runs" / d.name).mkdir(parents=True, exist_ok=True)
+    p.db.x("UPDATE runs SET dir=? WHERE id=?", (str(d), d.name))
+    (d / "detached.json").write_text(json.dumps([
+        {"name": "load", "rc": str(d / "load.rc"), "started": now - 300, "status": "running",
+         "owner": {"task": tid}}]))
+    e = eta.estimate(p.db, tid, now)
+    assert dict(e["legs"])["job load"] == pytest.approx(1800 - 300), e["legs"]
+    # an unmeasured job name beside a measured one: no estimate, the unmeasured one named.
+    (d / "detached.json").write_text(json.dumps([
+        {"name": "load", "rc": str(d / "load.rc"), "started": now - 300, "status": "running",
+         "owner": {"task": tid}},
+        {"name": "sweep", "rc": str(d / "sweep.rc"), "started": now - 300, "status": "running",
+         "owner": {"task": tid}}]))
+    p.db.update_task(tid, status="waiting", result=json.dumps(
+        {"status": "waiting", "summary": "s", "on_pass_cmd": "true",
+         "retry_when": "ttp detach --check load", "waiting_since": now}))
+    e = eta.estimate(p.db, tid, now)
+    assert e["end"] is None and "no measured sweep job run yet" in e["why"]
+
+
+def test_eta_history_shadow_uses_the_measured_job_medians(env):
+    """The eta_history shadow baseline of a task that runs detached jobs is the jobs' own medians."""
+    from ttp import etajobs, etaledger
+    p = make(env)
+    now = time.time()
+    _jobs_registry(p, [("load", now - 86400, "ended", now - 86400 + 600)])
+    t = _waiting_jobs_task(p, now, ["load-2"])
+    he = etaledger.hist_end(p.db, f"t{t}", now, None, etajobs.history(p.state, p.db, now))
+    assert he == pytest.approx(now + 600 - 300)

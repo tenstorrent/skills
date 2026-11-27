@@ -166,7 +166,7 @@ def _hist_on(where) -> bool:
     return costlevers.lever_on(where, "eta_history")
 
 
-def hist_end(db, ref: str, now: float, h: dict | None = None) -> float | None:
+def hist_end(db, ref: str, now: float, h: dict | None = None, jh: dict | None = None) -> float | None:
     """The finish the measured history gives a task ref (`t12`) at `now`: the median first-start wait, plus
     the median run time of its kind and tier (else of its kind) times the mean runs a done task of that
     kind and tier took (retries), plus for a code task the median review and the median landing (the push
@@ -191,10 +191,10 @@ def hist_end(db, ref: str, now: float, h: dict | None = None) -> float | None:
     t = db.task(int(ref[1:]))
     if not t:
         return None
-    from . import eta, etajobs
-    jh = etajobs.history(Path(db.path).parent, db, now)
-    if (jf := etajobs.finish(db, t, jh, now)) and jf.get("end") is not None:
-        return jf["end"]
+    from . import etajobs
+    if t["kind"] != "code" and jh is not None and (jf := etajobs.finish(db, t, jh, now)) \
+            and jf.get("end") is not None:
+        return jf["end"]   # a task that runs detached jobs: its shadow is the jobs' own medians
     from . import eta
     h = eta.history(db, now) if h is None else h
     kt = (t["kind"], t.get("tier"))
@@ -227,6 +227,7 @@ def record(db, where, items: list[tuple[str, str, dict]], now: float, src: str =
             last[r["ref"]] = r
     rows = []
     hist = None
+    jhist = None
     shadow_on = _hist_on(where)
     for ref, kind, e in items:
         if not rowable(e, now):
@@ -242,9 +243,10 @@ def record(db, where, items: list[tuple[str, str, dict]], now: float, src: str =
         if shadow_on:
             try:
                 if hist is None:
-                    from . import eta
+                    from . import eta, etajobs
                     hist = eta.history(db, now)
-                if (he := hist_end(db, ref, now, hist)) is not None:
+                    jhist = etajobs.history(Path(db.path).parent, db, now)
+                if (he := hist_end(db, ref, now, hist, jhist)) is not None:
                     row["hist"] = round(he, 1)
             except Exception:   # a shadow never costs the ETA row
                 pass

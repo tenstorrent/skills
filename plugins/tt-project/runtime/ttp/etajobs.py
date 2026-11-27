@@ -104,7 +104,7 @@ def finish(db, t: dict, h: dict, now: float) -> dict | None:
         legs.append((name, left))
         hi.append(_left(e, xs, now, P80) or left)
         started = started or e.get("status") not in ("queued",)
-    if why and not legs:
+    if why:
         return {"end": None, "conservative": None, "legs": [], "why": why}
     wait = queue_wait(db, t["id"], {n for n, _ in legs}, h, now)
     if wait:
