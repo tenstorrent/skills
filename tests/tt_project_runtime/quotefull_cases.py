@@ -48,15 +48,36 @@ def test_a_plain_status_reply_passes(env):
 
 def test_backrefs_finds_each_back_reference_once():
     from ttp import quotefull
-    assert quotefull.backrefs(_MISS) == ["in my earlier messages", "the item named as pending, without its text"]
+    assert quotefull.backrefs(_MISS) == ["the drafts named as pending, without its text", "in my earlier messages"]
     assert quotefull.backrefs("See above for the request.") == ["See above"]
     assert quotefull.backrefs("As drafted earlier, it went out.") == ["As drafted"]
     assert quotefull.backrefs("The draft I sent is ready to send.") == ["The draft I sent",
-                                                                        "the item named as pending, without its text"]
+                                                                        "the draft named as pending, without its text"]
     assert quotefull.backrefs("Two requests are pending your review.") != []
     assert quotefull.backrefs("Task #12 landed. The request went out and was answered.") == []
     why = quotefull.refused(_MISS, "reply")
     assert "quote the draft/ask/request/command in full" in why and "never point to earlier" in why
+
+
+def test_a_plain_line_or_list_item_after_the_phrase_is_not_its_text_and_plain_status_passes():
+    from ttp import quotefull
+    assert quotefull.backrefs(_MISS + "\nBudget at 40%.") != []
+    assert quotefull.backrefs("Open items:\n- drafts in my earlier messages, ready to send\n- task #12 running") != []
+    assert quotefull.backrefs("Open items:\n- the draft for <name>, ready to send\n- task #12 running") != []
+    assert quotefull.backrefs("Draft for <name>, ready to send:\nHi <name>, the update follows.\n[Authored by AI]") == []
+    assert quotefull.backrefs("A line that points back ('drafts in my earlier messages', 'see above') is refused.") == []
+    assert quotefull.backrefs("Here's where we are: drafts in my earlier messages aren't sent yet.") != []
+    for plain in ("No asks are still open.", "The command finished. The PR is pending review.",
+                  "I will ask the vendor. Task #14 is pending a worker."):
+        assert quotefull.backrefs(plain) == [], plain
+
+
+def test_a_reply_in_numbered_parts_passes_when_a_later_part_carries_the_drafts(env):
+    from ttp import coordinator as coord
+    p = make(env)
+    problems = coord.apply(p, [{"type": "reply", "chat": "c1", "text": "(1/2) Two drafts, ready to send:"},
+                               {"type": "reply", "chat": "c1", "text": "(2/2)" + _DRAFTS}], turn=1)
+    assert problems == [] and len(_sent(p)) == 2, problems
 
 
 def test_urgent_reply_refuses_a_back_reference(env, monkeypatch, capsys):

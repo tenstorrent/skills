@@ -3035,9 +3035,10 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                 if why := msgparts.too_long(a["text"], "reply"):
                     raise ValueError(why)
                 chat = a.get("chat") or default_chat
-                if why := pointers.refused(a["text"], "reply", pointers.later_parts(a["text"], [
-                        str(b.get("text") or "") for _, b in order[k + 1:]
-                        if (b or {}).get("type") == "reply" and (b.get("chat") or default_chat) == chat])):
+                later = pointers.later_parts(a["text"], [
+                    str(b.get("text") or "") for _, b in order[k + 1:]
+                    if (b or {}).get("type") == "reply" and (b.get("chat") or default_chat) == chat])
+                if why := pointers.refused(a["text"], "reply", later):
                     raise ValueError(why)
                 if why := handback.refused(a["text"], "reply"):
                     raise ValueError(why)
@@ -3050,7 +3051,7 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                                             batch_tasks, notes)
                 a["text"] = _wakemode_checked(p, a["text"], notes)
                 a["text"] = _pending_checked(p, a["text"], notes, "reply")
-                if why := quotefull.refused(a["text"], "reply"):
+                if why := quotefull.refused(a["text"], "reply", later):
                     raise ValueError(why)
                 a["text"], false = _claims_checked(p, a, notes)
                 a["text"] = _deploy_checked(p, a["text"], notes, a.get("claims"))
@@ -3980,8 +3981,9 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                     raise ValueError(f"notify rejected: {why}")
                 if why := msgparts.too_long(a["text"], "notify"):
                     raise ValueError(why)
-                if why := pointers.refused(a["text"], "notify", pointers.later_parts(a["text"], [
-                        str(b.get("text") or "") for _, b in order[k + 1:] if (b or {}).get("type") == "notify"])):
+                later = pointers.later_parts(a["text"], [
+                    str(b.get("text") or "") for _, b in order[k + 1:] if (b or {}).get("type") == "notify"])
+                if why := pointers.refused(a["text"], "notify", later):
                     raise ValueError(why)
                 if a.get("claims"):
                     notes += obligations.check_claims(a["claims"], p)
@@ -3990,7 +3992,7 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                 a["text"] = _onhost_checked(p, a["text"], None, a, order[k + 1:], batch_tasks, notes)
                 a["text"] = _wakemode_checked(p, a["text"], notes)
                 a["text"] = _pending_checked(p, a["text"], notes, "notify")
-                if why := quotefull.refused(a["text"], "notify"):
+                if why := quotefull.refused(a["text"], "notify", later):
                     raise ValueError(why)
                 a["text"], false = _claims_checked(p, a, notes)
                 a["text"] = _deploy_checked(p, a["text"], notes, a.get("claims"))
