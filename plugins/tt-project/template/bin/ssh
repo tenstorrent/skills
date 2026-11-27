@@ -14,7 +14,10 @@
 # Left as is: TTP_SSH_REUSE=0 (config ssh.reuse off); a call that sets its own sharing (-S, -M, -O,
 # ControlMaster, ControlPath) or forwards ports or stdio (-L -R -D -W -w -N -f: a forward added to a
 # shared connection would outlive the command); -v (a verbose master keeps the caller's stderr open for
-# its 10 minutes, so a captured call would hang); -G, -V, -Q.
+# its 10 minutes, so a captured call would hang); -G, -V, -Q. OpenSSH also reads options given after
+# the destination, up to the remote command (ssh box -p 2222 cmd): those get the same reading, and a call
+# with any of them runs with the mux options but opens no master itself, since a master opened from the
+# words up to the destination would drop them. The remote command's own words are never read.
 # The real ssh replaces this script (exec) for the command itself, so the caller's pid is ssh's own: a
 # kill of the caller (SIGTERM, a timeout's SIGKILL) stops ssh and its remote command, never only the
 # wrapper. A file in the folder that is no socket (ssh would then run unshared on every call) is removed
@@ -28,8 +31,10 @@
 # characters outside A-Za-z0-9._@- as _; the home is $TTP_HOME, else ~/.tt-project), shared by every
 # project on the host. While now < until, calls to that destination fail at once with 255 and one stderr
 # line naming it and the retry time; after it, one call probes again. Steps double 60 120 240 480 900
-# (the cap) s; the first successful start clears the record. A start that fails otherwise (auth, host
-# key) is ssh's own message and exit code, the command not run.
+# (the cap) s; the first successful start clears the record. A start that fails with no refusal line
+# (host down, auth, host key) writes <dir>/<destination>.fail ("<epoch> <rc> <pid>" then ssh's stderr, ssh's
+# own message kept): callers queued behind that start fail at once with its rc and stderr instead of
+# each retrying the start; the record is cleared by a start that succeeds.
 # Re-entry (an "ssh" further down PATH that execs plain ssh, finding this script again in the same
 # process) ends with 125 and a message instead of looping: the pid is marked before every exec.
 set -f
@@ -70,9 +75,11 @@ ctl() {
     esac
     return 1
 }
-# The options before the destination: the remote command's words are never read as ssh's.
+# ssh's options, before and after the destination: the remote command's words are never read as ssh's.
 want=
 dest=
+post=
+nd=
 n=0
 for a in "$@"; do
     n=$((n+1))
@@ -95,10 +102,13 @@ for a in "$@"; do
                break ;;
             esac
         done
-        [ "$want" = 0 ] && want=v ;;
-    *) dest=$a; break ;;
+        [ "$want" = 0 ] && want=v
+        [ -n "$dest" ] && post=1 ;;
+    *) [ -z "$dest" ] || break
+       dest=$a; nd=$n ;;
     esac
 done
+[ -n "$nd" ] && n=$nd
 dir=${TTP_SSH_CM_DIR:-${HOME:-/nonexistent}/.tt-project/cm}
 if [ ${#dir} -gt 45 ] || ! { [ -d "$dir" ] || mkdir -p -m 700 "$dir" 2>/dev/null; }; then
     dir=/tmp/ttp-cm-$(id -u)
@@ -111,15 +121,16 @@ fi
 mux="-o ControlMaster=auto -o ControlPath=$dir/%C -o ControlPersist=600 -o ServerAliveInterval=15 -o ServerAliveCountMax=3"
 set +f
 for f in "$dir"/* "$dir"/.[!.]*; do
-    case $f in *.lock|*.err) continue ;; esac
+    case $f in *.lock|*.err|*.fail*) continue ;; esac
     [ -e "$f" ] || [ -L "$f" ] || continue
     { [ -S "$f" ] && ! [ -L "$f" ]; } || [ -d "$f" ] || rm -f "$f"
 done
 set -f
-if [ -n "$dest" ]; then
+if [ -n "$dest" ] && [ -z "$post" ]; then
     thome=${TTP_HOME:-${HOME:-/nonexistent}/.tt-project}
     key=$(printf %s "$dest" | tr -c 'A-Za-z0-9._@-' _)
     rec=$thome/ssh-backoff/$key
+    failf=$dir/$key.fail
     # 0 and the one-line refusal while the destination is in backoff.
     backing() {
         read -r until step 2>/dev/null < "$rec" || return 1
@@ -137,7 +148,7 @@ if [ -n "$dest" ]; then
         "$real" $mux -fN "$@" </dev/null >/dev/null 2>"$err" 9>&-
         rc=$?
         cat "$err" >&2
-        if [ $rc -eq 0 ]; then rm -f "$err"; [ ! -e "$rec" ] || rm -f "$rec"; return 0; fi
+        if [ $rc -eq 0 ]; then rm -f "$err" "$failf"; [ ! -e "$rec" ] || rm -f "$rec"; return 0; fi
         if [ $rc -eq 255 ] && grep -qiE 'Exceeded MaxStartups|Connection reset|Connection closed by remote host|banner exchange|kex_exchange_identification' "$err"; then
             step=60
             if read -r _ prev 2>/dev/null < "$rec" && [ "$prev" -ge 60 ] 2>/dev/null; then
@@ -146,6 +157,8 @@ if [ -n "$dest" ]; then
             mkdir -p "$thome/ssh-backoff" && printf '%s %s\n' $(($(date +%s) + step)) $step > "$rec.$$" && mv -f "$rec.$$" "$rec"
             backing
             rc=255
+        else
+            { printf '%s %s %s\n' "$(date +%s)" "$rc" $$; cat "$err"; } >"$failf.$$" && mv -f "$failf.$$" "$failf"
         fi
         rm -f "$err"
         unlock
@@ -165,7 +178,16 @@ if [ -n "$dest" ]; then
         [ ! -e "$rec" ] || rm -f "$rec"
     else
         ! backing || exit 255
+        seen=$(head -n 1 "$failf" 2>/dev/null)
         lock
+        # A start that failed while this call was queued behind it: fail with its rc and stderr.
+        fline=$(head -n 1 "$failf" 2>/dev/null)
+        if [ -n "$fline" ] && [ "$fline" != "$seen" ]; then
+            tail -n +2 "$failf" >&2
+            unlock
+            set -- $fline
+            exit "${2:-255}"
+        fi
         if up "$@"; then [ ! -e "$rec" ] || rm -f "$rec"; else ! backing || { unlock; exit 255; }; open_master $n "$@"; fi
         unlock
     fi

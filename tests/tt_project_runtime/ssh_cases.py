@@ -404,11 +404,31 @@ def test_the_ssh_wrapper_leaves_calls_that_set_their_own_sharing_or_forward(tmp_
     assert r.returncode == 0 and log == [" ".join(args)]
 
 
-def test_the_ssh_wrapper_reads_only_options_before_the_host(tmp_path):
+def test_the_ssh_wrapper_never_reads_the_remote_commands_words(tmp_path):
     """A remote command's words (-Rf) and an option's value (-i -N) are not read as ssh options."""
     r, log = _run_wrapper(tmp_path, ["-i", "-N", "host-a", "rm", "-Rf", "/tmp/x"])
     assert r.returncode == 0 and "ControlMaster=auto" in log[0]
     assert log[0].endswith("-i -N host-a rm -Rf /tmp/x")
+
+
+def test_a_post_destination_option_takes_the_pre_change_paths(tmp_path):
+    """OpenSSH re-reads options after the destination, so the master must not be opened from the
+    pre-destination args alone: a plain option (-p 2222) runs the command with mux options and no
+    master open, and a sharing or forward option runs unshared."""
+    r, log = _run_wrapper(tmp_path, ["box-a", "-p", "2222", "true"])
+    assert r.returncode == 0 and len(log) == 1                 # the command runs, no master open
+    assert "ControlMaster=auto" in log[0] and "-fN" not in log[0]
+    assert log[0].endswith("box-a -p 2222 true")               # the option stays with the call
+    r, log = _run_wrapper(tmp_path, ["box-a", "-L", "1:h:2", "true"])
+    assert r.returncode == 0 and log == ["box-a -L 1:h:2 true"]   # not shared at all
+
+
+def test_options_after_the_host_open_no_master_but_the_commands_words_still_do(tmp_path, short_cm):
+    out, log = _spawn_wrappers(tmp_path, short_cm, 1, args=("box-a", "-p", "2222", "true"))
+    assert out[0][0] == 0 and not _opens(log) and log[-1].endswith("box-a -p 2222 true")
+    (tmp_path / "log").unlink()
+    out, log = _spawn_wrappers(tmp_path, short_cm, 1, args=("box-a", "ls", "-p", "2222"))
+    assert out[0][0] == 0 and len(_opens(log)) == 1 and log[-1].endswith("box-a ls -p 2222")
 
 
 def test_the_ssh_wrapper_passes_the_remote_exit_code_without_a_retry(tmp_path):
@@ -808,9 +828,33 @@ def test_a_refused_connection_start_backs_off_for_every_caller_and_doubles_per_s
 
 
 def test_a_start_that_fails_without_a_refusal_line_starts_no_backoff(tmp_path, short_cm):
-    out, log = _spawn_wrappers(tmp_path, short_cm, 3, FAKE_RC=255, FAKE_OPEN_ERR="Permission denied (publickey).")
+    out, log = _spawn_wrappers(tmp_path, short_cm, 3, FAKE_OPEN_DELAY=0.3,
+                               FAKE_RC=255, FAKE_OPEN_ERR="Permission denied (publickey).")
     assert [rc for rc, _ in out] == [255] * 3 and _backoff_rec(tmp_path) is None
-    assert len(_opens(log)) == 3 and all("Permission denied" in err for _, err in out)   # each is ssh's own answer
+    assert len(_opens(log)) == 1 and all("Permission denied" in err for _, err in out)   # ssh's own answer each
+
+
+def test_callers_queued_behind_a_failed_start_fail_with_it_instead_of_retrying(tmp_path, short_cm):
+    """A start that fails without a refusal line (host down) runs once: callers queued behind it fail
+    at once with its rc and stderr, so N callers do not wait N x the connect timeout."""
+    import time
+    down = "ssh: connect to host box-a port 22: Connection timed out"
+    t0 = time.monotonic()
+    out, log = _spawn_wrappers(tmp_path, short_cm, 5, FAKE_RC=255, FAKE_OPEN_ERR=down, FAKE_OPEN_DELAY=0.8)
+    took = time.monotonic() - t0
+    assert [rc for rc, _ in out] == [255] * 5
+    assert len(_opens(log)) == 1                               # the stub's -fN ran once, not per caller
+    assert all(down in err for _, err in out)                 # each carries the failed start's stderr
+    assert 0.8 <= took < 2.4, took                            # about one open delay, not five (4.0 s)
+
+
+def test_a_failed_start_from_before_a_call_began_waiting_does_not_fail_it(tmp_path, short_cm):
+    down = "ssh: connect to host box-a port 22: Connection timed out"
+    out, _ = _spawn_wrappers(tmp_path, short_cm, 1, FAKE_RC=255, FAKE_OPEN_ERR=down)
+    assert out[0][0] == 255
+    (tmp_path / "log").unlink()
+    out, log = _spawn_wrappers(tmp_path, short_cm, 1)         # the host is back: this call opens again
+    assert out[0][0] == 0 and len(_opens(log)) == 1 and not list(short_cm.glob("*.fail"))
 
 
 def test_a_backoff_record_is_per_destination_and_survives_the_socket_folder_cleanup(tmp_path, short_cm):
