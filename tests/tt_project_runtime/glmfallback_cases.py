@@ -74,7 +74,7 @@ def test_a_rerun_after_the_tasks_own_glm_run_failed_keeps_its_core_tier_model(en
                                 {"pin_required": True, "provider": "claude"}])
 def test_runs_the_work_route_keeps_on_core_never_take_the_fallback_model(env, monkeypatch, kw):
     """Reviews, plans, the deep tier, a run that answers a person and a required pin never route to GLM, so a
-    GLM outage never moves them to the fallback model."""
+    endpoint refusal never moves them to the fallback model."""
     from ttp import route, runclass
     p, d = _gf_setup(env, monkeypatch, "model_missing")
     got = _route_dispatch(p, d, monkeypatch, title="sum the logs", **{"kind": "work", "tier": "standard", **kw})
