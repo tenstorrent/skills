@@ -757,7 +757,6 @@ def source_commit() -> str:
 # Template files installed at the harness root. pytest.ini isolates harness-local test runs from an
 # enclosing repository's pytest config and conftest.py (pytest stops looking at the first config).
 HARNESS_ROOT_FILES = ("pytest.ini",)
-HARNESS_GITIGNORE = ("__pycache__/", "*.pyc", "tmp/")     # tmp/: scratch (test temp dirs, even git repos) kept out of commits
 # Files that hold a pytest config at a directory's root, and the section that makes them one
 _PYTEST_CONFIGS = {"pytest.ini": "", ".pytest.ini": "", "pytest.toml": "", ".pytest.toml": "",
                    "pyproject.toml": "[tool.pytest", "tox.ini": "[pytest]", "setup.cfg": "[tool:pytest]"}
@@ -794,7 +793,7 @@ def _new_harness(p: Project, template: Path) -> None:
         f.chmod(EXEC_MODE)
     for f in HARNESS_ROOT_FILES:
         replace_copy(template / f, p.harness / f)
-    durable_write(p.harness / ".gitignore", "".join(f"{n}\n" for n in HARNESS_GITIGNORE), sync=False)
+    durable_write(p.harness / ".gitignore", "__pycache__/\n*.pyc\n", sync=False)
     subprocess.run(["git", "init", "-q", "-b", "upstream", str(p.harness)], check=True)
     _git(p.harness, "add", "-A")
     _git(p.harness, "-c", "user.name=tt-project", "-c", "user.email=tt-project@localhost", "commit", "-q",
@@ -15318,44 +15317,6 @@ def _running_harness_start(p: Project) -> tuple[float, int] | None:
     return (float(r["started"]), int(r["task"])) if r else None
 
 
-def _merge_gitignore(h: Path) -> None:
-    """Add the template's .gitignore lines a harness lacks (it keeps its own lines and order)."""
-    path = h / ".gitignore"
-    have = path.read_text().splitlines() if path.exists() else []
-    if missing := [n for n in HARNESS_GITIGNORE if n not in have]:
-        durable_write(path, "".join(f"{n}\n" for n in have + missing), sync=False)
-
-
-def _name_left_out(embedded: set[str]) -> None:
-    if embedded:
-        print("left out of the local commit (embedded git repos): " + ", ".join(sorted(embedded)))
-
-
-def _stage_all(h: Path, names) -> None:
-    """Stage tracked changes and plain untracked files, never an embedded git repo (a gitlink, or an error
-    when it has no commit). An untracked file gone before it is added is skipped; any other git failure raises."""
-    _git(h, "add", "-u")
-    untracked = names("ls-files", "-z", "--others", "--exclude-standard")   # an embedded repo lists as `dir/`
-    _name_left_out({n for n in untracked if n.endswith("/")})
-    plain = sorted(n for n in untracked if not n.endswith("/") and os.path.lexists(h / n))
-    if not plain:
-        return
-    scratch = Path(tempfile.mkdtemp(prefix="ttp-add-"))
-    spec = scratch / "paths"
-    durable_write(spec, "\0".join(plain) + "\0", sync=False)
-    try:
-        _git(h, "--literal-pathspecs", "add", "--pathspec-from-file", str(spec), "--pathspec-file-nul")
-    except subprocess.CalledProcessError:
-        for n in plain:     # one is gone or unreadable: add the rest one by one
-            try:
-                _git(h, "--literal-pathspecs", "add", "--", n)
-            except subprocess.CalledProcessError:
-                if os.path.lexists(h / n):
-                    raise
-    finally:
-        shutil.rmtree(scratch, ignore_errors=True)
-
-
 def _commit_local_changes(p: Project, ident: list[str]) -> list[str]:
     """Commit the harness's local changes before a template upgrade merges into it. While harness tasks of
     the project run, they edit this same checkout and commit with their own message: only changes older
@@ -15363,7 +15324,6 @@ def _commit_local_changes(p: Project, ident: list[str]) -> list[str]:
     unknown) are left for their worker. Waiting for the run instead could hold an upgrade for hours.
     Returns the files left uncommitted."""
     h = p.harness
-    _merge_gitignore(h)
     if not _git(h, "status", "--porcelain"):
         return []
 
@@ -15375,7 +15335,7 @@ def _commit_local_changes(p: Project, ident: list[str]) -> list[str]:
     running = _running_harness_start(p)
     kept_out = _keep_out_runtime_data(h, running[0] if running else None)
     if not running:
-        _stage_all(h, names)
+        _git(h, "add", "-A")
         files = sorted(names("diff", "--cached", "--name-only", "--no-renames", "-z", "HEAD"))
         if plans := _refresh_plan_digests(p, files):
             _git(h, "--literal-pathspecs", "add", "--", *plans)
@@ -15387,8 +15347,6 @@ def _commit_local_changes(p: Project, ident: list[str]) -> list[str]:
 
     changed = (names("ls-files", "-z", "--modified", "--others", "--deleted", "--exclude-standard")
                | names("diff", "--cached", "--name-only", "--no-renames", "-z", "HEAD"))
-    _name_left_out({n for n in changed if n.endswith("/")})
-    changed = {n for n in changed if not n.endswith("/")}
     old, left = [], []
     for n in sorted(changed):
         try:
