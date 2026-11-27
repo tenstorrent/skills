@@ -87,22 +87,22 @@ def test_batch_pick_leaves_out_resourced_deep_pinned_and_held(env):
                                            inflight=[busy])] == [910]
 
 
-def test_batch_pick_keeps_urgent_and_routine_work_in_separate_runs(env, monkeypatch):
+def test_batch_pick_keeps_urgent_and_routine_work_in_separate_runs(env):
     from ttp import batchrun, obligations
     p = make(env)
-    _, base = _batch_tasks(p, 2)
+    _, base, owned = _batch_tasks(p, 3)
     row = lambda i, **kw: dict(base, id=i, **kw)
-    ids = lambda got: [t["id"] for t in got]
-    p1, p1b = row(1, priority=1), row(2, priority=1)
-    flagged = row(3, priority=2, spec="urgent: user asked\nFix it.")
-    owned = row(4, priority=2)
-    p2, p3, p3b, p3c = row(5, priority=2), row(6, priority=3), row(7, priority=3), row(8, priority=3)
-    monkeypatch.setattr(obligations, "owned_open", lambda db, tid: ["o1"] if tid == 4 else [])
+    ids = lambda got: sorted(t["id"] for t in got)
+    p1, p1b, flagged = row(101, priority=1), row(102, priority=1), row(103, priority=2, spec="urgent: now\nFix it.")
+    p2, p3, p3b, p3c = row(105, priority=2), row(106, priority=3), row(107, priority=3), row(108, priority=3)
+    mid = p.db.post("in", "please fix it", chat="c1")
+    obligations.add_order(p, "fix it", mid, [owned["id"]], action_class="change")
+    ordered = dict(owned, priority=2)   # a user order's task is urgent whatever its priority
     # (a) an urgent lead takes no routine task; (b) urgent tasks, whatever makes them urgent, share its run.
-    assert ids(batchrun.pick(p, p.config(), p1, [p2, p3, p1b, flagged, owned])) == [2, 3, 4]
+    assert ids(batchrun.pick(p, p.config(), p1, [p2, p3, p1b, flagged, ordered])) == sorted([102, 103, owned["id"]])
     assert batchrun.pick(p, p.config(), p1, [p2, p3]) == []
     # A routine lead takes no urgent task; (c) routine tasks batch as before.
-    assert ids(batchrun.pick(p, p.config(), p3, [p1, flagged, owned, p2, p3b, p3c])) == [5, 7, 8]
+    assert ids(batchrun.pick(p, p.config(), p3, [p1, flagged, ordered, p2, p3b, p3c])) == [105, 107, 108]
 
 
 def test_batch_pick_takes_members_whose_resources_the_lead_holds(env):

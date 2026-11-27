@@ -1607,6 +1607,12 @@ def open_keys_by_task(db) -> dict[int, list[str]]:
     return out
 
 
+def order_tasks(db) -> set[int]:
+    """The tasks of the open user orders (add_order), whether or not they are required owners."""
+    return {t for o in items(db) if _open(o) and (o.get("promise") or {}).get("order") is not None
+            for t in _owner_ids(o)}
+
+
 def owner_due(db) -> dict[int, float]:
     """Task id -> the earliest due time of the open obligations it is a required owner of (owned_open's
     owners): an unreceipted milestone's due, else a promise's, else math.inf. Dispatch starts these

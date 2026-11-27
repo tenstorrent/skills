@@ -13,7 +13,7 @@ deep and user-deep work), related or not, and queued tasks that wait only on the
 priority; a task whose files a running task on another branch holds is left out; a member that depends
 on another comes after it. The lead is whatever dispatch picked first (an urgent one leads): it never
 waits for a batch to fill. An urgent task (alerts.urgent: priority 1, an `urgent:` line or an open
-obligation) shares a run only with urgent tasks, and a routine one only with routine ones. A batch
+obligation, or a task of a user order) shares a run only with urgent tasks, and a routine one only with routine ones. A batch
 runs its shared steps once, after every member's commit: one focused test gate, one device smoke and,
 where it delivers outside the push queue, one landing request (a PR or a push request) carrying every
 member's commits (prompt_block). Off with `dispatch.batch` false.
@@ -46,7 +46,7 @@ import re
 import time
 from pathlib import Path
 
-from . import alerts
+from . import alerts, obligations
 from .db import dump_result, load_result
 from .util import task_labels
 
@@ -220,14 +220,16 @@ def pick(p, cfg: dict, lead: dict, ready: list[dict], inflight: list[dict] | Non
     if n <= 0:
         return []
     mine = _paths(p, lead)
-    lead_urgent = alerts.urgent(p.db, lead)
+    ordered = obligations.order_tasks(p.db)
+    urgent = lambda t: t["id"] in ordered or alerts.urgent(p.db, t)
+    lead_urgent = urgent(lead)
     held: set[str] = set()
     for t in inflight or []:
         if t["id"] != lead["id"] and (t.get("branch") or "") != (lead.get("branch") or ""):
             held |= _paths(p, t)
     cands = []
     for t in ready:
-        if not eligible(lead, t) or alerts.urgent(p.db, t) != lead_urgent:
+        if not eligible(lead, t) or urgent(t) != lead_urgent:
             continue   # urgent work shares a run only with urgent work, never with routine tasks
         ps = _paths(p, t)
         if ps & held:
