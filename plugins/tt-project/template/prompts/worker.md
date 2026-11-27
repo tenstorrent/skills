@@ -319,8 +319,9 @@ No `result.json`, no credit.
 <!-- /ttp:if wait -->
 - Anything still running when you stop dies with you unless detached: `ttp detach <name> -- <cmd>`
   writes `<name>.log` and `.rc` in your run folder and prints the `retry_when`.
-  A step known to fail now and then (a device status read, a network fetch) gets `--retry N --retry-rc <codes>`,
-  so it retries inside the job rather than ending it.
+<!-- ttp:if device -->
+  A step that fails now and then (a status read, a fetch) gets `--retry N --retry-rc <codes>` to retry in the job.
+<!-- /ttp:if device -->
 <!-- ttp:if wait -->
   `done` stops each live job its `retry_when` or `next_step` does not name.
   Add `--cores N` / `--devices N` when the command does not show them; `--lock <resource>`
