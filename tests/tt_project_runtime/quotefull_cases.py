@@ -183,5 +183,13 @@ def test_an_ask_matched_by_its_words_and_appended_in_full_is_not_refused():
     # a block naming an ask that is not open clears nothing
     made_up = "The ask about the board reboot is still open." + pendingask.HEADER + "\n- ask 99: board reboot"
     assert quotefull.backrefs(made_up, (), asks) != []
+    # matched on the whole message, as expand matches it, or already quoted in it
+    rollout = {"id": 13, "text": "Approve the new firmware rollout to the spare boards?"}
+    two = asks + [rollout]
+    whole, _ = pendingask.expand("Board reboot status: unchanged. The ask is still open, waiting on you.", two)
+    assert pendingask.HEADER in whole and quotefull.backrefs(whole, (), two) == []
+    said = ("The ask about the board reboot is still open, waiting on you. "
+            "Reboot the board now or after the soak? Still waiting on you. Recommendation: after the soak.")
+    assert pendingask.expand(said, two)[0] == said and quotefull.backrefs(said, (), two) == []
     # without the open asks, nothing matched by words is cleared
     assert quotefull.backrefs(expanded) != []

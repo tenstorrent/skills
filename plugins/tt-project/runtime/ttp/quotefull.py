@@ -85,9 +85,10 @@ def backrefs(text: str, later: list[str] | tuple = (), open_asks: list[dict] | t
         lo = max((x.end() for x in _STOP.finditer(text[:m.start()])), default=0)
         hi = _STOP.search(text, m.end())
         if not back and (pendingask.refs(m.group(0)) or (   # pendingask.expand, run first, appended it or saw it quoted
-                item and item.group(0).lower() in ("ask", "asks")   # ... or matched it by its words and appended it
-                and (hit := pendingask.match(text[lo:hi.start() if hi else head], list(open_asks)))
-                and {int(a["id"]) for a in hit} <= added)):
+                item and item.group(0).lower() in ("ask", "asks")   # ... or matched it by its words, as expand does
+                and (hit := pendingask.match(text[lo:hi.start() if hi else head], list(open_asks))
+                     or pendingask.match(text[:head], list(open_asks)))
+                and all(int(a["id"]) in added or pendingask.quoted(text[:head], a) for a in hit))):
             continue
         if back and _BARE.fullmatch(m.group(0)):   # 'in my earlier message I said ...' with nothing pending
             if not _PENDING.search(text[lo:hi.start() if hi else len(text)]) and not line_end.endswith(":"):
