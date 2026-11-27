@@ -87,3 +87,4 @@
 +300: the reply_due rule: the coordinator answers a finished reply-chat task in plain words, `delivers` naming the task
 +161: a landed/live reply line names its commit
 +293: a missing-entry-<task> must-act item: add the entry that turn and wake or requeue the task unless a Restriction, user hold or user-only setting forbids it (missingentry.py, #9767)
++56: quote in full: any mention of a pending ask, request, draft or command quotes it whole
