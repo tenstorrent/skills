@@ -2732,6 +2732,25 @@ def test_network_outage_on_a_tunnel_route_is_a_low_feed_line_raised_once_after_a
 
 
 
+@pytest.mark.parametrize("out, blames_tunnel", [
+    ("ssh: connect to host 127.0.0.1 port 2222: Connection refused", True),           # the port refuses
+    ("ssh: connect to host 127.0.0.1 port 2222: Connection timed out", True),         # nothing answers on it
+    ("Connection closed by 127.0.0.1 port 2222", False),                              # accepted, then closed
+    ("kex_exchange_identification: read: Connection reset by peer", False),           # accepted, then reset
+    ("Connection reset by 127.0.0.1 port 2222", False),
+    ("Connection timed out during banner exchange", False),                           # accepted, then silent
+])
+def test_an_outage_names_the_tunnel_only_when_its_port_refuses_else_the_far_host(env, monkeypatch, out, blames_tunnel):
+    p, d, tids, now, check = _net_setup(env, monkeypatch, probe=TUNNEL_PROBE, out=out,
+                                        ssh_config={"box-a": {"hostname": "127.0.0.1", "port": "2222"}})
+    check(now)
+    (m,) = check(now + 900)
+    assert ("tunnel from the user's workstation" in m["text"]) is blames_tunnel, m["text"]
+    assert (m["severity"] == "low") is blames_tunnel
+    if not blames_tunnel:
+        assert "box-a" in m["text"] and "appears down" in m["text"] and "VPN" not in m["text"], m["text"]
+
+
 def test_network_outage_on_a_tunnel_route_that_comes_back_before_the_threshold_never_pages(env, monkeypatch):
     from ttp import alerts
     p, d, tids, now, check = _net_setup(env, monkeypatch, probe=TUNNEL_PROBE, out=TUNNEL_OUT,

@@ -17,9 +17,10 @@ import fcntl
 import json
 import os
 import re
+import subprocess
 import time
 
-from . import machine_ledger as ml, machines, netwait, project, timefmt
+from . import machine_ledger as ml, machines, netwait, project, sshmux, timefmt
 
 STATE = "machine-reach.json"
 LOCK = "machine-reach.lock"
@@ -63,15 +64,34 @@ def _live() -> dict[str, dict]:
 
 def due(now: float, every_s: float = PROBE_S) -> list[str]:
     """The listed machines whose last probe is older than `every_s` (or that were never probed), less those held
-    or out whole (machine_ledger.no_ssh): no ssh at all goes to them."""
+    or out whole (machine_ledger.no_ssh) or backing off after a refused connection start (sshmux.backoff_until):
+    no ssh at all goes to them."""
     st = read()
     stale = [a for a in _live() if now - float(st.get(a, {}).get("ts") or 0) >= every_s]
     held = ml.no_ssh(stale, now) if stale else {}
-    return [a for a in stale if a not in held]
+    return [a for a in stale if a not in held and not sshmux.backoff_until(a, now)]
 
 
-def probe(aliases: list[str], env: dict | None = None) -> None:
-    record(netwait.reach(aliases, env))
+def cmds(p) -> dict[str, str]:
+    """ssh.reach_cmd: {alias: shell command} run in place of the ssh probe."""
+    got = ((p.config().get("ssh") or {}).get("reach_cmd") if p else None) or {}
+    return {str(a): str(c) for a, c in got.items() if str(c).strip()} if isinstance(got, dict) else {}
+
+
+def _run(cmd: str, env: dict | None) -> bool:
+    try:
+        return subprocess.run(cmd, shell=True, env=env, stdin=subprocess.DEVNULL, capture_output=True,
+                              timeout=netwait.CONFIRM_TIMEOUT_S + 20).returncode == 0
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+
+def probe(aliases: list[str], env: dict | None = None, via: dict[str, str] | None = None) -> None:
+    """Probe each alias and record the answers: `via[alias]` (ssh.reach_cmd) in place of ssh when set."""
+    via = via or {}
+    got = netwait.reach([a for a in aliases if a not in via], env)
+    got.update({a: _run(via[a], env) for a in aliases if a in via})
+    record(got)
 
 
 def _settings(p) -> tuple[float, float]:
@@ -87,15 +107,18 @@ def probe_every(p) -> float:
 
 
 def digest_lines(p, now: float | None = None) -> list[str]:
-    """One line per listed machine: its last ssh probe's answer and time (home zone), never probed, or held,
-    not probed (machine_ledger.no_ssh)."""
+    """One line per listed machine: its last ssh probe's answer and time (home zone), never probed, held,
+    not probed (machine_ledger.no_ssh), or backing off after a refused connection start (not down)."""
     now = time.time() if now is None else now
     st, live = read(), sorted(_live())[:machines.DIGEST_MACHINES]
     held = ml.no_ssh(live, now) if live else {}
     out = []
     for a in live:
         r = st.get(a)
-        out.append(f"- {a}: held, not probed ({held[a]})" if a in held else f"- {a}: never probed" if not r else
+        until = sshmux.backoff_until(a, now)
+        out.append(f"- {a}: held, not probed ({held[a]})" if a in held else
+                   f"- {a}: backing off until {timefmt.short(until, p, now)} (connection starts refused), not probed"
+                   if until else f"- {a}: never probed" if not r else
                    f"- {a}: {'answered' if r.get('ok') else 'no answer to'} ssh at {timefmt.short(float(r['ts']), p, now)}")
     return out
 

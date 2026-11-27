@@ -690,8 +690,9 @@ DEFAULT_CONFIG: dict[str, Any] = {
     # host for 10 minutes (OpenSSH ControlMaster through the harness's bin/ssh; sockets in ~/.tt-project/cm),
     # so an ssh agent signs once, not per command. Off: each ssh opens its own connection (sshmux.py).
     # reach_probe_s: each listed machine gets a harmless `ssh <alias> true` at most this often (reach.py);
-    # reach_fresh_min: a "can't reach <machine>" claim needs a probe this recent, else it is marked.
-    "ssh": {"reuse": True, "reach_probe_s": 1200, "reach_fresh_min": 30},
+    # reach_fresh_min: a "can't reach <machine>" claim needs a probe this recent, else it is marked;
+    # reach_cmd: {alias: shell command} run instead of that ssh (exit 0 = reachable), for hosts that limit connection starts.
+    "ssh": {"reuse": True, "reach_probe_s": 1200, "reach_fresh_min": 30, "reach_cmd": {}},
     # `ttp bench run` (benchrun.py): arms {name: {provider, model, effort}} (none shipped) and the
     # limits every cell gets alike.
     "bench": {"arms": {}, "reps": 1, "timeout_s": 3600, "stall_s": 900, "budget_usd": 8.0, "test_timeout_s": 900,

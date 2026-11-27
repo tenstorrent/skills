@@ -2606,6 +2606,11 @@ the pick order, so it takes the first starts. A resumed resource ramps only its 
   the coordinator's digest. A reply or notify saying a machine can't be reached is marked false when
   that machine answered within the last 30 minutes (`ssh.reach_fresh_min`), and unverified when no
   probe is that recent.
+  A machine in ssh backoff (above) is not probed and shows as backing off until the retry time, not
+  down. For a host that limits connection starts, `ssh.reach_cmd` maps a machine alias to a shell
+  command run from the project root instead of that ssh probe; exit 0 means reachable. An outage
+  alert names the user's workstation tunnel only when the tunnel's port refuses or nothing listens on
+  it; a connection that was made and then closed, reset or left silent names the far host.
 - A shared device or machine is taken per command, through its own queue (for example a device
   broker) or `ttp lock <resource> -- <command>`, so the rest of each task runs in parallel. A task
   marked exclusive holds the resource's lock for its whole run; while it waits for a slot, new

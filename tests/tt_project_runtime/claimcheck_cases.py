@@ -391,6 +391,59 @@ def test_the_reach_probe_makes_no_ssh_to_a_held_or_out_machine_and_shows_it_held
 
 
 
+def _stub_ssh(env, tmp_path, monkeypatch):
+    """A fake ssh first on PATH that logs each call; returns the log path."""
+    log, bindir = tmp_path / "ssh.log", tmp_path / "stubbin"
+    bindir.mkdir()
+    (bindir / "ssh").write_text(f"#!/bin/sh\necho \"$@\" >> {log}\nexit 0\n")
+    (bindir / "ssh").chmod(0o755)
+    monkeypatch.setenv("PATH", f"{bindir}:{os.environ['PATH']}")
+    return log
+
+
+def test_a_machine_with_a_reach_cmd_is_probed_by_that_command_and_never_by_ssh(env, tmp_path, monkeypatch):
+    from ttp import machines, reach
+    p = make(env)
+    log = _stub_ssh(env, tmp_path, monkeypatch)
+    for h in ("box-a", "box-b"):
+        machines.add(h)
+    p.set_config("ssh.reach_cmd", {"box-a": "exit 0", "box-b": "exit 3"})
+    via = reach.cmds(p)
+    assert via == {"box-a": "exit 0", "box-b": "exit 3"}
+    reach.probe(["box-a", "box-b"], None, via)
+    assert {a: r["ok"] for a, r in reach.read().items()} == {"box-a": True, "box-b": False}
+    assert not log.exists(), "the stub ssh was never called"
+    reach.probe(["box-a"], None, {})   # with no command for it, the ssh probe runs
+    assert log.exists()
+
+
+def test_a_machine_backing_off_after_a_refused_start_is_not_probed_and_reads_as_backing_off(env, tmp_path, monkeypatch):
+    from ttp import daemon as dm, machines, project, reach
+    from ttp import netwait
+    p = make(env)
+    asked = []
+    monkeypatch.setattr(netwait, "reach", lambda names, env=None: asked.append(list(names)) or {n: True for n in names})
+    for h in ("box-a", "box-b"):
+        machines.add(h)
+    now = time.time()
+    (project.HOME_DIR / "ssh-backoff").mkdir(parents=True)
+    (project.HOME_DIR / "ssh-backoff" / "box-a").write_text(f"{int(now) + 600} 120\n")
+    assert reach.due(now) == ["box-b"]
+    line = reach.digest_lines(p, now)[0]
+    assert line.startswith("- box-a: backing off until ") and "no answer" not in line and "down" not in line
+    monkeypatch.setenv("TTP_TEST_REACH", "1")
+    d = dm.Daemon(p.base)
+    for tick in range(3):   # three probe ticks, one machine in backoff
+        (project.HOME_DIR / reach.STATE).unlink(missing_ok=True)   # box-b is due again
+        d._reach = None
+        d.check_reach()
+        d._reach.join(5)
+        assert set(reach.read()) == {"box-b"}
+    assert asked == [["box-b"]] * 3, "no ssh went to the machine in backoff"
+    # Once the backoff ends the machine is probed again (the record only holds the step).
+    assert reach.due(now + 601) == ["box-a"] and reach.digest_lines(p, now + 601)[0] == "- box-a: never probed"
+
+
 @pytest.mark.parametrize("block", [
     "---\nThe smoke test is running on the box.\n---",
     "```\nThe smoke test is running on the box.\n```",

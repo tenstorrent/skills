@@ -82,7 +82,10 @@ _OFFLINE = re.compile(r"[Cc]ould not resolve hostname|Name or service not known|
 # ssh's own errors before any session: the probe never reached its host, whatever exit code it mapped this to
 _SSH_FAIL = re.compile(r"ssh: connect to host|ssh: [Cc]ould not resolve hostname|kex_exchange_identification|"
                        r"Connection (?:timed out|refused) during banner exchange|"
-                       r"ssh_exchange_identification|Connection closed by \S+ port \d+")
+                       r"ssh_exchange_identification|Connection closed by \S+ port \d+|Connection reset by")
+# The connection was made and then ended or went silent: whatever answered (a tunnel's far end included) is up, the far host is the cause.
+_FAR_SIDE = re.compile(r"kex_exchange_identification|banner exchange|ssh_exchange_identification|"
+                       r"Connection (?:closed|reset) by")
 # SMBIOS chassis types of a laptop or desktop (desktop, low profile, mini tower, portable, laptop,
 # notebook, hand held, all in one, sub notebook, space-saving, lunch box, tablet, convertible,
 # detachable, mini PC, stick PC); servers (main server chassis, rack mount, blade, ...) are not.
@@ -282,12 +285,19 @@ def shown(alias: str, rt: dict) -> str:
     return f"{alias} ({name})" if name and name != alias and not loopback(name) else alias
 
 
-def describe(names: list[str]) -> tuple[list[str], bool]:
-    """(the hosts as the alert shows them, whether every one is reached through a tunnel). A bare
-    loopback address (ssh's error names only what it resolved) is never shown as a host."""
+def far_side(outputs: list[str]) -> bool:
+    """A probe's ssh output shows its connection was made and then closed, reset or left silent."""
+    return any(_FAR_SIDE.search(o or "") for o in outputs)
+
+
+def describe(names: list[str], outputs: list[str] = ()) -> tuple[list[str], bool]:
+    """(the hosts as the alert shows them, whether every one is reached through a tunnel that is down).
+    A bare loopback address (ssh's error names only what it resolved) is never shown as a host. A tunnel
+    is blamed only when its port refuses or nothing listens on it: where the connection was made and then
+    ended (far_side) the far host is named."""
     routes = [(h, route(h)) for h in names]
     return ([shown(h, rt) for h, rt in routes if not loopback(h)],
-            bool(routes) and all(rt["tunnel"] for _, rt in routes))
+            bool(routes) and all(rt["tunnel"] for _, rt in routes) and not far_side(outputs))
 
 
 def step(st: dict | None, blocking: bool, unreachable: int, now: float, grace: float, debounce: float,
@@ -338,9 +348,12 @@ def workstation(cfg: dict | None = None) -> bool:
 
 def classify(outputs: list[str], failing: list[str], answering: list[str]) -> str:
     """"offline" (this machine cannot reach the network: a name does not resolve, no route out, or no
-    other host answers) or "hosts" (other hosts answer; only the failing ones are down)."""
+    other host answers) or "hosts" (other hosts answer, or the connection was made and ended: far_side;
+    only the failing ones are down)."""
     if any(_OFFLINE.search(o or "") for o in outputs):
         return "offline"
+    if far_side(outputs):
+        return "hosts"
     return "hosts" if set(answering) - set(failing) else "offline"
 
 

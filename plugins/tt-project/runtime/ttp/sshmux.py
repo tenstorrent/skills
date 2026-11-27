@@ -14,7 +14,11 @@ the wrapper documents its opt-outs. It execs the real ssh, so a kill of the call
 from __future__ import annotations
 
 import os
+import re
+import time
 from pathlib import Path
+
+from . import project
 
 ENV = "TTP_SSH_REUSE"
 MARK = "# tt-project ssh wrapper"
@@ -58,3 +62,13 @@ def argv(args, environ=None):
     if not _cached:
         _cached.append(wrapper())
     return type(args)([_cached[0], *args[1:]]) if _cached[0] else args
+
+
+def backoff_until(alias: str, now: float | None = None) -> float:
+    """The epoch until which the wrapper refuses new connections to `alias` after a refused start (the record
+    <home>/ssh-backoff/<alias with chars outside A-Za-z0-9._@- as _>: "<until> <step_s>"), else 0."""
+    try:
+        until = float((project.HOME_DIR / "ssh-backoff" / re.sub(r"[^A-Za-z0-9._@-]", "_", alias)).read_text().split()[0])
+    except (OSError, ValueError, IndexError):
+        return 0.0
+    return until if until > (time.time() if now is None else now) else 0.0

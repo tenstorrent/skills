@@ -5214,7 +5214,7 @@ class Daemon:
         due = reach.due(time.time(), reach.probe_every(self.p))
         if due and not (self._reach and self._reach.is_alive()) \
                 and (not os.environ.get("PYTEST_CURRENT_TEST") or os.environ.get("TTP_TEST_REACH")):
-            self._reach = threading.Thread(target=reach.probe, args=(due, self._probe_env()), daemon=True,
+            self._reach = threading.Thread(target=reach.probe, args=(due, self._probe_env(), reach.cmds(self.p)), daemon=True,
                                            name="machine-reach")
             self._reach.start()
 
@@ -12243,7 +12243,7 @@ class Daemon:
             others = self._net_others([tid for tid, _ in unreachable])
         if action == "alert":
             raw = list(dict.fromkeys(h for _, hs in unreachable for h in hs))
-            names, tunnel = netwait.describe(raw)
+            names, tunnel = netwait.describe(raw, [o[0] for t, _ in unreachable if (o := self._probe_out.get(t))])
             kind, known = self._net_kind(unreachable, raw, now, float(new["since"])) \
                 if not tunnel else ("offline", {})
             new.update(tasks=[tid for tid, _ in unreachable], hosts=names, tunnel=tunnel, kind=kind)
