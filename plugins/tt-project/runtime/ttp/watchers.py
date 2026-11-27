@@ -44,7 +44,7 @@ import time
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from pathlib import Path
 
-from . import ghauth, ghroute, prguard
+from . import ghauth, ghroute, prbabysit, prguard
 from . import screen as scr
 
 DAY = 86400.0
@@ -164,8 +164,10 @@ def _purview_scope(daemon) -> tuple[set[str], set[str], set[str]]:
                 branches.add(lab[10:].strip())
         if (k := prguard.pr_key(t["pr_url"] or "")) and "#" in k:
             repos.add(k.split("#", 1)[0])
-    for x in (cfg.get("watchers") or {}).get("purview_extra") or []:
+    for x in [*((cfg.get("watchers") or {}).get("purview_extra") or []), *prbabysit.settings(cfg)["extra_prs"]]:
         x = str(x).strip()
+        if m := re.fullmatch(r"([\w.-]+/[\w.-]+)#(\d+)", x):
+            x = f"https://github.com/{m.group(1)}/pull/{m.group(2)}"
         if prguard.is_pr(x):
             urls.add(x)
         elif re.fullmatch(r"[\w.-]+/[\w.-]+", x):
@@ -214,7 +216,8 @@ def _purview_rows(daemon, rows: list[dict], findings: dict, heads: dict, now: fl
             continue
         active = (v.get("branch") in busy or (findings.get(key) or {}).get("pending")
                   or now - float((heads.get(key) or {}).get("seen") or 0) < ACTIVE_S)
-        if active or now - float(v.get("read") or 0) >= DAY:
+        due = prbabysit.READ_S if prbabysit.settings(getattr(daemon, "cfg", None))["enabled"] else DAY
+        if active or now - float(v.get("read") or 0) >= due:
             out.append({"id": None, "pr_url": url, "title": "", "status": "open", "purview": True})
     return out
 
@@ -427,11 +430,13 @@ _CONNS = {
     "reviews": ("reviews(first:100){" + _PAGE + "nodes{id " + _AUTHOR + "state body submittedAt url "
                 "comments(first:50){totalCount nodes{" + _AUTHOR + "body}}}}", ("reviews",)),
     "checks": ("commits(last:1){nodes{commit{committedDate statusCheckRollup{contexts(first:100){" + _PAGE
-               + "nodes{__typename ... on CheckRun{name status conclusion} ... on StatusContext{context state}}}}}}}",
+               + "nodes{__typename ... on CheckRun{name status conclusion startedAt completedAt checkSuite{workflowRun{workflow{name}}}} "
+               "... on StatusContext{context state}}}}}}}",
                ("commits", "nodes", -1, "commit", "statusCheckRollup", "contexts")),
 }
 _PR_SEL = ("state isDraft mergeable reviewDecision url title headRefOid headRefName baseRefName body lastEditedAt "
-           "createdAt " + _AUTHOR
+           "createdAt updatedAt reviewRequests(first:20){nodes{requestedReviewer{__typename ... on User{login} "
+           "... on Team{name}}}} " + _AUTHOR
            + "".join(sel for sel, _ in _CONNS.values())
            + "reviewThreads(first:100){nodes{isResolved isOutdated path comments(first:50){nodes{" + _AUTHOR
            + "body url}}}}")
@@ -477,6 +482,9 @@ def _views(node: dict, nodes: dict) -> tuple[dict, dict]:
             "headRefOid": node.get("headRefOid"), "headRefName": node.get("headRefName"),
             "baseRefName": node.get("baseRefName"), "body": node.get("body"),
             "lastEditedAt": node.get("lastEditedAt"), "createdAt": node.get("createdAt"),
+            "updatedAt": node.get("updatedAt"),
+            "reviewRequests": [x["requestedReviewer"] for x in (node.get("reviewRequests") or {}).get("nodes") or []
+                               if x.get("requestedReviewer")],
             "headDate": _at(node, ("commits", "nodes", -1, "commit", "committedDate"))}
     data = {"data": {"repository": {"pullRequest": {
         "comments": {"nodes": nodes["comments"][-100:]}, "reviews": {"nodes": reviews[-100:]},
@@ -665,12 +673,12 @@ def pr_signature(pr: dict) -> dict:
                                         + str(c.get("state", "")) for c in human]).encode()).hexdigest()[:12]
     return {"state": pr.get("state"), "draft": pr.get("isDraft"), "decision": pr.get("reviewDecision"),
             "mergeable": pr.get("mergeable"), "checks": "pending" if pending else ("failing" if failing else
-                                                                                  ("passing" if states else "none")),
+                                                                                  ("passing" if set(states) - {"SKIPPED", "NEUTRAL"} else "none")),
             "failing": failing[:10], "activity": activity, "n_human": len(human)}
 
 
 PR_FIELDS = ("state,isDraft,mergeable,reviewDecision,statusCheckRollup,comments,reviews,url,title,author,headRefOid,"
-             "headRefName,baseRefName,body,createdAt")
+             "headRefName,baseRefName,body,createdAt,updatedAt,reviewRequests")
 
 
 def _read_pr(t: dict, root: str, end: float, run_end: float | None) -> dict:
@@ -813,6 +821,11 @@ def watch_prs(daemon, payload: dict | None = None) -> str:
                       if (seen.get(t["pr_url"]) or {}).get("state") not in DONE_STATES]
         except Exception as e:   # noqa: BLE001 - the purview never stops the task PRs' reads
             _log(daemon, f"pr-watch: purview not read: {type(e).__name__}: {e}")
+    elif prbabysit.settings(getattr(daemon, "cfg", None))["enabled"]:   # no discovery, but the known PRs are read
+        known = set(((db.kv(PURVIEW_KEY, {}) or {}).get("prs") or {})) | _purview_scope(daemon)[2]
+        named = {t["pr_url"] for t in watch}
+        watch += [{"id": None, "pr_url": u, "title": "", "status": "open", "purview": True} for u in sorted(known - named)
+                  if (seen.get(u) or {}).get("state") not in DONE_STATES]
     tried = {u: n for u, n in (db.kv(PR_TRIED_KEY, {}) or {}).items() if u in {t["pr_url"] for t in watch}}
     stint = max(tried.values(), default=0) + 1
     order = sorted(watch, key=lambda t: tried.get(t["pr_url"], 0))
@@ -864,6 +877,8 @@ def watch_prs(daemon, payload: dict | None = None) -> str:
         stale = body_stale(pr, bodies, heads, time.time()) if sig.get("draft") is True else ""
         failing_base = _base_failing(pr, base_cache, root, time.time()) if sig["failing"] else set()
         _check_findings(daemon, t, pr, sig, findings, data, stale=stale, failing_base=failing_base)
+        if prbabysit.settings(getattr(daemon, "cfg", None))["enabled"]:
+            prbabysit.sweep(daemon, t, pr, sig, _gh)
         old = seen.get(t["pr_url"])
         if t.get("purview"):   # only its findings are news: no pr_changed for a PR no task opened
             seen[t["pr_url"]] = sig
@@ -1085,7 +1100,7 @@ def _check_findings(daemon, t: dict, pr: dict, sig: dict, findings: dict, data: 
     else:   # unread: keep what was known
         bots, bot_keys = old.get("bot", []), old.get("bot_keys", sorted(old.get("bot", [])))
     draft = sig.get("draft") is True
-    humans = (human_open(data) if data is not None else old.get("human", [])) if draft else []
+    humans = human_open(data) if data is not None else old.get("human", [])
     base = set(failing_base or ())
     rec = {"task": t["id"], "url": url, "branch": pr.get("headRefName") or old.get("branch"),
            "failing": [c for c in sig["failing"] if c not in base], "pending": sig["checks"] == "pending",
@@ -1166,8 +1181,9 @@ def _check_findings(daemon, t: dict, pr: dict, sig: dict, findings: dict, data: 
                 + " and every bot review comment fixed or answered"
                 + (", every person's review thread answered and its description current: a draft at the finish "
                    "line" if draft else "")
-                + ". If its review task passed, ask the user for a draft review now (ask_user, blocking review, "
-                  "with its URL); never take it out of draft yourself.")
+                + (". If its review task passed, ask the user for a draft review now (ask_user, blocking review, "
+                   "with its URL); never take it out of draft yourself." if draft else
+                   ". It is out of draft: ready and merge stay the user's word."))
     db.x("INSERT INTO events(ts,source,kind,severity,text,status,task) VALUES(?,?,?,?,?,?,?)",
          (time.time(), "pr", "pr_findings" if dirty else "pr_clean", "normal", text, status, t["id"]))
 

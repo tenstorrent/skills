@@ -680,6 +680,7 @@ EFFORT_EVENT_TRIGGERS = {
     "resource_trouble": "resource", "machine_condition": "resource", "machine_change_overdue": "resource", "machine_outage_overdue": "resource", "change_probe_broken": "resource",
     # costly or irreversible decisions
     "task_budget_exhausted": "costly", "ask_timeout": "costly", "pr_findings": "costly", "pr_clean": "costly",
+    "pr_ci_not_run": "costly", "pr_idle": "costly",
     "pr_unapproved_ready": "costly", "after_push_failed": "costly", "push_batch_died": "costly",
     "push_tip_failed": "costly",
     # conflicting instructions: an appended rule a standing Restrictions item would override

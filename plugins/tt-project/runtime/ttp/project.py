@@ -591,6 +591,10 @@ DEFAULT_CONFIG: dict[str, Any] = {
     # beyond those its own records find (the push branch, its tasks' branches and PRs). Shipped empty.
     "watchers": {"deadline_s": 90, "gh_timeout_s": 20, "pr_workers": 4, "pr_timeout_s": 60, "gh_anon_cap": 30,
                  "purview_extra": []},
+    # pr_babysit: the model-free sweep of every open PR the project owns, draft or not (prbabysit): events
+    # pr_ci_not_run and pr_idle, and a chat line per status change. idle_h: quiet hours before pr_idle.
+    # extra_prs: 'owner/repo#N' PRs it owns though no record of its own names them.
+    "pr_babysit": {"enabled": True, "idle_h": 24, "extra_prs": []},
     # credentials false: this project keeps no GitHub login here, so no alert suggests `gh auth login`.
     "gh": {"credentials": True},
     # Who hears of a heal check its self-fix task could not repair (a heal block's own `escalate`

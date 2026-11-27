@@ -1803,6 +1803,8 @@ def test_pr_watch_parallel_reads_find_what_one_by_one_reads_find(env, monkeypatc
 
     def gh(args, cwd):
         time.sleep(0.01)
+        if args[0] == "api" and "/contents/" in args[1]:
+            return None
         if args[0] == "api":
             n = int(next(a for a in args if a.startswith("number=")).split("=")[1])
             pr = {"comments": {"nodes": []}, "reviews": {"nodes": []}, "reviewThreads": {"nodes": []}}
@@ -1969,7 +1971,8 @@ def _gql_node(n: int, *, state="OPEN", draft=True, decision=None, checks=(("buil
     return {"state": state, "isDraft": draft, "mergeable": "MERGEABLE", "reviewDecision": decision,
             "url": f"https://github.com/acme/widgets/pull/{n}", "title": f"t{n}", "headRefOid": HEAD,
             "headRefName": f"b{n}", "author": who("dev"), "baseRefName": "main", "body": f"Change {n}.",
-            "createdAt": "2026-01-01T00:00:00Z",
+            "createdAt": "2026-01-01T00:00:00Z", "updatedAt": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "reviewRequests": [],
             "comments": [{"author": who(a), "body": b, "createdAt": f"2026-01-01T00:{i // 60:02d}:{i % 60:02d}Z",
                           "url": f"c{n}-{i}"} for i, (a, b) in enumerate(comments)],
             "reviews": [{"id": f"R{n}-{i}", "author": who(a), "state": st, "body": b, "submittedAt": "2026-01-02",
@@ -2006,6 +2009,8 @@ class _BatchGh:
     def __call__(self, argv, timeout, **kw):
         from ttp import boundedchild, watchers
         a = argv[1:]
+        if a[0] == "api" and "/contents/" in a[1]:  # the babysit sweep's workflow files: not a PR read
+            return boundedchild.Result(1, "", "gh: Not Found (HTTP 404)")
         self.calls.append(a)
         ok = lambda body: boundedchild.Result(0, json.dumps(body), "")
         if a[:2] == ["pr", "view"]:
@@ -2017,7 +2022,7 @@ class _BatchGh:
                     "comments": [{"author": {"login": c["author"]["login"]}, "body": c["body"]} for c in pr["comments"]],
                     "reviews": [{k: v for k, v in r.items() if k != "comments"} for r in pr["reviews"]],
                     **{k: pr[k] for k in ("url", "title", "author", "headRefOid", "headRefName", "baseRefName", "body",
-                                          "createdAt")}}
+                                          "createdAt", "updatedAt", "reviewRequests")}}
             return ok({k: view[k] for k in a[4].split(",")})
         if a[:2] == ["pr", "list"]:
             return ok([{"url": pr["url"], "headRefName": pr["headRefName"], "author": pr["author"],
@@ -2158,7 +2163,7 @@ def test_a_check_failing_on_the_base_too_does_not_hold_a_draft(env, monkeypatch)
 
 def test_an_idle_purview_pr_is_read_daily_and_an_active_one_every_poll(env, monkeypatch):
     from ttp import watchers
-    p, gh, d = _purview_setup(env, monkeypatch, {9: _gql_node(9)})
+    p, gh, d = _purview_setup(env, monkeypatch, {9: _gql_node(9)}, pr_babysit={"enabled": False})
     now = [time.time()]
     monkeypatch.setattr(watchers.time, "time", lambda: now[0])
     reads = lambda: sum(c[:2] == ["api", "graphql"] or c[:2] == ["pr", "view"] for c in gh.calls)

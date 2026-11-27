@@ -4091,13 +4091,25 @@ the pick order, so it takes the first starts. A resumed resource ramps only its 
   coordinator asks the user before a draft PR under a code freeze, and the ask gate lets that ask
   through (an ask about a draft PR outside a freeze is still refused). Leaving draft always needs
   the user's yes, and human reviewers are never requested, whatever the setting.
+- PR babysitting sweep (`pr_babysit.enabled`, default true), read-only, run by pr-watch on every open PR the
+  project owns, draft or not: one of its tasks opened it, its head is a branch the project pushed, or it is
+  in `pr_babysit.extra_prs` (`owner/repo#N`; read even while gh is logged out, anonymously or through the
+  route). It posts nothing and dispatches nothing. A non-draft PR gets `pr_findings` for failed checks and
+  unanswered comments as a draft does. `pr_ci_not_run` lists checks skipped, or workflows that need a
+  manual or label trigger and never ran on the head, each with its trigger (read from the repo's workflows
+  at the head). `pr_idle` fires once per idle stretch past `pr_babysit.idle_h` (24) hours without commit,
+  review, comment or check activity, naming the requested reviewers. Status changes since the last
+  sweep (out of draft, review approved or changes requested, CI red or green, merged or closed, a new
+  conflict) are one chat line per PR with its link, once per change: a review approved and red CI on a ready PR
+  post at once, the rest join the digest. A gh call that is not answered yet (exit 75) gives nothing.
 - Draft PRs are taken to the finish line, and pr-watch enforces it. Its GitHub purview is every open
   PR of the project's tasks plus every open PR whose head is a branch the project works on (the push
   branch, task branches and `pr_branch:` lines of tasks open or made in the last 30 days), even one a
   person opened; it is found from those records only, listed hourly with one `gh pr list` per repo
   through the usual gh route, never from charter wording. `watchers.purview_extra` (empty by
   default) adds PR URLs or `owner/repo` names. A PR is read every poll while it is active (an open
-  task on its branch, findings pending, or its head moved in the last 6 h), else once a day. Each
+  task on its branch, findings pending, or its head moved in the last 6 h), else once a day (every 15
+  minutes while `pr_babysit.enabled`, so approvals and conflicts are told). Each
   open draft is `ready` (CI green, a check also failing on the base branch tip not counted; every bot
   comment and every person's review thread fixed or answered; the description current: not empty
   and edited since the head last moved), `finishing` (an open task owns what is left) or `stalled`
