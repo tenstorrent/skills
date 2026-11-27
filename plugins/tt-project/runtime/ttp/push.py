@@ -2475,13 +2475,16 @@ def checks_config(d: dict) -> Any:
     return [d.get("push_checks"), by] if by else d.get("push_checks")
 
 
-def checks_set_id(d: dict, task: bool = False) -> str:
+def checks_set_id(d: dict, task: bool = False, repo: Path | str | None = None, p: Project | None = None) -> str:
     """A short fingerprint of the check set a detached `ttp checks` run starts under: a run whose recorded
     id differs from the current one ran a superseded set (jobstop.sweep_superseded_checks). `task`: the run
     could take delivery.task_checks (testpick.task_set: a candidate run of a single-repo project's own
     checks, not --release), so the id covers task_checks while it is set, else the push checks it falls
-    back to (checks_config). Like is compared with like: a task-checks run ignores push_checks edits."""
-    cfg = ["task", d[TASK_KEY]] if task and d.get(TASK_KEY) else checks_config(d)
+    back to. Like is compared with like: a task-checks run ignores push_checks edits. With `repo` (the
+    checked repository; `p` its project) the push checks are the plan repo_checks resolves for it, so an
+    edit to another repository's entry leaves the id as it was; without, every check (checks_config)."""
+    cfg = ["task", d[TASK_KEY]] if task and d.get(TASK_KEY) else \
+        repo_checks(d, Path(repo), p)[0] if repo else checks_config(d)
     return hashlib.sha256(json.dumps(cfg, sort_keys=True, default=str).encode()).hexdigest()[:16]
 
 

@@ -976,8 +976,9 @@ def lane_tasks(p: Project) -> set[int]:
 
 def sweep_superseded_checks(p: Project, now: float | None = None) -> list[dict]:
     """Stop the detached checks an open task's run started under a superseded check set: checks.pid
-    records the configured set's id (push.checks_set_id; of task_checks for a run that can take them,
-    `checks_task`) and that set has changed since, so their result would no longer qualify the head. Each is ended (end_checks) and dropped (cli._checks_drop
+    records the configured set's id (push.checks_set_id of its worktree's own plan; of task_checks for a run
+    that can take them, `checks_task`) and that set has changed since (an edit to another repository's
+    entry changes none; an id of every check, recorded before plans were scoped, still counts), so their result would no longer qualify the head. Each is ended (end_checks) and dropped (cli._checks_drop
     writes checks.rc 1 and why), so the task wakes and reruns its checks under the current set. Runs of
     named commands or harness checks record no set and are left alone; a group checks_refused names is never
     signalled."""
@@ -999,8 +1000,12 @@ def sweep_superseded_checks(p: Project, now: float | None = None) -> list[dict]:
             continue
         seen.add(row["dir"])
         info = _read_checks_pid(d)
-        old, current = info.get("checks_set"), ids[bool(info.get("checks_task"))]
-        if not old or old == current or (d / CHECKS_RC).exists() or not _checks_alive(info):
+        old, every = info.get("checks_set"), ids[bool(info.get("checks_task"))]
+        try:
+            current = checks_set_id(delivery, bool(info.get("checks_task")), info.get("worktree") or None, p)
+        except Exception:   # its worktree is gone or unreadable: every check's id stands
+            current = every
+        if not old or old in (current, every) or (d / CHECKS_RC).exists() or not _checks_alive(info):
             continue
         if checks_refused(p, d, row["id"]):
             continue

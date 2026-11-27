@@ -6042,8 +6042,8 @@ def _harness_purpose(a) -> dict:
 
 
 def _checks_set(a, base: str, top: str = "") -> dict:
-    """The check set a detached `ttp checks` run of the configured checks starts under (push.checks_set_id),
-    so the daemon stops it once that set changes; none for named commands or harness checks. A run that
+    """The check set a detached `ttp checks` run of the configured checks starts under (push.checks_set_id of
+    the checked repository's own plan), so the daemon stops it once that plan changes; none for named commands or harness checks. A run that
     can take delivery.task_checks (testpick.task_set's rule) records `checks_task`, so its set is the task
     set while one is configured."""
     if a.cmd or getattr(a, "purpose", None) == "harness":
@@ -6052,9 +6052,10 @@ def _checks_set(a, base: str, top: str = "") -> dict:
     try:
         p = Project(base)
         d = p.config().get("delivery") or {}
+        repo = Path(top or os.getcwd())
         task = (getattr(a, "purpose", None) or "candidate") == "candidate" and not getattr(a, "release", False) \
-            and push.repo_checks(d, Path(top or os.getcwd()), p)[1] == "delivery.push_checks"
-        return {"checks_set": push.checks_set_id(d, task), **({"checks_task": True} if task else {})}
+            and push.repo_checks(d, repo, p)[1] == "delivery.push_checks"
+        return {"checks_set": push.checks_set_id(d, task, repo, p), **({"checks_task": True} if task else {})}
     except Exception:   # an unreadable config: the run is never counted superseded
         return {}
 

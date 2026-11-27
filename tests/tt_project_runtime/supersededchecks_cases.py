@@ -123,6 +123,46 @@ def test_a_task_checks_run_is_superseded_by_a_task_checks_edit_not_a_push_checks
             _stop_checks_group(proc)
 
 
+def test_a_check_set_edit_stops_only_the_runs_whose_own_repo_plan_it_changes(env, tmp_path):
+    """With delivery.push_checks_by_repo set, a detached run records the id of its own repository's plan:
+    an edit to another repository's entry leaves it running, an edit to the default plan stops only the
+    runs that use the default, and an edit to its own entry (here its if_changed scope) stops it."""
+    import argparse
+    from ttp import cli, jobstop
+    p = make(env)
+    repos = {}
+    for name in ("repo-a", "repo-b", "repo-c"):
+        repos[name] = tmp_path / name
+        subprocess.run(["git", "init", "-q", str(repos[name])], check=True)
+    a, b = str(repos["repo-a"].resolve()), str(repos["repo-b"].resolve())
+    p.set_config("delivery.push_checks", ["make default"])
+    p.set_config("delivery.push_checks_by_repo", {a: ["make a"], b: ["make b"]})
+    tid = p.db.add_task("t", "s", kind="code", tier="light", origin="user")
+    p.db.update_task(tid, status="waiting")
+    runs = {}
+    try:
+        for name, repo in repos.items():
+            mark = cli._checks_set(argparse.Namespace(cmd=[], purpose=None, release=True), str(p.base), str(repo))
+            d, _, proc = _json_checks_run(p, tid, f"checks-{name}")
+            (d / "checks.pid").write_text(json.dumps({**json.loads((d / "checks.pid").read_text()), **mark,
+                                                      "worktree": str(repo)}))
+            runs[name] = (d, proc)
+        assert jobstop.sweep_superseded_checks(p) == []
+        alive = lambda: sorted(n for n, (_, proc) in runs.items() if proc.poll() is None)   # noqa: E731
+        p.set_config("delivery.push_checks_by_repo", {a: ["make a"], b: ["make b2"]})
+        (out,) = jobstop.sweep_superseded_checks(p)
+        assert runs["repo-b"][1].wait(timeout=10) is not None and alive() == ["repo-a", "repo-c"], out
+        p.set_config("delivery.push_checks", ["make default2"])
+        (out,) = jobstop.sweep_superseded_checks(p)
+        assert runs["repo-c"][1].wait(timeout=10) is not None and alive() == ["repo-a"], out
+        p.set_config("delivery.push_checks_by_repo", {a: [{"run": "make a", "if_changed": "src/**"}], b: ["make b2"]})
+        (out,) = jobstop.sweep_superseded_checks(p)
+        assert runs["repo-a"][1].wait(timeout=10) is not None and alive() == [], out
+    finally:
+        for _, proc in runs.values():
+            _stop_checks_group(proc)
+
+
 def test_no_remote_check_starts_on_a_host_taken_off_the_spill_list(env, tmp_path, monkeypatch):
     """A spilled check carries its project (--spill); remotecheck refuses the host with an environment
     fault (75, so the run reruns elsewhere) once the project's list no longer has it. A pinned host
