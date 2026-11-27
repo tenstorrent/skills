@@ -20,6 +20,7 @@ from pathlib import Path
 
 WINDOW_S = 14 * 86400
 ROWS = 500
+P50 = 0.5
 P80 = 0.8
 
 
@@ -106,7 +107,7 @@ def job_finish(db, t: dict, h: dict, now: float, cache: dict | None = None) -> d
     for e in ents:
         name = normal(e.get("name"))
         xs = (h.get("job") or {}).get(name) or []
-        left = job_left(e, xs, now, 0.5)
+        left = job_left(e, xs, now, P50)
         if left is None:
             why = f"no measured {name} job run yet"
             continue
@@ -120,7 +121,7 @@ def job_finish(db, t: dict, h: dict, now: float, cache: dict | None = None) -> d
     if wait:
         legs.append(("queue", wait))
         hi.append(wait)
-    if not started and (s := pct(h.get("startup") or [], 0.5)) is not None:
+    if not started and (s := pct(h.get("startup") or [], P50)) is not None:
         legs.insert(0, ("startup", s))
         hi.insert(0, s)
     open_jobs = sum(1 for e in ents if e.get("status") not in ("ended", "died"))
@@ -139,7 +140,7 @@ def queue_wait(db, tid: int, names: set, h: dict, now: float, cache: dict | None
         for e in job_entries(db, r["id"], cache):
             if normal(e.get("name")) in names and e.get("status") not in ("ended", "died", "queued"):
                 xs = (h.get("job") or {}).get(normal(e.get("name"))) or []
-                m = pct(xs, 0.5)
+                m = pct(xs, P50)
                 if m is not None and e.get("started"):
                     best = max(best, m - (now - float(e["started"])))
     return max(0.0, best)
