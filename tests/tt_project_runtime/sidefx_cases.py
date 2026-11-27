@@ -242,7 +242,8 @@ def test_outside_writes_skips_regex_text_ssh_remote_commands_and_saved_tool_outp
     # regex and awk text is no path, in each tool and in a `bash -lc` script (Codex's form)
     assert found("grep -n '/^def' f.py; rm -f x", "awk '/_launch/ {print $1}' f > out.txt",
                  "sed -n '/^def/,/^$/p' f.py | head; touch y", "grep -rn -e /_launch -e '/x$' . > hits.txt",
-                 "bash -lc 'rg /_launch src > hits.txt'", "perl -ne 'print if /^\\d+/' f > o.txt") == set()
+                 "bash -lc 'rg /_launch src > hits.txt'", "perl -ne 'print if /^\\d+/' f > o.txt",
+                 "awk 'NR>=2 && /\\<later\\>/ {print NR\": \"$0}' f | head", "awk '{print $0 \" > \" NR}' f") == set()
     # a comparison is no redirect: `>=` after a cd elsewhere named '<dir>/=NNN:' before
     assert found(f"cd {tmp_path}/state && python3 -c 'print(1 if 5>=3 else 0)' && grep -c 'run>=123:' log") == set()
     # an ssh remote command's paths are the remote host's; its local redirect and key are local
@@ -263,7 +264,8 @@ def test_outside_writes_skips_regex_text_ssh_remote_commands_and_saved_tool_outp
                                                              "Library/Caches/x", "Library/LaunchAgentsX"))
     # real writes still count: an awk program's own output file, a grep's redirect, a quoted target
     assert found("awk '/x/ {print > \"/tmp/a\"}' f", "grep -n '/^def' f.py > /tmp/defs",
-                 "sed -i 's/a/b/' \"$HOME/.config/c\"") == {"/tmp/a", "/tmp/defs", f"{h}/.config/c"}
+                 "sed -i 's/a/b/' \"$HOME/.config/c\"", "awk '/a>b/ {print >> \"/tmp/m\"}' f") \
+        == {"/tmp/a", "/tmp/defs", f"{h}/.config/c", "/tmp/m"}
     assert found("rm /tmp/my\\ dir/f") == {"/tmp/my\\"}   # an escaped space is no regex escape
     assert found("echo hi 2>&1 > /tmp/s") == {"/tmp/s"} and found("echo 'unclosed > /tmp/u") == {"/tmp/u"}
 

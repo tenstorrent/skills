@@ -265,6 +265,28 @@ def _commands(toks: list[str], punct: list[bool]) -> set[int]:
     return out
 
 
+def _awk_text(prog: str) -> str:
+    """An awk program without its regex literals and string literals, except a string right after `>`, `>>` or `|`
+    (an output target): a `\\>` in /regex/ or a `" > "` in a string is no redirect."""
+    out, i, n = [], 0, len(prog)
+    while i < n:
+        c = prog[i]
+        if c == '"' or (c == "/" and re.search(r"(?:^|[(!,~;{&|\n])\s*$", prog[:i])):
+            j = i + 1
+            while j < n and prog[j] != c:
+                j += 2 if prog[j] == "\\" else 1
+            lit = prog[i:j + 1]
+            if c == '"' and re.search(r"(?:>>?|\|)\s*$", prog[:i]):
+                out.append(lit)
+            elif c == '"':
+                out.append('""')
+            i = j + 1
+        else:
+            out.append(c)
+            i += 1
+    return "".join(out)
+
+
 def _blank(pattern: str, tool: str) -> str:
     """A grep-like pattern goes whole; an awk or sed program keeps all but its regex literals."""
     return "" if tool in GREPS else REGEX_LITERAL_RE.sub("", pattern)
@@ -677,7 +699,7 @@ def classify_paths(cmd: str, home: str, cwd: str, run_dir: str, depth: int = 0) 
                 put(a, "executed", f"{name} runs it")
         else:
             if name in PROGS - {"sed"}:   # an awk program's own `print > "/file"`
-                for m in (m for a in paths for m in REDIRECT_RE.finditer(a)):
+                for m in (m for a in paths for m in REDIRECT_RE.finditer(_awk_text(a))):
                     put(m.group(1), "write", f"{name} program's output file")
             for a in paths:
                 put(a, "read" if name in READERS else "mentioned", f"{name} argument")

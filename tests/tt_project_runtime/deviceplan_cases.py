@@ -173,7 +173,19 @@ def test_a_backquote_escaped_in_a_string_is_text_not_a_hidden_command(tmp_path):
     for nested in ('bash -c "echo \\`reboot\\`"', 'timeout 5 sh -c "\\`reboot\\`"', 'ssh box "echo \\`reboot\\`"',
                    'find . -exec sh -c "\\`reboot\\`" \\;', "bash <<EOF\necho \\`reboot\\`\nEOF"):
         assert deviceplan.risky(nested), "another program may hand the text to a shell that runs it: " + nested
+    cd_text = 'cd /x && python3 -c "print(\'\\`reset\\` power cycle\')"'
+    assert not deviceplan.risky(cd_text), "a cd prefix does not make an escaped backquote live"
     assert ref("ipmitool chassis power cycle").startswith("power cycles and resets")
+
+
+def test_a_substitution_in_an_unquoted_heredoc_body_is_a_hidden_command(tmp_path):
+    from ttp import deviceplan, glmguard
+    for live in ("cat <<EOF\n`reboot`\nEOF", "cat <<EOF\n$(reboot)\nEOF", "cat <<-EOF\n\t`reboot`\n\tEOF"):
+        assert deviceplan.risky(live), "the shell runs the substitution whatever reads the body: " + live
+        assert glmguard.shell_refusal(live, str(tmp_path)), live
+    for text in ("cat <<'EOF'\n`reboot`\nEOF", 'cat <<"EOF"\n$(reboot)\nEOF', "cat <<EOF\n\\`reboot\\`\nEOF",
+                 "cat <<EOF\nthe reboot plan\nEOF"):
+        assert not deviceplan.risky(text), "a quoted delimiter or escaped text runs nothing: " + text
 
 
 def test_a_glm_device_run_runs_reads_bookkeeping_and_plan_steps_and_checks_risky_ones(tmp_path):
@@ -260,6 +272,7 @@ def test_the_plan_prompt_asks_for_exact_check_and_complete_submit_commands():
     assert "--help" not in deviceplan.DEVICE_PLAN
     assert "job-submit step is the complete command line" in deviceplan.DEVICE_PLAN
     assert "`ttp machines change list <alias>`" in deviceplan.DEVICE_PLAN
+    assert "write it as `edit <file>`" in deviceplan.DEVICE_PLAN, "a plain edit in the run worktree is a listed step"
 
 
 def test_glm_stops_at_a_failed_check_step():

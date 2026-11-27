@@ -70,6 +70,7 @@ DEFAULTS = {"power_routes": ["broker"], "device_scripts": [], "device_audits": 2
             "device_tools": ["run_cluster_validation", "test_system_health", "test_tt_fabric"]}
 FENCE = re.compile(r"```(?:json)?\s*(\{.*?\})\s*```", re.S)
 SUBST_TICK = re.compile(r"(?<!\\)(?:\\\\)*`")   # a backquote after an even run of backslashes starts a command
+SUBST_DOLLAR = re.compile(r"(?<!\\)(?:\\\\)*\$\(")   # `$(` after an even run of backslashes does too
 PROSE = re.compile(r"[A-Z][a-z]+(?:,?\s+[a-z][a-z'-]*){2,}[.:]?$")   # "Check the holder first." is no command
 IPMI_POWER = re.compile(r"(?:chassis\s+)?power\s+(?!status\b)\S+|raw\b|mc\s+reset\b|chassis\s+bootdev\b")
 RISKY = re.compile(r"(?i)\b(?:reboot|shutdown|poweroff|tt-flash|tt-topology|glx_reset|reset|power[ _-]?cycle|firmware|flash)\b")
@@ -97,7 +98,9 @@ DEVICE_PLAN = (
     "in run order. Every command that changes state must be a step (reads need none); `check` true for a step "
     "whose failure must stop the run. " + SOURCE_RULES + " Each other host the plan touches gets the scratch folder "
     "given with the task, which the harness sets: the agent may make it and write, copy and remove inside it freely, "
-    "so it needs no step; use that exact path for this run's files there. Every other write there is a step. Each "
+    "so it needs no step; use that exact path for this run's files there. Every other write there is a step. A plain "
+    "edit of a file in the run's own worktree is a step too: write it as `edit <file>` (check false), with no prose "
+    "in the command. Each "
     "check or gate command runs "
     "exactly as written, so use only options it "
     "takes: confirm them in its documentation or source, which you can read, and leave out any option you "
@@ -221,11 +224,23 @@ def _ssh_shell_feeds(cmd: str) -> list[tuple[str, str]]:
     return out
 
 
+def _substituted_bodies(cmd: str) -> str:
+    """The bodies of the heredocs of `cmd` with an unquoted delimiter that hold a command substitution: the shell
+    runs the substitution whatever program reads the body, and _split drops it."""
+    from . import hook
+    lines, bodies = hook._heredocs(cmd)
+    return "\n".join(ln for i, body, pos in bodies if not hook.HEREDOC_RE.match(lines[i], pos)[2]
+                     and any(SUBST_TICK.search(ln) or SUBST_DOLLAR.search(ln) for ln in body) for ln in body)
+
+
 def _segs(cmd: str):
     """hook's simple commands of `cmd` (wrappers dropped, `bash -c` and `$( )` read, file redirects gone), None
-    when it cannot be read: a backquote hides a command from that parser (an escaped one, `\\``, is only text)."""
+    when it cannot be read: a backquote hides a command from that parser (an escaped one, `\\``, is only text),
+    and so does a substitution in an unquoted heredoc body."""
     from . import glmguard, hook
     try:   # heredoc bodies no shell reads: gone, before REDIRECT takes their `<<`
+        if _substituted_bodies(cmd):
+            return None
         cmd = "\n".join([hook._split(cmd)[0], *(text for _, text in _ssh_shell_feeds(cmd))])
     except Exception:
         return None
@@ -409,7 +424,7 @@ def risky(cmd: str, routes=tuple(DEFAULTS["power_routes"])) -> bool:
     from .hook import DEVICE_TOOLS
     for x in _words(cmd):
         if x is None:
-            return bool(RISKY.search(hook._split(cmd)[0]))   # a commit message naming a reset resets nothing
+            return bool(RISKY.search(hook._split(cmd)[0] + "\n" + _substituted_bodies(cmd)))   # a commit message naming a reset resets nothing
         w = x[0]
         prog, args = os.path.basename(w[0]), w[1:]
         if prog == "git":
