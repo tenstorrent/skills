@@ -381,11 +381,19 @@ def keeps_core(db, cfg: dict, task: dict, tier: str, cls: str | None = None, pic
     return ""
 
 
-def fallback(cfg: dict, why: str) -> dict | None:
+def fallback(cfg: dict, why: str, db=None, after: int | None = None, task: dict | None = None) -> dict | None:
     """The model a glm_work run that cannot start on the endpoint (`why`, the route entry's fallback) takes on
-    core: {"provider", "model", "effort"}, or None when `why` is no endpoint refusal (it starts on core as is)."""
+    core: {"provider", "model", "effort"}, or None when `why` is no endpoint refusal (it starts on core as is).
+    A `rerun` after the task's own run (`after`) was refused its model mid-run is that refusal. A task that
+    answers a chat keeps its tier's model: the fallback run's own text reaches the person (#3512)."""
     s = settings(cfg)
-    return dict(s["fallback"]) if s and why in FALLBACK_ON else None
+    if not s or (task or {}).get("reply_chat"):
+        return None
+    if why == "rerun" and db is not None and after:
+        from . import route
+        row = db.one("SELECT note FROM runs WHERE id=?", (after,))
+        why = (route.of(row["note"]) or {}).get("fallback") if row else ""
+    return dict(s["fallback"]) if why in FALLBACK_ON else None
 
 
 def log_hour(db, why: str, wait_s: float | None = None, now: float | None = None) -> None:

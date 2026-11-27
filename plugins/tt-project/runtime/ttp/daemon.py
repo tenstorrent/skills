@@ -13633,8 +13633,8 @@ class Daemon:
                     log(self.p, f"task {task['id']}: device A/B not assigned: {e}"[:300])
                 if routed and routed.get(glmwork.KEY):
                     try:   # a GLM work run the endpoint could not take starts on its fallback model, named (#1924)
-                        if run_prov == provider and (fb := glmwork.fallback(self.cfg, routed["fallback"])) \
-                                and fb["provider"] == provider:
+                        if run_prov == provider and (fb := glmwork.fallback(
+                                self.cfg, routed["fallback"], db, routed.get("after"), task)) and fb["provider"] == provider:
                             cheap = {**fb, "class": run_cls, "why": f"glm_work fallback: {routed['fallback']}"}
                             routed["fallback_model"] = fb["model"]
                         glmwork.log_hour(db, routed["fallback"], routed.get("waited_s"), now)

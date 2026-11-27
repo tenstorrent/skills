@@ -1336,6 +1336,14 @@ GLM work route (`glmwork.py`, off by default). `route.glm_work` (a project and a
 project's model-hours to one chat model: `{"on": true, "model": "<chat model>", "effort": "max", "holdout": 0.1,
 "holdout_held": 0.05, "kinds": ["code", "work", "question", "harness"], "fallback": {"provider": "claude", "model":
 "sonnet", "effort": "high"}}` (the values shown are the defaults; `model` falls back to `route.code_sonnet.glm.model`).
+Fallback. A run the endpoint cannot take (the model is not served, the endpoint is down or erring, a quota, plan or
+pause gate holds it, or it had no room in time) starts on `fallback` instead of the core provider's tier model, and so
+do the next runs of a task whose own run was refused its model mid-run, for the hour they stay on core. Each fallback
+is per run: once the model is served again new runs go back to it, and no release flag moves. The run note's route
+entry names the cause (`fallback`) and the model (`fallback_model`), and the GLM share counts the run as not GLM.
+Runs the route keeps on core never take it (plans, reviews, coordinator turns, the deep tier, pinned and bounced runs),
+and neither does a task that answers a chat: it keeps its tier's model. Example: `ttp config <project>
+route.glm_work.fallback '{"model": "sonnet", "effort": "high"}'`.
 Person-facing tasks (`route.glm_work.person_writeup`, default on where `route.glm_work` is on). A task that answers a
 chat (`reply_chat`), holds a `conclusion:` line or tells the worker to post no longer stays on Opus whole: GLM does the
 work and Opus writes every word a person reads. For a `reply_chat` task whose run was on the chat provider the daemon
