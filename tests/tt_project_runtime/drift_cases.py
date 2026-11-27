@@ -147,10 +147,23 @@ def test_drift_pace_fires_on_spend_ahead_of_wall_or_most_of_the_budget_with_no_c
     assert "pace" not in _dr_flags(_dr_entry(now, spend=spend(0.5, 0.5), wall=wall(0.34)), now)
     assert "pace" not in _dr_flags(_dr_entry(now, spend=spend(0.49, 0.49), wall=wall(0.01)), now), "under the floor"
     git = lambda c: {"head": "h", "committed": c}  # noqa: E731
-    assert "pace" in _dr_flags(_dr_entry(now, spend=spend(0.4, 0.85), wall=wall(0.9), git=git([])), now)
-    assert "pace" not in _dr_flags(_dr_entry(now, spend=spend(0.4, 0.85), wall=wall(0.9), git=git(["a.py"])), now)
-    assert "pace" not in _dr_flags(_dr_entry(now, spend=spend(0.4, 0.79), wall=wall(0.9), git=git([])), now)
-    assert "pace" not in _dr_flags(_dr_entry(now, spend=spend(0.4, 0.85), wall=wall(0.9)), now), "no worktree"
+    assert "pace" in _dr_flags(_dr_entry(now, spend=spend(0.85, 0.85), wall=wall(0.9), git=git([])), now)
+    assert "pace" not in _dr_flags(_dr_entry(now, spend=spend(0.85, 0.85), wall=wall(0.9), git=git(["a.py"])), now)
+    assert "pace" not in _dr_flags(_dr_entry(now, spend=spend(0.79, 0.79), wall=wall(0.9), git=git([])), now)
+    assert "pace" not in _dr_flags(_dr_entry(now, spend=spend(0.85, 0.85), wall=wall(0.9)), now), "no worktree"
+
+
+def test_drift_pace_nothing_committed_judges_this_run_not_earlier_runs_work():
+    now = time.time()
+    spend = lambda run, task: {"run_usd": run * 8, "task_usd": task * 8, "budget_usd": 8.0, "share": task}  # noqa: E731
+    wall = {"elapsed_s": 1, "limit_s": 2, "share": 0.9}
+    git = {"head": "h", "committed": []}   # what this run's checkout shows: earlier runs' commits made
+    # elsewhere (harness repo, a commit helper on the root's branch) are not in it
+    early = _dr_flags(_dr_entry(now, spend=spend(0.02, 0.82), wall=wall, git=git), now)
+    assert "pace" not in early, "a continuation one minute in, task spend high, work committed earlier"
+    assert "pace" in _dr_flags(_dr_entry(now, spend=spend(0.82, 0.82), wall=wall, git=git), now), "never committed"
+    assert "pace" in _dr_flags(_dr_entry(now, spend=spend(0.81, 0.95), wall=wall, git=git), now), \
+        "a continuation that itself overspends with nothing new"
 
 
 def _dr_project(env, tmp_path, quiet=True, **cost):

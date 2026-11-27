@@ -14,7 +14,8 @@ Flags, each with its threshold under coordinator.drift.<name> (0 turns that flag
   or detach wait is pending, and the run's own detached checks are neither queued nor running (they
   count as activity: the run is waiting on them) (the runner's stall_s still ends a stalled run later);
 - pace (1.5): past PACE_FLOOR of the budget, the run's share of the task budget is over this times the
-  share of its wall limit used; or over PACE_NO_COMMIT of the budget is spent with no commit.
+  share of its wall limit used; or this run alone has spent over PACE_NO_COMMIT of the budget with no commit (earlier runs'
+  spend and their commits, wherever made, are not this run's to answer for).
 
 Ladder, once per flag per run: 1) an update in the run's steer.md naming the evidence; 2) still flagged
 raise_s (600) later and no `ttp note` since the update, one ride-along `worker_drift` event to the
@@ -142,13 +143,13 @@ def detect(e: dict, s: dict, named: list[str], waiting: bool, now: float,
     sp, wall = e.get("spend") or {}, e.get("wall") or {}
     budget = sp.get("budget_usd")
     if s["pace"] > 0 and budget:
-        run_share, task_share = float(sp.get("run_usd") or 0) / budget, float(sp.get("share") or 0)
+        run_share = float(sp.get("run_usd") or 0) / budget
         wall_share = wall.get("share")
         committed = (e.get("git") or {}).get("committed") if e.get("git") else None
         if wall_share is not None and run_share >= PACE_FLOOR and run_share > s["pace"] * wall_share:
             flags["pace"] = f"{run_share:.0%} of the budget spent in {wall_share:.0%} of the wall limit"
-        elif task_share > PACE_NO_COMMIT and committed == []:
-            flags["pace"] = f"{task_share:.0%} of the budget spent and nothing committed"
+        elif run_share > PACE_NO_COMMIT and committed == []:   # this run's spend against this run's commits
+            flags["pace"] = f"{run_share:.0%} of the budget spent and nothing committed"
     return flags
 
 
