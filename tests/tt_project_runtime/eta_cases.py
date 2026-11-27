@@ -479,7 +479,7 @@ def test_eta_a_measured_outside_wait_without_run_history_names_no_measured_run(e
     assert e["end"] is None and "no measured work run yet" in e["why"], e
     # a detached-jobs wait with no run history still estimates from its jobs' medians.
     _jobs_registry(p, [("load", now - 86400, "ended", now - 86400 + 600)])
-    t2 = _waiting_jobs_task(p, now, ["load-2"])
+    t2 = _waiting_jobs_task(p, now, ["load-2"], on_pass_cmd=None)
     e2 = eta.estimate(p.db, t2, now)
     assert e2["end"] == pytest.approx(now + 600 - 300), e2
 
@@ -1052,7 +1052,7 @@ def _jobs_registry(p, rows):
          "owner": {"task": tid}} for n, s, st, e in rows]))
 
 
-def _waiting_jobs_task(p, now, names, elapsed=300, probe="load", queued=False, qstarted=None):
+def _waiting_jobs_task(p, now, names, elapsed=300, probe="load", queued=False, qstarted=None, on_pass_cmd="true"):
     """A waiting task hand-off whose registry holds its detached `names` (running, `elapsed` s in,
     or queued; `qstarted`: the moment a queued job entered its queue) and whose probe waits on them."""
     tid = p.db.add_task("device work", "s", kind="work")
@@ -1065,9 +1065,10 @@ def _waiting_jobs_task(p, now, names, elapsed=300, probe="load", queued=False, q
         {"name": n, "rc": str(d / f"{n}.rc"),
          "started": (qstarted if qstarted is not None else 0) if queued else now - elapsed,
          "status": "queued" if queued else "running", "owner": {"task": tid}} for n in names]))
-    p.db.update_task(tid, status="waiting", result=json.dumps(
-        {"status": "waiting", "summary": "s", "on_pass_cmd": "true",
-         "retry_when": f"ttp detach --check {probe}", "waiting_since": now}))
+    res = {"status": "waiting", "summary": "s", "retry_when": f"ttp detach --check {probe}", "waiting_since": now}
+    if on_pass_cmd:
+        res["on_pass_cmd"] = on_pass_cmd
+    p.db.update_task(tid, status="waiting", result=json.dumps(res))
     return tid
 
 
@@ -1249,6 +1250,7 @@ def test_eta_history_shadow_uses_the_measured_job_medians(env):
     t = _waiting_jobs_task(p, now, ["load-2"])
     he = etaledger.hist_end(p.db, f"t{t}", now, None, [etajobs.job_history(p.state, p.db, now)])
     assert he == pytest.approx(now + 600 - 300)
+
 
 def test_eta_detached_jobs_shadow_with_all_jobs_ended_is_the_normal_shadow(env):
     """A task whose detached jobs have all ended gets the normal kind-median shadow, not "now"."""

@@ -2,10 +2,10 @@
 # SPDX-License-Identifier: Apache-2.0
 """A task's detached jobs' finish from this project's measured job history (eta.py's device leg).
 
-history() reads the runs the db knows in the window and their detach registries
+job_history() reads the runs the db knows in the window and their detach registries
 (state/runs/<id>/detached.json): every ended job's duration by normalised name (a trailing run word or
-id is dropped, so 'load-run2', 'load2' and 'load' are one job). finish() gives a task's finish from its own registry entries
-(jobstop.task_jobs, so a task that continues another also reads its jobs): each job's time left is
+id is dropped, so 'load-run2', 'load2' and 'load' are one job). job_finish() gives a task's finish from
+its own registry entries (jobstop.task_jobs, so a task that continues another also reads its jobs): each job's time left is
 the quantile of its name's samples less what has already elapsed, plus the queue wait behind
 another open task's jobs of the same name (its running one and those queued ahead of ours). A job
 name with no sample gives no estimate, never a padded default; the estimate says why.
