@@ -14,8 +14,9 @@ priority; a task whose files a running task on another branch holds is left out;
 on another comes after it. The lead is whatever dispatch picked first (an urgent one leads): it never
 waits for a batch to fill. An urgent task (alerts.urgent: priority 1, an `urgent:` line or an open
 obligation) shares a run only with urgent tasks, and a routine one only with routine ones. A batch
-runs its shared steps once, after every member's commit: one focused test gate, one device smoke and, where it delivers outside the push queue, one landing request (a PR or a
-push request) carrying every member's commits (prompt_block). Off with `dispatch.batch` false.
+runs its shared steps once, after every member's commit: one focused test gate, one device smoke and,
+where it delivers outside the push queue, one landing request (a PR or a push request) carrying every
+member's commits (prompt_block). Off with `dispatch.batch` false.
 
 The batch shares the lead's worktree and branch (each member's record carries it), and the worker
 prompt lists every member (prompt_block). The worker commits each member separately, no task number in
