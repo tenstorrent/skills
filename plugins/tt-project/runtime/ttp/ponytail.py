@@ -22,6 +22,7 @@ from pathlib import Path
 LABEL = "ponytail_lane:"     # ponytail_lane:<added lines at queue time, empty when unknown>: the review runs the lane
 FILE = "ponytail.json"       # {"verdict": "pass"|"fail", "head": <sha>, "findings": [{"severity", "text"}], "thread": bool}
                              # (+ "model": the one it ran on, when the subagent tool refused the pinned one)
+BLOCKING = ("", "block", "blocker", "critical", "high")   # finding severities that fail the lane
 ENV = "TTP_PONYTAIL_LANE"    # 1: this run's hand-off needs FILE (hook.handoff_problem)
 FAILED = "the ponytail lane failed it"   # lane_problem's prefix for a valid fail verdict
 WHY = re.compile(r"(?im)^[ \t>*-]*why this size:[ \t]*\S")
@@ -129,12 +130,12 @@ def lane_problem(run_dir, head: str = "") -> str:
 
 
 def findings(v: dict, note: bool = False) -> list[str]:
-    """The verdict's finding texts: the blocking ones (severity 'block', or none given: a bare string too),
-    or with `note` the 'note' ones (a small leftover that can wait), which never fail the lane."""
+    """The verdict's finding texts: the blocking ones (a BLOCKING severity, or none given: a bare string too),
+    or with `note` the others (note, info, minor...: a leftover that can wait), which never fail the lane."""
     out = []
     for x in v.get("findings") if isinstance(v.get("findings"), list) else []:
         sev, text = (str(x.get("severity") or "").strip().lower(), x.get("text")) if isinstance(x, dict) else ("", x)
-        if str(text or "").strip() and (sev == "note") == note:
+        if str(text or "").strip() and (sev not in BLOCKING) == note:
             out.append(str(text)[:300])
     return out
 

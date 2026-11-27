@@ -340,7 +340,9 @@ def test_the_lane_fails_on_a_block_finding_or_one_with_no_severity_and_passes_wi
     run = env["tmp"] / "lane-run"
     run.mkdir()
     for findings, ok in (([block], False), ([note, block], False), (["bare string"], False),
-                         ([{"text": "no severity"}], False), ([note], True), ([], True)):
+                         ([{"text": "no severity"}], False), ([note], True), ([], True),
+                         *(([{"severity": sev, "text": "t"}], False) for sev in ("blocker", "Critical", "high")),
+                         *(([{"severity": sev, "text": "t"}], True) for sev in ("info", "minor", "low", "nit", "suggestion"))):
         (run / ponytail.FILE).write_text(json.dumps({"verdict": "pass", "head": "a" * 40, "findings": findings}))
         assert (ponytail.lane_problem(run, "a" * 40) == "") is ok, findings
     (run / ponytail.FILE).write_text(json.dumps({"verdict": "fail", "findings": []}))
@@ -361,6 +363,22 @@ def test_the_lane_fails_on_a_block_finding_or_one_with_no_severity_and_passes_wi
     (fix,) = p.db.q("SELECT * FROM tasks WHERE kind='code' AND origin='daemon'")
     assert "helper.py should not exist" in fix["spec"] and "unused import" not in fix["spec"]
     assert json.loads(t["result"])["ponytail_notes"] == ["one unused import"]
+
+
+def test_a_passed_lane_with_only_info_findings_passes_the_review_and_queues_no_fix(env, monkeypatch):
+    """A severity other than a blocking one (info, minor, low...) is a note: the review stays done and its
+    findings are listed as not blocking, never queued as fix tasks."""
+    from ttp import ponytail
+    monkeypatch.delenv("TTP_TEST_PONYTAIL")
+    p = make(env)
+    info = [{"severity": "info", "text": f"info {i}"} for i in range(3)] + [{"severity": "minor", "text": "minor"}]
+    _, branch, _, (rev,) = _finish_code(env, p, "lean", {"c.py": 5})
+    head = _git_out(p.root, "rev-parse", branch).strip()
+    t = _lane_review(env, p, rev["id"], {"verdict": "pass", "head": head, "findings": info})
+    assert t["status"] == "done", t["result"]
+    assert json.loads(t["result"])["ponytail_notes"] == ["info 0", "info 1", "info 2", "minor"]
+    assert not p.db.q("SELECT * FROM tasks WHERE kind='code' AND origin='daemon'")
+    assert ponytail.gate(p.config(), t, env["tmp"] / f"run-{rev['id']}", {}) == ("", [])
 
 
 def test_the_lane_text_names_the_skill_file_to_read():

@@ -93,7 +93,8 @@ Every finding has all four parts, each one or two short sentences:
 When a caller asks for a verdict file (the ponytail lane's `ponytail.json`), give each finding a
 `severity`: `block` for code that should not exist, an unflagged copied or vendored tree, the size
 rule, or any bug or risk above; `note` for a small leftover that can wait (an unused import, a name
-that could be shorter). A `note` never fails the change. When unsure, use `block`.
+that could be shorter). Only `block` (also `blocker`, `critical`, `high` or no severity) fails the
+change; any other severity (`note`, `info`, `minor`, `low`, `nit`) never does. When unsure, use `block`.
 
 End with:
 - `Verdict: Ship.` or `Verdict: fix 1 and 3 first.`
