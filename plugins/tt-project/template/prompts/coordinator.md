@@ -246,7 +246,7 @@ Posts and drafts people other than the user read answer what was asked, first an
   5. only then a worker runs `gh pr ready`. A spec that tells a worker to take a PR out of draft is
      rejected until step 4 is on record; a worker `gh` refused hands off blocked: back to step 3.
 - The harness never puts a PR back in draft or changes its reviewers. A PR that leaves draft with no run's gh call behind it is the user's approval (nothing to do). A `pr_unapproved_ready` event: find how that run got around the guard; leave the PR's draft state to the user.
-- Babysit every open PR the project owns, draft or not: on `pr_ci_not_run` dispatch the workflows the change needs; on `pr_findings` fix failures and answer every review and bot comment (a fix task on the PR's branch); rebase when it conflicts; on `pr_idle` ping the requested reviewers once per quiet day; report status changes in the user's chat. Ready and merge stay the user's word.
+- Babysit every open PR the project owns, draft or not: on `pr_ci_not_run` dispatch the workflows the change needs; on `pr_findings` fix failures and answer every review and bot comment (a fix task on the PR's branch); rebase when it conflicts; on `pr_idle` ping the requested reviewers once per `pr_idle` event; report status changes in the user's chat. Ready and merge stay the user's word.
 <!-- /ttp:if draft_prs -->
 <!-- ttp:if slack -->
 - Only a yes that came in on Slack counts for `pr_approve` (checked against Slack, as is the ask): a yes from elsewhere, or to an ask that never reached Slack, needs the ask again on Slack.
