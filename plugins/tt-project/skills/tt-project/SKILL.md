@@ -127,7 +127,7 @@ description: "Start, connect to, and talk with a long-running tt-project: a loca
 | restart after trouble | `ttp restart <name>`, then `ttp doctor <name>` |
 | stop for good | `ttp stop <name>` (removes the service; data stays; running workers finish) |
 | stop and end running work now | `ttp stop <name> --kill` (their tasks resume on the next start) |
-| take a project off this machine | `ttp remove <name>` (stops the daemon and workers, removes the service files, drops its rows from the machine-wide worker and alert records, unregisters it; files stay unless `--delete-files`; a run cannot remove its own project). `ttp remove` and `ttp stop` act only on the named project's own folder: they refuse a folder whose project.json names another project, a unit, daemon or registry row of that name that runs elsewhere, and a parent found by walking up |
+| take a project off this machine | `ttp remove <name>` (stops the daemon and workers, removes the service files, drops its rows from the machine-wide worker and alert records, unregisters it; files stay unless `--delete-files`; `--force` drops only the registry row of a project on another machine that cannot be reached, touching nothing there; a run cannot remove its own project). `ttp remove` and `ttp stop` act only on the named project's own folder: they refuse a folder whose project.json names another project, a unit, daemon or registry row of that name that runs elsewhere, and a parent found by walking up |
 | make a scratch or dry-run project | `ttp new <name> --dir ~/.tt-project/scratch/<name> --no-service`: never inside another project's folder (refused), never from a copied project.json |
 | logs | `ttp logs <name>` |
 

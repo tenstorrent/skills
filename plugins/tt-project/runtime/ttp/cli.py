@@ -39,7 +39,7 @@ from .devq import unmask_devices
 from .detach import VERDICT_SH as _DETACH_VERDICT_SH
 from . import chatgone, checksqueue, checkwait, hoststate, runnerenv, setupfault, sshcmd, syntaxfault, timefmt, workerloss
 from . import schedule as sched
-from .project import here
+from .project import here, run_tmp_refusal
 from .project import (NAME_RE, Project, hostname, load_registry, load_secrets, register, save_secret,
                       durable_append, durable_write, write_json, ACCOUNT_KEYS, ACCOUNT_USER_ONLY, account_keys, DEFAULT_CONFIG, deep_merge,
                       load_account_settings, set_account_setting, max_workers_problem, zombie, device_timeout_max, command_env,
@@ -612,6 +612,8 @@ def resolve(name: str, full: bool = False) -> tuple[Project | None, dict | None]
     hits = search_transcripts(name) if cap is None else search_transcripts(name, cap_s=cap)
     for hit in hits:
         if hit["host"] == hostname() and Project(hit["dir"]).exists():
+            if run_tmp_refusal({"dir": hit["dir"]}):   # a scratch project of a run: the next hit may be real
+                continue
             register(name, {"host": hostname(), "dir": str(Project(hit["dir"]).root)})
             _found_in_chat_log(name, hostname(), str(Project(hit["dir"]).root), hit["seen_in"])
             return Project(hit["dir"]), None

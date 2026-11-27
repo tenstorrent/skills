@@ -336,7 +336,7 @@ def test_remove_drops_the_registry_row_even_when_its_daemon_is_gone_or_a_step_fa
         assert p.base.is_dir() != delete
 
 
-def _remote_entries(env, *names):
+def _remote_entries(*names):
     from ttp import project
     for n in names:
         project.register(n, {"host": "nowhere.invalid", "dir": f"/srv/{n}"})
@@ -344,7 +344,7 @@ def _remote_entries(env, *names):
 
 def test_remove_force_drops_only_the_row_of_a_remote_project_without_contacting_its_host(env, monkeypatch, capsys):
     from ttp import cli, outbox, project
-    _remote_entries(env, "gone", "kept")
+    _remote_entries("gone", "kept")
     outbox.add("gone", ["say", "hi"], "c1", None)
     monkeypatch.setattr(cli, "forward", lambda *a, **k: (_ for _ in ()).throw(AssertionError("ssh was used")))
     monkeypatch.setattr(cli, "flush_outbox", lambda *a, **k: (_ for _ in ()).throw(AssertionError("ssh was used")))
@@ -358,7 +358,7 @@ def test_remove_without_force_still_forwards_a_remote_project_and_keeps_its_row(
     import sys
     import pytest
     from ttp import cli, project
-    _remote_entries(env, "far")
+    _remote_entries("far")
     sent = []
     monkeypatch.setattr(cli, "flush_outbox", lambda *a, **k: None)
     monkeypatch.setattr(cli, "forward", lambda entry, argv: sent.append(argv) or 0)
@@ -383,7 +383,7 @@ def test_register_refuses_a_project_inside_a_runs_tmp_folder_unless_the_registry
     scratch = env["tmp"] / "state" / "runs" / "7" / "tmp" / "demo"
     real_home = env["tmp"] / "real-home"
     monkeypatch.setattr(project, "HOME_DIR", real_home)
-    with pytest.raises(project.RegistryRefused, match="tmp TTP_HOME"):
+    with pytest.raises(project.RegistryRefused, match="TTP_HOME inside that tmp folder"):
         project.register("demo", {"host": "testhost", "dir": str(scratch)})
     assert not (real_home / "registry.json").exists()
     project.register("ok", {"host": "testhost", "dir": str(env["tmp"] / "state" / "runs" / "7" / "other")})   # not the tmp folder
@@ -397,7 +397,6 @@ def test_adopt_into_a_registry_outside_a_runs_tmp_folder_is_refused_cleanly(env,
     from ttp import cli, project
     monkeypatch.setattr(project, "HOME_DIR", env["tmp"] / "real-home")
     scratch = env["tmp"] / "state" / "runs" / "9" / "tmp" / "demo"
-    monkeypatch.setattr(cli, "adopt_refusal", lambda *a, **k: None)
     with pytest.raises(SystemExit) as e:
         cli.main(["adopt", "demo", "--dir", str(scratch)])
     assert e.value.code != 0 and "not registering 'demo'" in capsys.readouterr().err
