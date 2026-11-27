@@ -35,7 +35,7 @@ The typical advice is "get correctness before chasing speed" but do not let this
 
 Treat RMSNorm, KV-cache layout, head ownership, bias placement, padding/slicing, and collective axes as first-class correctness questions. Most multi-chip bugs live there. If the failure involves subtle mesh layout, CCL, semaphore, cache, or routed-expert behavior and ordinary component comparisons are not enough, use `$autofix`; it will run `$autodebug` if needed, then verify or refute each proposed bug before keeping any fix.
 
-Async CCLs and semaphores are subtle. Read the relevant docs and consider reusing the CCL/semaphore helper classes that `tt_transformers`, `gpt_oss`, and `deepseek_v3` use.
+Async CCLs and semaphores are subtle. Read the relevant docs and consider reusing the CCL/semaphore helper classes that `ttt_compat`, `gpt_oss`, and `deepseek_v3` use.
 
 Use `$optimize` and `tt-perf-report` before finishing this stage. The final multichip decoder should use the hardware well within the limits of available TTNN ops.
 
@@ -134,8 +134,8 @@ Use this when hidden activations are sharded across the normalized dimension and
 - `models/common/modules/rmsnorm/rmsnorm_2d.py::decode_forward`
 - `models/common/modules/rmsnorm/rmsnorm_2d.py::prefill_forward`
 - `models/demos/deepseek_v3/tt/rms_norm/distributed_rms_norm.py::DistributedRMSNorm`
-- `models/tt_transformers/tt/ccl.py::tt_distributed_rmsnorm`
-- `models/tt_transformers/tt/ccl.py::tt_sharded_distributed_rmsnorm`
+- `models/ttt_compat/tt/ccl.py::tt_distributed_rmsnorm`
+- `models/ttt_compat/tt/ccl.py::tt_sharded_distributed_rmsnorm`
 
 Do not phrase distributed RMSNorm as always mandatory. Correct RMSNorm is mandatory. A faster replicated-activation stream plus local RMSNorm is acceptable if it preserves the decoder chain layout and improves measured performance.
 

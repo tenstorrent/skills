@@ -20,9 +20,9 @@ For the readiness harness, teacher-forcing decode must always use traced decode.
 Read only what helps the current task:
 
 - `tests/ttnn/tracy/test_trace_runs.py`: minimal trace capture/replay examples.
-- `models/tt_transformers/tt/generator.py`: canonical decode trace patterns, including host input preparation, persistent device inputs, replay refresh, and split sampling.
+- `models/ttt_compat/tt/generator.py`: canonical decode trace patterns, including host input preparation, persistent device inputs, replay refresh, and split sampling.
 - `models/common/sampling/generator.py` and `models/common/modules/sampling/sampling_1d.py`: common on-device sampling implementations to compare before choosing a token-out sampling path.
-- `models/tt_transformers/tt/model.py`: model-side `prepare_decode_inputs_host` and device-only `ttnn_decode_forward` split.
+- `models/ttt_compat/tt/model.py`: model-side `prepare_decode_inputs_host` and device-only `ttnn_decode_forward` split.
 - In the target tt-metal checkout, `tech_reports/AdvancedPerformanceOptimizationsForModels/TraceCorrectness.md` ([upstream guide](https://github.com/tenstorrent/tt-metal/blob/main/tech_reports/AdvancedPerformanceOptimizationsForModels/TraceCorrectness.md)): trace correctness requirements and the trace allocation tracker. Read this before accepting a capture/replay path or exempting intentionally shared trace buffers. This guide and the tracker implementation belong to tt-metal, not the installed skill package.
 - `advanced_perf_optimizations.md`: deeper examples for TTNN trace capture/replay, multiple command queues, trace plus multi-CQ, and production benchmarking patterns. Search this file for the API or failure mode you are working on before loading it wholesale.
 
@@ -138,7 +138,7 @@ After preparing all model and sampling variants under the warmup contract above,
 6. For greedy decode, keep the sampled token on device and benchmark the available on-device greedy strategies on the target mesh. Force-argmax is only a candidate. Do not select it by default.
 7. Read the chosen common sampler's trace lifetime before counting replays: a sampler that releases its sampling traces when its force-argmax state flips breaks the mode-switch lifetime rule, and explicit per-request seeds can take an eager path. Count traced sampling steps from the sampler's own traced condition, not from the generator's intent.
 
-The canonical pattern is in `models/tt_transformers/tt/generator.py`: capture decode once, bind the model to the same persistent trace inputs that replay refreshes, trace the chosen sampler path, and call sampling with `tt_out_tok` pointing at the decode token input. Untraced sampling hidden inside the model trace is not the canonical token-feedback path.
+The canonical pattern is in `models/ttt_compat/tt/generator.py`: capture decode once, bind the model to the same persistent trace inputs that replay refreshes, trace the chosen sampler path, and call sampling with `tt_out_tok` pointing at the decode token input. Untraced sampling hidden inside the model trace is not the canonical token-feedback path.
 
 The normal split-sampling path for greedy decode must be a semantically greedy path. Do not treat a slower generic sampled `top_k=32` or top-p-capable path as proof that split greedy is slow. If `top_k=1` split sampling fails because a gathered top-k tensor has a non-tile inner dimension, fix the sampler-ready shape by preserving or padding the top-k representation, or keep a minimal repro and leave the stage incomplete.
 
@@ -229,7 +229,7 @@ ttnn.end_trace_capture(mesh_device, trace_id, cq_id=0)
 
 If the fatal is a write, first check for host input creation, lazy weights, cache loads, page table refresh, sampling-state updates, semaphore resets, first-use persistent CCL buffers, or `copy_host_to_device_tensor` hidden in helper APIs. Also suspect a program-cache miss: an op compiling a new variant mid-capture issues that write. Confirm by setting `device.set_program_cache_misses_allowed(False)` around capture (a miss then fails as `"<Op>: program cache miss occurred, but cache misses are forbidden"`, naming the offending op), then fix it via warm-up (see Program-Cache Warmup).
 
-If replay uses stale inputs, compare the tensors captured by the model to the tensors refreshed before `execute_trace`. `tt_transformers` solves this by binding model-side trace inputs before capture and only refreshing those exact buffers before replay.
+If replay uses stale inputs, compare the tensors captured by the model to the tensors refreshed before `execute_trace`. `ttt_compat` solves this by binding model-side trace inputs before capture and only refreshing those exact buffers before replay.
 
 Before accepting any reduced input-refresh scheme, add a focused replay test that runs two decode steps with different token and current-position values, inspects the exact persistent trace input tensors, and asserts the output/logits changed. If page-table refresh is skipped, cover both unchanged and changed page tables.
 

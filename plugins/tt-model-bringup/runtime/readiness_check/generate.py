@@ -59,12 +59,12 @@ PROMPT_SOURCE_CHOICES = ("book", "aime24", "text", "file")
 
 def _load_book_text() -> str:
     """Load the tale of two cities book text."""
-    # Use the book from tt_transformers tests
-    book_file = str(Path.cwd() / "models/tt_transformers/tests/tale-of-two-cities.txt.bz2")
+    # Use the book from ttt_compat tests
+    book_file = str(Path.cwd() / "models/ttt_compat/tests/tale-of-two-cities.txt.bz2")
 
     if not os.path.exists(book_file):
         raise FileNotFoundError(
-            f"Book text not found at {book_file}. " "Expected models/tt_transformers/tests/tale-of-two-cities.txt.bz2"
+            f"Book text not found at {book_file}. " "Expected models/ttt_compat/tests/tale-of-two-cities.txt.bz2"
         )
 
     with bz2.open(book_file, "rt", encoding="utf-8") as f:

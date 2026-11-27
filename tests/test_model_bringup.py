@@ -273,7 +273,7 @@ def test_standalone_tti_checker_resolves_package_and_rejects_stock_evidence(inst
     gate = plugin / 'skills/tti-release/scripts/check-evidence.sh'
     result = run('bash', str(gate), cwd=target, env=env)
     assert result.returncode == 0, result.stderr + result.stdout
-    spec.write_text(json.dumps({'impl': {'code_path': 'models/tt_transformers'}}))
+    spec.write_text(json.dumps({'impl': {'code_path': 'models/ttt_compat'}}))
     result = run('bash', str(gate), cwd=target, env=env)
     assert result.returncode == 2
     assert 'stock implementation' in result.stderr

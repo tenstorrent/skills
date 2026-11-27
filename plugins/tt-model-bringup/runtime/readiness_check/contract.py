@@ -82,7 +82,7 @@ class Generator(ABC):
 
         class LlamaGenerator(Generator):
             def __init__(self, mesh_device, model_args, ...):
-                self._inner = tt_transformers.Generator(...)
+                self._inner = ttt_compat.Generator(...)
                 self._kv_cache = ...
                 self._page_table = ...
                 self.tokenizer = model_args.tokenizer
