@@ -747,8 +747,8 @@ def _read_anon(daemon, order: list[dict], results: dict[str, dict]) -> tuple[int
     """Read anonymously (ghanon) each PR of `order` gh did not read, into `results`, before the run's
     deadline. No GraphQL, so bot findings keep their last value (data None). Each repo it cannot read is
     observed once under a stable key. Once the budget is spent, each PR left gets its head alone by
-    `git ls-remote` (no API call; its result has `head`). Returns (PRs read anonymously, repos
-    unreadable, why it stopped, heads read only)."""
+    `git ls-remote` (no API call; its result has `head`), so an approval binds to a pushed commit.
+    Returns (PRs read anonymously, repos unreadable, why it stopped, heads read only)."""
     from . import ghanon
     cfg = (getattr(daemon, "cfg", None) or {}).get("watchers") or {}
     raw = cfg.get("gh_anon_cap", ghanon.CAP)
@@ -776,7 +776,7 @@ def _read_anon(daemon, order: list[dict], results: dict[str, dict]) -> tuple[int
             continue
         except ghanon.Spent as e:
             spent = str(e)
-            sha = ghanon.head_sha(repo, f"refs/pull/{number}/head")
+            sha = ghanon.head_sha(repo, f"refs/pull/{number}/head", timeout=max(1.0, _call_timeout()))
             if sha:
                 results[t["pr_url"]] = {"pr": None, "data": None, "head": sha, "cut": None,
                                         "calls": ["anonymous: head read only"]}
@@ -874,12 +874,8 @@ def watch_prs(daemon, payload: dict | None = None) -> str:
         if pr is None:
             read += not r["cut"]   # gh answered with an error: read, nothing to report
             key = prguard.pr_key(t["pr_url"])
-            if r.get("head") and key and (heads.get(key) or {}).get("sha") not in (None, r["head"]) \
-                    and not t.get("purview"):   # the budget is spent, yet a pushed commit is still news
-                heads[key] = {"sha": r["head"], "seen": time.time()}
-                db.x("INSERT INTO events(ts,source,kind,severity,text,status,task) VALUES(?,?,?,?,?,?,?)",
-                     (time.time(), "pr", "pr_changed", "normal", f"PR for task #{t['id']} ({t['pr_url']}): "
-                      f"head → {r['head'][:12]} (head read only)", "queued", t["id"]))
+            if r.get("head") and key and (heads.get(key) or {}).get("sha") != r["head"]:
+                heads[key] = {"sha": r["head"], "seen": time.time()}   # the budget is spent: approvals still bind
             continue
         read += 1
         key = prguard.pr_key(pr.get("url") or t["pr_url"])

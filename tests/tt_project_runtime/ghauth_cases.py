@@ -1156,7 +1156,8 @@ def test_the_task_runs_share_of_the_anonymous_budget_is_a_setting(env, monkeypat
 
 def test_pr_watch_reads_heads_by_ls_remote_once_the_anonymous_budget_is_spent(env, monkeypatch):
     """With the API budget spent, each watched PR's head is still read by `git ls-remote`: a pushed
-    commit moves the head an approval binds to and raises pr_changed; the PR shows as head read only."""
+    commit moves the head an approval binds to (no pr_changed, as on a full read); the PR shows as head
+    read only."""
     from ttp import ghanon, prguard, watchers
     from ttp.daemon import Daemon
     url, _ = _anon_pr(env, monkeypatch, {"check_runs": []}, [])
@@ -1174,10 +1175,7 @@ def test_pr_watch_reads_heads_by_ls_remote_once_the_anonymous_budget_is_spent(en
     assert "0 of 1 PRs read anonymously, 1 head read only" in status and "budget spent" in status, status
     assert asked == ["refs/pull/3/head"]
     assert p.db.kv(prguard.HEADS_KEY)[key]["sha"] == "b" * 40
-    texts = [r["text"] for r in p.db.q("SELECT text FROM events WHERE kind='pr_changed'")]
-    assert len(texts) == 1 and "head read only" in texts[0], texts
-    watchers.watch_prs(Daemon(p.base))
-    assert p.db.q("SELECT COUNT(*) n FROM events WHERE kind='pr_changed'")[0]["n"] == 1, "an unchanged head is not news"
+    assert not p.db.q("SELECT 1 FROM events WHERE kind='pr_changed'")
 
 
 def test_no_login_hint_while_gh_is_logged_out_and_a_private_repo_is_observed_once(env, monkeypatch):
