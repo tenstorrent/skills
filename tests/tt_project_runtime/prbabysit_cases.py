@@ -472,7 +472,7 @@ def test_prbabysit_a_pair_with_another_project_pr_and_a_disjoint_pair_give_no_ev
     assert "overlap2" in (ghauth._home(None) / prbabysit.HOST_FILE).read_text()
 
 
-def test_ghroute_mark_keeps_each_routes_answer_under_the_state_lock_and_survives_a_corrupt_file(env, monkeypatch):
+def test_ghroute_mark_keeps_each_routes_answer_under_the_state_lock(env, monkeypatch):
     from ttp import ghauth, ghroute
     held = []
     real = ghauth._locked
@@ -481,7 +481,12 @@ def test_ghroute_mark_keeps_each_routes_answer_under_the_state_lock_and_survives
     ghroute.mark(False, via="box2")
     assert held == [ghroute.STATE + ".lock"] * 2, "each write takes the route state's own lock"
     assert ghroute.last_answer("box1")["ok"] is True and ghroute.last_answer("box2")["ok"] is False
+
+
+def test_ghroute_a_corrupt_route_file_reads_as_no_record_and_never_raises(env):
+    from ttp import ghauth, ghroute
     path = ghauth._home(None) / ghroute.STATE
+    path.parent.mkdir(parents=True, exist_ok=True)
     for bad in ('{"via": "box1"}', '{"box1": 5, "via": ""}', '{"box1": {"ok": true, "at": "soon"}}', "[1]", "{"):
         path.write_text(bad)
         ghroute.mark(True, via="box3")   # never raises into the gh call path
