@@ -7854,18 +7854,25 @@ def _needless_ask(a: dict, text: str) -> str:
     return ""
 
 
+_CAP_KEYS = ("budget.daily_usd", "budget.weekly_usd", "budget.global_daily_usd")   # the dollar caps
+
+
 def _spend_ask(db, cfg: dict, a: dict, words: str) -> str:
     """Why a `spend` or `funds` ask is the coordinator's own call, or "", from structured state only: a
     task it names (`#<id>`) that is held on its own spent budget (per-task budgets are the coordinator's
-    setting), or saved budget gates showing no dollar cap limiting (budget.cap_limiting). Without saved
-    gates nothing is known, so the ask goes out."""
+    setting), or saved budget gates showing no dollar cap limiting (budget.cap_limiting). An ask naming a
+    dollar cap is never read as a task's, and one naming another spend setting only the user changes
+    (NEEDS_USER) goes out. Without saved gates nothing is known, so the ask goes out."""
     if a.get("blocking") not in ("spend", "funds"):
         return ""
-    for tid in dict.fromkeys(int(i) for i in re.findall(r"#(\d+)", words)):
-        t = db.task(tid)
-        if t and t["status"] == "blocked" and t.get("blocked_reason") == topup.BUDGET_HELD:
-            return (f"task #{tid}'s budget is your own setting, not a dollar cap: raise the task budget with "
-                    f"task_update budget_usd (user-ordered and urgent tasks never wait on it)")
+    if not _names_needs_user(words, _CAP_KEYS):
+        for tid in dict.fromkeys(int(i) for i in re.findall(r"#(\d+)", words)):
+            t = db.task(tid)
+            if t and t["status"] == "blocked" and t.get("blocked_reason") == topup.HOLD_REASON:
+                return (f"task #{tid}'s budget is your own setting, not a dollar cap: raise the task budget with "
+                        f"task_update budget_usd (user-ordered and urgent tasks never wait on it)")
+    if _names_needs_user(words, [k for k, v in NEEDS_USER.items() if v == "spend" and k not in _CAP_KEYS]):
+        return ""
     gates = db.kv("gates", {}) or {}
     if gates and not bud.cap_limiting(gates, cfg.get("budget") or {}, time.time()):
         return ("no cap is limiting: decide it yourself. The budget gate is green on every dollar cap and none "
@@ -8301,12 +8308,12 @@ _ONE_WAY_RE = re.compile(r"\b(?:delet\w*|purg\w*|wip(?:e|es|ing)|destroy\w*|publ
 _MONEY_RE = re.compile(r"\$|\b(?:budget|spend\w*|usd|dollars?|funds?|billing|paid|pay)\b", re.I)
 
 
-def _names_needs_user(said: str) -> bool:
-    """True when the text names a setting only the user may change (NEEDS_USER), by key or by its last part. A
-    last part that is a plain word (off, mode, checks) counts only after its parent ("guards off"),
-    so "turn it off" names no setting."""
+def _names_needs_user(said: str, keys=None) -> bool:
+    """True when the text names a setting only the user may change (NEEDS_USER, or those of `keys`), by key or
+    by its last part. A last part that is a plain word (off, mode, checks) counts only after its parent
+    ("guards off"), so "turn it off" names no setting."""
     low = said.lower()
-    for k in NEEDS_USER:
+    for k in NEEDS_USER if keys is None else keys:
         parent, _, last = k.rpartition(".")
         name = re.escape(last) if "_" in last or not parent else rf"{re.escape(parent.rsplit('.', 1)[-1])}[ ._-]{re.escape(last)}"
         if k in low or re.search(rf"\b{name}\b", low):

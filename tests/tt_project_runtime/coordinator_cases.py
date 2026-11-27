@@ -24415,10 +24415,19 @@ def test_a_spend_ask_goes_out_only_while_a_dollar_cap_limits_and_never_about_a_t
         assert m is not None and not problems, problems
         p.db.x("UPDATE messages SET handled=1 WHERE kind='ask'")
     tid = p.db.add_task("soak the board", "s", kind="work")
-    p.db.update_task(tid, status="blocked", blocked_reason=topup.BUDGET_HELD)
+    p.db.update_task(tid, status="blocked", blocked_reason=topup.HOLD_REASON)
     problems, m = _ask(p, f"Task #{tid} used its budget: may it spend more?", blocking="spend", **ask)
     assert "raise the task budget with task_update budget_usd" in problems[0] and f"#{tid}" in problems[0]
     assert m["text"].startswith("The daily dollar cap limits work (2)"), "no new ask was sent"
+    p.db.x("UPDATE messages SET handled=1 WHERE kind='ask'")
+    p.db.set_kv("gates", {"claude": held})   # a cap ask citing a number (a message, a PR) is no task-budget ask
+    problems, m = _ask(p, f"Per your words in #{tid}: raise budget.daily_usd?", blocking="spend", **ask)
+    assert m is not None and not problems, problems
+    p.db.x("UPDATE messages SET handled=1 WHERE kind='ask'")
+    p.db.set_kv("gates", {"claude": calm})   # another spend setting only the user changes goes out
+    problems, m = _ask(p, "Raise chains.max_usd so the soak chain may run on?", blocking="spend", **ask)
+    assert m is not None and not problems, problems
+    p.db.x("UPDATE messages SET handled=1 WHERE kind='ask'")
     p.db.set_kv("gates", {})   # nothing measured yet: the ask goes out
     problems, m = _ask(p, "Should the project keep spending on the soak today?", blocking="spend", **ask)
     assert m is not None and not problems and "keep spending" in m["text"], problems

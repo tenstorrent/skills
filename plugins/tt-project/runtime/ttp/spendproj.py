@@ -91,7 +91,7 @@ def line(spent: float, cap: float, per_h: float | None, reset_at: float | None, 
         return f"{at}: reset time unknown (rolling 24 h), no projection"
     if per_h <= 0:
         return f"{at}: not reached before {reset}"
-    if not reaches(spent, cap, per_h, reset_at, now):
-        return f"{at}: not reached before {reset}"
     reach = now + (cap - spent) / per_h * HOUR
+    if reach >= reset_at:
+        return f"{at}: not reached before {reset}"
     return f"{at}: reaches the cap at {timefmt.short(reach, where, now)}, before {reset}"
