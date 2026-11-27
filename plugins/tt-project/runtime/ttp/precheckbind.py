@@ -15,6 +15,8 @@ import os
 import time
 from pathlib import Path
 
+from . import project
+
 KEY = "precheck_binding:"   # + task id
 MAX_BYTES = 4096
 ENV = "TTP_PRECHECK_JSON"
@@ -66,5 +68,5 @@ def hand_over(db, task_id, run_dir) -> dict:
     if bound is None:
         return {}
     path = Path(run_dir) / "precheck.json"
-    path.write_text(json.dumps(bound, sort_keys=True) + "\n")
+    project.durable_write(path, json.dumps(bound, sort_keys=True) + "\n")
     return {ENV: str(path)}
