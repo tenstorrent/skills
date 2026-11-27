@@ -66,8 +66,12 @@ def backrefs(text: str, later: list[str] | tuple = ()) -> list[str]:
     out: list[str] = []
     text = str(text or "")
     tail = "\n".join(t or "" for t in later)
+    head = text.find(pendingask.HEADER)
+    expanded = head >= 0 and bool(re.search(r"^- ask \d+:", text[head:], re.M))
     found = [(m, True) for m in _POINT_BACK.finditer(text)] + [(m, False) for m in _STATUS_PHRASE.finditer(text)]
     for m, back in sorted(found, key=lambda f: f[0].start()):
+        if expanded and m.start() >= head:   # an appended ask's own words are its text, not a pointer
+            continue
         cut = max((x.end() for x in re.finditer(r"[.;:,](?=\s|$)|\n", text[:m.start()])), default=0)   # not 'v1.0'
         clause = (text[cut:m.start()]   # an aside ', not sent yet,' never negates
                   + re.sub(r",[^,]*,", " ", m.group(0)))
@@ -78,7 +82,8 @@ def backrefs(text: str, later: list[str] | tuple = ()) -> list[str]:
         line_end = text[m.end():eol if eol >= 0 else len(text)].rstrip()
         after = text[eol + 1 if eol >= 0 else len(text):] + "\n" + tail
         item = re.search(_ITEM, m.group(0), re.I)
-        if not back and pendingask.refs(m.group(0)):   # pendingask.expand, run first, appended it or saw it quoted
+        if not back and (pendingask.refs(m.group(0)) or (   # pendingask.expand, run first, appended it or saw it quoted
+                item and item.group(0).lower() == "ask" and expanded)):   # ... matched by its words and appended it
             continue
         if back and _BARE.fullmatch(m.group(0)):   # 'in my earlier message I said ...' with nothing pending
             lo = max((x.end() for x in _STOP.finditer(text[:m.start()])), default=0)

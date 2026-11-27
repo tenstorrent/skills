@@ -152,3 +152,15 @@ def test_an_earlier_message_pointer_needs_a_pending_item_and_an_ask_named_by_id_
                "Ask 12 (Reboot the board now or after the soak?) is still open.",
                "The draft for A is ready to send.\n`ttp approve 12`"):
         assert quotefull.backrefs(ok) == [], ok
+
+
+def test_an_ask_matched_by_its_words_and_appended_in_full_is_not_refused():
+    from ttp import pendingask, quotefull
+    asks = [{"id": 12, "text": "Reboot the board now or after the soak? Still waiting on you."}]
+    text = "The ask about the board reboot is still open, waiting on you."
+    assert quotefull.backrefs(text) != []
+    expanded, _ = pendingask.expand(text, asks)
+    assert pendingask.HEADER in expanded
+    assert quotefull.backrefs(expanded) == []
+    # a header with no appended ask line clears nothing
+    assert quotefull.backrefs(text + pendingask.HEADER) != []
