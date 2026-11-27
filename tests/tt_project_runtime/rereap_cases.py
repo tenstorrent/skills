@@ -94,11 +94,18 @@ def test_the_sweep_leaves_a_failure_already_acted_on_to_the_cli(env, tmp_path):
     from ttp import rereap
     p = make(env)
     d, tid, rid = _rr_quarantined(p, tmp_path, _RR_DONE)
-    p.db.x("UPDATE events SET status='handled' WHERE kind='task_failed' AND task=?", (tid,))   # e.g. a replacement queued
+    ev = p.db.one("SELECT id FROM events WHERE kind='task_failed' AND task=?", (tid,))["id"]
+    p.db.x("INSERT INTO runs(role,provider,started,status,note) VALUES('coordinator','fake',?,'running',?)",
+           (time.time(), json.dumps({"events": [ev]})))   # a coordinator turn deciding the failure now
+    rereap.sweep(p, lambda *_: None)
+    assert p.db.one("SELECT status FROM runs WHERE id=?", (rid,))["status"] == "failed"
+    p.db.x("UPDATE events SET status='handled' WHERE id=?", (ev,))   # it acted, e.g. queued a replacement
+    p.db.x("UPDATE runs SET status='ok' WHERE role='coordinator'")
     rereap.sweep(p, lambda *_: None)
     assert p.db.one("SELECT status FROM runs WHERE id=?", (rid,))["status"] == "failed"
     assert rereap.reread(p, rid) == ""
     assert p.db.one("SELECT status FROM runs WHERE id=?", (rid,))["status"] == "running"
+
 
 def test_ttp_task_reread_puts_a_quarantined_run_back_and_says_why_it_cannot(env, tmp_path, capsys):
     from ttp import cli

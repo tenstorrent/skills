@@ -1106,18 +1106,19 @@ def equivalent(p, branch: str, bump=None) -> tuple[str, str] | None:
         raise _timed_out[seen]
     end = time.monotonic() + EQUIV_BUDGET_S
     left = lambda: max(1.0, min(60.0, end - time.monotonic()))   # noqa: E731
+    spent = lambda: time.monotonic() > end - 1   # noqa: E731  (a git read cut by the budget is not a timeout to remember)
     try:
         # Each side's own commits: a branch that merged upstream commits the push branch also has
         # (criss-cross history, whose merge base can be the old fork point) does not read them.
         mine = _keys(repo, [f"--max-count={EQUIV_MAX_OWN + 1}", f"{tip}..{head}"], skip, left())
-        if len(mine) > EQUIV_MAX_OWN or time.monotonic() > end:
+        if len(mine) > EQUIV_MAX_OWN or spent():
             return None
         theirs: dict[str, str] = {}
         if mine:
             for sha, key in _keys(repo, ["--max-count=500", f"{head}..{tip}"], skip, left()):
                 theirs.setdefault(key, sha)
         if mine and not all(key in theirs for _, key in mine):
-            if time.monotonic() > end:
+            if spent():
                 return None
             whole = _git(repo, "diff", "-U0", "--no-renames", "--no-color", base, head, "--", ".",
                          *(f":(exclude){x}" for x in skip), timeout=left())

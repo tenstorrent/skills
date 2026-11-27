@@ -6,6 +6,7 @@ with its reap marked lean, so the normal reap tick finishes it from those files.
 run again, and a run whose result.json is missing or not a hand-off stays quarantined."""
 from __future__ import annotations
 
+import json
 import time
 from pathlib import Path
 from typing import Callable
@@ -71,8 +72,11 @@ def reread(p, run_id: int) -> str:
 
 
 def _unhandled(db, tid: int) -> bool:
-    """The abandon's task_failed event for task `tid` is still queued: nobody acted on the failure."""
-    return bool(db.one("SELECT 1 FROM events WHERE kind='task_failed' AND task=? AND status='queued'", (tid,)))
+    """Nobody acted on task `tid`'s failure: its task_failed event is still queued and no running
+    coordinator turn holds it (a turn's events are marked handled only when it is reaped)."""
+    ev = db.one("SELECT id FROM events WHERE kind='task_failed' AND task=? AND status='queued'", (tid,))
+    return bool(ev) and not any(ev["id"] in (json.loads(r["note"] or "{}").get("events") or [])
+                                for r in db.q("SELECT note FROM runs WHERE role='coordinator' AND status='running'"))
 
 
 def sweep(p, log: Callable[[object, str], None]) -> None:
