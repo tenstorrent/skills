@@ -57,6 +57,7 @@ from . import glmharness, policyfiles
 from . import deviceab
 from . import deviceshadow
 from . import ponytail
+from . import prsize
 from . import batchrun
 from . import leadmode
 from . import schedjobs
@@ -21099,6 +21100,7 @@ class Daemon:
                 held = reviewhold.blocking(db, carried, skip={task["id"]})
         else:
             lines.append("Review only: leave the branch" + (" and the PR" if pr else "") + " as they are.")
+        lines += prsize.review_prompt_lines(self.p, task, elsewhere, full)
         checks = self._precheck(task, full) if pushes else None
         if checks:
             lines.append(self._precheck_line(task, head, checks))

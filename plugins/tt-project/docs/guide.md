@@ -484,7 +484,14 @@ coordinator with that evidence.
   the same way, labelled or not: it measures each approved head against the change's own base and
   needs the lane's pass on that head; a refused review without the lane is labelled and runs it on its
   rerun. The defaults come from this repository's landed commits (5643 at the time of writing: 90%
-  added at most 288 lines, 95% at most 383); 0 turns the gate off.
+  added at most 288 lines, 95% at most 383); 0 turns the gate off. A change that delivers onto an
+  open PR's branch is also judged on the PR's cumulative diff: its review prompt carries the PR's whole
+  diffstat (lines added and removed, split into code, tests, docs and generated files) next to the
+  repo's norm (median and p90 added lines of its recently merged PRs, read anonymously and cached per
+  repo for a day; `norm unknown` when the gh route cannot answer), and the lane's verdict covers
+  whether the PR as a whole still does what its title and description say with the least code, not
+  only whether the commit under review is clean. Both reads are anonymous (ghanon), so a private
+  repository's PR gets no PR block: its facts cannot be read without a login.
 - A review judges the diff plus the gate results that already exist for the head it reviews, and
   never starts or waits on a repeat of a test that passed on that head: a further test it wants is a
   finding, and its verdict still goes out. Only the required checks (the suite and any smoke test)
