@@ -10747,7 +10747,7 @@ def cmd_detach(a) -> None:
             print(f"ttp detach: {rhost} did not answer; its boot id is recorded at the first answer", file=sys.stderr)
     if state is not None:
         activity.append(state, activity.base(Project(state.parent).name, ev="job", id=aid, job=a.name,
-                                             rcfile=str(rc), cmd=activity.head(cmd), start=time.time()))
+                                             rcfile=str(rc), cmd=activity.head(asked), start=time.time()))
     with detach.registry(rd) as jobs:
         jobs.append({"name": a.name, "rc": str(rc), "log": str(logf), "pid": pid, **detach.owner(state=state),
                  **({"pid_start": lk.start_time(pid)} if pid else {}), "started": time.time(),

@@ -383,9 +383,10 @@ _SECRET_ENV = re.compile(r"TOKEN|SECRET|PASSW|CREDENTIAL|API_?KEY|_KEY$|AUTH", r
 # exit code is never changed, no pipeline is run differently (a `| head` that ends on SIGPIPE behaves as
 # before), a `ttp` command keeps its own verdict (`ttp checks` passes a head whose only failures also
 # fail on its base), and TTP_DETACH_RC_ONLY=1 in the job's environment keeps the exit code as it is.
-# Uses $o (the log), $c (the exit code) and $1 (the command's first word); no single quotes, so the
-# remote wrapper can embed it (cli._REMOTE_START).
-VERDICT_SH = (r'if [ "$c" = 0 ] && [ -z "${TTP_DETACH_RC_ONLY-}" ]; then case ${1##*/} in ttp) ;; *) '
+# Uses $o (the log), $c (the exit code) and $1 (the command's first word; $8 under RETRY_SH's `ttp-retry`
+# loop); no single quotes, so the remote wrapper can embed it (cli._REMOTE_START).
+VERDICT_SH = (r'if [ "$c" = 0 ] && [ -z "${TTP_DETACH_RC_ONLY-}" ]; then case ${1##*/}:${4-}:${8##*/} in '
+              r'ttp:*|sh:ttp-retry:ttp) ;; *) '
               r'v=$(tail -n 200 "$o" 2>/dev/null | grep -aE "[0-9]+ (passed|failed|errors?|skipped|deselected|'
               r'xfailed|xpassed|warnings?)[, ].*in [0-9.]+s|^FAILED \((failures|errors)=|^OK$|^OK \(" | tail -n 1); '
               r'case $v in *[0-9]" failed"*|*[0-9]" error"*|"FAILED ("*) echo "ttp detach: the command exited 0 '
@@ -430,7 +431,8 @@ def retry_argv(retry, codes, delay, cmd: list) -> list:
     if delay is not None and not 0 <= delay < 1e6:
         raise ValueError("--retry-delay is a number of seconds, 0 or more")
     wait = "30" if delay is None else ("%.3f" % delay).rstrip("0").rstrip(".")
-    return ["sh", "-c", RETRY_SH, "sh", str(retry), codes, wait, *cmd]
+    codes = ",".join(str(int(c)) for c in codes.split(","))   # the loop compares text: 07 is 7
+    return ["sh", "-c", RETRY_SH, "ttp-retry", str(retry), codes, wait, *cmd]
 
 
 def started(rc: Path) -> Path:

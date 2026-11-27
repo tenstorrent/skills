@@ -3706,6 +3706,28 @@ def test_detach_retry_stops_at_an_unlisted_code_and_gives_the_last_code_once_its
         assert _ttp_run(p, "detach", "--check", str(rc)).returncode == 4
 
 
+def test_detach_retry_keeps_a_ttp_commands_own_verdict_and_reads_a_padded_code(env, tmp_path):
+    """Under the retry loop a `ttp` command still keeps its own exit code (a test summary in its log
+    reporting failures does not turn its 0 into 1), while any other command's summary still counts; a
+    code given as 07 retries on 7."""
+    p = make(env)
+    run_dir = p.runs / "7"
+    run_dir.mkdir(parents=True)
+    (tmp_path / "bin").mkdir()
+    for name in ("ttp", "tool"):
+        (tmp_path / "bin" / name).write_text('#!/bin/sh\necho "1 failed, 2 passed in 0.10s"\nexit 0\n')
+        (tmp_path / "bin" / name).chmod(0o755)
+    flaky, tries = _flaky(tmp_path, 7, 0)
+    for job, cmd, want in (("own", [str(tmp_path / "bin" / "ttp")], "0"), ("other", [str(tmp_path / "bin" / "tool")], "1"),
+                           ("padded", flaky, "0")):
+        r = _ttp_run(p, "detach", job, "--retry", "1", "--retry-rc", "07", "--retry-delay", "0", "--", *cmd,
+                     env=_lock_job_env(env, p, run_dir))
+        assert r.returncode == 0, r.stderr
+        rc = (run_dir / f"{job}.rc").resolve()
+        assert _wait_for_path(rc) and rc.read_text().strip() == want, (job, (run_dir / f"{job}.log").read_text())
+    assert tries.read_text().strip() == "2"
+
+
 def test_detach_retry_runs_on_the_remote_host_and_odd_retry_options_start_nothing(env, tmp_path):
     p = _device_project(env, device=False)
     run_dir = p.runs / "21"
