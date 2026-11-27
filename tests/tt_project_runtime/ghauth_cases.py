@@ -1799,7 +1799,7 @@ def test_gh_a_bridge_that_lacks_a_call_the_box_allows_is_named_as_an_older_relea
     capsys.readouterr()
     assert ghqueue._queued(run, b"", "acme/widgets", None, None, "gh workflow run") == 1
     err = capsys.readouterr().err
-    assert "older release (0.1.50)" in err and "does not take `gh workflow run`" in err and "install line" in err and "`ttp setup`" in err, err
+    assert "older release (0.1.50)" in err and "does not take `gh workflow run`" in err and "install line" in err and "`ttp bridge setup <box>`" in err, err
     # An older bridge's answer has no version; a refusal that is not the generic one is untouched.
     for stderr, want in ((generic, "it reports no version"), ("refused on the workstation: not the head of an open PR", "")):
         (d / f"{key}.done").write_text(json.dumps({"rc": 1, "write": True, "stderr": stderr, "at": time.time()}))

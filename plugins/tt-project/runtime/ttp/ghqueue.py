@@ -576,8 +576,8 @@ def _older_bridge(sent: list[str], data: bytes, got: dict) -> str:
     said = ver if isinstance(ver, str) and ver else "it reports no version"
     return (f"refused on the workstation: its bridge runs an older release ({said}) that does not take "
             f"`gh {' '.join(sent[:2])}` like this; update tt-project on the workstation (rerun its install line, "
-            f"docs/install.md, Update: it runs `ttp setup` from the new release, which restarts the gh-pull "
-            f"service), then retry (this host runs {__version__})\n")
+            f"docs/install.md, Update), then run `ttp bridge setup <box>` there to restart its gh-pull service on the "
+            f"new release, then retry (this host runs {__version__})\n")
 
 
 def _queued(sent: list[str], data: bytes, repo: str, cwd: str | None, home, what: str, key: str = "") -> int:
