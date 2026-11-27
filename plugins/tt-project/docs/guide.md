@@ -499,7 +499,7 @@ coordinator with that evidence.
   size, the norm and the budget. The gate lifts when a plan is recorded with
   `ttp pr plan <owner/repo#N> --budget <lines> --msg <chat message id>` (the coordinator posts
   the plan to the user's chat first; `--msg` names that message), which sets the PR's budget to
-  the plan's.
+  the plan's. The PR read is anonymous, so a private repository's PR is not gated.
 - A review judges the diff plus the gate results that already exist for the head it reviews, and
   never starts or waits on a repeat of a test that passed on that head: a further test it wants is a
   finding, and its verdict still goes out. Only the required checks (the suite and any smoke test)
