@@ -22,6 +22,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Iterator
 
+from .devq import fsync_dir
 from . import gitlocks, slop, statcache
 from .db import DB
 
@@ -2966,21 +2967,6 @@ def _stamp(ts: float) -> str:
     """A memory entry's `created`: UTC to the microsecond, so entries sort in the order they were
     written. Older entries carry the date alone, which sorts before any stamp of the same day."""
     return time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(ts)) + f".{int(ts % 1 * 1e6):06d}Z"
-
-
-def fsync_dir(path: Path) -> None:
-    """Make a rename or a new file in this directory survive a power cut. Some file systems
-    cannot open or sync a directory; they get what the OS gives."""
-    try:
-        fd = os.open(path, os.O_RDONLY)
-    except OSError:
-        return
-    try:
-        os.fsync(fd)
-    except OSError:
-        pass
-    finally:
-        os.close(fd)
 
 
 def sync_all() -> None:

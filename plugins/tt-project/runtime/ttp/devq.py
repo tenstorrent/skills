@@ -113,6 +113,23 @@ CAN_CANCEL = "runner.cancel"   # the live runner's pid: it honours CANCEL (an ol
 ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,99}")
 NAME_RE = ID_RE
 STATUSES = ("done", "failed", "skipped", "wedged")
+SUBPROC_TIMEOUT_S = 30      # one answer window for the bash/git/ps/ssh checks the guard runs
+WEDGE_SCAN_BYTES = 1 << 22  # one wedge scan's read of a job log (a longer line matches, only later)
+READ_CHUNK_BYTES = 1 << 20  # how much of a script or artifact is read at a time
+READABLE_TIMEOUT_S = 20     # past this an input path counts as unreadable (a hung mount)
+MAX_SYMLINK_HOPS = 40       # resolve_local stops here and keeps the path as written
+PCT_MAX = 100               # a percentage's upper end
+START_POLL_S = 0.05         # between looks for the starting runner to take its lock
+TERM_GRACE_S = 5.0          # a killed group's time to die on TERM before KILL
+KILL_POLL_S = 0.1           # between looks while a killed group exits
+PREWARM_DEFAULT_S = 1800    # a prewarm's limit when the setting is 0
+PREEMPT_TAIL_BYTES = 1 << 16   # how much of the log the preempt check reads
+KEEPER_REAP_S = 10          # the wait for the lock keeper to die with its wrapper
+AFTER_DROP_PASSES = 2       # health passes needed after a drop before a job may start again
+NS_PER_SEC = 1e9            # queue names carry time_ns; the wait line reports seconds
+BAD_SPEC_RC = 2             # submit/main: the request is malformed, nothing ran
+TIMEOUT_RC = 124            # sh: the command hit its limit
+NOT_FOUND_RC = 127          # sh: the command could not run at all
 
 
 _ALIASES = {"legacy_driver": "outside_user"}   # old key name -> the key it still sets (see settings)
@@ -142,8 +159,8 @@ def config_problems(name: str, cfg) -> list:
             ok = isinstance(v, list) and all(isinstance(x, str) and x.startswith(("/", "~")) for x in v)
             if not ok or (k == "netfs_prefixes" and any(x.rstrip("/") in ("", "~") for x in v)):
                 out.append(f"{where}.{k}: {v!r} is not a list of absolute paths (and not / or ~ itself)")
-    if isinstance(cfg.get("disk_max_pct"), (int, float)) and cfg["disk_max_pct"] > 100:
-        out.append(f"{where}.disk_max_pct: {cfg['disk_max_pct']} is above 100")
+    if isinstance(cfg.get("disk_max_pct"), (int, float)) and cfg["disk_max_pct"] > PCT_MAX:
+        out.append(f"{where}.disk_max_pct: {cfg['disk_max_pct']} is above PCT_MAX")
     for key in ("outside_user", "legacy_driver"):
         if isinstance(cfg.get(key), str) and cfg[key]:
             try:
@@ -201,11 +218,11 @@ def scan_wedge(path: Path, offset: int, patterns: list) -> tuple:
     try:
         with open(path, "rb") as f:
             f.seek(offset)
-            chunk = f.read(1 << 22)
+            chunk = f.read(WEDGE_SCAN_BYTES)
     except OSError:
         return offset, None
     end = chunk.rfind(b"\n") + 1
-    if not end and len(chunk) < 1 << 22:
+    if not end and len(chunk) < WEDGE_SCAN_BYTES:
         return offset, None
     chunk = chunk[:end] if end else chunk
     for raw in chunk.splitlines():
@@ -270,7 +287,7 @@ _UNKNOWN = re.compile(r"[$`*?\[{]")
 _TASK_ID = re.compile(r"(?<![A-Za-z0-9])(?:t|task)[-_]?([0-9]+)(?![A-Za-z0-9])")
 
 
-def _words(cmd: str) -> list:
+def _sh_words(cmd: str) -> list:
     import shlex
     lex = shlex.shlex(cmd.replace("\n", " ; "), posix=True, punctuation_chars=True)
     lex.whitespace_split = True
@@ -292,10 +309,10 @@ def _split_ops(w: str) -> list:
     return out
 
 
-def _segments(cmd: str) -> list:
+def _sh_segments(cmd: str) -> list:
     """Simple commands of `cmd`, in order; a subshell's `(` and `)` come as segments of their own."""
     out, cur = [], []
-    for w in (x for word in _words(cmd) for x in _split_ops(word)):
+    for w in (x for word in _sh_words(cmd) for x in _split_ops(word)):
         if w in _OPS:
             out.append(cur)
             out.append([w] if w in ("(", ")") else [])
@@ -315,7 +332,37 @@ _SH_LONG = {"--norc", "--noprofile", "--login", "--posix", "--verbose", "--restr
             "--debugger", "--protected"}
 
 
-def _interpreter_args(args: list, kind: str) -> tuple:
+def _peel_wrappers(words: list, cwd: str | None) -> tuple:
+    """(words, folder) of a segment's command once the wrapper commands around it are gone: their
+    options and the values those take are dropped (env's --chdir/-C moves the folder for this
+    command only), and timeout's duration. Anything not understood leaves the words as they are."""
+    here = cwd
+    while words and words[0].rsplit("/", 1)[-1] in _WRAPPERS:
+        wrapper, words = words[0].rsplit("/", 1)[-1], words[1:]
+        takes = _WRAPPER_ARGS.get(wrapper, "")
+        while words and (words[0].startswith("-") or (wrapper == "env" and "=" in words[0])):
+            opt, words = words[0], words[1:]
+            if wrapper == "env" and (opt.startswith("-S") or opt.startswith("--split")):
+                words = []                   # its command is one string: not looked into
+                continue
+            chdir = None
+            if wrapper == "env" and opt.startswith("--chdir="):
+                chdir = opt.split("=", 1)[1]
+            elif ((not opt.startswith("--") and len(opt) == 2 and opt[1] in takes)
+                  or opt in _WRAPPER_LONG_ARGS):
+                if wrapper == "env" and opt in ("-C", "--chdir"):
+                    chdir = words[0] if words else ""
+                words = words[1:]            # the option's value
+            elif wrapper == "env" and opt.startswith("-C") and not opt.startswith("--"):
+                chdir = opt[2:]
+            if chdir is not None:
+                here = None if not chdir or _UNKNOWN.search(chdir) else _join(here, chdir)
+        if wrapper == "timeout" and words:
+            words = words[1:]                # its duration
+    return words, here
+
+
+def _interpreter_operands(args: list, kind: str) -> tuple:
     """(operands, command string or None) of a shell's ("sh") or python's ("file") arguments. Option
     words are dropped with the values they take (`-o pipefail`, `-W ignore`); a shell's `c` in any
     short-option word (`-lc`, `-xec`) makes its first operand the command string. Anything not
@@ -373,7 +420,7 @@ def called_scripts(cmd: str, workdir: str = "", depth: int = 0) -> list:
     its #! line says so) or "file" (another interpreter's script). Words whose value only the host knows
     ($VAR, `...`, globs) are left out, as are bare names found through PATH."""
     found, cwd, saved = [], workdir or "~", []
-    for seg in _segments(cmd):
+    for seg in _sh_segments(cmd):
         if seg == ["("]:                          # a subshell: a cd inside it ends with it
             saved.append(cwd)
             continue
@@ -389,29 +436,7 @@ def called_scripts(cmd: str, workdir: str = "", depth: int = 0) -> list:
             i += 1
         while words and (words[0] in _KEYWORDS or re.match(r"[A-Za-z_][A-Za-z0-9_]*=", words[0])):
             words = words[1:]
-        here = cwd                               # env -C changes the folder for this command only
-        while words and words[0].rsplit("/", 1)[-1] in _WRAPPERS:
-            wrapper, words = words[0].rsplit("/", 1)[-1], words[1:]
-            takes = _WRAPPER_ARGS.get(wrapper, "")
-            while words and (words[0].startswith("-") or (wrapper == "env" and "=" in words[0])):
-                opt, words = words[0], words[1:]
-                if wrapper == "env" and (opt.startswith("-S") or opt.startswith("--split")):
-                    words = []                   # its command is one string: not looked into
-                    continue
-                chdir = None
-                if wrapper == "env" and opt.startswith("--chdir="):
-                    chdir = opt.split("=", 1)[1]
-                elif ((not opt.startswith("--") and len(opt) == 2 and opt[1] in takes)
-                      or opt in _WRAPPER_LONG_ARGS):
-                    if wrapper == "env" and opt in ("-C", "--chdir"):
-                        chdir = words[0] if words else ""
-                    words = words[1:]            # the option's value
-                elif wrapper == "env" and opt.startswith("-C") and not opt.startswith("--"):
-                    chdir = opt[2:]
-                if chdir is not None:
-                    here = None if not chdir or _UNKNOWN.search(chdir) else _join(here, chdir)
-            if wrapper == "timeout" and words:
-                words = words[1:]                # its duration
+        words, here = _peel_wrappers(words, cwd)
         if not words or words[0] in ("for", "case", "function"):
             continue
         head, base = words[0], words[0].rsplit("/", 1)[-1]
@@ -432,7 +457,7 @@ def called_scripts(cmd: str, workdir: str = "", depth: int = 0) -> list:
             script, kind = (words[1] if len(words) > 1 and not words[1].startswith("-") else None), "sh"
         elif base in _SHELLS or _PYTHONS.match(base):
             kind = "file" if _PYTHONS.match(base) else "sh"
-            rest, command = _interpreter_args(words[1:], kind)
+            rest, command = _interpreter_operands(words[1:], kind)
             if command is not None and depth < 2 and here is not None:
                 found += [x for x in called_scripts(command, here, depth + 1) if x not in found]
             script = rest[0] if rest else None
@@ -466,7 +491,7 @@ def lint(cmd: str, cfg: dict, job: str = "", workdir: str = "", task: str = "") 
     Warnings: a task id in a script path, the job id or the workdir that is not the submitting task's."""
     errors, warnings = [], []
     try:
-        r = subprocess.run(["bash", "-n", "-c", cmd], capture_output=True, text=True, timeout=30)
+        r = subprocess.run(["bash", "-n", "-c", cmd], capture_output=True, text=True, timeout=SUBPROC_TIMEOUT_S)
         if r.returncode:
             errors.append(f"the command is not valid shell (bash -n): {' '.join(r.stderr.split())[:300]}")
     except (OSError, subprocess.TimeoutExpired):
@@ -480,7 +505,7 @@ def lint(cmd: str, cfg: dict, job: str = "", workdir: str = "", task: str = "") 
                 else ["/bin/sh", "-c", snippet])
         where = f"host {s['host']}" if s["host"] else "this machine"
         try:
-            r = subprocess.run(argv, capture_output=True, text=True, timeout=30, stdin=subprocess.DEVNULL)
+            r = subprocess.run(argv, capture_output=True, text=True, timeout=SUBPROC_TIMEOUT_S, stdin=subprocess.DEVNULL)
             ok = r.returncode == 0
         except (OSError, subprocess.TimeoutExpired):
             r, ok = None, False
@@ -500,7 +525,7 @@ def lint(cmd: str, cfg: dict, job: str = "", workdir: str = "", task: str = "") 
                         kind == "sh" or re.match(r"#!.*[/ ]((ba|da|k|z)?sh)(\s|$)",
                                                  Path(path).read_text(errors="replace").split("\n", 1)[0])):
                     try:
-                        r2 = subprocess.run(["bash", "-n", path], capture_output=True, text=True, timeout=30)
+                        r2 = subprocess.run(["bash", "-n", path], capture_output=True, text=True, timeout=SUBPROC_TIMEOUT_S)
                     except (OSError, subprocess.TimeoutExpired):
                         continue
                     if r2.returncode:
@@ -630,7 +655,7 @@ def _job_texts(spec: dict) -> list:
         f = Path(os.path.expanduser(path))
         try:
             with open(f, errors="replace") as fh:
-                text = fh.read(1 << 20)
+                text = fh.read(READ_CHUNK_BYTES)
         except OSError:
             continue
         if kind == "sh" or (kind == "?" and re.match(r"#!.*[/ ]((ba|da|k|z)?sh)(\s|$)", text)):
@@ -690,7 +715,7 @@ def _download_problem(code: str) -> str:
             f"(check free space with `df` or the cache's size with `du` first, and stop when it is short)")
 
 
-def _expand(value: str, known: dict) -> str | None:
+def _expand_word(value: str, known: dict) -> str | None:
     """A path word with ~ and $VAR / ${VAR} / ${VAR:-x} filled in from `known`; None if one is unknown."""
     v = value.strip(_QUOTES)
     v = re.sub(r"\$\{([A-Za-z_]\w*):?-([^}]*)\}", lambda m: known.get(m.group(1)) or m.group(2), v)
@@ -700,7 +725,7 @@ def _expand(value: str, known: dict) -> str | None:
     return os.path.expanduser(v)
 
 
-def _under(path: str, prefixes: list) -> str:
+def _netfs_under(path: str, prefixes: list) -> str:
     for pre in prefixes:
         pre = os.path.expanduser(pre).rstrip("/")
         if path == pre or path.startswith(pre + "/"):
@@ -715,14 +740,14 @@ def resolve_local(path: str, prefixes: list) -> tuple:
     import posixpath
     parts, cur, hops = [x for x in path.split("/") if x], "/", 0
     while parts:
-        if _under(cur, prefixes):
+        if _netfs_under(cur, prefixes):
             break
         comp = parts.pop(0)
         if comp in (".", ".."):
             cur = posixpath.dirname(cur) if comp == ".." else cur
             continue
         nxt = posixpath.join(cur, comp)
-        if _under(nxt, prefixes):
+        if _netfs_under(nxt, prefixes):
             cur = nxt
             break
         try:
@@ -731,25 +756,25 @@ def resolve_local(path: str, prefixes: list) -> tuple:
             cur = nxt
             continue
         hops += 1
-        if hops > 40:
+        if hops > MAX_SYMLINK_HOPS:
             cur = nxt
             break
         parts = [x for x in target.split("/") if x] + parts
         cur = "/" if target.startswith("/") else cur
     out = posixpath.normpath(posixpath.join(cur, *parts)) if parts else cur
-    return out, _under(out, prefixes)
+    return out, _netfs_under(out, prefixes)
 
 
 def _netfs_problems(code: str, prefixes: list) -> list:
     known = {"HOME": str(Path.home()), **{k: v for k, v in os.environ.items()}}
     for m in _ASSIGN.finditer(code):              # in order: a later assignment wins
-        val = _expand(m.group(2), known)
+        val = _expand_word(m.group(2), known)
         if val is not None:
             known[m.group(1)] = val
     out = []
     for m in list(_CACHE_VAR.finditer(code)) + list(_CACHE_OPT.finditer(code)):
         word = m.group(m.lastindex)
-        path = _expand(word, known)
+        path = _expand_word(word, known)
         if not path or not path.startswith("/"):
             continue
         real, pre = resolve_local(path, prefixes)
@@ -773,21 +798,21 @@ def disk_full(cfg: dict, d: Path) -> str:
             u = shutil.disk_usage(os.path.expanduser(path))
         except OSError:
             continue
-        pct = 100.0 * u.used / ((u.used + u.free) or 1)
+        pct = PCT_MAX * u.used / ((u.used + u.free) or 1)
         if pct > cap:
             return (f"the disk holding {path} is {pct:.0f}% full, above the cap of {cap:.0f}% "
                     f"(disk_max_pct); free space there first")
     return ""
 
 
-def _readable(path: str, timeout: float = 20) -> str:
+def _readable_why(path: str, timeout: float = READABLE_TIMEOUT_S) -> str:
     """"" if `path` can be read here, else why. Asked in a child, so a hung mount costs `timeout`."""
     try:
         p = subprocess.Popen(["/bin/sh", "-c", 'test -r "$1"', "sh", path], stdin=subprocess.DEVNULL,
                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
         rc = p.wait(timeout=timeout)
     except subprocess.TimeoutExpired:
-        _kill_group(p.pid)
+        _kill_pgroup(p.pid)
         return f"no answer in {timeout:.0f} s (a hung mount?)"
     except OSError as e:
         return str(e)
@@ -817,7 +842,7 @@ def guard(d: Path, cfg: dict, spec: dict) -> tuple:
     base = spec.get("workdir") or str(Path.home())
     for path in spec.get("inputs") or []:
         full_path = os.path.join(base, os.path.expanduser(str(path)))
-        why = _readable(full_path)
+        why = _readable_why(full_path)
         if why:
             errors.append(f"input {path}: {why} on this host")
     cold, limit = float(spec.get("cold_start_s") or 0), job_limit(spec, cfg)
@@ -833,13 +858,13 @@ HASH_MAX_BYTES = 1 << 30   # an artifact larger than this is stamped by size and
 
 def _git(wd: str, *args: str) -> str | None:
     try:
-        r = subprocess.run(["git", "-C", wd, *args], capture_output=True, timeout=30)
+        r = subprocess.run(["git", "-C", wd, *args], capture_output=True, timeout=SUBPROC_TIMEOUT_S)
     except (OSError, subprocess.TimeoutExpired):
         return None
     return r.stdout.decode(errors="replace") if r.returncode == 0 else None
 
 
-def _changed(wd: str, porcelain: str) -> list:
+def _porcelain_paths(wd: str, porcelain: str) -> list:
     """Paths `git status --porcelain -z` names, relative to the checkout's top (a rename's old name skipped)."""
     out, parts = [], porcelain.split("\0")
     i = 0
@@ -853,10 +878,10 @@ def _changed(wd: str, porcelain: str) -> list:
     return out
 
 
-def _sha256(path: Path) -> str:
+def _sha256_of(path: Path) -> str:
     h = hashlib.sha256()
     with open(path, "rb") as f:
-        for chunk in iter(lambda: f.read(1 << 20), b""):
+        for chunk in iter(lambda: f.read(READ_CHUNK_BYTES), b""):
             h.update(chunk)
     return h.hexdigest()
 
@@ -888,9 +913,9 @@ def build_stamp(workdir: str, artifact: str = "") -> dict:
             stamp["artifact"] = {"path": str(a), "missing": True}
             return stamp
         stamp["artifact"] = {"path": str(a), "size": st.st_size, "mtime": st.st_mtime, "mtime_utc": _utc(st.st_mtime),
-                             "sha256": _sha256(a) if a.is_file() and st.st_size <= HASH_MAX_BYTES else None}
+                             "sha256": _sha256_of(a) if a.is_file() and st.st_size <= HASH_MAX_BYTES else None}
         if stamp["dirty"]:
-            for rel in _changed(wd, status or ""):
+            for rel in _porcelain_paths(wd, status or ""):
                 f = Path(top, rel)
                 with contextlib.suppress(OSError):
                     if f.suffix in _SOURCES and f.stat().st_mtime > st.st_mtime:
@@ -947,10 +972,12 @@ def _write(path: Path, text: str) -> None:
         f.flush()
         os.fsync(f.fileno())
     os.replace(tmp, path)
-    _sync_dir(path.parent)
+    fsync_dir(path.parent)
 
 
-def _sync_dir(d: Path) -> None:
+def fsync_dir(d: Path) -> None:
+    """Make a rename or a new file in this directory survive a power cut. Some file systems cannot
+    open or sync a directory; they get what the OS gives."""
     try:
         fd = os.open(d, os.O_RDONLY)
     except OSError:
@@ -971,7 +998,7 @@ def _append(path: Path, line: str) -> None:
         os.fsync(f.fileno())
 
 
-def _load(path: Path) -> dict:
+def _load_json(path: Path) -> dict:
     try:
         v = json.loads(path.read_text())
         return v if isinstance(v, dict) else {}
@@ -1041,11 +1068,11 @@ def _free(lock: Path) -> bool:
             f.close()
 
 
-def _queued(d: Path, job: str) -> list:
+def _queued_paths(d: Path, job: str) -> list:
     return sorted(q for q in (d / "queue").glob(f"*-{job}.json") if q.stem.split("-", 1)[1] == job)
 
 
-def _running(d: Path) -> list:
+def _running_jobs(d: Path) -> list:
     return sorted(f.stem for f in (d / "running").glob("*.json") if not f.name.endswith(".state.json"))
 
 
@@ -1055,7 +1082,7 @@ def where_is(d: Path, job: str) -> str:
         return "done"
     if (d / "running" / f"{job}.json").exists():
         return "running"
-    return "queued" if _queued(d, job) else "unknown"
+    return "queued" if _queued_paths(d, job) else "unknown"
 
 
 def runner_alive(d: Path) -> bool:
@@ -1071,7 +1098,7 @@ def outside_users(d: Path, pattern: str) -> list:
     try:
         rx = re.compile(pattern)
         out = subprocess.run(["ps", "-ww", "-U", str(os.getuid()), "-o", "pid=", "-o", "ppid=", "-o", "pgid=",
-                              "-o", "command="], capture_output=True, text=True, timeout=30).stdout
+                              "-o", "command="], capture_output=True, text=True, timeout=SUBPROC_TIMEOUT_S).stdout
     except (OSError, re.error, subprocess.SubprocessError):
         return []
     procs = {}
@@ -1085,7 +1112,7 @@ def outside_users(d: Path, pattern: str) -> list:
         pid = procs.get(pid, (0,))[0]
     jobs = set()
     for st in (d / "running").glob("*.state.json"):
-        cur = _load(st).get("cur") or {}
+        cur = _load_json(st).get("cur") or {}
         if isinstance(cur.get("pid"), int):
             jobs.add(cur["pid"])
     return [f"{p} {cmd[:160]}" for p, (_, pgid, cmd) in sorted(procs.items())
@@ -1098,7 +1125,7 @@ def probe(d: Path, job: str) -> int:
     runner alive: the project's daemon then runs `ttp devq start` itself and the task sleeps on."""
     at = where_is(d, job)
     if at == "done":
-        m = _load(d / "done" / f"{job}.json")
+        m = _load_json(d / "done" / f"{job}.json")
         print(f"{job}: {m.get('status', '?')} rc={m.get('rc')} log={m.get('log', '')}"
               + (f" build={stamp_line(m['build'])}" if m.get("build") else "")
               + (" (the build changed between submit and start: " + ", ".join(m["build_changed"]) + ")"
@@ -1110,7 +1137,7 @@ def probe(d: Path, job: str) -> int:
         print(f"{job}: unknown to the runner in {d}")
         return 0
     if not runner_alive(d):
-        outside = outside_users(d, settings(_load(d / "config.json"))["outside_user"])
+        outside = outside_users(d, settings(_load_json(d / "config.json"))["outside_user"])
         if outside:
             print(f"{job}: {at}; no runner yet: an outside device user still runs ({outside[0]})")
             return 1
@@ -1124,7 +1151,7 @@ WAIT_RE = re.compile(r"^(?P<job>\S+): queued (?P<waited>\d+) s, (?P<ahead>\d+) a
                      r"(?: task #(?P<task>\d+))?(?: for (?P<run>\d+) s)?(?:, pid (?P<pid>\d+) (?P<alive>alive|gone|unknown))?)$")
 
 
-def _pid_alive(pid: int) -> str:
+def _pid_state(pid: int) -> str:
     """liveness.pid_state: "unknown" from a sandbox with a PID namespace other than the daemon's."""
     from .liveness import pid_state
     return pid_state(pid)
@@ -1133,25 +1160,25 @@ def _pid_alive(pid: int) -> str:
 def wait_line(d: Path, job: str) -> str:
     """The probe's line for a queued job (parse_wait reads it back): how long it has queued, how many jobs
     are ahead of it, and the job the runner runs now with its task, run time and whether its pid lives."""
-    q, now = _queued(d, job), _now()
+    q, now = _queued_paths(d, job), _now()
     try:
-        arrived = int(q[0].name.split("-", 1)[0]) / 1e9 if q else now
+        arrived = int(q[0].name.split("-", 1)[0]) / NS_PER_SEC if q else now
     except ValueError:
         arrived = now
     ahead = sum(1 for f in (d / "queue").glob("*.json") if q and f.name < q[0].name)
-    running = _running(d)
+    running = _running_jobs(d)
     out = f"{job}: queued {max(0, int(now - arrived))} s, {ahead + len(running)} ahead; running: "
     if not running:
         return out + "none"
     rid = running[0]
-    spec, st = _load(d / "running" / f"{rid}.json"), _load(d / "running" / f"{rid}.state.json")
+    spec, st = _load_json(d / "running" / f"{rid}.json"), _load_json(d / "running" / f"{rid}.state.json")
     cur = st.get("cur") or {}
     out += rid + (f" task #{spec['task']}" if str(spec.get("task") or "").isdigit() else "")
     started = cur.get("started") or st.get("started")
     if isinstance(started, (int, float)):
         out += f" for {max(0, int(now - started))} s"
     if isinstance(cur.get("pid"), int) and cur["pid"] > 0:
-        seen = {"alive": "alive", "dead": "gone"}.get(_pid_alive(cur["pid"]), "unknown")
+        seen = {"alive": "alive", "dead": "gone"}.get(_pid_state(cur["pid"]), "unknown")
         out += f", pid {cur['pid']} {seen}"
     return out
 
@@ -1186,36 +1213,36 @@ def submit(d: Path, cfg: dict, spec: dict) -> int:
     job = str(spec.get("id") or "")
     if not ID_RE.fullmatch(job):
         print("devq submit: id missing or not letters, digits, . _ - (at most 100)", file=sys.stderr)
-        return 2
+        return BAD_SPEC_RC
     spec.setdefault("config", job)
     if not ID_RE.fullmatch(str(spec["config"])):
         print("devq submit: config must be letters, digits, . _ -", file=sys.stderr)
-        return 2
+        return BAD_SPEC_RC
     if not isinstance(spec.get("cmd"), str) or not spec["cmd"].strip():
         print("devq submit: cmd missing", file=sys.stderr)
-        return 2
+        return BAD_SPEC_RC
     if spec.get("wedge_patterns") is not None:
         bad = pattern_problems(spec["wedge_patterns"])
         if bad:
             print("devq submit: wedge_patterns: " + "; ".join(bad), file=sys.stderr)
-            return 2
+            return BAD_SPEC_RC
     wd = spec.get("workdir") or ""
     if wd and not Path(wd).is_dir():
         print(f"devq submit: workdir {wd} does not exist on this host", file=sys.stderr)
-        return 2
+        return BAD_SPEC_RC
     too_long = over_cap(spec, settings(cfg))
     if too_long:
         print(f"devq submit: refused: {too_long}", file=sys.stderr)
-        return 2
+        return BAD_SPEC_RC
     if broker_on(settings(cfg)):
         if float(spec.get("timeout_s") or 0) > BROKER_MAX_S:
             print(f"devq submit: refused: --timeout {spec['timeout_s']} is above the device broker's limit of "
                   f"{BROKER_MAX_S} s; {chunk_advice()}", file=sys.stderr)
-            return 2
+            return BAD_SPEC_RC
         too_big = chunk_problems(spec) if calls_broker(spec) else []
         if too_big:
             print("devq submit: refused: " + "; ".join(too_big), file=sys.stderr)
-            return 2
+            return BAD_SPEC_RC
         for w in broker_call_problems(spec) if calls_broker(spec) else []:
             print(f"devq submit: warning: {w} (a job that is not preemptable blocks a serving workload)",
                   file=sys.stderr)
@@ -1225,13 +1252,13 @@ def submit(d: Path, cfg: dict, spec: dict) -> int:
     if errors:
         print("devq submit: refused by this host's job guard (config device.runners): " + "; ".join(errors),
               file=sys.stderr)
-        return 2
+        return BAD_SPEC_RC
     if where_is(d, job) != "unknown":
         print(f"devq submit: id {job} was already used here; pick a new one (e.g. {job}-r2)", file=sys.stderr)
-        return 2
+        return BAD_SPEC_RC
     if not isinstance(spec.get("artifact", ""), str):
         print("devq submit: artifact must be a path", file=sys.stderr)
-        return 2
+        return BAD_SPEC_RC
     spec["build"] = build_stamp(wd, spec.get("artifact") or settings(cfg)["build_artifact"])
     print(f"build: {stamp_line(spec['build'])}")
     if spec["build"]["dirty"]:
@@ -1248,7 +1275,7 @@ def submit(d: Path, cfg: dict, spec: dict) -> int:
     # (it rereads them for each job it takes, see loop).
     _write(d / "config.json", json.dumps(settings(cfg), indent=1))
     _write(d / "queue" / f"{time.time_ns():020d}-{job}.json", json.dumps(spec, indent=1))
-    ahead = len(list((d / "queue").glob("*.json"))) - 1 + len(_running(d))
+    ahead = len(list((d / "queue").glob("*.json"))) - 1 + len(_running_jobs(d))
     print(f"queued {job} ({ahead} ahead)")
     rc = start(d, cfg)
     return 0 if rc == 3 else rc
@@ -1306,10 +1333,10 @@ def broker_kill(cur: dict) -> None:
     if cur.get("broker") and bid:
         with contextlib.suppress(OSError, subprocess.SubprocessError):
             subprocess.run([BROKER, "kill", bid], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-                           stderr=subprocess.DEVNULL, timeout=30)
+                           stderr=subprocess.DEVNULL, timeout=SUBPROC_TIMEOUT_S)
 
 
-def _env(**extra: str) -> dict:
+def _runner_env(**extra: str) -> dict:
     """The environment for the runner and its jobs: never a submitting run's `TTP_NO_DEVICE` or device
     mask (the runner is the device path, and outlives that run)."""
     return {**unmask_devices({k: v for k, v in os.environ.items() if k != "TTP_NO_DEVICE"}), **extra}
@@ -1329,7 +1356,7 @@ def start(d: Path, cfg: dict) -> int:
         return 3
     with open(d / "runner.out", "a") as out:
         proc = subprocess.Popen([sys.executable, str(Path(__file__).resolve()), "run", str(d)], cwd=str(d),
-                                stdin=subprocess.DEVNULL, stdout=out, stderr=out, start_new_session=True, env=_env())
+                                stdin=subprocess.DEVNULL, stdout=out, stderr=out, start_new_session=True, env=_runner_env())
     # wait for the runner's lock while it is still starting; its exit ends the wait at once
     deadline = time.monotonic() + START_WAIT_S
     while time.monotonic() < deadline:
@@ -1338,7 +1365,7 @@ def start(d: Path, cfg: dict) -> int:
             return 0
         if proc.poll() is not None:
             break
-        time.sleep(0.05)
+        time.sleep(START_POLL_S)
     if runner_alive(d):     # another start won the race
         print("runner already running")
         return 0
@@ -1346,7 +1373,7 @@ def start(d: Path, cfg: dict) -> int:
     return 1
 
 
-def _owned(spec: dict, project: str, task: str) -> bool:
+def _owned_by(spec: dict, project: str, task: str) -> bool:
     """Whether a job spec is this project's task's: both must match (a job queued before submit recorded
     its project names none, and is never dropped, since another project may share the runner)."""
     return bool(task) and str(spec.get("task") or "") == task and bool(project) and spec.get("project") == project
@@ -1361,8 +1388,8 @@ def drop(d: Path, project: str, task: str, why: str) -> int:
     _dirs(d)
     out = []
     for q in sorted((d / "queue").glob("*.json")):
-        spec = _load(q)
-        if not _owned(spec, project, task):
+        spec = _load_json(q)
+        if not _owned_by(spec, project, task):
             continue
         job = q.stem.split("-", 1)[1]
         try:
@@ -1381,8 +1408,8 @@ def drop(d: Path, project: str, task: str, why: str) -> int:
             honoured = (d / CAN_CANCEL).read_text().strip() == (d / "runner.pid").read_text().strip() != ""
         except OSError:
             honoured = False
-    for job in _running(d):
-        if _owned(_load(d / "running" / f"{job}.json"), project, task):
+    for job in _running_jobs(d):
+        if _owned_by(_load_json(d / "running" / f"{job}.json"), project, task):
             _write(d / "running" / f"{job}{CANCEL}", why)
             out.append({"id": job, "was": "running" if honoured else "running-unsupported"})
     print(json.dumps(out))
@@ -1411,7 +1438,7 @@ def status(d: Path, job: str = "") -> int:
         return 0
     state = (d / "state").read_text().strip() if (d / "state").exists() else "never ran"
     print(f"runner: {'alive' if runner_alive(d) else 'not running'}; {state}")
-    for job_ in _running(d):
+    for job_ in _running_jobs(d):
         print(f"running: {job_}")
     for f in sorted((d / "queue").glob("*.json")):
         print(f"queued:  {f.stem.split('-', 1)[1]}")
@@ -1427,7 +1454,7 @@ class Runner:
 
     def __init__(self, d: Path):
         self.d = d
-        self.cfg = settings(_load(d / "config.json"))
+        self.cfg = settings(_load_json(d / "config.json"))
         self._child = None
         self._keeper = None     # the keeper of the current attempt's lock (keep_lock)
         self._helper = None     # the health or drop check under way: ended with the runner
@@ -1436,7 +1463,7 @@ class Runner:
         """TERM, INT or HUP: end the health or drop check under way (its own process group) and exit at
         once, so nothing of the runner outlives it. Jobs keep running: the next runner adopts them."""
         if self._helper is not None:
-            _kill_group(self._helper.pid)
+            _kill_pgroup(self._helper.pid)
         self.log(f"runner stopped by signal {signum}")
         raise SystemExit(0)
 
@@ -1463,16 +1490,16 @@ class Runner:
         try:
             p = subprocess.Popen(["/bin/sh", "-c", cmd], cwd=cwd or str(self.d), stdin=subprocess.DEVNULL,
                                  stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
-                                 env=_env(**(env or {})), start_new_session=True)
+                                 env=_runner_env(**(env or {})), start_new_session=True)
         except OSError as e:
-            return 127, str(e)
+            return NOT_FOUND_RC, str(e)
         self._helper = p
         try:
             out, _ = p.communicate(timeout=timeout or None)
         except subprocess.TimeoutExpired:
-            _kill_group(p.pid)
+            _kill_pgroup(p.pid)
             p.communicate()
-            return 124, f"timed out after {timeout:.0f} s"
+            return TIMEOUT_RC, f"timed out after {timeout:.0f} s"
         finally:
             self._helper = None
         lines = [x for x in (out or "").splitlines() if x.strip()]
@@ -1515,7 +1542,7 @@ class Runner:
             return "not started: prewarm " + "; ".join(bad)
         self.set_state(f"{job}: prewarm")
         wd = spec.get("workdir") or ""
-        rc, out = self.sh(cmd, self.cfg["prewarm_timeout_s"] or 1800,
+        rc, out = self.sh(cmd, self.cfg["prewarm_timeout_s"] or PREWARM_DEFAULT_S,
                           {"TTP_DEVQ_JOB": job, "TTP_DEVQ_CONFIG": str(spec.get("config") or job),
                            "TTP_DEVQ_WORKDIR": wd}, cwd=wd if wd and Path(wd).is_dir() else None)
         with self.steady():
@@ -1545,7 +1572,7 @@ class Runner:
             self._finish(job, st, status, rc, reason, **extra)
 
     def _finish(self, job: str, st: dict, status: str, rc, reason: str, **extra) -> None:
-        spec = _load(self.d / "running" / f"{job}.json")
+        spec = _load_json(self.d / "running" / f"{job}.json")
         marker = {"id": job, "status": status, "rc": rc, "log": st.get("log", ""), "reason": reason,
                   "task": spec.get("task", ""), "config": spec.get("config", job),
                   "attempts": st.get("attempts", 0), "drops": st.get("drops", []),
@@ -1599,10 +1626,10 @@ class Runner:
             p = subprocess.Popen(["/bin/sh", "-c", wrapper, "sh", str(logf), str(rcf), cmd, str(lockf)],
                                  cwd=spec.get("workdir") or str(Path.home()), stdin=subprocess.DEVNULL,
                                  stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True,
-                                 env=_env(**env))
+                                 env=_runner_env(**env))
             self._keeper = keep_lock(lock, p.pid)
             if self._keeper is None:
-                _kill_group(p.pid)
+                _kill_pgroup(p.pid)
                 p.wait()
                 raise OSError("could not start the keeper of its lock")
         except OSError:
@@ -1623,6 +1650,32 @@ class Runner:
         else the box's reservation cap. The job sees it as TTP_DEVQ_TIMEOUT_S, to size the timeouts of
         what it starts within it."""
         return job_limit(spec, self.cfg)
+
+    def _refused_why(self, job: str, spec: dict, st: dict, need: int) -> tuple | None:
+        """(status, reason) the job ends with instead of starting, or None when it should start:
+        a drop asked for it, its limit is above the box's reservation cap, its config dropped too
+        many times in a row, its prewarm failed, or the health gate refused it."""
+        why = self.cancelled(job)
+        if why is not None:
+            return "cancelled", f"dropped before it started: {why}"
+        too_long = over_cap(spec, self.cfg)
+        if too_long:
+            return "failed", f"not started: {too_long}"
+        drops = self.drops_in_a_row(spec["config"])
+        if len(drops) >= int(self.cfg["max_drops"] or 0) > 0:
+            return "skipped", (f"config {spec['config']} dropped {len(drops)} times in a row; "
+                               f"`ttp devq clear <runner> {spec['config']}` allows it again")
+        why = self.prewarm(job, spec, st)
+        if why:
+            return "failed", why
+        self.no_outside_user(job)
+        why = self.healthy(need, job)
+        if why:
+            return "skipped", why
+        if "build" in spec:   # the build as the job starts: the tree may have moved since submit
+            st["build_at_start"] = build_stamp(spec.get("workdir") or "",
+                                               spec.get("artifact") or self.cfg["build_artifact"])
+        return None
 
     def wait(self, job: str, spec: dict, st: dict) -> tuple:
         """(rc, how) of the current attempt: how is "" (it ended), "timeout", "wedged" (its output matched
@@ -1647,7 +1700,7 @@ class Runner:
                 broker_kill(cur)
                 pid = cur.get("pid") or _lock_pid(lockf)
                 if pid and not _free(lockf):
-                    _kill_group(pid)
+                    _kill_pgroup(pid)
                 if child is not None:
                     child.poll()
                 return None, "cancelled"
@@ -1666,7 +1719,7 @@ class Runner:
                     broker_kill(cur)
                     pid = cur.get("pid") or _lock_pid(lockf)
                     if pid:
-                        _kill_group(pid)
+                        _kill_pgroup(pid)
                     if child is not None:
                         child.poll()
                     cur["wedge"] = {"pattern": hit[0], "line": hit[1]}
@@ -1674,8 +1727,8 @@ class Runner:
             if limit and not cur.get("broker") and _now() - cur["started"] >= limit:   # the broker ends its own
                 pid = cur.get("pid") or _lock_pid(lockf)
                 if pid:
-                    _kill_group(pid)
-                return 124, "timeout"
+                    _kill_pgroup(pid)
+                return TIMEOUT_RC, "timeout"
             time.sleep(self.cfg["poll_s"])
 
     def preempted(self, job: str, st: dict) -> bool:
@@ -1685,7 +1738,7 @@ class Runner:
             return True
         try:
             with open(st["cur"]["log"], "rb") as f:
-                f.seek(max(0, os.path.getsize(st["cur"]["log"]) - 65536))
+                f.seek(max(0, os.path.getsize(st["cur"]["log"]) - PREEMPT_TAIL_BYTES))
                 return bool(PREEMPTED_RE.search(f.read().decode(errors="replace")))
         except OSError:
             return False
@@ -1710,12 +1763,12 @@ class Runner:
         self.log(f"{job}: DROP attempt {st['cur']['n']} rc={rc} {how or ''} {evidence[:200]}")
 
     def run_job(self, job: str) -> None:
-        spec = _load(self.d / "running" / f"{job}.json")
+        spec = _load_json(self.d / "running" / f"{job}.json")
         if not spec.get("cmd"):
             self.finish(job, {}, "failed", None, "the job spec is unreadable")
             return
         spec.setdefault("config", job)
-        st = _load(self.d / "running" / f"{job}.state.json")
+        st = _load_json(self.d / "running" / f"{job}.state.json")
         st.setdefault("started", _now())
         need = 1
         if st.get("cur"):
@@ -1725,32 +1778,10 @@ class Runner:
                 self.save(job, st)
         while True:
             if not st.get("cur"):
-                why = self.cancelled(job)
-                if why is not None:
-                    self.finish(job, st, "cancelled", None, f"dropped before it started: {why}")
+                out = self._refused_why(job, spec, st, need)
+                if out:
+                    self.finish(job, st, out[0], None, out[1])
                     return
-                too_long = over_cap(spec, self.cfg)
-                if too_long:
-                    self.finish(job, st, "failed", None, f"not started: {too_long}")
-                    return
-                drops = self.drops_in_a_row(spec["config"])
-                if len(drops) >= int(self.cfg["max_drops"] or 0) > 0:
-                    self.finish(job, st, "skipped", None,
-                                f"config {spec['config']} dropped {len(drops)} times in a row; "
-                                f"`ttp devq clear <runner> {spec['config']}` allows it again")
-                    return
-                why = self.prewarm(job, spec, st)
-                if why:
-                    self.finish(job, st, "failed", None, why)
-                    return
-                self.no_outside_user(job)
-                why = self.healthy(need, job)
-                if why:
-                    self.finish(job, st, "skipped", None, why)
-                    return
-                if "build" in spec:   # the build as the job starts: the tree may have moved since submit
-                    st["build_at_start"] = build_stamp(spec.get("workdir") or "",
-                                                       spec.get("artifact") or self.cfg["build_artifact"])
                 try:
                     self.launch(job, spec, st)
                 except OSError as e:
@@ -1760,7 +1791,7 @@ class Runner:
             self._child = None
             if self._keeper is not None:   # it ends with the wrapper: reaped, never left a zombie
                 with contextlib.suppress(subprocess.TimeoutExpired):
-                    self._keeper.wait(timeout=10)
+                    self._keeper.wait(timeout=KEEPER_REAP_S)
                 self._keeper = None
             if how == "cancelled":
                 self.finish(job, st, "cancelled", None, f"stopped: {self.cancelled(job) or 'its task ended'}")
@@ -1791,7 +1822,7 @@ class Runner:
                     self.record_drop(job, spec, st, rc, how, evidence)
                     st["cur"] = None
                     self.save(job, st)
-                need = 2
+                need = AFTER_DROP_PASSES
                 continue
             if how == "wedged":
                 w = st["cur"]["wedge"]
@@ -1813,7 +1844,7 @@ class Runner:
     def next_job(self) -> str:
         """The job to run now: one left running (its runner died), else the oldest queued urgent one (an
         urgent task's, spec `urgent`), else the oldest queued. A running job is never interrupted."""
-        running = _running(self.d)
+        running = _running_jobs(self.d)
         if running:
             return running[0]
         for q in sorted((self.d / "queue").glob("*.json"), key=lambda f: (not _urgent_job(f), f.name)):
@@ -1839,14 +1870,12 @@ class Runner:
         self.log(f"runner started (pid {os.getpid()})")
         idle_since = _now()
         while True:
-            self.cfg = settings(_load(self.d / "config.json"))
+            self.cfg = settings(_load_json(self.d / "config.json"))
             job = self.next_job()
             if job:
-                self.cfg = settings(_load(self.d / "config.json"))  # as of the dequeue, not the poll before it
-                # Read again after the dequeue: submit writes the settings before the job, so a job
-                # queued since the read above runs with the settings of its own submit.
-                self.cfg = settings(_load(self.d / "config.json"))
-                self.cfg = settings(_load(self.d / "config.json"))   # as written by the submit that queued it
+                # Read again after the dequeue: submit writes the settings before the job it queues,
+                # so each job runs with the settings of its own submit, not of the poll before it.
+                self.cfg = settings(_load_json(self.d / "config.json"))
                 self.run_job(job)
                 idle_since = _now()
                 continue
@@ -1857,7 +1886,7 @@ class Runner:
                 # then is this runner's to run (the lock taken back), unless the runner its submit
                 # started holds the lock already. Either this look or that submit's start sees the other.
                 lock.close()
-                if not _running(self.d) and not any((self.d / "queue").glob("*.json")):
+                if not _running_jobs(self.d) and not any((self.d / "queue").glob("*.json")):
                     self.log(f"idle {self.cfg['idle_exit_s']:.0f} s, exiting")
                     return 0
                 lock = open(self.d / "runner.lock", "a")
@@ -1918,8 +1947,8 @@ def _lock_pid(lock: Path) -> int | None:
         return None
 
 
-def _kill_group(pid: int) -> None:
-    for sig, pause in ((signal.SIGTERM, 5.0), (signal.SIGKILL, 0)):
+def _kill_pgroup(pid: int) -> None:
+    for sig, pause in ((signal.SIGTERM, TERM_GRACE_S), (signal.SIGKILL, 0)):
         try:
             os.killpg(pid, sig)
         except OSError:
@@ -1930,14 +1959,14 @@ def _kill_group(pid: int) -> None:
                 os.killpg(pid, 0)
             except OSError:
                 return
-            time.sleep(0.1)
+            time.sleep(KILL_POLL_S)
 
 
 def main(argv: list) -> int:
     """python3 devq.py <run|start|submit|probe|status|clear|drop> <dir> [args]: the host side of `ttp devq`."""
     if len(argv) < 2:
         print(main.__doc__, file=sys.stderr)
-        return 2
+        return BAD_SPEC_RC
     op, d = argv[0], Path(os.path.expanduser(argv[1]))
     rest = argv[2:]
     if op == "run":
@@ -1955,7 +1984,7 @@ def main(argv: list) -> int:
     if op == "drop":
         return drop(d, rest[0], rest[1], rest[2] if len(rest) > 2 else "its task ended")
     print(f"devq: unknown op {op}", file=sys.stderr)
-    return 2
+    return BAD_SPEC_RC
 
 
 if __name__ == "__main__":
