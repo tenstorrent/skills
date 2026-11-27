@@ -2832,6 +2832,7 @@ def _gg_home(monkeypatch, tmp_path):
 
 @pytest.mark.parametrize("cmd", ["echo x > ~/notes.txt", "mkdir -p ~/scratch/a", "echo x > /tmp/foo-{n}.txt",
                                  "echo x > /var/tmp/foo-{n}.txt"])
+@pytest.mark.away_from_tmp
 def test_a_glm_run_writes_below_the_home_folder_and_tmp(cmd, monkeypatch, tmp_path):
     """Writes below the home folder or /tmp hurt nobody: they pass, onto the account's own
     existing temp file too."""
@@ -2854,6 +2855,7 @@ def test_a_glm_run_writes_below_the_home_folder_and_tmp(cmd, monkeypatch, tmp_pa
                                  "echo x > ~/.local/lib/python3.12/site-packages/zz.pth",
                                  "cp /bin/true ~/.local/bin/git", "echo x > ~/Library/LaunchAgents/x.plist",
                                  "echo x > ~/Library/Keychains/login.keychain-db"])
+@pytest.mark.away_from_tmp
 def test_a_glm_run_never_writes_what_starts_code_in_the_homes_sessions(cmd, monkeypatch, tmp_path):
     """Every hidden entry of the home (shell startup files, ~/.config, ~/.local), ~/bin and ~/Library/LaunchAgents
     start code or hold config for every later session, and the keychain folder holds credentials: refused, while
@@ -2879,6 +2881,7 @@ def test_a_glm_run_reads_another_projects_run_results_with_a_hash_or_a_quoted_sc
     assert not deny(cmd.format(p=other / "tt-project"))
 
 
+@pytest.mark.away_from_tmp
 def test_a_glm_run_still_refuses_writes_to_credentials_other_projects_the_harness_and_outside_home(monkeypatch, tmp_path):
     """Writes touching a credential folder, another registered project, the harness's own folder, outside the home
     folder and /tmp, onto another user's file or as another user stay refused; so do credential and secrets-store
