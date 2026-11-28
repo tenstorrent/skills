@@ -48,8 +48,8 @@ def defer(p, task, head: str, why: str, land: bool = True, say=None) -> int | No
         title = (f"Explain or split #{cid}: it went on over the size rule" if size
                  else f"Fix the ponytail lane's findings on #{cid}")
         spec = (f"Task #{cid}'s head {head[:12]} passed its checks, so this did not stop it landing: {why}\n"
-                + ("Record why it is this size (a `why this size:` line in a note on the task), or split what is "
-                   "left of it into smaller changes." if size else
+                + ("Record why it is this size (the `no_split` field of your hand-off), or split what is left of "
+                   "it into smaller changes." if size else
                    "Fix each finding that still holds on the landed code; one that a quoted user order in the "
                    "task's spec asks for is in scope: close it as such.") + f"\nContext: follow-up of task #{cid}.")
         labels = [mark] + ([f"start_when:landed:#{cid}", f"start_why:task #{cid} lands",

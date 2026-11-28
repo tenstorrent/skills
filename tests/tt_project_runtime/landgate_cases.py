@@ -69,7 +69,7 @@ def test_landgate_the_size_rule_on_a_checked_head_adds_explain_or_split(env, mon
     t = _lg_review(env, p, rev["id"], {"verdict": "pass", "head": "", "findings": []}, checked_head=head)
     assert t["status"] == "done", t["result"]
     (f,) = _lg_followups(p)
-    assert f["title"].startswith("Explain or split #") and "why this size" in f["spec"]
+    assert f["title"].startswith("Explain or split #") and "no_split" in f["spec"]
 
 
 def test_landgate_defer_needs_a_pass_on_that_head_and_adds_one_followup(env):
