@@ -59,13 +59,24 @@ def _event(db: DB, now: float, task: dict, text: str, data: dict) -> None:
           json.dumps(data), "queued", task["id"]))
 
 
-def _proceed(db: DB, t: dict, h: dict, rule: str, mins: int, now: float) -> None:
+def _proceed(db: DB, t: dict, h: dict, rule: str, mins: int, now: float) -> bool:
+    """Requeue the task (its attempt cap and a running run stand) and say so in its spec; False when refused."""
+    if db.requeue(t["id"], by="holdescalate"):
+        return False
     labels = without_deferral(json.loads(t["labels"] or "[]"))
     line = f"auto-proceeded past {rule} after {mins} min (holdescalate, user msg #4906)"
-    db.update_task(t["id"], status="queued", blocked_reason=None, labels=labels, not_before=None,
-                   spec=f"{t['spec'] or ''}\n{line}".strip())
+    db.update_task(t["id"], labels=labels, not_before=None, spec=f"{t['spec'] or ''}\n{line}".strip())
     db.set_kv(f"holdescalate:proceeded:{t['id']}", {"rule": rule, "minutes": mins, "kind": h["kind"], "ts": now})
     blockledger.append(db, "auto-proceed", t["id"], 0, f"{rule} ({h['kind']}, {mins} min)", source="holdescalate")
+    return True
+
+
+def _again(db: DB, t: dict, rule: str) -> bool:
+    """True when this rule already let the task proceed and it has not run since: the rule put it straight back
+    (a spent task budget), so another proceed would only loop."""
+    prev = db.kv(f"holdescalate:proceeded:{t['id']}")
+    return bool(prev and prev.get("rule") == rule and not db.one(
+        "SELECT 1 FROM runs WHERE task=? AND started>?", (t["id"], float(prev.get("ts") or 0))))
 
 
 def run(db: DB, cfg: dict | None, now: float) -> list[dict]:
@@ -88,6 +99,8 @@ def run(db: DB, cfg: dict | None, now: float) -> list[dict]:
         mins = int((now - h["start"]) / 60)
         ep = f"{t['id']}:{h['start']:.0f}"
         seen = state.get(ep)
+        if safety == "convenience" and seen is None and _again(db, t, rule):
+            continue   # it proceeded past this rule and the rule put it straight back: one try per run, no loop
         if safety != "convenience":
             if seen is None and safety not in QUIET:
                 _event(db, now, t, f"#{t['id']} {t['title'][:80]} held {mins} min by {rule} (safety: {safety})",
@@ -107,9 +120,9 @@ def run(db: DB, cfg: dict | None, now: float) -> list[dict]:
                     "proceeds_at": at + proceed_s if proceed_s > 0 else None})
             out.append({"task": t["id"], "rule": rule, "minutes": mins, "safety": safety, "did": "escalated"})
         elif proceed_s > 0 and now - float(seen["at"]) >= proceed_s and not seen.get("done"):
-            _proceed(db, t, h, rule, mins, now)
             seen["done"] = True
-            out.append({"task": t["id"], "rule": rule, "minutes": mins, "safety": safety, "did": "proceeded"})
+            if _proceed(db, t, h, rule, mins, now):
+                out.append({"task": t["id"], "rule": rule, "minutes": mins, "safety": safety, "did": "proceeded"})
     if state != (db.kv(KEY, {}) or {}):
         db.set_kv(KEY, state)
     return out

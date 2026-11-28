@@ -95,3 +95,26 @@ def test_hold_escalate_runs_from_the_selfblock_scan_and_is_a_stuck_event(env):
     _he_hold(p, now, 30, "waiting for the shipping window to open")
     selfblock.raise_due(p.db, now)
     assert len(_he_events(p)) == 1 and coordinator.EFFORT_EVENT_TRIGGERS["hold_escalate"] == "stuck"
+
+
+def test_hold_escalate_proceeds_once_per_run_and_leaves_a_running_or_capped_task(env):
+    from ttp import holdescalate as he
+    p = make(env)
+    now = time.time()
+    t = _he_hold(p, now, 6, "task budget reached, split the change")
+    he.run(p.db, {}, now)
+    assert [d["did"] for d in he.run(p.db, {}, now + 301)] == ["proceeded"]
+    p.db.x("UPDATE tasks SET status='blocked', blocked_reason='task budget reached, split the change' WHERE id=?", (t,))
+    p.db.x("INSERT INTO events(ts,source,kind,text,data,status,task) VALUES(?,?,?,?,?,?,?)",
+           (now + 400, "t", "task_blocked", f"#{t} ordered work is blocked: task budget reached", None, "handled", t))
+    for step in (800, 1200, 2400):   # the budget gate put it back and no run started: no second proceed, no loop
+        assert he.run(p.db, {}, now + step) == []
+    assert p.db.task(t)["status"] == "blocked" and len(_he_events(p)) == 1
+    capped = _he_hold(p, now, 6, "waiting for the shipping window to open", title="capped")
+    p.db.x("UPDATE tasks SET status='failed', attempts=3, max_attempts=3 WHERE id=?", (capped,))
+    running = _he_hold(p, now, 6, "waiting for the shipping window to open", title="running")
+    p.db.x("UPDATE tasks SET status='running' WHERE id=?", (running,))
+    assert he._proceed(p.db, p.db.task(capped), {"kind": "blocked"}, "r", 9, now) is False
+    assert he._proceed(p.db, p.db.task(running), {"kind": "blocked"}, "r", 9, now) is False
+    assert p.db.task(capped)["status"] == "failed" and p.db.task(running)["status"] == "running"
+    assert "auto-proceeded" not in (p.db.task(running)["spec"] or "") and p.db.kv(f"holdescalate:proceeded:{running}") is None
