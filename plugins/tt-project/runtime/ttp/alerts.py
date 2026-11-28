@@ -971,12 +971,12 @@ def machine_round(claim_key: str, key: str, owner: str, now: float, cleared: flo
 
 def reminder_chats(db, cfg: dict, claimer: bool) -> list[str | None]:
     """Where a project posts a logout reminder: the claim's holder to every chat, Slack and the
-    desktop (None); another project to its own chats that take high alerts, so the user gets one
+    desktop (None); another project to its own relay chats (not the web app, which lists every message) that take high alerts, so the user gets one
     message on the shared destinations and every project's own chat still hears of its work waiting."""
     if claimer:
         return [None]
     project = cfg["notify"].get("chat_min_severity")
-    return [c["id"] for c in db.q("SELECT id, min_severity FROM chats WHERE id!='slack'")
+    return [c["id"] for c in db.q("SELECT id, min_severity FROM chats WHERE id NOT IN ('slack','web')")
             if CHAT_RANK.get(chat_floor(c["min_severity"], project), 1) <= SEVERITY_RANK["high"]]
 
 

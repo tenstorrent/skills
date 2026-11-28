@@ -210,6 +210,7 @@ def test_a_project_that_does_not_hold_the_claim_gets_its_own_logout_reminder_onc
         d.alert("auth:fake", "fake is logged out", "high")
     q.db.x("INSERT INTO chats(id,created,label,last_active,last_read,min_severity) VALUES('say-x',?,?,?,0,'replies')",
            (start, "t", start))
+    q.db.x("INSERT INTO chats(id,created,label,last_active,last_read) VALUES('web',?,?,?,0)", (start, "w", start))
     told = lambda x: [m["text"] for m in x.db.unread_for_chat("c1", 0) if "still logged out" in m["text"]]
 
     def round_at(minutes, *daemons):
@@ -223,7 +224,7 @@ def test_a_project_that_does_not_hold_the_claim_gets_its_own_logout_reminder_onc
     assert json.loads(alerts.claims_path().read_text())[f"{hostname()}|auth:fake"]["owner"] == str(p.base)
     assert len(told(q)) == 1 and "log in to the agent CLI there" in told(q)[0], told(q)
     assert len(told(p)) == 1
-    assert q.db.q("SELECT id FROM messages WHERE chat='say-x'") == [], "a reply-only chat got the reminder"
+    assert q.db.q("SELECT id FROM messages WHERE chat IN ('say-x','web')") == [], "a reply-only chat or the web feed got the reminder"
     # Slack and the desktop read the messages addressed to no chat: only the claimer's is there.
     broadcast = lambda x: x.db.q("SELECT id FROM messages WHERE direction='out' AND chat IS NULL AND text LIKE '%still logged out%'")
     assert (len(broadcast(p)), len(broadcast(q))) == (1, 0), "the second project sent it to Slack and the desktop too"
