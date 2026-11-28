@@ -2435,8 +2435,10 @@ def sweep(p: Project, *, older_than_s: float = 0, names: list[str] | None = None
             # a git call per worktree; only one git does not list (another repository's, a prunable one) runs is_git
             if not half and not (rec and not rec["prunable"] and _has_git_entry(path)) and not is_git(path):
                 continue
-            if lock is None and not dry_run:
+            if w is None and lock is None and not dry_run:
                 keep(path)   # one made before keep() existed: from now on no partial-view prune orphans it
+            elif w is not None and (lock or "").startswith(KEEP_LOCK) and not dry_run:
+                unkeep(path)   # a run-folder worktree stays unlocked, so its worker can remove it itself
             if (lock or "").startswith(KEEP_LOCK):
                 lock = None   # the harness's own keep lock: remove_path lifts it if the worktree goes
             if w is None:

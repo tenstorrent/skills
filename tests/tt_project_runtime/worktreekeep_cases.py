@@ -144,7 +144,6 @@ def test_a_kept_record_under_a_hidden_or_unreadable_parent_stays(env, tmp_path):
     run_wt = p.runs / "900" / "wt"
     run_wt.parent.mkdir(parents=True)
     _git_out(p.root, "worktree", "add", "-q", "--detach", str(run_wt))
-    worktree.keep(run_wt)
     # The worktrees folder out of view (a sandbox that mounts only part of the tree): its records stay.
     hidden = tmp_path / "hidden"
     p.worktrees.rename(hidden)
@@ -153,7 +152,8 @@ def test_a_kept_record_under_a_hidden_or_unreadable_parent_stays(env, tmp_path):
         assert not [r for r in worktree.sweep(p, full_view=True) if r.get("gone")]
     finally:
         hidden.rename(p.worktrees)
-    # A run worktree's own parent folder unreadable, then missing: its record stays.
+    # A run worktree an older sweep kept, its own parent folder unreadable, then missing: its record stays.
+    worktree.keep(run_wt)
     shutil.rmtree(run_wt)
     if os.geteuid() != 0:
         run_wt.parent.chmod(0)
