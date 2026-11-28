@@ -23183,13 +23183,14 @@ SLOT_HELD_BY = {"held": "hold", "paused": "hold", "logged_out": "provider_gate",
 
 def _held_as(why: str | None, tid: int, ctx: dict) -> str:
     """_start_hold's `why` for task `tid` as a schedlog reason: its "gate" is "full" (the worker slots this
-    pass, ctx["full"]), budget_gate (ctx["gate"] closed to new work) or slot_cap (its routed host's slots)."""
+    pass, ctx["full"]), budget_gate (ctx["gate"] closed to new work or cut to 0 slots, as a plan window does)
+    or slot_cap (its routed host's slots)."""
     if why != "gate":
         return SLOT_HELD_BY.get(why, "other")
-    if tid in ctx.get("full", {}):
+    if ctx.get("full", {}).get(tid):
         return "full"
     gate = ctx.get("gate")
-    return "budget_gate" if gate is None or not gate.allow_new_work else "slot_cap"
+    return "budget_gate" if gate is None or not gate.allow_new_work or tid in ctx.get("full", {}) else "slot_cap"
 LOGIN_CHECK_PASSED = "its login check passed"
 ACCOUNT_SWITCH_EVENT = "login_account_changed"   # recorded when a login comes back as another account
 

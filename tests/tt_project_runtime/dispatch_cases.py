@@ -929,6 +929,7 @@ def test_a_gate_hold_is_logged_as_full_slots_a_closed_budget_gate_or_a_full_rout
     shut, open_ = SimpleNamespace(allow_new_work=False), SimpleNamespace(allow_new_work=True)
     assert _held_as("gate", 7, {"full": {7: 2}, "gate": open_}) == "full"
     assert _held_as("gate", 7, {"full": {}, "gate": shut}) == "budget_gate"
+    assert _held_as("gate", 7, {"full": {7: 0}, "gate": open_}) == "budget_gate", "a plan window's 0 slots"
     assert _held_as("gate", 7, {"full": {}, "gate": open_}) == "slot_cap"
     assert [_held_as(w, 7, {}) for w in ("logged_out", "net", "budget", "caps", "optional", "resource", "x")] == [
         "provider_gate", "provider_gate", "spend_cap", "spend_cap", "budget_gate", "lock", "other"]
