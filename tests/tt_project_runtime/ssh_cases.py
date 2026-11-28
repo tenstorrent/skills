@@ -1024,6 +1024,9 @@ def test_a_wrapper_copy_skips_a_chaining_guard_folder_when_it_looks_for_the_real
     env["PATH"] = f"{gbin}:{tmp_path / 'rbin'}:/usr/bin:/bin"
     r = subprocess.run(["sh", str(wbin / "ssh"), "-V", "host-a"], env=env, capture_output=True, text=True, timeout=30)
     assert r.returncode == 0 and "-V" in (tmp_path / "log").read_text()
+    (gbin / "ssh").write_text('#!/bin/sh\n[ "$1" = prod ] && exit 9\nexec sh "${0%/*}/lib/ttp-ssh" "$@"\n')
+    r = subprocess.run(["sh", str(wbin / "ssh"), "prod", "true"], env=env, capture_output=True, text=True, timeout=30)
+    assert r.returncode == 9                                                     # the guard's own check still runs
 
 
 def test_the_ssh_launcher_gives_ssh_local_no_stdin_and_keeps_the_callers_for_ssh(tmp_path):

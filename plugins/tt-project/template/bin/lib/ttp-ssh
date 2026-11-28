@@ -52,13 +52,21 @@ bindir=${0%/*}/..
 ifs=$IFS
 IFS=:
 for d in $PATH; do
-    if [ -n "$d" ] && [ -x "$d/ssh" ] && ! [ "$d/ssh" -ef "$0" ] && ! [ "$d" -ef "$bindir" ] && ! [ -f "$d/lib/ttp-ssh" ]; then
+    if [ -n "$d" ] && [ -x "$d/ssh" ] && ! [ "$d/ssh" -ef "$0" ] && ! [ "$d" -ef "$bindir" ]; then
         first=
         IFS= read -r first < "$d/ssh" 2>/dev/null
         case $first in
         '#!'*) ! grep -qsF '# tt-project ssh wrapper' "$d/ssh" || continue ;;
         esac
         real=$d/ssh
+        if [ -f "$d/lib/ttp-ssh" ]; then
+            # A project's own guard beside a wrapper body: it runs its checks and chains to its body, which finds the real ssh.
+            [ -z "$TTP_SSH_CHAINED" ] || { real=; continue; }
+            TTP_SSH_CHAINED=1
+            export TTP_SSH_CHAINED
+            unset TTP_SSH_WRAPPER_PID
+            exec "$real" "$@"
+        fi
         break
     fi
 done
