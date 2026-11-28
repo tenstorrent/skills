@@ -5,7 +5,9 @@ that speak on the same topic, listed the day the user says it so they are retire
 Topic words are the message's subject words (correction.ask_words, stemmed, the project's common talk
 dropped); a memory entry or charter item matches by half the topic words (two at least) or a shared anchor, a
 config key or an UPPER_SNAKE constant by sharing two topic words or one beside a value equal to a
-duration in the message (a constant also beside a name a matched memory entry gives); a value alone never matches. Durations are normalised to seconds (`durations`), so 'an hour', '60 min' and '3600 s'
+duration in the message (a constant also beside a name a matched memory entry gives); a value alone never matches.
+A number, date, time, size, amount or id ('2026', '24 h', '100M', 'msg-12', '#812') is no topic term or anchor, an
+anchor's own words count once, and a memory or charter row shows the shared term as its value. Durations are normalised to seconds (`durations`), so 'an hour', '60 min' and '3600 s'
 name one value. `note` runs where correction.flag reads a message and stores kv `rulematch:<msg id>`;
 `digest_lines` shows it for OPEN_S, the window to retire or rewrite them. `ttp rule-gone` (`gone`, `remaining`)
 re-runs the sources for the old value in every unit; once none remains it stores kv `rulematch:<msg id>:gone`,
@@ -42,21 +44,49 @@ def durations(text: str) -> set[int]:
     return {round(float(n or 1) * _UNITS[(u or w)[0].lower()]) for n, u, _, w in _DURATION.findall(text or "")}
 
 
+_ID_WORDS = set("""msg msgs message task tasks run runs ask issue note user id no v t r pst pdt utc cet gmt am pm h hr hrs
+min mins m s ms d k kb mb gb tb jan feb mar apr may jun jul aug sep oct nov dec""".split())   # ids, units and dates
+
+
+def _numeric(tok: str) -> bool:
+    """Whether a word or alias is only a number, date, time, size, amount or id: its letter runs are all units or
+    id words ('msg-4555', 'nov-28', 'v2'), or it has none ('2026', '24h', '$8000')."""
+    return all(w in _ID_WORDS for w in re.findall(r"[a-z]+", tok.lower()))
+
+
+def _words(text: str) -> set[str]:
+    return {reask._stem(w) for w in correction.ask_words(text) if not _numeric(w)}
+
+
+def _anchors(text: str) -> set[str]:
+    """reask.anchors without task ids and numeric aliases."""
+    return {a for a in reask.anchors(text) if not a.startswith("task:") and not (a.startswith("alias:") and _numeric(a[6:]))}
+
+
 def _topic(db, text: str) -> set[str]:
-    return {reask._stem(w) for w in correction.ask_words(text)} - {reask._stem(w) for w in correction._common(db)}
+    return _words(text) - {reask._stem(w) for w in correction._common(db)}
 
 
-def _same_topic(said: set[str], anc: set[str], item: str) -> int:
-    """The topic words `item` shares with the message, 0 when it is not on its topic."""
-    got = {reask._stem(w) for w in correction.ask_words(item)}
-    shared = len(said & got)
-    near = shared >= 2 and shared >= 0.5 * len(said) or shared >= 1 and bool(anc & reask.anchors(item))
-    return shared if near else 0
+def _same_topic(said: set[str], anc: set[str], item: str) -> tuple[int, set[str], set[str]]:
+    """(the topic words `item` shares with the message, 0 when it is not on its topic; those words; shared anchors).
+    An anchor's own words count once: a shared alias needs another shared word."""
+    words, both = said & _words(item), anc & _anchors(item)
+    rest = words - _words(" ".join(a.partition(":")[2] for a in both))
+    near = len(words) >= 2 and len(words) >= 0.5 * len(said) or bool(rest and both)
+    return (len(words) if near else 0), words, both
 
 
-def _value(text: str) -> str:
-    m = _DURATION.search(text) or re.search(r"\d+(?:\.\d+)?", text)
-    return m.group(0) if m else rulecite._clip(text, 60)
+def _value(text: str, words: set[str], both: set[str]) -> str:
+    """The shared term as `text` writes it: an anchor, else the longest shared topic word."""
+    low = text.lower()
+    for a in sorted(both):
+        i = low.find(a.partition(":")[2])
+        if i >= 0:
+            return text[i:i + len(a.partition(":")[2])]
+    for w in sorted(words, key=lambda w: (-len(w), w)):
+        if m := re.search(rf"\b{re.escape(w)}\w*", text, re.I):
+            return m.group(0)
+    return rulecite._clip(text, 60)
 
 
 def _seconds(v) -> int | None:
@@ -91,14 +121,15 @@ def _constants(p, cfg: dict, ref: str | None = None, pat: str = r"^\s*[A-Z][A-Z0
 
 def older(p, db, text: str) -> list[dict]:
     """The older rules on `text`'s topic, most shared words first, at most MAX."""
-    said, anc, dur = _topic(db, text), reask.anchors(text), durations(text)
+    said, anc, dur = _topic(db, text), _anchors(text), durations(text)
     if not said:
         return []
     cfg, found, named = p.config(), [], set()
     for e in p._memory_entries():
-        if n := _same_topic(said, anc, e["body"]):
+        n, words, both = _same_topic(said, anc, e["body"])
+        if n:
             found.append((n, {"where": "memory", "name": e["name"], "line": rulecite._clip(e["body"]),
-                              "value": _value(e["body"])}))
+                              "value": _value(e["body"], words, both)}))
             named |= set(_NAME_IN_TEXT.findall(e["body"]))
     try:
         charter = p.charter_path.read_text()
@@ -107,10 +138,11 @@ def older(p, db, text: str) -> list[dict]:
     for head, body in prompts.charter_sections(charter):
         user_only = head[3:].strip().lower().startswith("restriction")
         for item in rulecite._items(body) if head else []:
-            if n := _same_topic(said, anc, item):
+            n, words, both = _same_topic(said, anc, item)
+            if n:
                 found.append((n, {"where": "charter", "name": f"{head[3:].strip()}: {rulecite._clip(item, 40)}",
                                   "line": rulecite._clip(item) + (" (user-only: change only by the user's word)"
-                                                                  if user_only else ""), "value": _value(item)}))
+                                                                  if user_only else ""), "value": _value(item, words, both)}))
     for key, v in _flat(cfg):
         shared = len(said & {reask._stem(w) for w in re.split(r"[._]", key)})
         if shared and (shared >= 2 or _seconds(v) in dur):   # a topic word, and a second one or the duration
