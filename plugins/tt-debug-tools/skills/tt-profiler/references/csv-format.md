@@ -1,5 +1,15 @@
 # Reading `profile_log_device.csv`
 
+The streaming profiler's CSVs differ (tt-metal main, as of 2026-11-19): the ops
+CSV has 19 columns, a row per op per chip, `DEVICE ID`, `GLOBAL CALL COUNT`,
+`EXECUTION`, then durations in ns overall and per RISC; it joins to
+`ops_perf_results` on `GLOBAL CALL COUNT`. A row with `EXECUTION` 1 is a second
+kernel run under the same call count: add it to the op. `DEVICE KERNEL DURATION
+[ns]` and the per-RISC columns are spans, not busy time: an op that waits on
+another chip (an all-gather, ring attention) counts the wait, so the CSV cannot
+split compute from link wait (tested as of 2026-11-20). The zone CSV has the 15
+columns below plus `logical_x`, `logical_y` (17).
+
 Two header lines, then one row per zone boundary. Parse the header row rather
 than assuming column positions: the doc page still documents a 12-column layout
 with a `zone phase` of `begin`/`end`, and the file has 15 columns and
