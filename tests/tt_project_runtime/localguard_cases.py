@@ -427,6 +427,7 @@ def test_an_upgrade_local_commit_hands_git_its_paths_on_stdin_and_writes_no_scra
             adds.append((args, kw.get("stdin")))
         return real(cwd, *args, **kw)
     monkeypatch.setattr(cli, "_git", seen)
+    monkeypatch.setattr(cli.tempfile, "mkdtemp", lambda *a, **k: pytest.fail("a scratch folder was made"))
     cli._commit_local_changes(p, ["-c", "user.name=t", "-c", "user.email=t@t"])
     (args, stdin), = adds
     assert "--pathspec-from-file=-" in args and stdin == f"plain.txt\0{odd}\0"

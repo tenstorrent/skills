@@ -446,8 +446,8 @@ def _away_base() -> str | None:
     it cannot serve), made only when it is reached; None when none of them is away from the temp roots."""
     cache = os.path.join(REAL_HOME, ".cache")
     for root in (os.environ.get("XDG_RUNTIME_DIR", ""), f"/run/user/{os.getuid()}", cache):
-        if root == cache:
-            Path(root).mkdir(parents=True, exist_ok=True) if os.access(REAL_HOME, os.W_OK) else None
+        if root == cache and os.access(REAL_HOME, os.W_OK):
+            os.makedirs(cache, exist_ok=True)
         if root and os.access(root, os.W_OK | os.X_OK) and _away_from_tmp(Path(root, "x")):
             return root
     return None
