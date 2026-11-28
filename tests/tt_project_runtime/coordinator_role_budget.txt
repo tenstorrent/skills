@@ -90,3 +90,4 @@
 +56: quote in full: any mention of a pending ask, request, draft or command quotes it whole
 +383: the PR babysitting duty (pr_ci_not_run, pr_findings on any open PR, pr_idle; prbabysit.py)
 +70: observation_mute's `owner` and the update that keeps a mute's end
++210: the carry task owns its order with reviews inline; ttp carry report (carry.py, #10249)
