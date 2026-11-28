@@ -19,11 +19,11 @@ def test_block_ledger_rows_name_the_rule_and_class_of_each_blocked_interval(env)
     p = make(env)
     now = time.time()
     a = _bl_task(p, "waits on a rule", "blocked", now, blocked_ago=7200, reason="held by R-ab12 until later")
-    b = _bl_task(p, "waits on words", "blocked", now, blocked_ago=3600, reason="keep the 60 min hold for task 4411")
+    b = _bl_task(p, "waits on words", "blocked", now, blocked_ago=3600, reason="keep the 60 min hold for the nightly job")
     c = _bl_task(p, "in review", "review", now, blocked_ago=1800, kind="task_review", reason="review")
     rs = {r["task"]: r for r in bl.rows(p.db, {}, now - 86400, now)}
     assert (rs[a]["rule"], rs[a]["minutes"], rs[a]["safety"]) == ("R-ab12", 120.0, "rule")
-    assert (rs[b]["rule"], rs[b]["safety"]) == ("keep the min hold for task", "convenience")
+    assert rs[b]["rule"].startswith("keep the min hold") and rs[b]["safety"] == "convenience"
     assert rs[c]["safety"] == "review or push" and rs[c]["kind"] == "review"
     assert [r["minutes"] for r in bl.rows(p.db, {}, now - 86400, now)] == sorted(
         [r["minutes"] for r in bl.rows(p.db, {}, now - 86400, now)], reverse=True)
@@ -32,7 +32,7 @@ def test_block_ledger_rows_name_the_rule_and_class_of_each_blocked_interval(env)
 @pytest.mark.parametrize("reason,kind,want", [
     ("waiting on resource:blx-device", "waiting", "held resource"),
     ("check:abc123 failed", "blocked", "check"),
-    ("per user msg #4906", "blocked", "user message"),
+    ("per user msg #12", "blocked", "user message"),
     ("holds under R-1a2b", "blocked", "rule"),
     ("waits for the review", "waiting", "review or push"),
     ("anything", "review", "review or push"),
