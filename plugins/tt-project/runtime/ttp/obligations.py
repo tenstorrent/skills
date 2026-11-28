@@ -1590,10 +1590,23 @@ def _open(o: dict) -> bool:
     return not (o["receipt"] or o.get("dropped"))
 
 
+_OWNERS: dict[str, tuple[str, dict]] = {}   # database file -> (the obligations kv's text, owner -> open ids)
+
+
 def owned_open(db, tid: int) -> list[str]:
     """The open obligations task `tid` is a required owner of: its checks go ahead of its project's other
-    waiters for a host-wide checks slot (checkcap.task_priority) until each has its receipt or is dropped."""
-    return [o["id"] for o in items(db) if _open(o) and str(tid) in o["owners"]]
+    waiters for a host-wide checks slot (checkcap.task_priority) until each has its receipt or is dropped.
+    The kv is decoded once per change, not once per task asked about: a sweep asks about every task."""
+    row = db.one("SELECT value FROM kv WHERE key=?", (KV,))
+    text = row["value"] if row else ""
+    if db.path not in _OWNERS or _OWNERS[db.path][0] != text:
+        owners: dict = {}
+        for o in items(db):
+            if _open(o):
+                for t in o["owners"]:
+                    owners.setdefault(t, []).append(o["id"])
+        _OWNERS[db.path] = (text, owners)
+    return list(_OWNERS[db.path][1].get(str(tid), ()))
 
 
 def open_keys_by_task(db) -> dict[int, list[str]]:

@@ -1863,6 +1863,7 @@ class Project:
         self._harness_queued: dict[str, int] = {}   # harness path -> commits queued for it (commit_harness)
         self._last_good: dict | None = None   # project.json as this process last read it valid
         self.config_status = "ok"             # how raw_config last found it (see read_config)
+        self._name_memo: tuple[tuple, str] | None = None   # (project.json's stat, the name it gave): see `name`
 
     # layout -----------------------------------------------------------------------------------
     @property
@@ -2107,7 +2108,20 @@ class Project:
 
     @property
     def name(self) -> str:
-        return self.raw_config().get("name", self.root.name)
+        """The project's name, read from project.json again only once the file changed (every fact line,
+        note and digest asks for it): never kept for a file written within statcache.RACY_S, or one that
+        did not read as it is."""
+        try:
+            st = self.config_path.stat()
+        except OSError:
+            return self.raw_config().get("name", self.root.name)
+        stamp = statcache._stamp(st)
+        if self._name_memo and self._name_memo[0] == stamp:
+            return self._name_memo[1]
+        name = self.raw_config().get("name", self.root.name)
+        if self.config_status == "ok" and time.time() - max(st.st_mtime, st.st_ctime) > statcache.RACY_S:
+            self._name_memo = (stamp, name)
+        return name
 
     # memory -----------------------------------------------------------------------------------
     def commit_harness(self, paths: list[Path], message: str, removed: list[Path] = ()) -> None:

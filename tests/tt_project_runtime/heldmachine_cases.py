@@ -369,3 +369,45 @@ def test_a_failed_task_read_keeps_the_schedules_and_says_so(env, monkeypatch):
     monkeypatch.setattr(ml, "project_dbs", lambda: iter([("gamma", None, OSError("unable to open database file"))]))
     [gone] = [i for i in heldwork.live_items(_HM_BOX) if i["project"] == "gamma"]
     assert gone["kind"] == "unread" and "database could not be read" in gone["text"], gone
+
+
+def test_a_schedule_scan_gathers_the_machine_names_once_for_all_its_texts(env, monkeypatch):
+    from ttp import heldwork, machines
+    p = make(env)
+    machines.add(_HM_BOX, tags="device")
+    for i in range(6):
+        p.db.x("INSERT INTO schedules(name, kind, every_s, payload) VALUES(?,?,?,?)",
+               (f"check-{i}", "command", 60, json.dumps({"command": f"true {i}" if i < 5 else f"ssh {_HM_BOX} true"})))
+    gathered = []
+    real = heldwork._known_names
+    monkeypatch.setattr(heldwork, "_known_names", lambda alias: gathered.append(alias) or real(alias))
+    got = heldwork._schedules(_HM_BOX, "alpha", p.base, p.db)
+    assert [i["text"] for i in got] == ["command schedule 'check-5' names this machine"]
+    assert gathered == [_HM_BOX]
+
+
+def test_ssh_g_runs_once_per_alias_within_its_ttl_and_again_after_it(env, monkeypatch):
+    import subprocess
+    from ttp import heldwork
+    monkeypatch.delenv("TTP_TEST_NO_SSH_CHECK", raising=False)
+    monkeypatch.setattr(heldwork, "_SSH_G", {})
+    ran, clock = [], [1000.0]
+    monkeypatch.setattr(heldwork.time, "time", lambda: clock[0])
+    monkeypatch.setattr(heldwork.subprocess, "run", lambda cmd, **kw: ran.append(cmd[-1]) or subprocess.CompletedProcess(
+        cmd, 0, stdout=f"host {cmd[-1]}\nhostname {cmd[-1]}.example\n", stderr=""))
+    for _ in range(20):
+        assert heldwork._ssh_g("box-a") == {"hostname": "box-a.example"}
+    heldwork._ssh_g("box-b")
+    assert ran == ["box-a", "box-b"]
+    clock[0] += heldwork.SSH_G_TTL_S + 1
+    heldwork._ssh_g("box-a")
+    assert ran == ["box-a", "box-b", "box-a"]
+
+
+def test_a_word_scan_runs_no_pattern_on_a_text_without_the_needle(monkeypatch):
+    from ttp import responsibilities as rs
+    searched = []
+    real = rs.re.search
+    monkeypatch.setattr(rs.re, "search", lambda *a, **kw: searched.append(1) or real(*a, **kw))
+    assert not rs._word("hm-box", "nothing of the sort here " * 400) and not searched
+    assert rs._word("hm-box", "ssh hm-box true") and not rs._word("hm-box", "ssh hm-box.example true") and len(searched) == 2

@@ -1750,3 +1750,20 @@ def test_obform_kept_forms_are_not_rewritten_and_still_refused(env, monkeypatch)
     assert ob.get(p.db, part)["receipt"] is None and ob.open_order(p.db, mid)["promise"]["tasks"] == [code]
     assert f"#{made} is done, so not attached" in notes and f"#{rev} is a review task" in notes
     assert f"{plain} is open but has no promise or due to move" in notes
+
+
+def test_owned_open_decodes_the_obligations_once_for_a_sweep_of_many_tasks(env, monkeypatch):
+    from ttp import obligations as ob
+    p = make(env)
+    tids = [p.db.add_task(f"owner {i}", "s", kind="code", tier="light", origin="coordinator") for i in range(200)]
+    first = ob.add(p, "two owners", tids[:2], now=time.time())
+    ob.add(p, "no owner", [], now=time.time())
+    loads = []
+    real = ob._load
+    monkeypatch.setattr(ob, "_load", lambda db: loads.append(1) or real(db))
+    assert [ob.owned_open(p.db, t) for t in tids[:3]] == [[first], [first], []]
+    for t in tids:
+        ob.owned_open(p.db, t)
+    assert len(loads) == 1, "the kv is decoded once while it is unchanged"
+    done = ob.add(p, "owned by the last task", tids[-1:], now=time.time())
+    assert ob.owned_open(p.db, tids[-1]) == [done] and len(loads) == 3   # add's own read, then the changed kv

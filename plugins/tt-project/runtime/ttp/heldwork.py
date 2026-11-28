@@ -42,7 +42,8 @@ def names_of(alias: str) -> set[str]:
     return (out | _ssh_g_hostname(alias)) - {""}
 
 
-_SSH_G: dict[str, dict[str, str]] = {}   # name -> the route fields its `ssh -G` gave (cached per process)
+SSH_G_TTL_S = 300.0   # a name's `ssh -G` answer is reused this long, then read again (an ssh config edit shows)
+_SSH_G: dict[str, tuple[float, dict[str, str]]] = {}   # name -> (read at, the route fields its `ssh -G` gave)
 SSH_G_FIELDS = ("hostname", "port", "proxyjump")   # where `ssh <name>` really goes
 
 
@@ -51,16 +52,17 @@ def _ssh_g(name: str) -> dict[str, str]:
     cannot say). Read-only: ssh -G prints the config and never connects."""
     if os.environ.get("TTP_TEST_NO_SSH_CHECK") == "1":   # the test suite: no ssh reads
         return {}
-    if name not in _SSH_G:
+    if name not in _SSH_G or time.time() - _SSH_G[name][0] > SSH_G_TTL_S:
         try:
             r = subprocess.run(["ssh", "-G", name], capture_output=True, text=True,
                                 timeout=SSH_G_S, stdin=subprocess.DEVNULL)
             pairs = (ln.split(" ", 1) for ln in r.stdout.splitlines() if " " in ln)
-            _SSH_G[name] = ({k.lower(): v.strip() for k, v in pairs if k.lower() in SSH_G_FIELDS}
-                            if r.returncode == 0 else {})
+            fields = ({k.lower(): v.strip() for k, v in pairs if k.lower() in SSH_G_FIELDS}
+                      if r.returncode == 0 else {})
         except (OSError, subprocess.SubprocessError):
-            _SSH_G[name] = {}
-    return _SSH_G[name]
+            fields = {}
+        _SSH_G[name] = (time.time(), fields)
+    return _SSH_G[name][1]
 
 
 def _ssh_g_hostname(alias: str) -> set[str]:
@@ -173,7 +175,7 @@ SCRIPT_MAX_BYTES = 256 * 1024   # a script a schedule runs is read at most this 
 def _schedules(alias: str, name: str, base, db) -> list[dict]:
     """Project `name`'s enabled command schedules and watcher probes whose text, or the script one
     runs, names the machine: a schedule that names it will reach for it again."""
-    out = []
+    out, known = [], None
     rows = db.q("SELECT name, kind, payload FROM schedules WHERE enabled=1")
     for r in rows:
         try:
@@ -183,7 +185,8 @@ def _schedules(alias: str, name: str, base, db) -> list[dict]:
         payload = payload if isinstance(payload, dict) else {}
         texts = [r.get("name") or "", json.dumps(payload)]
         texts += _script_texts(base.parent, str(payload.get("command") or ""))
-        if any(_text_names(alias, t) for t in texts):
+        known = known or _known_names(alias)
+        if any(_text_names(alias, t, known) for t in texts):
             out.append({"kind": "schedule", "project": name,
                         "text": f"{r.get('kind')} schedule {r.get('name')!r} names this machine"})
     return out
@@ -205,22 +208,31 @@ def _script_texts(root, command: str) -> list[str]:
     return out
 
 
-def _text_names(alias: str, text: str) -> bool:
-    """Whether `text` names the machine: its alias or another of its names as a whole word, or a
-    resource named after it (`<alias>-...` that is no other machine's name: another machine
-    whose alias is also `<alias>-something` stays that machine's, never this one's)."""
-    from . import machines, responsibilities as rs
-    names = names_of(alias) - {alias}
-    if any(rs._word(n, text) for n in names):
-        return True
-    if rs._word(alias, text):
-        return True
+def _known_names(alias: str) -> tuple[set[str], set[str]]:
+    """The machine's other names (not its alias) and every other machine's alias and host name:
+    what `_text_names` reads, gathered once for the many texts of one scan."""
+    from . import machines
     others = set()
     for a, m in machines.load().items():
         if a != alias:
             others |= {a, str(m.get("hostname") or "")} - {""}
-    return any((tok := re.split(r"[:/]", t, maxsplit=1)[0]).startswith(alias + "-") and tok not in others
-               for t in re.split(r"\s", text))
+    return names_of(alias) - {alias}, others
+
+
+def _text_names(alias: str, text: str, known: tuple[set[str], set[str]] | None = None) -> bool:
+    """Whether `text` names the machine: its alias or another of its names as a whole word, or a
+    resource named after it (`<alias>-...` that is no other machine's name: another machine
+    whose alias is also `<alias>-something` stays that machine's, never this one's). `known` is
+    `_known_names(alias)` when the caller has it."""
+    from . import responsibilities as rs
+    names, others = known or _known_names(alias)
+    if any(rs._word(n, text) for n in names):
+        return True
+    if rs._word(alias, text):
+        return True
+    return alias + "-" in text and any(
+        (tok := re.split(r"[:/]", t, maxsplit=1)[0]).startswith(alias + "-") and tok not in others
+        for t in re.split(r"\s", text))
 
 
 _NOTHING_RUNS = re.compile(r"(?i)\b(?:nothing|none)\b[^.!?]{0,160}"

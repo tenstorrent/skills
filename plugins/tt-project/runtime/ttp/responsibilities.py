@@ -67,7 +67,7 @@ OUTAGE_VIA = "a known outage"      # the `via` of a machine only its recorded ou
 
 
 def _word(needle: str, text: str) -> bool:
-    return bool(needle) and re.search(rf"(?<![\w.-]){re.escape(needle)}(?![\w-]|\.\w)", text) is not None
+    return bool(needle) and needle in text and re.search(rf"(?<![\w.-]){re.escape(needle)}(?![\w-]|\.\w)", text) is not None
 
 
 PATH_EXT_RE = re.compile(r"\w\.[A-Za-z][A-Za-z0-9]{0,4}$")   # a file name's extension: heal.py, run.sh

@@ -802,3 +802,17 @@ def test_cfgshell_chat_settable_reports_the_keys_config_set_applies_as_ttp_confi
     with pytest.raises(SystemExit) as e:
         cli.cmd_chat_settable("waiting.poll_s", "120")
     assert e.value.code == 1 and "refused" in capsys.readouterr().out
+
+
+def test_the_project_name_reads_project_json_once_per_change(env, monkeypatch):
+    from ttp import project
+    p = make(env)
+    p.set_config("name", "first-name")
+    monkeypatch.setattr(project.statcache, "RACY_S", -1.0)   # a file written just now is read every time otherwise
+    reads = []
+    real = project.Project.read_config
+    monkeypatch.setattr(project.Project, "read_config", lambda self: reads.append(1) or real(self))
+    assert {p.name for _ in range(50)} == {"first-name"} and len(reads) == 1
+    data = json.loads(p.config_path.read_text())
+    p.config_path.write_text(json.dumps({**data, "name": "second-name"}))
+    assert {p.name for _ in range(50)} == {"second-name"} and len(reads) == 2
