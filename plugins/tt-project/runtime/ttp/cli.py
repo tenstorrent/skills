@@ -12317,7 +12317,7 @@ def add_task(p, a) -> tuple[int, str]:
     from .budget import task_default_usd
     tid = p.db.add_task(a.title, a.spec or "", kind=a.kind, tier=a.tier, priority=a.priority, origin="user",
                         budget_usd=budget if budget is not None else task_default_usd(p.config(), a.tier),
-                        labels=defer_labels(after, when, start_why(d, {}, when)), not_before=after)
+                        labels=defer_labels(after, when, start_why(d, {}, when, after)), not_before=after)
     stale = marker_only_probe(when, p.root)
     from . import userstep
     userstep.sync_deferrals(p.db, [p.db.task(tid)], cfg=p.config())   # a user-only step's one standing item

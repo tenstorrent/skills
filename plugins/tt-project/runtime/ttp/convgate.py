@@ -7,7 +7,8 @@ dependencies are met starts now. Its start gate (a `start_after` delay, a `start
 `landed:#<id>` chain) stays only when the gate's `why` (or the probe itself) names a safety class
 (CLASSES): the user's own word (a cited user message, project.USER_CITE, a cited message id or the
 owner's order, agent or quiet window, _OWNER_CITE, or a `test -e <dir>/user-<x>` probe; a bare "until
-the user's ok" cites none); a charter Restriction (a guard, Restriction or charter rule); data loss; a
+the user's ok" cites none); a charter Restriction (a guard, Restriction or charter rule); data loss;
+data that must accumulate (a data or measurement window that fills on its own); a
 spend cap or provider window; a shared device or machine (a lock, hold or pause, a restart, upgrade,
 reboot or power cycle; a lull, live traffic or a neighbour alone is a convenience);
 another person's work; a real dependency on another task's new file or symbol. The user's word and a Restriction come first, so a gate citing either is filed
@@ -63,6 +64,7 @@ CLASSES = (   # the user's word and a Restriction first: a gate citing either fi
     ("the user's word", USER_CITE.pattern + r"|\btest -[ef] \S*/user-[\w.-]+|" + _OWNER_CITE),
     ("charter restriction", r"\brestrictions?\b|\bcharter\b|\bguard\w*"),
     ("data loss", r"\bdata[ -]?loss\b|\blos(?:e|es|ing|t) (?:data|work|state|results?)\b|\bcorrupt\w*|\bbackups?\b"),
+    ("data that must accumulate", r"\bdata (?:that must|needs? to|has to|must) accumulate\b|\b(?:data|measurement) windows?\b"),
     ("spend cap or provider window", r"\bspend\w*|\bbudget\w*|\bcaps?\b|\bquotas?\b|\brate[ -]?limit\w*|\bcredits?\b"
                                      r"|\b(?:provider|usage|billing|token|rate|5[- ]?h(?:our)?) windows?\b"
                                      r"|\blimits? resets?\b|\bttp (?:budget|spend)\b"),

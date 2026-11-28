@@ -165,3 +165,48 @@ def test_hold_escalate_raises_one_hold_once_though_it_is_recorded_again(env):
            (now + 900, "t", "task_blocked", f"#{t} ordered work is blocked: waiting for the shipping window to open",
             None, "handled", t))
     assert [d["did"] for d in he.run(p.db, cfg, now + 1300)] == ["escalated"]   # a run came between: a new hold
+
+
+def test_a_start_after_deferral_on_outside_data_is_never_proceeded(env):
+    """A start_after deferral whose why names an outside fact (data that must accumulate, a cited
+    user message) is an outside wait, like a start_when probe: shown, never auto-proceeded. The
+    task_update deferral check keeps the same gate through the same classifier."""
+    from ttp import convgate, holdescalate as he
+    from ttp.coordinator import deferral_update
+    p = make(env)
+    now = time.time()
+    why = ("needs data that must accumulate: the after-figure is the full 24 h window, "
+           "like-for-like with the 24 h before-figure (user msg #1)")
+    t = p.db.add_task("compare the before and after figures")
+    p.db.x("UPDATE tasks SET priority=1 WHERE id=?", (t,))
+    upd, after, when, note = deferral_update(p.db, p.db.task(t), {"start_after": "23h", "why": why}, p)
+    assert "kept" in note and "dropped" not in note          # the task_update check keeps the gate
+    p.db.update_task(t, **upd)
+    assert any(str(lb).startswith(f"start_why:{why}") for lb in json.loads(p.db.task(t)["labels"])), upd["labels"]
+    assert convgate.safety_class(why, None) is not None      # one classifier serves both callers
+    assert convgate.safety_class("needs data that must accumulate first") == "data that must accumulate"
+    assert he._hold(p.db, p.db.task(t), now)["cls"] == convgate.safety_class(why, None)
+    out = [he.run(p.db, {}, now + step) for step in (3600, 3900, 7200)]
+    assert [r["did"] for rows in out for r in rows] == ["shown"] and out[0][0]["safety"] == he.OUTSIDE
+    task = p.db.task(t)
+    assert task["status"] == "queued" and "auto-proceeded" not in (task["spec"] or "")
+    assert any(str(lb).startswith("start_after:") for lb in json.loads(task["labels"]))
+    assert not _he_events(p)
+
+
+def test_a_start_after_deferral_with_no_outside_reason_still_proceeds(env):
+    """A start_after deferral whose why names no outside fact stays a convenience hold: it
+    escalates and proceeds after hold_proceed_min, as before."""
+    from ttp import convgate, holdescalate as he
+    p = make(env)
+    now = time.time()
+    t = p.db.add_task("tidy the notes")
+    p.db.x("UPDATE tasks SET priority=1, labels=? WHERE id=?",
+           (json.dumps([f"start_after:{now + 8 * 3600:.0f}", "start_why:later",
+                        f"deferred_since:{now - 600}"]), t))
+    assert convgate.safety_class("later", None) is None
+    assert he._hold(p.db, p.db.task(t), now).get("cls") is None
+    assert [d["did"] for d in he.run(p.db, {}, now)] == ["escalated"]
+    assert [d["did"] for d in he.run(p.db, {}, now + 301)] == ["proceeded"]
+    task = p.db.task(t)
+    assert "auto-proceeded" in (task["spec"] or "") and json.loads(task["labels"]) == []

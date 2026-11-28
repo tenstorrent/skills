@@ -5,8 +5,9 @@ A task the user ordered (blockledger._ordered) that is blocked, waiting or defer
 (blockledger.safety_of). A safety hold is never cleared: it raises one event per hold episode, none for a
 held resource or a pause the user set. Any other hold raises one `hold_escalate` event naming the task,
 the rule and the minutes, and, `coordinator.hold_proceed_min` (default 5; 0 escalate only) later, is
-cleared unless a safety cite was added meanwhile. A deferral on a `start_when` probe is an outside wait: it starts itself and
-is shown, never raised. A hold escalates once, though it is recorded again. A hold on an open task, an ask or a resource is left
+cleared unless a safety cite was added meanwhile. A deferral is an outside wait when it starts
+itself: a `start_when` probe, or a start_after whose why or probe names a safety class by the same
+classifier the deferral check uses (convgate.safety_class). It is shown, never raised. A hold escalates once, though it is recorded again. A hold on an open task, an ask or a resource is left
 alone: the root blocker is the thing to name. selfblock.raise_due runs this once a minute."""
 from __future__ import annotations
 
@@ -14,7 +15,7 @@ import json
 import re
 import time
 
-from . import blockledger, unblock
+from . import blockledger, convgate, unblock
 from .db import DB, deferral, without_deferral
 from .project import DEFAULT_CONFIG
 
@@ -45,7 +46,7 @@ def _hold(db: DB, t: dict, now: float) -> dict | None:
     if t["status"] == "queued" and (d := deferral(t)):
         reason = " ".join(str(d.get(k) or "") for k in ("why", "when")).strip() or "start_after"
         return {"kind": "deferred", "start": d.get("since") or float(t["created"] or now), "reason": reason,
-                "probe": bool(d.get("when"))}
+                "probe": bool(d.get("when")), "cls": convgate.safety_class(d.get("why"), d.get("when"))}
     return None
 
 
@@ -109,7 +110,7 @@ def run(db: DB, cfg: dict | None, now: float) -> list[dict]:
         if OPEN.search(h["reason"]) or _on_open_task(db, t):
             continue
         rule = blockledger.rule_of(h["reason"])
-        safety = OUTSIDE if h.get("probe") else blockledger.safety_of(f"{rule} {h['reason']}", "")
+        safety = OUTSIDE if h.get("probe") or h.get("cls") else blockledger.safety_of(f"{rule} {h['reason']}", "")
         mins = int((now - h["start"]) / 60)
         ep = f"{t['id']}:{h['start']:.0f}"
         if ep not in state and (prior := _prior(db, state, t, rule)):

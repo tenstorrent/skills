@@ -2461,12 +2461,13 @@ def check_probe(probe, what: str = "start_when") -> None:
             ends.check_not_trivial(probe.strip(), what)
 
 
-def start_why(a: dict, cur: dict, when: str | None) -> str | None:
-    """The plain words for a start_when probe: the action's `why`, else the current one while the
-    probe stays the same. None without a probe."""
-    if not when:
+def start_why(a: dict, cur: dict, when: str | None, after: float | None = None) -> str | None:
+    """The plain words for a start gate (a start_when probe or a start_after delay): the action's
+    `why`, else the current one while the gate stays the same. None without a gate."""
+    if not when and after is None and not cur.get("after"):
         return None
-    why = a.get("why") if a.get("why") is not None else cur.get("why") if when == cur.get("when") else None
+    same = (when and when == cur.get("when")) or (not when and after == cur.get("after"))
+    why = a.get("why") if a.get("why") is not None else cur.get("why") if same else None
     why = " ".join(str(why or "").split())[:START_WHY_CHARS]
     return why or None
 
@@ -2634,7 +2635,7 @@ def deferral_update(db, task: dict, a: dict, p: Project | None, labels: list | N
         # keep its retry timer (a new one when the deferral replaced it), as the hand-off set it.
         from .daemon import _retry_s   # daemon imports this module
         nb = task["not_before"] if task["not_before"] and not cur.get("after") else time.time() + _retry_s(prev)
-    return {"labels": without_deferral(labels) + defer_labels(after, when, start_why(a, cur, when))
+    return {"labels": without_deferral(labels) + defer_labels(after, when, start_why(a, cur, when, after))
             + convgate.labels_for(safe, after, when), "not_before": nb}, after, when, \
         "\n".join(x for x in (dropped, note) if x)
 
@@ -2644,7 +2645,7 @@ def defer_labels(after: float | None, when: str | None, why: str | None = None) 
     if after is None and not when:
         return []
     return ([f"start_after:{after:.0f}"] if after else []) + ([f"start_when:{when}"] if when else []) \
-        + ([f"start_why:{why}"] if when and why else []) + [f"deferred_since:{time.time():.0f}"]
+        + ([f"start_why:{why}"] if why else []) + [f"deferred_since:{time.time():.0f}"]
 
 
 STARTS_CLIP = 160   # chars of a start probe or its why that a starts line shows
@@ -3361,7 +3362,7 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                 clash = _file_overlaps(p, kind, a.get("spec") or "", {old["id"]} if old else set())
                 if dropped := _exempt_overlap_deps(p, old or followup, deps):
                     deps = [d for d in deps if d not in dropped]
-                why_after = start_why(a, {}, when)
+                why_after = start_why(a, {}, when, after)
                 roots = {int(a["continues"])} if a.get("continues") is not None else set()
                 roots |= {t["id"] for t in (old, followup, carried and carried[0]) if t}
                 # A task that rebases or re-lands another's change carries it: it never waits on it landing.
