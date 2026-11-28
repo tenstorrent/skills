@@ -13887,8 +13887,10 @@ class Daemon:
         seen = {t["id"] for t in ready}
         rest = [r for r in db.q("SELECT * FROM tasks WHERE status='queued'") if r["id"] not in seen]
         unmet = db.unmet_dependencies(rest) if rest else {}
+        carrying = {c["task"] for c in db.q("SELECT task FROM carry_state")} if unmet else set()
         for r in rest:
-            held[_queued_held_by(r, ctx["now"], unmet.get(r["id"]))] += 1
+            why = _queued_held_by(r, ctx["now"], unmet.get(r["id"]))
+            held["carry" if why == "depends_on" and r["id"] in carrying else why] += 1
         schedlog.record(schedlog.path(self.p), schedlog.entry(free, runnable, held, picked, ctx["now"],
                                                                    schedlog.slot_users(db)),
                         self.__dict__.setdefault("_schedlog", {}), lambda msg: log(self.p, msg))

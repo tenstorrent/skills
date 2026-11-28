@@ -233,3 +233,38 @@ def test_a_task_without_carry_state_settles_as_a_review_and_a_carry_owner_is_its
     assert push._reviewed_tasks(p, str(plain["id"])) == []
     carry.advance(p.db, plain["id"], carry.REVIEW)
     assert [r["id"] for r in push._reviewed_tasks(p, str(plain["id"]))] == [plain["id"]]
+
+
+def test_carry_report_counts_scheduler_minutes_and_phase_waits(env):
+    import json, time
+    from ttp import carry, schedlog
+    p = make(env)
+    now = time.time()
+    iso = lambda t: time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(t))
+    f = schedlog.path(p)
+    f.parent.mkdir(parents=True, exist_ok=True)
+    f.write_text("".join(json.dumps({"ts": iso(now - 3600 + 600 * i), "held": h}) + "\n" for i, h in
+                         enumerate([{"depends_on": 2, "carry": 1}, {"depends_on": 1}, {}])))
+    for ts, to in ((now - 3000, "change"), (now - 2400, "review"), (now - 1800, "queued"), (now - 1200, "landed"),
+                   (now - 600, "done")):
+        p.db.x("INSERT INTO events(ts,source,kind,severity,text,data,status,task) VALUES(?,?,?,?,?,?,?,?)",
+               (ts, "daemon", carry.EVENT, "low", "x", json.dumps({"task": 7, "from": None, "to": to, "ts": ts}),
+                "handled", 7))
+    a, b = carry.report(p, 1)
+    assert "30 min on depends_on" in a and "10 min as carry" in a   # 3 x 10 min and 1 x 10 min, then 1 x 10 min
+    assert "carry orders done: 1, median lead time 40 min, median push-queue/landed/deploy wait 20 min" in b
+
+
+def test_a_queued_carry_task_waiting_on_depends_on_is_held_as_carry(env):
+    import json
+    from ttp import carry, daemon as dm, schedlog
+    p = make(env)
+    a = _carry_task(p, "first")
+    b = _carry_task(p, "second", depends_on=[a["id"]])
+    c = _carry_task(p, "plain", depends_on=[a["id"]])
+    carry.advance(p.db, b["id"], carry.REVIEW)
+    d = dm.Daemon(p.base)
+    d.cfg = p.config()
+    d._log_slot_fill(0, [], {}, {"now": 1000.0}, "claude")
+    line = json.loads(schedlog.path(p).read_text().splitlines()[-1])
+    assert line["held"]["carry"] == 1 and line["held"]["depends_on"] == 1

@@ -10,7 +10,9 @@ chain-time measurements. `reconcile` brings phases forward to the push queue's r
 """
 from __future__ import annotations
 
+import datetime as dt
 import json
+import statistics
 import time
 
 from .db import dump_result, load_result
@@ -206,3 +208,46 @@ def show_line(db, task_id: int) -> str:
     """`carry: <phase> round <n>` for `ttp task show`, "" for a task with no state."""
     s = state(db, task_id)
     return f"carry: {s['phase']} round {s['round']}" if s else ""
+
+
+def _sched_minutes(p, since: float) -> dict[str, float]:
+    """Minutes queued tasks waited per held reason since `since`: each scheduler.jsonl line's count x the
+    gap to the next line (capped at 15 min). The log is not split by ordered work."""
+    from . import schedlog
+    rows = []
+    for f in (schedlog.path(p).with_name(schedlog.OLD), schedlog.path(p)):
+        try:
+            rows += [json.loads(x) for x in f.read_text().splitlines() if x.strip()]
+        except (OSError, ValueError):
+            pass
+    ts = [dt.datetime.fromisoformat(r["ts"].replace("Z", "+00:00")).timestamp() for r in rows]
+    out = {"depends_on": 0.0, "carry": 0.0}
+    for r, t, nxt in zip(rows, ts, ts[1:] + [time.time()]):
+        if t >= since:
+            for k in out:
+                out[k] += (r.get("held") or {}).get(k, 0) * min(max(nxt - t, 0), 900) / 60
+    return out
+
+
+def report(p, days: float = 1) -> list[str]:
+    """`ttp carry report`: model-free lines for the last `days`. Chain mode: minutes tasks waited on an
+    unfinished depends_on. Carry mode: minutes carry tasks waited, and for each order that reached done
+    the lead time (first carry_phase to done) and the minutes in the push queue, landed and deploy
+    phases, where no run is alive."""
+    since = time.time() - days * 86400
+    held = _sched_minutes(p, since)
+    first, last, wait = {}, {}, {}
+    for e in p.db.q("SELECT data FROM events WHERE kind=? AND ts>=? ORDER BY ts", (EVENT, since - 30 * 86400)):
+        d = json.loads(e["data"])
+        t = d["task"]
+        if t in last and last[t][1] in (QUEUED, LANDED, DEPLOY):
+            wait[t] = wait.get(t, 0) + d["ts"] - last[t][0]
+        first.setdefault(t, d["ts"])
+        last[t] = (d["ts"], d["to"])
+    done = [t for t, (ts, to) in last.items() if to == DONE and ts >= since]
+    lead = [(last[t][0] - first[t]) / 60 for t in done]
+    med = lambda xs: f"{statistics.median(xs):.0f}" if xs else "-"
+    return [f"last {days:g} d: tasks waited {held['depends_on']:.0f} min on depends_on (all work: the log does not "
+            f"split ordered work) and {held['carry']:.0f} min as carry tasks",
+            f"carry orders done: {len(done)}, median lead time {med(lead)} min, median push-queue/landed/deploy "
+            f"wait {med([wait.get(t, 0) / 60 for t in done])} min"]

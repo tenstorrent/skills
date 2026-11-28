@@ -12641,6 +12641,11 @@ def _schedule_run(p, name: str | None) -> int:
     return rc if isinstance(rc, int) else 1
 
 
+def cmd_carry(a) -> None:
+    from . import carry
+    print("\n".join(carry.report(need(a.name, sys.argv[1:]), a.days)))
+
+
 def cmd_schedules(a) -> None:
     """Read-only by default (list, show). Only --export writes: it moves the schedules into
     harness/schedules.json and commits it, so it is confirmed first."""
@@ -16805,7 +16810,7 @@ TASK_TIERS = ("light", "standard", "deep")                              # as cha
 # `ttp --help` lists the commands in these groups; a command in none is listed under "other".
 COMMAND_GROUPS = (
     ("everyday", ("new", "connect", "web", "status", "say", "listen", "list", "overview", "find", "task",
-                  "memory", "obligation", "config", "guards", "links", "pause", "resume", "drain", "alerts", "rollout", "issues", "mute",
+                  "memory", "obligation", "carry", "config", "guards", "links", "pause", "resume", "drain", "alerts", "rollout", "issues", "mute",
                   "quarantine", "machines", "runs", "logs", "doctor")),
     ("inside a run", ("note", "advise", "steer", "urgent-reply", "notify", "progress", "checks", "checks-shard", "checks-yield", "lock",
                       "occupancy", "host-run", "detach", "devq", "push", "install-check", "land", "express", "clip", "sandbox", "pool-wait", "pool-admit",
@@ -18232,6 +18237,13 @@ def ttp_parser():
                    "retry_when passes (\"\" clears it); without a probe its retry_when stays; an "
                    "always-passing probe alone is refused while the hand-off's on_pass_cmd stays")
     s.set_defaults(fn=cmd_task)
+
+    s = sub.add_parser("carry", help="carry tasks (one task carries an order to live): report = model-free wait "
+                                     "and lead minutes for the last --days, read-only")
+    s.add_argument("name", help="the project")
+    s.add_argument("action", choices=["report"], help="report: chain-wait and carry-wait minutes, lead time")
+    s.add_argument("--days", type=float, default=1, help="report: the window in days (default 1)")
+    s.set_defaults(fn=cmd_carry)
 
     s = sub.add_parser("obligation", help="urgent deliverables owed to the user: add, attach owner tasks, "
                                           "record progress and receipts, drop one recorded by mistake, list")

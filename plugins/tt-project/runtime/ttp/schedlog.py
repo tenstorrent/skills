@@ -24,10 +24,10 @@ TOP = 20
 # paused resource (lock), the machine-wide worker limit or a review's own checks (hold), its provider
 # logged out (provider_gate), the budget gate (closed to new work or cutting the slots; its own task
 # budget or the dollar caps), its routed host's slots full (slot_cap; the project's own full slots show
-# as runnable and not picked), an unfinished depends_on, or anything else (a branch clash, the disk
-# guard, the network). readywait.cause decides; FROM_CAUSE only renames it.
+# as runnable and not picked), an unfinished depends_on (a carry task's counts as carry), or anything
+# else (a branch clash, the disk guard, the network). readywait.cause decides; FROM_CAUSE only renames it.
 REASONS = ("start_when", "start_after", "retry_when", "lock", "hold", "provider_gate", "budget_gate", "slot_cap",
-           "depends_on", "other")
+           "depends_on", "carry", "other")
 # readywait's cause of a start hold (daemon._start_hold's answer) as a reason above: the one classifier
 # is readywait.cause; this only renames its answer.
 FROM_CAUSE = {"project_cap": "slot_cap", "machine_limit": "hold", "checks": "hold", "budget_gate": "budget_gate",
