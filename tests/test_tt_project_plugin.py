@@ -153,7 +153,7 @@ def test_skills_are_discoverable_and_self_contained():
         text = md.read_text(encoding="utf-8")
         assert not re.search(r"[`(]\.\./\w", text), f"{md}: relative ../ path"
         for ref in re.findall(r"`([\w-]+\.md)`", text):
-            if (md.parent / ref).exists() or ref in {"MEMORY.md", "CHARTER.md", "README.md"}:
+            if (md.parent / ref).exists() or ref in {"MEMORY.md", "CHARTER.md", "README.md", "system.md", "prompt.md"}:
                 continue
             if ref.startswith(("kind-", "daily-review", "coordinator", "worker")):
                 continue   # prompt templates of a project's harness, named for the reader
