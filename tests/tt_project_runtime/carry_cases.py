@@ -504,7 +504,9 @@ def test_a_carry_pass_of_a_change_that_needs_no_landing_ends_done(env, monkeypat
     assert not s.p.db.q("SELECT id FROM events WHERE kind='carry_fallback'")
 
 
-def test_an_inline_review_run_that_exits_ok_with_no_hand_off_still_counts_toward_the_run_cap(env, monkeypatch, tmp_path):
+@pytest.mark.parametrize("final_text, ended", [("", "no_handoff"), ('{"actions": []}', "role_miss")])
+def test_an_inline_review_run_that_exits_ok_but_ends_in_failure_still_counts_toward_the_run_cap(
+        env, monkeypatch, tmp_path, final_text, ended):
     from ttp import runcap
     from ttp.daemon import Daemon
     from ttp.providers.base import RunUsage
@@ -514,6 +516,6 @@ def test_an_inline_review_run_that_exits_ok_with_no_hand_off_still_counts_toward
     run_dir = tmp_path / "nohand"
     run_dir.mkdir()
     Daemon(s.p.base)._finish_worker({"task": s.code, "id": rid, "role": "reviewer", "note": "{}"},
-                                    RunUsage(cost_usd=0.1), "ok", run_dir)
-    assert s.p.db.one("SELECT status FROM runs WHERE id=?", (rid,))["status"] == "no_handoff"
+                                    RunUsage(cost_usd=0.1, final_text=final_text), "ok", run_dir)
+    assert s.p.db.one("SELECT status FROM runs WHERE id=?", (rid,))["status"] == ended
     assert rid in [r["id"] for r in runcap.runs(s.p.db, s.code)[0]]

@@ -182,7 +182,7 @@ def _findings(result: dict) -> str:
     return "\n".join([str(result.get("summary") or "")] + [f"- {f.get('title')}: {f.get('spec')}" for f in fups])[:6000]
 
 
-def pass_ends(daemon, task: dict) -> bool:
+def pass_ends(daemon, task: dict, why: str = "") -> bool:
     """An inline review passed with no valid push approval. The carry ends (phase done, True) only when the change
     needs no landing: no push branch, or a change kept off it. Else it fails closed: phase `plain`, one `carry_fallback`
     event, False; the task goes to review and the daemon's Review #N backs it, as for any code task."""
@@ -194,7 +194,7 @@ def pass_ends(daemon, task: dict) -> bool:
         return True
     advance(p.db, tid, PLAIN)
     pushq._event(p.db, task, "carry_fallback", f"#{tid} {task['title']}: its inline review passed with no valid push "
-                 "approval; it goes to the standard review", queued=False, severity="low")
+                 f"approval ({why or 'none'}); it goes to the standard review", queued=False, severity="low")
     return False
 
 
