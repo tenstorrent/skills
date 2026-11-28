@@ -7,7 +7,9 @@ dropped); a memory entry or charter item matches by half the topic words (two at
 config key or an UPPER_SNAKE constant by sharing two topic words or one beside a value equal to a
 duration in the message (a constant also beside a name a matched memory entry gives); a value alone never matches. Durations are normalised to seconds (`durations`), so 'an hour', '60 min' and '3600 s'
 name one value. `note` runs where correction.flag reads a message and stores kv `rulematch:<msg id>`;
-`digest_lines` shows it for OPEN_S, the window to retire or rewrite them.
+`digest_lines` shows it for OPEN_S, the window to retire or rewrite them. `ttp rule-gone` (`gone`, `remaining`)
+re-runs the sources for the old value in every unit; once none remains it stores kv `rulematch:<msg id>:gone`,
+the digest line closes, and a rule still there after OVERDUE_S reads 'overdue'.
 """
 from __future__ import annotations
 
@@ -20,8 +22,11 @@ from pathlib import Path
 from . import correction, prompts, reask, rulecite
 
 KV = "rulematch:"   # + message id: {"msg", "items": [older()'s rows]}
+GONE = ":gone"   # kv rulematch:<msg id>:gone {"ts"}: the rule is gone
 MAX = 5
 OPEN_S = 48 * 3600
+OVERDUE_S = 24 * 3600
+_SUFFIX = {"MIN": 60, "MINS": 60, "MINUTES": 60, "H": 3600, "HOURS": 3600, "D": 86400, "DAYS": 86400}   # a name's unit, else seconds
 _UNITS = {"s": 1, "m": 60, "h": 3600, "d": 86400}   # by the unit's first letter
 _WORD_UNIT = r"seconds?|secs?|minutes?|mins?|hours?|hrs?|days?"
 _A_UNIT = r"minutes?|mins?|hours?|hrs?|days?"   # not 'a second', the ordinal
@@ -64,11 +69,12 @@ def _flat(d: dict, pre: str = "") -> list[tuple[str, object]]:
     return [kv for k, v in d.items() for kv in (_flat(v, f"{pre}{k}.") if isinstance(v, dict) else [(pre + k, v)])]
 
 
-def _constants(p, cfg: dict) -> list[tuple[str, str, str]]:
-    """(file:line, NAME, value) of the UPPER_SNAKE assignments in the project's repo at its base ref."""
-    ref = str((cfg.get("delivery") or {}).get("base_ref") or "HEAD")
+def _constants(p, cfg: dict, ref: str | None = None, pat: str = r"^\s*[A-Z][A-Z0-9]*(_[A-Z0-9]+)+\s*(:[^=]+)?=",
+               files: tuple = ("*.py",)) -> list[tuple[str, str, str]]:
+    """(file:line, NAME, value) of the UPPER_SNAKE assignments in the project's repo at `ref` (its base ref)."""
+    ref = ref or str((cfg.get("delivery") or {}).get("base_ref") or "HEAD")
     try:
-        r = subprocess.run(["git", "grep", "-nE", r"^\s*[A-Z][A-Z0-9]*(_[A-Z0-9]+)+\s*(:[^=]+)?=", ref, "--", "*.py"],
+        r = subprocess.run(["git", "grep", "-nE", pat, ref, "--", *files],
                            cwd=p.root, capture_output=True, text=True, timeout=20)
     except (OSError, subprocess.SubprocessError):
         return []
@@ -129,12 +135,102 @@ def note(db, m: dict) -> None:
     db.set_kv(KV + str(m["id"]), {"msg": int(m["id"]), "items": items})   # kept even with none: one look per message
 
 
+def _secs(name: str, v) -> int | None:
+    """A value's seconds by its name's unit suffix (HOLD_MIN = 5 -> 300), None when it is no plain number."""
+    try:
+        return round(float(str(v).strip("'\" ").replace("_", "")) * _SUFFIX.get(re.split(r"[._]", name.upper())[-1], 1))
+    except (ValueError, OverflowError):
+        return None
+
+
+def _tip(p, cfg: dict) -> str:
+    """The push branch's tip when it exists in the repo, else the base ref."""
+    d = cfg.get("delivery") or {}
+    for ref in (d.get("push_branch"), d.get("base_ref"), "HEAD"):
+        if ref and subprocess.run(["git", "rev-parse", "-q", "--verify", str(ref)], cwd=p.root, capture_output=True).returncode == 0:
+            return str(ref)
+    return "HEAD"
+
+
+def remaining(p, db, old: str | None = None, name: str | None = None, items: list | None = None) -> list[str]:
+    """Where the rule still stands, as 'where name: line': `items` (older()'s rows) checked as recorded, else
+    every place that holds `old`: a memory entry or charter line naming it (in any unit), a config value or a code
+    constant (a duration only beside `name`) or an env default the repo carries, at the push branch's tip."""
+    cfg, ref = p.config(), _tip(p, p.config())
+    consts, env = _constants(p, cfg, ref), _constants(p, cfg, ref, r"^\s*[A-Z][A-Z0-9]*(_[A-Z0-9]+)+=", (":(exclude)*.py",))
+    if items is not None:
+        mem = {e["name"]: e["body"] for e in p._memory_entries()}
+        try:
+            charter = " ".join(p.charter_path.read_text().split())
+        except OSError:
+            charter = ""
+        flat = dict(_flat(cfg))
+        here = {"memory": lambda i: str(i["value"]) in mem.get(i["name"], ""),
+                "charter": lambda i: i["name"].partition(": ")[2].rstrip("…") in charter,
+                "config": lambda i: str(flat.get(i["name"])) == str(i["value"]),
+                "code": lambda i: any(n == i["name"] and v == i["value"] for _, n, v in consts)}
+        return [f"{i['where']} {i['name']}: {i['line']}" for i in items if here.get(i["where"], lambda _: True)(i)]
+    needle, dur, out = (old or "").strip().casefold(), durations(old or ""), []
+    if not needle:
+        return []
+    def hit(text: str) -> bool:
+        return needle in text.casefold() or bool(dur & durations(text))
+    out += [f"memory {e['name']}: {rulecite._clip(e['body'])}" for e in p._memory_entries() if hit(e["body"])]
+    try:
+        out += [f"charter: {rulecite._clip(l)}" for l in p.charter_path.read_text().splitlines() if hit(l)]
+    except OSError:
+        pass
+    key = (name or "").casefold()   # a duration in config or code counts only beside the name it was set under
+    out += [f"config {k} = {json.dumps(v)}" for k, v in _flat(cfg) if not isinstance(v, bool)
+            and (str(v).casefold() == needle or (key and key in k.casefold() and _secs(k, v) in dur))]
+    out += [f"{kind} {n}: {loc} = {v}" for kind, rows in (("code", consts), ("env", env)) for loc, n, v in rows
+            if v.strip("'\" ").casefold() == needle or (name == n and _secs(n, v) in dur)]
+    return out
+
+
+def gone(p, db, msg: int | None = None, old: str | None = None, name: str | None = None) -> list[str]:
+    """`remaining` for message `msg` (its recorded rules) or the value `old`; with none left, a message's
+    kv `rulematch:<id>:gone` is stored (once)."""
+    rec = db.kv(KV + str(msg)) if msg is not None else None
+    left = remaining(p, db, items=(rec or {}).get("items", [])) if rec is not None else remaining(p, db, old, name)
+    if msg is not None and not left and db.kv(KV + str(msg) + GONE) is None:
+        db.set_kv(KV + str(msg) + GONE, {"ts": time.time()})
+    return left
+
+
+def _records(db, now: float) -> list[dict]:
+    return [{**json.loads(r["value"] or "{}"), "ts": r["ts"]} for r in db.q(
+        "SELECT value, ts FROM kv WHERE key LIKE ? AND key NOT LIKE ? AND ts>=? ORDER BY ts", (KV + "%", "%" + GONE, now - OPEN_S))]
+
+
+def daily_line(db, now: float | None = None) -> str:
+    """Rules retired in the last 24 h (the message to its `gone` mark, median hours) and those overdue."""
+    now = time.time() if now is None else now
+    hours = []
+    for r in db.q("SELECT key, ts FROM kv WHERE key LIKE ? AND ts>=?", (KV + "%" + GONE, now - 86400)):
+        m = db.one("SELECT ts FROM messages WHERE id=?", (r["key"].removeprefix(KV).removesuffix(GONE),))
+        hours += [(r["ts"] - m["ts"]) / 3600] if m else []
+    late = [x for x in _records(db, now) if x.get("items") and now - x["ts"] >= OVERDUE_S and db.kv(KV + str(x["msg"]) + GONE) is None]
+    med = f" (median message-to-gone {sorted(hours)[len(hours) // 2]:.1f} h)" if hours else ""
+    return f"Rules retired today: {len(hours)}{med}; overdue: {len(late)}"
+
+
 def digest_lines(db, now: float | None = None) -> list[str]:
-    """Course check lines for the open `rulematch:` records, MAX per message."""
+    """Course check lines for the open `rulematch:` records, MAX per message; a gone rule closes its lines, a
+    rule still there after OVERDUE_S reads 'overdue' with where it stands."""
     now = time.time() if now is None else now
     out = []
-    for r in db.q("SELECT value FROM kv WHERE key LIKE ? AND ts>=? ORDER BY ts", (KV + "%", now - OPEN_S)):
-        rec = json.loads(r["value"] or "{}")
+    for rec in _records(db, now):
+        if db.kv(KV + str(rec["msg"]) + GONE) is not None:
+            continue
+        if now - rec["ts"] >= OVERDUE_S and rec.get("items"):
+            from .project import Project
+            try:
+                left = gone(Project(Path(db.path).parent.parent), db, msg=rec["msg"])
+            except Exception:
+                left = [f"{i['where']} {i['name']}" for i in rec["items"][:MAX]]
+            out += [f"- overdue: user msg {rec['msg']} rule still at {'; '.join(x.split(':')[0] for x in left[:MAX])}"] if left else []
+            continue
         out += [f"- user msg {rec['msg']} may retire: {i['where']} {i['name']} = {i['value']}; retire or rewrite it "
                 f"today" for i in rec.get("items", [])[:MAX]]
     return out

@@ -82,3 +82,87 @@ def test_rulematch_caps_the_list_and_flag_stores_and_shows_it_once(env):
     correction.flag(p.db, p.config(), [row])   # one record per message
     assert p.db.kv(rm.KV + str(mid)) == rec
     assert rm.digest_lines(p.db, time.time() + rm.OPEN_S + 60) == []
+
+
+def _rm_flag(p, text="the report worker cap is wrong, an hour is too long"):
+    from ttp import correction
+    mid = p.db.x("INSERT INTO messages(ts,direction,kind,text,handled) VALUES(?,?,?,?,?)",
+                 (time.time() - 3600, "in", "user", text, 1))
+    correction.flag(p.db, p.config(), [p.db.one("SELECT * FROM messages WHERE id=?", (mid,))])
+    return mid
+
+
+def _rm_retire(p):
+    import subprocess
+    for e in p._memory_entries():
+        p.forget_memory(e["name"])
+    p.charter_path.write_text("# Charter\n\n## Policies\n- Nothing about the worker.\n")
+    (p.root / "keep.py").write_text("LIMIT = 3\n")
+    for cmd in (["add", "-A"], ["-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "d"]):
+        subprocess.run(["git", *cmd], cwd=p.root, check=True, capture_output=True)
+
+
+def test_rule_gone_lists_where_the_old_value_still_stands_in_any_unit(env):
+    from ttp import rulematch as rm
+    p = _rm_project(env)
+    left = rm.remaining(p, p.db, old="an hour", name="KEEPALIVE_S")
+    assert {"memory", "charter", "code"} <= {x.split()[0].rstrip(":") for x in left}
+    assert any("KEEPALIVE_S" in x for x in left)
+    assert not [x for x in rm.remaining(p, p.db, old="3600 s", name="OTHER_CAP") if x.startswith(("code", "env", "config"))]
+    assert any("KEEPALIVE_S" in x for x in rm.remaining(p, p.db, old="60 min", name="KEEPALIVE_S"))
+    (p.root / "run.env").write_text("KEEPALIVE_MIN=60\nQUIET=1\n")
+    import subprocess
+    subprocess.run(["git", "add", "run.env"], cwd=p.root, check=True)
+    subprocess.run(["git", "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "e"], cwd=p.root, check=True)
+    assert any(x.startswith("env KEEPALIVE_MIN") for x in rm.remaining(p, p.db, old="1 hour", name="KEEPALIVE_MIN"))
+
+
+def test_rule_gone_is_gone_once_the_value_is_removed_and_marks_the_message(env):
+    from ttp import rulematch as rm
+    p = _rm_project(env)
+    mid = _rm_flag(p)
+    assert rm.gone(p, p.db, msg=mid) and p.db.kv(rm.KV + str(mid) + rm.GONE) is None
+    _rm_retire(p)
+    assert rm.gone(p, p.db, msg=mid) == []
+    assert p.db.kv(rm.KV + str(mid) + rm.GONE)["ts"] > 0
+    assert rm.remaining(p, p.db, old="3600 s") == []
+
+
+def test_rule_gone_digest_closes_the_line_and_reads_overdue_after_a_day(env):
+    from ttp import rulematch as rm
+    p = _rm_project(env)
+    mid = _rm_flag(p)
+    now = time.time()
+    assert rm.digest_lines(p.db, now) and all("may retire" in l for l in rm.digest_lines(p.db, now))
+    late = rm.digest_lines(p.db, now + rm.OVERDUE_S + 60)
+    assert len(late) == 1 and late[0].startswith(f"- overdue: user msg {mid} rule still at ")
+    assert "charter" in late[0]
+    _rm_retire(p)
+    rm.gone(p, p.db, msg=mid)
+    assert rm.digest_lines(p.db, now) == [] and rm.digest_lines(p.db, now + rm.OVERDUE_S + 60) == []
+
+
+def test_rule_gone_daily_line_counts_retired_rules_and_overdue_ones(env):
+    from ttp import rulematch as rm, unblock
+    p = _rm_project(env)
+    a, b = _rm_flag(p), _rm_flag(p, "the report worker keepalive cap is too long at an hour")
+    _rm_retire(p)
+    rm.gone(p, p.db, msg=a)
+    now = time.time()
+    assert rm.daily_line(p.db, now) == "Rules retired today: 1 (median message-to-gone 1.0 h); overdue: 0"
+    p.db.x("UPDATE kv SET ts=? WHERE key=?", (now - 2 * 86400 + 3600, rm.KV + str(b)))   # a day and more old, never gone
+    assert rm.daily_line(p.db, now).endswith("overdue: 1")
+    assert any(l.startswith("Rules retired today:") for l in unblock.lines(p.db, now))
+
+
+def test_rule_gone_command_exits_by_whether_the_rule_stands(env, monkeypatch, capsys):
+    from ttp import cli
+    p = _rm_project(env)
+    monkeypatch.chdir(p.root)
+    with pytest.raises(SystemExit) as e:
+        cli.main(["rule-gone", "--old", "60 min", "--name", "KEEPALIVE_S"])
+    assert e.value.code == 1 and "KEEPALIVE_S" in capsys.readouterr().out
+    with pytest.raises(SystemExit) as e:
+        cli.main(["rule-gone", "--old", "7 min"])
+    assert e.value.code == 0
+    assert "gone" in capsys.readouterr().out

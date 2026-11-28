@@ -9025,6 +9025,21 @@ def cmd_blocked(a) -> None:
         print(f"  {e['minutes']:g} min  {e['rule']}  [{e['safety']}]  x{e['count']}  tasks {e['tasks'][:6] or '-'}  key {e['key']}")
 
 
+def cmd_rule_gone(a) -> None:
+    """`ttp rule-gone --msg ID | --old TEXT [--name CONST]`: exit 0 once the rule a user message overrode (or the
+    value TEXT) stands nowhere (memory, charter, config, code at the push branch tip, env defaults), else exit 1
+    listing where it still does. With --msg the rule's `gone` mark is recorded (rulematch.gone)."""
+    from . import rulematch
+    p = here()
+    if p is None:
+        die("ttp rule-gone: no project here (run it in a project or its run)")
+    if (a.msg is None) == (a.old is None):
+        die("ttp rule-gone: give --msg ID or --old TEXT")
+    left = rulematch.gone(p, p.db, a.msg, a.old, a.name)
+    print("\n".join(left) if left else "gone")
+    raise SystemExit(1 if left else 0)
+
+
 def cmd_checks_shard(a) -> None:
     """Run one shard of a project's own test pool as a check of this host (checkcap.shard): a pool behind
     checks.wrap_cmd, and its local fallback, start each shard as `ttp checks-shard -- <cmd>` on the host
@@ -16821,7 +16836,7 @@ COMMAND_GROUPS = (
                   "quarantine", "machines", "runs", "logs", "doctor")),
     ("inside a run", ("note", "advise", "steer", "urgent-reply", "notify", "progress", "checks", "checks-shard", "checks-yield", "lock",
                       "occupancy", "host-run", "detach", "devq", "push", "install-check", "land", "express", "clip", "sandbox", "pool-wait", "pool-admit",
-                      "pool-shard", "skill", "killscan", "svcscan", "leftover-procs", "said", "block-log", "blocked", "hostcheck", "paths")),
+                      "pool-shard", "skill", "killscan", "svcscan", "leftover-procs", "said", "block-log", "blocked", "rule-gone", "hostcheck", "paths")),
     ("probes (retry_when, start_when)", ("landed", "alive", "eta", "ci", "ack-wait", "ssh-preflight", "broker-released",
                                          "deployed", "goal", "hours")),
     ("admin", ("setup", "upgrade", "start", "stop", "restart", "remove", "adopt", "prune", "secret", "consent",
@@ -17612,6 +17627,13 @@ def ttp_parser():
     s.add_argument("--done", metavar="KEY", help="record that the top blocker KEY was retired or rewritten (needs --how)")
     s.add_argument("--how", help="what retired or rewrote it")
     s.set_defaults(fn=cmd_blocked)
+    s = sub.add_parser("rule-gone", help="exit 0 once the rule a user message overrode (or an old value) stands nowhere: "
+                                         "memory, charter, config, code at the push branch tip, env defaults; else list "
+                                         "where it still does (read-only, records the message's gone mark)")
+    s.add_argument("--msg", type=int, help="the user message whose recorded older rules to check")
+    s.add_argument("--old", help="an old value or text to look for, in any unit (60 min = 3600 s = 1 h)")
+    s.add_argument("--name", help="with --old: only the code constant of this name")
+    s.set_defaults(fn=cmd_rule_gone)
     s = sub.add_parser("chat-load", help="this host's finished chat-provider calls over the trailing minutes: calls, "
                                          "refusals (429, 503, 529), errors and refusal rate, in total, by priority "
                                          "class and by project (read-only)")

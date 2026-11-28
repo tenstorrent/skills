@@ -952,7 +952,7 @@ def triggers_by_day(db: DB, now: float, days: int = TRIGGER_DAYS) -> str:
 
 def lines(db: DB, now: float | None = None, cfg: dict | None = None) -> list[str]:
     """The daily review's 'Unblocking quality' lines (`cfg`: the project's, for the queue-wait threshold)."""
-    from . import blockledger, queuewait
+    from . import blockledger, queuewait, rulematch
     now = time.time() if now is None else now
     out = [f"stuck now (inventory, whenever it started): {inventory_line(inventory(db, now))}",
            f"holds with no anchor (no ask, resource, until or when), by age: {unanchored_line(unanchored(db, now))}"]
@@ -974,4 +974,5 @@ def lines(db: DB, now: float | None = None, cfg: dict | None = None) -> list[str
     out.append(f"{reviewcap.TRIGGER}, 24 h: {reviewcap.daily_line(db, now - 86400)}")
     out.append(queuewait.daily_line(db, cfg, now))
     out.append(blockledger.daily_line(db, now))
+    out.append(rulematch.daily_line(db, now))
     return out
