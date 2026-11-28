@@ -29,7 +29,7 @@ def mode(cfg: dict | None) -> str:
 
 
 def ordered(task: dict, db) -> bool:
-    """A task of an open user order, ordered by a user message, or with an `urgent:` line."""
+    """A task of an open user order, one a user message ordered on resources (userorder), or with an `urgent:` line."""
     from . import obligations, urgent, userorder
     tid = task.get("id")
     return (tid in obligations.order_tasks(db) or tid in {o.get("task") for o in userorder.active(db).values()}
@@ -54,7 +54,7 @@ def state(db, task_id: int) -> dict | None:
 
 def advance(db, task: dict | int, phase: str, **fields) -> dict:
     """Put `task` in `phase`, with any of FIELDS, in one transaction that also writes the one `carry_phase`
-    event (task, from, to, ts). A task with no state starts from None; the same phase with no field is no change."""
+    event (task, from, to, ts), a record that wakes nobody. A task with no state starts from None; the same phase with no field is no change."""
     if phase not in PHASES:
         raise ValueError(f"unknown carry phase {phase!r}")
     if bad := set(fields) - set(FIELDS):
@@ -77,22 +77,24 @@ def advance(db, task: dict | int, phase: str, **fields) -> dict:
             data = {"task": tid, "from": before, "to": phase, "ts": now}
             db.x("INSERT INTO events(ts,source,kind,severity,text,data,status,task) VALUES(?,?,?,?,?,?,?,?)",
                  (now, "daemon", EVENT, "low", f"carry task #{tid}: {before or 'start'} -> {phase}",
-                  json.dumps(data), "new", tid))
+                  json.dumps(data), "handled", tid))
     return state(db, tid)
 
 
 def reconcile(db) -> list[tuple[int, str, str]]:
     """On daemon start: move each carry task's phase forward to its newest push row (approved or batched:
-    queued; landed: landed) and, once that row's batch finished its deploy step, to done. Returns
+    queued; pushed or landed: landed) and, once that row's batch ended its deploy step well (ok or skipped), to done. Returns
     (task, from, to) for each move. A task in `capped` is the coordinator's and stays."""
+    from .pushq import LANDED_OUTCOMES, OPEN_ROWS
     moved = []
     for s in db.q("SELECT task, phase FROM carry_state WHERE phase NOT IN (?,?)", (DONE, CAPPED)):
-        row = db.one("SELECT q.id, q.status, q.batch, q.head, b.after_finalized fin FROM push_queue q "
+        row = db.one("SELECT q.id, q.status, q.batch, q.head, b.after_push FROM push_queue q "
                      "LEFT JOIN push_batches b ON b.id=q.batch WHERE q.task=? ORDER BY q.id DESC LIMIT 1", (s["task"],))
         if not row:
             continue
-        want = (DONE if row["status"] == "landed" and row["fin"] else LANDED if row["status"] == "landed"
-                else QUEUED if row["status"] in ("approved", "batched") else None)
+        landed = row["status"] in LANDED_OUTCOMES
+        want = (DONE if landed and row["after_push"] in ("ok", "skipped") else LANDED if landed
+                else QUEUED if row["status"] in OPEN_ROWS and row["status"] != "held" else None)
         if want and _RANK[want] > _RANK[s["phase"]]:
             advance(db, s["task"], want, push_row=row["id"], batch=row["batch"], head=row["head"])
             moved.append((s["task"], s["phase"], want))

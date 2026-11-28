@@ -57,6 +57,7 @@ def test_advance_writes_one_phase_event_per_change_and_keeps_the_fields(env):
     assert [(e["task"], e["from"], e["to"]) for e in got] == [(t["id"], None, "change"), (t["id"], "change", "review"),
                                                            (t["id"], "review", "fix")]
     assert all(e["ts"] > 0 for e in got)
+    assert not p.db.q("SELECT id FROM events WHERE kind=? AND status='new'", (carry.EVENT,)), "a record, no wake"
     for bad in ({"phase": "nope"}, {"phase": "fix", "bogus": 1}):
         with pytest.raises(ValueError):
             carry.advance(p.db, t, **bad)
@@ -71,9 +72,10 @@ def test_reconcile_moves_phases_forward_to_the_push_queue_and_finished_batches(e
         carry.advance(p.db, tid, carry.CAPPED if n == "capped" else carry.REVIEW)
     carry.advance(p.db, ids["ahead"], carry.DEPLOY)
     now = 1000.0
-    p.db.x("INSERT INTO push_batches(id, marker, target, started, after_finalized) VALUES('b1','m','t',?,?)", (now, now))
-    p.db.x("INSERT INTO push_batches(id, marker, target, started) VALUES('b2','m','t',?)", (now,))
-    rows = {"queued": ("batched", "b2"), "landed": ("landed", "b2"), "done": ("landed", "b1"),
+    p.db.x("INSERT INTO push_batches(id, marker, target, started, after_push, after_finalized) VALUES('b1','m','t',?,'ok',?)", (now, now))
+    p.db.x("INSERT INTO push_batches(id, marker, target, started, after_push, after_finalized) VALUES('b2','m','t',?,'failed',?)", (now, now))
+    p.db.x("INSERT INTO push_batches(id, marker, target, started) VALUES('b3','m','t',?)", (now,))
+    rows = {"queued": ("batched", "b3"), "landed": ("pushed", "b2"), "done": ("landed", "b1"),
             "capped": ("approved", None), "ahead": ("approved", None)}
     for n, (status, batch) in rows.items():
         p.db.x("INSERT INTO push_queue(task,branch,head,target,status,batch,created,updated) VALUES(?,?,?,?,?,?,?,?)",
