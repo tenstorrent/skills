@@ -187,7 +187,7 @@ def check(db, cfg: dict, held_by: dict[int, list[dict]], now: float) -> None:
         stamp = None             # no stamp: judged in full every time
         hold = hold_of(db)       # and the hold read apart, in one statement
     inputs = (stamp, grace, tuple((x, tuple(t["id"] for t in ts)) for x, ts in sorted(held_by.items())))
-    if stamp is not None and _unchanged(db, inputs, state, grace, now):
+    if stamp is not None and _unchanged(db, inputs, state, grace, now, hold):
         return
     new: dict = {}
     rows = Rows(db, held_by) if held_by else None
@@ -211,11 +211,12 @@ def check(db, cfg: dict, held_by: dict[int, list[dict]], now: float) -> None:
         _last[db.path] = (inputs, json.dumps(new, sort_keys=True), now)
 
 
-def _unchanged(db, inputs: tuple, state: dict, grace: float, now: float) -> bool:
+def _unchanged(db, inputs: tuple, state: dict, grace: float, now: float, hold: str | None) -> bool:
     """True when a full check now would do nothing: the same rows (stamp), held tasks and grace as
     the last full check of this database within RECHECK_S, its saved state as that check left it,
-    and no dead wait in it due to be raised. It only skips re-judging: every raise and clear is made
-    by a full check from the saved rows."""
+    and no dead wait in it due to be raised (none while a hold explains the wait: the raise is
+    suppressed). It only skips re-judging: every raise and clear is made by a full check from the
+    saved rows."""
     last = _last.get(getattr(db, "path", None))
     if not last or last[0] != inputs or last[1] != json.dumps(state, sort_keys=True):
         return False
@@ -223,8 +224,9 @@ def _unchanged(db, inputs: tuple, state: dict, grace: float, now: float) -> bool
         return False
     for v in state.values():
         since = v.get("since") if isinstance(v, dict) else None
-        if not isinstance(v, dict) or (v.get("event") is None and (
-                not isinstance(since, (int, float)) or now - since >= grace)):
+        due = v.get("event") is None and hold is None and (
+            not isinstance(since, (int, float)) or now - since >= grace)
+        if not isinstance(v, dict) or due:
             return False   # due to be raised now, or a state only a full check judges
     return True
 
