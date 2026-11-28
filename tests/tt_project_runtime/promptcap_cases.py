@@ -26,7 +26,7 @@ def _a_task(p, title="tune the flange path", spec="Edit src/flange.py only."):
     return p.db.task(p.db.add_task(title, spec, kind="code", tier="standard", origin="user"))
 
 
-def _add_run(p, role, text, system="", forked=False):
+def _add_sized_run(p, role, text, system="", forked=False):
     from ttp import ctxfork
     tid = _a_task(p)["id"]
     rid = p.db.x("INSERT INTO runs(task,role,started,status,dir) VALUES(?,?,?,?,?)",
@@ -121,9 +121,9 @@ def test_a_forked_run_is_not_counted_and_the_size_line_gives_the_median_per_role
     restrictions = prompts.restrictions_block(p)
     task = "# YOUR TASK #5: t\n" + "t" * 5000
     for n in (10000, 20000, 30000):
-        _add_run(p, "worker", "w" * n + "\n\n" + task + "\n\n# next", system=restrictions)
-    forked = _add_run(p, "worker", "x" * 90000, system=restrictions, forked=True)
-    _add_run(p, "reviewer", "r" * 2000, system="s" * 1000 + restrictions)
+        _add_sized_run(p, "worker", "w" * n + "\n\n" + task + "\n\n# next", system=restrictions)
+    forked = _add_sized_run(p, "worker", "x" * 90000, system=restrictions, forked=True)
+    _add_sized_run(p, "reviewer", "r" * 2000, system="s" * 1000 + restrictions)
     assert promptdrift.counted_bytes(p, forked) is None
     got = promptdrift.sizes(p, time.time())
     assert got["worker"]["runs"] == 3 and got["worker"]["median"] == 20000 + len("\n\n") + len("\n# next")
