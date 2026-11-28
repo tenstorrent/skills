@@ -920,20 +920,36 @@ def test_a_pass_with_every_worker_slot_taken_still_logs_the_task_left_waiting(
         assert reap_tmp_processes(tmp_path) == [], "a stand-in run outlived the test"
 
 
-def test_a_gate_hold_is_logged_as_full_slots_a_closed_budget_gate_or_a_full_routed_host():
-    """The budget gate closed to new work (spend level, runaway guard, plan window) once logged as
-    provider_gate, and a task's own budget or the dollar caps as other: each now has its own reason."""
+def test_schedlog_and_readywait_name_every_start_hold_the_same_way():
+    """One classifier: readywait.cause decides what holds a start, schedlog only renames it (FROM_CAUSE),
+    and "full" is a task in ctx["full"]. A reserve kept for urgent work, even one that leaves 0 slots, is
+    the project's cap; only a closed or cutting budget gate is budget_gate."""
     from types import SimpleNamespace
-    from ttp import schedlog
+    from ttp import readywait, schedlog
     from ttp.daemon import _held_as
     shut, open_ = SimpleNamespace(allow_new_work=False), SimpleNamespace(allow_new_work=True)
-    assert _held_as("gate", 7, {"full": {7: 2}, "gate": open_}) == "full"
-    assert _held_as("gate", 7, {"full": {}, "gate": shut}) == "budget_gate"
-    assert _held_as("gate", 7, {"full": {7: 0}, "gate": open_}) == "budget_gate", "a plan window's 0 slots"
-    assert _held_as("gate", 7, {"full": {}, "gate": open_}) == "slot_cap"
-    assert [_held_as(w, 7, {}) for w in ("logged_out", "net", "budget", "caps", "optional", "resource", "x")] == [
-        "provider_gate", "provider_gate", "spend_cap", "spend_cap", "budget_gate", "lock", "other"]
-    assert {"budget_gate", "slot_cap", "spend_cap"} <= set(schedlog.REASONS)
+    cases = [("gate", {"full": {7: 2}, "gate": open_}, "full"),
+             ("gate", {"full": {7: 0}, "gate": open_}, "full"),   # the urgent reserve took every slot
+             ("gate", {"full": {7: 0}, "gate": open_, "cut": {7}}, "budget_gate"),   # the gate cut them to 0
+             ("gate", {"full": {7: 2}, "gate": open_, "cut": {7}}, "budget_gate"),
+             ("gate", {"full": {}, "gate": shut}, "budget_gate"),
+             ("gate", {"full": {}, "gate": open_}, "slot_cap"),   # the routed host's slots
+             ("held", {"held_by": {7: "the machine-wide worker limit (4)"}}, "hold"), ("held", {}, "other"),
+             ("held", {"held_by": {7: "its review's pre-checks (`ttp checks` on abc, started by the daemon), running"}},
+              "hold"),
+             ("paused", {}, "lock"), ("device", {}, "lock"), ("resource", {}, "lock"),
+             ("logged_out", {}, "provider_gate"), ("net", {}, "other"), ("optional", {}, "other"),
+             ("budget", {}, "budget_gate"), ("caps", {}, "budget_gate")]
+    for why, ctx, want in cases:
+        got = _held_as(why, 7, ctx)
+        assert got == want, (why, ctx, got)
+        c = readywait.cause(why, ctx.get("held_by", {}).get(7), ctx.get("gate"), False, cut=7 in ctx.get("cut", ()))
+        assert got == schedlog.FROM_CAUSE[c] or (got, c) == ("full", "project_cap"), (why, c, got)
+    # check_unstarted passes precheck=True for a review held by its checks: the same answer without it
+    words = "its review's pre-checks (`ttp checks` on abc, started by the daemon), waiting 3 min for a host checks slot"
+    assert readywait.cause("held", words, open_, False, held=True, precheck=True) == \
+        readywait.cause("held", words, open_, False) == "checks"
+    assert set(schedlog.FROM_CAUSE.values()) <= set(schedlog.REASONS)
 
 
 def test_the_scheduler_log_rotates_under_its_cap_and_keeps_one_old_copy(tmp_path, monkeypatch):

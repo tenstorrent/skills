@@ -28,6 +28,28 @@ def _ready_setup(env, monkeypatch):
     return p, d, check
 
 
+def test_a_daemon_restart_keeps_the_ready_wait_already_seen_and_a_long_silence_does_not(env, monkeypatch):
+    p, d, check = _ready_setup(env, monkeypatch)
+    tid = p.db.add_task("waiting work", "s", kind="work", tier="light", origin="coordinator", priority=3)
+    start = time.time()
+    check(start + 60)
+    check(start + 120)
+    first = d._ready_acc[tid]["first"]
+
+    def restart(at):   # a new daemon process: no sightings in memory, the first check only settles
+        for a in ("_ready_acc", "_unstarted_checked", "_unstarted_ready", "_unstarted_seen", "_unstarted_held"):
+            d.__dict__.pop(a, None)
+        monkeypatch.setattr(time, "time", lambda: at)
+        d.check_unstarted()
+        assert d._ready_acc.get(tid, {}).get("first") == first if at - start < 4000 else tid not in d._ready_acc
+    restart(start + 125)
+    check(start + 185)
+    assert d._ready_acc[tid]["first"] == first and "daemon_gap" not in d._ready_acc[tid]["causes"]
+    restart(start + 5000)   # the sightings are older than readywait.SAVED_S: dropped, the wait counts afresh
+    check(start + 5060)
+    assert d._ready_acc[tid]["first"] == start + 5060
+
+
 def test_ready_not_started_after_10_min_and_2_min_at_priority_1_once_and_clears_on_start(env, monkeypatch):
     p, d, check = _ready_setup(env, monkeypatch)
     routine = p.db.add_task("routine work", "s", kind="work", tier="light", origin="coordinator", priority=3)

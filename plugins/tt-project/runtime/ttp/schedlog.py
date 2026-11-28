@@ -20,14 +20,18 @@ OLD = "scheduler.1.jsonl"
 MAX_BYTES = 2 * 1024 * 1024
 TOP = 20
 # Why a queued task could not start: its start_when probe, its start_after or another start timer
-# (not_before), its own retry_when wait (a waiting hand-off's timer), a busy resource or `ttp lock`
-# (device slots too), a pause or hold (a paused resource, a branch or worktree another task uses, a
-# setting hold, the disk guard, a review's prechecks), its provider being out (logged out, API host
-# down), the budget gate closed to new work (spend level, runaway guard, plan window), its routed
-# host's slots full (slot_cap; the project's own full slots show as runnable and not picked), its own
-# task budget or the dollar caps (spend_cap), an unfinished depends_on, or anything else.
+# (not_before), its own retry_when wait (a waiting hand-off's timer), a busy resource, `ttp lock` or a
+# paused resource (lock), the machine-wide worker limit or a review's own checks (hold), its provider
+# logged out (provider_gate), the budget gate (closed to new work or cutting the slots; its own task
+# budget or the dollar caps), its routed host's slots full (slot_cap; the project's own full slots show
+# as runnable and not picked), an unfinished depends_on, or anything else (a branch clash, the disk
+# guard, the network). readywait.cause decides; FROM_CAUSE only renames it.
 REASONS = ("start_when", "start_after", "retry_when", "lock", "hold", "provider_gate", "budget_gate", "slot_cap",
-           "spend_cap", "depends_on", "other")
+           "depends_on", "other")
+# readywait's cause of a start hold (daemon._start_hold's answer) as a reason above: the one classifier
+# is readywait.cause; this only renames its answer.
+FROM_CAUSE = {"project_cap": "slot_cap", "machine_limit": "hold", "checks": "hold", "budget_gate": "budget_gate",
+              "resource": "lock", "logged_out": "provider_gate", "other": "other"}
 
 
 def path(p) -> Path:

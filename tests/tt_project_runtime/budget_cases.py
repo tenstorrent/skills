@@ -5390,6 +5390,36 @@ def test_ready_wait_cause_maps_each_start_hold():
     # A review held by its own pre-review checks: _start_hold answers "held" with the precheck words.
     assert rw.cause("held", "its pre-review checks run", open_, True, held=True, precheck=True) == "checks"
     assert rw.cause("held", "the disk guard", open_, True, held=True) == "other"
+    assert rw.cause("gate", None, open_, False, cut=True) == rw.cause(None, None, open_, False, cut=True) == "budget_gate"
+
+
+def test_start_hold_marks_a_full_gate_cut_but_not_a_reserve_or_unreached_cut(env, monkeypatch):
+    """Slots taken because the budget gate cut them are ctx["cut"]'s; slots a reserve for urgent work took,
+    or taken under the full configured number, are the project's own cap."""
+    from ttp import budget as bud
+    from ttp.daemon import Daemon, _held_as
+    p = make(env)
+    _no_events(p)
+    p.set_config("budget.max_parallel_workers", 4)
+    d = Daemon(p.base)
+    prov = d.cfg.get("core_provider", "claude")
+    task = p.db.task(p.db.add_task("routine", "s", kind="work", tier="standard", origin="user", priority=3))
+    monkeypatch.setattr(d, "_committed_usd", lambda: 0.0)
+
+    def hold(max_parallel: int, busy: int, kept: int = 0):
+        d.gates = {prov: bud.Gate(provider=prov, regime="caps", max_parallel=max_parallel)}
+        monkeypatch.setattr("ttp.urgent.reserve_slots", lambda *a, **k: kept)
+        ctx = {"now": time.time(), "paused": {}, "committed": None, "busy": {prov: busy}, "logged_out": {}}
+        return d._start_hold(task, prov, ctx), ctx
+
+    why, ctx = hold(2, 2)   # the gate allows 2 of 4 and 2 run
+    assert (why, _held_as(why, task["id"], ctx), ctx["cut"]) == ("gate", "budget_gate", {task["id"]})
+    why, ctx = hold(4, 4)   # all 4 run, no cut
+    assert (why, _held_as(why, task["id"], ctx), ctx["cut"]) == ("gate", "full", set())
+    why, ctx = hold(4, 3, kept=1)   # urgent work's reserve took the last slot
+    assert (why, _held_as(why, task["id"], ctx), ctx["cut"]) == ("gate", "full", set())
+    why, ctx = hold(2, 1, kept=1)   # the gate cut the slots, but the reserve is what holds this one
+    assert (why, _held_as(why, task["id"], ctx), ctx["cut"]) == ("gate", "full", set())
 
 
 def test_ready_wait_sightings_split_the_wait_by_cause_and_gaps_are_daemon_gaps():

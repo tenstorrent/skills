@@ -40,6 +40,8 @@ LABELS = {"project_cap": "project cap", "machine_limit": "machine-wide limit", "
           "budget_gate": "budget gate", "resource": "resource", "dispatch": "dispatch (free place)",
           "logged_out": "logged out", "daemon_gap": "no ready check", "other": "other hold", "unrecorded": "unrecorded"}
 GAP_S = 180.0   # a gap between ready checks longer than this (daemon stopped, host asleep): no cause seen
+SAVED_KV = "ready_wait_acc"   # kv: {"at": ts of the last check, "acc": {task id: sightings}}
+SAVED_S = 3600.0   # sightings older than this are not carried across a daemon restart
 REQUEUE = ("task_requeued", "start_when_passed", "push_requeued", "hold_released", "task_blocked")
 FIRST_EVENT_S = 3600.0   # a rebuilt first-run ready time this long before the task's first event: unknown
 
@@ -60,22 +62,32 @@ def ready_since(db, task: dict) -> float:
     return max(at, rq) if rq is not None else at
 
 
-def cause(why, held_by: str | None, gate, free: bool, held: bool = False, precheck: bool = False) -> str:
+def _gated(gate, cut: bool) -> str:
+    """A "gate" hold: budget_gate while the gate is closed to new work or cut the slots (`cut`), else the
+    worker places are taken (project_cap): a reserve kept for urgent work is the project's own cap."""
+    return "budget_gate" if cut or gate is not None and not getattr(gate, "allow_new_work", True) else "project_cap"
+
+
+def cause(why, held_by: str | None, gate, free: bool, held: bool = False, precheck: bool = False,
+          cut: bool = False) -> str:
     """The cause of `why` (daemon._start_hold's answer, or _own_checks_wait's words) for one ready task;
     `free`: a worker place of its provider is free; `held`: check_unstarted holds it; `precheck`: a review
-    whose own pre-review checks run (_start_hold answers "held" for it too)."""
+    whose own pre-review checks run (_start_hold answers "held" for it too); `cut`: the budget gate cut
+    its worker slots (budget.gate_slots) and they are taken."""
     if precheck:
         return "checks"
     if why is None:
         if free:
             return "checks" if held else "dispatch"   # held with nothing else: its own pre-review checks
-        return "budget_gate" if gate is not None and not getattr(gate, "allow_new_work", True) else "project_cap"
+        return _gated(gate, cut)
     if why == "gate":
-        return "budget_gate" if gate is not None and not getattr(gate, "allow_new_work", True) else "project_cap"
+        return _gated(gate, cut)
     if why in ("caps", "budget"):
         return "budget_gate"
     if why == "held":
-        return "machine_limit" if str(held_by or "").startswith("the machine-wide worker limit") else "other"
+        words = str(held_by or "")
+        return "machine_limit" if words.startswith("the machine-wide worker limit") else \
+            "checks" if words.startswith("its review's pre-checks") else "other"
     if why in ("resource", "device", "paused"):
         return "resource"
     if why == "logged_out":
@@ -99,6 +111,22 @@ def note(acc: dict, tid: int, c: str, now: float, since) -> None:
     if gap > 0:
         e["causes"][k] = e["causes"].get(k, 0.0) + gap
     e["last"], e["cause"] = now, c
+
+
+def save(db, acc: dict, now: float) -> None:
+    """Keep the sightings in the db (kv), so a daemon restart does not turn the wait already seen into
+    daemon_gap; one small write per ready check."""
+    db.set_kv(SAVED_KV, {"at": now, "acc": {str(t): e for t, e in acc.items()}})
+
+
+def restore(db, now: float) -> dict:
+    """The sightings `save` kept, if a ready check ran within SAVED_S: after a longer silence a task may
+    have been requeued, and its sightings no longer describe its wait."""
+    saved = db.kv_dict(SAVED_KV)[0]
+    if not 0 <= now - float(saved.get("at") or 0) <= SAVED_S or not isinstance(saved.get("acc"), dict):
+        return {}
+    return {int(t): e for t, e in saved["acc"].items() if isinstance(e, dict) and {"since", "first", "first_cause",
+            "last", "cause", "causes"} <= e.keys()}
 
 
 def prune(acc: dict, ready: set) -> None:

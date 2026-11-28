@@ -11440,7 +11440,9 @@ class Daemon:
         self._unstarted_checked = now
         if self.cfg_status == "unavailable" or self.settling() or now - last > STALL_GAP_S:
             self._unstarted_seen, self._unstarted_held, self._unstarted_ready = {}, set(), None
-            self._ready_acc = {}   # readywait: no cause seen across the gap
+            # readywait: no cause seen across the gap; a daemon restart (no previous check) keeps what was seen
+            self._ready_acc = {} if last or self.cfg_status == "unavailable" or self.settling() \
+                else readywait.restore(self.p.db, now)
             return
         db = self.p.db
         paused = db.paused_resources()
@@ -11480,16 +11482,17 @@ class Daemon:
             # (as _log_slot_fill checks), after READY_URGENT_S or urgent_slot_wait_min if shorter (0: off)
             hot = urgent.extra_ok(t, now) or tid in ctx["owners"]
             slots_only = hot and why == "gate" and tid in ctx.get("full", {}) and wait_s > 0 and self._start_hold(
-                t, prov, dict(ctx, busy={}, holds={}, full={}, branch={}, full_why={})) is None
+                t, prov, dict(ctx, busy={}, holds={}, full={}, branch={}, full_why={}, cut=set())) is None
             pre = t["kind"] == "review" and self._precheck_holds(t, now)   # its own pre-review checks run
             if ((why in self.SKIP_HOLDS or not free) and not (hot and (slots_only or why is None))) \
                     or pre or (why is None and (why := self._own_checks_wait(t))):
                 self._ready_note(acc, t, readywait.cause(why, ctx.get("held_by", {}).get(tid), gate, free, held=True,
-                                                         precheck=pre), now, was_ready, last)
+                                                         precheck=pre, cut=tid in ctx.get("cut", ())), now, was_ready, last)
                 self._unstarted_held.add(tid)
                 obligations._retire(db, now, f"held: {why or 'no free slot'}", fp)
                 continue
-            self._ready_note(acc, t, readywait.cause(why, ctx.get("held_by", {}).get(tid), gate, free), now, was_ready, last)
+            self._ready_note(acc, t, readywait.cause(why, ctx.get("held_by", {}).get(tid), gate, free,
+                                                     cut=tid in ctx.get("cut", ())), now, was_ready, last)
             since = seen.get(tid) or (now if tid in held_before else unstarted.ready_since(db, t))
             if was_ready is not None and tid not in was_ready:
                 since = max(since, last)
@@ -11535,6 +11538,7 @@ class Daemon:
             db.x("INSERT INTO events(ts,source,kind,fingerprint,severity,text,status,task) VALUES(?,?,?,?,?,?,?,?)",
                  (now, "daemon", unstarted.READY_KIND, fp, "normal", text[:4000], "queued", tid))
             log(self.p, f"ready not started: task {tid} ready {(now - since) / 60:.0f} min, held by {what[:200]}")
+        readywait.save(db, acc, now)
         for r in db.q("SELECT fingerprint, task FROM events WHERE kind=? AND status='queued'", (unstarted.READY_KIND,)):
             if r["task"] not in self._unstarted_seen and r["task"] not in self._unstarted_held:
                 obligations._retire(db, now, "started or left the queue", r["fingerprint"])
@@ -13813,7 +13817,7 @@ class Daemon:
                 continue
             prov = ctx.get("slot", {}).get(t["id"]) or t["provider"] or core
             if self._start_hold(t, prov, dict(ctx, busy={}, holds={}, full={}, full_why={}, branch={},
-                                              slot={})) is not None:
+                                              slot={}, cut=set())) is not None:
                 continue   # something besides the slots holds it: a preemption would free nothing for it
             if prov not in freeing:
                 freeing[prov] = preempt.stopping(db, prov)
@@ -13850,7 +13854,8 @@ class Daemon:
         """One schedlog line for this slot fill: the ready tasks dispatch walked, in its order, that started or
         were held only by the worker slots this pass filled (re-checked with no slot taken, nothing reserved),
         held counts by reason for the rest of the queue, and the ids started. A task whose start this pass
-        failed counts as other."""
+        failed counts as other. The re-check is one more _start_hold per full task, as the pass's own walk
+        made: cheap beside it, and the full tasks are what the log is for."""
         db = self.p.db
         try:
             due = obligations.owner_due(db) if ready else {}
@@ -13860,7 +13865,7 @@ class Daemon:
         for t in ready:
             why = fate.get(t["id"], "other")
             if why == "full":
-                c = dict(ctx, busy={}, holds={}, full={}, branch={})
+                c = dict(ctx, busy={}, holds={}, full={}, branch={}, cut=set())
                 why = self._start_hold(t, t["provider"] or core, c)
                 why = "runnable" if why is None else _held_as(why, t["id"], c)
             if why in ("picked", "runnable"):
@@ -13980,6 +13985,7 @@ class Daemon:
         ctx.setdefault("holds", {}).pop(task["id"], None)
         ctx.setdefault("full", {}).pop(task["id"], None)
         ctx.setdefault("full_why", {}).pop(task["id"], None)
+        ctx.setdefault("cut", set()).discard(task["id"])
         ctx.setdefault("branch", {}).pop(task["id"], None)
         ctx.setdefault("held_by", {}).pop(task["id"], None)
         if "live" not in ctx:
@@ -14039,6 +14045,9 @@ class Daemon:
                 # what set that number, so the slot wait names a budget gate cut (budget.slot_words)
                 ctx.setdefault("full_why", {})[task["id"]] = bud.slot_words(
                     gate, int(self.cfg["budget"].get("max_parallel_workers", 6)), extra, kept)
+                if ctx["busy"].get(provider, 0) >= gate.max_parallel and bud.gate_slots(
+                        gate, int(self.cfg["budget"].get("max_parallel_workers", 6))):
+                    ctx["cut"].add(task["id"])   # the gate's own cut of the slots is reached, not a kept reserve
             return "gate"
         if ctx.get("route_wait", {}).get(task["id"]) == provider:   # the host's routed slots are full
             return "gate"
@@ -23175,22 +23184,17 @@ LOGGED_OUT_NOTE = "held: logged out"
 NET_HELD_NOTE = "held: network,"
 BRANCH_HELD_NOTE = "held: waits for #"   # Daemon._branch_clash: another live task uses its branch or worktree
 PREEMPT_HOLD_S = 120.0   # a task preempted for an urgent one is not started again while that one still waits
-# _start_hold's reasons as schedlog reasons (Daemon._log_slot_fill); "gate" is split by _held_as.
-SLOT_HELD_BY = {"held": "hold", "paused": "hold", "logged_out": "provider_gate", "net": "provider_gate",
-                "gate": "budget_gate", "optional": "budget_gate", "budget": "spend_cap", "caps": "spend_cap",
-                "device": "lock", "resource": "lock"}
 
 
 def _held_as(why: str | None, tid: int, ctx: dict) -> str:
-    """_start_hold's `why` for task `tid` as a schedlog reason: its "gate" is "full" (the worker slots this
-    pass, ctx["full"]), budget_gate (ctx["gate"] closed to new work or cut to 0 slots, as a plan window does)
-    or slot_cap (its routed host's slots)."""
-    if why != "gate":
-        return SLOT_HELD_BY.get(why, "other")
-    if ctx.get("full", {}).get(tid):
-        return "full"
-    gate = ctx.get("gate")
-    return "budget_gate" if gate is None or not gate.allow_new_work or tid in ctx.get("full", {}) else "slot_cap"
+    """_start_hold's `why` for task `tid` as a schedlog reason: readywait.cause decides, schedlog.FROM_CAUSE
+    renames; only "full" (it is in ctx["full"]: the worker slots this pass) is added here."""
+    if why is None:
+        return "other"
+    c = readywait.cause(why, ctx.get("held_by", {}).get(tid), ctx.get("gate"), False, cut=tid in ctx.get("cut", ()))
+    return "full" if c == "project_cap" and tid in ctx.get("full", {}) else schedlog.FROM_CAUSE.get(c, "other")
+
+
 LOGIN_CHECK_PASSED = "its login check passed"
 ACCOUNT_SWITCH_EVENT = "login_account_changed"   # recorded when a login comes back as another account
 
