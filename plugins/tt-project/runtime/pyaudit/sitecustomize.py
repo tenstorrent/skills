@@ -116,8 +116,8 @@ def _install(pol: dict) -> None:
         return False
 
     def harness():
-        """Whether the outermost frame runs the harness's own checks entry (`python -c <boot> ...`, never a run's
-        code; inline code cannot change it) and the nearest caller that is the inline code or its ttp package is
+        """Whether the outermost frame runs the harness's own checks entry (`python -c <boot> ...`: a run gets it
+        only by starting that entry itself; inline code cannot change it) and the nearest caller that is the inline code or its ttp package is
         the package."""
         own, f, pkg = os.path.join(pol["runtime"], "ttp") + os.sep, sys._getframe(2), None
         while f.f_back is not None:

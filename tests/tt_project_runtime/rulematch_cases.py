@@ -22,7 +22,8 @@ def test_rulematch_durations_name_one_value_in_any_unit():
     assert rm.durations("make it 5 min or 1.5 hours") == {300, 5400}
     assert rm.durations("fix the bugs and tests, as I am sure") == set()   # plain words are no durations
     assert rm.durations("a second question: the report worker is slow") == set()
-    assert rm.durations("12M and 100M tokens, 1.5M jobs") == set()   # a capital letter is a size, not minutes
+    assert rm.durations("12M and 100M tokens, 1.5M jobs") == set()   # a capital M is a size, not minutes
+    assert rm.durations("24H or 2D") == {86400, 172800}
 
 
 def test_rulematch_lists_the_older_rules_on_the_topic_and_marks_restrictions(env):
