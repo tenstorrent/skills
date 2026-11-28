@@ -375,11 +375,16 @@ def test_block_ledger_counts_a_held_landing_wait_under_the_holds_class(env):
     p.db.update_task(x, status="done", branch=f"ttp/t{x}-feature")
     a = _bl_wait(p, "after the feature", now, 3 * 3600, f"ttp landed --task {x}")
     rule = lambda: {r["task"]: r["rule"] for r in bl.rows(p.db, now - 86400, now) if r["source"] == "task"}
+    ended = _bl_wait(p, "ended wait", now, 3 * 3600, f"ttp landed --task {x}")
+    p.db.x("INSERT INTO events(ts,source,kind,text,data,status,task) VALUES(?,?,?,?,?,?,?)",
+           (now - 3600, "t", "task_queued", "queued", None, "handled", ended))
+    p.db.update_task(ended, status="queued")
     for hold_set, hold in ((lambda: p.db.set_kv("paused", True), "user hold"),
                            (lambda: p.db.set_kv(envfault.KV, {"runner": {"queue": True}}), "outage")):
         hold_set()
         assert deadwait.hold_of(p.db) == hold, hold
         assert rule()[a] == hold, "the wait is held, not dead"
+        assert rule()[ended] == bl.STUCK, "a wait that ended before the hold keeps its verdict"
         p.db.x("DELETE FROM kv WHERE key IN ('paused',?)", (envfault.KV,))
     assert rule()[a] == bl.STUCK, "no hold left: it is a stuck landing again"
 

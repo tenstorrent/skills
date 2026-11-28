@@ -99,10 +99,11 @@ def probe_class(probe: str, cfg: dict | None = None, down: dict | None = None) -
     return "outage" if down and progress._outage_hosts(probe, down) else "other"
 
 
-def _wait_rule(data: dict, reason: str, db: DB | None = None, task: int | None = None) -> tuple[str, str] | None:
+def _wait_rule(data: dict, reason: str, db: DB | None = None, task: int | None = None,
+               live: bool = False) -> tuple[str, str] | None:
     """(rule, reason) of a wait its task_waiting `data` or reason places: the task's own detached job, another
     task's landing (STUCK once its target is done and deadwait.path finds nothing to land it; under the
-    hold's class while deadwait.hold_of names one that stops every landing), a planned
+    hold's class while deadwait.hold_of names one, for a wait still open: `live`), a planned
     window (a bare clock-gate probe, or the hand-off's own: unblock.classify_wait)."""
     probe = str(data.get("probe") or "")
     if queuewait.own_job(probe):
@@ -111,8 +112,8 @@ def _wait_rule(data: dict, reason: str, db: DB | None = None, task: int | None =
         x = int(next(g for g in m.groups() if g))
         if db is not None and task is not None and (db.task(x) or {}).get("status") == "done" \
                 and not deadwait.path(db, x, {task}):
-            if hold := deadwait.hold_of(db):   # the wait is held, not dead: count it under the hold
-                why = "the user's pause of the push lock" if hold == "user hold" \
+            if live and (hold := deadwait.hold_of(db)):   # the wait is held, not dead: count it under the hold
+                why = "a pause the user set" if hold == "user hold" \
                     else "an outage of the landing machinery"
                 return hold, f"#{x} is done, not landed, and {why} holds its landing"
             return STUCK, f"#{x} is done, not landed, and nothing open can land it"
@@ -181,7 +182,7 @@ def rows(db: DB, since: float, until: float | None = None) -> list[dict]:
         task = db.task(seg["task"]) or {}
         reason = _why((ev and ev["text"]) or task.get("blocked_reason") or seg["title"], seg["task"], seg["title"])
         rule, why = ("review", reason) if seg["kind"] == "review" else \
-            _wait_rule(loads_dict(ev and ev["data"]), reason, db, seg["task"]) or (rule_of(reason), reason)
+            _wait_rule(loads_dict(ev and ev["data"]), reason, db, seg["task"], not seg.get("end")) or (rule_of(reason), reason)
         out.append(_row(rule, seg["task"], seg["kind"], max(start, since), end, why, "task"))
     out += _refusals(db, since, until)
     st = db.kv(queuewait.KV) or {}
@@ -190,7 +191,7 @@ def rows(db: DB, since: float, until: float | None = None) -> list[dict]:
         if end >= since and float(e["since"]) <= until:
             rule, why = f"queue:{e['queue']}", e["queue"]
             if e["queue"] == "own":   # an urgent task's own probe: its detached job, another task's landing, a clock
-                rule, why = _wait_rule({"probe": e.get("probe")}, why, db, e.get("task")) or (rule, why)
+                rule, why = _wait_rule({"probe": e.get("probe")}, why, db, e.get("task"), not e.get("end")) or (rule, why)
             out.append(_row(rule, e.get("task"), "queue", max(float(e["since"]), since), end, why, "queue"))
     log = Path(db.path).parent / LOG
     for line in (log.read_text(errors="replace").splitlines() if log.is_file() else ()):
