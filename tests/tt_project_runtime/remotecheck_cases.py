@@ -22,19 +22,19 @@ shift
 [ -n "$FAKE_SSH_ARGS" ] && echo "$all" >> "$FAKE_SSH_ARGS"
 unset GIT_DIR GIT_WORK_TREE   # a real host never gets this side's git variables
 if [ "$host" = down ]; then echo "ssh: connect to host down port 22: Connection refused" >&2; exit 255; fi
-# A script fed on stdin (remotecheck._ssh_fed): read here up to its end line, so the matches below see it, then
-# fed to the real loader again (run), the rest of stdin after it.
+# A script fed on stdin (remotecheck._ssh_fed, the command `sh -s`): read here up to its last line, the one that
+# runs it, so the matches below see it, then fed to the real `sh -s` again (run), the rest of stdin after it.
 fed= end=
-case "$1" in *ttp-script-end:*)
-  end=$(printf '%s' "$1" | sed -n 's/.*\(ttp-script-end:[0-9a-f]*\).*/\1/p')
-  fed=$(while IFS= read -r l; do [ "$l" = "$end" ] && break; printf '%s\n' "$l"; done);;
+case "$1" in "sh -s")
+  end='}; exit'
+  fed=$(while IFS= read -r l; do printf '%s\n' "$l"; [ "$l" = "$end" ] && break; done);;
 esac
 # Like ssh, it ends when the command does, with stdin still open: a pipe from cat would wait for stdin's end.
 run() {
   [ -n "$end" ] || { sh -c "$1"; return; }
   q=$(mktemp -d) && mkfifo "$q/in"
   exec 4<&0   # a background list's own stdin is /dev/null
-  { printf '%s\n%s\n' "$fed" "$end"; exec cat <&4; } > "$q/in" 2>/dev/null &
+  { printf '%s\n' "$fed"; exec cat <&4; } > "$q/in" 2>/dev/null &
   feeder=$!
   exec 4<&-
   sh -c "$1" < "$q/in"; rc=$?
@@ -6025,18 +6025,17 @@ def test_every_ssh_a_check_host_run_starts_gets_the_real_home_while_the_process_
 
 
 def test_a_script_fed_on_ssh_s_stdin_runs_whole_keeps_stdin_as_its_stop_signal_and_a_cut_one_runs_nothing(tmp_path):
-    """remotecheck._ssh_fed's loader, under each sh there is: the script runs as written (a here-document, its
-    exit code), stdin still open behind it ends it when it closes, and a stream cut before the end line runs
-    nothing (97)."""
+    """remotecheck._ssh_fed's `sh -s`, under each sh there is: the script runs as written (a here-document, its
+    exit code), stdin still open behind it ends it when it closes, and a stream cut before its last line runs
+    nothing (97). The command line holds no script and no expansion."""
     from ttp import remotecheck
     script = ('cat > "$TMPDIR/out" <<EOT\nhome $HOME\nEOT\n'
               'exec 3<&0; (cat <&3 >/dev/null; echo stopped >> "$TMPDIR/out") & wait; exit 7')
     for sh in [s for s in ("sh", "dash", "bash") if shutil.which(s)]:
         argv, fed = remotecheck._ssh_fed("h", script)
-        assert fed not in argv[-1] and "exit 7" not in argv[-1]
-        loader = shlex.split(argv[-1])[2]   # the argv's `sh -c <loader>`, run here by `sh`
+        assert argv[-1] == "sh -s" and "exit 7" not in " ".join(argv)
         env = dict(os.environ, TMPDIR=str(tmp_path), HOME="/h")
-        p = subprocess.Popen([sh, "-c", loader], stdin=subprocess.PIPE, env=env)
+        p = subprocess.Popen([sh, "-s"], stdin=subprocess.PIPE, env=env)
         p.stdin.write(fed.encode())
         p.stdin.flush()
         time.sleep(0.3)
@@ -6045,5 +6044,63 @@ def test_a_script_fed_on_ssh_s_stdin_runs_whole_keeps_stdin_as_its_stop_signal_a
         assert p.wait(timeout=10) == 7, sh
         assert (tmp_path / "out").read_text() == "home /h\nstopped\n", sh
         (tmp_path / "out").unlink()
-        cut = subprocess.run([sh, "-c", loader], input=fed.rsplit(remotecheck.FED_END, 1)[0], text=True, env=env)
-        assert cut.returncode == 97 and not (tmp_path / "out").exists(), sh
+        for cut in (fed.rsplit(remotecheck.FED_RUN, 1)[0], fed[:fed.index("\n") + 1], fed[:-20]):
+            r = subprocess.run([sh, "-s"], input=cut, text=True, env=env, stderr=subprocess.DEVNULL)
+            assert r.returncode == 97 and not (tmp_path / "out").exists(), (sh, cut[-30:])
+
+
+def test_a_spill_ssh_the_runs_guard_refuses_is_an_environment_fault_never_the_hosts_or_the_changes(
+        env, tmp_path, monkeypatch, capsys):
+    """The run's guard refusing a Popen (a PermissionError before any ssh starts) ends the remote check as an
+    environment fault (FAULT_RC), and no failure verdict is drawn from it: not the host's, not the change's."""
+    from types import SimpleNamespace
+    from ttp import cli, remotecheck
+    p, repo, run, remote = _spill_setup(env, tmp_path, monkeypatch, ["check-host-a"])
+    monkeypatch.chdir(repo)
+
+    def refused(*a, **k):
+        raise PermissionError("tt-project guard: refused, not run: an expansion the guard cannot read")
+    monkeypatch.setattr(remotecheck, "_attempt", refused)
+    assert remotecheck.main(["--host", "check-host-a", "--", "true"]) == remotecheck.FAULT_RC
+    said = capsys.readouterr()
+    log = tmp_path / "checks.log"
+    log.write_text("ttp remote check: sending x\n" + said.out + said.err)
+    assert remotecheck.GUARD_REFUSED in log.read_text() and "Not the host and not the change" in log.read_text()
+    cfg = {"delivery": {"checks_spill_hosts": ["check-host-a", "check-host-b"], "checks_remote_only": True}}
+    cfg_p = SimpleNamespace(config=lambda: cfg)
+    args = (SimpleNamespace(host="check-host-a"), False, True, False, 1, None, [], "check-host-b:fail")
+    # the same two failures count as the change's verdict with a plain log, and none with the guard's refusal
+    plain = tmp_path / "plain.log"
+    plain.write_text("ttp remote check: sending x\nFAILED t.py::t\n")
+    assert cli._spill_fail_verdict(*args, str(plain), 0, str(repo), cfg_p) == ["check-host-b", "check-host-a"]
+    assert cli._spill_fail_verdict(*args, str(log), 0, str(repo), cfg_p) == []
+
+
+@pytest.mark.parametrize("refusals, passed", [(1, True), (2, None)])
+def test_ttp_checks_runs_again_once_after_the_runs_guard_refused_the_spill_ssh_then_gives_no_verdict(
+        env, tmp_path, monkeypatch, refusals, passed):
+    """A spill whose ssh the run's own guard refused ran nothing: `ttp checks` runs it once more (that run's
+    result counts) and, refused again, records an environment fault with no pass or fail; neither time does
+    the host get struck off or the run fall back to a local run of its checks."""
+    import threading
+    from ttp import checkspill, remotecheck, cli
+    p, repo, run, remote = _spill_setup(env, tmp_path, monkeypatch, ["check-host-a"])
+    p.set_config("delivery.push_checks", ["true"])
+    starts = []
+
+    def argv(*a, **k):
+        starts.append(a[1])
+        bad = f"echo {shlex.quote(remotecheck.GUARD_REFUSED + ': not run')} >&2; exit {remotecheck.FAULT_RC}"
+        return ["sh", "-c", bad if len(starts) <= refusals else "exit 0"]
+    monkeypatch.setattr(remotecheck, "argv", argv)
+    lane = _spill_lane(p, repo)
+    threading.Timer(2.0, lane.close).start()
+    try:
+        cli.main(["checks", "--fresh"])
+    except SystemExit:
+        pass
+    rec = json.loads((run / "checks.json").read_text())
+    assert starts == ["check-host-a"] * min(refusals + 1, 2)
+    assert rec["passed"] is (passed or False)
+    assert rec.get("infra_fault") == (None if passed else "guard-refused")
+    assert checkspill._strikes(p.db).get("hosts", {}).get("check-host-a", {}).get("n", 0) == 0

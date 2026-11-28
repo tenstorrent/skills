@@ -60,6 +60,7 @@ from typing import Any
 from . import sshagent, tailnet
 
 FAULT_RC = 75
+GUARD_REFUSED = "the run's guard refused a command before it started"
 # A failure line of a timing-sensitive test (a timeout, a deadline, an elapsed-time assert): such a failure on
 # a host whose CPU demand is near its cores at the end of the run is the host's load, not the change (_fault).
 TIMING = re.compile(r"Timeout(Error|Expired)?\b|timed out|took too long|too slow|deadline exceeded|\belapsed\b",
@@ -163,27 +164,26 @@ def real_home_env() -> list[str]:
     return ["env", f"HOME={real}"]
 
 
-def _ssh(host: str, script: str, direct: bool = False, compress: bool = False) -> list[str]:
+def _ssh(host: str, script: str, direct: bool = False, compress: bool = False, command: str = "") -> list[str]:
     # The login shell parses the command line: hand it one quoted word for sh, whatever that shell is.
     # compress: the tree copy (a plain tar, about 3x smaller compressed) on a slow link.
+    # command: the whole remote command, instead of `sh -c <script>` (_ssh_fed's literal `sh -s`).
     # Every caller (checkspill's probe) takes this argv, so each ssh runs under the real HOME.
     return [*real_home_env(), *SSH, *(DIRECT if direct else []), *(["-o", "Compression=yes"] if compress else []),
-            host, f"sh -c {shlex.quote(script)}"]
+            host, command or f"sh -c {shlex.quote(script)}"]
 
 
-FED_END = "ttp-script-end:"
+FED_RUN = "}; exit"
 
 
 def _ssh_fed(host: str, script: str, direct: bool = False) -> tuple[list[str], str]:
-    """(argv, stdin text) for `script` sent on ssh's stdin, not in its command line: the host's sh reads it up
-    to a random end line one byte at a time (read never takes more than its line from a pipe), then runs it,
-    so stdin, kept open, still stops it when it ends (_run_script's watcher). The harness's own scripts name
-    credential stores and kill process groups on the host, which a run's guard reads as its own reads and
-    kills here; stdin it never judges. A stream that ends before the end line runs nothing (exit 97)."""
-    end = FED_END + secrets.token_hex(8)
-    loader = (f's=$(while IFS= read -r l; do [ "$l" = {end} ] && exit 0; printf "%s\\n" "$l"; done; exit 1) '
-              '|| exit 97; eval "$s"')
-    return _ssh(host, loader, direct), script.rstrip("\n") + f"\n{end}\n"
+    """(argv, stdin text) for `script` sent on ssh's stdin, not in its command line: the command is the literal
+    `sh -s`, which reads the text as one brace group, so it runs the script only once its closing line is in
+    and stdin, kept open, still stops it when it ends (_run_script's watcher). The harness's own scripts name
+    credential stores and kill process groups on the host, which a run's guard reads as its own reads and kills
+    here, and a command line holding an expansion (`$( )`, `eval`) is refused by a guard that cannot read it;
+    stdin it never judges. A stream that ends before that line runs nothing (exit 97)."""
+    return _ssh(host, "", direct, command="sh -s"), f"trap 'exit 97' EXIT\n{{ trap - EXIT\n{script.rstrip(chr(10))}\n{FED_RUN}\n"
 
 
 def paused(host: str, where: str | Path | None = None) -> str:
@@ -407,7 +407,8 @@ def _staged(why: str) -> str:
 
 
 def _fault(host: str, why: str) -> int:
-    agent = sshagent.WHY in why   # the ssh agent here (sshagent.py): neither the host nor the change
+    # this run's own environment (the ssh agent here, its guard): neither the host nor the change
+    agent = sshagent.WHY in why or GUARD_REFUSED in why
     _say(f"environment fault {SIG}{host}: {why}. "
          + ("Not the host and not the change: the run waits and retries" if agent else "This is the host, not the change"))
     return FAULT_RC
@@ -647,7 +648,12 @@ def main(args: list[str]) -> int:
         if wait is not None:
             _say(f"ssh's shared connection to {host} refused a session ({MUX_REFUSED}): trying again "
                  f"in {wait} s on a connection of its own")
-        rc, why = _attempt(host, top, head, env, extra, cmd, mark, wrap, wait, build, spill)
+        try:
+            rc, why = _attempt(host, top, head, env, extra, cmd, mark, wrap, wait, build, spill)
+        except PermissionError as e:   # the run's guard refused a Popen: no ssh ran, so nothing says the host failed
+            if "guard" not in str(e):
+                raise
+            return _fault(host, f"{GUARD_REFUSED}: {(str(e).strip().splitlines() or [''])[0][:300]}")
         if not why:
             return rc
     return _fault(host, f"{why}; ssh's shared connection refused a session ({MUX_REFUSED}) on each of "

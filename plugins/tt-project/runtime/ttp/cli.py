@@ -4577,7 +4577,7 @@ def cmd_checks(a) -> None:
     # A preempted run's rerun (and a re-queue) passes its own state to itself in os.environ (RUN_ONLY_ENV,
     # its arrival, its kept wait); none of it outlives the call, or a later call in this process would
     # resume from another run's passed files or log its wait as cut.
-    own = [k for k in (*checkcap.RUN_ONLY_ENV, checkcap.ARRIVED_ENV, _WAIT_KEPT_ENV) if k not in os.environ]
+    own = [k for k in (*checkcap.RUN_ONLY_ENV, checkcap.ARRIVED_ENV, _WAIT_KEPT_ENV, _GUARD_RETRY_ENV) if k not in os.environ]
     rc: int | str = "killed"   # however this call ends, the checks.running it wrote is finish-marked
     try:
         _cmd_checks(a)
@@ -5098,6 +5098,7 @@ def _cmd_checks(a) -> None:
         # taken out of the environment so no check command or later in-process run inherits it.
         wait_kept = os.environ.pop(_WAIT_KEPT_ENV, "")
         retry = _retry_ids_of(os.environ.pop(_RETRY_IDS_ENV, ""))
+        guard_retried = os.environ.pop(_GUARD_RETRY_ENV, "")
         from . import checkjoin, checklane, checkspill, remotecheck
         # A rerun of checks that did not pass on a spill host keeps off that host (checkspill.kept_off);
         # "1" keeps them off every spill host.
@@ -5590,7 +5591,7 @@ def _cmd_checks(a) -> None:
             how = (f"no output for {timed_out['silent_s']:g} s: a hang, stopped" if hang
                    else f"past the {timed_out['cap_s']:g} s wall-time cap" if timed_out else f"exit {rc}")
             env_why, real, ran_out = "", [], ""
-            slow = False
+            slow = guard = False
             if not timed_out:   # a package missing there: a fault of the spill env config (checkspill.env_off)
                 try:
                     with open(log, "rb") as f:
@@ -5604,7 +5605,15 @@ def _cmd_checks(a) -> None:
                 # Its tree copy timed out: that host is kept off now, never a second full timeout there.
                 from . import remotecheck
                 slow = rc == remotecheck.FAULT_RC and not env_why and remotecheck.COPY_TIMEOUT in ran_out
-            if rc == UPGRADE_BUSY and not timed_out:   # its spill wrapper refused it or is missing: status names it (a limit line)
+                guard = _guard_refused(ran_out)
+            if guard and guard_retried:   # refused again: it would never start, so no verdict
+                write_json(Path(run_dir) / prguard.CHECKS_FILE, {"head": head, "worktree": top, "passed": False,
+                                                                 "commands": todo, "skipped": skipped, "ts": time.time(),
+                                                                 "purpose": purpose, "infra_fault": "guard-refused"})
+                print(f"ttp checks: the run's guard refused the ssh command to spill host {spilled.host} again: the "
+                      "checks never started, so the change is neither passed nor failed", file=sys.stderr)
+                raise ChecksKilled(UPGRADE_BUSY)
+            if rc == UPGRADE_BUSY and not timed_out and not guard:   # its spill wrapper refused it or is missing: status names it (a limit line)
                 from . import checklane, checkspill, remotecheck
                 if (wrapped := remotecheck.wrap_fault(ran_out))[1]:   # every host refusing alike: one event (wrap_refused)
                     checkspill.wrap_refused(p, wrapped[0] or spilled.host, wrapped[1], checklane.scope_text(todo)[:300],
@@ -5637,8 +5646,9 @@ def _cmd_checks(a) -> None:
                 out.flush()
                 print(f"ttp checks: {said}", flush=True)
             else:
-                no_spill = checkspill.spill_off_add(no_spill, spilled.host, rc == UPGRADE_BUSY and not timed_out,
-                                                    env_cfg, cfg=p.config(), slow=slow, hang=hang)
+                if not guard:   # no ssh ran: the host stays in use
+                    no_spill = checkspill.spill_off_add(no_spill, spilled.host, rc == UPGRADE_BUSY and not timed_out,
+                                                        env_cfg, cfg=p.config(), slow=slow, hang=hang)
                 if slow:
                     how += f": {remotecheck.COPY_TIMEOUT}, so that host is kept off this run"
                 if env_why:
@@ -5664,6 +5674,10 @@ def _cmd_checks(a) -> None:
                            if spilled.host in checkspill.kept_off(no_spill, p.config())
                            else "(that one again once free: the fault was the host's)" if not env_why
                            else "(once: an import failure runs again once per head)"))
+                if guard:
+                    os.environ[_GUARD_RETRY_ENV] = "1"
+                    said = (f"the run's guard refused the ssh command to spill host {spilled.host} before it started: "
+                            "a fault of this run's environment, not the host or the change; running the checks again")
                 out.write(f"ttp checks: {said}\n")
                 out.flush()
                 print(f"ttp checks: {said}", flush=True)
@@ -6098,6 +6112,7 @@ CHECKS_DROPPED = "checks.dropped"
 _WAIT_KEPT_ENV = "TTP_CHECKS_WAIT_KEPT"   # a rerun's wait is its first run's (cmd_checks; never inherited)
 # A rerun of checks that failed tests on a spill host runs only those tests (_spill_failed_ids; never inherited).
 _RETRY_IDS_ENV = "TTP_CHECKS_RETRY_IDS"
+_GUARD_RETRY_ENV = "TTP_CHECKS_GUARD_RETRY"   # set once the checks went again after the run's guard refused a spill ssh (never inherited)
 _RETRY_IDS_MAX = 1000   # more failed there than this: the whole check runs again
 # A rerun's commit: the one its first run checked (spill failure, preemption; _rerun_head; never inherited).
 _RERUN_HEAD_ENV = "TTP_CHECKS_RERUN_HEAD"
@@ -6754,11 +6769,19 @@ def _spill_fail_verdict(spilled, passed, executed, timed_out, rc, failed, todo, 
     try:
         with open(log, "rb") as f:
             f.seek(start)
-            if push.env_problem(f.read().decode("utf-8", errors="replace"), top):
+            text = f.read().decode("utf-8", errors="replace")
+            if push.env_problem(text, top) or _guard_refused(text):
                 return []
     except OSError:
         pass
     return hosts
+
+
+def _guard_refused(text: str) -> bool:
+    """The checks log `text` says the run's own guard refused the spill ssh (remotecheck.GUARD_REFUSED): the
+    checks never ran there, a fault of this run's environment that is neither the host's nor the change's."""
+    from . import remotecheck
+    return remotecheck.GUARD_REFUSED in text
 
 
 def _occupancy_here(p) -> str:

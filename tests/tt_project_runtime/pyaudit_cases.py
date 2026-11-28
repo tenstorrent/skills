@@ -216,3 +216,31 @@ def test_pyaudit_passes_the_remote_checks_own_ssh_and_still_refuses_credential_r
                     cred_home.work)
         assert r.returncode != 0 and "tt-project guard" in r.stderr and "fed" not in r.stdout, (argv, r.stderr[-400:])
         assert "token" not in r.stdout
+
+
+def test_pyaudit_on_the_glm_arm_passes_the_remote_checks_ssh_command_line(env, cred_home):
+    """On the GLM arm the judge reads an ssh command's remote command too and refuses an expansion in it
+    (`$( )`, `eval`): the spilled check's own ssh holds none, so its Popen is not refused."""
+    stubs = cred_home.work / "bin"
+    stubs.mkdir()
+    (stubs / "ssh").write_text("#!/bin/sh\ncat >/dev/null; echo fed\n")
+    (stubs / "ssh").chmod(0o755)
+    e = _pa_env(cred_home, glm=True)
+    e.update(PATH=f"{stubs}:{e['PATH']}")
+    code = """if 1:
+        import subprocess
+        from ttp import remotecheck as rc
+        argv, fed = rc._ssh_fed('spill', 'echo "$(date)"; eval "$X"')
+        assert not any(c in a for a in argv for c in ('$', '`', 'eval')), argv
+        p = subprocess.Popen(argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+        p.stdin.write(fed)
+        p.stdin.close()
+        assert p.stdout.read() == 'fed\\n'
+        try:
+            subprocess.run(['ssh', 'spill', 'sh -c \\'s=$(cat); eval "$s"\\''])
+            raise SystemExit('an expansion in the command line: passed')
+        except PermissionError:
+            pass
+        print('ok')"""
+    r = _pa_run(e, code, cred_home.work)
+    assert r.returncode == 0 and r.stdout == "ok\n", r.stderr[-800:]
