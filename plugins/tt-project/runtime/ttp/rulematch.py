@@ -27,22 +27,34 @@ KV = "rulematch:"   # + message id: {"msg", "items": [older()'s rows]}
 GONE = ":gone"   # kv rulematch:<msg id>:gone {"ts"}: the rule is gone
 CHECKED = "rulematch-checked:"   # + message id: {"at", "left"}: the last overdue check of a message's rules
 CHECK_S = 3600
-MATCHER = 1   # bump when older() changes: each stored record is re-matched once by the new matcher
+MATCHER = 2   # bump when older() changes: each stored record is re-matched once by the new matcher
 MAX = 5
 OPEN_S = 48 * 3600
 OVERDUE_S = 24 * 3600
+NEAR = 4   # words either side of a duration that it is the time of
 _SUFFIX = {"MIN": 60, "MINS": 60, "MINUTES": 60, "H": 3600, "HOURS": 3600, "D": 86400, "DAYS": 86400}   # a name's unit, else seconds
 _UNITS = {"s": 1, "m": 60, "h": 3600, "d": 86400}   # by the unit's first letter
 _WORD_UNIT = r"seconds?|secs?|minutes?|mins?|hours?|hrs?|days?"
 _A_UNIT = r"minutes?|mins?|hours?|hrs?|days?"   # not 'a second', the ordinal
-_DURATION = re.compile(rf"\b(\d+(?:\.\d+)?)\s*({_WORD_UNIT}|[smhd])\b|\b(an?|one)\s+({_A_UNIT})\b", re.I)   # 'a' or 'an' only before a whole unit word
+_DURATION = re.compile(rf"\b(\d+(?:\.\d+)?)\s*({_WORD_UNIT}|(?-i:[smhd]))\b|\b(an?|one)\s+({_A_UNIT})\b", re.I)   # 'a' or 'an' only before a whole unit word
 _CONST = re.compile(r"^\s*([A-Z][A-Z0-9]*(?:_[A-Z0-9]+)+)\s*(?::[^=]+)?=\s*(.+?)\s*(?:#.*)?$")
 _NAME_IN_TEXT = re.compile(r"\b[A-Z][A-Z0-9]*(?:_[A-Z0-9]+)+\b")
 
 
 def durations(text: str) -> set[int]:
     """The durations `text` names, in seconds: 'an hour', '60 min', '3600 s' -> {3600}."""
-    return {round(float(n or 1) * _UNITS[(u or w)[0].lower()]) for n, u, _, w in _DURATION.findall(text or "")}
+    return {_sec(m) for m in _DURATION.finditer(text or "")}
+
+
+def _sec(m: re.Match) -> int:
+    n, u, _, w = m.groups()
+    return round(float(n or 1) * _UNITS[(u or w)[0].lower()])
+
+
+def _timed(text: str) -> list[tuple[int, set[str]]]:
+    """Each duration `text` names, in seconds, with the words within NEAR words of it (what it is the time of)."""
+    return [(_sec(m), _words(" ".join(re.findall(r"[\w-]+", text[:m.start()])[-NEAR:] + re.findall(r"[\w-]+", text[m.end():])[:NEAR])))
+            for m in _DURATION.finditer(text or "")]
 
 
 _ID_REF = re.compile(r"(msgs?|message|tasks?|runs?|ask|issue|note|user|id|no|pst|pdt|utc|cet|gmt|ms|jan|feb|mar|apr|may|jun|jul"
@@ -124,7 +136,7 @@ def _constants(p, cfg: dict, ref: str | None = None, pat: str = r"^\s*[A-Z][A-Z0
 
 def older(p, db, text: str, cap: int | None = MAX) -> list[dict]:
     """The older rules on `text`'s topic, most shared words first, at most `cap`."""
-    said, anc, dur = _topic(db, text), _anchors(text), durations(text)
+    said, anc, timed = _topic(db, text), _anchors(text), _timed(text)
     if not said:
         return []
     cfg, found, named = p.config(), [], set()
@@ -147,14 +159,16 @@ def older(p, db, text: str, cap: int | None = MAX) -> list[dict]:
                                   "line": rulecite._clip(item) + (" (user-only: change only by the user's word)"
                                                                   if user_only else ""), "value": _value(item, words, both)}))
     for key, v in _flat(cfg):
-        shared = len(said & {reask._stem(w) for w in re.split(r"[._]", key)})
-        if shared and (shared >= 2 or _seconds(v) in dur):   # a topic word, and a second one or the duration
-            n = shared + 2 * (_seconds(v) in dur)
+        words = said & {reask._stem(w) for w in re.split(r"[._]", key)}
+        dur, shared = any(s == _seconds(v) and words & near for s, near in timed), len(words)
+        if shared and (shared >= 2 or dur):   # a topic word, and a second one or the duration beside it
+            n = shared + 2 * dur
             found.append((n, {"where": "config", "name": key, "line": f"{key} = {json.dumps(v)}", "value": str(v)}))
     for loc, name, v in _constants(p, cfg):
-        shared = len(said & {reask._stem(w) for w in name.lower().split("_")})
-        n = shared + (name in named) + 2 * (_seconds(v) in dur)
-        if shared and (shared >= 2 or name in named or _seconds(v) in dur):   # a topic word in the name, and a second reason
+        words = said & {reask._stem(w) for w in name.lower().split("_")}
+        dur, shared = any(s == _seconds(v) and words & near for s, near in timed), len(words)
+        n = shared + (name in named) + 2 * dur
+        if shared and (shared >= 2 or name in named or dur):   # a topic word in the name, and a second reason
             found.append((n, {"where": "code", "name": name, "line": f"{loc} {name} = {v}",
                                                 "value": v}))
     return [x for _, x in sorted(found, key=lambda f: -f[0])[:cap]]

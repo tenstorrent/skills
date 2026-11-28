@@ -22,6 +22,7 @@ def test_rulematch_durations_name_one_value_in_any_unit():
     assert rm.durations("make it 5 min or 1.5 hours") == {300, 5400}
     assert rm.durations("fix the bugs and tests, as I am sure") == set()   # plain words are no durations
     assert rm.durations("a second question: the report worker is slow") == set()
+    assert rm.durations("12M and 100M tokens, 1.5M jobs") == set()   # a capital letter is a size, not minutes
 
 
 def test_rulematch_lists_the_older_rules_on_the_topic_and_marks_restrictions(env):
@@ -57,6 +58,20 @@ def test_rulematch_a_value_alone_never_matches_a_constant(env):
     assert not [g for g in got if g["where"] == "code"], got
     got = rm.older(p, p.db, "the crash handling of an hour is too long, make it 5 min")
     assert [g["name"] for g in got if g["where"] == "code"] == ["CRASH_WINDOW_S"]   # one name word plus the value
+
+
+def test_rulematch_a_constant_needs_its_name_word_beside_the_duration(env):
+    import subprocess
+    from ttp import rulematch as rm
+    p = _rm_project(env)
+    (p.root / "vals.py").write_text("LIMIT_S = 3600\n")
+    subprocess.run(["git", "add", "vals.py"], cwd=p.root, check=True, capture_output=True)
+    subprocess.run(["git", "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "v"], cwd=p.root, check=True,
+                   capture_output=True)
+    far = "the provider limit we hit is fine; what bothers me is the dashboard taking an hour to load"
+    assert not [g for g in rm.older(p, p.db, far) if g["where"] == "code"]
+    near = "the provider limit of an hour is too short"
+    assert [g["name"] for g in rm.older(p, p.db, near) if g["where"] == "code"] == ["LIMIT_S"]
 
 
 def test_rulematch_finds_nothing_for_unrelated_text(env):
@@ -290,3 +305,20 @@ def test_rule_gone_rematch_replaces_a_stale_value_with_the_current_matchers_item
            (json.dumps({"msg": a, "items": stale}), time.time() - 3600, rm.KV + str(a)))
     assert rm.digest_lines(p.db, time.time()) is not None
     assert p.db.kv(rm.KV + str(a))["items"] == real
+
+
+def test_rule_gone_rematch_redoes_a_record_an_earlier_matcher_already_rematched(env):
+    """A record an earlier matcher version stamped (here with a number as its value) is re-matched by the current
+    one, and the stale '2026' item disappears."""
+    from ttp import rulematch as rm
+    p = _rm_project(env)
+    p.add_memory("The dashboard budget review is due in 2026.", kind="decision")
+    a = _rm_flag(p)
+    real = p.db.kv(rm.KV + str(a))["items"]
+    stale = [{**i, "value": "2026"} for i in real]
+    p.db.x("UPDATE kv SET value=?, ts=? WHERE key=?",
+           (json.dumps({"msg": a, "items": stale, "matcher": 1}), time.time() - 3600, rm.KV + str(a)))
+    rm.digest_lines(p.db, time.time())
+    rec = p.db.kv(rm.KV + str(a))
+    assert rec["items"] == real and rec["matcher"] == rm.MATCHER
+    assert not [i for i in rec["items"] if i["value"] == "2026"]
