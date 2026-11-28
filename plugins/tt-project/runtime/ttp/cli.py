@@ -9006,8 +9006,8 @@ def cmd_blocked(a) -> None:
     if p is None:
         die("ttp blocked: no project here (run it in a project or its run)")
     now = time.time()
-    rs = bl.rows(p.db, p.config(), now - a.days * DAY_S, now)
-    out = {"share": bl.window_share(p.db, p.config(), now - a.days * DAY_S, now), "target": bl.TARGET, "top": bl.top(rs)}
+    rs = bl.rows(p.db, now - a.days * DAY_S, now)
+    out = {"share": bl.window_share(p.db, now - a.days * DAY_S, now, rs), "target": bl.TARGET, "top": bl.top(rs)}
     if a.json:
         print(json.dumps(out))
         return

@@ -1,7 +1,7 @@
 """Older rules a user message overrides: the memory entries, charter items, config keys and code constants
 that speak on the same topic, listed the day the user says it so they are retired or rewritten the same day.
 
-`older(p, db, text, msg_id)` returns [{where: memory|charter|config|code, name, line, value}], at most MAX.
+`older(p, db, text)` returns [{where: memory|charter|config|code, name, line, value}], at most MAX.
 Topic words are the message's subject words (correction.ask_words, stemmed, the project's common talk
 dropped); a memory entry or charter item matches by half the topic words (two at least) or a shared anchor, a
 config key or an UPPER_SNAKE constant by sharing two topic words or one beside a value equal to a
@@ -81,7 +81,7 @@ def _constants(p, cfg: dict) -> list[tuple[str, str, str]]:
     return out
 
 
-def older(p, db, text: str, msg_id: int) -> list[dict]:
+def older(p, db, text: str) -> list[dict]:
     """The older rules on `text`'s topic, most shared words first, at most MAX."""
     said, anc, dur = _topic(db, text), reask.anchors(text), durations(text)
     if not said:
@@ -117,13 +117,13 @@ def older(p, db, text: str, msg_id: int) -> list[dict]:
     return [x for _, x in sorted(found, key=lambda f: -f[0])[:MAX]]
 
 
-def note(db, cfg: dict | None, m: dict, now: float | None = None) -> None:
+def note(db, m: dict) -> None:
     """Store the older rules the inbound user message `m` overrides (once per message); never raises."""
     if m.get("direction", "in") != "in" or db.kv(KV + str(m["id"])) is not None:
         return
     try:
         from .project import Project
-        items = older(Project(Path(db.path).parent.parent), db, m.get("text") or "", int(m["id"]))
+        items = older(Project(Path(db.path).parent.parent), db, m.get("text") or "")
     except Exception:
         return
     db.set_kv(KV + str(m["id"]), {"msg": int(m["id"]), "items": items})   # kept even with none: one look per message

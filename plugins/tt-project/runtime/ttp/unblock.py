@@ -973,5 +973,5 @@ def lines(db: DB, now: float | None = None, cfg: dict | None = None) -> list[str
     out.append(f"coordinator triggers by day, {TRIGGER_DAYS} d: {triggers_by_day(db, now)}")
     out.append(f"{reviewcap.TRIGGER}, 24 h: {reviewcap.daily_line(db, now - 86400)}")
     out.append(queuewait.daily_line(db, cfg, now))
-    out.append(blockledger.daily_line(db, cfg, now))
+    out.append(blockledger.daily_line(db, now))
     return out

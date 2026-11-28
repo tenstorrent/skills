@@ -27,29 +27,29 @@ def test_rulematch_durations_name_one_value_in_any_unit():
 def test_rulematch_lists_the_older_rules_on_the_topic_and_marks_restrictions(env):
     from ttp import rulematch as rm
     p = _rm_project(env)
-    got = rm.older(p, p.db, "an hour is too long for the report worker, make it 5 min", 9)
+    got = rm.older(p, p.db, "an hour is too long for the report worker, make it 5 min")
     where = {(g["where"], g["name"]) for g in got}
     assert any(w == "memory" for w, _ in where) and ("code", "KEEPALIVE_S") in where
     assert ("code", "LIMIT") not in where and len(got) <= rm.MAX
     charter = [g for g in got if g["where"] == "charter"]
     assert any("user-only: change only by the user's word" in g["line"] for g in charter), got
     assert any(g["where"] == "charter" and "Restrictions" in g["name"] for g in got)
-    cfg = rm.older(p, p.db, "the worker isolation setting is wrong", 10)
+    cfg = rm.older(p, p.db, "the worker isolation setting is wrong")
     assert ("config", "providers.claude.worker_isolation") in {(g["where"], g["name"]) for g in cfg}
 
 
 def test_rulematch_needs_more_than_one_shared_word_for_code_and_config(env):
     from ttp import rulematch as rm
     p = _rm_project(env)
-    got = rm.older(p, p.db, "please add a test for the keepalive handling", 11)
+    got = rm.older(p, p.db, "please add a test for the keepalive handling")
     assert not [g for g in got if g["where"] in ("code", "config")]
 
 
 def test_rulematch_finds_nothing_for_unrelated_text(env):
     from ttp import rulematch as rm
     p = _rm_project(env)
-    assert rm.older(p, p.db, "thanks, looks great", 11) == []
-    assert rm.older(p, p.db, "please rename the colour palette of the dashboard", 12) == []
+    assert rm.older(p, p.db, "thanks, looks great") == []
+    assert rm.older(p, p.db, "please rename the colour palette of the dashboard") == []
 
 
 def test_rulematch_caps_the_list_and_flag_stores_and_shows_it_once(env):

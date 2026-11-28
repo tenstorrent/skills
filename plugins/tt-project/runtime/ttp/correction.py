@@ -603,7 +603,7 @@ def flag(db: DB, cfg: dict | None, msgs: list[dict], now: float | None = None) -
     for m in msgs:
         if m.get("direction", "in") != "in":
             continue
-        rulematch.note(db, cfg, m, now)   # the older rules this message overrides, for the digest
+        rulematch.note(db, m)   # the older rules this message overrides, for the digest
         if hit := request(m.get("text") or ""):
             out[int(m["id"])] = f"{REQUEST} '{hit[:40]}'"
             continue

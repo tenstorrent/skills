@@ -1,7 +1,7 @@
 """Blocked-time ledger: which rule held how much of the project's work, so the top blockers can be
 retired or rewritten the same day.
 
-`rows(db, cfg, since, until)` lists {rule, task, kind, start, end, minutes, safety, source[, n]} from four
+`rows(db, since, until)` lists {rule, task, kind, start, end, minutes, safety, source[, n]} from four
 sources: the stuck intervals of tasks (unblock.intervals), guard refusals in each run's
 `refusals.jsonl` / `glm_refusals.jsonl` (minutes: until the task next ran, when that run handed off
 blocked or waiting), queue-wait episodes (queuewait) and `state/blocklog.jsonl`, which `ttp block-log`
@@ -98,7 +98,7 @@ def _refusals(db: DB, since: float, until: float) -> list[dict]:
     return out
 
 
-def rows(db: DB, cfg: dict | None, since: float, until: float | None = None) -> list[dict]:
+def rows(db: DB, since: float, until: float | None = None) -> list[dict]:
     """The ledger's rows whose time overlaps [since, until], longest first."""
     until = time.time() if until is None else until
     out = []
@@ -149,14 +149,15 @@ def _union_min(spans: list[tuple[float, float]]) -> float:
     return total / 60
 
 
-def window_share(db: DB, cfg: dict | None, start: float, end: float) -> dict:
-    """{share, blocked_min, ordered_min} over [start, end]: blocked minutes of ordered tasks over their wall minutes."""
+def window_share(db: DB, start: float, end: float, rs: list[dict] | None = None) -> dict:
+    """{share, blocked_min, ordered_min} over [start, end] from the ledger's `rs` (rows() of that window): blocked
+    minutes of ordered tasks over their wall minutes."""
     ordered = _ordered(db)
     wall = sum(max(0.0, min(float(t["updated"] if t["status"] in unblock.ENDED else end), end)
                     - max(float(t["created"] or 0), start))
                for t in db.q("SELECT * FROM tasks") if t["id"] in ordered) / 60
     by: dict = {}
-    for r in rows(db, cfg, start, end):
+    for r in rows(db, start, end) if rs is None else rs:
         if r["task"] in ordered and r["minutes"]:
             by.setdefault(r["task"], []).append((max(r["start"], start), min(r["end"], end)))
     blocked = sum(_union_min(v) for v in by.values())
@@ -176,9 +177,10 @@ def top(rs: list[dict], n: int = 10) -> list[dict]:
             for e in sorted(by.values(), key=lambda e: -e["minutes"])[:n]]
 
 
-def daily_line(db: DB, cfg: dict | None, now: float | None = None) -> str:
+def daily_line(db: DB, now: float | None = None) -> str:
     now = time.time() if now is None else now
-    s = window_share(db, cfg, now - 86400, now)
-    t = top([r for r in rows(db, cfg, now - 86400, now) if r["safety"] == "convenience"], 3)
+    rs = rows(db, now - 86400, now)
+    s = window_share(db, now - 86400, now, rs)
+    t = top([r for r in rs if r["safety"] == "convenience"], 3)
     return (f"Blocked time: {s['share'] * 100:.1f}% of ordered work (target {TARGET * 100:g}%); top: "
             + (", ".join(f"{e['rule']} {e['minutes']:g}m" for e in t) or "none"))

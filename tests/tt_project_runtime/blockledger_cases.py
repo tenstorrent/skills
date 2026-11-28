@@ -21,12 +21,12 @@ def test_block_ledger_rows_name_the_rule_and_class_of_each_blocked_interval(env)
     a = _bl_task(p, "waits on a rule", "blocked", now, blocked_ago=7200, reason="held by R-ab12 until later")
     b = _bl_task(p, "waits on words", "blocked", now, blocked_ago=3600, reason="keep the 60 min hold for the nightly job")
     c = _bl_task(p, "in review", "review", now, blocked_ago=1800, kind="task_review", reason="review")
-    rs = {r["task"]: r for r in bl.rows(p.db, {}, now - 86400, now)}
+    rs = {r["task"]: r for r in bl.rows(p.db, now - 86400, now)}
     assert (rs[a]["rule"], rs[a]["minutes"], rs[a]["safety"]) == ("R-ab12", 120.0, "rule")
     assert rs[b]["rule"].startswith("keep the min hold") and rs[b]["safety"] == "convenience"
     assert rs[c]["safety"] == "review or push" and rs[c]["kind"] == "review"
-    assert [r["minutes"] for r in bl.rows(p.db, {}, now - 86400, now)] == sorted(
-        [r["minutes"] for r in bl.rows(p.db, {}, now - 86400, now)], reverse=True)
+    assert [r["minutes"] for r in bl.rows(p.db, now - 86400, now)] == sorted(
+        [r["minutes"] for r in bl.rows(p.db, now - 86400, now)], reverse=True)
 
 
 def test_block_ledger_counts_a_hold_that_began_before_the_window_and_ignores_the_title(env):
@@ -35,11 +35,11 @@ def test_block_ledger_counts_a_hold_that_began_before_the_window_and_ignores_the
     now = time.time()
     old = _bl_task(p, "kernels", "blocked", now, blocked_ago=30 * 3600, reason="keep the 60 min hold for the nightly job")
     titled = _bl_task(p, "review the post-processing merge", "blocked", now, blocked_ago=3600, reason="keep the 60 min hold")
-    rs = {r["task"]: r for r in bl.rows(p.db, {}, now - 86400, now)}
+    rs = {r["task"]: r for r in bl.rows(p.db, now - 86400, now)}
     assert rs[old]["minutes"] == pytest.approx(24 * 60, abs=1) and rs[old]["start"] == pytest.approx(now - 86400, abs=1)
     assert rs[titled]["safety"] == "convenience"
     p.db.x("UPDATE events SET text=? WHERE task=?", (f"#{titled} review the post-processing merge: keep the 60 min hold", titled))
-    plain = {r["task"]: r for r in bl.rows(p.db, {}, now - 86400, now)}[titled]   # the waiting event's form, no 'blocked'
+    plain = {r["task"]: r for r in bl.rows(p.db, now - 86400, now)}[titled]   # the waiting event's form, no 'blocked'
     assert plain["safety"] == "convenience" and plain["rule"].startswith("keep the min hold")
 
 
@@ -50,7 +50,7 @@ def test_block_ledger_clips_queue_waits_and_log_rows_to_the_window(env):
     t = _bl_task(p, "queued long", "queued", now)
     p.db.set_kv(queuewait.KV, {"open": {"k": {"task": t, "queue": "checks", "since": now - 3 * 86400}}})
     bl.append(p.db, "keep 60 min", t, 3 * 86400, "a long loss")
-    rs = bl.rows(p.db, {}, now - 3600, now)
+    rs = bl.rows(p.db, now - 3600, now)
     assert {r["source"]: r["minutes"] for r in rs if r["source"] in ("queue", "cli")} == {"queue": 60.0, "cli": 60.0}
 
 
@@ -60,7 +60,7 @@ def test_block_ledger_counts_a_hold_that_began_before_the_window_and_ended_insid
     now = time.time()
     t = _bl_task(p, "moved on", "queued", now, blocked_ago=5 * 3600, reason="keep the 60 min hold")
     p.db.x("INSERT INTO runs(task,role,status,started,ended) VALUES(?,?,?,?,?)", (t, "worker", "ok", now - 3 * 3600, now - 3 * 3600 + 60))
-    rs = [r for r in bl.rows(p.db, {}, now - 4 * 3600, now) if r["task"] == t]
+    rs = [r for r in bl.rows(p.db, now - 4 * 3600, now) if r["task"] == t]
     assert [r["minutes"] for r in rs] == [pytest.approx(60, abs=1)]
 
 
@@ -73,7 +73,7 @@ def test_block_ledger_refusals_are_one_row_per_run_and_rule(env):
     d = p.state / "runs" / str(p.db.one("SELECT max(id) AS i FROM runs")["i"])
     d.mkdir(parents=True)
     (d / "refusals.jsonl").write_text("".join(json.dumps({"ts": now - 7100 + i, "kind": "full_suite"}) + "\n" for i in range(10)))
-    rs = [r for r in bl.rows(p.db, {}, now - 86400, now) if r["source"] == "refusal"]
+    rs = [r for r in bl.rows(p.db, now - 86400, now) if r["source"] == "refusal"]
     assert [(r["rule"], r["n"], r["start"]) for r in rs] == [("full_suite", 10, pytest.approx(now - 7100, abs=1))]
 
 
@@ -113,13 +113,13 @@ def test_block_ledger_counts_guard_refusals_queue_waits_and_the_block_log(env):
                                       + json.dumps({"ts": now - 7030, "kind": "no_device", "command": "tt-smi"}) + "\n")
     p.db.set_kv(queuewait.KV, {"hist": [{"task": t, "queue": "checks", "since": now - 5000, "end": now - 4400}]})
     bl.append(p.db, "keep 60 min", t, 300, "refused a restart")
-    rs = bl.rows(p.db, {}, now - 86400, now)
+    rs = bl.rows(p.db, now - 86400, now)
     by = {r["rule"]: r for r in rs if r["source"] != "task"}
     assert by["full_suite"]["source"] == "refusal" and by["full_suite"]["n"] == 1
     assert by["records"]["n"] == 1 and by["records"]["minutes"] > 60   # until the task next ran
     assert (by["records"]["safety"], by["no_device"]["safety"]) == ("guard", "guard")   # safety guards are no rules to retire
     assert by["full_suite"]["safety"] == by["redirected"]["safety"] == "convenience"
-    assert all(r["end"] <= now - 3000 for r in bl.rows(p.db, {}, now - 86400, now - 3000) if r["source"] == "refusal")
+    assert all(r["end"] <= now - 3000 for r in bl.rows(p.db, now - 86400, now - 3000) if r["source"] == "refusal")
     assert by["queue:checks"]["minutes"] == 10.0
     assert (by["keep 60 min"]["minutes"], by["keep 60 min"]["source"]) == (5.0, "cli")
     assert [e["rule"] for e in bl.top(rs, 1)] == [rs[0]["rule"]]
@@ -136,7 +136,7 @@ def test_block_ledger_share_counts_only_ordered_work_and_each_task_once(env):
     b = _bl_task(p, "routine", "blocked", now, blocked_ago=3600, reason="held by a keep constant")
     bl.append(p.db, "keep constant", a, 1800, "overlaps its blocked interval")
     p.db.x("UPDATE tasks SET created=? WHERE id IN (?,?)", (now - 7200, a, b))
-    s = bl.window_share(p.db, {}, now - 7200, now)
+    s = bl.window_share(p.db, now - 7200, now)
     assert s["ordered_min"] == pytest.approx(120, abs=1) and s["blocked_min"] == pytest.approx(60, abs=1)
     assert s["share"] == pytest.approx(0.5, abs=0.01)
     assert bl.TARGET == 0.05
