@@ -599,9 +599,11 @@ def flag(db: DB, cfg: dict | None, msgs: list[dict], now: float | None = None) -
     msgs = [dict(m) for m in msgs if m.get("kind", "user") != "finding"]
     again = resends(db, msgs, now)
     msgs = [m for m in msgs if int(m["id"]) not in again]
+    from . import rulematch
     for m in msgs:
         if m.get("direction", "in") != "in":
             continue
+        rulematch.note(db, cfg, m, now)   # the older rules this message overrides, for the digest
         if hit := request(m.get("text") or ""):
             out[int(m["id"])] = f"{REQUEST} '{hit[:40]}'"
             continue

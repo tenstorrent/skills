@@ -231,7 +231,8 @@ def digest_lines(db: DB, now: float | None = None) -> list[str]:
            "safety rule or dependency it follows, or lift it" for r in got[:SHOWN]]
     if len(got) > SHOWN:
         out.append(f"- uncited hold: {len(got) - SHOWN} more")
-    return out
+    from . import rulematch
+    return out + rulematch.digest_lines(db, now)
 
 
 def metric(p, now: float | None = None, window_s: float = DAY) -> dict:
