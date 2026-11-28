@@ -39,7 +39,9 @@ Tracy.
 Use the **streaming profiler** where the checkout has it: Blackhole only,
 `ls tt_metal/tools/profiler/STREAMING_PROFILER.md` shows whether it is there. It
 drains records continuously, so the device profiler's per-core buffer, its drain
-calls and its dropped-marker limit do not apply.
+calls and its dropped-marker limit do not apply. On a long run the ops CSV can
+still miss frames, and the only sign is `missed N bytes of frames` in the log:
+check it before trusting per-op numbers.
 
 ```bash
 TT_METAL_STREAMING_PROFILER=1 TT_METAL_STREAMING_PROFILER_OPS_CSV=ops.csv pytest <test id>

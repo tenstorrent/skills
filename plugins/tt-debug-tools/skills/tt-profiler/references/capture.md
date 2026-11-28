@@ -2,8 +2,7 @@
 
 This page covers the device profiler, the fallback where the checkout has no
 streaming profiler (SKILL.md, "Which profiler"). Three ways in, and they are not
-alternatives so much as layers. The Tracy entry points (sections 2 and 3) also
-apply to streaming runs sent to Tracy.
+alternatives so much as layers.
 
 ## 1. The environment variable alone
 
