@@ -1808,6 +1808,22 @@ def test_gh_workstation_reads_runs_and_edits_labels_and_comments_only_on_its_own
     assert got["rc"] == 0 and ws_calls.read_text().splitlines()[len(calls):] == ["api repos/acme/widgets/issues/3/comments"]
 
 
+def test_gh_workstation_refuses_the_writes_around_the_babysitting_reads():
+    """Beside the run, workflow and PR-diff reads, the writes that would close, retarget or strip a PR, delete
+    a run, or touch an issue, a variable or a key stay refused; the reads' own log and yaml options pass."""
+    from ttp import ghqueue
+    for ok in (["run", "watch", "77", "--log-failed", "--exit-status"], ["workflow", "view", "ci.yml", "--yaml"],
+               ["pr", "diff", "7", "-R", "acme/widgets"], ["api", "-X", "GET", "repos/acme/widgets/issues/7/comments"]):
+        assert ghqueue.allowed(ok) == "", ok
+    for bad in (["pr", "close", "7", "--delete-branch"], ["pr", "edit", "7", "--remove-reviewer", "x"],
+                ["pr", "merge", "7", "--auto"], ["secret", "set", "K", "--body", "v"], ["variable", "list"],
+                ["api", "-X", "POST", "repos/acme/widgets/git/refs/tags/v1"],
+                ["api", "-X", "POST", "repos/acme/settings/keys", "-f", "title=x"],
+                ["api", "-X", "POST", "users/someone/keys", "-f", "title=x"], ["ssh-key", "list"],
+                ["run", "delete", "77"], ["issue", "edit", "7", "--add-label", "x"]):
+        assert ghqueue.allowed(bad), bad
+
+
 def test_gh_publish_with_a_lease_replaces_its_branch_only_at_the_old_sha_and_only_under_rebase_replace_lease(
         env, monkeypatch, tmp_path):
     """`git-publish <repo> <ttp/ branch> <sha> --lease=<old sha>` passes the allowlist with full shas only; the
@@ -1876,11 +1892,14 @@ def test_gh_workflow_run_takes_up_to_eight_plain_inputs_and_nothing_else_on_both
     _cfg, _repo, _gh, ws_calls = _workstation(env, monkeypatch)
     run = ["workflow", "run", "heavy.yml", "--ref", "ttp/x", "-R", "acme/widgets"]
     for inputs in (["-f", "mode=full"], ["-f", "a=b", "-f", "c=d"], ["-f", "empty="], ["-f", "ref=ttp/x@1.2,3:4+5=6"],
+                   ["-f", "sku=id-1 (Product Name)"], ["-f", "platform=Ubuntu 22.04"], ["-f", "k=" + "a " * 64],
                    [x for i in range(8) for x in ("-f", f"k{i}=v")]):
         assert ghqueue.allowed([*run, *inputs]) == "", inputs
         assert ghqueue.allowed([*run[:5], *inputs, *run[5:]]) == "", inputs
-    for inputs in (["-f", "bad key=v"], ["-f", "=v"], ["-f", "k"], ["-f"], ["-f", "k=a b"], ["-f", "k=$(id)"],
-                   ["-f", 'k="x"'], ["-f", "k=@/etc/passwd"], ["-f", "k=" + "v" * 129], ["-f", "k" * 65 + "=v"],
+    for inputs in (["-f", "bad key=v"], ["-f", "=v"], ["-f", "k"], ["-f"], ["-f", "k=a\nb"], ["-f", "k=$(id)"],
+                   ["-f", 'k="x"'], ["-f", "k='x'"], ["-f", "k=a;b"], ["-f", "k=a|b"], ["-f", "k=a&b"],
+                   ["-f", "k=a>b"], ["-f", "k=a<b"], ["-f", "k=`id`"], ["-f", "k=${HOME}"], ["-f", "k=a\tb"],
+                   ["-f", "k=@ x"], ["-f", "k=" + "a " * 65], ["-f", "k=@/etc/passwd"], ["-f", "k=" + "v" * 129], ["-f", "k" * 65 + "=v"],
                    ["-F", "k=v"], ["-F", "k=@file"], ["--raw-field", "k=v"], ["--field", "k=v"], ["--json"], ["-fk=v"],
                    ["-f", "k=v", "-f", "k2"], [x for i in range(9) for x in ("-f", f"k{i}=v")]):
         assert ghqueue.allowed([*run, *inputs]), inputs
@@ -1909,6 +1928,8 @@ def test_gh_a_bridge_that_lacks_a_call_the_box_allows_is_named_as_an_older_relea
     _cfg, _repo, _gh, _calls = _workstation(env, monkeypatch)
     run = ["workflow", "run", "heavy.yml", "--ref", "ttp/x", "--repo", "acme/widgets", "-f", "mode=full"]
     generic = "refused on the workstation: `gh workflow run` is not on the workstation's allowlist"
+    old_no_inputs = ("refused on the workstation: `gh workflow run` takes one workflow, --ref and "
+                     "--repo, no inputs (`-f` is not allowed)")
     key = ghqueue._key("acme/widgets", run, b"")
     d = ghqueue.outbox()
     d.mkdir(parents=True, exist_ok=True)
@@ -1920,15 +1941,18 @@ def test_gh_a_bridge_that_lacks_a_call_the_box_allows_is_named_as_an_older_relea
     assert ghqueue._queued(run, b"", "acme/widgets", None, None, "gh workflow run") == 1
     err = capsys.readouterr().err
     assert "older release (0.1.50)" in err and "does not take `gh workflow run`" in err and "install line" in err and "`ttp bridge setup <box>`" in err, err
-    # An older bridge's answer has no version; a refusal that is not the generic one is untouched.
-    for stderr, want in ((generic, "it reports no version"), ("refused on the workstation: not the head of an open PR", "")):
+    # An answer with no version is never presumed an older release: a policy route's own refusal keeps
+    # its words; only the no-inputs refusal, whose words name the old release, still gets the hint.
+    for stderr, want in ((generic, ""), ("refused on the workstation: not the head of an open PR", ""),
+                          (old_no_inputs, "older release")):
         (d / f"{key}.done").write_text(json.dumps({"rc": 1, "write": True, "stderr": stderr, "at": time.time()}))
         ghqueue._queued(run, b"", "acme/widgets", None, None, "gh workflow run")
         err = capsys.readouterr().err
-        assert (want in err and "older release" in err) if want else err == stderr, err
+        assert ("older release" in err and "update tt-project" in err) if want else err == stderr, err
     # The rewritten refusal came before gh ran, so the retry after the update queues the call again; a refusal
     # that was not rewritten stays kept for a write, so a retried write never posts twice.
-    for stderr, queued in ((generic, True), ("refused on the workstation: not the head of an open PR", False)):
+    for stderr, queued in ((generic, False), (old_no_inputs, True),
+                           ("refused on the workstation: not the head of an open PR", False)):
         (d / f"{key}.done").write_text(json.dumps({"rc": 1, "write": True, "stderr": stderr, "at": time.time()}))
         assert ghqueue._queued(run, b"", "acme/widgets", None, None, "gh workflow run") == 1
         assert (d / f"{key}.done").exists() is not queued
@@ -1938,10 +1962,9 @@ def test_gh_a_bridge_that_lacks_a_call_the_box_allows_is_named_as_an_older_relea
         (d / f"{key}.q").unlink(missing_ok=True)
         (d / f"{key}.done").unlink(missing_ok=True)
         capsys.readouterr()
-    old = "refused on the workstation: `gh workflow run` takes one workflow, --ref and --repo, no inputs (`-f` is not allowed)"
-    (d / f"{key}.done").write_text(json.dumps({"rc": 1, "write": True, "stderr": old, "at": time.time()}))
+    (d / f"{key}.done").write_text(json.dumps({"rc": 1, "write": True, "stderr": old_no_inputs, "at": time.time()}))
     ghqueue._queued(run, b"", "acme/widgets", None, None, "gh workflow run")
-    assert "older release (it reports no version)" in capsys.readouterr().err
+    assert "older release" in capsys.readouterr().err   # the no-inputs words prove the old release, version or not
     # A call this box does not allow either keeps the bridge's own words.
     bad = ["workflow", "enable", "heavy.yml", "--repo", "acme/widgets"]
     (d / f"{ghqueue._key('acme/widgets', bad, b'')}.done").write_text(json.dumps({"rc": 1, "stderr": generic, "at": time.time()}))

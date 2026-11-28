@@ -4170,7 +4170,8 @@ the pick order, so it takes the first starts. A resumed resource ramps only its 
   since it started) keeps the PR's findings while that publication step is open: pr-watch names the
   step once and queues no second fix. A bot review whose summary only repeats inline threads already
   answered or resolved has their disposition; a summary with text of its own is still a finding. Through the gh route the
-  workstation runs a dispatch or label only on an open PR its own gh user opened.
+  workstation runs a dispatch, a label, a rerun or an issue comment only on an open PR its own gh user opened
+  whose head is one of the project's own branches.
 - Draft PRs are taken to the finish line, and pr-watch enforces it. Its GitHub purview is every open
   PR of the project's tasks plus every open PR whose head is a branch the project works on (the push
   branch, task branches and `pr_branch:` lines of tasks open or made in the last 30 days), even one a

@@ -150,7 +150,8 @@ def _upkeep(argv: list[str], stdin: bytes) -> str:
 
 
 _INPUT_KEY = re.compile(r"[A-Za-z0-9_-]{1,64}")
-_INPUT_VAL = re.compile(r"[A-Za-z0-9._,:/@+=-]{0,128}")
+# one line: letters, digits, spaces, parentheses and . _ , : / @ + = - (no quote, backtick, $, ; | & < >, newline)
+_INPUT_VAL = re.compile(r"[A-Za-z0-9._,:/@+=() -]{0,128}")
 INPUTS_MAX = 8
 
 
@@ -165,7 +166,7 @@ def _inputs(rest: list[str]) -> tuple[list[str], str]:
         key, eq, val = (rest[i + 1] if i + 1 < len(rest) else "").partition("=")
         found += 1
         if not eq or not _INPUT_KEY.fullmatch(key) or not _INPUT_VAL.fullmatch(val) or val.startswith("@"):
-            return out, "an input is `-f key=value` with a plain key and a plain value (no spaces, quotes or @file)"
+            return out, "an input is `-f key=value` with a plain key and a one-line value of up to 128 plain characters (no quotes, shell characters or @file)"
         i += 2
     return out, f"at most {INPUTS_MAX} inputs" if found > INPUTS_MAX else ""
 
@@ -620,12 +621,16 @@ NO_INPUTS = "takes one workflow, --ref and --repo, no inputs"   # an older relea
 def _older_bridge(sent: list[str], data: bytes, got: dict) -> str:
     """The stored answer's stderr, with an old bridge's refusal of a call this host's own allowlist has (the
     generic not-on-the-allowlist one, or the old no-inputs one) made plain: the workstation runs an older
-    release, and how to update it."""
+    release, and how to update it. A version is what makes the generic refusal an old release's: a route that
+    reports no version is never presumed older, so only the no-inputs refusal, whose own words name the old
+    release, still says so without one."""
     err = str(got.get("stderr") or "")
-    if not (err.rstrip().endswith(NOT_LISTED) or NO_INPUTS in err) or allowed(sent, data):
-        return err
     ver = got.get("bridge_version")
-    said = ver if isinstance(ver, str) and ver else "it reports no version"
+    versioned = isinstance(ver, str) and bool(ver)
+    if not (err.rstrip().endswith(NOT_LISTED) or NO_INPUTS in err) or allowed(sent, data) \
+            or not (versioned or NO_INPUTS in err):
+        return err
+    said = ver if versioned else "it reports no version"
     return (f"refused on the workstation: its bridge runs an older release ({said}) that does not take "
             f"`gh {' '.join(sent[:2])}` like this; update tt-project on the workstation (rerun its install line, "
             f"docs/install.md, Update), then run `ttp bridge setup <box>` there to restart its gh-pull service on the "

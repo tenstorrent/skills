@@ -256,6 +256,22 @@ def test_prbabysit_guard_lets_a_listed_workflow_run_on_an_owned_prs_head_and_not
     assert _pb_why(p, cfg, *run, "--ref", "ttp/x", "-f", "mode=full") is None
 
 
+def test_prbabysit_guard_and_the_queue_take_one_line_inputs_with_spaces_and_parentheses_and_no_shell_characters(env):
+    """A dispatch whose inputs hold spaces and parentheses ('sku=<id> (<Product Name>)') passes the shared
+    parser and the babysit guard on an owned PR's head; a quote, a newline or a shell character is refused."""
+    from ttp import ghqueue
+    p, cfg = _pb_guarded(env)
+    p.db.set_kv("pr_babysit", {"acme/widgets#7": {"branch": "ttp/x", "open": True}})
+    run = ["workflow", "run", "heavy.yml", "--repo", "acme/widgets", "--ref", "ttp/x"]
+    good = ["-f", "model=m-1", "-f", "sku=id-9 (Widget Pro)", "-f", "platform=Ubuntu 22.04", "-f", "build-type=Release",
+            "-f", "enable-lto=false"]
+    assert ghqueue.parse_dispatch(run[2:] + good)[2] == ""
+    assert _pb_why(p, cfg, *run, *good) is None
+    for val in ('x"y', "x'y", "x\ny", "x;y", "x|y", "x&y", "x<y", "x>y", "x`y`", "x$y", "@x y", "a " * 65):
+        assert ghqueue.parse_dispatch(run[2:] + ["-f", f"k={val}"])[2], val
+        assert "no inputs but plain -f" in _pb_why(p, cfg, *run, "-f", f"k={val}"), val
+
+
 def test_prbabysit_guard_adds_only_a_listed_label_to_an_owned_pr_and_never_a_reviewer(env):
     p, cfg = _pb_guarded(env)
     p.db.set_kv("pr_babysit", {"acme/widgets#7": {"branch": "ttp/x", "open": True}})
