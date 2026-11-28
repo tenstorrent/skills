@@ -647,7 +647,7 @@ def main(args: list[str]) -> int:
         if wait is not None:
             _say(f"ssh's shared connection to {host} refused a session ({MUX_REFUSED}): trying again "
                  f"in {wait} s on a connection of its own")
-        rc, why = _attempt(host, top, head, env, extra, cmd, mark, wrap, wait, build)
+        rc, why = _attempt(host, top, head, env, extra, cmd, mark, wrap, wait, build, spill)
         if not why:
             return rc
     return _fault(host, f"{why}; ssh's shared connection refused a session ({MUX_REFUSED}) on each of "
@@ -948,7 +948,7 @@ def _archive(host, top, head, q, direct, deadline) -> tuple[int, str]:
     return 0, why
 
 
-def _attempt(host, top, head, env, extra, cmd, mark, wrap, wait, build=True) -> tuple[int, str]:
+def _attempt(host, top, head, env, extra, cmd, mark, wrap, wait, build=True, spill="") -> tuple[int, str]:
     """One try of the check on `host` (main), after `wait` s on a connection of its own when given:
     (exit code, ""), or (FAULT_RC, why) when ssh failed after its shared connection refused a session."""
     for s in (signal.SIGTERM, signal.SIGHUP, signal.SIGINT):
@@ -1073,6 +1073,8 @@ def _attempt(host, top, head, env, extra, cmd, mark, wrap, wait, build=True) -> 
         proc.wait()
         if no_wrap == NO_ENV and not build:   # this project's setting, not the host's fault: no mark for others
             from .runnerenv import NO_INSTALL
+            from . import checkspill   # off this project's pool, so its next checks do not pick it again
+            checkspill.no_install_off(spill, host)
             return _fault(host, f"{NO_INSTALL} there, so the check did not run"), ""
         if no_wrap == NO_ENV:
             why = ("the checks' pinned Python env could not be made there (its error is above), "

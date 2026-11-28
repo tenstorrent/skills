@@ -2432,6 +2432,22 @@ def strike_settle(p, cfg: dict | None, head: str, passed_on: str = "", now: floa
     return took
 
 
+def no_install_off(project_dir: str, alias: str, now: float | None = None) -> None:
+    """Take `alias` off the spill pool of the project at `project_dir` for DOWN_RETRY_S: a spilled check found
+    no ready checks env there and checks.spill_install is off. Only this project; ends like any quarantine."""
+    from .project import Project
+    now = time.time() if now is None else now
+    try:
+        p = Project(project_dir)
+        with p.db.tx():
+            doc = _strikes(p.db)
+            doc["hosts"].setdefault(alias, {})["off"] = {"kind": "no-install", "since": now,
+                                                         "until": now + DOWN_RETRY_S, "n": 0}
+            p.db.set_kv(STRIKES_KV, doc)
+    except Exception:   # no project there, its db unwritable: the fault itself still says why
+        pass
+
+
 def quarantined(p, alias: str, now: float | None = None) -> str:
     """Why `alias` is quarantined for project `p`'s checks ("" when it is not). A quarantine past its end
     ends here as lift ends one (its event, its strikes reset), ledger entry or not; a health one ends only on a
@@ -2449,6 +2465,9 @@ def quarantined(p, alias: str, now: float | None = None) -> str:
         return ""
     if off.get("kind") == "health":   # spillhealth: back once its health check passes
         return f"quarantined: its health check failed ({off.get('why')}); back once it passes, or with `ttp checks --spill-back {alias}`"
+    if off.get("kind") == "no-install":
+        from .runnerenv import NO_INSTALL
+        return f"{NO_INSTALL}; tried again at {timefmt.clock(now=float(off['until']))}"
     return (f"quarantined: {off.get('n')} spilled runs in a row failed there and passed elsewhere; back once a "
             f"known-good run of the base passes there (`ttp checks --spill-probe {alias}`) or with "
             f"`ttp checks --spill-back {alias}`, at the latest {timefmt.clock(now=float(off['until']))}")

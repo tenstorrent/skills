@@ -5859,7 +5859,7 @@ def test_a_host_that_cannot_make_the_checks_env_is_down_for_every_project_until_
 def test_a_spill_host_without_a_ready_checks_env_installs_nothing_unless_the_project_opts_in(env, tmp_path, monkeypatch):
     """cells: spill_install_off_no_env, spill_install_off_ready, spill_install_on. checks.spill_install unset (off):
     the lines sent to a spill host run no pip and only reuse a ready pinned env; a host without one takes no
-    check (FAULT_RC, the run goes elsewhere) and is not marked down for other projects, and a host with one runs
+    check (FAULT_RC, the run goes elsewhere) and leaves only this project's pool for a while, and a host with one runs
     it. On: the bootstrap as before (pip, and a host that cannot make the env is down for every project)."""
     from ttp import checkspill, remotecheck, runnerenv, spillhealth
     off = runnerenv.remote_lines(None, "x", "y", False)
@@ -5875,6 +5875,8 @@ def test_a_spill_host_without_a_ready_checks_env_installs_nothing_unless_the_pro
     rc, said = _rc_run(tmp_path, repo, "true", host="check-host-b", spill=str(p.root), TTP_TEST_CHECKS_PYTHON_ENV=none)
     assert rc == remotecheck.FAULT_RC and runnerenv.NO_INSTALL in said, said
     assert checkspill.down_why("check-host-b") == "", "this project's setting, not the host: no mark for the others"
+    assert runnerenv.NO_INSTALL in checkspill.quarantined(p, "check-host-b"), "off this project's pool for a while"
+    assert checkspill.lift(p, "check-host-b", severity="")
     rc, said = _rc_run(tmp_path, repo, "true", host="check-host-b", spill=str(p.root))   # a ready env there: used
     assert rc == 0, said
     with pytest.raises(ValueError, match="checks.spill_install"):
