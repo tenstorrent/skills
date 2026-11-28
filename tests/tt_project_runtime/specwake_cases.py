@@ -1104,3 +1104,80 @@ def test_a_user_order_wakes_a_sleeping_task_that_still_carries_a_step_it_superse
     d.probe_waiting()
     assert not _asleep(p, tid), "the task carrying the superseded step slept on"
     assert len(p.db.q("SELECT id FROM events WHERE task=? AND kind=?", (tid, coord.ORDER_WAKE_KIND))) == 1
+
+
+def _ordered_sleeper(p, probe, ordered=True):
+    """A sleeping task on `probe`, the owner of an open user order when `ordered`."""
+    from ttp import obligations
+    tid = _spec_sleeper(p, probe)
+    if ordered:
+        obligations.add_order(p, "carry it to live", p.db.post("in", "carry it to live", chat="c1"), [tid],
+                              action_class="change")
+    return tid
+
+
+def test_the_end_of_what_a_probe_waits_on_runs_it_at_once(env, tmp_path):
+    from ttp import waitend
+    p = make(env)
+    before = time.time() - 1
+    rc, marker = tmp_path / "job.rc", tmp_path / "push.json"
+    probes = {"job": f"ttp detach --check {rc}", "push": f"ttp push --result {marker}",
+              "landing": "landed:#41", "landing_cmd": "ttp landed --task 41"}
+    assert not any(waitend.ended_since(p, q, before) for q in probes.values()), "nothing has ended yet"
+    rc.write_text("0\n")
+    marker.write_text("{}")
+    p.db.x("INSERT INTO task_landings(marker, task, sha, target, ts) VALUES(?,?,?,?,?)",
+           ("m", 41, "abc", "branch", time.time()))
+    assert all(waitend.ended_since(p, q, before) for q in probes.values())
+    after = time.time() + 5
+    assert not any(waitend.ended_since(p, q, after) for q in probes.values()), "only what ended since the last run"
+    p.db.x("INSERT INTO task_landings(marker, task, sha, target, ts) VALUES(?,?,?,?,?)",
+           ("n", 42, "abc", "branch", time.time() + 10))
+    assert not waitend.ended_since(p, "landed:#41", after), "another task's landing does not count"
+    assert not waitend.ended_since(p, "exit 1", 0) and not waitend.ended_since(p, "", 0)
+
+
+@pytest.mark.parametrize("path", ["job", "push", "landing"])
+def test_a_sleeping_task_whose_job_push_or_landing_ended_has_its_probe_run_within_a_tick(
+        env, monkeypatch, tmp_path, path):
+    p = make(env)
+    rc, marker = tmp_path / "job.rc", tmp_path / "push.json"
+    probe = {"job": f"ttp detach --check {rc}", "push": f"ttp push --result {marker}", "landing": "landed:#41"}[path]
+    tid = _spec_sleeper(p, probe)
+    d = _spec_daemon(p, monkeypatch)
+    ran = []
+    monkeypatch.setattr(d, "_start_probe", lambda t, *a, **k: ran.append(t))
+    d._probed[tid] = time.time() - 1   # asked a second ago: the poll gap has not run out
+    d.probe_waiting()
+    assert ran == [], "no event: the poll gap holds"
+    {"job": lambda: rc.write_text("0\n"), "push": lambda: marker.write_text("{}"),
+     "landing": lambda: p.db.x("INSERT INTO task_landings(marker, task, sha, target, ts) VALUES(?,?,?,?,?)",
+                               ("m", 41, "abc", "branch", time.time()))}[path]()
+    d.probe_waiting()
+    assert ran == [tid], "the event did not run the probe"
+
+
+def test_a_task_of_an_open_order_is_asked_and_woken_within_two_minutes(env, monkeypatch):
+    from ttp import waitpoll
+    p = make(env)
+    probe = "ttp detach --check /nowhere/job.rc"
+    plain, ordered = _ordered_sleeper(p, probe, ordered=False), _ordered_sleeper(p, probe)
+    d = _spec_daemon(p, monkeypatch)
+    d.probe_waiting()
+    assert d._probe_gap(ordered) <= 120 == waitpoll.ORDERED_CAP_S and d._ordered(p.db.task(ordered))
+    assert not d._ordered(p.db.task(plain))
+    ran = []
+    monkeypatch.setattr(d, "_start_probe", lambda t, *a, **k: ran.append(t))
+    d._poll_s = lambda: 180.0   # a poll gap longer than the bound
+    d.probe_waiting()
+    d._probed.update({plain: time.time() - 130, ordered: time.time() - 130})
+    d._ordered_ids = {ordered}
+    ran.clear()
+    d.probe_waiting()
+    assert ran == [ordered], "130 s since its last run: the ordered task is asked, the plain one is not"
+    job = {"retry_when": probe}
+    assert waitpoll.capped({}, p.db.task(plain), job, 3600, ordered=True) == 120
+    assert waitpoll.capped({"waiting": {"urgent_retry_cap_s": 60}}, p.db.task(plain), job, 3600, ordered=True) == 60
+    assert waitpoll.capped({}, p.db.task(plain), job, 3600) == 3600
+    assert waitpoll.capped({}, p.db.task(plain), {"retry_when": 'test "$(date +%s)" -ge 1900000000'}, 3600,
+                           ordered=True) == 3600, "a bare clock gate stays its own deadline"

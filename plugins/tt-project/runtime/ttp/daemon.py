@@ -132,7 +132,7 @@ from . import userstep
 from . import ownwait
 from . import overlapdep
 from . import rankinherit
-from . import waitpoll
+from . import waitend, waitpoll
 from . import workernotify
 from . import anchors
 from . import askrethink
@@ -1420,6 +1420,7 @@ class Daemon:
         self._probes: dict[int, tuple[subprocess.Popen, float, str]] = {}   # running: proc, started, probe
         self._probe_left: list[tuple] = []   # finished probes a cut-off tick left unhandled, with their texts
         self._probed: dict[int, float] = {}
+        self._ordered_ids: set[int] = set()   # the tasks of open user orders, read once per probe_waiting
         # task -> (what its probe runs: command, directory, environment; when its latest run started):
         # which runs another task may share (_start_probe)
         self._probe_ctx: dict[int, tuple[str, float]] = {}
@@ -8448,7 +8449,7 @@ class Daemon:
                 extra["woke"] = "the host rebooted"
                 reason = f"waiting for {what}; the host rebooted, so it runs again now"
             else:
-                not_before = time.time() + waitpoll.capped(self.cfg, task, result, _retry_s(result))
+                not_before = time.time() + waitpoll.capped(self.cfg, task, result, _retry_s(result), self._ordered(task))
                 extra["waiting_since"] = time.time()
                 # Its check plan (waketier): the checks its model makes of this wait, the first one sooner.
                 if isinstance(prev_res.get(waketier.PLAN_SET), dict):
@@ -16112,6 +16113,7 @@ class Daemon:
         make the probe pass) and raises one `wait_stale` event for the coordinator.
         Tasks with the same probe share its runs."""
         db, now = self.p.db, time.time()
+        self._ordered_ids = obligations.order_tasks(db)
         self._poll_on_pass(now)
         self._sweep_on_pass_notes(now)
         outs: dict[int, str] = {}   # one read of a probe run's output, whichever tasks share it
@@ -16256,8 +16258,8 @@ class Daemon:
                 if not self._hold_waiting(t, prev, now):
                     continue
             elif t["id"] in self._probes or now - self._probed.get(t["id"], 0) < self._probe_gap(t["id"]) \
-                    and not checksgone.ended_since(probe, self._probed.get(t["id"], 0)):
-                continue   # checks that just ended are asked at once: their end wakes model-free, not the timer
+                    and not waitend.ended_since(self.p, probe, self._probed.get(t["id"], 0)):
+                continue   # what the probe waits on just ended: asked at once, its verdict wakes model-free
             if self._stack_wait_done(t, prev):
                 continue
             self._start_probe(t["id"], probe, now)
@@ -16454,10 +16456,15 @@ class Daemon:
         the freshness unit a verdict is judged by."""
         return min(waitpoll.poll_s(self.cfg), PROBE_EVERY_S)
 
+    def _ordered(self, task: dict) -> bool:
+        """Whether the task is one of an open user order: its waits are re-checked within waitpoll.ORDERED_CAP_S."""
+        return task["id"] in obligations.order_tasks(self.p.db)
+
     def _probe_gap(self, tid: int) -> float:
         """How long after its last run a task's probe runs again: waiting.poll_s (waitpoll), or seconds
-        while it waits on a down host (downwait.gap)."""
-        return downwait.gap(self._down_n.get(tid, 0), self._poll_s())
+        while it waits on a down host (downwait.gap); at most waitpoll.ORDERED_CAP_S for an open user order's task."""
+        gap = downwait.gap(self._down_n.get(tid, 0), self._poll_s())
+        return min(gap, waitpoll.ORDERED_CAP_S) if tid in self._ordered_ids else gap
 
     def _host_down(self, tid: int, probe: str, out: str, rc, now: float) -> None:
         """downwait: a probe whose 255 is ssh's own (rc stays UNREACHABLE_RC after _own_255) shortens its
@@ -17758,7 +17765,7 @@ class Daemon:
                 if self._stale_wait_event(task, prev, start, max_hold):
                     self._flag_never_passes(task, str(prev.get("retry_when") or ""), rc,
                                             (self._probe_out.get(tid) or ("",))[0], stale=True)
-            retry = waitpoll.capped(self.cfg, task, prev, _retry_s(prev))
+            retry = waitpoll.capped(self.cfg, task, prev, _retry_s(prev), self._ordered(task))
             nb = now + retry if held else min(now + retry, start + max_hold)
             what = self._wait_what(tid, prev)
             says = "host unreachable" if rc == 255 else \
@@ -18666,7 +18673,7 @@ class Daemon:
             if nxt is None or load_result(cur["result"]).get("status") != "waiting":
                 return False
             left = len(nxt.get(thenwaits.KEY) or [])
-            retry = waitpoll.capped(self.cfg, cur, nxt, _retry_s(nxt))   # as a hand-off's: urgent stays capped
+            retry = waitpoll.capped(self.cfg, cur, nxt, _retry_s(nxt), self._ordered(cur))   # as a hand-off's: urgent stays capped
             db.update_task(tid, result=dump_result(nxt), not_before=now + retry,
                            blocked_reason=f"its {why}; stage {nxt[thenwaits.STAGE_KEY] + 1} of "
                                           f"{nxt[thenwaits.STAGE_KEY] + 1 + left} waits on: {nxt['retry_when'][:200]}")
