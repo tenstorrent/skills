@@ -444,6 +444,10 @@ def _away_base(uid: int | None = None) -> str | None:
     """A writable folder for `away_from_tmp` tests: the runtime folder, else the user cache folder (the checkout
     holds a pytest file, so it cannot serve); None when none of them is away from the temp roots."""
     cache = os.environ.get("XDG_CACHE_HOME") or str(Path.home() / ".cache")
+    try:
+        os.makedirs(cache, exist_ok=True)
+    except OSError:
+        pass
     for root in (os.environ.get("XDG_RUNTIME_DIR", ""), f"/run/user/{os.getuid() if uid is None else uid}", cache):
         if root and os.access(root, os.W_OK | os.X_OK) and _away_from_tmp(Path(root, "x")):
             return root

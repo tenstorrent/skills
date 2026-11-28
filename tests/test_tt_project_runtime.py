@@ -46243,9 +46243,11 @@ def test_away_from_tmp_falls_back_to_the_user_cache_folder_without_a_runtime_fol
     monkeypatch.setenv("XDG_CACHE_HOME", str(cache))
     assert conftest._away_base(uid=2 ** 31) == str(cache)
     assert conftest._away_from_tmp(cache / "x")
-    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "missing"))
-    monkeypatch.setenv("HOME", str(tmp_path / "missing"))
+    (tmp_path / "file").write_text("")
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "file"))
     assert conftest._away_base(uid=2 ** 31) is None
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "new" / "cache"))
+    assert conftest._away_base(uid=2 ** 31) == str(tmp_path / "new" / "cache"), "a missing cache folder is made"
 
 
 def test_short_tmp_root_is_short_in_production(env, monkeypatch):
