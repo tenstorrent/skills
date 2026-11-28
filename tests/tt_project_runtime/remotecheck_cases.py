@@ -6082,10 +6082,8 @@ def test_a_guarded_runs_spill_check_makes_its_temp_files_in_the_runs_own_scratch
     host: the judge refuses a temporary file in the harness's own scratch folder of a shared temp dir, where the check's
     TMPDIR is, so the check passes only with remotecheck.guarded_tmp pointing tempfile at the run's scratch."""
     from ttp import remotecheck
-    remotecheck_guard_said = remotecheck.GUARD_REFUSED
     bin_, remote = _rc_fake_ssh(tmp_path)
     repo = _rc_repo(tmp_path)
-    (cred_home.run / "tmp").mkdir()
     e = _pa_env(cred_home, glm=True)
     shared = tmp_path / "shared-tmp"   # plays the shared temp dir; the check's TMPDIR is the harness's scratch in it
     scratch = shared / f"ttp-{os.getuid()}" / "check"
@@ -6099,7 +6097,7 @@ def test_a_guarded_runs_spill_check_makes_its_temp_files_in_the_runs_own_scratch
             f"sys.modules['_ttp_pyaudit.glmguard']._TMP = ({str(shared)!r},)\n"
             "sys.exit(remotecheck.main(['--host', 'check-host-a', '--', 'true']))")
     r = _pa_run(e, code, repo)
-    assert r.returncode == 0 and remotecheck_guard_said not in r.stdout + r.stderr, (r.stdout[-400:], r.stderr[-400:])
+    assert r.returncode == 0 and remotecheck.GUARD_REFUSED not in r.stdout + r.stderr, (r.stdout[-400:], r.stderr[-400:])
     log = cred_home.run / "refusals.jsonl"
     assert str(scratch) not in (log.read_text() if log.exists() else "")
 
