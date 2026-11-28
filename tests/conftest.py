@@ -440,14 +440,14 @@ def _away_from_tmp(path: Path) -> bool:
         (d / f).is_file() for d in real.parents for f in _PYTEST_FILES)
 
 
-def _away_base(uid: int | None = None) -> str | None:
+def _away_base() -> str | None:
     """A writable folder for `away_from_tmp` tests: the runtime folder, else the account's own cache folder
     (REAL_HOME, not the per-test HOME, which is under pytest's temp root; the checkout holds a pytest file, so
     it cannot serve), made only when it is reached; None when none of them is away from the temp roots."""
     cache = os.path.join(REAL_HOME, ".cache")
-    for root in (os.environ.get("XDG_RUNTIME_DIR", ""), f"/run/user/{os.getuid() if uid is None else uid}", cache):
+    for root in (os.environ.get("XDG_RUNTIME_DIR", ""), f"/run/user/{os.getuid()}", cache):
         if root == cache:
-            os.makedirs(root, exist_ok=True)
+            Path(root).mkdir(parents=True, exist_ok=True) if os.access(REAL_HOME, os.W_OK) else None
         if root and os.access(root, os.W_OK | os.X_OK) and _away_from_tmp(Path(root, "x")):
             return root
     return None
