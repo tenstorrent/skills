@@ -6079,21 +6079,29 @@ def test_a_spill_ssh_the_runs_guard_refuses_is_an_environment_fault_never_the_ho
 
 def test_a_guarded_runs_spill_check_makes_its_temp_files_in_the_runs_own_scratch(env, cred_home, tmp_path):
     """A run whose Python the run-time judge limits to its worktree, run folder and scratch runs a check on a fake
-    host: the judge refuses the temporary file ssh's output goes to unless it is made in that scratch, so the
-    check passes only with remotecheck.guarded_tmp pointing tempfile there."""
+    host: the judge refuses a temporary file in the harness's own scratch folder of a shared temp dir, where the check's
+    TMPDIR is, so the check passes only with remotecheck.guarded_tmp pointing tempfile at the run's scratch."""
     from ttp import remotecheck
     remotecheck_guard_said = remotecheck.GUARD_REFUSED
     bin_, remote = _rc_fake_ssh(tmp_path)
     repo = _rc_repo(tmp_path)
     (cred_home.run / "tmp").mkdir()
-    e = _pa_env(cred_home, glm=True)   # its TMPDIR is a folder the judge does not let it write in
-    e.update(PATH=f"{bin_}{os.pathsep}{e['PATH']}", FAKE_REMOTE_TMP=str(remote), PYTHONDONTWRITEBYTECODE="1")
-    code = ("import sys; from ttp import remotecheck; "
+    e = _pa_env(cred_home, glm=True)
+    shared = tmp_path / "shared-tmp"   # plays the shared temp dir; the check's TMPDIR is the harness's scratch in it
+    scratch = shared / f"ttp-{os.getuid()}" / "check"
+    scratch.mkdir(parents=True)
+    e.update(PATH=f"{bin_}{os.pathsep}{e['PATH']}", FAKE_REMOTE_TMP=str(remote), PYTHONDONTWRITEBYTECODE="1",
+             TMPDIR=str(scratch))
+    # the judge reads the rules from its own copy of the runtime, loaded on its first write check: a write there
+    # loads it, then that copy's shared temp dir is the fake one
+    code = ("import sys; from ttp import remotecheck\n"
+            f"try:\n open({str(shared / 'probe')!r}, 'w').close()\nexcept OSError:\n pass\n"
+            f"sys.modules['_ttp_pyaudit.glmguard']._TMP = ({str(shared)!r},)\n"
             "sys.exit(remotecheck.main(['--host', 'check-host-a', '--', 'true']))")
     r = _pa_run(e, code, repo)
     assert r.returncode == 0 and remotecheck_guard_said not in r.stdout + r.stderr, (r.stdout[-400:], r.stderr[-400:])
     log = cred_home.run / "refusals.jsonl"
-    assert e["TMPDIR"] not in (log.read_text() if log.exists() else "")
+    assert str(scratch) not in (log.read_text() if log.exists() else "")
 
 
 @pytest.mark.parametrize("refusals, check, passed", [(1, "true", True), (2, "true", True), (2, "false", False)])
