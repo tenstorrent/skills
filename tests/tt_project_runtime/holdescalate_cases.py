@@ -151,16 +151,17 @@ def test_hold_escalate_raises_one_hold_once_though_it_is_recorded_again(env):
     from ttp import holdescalate as he
     p = make(env)
     now = time.time()
+    cfg = {"hold_proceed_min": 0}
     t = _he_hold(p, now, 6, "waiting for the shipping window to open")
-    he.run(p.db, {}, now)
+    assert [d["did"] for d in he.run(p.db, cfg, now)] == ["escalated"]
     p.db.x("UPDATE tasks SET status='waiting' WHERE id=?", (t,))   # re-recorded: a new segment, so a later hold start
     p.db.x("INSERT INTO events(ts,source,kind,text,data,status,task) VALUES(?,?,?,?,?,?,?)",
            (now + 30, "t", "task_waiting", f"#{t} ordered work is waiting: waiting for the shipping window to open",
             None, "handled", t))
-    assert he.run(p.db, {}, now + 40) == [] and len(_he_events(p)) == 1
-    p.db.x("INSERT INTO runs(task, role, started, ended, status) VALUES(?,?,?,?,?)", (t, "worker", now + 60, now + 90, "done"))
+    assert he.run(p.db, cfg, now + 400) == [] and len(_he_events(p)) == 1
+    p.db.x("INSERT INTO runs(task, role, started, ended, status) VALUES(?,?,?,?,?)", (t, "worker", now + 500, now + 520, "done"))
     p.db.x("UPDATE tasks SET status='blocked' WHERE id=?", (t,))
     p.db.x("INSERT INTO events(ts,source,kind,text,data,status,task) VALUES(?,?,?,?,?,?,?)",
-           (now + 400, "t", "task_blocked", f"#{t} ordered work is blocked: waiting for the shipping window to open",
+           (now + 900, "t", "task_blocked", f"#{t} ordered work is blocked: waiting for the shipping window to open",
             None, "handled", t))
-    assert [d["did"] for d in he.run(p.db, {}, now + 800)] == ["escalated"]   # a run came between: a new hold
+    assert [d["did"] for d in he.run(p.db, cfg, now + 1300)] == ["escalated"]   # a run came between: a new hold
