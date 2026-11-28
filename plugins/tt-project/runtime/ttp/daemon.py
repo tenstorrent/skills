@@ -22866,8 +22866,8 @@ class Daemon:
                     severity=severity, ref=key)
 
     def remind_logouts(self) -> None:
-        """Each open logout: report what waits on it here into its machine-wide claim, and if this
-        project holds the claim and a reminder is due (alerts.LOGOUT_REMIND_S), remind the chats with
+        """Each open logout: report what waits on it here into its machine-wide claim, and if work here
+        needs the login and a reminder is due (alerts.LOGOUT_REMIND_S), remind this project's chats with
         how many projects, tasks and high events wait on it. Only work no other provider can run counts
         (logout_waits): while every project's work runs elsewhere, no reminder asks for the login and
         the alert stays one low status line, re-posted quietly when that changes; an acknowledged
@@ -22895,9 +22895,8 @@ class Daemon:
             # Only projects whose work can run nowhere else wait on the login (a report without
             # `need` comes from an older daemon: it counts).
             waiting = [x for x in due["waiting"] if x.get("need", True)]
-            if not waiting or (cur and alerts.acked(db, cur) and cur["severity"] == "high") \
-                    or alerts.condition_acked(db, key):
-                continue   # nothing needs the login, or the user knows and nothing changed
+            if (cur and alerts.acked(db, cur) and cur["severity"] == "high") or alerts.condition_acked(db, key):
+                continue   # the user knows and nothing changed
             try:
                 hint = get_provider(prov).login_hint
             except Exception:

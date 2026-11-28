@@ -144,7 +144,7 @@ def test_a_stopped_claimers_claim_does_not_silence_the_others(env, monkeypatch):
 
 
 
-def test_a_logout_is_one_alert_per_machine_reminded_at_15_minutes_1_4_and_12_hours_with_what_waits(env, monkeypatch):
+def test_a_logout_is_reminded_to_each_waiting_project_at_15_minutes_1_4_and_12_hours_with_what_waits(env, monkeypatch):
     from ttp import alerts
     from ttp.daemon import Daemon
     p, q = _two_projects(env)
@@ -168,7 +168,7 @@ def test_a_logout_is_one_alert_per_machine_reminded_at_15_minutes_1_4_and_12_hou
             d._logout_round = 0.0
             d.remind_logouts()
         seen.append((hours, len(told(p))))
-    assert told(q) == [], "the second project paged the chat too"
+    assert len(told(q)) == 5 and "2 project(s) wait on it (demo, second)" in told(q)[0], "the second project was not reminded"
     sent = told(p)
     assert sent[0] == "fake is logged out" and len(sent) == 6, sent
     assert [h for (h, n), (_, m) in zip(seen[1:], seen) if n > m] == [0.26, 1.01, 4.01, 12.01, 36.01]
@@ -182,17 +182,49 @@ def test_a_logout_is_one_alert_per_machine_reminded_at_15_minutes_1_4_and_12_hou
     clock["t"] = start + 36.5 * 3600
     dq._logout_round = 0.0
     dq.remind_logouts()
-    assert told(q) == []
+    assert len(told(q)) == 5
     clock["t"] = start + 60.01 * 3600
     dq._logout_round = 0.0
     dq.remind_logouts()
-    assert len(told(q)) == 1 and "1 project(s) wait on it (second)" in told(q)[0]
+    assert len(told(q)) == 6 and "1 project(s) wait on it (second)" in told(q)[-1]
     # Logged in again: no more reminders.
     dq._close_breaker("fake", alerts.breaker(q.db, "fake"), "login check passed")
     clock["t"] = start + 90 * 3600
     dq._logout_round = 0.0
     dq.remind_logouts()
-    assert len(told(q)) == 1
+    assert len(told(q)) == 6
+
+
+def test_a_project_that_does_not_hold_the_claim_gets_its_own_logout_reminder_once_across_a_restart(env, monkeypatch):
+    from ttp import alerts
+    from ttp.daemon import Daemon
+    from ttp.project import hostname
+    p, q = _two_projects(env)
+    monkeypatch.setattr(alerts, "owner_alive", lambda owner: True)
+    start = time.time()
+    clock = {"t": start}
+    monkeypatch.setattr(time, "time", lambda: clock["t"])
+    dp, dq = Daemon(p.base), Daemon(q.base)
+    for d in (dp, dq):
+        d.open_breaker("fake", "logged out")
+        d.alert("auth:fake", "fake is logged out", "high")
+    told = lambda x: [m["text"] for m in x.db.unread_for_chat("c1", 0) if "still logged out" in m["text"]]
+
+    def round_at(minutes, *daemons):
+        clock["t"] = start + minutes * 60
+        for d in daemons:
+            d._logout_round = 0.0
+            d.remind_logouts()
+    round_at(14, dp, dq)
+    assert told(q) == [], "reminded before the hold was 15 minutes old"
+    round_at(16, dp, dq)   # p reported first and holds the claim
+    assert json.loads(alerts.claims_path().read_text())[f"{hostname()}|auth:fake"]["owner"] == str(p.base)
+    assert len(told(q)) == 1 and "log in to the agent CLI there" in told(q)[0], told(q)
+    assert len(told(p)) == 1
+    round_at(20, Daemon(q.base), Daemon(p.base))   # both restarted
+    assert len(told(q)) == 1, "a restart sent the reminder again"
+    round_at(61, dp, dq)
+    assert len(told(q)) == 2, "the next reminder did not come"
 
 
 

@@ -26,8 +26,9 @@ folder, and the others post theirs on the `quiet` channel, shown in the web app 
 but never sent to a chat, Slack or the desktop.
 
 A logout is the exception to the one daily reminder: every project waiting on the logged-out CLI
-reports itself into the claim (machine_round), and the claimer reminds the chats at LOGOUT_REMIND_S
-with how many projects, queued tasks and high events wait, whichever project holds the claim then.
+reports itself into the claim (machine_round), and each project whose work can run on no other
+provider reminds its own chats at LOGOUT_REMIND_S with how many projects, queued tasks and high
+events wait, whether or not it holds the claim.
 
 Page severity of daemon events that need no user decision, so they wake the coordinator only when it matters.
 
@@ -916,10 +917,11 @@ def due_reminders(since: float, now: float) -> int:
 def machine_round(claim_key: str, key: str, owner: str, now: float, cleared: float, raised: float,
                   info: dict) -> dict | None:
     """One project's turn on a machine-wide logout: report what waits on it here (`info`: name,
-    queued, events) into the shared claim, and if this project holds or may take the claim and a
-    reminder is due, mark it sent and return what the reminder says: {since, reminder, waiting}
-    (the live projects' reports). None otherwise, also when the claim file cannot be used: a
-    reminder is extra, the first alert already went out."""
+    queued, events, need) into the shared claim, and if work here can run on no other provider
+    (`need`) and a reminder is due that this project has not sent, mark it sent for this project and
+    return what the reminder says: {since, reminder, waiting} (the live projects' reports). Every
+    such project reminds its own chats, not only the claim's holder. None otherwise, also when the
+    claim file cannot be used: a reminder is extra, the first alert already went out."""
     path = claims_path()
     try:
         path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -941,17 +943,19 @@ def machine_round(claim_key: str, key: str, owner: str, now: float, cleared: flo
                    and (o == owner or owner_alive(o))}
         waiting[owner] = {**info, "ts": now}
         since = min(float((held or {}).get("since") or raised), raised)
-        out = None
         if held and held.get("owner") != owner and owner_alive(str(held.get("owner"))):
             data[claim_key] = {**held, "waiting": waiting, "since": since}
         else:
             _take(data, claim_key, key, owner, now, cleared)
-            rec = data[claim_key]
-            rec.update(waiting=waiting, since=since)
-            due = due_reminders(since, now)
-            if due > int(rec.get("reminded") or 0):
-                rec["reminded"] = due
-                out = {"since": since, "reminder": due, "waiting": list(waiting.values())}
+            data[claim_key].update(waiting=waiting, since=since)
+        rec = data[claim_key]
+        sent = rec.get("reminded")
+        sent = sent if isinstance(sent, dict) else {rec["owner"]: int(sent or 0)}   # an older claim counted the claimer's only
+        due = due_reminders(since, now)
+        out = None
+        if info.get("need", True) and due > int(sent.get(owner) or 0):
+            rec["reminded"] = {**sent, owner: due}
+            out = {"since": since, "reminder": due, "waiting": list(waiting.values())}
         from .project import write_json
         write_json(path, data, 0o600)
         return out
