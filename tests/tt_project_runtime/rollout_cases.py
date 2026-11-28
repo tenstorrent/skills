@@ -1562,3 +1562,69 @@ def test_digest_and_status_word_each_flags_effective_state_and_source_alike(env,
     assert "deslop: off (rollout off)" in line, "off"
     out = _roll(capsys, "status")[1]
     assert "in alpha: shadow (own setting; rollout off)" in out, "the status view words it as the digest does"
+
+
+def _coordinator_session(env, monkeypatch, name="alpha"):
+    """A project with a running coordinator run row, and the env its daemon gives that run."""
+    from ttp import rollout
+    p = make(env, name)
+    rid = p.db.x("INSERT INTO runs(role,started,status) VALUES('coordinator',?,'running')", (time.time(),))
+    for k, v in (("TTP_RUN_DIR", str(p.runs / str(rid))), ("TTP_ROLE", "coordinator"), ("TTP_RUN_ID", str(rid)),
+                 ("TTP_PROJECT", str(p.base))):
+        monkeypatch.setenv(k, v)
+    monkeypatch.delenv("TTP_TASK", raising=False)
+    return p, rollout
+
+
+def test_the_coordinator_session_sets_and_promotes_a_flag_up_to_its_level_on_a_reason(env, capsys, monkeypatch):
+    p, rollout = _coordinator_session(env, monkeypatch)
+    code, out = _roll(capsys, "set", "deslop", "0")
+    assert code == 2 and "--reason" in out and rollout.level("deslop") == rollout.OFF
+    assert _roll(capsys, "set", "deslop", "0", "--reason", "arm the canary")[0] == 0
+    assert _roll(capsys, "promote", "deslop", "--reason", "canary clean")[0] == 0 and rollout.level("deslop") == 1
+    assert [(r["kind"], r["by"], r["reason"]) for r in rollout.ledger("deslop")] == [
+        ("set", "coordinator:alpha", "arm the canary"), ("promote", "coordinator:alpha", "canary clean")]
+    assert "last changed by coordinator:alpha: canary clean" in _roll(capsys, "status")[1]
+    assert _roll(capsys, "set", "deslop", "off", "--reason", "pause it")[0] == 0 and rollout.level("deslop") == rollout.OFF
+    _roll(capsys, "set", "deslop", "1", "--reason", "again")
+    assert "frozen" in rollout.rollback("deslop", "failed runs up", "daemon:alpha"), "the health watch still guards it"
+    assert rollout.frozen("deslop") and rollout.level("deslop") == rollout.OFF
+
+
+def test_the_coordinator_session_never_sets_level_2_auto_rings_or_waves(env, capsys, monkeypatch):
+    p, rollout = _coordinator_session(env, monkeypatch)
+    _roll(capsys, "set", "glm_work", "1", "--reason", "canary")
+    for argv in (("set", "glm_work", "2"), ("promote", "glm_work"), ("set", "glm_work", "auto"),
+                 ("ring", "alpha", "0"), ("waves", "glm_work", "alpha")):
+        code, out = _roll(capsys, *argv, "--reason", "wider")
+        assert code == 2 and "ring 2 needs the user's word" in out, (argv, out)
+    assert rollout.level("glm_work") == 1 and rollout.settings().get("rings") is None
+    assert rollout.settings().get("waves") is None
+
+
+def test_a_task_run_or_a_forged_coordinator_env_is_refused_and_off_restores_the_old_refusal(env, capsys, monkeypatch):
+    from ttp.project import set_account_setting
+    p, rollout = _coordinator_session(env, monkeypatch)
+    run_id = os.environ["TTP_RUN_ID"]
+    monkeypatch.setenv("TTP_TASK", "7")
+    code, out = _roll(capsys, "set", "deslop", "1", "--reason", "worker")
+    assert code == 2 and "only the user's terminal" in out, "a task run is no coordinator"
+    monkeypatch.delenv("TTP_TASK")
+    monkeypatch.setenv("TTP_RUN_ID", "999")
+    code, out = _roll(capsys, "set", "deslop", "1", "--reason", "forged")
+    assert code == 2 and "only the user's terminal" in out, "no coordinator run row: the env alone is nothing"
+    monkeypatch.setenv("TTP_RUN_ID", run_id)
+    for off in ("off", -1):
+        set_account_setting("rollout.coordinator_max_level", off)
+        code, out = _roll(capsys, "set", "deslop", "1", "--reason", "x")
+        assert code == 2 and "only the user's terminal" in out and rollout.level("deslop") == rollout.OFF
+    assert not rollout.ledger("deslop")
+
+
+def test_a_run_never_clears_or_sets_the_coordinators_level(env, capsys, monkeypatch):
+    from ttp import cli
+    p, rollout = _coordinator_session(env, monkeypatch)
+    for argv in (["--account", "rollout.coordinator_max_level", "2"], ["--account", "rollout.coordinator_max_level", ""]):
+        with pytest.raises(SystemExit) as e:
+            cli.main(["config", *argv])
+        assert e.value.code and "coordinator_max_level" not in str(rollout.settings())

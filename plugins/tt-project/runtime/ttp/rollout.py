@@ -862,6 +862,8 @@ def status(projects: dict | None = None) -> dict:
                           "shadow": bool(m.get("shadow")), "waves": waves(f, cfg), "wave": wave_at(f, cfg),
                           "rolled_back": rolled_back(f, cfg), "overrides": over.get(f, []),
                           "own": {n: effective(f, n, r, cfg) for n, r in raws.items() if own_setting(r, m["key"])},
+                          "set_by": next(({k: r.get(k) for k in ("by", "reason")} for r in reversed(ledger(f))
+                                          if r.get("kind") in ("set", "promote", "rollback", "arm")), None),
                           "armed": next((r for r in reversed(ledger(f))
                                          if r.get("op") == "project_arm" and r.get("run")), None),
                           "fixed": fixed_shown(f)}
@@ -869,6 +871,46 @@ def status(projects: dict | None = None) -> dict:
 
 
 RUN_REARM_KEY = "run_rearm"   # rollout.*: whether a run may re-arm one project with evidence
+COORD_MAX_KEY = "coordinator_max_level"   # rollout.*: the widest level a coordinator session sets (off or -1: none)
+
+
+def coordinator_project() -> str:
+    """The name of the project whose coordinator session is calling, else "": the daemon's run row says so
+    (a task run has a TTP_TASK, and the row is the coordinator's and still running), never the env alone."""
+    from . import coordtools, project as project_mod
+    run = os.environ.get("TTP_RUN_ID") or ""
+    if os.environ.get("TTP_TASK") or os.environ.get(coordtools.ROLE_ENV) != "coordinator" or not run.isdigit():
+        return ""
+    p = project_mod.here()
+    row = p.db.one("SELECT id FROM runs WHERE id=? AND role='coordinator' AND status='running'", (int(run),)) \
+        if p is not None else None
+    return p.name if row else ""
+
+
+def coordinator_max() -> int:
+    """`rollout.coordinator_max_level`: the widest ring a coordinator session sets (default 1); -1 when off."""
+    cap = settings().get(COORD_MAX_KEY, 1)
+    return cap if isinstance(cap, int) and not isinstance(cap, bool) and cap >= 0 else -1
+
+
+def coordinator_refusal(a, reason: str) -> str:
+    """Why a coordinator session may not `set` or `promote` as asked, else "": it names a reason and stays
+    within `coordinator_max`; auto and anything wider stay the user's."""
+    cap = coordinator_max()
+    stays = (f"a coordinator sets or promotes a flag up to level {cap} (rollout.coordinator_max_level); "
+             "level 2, auto, rings and waves stay the user's terminal: ring 2 needs the user's word")
+    if a.action in ("ring", "waves"):
+        return stays
+    if not reason:
+        return "a coordinator's change carries its --reason"
+    try:
+        cur = level(a.target) if a.action == "promote" else None
+        to = parse_level(a.value) if a.action == "set" else (0 if cur == OFF else cur + 1 if cur != AUTO else AUTO)
+    except ValueError:
+        return ""   # an unknown flag or level: the change itself says so
+    if to == AUTO or (to != OFF and to > cap):
+        return stays
+    return ""
 
 
 def rearm_refusal(a) -> tuple[str, dict]:
@@ -945,7 +987,8 @@ def rearm_replay(ref: str, target, p, not_before: float = 0.0) -> str:
 
 
 def run(a) -> int:
-    """`ttp rollout ACTION ...`: the terminal's (the user's) edit of the rollout state. A run's own call may
+    """`ttp rollout ACTION ...`: the terminal's (the user's) edit of the rollout state. A project's coordinator
+    session may also `set` and `promote` a flag up to `rollout.coordinator_max_level`, on a reason. A run's own call may
     only read it (`status`, or `on`, a wait's probe), roll a flag back in one project for a quality reason
     (stop_project: never the whole flag, never a freeze; an outage or quota reason is refused: outage_refusal)
     or re-arm one project (rearm_refusal: on the evidence its fix landed, deployed and its replay passed),
@@ -954,10 +997,15 @@ def run(a) -> int:
     in_run = bool(os.environ.get("TTP_RUN_DIR"))
     act = a.action
     evidence: dict = {}
+    coord = coordinator_project() if in_run and act in ("set", "promote", "ring", "waves") and coordinator_max() >= 0 else ""
     if in_run and act == "arm":   # one project, on evidence; everything else stays the user's
         why, evidence = rearm_refusal(a)
         if why:
             print(f"ttp rollout arm: {why}", flush=True)
+            return 2
+    elif coord:   # the coordinator session, a third class: set and promote within its level, on a reason; the rest refused
+        if why := coordinator_refusal(a, (a.reason or "").strip()):
+            print(f"ttp rollout {act}: {why}", flush=True)
             return 2
     elif in_run and act not in ("status", "rollback", "on", "fixed"):
         print(f"ttp rollout {act}: only the user's terminal changes the rollout state; a run may read it "
@@ -998,6 +1046,8 @@ def run(a) -> int:
                     print("  waves: " + " | ".join(("> " if i == e["wave"] else "") + ",".join(w)
                                                     for i, w in enumerate(e["waves"]))
                           + (f"  (auto: waves 0..{e['wave']} on)" if e["level"] == AUTO else ""))
+                if e["set_by"]:
+                    print(f"  last changed by {e['set_by']['by']}: {e['set_by']['reason']}")
                 for n, r in sorted(e["rolled_back"].items()):
                     print(f"  rolled back in {n} alone: {r.get('why')}  (`ttp rollout arm {f} {n}`)")
                 if e.get("armed"):
@@ -1012,6 +1062,7 @@ def run(a) -> int:
                     print(f"  in {n}: {text}" + (f", overriding the rollout since {since[n]}" if n in since else ""))
             return 0
         reason = (a.reason or "").strip()
+        by = f"coordinator:{coord}" if coord else "user"
         if act == "fixed":
             _check(a.target)
             why, rec = fixed_refusal(a)
@@ -1032,9 +1083,9 @@ def run(a) -> int:
         if act == "ring":
             print(set_ring(a.target, a.value))
         elif act == "set":
-            print(set_level(a.target, a.value, reason or "set by hand"))
+            print(set_level(a.target, a.value, reason or "set by hand", by))
         elif act == "promote":
-            print(promote(a.target, reason))
+            print(promote(a.target, reason, by))
         elif act == "rollback" and in_run:   # one project, never a freeze; the whole flag is the user's
             _check(a.target)
             why = outage_refusal(reason)

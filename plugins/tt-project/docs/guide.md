@@ -5440,7 +5440,7 @@ daemon tick, so a change needs no restart.
 
 `ttp rollout status` shows it; `ttp rollout ring <project> 0|1|2|exclude|include`, `set <flag> off|0|1|2`
 and `promote <flag>` change it; `rollback <flag>` turns a flag off and freezes it until `arm <flag>` (a fix
-landed). Only the user's terminal widens a flag or edits the ring lists; a run may read the state, roll a
+landed). Only the user's terminal widens a flag past `rollout.coordinator_max_level` (default 1; `off` or -1 withdraws it) or edits the ring lists, sets level 2 or auto, or sets waves: a project's coordinator session may `set` and `promote` a flag up to that level, with `--reason`, ledgered as `coordinator:<project>` and shown by `status`. A run may read the state, roll a
 flag back or, when the account setting `rollout.run_rearm` is on, re-arm one rolled-back project with
 `ttp rollout arm FLAG PROJECT --fix TASK --replay RUN`: the fix task's change must be on the push branch
 and deployed to that project, and the replay of the rollback's cause must have passed. The command writes only the account settings and the ledger, never a project's charter, memory,

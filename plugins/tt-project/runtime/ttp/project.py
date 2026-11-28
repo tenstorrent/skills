@@ -3503,7 +3503,7 @@ ACCOUNT_KEYS = {"budget": {"global_daily_usd", "day_start", "timezone", "push_sp
                 # thresholds (the health watch's limits), scratch_cap_usd (a ring-0 scratch project's daily spend cap),
                 # waves {flag: [[names]]}, wave_at {flag: k} and project_rollback {flag: {name: {ts, why}}} (auto's wave gate)
                 "rollout": {"flags", "rings", "excluded", "thresholds", "scratch_cap_usd", "waves", "wave_at",
-                            "project_rollback", "run_rearm"},
+                            "project_rollback", "run_rearm", "coordinator_max_level"},
                 "chat": {"max_inflight"},   # the host's chat-provider calls in flight at once (inflight.py)
                 "machine": {"max_workers"}}   # the user's worker ceiling for all projects on the machine (machinecap.ceiling)
 # Account keys a run may only clear (ttp config --account refuses setting them inside a run): remove them
@@ -3512,7 +3512,7 @@ ACCOUNT_KEYS = {"budget": {"global_daily_usd", "day_start", "timezone", "push_sp
 ACCOUNT_USER_ONLY = {"checks.spill_hosts", "providers.chat.ranking_source",
                      "providers.chat.ranking_key_file", "rollout.flags", "rollout.rings", "rollout.excluded",
                      "rollout.thresholds", "rollout.scratch_cap_usd", "rollout.waves", "rollout.wave_at",
-                     "rollout.project_rollback", "rollout.run_rearm"}
+                     "rollout.project_rollback", "rollout.run_rearm", "rollout.coordinator_max_level"}
 ACCOUNT_OFF_VALUE = {"checks.spill_hosts": [], "rollout.flags": {}}
 # Host-wide account keys the runtime reads only from the account settings: a project's own copy would
 # show a value nothing uses, so layered() shows the account's in every project and set_config refuses one.
