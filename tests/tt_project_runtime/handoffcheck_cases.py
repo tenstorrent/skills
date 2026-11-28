@@ -865,3 +865,72 @@ def test_a_glm_hand_off_is_sent_back_for_an_incident_comment_and_passes_once_it_
     git("commit", "-qam", "the rule instead")
     git("checkout", "-q", "-")
     assert handoffcheck.verdict(p, {}, glm, {"status": "done"}, None) == {}
+
+
+def _probe_branch(p, rel, text):
+    git = lambda *a: subprocess.run(["git", "-C", str(p.root), *a], check=True, capture_output=True)   # noqa: E731
+    git("checkout", "-q", "-b", "ttp/probes")
+    (p.root / rel).parent.mkdir(parents=True, exist_ok=True)
+    (p.root / rel).write_text(text)
+    git("add", "-A")
+    git("commit", "-qm", "change")
+    git("checkout", "-q", "-")
+
+
+def _probe_task(p, even):
+    """A GLM code task on the branch, with an even (treatment) or odd (control) id."""
+    from ttp import route
+    while True:
+        task = _gw9846_task(p, route.TO, "example-org/glm-x", "ttp/probes")
+        if (task["id"] % 2 == 0) == even:
+            return task
+
+
+def test_the_probe_arm_is_the_task_id_parity():
+    from ttp import codearm
+    assert [codearm.probe_arm(i) for i in (2, 3, 10, 11)] == ["treatment", "control", "treatment", "control"]
+
+
+def test_a_treatment_arm_glm_hand_off_that_changes_code_is_sent_back_without_probes(env):
+    """With glm_probes on: a treatment-arm GLM hand-off changing code needs two filled-in probes (in the hand-off or
+    its self_check); the control arm, a docs-only change, a blocked hand-off and a project with the flag off owe none."""
+    from ttp import handoffcheck
+    p = make(env)
+    _probe_branch(p, "src/rule.py", "def rule(x):\n    return x\n")
+    treat, control = _probe_task(p, True), _probe_task(p, False)
+    done = {"status": "done"}
+    assert handoffcheck.verdict(p, {}, treat, done, None) == {}, "the flag is off"
+    p.set_config("glm.probes", True)
+    got = handoffcheck.verdict(p, {}, treat, done, None)
+    assert got["failed"]["name"] == handoffcheck.GLM_CHECK and "adversarial probes" in got["failed"]["output"], got
+    assert handoffcheck.verdict(p, {}, control, done, None) == {}, "the control arm owes none"
+    assert handoffcheck.verdict(p, {}, treat, {"status": "blocked"}, None) == {}
+    one = {"input": "[]", "output": "0", "expected": "0"}
+    assert handoffcheck.verdict(p, {}, treat, {**done, "probes": [one]}, None)["failed"], "one probe is too few"
+    assert handoffcheck.verdict(p, {}, treat, {**done, "probes": [one, {**one, "output": ""}]}, None)["failed"]
+    assert handoffcheck.verdict(p, {}, treat, {**done, "probes": [one, {**one, "input": "[-1]"}]}, None) == {}
+    assert handoffcheck.verdict(p, {}, treat, {**done, "self_check": {"probes": [one, one]}}, None) == {}
+    p.set_config("glm.probes", False)
+    assert handoffcheck.verdict(p, {}, treat, done, None) == {}, "its own false turns it off"
+
+
+def test_a_treatment_arm_docs_only_change_owes_no_probes(env):
+    from ttp import handoffcheck
+    p = make(env)
+    _probe_branch(p, "docs/notes.md", "A note.\n")
+    p.set_config("glm.probes", True)
+    assert handoffcheck.verdict(p, {}, _probe_task(p, True), {"status": "done"}, None) == {}
+
+
+def test_only_a_treatment_arm_glm_code_prompt_asks_for_probes(env):
+    from ttp import route
+    from ttp.prompts import worker_task
+    p = make(env)
+    ids = []
+    while len({i % 2 for i in ids}) < 2:
+        ids.append(p.db.add_task("t", "s", kind="code", tier="light", origin="user"))
+    even, odd = [next(i for i in ids if i % 2 == par) for par in (0, 1)]
+    ask = lambda tid, prov: "Adversarial probes" in worker_task(p, p.db.task(tid), str(p.root), None, provider=prov)   # noqa: E731
+    assert not ask(even, route.TO), "the flag is off"
+    p.set_config("glm.probes", True)
+    assert ask(even, route.TO) and not ask(odd, route.TO) and not ask(even, "claude")

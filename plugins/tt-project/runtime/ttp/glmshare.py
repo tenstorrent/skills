@@ -68,7 +68,8 @@ import json
 import re
 from pathlib import Path
 
-from . import glmassist, route, runclass
+from . import codearm, glmassist, route, runclass
+from .db import load_result
 from .util import task_labels
 
 ROLES = ("coordinator", "plan", "review", "code", "work", "question", "harness", "device", "other")
@@ -167,17 +168,39 @@ def arm_of(tid: int, runs: list[dict], work: dict, code: dict) -> str:
 
 
 def _reviews(db, since: float) -> dict[int, dict]:
-    """{task id: {"first": done | failed | None, "at": the first deciding review's created time, "open": bool}}
+    """{task id: {"first": done | failed | None, "at": the first deciding review's created time, "open": bool,
+    "code_finding": the first failed review found a bug in the code (review_failure substantive or mixed)}}
     from its auto reviews created since `since`."""
     out: dict[int, dict] = {}
-    for r in db.q("SELECT id, status, labels, created FROM tasks WHERE kind='review' AND labels LIKE '%\"auto_review:%' "
+    for r in db.q("SELECT id, status, labels, created, result FROM tasks WHERE kind='review' AND labels LIKE '%\"auto_review:%' "
                   "AND created>=? ORDER BY id", (since,)):
         for lb in task_labels(r):
             if lb.startswith("auto_review:") and lb[12:].isdigit():
                 v = out.setdefault(int(lb[12:]), {"first": None, "at": None, "open": False})
                 if r["status"] in ("done", "failed") and v["first"] is None:
                     v["first"], v["at"] = r["status"], float(r["created"] or 0)
+                    v["code_finding"] = (r["status"] == "failed"
+                                         and load_result(r["result"]).get("review_failure") in ("substantive", "mixed"))
                 v["open"] |= r["status"] not in ("done", "failed", "cancelled")
+    return out
+
+
+def probe_arms(ids, tasks: dict, reviews: dict) -> dict:
+    """The adversarial-probe A/B (codearm.probe_arm) over the GLM code tasks `ids`, per arm: those with a first
+    review, how many failed it, how many of those failed on a finding in the code (the share logic bugs make of the
+    failures; the review's own `review_failure`, no model), and both as percents."""
+    out = {a: {"reviewed": 0, "failed": 0, "code_findings": 0} for a in codearm.PROBE_ARMS}
+    for t in ids:
+        rv = reviews.get(t) or {}
+        if (tasks.get(t) or {}).get("kind") != "code" or not rv.get("first"):
+            continue
+        v = out[codearm.probe_arm(t)]
+        v["reviewed"] += 1
+        v["failed"] += rv["first"] == "failed"
+        v["code_findings"] += bool(rv.get("code_finding"))
+    for v in out.values():
+        v["first_fail_pct"] = round(100.0 * v["failed"] / v["reviewed"], 1) if v["reviewed"] else None
+        v["logic_bug_pct"] = round(100.0 * v["code_findings"] / v["failed"], 1) if v["failed"] else None
     return out
 
 
@@ -402,7 +425,7 @@ def report(p, since: float, now: float) -> dict:
     from . import correction
     corr = [c for c in (db.kv(correction.KEY, []) or []) if isinstance(c, dict) and since <= float(c.get("ts") or 0) < now]
     return {"project": p.name, "since": since, "until": now, "days": days, "total": total, "roles": roles,
-            "arms": arms, "held": held(p, since, now), "claude_usd_per_day": round(float(usd or 0) / days, 2) if days > 0 else None,
+            "arms": arms, "probes": probe_arms(by_arm["glm"], tasks, ctx[0]), "held": held(p, since, now), "claude_usd_per_day": round(float(usd or 0) / days, 2) if days > 0 else None,
             "corrections": {"n": len(corr), "per_arm": None,
                             "note": "a correction names no task, so it is counted per project; kept 7 days"},
             "bad_output": bad_output(p, rows),
@@ -519,6 +542,10 @@ def text(s: dict) -> str:
                      f"{q['reopened']} reopened, first review passed {pct(q['first_pass_pct'])} of {q['reviewed']}, "
                      f"fix rounds/reviewed {q['fix_rounds_per_reviewed'] if q['fix_rounds_per_reviewed'] is not None else '-'}, "
                      f"{q['bounces']} bounced, {q['incidents']} device incidents on GLM runs")
+    for a, v in (s.get("probes") or {}).items():
+        if v["reviewed"]:
+            lines.append(f"  GLM code probes {a}: first review failed {pct(v['first_fail_pct'])} of {v['reviewed']}, "
+                         f"{pct(v['logic_bug_pct'])} of the failures on a code finding")
     lines.append(f"  Claude ${s['claude_usd_per_day'] or 0:.2f}/day; user corrections {s['corrections']['n']} "
                  "(per project: a correction names no task)")
     if (rv := s.get("reviews_on_glm")):

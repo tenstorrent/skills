@@ -542,3 +542,28 @@ def test_a_task_that_bounced_after_its_first_review_keeps_that_review_as_glms(en
     _gs_run(p, tid, t0 + 90000, 2, note={route.KEY: {"to": route.TO, "fallback": route.BOUNCE}})
     _gs_run(p, tid, t0 + 95000, 3, provider="claude", model="opus")
     assert glmshare.judge(p, _GS_CFG, now)["glm_pct"] < 100.0, "the review before the bounce is GLM's"
+
+
+def test_glm_share_reports_the_first_review_fail_rate_and_code_finding_share_per_probe_arm(env, capsys):
+    """GLM code tasks split by task-id parity (treatment even, control odd): first reviews failed, and how many of
+    those failed on a code finding (review_failure substantive or mixed, not check_only)."""
+    from ttp import glmshare
+    p = make(env)
+    now = 1_000_000_000.0 + 30 * 86400
+    t = now - 20 * 3600
+    even, odd = [], []
+    while len(even) < 3 or len(odd) < 3:
+        tid = _gs_task(p)
+        (even if tid % 2 == 0 else odd).append(tid)
+        _gs_run(p, tid, t, 1)
+    for tid, status, kind in ((even[0], "done", None), (even[1], "failed", "substantive"), (even[2], "failed", "check_only"),
+                              (odd[0], "failed", "mixed"), (odd[1], "failed", "substantive"), (odd[2], "done", None)):
+        rv = _gs_review(p, tid, status)
+        if kind:
+            p.db.x("UPDATE tasks SET result=? WHERE id=?", (json.dumps({"review_failure": kind}), rv))
+    s = glmshare.report(p, now - 86400, now)
+    got = {a: (v["reviewed"], v["failed"], v["code_findings"], v["first_fail_pct"], v["logic_bug_pct"])
+           for a, v in s["probes"].items()}
+    assert got == {"treatment": (3, 2, 1, 66.7, 50.0), "control": (3, 2, 2, 66.7, 100.0)}, got
+    out = glmshare.text(s)
+    assert "GLM code probes treatment: first review failed 66.7% of 3, 50% of the failures on a code finding" in out, out

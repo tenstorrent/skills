@@ -30,7 +30,8 @@ of its new tests failing on the base commit (new_test_gap), whatever ran it, cou
 commits add (_own_tests: never those a known base or the accepted head it continues already reaches); a run on the GLM model is checked
 further: its branch's added test lines must not name the real /tmp, /home, ~ or Path.home()
 (glm_test_hygiene), its added comments and docstrings must state the rule and never tell what happened
-(slop.new_noisy), and its hand-off must name each numbered spec step (handoff_gaps). A failure sends back like a project check, under
+(slop.new_noisy), and its hand-off must name each numbered spec step (handoff_gaps), and with the glm_probes flag on, a treatment-arm hand-off that
+changes code carries its adversarial `probes` (probe_gap). A failure sends back like a project check, under
 the same cap."""
 from __future__ import annotations
 
@@ -63,6 +64,7 @@ RUN_VARS = ("TTP_RUN_DIR", "TTP_TASK", "TTP_TASK_ID", "TTP_RUN_ID", "TTP_PROJECT
 SEEN_TTL_S = 300
 KILL_WAIT_S = 5                   # the wait for a killed check's output; an escaped child is not waited for
 _seen: dict[tuple[str, int, str], tuple[float, dict]] = {}
+PROBE_KEYS = ("input", "output", "expected")
 GLM_CHECK = "glm hand-off check"   # a GLM run's full built-in check
 CODE_CHECK = "new-test check"        # any other run's: a new test must be shown failing on the base
 # The real machine's paths in a test (a temp dir or the user's home): a string literal that opens with one, or
@@ -196,6 +198,25 @@ def handoff_gaps(diff_text: str, spec: str, handoff: dict, own: set | None = Non
     return out
 
 
+def probe_gap(p: Project, task: dict, handoff: dict, diff_text: str) -> str | None:
+    """The line a treatment-arm GLM hand-off that changes code owes without `probes` (codearm.probes_on): at
+    least two {input, output, expected} entries, in the hand-off or its self_check, each filled in."""
+    from . import codearm, reviewstats
+    if (codearm.probe_arm(task["id"]) != "treatment" or handoff.get("status") not in ("done", "needs_review")
+            or not codearm.probes_on(p)
+            or not any(reviewstats.area(path) == "runtime" for path, _ in _added(diff_text))):
+        return None
+    check = handoff.get("self_check")
+    got = handoff.get("probes") or (check.get("probes") if isinstance(check, dict) else None)
+    ok = [x for x in got if isinstance(x, dict) and all(str(x.get(k) or "").strip() for k in PROBE_KEYS)] \
+        if isinstance(got, list) else []
+    if len(ok) < 2:
+        return ("The change has no adversarial probes: run each changed function or rule on 2-3 inputs (a boundary "
+                "value, an empty input, the spec's failure case) and put the actual outputs in `probes`: "
+                '[{"input", "output", "expected"}].')
+    return None
+
+
 def _glm_run(p: Project, task: dict) -> bool:
     """Whether `task` is a code task whose last worker run ran on the GLM model (glmshare.on_glm)."""
     if task.get("kind") != "code" or not task.get("id"):
@@ -284,7 +305,8 @@ def builtin_check(p: Project, task: dict, handoff) -> dict | None:
     out = (["Tests must not touch the real machine's paths:", *bad[:20]] if bad else []) \
         + (["Comments and docstrings state the rule, never an incident (a date, id or host):",
             *(f"{n['at']}: {n['text']}" for n in noisy[:20])] if noisy else []) \
-        + handoff_gaps(diff, task.get("spec") or "", handoff, own)
+        + handoff_gaps(diff, task.get("spec") or "", handoff, own) \
+        + [gap for gap in [probe_gap(p, task, handoff, diff)] if gap]
     return {"name": GLM_CHECK, "output": "\n".join(out)} if out else None
 
 

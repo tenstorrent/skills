@@ -202,6 +202,21 @@ def held(db, cfg: dict) -> bool:
     return isinstance(got, dict) and bool(got.get("ts")) and got.get("setting") == setting_mark(cfg)
 
 
+PROBE_ARMS = ("treatment", "control")   # the adversarial-probe A/B: an even task id is the treatment
+
+
+def probe_arm(task_id) -> str:
+    return PROBE_ARMS[int(task_id) % 2]
+
+
+def probes_on(p) -> bool:
+    """The glm_probes release flag (rollout.py) is on for the project; its own `glm.probes: false` turns it off."""
+    from . import rollout
+    raw = p.raw_config()
+    own = raw.get("glm") if isinstance(raw.get("glm"), dict) else {}
+    return rollout.on("glm_probes", p.name, raw) and own.get("probes") is not False
+
+
 def coin(task_id, share: float, seed: str = "") -> bool:
     """The seeded coin: the same task and seed get the same side every time."""
     h = hashlib.sha256(f"code-arm:{seed}:{task_id}".encode()).hexdigest()

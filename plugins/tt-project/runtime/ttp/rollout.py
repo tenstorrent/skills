@@ -76,6 +76,10 @@ FLAGS: dict[str, dict[str, Any]] = {
     # lane turn beside the coordinator's own, nothing applied); live mode is the project's own setting.
     "glm_coord": {"key": "coordinator.routine.mode", "area": "coordinator", "code": _code("coordroute.py", "daemon.py"),
                   "arm": "glm", "runs": "coordinator"},
+    # The adversarial-probe step (codearm.probes_on): a GLM code run of the treatment arm (even task id) puts probe
+    # outputs in its hand-off, and the hand-off check sends one without them back; glmshare reports both arms.
+    "glm_probes": {"key": "glm.probes", "area": "route", "code": _code("codearm.py", "handoffcheck.py", "prompts.py"),
+                   "arm": "glm"},
     "eta_history": {"key": "eta.history", "area": "eta", "shadow": True,
                     "code": _code("etaledger.py", "costlevers.py", "cli.py")},
     "deslop": {"key": "deslop.enabled", "area": "review", "code": _code("deslop.py")},
