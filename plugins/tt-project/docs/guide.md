@@ -950,7 +950,7 @@ coordinator with that evidence.
   other scripts onto 0 and 1 with a wrapper, e.g. a fix already merged:
   `premise_cmd: git merge-base --is-ancestor <sha> origin/<branch> && exit 1 || exit 0`. The daily
   review counts premise-closed tasks and the cost they saved at the tier's median code run.
-- Dead landing waits (model-free): a queued task whose start_when is exactly `landed:#<id>`, with
+- Dead landing waits (model-free): a queued task whose start_when or retry_when is only landing waits (`landed:#<id>`, `ttp landed --task <id>`), with
   that producer done, not landed and nothing open that can land it (no review, fix, rebase, task on
   its branch or push queue row) for `waiting.landed_wait_dead_s` (900), raises one
   `landed_wait_dead` event naming the held tasks, judged from saved task rows only, so a restart
