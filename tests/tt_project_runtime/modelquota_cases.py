@@ -62,7 +62,12 @@ def test_model_quota_bucket_is_set_by_a_429_or_an_empty_header_and_clears_at_its
     assert modelquota._reset({"x-ratelimit-reset": "30"}, 1e9) == 1e9 + 30
     assert modelquota._reset({"x-ratelimit-reset": "1900000000"}, 1e9) == 1.9e9
     assert modelquota._reset({"x-ratelimit-reset-tokens": "1h2m3s"}, 0) == 3723
+    assert modelquota._reset({"x-ratelimit-reset-tokens": "6ms"}, 0) == 0.006
     assert modelquota._reset({}, 7200.5) == 10800
+    # Requests at 0 reads the requests reset, not the tokens one.
+    modelquota.note("rq-model", {"x-ratelimit-remaining-tokens": "9", "x-ratelimit-reset-tokens": "5s",
+                                 "x-ratelimit-remaining-requests": "0", "x-ratelimit-reset-requests": "2m"}, now=1e9)
+    assert modelquota.until("rq-model", now=1e9) == 1e9 + 120
 
 
 def test_model_quota_flag_off_by_default_and_routing_unchanged_while_off(env, monkeypatch):
@@ -77,7 +82,7 @@ def test_model_quota_flag_off_by_default_and_routing_unchanged_while_off(env, mo
 
 
 def test_model_quota_empty_bucket_takes_the_first_served_alternate_with_room(env, monkeypatch):
-    from ttp import modelquota, route
+    from ttp import modelpick, modelquota, route
     p, d = _mq_setup(env, monkeypatch)
     prov, _, note = _route_dispatch(p, d, monkeypatch, title="room")
     assert prov == "chat" and note[route.KEY]["model"] == _RT_MODEL and modelquota.KEY not in note[route.KEY]
@@ -87,6 +92,7 @@ def test_model_quota_empty_bucket_takes_the_first_served_alternate_with_room(env
     q = note[route.KEY][modelquota.KEY]
     assert prov == "chat" and note[route.KEY]["model"] == "alt-b" and note[route.KEY]["fallback"] == "none"
     assert (q["from"], q["to"], q["n"]) == (_RT_MODEL, "alt-b", 2) and q["until"] > time.time()
+    assert modelpick.run_model(note, "chat", _RT_MODEL, "") == ("alt-b", ""), "the run starts on the alternate"
     assert q["why"].startswith(f"{_RT_MODEL} quota bucket empty until ") and q["why"].endswith(": alternate 2, alt-b")
     # An alternate the endpoint does not serve is skipped; none with room: the core provider, fallback quota.
     route.write_served(p.state, "chat", True, "HTTP 200", [_RT_MODEL, "alt-a"], time.time())
@@ -132,6 +138,10 @@ def test_model_quota_a_chat_model_pin_waits_while_its_bucket_is_empty(env, monke
     assert "pinned-m's quota bucket on chat is empty until" in d._required_model_down({"model": "pinned-m"}, "chat", now)
     assert d._required_model_down({"model": "pinned-m"}, "claude", now) == ""
     assert d._required_model_down({"model": "pinned-m"}, "chat", modelquota.until("pinned-m") + 1) == ""
+    # An unpinned run on chat starts on its tier's model: it waits while that bucket is empty too.
+    assert d._required_model_down({"tier": "light"}, "chat", now) == ""
+    modelquota.mark(_RT_MODEL, now=now)
+    assert f"{_RT_MODEL}'s quota bucket on chat is empty until" in d._required_model_down({"tier": "light"}, "chat", now)
 
 
 def test_model_quota_stop_with_an_alternate_free_neither_pauses_nor_cools_the_endpoint(env, monkeypatch):

@@ -14448,12 +14448,16 @@ class Daemon:
     def _required_model_down(self, task: dict, provider: str, now: float) -> str:
         """Why a task whose required model pin (failover.required) on chat is down (modelrank.down) waits,
         else '': such a pin is never swapped for a ranked model. With glm_quota_alt on, any model pin on chat
-        waits while that model's quota bucket is empty (modelquota.py)."""
+        waits while that model's (else its tier's chat model's) quota bucket is empty (modelquota.py)."""
         model = str(task.get("model") or "")
-        if provider != route.TO or not model:
+        if provider != route.TO:
             return ""
-        if self._quota_on() and (t := modelquota.until(model, now)):   # never dispatched to an empty bucket
-            return f"its model {model}'s quota bucket on {route.TO} is empty until {timefmt.long(t, self.p)}"
+        tier = (((self.cfg.get("providers") or {}).get(route.TO) or {}).get("tiers") or {}).get(task.get("tier"))
+        m = model or str(tier.get("model") or "" if isinstance(tier, dict) else "")
+        if m and self._quota_on() and (t := modelquota.until(m, now)):   # never dispatched to an empty bucket
+            return f"its model {m}'s quota bucket on {route.TO} is empty until {timefmt.long(t, self.p)}"
+        if not model:
+            return ""
         try:
             why = modelrank.down(self.p.db, self.cfg, self.p.state, model, now)
             return f"its required model {model} is down on {route.TO} ({why}); it waits until that is served again" \

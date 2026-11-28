@@ -25,23 +25,24 @@ FILE = "_models"               # glmquota's file key: quota/_models.json
 ALT_KEY = "providers.chat.quota_alternates"   # account setting: the ordered alternates list
 FLASH_MAX, FLASH_MIN_CALLS = 0.05, 20
 COUNT_S = 7 * 86400            # a model's call and refusal counts start over this often
-_DUR = re.compile(r"^(?:(\d+)h)?(?:(\d+)m(?!s))?(?:([\d.]+)s)?$")
+_DUR = re.compile(r"^(?:(\d+)h)?(?:(\d+)m(?!s))?(?:([\d.]+)s)?(?:(\d+)ms)?$")
 
 
 def _hour_end(now: float) -> float:
     return (int(now) // 3600 + 1) * 3600.0
 
 
-def _reset(headers, now: float) -> float:
-    """The reset a rate-limit header gives (seconds, `6m0s` or an epoch), else the end of this UTC hour."""
-    for name in ("x-ratelimit-reset-tokens", "x-ratelimit-reset"):
+def _reset(headers, now: float, kind: str = "tokens") -> float:
+    """The reset a rate-limit header gives for `kind` (tokens or requests: seconds, `6m0s`, `6ms` or an epoch),
+    else the end of this UTC hour."""
+    for name in (f"x-ratelimit-reset-{kind}", "x-ratelimit-reset"):
         v = str(headers.get(name) or "").strip()
         if re.fullmatch(r"\d+(\.\d+)?", v):
             s = float(v)
             return s if s > 1e9 else now + s
         if v and (m := _DUR.match(v)) and any(m.groups()):
-            h, mi, s = (float(x or 0) for x in m.groups())
-            return now + h * 3600 + mi * 60 + s
+            h, mi, s, ms = (float(x or 0) for x in m.groups())
+            return now + h * 3600 + mi * 60 + s + ms / 1000
     return _hour_end(now)
 
 
@@ -64,9 +65,10 @@ def note(model: str, headers, now: float | None = None) -> None:
     if headers is None or not model:
         return
     h = {str(k).lower(): str(v) for k, v in headers.items()}
-    if any(h.get(n, "").strip() == "0" for n in ("x-ratelimit-remaining-tokens", "x-ratelimit-remaining-requests")):
-        now = time.time() if now is None else now
-        mark(model, {"reset": _reset(h, now)}, now)
+    resets = [_reset(h, time.time() if now is None else now, kind) for kind in ("tokens", "requests")
+              if h.get(f"x-ratelimit-remaining-{kind}", "").strip() == "0"]
+    if resets:
+        mark(model, {"reset": max(resets)}, now)
 
 
 def count(model: str, calls: int, refusals: int, now: float | None = None) -> None:

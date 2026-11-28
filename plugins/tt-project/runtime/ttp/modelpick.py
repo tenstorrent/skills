@@ -147,13 +147,13 @@ def target(cfg: dict, pick: dict | None) -> dict | None:
 
 def run_model(note: dict | None, provider: str, model: str, effort: str) -> tuple[str, str]:
     """(model, effort) a run on `provider` starts with: its routed pick's option when the run note's
-    route entry is one (route.KEY with model_pick, or a code arm: codearm.KEY) to that provider, or its ranked stand-in for a model
+    route entry is one (route.KEY with model_pick, a code arm: codearm.KEY, or a quota alternate: modelquota.KEY) to that provider, or its ranked stand-in for a model
     that is down (modelrank.KEY), else the ones given."""
     from .modelrank import KEY as RANKED
     from .route import KEY as ROUTE
     rt = (note or {}).get(ROUTE)
-    if isinstance(rt, dict) and (rt.get("model_pick") or rt.get(RANKED) or rt.get("code_arm")) \
-            and rt.get("to") == provider:
+    if isinstance(rt, dict) and (rt.get("model_pick") or rt.get(RANKED) or rt.get("code_arm")
+                                 or (rt.get("quota_alt") or {}).get("to")) and rt.get("to") == provider:
         return str(rt.get("model") or model), str(rt.get("pick_effort") or effort)
     return model, effort
 
