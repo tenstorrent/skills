@@ -50,6 +50,19 @@ detect workspace → load recipe → research target → route → execute → r
 - Host: Bash. Build, git, file I/O, pip, health checks.
 - In doubt: needs a TT device → MCP.
 
+## Long-run watchdog
+
+- **Compile is not a wedge.** New log lines and growing caches are progress. Cold JIT and trace capture can run for minutes: NEVER kill them.
+- The backend reaps a job with neither output nor storage I/O after 300 s, independently of `timeout_sec`. For a job quiet by design longer than that (weight conversion, cold JIT), pass `hung_silence_sec` (60–3600) at submit.
+- Wedge: output flat for minutes past the job-timeout envelope. The envelope comes from history (`tt-buddy:note`, `tt-buddy:learn`), not a guess.
+- Past the envelope with flat output: follow `recovery.md`.
+- Layer details: `execution.md` § Job-timeout envelope, `recovery.md` § Detect the wedge early.
+
+## Low contention
+
+- A device job holds the shared device for its whole run; host work (build, data prep, weight conversion, analysis, kernel JIT compile) stays outside it in Bash.
+- Cold cache: compiling inside the job can exceed its timeout. Warm the cache off-device before submitting.
+
 ## Progressive Load Table
 
 | Sub-task | Load |
@@ -57,7 +70,7 @@ detect workspace → load recipe → research target → route → execute → r
 | Detect workspace, repo, platform, arch | `workspace-detect.md` |
 | Workspace setup and activation | `<plugin-root>/recipes/workspace.md` |
 | Command routing, env sources, auto-triage contract | `execution.md` |
-| Full device recovery (triage → kill → reset → verify → cache) | `recovery.md` |
+| Full device recovery (triage → kill → reset if needed → verify → cache) | `recovery.md` |
 | Test invocation for detected repo | `<plugin-root>/recipes/<repo>/test.md` |
 | Server lifecycle (vllm-tt-plugin only) | `<plugin-root>/recipes/vllm-tt-plugin/server.md` |
 | Benchmark (vllm-tt-plugin only) | `<plugin-root>/recipes/vllm-tt-plugin/benchmark.md` |
