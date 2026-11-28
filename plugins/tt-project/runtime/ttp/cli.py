@@ -5628,13 +5628,6 @@ def _cmd_checks(a) -> None:
                 slow = rc == remotecheck.FAULT_RC and not env_why and remotecheck.COPY_TIMEOUT in ran_out
                 guard = rc == remotecheck.FAULT_RC and \
                     remotecheck.said_why(ran_out, spilled.host).startswith(remotecheck.GUARD_REFUSED)
-            if guard and guard_retried:   # refused again: it would never start, so no verdict
-                write_json(Path(run_dir) / prguard.CHECKS_FILE, {"head": head, "worktree": top, "passed": False,
-                                                                 "commands": todo, "skipped": skipped, "ts": time.time(),
-                                                                 "purpose": purpose, "infra_fault": "guard-refused"})
-                print(f"ttp checks: the run's guard refused the ssh command to spill host {spilled.host} again: the "
-                      "checks never started, so the change is neither passed nor failed", file=sys.stderr)
-                raise ChecksKilled(UPGRADE_BUSY)
             if rc == UPGRADE_BUSY and not timed_out and not guard:   # its spill wrapper refused it or is missing: status names it (a limit line)
                 from . import checklane, checkspill, remotecheck
                 if (wrapped := remotecheck.wrap_fault(ran_out))[1]:   # every host refusing alike: one event (wrap_refused)
@@ -5696,7 +5689,12 @@ def _cmd_checks(a) -> None:
                            if spilled.host in checkspill.kept_off(no_spill, p.config())
                            else "(that one again once free: the fault was the host's)" if not env_why
                            else "(once: an import failure runs again once per head)"))
-                if guard:
+                if guard and guard_retried:   # refused again: it would never start there, so run them here, with their usual workers
+                    no_spill = "1"
+                    said = (f"the run's guard refused the ssh command to spill host {spilled.host} again: a fault of "
+                            "this run's environment, not the host or the change; running the checks on this machine, "
+                            "whose result counts")
+                elif guard:
                     os.environ[_GUARD_RETRY_ENV] = "1"
                     said = (f"the run's guard refused the ssh command to spill host {spilled.host} before it started: "
                             "a fault of this run's environment, not the host or the change; running the checks again")

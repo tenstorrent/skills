@@ -591,7 +591,22 @@ def _stop(_sig, _frame) -> None:
     raise _Stop()
 
 
+def guarded_tmp() -> str:
+    """The run's own scratch folder when the run-time judge (pyaudit) limits this process's writes, else "".
+    A check's own TMPDIR is outside the folders the judge lets the run write in, so a temporary file made there
+    is refused before ssh starts."""
+    from . import glmguard, pyaudit
+    try:
+        run_dir = json.loads(os.environ.get(pyaudit.POLICY_ENV) or "{}")["glm"]["run_dir"]
+    except (ValueError, KeyError, TypeError):
+        return ""
+    scratch = Path(str(run_dir)) / glmguard.SCRATCH
+    return str(scratch) if scratch.is_dir() and os.access(scratch, os.W_OK) else ""
+
+
 def main(args: list[str]) -> int:
+    if scratch := guarded_tmp():
+        tempfile.tempdir = scratch   # this check's temporary files, in a folder the run's guard lets it write in
     host, env, commit, wrap, py, literal, spill = "", {}, "", (), [], {}, ""
     while args and args[0] != "--":
         flag, value, args = args[0], args[1] if len(args) > 1 else "", args[2:]

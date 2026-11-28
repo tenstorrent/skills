@@ -6077,16 +6077,35 @@ def test_a_spill_ssh_the_runs_guard_refuses_is_an_environment_fault_never_the_ho
     assert cli._spill_fail_verdict(*head, remotecheck.FAULT_RC, *tail, str(log), 0, str(repo), cfg_p) == []
 
 
-@pytest.mark.parametrize("refusals, passed", [(1, True), (2, None)])
-def test_ttp_checks_runs_again_once_after_the_runs_guard_refused_the_spill_ssh_then_gives_no_verdict(
-        env, tmp_path, monkeypatch, refusals, passed):
+def test_a_guarded_runs_spill_check_makes_its_temp_files_in_the_runs_own_scratch(env, cred_home, tmp_path):
+    """A run whose Python the run-time judge limits to its worktree, run folder and scratch runs a check on a fake
+    host: the judge refuses the temporary file ssh's output goes to unless it is made in that scratch, so the
+    check passes only with remotecheck.guarded_tmp pointing tempfile there."""
+    from ttp import remotecheck
+    remotecheck_guard_said = remotecheck.GUARD_REFUSED
+    bin_, remote = _rc_fake_ssh(tmp_path)
+    repo = _rc_repo(tmp_path)
+    (cred_home.run / "tmp").mkdir()
+    e = _pa_env(cred_home, glm=True)   # its TMPDIR is a folder the judge does not let it write in
+    e.update(PATH=f"{bin_}{os.pathsep}{e['PATH']}", FAKE_REMOTE_TMP=str(remote), PYTHONDONTWRITEBYTECODE="1")
+    code = ("import sys; from ttp import remotecheck; "
+            "sys.exit(remotecheck.main(['--host', 'check-host-a', '--', 'true']))")
+    r = _pa_run(e, code, repo)
+    assert r.returncode == 0 and remotecheck_guard_said not in r.stdout + r.stderr, (r.stdout[-400:], r.stderr[-400:])
+    log = cred_home.run / "refusals.jsonl"
+    assert e["TMPDIR"] not in (log.read_text() if log.exists() else "")
+
+
+@pytest.mark.parametrize("refusals, check, passed", [(1, "true", True), (2, "true", True), (2, "false", False)])
+def test_ttp_checks_runs_again_once_after_the_runs_guard_refused_the_spill_ssh_then_runs_them_here(
+        env, tmp_path, monkeypatch, refusals, check, passed):
     """A spill whose ssh the run's own guard refused ran nothing: `ttp checks` runs it once more (that run's
-    result counts) and, refused again, records an environment fault with no pass or fail; neither time does
-    the host get struck off or the run fall back to a local run of its checks."""
+    result counts) and, refused again, runs them on this machine, whose pass or fail is the verdict, never an
+    environment fault with no verdict; neither time does the host get struck off."""
     import threading
     from ttp import checkspill, remotecheck, cli
     p, repo, run, remote = _spill_setup(env, tmp_path, monkeypatch, ["check-host-a"])
-    p.set_config("delivery.push_checks", ["true"])
+    p.set_config("delivery.push_checks", [check])
     starts = []
 
     said = io.StringIO()
@@ -6106,6 +6125,6 @@ def test_ttp_checks_runs_again_once_after_the_runs_guard_refused_the_spill_ssh_t
         pass
     rec = json.loads((run / "checks.json").read_text())
     assert starts == ["check-host-a"] * min(refusals + 1, 2)
-    assert rec["passed"] is (passed or False)
-    assert rec.get("infra_fault") == (None if passed else "guard-refused")
+    assert rec["passed"] is passed
+    assert rec.get("infra_fault") is None
     assert checkspill._strikes(p.db).get("hosts", {}).get("check-host-a", {}).get("n", 0) == 0
