@@ -4,7 +4,7 @@
 from __future__ import annotations
 
 
-def _basis_run(d, provider, lines, *, budget_usd=None, timeout_s=None, note=None, env=None, started=None):
+def _basis_run(d, provider, lines, *, budget_usd=None, timeout_s=None, note=None, env=None, started=None, argv=None):
     """_finished_run, with a run.json carrying the run's budget and timeout (what _cut_off_cost reads)."""
     db = d.p.db
     tid = db.add_task("build", "", kind="work", tier="standard", priority=3, budget_usd=8.0, labels=[])
@@ -18,7 +18,7 @@ def _basis_run(d, provider, lines, *, budget_usd=None, timeout_s=None, note=None
     (run_dir / "output.jsonl").write_text("".join(json.dumps(x) + "\n" for x in lines))
     (run_dir / "stderr.log").write_text("")
     if budget_usd is not None or env:
-        (run_dir / "run.json").write_text(json.dumps({"budget_usd": budget_usd, "timeout_s": timeout_s, "argv": [],
+        (run_dir / "run.json").write_text(json.dumps({"budget_usd": budget_usd, "timeout_s": timeout_s, "argv": argv or [],
                                                       **({"env": env} if env else {})}))
     d.finish_run(db.one("SELECT * FROM runs WHERE id=?", (rid,)),
                  {"rc": 0, "started": started or time.time() - 600, "ended": time.time(), "stopped": None, "slept_s": 0})
@@ -702,3 +702,47 @@ def test_a_cut_off_resumed_codex_run_is_priced_from_its_rollouts_rise(tmp_path):
     assert prov.cost_so_far(out, started, env) == pytest.approx(0.753136)
     out.write_text("".join(json.dumps(x) + "\n" for x in _codex_lines("th-i", CODEX_B)))
     assert get_provider("codex").use("opus", CODEX_PRICES).cost_so_far(out, started, env) == pytest.approx(0.753136)
+
+
+def _compacted_fork_lines(total, sid="s-copy"):
+    """A copied session's run that answered once, compacted, and was stopped by Claude Code's budget cap
+    reporting the copied session's running total."""
+    return [{"type": "system", "subtype": "init", "session_id": sid, "model": "claude-opus-5-5"},
+            {"type": "assistant", "message": {"id": "m1", "model": "claude-opus-5-5",
+                                              "content": [{"type": "text", "text": "working"}],
+                                              "usage": {"input_tokens": 10, "output_tokens": 5}}},
+            {"type": "system", "subtype": "compact_boundary", "session_id": sid},
+            {"type": "result", "subtype": "error_max_budget_usd", "is_error": True, "result": "",
+             "total_cost_usd": total, "session_id": sid, "usage": {"input_tokens": 10, "output_tokens": 5}}]
+
+
+def test_a_copied_run_stopped_at_a_compaction_books_its_own_cost_and_restarts_free(env):
+    """A run copied from a session whose total was $700 at the copy, stopped by Claude Code's cap right
+    after a compaction reporting $703.50, books its own $3.50 (the compaction's call is in the report, in
+    no stream call): never $0, never the copied total. Under its $7.50 cap that stop is the harness's
+    fault: the task requeues with no attempt and its next start copies no session. Over its cap it is a
+    real budget stop: an attempt, as before."""
+    from ttp import ctxfork
+    from ttp.daemon import Daemon
+    d = Daemon(make(env).base)
+    note = {ctxfork.KEY: {"how": "fork", "session": "s-copy", "base_usd": 700.0}}
+    run = _basis_run(d, "claude", _compacted_fork_lines(703.5), budget_usd=8.0, note=note,
+                     argv=["--max-budget-usd", "7.5"])
+    got = json.loads(run["note"])
+    assert abs(run["cost_usd"] - 3.5) < 1e-6 and got["fork_base_usd"] == 700.0, (run["cost_usd"], got)
+    assert got["not_waste"] == ctxfork.MISREAD
+    task = d.p.db.task(run["task"])
+    assert task["status"] == "queued" and task["attempts"] == 0, dict(task)
+    assert "compaction" in task["result"] or "compaction" in json.dumps(dict(task))
+    for how in ("fork", "resume"):   # ctxfork.prepare then starts it from the disk block
+        assert "after a compaction" in ctxfork._fork_rejected(d.p, run["task"], how)
+    # Its own cost at its cap: a real budget stop, booked whole and counted.
+    real = _basis_run(d, "claude", _compacted_fork_lines(709.0), budget_usd=8.0, note=note,
+                      argv=["--max-budget-usd", "7.5"])
+    assert abs(real["cost_usd"] - 9.0) < 1e-6
+    assert json.loads(real["note"]).get("not_waste") != ctxfork.MISREAD
+    assert d.p.db.task(real["task"])["attempts"] == 1
+    # No compaction: the per-call booking stands, whatever the report says.
+    plain = [x for x in _compacted_fork_lines(703.5) if x.get("subtype") != "compact_boundary"]
+    run = _basis_run(d, "claude", plain, budget_usd=8.0, note=note, argv=["--max-budget-usd", "7.5"])
+    assert run["cost_usd"] < 0.01 and "fork_base_usd" not in json.loads(run["note"])

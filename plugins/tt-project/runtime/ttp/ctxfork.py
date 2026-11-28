@@ -74,6 +74,9 @@ from .coordroute import OWN_SQL   # the coordinator's own session, never a lane 
 from .util import as_float
 
 KEY = "coord_context"
+# A copied session's run that Claude Code stopped on its budget right after a compaction, under its own
+# cap (budget_misread): a harness fault, so its task restarts free from a fresh session (_fork_rejected).
+MISREAD = "budget_misread"
 ROLES = ("worker", "reviewer")
 MODES = ("fork", "disk", "off")
 FORK_HEAD = "# FORKED FROM THE COORDINATOR'S SESSION"
@@ -435,7 +438,7 @@ def prepare(p, cfg: dict, prov, provider: str, cwd: str, env: dict | None, now: 
                     lane = {"lane": src["lane"]} if src.get("lane") else {}
                     lead = lane_lead if lane else own_lead if src.get("own") else resume_lead
                     return {"how": "resume", "why": src.get("why") or f"run {src['run']}'s session {src['session'][:8]}",
-                            "session": new, "run": src["run"], **lane,
+                            "session": new, "run": src["run"], "src": src["session"], **lane,
                             "lead": lead(src, delta_block(p, cfg, src["ended"], now))}
         except Exception as e:   # the coordinator fork, then the disk block, is always tried
             gap = f"resume failed: {type(e).__name__}: {e}"[:200]
@@ -451,7 +454,8 @@ def prepare(p, cfg: dict, prov, provider: str, cwd: str, env: dict | None, now: 
                 if not why:
                     tokens = int(as_float(st.get("context_tokens"), 0))
                     return {"how": "fork", "why": f"session {str(st['id'])[:8]}" + (f"; no resume: {gap}" if gap else ""),
-                            "session": new, "from": str(st.get("provider") or provider), "lead": fork_lead(),
+                            "session": new, "from": str(st.get("provider") or provider), "src": str(st["id"]),
+                            "lead": fork_lead(),
                             "tokens": min(tokens, tail) if tail else tokens, **({"tail": tail} if tail else {})}
         except Exception as e:   # the disk block is always safe
             why = f"fork failed: {type(e).__name__}: {e}"[:200]
@@ -558,7 +562,8 @@ def _hop_capped(p, cfg: dict, src: dict, task: int | None) -> str:
 def _fork_rejected(p, task: int | None, how: str = "fork") -> str:
     """Why the task's runs say a copy of this kind will not work again ("" when they do not): a fork, when
     its last run's fork was rejected before it did anything; a resume, when any run's resume was (so a
-    resume and a fork rejected in turn end on the disk block, never loop)."""
+    resume and a fork rejected in turn end on the disk block, never loop). A run stopped on a misread
+    budget (MISREAD) rejects both: its task's next run starts from the disk block, in a fresh session."""
     if task is None:
         return ""
     import json
@@ -571,6 +576,8 @@ def _fork_rejected(p, task: int | None, how: str = "fork") -> str:
         if r["status"] == "failed" and forked(note) and note.get("not_waste") == "resume" \
                 and note[KEY].get("how") == how:
             return f"run {r['id']}'s {how} was rejected before it started: {note.get('resume_error') or 'no output'}"[:200]
+        if r["status"] == "failed" and forked(note) and note.get("not_waste") == MISREAD:
+            return f"run {r['id']}'s copied session stopped on its budget after a compaction, under its own cap"
     return ""
 
 
@@ -648,6 +655,38 @@ def _fork_gap(p, cfg: dict, prov, provider: str, cwd: str, env: dict | None, now
 
 # Settings env that changes the Bash tool's description, so the tools' text (coordtools.hook_settings).
 _TOOL_ENV = ("BASH_DEFAULT_TIMEOUT_MS", "BASH_MAX_TIMEOUT_MS")
+
+
+def budget_misread(note: dict | None, subtype: str, compacted_last: bool, own_usd: float,
+                   cap_usd: float | None) -> bool:
+    """A run from a copied session (forked) that Claude Code stopped with error_max_budget_usd right after a
+    compaction (`compacted_last`) while its own cost (`own_usd`: what the run booked, its report less the
+    copy's base) stayed under its --max-budget-usd `cap_usd`: the CLI counted the copied session's total.
+    A stop at or over its cap is a real budget stop."""
+    return forked(note) and subtype == "error_max_budget_usd" and compacted_last and cap_usd is not None \
+        and own_usd < cap_usd
+
+
+def compacted(out: Path) -> tuple[bool, bool]:
+    """Whether a Claude run's output.jsonl `out` shows a compaction (a compact_boundary line), and whether
+    the model answered nothing after the last one (the run ended at that compaction)."""
+    seen = last = False
+    try:
+        with open(out, "rb") as f:
+            for line in f:
+                if b'"compact_boundary"' not in line and b'"assistant"' not in line:
+                    continue
+                try:
+                    ev = json.loads(line)
+                except ValueError:
+                    continue
+                if ev.get("subtype") == "compact_boundary":
+                    seen = last = True
+                elif ev.get("type") == "assistant":
+                    last = False
+    except OSError:
+        pass
+    return seen, last
 
 
 def _arg(argv: list[str], flag: str) -> str | None:

@@ -4163,7 +4163,9 @@ class Daemon:
                     # The hand-off rule goes last, after the task: a fork's copied history ends in the
                     # coordinator's {"actions"} answers, and a retry of a role miss says why.
                     prompt = prompt + "\n\n" + ctxfork.handoff_tail(missed)
-                note = {**(note or {}), ctxfork.KEY: {**{k: got[k] for k in ("how", "why", "session", "tokens", "tail", "run", "lane", "from", "role_gap", "fresh")
+                if got.get("src") and (base := self._session_total_before(got["src"], 1 << 62)) is not None:
+                    got["base_usd"] = base   # the copied session's total: Claude Code's report starts there (_book_cost)
+                note = {**(note or {}), ctxfork.KEY: {**{k: got[k] for k in ("how", "why", "session", "tokens", "tail", "run", "lane", "from", "role_gap", "fresh", "base_usd")
                                                          if k in got}, **({"prefix": prefix_by} if prefix_by else {})}}
             elif task and role in ctxfork.ROLES:   # a lost run continued in its own session (_resumable)
                 note = {**(note or {}), ctxfork.KEY: {"how": "resume", "why": "continues its own session",
@@ -5934,6 +5936,8 @@ class Daemon:
         the report, netted (_net_of_session), or the token or elapsed estimate. A resumed or forked run whose
         stream shows Claude Code started (init) but no call that answered books $0 whatever its result
         reports (a lost or failed fork carries the parent session's total and its tokens): never the old way.
+        A copied run that compacted books at least its report less the copied session's total at the copy
+        (its note's base_usd): the compaction's call is in the report but in no stream call.
         With `metering` (meter_running, a run still going) the session logs are read incrementally
         (claude.LogTail kept per run), never whole each minute."""
         if (r["provider"] or "") == "claude":
@@ -5960,7 +5964,15 @@ class Daemon:
                     if session and reported > 0:
                         usage.extra["session_cost_usd"] = reported
                 usage.extra[CALLS_NOTE] = got.calls
-                usage.cost_usd = got.usd
+                usd = got.usd
+                base = (json.loads(r["note"] or "{}").get(ctxfork.KEY) or {}).get("base_usd")
+                if session and reported is not None and isinstance(base, (int, float)) and 0 <= base <= reported \
+                        and ctxfork.compacted(out)[0]:
+                    # A compaction's own call is in the report, not in the stream's calls: the copy's report
+                    # less the copied session's total at the copy.
+                    usd = max(usd, round(reported - base, 6))
+                    usage.extra["fork_base_usd"] = base
+                usage.cost_usd = usd
                 return usage.cost_usd
         self._own_usage(r, usage, out, metering)
         self._priced(r, usage)
@@ -6737,7 +6749,7 @@ class Daemon:
         for k in ("own_basis", "thread_totals", "reported_turn_usd"):   # Codex: how its own tokens were found
             if k in usage.extra:
                 note[k] = usage.extra[k]
-        for k in ("reported_usd", CALLS_NOTE):   # Claude Code's own total, kept beside the per-call booking
+        for k in ("reported_usd", CALLS_NOTE, "fork_base_usd"):   # Claude Code's own total, kept beside the per-call booking
             if k in usage.extra:
                 note[k] = usage.extra[k]
         if usage.extra.get("subagent_usd"):   # its subagents' share of cost_usd (_subagent_cost)
@@ -6773,6 +6785,11 @@ class Daemon:
             note["not_waste"] = "resume"   # nothing ran: the task starts fresh (_finish_worker)
             if ctxfork.forked(note):   # its next start skips the fork (ctxfork.prepare)
                 note["resume_error"] = str(usage.error or f"exit {exit_info.get('rc')}")[:200]
+        elif status in ("failed", "budget") and r["role"] != "coordinator" and \
+                ctxfork.budget_misread(note, str(usage.extra.get("subtype") or ""),
+                                       ctxfork.compacted(run_dir / "output.jsonl")[1],
+                                       float(usage.cost_usd or 0), _run_cap(run_dir)):
+            note["not_waste"] = ctxfork.MISREAD   # a harness fault: its task restarts free, fresh (_finish_worker)
         if r["task"] and r["role"] in ctxfork.ROLES and \
                 (miss := ctxfork.role_miss(usage.final_text, _read_result(run_dir / RESULT_FILE))):
             note["role_miss"] = miss   # its task's next start copies no session (ctxfork.prepare)
@@ -6878,7 +6895,8 @@ class Daemon:
                                         crashed=bool(note.get("lost_to_crash")),
                                         orderly=note.get("shutdown") == "orderly",
                                         slept=bool(note.get("lost_to_sleep") or note.get("lost_to_network")),
-                                        held=held, root_wake=root_wake)
+                                        held=held, root_wake=root_wake,
+                                        misread=note.get("not_waste") == ctxfork.MISREAD)
         self._writeups.pop(r["task"], None)
         try:
             self._note_no_call(r, no_call, called, usage, prov)
@@ -7904,9 +7922,12 @@ class Daemon:
     def _finish_worker(self, r: dict, usage, status: str, run_dir: Path, ended: str | None = None,
                        rebooted: bool = False, slept: bool = False, handoff: dict | None = None,
                        orderly: bool = False, refused: str = "", push_verified: bool = False,
-                       held: str = "", root_wake: dict | None = None, crashed: bool = False) -> None:
+                       held: str = "", root_wake: dict | None = None, crashed: bool = False,
+                       misread: bool = False) -> None:
         """`crashed`: the run's process died without a result on this boot, its first such loss in a row
         (finish_run's lost_to_crash): requeued like a run a reboot cut short, no attempt spent.
+        `misread`: a copied session's run stopped on a budget Claude Code misread (ctxfork.budget_misread):
+        requeued with no attempt spent; a real budget stop is handled as one.
         `root_wake`: tracked paths the run newly dirtied in the project root (_root_wake): a `done`
         is sent back once to commit or revert them; else check_root_checkout reports them.
         `handoff` stands in for the run's result.json: the `on_pass` its checks earned (_probe_passed).
@@ -8334,6 +8355,12 @@ class Daemon:
             new = {"done": "done", "blocked": "blocked", "failed": "failed", "needs_review": "review"}[rstatus]
         elif status in FREE_ENDS or reboot_lost:
             new = "queued"   # not an attempt: the account refused or the host went down, the task did not fail
+        elif misread:
+            # Claude Code counted the copied session's total against the run's cap at a compaction: the
+            # harness's fault. Not an attempt; its next start copies no session (ctxfork._fork_rejected).
+            new = "queued"
+            summary = ("stopped on its budget right after a compaction while its own cost stayed under its cap; "
+                       f"it restarts from the task record in a fresh session. {summary}")[:1500]
         elif turnsize.over_budget(status, usage) and (topup.eligible(task, db) and topup.enabled(self.cfg)
                                                       or topup.raised_during(db, task, r)):
             # An urgent or user-ordered task stopped by its budget (the runner's check, or the agent's
@@ -8351,7 +8378,7 @@ class Daemon:
         else:
             new = "failed"
         carry_run = r.get("role") == carry.ROLE and task["kind"] == "code"   # an inline review: never an attempt when it ends
-        attempts = int(task["attempts"] or 0) + (0 if status in FREE_ENDS or waiting or reboot_lost
+        attempts = int(task["attempts"] or 0) + (0 if status in FREE_ENDS or waiting or reboot_lost or misread
                                                   or rejects or topped or resumed or (carry_run and status == "ok") else 1)
         if carry_run and status != "ok" and r.get("id"):   # the row said ok at process end: runcap and the waste ledger count it
             db.x("UPDATE runs SET status=? WHERE id=?", (status, r["id"]))
@@ -23853,6 +23880,15 @@ def _salvageable_answer(status: str, usage, note: dict) -> bool:
     budget ended it on a whole final answer the run could not apply (RunUsage.answer)."""
     answer = getattr(usage, "answer", None)
     return isinstance(answer, dict) and isinstance(answer.get("actions"), list) and turnsize.over_budget(status, usage)
+
+
+def _run_cap(run_dir: Path) -> float | None:
+    """The --max-budget-usd its run.json's argv gave the agent, None when it gave none."""
+    try:
+        return float(ctxfork._arg(json.loads((run_dir / "run.json").read_text()).get("argv") or [],
+                                  "--max-budget-usd"))
+    except (OSError, ValueError, TypeError, AttributeError):
+        return None
 
 
 def _resume_never_started(note: dict, usage) -> bool:

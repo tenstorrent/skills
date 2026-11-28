@@ -44,6 +44,8 @@ PATCH_RE = re.compile(r"^\*\*\* (?:Add|Update|Delete) File: (.+)$|^\*\*\* Move t
 # A path in shell text: ~ or $HOME first, or absolute after a word break (not s/a/b/ or a URL's //host)
 SHELL_PATH_RE = re.compile(r"""(?:^|(?<=[\s'"=<>(]))(?:(?:~|\$\{?HOME\}?|\$\{?TTP_RUN_DIR\}?)?/[^\s'"`;|&<>()]*"""
                            r"""|(?:~|\$\{?HOME\}?)(?=[\s'"`;|&<>()]|$))""")
+# `+ '` before a quoted literal (its quotes re-quoted when a heredoc body is read as shell text): joined onto a value
+JOINED_RE = re.compile(r"\+\s*['\"]+$")
 REDIRECT_RE = re.compile(r"(?<![0-9&<>=-])(?:[0-9]?>>?|&>>?)(?![=&])\s*(?!&)([^\s;|&<>()'\"]+|'[^']+'|\"[^\"]+\")")
 TEE_RE = re.compile(r"\btee\s+(?:-a\s+)?([^\s;|&<>()]+)")
 CD_RE = re.compile(r"(?:^|[;&|(]\s*|\n\s*)cd\s+([^\s;|&<>()]+)")
@@ -90,7 +92,7 @@ def _expand(path: str, home: str, cwd: str, run_dir: str, base: str | None = Non
     if p == "~" or p.startswith("~/"):
         p = home + p[1:]
     if not p.startswith("/"):
-        p = os.path.join(base or cwd, p)
+        p = os.path.join(base or cwd or run_dir, p)   # never under / when the call's cwd is unknown
     return os.path.normpath(p)
 
 
@@ -291,14 +293,20 @@ def _blank(pattern: str, tool: str) -> str:
     return "" if tool in GREPS else REGEX_LITERAL_RE.sub("", pattern)
 
 
+def _path_words(text: str) -> list[str]:
+    """The paths SHELL_PATH_RE finds in `text`, but regexes; a literal joined onto a value in inline code
+    (`d + '/out.json'`, JOINED_RE) is a relative tail (`out.json`), not a path under /."""
+    return [w for m in SHELL_PATH_RE.finditer(text) if not REGEX_PATH_RE.search(m.group(0))
+            and (w := m.group(0).lstrip("/") if JOINED_RE.search(text, 0, m.start()) else m.group(0))]
+
+
 def _shell_paths(cmd: str, home: str, cwd: str, run_dir: str) -> list[str]:
     """The paths a shell command names: its absolute and home paths but its `cd` targets, and its
     redirection and tee targets (a relative one after `cd <dir>` resolves under that dir)."""
     cds = [m.group(1) for m in CD_RE.finditer(cmd)]
     base = _expand(cds[-1], home, cwd, run_dir) if cds else None
     dirs = {_expand(d, home, cwd, run_dir) for d in cds}   # where it went, not what it touched
-    out = [p for m in SHELL_PATH_RE.finditer(cmd) if not REGEX_PATH_RE.search(m.group(0))
-           and (p := _expand(m.group(0), home, cwd, run_dir)) not in dirs]
+    out = [p for w in _path_words(cmd) if (p := _expand(w, home, cwd, run_dir)) not in dirs]
     out += [_expand(m.group(1), home, cwd, run_dir, base) for r in (REDIRECT_RE, TEE_RE) for m in r.finditer(cmd)]
     return [p for p in out if len(p) > 1 and not _tool_output(p, home)]
 
@@ -607,7 +615,7 @@ def classify_paths(cmd: str, home: str, cwd: str, run_dir: str, depth: int = 0) 
     base: str | None = None
 
     def put(word: str, cls: str, why: str, target: bool = False) -> None:
-        found = [m.group(0) for m in SHELL_PATH_RE.finditer(word) if not REGEX_PATH_RE.search(m.group(0))]
+        found = _path_words(word)
         if not found and target and word and not word.startswith("-"):
             found = [word]   # a relative target, under the last cd
         for w in found:

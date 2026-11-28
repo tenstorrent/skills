@@ -263,6 +263,23 @@ def test_a_rejected_fork_requeues_free_and_the_next_start_takes_the_disk_block(e
                            task=tid)["how"] == "fork"
 
 
+def test_a_forked_run_records_the_copied_sessions_total_as_its_base(env, monkeypatch, tmp_path):
+    """The copy's note keeps the coordinator session's total as Claude Code last reported it: the base its
+    run's report starts from (_book_cost). With no run of that session showing a total, none is kept."""
+    from ttp import coordsession
+    p, d, cfg_dir, run = _fork_daemon(env, monkeypatch, tmp_path)
+    sid = str(uuid.uuid4())
+    _fork_transcript(cfg_dir, p.base, sid)
+    p.db.set_kv(coordsession.KEY, {"id": sid, "provider": "claude", "context_tokens": 5000})
+    got = run()[2]
+    assert got["how"] == "fork" and "base_usd" not in got, got
+    p.db.x("INSERT INTO runs(role, provider, started, ended, status, session_id, note) "
+           "VALUES('coordinator','claude',?,?,'ok',?,?)",
+           (time.time() - 120, time.time() - 60, sid, json.dumps({"session_cost_usd": 700.0})))
+    got = run()[2]
+    assert got["how"] == "fork" and got["base_usd"] == 700.0, got
+
+
 def _worker_session(cfg_dir, cwd, sid, said="I changed daemon.py and handed off"):
     """A finished worker run's transcript: its prompt and its last answer, a text."""
     folder = cfg_dir / "projects" / re.sub(r"[^a-zA-Z0-9]", "-", str(cwd))

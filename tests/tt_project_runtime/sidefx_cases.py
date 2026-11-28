@@ -685,3 +685,23 @@ def test_sed_in_place_counts_only_its_file_operands_as_targets_never_its_script(
     assert sidefx.classify_paths("sed -i -f /tmp/s.sed f.py", "/home/u", wt, "")["/tmp/s.sed"][0] == "executed"
     assert writes("cd /srv/o && sed -i s/a/b/ rel.txt") == {"/srv/o/rel.txt": "sed -i target"}
     assert writes("sed 's/a/b/' /srv/c > /srv/d") == {"/srv/d": "redirect target"}   # no -i: reads /srv/c
+
+
+def test_outside_writes_reads_a_literal_joined_onto_a_value_and_a_relative_path_as_under_the_cwd(tmp_path, scratch_home):
+    """`D + '/name'` in inline or heredoc code names a file under D, not under /; a relative path resolves
+    against the call's cwd, or the run folder when the cwd is unknown, never against /."""
+    from ttp import sidefx
+    wt, rd = tmp_path / "wt", tmp_path / "run"
+    wt.mkdir(), rd.mkdir()
+    inline = """python3 -c "open(D + '/o.json', 'w').write('x'); open('/etc/x', 'w')" """
+    heredoc = "python3 << 'EOF'\nRUN = 'out'\nwith open(RUN + '/rows.jsonl', 'w') as f:\n    f.write('x')\nEOF"
+    for cmd in (inline, heredoc):
+        got = sidefx.classify_paths(cmd, str(scratch_home), str(wt), str(rd))
+        assert not any(k in got for k in ("/o.json", "/rows.jsonl")), got
+    assert sidefx.classify_paths(inline, str(scratch_home), str(wt), str(rd))["/etc/x"][0] == "write"
+    rel = "echo x > notes/out.txt"
+    assert f"{wt}/notes/out.txt" in sidefx.classify_paths(rel, str(scratch_home), str(wt), str(rd))
+    assert f"{rd}/notes/out.txt" in sidefx.classify_paths(rel, str(scratch_home), "", str(rd))
+    (rd / "output.jsonl").write_text("".join(json.dumps(x) + "\n" for x in _claude_calls(
+        ("Bash", {"command": inline}), ("Bash", {"command": heredoc}))))
+    assert {f["path"] for f in sidefx.scan(rd, "", str(scratch_home))} == {"/etc/x"}
