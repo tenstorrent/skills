@@ -1724,14 +1724,17 @@ def inspect(path: Path) -> dict:
     if subs.returncode != 0:
         return {**out, "why": "git submodule status failed"}
     inited = [(ln[0], ln[1:].split()[1]) for ln in subs.stdout.splitlines() if ln.strip() and ln[0] != "-"]
-    dirs = [Path(r.stdout.strip()) for _, sub in inited
-            if (r := git("-C", sub, "rev-parse", "--absolute-git-dir")).returncode == 0]
-    if modules.is_dir() and any(not any(m == d or m in d.parents for d in dirs) for m in modules.iterdir()):
+    pairs = [(mark, sub, git("-C", sub, "rev-parse", "--absolute-git-dir")) for mark, sub in inited]
+    unread = next((sub for _, sub, r in pairs if r.returncode != 0), None)
+    if unread:
+        return {**out, "why": f"submodule {unread} could not be read"}
+    pairs = [(mark, sub, Path(r.stdout.strip())) for mark, sub, r in pairs]
+    if modules.is_dir() and any(not any(m == d or m in d.parents for *_, d in pairs) for m in modules.iterdir()):
         return {**out, "why": "has submodules set up (modules/) that are not checked out; their commits may "
                 "exist only here, so it is never removed automatically"}
-    for (mark, sub), d in zip(inited, dirs):
+    for mark, sub, d in pairs:
         main = (path / common).resolve() / "modules" / d.relative_to(modules) if modules in d.parents else None
-        why = _submodule_loss(path / sub, mark, main) if len(dirs) == len(inited) else "could not be read"
+        why = _submodule_loss(path / sub, mark, main)
         if why:
             return {**out, "why": f"submodule {sub} {why}"}
     st = git("status", "--porcelain", "--untracked-files=normal", "--ignore-submodules=none")

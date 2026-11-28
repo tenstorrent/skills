@@ -1290,8 +1290,8 @@ def _holds_part(repo: Path, head: str, sha: str) -> bool:
     mb = _git(repo, "merge-base", head, sha).stdout.strip()
     added = held = 0
     for f in _git(repo, "diff", "--name-only", mb, head, "--", ".", *_BOOKKEEPING).stdout.split() if mb else []:
-        have = {x.strip() for x in _git(repo, "show", f"{sha}:{f}", local=True).stdout.splitlines()}
-        for x in _git(repo, "diff", "-U0", mb, head, "--", f, local=True).stdout.splitlines():
+        have = {x.strip() for x in _git(repo, "show", f"{sha}:{f}").stdout.splitlines()}
+        for x in _git(repo, "diff", "-U0", mb, head, "--", f).stdout.splitlines():
             if x.startswith("+") and not x.startswith("+++") and len(x.strip()) > 12:
                 added, held = added + 1, held + (x[1:].strip() in have)
     return 2 * held >= added

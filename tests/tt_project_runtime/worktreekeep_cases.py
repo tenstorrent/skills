@@ -382,3 +382,19 @@ def test_a_worktree_whose_submodule_has_changes_or_unpushed_commits_stays_naming
     with pytest.raises(RuntimeError, match="submodules"):
         worktree.remove_path(top, wt)
     assert (wt / "lib" / ".git").exists()
+
+
+def test_a_worktree_whose_submodule_git_dir_cannot_be_read_stays_naming_it(tmp_path, monkeypatch):
+    from ttp import gitmemo, worktree
+    top, wt, ident = _wk_submodule_worktree(tmp_path)
+    real = gitmemo.run
+
+    def run(cmd, **kw):   # the superproject lists lib, but lib's own git dir cannot be read
+        if cmd[3:6] == ["-C", "lib", "rev-parse"]:
+            return subprocess.CompletedProcess(cmd, 128, "", "fatal: not a git repository")
+        return real(cmd, **kw)
+    monkeypatch.setattr(gitmemo, "run", run)
+    assert worktree.keep_reason(wt) == "submodule lib could not be read"
+    with pytest.raises(RuntimeError, match="submodules"):
+        worktree.remove_path(top, wt)
+    assert (wt / "lib" / "f.txt").exists()
