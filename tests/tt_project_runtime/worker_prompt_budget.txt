@@ -75,3 +75,5 @@ code +240: the profile-bucket line: earlier A/B or ablation results beside it, t
 question +240: the profile-bucket line: earlier A/B or ablation results beside it, the profiler's own overhead as a bucket
 every +240: the profile-bucket line: earlier A/B or ablation results beside it, the profiler's own overhead as a bucket
 system +240: the profile-bucket line: earlier A/B or ablation results beside it, the profiler's own overhead as a bucket
+code +8: `ttp ci --branch` names that it also waits for dispatched runs
+every +8: the same `ttp ci` dispatched-runs words (the line counts in every prompt)

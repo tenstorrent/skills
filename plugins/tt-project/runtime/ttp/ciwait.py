@@ -187,10 +187,24 @@ def probe(repo: str | None = None, branch: str | None = None, sha: str | None = 
                                 f"routes it"]
 
 
+def _api(repo: str | None, path: str) -> list | dict | None:
+    """A `gh api` GET under the repo, which every workstation bridge takes (an older one refuses `gh run`)."""
+    return _gh(["api", f"repos/{repo or '{owner}/{repo}'}/actions/{path}"])
+
+
+def api_run(repo: str | None, run: str) -> dict | None:
+    """One run read with `_api`, in `gh run view`'s field names."""
+    r = _api(repo, f"runs/{run}")
+    if not isinstance(r, dict):
+        return None
+    return {"databaseId": r.get("id"), "status": r.get("status"), "conclusion": r.get("conclusion"),
+            "headSha": r.get("head_sha"), "headBranch": r.get("head_branch"), "workflowName": r.get("name"),
+            "url": r.get("html_url"), "createdAt": r.get("created_at")}
+
+
 def pr_checks(repo: str | None, branch: str | None, sha: str | None) -> tuple[int, list[str]]:
     """On the workstation route, read the PR's head and checks with `gh pr view` and the head's workflow runs
-    with a `gh api` read, which every workstation bridge takes (an older one refuses `gh run list`); the runs
-    count dispatched ones the PR's checks leave out. 0 once every check and run on the head completed, 75
+    with `_api`; the runs count dispatched ones the PR's checks leave out. 0 once every check and run on the head completed, 75
     while one is queued or running (or gh cannot answer)."""
     view = _gh(["pr", "view", *([branch] if branch else []), *_repo(repo), "--json", "headRefOid,statusCheckRollup"])
     if not isinstance(view, dict):
@@ -204,7 +218,7 @@ def pr_checks(repo: str | None, branch: str | None, sha: str | None) -> tuple[in
             or (c.get("state") or "SUCCESS") in ("PENDING", "EXPECTED")]
     if live:
         return 75, [f"running: {len(live)} of {len(checks)} checks on {head[:12]} not completed"]
-    runs = _gh(["api", f"repos/{repo or '{owner}/{repo}'}/actions/runs?head_sha={head}&per_page=100"])
+    runs = _api(repo, f"runs?head_sha={head}&per_page=100")
     if not isinstance(runs, dict):
         return 75, [f"not yet: gh could not read the workflow runs on {head[:12]}"]
     going = [r for r in runs.get("workflow_runs") or [] if (r.get("status") or "completed") != "completed"]
@@ -215,10 +229,13 @@ def pr_checks(repo: str | None, branch: str | None, sha: str | None) -> tuple[in
 
 
 def _probe(repo, branch, sha, workflow, run, hang, **kw) -> tuple[int, list[str]]:
-    if not run and ghroute.route() == ghroute.WORKSTATION:
+    ws = ghroute.route() == ghroute.WORKSTATION
+    if ws and not run:
         return pr_checks(repo, branch, sha)
+    hang = hang and not ws   # the hang check reads jobs and past runs with `gh run`
     if run:
-        one = _gh(["run", "view", str(run), *_repo(repo), "--json", RUN_FIELDS + ",headBranch"])
+        one = api_run(repo, str(run)) if ws else _gh(["run", "view", str(run), *_repo(repo), "--json",
+                                                        RUN_FIELDS + ",headBranch"])
         if one is None:
             return 75, [f"not yet: gh could not read run {run}"]
         runs, branch = [one], branch or one.get("headBranch")
