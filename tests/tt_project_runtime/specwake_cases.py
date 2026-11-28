@@ -1181,3 +1181,25 @@ def test_a_task_of_an_open_order_is_asked_and_woken_within_two_minutes(env, monk
     assert waitpoll.capped({}, p.db.task(plain), job, 3600) == 3600
     assert waitpoll.capped({}, p.db.task(plain), {"retry_when": 'test "$(date +%s)" -ge 1900000000'}, 3600,
                            ordered=True) == 3600, "a bare clock gate stays its own deadline"
+
+
+def test_a_start_when_probe_runs_at_once_when_its_job_ends_and_within_two_minutes_for_an_open_order(
+        env, monkeypatch, tmp_path):
+    p = make(env)
+    d = _spec_daemon(p, monkeypatch)
+    now = time.time()
+    rc = tmp_path / "job.rc"
+    slow = "git ls-remote origin some-branch | grep -q ."   # an arbitrary command: its not-yet backs off to 10 min
+    gate = {"when": slow, "rc": 1, "since": now - 6 * 3600}
+    d._probed[7] = now - 300
+    assert not d._start_probe_due(7, slow, gate, None, now), "5 min after its last run: backed off"
+    d._ordered_ids = {7}
+    assert d._start_probe_due(7, slow, gate, None, now), "a task of an open order is asked within 2 min"
+    d._probed[7] = now - 100
+    assert not d._start_probe_due(7, slow, gate, None, now)
+    d._ordered_ids = set()
+    job = f"ttp detach --check {rc}"
+    d._probed[8] = now - 1
+    assert not d._start_probe_due(8, job, {"when": job, "rc": 1, "since": now - 3600}, None, now)
+    rc.write_text("0\n")
+    assert d._start_probe_due(8, job, {"when": job, "rc": 1, "since": now - 3600}, None, now + 1), "its job ended"

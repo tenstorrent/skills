@@ -16372,7 +16372,8 @@ class Daemon:
     def _start_probe_due(self, tid: int, when: str, gate: dict | None, pushed: float | None, now: float) -> bool:
         """Whether task `tid`'s start_when probe runs now: none of it running, and its cadence
         (startgate.every: a healthy not-yet of an arbitrary command backs off with the wait's length)
-        passed since its last run. A landing gate also runs on the tick after the push queue records a
+        passed since its last run (at most waitpoll.ORDERED_CAP_S for a task of an open user order), or what it
+        waits on ended since (waitend). A landing gate also runs on the tick after the push queue records a
         push (`pushed`, the newest pushed or landed row's time), so it starts within about a tick."""
         if tid in self._probes:
             return False
@@ -16381,7 +16382,9 @@ class Daemon:
         # A probe on a confirmed-down host keeps downwait's seconds-scale gap, never the backed-off one.
         every = self._probe_gap(tid) if self._down_n.get(tid) else \
             startgate.every(when, g.get("rc"), now - float(g.get("since") or now), self._poll_s())
-        if now - last >= every:
+        if tid in self._ordered_ids:
+            every = min(every, waitpoll.ORDERED_CAP_S)
+        if now - last >= every or waitend.ended_since(self.p, when, last):
             return True
         landing = landed.probe_command(when, self.p) != when
         return landing and pushed is not None and pushed > last and now - last >= LANDED_REPROBE_S
