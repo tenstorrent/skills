@@ -1,0 +1,115 @@
+"""Hold escalation: ordered work held by a rule that is no safety gate proceeds on its own.
+
+A task the user ordered (blockledger._ordered) that is blocked, waiting or deferred longer than
+`coordinator.hold_escalate_min` (default 5; 0 off) is classified like the blocked-time ledger does
+(blockledger.safety_of). A safety hold is never cleared: it raises one event per hold episode, none for a
+held resource or a pause the user set. Any other hold raises one `hold_escalate` event naming the task,
+the rule and the minutes, and, `coordinator.hold_proceed_min` (default 5; 0 escalate only) later, is
+cleared unless a safety cite was added meanwhile. A hold on an open task, an ask or a resource is left
+alone: the root blocker is the thing to name. selfblock.raise_due runs this once a minute."""
+from __future__ import annotations
+
+import json
+import re
+import time
+
+from . import blockledger, unblock
+from .db import DB, deferral, without_deferral
+
+KIND = "hold_escalate"
+KEY = "holdescalate:episodes"   # kv: {"<task>:<hold start>": {"at": escalated, "rule", "safe"}}
+KEEP_S = 7 * 86400
+DEFAULTS = {"hold_escalate_min": 5, "hold_proceed_min": 5}
+QUIET = ("held resource", "a pause or hold the user set")   # shown in the ledger, no wake
+OPEN = re.compile(r"\bask:\d+|\blanded\b", re.I)   # waits on a user answer or another task's landing
+
+
+def _cfg(db: DB) -> dict:
+    from . import selfblock
+    coord = (selfblock._raw_config(db) or {}).get("coordinator")
+    return {**DEFAULTS, **{k: v for k, v in (coord if isinstance(coord, dict) else {}).items() if k in DEFAULTS}}
+
+
+def _hold(db: DB, t: dict, now: float) -> dict | None:
+    """{kind, start, reason} of the task's hold, or None when it is not one this module handles."""
+    if t["status"] in ("blocked", "waiting"):
+        eps = unblock._task_episodes(db, t, now)
+        seg = eps[-1]["segments"][-1] if eps and eps[-1]["open"] else None
+        ev = db.one("SELECT text FROM events WHERE task=? AND kind=? ORDER BY ts DESC, id DESC LIMIT 1",
+                    (t["id"], f"task_{t['status']}"))
+        reason = t["blocked_reason"] or blockledger._why((ev and ev["text"]) or "", t["id"], t["title"])
+        return {"kind": t["status"], "start": seg["start"] if seg else float(t["updated"] or now), "reason": reason}
+    if t["status"] == "queued" and (d := deferral(t)):
+        reason = " ".join(str(d.get(k) or "") for k in ("why", "when")).strip() or "start_after"
+        return {"kind": "deferred", "start": d.get("since") or float(t["created"] or now), "reason": reason}
+    return None
+
+
+def _on_open_task(db: DB, t: dict) -> bool:
+    try:
+        deps = json.loads(t["depends_on"] or "[]")
+    except (TypeError, ValueError):
+        return False
+    return any((d := db.task(int(i))) and d["status"] not in unblock.ENDED for i in deps if str(i).isdigit())
+
+
+def _event(db: DB, now: float, task: dict, text: str, data: dict) -> None:
+    db.x("INSERT INTO events(ts,source,kind,fingerprint,severity,text,data,status,task) VALUES(?,?,?,?,?,?,?,?,?)",
+         (now, "daemon", KIND, f"{KIND}:{task['id']}:{data['start']:.0f}:{data['stage']}", "normal", text,
+          json.dumps(data), "queued", task["id"]))
+
+
+def _proceed(db: DB, t: dict, h: dict, rule: str, mins: int, now: float) -> None:
+    labels = without_deferral(json.loads(t["labels"] or "[]"))
+    line = f"auto-proceeded past {rule} after {mins} min (holdescalate, user msg #4906)"
+    db.update_task(t["id"], status="queued", blocked_reason=None, labels=labels, not_before=None,
+                   spec=f"{t['spec'] or ''}\n{line}".strip())
+    db.set_kv(f"holdescalate:proceeded:{t['id']}", {"rule": rule, "minutes": mins, "kind": h["kind"], "ts": now})
+    blockledger.append(db, "auto-proceed", t["id"], 0, f"{rule} ({h['kind']}, {mins} min)", source="holdescalate")
+
+
+def run(db: DB, cfg: dict | None, now: float) -> list[dict]:
+    """Escalate and clear due holds; returns what it did: {task, rule, minutes, safety, did}."""
+    cfg = {**DEFAULTS, **(cfg if cfg is not None else _cfg(db))}
+    esc_s, proceed_s = float(cfg["hold_escalate_min"]) * 60, float(cfg["hold_proceed_min"]) * 60
+    if esc_s <= 0:
+        return []
+    ordered = blockledger._ordered(db)
+    state = {k: v for k, v in (db.kv(KEY, {}) or {}).items()
+             if isinstance(v, dict) and now - float(v.get("at") or 0) < KEEP_S}
+    out = []
+    for t in db.q("SELECT * FROM tasks WHERE status IN ('blocked','waiting','queued') ORDER BY id"):
+        if t["id"] not in ordered or not (h := _hold(db, t, now)) or now - h["start"] < esc_s:
+            continue
+        if OPEN.search(h["reason"]) or _on_open_task(db, t):
+            continue
+        rule = blockledger.rule_of(h["reason"])
+        safety = blockledger.safety_of(f"{rule} {h['reason']}", "")
+        mins = int((now - h["start"]) / 60)
+        ep = f"{t['id']}:{h['start']:.0f}"
+        seen = state.get(ep)
+        if safety != "convenience":
+            if seen is None and safety not in QUIET:
+                _event(db, now, t, f"#{t['id']} {t['title'][:80]} held {mins} min by {rule} (safety: {safety})",
+                       {"task": t["id"], "rule": rule, "safety": safety, "start": h["start"], "stage": "safety"})
+            if seen is None:
+                state[ep] = {"at": now, "rule": rule, "safe": True}
+                out.append({"task": t["id"], "rule": rule, "minutes": mins, "safety": safety, "did": "shown"})
+            continue
+        if seen is None or seen.get("safe"):   # the hold was safety until a cite changed; its proceed clock starts now
+            at = now
+            state[ep] = {"at": at, "rule": rule, "safe": False}
+            at_hhmm = time.strftime("%H:%M", time.localtime(at + proceed_s))
+            tail = (f"; proceeds at {at_hhmm} unless you cite a safety gate" if proceed_s > 0
+                    else "; it needs a safety cite or a fix")
+            _event(db, now, t, f"#{t['id']} {t['title'][:80]} held {mins} min by {rule} (no safety gate named){tail}",
+                   {"task": t["id"], "rule": rule, "safety": safety, "start": h["start"], "stage": "escalate",
+                    "proceeds_at": at + proceed_s if proceed_s > 0 else None})
+            out.append({"task": t["id"], "rule": rule, "minutes": mins, "safety": safety, "did": "escalated"})
+        elif proceed_s > 0 and now - float(seen["at"]) >= proceed_s and not seen.get("done"):
+            _proceed(db, t, h, rule, mins, now)
+            seen["done"] = True
+            out.append({"task": t["id"], "rule": rule, "minutes": mins, "safety": safety, "did": "proceeded"})
+    if state != (db.kv(KEY, {}) or {}):
+        db.set_kv(KEY, state)
+    return out

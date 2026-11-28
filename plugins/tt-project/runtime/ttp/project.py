@@ -414,6 +414,10 @@ DEFAULT_CONFIG: dict[str, Any] = {
                     # An open restriction, irreversible or human ask that holds a blocked task longer
                     # than this goes back to a tricky turn once to decide it (askrethink.py); 0 off.
                     "ask_rethink_h": 2,
+                    # Ordered work held longer than this many minutes by a rule that is no safety gate is
+                    # raised to the coordinator, and cleared after `hold_proceed_min` more unless a safety
+                    # gate is cited (holdescalate.py); 0 turns each off.
+                    "hold_escalate_min": 5, "hold_proceed_min": 5,
                     # A task deferred with `start_when` that has not started after this long is raised
                     # to the coordinator once.
                     "defer_max_days": 14,

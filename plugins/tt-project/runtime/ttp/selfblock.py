@@ -302,4 +302,6 @@ def raise_due(db, now: float | None = None) -> list[dict]:
                 db.set_kv(REPLY_RAISED_KEY, now)
         if new or raised != (db.kv(RAISED_KEY, {}) or {}):
             db.set_kv(RAISED_KEY, raised)
+    from . import holdescalate
+    holdescalate.run(db, None, now)   # ordered work held by a non-safety rule proceeds (holdescalate.py)
     return new

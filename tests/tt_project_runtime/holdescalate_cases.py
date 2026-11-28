@@ -1,0 +1,97 @@
+# Hold escalation tests (holdescalate.run, selfblock.raise_due) of tests/test_tt_project_runtime.py, which runs
+# this file in its own namespace (see _include_cases there): helpers, fixtures and imports come from that file
+# (_bl_task is blockledger_cases.py's). Add new hold-escalation tests here.
+from __future__ import annotations
+
+
+def _he_events(p):
+    return p.db.q("SELECT * FROM events WHERE kind='hold_escalate' ORDER BY id")
+
+
+def _he_hold(p, now, minutes, reason, priority=1, title="ordered work"):
+    return _bl_task(p, title, "blocked", now, priority=priority, blocked_ago=minutes * 60, reason=reason)
+
+
+def test_hold_escalate_never_clears_a_safety_hold(env):
+    from ttp import holdescalate as he
+    p = make(env)
+    now = time.time()
+    held = {_he_hold(p, now, 40, r, title=r): r for r in (
+        "held by R-ab12 until later", "needs your credentials to continue", "a charter Restriction forbids it",
+        "waits on resource:dev-box", "paused by the user until they say so")}
+    for step in (0, 600, 3600):
+        he.run(p.db, {}, now + step)
+    assert {p.db.task(t)["status"] for t in held} == {"blocked"}
+    texts = [e["text"] for e in _he_events(p)]
+    assert len(texts) == 3 and all("(safety: " in t and "proceeds" not in t for t in texts)
+    assert not any("resource" in t or "paused" in t for t in texts)   # a lock or a user pause shows, no wake
+
+
+def test_hold_escalate_raises_a_convenience_hold_at_five_minutes_and_clears_it_at_ten(env):
+    from ttp import holdescalate as he
+    p = make(env)
+    now = time.time()
+    t = _he_hold(p, now, 6, "waiting for the shipping window to open")
+    assert [d["did"] for d in he.run(p.db, {}, now)] == ["escalated"]
+    ev = _he_events(p)
+    assert len(ev) == 1 and "held 6 min" in ev[0]["text"] and "proceeds at" in ev[0]["text"] and "unless you cite a safety gate" in ev[0]["text"]
+    assert he.run(p.db, {}, now + 60) == [] and p.db.task(t)["status"] == "blocked"
+    assert [d["did"] for d in he.run(p.db, {}, now + 301)] == ["proceeded"]
+    task = p.db.task(t)
+    assert task["status"] == "queued" and not task["blocked_reason"]
+    assert "auto-proceeded past for the shipping window to open after 11 min (holdescalate, user msg #4906)" in task["spec"]
+    assert p.db.kv(f"holdescalate:proceeded:{t}")["minutes"] == 11
+    from ttp import blockledger as bl
+    assert any(r["rule"] == "auto-proceed" and r["task"] == t for r in bl.rows(p.db, now - 86400, now + 400))
+    assert he.run(p.db, {}, now + 900) == [] and len(_he_events(p)) == 1   # one escalation per hold episode
+
+
+def test_hold_escalate_clears_a_deferral_and_stops_on_a_safety_cite(env):
+    from ttp import holdescalate as he
+    p = make(env)
+    now = time.time()
+    d = p.db.add_task("deferred order")
+    p.db.x("UPDATE tasks SET priority=1, labels=? WHERE id=?",
+           (json.dumps([f"start_after:{now + 86400}", "start_why:nightly window", f"deferred_since:{now - 600}"]), d))
+    held = _he_hold(p, now, 8, "waiting for the shipping window to open", title="held")
+    he.run(p.db, {}, now)
+    p.db.update_task(held, blocked_reason="held by R-ab12 until later")   # a safety cite added after the escalation
+    he.run(p.db, {}, now + 400)
+    assert p.db.task(held)["status"] == "blocked"
+    task = p.db.task(d)
+    assert task["status"] == "queued" and json.loads(task["labels"]) == []
+    assert any(e["status"] == "queued" and f"#{d} " in e["text"] for e in _he_events(p))
+
+
+def test_hold_escalate_leaves_routine_work_open_dependencies_asks_and_review_alone(env):
+    from ttp import holdescalate as he
+    p = make(env)
+    now = time.time()
+    routine = _he_hold(p, now, 90, "waiting for the shipping window to open", priority=3, title="routine")
+    root = p.db.add_task("root")
+    dep = _he_hold(p, now, 90, "waiting for the shipping window to open", title="dependent")
+    p.db.update_task(dep, depends_on=[root])
+    ask = _he_hold(p, now, 90, "ask:12", title="asked")
+    rev = _bl_task(p, "in review", "review", now, priority=1, blocked_ago=5400, kind="task_review", reason="review")
+    assert he.run(p.db, {}, now) == [] and he.run(p.db, {}, now + 900) == []
+    assert [p.db.task(i)["status"] for i in (routine, dep, ask, rev)] == ["blocked", "blocked", "blocked", "review"]
+
+
+def test_hold_escalate_config_turns_it_off_or_stops_at_the_event(env):
+    from ttp import holdescalate as he
+    p = make(env)
+    now = time.time()
+    t = _he_hold(p, now, 30, "waiting for the shipping window to open")
+    assert he.run(p.db, {"hold_escalate_min": 0}, now) == [] and not _he_events(p)
+    assert [d["did"] for d in he.run(p.db, {"hold_proceed_min": 0}, now)] == ["escalated"]
+    assert "proceeds at" not in _he_events(p)[0]["text"]
+    assert he.run(p.db, {"hold_proceed_min": 0}, now + 3600) == [] and p.db.task(t)["status"] == "blocked"
+
+
+def test_hold_escalate_runs_from_the_selfblock_scan_and_is_a_stuck_event(env):
+    from ttp import coordinator, selfblock
+    p = make(env)
+    now = time.time()
+    _he_hold(p, now, 30, "waiting for the shipping window to open")
+    selfblock.raise_due(p.db, now)
+    assert len(_he_events(p)) == 1 and coordinator.EFFORT_EVENT_TRIGGERS["hold_escalate"] == "stuck"
