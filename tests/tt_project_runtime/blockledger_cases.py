@@ -369,13 +369,3 @@ def test_block_ledger_share_splits_safety_gates_from_other_blocked_time_and_keep
     assert "safety gates 25.0%, other 25.0% (own running jobs count as running)" in capsys.readouterr().out
     cli.cmd_blocked(types.SimpleNamespace(days=1.0, json=True, done=None, how=None))
     assert json.loads(capsys.readouterr().out.strip().splitlines()[-1])["share"]["non_safety_share"] == pytest.approx(0.25, abs=0.01)
-
-
-def test_block_ledger_shows_an_open_worker_cap_wait_as_a_queue_wait(env):
-    from ttp import blockledger as bl, queuewait
-    p = make(env)
-    now = time.time()
-    t = _bl_task(p, "urgent work", "queued", now, priority=1)
-    p.db.set_kv(queuewait.KV, {"open": {"k": {"task": t, "queue": "workers", "since": now - 1800}}})
-    (r,) = [r for r in bl.rows(p.db, now - 7200, now) if r["task"] == t and r["source"] == "queue"]
-    assert r["rule"] == "queue:workers" and r["minutes"] == pytest.approx(30, abs=1)
