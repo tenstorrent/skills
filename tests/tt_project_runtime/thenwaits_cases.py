@@ -215,7 +215,7 @@ def test_a_later_stage_keeps_an_urgent_tasks_capped_retry(env, monkeypatch, tmp_
     p = make(env)
     d = _then_daemon(p, monkeypatch)
     tid, _ = _then_task(p, tmp_path, [{"retry_when": "false", "retry_after_s": 3600}])
-    monkeypatch.setattr(dmod.waitpoll, "capped", lambda cfg, task, result, retry_s: min(retry_s, 120))
+    monkeypatch.setattr(dmod.waitpoll, "capped", lambda cfg, task, result, retry_s, ordered=False: min(retry_s, 120))
     _settle_probe(d, tid)
     task = p.db.task(tid)
     assert json.loads(task["result"])["then_stage"] == 1

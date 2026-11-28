@@ -956,6 +956,7 @@ FINISH_ROUND_MEMORY = {
     "_fix_cut": "scratch: as _nofix, a git time budget cutting the fix's branch read sets it",
     "_net_holds": "a hold a run that reached its API proved over: kept ended; its kv row, if rolled back, "
                   "is rewritten on the next hold change and dropped after NET_HOLD_MAX_S on a restart",
+    "_ordered_ids": "a cache: rewritten from the open orders by probe_waiting and _ordered before each read",
     "_wait_what_errs": "a log-once set: a retried round may drop that one line, never repeat it",
 }
 _MUTATORS = frozenset({"pop", "append", "add", "update", "clear", "setdefault", "discard", "remove", "extend",
