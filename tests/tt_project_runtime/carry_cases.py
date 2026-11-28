@@ -169,7 +169,7 @@ def test_a_failed_deploy_raises_one_event_and_wakes_the_owner_only_when_the_log_
     monkeypatch.setattr(pushq, "_tail_of", lambda m, d=None, n=0: "boom in other.py")
     pushq._after(p, b, {"tip": "t" * 40, "after_push": {"cmd": "deploy"}, "log": "l"}, "failed",
                  lambda *a, **k: None, 3000.0)
-    assert p.db.task(t["id"])["status"] == "pushing" and carry_phase(p, t) == "deploy", "not its files: no wake"
+    assert p.db.task(t["id"])["status"] == "blocked" and carry_phase(p, t) == "deploy", "not its files: no wake, no longer pushing"
     assert len(p.db.q("SELECT id FROM events WHERE task=? AND kind='carry_deploy_failed' AND status='queued'", (t["id"],))) == 1
     t2, b2 = _pushing(p, batch="b2", after_push=None)
     p.db.x("UPDATE carry_state SET phase='deploy', batch='b2' WHERE task=?", (t2["id"],))

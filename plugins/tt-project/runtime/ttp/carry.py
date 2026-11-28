@@ -181,7 +181,7 @@ def on_after(p, b: dict, m: dict, status: str, line: str, tail: str, now: float)
     """The batch's after_push ended with `status`, `line` in words and `tail` the end of its log. Each carry
     task that landed in the batch: ok, skipped or superseded finishes it, `line` the obligation's progress;
     a failure raises `carry_deploy_failed` to the coordinator and wakes the owner only if the log names a
-    file its landed commit touched."""
+    file its landed commit touched, else blocks the task for the coordinator."""
     from . import pushq
     db = p.db
     for s in db.q("SELECT task FROM carry_state WHERE batch=? AND phase IN (?,?)", (b["id"], LANDED, DEPLOY)):
@@ -198,6 +198,8 @@ def on_after(p, b: dict, m: dict, status: str, line: str, tail: str, now: float)
                      + (f"; the log names {', '.join(named[:10])} from its change" if named else ""), queued=True)
         if named:
             pushq._requeue(db, task, f"{line}; the log names {', '.join(named[:10])} from your change:\n{tail}")
+        else:   # no longer a push in flight (drain, host cycles and sweeps count `pushing`): the coordinator's
+            db.update_task(task["id"], status="blocked", blocked_reason=line[:500])
 
 
 def show_line(db, task_id: int) -> str:
