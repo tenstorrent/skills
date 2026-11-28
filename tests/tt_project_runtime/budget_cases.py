@@ -1604,19 +1604,20 @@ def test_new_tasks_failing_one_after_another_hold_their_loop_source_not_a_user_o
     from ttp import budget as bud
     now = time.time()
     p.db.x("UPDATE tasks SET status='done'")
-    ids = {o: p.db.add_task(f"from {o}", "s", kind="work", tier="light", origin=o) for o in ("daemon", "schedule", "user")}
+    ids = {o: p.db.add_task(f"from {o}", "s", kind="work", tier="light", origin=o) for o in ("harness", "schedule", "daemon", "user")}
     twin = {o: p.db.add_task(f"again from {o}", "s", kind="work", tier="light", origin=o) for o in ids}
     for i, task in enumerate([*ids.values(), *twin.values()]):
         p.db.x("INSERT INTO runs(task,role,provider,status,started,ended,cost_usd) "   # $9 a source: over one worker's limit
                "VALUES(?,'worker','claude','timeout',?,?,4.5)", (task, now - 3000 + i * 300, now - 2400 + i * 300))
     g = bud.evaluate(p.db, p.config(), "claude", [], now)
     assert g.level == "green" and {h["task"] for h in g.waste_holds} - {None} == {*ids.values(), *twin.values()}, g.waste_holds
-    assert {h["origin"] for h in g.waste_holds} - {None} == {"daemon", "schedule"}, g.waste_holds
+    assert {h["origin"] for h in g.waste_holds} - {None} == {"harness", "schedule"}, g.waste_holds
     mine = lambda o: bud.waste_hold(g, p.db.task(p.db.add_task("new", "s", kind="work", tier="light", origin=o)))
-    assert mine("daemon") and mine("schedule") and not mine("user"), "a new task of a loop source waits, a user's does not"
+    assert mine("harness") and mine("schedule") and not mine("user") and not mine("daemon"), \
+        "a new task of a loop source waits; a user's and the daemon's (reviews of an order) do not"
     # a busy source whose own waste is small is no loop: only the source that wasted past a worker's limit waits
     p.db.x("DELETE FROM runs")
-    small = p.db.add_task("daemon review", "s", kind="review", tier="light", origin="daemon")
+    small = p.db.add_task("harness chore", "s", kind="work", tier="light", origin="harness")
     for i, (task, cost) in enumerate(((small, 0.5), (ids["schedule"], 5.0), (twin["schedule"], 5.0), (ids["user"], 5.0))):
         p.db.x("INSERT INTO runs(task,role,provider,status,started,ended,cost_usd) "
                "VALUES(?,'worker','claude','timeout',?,?,?)", (task, now - 3000 + i * 600, now - 2700 + i * 600, cost))
@@ -5676,7 +5677,7 @@ def test_a_forked_run_with_little_budget_left_is_raised_once_by_the_shortfall_wi
     assert forkroom.fit(p, cfg, task(5.0, 4.0), "claude")["budget_usd"] == 5.0   # no fork, no raise
 
 
-def _waste_hold_setup(env, monkeypatch, tmp_path, costs):
+def _waste_hold_setup(env, monkeypatch, costs):
     """A project whose task A failed once per cost in `costs` in the last hour, with A and another task B queued."""
     from ttp.daemon import Daemon
     p = make(env)
@@ -5693,10 +5694,10 @@ def _waste_hold_setup(env, monkeypatch, tmp_path, costs):
     return p, Daemon(p.base), a, b
 
 
-def test_a_task_wasting_past_the_limit_is_held_and_no_other_task_is(env, monkeypatch, tmp_path):
+def test_a_task_wasting_past_the_limit_is_held_and_no_other_task_is(env, monkeypatch):
     """$15 wasted by one task against the $8 limit holds that task until its hour is up; the gate stays
     green, another task starts, and the coordinator gets one event naming the setting."""
-    p, d, a, b = _waste_hold_setup(env, monkeypatch, tmp_path, (7.5, 7.5))
+    p, d, a, b = _waste_hold_setup(env, monkeypatch, (7.5, 7.5))
     d.tick()
     d.tick()
     g = d.gates["fake"]
@@ -5705,17 +5706,13 @@ def test_a_task_wasting_past_the_limit_is_held_and_no_other_task_is(env, monkeyp
     assert p.db.q("SELECT id FROM runs WHERE task=?", (b,))
     (ev,) = p.db.q("SELECT text, data FROM events WHERE kind='task_waste_hold'")
     assert "budget.hourly_waste_usd" in ev["text"] and json.loads(ev["data"])["task"] == a, ev
-    assert any("hourly_waste_usd" in line for line in
-               bud_lines(p, d)), "the held task is shown with its setting"
-
-
-def bud_lines(p, d):
     from ttp import budget as bud
-    return bud.waste_hold_lines({k: g.as_dict() for k, g in d.gates.items()}, time.time(), str)
+    assert any("hourly_waste_usd" in line for line in bud.waste_hold_lines(
+        {k: g.as_dict() for k, g in d.gates.items()}, time.time(), str)), "the held task is shown with its setting"
 
 
-def test_on_a_plan_a_task_with_more_wasted_runs_than_the_limit_is_held_and_no_other_task_is(env, monkeypatch, tmp_path):
-    p, d, a, b = _waste_hold_setup(env, monkeypatch, tmp_path, (0.1,) * 5)
+def test_on_a_plan_a_task_with_more_wasted_runs_than_the_limit_is_held_and_no_other_task_is(env, monkeypatch):
+    p, d, a, b = _waste_hold_setup(env, monkeypatch, (0.1,) * 5)
     p.set_config("providers.fake.billing", "plan")
     d.cfg = p.config()
     d.tick()
@@ -5726,8 +5723,8 @@ def test_on_a_plan_a_task_with_more_wasted_runs_than_the_limit_is_held_and_no_ot
     assert not p.db.q("SELECT id FROM runs WHERE task=? AND status!='failed'", (a,))
 
 
-def test_the_hourly_total_ceiling_still_turns_the_project_red(env, monkeypatch, tmp_path):
-    p, d, a, b = _waste_hold_setup(env, monkeypatch, tmp_path, ())
+def test_the_hourly_total_ceiling_still_turns_the_project_red(env, monkeypatch):
+    p, d, a, b = _waste_hold_setup(env, monkeypatch, ())
     p.set_config("budget.daily_usd", 1000)
     p.set_config("budget.weekly_usd", 5000)
     p.db.spend("fake", 300.0, "task:9")      # far over the hourly ceiling
