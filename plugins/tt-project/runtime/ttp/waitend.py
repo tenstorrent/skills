@@ -14,9 +14,8 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
-from . import checksgone, rebootwait
+from . import checksgone, landed, rebootwait
 
-LANDED = re.compile(r"landed:\s*#?(\d+)|\blanded\s+--task\s+(\d+)")
 PUSH_RESULT = re.compile(r"\bpush\s+--result\s+(\S+)")
 
 
@@ -35,6 +34,6 @@ def ended_since(p, probe: str, at: float) -> bool:
         return True
     if any(_changed(Path(m.group(1).strip("'\"")), at) for m in PUSH_RESULT.finditer(probe)):
         return True
-    tasks = [int(a or b) for a, b in LANDED.findall(probe)]
+    tasks = [int(t) for t in landed.task_refs(probe) if t.isdigit()]
     return bool(tasks) and p.db.one(f"SELECT 1 FROM task_landings WHERE ts>=? AND task IN ({','.join('?' * len(tasks))})",
                                     (at, *tasks)) is not None
