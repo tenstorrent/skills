@@ -3457,7 +3457,8 @@ def _note_to(a, run_dir: str) -> None:
         return _note_upstream(a, me)
     if not a.text.strip():
         die("empty note")
-    at = _note_find_peer(a, me) if not routed and not far and not local_project(a.to) else at
+    if not routed and not far and not local_project(a.to):
+        at = _note_find_peer(a, me)
     # A reply is marked with the note it answers (upstream.reply_text): its id and every copy keep it.
     reply = upstream._check_fp(a.reply) if getattr(a, "reply", None) else None
     try:
