@@ -1008,7 +1008,7 @@ def _check_unapproved(daemon, t: dict, pr: dict, sig: dict, before: set, flagged
     shown = pr.get("url") or url
     if "run" not in (flagged.get(key) or {}):   # a flag from before the gh log is judged again
         since = float(drafts.get(key) or now - DAY) - GH_LOG_MARGIN_S
-        calls = [c for c in prguard.worker_calls(daemon.p.state, key, since) if not c.get("refused")]
+        calls = prguard.worker_calls(daemon.p.state, key, since)
         if not calls:
             flagged.pop(key, None)
             prguard.approve_from_github(db, key, pr.get("headRefOid"), now)

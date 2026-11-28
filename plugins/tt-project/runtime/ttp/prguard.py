@@ -422,8 +422,8 @@ def log_call(state_dir, seen: list, args: list[str], refused: bool, rc: int | No
 
 
 def worker_calls(state_dir, key: str, since: float) -> list[dict]:
-    """Runs' gh calls since `since` that marked `key` ready or requested reviewers on it, run or
-    refused, newest last. A call whose PR could not be identified counts for every PR."""
+    """Runs' gh calls since `since` that marked `key` ready or requested reviewers on it and ran (a refused
+    call never wrote), newest last. A call whose PR could not be identified counts for every PR."""
     try:
         lines = gh_log_path(state_dir).read_text(errors="replace").splitlines()
     except OSError:
@@ -434,7 +434,7 @@ def worker_calls(state_dir, key: str, since: float) -> list[dict]:
             rec = json.loads(line)
         except ValueError:
             continue
-        if isinstance(rec, dict) and float(rec.get("ts") or 0) >= since \
+        if isinstance(rec, dict) and not rec.get("refused") and float(rec.get("ts") or 0) >= since \
                 and (key in (rec.get("prs") or []) or not rec.get("prs")):
             out.append(rec)
     return out

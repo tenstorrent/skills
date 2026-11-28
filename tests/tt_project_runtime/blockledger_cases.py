@@ -181,8 +181,10 @@ def test_block_ledger_a_wait_on_the_tasks_own_detached_job_is_work_not_blocked_t
     t = _bl_wait(p, "runs its suite", now, 3600, "ttp detach --check /r/runs/9/suite2.rc && ttp detach --check /r/x.rc")
     o = _bl_wait(p, "waits on a box", now, 3600, "ssh box true")
     p.db.x("UPDATE tasks SET created=? WHERE id IN (?,?)", (now - 7200, t, o))
-    p.db.set_kv(queuewait.KV, {"hist": [{"task": t, "queue": "own", "since": now - 3590, "end": now - 600}],
-                               "open": {"k": {"task": o, "queue": "own", "since": now - 3590}}})
+    jobs = queuewait.own_job("ttp detach --check /r/runs/9/suite2.rc && ttp detach --check /r/x.rc")
+    assert jobs and not queuewait.own_job("ssh box true") and not queuewait.own_job("")
+    p.db.set_kv(queuewait.KV, {"hist": [{"task": t, "queue": "own", "since": now - 3590, "end": now - 600, "job": jobs}],
+                               "open": {"k": {"task": o, "queue": "own", "since": now - 3590, "job": False}}})
     rs = [r for r in bl.rows(p.db, now - 7200, now) if r["source"] == "queue"]
     assert {r["task"]: r["rule"] for r in rs} == {t: "own job", o: "queue:own"}
     assert [e["rule"] for e in bl.top(p.db, now) if e["rule"] in ("own job", "queue:own")] == ["queue:own"]
@@ -196,13 +198,14 @@ def test_block_ledger_review_rows_and_clock_gated_windows(env):
     now = time.time()
     r = _bl_task(p, "in review", "review", now, priority=1, blocked_ago=1800, kind="task_review", reason="held by R-ab12")
     w = _bl_wait(p, "lands at night", now, 3600,
-                 "bash -c 'L=x; [ $(date +%s) -ge 1796673600 ] && exit 0; test -e out || exit 1'",
-                 reason="for landing on the push branch")
-    p.db.x("UPDATE tasks SET created=? WHERE id IN (?,?)", (now - 7200, r, w))
+                 'test "$(date +%s)" -ge 1796673600', reason="for landing on the push branch")
+    m = _bl_wait(p, "box or deadline", now, 3600, 'ssh box true || test "$(date +%s)" -ge 1796673600', reason="the box")
+    p.db.x("UPDATE tasks SET created=? WHERE id IN (?,?,?)", (now - 7200, r, w, m))
     rs = {x["task"]: x for x in bl.rows(p.db, now - 7200, now) if x["source"] == "task"}
     assert (rs[r]["rule"], rs[w]["rule"]) == ("review", "planned window")
+    assert rs[m]["rule"] != "planned window", "a real wait with a deadline is no planned window"
     assert "planned window" not in [e["rule"] for e in bl.top(p.db, now)]
-    assert bl.window_share(p.db, now - 7200, now)["blocked_min"] == pytest.approx(30, abs=1)
+    assert bl.window_share(p.db, now - 7200, now)["blocked_min"] == pytest.approx(30 + 60, abs=1)
 
 
 def test_block_ledger_redirect_refusals_hold_no_minutes_and_count_once(env):

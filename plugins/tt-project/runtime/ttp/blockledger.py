@@ -23,7 +23,7 @@ import re
 import time
 from pathlib import Path
 
-from . import obligations, queuetrim, queuewait, rulecite, selfblock, unblock
+from . import obligations, queuetrim, queuewait, rulecite, selfblock, unblock, unstarted
 from .db import DB
 from .util import loads_dict
 
@@ -36,7 +36,6 @@ REFUSALS = ("refusals.jsonl", "glm_refusals.jsonl")
 REDIRECT = "redirect"   # glmguard.REDIRECTED: the refusal told the allowed way and the run went on
 WORK = frozenset({"own job", "planned window"})   # work in progress or a planned start: no blocked time
 NOT_TOP = WORK | {"dependency"}
-CLOCK = re.compile(r"(?:\btest|\[\[?)\s+\"?\$\(\s*date\s+\+%s\s*\)\"?\s+-ge\s+\d+")   # a retry_when clock gate
 LANDED = re.compile(r"\blanded:#?(\d+)|\bttp\s+landed\s+--task\s+(\d+)|\blanding of task #(\d+)")
 GUARD_KINDS = frozenset({"no_device", "worker_role", "provenance", "user_site"})   # hook refusals of a safety guard
 # Safety gates beyond selfblock.GATES: a held resource, a check, a review or push, a user message, a rule id.
@@ -80,11 +79,14 @@ def safety_of(reason: str, kind: str = "") -> str:
     return "convenience"
 
 
-def _wait_rule(probe: str, reason: str) -> tuple[str, str] | None:
-    """(rule, reason) of a wait its probe or reason places: another task's landing, a clock-gated window."""
+def _wait_rule(data: dict, reason: str) -> tuple[str, str] | None:
+    """(rule, reason) of a wait its task_waiting `data` or reason places: another task's landing, a planned
+    window (a bare clock-gate probe, or the hand-off's own planned window: unblock.classify_wait)."""
+    probe = str(data.get("probe") or "")
     if m := LANDED.search(probe) or LANDED.search(reason):
         return "dependency", f"needs #{next(g for g in m.groups() if g)}"
-    return ("planned window", reason) if CLOCK.search(probe) else None
+    window = unstarted.TIME_ONLY.match(probe) or data.get("why") == "planned window"
+    return ("planned window", reason) if window else None
 
 
 def _row(rule, task, kind, start, end, reason, source, **extra) -> dict:
@@ -133,14 +135,6 @@ def _refusals(db: DB, since: float, until: float) -> list[dict]:
     return out
 
 
-def _own_job(db: DB, e: dict) -> bool:
-    """Whether a queue wait the task's own probe explains waits only on its own detached jobs (`ttp detach --check`)."""
-    ev = db.one("SELECT data FROM events WHERE task=? AND kind='task_waiting' AND ts BETWEEN ? AND ? "
-                "ORDER BY ts DESC LIMIT 1", (e.get("task"), float(e["since"]) - 600, float(e["since"]) + 60))
-    got = unblock.wait_probes(loads_dict(ev and ev["data"]).get("probe"))
-    return bool(got and got[0] and not got[1])
-
-
 def rows(db: DB, since: float, until: float | None = None) -> list[dict]:
     """The ledger's rows whose time overlaps [since, until], longest first."""
     until = time.time() if until is None else until
@@ -152,14 +146,14 @@ def rows(db: DB, since: float, until: float | None = None) -> list[dict]:
         task = db.task(seg["task"]) or {}
         reason = _why((ev and ev["text"]) or task.get("blocked_reason") or seg["title"], seg["task"], seg["title"])
         rule, why = ("review", reason) if seg["kind"] == "review" else \
-            _wait_rule(str(loads_dict(ev and ev["data"]).get("probe") or ""), reason) or (rule_of(reason), reason)
+            _wait_rule(loads_dict(ev and ev["data"]), reason) or (rule_of(reason), reason)
         out.append(_row(rule, seg["task"], seg["kind"], max(start, since), end, why, "task"))
     out += _refusals(db, since, until)
     st = db.kv(queuewait.KV) or {}
     for e in [*(st.get("hist") or []), *(st.get("open") or {}).values()]:
         end = min(float(e.get("end") or until), until)
         if end >= since and float(e["since"]) <= until:
-            rule = "own job" if e["queue"] == "own" and _own_job(db, e) else f"queue:{e['queue']}"
+            rule = "own job" if e["queue"] == "own" and e.get("job") else f"queue:{e['queue']}"
             out.append(_row(rule, e.get("task"), "queue", max(float(e["since"]), since), end, e["queue"], "queue"))
     log = Path(db.path).parent / LOG
     for line in (log.read_text(errors="replace").splitlines() if log.is_file() else ()):

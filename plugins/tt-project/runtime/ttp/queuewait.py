@@ -99,6 +99,13 @@ def classify(probe: str, reason: str, device: set | frozenset = frozenset()) -> 
     return None
 
 
+def own_job(probe: str) -> bool:
+    """Whether a wait probe waits only on the task's own detached jobs (`ttp detach --check`): work in progress."""
+    from .unblock import wait_probes
+    got = wait_probes(probe or "")
+    return bool(got and got[0] and not got[1])
+
+
 def _task_of(label: str, project: str) -> int | None:
     m = re.match(rf"{re.escape(project)} task #(\d+)\b", label or "")
     return int(m[1]) if m else None
@@ -149,9 +156,9 @@ def collect(p, cfg: dict, now: float, host: dict | None = None, device: set | No
     from .coordinator import task_resources
     probes = progress.load(db).get("probes") or {}
 
-    def own(t, since):   # an urgent task's wait no queue explains: its probe's last words and its resources
+    def own(t, since, probe=""):   # an urgent task's wait no queue explains: its probe's last words and its resources
         add(t["id"], "own", ",".join(sorted(task_resources(t))), since,
-            {"cap": None, "running": [], "queued": [],
+            {"cap": None, "running": [], "queued": [], "job": own_job(probe),
              "says": str((probes.get(str(t["id"])) or {}).get("reason") or "")[:200]})
 
     for t in map(dict, db.q("SELECT * FROM tasks WHERE status='queued'")):
@@ -164,7 +171,7 @@ def collect(p, cfg: dict, now: float, host: dict | None = None, device: set | No
             continue
         got = classify(prev.get("retry_when") or "", t["blocked_reason"] or "", device)
         if got is None and urgent.is_urgent(t):
-            own(t, prev["waiting_since"])
+            own(t, prev["waiting_since"], prev.get("retry_when") or "")
             continue
         if got and got[0] == "checks" and not (queued and _checks_waiting(p, prev.get("retry_when"))):
             continue   # its checks finished, run or never queued, or the host queue is empty: no slot to wait for
@@ -538,6 +545,8 @@ def scan(p, cfg: dict, now: float | None = None, host: dict | None = None, devic
         rec = opened.setdefault(ep, {"task": w["task"], "queue": w["queue"], "res": w["res"], "since": w["since"],
                                      "opened": int(now), "seen": now, "acted": None,
                                      **({"dir": w["dir"]} if w.get("dir") else {})})
+        if w["queue"] == "own":
+            rec["job"] = bool(w.get("job"))   # its current probe: the blocked-time ledger counts no own-job wait
         if rec.get("acted"):
             continue
         k = key(w)

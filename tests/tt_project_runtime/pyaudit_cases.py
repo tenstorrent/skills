@@ -268,3 +268,4 @@ def test_pyaudit_lets_a_glm_run_write_the_checks_upload_locks(env, cred_home):
     pol = json.loads(_pa_env(cred_home, glm=True)[pyaudit.POLICY_ENV])
     assert str(checkcap.slot_dir() / "uploads") in pol["glm"]["roots"]
     assert not any(r.endswith("check-slots") for r in pol["glm"]["roots"]), "only the upload locks"
+    assert pyaudit.glm_write(str(checkcap.slot_dir() / "uploads" / "box1.lock"), pol["glm"]) is None

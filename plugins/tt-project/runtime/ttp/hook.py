@@ -1236,15 +1236,6 @@ def _scripts(segments: list[list[str]], cwd: str) -> list[Path]:
     return found
 
 
-def _log_bypass(cmd: str) -> None:
-    """Record a denied draft-guard bypass in the gh guard log as the run's refused 'ready' call: evidence
-    only, since it never ran, so pr-watch blames a run only for a PR write it ran. The run dir is
-    <state>/runs/<id>."""
-    from . import prguard
-    prguard.log_call(Path(os.environ["TTP_RUN_DIR"]).parent.parent, [("ready", [])], ["hook-denied", cmd],
-                     refused=True)
-
-
 # The project's web app token (state/web.token, or under state.noindex on macOS), named in a command
 WEB_TOKEN_RE = re.compile(r"state(?:\.noindex)?/+web\.token\b")
 # The per-user secrets store by path, and the runtime calls that hand back its values: a tool call's
@@ -1619,7 +1610,6 @@ def _pre_tool_use(payload: dict) -> tuple[dict | None, None]:
     commands, scan = _split(cmd)
     segments = _segments(commands)
     why = _guard("gh_anon", draft_bypass(cmd))
-    bypass = bool(why)
     if not why and (any(os.path.basename(s[0]) == "ttp" and s[1:2] == ["say"] for s in segments)
                     or (re.search(r"/api/say\b", cmd) and HTTP_CLIENT_RE.search(cmd))):
         # What a run posts as the user could count as the user's approval (pr_approve).
@@ -1671,10 +1661,7 @@ def _pre_tool_use(payload: dict) -> tuple[dict | None, None]:
                 continue
             if why:
                 why = f"{f.name}: {why}"
-                bypass = True
                 break
-    if bypass:
-        _log_bypass(cmd)
     if not why:
         why = _guard("sleep_wait", idle_wait(cmd))
     if not why:

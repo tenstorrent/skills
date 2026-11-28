@@ -30801,7 +30801,7 @@ def test_workers_gh_logs_its_ready_and_reviewer_calls_for_pr_watch(env, tmp_path
     monkeypatch.delenv("TTP_RUN_ID")
     n = len(logged())
     assert _gh_runner(p, tmp_path)("pr", "ready", "8")[0] == 1 and len(logged()) == n
-    # pr-watch finds run 41's refused call: the PR leaving draft is flagged high, never undone.
+    # pr-watch finds run 41's call that ran: the PR leaving draft is flagged high, never undone.
     p.db.set_kv(prguard.APPROVALS_KEY, {})
     monkeypatch.setattr(watchers, "_gh", lambda args, cwd: None if args[0] == "api" else
                         {"url": url, "state": "OPEN", "title": "t", "headRefOid": HEAD, "isDraft": False})
@@ -39124,7 +39124,8 @@ def test_every_push_checks_call_site_fails_a_masked_failure(env, tmp_path, monke
     assert json.loads((crun / "checks.json").read_text())["passed"] is False
 
 
-def test_the_worker_hook_logs_a_denied_draft_guard_bypass_to_the_gh_guard_log(env, monkeypatch, tmp_path):
+def test_the_worker_hook_denies_a_draft_guard_bypass_and_logs_no_gh_call(env, monkeypatch, tmp_path):
+    """A refused call never wrote: the refusal log keeps it, the gh guard log (pr-watch's) does not."""
     from ttp import hook, prguard
     run_dir = tmp_path / "state" / "runs" / "7"
     run_dir.mkdir(parents=True)
@@ -39135,9 +39136,8 @@ def test_the_worker_hook_logs_a_denied_draft_guard_bypass_to_the_gh_guard_log(en
     assert out and not (state / prguard.GH_LOG).exists()
     out, _ = hook.pre_tool_use({"tool_name": "Bash", "tool_input": {"command": "/usr/bin/gh pr ready 5"}})
     assert out["hookSpecificOutput"]["permissionDecision"] == "deny"
-    (rec,) = [json.loads(x) for x in (state / prguard.GH_LOG).read_text().splitlines()]
-    assert rec["action"] == "ready" and rec["refused"] is True and rec["run"] == "7"
-    assert prguard.worker_calls(state, "o/r#5", 0)
+    assert not (state / prguard.GH_LOG).exists() and not prguard.worker_calls(state, "o/r#5", 0)
+    assert json.loads((run_dir / "refusals.jsonl").read_text().splitlines()[-1])["guard"] == "gh_anon"
 
 
 def test_new_and_upgrade_give_the_harness_a_local_git_identity_but_keep_one_already_set(env, monkeypatch):
