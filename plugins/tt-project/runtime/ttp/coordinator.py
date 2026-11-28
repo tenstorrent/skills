@@ -2609,7 +2609,7 @@ def deferral_update(db, task: dict, a: dict, p: Project | None, labels: list | N
     except MissingTaskRef as e:
         raise MissingTaskRef(f"#{task['id']} rejected: {e}") from None
     same = after == cur.get("after") and when == cur.get("when")
-    why = a.get("why") if a.get("why") is not None else cur.get("why") if when and when == cur.get("when") else None
+    why = start_why(a, cur, when, after)
     as_now = {"priority": a.get("priority") or task.get("priority"),
               "spec": "\n".join(x for x in (task.get("spec"), a.get("spec")) if x)}
     held = json.loads(task["labels"] or "[]")   # its kept class counts for the same gate; its overlap tie always
@@ -3625,7 +3625,7 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                 if write_moved:   # the audit trail of a power grant being moved
                     untrusted_write_event(db, task["id"], write_moved)
                 if a.get("start_after") is not None or a.get("start_when") is not None \
-                        or (a.get("why") is not None and deferral(task)):
+                        or (a.get("why") is not None and task["status"] == "queued" and deferral(task)):
                     if task["status"] in ("running", *TERMINAL_TASK_STATES):
                         raise InfoRejection(f"task #{task['id']} is {task['status']}: only a task that has not "
                                          f"started can be deferred; add a new one with start_after/start_when")

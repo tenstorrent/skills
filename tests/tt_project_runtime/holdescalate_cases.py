@@ -242,3 +242,14 @@ def test_a_why_alone_on_a_start_after_deferral_runs_the_deferral_check(env):
     assert he._hold(p.db, p.db.task(t), now)["cls"] is None
     coord.apply(p, [{"type": "task_update", "id": t, "why": "needs data that must accumulate first"}])
     assert he._hold(p.db, p.db.task(t), now)["cls"] == "data that must accumulate"
+
+
+def test_a_why_on_a_started_task_with_an_old_start_after_label_is_not_refused(env):
+    """A why sent with a spec change to a running task that once had a start_after still applies."""
+    from ttp import coordinator as coord
+    p = make(env)
+    t = p.db.add_task("steer me")
+    p.db.x("UPDATE tasks SET status='running', labels=? WHERE id=?",
+           (json.dumps([f"start_after:{time.time() - 3600:.0f}"]), t))
+    coord.apply(p, [{"type": "task_update", "id": t, "why": "steer it", "spec": "more"}])
+    assert "more" in p.db.task(t)["spec"]
