@@ -900,6 +900,41 @@ def test_a_slot_fill_files_a_retry_when_wait_under_retry_when_not_start_after(en
         drain(d)
 
 
+def test_a_pass_with_every_worker_slot_taken_still_logs_the_task_left_waiting(
+        env, monkeypatch, tmp_path, reap_tmp_processes):
+    """Full slots were never logged (a line needed a free slot), so a wait for a slot read as no wait at
+    all. A pass with no free slot logs the ready task the slots hold back, runnable and not picked."""
+    p, d, drain, settle = _slot_setup(env, monkeypatch, tmp_path, slots=1)
+    try:
+        a = p.db.add_task("first", "s", kind="work", tier="light", origin="user", priority=1)
+        d.dispatch()
+        assert _slot_tasks(p) == [a]
+        b = p.db.add_task("second", "s", kind="work", tier="light", origin="user", priority=2)
+        d.dispatch()
+        assert _slot_tasks(p) == [a]
+        line = _sched_lines(p)[-1]
+        assert line["free_slots"] == 0 and line["picked"] == [] and line["runnable_total"] == 1, line
+        assert line["runnable"][0]["id"] == b
+    finally:
+        drain(d)
+        assert reap_tmp_processes(tmp_path) == [], "a stand-in run outlived the test"
+
+
+def test_a_gate_hold_is_logged_as_full_slots_a_closed_budget_gate_or_a_full_routed_host():
+    """The budget gate closed to new work (spend level, runaway guard, plan window) once logged as
+    provider_gate, and a task's own budget or the dollar caps as other: each now has its own reason."""
+    from types import SimpleNamespace
+    from ttp import schedlog
+    from ttp.daemon import _held_as
+    shut, open_ = SimpleNamespace(allow_new_work=False), SimpleNamespace(allow_new_work=True)
+    assert _held_as("gate", 7, {"full": {7: 2}, "gate": open_}) == "full"
+    assert _held_as("gate", 7, {"full": {}, "gate": shut}) == "budget_gate"
+    assert _held_as("gate", 7, {"full": {}, "gate": open_}) == "slot_cap"
+    assert [_held_as(w, 7, {}) for w in ("logged_out", "net", "budget", "caps", "optional", "resource", "x")] == [
+        "provider_gate", "provider_gate", "spend_cap", "spend_cap", "budget_gate", "lock", "other"]
+    assert {"budget_gate", "slot_cap", "spend_cap"} <= set(schedlog.REASONS)
+
+
 def test_the_scheduler_log_rotates_under_its_cap_and_keeps_one_old_copy(tmp_path, monkeypatch):
     from ttp import schedlog
     monkeypatch.setattr(schedlog, "MAX_BYTES", 2000)

@@ -1,5 +1,5 @@
 """The scheduler's audit log: one JSON line in the project's state/scheduler.jsonl for each slot fill
-(a dispatch pass with at least one free worker slot), so whether a pick followed priority and
+(a dispatch pass with ready work, free worker slots or not, so full slots and a closed budget gate show), so whether a pick followed priority and
 obligation order can be checked after the fact. A line holds the time (ISO UTC), the free slots, the
 runnable queued candidates in the order dispatch ranked them (id, priority, owns_obligation; the first
 TOP of them plus their total), counts of the queued tasks that could not start, by reason (REASONS),
@@ -22,9 +22,12 @@ TOP = 20
 # Why a queued task could not start: its start_when probe, its start_after or another start timer
 # (not_before), its own retry_when wait (a waiting hand-off's timer), a busy resource or `ttp lock`
 # (device slots too), a pause or hold (a paused resource, a branch or worktree another task uses, a
-# setting hold, the disk guard, a review's prechecks), its provider's gate (logged out, API host down,
-# budget gate), an unfinished depends_on, or anything else.
-REASONS = ("start_when", "start_after", "retry_when", "lock", "hold", "provider_gate", "depends_on", "other")
+# setting hold, the disk guard, a review's prechecks), its provider being out (logged out, API host
+# down), the budget gate closed to new work (spend level, runaway guard, plan window), its routed
+# host's slots full (slot_cap; the project's own full slots show as runnable and not picked), its own
+# task budget or the dollar caps (spend_cap), an unfinished depends_on, or anything else.
+REASONS = ("start_when", "start_after", "retry_when", "lock", "hold", "provider_gate", "budget_gate", "slot_cap",
+           "spend_cap", "depends_on", "other")
 
 
 def path(p) -> Path:

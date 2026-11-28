@@ -13419,7 +13419,7 @@ class Daemon:
                 continue
             task = forkroom.fit(self.p, self.cfg, task, provider, self.gates.get(provider), now)   # within the dollar caps
             why = self._start_hold(task, provider, ctx, reserve=True)
-            fate[task["id"]] = "full" if why == "gate" and task["id"] in ctx["full"] else SLOT_HELD_BY.get(why, "other")
+            fate[task["id"]] = _held_as(why, task["id"], ctx)
             if why == "held":
                 if task["id"] in ctx["branch"]:
                     self._note_branch_hold(task, ctx["branch"][task["id"]])
@@ -13582,8 +13582,7 @@ class Daemon:
                 why = self._start_hold(task, run_prov, ctx, reserve=True, reroute=False)
                 if why:
                     self._route_unlease(lease)
-                    fate[task["id"]] = "full" if why == "gate" and task["id"] in ctx["full"] \
-                        else SLOT_HELD_BY.get(why, "other")
+                    fate[task["id"]] = _held_as(why, task["id"], ctx)
                     if why != "resource":
                         reached.discard(task["id"])
                     continue
@@ -13793,7 +13792,7 @@ class Daemon:
         for task in ready:
             if task["id"] not in reached:
                 self._unreserve(task)
-        if free and only is None:
+        if (free or ready) and only is None:   # full slots and a closed gate are logged too
             try:
                 self._log_slot_fill(free, ready, fate, ctx, core)
             except Exception:   # the audit log never stops dispatch
@@ -13861,8 +13860,9 @@ class Daemon:
         for t in ready:
             why = fate.get(t["id"], "other")
             if why == "full":
-                why = self._start_hold(t, t["provider"] or core, dict(ctx, busy={}, holds={}, full={}, branch={}))
-                why = "runnable" if why is None else SLOT_HELD_BY.get(why, "other")
+                c = dict(ctx, busy={}, holds={}, full={}, branch={})
+                why = self._start_hold(t, t["provider"] or core, c)
+                why = "runnable" if why is None else _held_as(why, t["id"], c)
             if why in ("picked", "runnable"):
                 runnable.append({"id": t["id"], "priority": t["priority"], "owns_obligation": t["id"] in due})
                 if why == "picked":
@@ -23175,9 +23175,21 @@ LOGGED_OUT_NOTE = "held: logged out"
 NET_HELD_NOTE = "held: network,"
 BRANCH_HELD_NOTE = "held: waits for #"   # Daemon._branch_clash: another live task uses its branch or worktree
 PREEMPT_HOLD_S = 120.0   # a task preempted for an urgent one is not started again while that one still waits
-# _start_hold's reasons as schedlog reasons (Daemon._log_slot_fill); budget, caps and optional are other.
+# _start_hold's reasons as schedlog reasons (Daemon._log_slot_fill); "gate" is split by _held_as.
 SLOT_HELD_BY = {"held": "hold", "paused": "hold", "logged_out": "provider_gate", "net": "provider_gate",
-                "gate": "provider_gate", "device": "lock", "resource": "lock"}
+                "gate": "budget_gate", "optional": "budget_gate", "budget": "spend_cap", "caps": "spend_cap",
+                "device": "lock", "resource": "lock"}
+
+
+def _held_as(why: str | None, tid: int, ctx: dict) -> str:
+    """_start_hold's `why` for task `tid` as a schedlog reason: its "gate" is "full" (the worker slots this
+    pass, ctx["full"]), budget_gate (ctx["gate"] closed to new work) or slot_cap (its routed host's slots)."""
+    if why != "gate":
+        return SLOT_HELD_BY.get(why, "other")
+    if tid in ctx.get("full", {}):
+        return "full"
+    gate = ctx.get("gate")
+    return "budget_gate" if gate is None or not gate.allow_new_work else "slot_cap"
 LOGIN_CHECK_PASSED = "its login check passed"
 ACCOUNT_SWITCH_EVENT = "login_account_changed"   # recorded when a login comes back as another account
 
