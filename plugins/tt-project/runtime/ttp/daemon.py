@@ -6479,7 +6479,7 @@ class Daemon:
         # glm_quota_alt: the model's own bucket (modelquota.py) holds it, not a pause of the whole provider,
         # while a listed alternate has room
         q_alt = bool(quota) and self._quota_on() and \
-            bool(modelquota.room(db, self.cfg, p.state, r["model"] or "", time.time()))
+            bool(modelquota.room(db, self.cfg, p.state, r["model"] or "", time.time(), project=p.name))
         if exit_info.get("launch_auth"):
             # The chat bridge had no usable key (none saved, or saved for another URL): the provider's
             # auth gate holds it like a logout, never a launch failure that costs attempts.
@@ -10417,7 +10417,8 @@ class Daemon:
                 from . import glmshare
                 if bad := glmshare.daily_lines(self.p, time.time()):
                     spec += (f"\n\nGLM bad output by day (last {glmshare.BAD_DAYS} d; tool calls rejected for bad input, "
-                             "unparsed tool arguments, reasoning-only answers, junk answers; rate per answer):\n"
+                             "unparsed tool arguments, reasoning-only answers, junk answers; rate per answer; "
+                             "then minutes per UTC hour each model's quota bucket was empty, last day):\n"
                              + "\n".join(f"- {line}" for line in bad))
             except Exception as e:   # nor must the GLM bad-output lines
                 log(self.p, f"GLM bad output lines failed: {type(e).__name__}: {e}")
@@ -14442,7 +14443,7 @@ class Daemon:
             return None
         try:
             return modelquota.route(self.p.db, self.cfg, self.p.state, model, task, cls, now,
-                                    lambda t: timefmt.long(t, self.p))
+                                    lambda t: timefmt.long(t, self.p), self.p.name)
         except Exception as e:   # quota routing must never hold a task back
             log(self.p, f"task {task.get('id')}: model quota not checked: {type(e).__name__}: {e}")
             return None

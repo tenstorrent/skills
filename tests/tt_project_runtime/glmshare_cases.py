@@ -603,3 +603,32 @@ def test_glm_share_probe_window_ignores_rollout_changes_that_leave_the_project_c
     p.set_config("glm.probes", True)
     (p.state / "config-changes.jsonl").unlink(missing_ok=True)   # set by hand, no change log: no window start
     assert glmshare.probes_on_since(p) == 0.0
+
+
+def test_the_quota_alternate_judge_names_the_alternate_worse_than_its_claude_baseline(env, monkeypatch):
+    from ttp import glmshare, modelquota, project, rollout, route
+    monkeypatch.setattr(project, "HOME_DIR", env["tmp"] / "gs-quota-home")
+    p = make(env)
+    now = 1_000_000_000.0 + 60 * 86400
+    t0 = now - 5 * 86400
+    assert glmshare.judge_quota(p, _GS_CFG, now)["state"] == "wait"
+    for _ in range(4):
+        _gs_decided(p, t0 - 3 * 86400, 1, provider="claude")
+    tids = []
+    for i, (m, ok) in enumerate([("alt-a", 0)] * 4 + [("alt-b", 1)] * 4):
+        tid = _gs_task(p, status="done" if ok else "failed")
+        tids.append(tid)
+        alt = {"from": _GS_GLM, "to": m, "n": 1, "why": "empty", "until": now}
+        _gs_run(p, tid, t0 + 3600 * (i + 1), 1, model=m, note={route.KEY: {"to": "chat", "model": m, modelquota.KEY: alt}})
+        _gs_review(p, tid, "done" if ok else "failed")
+    v = glmshare.judge_quota(p, _GS_CFG, now)
+    assert (v["state"], v["model"]) == ("worse", "alt-a"), v
+    assert v["why"].startswith("alternate alt-a: worse than the Claude baseline") and "Claude baseline 4 with" in v["why"]
+    # An alternate's runs are its own by the model they ran on, not by a GLM name (alt-a has none).
+    tasks, runs = glmshare._tasks(p.db, tids), glmshare._worker_runs(p.db, tids)
+    q = lambda mine=None: glmshare.quality(p.db, _GS_CFG, tids[:4], tasks, runs, {}, {}, set(), 1, now,  # noqa: E731
+                                           mine=mine)["glm_runs"]
+    assert (q(), q(lambda r: r["model"] == "alt-a")) == (0, 4)
+    rollout.stop_project(modelquota.FLAG, f"{p.name}:alt-a", "worse")
+    v = glmshare.judge_quota(p, _GS_CFG, now)
+    assert (v["state"], v["model"]) == ("ok", "alt-b"), v

@@ -21,7 +21,8 @@ config or state.
   for that flag alone (rollout.project_rollback {flag: {name: {ts, why}}}). wave_tick, model-free and hourly,
   judges the covered projects: a worse one is rolled back alone, a wave whose projects are all ok opens the next.
   A flag marked `ring_judge` (glm_code) is also judged at a ring level: the projects on this host that the rings
-  cover, rollback only.
+  cover, rollback only. One marked `own_judge` (glm_quota_alt) is judged at every level in each project on this
+  host it is on for, its own setting included; a verdict naming a `model` rolls back `<project>:<model>` alone.
 """
 from __future__ import annotations
 
@@ -81,8 +82,10 @@ FLAGS: dict[str, dict[str, Any]] = {
     "glm_probes": {"key": "glm.probes", "area": "route", "code": _code("codearm.py", "handoffcheck.py", "prompts.py", "glmshare.py"),
                    "arm": "glm"},
     # Per-model quota buckets (modelquota.py): a run whose model's bucket is empty takes a listed alternate.
-    "glm_quota_alt": {"key": "route.glm_work.quota_alt", "area": "route", "arm": "glm",
-                      "code": _code("modelquota.py", "daemon.py", "chatbridge.py")},
+    # own_judge: judged in every project it is on for (its own setting too, at any level), per alternate: a
+    # worse one is rolled back as `<project>:<model>`, the flag stays on there
+    "glm_quota_alt": {"key": "route.glm_work.quota_alt", "area": "route", "arm": "glm", "judge": "quota",
+                      "own_judge": True, "code": _code("modelquota.py", "daemon.py", "chatbridge.py")},
     "eta_history": {"key": "eta.history", "area": "eta", "shadow": True,
                     "code": _code("etaledger.py", "costlevers.py", "cli.py")},
     "deslop": {"key": "deslop.enabled", "area": "review", "code": _code("deslop.py")},
@@ -251,10 +254,11 @@ def change_lines(project: str, since: float, raw: dict | None = None, now: float
         if ts <= since or kind in ("clean", "waves"):
             continue
         at, who = timefmt.short(float(ts), raw, now), WHO.get(r.get("by") or "") or r.get("by") or "the terminal"
+        alt = f"alternate {r['model']} " if r.get("model") else ""   # a per-model rollback: that model alone
         if kind == "project_rollback" and r.get("project") == project:
-            out.append(f"{flag} rolled back for this project by {who} at {at} ({r.get('why')})")
+            out.append(f"{flag} rolled back {alt}for this project by {who} at {at} ({r.get('why')})")
         elif kind == "project_arm" and r.get("project") == project:
-            out.append(f"{flag} re-armed for this project by {who} at {at} ({r.get('why')})")
+            out.append(f"{flag} re-armed {alt}for this project by {who} at {at} ({r.get('why')})")
         elif kind == "advance" and project in (r.get("projects") or []):
             out.append(f"{flag} opened wave {r.get('wave')}, which holds this project: it is on here now")
         elif kind in ("set", "promote", "rollback", "arm"):
@@ -406,7 +410,12 @@ def armed_at(project: str, *flags: str) -> float:
     """When the terminal last re-armed `project` for any of `flags` (0: never): the judged window of its outcomes
     starts there, so the outcomes that led to the rollback never count against the fix."""
     return max((float(r.get("ts") or 0) for f in flags for r in ledger(f)
-                if r.get("op") == "project_arm" and r.get("project") == project), default=0.0)
+                if r.get("op") == "project_arm" and _key(r) == project), default=0.0)
+
+
+def _key(r: dict) -> str:
+    """A project ledger record's rollback key: `<project>:<model>` when it names a model, else the project."""
+    return f"{r.get('project')}:{r['model']}" if r.get("model") else str(r.get("project"))
 
 
 FIXED_OP = "stops_fixed"   # a live guard fix's list of the stops it covers (`ttp rollout fixed`)
@@ -568,7 +577,11 @@ def arm(flag: str, reason: str = "", by: str = "user", project: str = "", eviden
                 return f"{flag} is not rolled back in {project}; nothing changed"
             back.pop(project)
             _put("project_rollback", flag, back or None)
-            _op("project_arm", flag, reason or "fix landed", by, project=project, **(evidence or {}))
+            name, _, model = project.partition(":")
+            _op("project_arm", flag, reason or "fix landed", by, project=name, **({"model": model} if model else {}),
+                **(evidence or {}))
+        if model:
+            return f"{flag} re-armed in {name}: alternate {model} is used there again"
         p = local_projects().get(project)
         return f"{flag} re-armed in {project}: {'on' if on(flag, project, _raw(p) if p else None) else 'off'} for it again"
     with _locked():
@@ -668,7 +681,8 @@ def _wave_state() -> dict:
 
 
 def wave_tick(now: float | None = None, judge=None, projects: dict | None = None, by: str = "daemon") -> list[dict]:
-    """The wave gate, model-free: for each flag at auto, or at a ring level when marked `ring_judge`, not judged in
+    """The wave gate, model-free: for each flag at auto, at a ring level when marked `ring_judge`, or marked
+    `own_judge` (the projects it is on for, at any level), not judged in
     the last hour, judge each project it covers (`judge(p, cfg, now)`: the flag's own judge, ok | worse | wait): at
     auto the projects of its covered waves, at a ring level this host's projects in those rings. A worse one is
     rolled back for that flag alone (the others stay); at auto, when every project left in the current wave is ok
@@ -677,7 +691,8 @@ def wave_tick(now: float | None = None, judge=None, projects: dict | None = None
     from .project import write_json
     now = time.time() if now is None else now
     cfg = settings()
-    at = {f: lv for f in FLAGS if (lv := level(f, cfg)) == AUTO or lv != OFF and FLAGS[f].get("ring_judge")}
+    at = {f: lv for f in FLAGS if (lv := level(f, cfg)) == AUTO or lv != OFF and FLAGS[f].get("ring_judge")
+          or FLAGS[f].get("own_judge")}
     if not at:
         return []
     with _locked():
@@ -695,13 +710,14 @@ def wave_tick(now: float | None = None, judge=None, projects: dict | None = None
         if lv != at[flag]:
             continue   # the user changed it meanwhile: the next hour judges the new state
         rings, excl = cfg.get("rings"), set(cfg.get("excluded") or [])
-        names = ([n for w in ws[:k + 1] for n in w] if lv == AUTO
+        names = ([n for n, p in projs.items() if on(flag, n, _raw(p), cfg)] if FLAGS[flag].get("own_judge")
+                 else [n for w in ws[:k + 1] for n in w] if lv == AUTO
                  else [n for n, p in projs.items() if (r := ring_of(n, cfg)) is not None and r <= lv
                        and not own_setting(_raw(p), FLAGS[flag]["key"])])   # the project's own value wins
         verdicts: dict[str, dict] = {}
         try:
             from . import deviceplan, glmshare
-            judges = {"deviceplan": deviceplan.judge, "codearm": glmshare.judge_code}
+            judges = {"deviceplan": deviceplan.judge, "codearm": glmshare.judge_code, "quota": glmshare.judge_quota}
             fj = judge or judges.get(FLAGS.get(flag, {}).get("judge"), glmshare.judge)
         except ImportError:
             continue
@@ -723,13 +739,14 @@ def wave_tick(now: float | None = None, judge=None, projects: dict | None = None
                 continue   # the user changed it meanwhile: the next hour judges the new state
             back, worse = rolled_back(flag, cfg), []
             for name, v in verdicts.items():
-                if v.get("state") == "worse" and name not in back:
+                key = f"{name}:{v['model']}" if v.get("model") else name   # a judge naming a model rolls back it alone
+                if v.get("state") == "worse" and key not in back:
                     why = str(v.get("why") or "worse than its own baseline")[:300]
-                    back[name] = {"ts": round(now, 3), "why": why}
-                    worse.append(name)
+                    back[key] = {"ts": round(now, 3), "why": why}
+                    worse.append(key)
                     # the verdict's comparison rides along on the ledger line: both pass rates and the window
                     out.append(_op("project_rollback", flag, why, by, project=name, n=v.get("n"),
-                                   **{k: v[k] for k in ("glm_pct", "base_pct", "base_window") if k in v}))
+                                   **{k: v[k] for k in ("glm_pct", "base_pct", "base_window", "model") if k in v}))
             if worse:
                 _put("project_rollback", flag, back)
             left = [n for n in ws[k] if n not in excl and n not in back] if lv == AUTO else []
@@ -804,6 +821,10 @@ def project_events(p, now: float | None = None) -> list[str]:
             add("rollout_wave", f"rollout_wave:{flag}:{r.get('wave')}",
                 f"Release flag {flag} opened wave {r.get('wave')}, which holds this project: it is on here now "
                 f"(its own setting for {FLAGS.get(flag, {}).get('key')} still wins). Why: {r.get('why')}")
+        elif r["op"] == "project_rollback" and r.get("project") == name and (m := r.get("model")):
+            add("rollout_wave", f"rollout_wave_rollback:{flag}:{m}",
+                f"Release flag {flag} stopped quota alternate {m} for this project alone ({r.get('why')}); the "
+                f"other alternates and projects keep it. It stays off here until `ttp rollout arm {flag} {name}:{m}`.")
         elif r["op"] == "project_rollback" and r.get("project") == name:
             add("rollout_wave", f"rollout_wave_rollback:{flag}",
                 f"Release flag {flag} was rolled back for this project alone ({r.get('why')}); the other projects "

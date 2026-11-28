@@ -10,7 +10,17 @@ takes the first model of the account setting providers.chat.quota_alternates (an
 that the endpoint serves, is not down (modelrank.down) and whose own bucket has room; with none it starts on the
 core provider as before (fallback `quota`). Coordinator, plan, question, review, conclusion and person-facing
 (`reply_chat`) runs never take an alternate. A model whose id contains `flash` is taken only once its server
-refusals (429/503 given up, rate-limit faults: count()) are under FLASH_MAX of at least FLASH_MIN_CALLS calls."""
+refusals (429/503 given up, rate-limit faults: count()) are under FLASH_MAX of at least FLASH_MIN_CALLS calls.
+
+The x-quota-remaining-llm_* headers give the lowest amount left across the endpoint's hourly, daily and monthly
+windows, with no reset: an empty one marks the bucket to the end of the hour. When a longer window ran out, the
+next run there takes one 429, whose reset then marks the real end (accepted: one refused call an hour at most).
+
+Each mark also keeps the bucket's empty windows (`empty`: [start, end] pairs, kept EMPTY_S): empty_minutes()
+gives the minutes per UTC hour each model's bucket was empty, for the daily GLM-share lines (glmshare.report).
+The glm_quota_alt wave judge (glmshare.judge_quota) judges each alternate's tasks in a project against its own
+Claude baseline; a worse one is rolled back for that project alone (rollout key `<project>:<model>`, read by
+rolled_back_models()), so room() skips it there until `ttp rollout arm glm_quota_alt <project>:<model>`."""
 
 from __future__ import annotations
 
@@ -25,6 +35,7 @@ FILE = "_models"               # glmquota's file key: quota/_models.json
 ALT_KEY = "providers.chat.quota_alternates"   # account setting: the ordered alternates list
 FLASH_MAX, FLASH_MIN_CALLS = 0.05, 20
 COUNT_S = 7 * 86400            # a model's call and refusal counts start over this often
+EMPTY_S = 8 * 86400            # a model's empty windows are kept this long (past the 7-day report)
 _DUR = re.compile(r"^(?:(\d+)h)?(?:(\d+)m(?!s))?(?:([\d.]+)s)?(?:(\d+)ms)?$")
 
 
@@ -57,9 +68,28 @@ def mark(model: str, got: dict | None = None, now: float | None = None) -> None:
     with glmquota._locked(FILE) as path:
         st = glmquota._read(path)
         m = st.get(model) or {}
-        st[model] = {**m, "until": max(reset if reset > now else _hour_end(now), float(m.get("until") or 0)), "at": now,
+        end = max(reset if reset > now else _hour_end(now), float(m.get("until") or 0))
+        empty = [w for w in m.get("empty") or [] if w[1] > now - EMPTY_S]
+        if empty and empty[-1][1] >= now:
+            empty[-1][1] = end   # still empty: the window grows
+        else:
+            empty.append([now, end])
+        st[model] = {**m, "until": end, "at": now, "empty": empty,
                      **{k: int(got[k]) for k in ("used", "limit") if isinstance(got.get(k), (int, float))}}
         glmquota._write(path, st)
+
+
+def empty_minutes(since: float, now: float, st: dict | None = None) -> dict[str, dict[float, float]]:
+    """{model: {UTC hour start: minutes its bucket was empty}} over [since, now), from the marked windows."""
+    out: dict[str, dict[float, float]] = {}
+    for model, m in (_state() if st is None else st).items():
+        for a, b in (m.get("empty") or []) if isinstance(m, dict) else []:
+            a, b = max(float(a), since), min(float(b), now)
+            while a < b:
+                e, hs = _hour_end(a), out.setdefault(model, {})
+                hs[e - 3600] = round(hs.get(e - 3600, 0) + (min(b, e) - a) / 60, 1)
+                a = e
+    return out
 
 
 def note(model: str, headers, now: float | None = None) -> None:
@@ -117,20 +147,27 @@ def _flash_ok(m: dict) -> bool:
     return int(c.get("n") or 0) >= FLASH_MIN_CALLS and int(c.get("refused") or 0) < FLASH_MAX * int(c["n"])
 
 
-def room(db, cfg: dict, state, model: str, now: float, st: dict | None = None) -> tuple[int, str] | None:
-    """(place from 1, model) of the first listed alternate other than `model` that is served, not down and has
-    room, else None."""
+def rolled_back_models(project: str) -> set[str]:
+    """The alternates the wave gate rolled back in `project` (rollout key `<project>:<model>`)."""
+    from . import rollout
+    return {k[len(project) + 1:] for k in rollout.rolled_back(FLAG) if k.startswith(f"{project}:")}
+
+
+def room(db, cfg: dict, state, model: str, now: float, st: dict | None = None, project: str = "") -> tuple[int, str] | None:
+    """(place from 1, model) of the first listed alternate other than `model` that is served, not down, not
+    rolled back in `project` and has room, else None."""
     from . import modelrank
     st = _state() if st is None else st
-    ids = modelrank.served(state, now) or []
+    ids, off = modelrank.served(state, now) or [], rolled_back_models(project) if project else set()
     for n, m in enumerate(alternates(), 1):
-        if m != model and m in ids and not until(m, now, st) and not modelrank.down(db, cfg, state, m, now) \
+        if m != model and m in ids and m not in off and not until(m, now, st) and not modelrank.down(db, cfg, state, m, now) \
                 and ("flash" not in m.lower() or _flash_ok(st.get(m) or {})):
             return n, m
     return None
 
 
-def route(db, cfg: dict, state, model: str, task: dict, cls: str | None, now: float, fmt=None) -> dict | None:
+def route(db, cfg: dict, state, model: str, task: dict, cls: str | None, now: float, fmt=None,
+          project: str = "") -> dict | None:
     """None while `model`'s bucket has room; else the route entry's KEY record: {"from", "until", "why"} plus
     "to" and "n" (its place in the list, from 1) when an alternate has room. `fmt` shows a time."""
     st = _state()
@@ -139,7 +176,7 @@ def route(db, cfg: dict, state, model: str, task: dict, cls: str | None, now: fl
         return None
     fmt = fmt or (lambda x: time.strftime("%H:%M UTC", time.gmtime(x)))
     rec = {"from": model, "until": t, "why": f"{model} quota bucket empty until {fmt(t)}"}
-    if eligible(task, cls) and (got := room(db, cfg, state, model, now, st)):
+    if eligible(task, cls) and (got := room(db, cfg, state, model, now, st, project)):
         n, m = got
         return {**rec, "to": m, "n": n, "why": f"{rec['why']}: alternate {n}, {m}"}
     return {**rec, "why": f"{rec['why']}: no alternate has room, fallback to the core provider"}

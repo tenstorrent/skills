@@ -68,7 +68,7 @@ import json
 import re
 from pathlib import Path
 
-from . import codearm, costlevers, glmassist, route, runclass
+from . import codearm, costlevers, glmassist, modelquota, route, runclass
 from .db import load_result
 from .util import task_labels
 
@@ -263,13 +263,15 @@ def _incidents(db, cfg: dict, runs: list[dict], tasks: dict, until: float) -> in
 
 
 def quality(db, cfg: dict, tids, tasks: dict, runs: dict, reviews: dict, fixes: dict, requeued: set,
-            days: float, until: float, fixed: dict | None = None, arm: str = "glm") -> dict:
+            days: float, until: float, fixed: dict | None = None, arm: str = "glm", mine=None) -> dict:
     """One arm's quality over tasks `tids` (the module doc); a bounce `fixed` (rollout.fixed_stops) lists from
     before its fix went live is not counted: a task whose every bounce that is lands in q["not_counted"]. A
     task of the GLM arm that bounced and whose last run finished on the core provider keeps only its bounce
     count (a retry after GLM's own failed or reopened work still counts against GLM): its outcome is Opus's,
-    not GLM's, so it moves none of the outcome metrics."""
+    not GLM's, so it moves none of the outcome metrics. `mine(run)`: whether a run is the judged arm's (default:
+    on GLM)."""
     from . import effort, rollout
+    mine = mine or (lambda r: on_glm(r["provider"], r["model"], r["note"]))
     q = {"tasks": 0, "done": 0, "failed": 0, "reopened": 0, "reviewed": 0, "first_pass": 0, "fix_rounds": 0,
          "bounces": 0, "decided": 0, "glm_runs": 0, "incidents": 0}
     glm_runs, q["not_counted"] = [], []
@@ -279,7 +281,7 @@ def quality(db, cfg: dict, tids, tasks: dict, runs: dict, reviews: dict, fixes: 
             continue
         rs, rv = runs.get(tid) or [], reviews.get(tid) or {}
         bounced = [r for r in rs if (_note(r["note"]).get(route.KEY) or {}).get("fallback") == route.BOUNCE]
-        finished_off = (arm == "glm" and bounced and not on_glm(rs[-1]["provider"], rs[-1]["model"], rs[-1]["note"])
+        finished_off = (arm == "glm" and bounced and not mine(rs[-1])
                         and (not rv.get("at") or float(bounced[0]["started"] or 0) < rv["at"]))   # Opus finished it before its first review
         q["tasks"] += 1
         if not finished_off:
@@ -295,7 +297,7 @@ def quality(db, cfg: dict, tids, tasks: dict, runs: dict, reviews: dict, fixes: 
         deep = effort.wants_deep(t.get("result"))
         q["not_counted"] += off if off and len(off) == len(bounced) and not deep else []   # the task's bounce it took out
         q["bounces"] += len(off) < len(bounced) or deep
-        glm_runs += [r for r in rs if on_glm(r["provider"], r["model"], r["note"])]
+        glm_runs += [r for r in rs if mine(r)]
     q["glm_runs"] = len(glm_runs)
     q["incidents"] = _incidents(db, cfg, glm_runs, tasks, until)
     rate = lambda a, b: round(100.0 * a / b, 1) if b else None   # noqa: E731
@@ -446,7 +448,7 @@ def report(p, since: float, now: float) -> dict:
             "arms": arms, "probes": probe_arms(by_arm["glm"], tasks, ctx[0], probes_on_since(p)) if costlevers.lever_on(p, "glm_probes") else {}, "held": held(p, since, now), "claude_usd_per_day": round(float(usd or 0) / days, 2) if days > 0 else None,
             "corrections": {"n": len(corr), "per_arm": None,
                             "note": "a correction names no task, so it is counted per project; kept 7 days"},
-            "bad_output": bad_output(p, rows),
+            "bad_output": bad_output(p, rows), "bucket_empty": modelquota.empty_minutes(since, now),
             "reviews_on_glm": [{"run": r["id"], "started": r["started"], "class": _note(r["note"]).get(runclass.KEY) or "-"}
                                for r in rows if (tasks.get(r["task"]) or {}).get("kind") == "review"
                                and on_glm(r["provider"], r["model"], r["note"])]}
@@ -536,11 +538,19 @@ def bad_lines(got: list[dict]) -> list[str]:
 
 
 def daily_lines(p, now: float) -> list[str]:
-    """The daily review's lines: the last BAD_DAYS days of bad_output; [] with no GLM run in them."""
+    """The daily review's lines: the last BAD_DAYS days of bad_output, then the last day's empty quota buckets;
+    [] with neither."""
     since = now - BAD_DAYS * 86400
     rows = p.db.q("SELECT id, task, role, provider, model, started, ended, note, dir FROM runs WHERE started>=? "
                   "AND started<?", (since, now))
-    return bad_lines(bad_output(p, rows))
+    return bad_lines(bad_output(p, rows)) + empty_lines(modelquota.empty_minutes(now - 86400, now))
+
+
+def empty_lines(got: dict) -> list[str]:
+    """One line per model of modelquota.empty_minutes: the UTC hours its quota bucket was empty, in minutes."""
+    hour = lambda h: f"{datetime.datetime.fromtimestamp(h, datetime.timezone.utc):%m-%d %H}h"   # noqa: E731
+    return [f"quota bucket of {m} empty (min per UTC hour): " + ", ".join(f"{hour(h)} {v:g}" for h, v in sorted(hs.items()))
+            for m, hs in sorted(got.items()) if hs]
 
 
 def text(s: dict) -> str:
@@ -573,6 +583,7 @@ def text(s: dict) -> str:
     if s.get("bad_output"):
         lines.append("  GLM bad output by day (rate per answer):")
         lines += [f"    {x}" for x in bad_lines(s["bad_output"])]
+    lines += [f"  {x}" for x in empty_lines(s.get("bucket_empty") or {})]
     return "\n".join(lines)
 
 
@@ -697,12 +708,30 @@ def judge_code(p, cfg: dict, now: float) -> dict:
     return _judge_arms(p, cfg, now, True)
 
 
-def _judge_arms(p, cfg: dict, now: float, code: bool) -> dict:
+def judge_quota(p, cfg: dict, now: float) -> dict:
+    """The glm_quota_alt wave judge: each quota alternate's tasks in this project (first run there) against its own
+    Claude baseline; the worst alternate's verdict, naming it in `model` (rollout rolls back `<project>:<model>`)."""
+    alts: dict[str, dict] = {}
+    for r in p.db.q("SELECT task, started, note FROM runs WHERE role='worker' AND task IS NOT NULL "
+                    "AND note LIKE ? ORDER BY id", (f'%"{modelquota.KEY}"%',)):
+        to = ((route.of(r["note"]) or {}).get(modelquota.KEY) or {}).get("to")
+        if to and not any(r["task"] in a for a in alts.values()):
+            alts.setdefault(to, {})[r["task"]] = {"arm": "glm", "ts": r["started"]}
+    skip, off = {t for r in alts.values() for t in r}, modelquota.rolled_back_models(getattr(p, "name", ""))
+    rank = {"worse": 0, "wait": 1, "ok": 2}
+    got = [{**v, "why": f"alternate {m}: {v['why']}", "model": m}
+           for m, r in sorted(alts.items()) if m not in off for v in [_judge_arms(p, cfg, now, False, (m, r, skip))]]
+    return min(got, key=lambda v: rank.get(v["state"], 1), default={
+        "state": "wait", "why": "not enough data: no runs on a quota alternate yet", "n": 0, "signals": []})
+
+
+def _judge_arms(p, cfg: dict, now: float, code: bool, alt: tuple | None = None) -> dict:
     """The wave gate judge shared by glm_work and glm_code (`code`: the code arm's records, a baseline of code
-    tasks and CODE_METRICS alone)."""
-    from . import correction, deviceplan, rollout
+    tasks and CODE_METRICS alone) and glm_quota_alt (`alt`: (model, its tasks' records, every alternate task, kept
+    out of the baseline))."""
+    from . import correction, deviceplan, modelrank, rollout
     db, st = p.db, settings(cfg)
-    recs = arm_records(db, CODE_ARM_KV if code else ARM_KV)
+    recs = alt[1] if alt else arm_records(db, CODE_ARM_KV if code else ARM_KV)
     if not recs:
         return {"state": "wait", "why": f"not enough data: no {'glm_code' if code else 'glm_work'} arm records yet",
                 "n": 0, "signals": []}
@@ -712,23 +741,25 @@ def _judge_arms(p, cfg: dict, now: float, code: bool) -> dict:
     ids = set(recs) | pre | post
     tasks, runs = _tasks(db, ids), _worker_runs(db, ids)
     work = lambda ts: [t for t in ts if (tasks.get(t) or {}).get("kind") != "review"]   # noqa: E731
-    armed = rollout.armed_at(getattr(p, "name", ""), "glm_work", "glm_code")   # a re-arm starts a new window
+    armed = rollout.armed_at(f"{getattr(p, 'name', '')}:{alt[0]}", modelquota.FLAG) if alt else \
+        rollout.armed_at(getattr(p, "name", ""), "glm_work", "glm_code")   # a re-arm starts a new window
     device = lambda t: deviceplan.device(tasks.get(t) or {}, cfg)   # noqa: E731
     glm = [t for t, r in recs.items() if r.get("arm") == "glm" and float(r.get("ts") or now) >= armed]
     dev_glm = [t for t in glm if device(t)]   # device runs are judged by glm_device's own judge: only incidents count here
     glm = [t for t in glm if t not in dev_glm]
     cand = [t for t, r in recs.items() if r.get("arm") != "glm" and not device(t)] + [
         t for t in work(pre | post) if t not in recs and runs.get(t) and not device(t)
-        and (not code or (tasks.get(t) or {}).get("kind") == "code")
+        and (not code or (tasks.get(t) or {}).get("kind") == "code") and t not in (alt[2] if alt else ())
         and not on_glm(runs[t][0]["provider"], runs[t][0]["model"], runs[t][0]["note"])]
     ctx = (_reviews(db, since), _fix_rounds(db, since), _requeued(db, since))
     w0 = max(t0, armed)   # the GLM window being judged: the baseline is Claude's outcomes from the same period
     base, lo = base_window(cand, tasks, runs, ctx[0], w0, since, st["min_window"])
     days = max((now - t0) / 86400, 1e-9)
     fixed = rollout.fixed_stops(getattr(p, "name", ""), "glm_work", "glm_code")
-    g = quality(db, cfg, glm, tasks, runs, *ctx, days, now, fixed)
-    g["incidents"] += _incidents(db, cfg, [r for t in dev_glm for r in runs.get(t, [])
-                                           if on_glm(r["provider"], r["model"], r["note"])], tasks, now)
+    mine = (lambda r: modelrank.ran(r["model"], r["note"])[0] == alt[0]) if alt else None   # noqa: E731
+    g = quality(db, cfg, glm, tasks, runs, *ctx, days, now, fixed, mine=mine)
+    mine = mine or (lambda r: on_glm(r["provider"], r["model"], r["note"]))   # noqa: E731
+    g["incidents"] += _incidents(db, cfg, [r for t in dev_glm for r in runs.get(t, []) if mine(r)], tasks, now)
     b = quality(db, cfg, base, tasks, runs, *ctx, days, now, arm="claude")
     before = quality(db, cfg, work(pre), tasks, runs, *ctx, BASE_DAYS, t0, arm="claude")
     after = quality(db, cfg, work(post), tasks, runs, *ctx, days, now, arm="claude")
@@ -739,16 +770,17 @@ def _judge_arms(p, cfg: dict, now: float, code: bool) -> dict:
         sig = [s for s in sig if s["signal"] in CODE_METRICS]
     n = g["decided"]
     frm = datetime.datetime.fromtimestamp(lo, datetime.timezone.utc)
-    nums = (f"GLM {n} tasks with an outcome; Claude baseline {b['decided']} with an outcome since "
+    who = f"alternate {alt[0]}" if alt else "GLM"
+    nums = (f"{who} {n} tasks with an outcome; Claude baseline {b['decided']} with an outcome since "
             f"{frm:%Y-%m-%d %H:%M} UTC; " + "; ".join(_says(s) for s in _failing_first(sig))
             + (f"; {rollout.not_counted_line(g['not_counted'], p)}" if g["not_counted"] else ""))
     out = lambda state, why: {"state": state, "why": f"{why}; {nums}", "n": n, "signals": sig,   # noqa: E731
                               "glm_pct": g["first_pass_pct"], "base_pct": b["first_pass_pct"],
                               "base_window": [round(lo, 3), round(now, 3)]}
     if g["incidents"]:
-        return out("worse", f"{g['incidents']} device incident(s) on GLM runs")
+        return out("worse", f"{g['incidents']} device incident(s) on {who} runs")
     if n < st["min_tasks"] or b["decided"] < st["min_base"]:
-        return out("wait", f"not enough data: {n} of {st['min_tasks']} GLM tasks and {b['decided']} of "
+        return out("wait", f"not enough data: {n} of {st['min_tasks']} {who} tasks and {b['decided']} of "
                            f"{st['min_base']} baseline tasks with an outcome")
     worse = [s["signal"] for s in sig if s["verdict"] == "worse"]
     if worse:

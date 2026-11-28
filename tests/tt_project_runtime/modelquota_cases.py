@@ -261,3 +261,49 @@ def test_model_quota_coordinator_wake_triage_skips_an_empty_bucket_while_the_fla
         ev = dict(p.db.one("SELECT * FROM events ORDER BY id DESC LIMIT 1"))
         assert waketriage.fold(p.db, d.cfg, [ev], now, buckets=buckets)[0] and asked[-1] == want, asked
     assert d._quota_on(), "the daemon passes the state folder only while the flag is on"
+
+
+def test_model_quota_records_each_empty_window_and_counts_empty_minutes_per_hour(env, monkeypatch):
+    from ttp import glmshare, modelquota
+    _mq_home(env, monkeypatch)
+    h = 1_800_000_000 // 3600 * 3600
+    # An empty llm header (lowest of the hourly, daily and monthly windows, no reset) marks to the hour's end;
+    # past it the bucket has room, and the next run's 429 sets the longer window's real reset.
+    modelquota.note("w-model", {"x-quota-remaining-llm_tokens": "0"}, now=h + 1800)
+    assert modelquota.until("w-model", now=h + 3601) == 0.0
+    modelquota.mark("w-model", {"reset": h + 3 * 3600}, now=h + 3600 + 600)
+    modelquota.mark("w-model", now=h + 3600 + 900)   # still empty: its window grows, no new one
+    assert modelquota._state()["w-model"]["empty"] == [[h + 1800, h + 3600], [h + 4200, h + 3 * 3600]]
+    got = modelquota.empty_minutes(h, h + 3 * 3600)
+    assert got == {"w-model": {h: 30.0, h + 3600: 50.0, h + 7200: 60.0}}
+    assert modelquota.empty_minutes(h + 3600, h + 3600 + 1800) == {"w-model": {h + 3600: 20.0}}, "clipped to the window"
+    line = glmshare.empty_lines(got)
+    assert line == ["quota bucket of w-model empty (min per UTC hour): 01-15 08h 30, 01-15 09h 50, 01-15 10h 60"], line
+    # A window older than EMPTY_S is dropped at the next mark.
+    modelquota.mark("w-model", now=h + modelquota.EMPTY_S + 4 * 3600)
+    assert [w[0] for w in modelquota._state()["w-model"]["empty"]] == [h + modelquota.EMPTY_S + 4 * 3600]
+
+
+def test_model_quota_a_worse_alternate_is_rolled_back_in_its_project_alone(env, monkeypatch):
+    from ttp import modelquota, rollout, route
+    p, d = _mq_setup(env, monkeypatch)   # on by the project's own setting, the rollout level off
+    assert rollout.level(modelquota.FLAG) == "off"
+    worse = {"state": "worse", "why": "alternate alt-a: worse than the Claude baseline", "n": 4, "model": "alt-a"}
+    recs = rollout.wave_tick(time.time(), lambda *a: worse, {p.name: p})
+    assert [(r["op"], r["project"], r["model"]) for r in recs] == [("project_rollback", p.name, "alt-a")]
+    assert d._quota_on(), "the flag stays on in the project"
+    assert modelquota.rolled_back_models(p.name) == {"alt-a"} and modelquota.rolled_back_models("other") == set()
+    # Its coordinator and the change lines name the alternate and the key that restores it alone.
+    rollout.project_events(p)
+    ev = p.db.q("SELECT text FROM events WHERE kind='rollout_wave'")
+    assert len(ev) == 1 and f"`ttp rollout arm {modelquota.FLAG} {p.name}:alt-a`" in ev[0]["text"], ev
+    assert any(f"{modelquota.FLAG} rolled back alternate alt-a for this project" in x
+               for x in rollout.change_lines(p.name, 0)), rollout.change_lines(p.name, 0)
+    modelquota.mark(_RT_MODEL)
+    prov, _, note = _route_dispatch(p, d, monkeypatch, title="skips alt-a")
+    assert prov == "chat" and note[route.KEY]["model"] == "alt-b", note
+    said = rollout.arm(modelquota.FLAG, project=f"{p.name}:alt-a")
+    assert said == f"{modelquota.FLAG} re-armed in {p.name}: alternate alt-a is used there again", said
+    assert rollout.armed_at(f"{p.name}:alt-a", modelquota.FLAG) > 0 == rollout.armed_at(p.name, modelquota.FLAG)
+    prov, _, note = _route_dispatch(p, d, monkeypatch, title="alt-a again")
+    assert note[route.KEY]["model"] == "alt-a", note
