@@ -186,13 +186,20 @@ def _reviews(db, since: float) -> dict[int, dict]:
 
 
 def probes_on_since(p) -> float:
-    """When the glm_probes flag last turned on for `p`: its own setting's change, else the flag's last rollout
-    change. A task made before then ran without the probe step, whatever its id's parity."""
-    from . import rollout
+    """When the glm_probes flag last turned on for `p`: its own setting's last change, else the last rollout
+    change that took the flag from a level not covering `p`'s ring to one that does; 0 when none is recorded.
+    A task made before then ran without the probe step, whatever its id's parity."""
+    from . import configwho, rollout
     key = rollout.FLAGS["glm_probes"]["key"]
     if rollout.own_setting(p.raw_config(), key):
-        return rollout.override_since(p, key) or 0.0
-    return max((float(r.get("ts") or 0) for r in rollout.ledger("glm_probes") if r.get("kind") in ("set", "promote", "arm")),
+        rows = [r for r in configwho.history(p, key) if not r.get("refused") and "new" in r]
+        return float(rows[-1]["ts"]) if rows else 0.0
+    ring = rollout.ring_of(p.name)
+
+    def covered(v) -> bool:
+        return v == rollout.AUTO or (v in (0, 1, 2) and not isinstance(v, bool) and ring is not None and ring <= v)
+    return max((float(r.get("ts") or 0) for r in rollout.ledger("glm_probes")
+                if r.get("kind") in ("set", "promote", "arm") and covered(r.get("to")) and not covered(r.get("from"))),
                default=0.0)
 
 

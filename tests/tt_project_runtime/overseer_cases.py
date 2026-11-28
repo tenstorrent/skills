@@ -582,3 +582,11 @@ def test_an_urgent_task_held_by_the_project_cap_still_counts_as_a_wait(env, monk
     p, now = _urgent_task_with_saved_wait(env, monkeypatch, "logged_out", {"dispatch": 10.0}, 30)
     h = overseer.measure(p, now)
     assert h["urgent_held"] == 1 and readywait.LABELS["logged_out"] in h["urgent_hold"]
+
+
+def test_an_urgent_wait_never_counts_from_before_the_task_was_made_urgent(env, monkeypatch):
+    from ttp import overseer
+    p, now = _urgent_task_with_saved_wait(env, monkeypatch, "project_cap", {"project_cap": 3000.0}, 30)
+    p.db.x("UPDATE tasks SET updated=? WHERE id=(SELECT MAX(id) FROM tasks)", (now - 100,))   # made urgent 100 s ago
+    h = overseer.measure(p, now)
+    assert h["urgent_held"] == 0 and 95 <= h["urgent_wait_s"] <= 105 and h["failing"] == []

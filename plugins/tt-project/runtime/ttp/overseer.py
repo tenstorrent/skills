@@ -123,7 +123,8 @@ def _free_wait(d, task: dict, since: float, now: float) -> float:
     seen = _seen(d, task["id"], now)
     if not seen:
         return _age(now, since) or 0.0
-    return sum(seen["causes"].get(c, 0.0) for c in UNEXCUSED) + (now - seen["last"] if seen["cause"] in UNEXCUSED else 0.0)
+    wait = sum(seen["causes"].get(c, 0.0) for c in UNEXCUSED) + (now - seen["last"] if seen["cause"] in UNEXCUSED else 0.0)
+    return min(wait, _age(now, since) or 0.0)   # never from before `since` (e.g. when the task was made urgent)
 
 
 def _seen(d, tid: int, now: float) -> dict | None:

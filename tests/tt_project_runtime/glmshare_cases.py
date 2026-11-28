@@ -588,3 +588,18 @@ def test_glm_share_probe_arms_count_only_tasks_made_after_the_flag_turned_on(env
         _gs_review(p, tid, "done")
     arms = glmshare.report(p, now - 86400, now)["probes"]
     assert sum(v["reviewed"] for v in arms.values()) == 2 and sum(v["failed"] for v in arms.values()) == 0
+
+
+def test_glm_share_probe_window_ignores_rollout_changes_that_leave_the_project_covered(env, monkeypatch):
+    from ttp import glmshare, rollout
+    p = make(env)
+    ring = rollout.ring_of(p.name)
+    rec = lambda ts, kind, old, new: {"ts": ts, "kind": kind, "flag": "glm_probes", "from": old, "to": new}
+    monkeypatch.setattr(rollout, "ledger", lambda flag=None: [rec(100.0, "set", "off", ring), rec(900.0, "promote", ring, 2)])
+    assert glmshare.probes_on_since(p) == 100.0   # a promote that changes nothing for this project keeps its window
+    monkeypatch.setattr(rollout, "ledger", lambda flag=None: [rec(100.0, "set", "off", ring), rec(500.0, "set", ring, "off"),
+                                                              rec(900.0, "set", "off", 2)])
+    assert glmshare.probes_on_since(p) == 900.0
+    p.set_config("glm.probes", True)
+    (p.state / "config-changes.jsonl").unlink(missing_ok=True)   # set by hand, no change log: no window start
+    assert glmshare.probes_on_since(p) == 0.0
