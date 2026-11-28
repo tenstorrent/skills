@@ -157,9 +157,9 @@ def test_block_log_and_blocked_commands_and_the_daily_line(env, capsys, monkeypa
     assert json.loads(log[0])["rule"] == "keep constant" and json.loads(log[0])["seconds"] == 90.0
     line = next(x for x in unblock.lines(p.db, now, {}) if x.startswith("Blocked time: "))
     assert "of ordered work (target 5%); top: " in line and "keep constant" in line
-    cli.cmd_blocked(types.SimpleNamespace(days=1.0, json=True))
+    cli.cmd_blocked(types.SimpleNamespace(days=1.0, json=True, done=None, how=None))
     out = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
     assert out["target"] == 0.05 and {e["rule"] for e in out["top"]} == {"held by a keep constant", "keep constant"}
     assert {e["safety"] for e in out["top"]} == {"convenience"}
-    cli.cmd_blocked(types.SimpleNamespace(days=1.0, json=False))
+    cli.cmd_blocked(types.SimpleNamespace(days=1.0, json=False, done=None, how=None))
     assert "of ordered work over 1 d (target 5%)" in capsys.readouterr().out
