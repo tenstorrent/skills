@@ -55,3 +55,19 @@ def test_an_unset_project_cap_uses_the_account_cap_and_says_nothing_of_a_project
     assert any(r.startswith("global daily cap reached: $120 of $100 today") for r in g.reasons), g.reasons
     assert "global_account_cap" not in g.numbers and "project daily cap" not in line, line
     assert "global daily cap (whole account, per provider)" in line and "project cap" not in web, (line, web)
+
+
+def test_a_project_cap_is_named_when_the_account_cap_is_the_default_or_off(env, tmp_path):
+    from ttp import project
+    for acct, words in ((None, "above the account cap of $200"), (0, "the account has no cap")):
+        p, other = _global_cap_setup(env, tmp_path)
+        s = project.load_account_settings()
+        s["budget"].pop("global_daily_usd")
+        if acct is not None:
+            s["budget"]["global_daily_usd"] = acct
+        (project.HOME_DIR / "settings.json").write_text(json.dumps(s))
+        p.set_config("budget.global_daily_usd", 250)
+        other.spend("fake", 260.0, "task:1")
+        from ttp import budget as bud
+        g = bud.evaluate(p.db, p.config(), "fake", [], time.time())
+        assert any(r.startswith("project daily cap $250 reached") and words in r for r in g.reasons), (acct, g.reasons)

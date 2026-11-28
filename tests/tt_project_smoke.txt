@@ -4,6 +4,7 @@
 tests/test_tt_project_runtime.py::test_a_project_cap_below_the_account_cap_is_named_as_the_one_that_binds
 tests/test_tt_project_runtime.py::test_a_project_cap_equal_to_the_account_cap_reads_as_the_account_cap
 tests/test_tt_project_runtime.py::test_a_project_cap_above_the_account_cap_says_it_is_the_projects_and_higher
+tests/test_tt_project_runtime.py::test_a_project_cap_is_named_when_the_account_cap_is_the_default_or_off
 tests/test_tt_project_runtime.py::test_an_unset_project_cap_uses_the_account_cap_and_says_nothing_of_a_project_cap
 # One test per line (file::name, all its parametrizations); a renamed or removed test fails
 # test_smoke_list_names_existing_tests_and_covers_each_area. Each case file keeps at least one test here.

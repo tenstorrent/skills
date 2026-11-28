@@ -9463,7 +9463,7 @@ class Daemon:
             if due:
                 for c in due:
                     episodes[prov][c]["alerted"] = True
-                capped = any("cap reached" in r for r in held)
+                capped = any(bud.red_class(r) in ("cap", "global cap") for r in held)
                 hint = f"New work on {prov} waits; running work finishes and replies to you continue. " + (
                     "It starts again by itself when the budget day resets. "
                     if any(bud.red_class(r) == "global cap" for r in held) else

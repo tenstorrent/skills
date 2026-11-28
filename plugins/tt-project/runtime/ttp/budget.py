@@ -767,9 +767,8 @@ def _global(db: DB, g: Gate, b: dict, provider: str, day: tuple[float, float] | 
     # The project's own cap is in force when it differs from the account-level setting: the gate then
     # names it as the project's, with the account cap beside it.
     from . import project
-    acct = project.account_value("budget.global_daily_usd")
-    acct = float(acct) if isinstance(acct, (int, float)) and not isinstance(acct, bool) and acct > 0 else 0.0
-    if acct and acct != cap:
+    acct = float(project.layered({})["budget"].get("global_daily_usd") or 0)   # the account's, 0 = off
+    if acct != cap:
         g.numbers["global_account_cap"] = acct
     g.numbers.update({"global_today": round(t["usd"], 2), "global_cap": cap, "global_stale": t["stale"],
                       "global_includes": t["includes"], "global_resets_at": end if day else None,

@@ -866,7 +866,7 @@ def uncounted(n: dict) -> str:
 def project_cap(n: dict) -> bool:
     """True when this project's own budget.global_daily_usd is the cap its gate enforces, set apart
     from the account-level value (budget._global records that one as `global_account_cap`)."""
-    return bool(n.get("global_account_cap"))
+    return n.get("global_account_cap") is not None
 
 
 def cap_scope(n: dict) -> str:
@@ -880,6 +880,8 @@ def vs_account(n: dict) -> str:
     if not project_cap(n):
         return ""
     cap, acct = float(n.get("global_cap") or 0), float(n["global_account_cap"])
+    if acct <= 0:
+        return "the account has no cap"
     return f"{'below' if cap < acct else 'above'} the account cap of ${acct:.0f}"
 
 
