@@ -28,6 +28,11 @@ SAFE = (("held resource", re.compile(r"\bresource:\S+|\block\b", re.I)), ("check
         ("rule", re.compile(r"\bR-[0-9a-f]{4}")))
 
 
+def _why(text: str) -> str:
+    """The reason after 'blocked:' / 'waiting:' in a task event's text, which opens with the task's title."""
+    return re.split(r"(?:blocked|waiting)[: ]+", text, 1, re.I)[-1]
+
+
 def rule_of(reason: str) -> str:
     """The first rule id the reason cites, else its first six words with digits and ids stripped."""
     m = rulecite._ID.search(reason)
@@ -62,10 +67,12 @@ def _handed_next(db: DB, r: dict, until: float) -> float | None:
 
 
 def _refusals(db: DB, since: float, until: float) -> list[dict]:
+    """One row per run and refusal rule: from the first refusal, `n` counting them, until the task next ran."""
     out = []
     for r in db.q("SELECT id, task, started, ended FROM runs WHERE task IS NOT NULL AND started<=? "
                   "AND COALESCE(ended, ?)>=?", (until, until, since)):
         end = _handed_next(db, r, until)
+        by: dict = {}
         for name in REFUSALS:
             f = Path(db.path).parent / "runs" / str(r["id"]) / name
             for line in (f.read_text(errors="replace").splitlines() if f.is_file() else ()):
@@ -77,10 +84,14 @@ def _refusals(db: DB, since: float, until: float) -> list[dict]:
                 if not isinstance(rec, dict) or not since <= ts <= until:
                     continue
                 kind = str(rec.get("kind") or rec.get("rule") or "refusal")
-                row = _row(kind, r["task"], "refusal", ts, max(ts, min(end or ts, until)), "", "refusal", n=int(rec.get("n") or 1))
-                if rec.get("class") == "harmful" or rec.get("kind") in GUARD_KINDS:
-                    row["safety"] = "guard"   # a safety guard's refusal is no rule to retire
-                out.append(row)
+                e = by.setdefault(kind, {"ts": ts, "n": 0, "guard": False})
+                e["ts"], e["n"] = min(e["ts"], ts), e["n"] + 1
+                e["guard"] |= rec.get("class") == "harmful" or rec.get("kind") in GUARD_KINDS
+        for kind, e in by.items():
+            row = _row(kind, r["task"], "refusal", e["ts"], max(e["ts"], min(end or e["ts"], until)), "", "refusal", n=e["n"])
+            if e["guard"]:
+                row["safety"] = "guard"   # a safety guard's refusal is no rule to retire
+            out.append(row)
     return out
 
 
@@ -88,13 +99,13 @@ def rows(db: DB, cfg: dict | None, since: float, until: float | None = None) -> 
     """The ledger's rows whose time overlaps [since, until], longest first."""
     until = time.time() if until is None else until
     out = []
-    for seg in unblock.intervals(db, since, until):
+    for seg in unblock.overlapping(db, since, until):
         start, end = seg["start"], min(seg.get("end") or until, until)
         ev = db.one("SELECT text FROM events WHERE task=? AND kind=? AND ts<=? ORDER BY ts DESC LIMIT 1",
                     (seg["task"], f"task_{seg['kind']}", start))
         task = db.task(seg["task"]) or {}
-        reason = (ev and ev["text"]) or task.get("blocked_reason") or seg["title"]
-        out.append(_row(rule_of(reason), seg["task"], seg["kind"], start, end, reason, "task"))
+        reason = _why((ev and ev["text"]) or task.get("blocked_reason") or seg["title"])   # not the title before it
+        out.append(_row(rule_of(reason), seg["task"], seg["kind"], max(start, since), end, reason, "task"))
     out += _refusals(db, since, until)
     st = db.kv(queuewait.KV) or {}
     for e in [*(st.get("hist") or []), *(st.get("open") or {}).values()]:

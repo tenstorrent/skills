@@ -29,6 +29,30 @@ def test_block_ledger_rows_name_the_rule_and_class_of_each_blocked_interval(env)
         [r["minutes"] for r in bl.rows(p.db, {}, now - 86400, now)], reverse=True)
 
 
+def test_block_ledger_counts_a_hold_that_began_before_the_window_and_ignores_the_title(env):
+    from ttp import blockledger as bl
+    p = make(env)
+    now = time.time()
+    old = _bl_task(p, "kernels", "blocked", now, blocked_ago=30 * 3600, reason="keep the 60 min hold for the nightly job")
+    titled = _bl_task(p, "review the post-processing merge", "blocked", now, blocked_ago=3600, reason="keep the 60 min hold")
+    rs = {r["task"]: r for r in bl.rows(p.db, {}, now - 86400, now)}
+    assert rs[old]["minutes"] == pytest.approx(24 * 60, abs=1) and rs[old]["start"] == pytest.approx(now - 86400, abs=1)
+    assert rs[titled]["safety"] == "convenience"
+
+
+def test_block_ledger_refusals_are_one_row_per_run_and_rule(env):
+    from ttp import blockledger as bl
+    p = make(env)
+    now = time.time()
+    t = _bl_task(p, "refused often", "queued", now)
+    p.db.x("INSERT INTO runs(task,role,status,started,ended) VALUES(?,?,?,?,?)", (t, "worker", "ok", now - 7200, now - 7000))
+    d = p.state / "runs" / str(p.db.one("SELECT max(id) AS i FROM runs")["i"])
+    d.mkdir(parents=True)
+    (d / "refusals.jsonl").write_text("".join(json.dumps({"ts": now - 7100 + i, "kind": "full_suite"}) + "\n" for i in range(10)))
+    rs = [r for r in bl.rows(p.db, {}, now - 86400, now) if r["source"] == "refusal"]
+    assert [(r["rule"], r["n"], r["start"]) for r in rs] == [("full_suite", 10, pytest.approx(now - 7100, abs=1))]
+
+
 @pytest.mark.parametrize("reason,kind,want", [
     ("waiting on resource:blx-device", "waiting", "held resource"),
     ("check:abc123 failed", "blocked", "check"),
@@ -68,7 +92,7 @@ def test_block_ledger_counts_guard_refusals_queue_waits_and_the_block_log(env):
     rs = bl.rows(p.db, {}, now - 86400, now)
     by = {r["rule"]: r for r in rs if r["source"] != "task"}
     assert by["full_suite"]["source"] == "refusal" and by["full_suite"]["n"] == 1
-    assert by["records"]["n"] == 2 and by["records"]["minutes"] > 60   # until the task next ran
+    assert by["records"]["n"] == 1 and by["records"]["minutes"] > 60   # until the task next ran
     assert (by["records"]["safety"], by["no_device"]["safety"]) == ("guard", "guard")   # safety guards are no rules to retire
     assert by["full_suite"]["safety"] == by["redirected"]["safety"] == "convenience"
     assert all(r["end"] <= now - 3000 for r in bl.rows(p.db, {}, now - 86400, now - 3000) if r["source"] == "refusal")

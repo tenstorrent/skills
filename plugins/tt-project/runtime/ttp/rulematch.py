@@ -23,15 +23,15 @@ KV = "rulematch:"   # + message id: {"msg", "items": [older()'s rows]}
 MAX = 5
 OPEN_S = 48 * 3600
 _UNITS = {"s": 1, "m": 60, "h": 3600, "d": 86400}   # by the unit's first letter
-_DURATION = re.compile(r"\b(\d+(?:\.\d+)?|an?|one)\s*(seconds?|secs?|minutes?|mins?|hours?|hrs?|days?|[smhd])\b", re.I)
+_WORD_UNIT = r"seconds?|secs?|minutes?|mins?|hours?|hrs?|days?"
+_DURATION = re.compile(rf"\b(\d+(?:\.\d+)?)\s*({_WORD_UNIT}|[smhd])\b|\b(an?|one)\s+({_WORD_UNIT})\b", re.I)   # 'a' or 'an' only before a whole unit word
 _CONST = re.compile(r"^\s*([A-Z][A-Z0-9]*(?:_[A-Z0-9]+)+)\s*(?::[^=]+)?=\s*(.+?)\s*(?:#.*)?$")
 _NAME_IN_TEXT = re.compile(r"\b[A-Z][A-Z0-9]*(?:_[A-Z0-9]+)+\b")
 
 
 def durations(text: str) -> set[int]:
     """The durations `text` names, in seconds: 'an hour', '60 min', '3600 s' -> {3600}."""
-    return {round((1 if n.lower() in ("a", "an", "one") else float(n)) * _UNITS[u[0].lower()])
-            for n, u in _DURATION.findall(text or "")}
+    return {round(float(n or 1) * _UNITS[(u or w)[0].lower()]) for n, u, _, w in _DURATION.findall(text or "")}
 
 
 def _topic(db, text: str) -> set[str]:
@@ -123,7 +123,7 @@ def note(db, cfg: dict | None, m: dict, now: float | None = None) -> None:
         items = older(Project(Path(db.path).parent.parent), db, m.get("text") or "", int(m["id"]))
     except Exception:
         return
-    db.set_kv(KV + str(m["id"]), {"msg": int(m["id"]), "items": items})
+    db.set_kv(KV + str(m["id"]), {"msg": int(m["id"]), "items": items})   # kept even with none: one look per message
 
 
 def digest_lines(db, now: float | None = None) -> list[str]:

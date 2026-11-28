@@ -491,6 +491,19 @@ def intervals(db: DB, since: float, now: float | None = None) -> list[dict]:
             for ep in _stuck_since(db, since, now) for seg in ep["segments"] if seg["start"] >= since]
 
 
+def overlapping(db: DB, since: float, now: float | None = None) -> list[dict]:
+    """Per-state intervals that overlap [since, now], with the task and title: those of the tasks with a stuck
+    hand-off at or after `since` and of the tasks stuck now, so a hold that began before `since` shows."""
+    now = time.time() if now is None else now
+    ids = {r["task"] for r in db.q(
+        f"SELECT DISTINCT task FROM events WHERE task IS NOT NULL AND ts>=? AND kind IN ({','.join('?' * len(STUCK))})",
+        (since, *STUCK))} | {r["id"] for r in db.q("SELECT id FROM tasks WHERE status IN ('blocked','waiting','review')")}
+    return [{**seg, "task": ep["task"], "title": ep["title"]}
+            for tid in sorted(ids) if (task := db.task(tid))
+            for ep in _task_episodes(db, task, now) for seg in ep["segments"]
+            if seg["start"] <= now and (seg.get("end") or now) >= since]
+
+
 def inventory(db: DB, now: float | None = None) -> list[dict]:
     """Tasks stuck now, whenever they got stuck: {task, title, kind (its status), state_s (time in
     that state, None when unknown), stuck_s (the whole open episode, None when unknown)}. A waiting
