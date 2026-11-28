@@ -4466,6 +4466,8 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                 before = _only_adds_repos(cfg, [] if remove else value) if key == MERGE_KEY else []
                 own = _granted_by(db, a, key, _users_own(db, messages or []) if user_turn else [],
                                   bool(needs_users_word(key)) and by_user or bool(said))
+                if not own and not needs_users_word(key):
+                    own = _logged_grant(db, a, key)
                 if key in accountset.KEYS:   # account-level: logged with its setter and undo, a user's value kept
                     notes.append(accountset.apply(key, value, configwho.by("user", msgs=own, via="chat") if own
                                                   else configwho.by("coordinator", via="config_set")))
@@ -8687,6 +8689,21 @@ def _granted_by(db, a: dict, key: str, own: list[int], needs_word: bool) -> list
         return []
     rows = db.q(f"SELECT id, text FROM messages WHERE id IN ({','.join('?' * len(own))})", list(own))
     return [r["id"] for r in rows if quote in " ".join(str(r["text"] or "").split()).lower()]
+
+
+def _logged_grant(db, a: dict, key: str) -> list[int]:
+    """[id] when config_set `a` cites the user's own logged message from any turn: `user_msg` names an inbound
+    user message (none the harness posted, never a relayer's findings) whose own words, not a relayer's
+    context, hold `quote` (3+ chars, case and spacing aside), and that is newer than any value the user set
+    for `key` since. Else []: the value is the coordinator's."""
+    mid, quote = str(a.get("user_msg") or "").strip(), echoes._flat(a.get("quote"))
+    if not mid.isdigit() or len(quote) < 3 or not _users_own(db, [int(mid)]):
+        return []
+    row = db.q("SELECT ts, text FROM messages WHERE id=?", (int(mid),))[0]
+    rec = configwho.get(db, key)
+    if configwho.role(rec) == "user" and float(row["ts"] or 0) <= float(rec.get("ts") or 0):
+        return []   # the user's later setting is their newer word
+    return [int(mid)] if quote in echoes._flat(relay.split(row["text"] or "")[0]) else []
 
 
 def _cited_word(db, src, agent: bool) -> tuple[list[int], bool, str]:

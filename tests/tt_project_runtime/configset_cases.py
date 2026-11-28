@@ -580,7 +580,7 @@ def test_coordinator_config_set_in_a_user_turn_is_the_users_only_when_it_cites_t
     assert configwho.role(configwho.get(p.db, key)) == "coordinator"
     assert coord.apply(p, [{"type": "config_set", "key": key, "value": ["a", "b"]}]) == []   # still its own
     assert p.raw_config()["providers"]["claude"]["mcp_withheld"] == ["a", "b"]
-    # A quote not in the user's message, or a user_msg from another turn, grants nothing.
+    # A quote not in the user's message, or a user_msg naming no message, grants nothing.
     for cite in ({"quote": "withhold the mail connector"}, {"user_msg": m + 99}, {"quote": "la"}):
         assert coord.apply(p, [{"type": "config_set", "key": key, "value": ["a", "c"], **cite}],
                            user_turn=True, messages=[m]) == [], cite
@@ -603,6 +603,51 @@ def test_coordinator_config_set_in_a_user_turn_is_the_users_only_when_it_cites_t
                        user_turn=True, messages=[w]) == []
     rec = configwho.get(p.db, "budget.weekly_usd")
     assert rec["by"] == "user" and rec["msgs"] == [w], rec
+
+
+def test_coordinator_config_set_citing_a_logged_user_message_from_an_earlier_turn_is_the_users(env):
+    """[note 71af05b3ca64a2d2] A config_set whose `user_msg` names the user's own logged message from any earlier
+    turn and whose `quote` (3+ chars, case and spacing aside) is in that message's own words is the user's. A
+    harness-posted message, a relayer's findings or context, an unknown id, a short quote or a message older than
+    the user's own later setting grants nothing, and a key only the user's word sets stays refused outside their
+    turn whatever the cite."""
+    from ttp import configwho, coordinator as coord, relay
+    p = make(env)
+
+    def said(text, kind="user", provenance=None):
+        return p.db.x("INSERT INTO messages(ts, direction, kind, text, provenance) VALUES (?, 'in', ?, ?, ?)",
+                      (time.time(), kind, text, provenance))
+
+    key, words = "providers.claude.mcp_withheld", "please keep the mail connector out of workers"
+    good = said(words)
+    for cite in ({"user_msg": good, "quote": "withhold the drive connector"},
+                 {"user_msg": said(words, provenance="system"), "quote": "mail connector"},
+                 {"user_msg": said(words, kind="finding", provenance="cli-peer"), "quote": "mail connector"},
+                 {"user_msg": said(f"go on\n{relay.MARK}\n{words}", provenance="cli-peer"), "quote": "mail connector"},
+                 {"user_msg": good + 999, "quote": "mail connector"},
+                 {"user_msg": good, "quote": "ma"}):
+        assert coord.apply(p, [{"type": "config_set", "key": key, "value": ["mail"], **cite}]) == [], cite
+        assert configwho.role(configwho.get(p.db, key)) == "coordinator", cite
+    assert coord.apply(p, [{"type": "config_set", "key": key, "value": ["mail"], "user_msg": str(good),
+                            "quote": "Keep the  MAIL connector OUT"}]) == []
+    rec = configwho.get(p.db, key)
+    assert rec["by"] == "user" and rec["msgs"] == [good], rec
+    probs = coord.apply(p, [{"type": "config_set", "key": key, "value": ["mail", "x"]}])
+    assert probs and "a coordinator never changes a value the user set" in probs[0], probs
+    # A cite older than the user's setting never replaces it; a newer one is their newer word.
+    probs = coord.apply(p, [{"type": "config_set", "key": key, "value": ["x"], "user_msg": good,
+                             "quote": "mail connector"}])
+    assert probs and "a coordinator never changes a value the user set" in probs[0], probs
+    newer = said("now withhold the drive connector too")
+    assert coord.apply(p, [{"type": "config_set", "key": key, "value": ["mail", "drive"], "user_msg": newer,
+                            "quote": "drive connector"}]) == []
+    assert configwho.get(p.db, key)["msgs"] == [newer]
+    for key, value in (("delivery.push_allowed", True), ("machines.allowed", ["box"]), ("budget.weekly_usd", 900)):
+        u = said(f"set {key} to {value}")
+        probs = coord.apply(p, [{"type": "config_set", "key": key, "value": value, "user_msg": u,
+                                 "quote": f"set {key}"}])
+        assert probs and ("needs the user's approval" in probs[0] or "not user-settable" in probs[0]), (key, probs)
+        assert configwho.get(p.db, key) is None, key
 
 
 def test_config_accepts_waiting_check_plan_whole_and_by_field_and_waketier_reads_it(env, capsys):
