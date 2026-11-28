@@ -77,3 +77,5 @@ every +240: the profile-bucket line: earlier A/B or ablation results beside it, 
 system +240: the profile-bucket line: earlier A/B or ablation results beside it, the profiler's own overhead as a bucket
 code +8: `ttp ci --branch` names that it also waits for dispatched runs
 every +8: the same `ttp ci` dispatched-runs words (the line counts in every prompt)
+code +8: the `ttp ci` line says the hang check is not run through a gh bridge
+every +11: the same `ttp ci` gh-bridge words (the line counts in every prompt)
