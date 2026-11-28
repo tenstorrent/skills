@@ -40,7 +40,8 @@ NOTE = "setting hold:"
 # The flags after the command say whether it is `--own`.
 _FLAGS = r"(?P<flags>(?:[ \t]+--?[\w-]+(?:=\S+)?)*)"
 _VERB = (r"\b(?:run|use|land|push|publish|deliver|ship)\b(?:[ \t]+(?!ttp\b)[\w#/.-]+){0,4}?"
-         r"[ \t]+(?:with|using|via|through|by running)[ \t]+|\b(?:run|use)[ \t]+")
+         r"[ \t]+(?:with|using|via|through|by running)[ \t]+(?:(?:a[ \t]+)?plain[ \t]+|the[ \t]+)?"
+         r"|\b(?:run|use)[ \t]+")
 INSTRUCTION = re.compile(rf"(?:{_VERB})`?ttp push\b{_FLAGS}", re.I)
 LINE = re.compile(rf"(?:^[ \t]*(?:[-*>$]|\d+[.)])?[ \t]*|{_VERB})`?ttp push\b{_FLAGS}", re.I | re.M)
 LAND_ON = r"\bland(?:s|ing)?\b[^.!?\n]{{0,80}}?\bon[ \t]+`?(?:the[ \t]+(?:configured[ \t]+)?push[ \t]+branch\b{names})"

@@ -39461,6 +39461,19 @@ def test_setting_hold_reads_landing_specs():
     assert not lands({"kind": "review", "spec": yes[0]})
 
 
+@pytest.mark.parametrize("spec,lands_it", [
+    ("Land it yourself with plain `ttp push` (not `--land`: the queue does that).", True),
+    ("Land it with a plain `ttp push`.", True),
+    ("Publish it using the `ttp push` command.", True),
+    ("Do not land it with plain `ttp push`.", False),
+    ("Never publish using the `ttp push` command.", False),
+    ("Land it with plain `ttp push --own`.", False),
+])
+def test_setting_hold_reads_a_plain_or_the_before_ttp_push(spec, lands_it):
+    from ttp.settinghold import lands
+    assert bool(lands({"kind": "code", "spec": spec})) is lands_it
+
+
 @pytest.mark.parametrize("title,spec,held", [
     ("Fix ttp push retry on conflict", "", False),                       # a mention in a title
     ("Docs", "The README describes how `ttp push` works", False),        # prose
