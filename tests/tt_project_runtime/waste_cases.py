@@ -379,3 +379,54 @@ def test_the_waste_fix_task_is_not_queued_again_for_runs_a_diagnosis_already_cov
     _waste_run(p, f, 3.0, now)                                    # a new flagged run: a new diagnosis
     assert "Queued fix task #" in d._waste_ledger(p.db)
     assert len(p.db.q("SELECT id FROM tasks WHERE labels LIKE '%waste_fix:%'")) == 3
+
+
+def test_failed_tasks_that_kept_work_are_their_own_retained_class_apart_from_discarded_work(env, monkeypatch):
+    import time as _time
+    from ttp import runcap, waste
+    p = make(env)
+    now = _time.time()
+    gone = _waste_task(p, "discarded idea", status="failed")
+    _handoff_run(p, gone, 2.0, now - 900, {"status": "failed", "summary": "nothing"})
+    cont = _waste_task(p, "continued work", status="failed")
+    _waste_run(p, cont, 3.0, now)
+    nxt = _waste_task(p, "carry on", labels=[f"continues:{cont}"])
+    rev = _waste_task(p, "reviewed work", status="failed")
+    _waste_run(p, rev, 4.0, now)
+    ok = _waste_task(p, f"Review #{rev}", kind="review", labels=[f"auto_review:{rev}"])
+    chk = _waste_task(p, "checks passed", status="failed")
+    _handoff_run(p, chk, 5.0, now - 800, {"status": "failed", "summary": "ran out"})
+    chk_run = p.db.one("SELECT id, dir FROM runs WHERE task=?", (chk,))
+    (Path(chk_run["dir"]) / "checks.rc").write_text("0\n")
+    com = _waste_task(p, "committed work", status="failed")
+    _handoff_run(p, com, 6.0, now - 700)
+    com_run = p.db.one("SELECT id FROM runs WHERE task=?", (com,))["id"]
+    monkeypatch.setattr(runcap, "committed", lambda p_, task, run: task.get("id") == com)
+    rep = waste.report(p.db, now - 86400, now + 1, p.config(), p=p)
+    b = rep["buckets"]
+    assert (b["failed_task"]["usd"], b["failed_task"]["tasks"], b["failed_task"]["retained_usd"]) == (2.0, [gone], 0)
+    kept = b["failed_owner"]
+    assert (kept["usd"], kept["retained_usd"], sorted(kept["tasks"])) == (18.0, 18.0, sorted([cont, rev, chk, com]))
+    assert rep["kept"] == {com: [f"run {com_run} committed"], chk: [f"run {chk_run['id']} passed its checks"],
+                           rev: [f"passed review #{ok}"], cont: [f"continued by #{nxt}"]}
+    assert (rep["avoidable"], rep["retained"]) == (20.0, 18.0)          # raw charges stay; the share nets what was kept
+    assert waste.fix_bucket(rep, any_share=True) == "failed_task"
+    text = "\n".join(waste.lines(rep))
+    assert f"failed tasks whose work was kept: $18.00" in text and f"#{cont} (continued by #{nxt})" in text
+
+
+def test_the_waste_fix_task_spec_carries_the_kept_work_of_failed_tasks(env):
+    import time as _time
+    from ttp import daemon as dmod
+    p = make(env)
+    now = _time.time()
+    gone = _waste_task(p, "discarded idea", status="failed")
+    _waste_run(p, gone, 5.0, now)
+    cont = _waste_task(p, "continued work", status="failed")
+    _waste_run(p, cont, 3.0, now)
+    nxt = _waste_task(p, "carry on", labels=[f"continues:{cont}"])
+    d = dmod.Daemon(p.base)
+    d.alert = lambda *a, **k: None
+    d._waste_ledger(p.db)
+    spec = p.db.one("SELECT spec FROM tasks WHERE labels LIKE '%waste_fix:failed_task%'")["spec"]
+    assert f"tasks #{gone}" in spec and f"#{cont} (continued by #{nxt})" in spec and "Not waste: $3.00" in spec

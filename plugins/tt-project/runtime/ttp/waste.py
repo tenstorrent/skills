@@ -6,7 +6,10 @@ its own runs. Each run that ended in the window counts once, in the first bucket
   stand_in       runs started after the project moved (kv `project_moved_at` or `waste.moved_at`, epoch):
                  the old copy kept working beside the new one
   superseded     work on tasks later cancelled, superseded (task_superseded) or abandoned
-  failed_task    work on tasks that failed with no verdict (a broken run, no hand-off)
+  failed_owner   work on failed tasks that kept something: a commit or passed checks in one of its runs, a
+                 passing review of it, or a successor that `continues` it. All of it is retained, its evidence
+                 listed per task (the run receipts, the continuation and review ids)
+  failed_task    work on tasks that failed with no verdict and kept none of that: verified discarded work
   rejected       failed reviews that returned a verdict (changes_needed, superseded, or a failed hand-off with
                  review_failure or followups): rework of the change they reviewed, listed by that change,
                  not a broken run
@@ -33,15 +36,17 @@ only reads; it never closes a task, an obligation or a promise."""
 from __future__ import annotations
 
 import re
+from pathlib import Path
 
 from . import budget, chainprio, runcap
 from .db import CHANGES_NEEDED, load_result
 from .reviewreuse import FORCED_LABEL, HEAD_LABEL, PAYLOAD_LABEL
 from .util import task_labels
 
-BUCKETS = ("stand_in", "superseded", "failed_task", "rejected", "duplicate", "rereview", "review_rounds", "crashed",
+BUCKETS = ("stand_in", "superseded", "failed_owner", "failed_task", "rejected", "duplicate", "rereview", "review_rounds", "crashed",
            "over_runs", "costly_wake")
 LABELS = {"stand_in": "stand-in after a move", "superseded": "cancelled or superseded work",
+          "failed_owner": "failed tasks whose work was kept",
           "failed_task": "failed tasks", "rejected": "rejected changes", "duplicate": "duplicate tasks", "rereview": "re-reviews of a same head",
           "review_rounds": "review rounds past the limit", "crashed": "crashed or timed-out runs",
           "over_runs": "runs past the per-task limit", "costly_wake": "coordinator wakes over the limit"}
@@ -98,7 +103,8 @@ def _task_sets(db, cfg: dict) -> dict:
         "failed_task": {i for i, t in tasks.items() if t["status"] == "failed"} - set(rejected), "rejected": set(rejected),
         "rejected_of": rejected,
         "done": {i for i, t in tasks.items() if t["status"] == "done"},
-        "duplicate": set(), "rereview": set(), "review_rounds": set(), "retained": set()}
+        "duplicate": set(), "rereview": set(), "review_rounds": set(), "retained": set(),
+        "continued_by": {}, "accepted_by": {}}
     kept = {r["task"] for r in db.q("SELECT task FROM task_superseded UNION "
                                     "SELECT task FROM task_class_fix WHERE fix_task IS NOT NULL OR sha != ''")}
     seen: dict[str, float] = {}
@@ -110,6 +116,8 @@ def _task_sets(db, cfg: dict) -> dict:
         prior = _num(labels, "continues:")
         if prior in out["superseded"] and t["status"] not in ("cancelled", "failed") and i not in gone:
             kept.add(prior)   # a successor carries its work on
+        if prior in out["failed_task"] and t["status"] not in ("cancelled", "failed"):
+            out["continued_by"].setdefault(prior, []).append(i)
         if t["origin"] != "schedule" and t["kind"] != "review" and _num(labels, "continues:") is None:
             key, at = _norm(t["title"]), float(t["created"] or 0)
             if key and key in seen and at - seen[key] <= DUP_WINDOW_S:
@@ -117,6 +125,9 @@ def _task_sets(db, cfg: dict) -> dict:
             seen[key] = at
         if t["kind"] == "review":
             reviews[i] = labels
+            if t["status"] == "done":
+                for c in chainprio.covered(t):
+                    out["accepted_by"].setdefault(c, []).append(i)
             head = next((v for v in labels if v.startswith(HEAD_LABEL)), "")
             payload = next((v for v in labels if v.startswith(PAYLOAD_LABEL)), "")
             if head and payload and FORCED_LABEL not in labels:
@@ -132,6 +143,25 @@ def _task_sets(db, cfg: dict) -> dict:
         if limit and depth > limit:
             out["review_rounds"].add(i)
     out["retained"] = kept & out["superseded"]
+    return out
+
+
+def _kept(db, p, task: int, sets: dict) -> list[str]:
+    """The evidence failed task `task` kept work, empty for verified discarded work: its successors, its
+    passing reviews, and the runs that committed (runcap.committed) or passed their own checks (checks.rc 0)."""
+    from .cli import CHECKS_RC
+    out = [f"continued by #{i}" for i in sets["continued_by"].get(task, [])]
+    out += [f"passed review #{i}" for i in sets["accepted_by"].get(task, [])]
+    row = db.one("SELECT * FROM tasks WHERE id=?", (task,)) or {}
+    for r in db.q("SELECT id, dir, started, ended FROM runs WHERE task=? AND ended IS NOT NULL ORDER BY id", (task,)):
+        try:
+            passed = bool(r["dir"]) and (Path(r["dir"]) / CHECKS_RC).read_text().strip() == "0"
+        except OSError:
+            passed = False
+        if passed:
+            out.append(f"run {r['id']} passed its checks")
+        elif p is not None and runcap.committed(p, row, r) is True:
+            out.append(f"run {r['id']} committed")
     return out
 
 
@@ -187,6 +217,7 @@ def report(db, since: float, now: float, cfg: dict | None = None, p=None) -> dic
     sleeps = db.kv("host_sleeps", []) or [] if wake else []   # the daemon's record of this host's sleeps
     buckets = {b: {"usd": 0.0, "runs": 0, "run_ids": [], "tasks": {}, "retained_usd": 0.0, "retained_tasks": {}}
                for b in BUCKETS}
+    evidence: dict[int, list[str]] = {}   # failed task -> what it kept
     continued = {"usd": 0.0, "runs": [], "limit": max_runs}
     total = 0.0
     for r in runs:
@@ -201,7 +232,9 @@ def report(db, since: float, now: float, cfg: dict | None = None, p=None) -> dic
         elif task in sets["superseded"]:
             got = "superseded"
         elif task in sets["failed_task"]:
-            got = "failed_task"
+            if task not in evidence:
+                evidence[task] = _kept(db, p, task, sets)
+            got = "failed_owner" if evidence[task] else "failed_task"
         elif task in sets["rejected"]:
             got = "rejected"
         elif task in sets["duplicate"]:
@@ -226,7 +259,7 @@ def report(db, since: float, now: float, cfg: dict | None = None, p=None) -> dic
             if task is not None:
                 named = sets["rejected_of"][task] if got == "rejected" else task
                 b["tasks"][named] = b["tasks"].get(named, 0.0) + usd
-            if got == "superseded" and task in sets["retained"]:
+            if got == "failed_owner" or (got == "superseded" and task in sets["retained"]):
                 b["retained_usd"] += usd
                 b["retained_tasks"][task] = b["retained_tasks"].get(task, 0.0) + usd
     for b in buckets.values():
@@ -236,7 +269,8 @@ def report(db, since: float, now: float, cfg: dict | None = None, p=None) -> dic
     retained = sum(b["retained_usd"] for b in buckets.values())
     return {"total": total, "avoidable": avoidable, "retained": retained,
             "share": max(avoidable - retained, 0.0) / total if total else 0.0,
-            "target": float(cfg.get("target_share") or 0), "buckets": buckets, "continued": continued}
+            "target": float(cfg.get("target_share") or 0), "buckets": buckets, "continued": continued,
+            "kept": {t: evidence[t] for t in buckets["failed_owner"]["tasks"]}}
 
 
 def lines(rep: dict) -> list[str]:
@@ -251,13 +285,19 @@ def lines(rep: dict) -> list[str]:
         kept = ", ".join(f"#{t}" for t in b["retained_tasks"][:5])
         out.append(f"{LABELS[name]}: ${b['usd']:.2f} ({share:.0%}), {b['runs']} run(s)" + (f"; {top}" if top else "")
                    + (f"; ${b['retained_usd']:.2f} of it kept by a successor's work ({kept}), not saved"
-                      if b["retained_usd"] > 0 else ""))
+                      if b["retained_usd"] > 0 and name != "failed_owner" else "")
+                   + ("; kept, not waste: " + "; ".join(kept_line(rep)) if name == "failed_owner" else ""))
     c = rep.get("continued") or {}
     if c.get("runs"):
         named = ", ".join(f"run {x['run']} (#{x['task']}, run {x['rank']})" for x in c["runs"][:5])
         out.append(f"runs past the per-task limit ({c['limit']}) that brought a new result: ${c['usd']:.2f}, "
                    f"{len(c['runs'])} run(s), not avoidable; {named}")
     return out
+
+
+def kept_line(rep: dict, limit: int = 5) -> list[str]:
+    """Per failed task whose work was kept, its evidence: `#12 (continued by #15, run 40 committed)`."""
+    return [f"#{t} ({', '.join(e)})" for t, e in list((rep.get("kept") or {}).items())[:limit]]
 
 
 def over(rep: dict) -> bool:
