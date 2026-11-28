@@ -1,6 +1,10 @@
 # The tt-project smoke suite: `pytest -m tt_smoke` runs these before a change lands (delivery.push_checks).
 # Kept under 5 min (300 s) on its host (gatetime.DEFAULT_MAX_S): an area with a slow test keeps a fast one here, and the runner starts the slowest first. The rest of the tests run
 # after landing (delivery.post_land_checks: `pytest -m "not tt_smoke"`).
+tests/test_tt_project_runtime.py::test_a_project_cap_below_the_account_cap_is_named_as_the_one_that_binds
+tests/test_tt_project_runtime.py::test_a_project_cap_equal_to_the_account_cap_reads_as_the_account_cap
+tests/test_tt_project_runtime.py::test_a_project_cap_above_the_account_cap_says_it_is_the_projects_and_higher
+tests/test_tt_project_runtime.py::test_an_unset_project_cap_uses_the_account_cap_and_says_nothing_of_a_project_cap
 # One test per line (file::name, all its parametrizations); a renamed or removed test fails
 # test_smoke_list_names_existing_tests_and_covers_each_area. Each case file keeps at least one test here.
 # Left out (they fail on the base branch on the Mac too; they run after landing): test_the_sweep_leaves_a_running_sandbox_alone, test_kill_guard_allows_a_group_its_tasks_earlier_run_detached_and_nothing_forged, test_the_dry_run_can_be_switched_off. All of checkreap_cases fails on the Mac (needs /proc), so it has no entry here.

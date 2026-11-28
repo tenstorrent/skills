@@ -9466,7 +9466,7 @@ class Daemon:
                 capped = any("cap reached" in r for r in held)
                 hint = f"New work on {prov} waits; running work finishes and replies to you continue. " + (
                     "It starts again by itself when the budget day resets. "
-                    if any(r.startswith("global daily cap") for r in held) else
+                    if any(bud.red_class(r) == "global cap" for r in held) else
                     "It starts again by itself once the gate leaves red. ") + (
                     "The caps are in the web app's Budget tab." if capped
                     else "The web app's Budget tab shows what spent it.")

@@ -160,7 +160,7 @@ def _held(gate: Any, pause: dict | None, logged_out: bool, now: float) -> tuple[
         if " window at " in r and "the project stops at" in r:
             rows = [w for w in n.get("plan") or [] if w.get("allowed") == 0 and r.startswith(f"{w.get('window')} ")]
             ends += [w.get("resets_at") for w in rows] or [None]
-        elif r.startswith("global daily cap"):
+        elif r.startswith(("global daily cap", "project daily cap")):
             ends.append(n.get("global_resets_at"))
         elif r.startswith("cap reached"):
             ends.append(n.get("day_end"))   # a rolling day or week has no fixed end

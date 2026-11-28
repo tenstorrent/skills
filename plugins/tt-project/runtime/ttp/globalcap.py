@@ -863,6 +863,26 @@ def uncounted(n: dict) -> str:
     return f"; not counted: {', '.join(parts)}" if parts else ""
 
 
+def project_cap(n: dict) -> bool:
+    """True when this project's own budget.global_daily_usd is the cap its gate enforces, set apart
+    from the account-level value (budget._global records that one as `global_account_cap`)."""
+    return bool(n.get("global_account_cap"))
+
+
+def cap_scope(n: dict) -> str:
+    """'project' when the project's own global daily cap differs from the account's, else 'account'."""
+    return "project" if project_cap(n) else "account"
+
+
+def vs_account(n: dict) -> str:
+    """Plain words on how the project's own cap stands to the account cap ('below the account cap of
+    $8000'); empty when the account's cap is the one in force."""
+    if not project_cap(n):
+        return ""
+    cap, acct = float(n.get("global_cap") or 0), float(n["global_account_cap"])
+    return f"{'below' if cap < acct else 'above'} the account cap of ${acct:.0f}"
+
+
 def money(usd: float) -> str:
     """$0.17, $12.50, $340: cents below $100, whole dollars above."""
     return f"${usd:.2f}" if abs(usd) < 100 else f"${usd:.0f}"

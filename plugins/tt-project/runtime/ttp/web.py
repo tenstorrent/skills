@@ -125,8 +125,9 @@ def gate_detail(g: dict, now: float | None = None, where=None, gates: dict | Non
         plan = any(x.get("regime") == "windows" for x in (gates or {}).values())
         out = f"no dollar cap{' (plan windows apply)' if plan else ''}: {out}"
     if "global_today" in n:
-        out += (f"; global {gcap.money(n['global_today'])} of ${float(n.get('global_cap') or 0):.0f} today: "
-                f"{n.get('global_includes') or 'this account'}")
+        out += (f"; {'project cap' if gcap.project_cap(n) else 'global'} {gcap.money(n['global_today'])} of "
+                f"${float(n.get('global_cap') or 0):.0f} today: {n.get('global_includes') or 'this account'}"
+                + (f" ({gcap.vs_account(n)})" if gcap.project_cap(n) else ""))
     return out
 
 
@@ -293,7 +294,8 @@ def usage_line(n: dict, now: float, where=None) -> str:
     mine = n["spent_today"] if "spent_today" in n else n.get("spent_24h", 0)
     line = f"{'today' if 'spent_today' in n else '24h'} {gcap.money(mine)} this project"
     if "global_today" in n:
-        line += f", {gcap.money(n['global_today'])} of ${float(n.get('global_cap') or 0):.0f} global"
+        line += (f", {gcap.money(n['global_today'])} of ${float(n.get('global_cap') or 0):.0f} "
+                 + (f"project cap ({gcap.vs_account(n)})" if gcap.project_cap(n) else "global"))
         line += gcap.uncounted(n)
     end = n.get("day_end") or n.get("global_resets_at")
     if end:

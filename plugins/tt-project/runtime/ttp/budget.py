@@ -112,7 +112,7 @@ def red_class(reason: str) -> str | None:
     """The class of a red reason other than a plan window's line (daemon: one alert per episode of a
     class), or None."""
     for prefix, cls in (("runaway guard", "runaway guard"), ("cap reached", "cap"),
-                        ("global daily cap reached", "global cap")):
+                        ("global daily cap reached", "global cap"), ("project daily cap", "global cap")):
         if reason.startswith(prefix):
             return cls
     return "spend limit" if "reports its spend limit reached" in reason else None
@@ -150,7 +150,7 @@ def cap_limiting(gates: dict, b: dict, now: float) -> list[str]:
             out.append(f"{prov}: the daily cap is reached before its reset")
         elif spendproj.reaches(float(n.get("global_today") or 0), n.get("global_cap"), n.get("global_per_h"),
                                n.get("global_resets_at"), now):
-            out.append(f"{prov}: the global daily cap is reached before its reset")
+            out.append(f"{prov}: the {gcap.cap_scope(n)} daily cap is reached before its reset")
     return out
 
 
@@ -658,6 +658,13 @@ def caps_line(db: DB, gates: dict, b: dict, now: float, where=None) -> str:
                                m.get("global_resets_at"), now, where)
         parts.append(f"{prov} ${float(m['global_today']):.2f} of ${float(m.get('global_cap') or 0):.0f} today "
                      f"({m.get('global_includes') or 'this account'}{stale})" + (f", {ahead}" if ahead else ""))
+    n0 = totals[0][1]
+    if gcap.project_cap(n0):
+        cap = float(n0.get("global_cap") or 0)
+        head = (f"project daily cap ${cap:.0f}, {gcap.vs_account(n0)} (this project's own limit on the whole "
+                f"account's spend, per provider): " + "; ".join(parts))
+        daily = float(b.get("daily_usd") or 0)
+        return f"{out} · {head}" if 0 < daily < cap else f"{head} · {out}"
     return out + " · global daily cap (whole account, per provider): " + "; ".join(parts)
 
 
@@ -757,6 +764,13 @@ def _global(db: DB, g: Gate, b: dict, provider: str, day: tuple[float, float] | 
         g.reasons.append(f"global daily total unavailable ({type(e).__name__}); the project caps still apply")
         return
     t = {**t, "usd": t["usd"] + extra}   # paid-credit spend past a plan window counts too
+    # The project's own cap is in force when it differs from the account-level setting: the gate then
+    # names it as the project's, with the account cap beside it.
+    from . import project
+    acct = project.account_value("budget.global_daily_usd")
+    acct = float(acct) if isinstance(acct, (int, float)) and not isinstance(acct, bool) and acct > 0 else 0.0
+    if acct and acct != cap:
+        g.numbers["global_account_cap"] = acct
     g.numbers.update({"global_today": round(t["usd"], 2), "global_cap": cap, "global_stale": t["stale"],
                       "global_includes": t["includes"], "global_resets_at": end if day else None,
                       **{f"global_{k}": round(t.get(k) or 0, 2) for k in ("plan_usd", "unbilled_usd", "stale_usd")}})
@@ -769,8 +783,12 @@ def _global(db: DB, g: Gate, b: dict, provider: str, day: tuple[float, float] | 
     if t["usd"] >= cap:
         when = f"; new work resumes at the reset in {max(end - now, 0) / HOUR:.1f} h" if day else ""
         stale = f" ({len(t['stale'])} machine{'s' if len(t['stale']) != 1 else ''} stale)" if t["stale"] else ""
-        _raise(g, "red", f"global daily cap reached: {gcap.money(t['usd'])} of ${cap:.0f} today across the "
-                         f"account{stale}{when}")
+        if "global_account_cap" in g.numbers:
+            _raise(g, "red", f"project daily cap ${cap:.0f} reached: {gcap.money(t['usd'])} today across the "
+                             f"account{stale}, this project's own limit ({gcap.vs_account(g.numbers)}){when}")
+        else:
+            _raise(g, "red", f"global daily cap reached: {gcap.money(t['usd'])} of ${cap:.0f} today across the "
+                             f"account{stale}{when}")
 
 
 def _plan(db: DB, g: Gate, provider: str, plan: list[Window], line: float, most: int, now: float,
