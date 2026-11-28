@@ -144,9 +144,10 @@ def max_wait_s(cfg: dict | None) -> float:
 
 
 def stall_s(cfg: dict | None) -> float | None:
-    """checks.stall_s as set (_hung's silence limit for a lane holder), None when unset or not a number >= 0."""
+    """The project's checks.stall_s (_hung's silence limit for a lane holder), None when unset or not a number >= 0."""
+    sec = (cfg or {}).get("checks")
     try:
-        v = float(setting(cfg, "stall_s"))
+        v = float(sec.get("stall_s") if isinstance(sec, dict) else None)
     except (TypeError, ValueError):
         return None
     return v if v >= 0 else None
@@ -159,8 +160,9 @@ def limits(p) -> dict:
     cfg = p.config() if p else None
     wall, how = checkwall.cap(p)
     stall = stall_s(cfg)
-    return {"max_wait_s": {"s": max_wait_s(cfg),
-                           "from": "checks.max_wait_s" if _seconds(cfg, "max_wait_s", -1.0) >= 0 else "default"},
+    own = (cfg or {}).get("checks") if isinstance((cfg or {}).get("checks"), dict) else {}
+    return {"max_wait_s": {"s": max_wait_s(cfg), "from": "default" if _seconds(cfg, "max_wait_s", -1.0) < 0
+                           else "checks.max_wait_s" if own.get("max_wait_s") not in (None, "") else "account checks.max_wait_s"},
             "wall_cap_s": {"s": wall, "from": how},
             "stall_s": {"s": HANG_LOG_MIN_S, "from": "default: this, or one usual passing run if longer"}
             if stall is None else {"s": stall, "from": "checks.stall_s"}}
@@ -169,7 +171,7 @@ def limits(p) -> dict:
 def limits_line(lim: dict) -> str:
     def one(k: str) -> str:
         s = float(lim[k]["s"])
-        return f"{k} {s:g} s ({lim[k]['from']})" + (" off" if s == 0 and k != "max_wait_s" else "")
+        return f"{k} {s:g} s ({lim[k]['from']})" + (" off" if s == 0 else "")
     return "limits: " + ", ".join(one(k) for k in ("max_wait_s", "wall_cap_s", "stall_s"))
 
 

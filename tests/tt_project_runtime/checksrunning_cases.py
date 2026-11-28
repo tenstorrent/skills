@@ -197,3 +197,15 @@ def test_checks_result_says_the_admission_phase_of_a_queued_a_running_and_a_cut_
     (run / "checks.json").write_text(json.dumps({"ts": time.time(), "passed": False,
                                                  "timed_out": {"check": "pytest", "silent_s": 900}}))
     assert _result_json(run, capsys)[1]["phase"] == "cut_silent"
+
+
+def test_checks_result_phase_follows_the_report_for_a_foreground_run(env, tmp_path, monkeypatch, capsys):
+    p, repo, run, git = _checks_repo(env, tmp_path, monkeypatch)
+    me = os.getpid()
+    (run / "checks.running").write_text(json.dumps({"since": time.time(), "pid": me}))
+    code, rec = _result_json(run, capsys)
+    assert code == 1 and rec["phase"] == "running", rec
+    assert any("running in the foreground" in line for line in rec["lines"]), rec
+    (run / "checks.running").write_text(json.dumps({"since": time.time(), "pid": me, "ended": time.time(), "rc": 0}))
+    code, rec = _result_json(run, capsys)
+    assert code == 0 and rec["phase"] == "finished", rec

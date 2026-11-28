@@ -8408,9 +8408,14 @@ def _checks_phase(run_dir: Path) -> str:
         return "not_started" if detach.lost(rc_file).exists() else "dropped" if _checks_dropped(run_dir) else "killed"
     if rc is not None:
         return "finished"
-    fg = read_dict(run_dir / CHECKS_RUNNING)
-    info = _read_checks_pid(run_dir) or ({"pid": fg["pid"]} if fg.get("pid") and "ended" not in fg else {})
-    if not info or not _checks_alive(info):
+    info, fg = _read_checks_pid(run_dir), read_dict(run_dir / CHECKS_RUNNING)
+    if isinstance(fg.get("pid"), int) and not fg.get("detached") and not (   # a newer foreground run answers,
+            info and (fg["pid"] == info.get("pid") or float(fg.get("since") or 0) < float(info.get("ts") or 0))):
+        info = fg                                                           # as in _checks_foreground
+        if "ended" in fg:
+            return "killed" if fg.get("rc") == "killed" else "finished"
+    if not info or _checks_old_boot(info) or not (_checks_elsewhere(info) or (
+            _checks_alive(info) if info.get("started") else _pid_alive(info["pid"]))):
         return "none"
     wait = read_dict(run_dir / CHECKS_SLOT_WAIT)
     for key, phase in (("parked", "parked"), ("follows", "following"), ("suite", "waiting_lane"), ("spill", "waiting_spill")):
