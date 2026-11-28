@@ -296,10 +296,13 @@ coordinator with that evidence.
 - A runaway guard pauses a project whose hourly spend jumps far above its own norm.
   It has no coordinator dollar limit (`budget.hourly_coordinator_usd` is retired): the always-on
   coordinator optimizes its own cost inside the dollar caps. Its coordinator signal (on a plan, too
-  many self-started turns or turns on the same evidence) throttles the coordinator only: its self-started turns wait until the
+  many self-started turns, `budget.hourly_coordinator_turns`, or turns on the same evidence,
+  `budget.hourly_coordinator_repeats`) throttles the coordinator only: its self-started turns wait until the
   trailing hour is back under the limit, then one turn takes everything queued meanwhile. Your
   messages and must-act items still wake it at once, and worker tasks keep starting under the normal
-  caps. `ttp status` says so on its coordinator line.
+  caps. `ttp status` says so on its coordinator line. Failed or stalled runs hold only the task that keeps
+  failing (two failed runs in the hour or past `budget.hourly_waste_usd`, on a plan `hourly_waste_runs`) or the
+  loop source that queues them; a task that failed once, and an urgent or user-ordered one, keeps running.
 - A coordinator turn that goes over `coordinator.turn_budget_usd` is never retried as is: its batch is
   halved down to single items; a single item runs once more alone at the ceiling
   (`coordinator.turn_budget_ceiling_usd`, 0: twice the cap, never above

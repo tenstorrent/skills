@@ -36,7 +36,7 @@ from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 from typing import Any
 
-from . import ackwait, credits
+from . import ackwait, credits, urgent
 from . import globalcap as gcap
 from . import spendproj, timefmt
 from . import localspend  # noqa: F401  (adds this machine's other Claude Code spend to the global total)
@@ -449,12 +449,13 @@ def evaluate(db: DB, cfg: dict, provider: str, windows: list[Window], now: float
         repeat_cap = int(b.get("hourly_coordinator_repeats", 4))
         shares += [_share(len(selfs), turn_cap), _share(same, repeat_cap)]
         if len(selfs) > turn_cap:
-            coord_red.append(f"runaway guard: {len(selfs)} self-started coordinator turns in the last hour "
-                             f"(limit {turn_cap}; turns for user messages not counted)")
+            coord_red.append(f"runaway guard: {len(selfs)} self-started coordinator turns (${thrash:.2f}) in the last hour "
+                             f"passed budget.hourly_coordinator_turns ({turn_cap}; turns for user messages not counted)")
             resume.append(rolls_under(selfs, lambda rs: len(rs) > turn_cap, now))
         if same >= repeat_cap:
-            coord_red.append(f"runaway guard: {same} self-started coordinator turns in the last hour met the "
-                             f"same evidence (limit {repeat_cap - 1}); resumes automatically as the hour rolls over")
+            coord_red.append(f"runaway guard: {same} self-started coordinator turns (${thrash:.2f}) in the last hour met the "
+                             f"same evidence, past budget.hourly_coordinator_repeats ({repeat_cap - 1}); "
+                             f"resumes automatically as the hour rolls over")
             resume.append(rolls_under(selfs, lambda rs: repeated_turns(rs) >= repeat_cap, now))
     else:
         shares.append(_share(last_h, ceiling))
@@ -498,6 +499,7 @@ def rolls_under(runs: list, over, now: float | None = None) -> float:
 
 LOOP_ORIGINS = ("schedule", "harness")   # sources that keep queuing new tasks: a failing loop's source (not the daemon: its reviews and
 #   owner tasks serve user orders, and the per-task hold covers one that fails)
+REPEAT_RUNS = 2   # a task with this many wasted runs in the last hour keeps failing (one cheap failure holds nothing)
 
 
 def waste_holds(db: DB, b: dict, spans: list, virtual: bool, workers: int, now: float) -> list[dict]:
@@ -505,8 +507,8 @@ def waste_holds(db: DB, b: dict, spans: list, virtual: bool, workers: int, now: 
     whose own waste passes the per-worker limit (budget.hourly_waste_usd, on a plan
     budget.hourly_waste_runs) is held until its trailing hour is back under it. New tasks failing one
     after another show as the other tasks' waste passing the limit for `workers` together: each task
-    that wasted is held, and so is each loop source (LOOP_ORIGINS) among them whose own tasks wasted more than
-    one worker's limit, for its new tasks."""
+    that failed again (REPEAT_RUNS runs in the hour) is held, never one that failed once, and so is each loop
+    source (LOOP_ORIGINS) among them whose own tasks wasted more than one worker's limit, for its new tasks."""
     setting = "hourly_waste_runs" if virtual else "hourly_waste_usd"
     per = float(b.get(setting, 4 if virtual else 8.0))
 
@@ -531,7 +533,8 @@ def waste_holds(db: DB, b: dict, spans: list, virtual: bool, workers: int, now: 
     if total(rest) > per * workers:
         ids = sorted(set(by_task) - over)
         for t in ids:
-            hold(by_task[t], per * workers, rest, task=t)
+            if len(by_task[t]) >= REPEAT_RUNS:   # one failure holds nothing: a user's task is not stopped by it
+                hold(by_task[t], per * workers, rest, task=t)
         origin = {r["id"]: r["origin"] for r in db.q(f"SELECT id, origin FROM tasks WHERE id IN ({','.join('?' * len(ids))})",
                                                      tuple(ids))}
         for o in sorted(set(origin.values()) & set(LOOP_ORIGINS)):
@@ -544,8 +547,10 @@ def waste_holds(db: DB, b: dict, spans: list, virtual: bool, workers: int, now: 
 def waste_hold(gate: Gate | dict | None, task: dict) -> dict | None:
     """The waste hold on `task` (its own, or its origin's when that is a failing loop's source), or None."""
     for h in (getattr(gate, "waste_holds", None) if not isinstance(gate, dict) else gate.get("waste_holds")) or []:
-        if h.get("task") == task["id"] or (h.get("origin") and h["origin"] == task["origin"]):
+        if h.get("task") == task["id"]:
             return h
+        if h.get("origin") and h["origin"] == task["origin"] and not (urgent.is_urgent(task) or urgent.user_ordered(task)):
+            return h   # a failing source's other tasks wait; an urgent or user-ordered one does not
     return None
 
 

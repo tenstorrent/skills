@@ -622,8 +622,8 @@ def test_the_default_plan_turn_guard_fires_below_the_coordinators_own_turn_limit
     cap = bud.default_turn_cap(p.config())
     g = turns(cap + 1)
     assert cap + 1 < limit and g.coord_hold, "the default turn guard cannot fire under max_turns_per_hour"
-    assert any(f"{cap + 1} self-started coordinator turns in the last hour (limit {cap};" in r
-               for r in g.coord_hold["reasons"])
+    assert any(f"{cap + 1} self-started coordinator turns ($" in r and f"budget.hourly_coordinator_turns ({cap};" in r
+               for r in g.coord_hold["reasons"]), "the hold names the turns, their spend and the setting"
     assert g.numbers["guard_ratio"] > 1
     g = turns(cap)
     assert not g.coord_hold and g.numbers["guard_ratio"] == 1.0, g.coord_hold
@@ -1587,14 +1587,14 @@ def test_the_waste_limit_scales_with_parallel_workers(env):
     g = bud.evaluate(p.db, p.config(), "claude", [], now)
     assert not any("failed or stalled" in r for r in g.reasons), g.reasons
     # One task failing over and over is a loop, however many workers the project may run; so are
-    # new tasks failing one after another.
-    for tasks in ((1, 1, 1), (1, 2, 3)):
+    # tasks failing again one after another (the ones that failed once are held by nothing).
+    for tasks, held in (((1, 1, 1), {1}), ((1, 1, 2, 2, 3), {1, 2}), ((1, 2, 3), set())):
         p.db.x("DELETE FROM runs")
         for i, task in enumerate(tasks):
             p.db.x("INSERT INTO runs(task,role,provider,status,started,ended,cost_usd) "
-                   "VALUES(?,'worker','claude','timeout',?,?,4.0)", (task, now - 3000 + i * 900, now - 2200 + i * 900))
+                   "VALUES(?,'worker','claude','timeout',?,?,4.0)", (task, now - 3000 + i * 600, now - 2400 + i * 600))
         g = bud.evaluate(p.db, p.config(), "claude", [], now)
-        assert g.level == "green" and {h["task"] for h in g.waste_holds} == set(tasks), (tasks, g.waste_holds)
+        assert g.level == "green" and {h["task"] for h in g.waste_holds} == held, (tasks, g.waste_holds)
         assert g.numbers["waste_limit"] == 8.0, g.numbers
 
 
@@ -1610,7 +1610,7 @@ def test_new_tasks_failing_one_after_another_hold_their_loop_source_not_a_user_o
         p.db.x("INSERT INTO runs(task,role,provider,status,started,ended,cost_usd) "   # $9 a source: over one worker's limit
                "VALUES(?,'worker','claude','timeout',?,?,4.5)", (task, now - 3000 + i * 300, now - 2400 + i * 300))
     g = bud.evaluate(p.db, p.config(), "claude", [], now)
-    assert g.level == "green" and {h["task"] for h in g.waste_holds} - {None} == {*ids.values(), *twin.values()}, g.waste_holds
+    assert g.level == "green" and {h["task"] for h in g.waste_holds} - {None} == set(), "each failed once: no task is held"
     assert {h["origin"] for h in g.waste_holds} - {None} == {"harness", "schedule"}, g.waste_holds
     mine = lambda o: bud.waste_hold(g, p.db.task(p.db.add_task("new", "s", kind="work", tier="light", origin=o)))
     assert mine("harness") and mine("schedule") and not mine("user") and not mine("daemon"), \
