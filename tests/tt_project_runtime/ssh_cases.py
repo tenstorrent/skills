@@ -1029,7 +1029,7 @@ def test_a_wrapper_copy_skips_a_chaining_guard_folder_when_it_looks_for_the_real
     assert r.returncode == 9                                                     # the guard's own check still runs
 
 
-def test_the_chain_flag_does_not_reach_the_real_ssh_or_the_ssh_calls_it_starts(tmp_path):
+def test_a_nested_ssh_call_still_reaches_a_projects_guard_after_a_chained_call(tmp_path):
     import subprocess
     wbin, env = _launcher_dir(tmp_path)
     gbin = tmp_path / "gbin"
@@ -1039,7 +1039,10 @@ def test_the_chain_flag_does_not_reach_the_real_ssh_or_the_ssh_calls_it_starts(t
     (tmp_path / "rbin" / "ssh").write_text(f'#!/bin/sh\ncase " $* " in *" -O "*|*" -fN "*) exit 0 ;; esac\necho "chained=${{TTP_SSH_CHAINED-unset}}" > {tmp_path}/seen\n')
     env["PATH"] = f"{wbin}:{gbin}:{tmp_path / 'rbin'}:/usr/bin:/bin"
     assert subprocess.run(["sh", str(wbin / "ssh"), "host-a", "true"], env=env, timeout=30).returncode == 0
-    assert (tmp_path / "seen").read_text() == "chained=unset\n"
+    chained = (tmp_path / "seen").read_text().split("=")[1].strip()
+    env["TTP_SSH_CHAINED"] = chained                   # what a nested ssh started by the real ssh inherits
+    (gbin / "ssh").write_text('#!/bin/sh\n[ "$1" = prod ] && exit 9\nexec sh "${0%/*}/lib/ttp-ssh" "$@"\n')
+    assert subprocess.run(["sh", str(wbin / "ssh"), "prod", "true"], env=env, timeout=30).returncode == 9
 
 
 def test_the_ssh_launcher_gives_ssh_local_no_stdin_and_keeps_the_callers_for_ssh(tmp_path):

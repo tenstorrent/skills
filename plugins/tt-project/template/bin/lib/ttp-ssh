@@ -61,8 +61,8 @@ for d in $PATH; do
         real=$d/ssh
         if [ -f "$d/lib/ttp-ssh" ]; then
             # A project's own guard beside a wrapper body: it runs its checks and chains to its body, which finds the real ssh.
-            [ -z "$TTP_SSH_CHAINED" ] || { real=; continue; }
-            TTP_SSH_CHAINED=1
+            [ "$TTP_SSH_CHAINED" != "$$" ] || { real=; continue; }       # the pid survives exec, never a nested ssh
+            TTP_SSH_CHAINED=$$
             export TTP_SSH_CHAINED
             unset TTP_SSH_WRAPPER_PID
             exec "$real" "$@"
@@ -71,7 +71,6 @@ for d in $PATH; do
     fi
 done
 IFS=$ifs
-unset TTP_SSH_CHAINED
 if [ -z "$real" ]; then
     for c in /usr/bin/ssh /usr/local/bin/ssh /opt/homebrew/bin/ssh; do
         [ -x "$c" ] && { real=$c; break; }
