@@ -297,6 +297,7 @@ def _not_run(daemon, pr: dict, key: str, gh, now: float, pending: bool) -> tuple
     listed = settings(getattr(daemon, "cfg", None))["dispatch"].get(repo, [])
     rules = _base_rules(daemon, gh, repo, pr["baseRefName"], now) if sha and pr.get("baseRefName") else None
     reported = {c.get("name") or c.get("context") for c in checks}
+    # todo is keyed by name: a required check and a skipped-run workflow of the same name share one entry
     todo = {n: (f"required by {pr['baseRefName']}'s rules, not reported on the head", "required")
             for n in (rules or {}).get("required", []) if n not in reported and not pending}
     text = lambda held: "; ".join(f"{n} ({why})" for n, (why, f) in sorted(todo.items())

@@ -2008,7 +2008,7 @@ def test_ci_wait_on_a_sha_finds_its_run_past_the_newest_page_and_never_calls_a_f
     from ttp import ciwait
     sha = "c" * 40
     mine = {"databaseId": 7, "status": "completed", "conclusion": "success", "headSha": sha,
-            "workflowName": "CI", "url": "u/7"}
+            "workflowName": "CI", "url": "u/7", "createdAt": "2026-01-01T00:00:00Z"}
     other = [{"databaseId": 100 + i, "status": "completed", "conclusion": "success", "headSha": f"{i:040x}",
               "workflowName": "CI", "url": f"u/{100 + i}", "createdAt": "2026-01-02T00:00:00Z"} for i in range(250)]
     runs, filtered, calls = [*other[:49], mine, *other[49:]], [True], []

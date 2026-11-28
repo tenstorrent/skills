@@ -218,7 +218,7 @@ def pr_checks(repo: str | None, branch: str | None, sha: str | None) -> tuple[in
             or (c.get("state") or "SUCCESS") in ("PENDING", "EXPECTED")]
     if live:
         return 75, [f"running: {len(live)} of {len(checks)} checks on {head[:12]} not completed"]
-    runs = _api(repo, f"runs?head_sha={head}&per_page=100")
+    runs = _api(repo, f"runs?head_sha={head}&per_page=100")   # first page only: a head with over 100 runs is read in part
     if not isinstance(runs, dict):
         return 75, [f"not yet: gh could not read the workflow runs on {head[:12]}"]
     going = [r for r in runs.get("workflow_runs") or [] if (r.get("status") or "completed") != "completed"]
