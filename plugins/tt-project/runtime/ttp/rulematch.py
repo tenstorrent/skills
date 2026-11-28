@@ -6,7 +6,7 @@ Topic words are the message's subject words (correction.ask_words, stemmed, the 
 dropped); a memory entry or charter item matches by half the topic words (two at least) or a shared anchor, a
 config key or an UPPER_SNAKE constant by sharing two topic words or one beside a value equal to a
 duration in the message (a constant also beside a name a matched memory entry gives); a value alone never matches.
-A number, date, time, size, amount or id ('2026', '24 h', '100M', 'msg-12', '#812') is no topic term or anchor, an
+A number, date, time, size, amount or id ('2026', '24 h', '100M', 'msg-12', '#7') is no topic term or anchor, an
 anchor's own words count once, and a memory or charter row shows the shared term as its value. Durations are normalised to seconds (`durations`), so 'an hour', '60 min' and '3600 s'
 name one value. `note` runs where correction.flag reads a message and stores kv `rulematch:<msg id>`;
 `digest_lines` shows it for OPEN_S, the window to retire or rewrite them. `ttp rule-gone` (`gone`, `remaining`)
