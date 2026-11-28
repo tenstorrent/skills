@@ -837,7 +837,7 @@ def worker_memory_block(p: Project) -> str:
     _, mem, use = worker_context(p, reserve=WORKER_RANKED_MIN_CHARS)   # the rest of its own: worker_rules
     # The user's corrections come before the rest of memory, outside its budget (Project.user_corrections).
     fixed = worker_corrections(p)
-    p.note_memory_shown([e["name"] for e in fixed + mem + use["pointers"]])
+    p.note_memory_shown([e["name"] for e in fixed + mem + use["pointers"][:MEMORY_POINTERS_LISTED]])
     parts = []
     if fixed:
         parts.append(f"# {CORRECTIONS_HEADER.upper()}\n" + "\n".join(e["line"] for e in fixed))

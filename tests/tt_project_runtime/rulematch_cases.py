@@ -52,12 +52,10 @@ def test_rulematch_caps_the_list_and_flag_stores_and_shows_it_once(env):
     row = p.db.one("SELECT * FROM messages WHERE id=?", (mid,))
     correction.flag(p.db, p.config(), [row])
     rec = p.db.kv(rm.KV + str(mid))
-    assert rec["msg"] == mid and 0 < len(rec["items"]) <= rm.MAX and rec["gone"] is False
+    assert rec["msg"] == mid and 0 < len(rec["items"]) <= rm.MAX
     lines = rulecite.digest_lines(p.db)
-    assert lines and all(l.startswith(f"- user msg {mid} may retire: ") and f"ttp rule-gone --msg {mid}" in l for l in lines)
+    assert lines and all(l.startswith(f"- user msg {mid} may retire: ") for l in lines)
     assert len(lines) <= rm.MAX
     correction.flag(p.db, p.config(), [row])   # one record per message
     assert p.db.kv(rm.KV + str(mid)) == rec
-    p.db.set_kv(rm.KV + str(mid), {**rec, "gone": True})
-    assert rulecite.digest_lines(p.db) == []
     assert rm.digest_lines(p.db, time.time() + rm.OPEN_S + 60) == []

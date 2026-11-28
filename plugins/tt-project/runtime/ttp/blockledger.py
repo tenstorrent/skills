@@ -5,8 +5,8 @@ retired or rewritten the same day.
 sources: the stuck intervals of tasks (unblock.intervals), guard refusals in each run's
 `refusals.jsonl` / `glm_refusals.jsonl` (minutes: until the task next ran, when that run handed off
 blocked or waiting), queue-wait episodes (queuewait) and `state/blocklog.jsonl`, which `ttp block-log`
-appends to. `safety` names the safety gate that holds the time, else "convenience". `share(db, cfg, day)`
-is the blocked share of ordered work's wall time (TARGET 5%): overlapping rows of one task count once.
+appends to. `safety` names the safety gate that holds the time, else "convenience". `window_share` is the
+blocked share of ordered work's wall time (TARGET 5%): overlapping rows of one task count once.
 """
 from __future__ import annotations
 
@@ -19,9 +19,9 @@ from . import obligations, queuetrim, queuewait, rulecite, selfblock, unblock
 from .db import DB
 
 LOG = "blocklog.jsonl"
-KV = "blockledger:day:"   # + YYYY-MM-DD: {"share", "blocked_min", "ordered_min"}, kept for a finished day
 TARGET = 0.05
 REFUSALS = ("refusals.jsonl", "glm_refusals.jsonl")
+GUARD_KINDS = frozenset({"no_device", "worker_role", "provenance", "user_site"})   # hook refusals of a safety guard
 # Safety gates beyond selfblock.GATES: a held resource, a check, a review or push, a user message, a rule id.
 SAFE = (("held resource", re.compile(r"\bresource:\S+|\block\b", re.I)), ("check", re.compile(r"\bcheck:\S+")),
         ("review or push", re.compile(r"\b(?:review|pushing)\b", re.I)), ("user message", rulecite._MSG),
@@ -52,10 +52,20 @@ def _row(rule, task, kind, start, end, reason, source, **extra) -> dict:
             "source": source, **extra}
 
 
+def _handed_next(db: DB, r: dict, until: float) -> float | None:
+    """When the task next ran after run `r` handed off blocked or waiting, else None."""
+    hand = db.one("SELECT ts FROM events WHERE task=? AND kind IN ('task_blocked','task_waiting') "
+                  "AND ts>=? AND ts<=? ORDER BY ts LIMIT 1", (r["task"], r["started"], (r["ended"] or until) + 60))
+    nxt = hand and db.one("SELECT started FROM runs WHERE task=? AND role!='coordinator' AND started>? "
+                          "ORDER BY started LIMIT 1", (r["task"], hand["ts"]))
+    return nxt and nxt["started"]
+
+
 def _refusals(db: DB, since: float, until: float) -> list[dict]:
     out = []
     for r in db.q("SELECT id, task, started, ended FROM runs WHERE task IS NOT NULL AND started<=? "
                   "AND COALESCE(ended, ?)>=?", (until, until, since)):
+        end = _handed_next(db, r, until)
         for name in REFUSALS:
             f = Path(db.path).parent / "runs" / str(r["id"]) / name
             for line in (f.read_text(errors="replace").splitlines() if f.is_file() else ()):
@@ -66,13 +76,11 @@ def _refusals(db: DB, since: float, until: float) -> list[dict]:
                     continue
                 if not isinstance(rec, dict) or not since <= ts <= until:
                     continue
-                hand = db.one("SELECT ts FROM events WHERE task=? AND kind IN ('task_blocked','task_waiting') "
-                              "AND ts>=? AND ts<=? ORDER BY ts LIMIT 1", (r["task"], r["started"], (r["ended"] or until) + 60))
-                nxt = hand and db.one("SELECT started FROM runs WHERE task=? AND role!='coordinator' AND started>? "
-                                      "ORDER BY started LIMIT 1", (r["task"], hand["ts"]))
-                end = nxt["started"] if nxt else ts
-                out.append(_row(str(rec.get("kind") or rec.get("rule") or "refusal"), r["task"], "refusal", ts,
-                                max(ts, end), "", "refusal", n=int(rec.get("n") or 1)))   # the rule's name alone classes it
+                kind = str(rec.get("kind") or rec.get("rule") or "refusal")
+                row = _row(kind, r["task"], "refusal", ts, max(ts, min(end or ts, until)), "", "refusal", n=int(rec.get("n") or 1))
+                if rec.get("class") == "harmful" or rec.get("kind") in GUARD_KINDS:
+                    row["safety"] = "guard"   # a safety guard's refusal is no rule to retire
+                out.append(row)
     return out
 
 
@@ -140,19 +148,6 @@ def window_share(db: DB, cfg: dict | None, start: float, end: float) -> dict:
     blocked = sum(_union_min(v) for v in by.values())
     return {"share": round(blocked / wall, 4) if wall else 0.0, "blocked_min": round(blocked, 1),
             "ordered_min": round(wall, 1)}
-
-
-def share(db: DB, cfg: dict | None, day: str, now: float | None = None) -> dict:
-    """The local day `day` (YYYY-MM-DD) as window_share; a finished day is cached in kv."""
-    now = time.time() if now is None else now
-    start = time.mktime(time.strptime(day, "%Y-%m-%d"))
-    cached = db.kv(KV + day)
-    if cached and start + 86400 <= now:
-        return cached
-    out = window_share(db, cfg, start, min(start + 86400, now))
-    if start + 86400 <= now:
-        db.set_kv(KV + day, out)
-    return out
 
 
 def top(rs: list[dict], n: int = 10) -> list[dict]:

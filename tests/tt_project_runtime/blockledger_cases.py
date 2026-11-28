@@ -58,13 +58,20 @@ def test_block_ledger_counts_guard_refusals_queue_waits_and_the_block_log(env):
     d.mkdir(parents=True)
     (d / "refusals.jsonl").write_text(
         json.dumps({"ts": now - 7100, "kind": "full_suite", "command": "pytest"}) + "\nnot json\n")
-    (d / "glm_refusals.jsonl").write_text(json.dumps({"ts": now - 7050, "rule": "records", "n": 2, "why": "x"}) + "\n")
+    (d / "glm_refusals.jsonl").write_text(
+        json.dumps({"ts": now - 7050, "rule": "records", "class": "harmful", "n": 2, "why": "x"}) + "\n"
+        + json.dumps({"ts": now - 7040, "rule": "redirected", "class": "redirect", "n": 1, "why": "y"}) + "\n")
+    (d / "refusals.jsonl").write_text((d / "refusals.jsonl").read_text()
+                                      + json.dumps({"ts": now - 7030, "kind": "no_device", "command": "tt-smi"}) + "\n")
     p.db.set_kv(queuewait.KV, {"hist": [{"task": t, "queue": "checks", "since": now - 5000, "end": now - 4400}]})
     bl.append(p.db, "keep 60 min", t, 300, "refused a restart")
     rs = bl.rows(p.db, {}, now - 86400, now)
     by = {r["rule"]: r for r in rs if r["source"] != "task"}
     assert by["full_suite"]["source"] == "refusal" and by["full_suite"]["n"] == 1
     assert by["records"]["n"] == 2 and by["records"]["minutes"] > 60   # until the task next ran
+    assert (by["records"]["safety"], by["no_device"]["safety"]) == ("guard", "guard")   # safety guards are no rules to retire
+    assert by["full_suite"]["safety"] == by["redirected"]["safety"] == "convenience"
+    assert all(r["end"] <= now - 3000 for r in bl.rows(p.db, {}, now - 86400, now - 3000) if r["source"] == "refusal")
     assert by["queue:checks"]["minutes"] == 10.0
     assert (by["keep 60 min"]["minutes"], by["keep 60 min"]["source"]) == (5.0, "cli")
     assert [e["rule"] for e in bl.top(rs, 1)] == [rs[0]["rule"]]
@@ -85,11 +92,6 @@ def test_block_ledger_share_counts_only_ordered_work_and_each_task_once(env):
     assert s["ordered_min"] == pytest.approx(120, abs=1) and s["blocked_min"] == pytest.approx(60, abs=1)
     assert s["share"] == pytest.approx(0.5, abs=0.01)
     assert bl.TARGET == 0.05
-    yday = time.strftime("%Y-%m-%d", time.localtime(now - 86400))
-    first = bl.share(p.db, {}, yday, now)
-    assert p.db.kv(bl.KV + yday) == first   # a finished day is cached
-    p.db.x("UPDATE tasks SET priority=3")
-    assert bl.share(p.db, {}, yday, now) == first
 
 
 def test_block_log_and_blocked_commands_and_the_daily_line(env, capsys, monkeypatch):

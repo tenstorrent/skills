@@ -7,7 +7,7 @@ dropped); a memory entry or charter item matches by half the topic words (two at
 config key or an UPPER_SNAKE constant by sharing one topic word; a constant also by a value equal to a
 duration in the message or a name in a matched memory entry. Durations are normalised to seconds (`durations`), so 'an hour', '60 min' and '3600 s'
 name one value. `note` runs where correction.flag reads a message and stores kv `rulematch:<msg id>`;
-`digest_lines` shows it for OPEN_S, until `ttp rule-gone --msg <id>` marks it gone.
+`digest_lines` shows it for OPEN_S, the window to retire or rewrite them.
 """
 from __future__ import annotations
 
@@ -19,7 +19,7 @@ from pathlib import Path
 
 from . import correction, prompts, reask, rulecite
 
-KV = "rulematch:"   # + message id: {"msg", "items": [older()'s rows], "gone": false}
+KV = "rulematch:"   # + message id: {"msg", "items": [older()'s rows]}
 MAX = 5
 OPEN_S = 48 * 3600
 _UNITS = {"s": 1, "m": 60, "h": 3600, "d": 86400}   # by the unit's first letter
@@ -123,7 +123,7 @@ def note(db, cfg: dict | None, m: dict, now: float | None = None) -> None:
         items = older(Project(Path(db.path).parent.parent), db, m.get("text") or "", int(m["id"]))
     except Exception:
         return
-    db.set_kv(KV + str(m["id"]), {"msg": int(m["id"]), "items": items, "gone": False})
+    db.set_kv(KV + str(m["id"]), {"msg": int(m["id"]), "items": items})
 
 
 def digest_lines(db, now: float | None = None) -> list[str]:
@@ -133,6 +133,5 @@ def digest_lines(db, now: float | None = None) -> list[str]:
     for r in db.q("SELECT value FROM kv WHERE key LIKE ? AND ts>=? ORDER BY ts", (KV + "%", now - OPEN_S)):
         rec = json.loads(r["value"] or "{}")
         out += [f"- user msg {rec['msg']} may retire: {i['where']} {i['name']} = {i['value']}; retire or rewrite it "
-                f"today, then `ttp rule-gone --msg {rec['msg']}`" for i in rec.get("items", [])[:MAX]
-                if not rec.get("gone")]
+                f"today" for i in rec.get("items", [])[:MAX]]
     return out

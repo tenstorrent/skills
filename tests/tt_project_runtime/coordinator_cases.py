@@ -18926,7 +18926,9 @@ def test_pinned_worker_memory_past_its_room_shows_or_points_to_every_entry_and_n
     cut = next(x["line"] for x in use["pointers"] if x["name"] == long)
     assert cut.endswith("…") and cut.startswith(f"[{long}] LONG-PREF xx") and len(cut) == MEMORY_POINTER_CHARS, cut
     assert f"Shortened for room, each in full in {p.memory_dir}/<name>.md" in block
-    assert p.db.kv("memory_shown")["entries"].keys() >= whole | pointed
+    from ttp.prompts import MEMORY_POINTERS_LISTED
+    named = {x["name"] for x in use["pointers"][:MEMORY_POINTERS_LISTED]}
+    assert p.db.kv("memory_shown")["entries"].keys() >= whole | named
     line = coord.worker_pinned_line(p)
     assert all(n in line for n in pointed) and f"shortens {len(pointed)} of {use['pinned']}" in line, line
     assert line in audit.lines(p.db, p=p)
