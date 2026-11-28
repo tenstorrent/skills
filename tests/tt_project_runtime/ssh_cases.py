@@ -1039,10 +1039,22 @@ def test_a_nested_ssh_call_still_reaches_a_projects_guard_after_a_chained_call(t
     (tmp_path / "rbin" / "ssh").write_text(f'#!/bin/sh\ncase " $* " in *" -O "*|*" -fN "*) exit 0 ;; esac\necho "chained=${{TTP_SSH_CHAINED-unset}}" > {tmp_path}/seen\n')
     env["PATH"] = f"{wbin}:{gbin}:{tmp_path / 'rbin'}:/usr/bin:/bin"
     assert subprocess.run(["sh", str(wbin / "ssh"), "host-a", "true"], env=env, timeout=30).returncode == 0
-    chained = (tmp_path / "seen").read_text().split("=")[1].strip()
-    env["TTP_SSH_CHAINED"] = chained                   # what a nested ssh started by the real ssh inherits
+    assert (tmp_path / "seen").read_text().strip() == "chained=unset"   # a nested ssh starts with no guard list
     (gbin / "ssh").write_text('#!/bin/sh\n[ "$1" = prod ] && exit 9\nexec sh "${0%/*}/lib/ttp-ssh" "$@"\n')
     assert subprocess.run(["sh", str(wbin / "ssh"), "prod", "true"], env=env, timeout=30).returncode == 9
+
+
+def test_two_guards_that_run_their_body_as_a_child_each_run_once_and_reach_the_real_ssh(tmp_path):
+    import subprocess
+    wbin, env = _launcher_dir(tmp_path)
+    for g in ("g1", "g2"):
+        (tmp_path / g).mkdir()
+        _copy_ssh_bin(tmp_path / g)
+        (tmp_path / g / "ssh").write_text(f'#!/bin/sh\necho {g} >> {tmp_path}/guards\nsh "${{0%/*}}/lib/ttp-ssh" "$@"\n')
+    (tmp_path / "rbin" / "ssh").write_text('#!/bin/sh\ncase " $* " in *" -O "*|*" -fN "*) exit 0 ;; esac\nexit 0\n')
+    env["PATH"] = f"{wbin}:{tmp_path / 'g1'}:{tmp_path / 'g2'}:{tmp_path / 'rbin'}:/usr/bin:/bin"
+    assert subprocess.run(["sh", str(wbin / "ssh"), "host-a", "true"], env=env, timeout=30).returncode == 0
+    assert (tmp_path / "guards").read_text().split() == ["g1", "g2"]
 
 
 def test_the_ssh_launcher_gives_ssh_local_no_stdin_and_keeps_the_callers_for_ssh(tmp_path):
