@@ -247,9 +247,10 @@ def change_fails(db: DB, review: dict, now: float | None = None) -> int:
 
 
 def failed_reviews(db: DB, since: float) -> list[int]:
-    """Reviews that failed or asked for changes since `since`, each once, but none no reviewer judged (unjudged)."""
+    """Reviews (a carry task's inline ones too) that failed or asked for changes since `since`, each task once, but none no reviewer judged (unjudged)."""
     return [r["task"] for r in db.q(
-        "SELECT DISTINCT e.task, t.result FROM events e JOIN tasks t ON t.id=e.task WHERE t.kind='review' AND e.ts>? "
+        "SELECT DISTINCT e.task, t.result FROM events e JOIN tasks t ON t.id=e.task "
+        "WHERE (t.kind='review' OR t.id IN (SELECT task FROM carry_state)) AND e.ts>? "
         f"AND e.kind IN ({','.join('?' * len(FAILED_KINDS))}) ORDER BY e.task", (since, *FAILED_KINDS))
         if not unjudged(r)]
 

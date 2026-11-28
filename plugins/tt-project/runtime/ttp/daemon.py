@@ -8350,8 +8350,9 @@ class Daemon:
                 topped = True
         else:
             new = "failed"
+        carry_run = r.get("role") == carry.ROLE and task["kind"] == "code"   # an inline review: never an attempt when it ends
         attempts = int(task["attempts"] or 0) + (0 if status in FREE_ENDS or waiting or reboot_lost
-                                                  or rejects or topped or resumed or (r.get("role") == carry.ROLE and task["kind"] == "code" and new == "done") else 1)
+                                                  or rejects or topped or resumed or (carry_run and status == "ok") else 1)
         if new == "failed" and not guard and attempts < int(task["max_attempts"] or 3) \
                 and status in ("failed", "lost", "timeout", "stalled", "no_handoff", "refused_wait", "role_miss"):
             new = "queued"
@@ -8530,7 +8531,8 @@ class Daemon:
         if (new == "done" or member_vs) and entries not in (None, "", []):
             try:
                 check = (pushq.check_approval(self.p, task, entries, cfg=self.cfg) if task["kind"] == "review"
-                         else {"ignored": "only a review task approves pushes"})
+                         else carry.check_approval(self, task, usage.session_id or carry.session_of(r), entries, self.cfg)
+                         if carry_run else {"ignored": "only a review task approves pushes"})
             except subprocess.TimeoutExpired as e:   # gitmemo.TX_GIT_S ran out: invalid, so the review runs again
                 check = {"invalid": f"local git timed out checking it (after {e.timeout:.0f} s)"}
             if check.get("entries") and (why := self._ponytail_approval(task, check, result, run_dir)):
@@ -8571,6 +8573,13 @@ class Daemon:
                     extra[pushq.JUDGED_KEY] = sorted(took | set(extra.get(pushq.JUDGED_KEY) or []))
                 for note in check.get("notes") or []:
                     log(self.p, f"task {task['id']}: {note}")
+        if carry_run and status == "ok" and not approval:   # an inline review's verdict: fixed in place, capped, or nothing to push
+            if new == "failed":
+                new, more = carry.failed(self, task, result, run_dir)
+                extra.update(more)
+                not_before = time.time() if new == "queued" else not_before
+            elif new == "done":
+                carry.advance(db, task["id"], carry.DONE)
         # A push-conflict fix (conflictfix.py) costs no review attempt when it approves a new head. A
         # light one that ends any other way (done with nothing approved included; a refused account, a
         # lost host, a block or a needs_review aside) runs again at once at standard, also without an
@@ -8772,7 +8781,9 @@ class Daemon:
                 upd["labels"] = gate_labels
         if approval:
             with db.tx():   # rows, pins and the status together: a failed pin leaves the run to be retried
-                pushq.approve(self.p, task["id"], r.get("id"), approval)
+                ids = pushq.approve(self.p, task["id"], r.get("id"), approval)
+                if carry_run:
+                    carry.advance(db, task["id"], carry.QUEUED, push_row=ids[0])
                 db.update_task(task["id"], **upd)
                 # Handled: nothing to decide until the batch reports (pushq.finalize).
                 db.x("INSERT INTO events(ts,source,kind,severity,text,status,task) VALUES(?,?,?,?,?,?,?)",
@@ -8952,17 +8963,15 @@ class Daemon:
         # Its git reads get a short timeout of their own (gitmemo.FINISH_REVIEW_GIT_S): a slow one marks the
         # review pending for the next tick (retry_unread_reviews), never the transaction's whole budget.
         # A carry task's review is a run of the task itself: it goes back to the queue with that run due.
-        inline = reviewable and not split and not requeued and r.get("role") != carry.ROLE \
-            and carry.enabled(self.cfg, task, db, self.p) and self._code_change(task)
+        changed = reviewable and not split and not requeued and not carry_run and self._code_change(task)
+        inline = changed and carry.enabled(self.cfg, task, db, self.p)
         with gitmemo.bounded(gitmemo.FINISH_REVIEW_GIT_S):
             if inline and carry.inline_review(self, dict(task, **upd), summary):
                 db.update_task(task["id"], status="queued", not_before=None)
                 text += "\nIts review runs next as a run of this task (carry), not as a Review task."
                 review = None
             else:
-                review = self._auto_review(dict(task, **upd), summary) \
-                    if reviewable and not split and not requeued and not inline \
-                    and self._code_change(task) else None
+                review = self._auto_review(dict(task, **upd), summary) if changed and not inline else None
         # A fix of a failed review that adds no commit to the head that review saw leaves its re-review
         # nothing new to check: the re-review is blocked, never run on the same head, and the coordinator
         # decides.
@@ -20699,7 +20708,7 @@ class Daemon:
         record checks first, git last. `heads` ({branch: head}, worktree.branch_heads) is the pass's one
         batched read of every head; None reads this task's head on its own."""
         db, d, tid = self.p.db, self.cfg.get("delivery") or {}, t["id"]
-        if carry.state(db, tid):
+        if carry.state(db, tid) and carry.enabled(self.cfg, t, db, self.p):
             return "a carry task reviews inline"
         result = load_result(t["result"])
         if t["status"] == "queued":
@@ -20884,7 +20893,7 @@ class Daemon:
         rules = cfg.get("review") or {}
         if not rules.get("auto", True) or not (d.get("review_before_pr", True) or d.get("push_branch")):
             return None
-        if not spec_only and carry.state(db, task["id"]):
+        if not spec_only and carry.state(db, task["id"]) and carry.enabled(cfg, task, db, self.p):
             return None   # a carry task's review is a run of the task itself (carry.inline_review builds its prompt)
         if self._landed_elsewhere(task):
             return None

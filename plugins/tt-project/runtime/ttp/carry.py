@@ -12,8 +12,11 @@ from __future__ import annotations
 
 import datetime as dt
 import json
+import re
 import statistics
 import time
+from pathlib import Path
+from types import SimpleNamespace
 
 from .db import dump_result, load_result
 
@@ -23,6 +26,7 @@ PHASES = (CHANGE, REVIEW, FIX, QUEUED, LANDED, DEPLOY, DONE, REBASE, CHECKFIX, C
 EVENT = "carry_phase"
 MODES = ("ordered", "all", "off")
 FIELDS = ("round", "head", "review_run", "push_row", "batch", "note")
+UPDATE = "## Update (review round"   # heads each block of findings appended to the owner's spec
 ROLE = "reviewer"   # runs.role of an inline review: the role of every independent review, with its guards (no edits)
 # How far along the chain a phase is: reconcile only moves a task to a later one.
 _RANK = {CHANGE: 0, REVIEW: 1, FIX: 1, REBASE: 1, CHECKFIX: 1, QUEUED: 2, LANDED: 3, DEPLOY: 4, DONE: 5}
@@ -128,6 +132,9 @@ def inline_review(daemon, task: dict, summary: str) -> bool:
     got = daemon._auto_review(task, summary, spec_only=True)
     if not isinstance(got, dict):
         return False
+    earlier = re.findall(r"^" + re.escape(UPDATE) + r".*?(?=^## |\Z)", task.get("spec") or "", re.M | re.S)
+    if earlier:   # a re-review: the reviewer checks each earlier finding
+        got["spec"] += "\n\nEarlier findings of this change; check that each is fixed:\n" + "\n".join(x.strip() for x in earlier)
     begin_review(daemon.p, task, got["head"], note=json.dumps({k: got[k] for k in ("title", "spec", "tier", "labels")}))
     return True
 
@@ -138,6 +145,69 @@ def review_view(task: dict, s: dict) -> dict:
     got = json.loads(s["note"] or "{}")
     return dict(task, kind="review", spec=got.get("spec", ""), tier=got.get("tier") or "standard", title=got.get("title") or task["title"],
                 labels=json.dumps(got.get("labels") or []), attempts=0)
+
+
+def _authors(db, tid: int) -> list[dict]:
+    """The task's own runs, newest first: every one that is not an inline review (or a coordinator's)."""
+    return db.q("SELECT * FROM runs WHERE task=? AND role NOT IN (?, 'coordinator') ORDER BY id DESC", (tid, ROLE))
+
+
+def session_of(run: dict) -> str:
+    return str(run.get("session_id") or json.loads(run.get("note") or "{}").get("session_id") or "")
+
+
+def check_approval(daemon, task: dict, session: str, entries, cfg: dict) -> dict:
+    """pushq.check_approval for the push list of carry `task`'s inline review (run in `session`), once the review
+    is independent: its session is none of the author's runs' and the branch is still at the pinned head (the
+    reviewer committed nothing, nobody else did). {"invalid": why} otherwise: the review runs again."""
+    from . import pushq
+    s = state(daemon.p.db, task["id"])
+    if not s or s["phase"] != REVIEW:
+        return {"invalid": "its task is no longer in review"}
+    if session and session in {session_of(a) for a in _authors(daemon.p.db, task["id"])}:
+        return {"invalid": "its review ran in the author's own session, not an independent one"}
+    if (now := daemon._branch_head(task)) != s["head"]:
+        return {"invalid": f"the branch is at {str(now)[:12] or 'no commit'}, not the reviewed {str(s['head'])[:12]}: "
+                           "it moved during the review"}
+    # What the review's spec says it reviewed ("branch at head", as a Review task's does) is what pushq may approve.
+    named = dict(task, spec=f"{task.get('spec') or ''}\nReviewed: {task.get('branch')} at {s['head']}")
+    return pushq.check_approval(daemon.p, named, entries, cfg=cfg)
+
+
+def _findings(result: dict) -> str:
+    fups = [f for f in result.get("followups") or [] if isinstance(f, dict)]
+    return "\n".join([str(result.get("summary") or "")] + [f"- {f.get('title')}: {f.get('spec')}" for f in fups])[:6000]
+
+
+def failed(daemon, task: dict, result: dict, run_dir) -> tuple[str, dict]:
+    """Carry `task`'s inline review failed or asked for changes. Within `review.auto_fix_rounds` + 1 review runs: phase
+    fix, the findings and this run's result.json appended to the spec, the owner woken (its author session resumed
+    where the provider allows, else a fresh run from the spec): (queued, result fields). Past them, or when only the
+    approval's form failed (nothing for the author to fix): phase capped, a `carry_capped` event to the coordinator and
+    the task in `review`. A failed review is counted by reviewcap (a `task_changes_needed` event)."""
+    from . import pushq
+    from .daemon import AUTO_FIX_ROUNDS, HANDOFF_RESUME_KEY
+    db, tid = daemon.p.db, task["id"]
+    s = state(db, tid)
+    if not s or s["phase"] != REVIEW:
+        return "failed", {}
+    path, text = Path(run_dir) / "result.json", _findings(result)
+    pushq._event(db, task, "task_changes_needed", f"#{tid} {task['title']}: inline review round {s['round']} failed: "
+                 f"{text.splitlines()[0] if text else ''}", queued=False, severity="low")
+    cap = int((daemon.cfg.get("review") or {}).get("auto_fix_rounds", AUTO_FIX_ROUNDS)) + 1
+    if int(s["round"]) >= cap or result.get("review_failure") in ("approval", "marker"):
+        advance(db, tid, CAPPED, note=str(path))
+        pushq._event(db, task, "carry_capped", f"#{tid} {task['title']}: its inline review failed {s['round']} time(s); "
+                     f"findings in {path}. Decide: scope it down, redesign it or accept the gaps", queued=True, severity="high")
+        return "review", {}
+    woke = f"its review (round {s['round']}) failed; findings below and in {path}. Fix them on your own branch, then hand off done"
+    db.update_task(tid, spec=f"{task['spec'] or ''}\n\n{UPDATE} {s['round']}: findings)\n{text}\nReview result: {path}")
+    advance(db, tid, FIX)
+    extra = {"woke": woke}
+    if (last := next(iter(_authors(db, tid)), None)) and last.get("dir") and (
+            back := daemon._handoff_resume(last, task, SimpleNamespace(session_id=session_of(last)), Path(last["dir"]), woke)):
+        extra[HANDOFF_RESUME_KEY] = back
+    return "queued", extra
 
 
 def reconcile(db) -> list[tuple[int, str, str]]:

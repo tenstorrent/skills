@@ -335,6 +335,16 @@ def test_the_carry_review_run_is_a_fresh_reviewer_run_of_the_same_task_at_the_pi
     assert carry.state(p.db, tid)["round"] == 1 and not p.db.q("SELECT id FROM tasks WHERE kind='review'")
 
 
+def test_a_task_whose_carry_state_outlives_the_flag_still_gets_its_review_task(env):
+    from ttp import carry
+    p = make(env)   # review.inline is not set: carry is off
+    _with_origin(env, clone=False)
+    tid, _, _, reviews = _finish_code(env, p, "stale", {"app.py": 20},
+                                      before=lambda t, head: carry.advance(p.db, t, carry.CHANGE))
+    assert carry.state(p.db, tid) is not None and not carry.enabled(p.config(), p.db.task(tid), p.db, p)
+    assert [r["title"] for r in reviews] == [f"Review #{tid}: stale"]
+
+
 def test_a_finished_review_task_still_spends_its_attempt(env):
     from ttp.daemon import Daemon
     from ttp.providers.base import RunUsage
@@ -368,3 +378,95 @@ def test_a_failing_carry_review_run_counts_an_attempt_and_stops_after_max_attemp
     t = p.db.task(tid)
     assert t["status"] != "queued" and runs == int(t["max_attempts"] or 3) - attempts, "bounded by max_attempts"
     assert int(t["attempts"]) == int(t["max_attempts"] or 3)
+
+
+def _inline(env, monkeypatch):
+    """A push-queue project (_pq) whose code task has an author run (session `author`) and an inline review
+    due on its head, round 1: the next reviewer run of the task is that review's verdict."""
+    from ttp import carry
+    s = _pq(env, monkeypatch)
+    s.p.set_config("review.inline", "all")
+    s.head = s.head.strip()
+    s.p.db.x("INSERT INTO runs(task, role, started, ended, status, session_id) VALUES(?,?,?,?,?,?)",
+             (s.code, "worker", 1.0, 2.0, "ok", "author"))
+    carry.begin_review(s.p, s.p.db.task(s.code), s.head, note=json.dumps(
+        {"title": "t", "spec": "Independently review it.", "tier": "standard", "labels": None}))
+    s.p.db.update_task(s.code, status="running", attempts=1)
+    return s
+
+
+def _verdict(env, s, result, session="reviewer"):
+    from ttp.daemon import Daemon
+    from ttp.providers.base import RunUsage
+    run_dir = env["tmp"] / f"verdict-{time.monotonic_ns()}"
+    run_dir.mkdir()
+    (run_dir / "result.json").write_text(json.dumps(result))
+    s.p.db.update_task(s.code, status="running")
+    Daemon(s.p.base)._finish_worker({"task": s.code, "id": 9, "role": "reviewer", "note": "{}"},
+                                    RunUsage(cost_usd=0.5, session_id=session), "ok", run_dir)
+    return s.p.db.task(s.code), run_dir
+
+
+_REVIEW_PASS = lambda s: {"status": "done", "summary": "looks good", "push": [{"branch": s.branch, "head": s.head}]}
+_REVIEW_FAIL = {"status": "failed", "summary": "it breaks", "followups": [{"title": "Fix the crash", "spec": "guard the empty list"}]}
+
+
+def test_an_independent_inline_pass_approves_the_push_row_for_the_owner_and_advances_the_phase(env, monkeypatch):
+    from ttp import carry
+    s = _inline(env, monkeypatch)
+    t, _ = _verdict(env, s, _REVIEW_PASS(s))
+    rows = s.p.db.q("SELECT * FROM push_queue")
+    assert t["status"] == "pushing" and [(r["task"], r["run"], r["head"], r["status"]) for r in rows] == [
+        (s.code, 9, s.head, "approved")]
+    st = carry.state(s.p.db, s.code)
+    assert (st["phase"], st["push_row"], st["round"]) == ("queued", rows[0]["id"], 1)
+    assert int(t["attempts"]) == 1, "a review run is no attempt"
+
+
+def test_an_inline_pass_is_refused_from_the_authors_own_session_or_a_moved_branch(env, monkeypatch):
+    from ttp import carry
+    s = _inline(env, monkeypatch)
+    t, _ = _verdict(env, s, _REVIEW_PASS(s), session="author")
+    assert t["status"] == "queued" and not s.p.db.q("SELECT * FROM push_queue") and carry.state(s.p.db, s.code)["phase"] == "review"
+    assert "author's own session" in t["result"]
+    _commit(s.path, "late.txt", "late\n")   # the reviewer (or someone) committed: the branch is not the reviewed head
+    t, _ = _verdict(env, s, _REVIEW_PASS(s))
+    assert not s.p.db.q("SELECT * FROM push_queue") and "moved during the review" in t["result"]
+    assert carry.state(s.p.db, s.code)["phase"] == "capped", "the second refusal is the approval's form failing: the coordinator's"
+
+
+def test_a_failed_inline_review_fixes_in_place_and_its_re_review_lists_the_earlier_findings(env, monkeypatch):
+    from ttp import carry, reviewcap
+    from ttp.daemon import Daemon
+    from ttp.providers.base import RunUsage
+    s = _inline(env, monkeypatch)
+    before = s.p.db.q("SELECT id FROM tasks")
+    t, run_dir = _verdict(env, s, _REVIEW_FAIL)
+    st = carry.state(s.p.db, s.code)
+    assert (st["phase"], st["round"], t["status"], int(t["attempts"])) == ("fix", 1, "queued", 1), "the owner is woken; no attempt"
+    assert "## Update (review round 1: findings)" in t["spec"] and "guard the empty list" in t["spec"]
+    assert str(run_dir / "result.json") in t["spec"] and "it breaks" in t["spec"]
+    assert "its review (round 1) failed" in json.loads(t["result"])["woke"]
+    assert s.p.db.q("SELECT id FROM tasks") == before, "no Review or Fix task"
+    assert s.code in reviewcap.failed_reviews(s.p.db, 0), "the failure still counts for the review cap"
+    _commit(s.path, "fix.txt", "fixed\n")   # the author's next run fixes it and hands off
+    again = env["tmp"] / "author-again"
+    again.mkdir()
+    (again / "result.json").write_text(json.dumps({"status": "done", "summary": "fixed"}))
+    s.p.db.update_task(s.code, status="running")
+    Daemon(s.p.base)._finish_worker({"task": s.code, "id": 10, "role": "worker", "note": "{}"}, RunUsage(cost_usd=1.0), "ok", again)
+    st = carry.state(s.p.db, s.code)
+    assert (st["phase"], st["round"]) == ("review", 2) and st["head"] != s.head
+    assert "guard the empty list" in json.loads(st["note"])["spec"], "the re-review checks each earlier finding"
+
+
+def test_a_second_failed_inline_review_caps_the_task_for_the_coordinator(env, monkeypatch):
+    from ttp import carry
+    s = _inline(env, monkeypatch)
+    _verdict(env, s, _REVIEW_FAIL)
+    carry.begin_review(s.p, s.p.db.task(s.code), s.head, note="{}")   # round 2 of the same head
+    t, run_dir = _verdict(env, s, _REVIEW_FAIL)
+    assert carry.state(s.p.db, s.code)["phase"] == "capped" and t["status"] == "review"
+    ev, = s.p.db.q("SELECT * FROM events WHERE kind='carry_capped'")
+    assert str(run_dir / "result.json") in ev["text"] and ev["status"] == "queued" and ev["severity"] == "high"
+    assert int(t["attempts"]) == 1
