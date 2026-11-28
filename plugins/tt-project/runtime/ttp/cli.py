@@ -3091,8 +3091,7 @@ def cmd_gh_queue(a) -> None:
     from . import ghqueue
     if a.action == "run":
         args = a.args[1:] if a.args[:1] == ["--"] else a.args
-        sys.exit(ghqueue.enqueue(args, None if sys.stdin is None or sys.stdin.isatty() else sys.stdin.buffer.read(),
-                                 os.getcwd()))
+        sys.exit(ghqueue.enqueue(args, ghqueue.run_input(args, sys.stdin), os.getcwd()))
     if a.action == "take":
         print(json.dumps(ghqueue.take()))
         return

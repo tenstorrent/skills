@@ -948,3 +948,47 @@ def test_prbabysit_guard_binds_a_dispatch_to_the_run_it_produced_and_its_inputs(
         assert why() is None, event
     runs.write_text(json.dumps([run(51, event="pull_request")]))
     assert "run 51 of heavy.yml" in (why() or "")
+
+
+def test_prbabysit_reads_each_checks_run_through_the_real_batched_query(env, monkeypatch):
+    """Per-run skip judging gets each check's run from the batched GraphQL read itself: the fake GitHub gives a
+    check's detailsUrl only to a query that asks for it, so a batched query that stopped asking (each check then
+    in no run, and a skipped run hidden by its workflow's sibling run that ran) fails here; no per-run stand-in
+    for the reader (#10202)."""
+    import base64
+    from ttp import watchers
+    from ttp.daemon import Daemon
+    run = lambda wf, name, rid, end="SUCCESS": {
+        "__typename": "CheckRun", "name": name, "status": "COMPLETED", "conclusion": end,
+        "detailsUrl": f"https://github.com/acme/widgets/actions/runs/{rid}/job/9",
+        "checkSuite": {"workflowRun": {"workflow": {"name": wf}}}}
+    checks = [run("ci", "validate", 1), run("ci", "publish", 1, "SKIPPED"), run("Heavy", "build", 2, "SKIPPED"),
+              run("Heavy", "lint", 3)]
+
+    class Gh(_BatchGh):   # GitHub's contents API for the workflow files; detailsUrl only when asked for
+        def __call__(self, argv, timeout, **kw):
+            from ttp import boundedchild
+            a = argv[1:]
+            if a[0] == "api" and "/contents/" in a[1]:
+                path = a[1].split("?")[0].split("/contents/", 1)[1]
+                body = ([{"name": k.rsplit("/", 1)[-1], "path": k} for k in _PB_FLOWS] if path == ".github/workflows"
+                        else {"content": base64.b64encode(_PB_FLOWS[path].encode()).decode()} if path in _PB_FLOWS
+                        else None)
+                return boundedchild.Result(0, json.dumps(body), "") if body else boundedchild.Result(1, "", "404")
+            q = next((x for x in a if x.startswith("query=")), "")
+            if "p0:pullRequest(number:" in q:
+                self.batched += 1
+                self.prs[7]["checks"] = [c if "detailsUrl" in q else {k: v for k, v in c.items() if k != "detailsUrl"}
+                                         for c in checks]
+            return super().__call__(argv, timeout, **kw)
+
+    p, _ = _pr_batch_setup(env, monkeypatch, {})
+    gh = Gh({7: _gql_node(7, draft=False)})
+    gh.batched = 0
+    monkeypatch.setattr(__import__("ttp.boundedchild").boundedchild, "run", gh)
+    p.db.x("INSERT INTO tasks(title,kind,status,pr_url,created) VALUES('t','code','waiting',?,?)",
+           (_PB_URL, time.time()))
+    watchers.watch_prs(Daemon(p.base))
+    assert gh.batched == 1 and not any(c[:2] == ["pr", "view"] for c in gh.calls), gh.calls
+    ev = [t for k, t in _pb_events(p) if k == "pr_ci_not_run"]
+    assert len(ev) == 1 and "Heavy (heavy.yml" in ev[0] and "ci (" not in ev[0], ev

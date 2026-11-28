@@ -2029,3 +2029,31 @@ def test_ci_wait_on_a_sha_finds_its_run_past_the_newest_page_and_never_calls_a_f
     assert rc == 75 and "incomplete" in lines[0] and "no run yet" not in lines[0], (rc, lines)
     del runs[10:]
     assert ciwait.probe(repo="o/r", sha=sha) == (1, ["waiting: no run yet"]), "a short list read in full"
+
+
+def test_gh_queue_run_reads_stdin_only_for_a_call_that_reads_it(monkeypatch):
+    """`ttp gh-queue run` under a tool whose stdin is an open pipe nobody closes never waits on it: a read
+    gets no stdin; a body on "-" (and a publish's bundle) is still read and queued with the call."""
+    import argparse
+    from ttp import cli, ghqueue
+
+    class Pipe:   # an open pipe: reading it would block forever
+        def __init__(self, data=None):
+            self.data, self.buffer = data, self
+
+        def isatty(self):
+            return False
+
+        def read(self):
+            assert self.data is not None, "read a stdin the call does not read"
+            return self.data
+
+    got = []
+    monkeypatch.setattr(ghqueue, "enqueue", lambda args, data, cwd: got.append((args, data)) or 75)
+    for args, stdin in ((["pr", "view", "7"], Pipe()), (["api", "repos/o/r/actions/runs/1"], Pipe()),
+                        (["pr", "comment", "7", "--body-file", "-"], Pipe(b"hi")),
+                        ([ghqueue.PUBLISH, "o/r", "b", "f" * 40], Pipe(b"bundle"))):
+        monkeypatch.setattr(cli.sys, "stdin", stdin)
+        with pytest.raises(SystemExit):
+            cli.cmd_gh_queue(argparse.Namespace(action="run", args=["--", *args]))
+    assert [d for _, d in got] == [None, None, b"hi", b"bundle"], got

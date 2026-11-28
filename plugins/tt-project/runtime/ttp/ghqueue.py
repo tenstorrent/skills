@@ -595,6 +595,15 @@ def enqueue(args: list[str], input: bytes | None = None, cwd: str | None = None,
     return _queued(sent, data, repo, cwd, home, f"gh {' '.join(args[:2])}", key)
 
 
+def run_input(args: list[str], stdin) -> bytes | None:
+    """`ttp gh-queue run`'s stdin for `gh args`: read only when the call reads it (a body or bundle on "-"),
+    else None, so an open pipe nobody writes to or closes (a tool's, a parent's) never stalls the call."""
+    from .prguard import needs_stdin
+    if stdin is None or stdin.isatty() or not (args[:1] == [PUBLISH] or needs_stdin(args)):
+        return None
+    return stdin.buffer.read()
+
+
 def lease_problem(sent: list[str], cwd: str | None) -> str:
     """Why this project must not queue `sent`, a publish that replaces its branch (--lease), or "": only
     under its delivery.rebase_replace `lease` with delivery.never_force off."""
@@ -657,7 +666,8 @@ def _queued(sent: list[str], data: bytes, repo: str, cwd: str | None, home, what
                                 "task": os.environ.get("TTP_TASK", ""), "write": sent[0] == PUBLISH or is_write(sent),
                                 "stdin": base64.b64encode(data).decode(), "queued_at": time.time()})
     print(f"gh (tt-project): `{what}` is queued for the user's workstation ({SETTING} is "
-          f"{WORKSTATION}); the same call again returns its answer once in (exit {HELD_RC}).", file=sys.stderr)
+          f"{WORKSTATION}); the same call again returns its answer once in (exit {HELD_RC}). A read's answer is "
+          f"handed out once: keep the output of the call that gets it.", file=sys.stderr)
     return HELD_RC
 
 

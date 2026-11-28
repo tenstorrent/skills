@@ -223,6 +223,7 @@ No `result.json`, no credit.
 <!-- ttp:if wait -->
   GitHub CI: `ttp ci --repo <owner/repo> --branch <branch>` (dispatched runs too; or `--run <id>`)
   exits 0 when a job hangs (not via a gh bridge); rerun it on waking, report any `hung:` line (`--no-hang` keeps waiting).
+  A gh call held for the workstation (exit 75) answers a read once: keep that call's output.
   Several steps (build, then device run): chain them in one detached driver script that writes a
   final marker, and point `retry_when` at it. The driver runs with `set -eo pipefail`, never pipes a
   step into tail/head, logs each step's exit code and writes the first non-zero one to the marker

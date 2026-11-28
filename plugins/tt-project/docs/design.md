@@ -254,6 +254,16 @@ disk untouched, with no migration; nothing else is reclaimed by check recovery.
   could advance it was dropped: it took ordinary waits, backoffs and review and fix stacks for stuck
   owners and raised high events that woke the coordinator.
 
+- The PR sweep (`prbabysit.py`) has four accepted gaps. They are kept open as no real incident has
+  needed them (settled area: no new edge-case logic there).
+  - A required check counts as reported once any run on the head reports it, SKIPPED included. It is
+    not judged per required check across runs.
+  - Comments by bots never reset `pr_idle`, but a new head does, whoever pushed it.
+  - Each mark is kept per PR, never shared across PRs. A not-run finding that clears is told again if
+    it comes back, even on the same head; there is no separate episode record.
+  - A dispatch is bound to the first new `workflow_dispatch` run on its head that the guard had not
+    yet seen. That is the run it most likely produced, not one the call itself names.
+
 ## Liveness, progress and deploys
 
 A project once stayed busy for days, finishing tasks with a fresh heartbeat, while its daemon ran
