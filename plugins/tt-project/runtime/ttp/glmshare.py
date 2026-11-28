@@ -68,7 +68,7 @@ import json
 import re
 from pathlib import Path
 
-from . import codearm, glmassist, route, runclass
+from . import codearm, costlevers, glmassist, route, runclass
 from .db import load_result
 from .util import task_labels
 
@@ -425,7 +425,7 @@ def report(p, since: float, now: float) -> dict:
     from . import correction
     corr = [c for c in (db.kv(correction.KEY, []) or []) if isinstance(c, dict) and since <= float(c.get("ts") or 0) < now]
     return {"project": p.name, "since": since, "until": now, "days": days, "total": total, "roles": roles,
-            "arms": arms, "probes": probe_arms(by_arm["glm"], tasks, ctx[0]), "held": held(p, since, now), "claude_usd_per_day": round(float(usd or 0) / days, 2) if days > 0 else None,
+            "arms": arms, "probes": probe_arms(by_arm["glm"], tasks, ctx[0]) if costlevers.lever_on(p, "glm_probes") else {}, "held": held(p, since, now), "claude_usd_per_day": round(float(usd or 0) / days, 2) if days > 0 else None,
             "corrections": {"n": len(corr), "per_arm": None,
                             "note": "a correction names no task, so it is counted per project; kept 7 days"},
             "bad_output": bad_output(p, rows),

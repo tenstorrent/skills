@@ -549,6 +549,8 @@ def test_glm_share_reports_the_first_review_fail_rate_and_code_finding_share_per
     those failed on a code finding (review_failure substantive or mixed, not check_only)."""
     from ttp import glmshare
     p = make(env)
+    assert glmshare.report(p, 0, 1_000_000_000.0)["probes"] == {}, "the flag is off"
+    p.set_config("glm.probes", True)
     now = 1_000_000_000.0 + 30 * 86400
     t = now - 20 * 3600
     even, odd = [], []

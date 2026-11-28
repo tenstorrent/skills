@@ -199,11 +199,11 @@ def handoff_gaps(diff_text: str, spec: str, handoff: dict, own: set | None = Non
 
 
 def probe_gap(p: Project, task: dict, handoff: dict, diff_text: str) -> str | None:
-    """The line a treatment-arm GLM hand-off that changes code owes without `probes` (codearm.probes_on): at
+    """The line a treatment-arm GLM hand-off that changes code owes without `probes` (the glm_probes flag): at
     least two {input, output, expected} entries, in the hand-off or its self_check, each filled in."""
-    from . import codearm, reviewstats
+    from . import codearm, costlevers, reviewstats
     if (codearm.probe_arm(task["id"]) != "treatment" or handoff.get("status") not in ("done", "needs_review")
-            or not codearm.probes_on(p)
+            or not costlevers.lever_on(p, "glm_probes")
             or not any(reviewstats.area(path) == "runtime" for path, _ in _added(diff_text))):
         return None
     check = handoff.get("self_check")

@@ -12,7 +12,7 @@ from pathlib import Path
 
 from . import budget as bud
 from . import chaincap, conflictfix, ctxblock, overlap, relay, replymsg, settinghold, settled, taskfacts, tierfloor, timefmt
-from . import codearm, knownpaths, preempt, route, sidefx, spans, specfold, streamguard
+from . import codearm, costlevers, knownpaths, preempt, route, sidefx, spans, specfold, streamguard
 from .db import continues_id, load_result
 from .hook import unread_update
 from .ponytail import pinned, skill_file
@@ -994,11 +994,11 @@ def worker_task(p: Project, task: dict, cwd: str, branch: str | None, wake: dict
                     + f": `git worktree add <dir>/t{task['id']} -b ttp/t{task['id']}-<topic> <start>`, <start> "
                     "the branch you build on.\n")
     if (kind == "code" and (provider or task.get("provider")) == route.TO and codearm.probe_arm(task["id"]) == "treatment"
-            and codearm.probes_on(p)):
+            and costlevers.lever_on(p, "glm_probes")):
         history += ("\nAdversarial probes: before the hand-off run each function or rule you changed on 2-3 inputs "
                     "built to break it (a boundary value, an empty input, the failure case the spec implies). Put "
                     'the actual outputs in the hand-off as `"probes": [{"input": ..., "output": ..., "expected": '
-                    "...}]`; fix the code when an output is wrong. The hand-off check sends one back without them.\n")
+                    "...}]`; fix the code when an output is wrong.\n")
     history += verified_line(p, task, cwd)
     if kind in ("code", "review", "work", "harness"):
         history += remote_only_line(cfg)
