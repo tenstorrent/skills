@@ -231,23 +231,30 @@ def reviewed_heads(db, task: dict) -> list[str]:
 
 
 def reviewed_pr_pushes(env: dict | None = None) -> list[str]:
-    """`refs/heads/<branch>@<sha>` for each head of this run's task an independent review passed
-    (reviewed_heads), on the pr_branch the coordinator recorded for it (recorded_pr_branch): the only
-    push to a branch not the task's own a labelled run may make. [] when it has none."""
+    """`refs/heads/<branch>@<sha>` for each head an independent review passed (reviewed_heads) for this
+    run's task or a task it continues (the work it carries on or publishes), on the pr_branch the
+    coordinator recorded for it (recorded_pr_branch): the only push to a branch not the task's own a
+    labelled run may make. [] when it has none."""
     task, base = _task(env)
     if not task.isdigit() or not base:
         return []
+    from .db import continues_id
     from .project import Project
     db = Project(base).db
     t = db.task(int(task))
     branch = recorded_pr_branch(t) if t else ""
-    return [f"refs/heads/{branch}@{sha}" for sha in reviewed_heads(db, t)] if branch else []
+    heads, seen = [], set()
+    while branch and t and t["id"] not in seen:
+        seen.add(t["id"])
+        heads += reviewed_heads(db, t)
+        t = db.task(c) if (c := continues_id(t)) is not None else None
+    return [f"refs/heads/{branch}@{sha}" for sha in dict.fromkeys(heads)]
 
 
 def push_refs(env: dict, name=lambda ref: ref) -> list[str]:
     """The refs an untrusted run's push may update (gitguard's pre-push hook), or [] when the run is no
-    such run: its own branch, the push branch, and its recorded pr_branch only at a reviewed head
-    (`ref@sha`: reviewed_pr_pushes). `name` maps delivery.push_branch to its branch (gitguard._branch_name)."""
+    such run: its own branch, the push branch, and its recorded pr_branch only at a head reviewed for it or
+    the work it continues (`ref@sha`: reviewed_pr_pushes). `name` maps delivery.push_branch to its branch (gitguard._branch_name)."""
     if not active(env):
         return []
     branches = (own_branch(env), name(b) if (b := push_branch(raw=True)) else "")

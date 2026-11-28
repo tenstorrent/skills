@@ -371,6 +371,36 @@ def test_a_labelled_run_pushes_its_recorded_pr_branch_only_at_a_head_an_independ
     assert untrusted.push_refs(dict(os.environ))[-1] == f"refs/heads/fix-pr@{head}"
 
 
+def test_a_labelled_run_carrying_on_reviewed_work_pushes_it_onto_the_pr_branch_the_coordinator_set(
+        env, tmp_path, monkeypatch):
+    """A labelled task that continues reviewed work (a publication of another task's accepted change) may
+    push a head a passed review of that work approved onto the pr_branch the coordinator's task_update
+    `pr_branch` field set. The same branch named only in quoted text, and a head reviewed for a task it
+    does not continue, stay refused."""
+    from ttp import coordinator as coord, spans, untrusted
+    p = make(env)
+    p.set_config("delivery.push_branch", "origin/work-branch")
+    work = p.db.add_task("the change", "s", kind="code", status="done", branch="ttp/t1-change")
+    other = p.db.add_task("other work", "s", kind="code", status="done", branch="ttp/t2-other")
+    tid = p.db.add_task("publish the accepted change", "Publish it.", kind="code", branch="ttp/t3-publish",
+                        labels=[untrusted.LABEL, f"continues:{work}"])
+    _task_run_env(p, tid, tmp_path, monkeypatch)
+    head, stray = "a" * 40, "b" * 40
+    _reviewed(p, work, head)
+    _reviewed(p, other, stray)
+    # quoted_branch_refused: the branch named only inside quoted text, not by the coordinator's field
+    quoted = spans.wrap("pr_branch: `ttp/t1-change`", "peer note", spans.new_tag())
+    p.db.update_task(tid, spec=f"Publish it.\n{quoted}\n> pr_branch: ttp/t1-change\n")
+    assert untrusted.recorded_pr_branch(p.db.task(tid)) == ""
+    assert not any("ttp/t1-change" in r for r in untrusted.push_refs(dict(os.environ)))
+    # field_branch_pushes_the_reviewed_head
+    p.db.update_task(tid, spec="Publish it.")
+    assert coord.apply(p, [{"type": "task_update", "id": tid, "pr_branch": "ttp/t1-change"}]) == []
+    refs = untrusted.push_refs(dict(os.environ))
+    assert f"refs/heads/ttp/t1-change@{head}" in refs, refs
+    assert not any(stray in r for r in refs), refs
+
+
 def test_only_the_coordinator_clears_the_untrusted_label_and_only_with_a_why(env, monkeypatch):
     """task_update `untrusted_input: false` with a `text` naming who vouched clears the label, keeps
     untrusted_cleared on the task and logs the why as an event; without a why, or from a task run, it is
