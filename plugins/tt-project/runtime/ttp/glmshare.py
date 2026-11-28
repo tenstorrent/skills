@@ -185,14 +185,25 @@ def _reviews(db, since: float) -> dict[int, dict]:
     return out
 
 
-def probe_arms(ids, tasks: dict, reviews: dict) -> dict:
-    """The adversarial-probe A/B (codearm.probe_arm) over the GLM code tasks `ids`, per arm: those with a first
+def probes_on_since(p) -> float:
+    """When the glm_probes flag last turned on for `p`: its own setting's change, else the flag's last rollout
+    change. A task made before then ran without the probe step, whatever its id's parity."""
+    from . import rollout
+    key = rollout.FLAGS["glm_probes"]["key"]
+    if rollout.own_setting(p.raw_config(), key):
+        return rollout.override_since(p, key) or 0.0
+    return max((float(r.get("ts") or 0) for r in rollout.ledger("glm_probes") if r.get("kind") in ("set", "promote", "arm")),
+               default=0.0)
+
+
+def probe_arms(ids, tasks: dict, reviews: dict, since: float = 0.0) -> dict:
+    """The adversarial-probe A/B (codearm.probe_arm) over the GLM code tasks `ids` made since `since`, per arm: those with a first
     review, how many failed it, how many of those failed on a finding in the code (the share logic bugs make of the
     failures; the review's own `review_failure`, no model), and both as percents."""
     out = {a: {"reviewed": 0, "failed": 0, "code_findings": 0} for a in codearm.PROBE_ARMS}
     for t in ids:
         rv = reviews.get(t) or {}
-        if (tasks.get(t) or {}).get("kind") != "code" or not rv.get("first"):
+        if (tasks.get(t) or {}).get("kind") != "code" or not rv.get("first") or float(tasks[t]["created"] or 0) < since:
             continue
         v = out[codearm.probe_arm(t)]
         v["reviewed"] += 1
@@ -425,7 +436,7 @@ def report(p, since: float, now: float) -> dict:
     from . import correction
     corr = [c for c in (db.kv(correction.KEY, []) or []) if isinstance(c, dict) and since <= float(c.get("ts") or 0) < now]
     return {"project": p.name, "since": since, "until": now, "days": days, "total": total, "roles": roles,
-            "arms": arms, "probes": probe_arms(by_arm["glm"], tasks, ctx[0]) if costlevers.lever_on(p, "glm_probes") else {}, "held": held(p, since, now), "claude_usd_per_day": round(float(usd or 0) / days, 2) if days > 0 else None,
+            "arms": arms, "probes": probe_arms(by_arm["glm"], tasks, ctx[0], probes_on_since(p)) if costlevers.lever_on(p, "glm_probes") else {}, "held": held(p, since, now), "claude_usd_per_day": round(float(usd or 0) / days, 2) if days > 0 else None,
             "corrections": {"n": len(corr), "per_arm": None,
                             "note": "a correction names no task, so it is counted per project; kept 7 days"},
             "bad_output": bad_output(p, rows),

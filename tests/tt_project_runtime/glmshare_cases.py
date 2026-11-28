@@ -569,3 +569,22 @@ def test_glm_share_reports_the_first_review_fail_rate_and_code_finding_share_per
     assert got == {"treatment": (3, 2, 1, 66.7, 50.0), "control": (3, 2, 2, 66.7, 100.0)}, got
     out = glmshare.text(s)
     assert "GLM code probes treatment: first review failed 66.7% of 3, 50% of the failures on a code finding" in out, out
+
+
+def test_glm_share_probe_arms_count_only_tasks_made_after_the_flag_turned_on(env):
+    from ttp import glmshare
+    p = make(env)
+    now = 1_000_000_000.0 + 30 * 86400
+    old = [_gs_task(p) for _ in range(4)]
+    for tid in old:
+        p.db.x("UPDATE tasks SET created=? WHERE id=?", (now - 40 * 86400, tid))
+        _gs_run(p, tid, now - 20 * 3600, 1)
+        _gs_review(p, tid, "failed")
+    p.set_config("glm.probes", True)
+    assert glmshare.probes_on_since(p) > now - 40 * 86400
+    new = [_gs_task(p) for _ in range(2)]
+    for tid in new:
+        _gs_run(p, tid, now - 20 * 3600, 1)
+        _gs_review(p, tid, "done")
+    arms = glmshare.report(p, now - 86400, now)["probes"]
+    assert sum(v["reviewed"] for v in arms.values()) == 2 and sum(v["failed"] for v in arms.values()) == 0
