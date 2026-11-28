@@ -26,9 +26,9 @@ folder, and the others post theirs on the `quiet` channel, shown in the web app 
 but never sent to a chat, Slack or the desktop.
 
 A logout is the exception to the one daily reminder: every project waiting on the logged-out CLI
-reports itself into the claim (machine_round), and each project whose work can run on no other
-provider reminds its own chats at LOGOUT_REMIND_S with how many projects, queued tasks and high
-events wait, whether or not it holds the claim.
+reports itself into the claim (machine_round). At LOGOUT_REMIND_S the claimer reminds the chats, Slack
+and the desktop, and every other project whose work can run on no other provider reminds its own
+chats only (reminder_chats), with how many projects, queued tasks and high events wait.
 
 Page severity of daemon events that need no user decision, so they wake the coordinator only when it matters.
 
@@ -917,11 +917,12 @@ def due_reminders(since: float, now: float) -> int:
 def machine_round(claim_key: str, key: str, owner: str, now: float, cleared: float, raised: float,
                   info: dict) -> dict | None:
     """One project's turn on a machine-wide logout: report what waits on it here (`info`: name,
-    queued, events, need) into the shared claim, and if work here can run on no other provider
-    (`need`) and a reminder is due that this project has not sent, mark it sent for this project and
-    return what the reminder says: {since, reminder, waiting} (the live projects' reports). Every
-    such project reminds its own chats, not only the claim's holder. None otherwise, also when the
-    claim file cannot be used: a reminder is extra, the first alert already went out."""
+    queued, events, need) into the shared claim, and if a reminder is due that this project has not
+    sent, mark it sent and return what it says: {since, reminder, waiting, claimer}, `waiting` the
+    live reports of projects whose work needs the login. The claim's holder reminds when any
+    project needs it; every other project reminds when its own work does (see reminder_chats).
+    None otherwise, also when the claim file cannot be used: a reminder is extra, the first alert
+    already went out."""
     path = claims_path()
     try:
         path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -951,11 +952,13 @@ def machine_round(claim_key: str, key: str, owner: str, now: float, cleared: flo
         rec = data[claim_key]
         sent = rec.get("reminded")
         sent = sent if isinstance(sent, dict) else {rec["owner"]: int(sent or 0)}   # an older claim counted the claimer's only
+        needers = [w for w in waiting.values() if w.get("need", True)]   # a report without `need` is from an older daemon
+        claimer = rec["owner"] == owner
         due = due_reminders(since, now)
         out = None
-        if info.get("need", True) and due > int(sent.get(owner) or 0):
+        if (needers if claimer else info.get("need", True)) and due > int(sent.get(owner) or 0):
             rec["reminded"] = {**sent, owner: due}
-            out = {"since": since, "reminder": due, "waiting": list(waiting.values())}
+            out = {"since": since, "reminder": due, "waiting": needers, "claimer": claimer}
         from .project import write_json
         write_json(path, data, 0o600)
         return out
@@ -963,6 +966,13 @@ def machine_round(claim_key: str, key: str, owner: str, now: float, cleared: flo
         return None
     finally:
         os.close(fd)
+
+
+def reminder_chats(db, claimer: bool) -> list[str | None]:
+    """Where a project posts a logout reminder: the claim's holder to every chat, Slack and the
+    desktop (None); another project to its own chats only, so the user gets one message on the
+    shared destinations and every project's own chat still hears of its work waiting."""
+    return [None] if claimer else [r["id"] for r in db.q("SELECT id FROM chats WHERE id!='slack'")]
 
 
 def release(claim_keys: list[str], cleared: float) -> None:

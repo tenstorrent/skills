@@ -221,6 +221,9 @@ def test_a_project_that_does_not_hold_the_claim_gets_its_own_logout_reminder_onc
     assert json.loads(alerts.claims_path().read_text())[f"{hostname()}|auth:fake"]["owner"] == str(p.base)
     assert len(told(q)) == 1 and "log in to the agent CLI there" in told(q)[0], told(q)
     assert len(told(p)) == 1
+    # Slack and the desktop read the messages addressed to no chat: only the claimer's is there.
+    broadcast = lambda x: x.db.q("SELECT id FROM messages WHERE direction='out' AND chat IS NULL AND text LIKE '%still logged out%'")
+    assert (len(broadcast(p)), len(broadcast(q))) == (1, 0), "the second project sent it to Slack and the desktop too"
     round_at(20, Daemon(q.base), Daemon(p.base))   # both restarted
     assert len(told(q)) == 1, "a restart sent the reminder again"
     round_at(61, dp, dq)
@@ -268,6 +271,19 @@ def test_a_logout_with_work_waiting_alerts_once_at_15_minutes_with_the_step_acro
     restarted._logout_round = 0.0
     restarted.remind_logouts()
     assert len(told()) == 1
+
+
+def test_the_claimer_reminds_for_a_waiting_project_while_a_project_with_nothing_waiting_sends_none(env, monkeypatch):
+    from ttp import alerts
+    monkeypatch.setattr(alerts, "owner_alive", lambda owner: True)
+    key, now = "host|auth:fake", time.time()
+    round_ = lambda owner, need, at: alerts.machine_round(key, "auth:fake", owner, now + at, 0.0, now,
+                                                          {"name": owner, "queued": 1, "events": 0, "need": need})
+    assert round_("a", False, 1000) is None, "nothing waits yet and a reminder was spent"
+    assert round_("b", True, 1001)["claimer"] is False
+    got = round_("a", False, 1002)   # the claimer's own work runs elsewhere, but b's waits on the login
+    assert got["claimer"] is True and [w["name"] for w in got["waiting"]] == ["b"]
+    assert round_("a", False, 1003) is None and round_("b", True, 1004) is None
 
 
 def test_account_mismatch_then_match_keeps_caps_meanwhile_and_alerts_once(env, monkeypatch):

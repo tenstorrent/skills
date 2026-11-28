@@ -22892,9 +22892,7 @@ class Daemon:
                                        float(prev["c"] or 0) if prev else 0.0, float(ep["raised"]), info)
             if not due:
                 continue
-            # Only projects whose work can run nowhere else wait on the login (a report without
-            # `need` comes from an older daemon: it counts).
-            waiting = [x for x in due["waiting"] if x.get("need", True)]
+            waiting = due["waiting"]
             if (cur and alerts.acked(db, cur) and cur["severity"] == "high") or alerts.condition_acked(db, key):
                 continue   # the user knows and nothing changed
             try:
@@ -22907,7 +22905,8 @@ class Daemon:
                     f"{sum(int(x.get('queued') or 0) for x in waiting)} task(s) no other provider can run and "
                     f"{sum(int(x.get('events') or 0) for x in waiting)} high event(s) not handled yet. "
                     f"Log in once on that machine{f' ({hint})' if hint else ''}; work resumes by itself.")
-            db.post("out", text, chat=None, kind="alert", severity="high", ref=key)
+            for chat in alerts.reminder_chats(db, due["claimer"]):
+                db.post("out", text, chat=chat, kind="alert", severity="high", ref=key)
             log(self.p, f"{key}: logout reminder {due['reminder']} sent")
 
     def coordinator_blocked(self) -> str | None:
