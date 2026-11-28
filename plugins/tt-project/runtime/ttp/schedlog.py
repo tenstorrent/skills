@@ -39,7 +39,8 @@ def path(p) -> Path:
 
 
 def _key(line: dict) -> list:
-    return [line.get("runnable"), line.get("runnable_total"), line.get("held"), line.get("picked")]
+    return [line.get("runnable"), line.get("runnable_total"), line.get("held"), line.get("picked"),
+            line.get("held_class")]
 
 
 def _last_key(f: Path) -> list | None:
@@ -83,15 +84,18 @@ def slot_words(users: dict) -> str:
 
 
 def entry(free: int, runnable: list[dict], held: dict[str, int], picked: list[int],
-          now: float | None = None, slots: dict | None = None) -> dict:
+          now: float | None = None, slots: dict | None = None, classes: dict | None = None) -> dict:
     """The line for one slot fill. runnable: {"id", "priority", "owns_obligation"} in rank order. slots:
-    what holds the worker slots (slot_users), so a line with few free slots names their users."""
+    what holds the worker slots (slot_users), so a line with few free slots names their users. classes:
+    the held start_when and retry_when counts by probe class ({reason: {class: n}}, blockledger.probe_class),
+    written as `held_class` beside the unchanged `held` (minutes are the gaps between consecutive lines)."""
     ts = dt.datetime.fromtimestamp(now, dt.timezone.utc) if now is not None else dt.datetime.now(dt.timezone.utc)
     return {"ts": ts.isoformat(timespec="seconds").replace("+00:00", "Z"), "free_slots": int(free),
             "runnable": [{"id": int(c["id"]), "priority": c["priority"], "owns_obligation": bool(c["owns_obligation"])}
                          for c in runnable[:TOP]],
             "runnable_total": len(runnable), "held": {r: int(held.get(r, 0)) for r in REASONS},
-            "picked": [int(i) for i in picked], **({"slots": slots} if slots is not None else {})}
+            "picked": [int(i) for i in picked], **({"slots": slots} if slots is not None else {}),
+            **({"held_class": classes} if classes else {})}
 
 
 def record(f: Path, line: dict, cache: dict, warn: Callable[[str], None]) -> bool:

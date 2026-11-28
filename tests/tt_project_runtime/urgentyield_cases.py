@@ -247,3 +247,27 @@ def test_lock_yield_and_urgent_start_agree_on_own_versus_other_holds(env, tmp_pa
     finally:
         for fd in fds:
             os.close(fd)
+
+
+def test_the_every_slot_taken_line_is_logged_once_per_task_and_state_not_on_every_fill(env, monkeypatch):
+    """A user-ordered urgent task held by full slots, with no run to preempt, logs its line once; it logs
+    again only after it stopped being held by full slots (a later hold is a new state)."""
+    from ttp import daemon as dm, preempt
+    p = make(env)
+    d = dm.Daemon(p.base)
+    d.cfg = p.config()
+    t = p.db.task(p.db.add_task("urgent work", "s\nurgent: the user ordered it now", kind="work", tier="light",
+                                origin="user", priority=1))
+    lines = []
+    monkeypatch.setattr(dm, "log", lambda p_, text: lines.append(text))
+    monkeypatch.setattr(d, "_start_hold", lambda *a, **k: None)
+    monkeypatch.setattr(preempt, "stopping", lambda *a: 0)
+    monkeypatch.setattr(preempt, "lock_holders", lambda *a: {})
+    monkeypatch.setattr(preempt, "pick", lambda *a: None)
+    fill = lambda fate: d._preempt_for_urgent([t], {t["id"]: fate}, {"now": time.time()}, "claude")
+    for _ in range(3):
+        fill("full")
+    assert lines == [f"urgent task {t['id']}: every claude slot taken and no run may be preempted"]
+    fill("slot_cap")
+    fill("full")
+    assert len(lines) == 2

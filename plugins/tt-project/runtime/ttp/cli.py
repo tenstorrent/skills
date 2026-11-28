@@ -9019,7 +9019,8 @@ def cmd_blocked(a) -> None:
         return
     s = out["share"]
     print(f"blocked {s['share'] * 100:.1f}% of ordered work over {a.days:g} d (target {bl.TARGET * 100:g}%): "
-          f"{s['blocked_min']:g} of {s['ordered_min']:g} min")
+          f"{s['blocked_min']:g} of {s['ordered_min']:g} min; safety gates {s['safety_share'] * 100:.1f}%, "
+          f"other {s['non_safety_share'] * 100:.1f}% (own running jobs count as running)")
     for e in out["top"]:
         print(f"  {e['minutes']:g} min  {e['rule']}  [{e['safety']}]  x{e['count']}  tasks {e['tasks'][:6] or '-'}  key {e['key']}")
 

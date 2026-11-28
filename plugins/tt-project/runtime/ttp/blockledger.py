@@ -23,7 +23,7 @@ import re
 import time
 from pathlib import Path
 
-from . import glmguard, obligations, queuetrim, queuewait, rulecite, selfblock, unblock, unstarted
+from . import deadwait, glmguard, obligations, queuetrim, queuewait, rulecite, selfblock, unblock, unstarted, userpause
 from .db import DB
 from .util import loads_dict
 
@@ -82,14 +82,35 @@ def safety_of(reason: str, kind: str = "") -> str:
     return "convenience"
 
 
-def _wait_rule(data: dict, reason: str) -> tuple[str, str] | None:
+STUCK = "stuck landing"   # a wait on a done change nothing open can land: blocked time, not an ordinary dependency
+
+
+def probe_class(probe: str, cfg: dict | None = None, down=()) -> str:
+    """The class of a held start_when or retry_when probe, for the scheduler log's split: user_hold (a user
+    pause), own_job (the task's own detached job), landing (another task's landing), outage (it names a machine
+    in `down`, the aliases with a known outage), else other."""
+    if userpause.is_probe(probe, cfg):
+        return "user_hold"
+    if queuewait.own_job(probe):
+        return "own_job"
+    if LANDED.search(probe):
+        return "landing"
+    return "outage" if any(re.search(rf"\b{re.escape(a)}\b", probe) for a in down) else "other"
+
+
+def _wait_rule(data: dict, reason: str, db: DB | None = None, task: int | None = None) -> tuple[str, str] | None:
     """(rule, reason) of a wait its task_waiting `data` or reason places: the task's own detached job, another
-    task's landing, a planned window (a bare clock-gate probe, or the hand-off's own: unblock.classify_wait)."""
+    task's landing (STUCK once its target is done and deadwait.path finds nothing to land it), a planned
+    window (a bare clock-gate probe, or the hand-off's own: unblock.classify_wait)."""
     probe = str(data.get("probe") or "")
     if queuewait.own_job(probe):
         return "own job", reason
     if m := LANDED.search(probe) or LANDED.search(reason):
-        return "dependency", f"needs #{next(g for g in m.groups() if g)}"
+        x = int(next(g for g in m.groups() if g))
+        if db is not None and task is not None and (db.task(x) or {}).get("status") == "done" \
+                and not deadwait.path(db, x, {task}):
+            return STUCK, f"#{x} is done, not landed, and nothing open can land it"
+        return "dependency", f"needs #{x}"
     window = unstarted.TIME_ONLY.match(probe) or data.get("why") == "planned window"
     return ("planned window", reason) if window else None
 
@@ -154,7 +175,7 @@ def rows(db: DB, since: float, until: float | None = None) -> list[dict]:
         task = db.task(seg["task"]) or {}
         reason = _why((ev and ev["text"]) or task.get("blocked_reason") or seg["title"], seg["task"], seg["title"])
         rule, why = ("review", reason) if seg["kind"] == "review" else \
-            _wait_rule(loads_dict(ev and ev["data"]), reason) or (rule_of(reason), reason)
+            _wait_rule(loads_dict(ev and ev["data"]), reason, db, seg["task"]) or (rule_of(reason), reason)
         out.append(_row(rule, seg["task"], seg["kind"], max(start, since), end, why, "task"))
     out += _refusals(db, since, until)
     st = db.kv(queuewait.KV) or {}
@@ -163,7 +184,7 @@ def rows(db: DB, since: float, until: float | None = None) -> list[dict]:
         if end >= since and float(e["since"]) <= until:
             rule, why = f"queue:{e['queue']}", e["queue"]
             if e["queue"] == "own":   # an urgent task's own probe: its detached job, another task's landing, a clock
-                rule, why = _wait_rule({"probe": e.get("probe")}, why) or (rule, why)
+                rule, why = _wait_rule({"probe": e.get("probe")}, why, db, e.get("task")) or (rule, why)
             out.append(_row(rule, e.get("task"), "queue", max(float(e["since"]), since), end, why, "queue"))
     log = Path(db.path).parent / LOG
     for line in (log.read_text(errors="replace").splitlines() if log.is_file() else ()):
@@ -207,12 +228,18 @@ def window_share(db: DB, start: float, end: float, rs: list[dict] | None = None)
                     - max(float(t["created"] or 0), start))
                for t in db.q("SELECT * FROM tasks") if t["id"] in ordered) / 60
     by: dict = {}
+    safe: dict = {}
     for r in rows(db, start, end) if rs is None else rs:
         if r["task"] in ordered and r["minutes"] and r["rule"] not in WORK:
-            by.setdefault(r["task"], []).append((max(r["start"], start), min(r["end"], end)))
+            span = (max(r["start"], start), min(r["end"], end))
+            by.setdefault(r["task"], []).append(span)
+            if r["safety"] != "convenience":
+                safe.setdefault(r["task"], []).append(span)
     blocked = sum(_union_min(v) for v in by.values())
-    return {"share": round(blocked / wall, 4) if wall else 0.0, "blocked_min": round(blocked, 1),
-            "ordered_min": round(wall, 1)}
+    held = sum(_union_min(v) for v in safe.values())   # time a safety gate also held counts as safety
+    share = lambda m: round(m / wall, 4) if wall else 0.0
+    return {"share": share(blocked), "blocked_min": round(blocked, 1), "ordered_min": round(wall, 1),
+            "safety_share": share(held), "non_safety_share": share(blocked - held)}
 
 
 def key_of(rule: str) -> str:

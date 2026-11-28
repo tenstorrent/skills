@@ -53,6 +53,7 @@ from . import (   # one name per line: two changes adding names merge without a 
 )
 from . import rolerestore
 from . import stalegates
+from . import blockledger
 from . import codearm
 from . import glmwork
 from . import coordroute
@@ -13903,8 +13904,10 @@ class Daemon:
         db, now, out = self.p.db, ctx["now"], []
         freeing: dict[str, int] = {}
         held = None
+        said = self.__dict__.setdefault("_preempt_said", {})   # task id -> provider its "slot taken" line named
         for t in ready:
             if fate.get(t["id"]) != "full" or not urgent.extra_ok(t, now):
+                said.pop(t["id"], None)   # no longer held by full slots: a later hold is a new state
                 continue
             prov = ctx.get("slot", {}).get(t["id"]) or t["provider"] or core
             if self._start_hold(t, prov, dict(ctx, busy={}, holds={}, full={}, full_why={}, branch={},
@@ -13919,8 +13922,11 @@ class Daemon:
                 held = preempt.lock_holders(preempt.lock_dirs(self.p, self.cfg))
             got = preempt.pick(db, prov, ctx.get("owners") or {}, held)
             if not got:
-                log(self.p, f"urgent task {t['id']}: every {prov} slot taken and no run may be preempted")
+                if said.get(t["id"]) != prov:   # once per task and state, not on every fill; the wait itself shows
+                    said[t["id"]] = prov        # in the ledger as the workers queue (queuewait), the worker cap
+                    log(self.p, f"urgent task {t['id']}: every {prov} slot taken and no run may be preempted")
                 continue
+            said.pop(t["id"], None)
             r, v = got["run"], got["task"]
             runner.request_stop(Path(r["dir"]) if r["dir"] else self.p.runs / str(r["id"]), preempt.STOP_TEXT)
             out.append(r["id"])
@@ -13969,11 +13975,18 @@ class Daemon:
         rest = [r for r in db.q("SELECT * FROM tasks WHERE status='queued'") if r["id"] not in seen]
         unmet = db.unmet_dependencies(rest) if rest else {}
         carrying = {c["task"] for c in db.q("SELECT task FROM carry_state")} if unmet else set()
+        classes: dict = {}
+        down = list(machine_ledger.outages(ctx["now"])) if rest else []
         for r in rest:
             why = _queued_held_by(r, ctx["now"], unmet.get(r["id"]))
             held["carry" if why == "depends_on" and r["id"] in carrying else why] += 1
+            if why in ("start_when", "retry_when"):
+                probe = deferral(r)["when"] if why == "start_when" else load_result(r["result"])["retry_when"]
+                by = classes.setdefault(why, {})
+                c = blockledger.probe_class(str(probe), self.cfg, down)
+                by[c] = by.get(c, 0) + 1
         schedlog.record(schedlog.path(self.p), schedlog.entry(free, runnable, held, picked, ctx["now"],
-                                                                   schedlog.slot_users(db)),
+                                                                   schedlog.slot_users(db), classes),
                         self.__dict__.setdefault("_schedlog", {}), lambda msg: log(self.p, msg))
 
     def _batch_members(self, lead: dict, ready: list[dict], taken: set[int], live: dict) -> list[dict]:
@@ -16503,16 +16516,17 @@ class Daemon:
         return landing and pushed is not None and pushed > last and now - last >= LANDED_REPROBE_S
 
     def _dead_landed_waits(self, deferred: list[dict], now: float) -> None:
-        """deadwait.check over the queued tasks whose start_when is exactly `landed:#<id>`: one event
-        per producer nothing can land. Saved task rows only, never the in-memory probe verdicts
+        """deadwait.check over the queued tasks whose start_when or retry_when is exactly `landed:#<id>` or
+        `ttp landed --task <id>`: one event per producer nothing can land. Saved task rows only, never the in-memory probe verdicts
         (_start_rc), which are empty after a restart: a wait in a longer probe is not judged."""
         held: dict[int, list[dict]] = {}
         # Where no landing can be checked the wait is on the producer being done (landed.DONE_ENV):
         # nothing is held on a landing, and an earlier event clears.
-        for t in deferred if landed.can_check(self.p) else []:
-            m = landed.LANDED_PROBE.fullmatch(deferral(t).get("when") or "")
-            if m:
-                held.setdefault(int(m.group(1)), []).append(t)
+        waiting = self.p.db.q("SELECT * FROM tasks WHERE status='queued' AND result LIKE '%retry_when%'")
+        for t in {t["id"]: t for t in [*deferred, *waiting]}.values() if landed.can_check(self.p) else []:
+            for what, probe in self.task_probes(t):   # a start_when or a waiting hand-off's retry_when
+                if what != "waits_on when" and (x := deadwait.plain_ref(probe)):
+                    held.setdefault(x, []).append(t)
         try:
             deadwait.check(self.p.db, self.cfg, held, now)
         except Exception:

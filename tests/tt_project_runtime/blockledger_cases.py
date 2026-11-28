@@ -323,3 +323,58 @@ def test_block_ledger_worker_role_and_pyaudit_refusals_without_a_class_are_redir
         assert (r["n"], r["minutes"], r["safety"]) == (3, 0.0, "guard"), r
     [r] = run(True, "worker_role")
     assert r["minutes"] > 60 and r["safety"] == "guard"
+
+
+def test_block_ledger_probe_class_names_what_a_held_wait_is_on(env):
+    from ttp import blockledger as bl
+    cls = lambda probe, down=(): bl.probe_class(probe, {}, down)
+    assert cls("test -e /h/user-hold-x || exit 1") == "user_hold"
+    assert cls("ttp detach --check /r/runs/9/suite.rc") == "own_job"
+    assert cls("landed:#12") == cls("ttp landed --task 12") == "landing"
+    assert cls("ssh box7 true", ["box7"]) == "outage" and cls("ssh box70 true", ["box7"]) == "other"
+    assert cls("test -e /tmp/some-marker") == "other"
+
+
+def test_block_ledger_a_done_target_nothing_can_land_is_a_stuck_landing_not_a_dependency(env):
+    from ttp import blockledger as bl
+    p = make(env)
+    now = time.time()
+    x = p.db.add_task("feature", "s", kind="code")
+    p.db.update_task(x, status="done", branch=f"ttp/t{x}-feature")
+    live = p.db.add_task("still running", "s", kind="code")
+    p.db.update_task(live, status="running")
+    a = _bl_wait(p, "after the feature", now, 3 * 3600, f"ttp landed --task {x}")
+    b = _bl_wait(p, "after the live one", now, 3 * 3600, f"landed:#{live}")
+    rs = {r["task"]: r for r in bl.rows(p.db, now - 86400, now) if r["source"] == "task"}
+    assert (rs[a]["rule"], rs[b]["rule"]) == (bl.STUCK, "dependency")
+    assert [e["rule"] for e in bl.top(p.db, now)] == [bl.STUCK], "a stuck landing is a blocker to retire"
+    p.db.add_task(f"Review #{x}", "s", kind="review", depends_on=[x])   # an open review can land it
+    rs = {r["task"]: r for r in bl.rows(p.db, now - 86400, now) if r["source"] == "task"}
+    assert rs[a]["rule"] == "dependency"
+
+
+def test_block_ledger_share_splits_safety_gates_from_other_blocked_time_and_keeps_its_old_keys(env, capsys, monkeypatch):
+    from ttp import blockledger as bl, cli
+    p = make(env)
+    monkeypatch.chdir(p.root)
+    now = time.time()
+    a = _bl_task(p, "held by a rule", "blocked", now, priority=1, blocked_ago=3600, reason="held by R-ab12 until later")
+    b = _bl_task(p, "held by words", "blocked", now, priority=1, blocked_ago=3600, reason="keep the 60 min hold")
+    p.db.x("UPDATE tasks SET created=? WHERE id IN (?,?)", (now - 7200, a, b))
+    s = bl.window_share(p.db, now - 7200, now)
+    assert (s["share"], s["blocked_min"], s["ordered_min"]) == (0.5, pytest.approx(120, abs=1), pytest.approx(240, abs=1))
+    assert s["safety_share"] == pytest.approx(0.25, abs=0.01) and s["non_safety_share"] == pytest.approx(0.25, abs=0.01)
+    cli.cmd_blocked(types.SimpleNamespace(days=1.0, json=False, done=None, how=None))
+    assert "safety gates 25.0%, other 25.0% (own running jobs count as running)" in capsys.readouterr().out
+    cli.cmd_blocked(types.SimpleNamespace(days=1.0, json=True, done=None, how=None))
+    assert json.loads(capsys.readouterr().out.strip().splitlines()[-1])["share"]["non_safety_share"] == pytest.approx(0.25, abs=0.01)
+
+
+def test_block_ledger_shows_an_open_worker_cap_wait_as_a_queue_wait(env):
+    from ttp import blockledger as bl, queuewait
+    p = make(env)
+    now = time.time()
+    t = _bl_task(p, "urgent work", "queued", now, priority=1)
+    p.db.set_kv(queuewait.KV, {"open": {"k": {"task": t, "queue": "workers", "since": now - 1800}}})
+    (r,) = [r for r in bl.rows(p.db, now - 7200, now) if r["task"] == t and r["source"] == "queue"]
+    assert r["rule"] == "queue:workers" and r["minutes"] == pytest.approx(30, abs=1)

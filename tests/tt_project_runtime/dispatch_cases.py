@@ -3315,3 +3315,41 @@ def test_ok_inline_review_runs_take_no_rank_in_the_waste_ledger(env):
     _code_runs(p, tid, 3, "reviewer", "ok")
     rep = waste.report(p.db, time.time() - 99, time.time() + 99, {"waste": {"max_runs": 2}})
     assert not rep["buckets"]["over_runs"]["run_ids"] and not rep["continued"]["runs"]
+
+
+def test_the_scheduler_log_splits_held_start_when_and_retry_when_by_probe_class_beside_the_old_counts(env, monkeypatch):
+    """Each held start_when and retry_when is counted by what it waits on (`held_class`): a user hold, the
+    task's own job, a landing, a machine out for a known reason, anything else. `held` keeps its totals; a
+    change of class alone is a new line, and a line without such waits has no `held_class`."""
+    from ttp import daemon as dm, machine_ledger, schedlog
+    p = make(env)
+    monkeypatch.setattr(machine_ledger, "outages", lambda now=None, doc=None: {"box7": {}})
+    when = {"hold": "test -e /h/user-hold-x || exit 1", "job": "ttp detach --check /r/runs/9/a.rc",
+            "land": "ttp landed --task 5", "down": "ssh box7 true", "misc": "test -e /tmp/x"}
+    for k, probe in when.items():
+        _sched_held(p, k, labels=json.dumps([f"start_when:{probe}"]))
+    tid = _sched_held(p, "retrying")
+    p.db.update_task(tid, result=json.dumps({"status": "waiting", "retry_when": "landed:#6"}))
+    p.db.x("UPDATE tasks SET not_before=? WHERE id=?", (time.time() + 3600, tid))
+    d = dm.Daemon(p.base)
+    d.cfg = p.config()
+    d._log_slot_fill(0, [], {}, {"now": time.time()}, "claude")
+    line = _sched_lines(p)[-1]
+    assert (line["held"]["start_when"], line["held"]["retry_when"]) == (5, 1)
+    assert line["held_class"] == {"start_when": {"user_hold": 1, "own_job": 1, "landing": 1, "outage": 1, "other": 1},
+                                  "retry_when": {"landing": 1}}
+    p.db.x("UPDATE tasks SET status='done' WHERE title='misc'")
+    d._log_slot_fill(0, [], {}, {"now": time.time()}, "claude")
+    assert "other" not in _sched_lines(p)[-1]["held_class"]["start_when"]
+    p.db.x("UPDATE tasks SET status='done'")
+    d._log_slot_fill(0, [], {}, {"now": time.time()}, "claude")
+    assert "held_class" not in _sched_lines(p)[-1]
+
+
+def test_schedlog_dedup_key_includes_the_held_class_and_the_entry_omits_it_when_empty():
+    from ttp import schedlog
+    a = schedlog.entry(0, [], {"start_when": 1}, [], 1000.0, classes={"start_when": {"landing": 1}})
+    b = schedlog.entry(0, [], {"start_when": 1}, [], 1000.0, classes={"start_when": {"other": 1}})
+    assert a["held"] == b["held"] and schedlog._key(a) != schedlog._key(b)
+    assert "held_class" not in schedlog.entry(0, [], {}, [], 1000.0) and "held_class" not in schedlog.entry(
+        0, [], {}, [], 1000.0, classes={})

@@ -178,3 +178,31 @@ def test_landed_follows_link_counts_only_a_follower_on_its_predecessors_branch(e
     redo = p.db.add_task(f"Re-land #{other}", "s", kind="code")
     p.db.update_task(redo, status="done", branch=f"ttp/t{redo}-reland")
     assert redo in landed.carriers(p.db, other)
+
+
+def test_a_wait_on_a_done_unlanded_target_in_any_landing_form_is_a_dead_wait_naming_the_last_review(env):
+    """A plain `ttp landed --task N` start_when and a plain landing retry_when are judged like `landed:#N`;
+    the event names the target, the waiting tasks and the target's last review verdict. A longer probe is not."""
+    import json
+    from ttp import daemon as dm, deadwait
+    assert [deadwait.plain_ref(s) for s in ("landed:#7", "ttp landed --task 7", "ttp landed #7 || exit 1",
+                                            "ttp landed --task 7 && test -e x", "ttp landed --task", "", None)] \
+        == [7, 7, 7, None, None, None, None]
+    p = make(env)
+    p.set_config("delivery.push_branch", "origin/work")   # landed:#<id> is checkable here
+    x, w = _dw_producer(p, "feature")
+    p.db.update_task(w, labels=[f"start_when:ttp landed --task {x}"])
+    r = p.db.add_task("retrying", "s", origin="coordinator")
+    p.db.update_task(r, result=json.dumps({"status": "waiting", "retry_when": f"landed:#{x}"}))
+    longer = p.db.add_task("longer", "s", origin="coordinator", labels=[f"start_when:landed:#{x} && test -e y"])
+    review = p.db.add_task(f"Review #{x}", "s", kind="review", depends_on=[x])
+    p.db.update_task(review, status="failed")
+    d = dm.Daemon(p.base)
+    d.cfg = dict(p.config(), waiting={"landed_wait_dead_s": 0})
+    t0 = time.time()
+    for k in range(3):
+        d._dead_landed_waits(p.db.q("SELECT * FROM tasks WHERE status='queued'"), t0 + k)
+    (ev,) = p.db.q("SELECT * FROM events WHERE kind=?", (deadwait.DEAD_EVENT,))
+    assert f"#{x}" in ev["text"] and f"its last review #{review} is failed" in ev["text"], ev["text"]
+    assert f"#{w}" in ev["text"] and f"#{r}" in ev["text"] and f"#{longer}" not in ev["text"], ev["text"]
+    assert "Held by a landing wait" in ev["text"]

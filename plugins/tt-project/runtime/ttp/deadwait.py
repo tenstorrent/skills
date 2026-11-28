@@ -6,16 +6,17 @@
   branches that are not one stack, a task cap): one `review_nofix` event per review, naming the
   review, its branch and what waits on it (Daemon._fix_failed_review says why). One with no fix
   follow-ups says the same in its own task_failed event, which already wakes the coordinator.
-- A start_when that is exactly `landed:#X` whose producer X is done, its work not landed, and nothing open can land
-  it: no open review, fix, rebase or continue hop carrying X's change (landed.carriers), no open task
+- A start_when or retry_when that is exactly `landed:#X` or `ttp landed --task X` whose producer X is done,
+  its work not landed, and nothing open can land it: no open review, fix, rebase or continue hop carrying X's change (landed.carriers), no open task
   on X's branch, and no push queue row. One `landed_wait_dead` event per X names the held tasks;
   once a path appears, X lands or no queued task waits on it, it is cleared (handled), and a later
-  dead end raises it again. Saved database facts only: a daemon restart (empty probe verdicts) or a
-  broken probe exit neither clears nor re-raises it. A `landed:#X` inside a longer probe is not judged.
+  dead end raises it again. The event names the producer's last review and its verdict. Saved database
+  facts only: a daemon restart (empty probe verdicts) or a broken probe exit neither clears nor re-raises it. A `landed:#X` inside a longer probe is not judged.
 """
 from __future__ import annotations
 
 import json
+import re
 import time
 
 from . import landed
@@ -33,7 +34,15 @@ STAMP_SQL = ("SELECT (SELECT count(*) || ':' || max(id) || ':' || max(updated) F
              "(SELECT count(*) || ':' || max(rowid) FROM task_superseded), "
              "(SELECT count(*) || ':' || total(task) || ':' || max(ts) FROM task_abandoned), "
              "(SELECT count(*) || ':' || max(rowid) FROM task_dropped)")
+# A probe that is only one landing wait (`landed:#X`, `ttp landed --task X`, an optional `|| exit 1` after it).
+_PLAIN = re.compile(r"\s*(?:landed:\s*#?|ttp\s+landed\s+(?:--task\s+|#))(\d+)\s*(?:\|\|\s*exit\s+1\s*)?")
 _last: dict[str, tuple] = {}   # db path -> (inputs, saved state after, when) of its last full check
+
+
+def plain_ref(probe: str | None) -> int | None:
+    """The task id a probe that is only a landing wait waits on, else None (a longer probe is not judged)."""
+    m = _PLAIN.fullmatch(probe or "")
+    return int(m.group(1)) if m else None
 
 
 def waiters(db, ids: set[int], skip: set[int] = frozenset()) -> list[dict]:
@@ -193,14 +202,14 @@ def _unchanged(db, inputs: tuple, state: dict, grace: float, now: float) -> bool
 
 def _raise_dead(db, x: int, tasks: list[dict], rows: Rows) -> int:
     t = rows.tasks.get(x) or {"title": "?", "branch": ""}
-    failed = db.one("SELECT id FROM tasks WHERE kind='review' AND status='failed' AND id IN "
-                    f"({','.join('?' * len(c))}) ORDER BY id DESC", tuple(c)) \
+    last = db.one("SELECT id, status FROM tasks WHERE kind='review' AND id IN "
+                  f"({','.join('?' * len(c))}) ORDER BY id DESC", tuple(c)) \
         if (c := sorted(landed.carriers(db, x, rows))) else None
     text = (f"#{x} {t['title']} is done but its work has not landed, and nothing open can land it: no open "
             f"review, fix, rebase or push of branch {t.get('branch') or '?'}"
-            + (f" (its last review #{failed['id']} failed)" if failed else "")
-            + f". Held by start_when landed:#{x}: {names(tasks)}. Decide: queue the fix and re-review (or "
-              f"the push), re-point or clear their start_when, or cancel them.")
+            + (f" (its last review #{last['id']} is {last['status']})" if last else " (no review of it)")
+            + f". Held by a landing wait on #{x}: {names(tasks)}. Decide: queue the fix and re-review (or "
+              f"the push), re-point or clear their wait, or cancel them.")
     return db.x("INSERT INTO events(ts,source,kind,fingerprint,severity,text,data,status,task) "
                 "VALUES(?,?,?,?,?,?,?,?,?)",
                 (time.time(), "daemon", DEAD_EVENT, f"{DEAD_EVENT}:{x}:{time.time():.0f}", "normal", text,
