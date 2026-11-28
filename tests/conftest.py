@@ -451,10 +451,8 @@ def _away_base() -> str | None:
             try:
                 root = str(hoststate.real_home() / ".cache")
                 os.makedirs(root, exist_ok=True)
-            except KeyError:                                         # no password-database entry for this account
+            except (KeyError, OSError):                              # no password-database entry, or no folder made
                 root = ""
-            except OSError:
-                pass
         if root and os.access(root, os.W_OK | os.X_OK) and _away_from_tmp(Path(root, "x")):
             return root
     return None
