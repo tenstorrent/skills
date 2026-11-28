@@ -13,7 +13,9 @@ lock), reads the run folders and writes RESULTS to state/HEALTH_FILE:
   the tasks dispatch would start: urgent_held / urgent_hold count and name those a hold keeps out (the
   project paused, its provider's saved budget gate allowing no new work, a paused resource it names, a
   review held while the checks the daemon started on its head run (daemon.precheck_holds, the daemon's
-  own test), or a dispatch_hold the daemon recorded since it became ready). Accepted gap: the overseer reads no live
+  own test), or a dispatch_hold the daemon recorded since it became ready, or the hold of dispatch's own start check that
+  the daemon's last ready check saw (readywait: a provider logged out, the waste guard, the device cap, the
+  dollar caps, the budget gate's slot cut), while that check still runs). Accepted gap: the overseer reads no live
   lock or slot state, so a hold that ended after its record still reads as held until the task changes;
 - unreaped / unreaped_s: finished runs (exit.json on disk) still `running`, and the oldest one's age;
 - unapplied / unapplied_s: the same for coordinator runs (an answer finished but not applied);
@@ -101,7 +103,13 @@ def _hold(d, task: dict, since: float, cfg: dict, state: Path, now: float) -> st
         return "its review's prechecks are running"
     ev = d.one("SELECT text FROM events WHERE kind='dispatch_hold' AND task=? AND ts>=? ORDER BY ts DESC LIMIT 1",
                (task["id"], since))
-    return (ev["text"] or "a resource it needs is held")[:80] if ev else ""
+    if ev:
+        return (ev["text"] or "a resource it needs is held")[:80]
+    from .readywait import GAP_S, restore
+    seen = restore(d, now).get(task["id"])   # the hold the daemon's ready check saw last (its _start_hold)
+    if seen and 0 <= now - seen["last"] <= GAP_S and seen["cause"] != "dispatch":
+        return f"dispatch holds it ({seen['cause'].replace('_', ' ')})"
+    return ""
 
 
 def slept_since_boot() -> float | None:

@@ -518,3 +518,32 @@ def test_the_host_sleep_since_boot_reads_the_clock_pair_each_os_has(monkeypatch)
     assert overseer.slept_since_boot() == 250.0     # macOS: MONOTONIC runs through sleep, UPTIME_RAW stops
     monkeypatch.delattr(overseer.time, "CLOCK_UPTIME_RAW")
     assert overseer.slept_since_boot() is None      # no such pair: no sleep is taken out
+
+
+def test_an_urgent_task_dispatch_holds_for_its_own_reason_is_no_stall_while_a_slot_is_free(env, monkeypatch):
+    """Dispatch holds a ready task for more reasons than the project's worker count (a provider logged
+    out, the waste guard, the device cap, a spent task budget, the dollar caps, the budget gate's slot
+    cut) and leaves no dispatch_hold event for most of them: the loop-health check took that wait for a
+    stall. It reads the hold the daemon's ready check last saw (readywait), while that check still runs."""
+    from ttp import overseer, readywait
+    from ttp.daemon import Daemon
+    monkeypatch.setattr(overseer, "capture_stacks", lambda p, now, why: None)
+    p = make(env)
+    p.db.x("UPDATE tasks SET status='done'")
+    tid = p.db.add_task("urgent fix", "urgent: the user is waiting", kind="code", priority=1)
+    old = time.time() - 900
+    p.db.x("UPDATE tasks SET updated=?, created=? WHERE id=?", (old, old, tid))
+    (p.state / "heartbeat").write_text(json.dumps({"pid": 1}))
+    d = Daemon(p.base)
+    d.cfg = p.config()
+    d.update_gates()
+    monkeypatch.setattr(d, "dispatch", lambda: None)
+    monkeypatch.setattr(d, "_logged_out", lambda prov: True)
+    d._unstarted_checked = time.time() - 61
+    d.check_unstarted()
+    now = time.time()
+    h = overseer.measure(p, now)
+    assert h["free_slots"] > 0 and h["urgent_ready"] == 1 and h["urgent_held"] == 1 and h["failing"] == []
+    assert "logged out" in h["urgent_hold"]
+    h = overseer.measure(p, now + readywait.GAP_S + 60)   # the ready check stopped: a stall again
+    assert h["urgent_held"] == 0 and h["failing"] and "free slot" in h["failing"][0]
