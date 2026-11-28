@@ -39,7 +39,7 @@ def test_hold_escalate_raises_a_convenience_hold_at_five_minutes_and_clears_it_a
     assert [d["did"] for d in he.run(p.db, {}, now + 301)] == ["proceeded"]
     task = p.db.task(t)
     assert task["status"] == "queued" and not task["blocked_reason"]
-    assert "auto-proceeded past for the shipping window to open after 11 min (holdescalate, user msg #4906)" in task["spec"]
+    assert "auto-proceeded past for the shipping window to open after 11 min (holdescalate)" in task["spec"]
     assert p.db.kv(f"holdescalate:proceeded:{t}")["minutes"] == 11
     from ttp import blockledger as bl
     assert any(r["rule"] == "auto-proceed" and r["task"] == t for r in bl.rows(p.db, now - 86400, now + 400))

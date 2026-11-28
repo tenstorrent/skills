@@ -64,7 +64,7 @@ def _proceed(db: DB, t: dict, h: dict, rule: str, mins: int, now: float) -> bool
     if db.requeue(t["id"], by="holdescalate"):
         return False
     labels = without_deferral(json.loads(t["labels"] or "[]"))
-    line = f"auto-proceeded past {rule} after {mins} min (holdescalate, user msg #4906)"
+    line = f"auto-proceeded past {rule} after {mins} min (holdescalate)"
     db.update_task(t["id"], labels=labels, not_before=None, spec=f"{t['spec'] or ''}\n{line}".strip())
     db.set_kv(f"holdescalate:proceeded:{t['id']}", {"rule": rule, "minutes": mins, "kind": h["kind"], "ts": now})
     blockledger.append(db, "auto-proceed", t["id"], 0, f"{rule} ({h['kind']}, {mins} min)", source="holdescalate")
