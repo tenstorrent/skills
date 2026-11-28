@@ -5,7 +5,8 @@ A task the user ordered (blockledger._ordered) that is blocked, waiting or defer
 (blockledger.safety_of). A safety hold is never cleared: it raises one event per hold episode, none for a
 held resource or a pause the user set. Any other hold raises one `hold_escalate` event naming the task,
 the rule and the minutes, and, `coordinator.hold_proceed_min` (default 5; 0 escalate only) later, is
-cleared unless a safety cite was added meanwhile. A hold on an open task, an ask or a resource is left
+cleared unless a safety cite was added meanwhile. A deferral on a `start_when` probe is an outside wait: it starts itself and
+is shown, never raised. A hold escalates once, though it is recorded again. A hold on an open task, an ask or a resource is left
 alone: the root blocker is the thing to name. selfblock.raise_due runs this once a minute."""
 from __future__ import annotations
 
@@ -15,12 +16,14 @@ import time
 
 from . import blockledger, unblock
 from .db import DB, deferral, without_deferral
+from .project import DEFAULT_CONFIG
 
 KIND = "hold_escalate"
 KEY = "holdescalate:episodes"   # kv: {"<task>:<hold start>": {"at": escalated, "rule", "safe"}}
 KEEP_S = 7 * 86400
-DEFAULTS = {"hold_escalate_min": 5, "hold_proceed_min": 5}
-QUIET = ("held resource", "a pause or hold the user set")   # shown in the ledger, no wake
+DEFAULTS = {k: DEFAULT_CONFIG["coordinator"][k] for k in ("hold_escalate_min", "hold_proceed_min")}
+OUTSIDE = "an outside wait"   # a deferral on a start_when probe: it starts itself once the outside condition holds
+QUIET = ("held resource", "a pause or hold the user set", OUTSIDE)   # shown in the ledger, no wake
 OPEN = re.compile(r"\bask:\d+|\blanded\b", re.I)   # waits on a user answer or another task's landing
 
 
@@ -41,7 +44,8 @@ def _hold(db: DB, t: dict, now: float) -> dict | None:
         return {"kind": t["status"], "start": seg["start"] if seg else float(t["updated"] or now), "reason": reason}
     if t["status"] == "queued" and (d := deferral(t)):
         reason = " ".join(str(d.get(k) or "") for k in ("why", "when")).strip() or "start_after"
-        return {"kind": "deferred", "start": d.get("since") or float(t["created"] or now), "reason": reason}
+        return {"kind": "deferred", "start": d.get("since") or float(t["created"] or now), "reason": reason,
+                "probe": bool(d.get("when"))}
     return None
 
 
@@ -79,6 +83,16 @@ def _again(db: DB, t: dict, rule: str) -> bool:
         "SELECT 1 FROM runs WHERE task=? AND started>?", (t["id"], float(prev.get("ts") or 0))))
 
 
+def _prior(db: DB, state: dict, t: dict, rule: str) -> str | None:
+    """The key of an earlier episode of this task under the same rule that no run has followed: a hold that
+    is re-recorded (its start moves) is still the one hold and escalates once."""
+    for key, v in state.items():
+        if key.startswith(f"{t['id']}:") and v.get("rule") == rule and not db.one(
+                "SELECT 1 FROM runs WHERE task=? AND started>?", (t["id"], float(v.get("at") or 0))):
+            return key
+    return None
+
+
 def run(db: DB, cfg: dict | None, now: float) -> list[dict]:
     """Escalate and clear due holds; returns what it did: {task, rule, minutes, safety, did}."""
     cfg = {**DEFAULTS, **(cfg if cfg is not None else _cfg(db))}
@@ -95,9 +109,11 @@ def run(db: DB, cfg: dict | None, now: float) -> list[dict]:
         if OPEN.search(h["reason"]) or _on_open_task(db, t):
             continue
         rule = blockledger.rule_of(h["reason"])
-        safety = blockledger.safety_of(f"{rule} {h['reason']}", "")
+        safety = OUTSIDE if h.get("probe") else blockledger.safety_of(f"{rule} {h['reason']}", "")
         mins = int((now - h["start"]) / 60)
         ep = f"{t['id']}:{h['start']:.0f}"
+        if ep not in state and (prior := _prior(db, state, t, rule)):
+            ep = prior
         seen = state.get(ep)
         if safety == "convenience" and seen is None and _again(db, t, rule):
             continue   # it proceeded past this rule and the rule put it straight back: one try per run, no loop

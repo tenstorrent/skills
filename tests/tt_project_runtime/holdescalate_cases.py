@@ -118,3 +118,49 @@ def test_hold_escalate_proceeds_once_per_run_and_leaves_a_running_or_capped_task
     assert he._proceed(p.db, p.db.task(running), {"kind": "blocked"}, "r", 9, now) is False
     assert p.db.task(capped)["status"] == "failed" and p.db.task(running)["status"] == "running"
     assert "auto-proceeded" not in (p.db.task(running)["spec"] or "") and p.db.kv(f"holdescalate:proceeded:{running}") is None
+
+
+def test_hold_escalate_defaults_are_the_project_config_defaults(monkeypatch):
+    import importlib
+    from ttp import holdescalate, project
+    monkeypatch.setitem(project.DEFAULT_CONFIG["coordinator"], "hold_escalate_min", 9)
+    monkeypatch.setitem(project.DEFAULT_CONFIG["coordinator"], "hold_proceed_min", 7)
+    try:
+        assert importlib.reload(holdescalate).DEFAULTS == {"hold_escalate_min": 9, "hold_proceed_min": 7}
+    finally:
+        monkeypatch.undo()
+        importlib.reload(holdescalate)
+    assert holdescalate.DEFAULTS == {k: project.DEFAULT_CONFIG["coordinator"][k] for k in holdescalate.DEFAULTS}
+
+
+def test_hold_escalate_treats_a_start_when_probe_as_an_outside_wait(env):
+    from ttp import holdescalate as he
+    p = make(env)
+    now = time.time()
+    d = p.db.add_task("rebase after the merge")
+    labels = [f"start_when:test -e {p.base}/merged", "start_why:rebases only after the other PR has merged into main",
+              f"deferred_since:{now - 3600}"]
+    p.db.x("UPDATE tasks SET priority=1, labels=? WHERE id=?", (json.dumps(labels), d))
+    out = [he.run(p.db, {}, now + step) for step in (0, 600, 3600)]
+    assert out[0] == [{"task": d, "rule": out[0][0]["rule"], "minutes": 60, "safety": he.OUTSIDE, "did": "shown"}]
+    assert out[1] == out[2] == [] and not _he_events(p)
+    assert p.db.task(d)["status"] == "queued" and json.loads(p.db.task(d)["labels"]) == labels
+
+
+def test_hold_escalate_raises_one_hold_once_though_it_is_recorded_again(env):
+    from ttp import holdescalate as he
+    p = make(env)
+    now = time.time()
+    t = _he_hold(p, now, 6, "waiting for the shipping window to open")
+    he.run(p.db, {}, now)
+    p.db.x("UPDATE tasks SET status='waiting' WHERE id=?", (t,))   # re-recorded: a new segment, so a later hold start
+    p.db.x("INSERT INTO events(ts,source,kind,text,data,status,task) VALUES(?,?,?,?,?,?,?)",
+           (now + 30, "t", "task_waiting", f"#{t} ordered work is waiting: waiting for the shipping window to open",
+            None, "handled", t))
+    assert he.run(p.db, {}, now + 40) == [] and len(_he_events(p)) == 1
+    p.db.x("INSERT INTO runs(task, role, started, ended, status) VALUES(?,?,?,?,?)", (t, "worker", now + 60, now + 90, "done"))
+    p.db.x("UPDATE tasks SET status='blocked' WHERE id=?", (t,))
+    p.db.x("INSERT INTO events(ts,source,kind,text,data,status,task) VALUES(?,?,?,?,?,?,?)",
+           (now + 400, "t", "task_blocked", f"#{t} ordered work is blocked: waiting for the shipping window to open",
+            None, "handled", t))
+    assert [d["did"] for d in he.run(p.db, {}, now + 800)] == ["escalated"]   # a run came between: a new hold
