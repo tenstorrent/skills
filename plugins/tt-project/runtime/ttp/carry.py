@@ -131,7 +131,7 @@ def _land_done(p, task: dict, b: dict, m: dict, now: float) -> None:
         advance(p.db, task, DONE, batch=b["id"])
 
 
-def _progress(p, tid: int, evidence: str) -> None:
+def _owner_progress(p, tid: int, evidence: str) -> None:
     """`evidence` as progress on each open obligation task `tid` owns (no receipt: its owner or the coordinator closes it)."""
     from . import obligations
     for key in obligations.owned_open(p.db, tid):
@@ -150,7 +150,7 @@ def on_settle(p, task: dict, kind: str, b: dict, m: dict, now: float, deploy: bo
     row = next(r for r in reversed(current) if r["status"] in hit)
     at = {"push_row": row["id"], "batch": b["id"], "head": row["head"]}
     if kind == LANDED:
-        _progress(p, tid, f"landed {pushq._short(row['pushed_sha'])} on {target} (batch {b['id']})")
+        _owner_progress(p, tid, f"landed {pushq._short(row['pushed_sha'])} on {target} (batch {b['id']})")
         advance(db, tid, LANDED, **at)
         if deploy:
             advance(db, tid, DEPLOY)
@@ -189,7 +189,7 @@ def on_after(p, b: dict, m: dict, status: str, line: str, tail: str, now: float)
         if not task or task["status"] != "pushing":
             continue
         if status in ("ok", "skipped", "superseded"):
-            _progress(p, task["id"], line)
+            _owner_progress(p, task["id"], line)
             _land_done(p, task, b, m, now)
             continue
         head = next((r["head"] for r in _approvals(db, task["id"])[1] if r["batch"] == b["id"]), None)
