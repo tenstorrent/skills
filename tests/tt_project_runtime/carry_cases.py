@@ -519,3 +519,37 @@ def test_an_inline_review_run_that_exits_ok_but_ends_in_failure_still_counts_tow
                                     RunUsage(cost_usd=0.1, final_text=final_text), "ok", run_dir)
     assert s.p.db.one("SELECT status FROM runs WHERE id=?", (rid,))["status"] == ended
     assert rid in [r["id"] for r in runcap.runs(s.p.db, s.code)[0]]
+
+
+def _refuse_twice(env, s, monkeypatch):
+    """Two inline passes, the first from the author's own session, each with a follow-up: the second refusal is the
+    approval-form fallback of a hand-off review.at_once does not queue."""
+    from ttp.daemon import Daemon
+    asked, real = [], Daemon._auto_review
+    monkeypatch.setattr(Daemon, "_auto_review", lambda self, t, *a, **k: (asked.append(t["id"]), real(self, t, *a, **k))[1])
+    withfollowup = dict(_REVIEW_PASS(s), followups=[{"title": "Tidy the helper", "spec": "rename it"}])   # not a plain hand-off
+    _verdict(env, s, withfollowup, session="author")
+    assert not asked
+    _commit(s.path, "late.txt", "late\n")
+    _verdict(env, s, withfollowup)
+    return asked
+
+
+def test_an_approval_form_failure_queues_the_standard_review_in_the_same_pass(env, monkeypatch):
+    from ttp import carry
+    s = _inline(env, monkeypatch)
+    asked = _refuse_twice(env, s, monkeypatch)
+    assert carry.state(s.p.db, s.code)["phase"] == "plain" and s.p.db.task(s.code)["status"] == "review"
+    assert asked == [s.code], "the daemon asks for the standard review at once, with no sweep wait"
+
+
+def test_a_form_only_failure_is_no_failed_review(env, monkeypatch):
+    s = _inline(env, monkeypatch)
+    _refuse_twice(env, s, monkeypatch)
+    assert not s.p.db.q("SELECT id FROM events WHERE kind='task_changes_needed'")
+
+
+def test_a_real_changes_needed_verdict_is_a_failed_review(env, monkeypatch):
+    s = _inline(env, monkeypatch)
+    _verdict(env, s, _REVIEW_FAIL)
+    assert len(s.p.db.q("SELECT id FROM events WHERE kind='task_changes_needed'")) == 1

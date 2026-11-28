@@ -201,9 +201,10 @@ def pass_ends(daemon, task: dict, why: str = "") -> str:
 def failed(daemon, task: dict, result: dict, run_dir) -> tuple[str, dict]:
     """Carry `task`'s inline review failed or asked for changes. Within `review.auto_fix_rounds` + 1 review runs: phase
     fix, the findings and this run's result.json appended to the spec, the owner woken (its author session resumed
-    where the provider allows, else a fresh run from the spec): (queued, result fields). Past them, or when only the
-    approval's form failed (nothing for the author to fix): phase capped, a `carry_capped` event to the coordinator and
-    the task in `review`. A failed review is counted by reviewcap (a `task_changes_needed` event)."""
+    where the provider allows, else a fresh run from the spec): (queued, result fields). Past them: phase capped, a
+    `carry_capped` event to the coordinator and the task in `review`. Only the approval's form failed (nothing for the
+    author to fix): phase plain and the task in `review`, for the standard review. A real failed review is counted by
+    reviewcap (a `task_changes_needed` event); a form-only failure is not."""
     from . import pushq
     from .daemon import AUTO_FIX_ROUNDS, HANDOFF_RESUME_KEY
     db, tid = daemon.p.db, task["id"]
@@ -211,14 +212,14 @@ def failed(daemon, task: dict, result: dict, run_dir) -> tuple[str, dict]:
     if not s or s["phase"] != REVIEW:
         return "failed", {}
     path, text = Path(run_dir) / "result.json", _findings(result)
-    pushq._event(db, task, "task_changes_needed", f"#{tid} {task['title']}: inline review round {s['round']} failed: "
-                 f"{text.splitlines()[0] if text else ''}", queued=False, severity="low")
     cap = int((daemon.cfg.get("review") or {}).get("auto_fix_rounds", AUTO_FIX_ROUNDS)) + 1
     if result.get("review_failure") in ("approval", "marker"):   # nothing for the author to fix: the standard review takes it
         advance(db, tid, PLAIN, note=str(path))
         pushq._event(db, task, "carry_fallback", f"#{tid} {task['title']}: its inline review's push approval failed "
                      f"({text.splitlines()[0] if text else ''}); it goes to the standard review", queued=False, severity="low")
         return "review", {}
+    pushq._event(db, task, "task_changes_needed", f"#{tid} {task['title']}: inline review round {s['round']} failed: "
+                 f"{text.splitlines()[0] if text else ''}", queued=False, severity="low")
     if int(s["round"]) >= cap:
         advance(db, tid, CAPPED, note=str(path))
         pushq._event(db, task, "carry_capped", f"#{tid} {task['title']}: its inline review failed {s['round']} time(s); "

@@ -8581,6 +8581,7 @@ class Daemon:
                 new, more = carry.failed(self, task, result, run_dir)
                 extra.update(more)
                 not_before = time.time() if new == "queued" else not_before
+                fell_back = new == "review" and (carry.state(db, task["id"]) or {}).get("phase") == carry.PLAIN
             elif new == "done":
                 new = carry.pass_ends(self, task, push_note.strip(" .") or "no push list")
                 fell_back = new == "review"
