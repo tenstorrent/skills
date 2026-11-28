@@ -11095,9 +11095,7 @@ class Daemon:
         for t in gated:   # dependencies met, a worker slot free and nothing else holds it: only its kept gate
             if self._start_hold(t, t["provider"] or core, ctx) is None:
                 labels, d = convgate.stored(t)
-                kept = convgate.safety_class(d.get("why"), d.get("when")) or convgate.kept_class(labels) \
-                    or convgate.tie_class(labels, d.get("when")) \
-                    or (convgate.LANDED if convgate.landed_only(d.get("when")) else None)
+                kept = convgate.gate_class(d.get("why"), d.get("when"), labels)
                 other[t["id"]] = (t, f"its start gate ({kept or 'no safety class'}): "
                                      f"{convgate.gate_words((d.get('after') or 0) > now and d.get('after'), d.get('when'), now)}"
                                      f"{'; ' + d['why'][:120] if d.get('why') else ''}, while a worker slot is free")

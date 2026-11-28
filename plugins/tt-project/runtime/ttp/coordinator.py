@@ -3625,7 +3625,7 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                 if write_moved:   # the audit trail of a power grant being moved
                     untrusted_write_event(db, task["id"], write_moved)
                 if a.get("start_after") is not None or a.get("start_when") is not None \
-                        or (a.get("why") is not None and deferral(task).get("when")):
+                        or (a.get("why") is not None and deferral(task)):
                     if task["status"] in ("running", *TERMINAL_TASK_STATES):
                         raise InfoRejection(f"task #{task['id']} is {task['status']}: only a task that has not "
                                          f"started can be deferred; add a new one with start_after/start_when")

@@ -121,6 +121,14 @@ def landed_only(when: str | None) -> bool:
     return bool(str(when or "").strip()) and all(_LANDED_TERM.fullmatch(t.strip()) for t in terms)
 
 
+def gate_class(why: str | None, when: str | None, labels: list | None) -> str | None:
+    """The safety class a start gate names: its why or probe, the class the check recorded, a chain
+    on a task's new file, or a probe that only waits for a landing."""
+    labels = labels or []
+    return safety_class(why, when) or kept_class(labels) or tie_class(labels, when) \
+        or (LANDED if landed_only(when) else None)
+
+
 def judge(task: dict, after, when: str | None, why: str | None, labels: list | None = None
           ) -> tuple[bool, str | None]:
     """(drop, class) for gate (`after`, `when`, `why`) of `task` (its priority and spec as they will be):
@@ -128,8 +136,7 @@ def judge(task: dict, after, when: str | None, why: str | None, labels: list | N
     found (also for a task that is not urgent, so a later raise keeps the gate)."""
     if not after and not when:
         return False, None
-    cls = safety_class(why, when) or kept_class(labels or []) or tie_class(labels or [], when) \
-        or (LANDED if landed_only(when) else None)
+    cls = gate_class(why, when, labels)
     return (urgent.is_urgent(task) and cls is None), cls
 
 
@@ -187,7 +194,7 @@ def stored_class(task: dict) -> str | None:
     """The safety class a queued task's stored start gate names (its why, its probe, the class the
     check recorded, a chain on a task's new file), else None for a convenience."""
     labels, d = stored(task)
-    return safety_class(d.get("why"), d.get("when")) or kept_class(labels) or tie_class(labels, d.get("when"))
+    return gate_class(d.get("why"), d.get("when"), labels)
 
 
 # A checks or suite task: a work task with no branch (it changes nothing) whose title says so.

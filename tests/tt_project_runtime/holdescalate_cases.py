@@ -180,7 +180,7 @@ def test_a_start_after_deferral_on_outside_data_is_never_proceeded(env):
     t = p.db.add_task("compare the before and after figures")
     p.db.x("UPDATE tasks SET priority=1 WHERE id=?", (t,))
     upd, after, when, note = deferral_update(p.db, p.db.task(t), {"start_after": "23h", "why": why}, p)
-    assert "kept" in note and "dropped" not in note          # the task_update check keeps the gate
+    assert after and any(str(lb).startswith("start_after:") for lb in upd["labels"])   # the check keeps the gate
     p.db.update_task(t, **upd)
     assert any(str(lb).startswith(f"start_why:{why}") for lb in json.loads(p.db.task(t)["labels"])), upd["labels"]
     assert convgate.safety_class(why, None) is not None      # one classifier serves both callers
@@ -225,3 +225,20 @@ def test_a_start_after_deferral_the_check_kept_is_never_proceeded_without_a_stor
                         f"deferred_since:{now - 3600}"]), t))
     assert [d["did"] for d in he.run(p.db, {}, now) + he.run(p.db, {}, now + 600)] == ["shown"]
     assert p.db.task(t)["status"] == "queued" and "auto-proceeded" not in (p.db.task(t)["spec"] or "")
+
+
+def test_a_why_alone_on_a_start_after_deferral_runs_the_deferral_check(env):
+    """A task_update that adds only a `why` to a start_after deferral stores it (the fix
+    hold-escalate asks for), and the same classifier then classes the hold; a why that names no
+    outside fact is stored too and stays a convenience."""
+    from ttp import coordinator as coord, holdescalate as he
+    p = make(env)
+    now = time.time()
+    t = p.db.add_task("compare the before and after figures")
+    p.db.x("UPDATE tasks SET priority=3, labels=? WHERE id=?",
+           (json.dumps([f"start_after:{now + 8 * 3600:.0f}", f"deferred_since:{now - 600}"]), t))
+    coord.apply(p, [{"type": "task_update", "id": t, "why": "later"}])
+    assert "start_why:later" in json.loads(p.db.task(t)["labels"])
+    assert he._hold(p.db, p.db.task(t), now)["cls"] is None
+    coord.apply(p, [{"type": "task_update", "id": t, "why": "needs data that must accumulate first"}])
+    assert he._hold(p.db, p.db.task(t), now)["cls"] == "data that must accumulate"
