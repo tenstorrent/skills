@@ -336,6 +336,25 @@ def test_block_ledger_probe_class_names_what_a_held_wait_is_on(env):
     assert cls("test -e /tmp/some-marker") == "other"
 
 
+def test_block_ledger_counts_a_held_landing_wait_under_the_holds_class(env):
+    """A wait on a done target nothing can land counts under the class of the hold that stops every
+    landing (deadwait.hold_of), not as a stuck landing, while that hold lasts."""
+    from ttp import blockledger as bl, deadwait, envfault
+    p = make(env)
+    now = time.time()
+    x = p.db.add_task("feature", "s", kind="code")
+    p.db.update_task(x, status="done", branch=f"ttp/t{x}-feature")
+    a = _bl_wait(p, "after the feature", now, 3 * 3600, f"ttp landed --task {x}")
+    rule = lambda: {r["task"]: r["rule"] for r in bl.rows(p.db, now - 86400, now) if r["source"] == "task"}
+    for hold_set, hold in ((lambda: p.db.set_kv("paused", True), "user hold"),
+                           (lambda: p.db.set_kv(envfault.KV, {"runner": {"queue": True}}), "outage")):
+        hold_set()
+        assert deadwait.hold_of(p.db) == hold, hold
+        assert rule()[a] == hold, "the wait is held, not dead"
+        p.db.x("DELETE FROM kv WHERE key IN ('paused',?)", (envfault.KV,))
+    assert rule()[a] == bl.STUCK, "no hold left: it is a stuck landing again"
+
+
 def test_block_ledger_a_done_target_nothing_can_land_is_a_stuck_landing_not_a_dependency(env):
     from ttp import blockledger as bl
     p = make(env)

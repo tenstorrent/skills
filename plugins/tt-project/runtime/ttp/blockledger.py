@@ -101,7 +101,8 @@ def probe_class(probe: str, cfg: dict | None = None, down: dict | None = None) -
 
 def _wait_rule(data: dict, reason: str, db: DB | None = None, task: int | None = None) -> tuple[str, str] | None:
     """(rule, reason) of a wait its task_waiting `data` or reason places: the task's own detached job, another
-    task's landing (STUCK once its target is done and deadwait.path finds nothing to land it), a planned
+    task's landing (STUCK once its target is done and deadwait.path finds nothing to land it; under the
+    hold's class while deadwait.hold_of names one that stops every landing), a planned
     window (a bare clock-gate probe, or the hand-off's own: unblock.classify_wait)."""
     probe = str(data.get("probe") or "")
     if queuewait.own_job(probe):
@@ -110,6 +111,10 @@ def _wait_rule(data: dict, reason: str, db: DB | None = None, task: int | None =
         x = int(next(g for g in m.groups() if g))
         if db is not None and task is not None and (db.task(x) or {}).get("status") == "done" \
                 and not deadwait.path(db, x, {task}):
+            if hold := deadwait.hold_of(db):   # the wait is held, not dead: count it under the hold
+                why = "the user's pause of the push lock" if hold == "user hold" \
+                    else "an outage of the landing machinery"
+                return hold, f"#{x} is done, not landed, and {why} holds its landing"
             return STUCK, f"#{x} is done, not landed, and nothing open can land it"
         return "dependency", f"needs #{x}"
     window = unstarted.TIME_ONLY.match(probe) or data.get("why") == "planned window"

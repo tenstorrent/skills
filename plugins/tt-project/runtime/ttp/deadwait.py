@@ -8,7 +8,9 @@
   follow-ups says the same in its own task_failed event, which already wakes the coordinator.
 - A start_when or retry_when made only of landing waits on X (eta.landing_waits) whose producer X is done,
   its work not landed, and nothing open can land it: no open review, fix, rebase or continue hop carrying X's change (landed.carriers), no open task
-  on X's branch, and no push queue row. One `landed_wait_dead` event per X names the held tasks;
+  on X's branch, and no push queue row. While a hold stops every landing (hold_of: a user pause, an
+  environment fault holding the push queue, a network outage), the wait is held, not dead, and no event is
+  raised. One `landed_wait_dead` event per X names the held tasks;
   once a path appears, X lands or no queued task waits on it, it is cleared (handled), and a later
   dead end raises it again. The event names the producer's last review and its verdict. Saved database
   facts only: a daemon restart (empty probe verdicts) or a broken probe exit neither clears nor re-raises it. A landing wait inside a longer probe is not judged.
@@ -18,22 +20,35 @@ from __future__ import annotations
 import json
 import time
 
-from . import landed
-from .db import TERMINAL_TASK_STATES, deferral, dependency_ids
+from . import envfault, landed, netwait
+from .db import PAUSED_RESOURCES_KEY, TERMINAL_TASK_STATES, deferral, dependency_ids
 
 NOFIX_EVENT = "review_nofix"
 DEAD_EVENT = "landed_wait_dead"
 KEY = "dead_landed_waits"   # kv: producer id -> {"since": first seen dead, "event": event id or None}
 GRACE_S = 900               # default of waiting.landed_wait_dead_s: a review or push row the same step queues
 RECHECK_S = 60              # check re-judges at least this often, even when its stamp of the rows is unchanged
+# The kv rows a hold lives in, and the stamp column each becomes in STAMP_SQL: a write to any of
+# them (a pause set or lifted, a fault found or gone) re-judges the check as any other row change.
+HOLD_KV = (("paused", "hold_paused"), (PAUSED_RESOURCES_KEY, "hold_pauses"),
+           (envfault.KV, "hold_faults"), (netwait.STATE_KEY, "hold_outage"))
 # The rows check reads, stamped: a write to any of them (update_task sets tasks.updated) changes the stamp.
+HOLD_SQL = ", ".join(f"(SELECT value FROM kv WHERE key='{k}') AS {v}" for k, v in HOLD_KV)
 STAMP_SQL = ("SELECT (SELECT count(*) || ':' || max(id) || ':' || max(updated) FROM tasks), "
              "(SELECT count(*) || ':' || max(id) || ':' || max(updated) FROM push_queue), "
              "(SELECT count(*) || ':' || max(rowid) FROM task_landings), "
              "(SELECT count(*) || ':' || max(rowid) FROM task_superseded), "
              "(SELECT count(*) || ':' || total(task) || ':' || max(ts) FROM task_abandoned), "
-             "(SELECT count(*) || ':' || max(rowid) FROM task_dropped)")
+             "(SELECT count(*) || ':' || max(rowid) FROM task_dropped), "
+             + HOLD_SQL)
 _last: dict[str, tuple] = {}   # db path -> (inputs, saved state after, when) of its last full check
+
+
+def _loads(v) -> object:
+    try:
+        return json.loads(v) if v is not None else None
+    except (TypeError, ValueError):
+        return None   # a torn kv row holds nothing
 
 
 def waiters(db, ids: set[int], skip: set[int] = frozenset()) -> list[dict]:
@@ -140,6 +155,24 @@ def stuck_by(db, x: int, rows: Rows | None = None) -> dict | None:
     return None
 
 
+def _hold(paused, resources: dict, faults: dict, outage: dict) -> str | None:
+    """The class of the hold that stops every landing, from its kv rows: a hold the user set (the
+    project's own pause, or a pause of the push resource), else the landing machinery being out
+    (an environment fault holding the push queue, a network outage); None when nothing holds it."""
+    if paused or any(r == "push" or r.startswith("push:") for r in (resources or {})):
+        return "user hold"
+    if any(isinstance(f, dict) and f.get("queue") for f in (faults or {}).values()):
+        return "outage"
+    return "outage" if (outage or {}).get("alerted") else None
+
+
+def hold_of(db) -> str | None:
+    """`_hold` of the hold rows read in one statement, so `check` (which reads them in its stamp)
+    and the block ledger (which reads them here) decide by the same rule."""
+    row = db.one(f"SELECT {HOLD_SQL}")
+    return _hold(*(_loads(row[v]) for _, v in HOLD_KV))
+
+
 def check(db, cfg: dict, held_by: dict[int, list[dict]], now: float) -> None:
     """`held_by`: producer id -> the queued tasks whose start_when or retry_when is only landing waits
     on it (eta.landing_waits). Raises
@@ -148,9 +181,11 @@ def check(db, cfg: dict, held_by: dict[int, list[dict]], now: float) -> None:
     grace = float((cfg.get("waiting") or {}).get("landed_wait_dead_s", GRACE_S) or 0)
     state = db.kv(KEY, {}) or {}
     try:
-        stamp = tuple(db.one(STAMP_SQL).values())
+        row = db.one(STAMP_SQL)
+        stamp, hold = tuple(row.values()), _hold(*(_loads(row[v]) for _, v in HOLD_KV))
     except Exception:
-        stamp = None   # no stamp: judged in full every time
+        stamp = None             # no stamp: judged in full every time
+        hold = hold_of(db)       # and the hold read apart, in one statement
     inputs = (stamp, grace, tuple((x, tuple(t["id"] for t in ts)) for x, ts in sorted(held_by.items())))
     if stamp is not None and _unchanged(db, inputs, state, grace, now):
         return
@@ -162,7 +197,9 @@ def check(db, cfg: dict, held_by: dict[int, list[dict]], now: float) -> None:
             continue
         prev = state.get(str(x)) or {}
         got = {"since": prev.get("since") or now, "event": prev.get("event")}
-        if got["event"] is None and now - got["since"] >= grace:
+        # A hold that stops every landing explains the wait: no event while it lasts, and the
+        # minutes count under the hold's class (blockledger reads the same rule).
+        if got["event"] is None and hold is None and now - got["since"] >= grace:
             got["event"] = _raise_dead(db, x, tasks, rows)
         new[str(x)] = got
     for k, v in state.items():

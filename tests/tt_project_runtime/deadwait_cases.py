@@ -88,6 +88,38 @@ def test_deadwait_check_reads_a_fixed_number_of_rows_sets_however_many_producers
     p.db.conn.set_trace_callback(None)
 
 
+def test_a_hold_that_stops_every_landing_keeps_a_dead_wait_silent(env):
+    """While a hold explains why nothing lands (deadwait.hold_of: a pause the user set, a push
+    pause, an environment fault holding the push queue, a network outage), no landed_wait_dead is
+    raised; the wait's clock keeps running, and the event fires on the first check after the hold
+    lifts, still past its grace."""
+    from ttp import deadwait, envfault, netwait
+    p = make(env)
+    x, w = _dw_producer(p, "feature")
+    dead = lambda: p.db.q("SELECT * FROM events WHERE kind=?", (deadwait.DEAD_EVENT,))
+    cfg = {"waiting": {"landed_wait_dead_s": 30}}
+    held_by = {x: [p.db.task(w)]}
+    t0 = time.time()
+    holds = [(lambda: p.db.set_kv("paused", True), "user hold"),
+             (lambda: p.db.set_kv("paused_resources", {"push": {"by": "user"}}), "user hold"),
+             (lambda: p.db.set_kv(envfault.KV, {"runner": {"queue": True, "since": t0}}), "outage"),
+             (lambda: p.db.set_kv(netwait.STATE_KEY, {"alerted": True}), "outage")]
+    for i, (hold_set, hold) in enumerate(holds):
+        hold_set()
+        assert deadwait.hold_of(p.db) == hold, hold
+        deadwait.check(p.db, cfg, held_by, t0 + 1)
+        deadwait.check(p.db, cfg, held_by, t0 + 3600)
+        assert dead() == [], hold
+        assert p.db.kv(deadwait.KEY)[str(x)] == {"since": t0 + 1, "event": None}, "the clock runs on"
+        p.db.x("DELETE FROM kv WHERE key IN ('paused','paused_resources',?,?)", (envfault.KV, netwait.STATE_KEY))
+        deadwait.check(p.db, cfg, held_by, t0 + 3601)   # the hold lifted: the wait was dead all along
+        assert len(dead()) == 1, hold
+        p.db.set_kv(deadwait.KEY, {})   # judge the next hold from a fresh wait
+        p.db.x("DELETE FROM events")
+        deadwait._last.clear()
+    assert deadwait.hold_of(p.db) is None, "nothing holds the landing"
+
+
 def test_deadwait_skip_never_delays_a_new_dead_wait_past_its_grace(env):
     """The skip of an unchanged check never holds a raise back: a wait dead since t0 is raised on the
     first check at t0 + grace, a path that ends is judged on the next check, and a write that keeps
