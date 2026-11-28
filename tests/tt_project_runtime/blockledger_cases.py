@@ -54,6 +54,16 @@ def test_block_ledger_clips_queue_waits_and_log_rows_to_the_window(env):
     assert {r["source"]: r["minutes"] for r in rs if r["source"] in ("queue", "cli")} == {"queue": 60.0, "cli": 60.0}
 
 
+def test_block_ledger_counts_a_hold_that_began_before_the_window_and_ended_inside_it(env):
+    from ttp import blockledger as bl
+    p = make(env)
+    now = time.time()
+    t = _bl_task(p, "moved on", "queued", now, blocked_ago=5 * 3600, reason="keep the 60 min hold")
+    p.db.x("INSERT INTO runs(task,role,status,started,ended) VALUES(?,?,?,?,?)", (t, "worker", "ok", now - 3 * 3600, now - 3 * 3600 + 60))
+    rs = [r for r in bl.rows(p.db, {}, now - 4 * 3600, now) if r["task"] == t]
+    assert [r["minutes"] for r in rs] == [pytest.approx(60, abs=1)]
+
+
 def test_block_ledger_refusals_are_one_row_per_run_and_rule(env):
     from ttp import blockledger as bl
     p = make(env)

@@ -495,9 +495,11 @@ def overlapping(db: DB, since: float, now: float | None = None) -> list[dict]:
     """Per-state intervals that overlap [since, now], with the task and title: those of the tasks with a stuck
     hand-off at or after `since` and of the tasks stuck now, so a hold that began before `since` shows."""
     now = time.time() if now is None else now
+    kinds = (*STUCK, *MOVED)   # a move or a run in the window ends a hold that began before it
     ids = {r["task"] for r in db.q(
-        f"SELECT DISTINCT task FROM events WHERE task IS NOT NULL AND ts>=? AND kind IN ({','.join('?' * len(STUCK))})",
-        (since, *STUCK))} | {r["id"] for r in db.q("SELECT id FROM tasks WHERE status IN ('blocked','waiting','review')")}
+        f"SELECT DISTINCT task FROM events WHERE task IS NOT NULL AND ts>=? AND kind IN ({','.join('?' * len(kinds))})",
+        (since, *kinds))} | {r["id"] for r in db.q("SELECT id FROM tasks WHERE status IN ('blocked','waiting','review')")} \
+        | {r["task"] for r in db.q("SELECT DISTINCT task FROM runs WHERE task IS NOT NULL AND started>=?", (since,))}
     return [{**seg, "task": ep["task"], "title": ep["title"]}
             for tid in sorted(ids) if (task := db.task(tid))
             for ep in _task_episodes(db, task, now) for seg in ep["segments"]

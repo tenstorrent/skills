@@ -38,6 +38,13 @@ def test_rulematch_lists_the_older_rules_on_the_topic_and_marks_restrictions(env
     assert ("config", "providers.claude.worker_isolation") in {(g["where"], g["name"]) for g in cfg}
 
 
+def test_rulematch_needs_more_than_one_shared_word_for_code_and_config(env):
+    from ttp import rulematch as rm
+    p = _rm_project(env)
+    got = rm.older(p, p.db, "please add a test for the keepalive handling", 11)
+    assert not [g for g in got if g["where"] in ("code", "config")]
+
+
 def test_rulematch_finds_nothing_for_unrelated_text(env):
     from ttp import rulematch as rm
     p = _rm_project(env)
