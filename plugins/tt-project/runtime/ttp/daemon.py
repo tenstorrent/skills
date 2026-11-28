@@ -8578,8 +8578,8 @@ class Daemon:
                 new, more = carry.failed(self, task, result, run_dir)
                 extra.update(more)
                 not_before = time.time() if new == "queued" else not_before
-            elif new == "done":
-                carry.advance(db, task["id"], carry.DONE)
+            elif new == "done" and not carry.pass_ends(self, task):
+                carry_run = False   # no valid approval and a landing to make: the standard review flow takes it
         # A push-conflict fix (conflictfix.py) costs no review attempt when it approves a new head. A
         # light one that ends any other way (done with nothing approved included; a refused account, a
         # lost host, a block or a needs_review aside) runs again at once at standard, also without an

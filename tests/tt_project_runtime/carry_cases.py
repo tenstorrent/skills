@@ -478,3 +478,25 @@ def test_an_author_failure_of_a_carry_task_is_no_failed_review_for_the_cap(env, 
     s.p.db.x("INSERT INTO events(ts,source,kind,severity,text,status,task) VALUES(?,?,?,?,?,?,?)",
              (time.time(), "daemon", "task_failed", "normal", "the author timed out", "handled", s.code))
     assert s.code not in reviewcap.failed_reviews(s.p.db, 0)
+
+
+def test_a_carry_pass_with_no_valid_approval_falls_back_to_the_standard_review_not_done(env, monkeypatch):
+    from ttp import carry
+    from ttp.daemon import Daemon
+    s = _inline(env, monkeypatch)
+    asked, real = [], Daemon._auto_review
+    monkeypatch.setattr(Daemon, "_auto_review", lambda self, t, *a, **k: (asked.append(t["id"]), real(self, t, *a, **k))[1])
+    _verdict(env, s, {"status": "done", "summary": "looks good"})   # a pass with no push list
+    assert carry.state(s.p.db, s.code)["phase"] == "plain" and not s.p.db.q("SELECT * FROM push_queue")
+    assert len(s.p.db.q("SELECT id FROM events WHERE kind='carry_fallback'")) == 1
+    assert not carry.enabled(s.p.config(), s.p.db.task(s.code), s.p.db, s.p), "the standard flow takes the task"
+    assert s.p.db.task(s.code)["status"] == "done" and asked == [s.code], "the daemon's normal review is asked for"
+
+
+def test_a_carry_pass_of_a_change_that_needs_no_landing_ends_done(env, monkeypatch):
+    from ttp import carry
+    s = _inline(env, monkeypatch)
+    s.p.db.update_task(s.code, spec=f"{s.p.db.task(s.code)['spec'] or ''}\nno_push: notes only")
+    t, _ = _verdict(env, s, {"status": "done", "summary": "looks good"})
+    assert carry.state(s.p.db, s.code)["phase"] == "done" and t["status"] == "done"
+    assert not s.p.db.q("SELECT id FROM events WHERE kind='carry_fallback'")

@@ -3282,3 +3282,36 @@ def test_a_requeue_of_a_task_whose_every_obligation_was_dropped_names_the_contin
     for tid in (mixed, plain):
         cli.main(["task", "demo", "requeue", str(tid), "--force"])
         assert p.db.task(tid)["status"] == "queued", tid
+
+
+def _code_runs(p, tid, n, role, status):
+    for _ in range(n):
+        p.db.x("INSERT INTO runs(task,role,provider,status,started,ended,cost_usd) VALUES(?,?,?,?,?,?,?)",
+               (tid, role, "claude", status, time.time(), time.time() + 1, 0.1))
+
+
+def test_ok_inline_review_runs_are_no_try_of_a_code_task_but_failed_ones_and_author_runs_are(env):
+    from ttp import runcap
+    p = make(env)
+    _no_events(p)
+    tid = p.db.add_task("carried", "s", kind="code", origin="user", provider="claude")
+    _code_runs(p, tid, 2, "worker", "ok")
+    _code_runs(p, tid, 2, "reviewer", "ok")
+    assert len(runcap.runs(p.db, tid)[0]) == 2 and "max_task_runs" not in runcap.check(p, p.config(), p.db.task(tid)), "4 runs, 2 ok reviews"
+    _code_runs(p, tid, 1, "reviewer", "failed")
+    _code_runs(p, tid, 1, "worker", "ok")
+    assert len(runcap.runs(p.db, tid)[0]) == 4 and "max_task_runs 4" in runcap.check(p, p.config(), p.db.task(tid))
+    other = p.db.add_task("authored", "s", kind="code", origin="user", provider="claude")
+    _code_runs(p, other, 4, "worker", "ok")
+    assert "max_task_runs 4" in runcap.check(p, p.config(), p.db.task(other)), "author runs always count"
+
+
+def test_ok_inline_review_runs_take_no_rank_in_the_waste_ledger(env):
+    from ttp import waste
+    p = make(env)
+    _no_events(p)
+    tid = p.db.add_task("carried", "s", kind="code", origin="user", provider="claude")
+    _code_runs(p, tid, 1, "worker", "ok")
+    _code_runs(p, tid, 3, "reviewer", "ok")
+    rep = waste.report(p.db, time.time() - 99, time.time() + 99, {"waste": {"max_runs": 2}})
+    assert not rep["buckets"]["over_runs"]["run_ids"] and not rep["continued"]["runs"]

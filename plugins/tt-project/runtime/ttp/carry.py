@@ -22,14 +22,15 @@ from .db import dump_result, load_result
 
 CHANGE, REVIEW, FIX, QUEUED, LANDED, DEPLOY, DONE = "change", "review", "fix", "queued", "landed", "deploy", "done"
 REBASE, CHECKFIX, CAPPED = "rebase", "checkfix", "capped"   # a push conflict, failed push checks, over the rounds cap
-PHASES = (CHANGE, REVIEW, FIX, QUEUED, LANDED, DEPLOY, DONE, REBASE, CHECKFIX, CAPPED)
+PLAIN = "plain"   # a pass with no valid push approval: the standard review flow takes the task (pass_ends)
+PHASES = (CHANGE, REVIEW, FIX, QUEUED, LANDED, DEPLOY, DONE, REBASE, CHECKFIX, CAPPED, PLAIN)
 EVENT = "carry_phase"
 MODES = ("ordered", "all", "off")
 FIELDS = ("round", "head", "review_run", "push_row", "batch", "note")
 UPDATE = "## Update (review round"   # heads each block of findings appended to the owner's spec
 ROLE = "reviewer"   # runs.role of an inline review: the role of every independent review, with its guards (no edits)
 # How far along the chain a phase is: reconcile only moves a task to a later one.
-_RANK = {CHANGE: 0, REVIEW: 1, FIX: 1, REBASE: 1, CHECKFIX: 1, QUEUED: 2, LANDED: 3, DEPLOY: 4, DONE: 5}
+_RANK = {CHANGE: 0, REVIEW: 1, FIX: 1, REBASE: 1, CHECKFIX: 1, PLAIN: 1, QUEUED: 2, LANDED: 3, DEPLOY: 4, DONE: 5}
 
 
 def mode(cfg: dict | None) -> str:
@@ -52,9 +53,11 @@ def selected(cfg: dict | None, task: dict | None, db) -> bool:
 
 
 def enabled(cfg: dict | None, task: dict | None, db, p=None) -> bool:
-    """Whether `task` carries: selected, and `inline_review` on for project `p` (off without one)."""
+    """Whether `task` carries: selected, and `inline_review` on for project `p` (off without one), and not
+    handed to the standard review flow (phase `plain`)."""
     from . import costlevers
-    return selected(cfg, task, db) and p is not None and costlevers.lever_on(p, "inline_review")
+    return (selected(cfg, task, db) and p is not None and costlevers.lever_on(p, "inline_review")
+            and (state(db, task["id"]) or {}).get("phase") != PLAIN)
 
 
 def state(db, task_id: int) -> dict | None:
@@ -179,6 +182,22 @@ def _findings(result: dict) -> str:
     return "\n".join([str(result.get("summary") or "")] + [f"- {f.get('title')}: {f.get('spec')}" for f in fups])[:6000]
 
 
+def pass_ends(daemon, task: dict) -> bool:
+    """An inline review passed with no valid push approval. The carry ends (phase done, True) only when the change
+    needs no landing: no push branch, or a change kept off it. Else it fails closed: phase `plain`, one `carry_fallback`
+    event, False; the task goes to review and the daemon's Review #N backs it, as for any code task."""
+    from . import landed, push, pushq, worktree
+    p, tid = daemon.p, task["id"]
+    d = daemon.cfg.get("delivery") or {}
+    if not landed.has_push_branch(p) or push.kept_off(task, worktree.diff_lines(p, [task["branch"]]), d, p):
+        advance(p.db, tid, DONE)
+        return True
+    advance(p.db, tid, PLAIN)
+    pushq._event(p.db, task, "carry_fallback", f"#{tid} {task['title']}: its inline review passed with no valid push "
+                 "approval; it goes to the standard review", queued=False, severity="low")
+    return False
+
+
 def failed(daemon, task: dict, result: dict, run_dir) -> tuple[str, dict]:
     """Carry `task`'s inline review failed or asked for changes. Within `review.auto_fix_rounds` + 1 review runs: phase
     fix, the findings and this run's result.json appended to the spec, the owner woken (its author session resumed
@@ -213,10 +232,10 @@ def failed(daemon, task: dict, result: dict, run_dir) -> tuple[str, dict]:
 def reconcile(db) -> list[tuple[int, str, str]]:
     """On daemon start: move each carry task's phase forward to its newest push row (approved or batched:
     queued; pushed or landed: landed) and, once that row's batch ended its deploy step well (ok or skipped), to done. Returns
-    (task, from, to) for each move. A task in `capped` is the coordinator's and stays."""
+    (task, from, to) for each move. A task in `capped` is the coordinator's and stays; one in `plain` is the standard review's."""
     from .pushq import LANDED_OUTCOMES, OPEN_ROWS
     moved = []
-    for s in db.q("SELECT task, phase FROM carry_state WHERE phase NOT IN (?,?)", (DONE, CAPPED)):
+    for s in db.q("SELECT task, phase FROM carry_state WHERE phase NOT IN (?,?,?)", (DONE, CAPPED, PLAIN)):
         row = db.one("SELECT q.id, q.status, q.batch, q.head, b.after_push FROM push_queue q "
                      "LEFT JOIN push_batches b ON b.id=q.batch WHERE q.task=? ORDER BY q.id DESC LIMIT 1", (s["task"],))
         if not row:

@@ -24,6 +24,7 @@ from pathlib import Path
 
 from . import chaincap, routinedefault, unblock
 from .db import load_result
+from .carry import ROLE as CARRY_ROLE
 from .dispatchguard import EXPLICIT_SOURCES, REQUEUED
 
 RUN_CAP_EVENT = "run_cap"
@@ -44,13 +45,17 @@ def limits(cfg: dict) -> tuple[int, int, int]:
     return out[0], out[1], out[2]
 
 
+# An ok inline review run of a code task (carry.py) is no try of its task: it counts toward no run cap or rank.
+NOT_CARRY_OK = f"NOT (role='{CARRY_ROLE}' AND status='ok' AND task IN (SELECT id FROM tasks WHERE kind='code'))"
+
+
 def runs(db, task_id: int) -> tuple[list[dict], int]:
     """The task's ended runs since its last explicit requeue, oldest first, and that requeue's event id (0)."""
     last = db.one("SELECT id, ts FROM events WHERE task=? AND kind=? "
                   f"AND source IN ({','.join('?' * len(EXPLICIT_SOURCES))}) ORDER BY id DESC LIMIT 1",
                   (task_id, REQUEUED, *EXPLICIT_SOURCES))
     rows = db.q("SELECT * FROM runs WHERE task=? AND role!='coordinator' AND ended IS NOT NULL AND started>=? "
-                f"AND status NOT IN ({','.join('?' * len(FREE))}) ORDER BY id",
+                f"AND status NOT IN ({','.join('?' * len(FREE))}) AND {NOT_CARRY_OK} ORDER BY id",
                 (task_id, float((last or {}).get("ts") or 0), *FREE))
     cut = [float(e["ts"]) for e in db.q("SELECT ts FROM events WHERE task=? AND kind='task_preempted' AND ts>=?",
                                         (task_id, float((last or {}).get("ts") or 0)))]
