@@ -27,7 +27,7 @@ def test_rulematch_durations_name_one_value_in_any_unit():
 def test_rulematch_lists_the_older_rules_on_the_topic_and_marks_restrictions(env):
     from ttp import rulematch as rm
     p = _rm_project(env)
-    got = rm.older(p, p.db, "an hour is too long for the report worker, make it 5 min")
+    got = rm.older(p, p.db, "the keepalive of an hour is too long for the report worker, make it 5 min")
     where = {(g["where"], g["name"]) for g in got}
     assert any(w == "memory" for w, _ in where) and ("code", "KEEPALIVE_S") in where
     assert ("code", "LIMIT") not in where and len(got) <= rm.MAX
@@ -43,6 +43,20 @@ def test_rulematch_needs_more_than_one_shared_word_for_code_and_config(env):
     p = _rm_project(env)
     got = rm.older(p, p.db, "please add a test for the keepalive handling")
     assert not [g for g in got if g["where"] in ("code", "config")]
+
+
+def test_rulematch_a_value_alone_never_matches_a_constant(env):
+    import subprocess
+    from ttp import rulematch as rm
+    p = _rm_project(env)
+    (p.root / "vals.py").write_text("RIDE_ALONG_MAX_S = 3600\nCRASH_WINDOW_S = 3600\nKEYLESS_TTL = 3600\nLIMIT_S = 300\n")
+    subprocess.run(["git", "add", "vals.py"], cwd=p.root, check=True, capture_output=True)
+    subprocess.run(["git", "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "v"], cwd=p.root, check=True,
+                   capture_output=True)
+    got = rm.older(p, p.db, "the nightly report email is taking an hour, make it 5 min")
+    assert not [g for g in got if g["where"] == "code"], got
+    got = rm.older(p, p.db, "the crash window of an hour is too long, make it 5 min")
+    assert [g["name"] for g in got if g["where"] == "code"] == ["CRASH_WINDOW_S"]   # name and value both match
 
 
 def test_rulematch_finds_nothing_for_unrelated_text(env):

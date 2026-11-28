@@ -5,7 +5,7 @@ that speak on the same topic, listed the day the user says it so they are retire
 Topic words are the message's subject words (correction.ask_words, stemmed, the project's common talk
 dropped); a memory entry or charter item matches by half the topic words (two at least) or a shared anchor, a
 config key or an UPPER_SNAKE constant by sharing two topic words or one beside a value equal to a
-duration in the message (a constant also by that value alone, or a name in a matched memory entry). Durations are normalised to seconds (`durations`), so 'an hour', '60 min' and '3600 s'
+duration in the message (a constant also beside a name a matched memory entry gives); a value alone never matches. Durations are normalised to seconds (`durations`), so 'an hour', '60 min' and '3600 s'
 name one value. `note` runs where correction.flag reads a message and stores kv `rulematch:<msg id>`;
 `digest_lines` shows it for OPEN_S, the window to retire or rewrite them.
 """
@@ -111,7 +111,7 @@ def older(p, db, text: str) -> list[dict]:
     for loc, name, v in _constants(p, cfg):
         shared = len(said & {reask._stem(w) for w in name.lower().split("_")})
         n = shared + (name in named) + 2 * (_seconds(v) in dur)
-        if n and (shared >= 2 or name in named or _seconds(v) in dur):   # one shared word alone is no match
+        if shared and (shared >= 2 or name in named or _seconds(v) in dur):   # a topic word in the name, and a second reason
             found.append((n, {"where": "code", "name": name, "line": f"{loc} {name} = {v}",
                                                 "value": v}))
     return [x for _, x in sorted(found, key=lambda f: -f[0])[:MAX]]
