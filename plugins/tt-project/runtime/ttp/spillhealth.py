@@ -125,9 +125,9 @@ def probe(targets: list[tuple[str, list[str], bool]], now: float | None = None) 
 
 
 def targets(cfg: dict | None, p=None) -> list[tuple[str, list[str], bool]]:
-    """(host, wrap, build: checkspill.install) for each spill host; given project `p`, only those checkspill.allowed lets it use (not
+    """(host, wrap, build: checkspill.may_install) for each spill host; given project `p`, only those checkspill.allowed lets it use (not
     paused, held, retired, banned or missing from the machines list), so none of those is probed."""
-    wrap, build = wrap_words(cfg), checkspill.install(cfg)
+    wrap, build = wrap_words(cfg), checkspill.may_install(cfg)
     return [(h, wrap, build) for h in checkspill.hosts(cfg) if p is None or not checkspill.allowed(p, cfg or {}, h)]
 
 

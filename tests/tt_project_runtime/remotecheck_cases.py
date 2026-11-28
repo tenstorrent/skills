@@ -5868,7 +5868,7 @@ def test_a_spill_host_without_a_ready_checks_env_installs_nothing_unless_the_pro
     on = env_line(runnerenv.remote_lines(None, "x", "y"))
     assert "PIP_RETRIES=" in on and "--no-install" not in on
     p, repo, run, remote = _spill_setup(env, tmp_path, monkeypatch, ["check-host-b"])
-    assert checkspill.install(p.config()) is False
+    assert checkspill.may_install(p.config()) is False
     assert [b for _, _, b in spillhealth.targets(p.config())] == [False]
     assert "PIP_" not in env_line(spillhealth.script([], False)) and "--no-install" in spillhealth.script([], False)
     none = str(tmp_path / "none")

@@ -758,7 +758,7 @@ def install_of(v: Any) -> bool:
         raise ValueError(f"checks.{INSTALL_KEY}: {v!r} is not true or false; nothing was changed") from None
 
 
-def install(cfg: dict | None) -> bool:
+def may_install(cfg: dict | None) -> bool:
     """Whether a spill host may build the pinned checks env from its package index (checks.spill_install;
     unset or malformed: no). No: a host without a ready env takes no check (runnerenv.remote_lines)."""
     checks = (cfg or {}).get("checks")

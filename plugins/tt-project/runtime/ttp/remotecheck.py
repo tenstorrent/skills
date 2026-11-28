@@ -618,7 +618,7 @@ def main(args: list[str]) -> int:
     mark = f"ttp-remote-rc:{secrets.token_hex(8)}:"
     from . import checkspill
     # A spill host builds the env only where the project lets it (checks.spill_install); a check host always may.
-    build = not spill or checkspill.install(checkspill.config_of(spill))
+    build = not spill or checkspill.may_install(checkspill.config_of(spill))
     try:   # the pinned Python env there, as here (runnerenv): no env, no run (NO_ENV)
         from . import runnerenv
         extra = shipped(py, literal) + runnerenv.remote_lines(os.environ.get(runnerenv.LOCK_ENV), ENV_DIR,
