@@ -55,8 +55,8 @@ def test_rulematch_a_value_alone_never_matches_a_constant(env):
                    capture_output=True)
     got = rm.older(p, p.db, "the nightly report email is taking an hour, make it 5 min")
     assert not [g for g in got if g["where"] == "code"], got
-    got = rm.older(p, p.db, "the crash window of an hour is too long, make it 5 min")
-    assert [g["name"] for g in got if g["where"] == "code"] == ["CRASH_WINDOW_S"]   # name and value both match
+    got = rm.older(p, p.db, "the crash handling of an hour is too long, make it 5 min")
+    assert [g["name"] for g in got if g["where"] == "code"] == ["CRASH_WINDOW_S"]   # one name word plus the value
 
 
 def test_rulematch_finds_nothing_for_unrelated_text(env):
