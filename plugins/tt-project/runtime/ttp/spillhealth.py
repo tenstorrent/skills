@@ -4,7 +4,8 @@
 list and the account pool), so no host keeps getting runs it can only fail.
 
 The check, over ssh within PROBE_TIMEOUT_S: python3 is there, the pinned checks env is made or reused
-there (runnerenv.remote_lines), and `<spill_wrap_cmd> python3 -c 'import pytest'` exits 0. A wrapper that
+there (runnerenv.remote_lines; only reused unless the project sets checks.spill_install, so a host without a
+ready one fails with that reason, never a config fault), and `<spill_wrap_cmd> python3 -c 'import pytest'` exits 0. A wrapper that
 refuses the run (it writes the file remotecheck.WRAP_REFUSED_ENV names, then exits FAULT_RC) is busy, not
 failing. No model and no claude CLI runs there. A wrapper given as a path relative to the project's tree
 cannot run without a copy of its commit, so the import then runs without it.
@@ -56,26 +57,26 @@ def wrap_words(cfg: dict | None) -> list[str]:
     return [] if words and "/" in words[0] and not words[0].startswith(("/", "~")) else list(words)
 
 
-def _file(host: str, wrap: list[str]) -> Path:
-    tag = hashlib.sha256(json.dumps(wrap).encode()).hexdigest()[:8]
+def _file(host: str, wrap: list[str], build: bool = True) -> Path:
+    tag = hashlib.sha256(json.dumps(wrap if build else [wrap, "no-install"]).encode()).hexdigest()[:8]
     return checkspill.claim_dir() / f"{host}.{tag}.health"
 
 
-def read(host: str, wrap: list[str]) -> dict:
+def read(host: str, wrap: list[str], build: bool = True) -> dict:
     try:
-        r = json.loads(_file(host, wrap).read_text())
+        r = json.loads(_file(host, wrap, build).read_text())
         return r if isinstance(r, dict) else {}
     except (OSError, ValueError):
         return {}
 
 
-def script(wrap: list[str]) -> str:
+def script(wrap: list[str], build: bool = True) -> str:
     refused = f"{WHERE}/refused"
     # As a check run (remotecheck._run_script): the wrapper under the real HOME, what it runs under the scratch one.
     run = (f'env HOME="${{{remotecheck.REAL_HOME}:-$HOME}}" {shlex.join(wrap)} env HOME="$HOME" ' if wrap else "") \
         + shlex.join(["python3", "-c", "import pytest"])
     return ("command -v python3 >/dev/null 2>&1 || { echo 'no python3 on PATH'; exit 4; }\n"
-            + runnerenv.remote_lines(None, WHERE, "exit 5")
+            + runnerenv.remote_lines(None, WHERE, "exit 5" if build else "exit 6", build)
             + f"mkdir -p {WHERE}; rm -f {refused}; export {remotecheck.WRAP_REFUSED_ENV}=\"$PWD\"/{refused}\n"
             + f"out=$({run} 2>&1); rc=$?\n"
             + "printf '%s\\n' \"$out\" | tail -n 3\n"
@@ -83,9 +84,9 @@ def script(wrap: list[str]) -> str:
             + "exit $rc\n")
 
 
-def check(host: str, wrap: list[str]) -> dict:
-    """One probe of `host`: {state: ok|fail|busy, why}."""
-    argv = remotecheck._ssh(host, script(wrap))
+def check(host: str, wrap: list[str], build: bool = True) -> dict:
+    """One probe of `host`: {state: ok|fail|busy, why}; `build` false: the pinned env must be there already."""
+    argv = remotecheck._ssh(host, script(wrap, build))
     try:
         r = subprocess.run(argv, capture_output=True, text=True, timeout=PROBE_TIMEOUT_S)
     except subprocess.TimeoutExpired:
@@ -97,35 +98,37 @@ def check(host: str, wrap: list[str]) -> dict:
         return {"state": "ok", "why": ""}
     if r.returncode == 75:
         return {"state": "busy", "why": "its spill wrapper refused the run"}
+    if r.returncode == 6:   # the project's setting, not a host fault (apply: never a config fault)
+        return {"state": "fail", "why": runnerenv.NO_INSTALL, "no_install": True}
     why = {255: "ssh failed", 4: "no python3", 5: "the pinned checks env could not be made",
            127: "the spill wrapper is missing", 76: "it exited 75 without writing its refusal file"}.get(r.returncode, f"`import pytest` exited {r.returncode}")
     return {"state": "fail", "why": f"{why}: {tail}" if tail else why}
 
 
-def probe(targets: list[tuple[str, list[str]]], now: float | None = None) -> None:
-    """Probe each (host, wrap) whose shared result is older than EVERY_S; a host another daemon is probing
+def probe(targets: list[tuple[str, list[str], bool]], now: float | None = None) -> None:
+    """Probe each (host, wrap, build) whose shared result is older than EVERY_S; a host another daemon is probing
     is left to it. Runs in a thread: it writes only the shared result files."""
-    for host, wrap in targets:
+    for host, wrap, build in targets:
         now_ = time.time() if now is None else now
-        if now_ - float(read(host, wrap).get("at") or 0) < EVERY_S:
+        if now_ - float(read(host, wrap, build).get("at") or 0) < EVERY_S:
             continue
-        f = _file(host, wrap)
+        f = _file(host, wrap, build)
         f.parent.mkdir(parents=True, exist_ok=True)
         with open(f.with_suffix(".lock"), "a") as lk:
             try:
                 fcntl.flock(lk, fcntl.LOCK_EX | fcntl.LOCK_NB)
             except OSError:
                 continue
-            if now_ - float(read(host, wrap).get("at") or 0) < EVERY_S:
+            if now_ - float(read(host, wrap, build).get("at") or 0) < EVERY_S:
                 continue
-            project.durable_write(f, json.dumps({**check(host, wrap), "at": now_}))
+            project.durable_write(f, json.dumps({**check(host, wrap, build), "at": now_}))
 
 
-def targets(cfg: dict | None, p=None) -> list[tuple[str, list[str]]]:
-    """(host, wrap) for each spill host; given project `p`, only those checkspill.allowed lets it use (not
+def targets(cfg: dict | None, p=None) -> list[tuple[str, list[str], bool]]:
+    """(host, wrap, build: checkspill.install) for each spill host; given project `p`, only those checkspill.allowed lets it use (not
     paused, held, retired, banned or missing from the machines list), so none of those is probed."""
-    wrap = wrap_words(cfg)
-    return [(h, wrap) for h in checkspill.hosts(cfg) if p is None or not checkspill.allowed(p, cfg or {}, h)]
+    wrap, build = wrap_words(cfg), checkspill.install(cfg)
+    return [(h, wrap, build) for h in checkspill.hosts(cfg) if p is None or not checkspill.allowed(p, cfg or {}, h)]
 
 
 def _loopback(host: str, why: str) -> bool:
@@ -150,7 +153,7 @@ def apply(p, cfg: dict | None, now: float | None = None) -> list[str]:
     """Act on the shared results for project `p`: hosts it took out (quarantined) or brought back."""
     now = time.time() if now is None else now
     tg = targets(cfg, p)
-    res = {h: read(h, w) for h, w in tg}
+    res = {h: read(h, w, b) for h, w, b in tg}
     res = {h: r for h, r in res.items() if r.get("state") in ("ok", "fail", "busy") and now - float(r.get("at") or 0) < 3 * EVERY_S}
     # Until every host has a fresh result, a few failures cannot be told from a config fault: take none out yet.
     whole = bool(res) and len(res) == len(tg)
@@ -181,7 +184,7 @@ def apply(p, cfg: dict | None, now: float | None = None) -> list[str]:
                     checkspill._event(p.db, now, "spill-health-bridge:back", "low",
                                       f"The workstation tunnel is back: {p.name}'s spill hosts behind it can be "
                                       f"reached again.")
-        rest = {h: r for h, r in failing.items() if h not in tun}
+        rest = {h: r for h, r in failing.items() if h not in tun and not r.get("no_install")}
         if len(rest) >= checkspill.CONFIG_FAULT_HOSTS and len(failing) == len(res):   # fewer: each its own host
             with p.db.tx():
                 if not _told(p.db, "spill-health-config", now):
@@ -189,7 +192,7 @@ def apply(p, cfg: dict | None, now: float | None = None) -> list[str]:
                     checkspill._event(p.db, now, "spill-health-config", "high",
                                       f"Every spill host failed its health check at once ({', '.join(sorted(rest))}): "
                                       f"a config fault, so none was taken out. {why}")
-            failing = {h: r for h, r in failing.items() if h in tun}
+            failing = {h: r for h, r in failing.items() if h in tun or r.get("no_install")}
     for host, r in res.items():
         with p.db.tx():
             doc = checkspill._strikes(p.db)

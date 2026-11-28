@@ -143,6 +143,7 @@ PRE_KEY = "spill_pre_cmd"   # checks.spill_pre_cmd: the project's own go/skip co
 PRE_TIMEOUT_S = 30
 PRE_SKIP_RC = 75   # the pre-run hook's "not now": the host is skipped this time, no error
 AFTER_KEY = "checks_spill_after_s"
+INSTALL_KEY = "spill_install"   # checks.spill_install: a spill host may build the pinned checks env (install)
 FIRST_KEY = "checks_spill_first"   # delivery.checks_spill_first: a spillable run tries the spill hosts before a place here (first)
 REMOTE_ONLY_KEY = "checks_remote_only"   # delivery.checks_remote_only: on a workstation a busy pool is waited for (remote_only)
 REMOTE_ONLY_ENV = "TTP_TEST_REMOTE_ONLY"   # tests: "1"/"0" instead of this machine's kind when the setting is unset
@@ -565,13 +566,7 @@ def off_list(project_dir: str, alias: str) -> str:
     """Why spill host `alias` may no longer take a check of the project at `project_dir`, or "": hosts() of
     its settings as they are now no longer lists it (taken off its list or the account's pool, or banned).
     A folder that is no project, or settings that cannot be read, say nothing (the pick checked them)."""
-    from .project import Project
-    try:
-        p = Project(project_dir)
-        if not p.exists():
-            return ""
-        cfg = p.config()
-    except Exception:
+    if (cfg := config_of(project_dir)) is None:
         return ""
     listed = hosts(cfg)
     if alias in listed:
@@ -753,6 +748,35 @@ def first_of(v: Any) -> bool:
     if t in ("0", "false", "no", "off"):
         return False
     raise ValueError(f"delivery.{FIRST_KEY}: {v!r} is not true or false; nothing was changed")
+
+
+def install_of(v: Any) -> bool:
+    """A `checks.spill_install` value set by `ttp config`: true or false."""
+    try:
+        return first_of(v)
+    except ValueError:
+        raise ValueError(f"checks.{INSTALL_KEY}: {v!r} is not true or false; nothing was changed") from None
+
+
+def install(cfg: dict | None) -> bool:
+    """Whether a spill host may build the pinned checks env from its package index (checks.spill_install;
+    unset or malformed: no). No: a host without a ready env takes no check (runnerenv.remote_lines)."""
+    checks = (cfg or {}).get("checks")
+    try:
+        return install_of(checks.get(INSTALL_KEY, False)) if isinstance(checks, dict) else False
+    except ValueError:
+        return False
+
+
+def config_of(project_dir: str) -> dict | None:
+    """The settings of the project at `project_dir` as they are now; None for a folder that is no project, or
+    settings that cannot be read."""
+    from .project import Project
+    try:
+        p = Project(project_dir)
+        return p.config() if p.exists() else None
+    except Exception:
+        return None
 
 
 def first(cfg: dict | None) -> bool:

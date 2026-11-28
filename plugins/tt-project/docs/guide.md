@@ -3270,7 +3270,9 @@ the pick order, so it takes the first starts. A resumed resource ramps only its 
   on this machine while the run's other checks (pytest) spill, and the run gives one verdict for both parts. A
   failure of the part kept here counts at once. Only a check that is not a test suite or build splits off this
   way, so a spill host needs git, tar and what its checks run (python3 and the checks env for pytest), never an
-  agent CLI or its sign-in. A check whose script file calls one says `"host": "local"`. A device job means one of the host's device
+  agent CLI or its sign-in. The checks env is built there only when the project sets `checks.spill_install`
+  to `true` (default `false`): until then no package is downloaded onto a spill host, and one without a ready env
+  of the same lock and interpreter is skipped, with `no ready checks env; install off` on its `ttp status` line. A check whose script file calls one says `"host": "local"`. A device job means one of the host's device
   locks (`<alias>-device`, the device names of its machines-list `shared` entry, `device.locks` names on it)
   is held, reserved or waited for (a pool check run's own hold of the host's lock is none, even when `device.locks`
   lists the bare alias), or a broker heal check (preset broker) of the project on that machine

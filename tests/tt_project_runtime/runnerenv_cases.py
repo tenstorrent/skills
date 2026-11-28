@@ -45,6 +45,19 @@ def test_runnerenv_reuses_an_env_and_a_lock_change_builds_beside_it(tmp_path, mo
     assert "python env " + second["key"] in runnerenv.describe(second)
 
 
+
+def test_runnerenv_without_build_reuses_a_ready_env_and_never_makes_one(tmp_path, monkeypatch):
+    # ensure(build=False), as a spill host runs it with checks.spill_install off: no env, no build (NO_INSTALL)
+    runnerenv, builds = _fake_base(tmp_path, monkeypatch)
+    lock = tmp_path / "a.lock"
+    lock.write_text("pytest==8.4.2\n")
+    with pytest.raises(runnerenv.Unavailable, match="install off"):
+        runnerenv.ensure(lock, build=False)
+    assert builds() == 0 and not runnerenv.root().exists()
+    made = runnerenv.ensure(lock)
+    runnerenv._ready.clear()
+    assert runnerenv.ensure(lock, build=False)["path"] == made["path"] and builds() == 1
+
 def test_runnerenv_rebuilds_a_broken_env_into_a_new_folder_and_moves_the_link(tmp_path, monkeypatch):
     runnerenv, builds = _fake_base(tmp_path, monkeypatch)
     lock = tmp_path / "a.lock"
