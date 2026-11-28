@@ -42,3 +42,30 @@ def test_a_failing_source_does_not_hold_a_priority_task(env):
     new = lambda **k: p.db.task(p.db.add_task("new", k.pop("spec", "s"), kind="work", tier="light", origin="harness", **k))
     assert bud.waste_hold(g, new())
     assert not bud.waste_hold(g, new(spec="urgent: ordered"), True), "the daemon passes Daemon._priority_task"
+
+
+def test_dispatch_holds_a_failing_loops_routine_task_but_not_an_urgent_or_ordered_one(env, monkeypatch):
+    p = make(env)
+    from ttp import budget as bud
+    from ttp.daemon import Daemon
+    now = time.time()
+    p.db.x("UPDATE tasks SET status='done'")
+    for i in range(3):
+        _wh_failures(p, p.db.add_task(f"chore {i}", "s", kind="work", tier="light", origin="harness"), [4.0, 4.0], now, 2 * i)
+    d = Daemon(p.base)
+    prov = "claude"   # the provider the failed runs are on
+    d.gates = {prov: bud.evaluate(p.db, p.config(), prov, [], now)}
+    g = d.gates[prov]
+    assert {h["origin"] for h in g.waste_holds} - {None} == {"harness"}, (prov, g.level, g.reasons, g.waste_holds)
+    for name in ("_branch_clash", "_disk_holds", "_precheck_holds", "_required_model_down"):
+        monkeypatch.setattr(d, name, lambda *a: None)
+    monkeypatch.setattr(d, "_premise_fresh", lambda *a: True)
+    new = lambda spec, **k: p.db.task(p.db.add_task("new", spec, kind="work", tier="light", origin="harness", **k))
+
+    def held(task):
+        ctx = {"now": now, "paused": {}, "committed": None, "busy": {}, "logged_out": {}, "live": []}
+        return d._start_hold(task, prov, ctx) == "held" and ctx["held_by"].get(task["id"], "")
+
+    assert "new harness tasks held" in held(new("s")), "a routine task of the failing source waits"
+    assert not held(new("urgent: ordered")), "an urgent task of the failing source starts"
+    assert not held(new("s", priority=1)), "a priority-1 task of the failing source starts"

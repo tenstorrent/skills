@@ -14056,8 +14056,9 @@ class Daemon:
             return "net"
         gate = self.gates.get(provider) or bud.evaluate(self.p.db, self.cfg, provider, bud.plan_windows(self.p.db))
         # The coordinator turn guard holds routine work only: urgent and user-ordered tasks start under the rest.
-        gate = ctx["gate"] = bud.for_task(gate, bool(getattr(gate, "lane", None)) and self._priority_task(task, ctx))
-        if hold := bud.waste_hold(gate, task, self._priority_task(task, ctx)):   # the task or loop that wasted: no other task is held by it
+        priority = self._priority_task(task, ctx)
+        gate = ctx["gate"] = bud.for_task(gate, bool(getattr(gate, "lane", None)) and priority)
+        if hold := bud.waste_hold(gate, task, priority):   # the task or loop that wasted: no other task is held by it
             ctx["held_by"][task["id"]] = bud.waste_hold_words(hold, timefmt.short(hold["until"], self.cfg, now))
             return "held"
         if "owners" not in ctx:   # an obligation's required owner ranks ahead of urgent work (db.ready_tasks)
