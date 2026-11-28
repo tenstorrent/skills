@@ -9687,6 +9687,36 @@ def test_a_rebase_whose_delta_its_checks_cover_runs_them_again(env, monkeypatch)
     assert cli._carried_pass(p, repo, h2, tree, cmds, "main") is None
 
 
+def test_checks_whose_project_checks_all_skip_reuse_the_pass_recorded_on_that_exact_head(env, tmp_path, monkeypatch):
+    # A change whose only project check skips (if_exists absent), passed by its task with a command
+    # after `--`: a review's plain `ttp checks` on that same head reuses that pass.
+    from ttp import cli
+    p, repo, run, git = _checks_repo(env, tmp_path, monkeypatch)
+    main = subprocess.run([*git, "branch", "--show-current"], capture_output=True, text=True).stdout.strip()
+    subprocess.run([*git, "checkout", "-qb", "change"], check=True)
+    (repo / "b.txt").write_text("b\n")
+    subprocess.run([*git, "add", "b.txt"], check=True)
+    subprocess.run([*git, "commit", "-qm", "b"], check=True)
+    p.set_config("delivery.push_checks", [COND])
+    p.set_config("delivery.push_branch", main)
+    cli.main(["checks", "--", "test", "-f", "b.txt"])
+    cli.main(["checks"])
+    assert json.loads((run / "checks.json").read_text())["passed"] is True
+    assert "recorded on exactly this head in run 41" in (run / "checks.log").read_text()
+    # The same tree under another commit is not that head: its checks find nothing that applies.
+    subprocess.run([*git, "commit", "-q", "--amend", "-m", "b2"], check=True)
+    with pytest.raises(SystemExit) as e:
+        cli.main(["checks"])
+    assert e.value.code == 1 and json.loads((run / "check_failure.json").read_text())["kind"] == "none_apply"
+    # Nor is a head with a change of its own: with no check applying, it fails as before.
+    (repo / "c.txt").write_text("c\n")
+    subprocess.run([*git, "add", "c.txt"], check=True)
+    subprocess.run([*git, "commit", "-qm", "c"], check=True)
+    with pytest.raises(SystemExit) as e:
+        cli.main(["checks"])
+    assert e.value.code == 1 and json.loads((run / "check_failure.json").read_text())["kind"] == "none_apply"
+
+
 def test_an_urgent_review_held_by_its_pre_checks_names_the_host_checks_slot_wait(env, monkeypatch):
     # The urgent-wait observation said "a disk guard or its review's pre-checks"; it names the real hold.
     from ttp import checkcap, cli

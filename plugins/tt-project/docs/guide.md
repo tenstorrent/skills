@@ -2994,7 +2994,9 @@ the pick order, so it takes the first starts. A resumed resource ramps only its 
   repo path or glob (a directory counts by its files) looked up in the commit being checked. A
   skipped check is logged as `skipped (not applicable: ...)` by `ttp push`, the push queue and
   `ttp checks` (in `checks.log`), and never counts as passed: when every check is skipped the
-  push or `ttp checks` fails. Plain string checks never skip; `after_push` takes the same form.
+  push or `ttp checks` fails, unless `ttp checks` finds a pass recorded on exactly that commit (its
+  task's `ttp checks -- <cmd>`), which it reuses. Plain string checks never skip; `after_push` takes
+  the same form.
 - A check that covers only some paths can be scoped by them:
   `{"run": "pytest -q tests", "if_changed": ["src/**", "tests/**"]}` (one glob or a list, matched
   as `delivery.push_exclude_paths` is). It is skipped, and logged as `skipped (not applicable:

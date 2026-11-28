@@ -4136,26 +4136,28 @@ def _spill_to(todo: list, host: str, cfg: dict | None = None, workers: int = 0) 
     return out
 
 
-def _recorded_pass(p: Project | None, tree: str, cmds: list, purpose: str = "candidate",
-                   envs: list[str] | None = None) -> dict | None:
+def _recorded_pass(p: Project | None, tree: str, cmds: list | None, purpose: str = "candidate",
+                   envs: list[str] | None = None, head: str = "") -> dict | None:
     """The recorded pass of exactly these commands, in this order, on this tree, for this purpose, or
     None. A pass of more commands that start with these is one of these too: they ran first, in order,
     and passed (the daemon's pre-started checks run the project's checks alone; a worker ran them with
     its own after `--`). A pass for the other purpose never counts (a record without one is candidate).
     With `envs` (pushpass.check_envs of the commands), only a pass recorded under the same
     environment for each of them counts; one recorded without it never does. A suite pass of one
-    command (_suite_pass) is no pass of a call and never counts here."""
+    command (_suite_pass) is no pass of a call and never counts here. With `head`, only a pass recorded
+    on exactly that commit (its `at` head, _carry_ref) counts, and `cmds` None takes one of any commands:
+    what a call whose project checks all skip there reuses instead of failing none_apply."""
     if not p or not tree:
         return None
     try:
         passes = json.loads((p.state / CHECK_PASSES).read_text()).get("passes")
     except (OSError, ValueError, AttributeError):
         return None
-    key = _commands_hash(cmds)
+    key = _commands_hash(cmds) if cmds is not None else None
     for e in reversed(passes if isinstance(passes, list) else []):
         if isinstance(e, dict) and not e.get("suite") and e.get("tree") == tree \
-                and e.get("purpose", "candidate") == purpose and (
-                e.get("commands") == key or key in (e.get("prefixes") or ())) and (
+                and e.get("purpose", "candidate") == purpose and (not head or e.get("head") == head) and (
+                key is None or e.get("commands") == key or key in (e.get("prefixes") or ())) and (
                 envs is None or (isinstance(e.get("envs"), list) and e["envs"][:len(envs)] == list(envs))):
             return e
     return None
@@ -5031,6 +5033,14 @@ def _cmd_checks(a) -> None:
         elif not todo and passed and push.outside_scope(cmds, skipped):
             out.write(f"{push.OUT_OF_SCOPE}\n")
             print(f"ttp checks: {push.OUT_OF_SCOPE}")
+        elif not todo and passed and not a.fresh and (got := _recorded_pass(p, tree, None, purpose, head=head)):
+            rl = str(got.get("log") or "")
+            said = (f"every project check is skipped on {head[:12]}; the pass of "
+                    f"{len(got.get('prefixes') or ()) + 1} command(s) recorded on exactly this head in run "
+                    f"{got.get('run') or '?'} at {timefmt.long(float(got.get('ts') or 0), p)} stands for them"
+                    + (f" (full output: {rl})" if rl and Path(rl).is_file() else ""))
+            out.write(f"{said}\n")
+            print(f"ttp checks: {said}")
         elif not todo and passed:
             out.write(f"{push.NONE_APPLY}\n")
             passed, failed = False, push.NONE_APPLY
