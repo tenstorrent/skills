@@ -6080,7 +6080,7 @@ def test_a_spill_ssh_the_runs_guard_refuses_is_an_environment_fault_never_the_ho
 def test_a_guarded_runs_spill_check_makes_its_temp_files_in_the_runs_own_scratch(env, cred_home, tmp_path):
     """A run whose Python the run-time judge limits to its worktree, run folder and scratch runs a check on a fake
     host: the judge refuses a temporary file in the harness's own scratch folder of a shared temp dir, where the check's
-    TMPDIR is, so the check passes only with remotecheck.guarded_tmp pointing tempfile at the run's scratch."""
+    TMPDIR is, so the refusal log stays free of it only with remotecheck.guarded_tmp pointing tempfile at the run's scratch."""
     from ttp import remotecheck
     bin_, remote = _rc_fake_ssh(tmp_path)
     repo = _rc_repo(tmp_path)
