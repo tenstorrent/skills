@@ -1474,6 +1474,7 @@ def digest_parts(p: Project, gates: dict, event_ids: list[int], msg_ids: list[in
                      + (" · " + bud.coord_hold_words(g["coord_hold"], "in %.0f min" % ((float(g["coord_hold"]["until"]) - now) / 60))
                         if float((g.get("coord_hold") or {}).get("until") or 0) > now else "")
                      + (f" · unblock path: {path}" if path else ""))
+    lines += ["- " + w for w in bud.waste_hold_lines(gates, now, lambda ts: "in %.0f min" % ((ts - now) / 60))]
     # Once, not per provider: the caps bound every usage-billed provider's spend together.
     lines.append("- project caps (usage-billed providers together): " + bud.caps_line(db, gates, b, now, home))
     lines.append(f"- per-task default budgets: {b.get('task_default_usd')}")

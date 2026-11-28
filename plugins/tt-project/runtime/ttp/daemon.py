@@ -9480,6 +9480,15 @@ class Daemon:
                 self.p.db.set_kv("budget_red_episodes", {**known, **episodes})
             for text, sev, ref in news:
                 self.p.db.post("out", text, chat=None, kind="alert", severity=sev, ref=ref)
+            for prov, g in gates.items():   # one event per hold episode: the coordinator decides what to do
+                old = {(h["task"], h["origin"]) for h in (self.gates.get(prov) or _saved_gate(saved.get(prov))
+                                                          or bud.Gate(prov)).waste_holds}
+                for h in g.waste_holds:
+                    if (h["task"], h["origin"]) not in old:
+                        self.p.db.x("INSERT INTO events(ts,source,kind,severity,text,data,status,task) VALUES(?,?,?,?,?,?,?,?)",
+                                    (now, "harness", "task_waste_hold", "normal",
+                                     bud.waste_hold_words(h, timefmt.short(h["until"], self.cfg, now)),
+                                     json.dumps(h), "queued", h["task"]))
         self.gates = gates
         # A login with no plan readings of its own yet, its kind unknown: the dollar caps hold it
         # meanwhile (the stricter side). A self-clearing status line, never "needs you": its next run
@@ -14019,6 +14028,9 @@ class Daemon:
         gate = self.gates.get(provider) or bud.evaluate(self.p.db, self.cfg, provider, bud.plan_windows(self.p.db))
         # The coordinator turn guard holds routine work only: urgent and user-ordered tasks start under the rest.
         gate = ctx["gate"] = bud.for_task(gate, bool(getattr(gate, "lane", None)) and self._priority_task(task, ctx))
+        if hold := bud.waste_hold(gate, task):   # the task or loop that wasted: no other task is held by it
+            ctx["held_by"][task["id"]] = bud.waste_hold_words(hold, timefmt.short(hold["until"], self.cfg, now))
+            return "held"
         if "owners" not in ctx:   # an obligation's required owner ranks ahead of urgent work (db.ready_tasks)
             ctx["owners"] = self._owner_due()
         # Deadline work may take budget.urgent_extra_slots burst slots beyond them. A stated urgent task

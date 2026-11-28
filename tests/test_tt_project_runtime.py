@@ -20830,16 +20830,14 @@ def test_a_power_cycle_intent_in_the_machine_ledger_makes_this_hosts_reboot_plan
     assert "new firmware" in n["text"] and not any(w in n["text"] for w in _UNSTABLE_WORDS), n
 
 
-def test_runs_lost_on_the_same_boot_still_trip_the_runaway_guard(env, tmp_path):
+def test_runs_lost_on_the_same_boot_still_hold_their_tasks_in_the_runaway_guard(env, tmp_path):
     p = make(env)
     from ttp.daemon import Daemon
     d = Daemon(p.base)
-    _lost_deep_runs(p, tmp_path, d.boot)
-    nxt = p.db.add_task("next", "s", kind="work", tier="light", origin="user")
+    lost, _ = _lost_deep_runs(p, tmp_path, d.boot)
     d.tick()
     g = d.gates["fake"]
-    assert g.level == "red" and any("failed or stalled" in r for r in g.reasons), g.reasons
-    assert not p.db.q("SELECT id FROM runs WHERE task=?", (nxt,))
+    assert g.level != "red" and sorted(h["task"] for h in g.waste_holds) == sorted(lost), (g.level, g.waste_holds)
     assert not _reboot_notices(p)
 
 

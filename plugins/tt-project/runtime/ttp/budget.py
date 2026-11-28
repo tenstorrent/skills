@@ -99,6 +99,10 @@ class Gate:
     # self-started coordinator turn before `until` (user messages and must-act items excepted); worker
     # runs are not held by it. Empty otherwise.
     coord_hold: dict = field(default_factory=dict)
+    # The tasks (and loop sources) the waste signal holds: [{"task": id or None, "origin": name or None,
+    # "usd", "runs", "setting", "limit", "until"}]. The daemon starts none of them before `until`; every
+    # other task starts as the rest of the gate allows. Empty otherwise.
+    waste_holds: list = field(default_factory=list)
 
     def as_dict(self) -> dict:
         return asdict(self)
@@ -385,7 +389,8 @@ def evaluate(db: DB, cfg: dict, provider: str, windows: list[Window], now: float
 
     # Runaway guard: catch loops, not busy projects. Three signals over the last hour:
     # - waste: spend on runs that ended without an outcome (failed, stalled, timed out, lost), except
-    #   runs a reboot cut short or whose hand-off stood;
+    #   runs a reboot cut short or whose hand-off stood. It holds the task or loop that wastes
+    #   (Gate.waste_holds), never the project: the gate level does not move;
     # - coordinator: no dollar signal. The always-on session coordinator optimizes its own cost inside
     #   the dollar caps, which bound it with everything else; its self-started spend is only shown
     #   (coordinator_1h). Loops show as turns re-woken on the same evidence (on a plan, below);
@@ -415,7 +420,7 @@ def evaluate(db: DB, cfg: dict, provider: str, windows: list[Window], now: float
     # The waste limit is per worker: parallel workers each losing a run (a shared device kept them
     # all waiting) are not a loop. Workers are the most tasks whose wasted runs went at once, so one
     # task failing over and over, or new tasks failing one after another, count as one worker.
-    spans = [r for r in db.q(f"SELECT task, started, ended, status, note FROM runs WHERE provider=? "
+    spans = [r for r in db.q(f"SELECT task, started, ended, status, note, cost_usd FROM runs WHERE provider=? "
                              f"AND role!='coordinator' AND ended>=? AND status IN ({','.join('?' * len(WASTED))})",
                              (provider, hour_ago, *WASTED)) if wasted(r)]
     workers = min(max(_peak_tasks(spans, now), 1), max(spend_workers(db, int(b.get("max_parallel_workers", 6))), 1))
@@ -428,18 +433,10 @@ def evaluate(db: DB, cfg: dict, provider: str, windows: list[Window], now: float
                       "coordinator_1h": round(thrash, 2), "coordinator_user_1h": round(asked, 2)})
     if virtual:
         # On a plan a costly failed run is no loop by itself: count the wasted runs instead.
-        lost = sum(1 for r in runs_h if wasted(r))
-        lost_cap = int(b.get("hourly_waste_runs", 4)) * workers
-        g.numbers.update({"waste_runs_1h": lost, "waste_runs_limit": lost_cap})
-        shares.append(_share(lost, lost_cap))
-        if lost > lost_cap:
-            _raise(g, "red", f"runaway guard: {lost} failed or stalled runs in the last hour "
-                             f"(limit {lost_cap}); resumes automatically as the hour rolls over")
-    else:
-        shares.append(_share(waste, waste_cap))
-    if not virtual and waste > waste_cap:
-        _raise(g, "red", f"runaway guard: ${waste:.2f} spent on failed or stalled runs in the last hour "
-                         f"(limit ${waste_cap:.0f}); resumes automatically as the hour rolls over")
+        g.numbers.update({"waste_runs_1h": sum(1 for r in runs_h if wasted(r)),
+                          "waste_runs_limit": int(b.get("hourly_waste_runs", 4)) * workers})
+    # Waste holds the task or loop that wastes, never the project: the gate level is not raised.
+    g.waste_holds = waste_holds(db, b, spans, virtual, workers, now)
     selfs = [r for r in coord_h if not user_turn(r)]
     same = repeated_turns(selfs)
     coord_red: list[str] = []   # the coordinator turn signals: they throttle the coordinator, see below
@@ -478,8 +475,8 @@ def evaluate(db: DB, cfg: dict, provider: str, windows: list[Window], now: float
         g.max_tier, g.max_parallel, g.allow_optional, g.allow_new_work = "light", 0, False, False
     if coord_red:
         # The coordinator turn guard throttles the coordinator, not worker dispatch: only coordinator turns
-        # spent it, and worker runs stay under their per-task budgets, the dollar caps and the waste and
-        # total signals above (their red still stops new work). The daemon runs no self-started coordinator
+        # spent it, and worker runs stay under their per-task budgets, the dollar caps, the waste holds and the
+        # total signal above (its red still stops new work). The daemon runs no self-started coordinator
         # turn before `until`, when the trailing hour is back under every tripped limit, and then gathers
         # what queued meanwhile into one wake (Daemon.maybe_coordinate); user messages and must-act items
         # still wake it at once. That turn's own spend re-trips the guard while the rate stays high, so
@@ -497,6 +494,71 @@ def rolls_under(runs: list, over, now: float | None = None) -> float:
     while rest and over(rest):
         at = float(rest.pop(0)["ended"] or 0) + HOUR
     return at
+
+
+LOOP_ORIGINS = ("schedule", "harness")   # sources that keep queuing new tasks: a failing loop's source
+
+
+def waste_holds(db: DB, b: dict, spans: list, virtual: bool, workers: int, now: float) -> list[dict]:
+    """The holds the last hour's wasted runs (`spans`: rows with task, ended, cost_usd) call for. A task
+    whose own waste passes the per-worker limit (budget.hourly_waste_usd, on a plan
+    budget.hourly_waste_runs) is held until its trailing hour is back under it. New tasks failing one
+    after another show as the other tasks' waste passing the limit for `workers` together: each task
+    that wasted is held, and so is each loop source (LOOP_ORIGINS) among them, for its new tasks."""
+    setting = "hourly_waste_runs" if virtual else "hourly_waste_usd"
+    per = float(b.get(setting, 4 if virtual else 8.0))
+
+    def total(rs: list) -> float:
+        return float(len(rs)) if virtual else sum(float(r["cost_usd"] or 0) for r in rs)
+
+    by_task: dict = {}
+    for r in spans:
+        if r["task"] is not None:
+            by_task.setdefault(r["task"], []).append(r)
+    over = {t for t, rs in by_task.items() if total(rs) > per}
+    rest = [r for t, rs in by_task.items() if t not in over for r in rs]
+    loop = total(rest) > per * workers
+    out = []
+
+    def hold(rs: list, limit: float, measured: list, **who) -> None:
+        # `rs` is what is shown, `measured` what the limit is measured on (and so when it is back under it)
+        out.append({"task": None, "origin": None, **who, "usd": round(sum(float(r["cost_usd"] or 0) for r in rs), 2),
+                    "runs": len(rs), "setting": setting, "limit": limit,
+                    "until": round(rolls_under(measured, lambda x: total(x) > limit, now), 1)})
+    for t in sorted(over):
+        hold(by_task[t], per, by_task[t], task=t)
+    if loop:
+        ids = sorted(set(by_task) - over)
+        for t in ids:
+            hold(by_task[t], per * workers, rest, task=t)
+        for o in sorted({r["origin"] for r in db.q(f"SELECT origin FROM tasks WHERE id IN ({','.join('?' * len(ids))})",
+                                                   tuple(ids))} & set(LOOP_ORIGINS)):
+            hold(rest, per * workers, rest, origin=o)
+    return out
+
+
+def waste_hold(gate: Gate | dict | None, task: dict) -> dict | None:
+    """The waste hold on `task` (its own, or its origin's when that is a failing loop's source), or None."""
+    for h in (getattr(gate, "waste_holds", None) if not isinstance(gate, dict) else gate.get("waste_holds")) or []:
+        if h.get("task") == task["id"] or (h.get("origin") and h["origin"] == task["origin"]):
+            return h
+    return None
+
+
+def waste_hold_words(h: dict, when: str) -> str:
+    """One waste hold in words for status lines and the held task's reason; `when` is its `until` as shown."""
+    who = f"task #{h['task']}" if h.get("task") is not None else f"new {h['origin']} tasks"
+    lim = f"{h['limit']:g} runs" if h["setting"] == "hourly_waste_runs" else f"${h['limit']:g}"
+    return (f"{who} held until {when}: ${h['usd']:.2f} wasted on {h['runs']} failed or stalled runs in the last hour "
+            f"passed budget.{h['setting']} ({lim}); other tasks keep starting")
+
+
+def waste_hold_lines(gates: dict | None, now: float, when) -> list[str]:
+    """Each waste hold still running in the saved gates (dicts by provider), one line each for ttp status,
+    the web app and the coordinator's digest; `when(ts)` shows a time."""
+    return [f"{prov}: " + waste_hold_words(h, when(h["until"]))
+            for prov, g in sorted((gates or {}).items()) for h in (g or {}).get("waste_holds") or []
+            if float(h.get("until") or 0) > now]
 
 
 def coord_hold_words(hold: dict | None, when: str) -> str:

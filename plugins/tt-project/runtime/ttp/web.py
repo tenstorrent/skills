@@ -528,6 +528,7 @@ def health(p: Project, db: DB, alive: bool = True, now: float | None = None) -> 
     spend["slot_lines"] = bud.slot_lines(gates, int(cfg["budget"].get("max_parallel_workers", 6) or 0), {
         r["provider"]: r["n"] for r in db.q("SELECT provider, COUNT(*) n FROM runs WHERE status='running' "
                                              "AND role!='coordinator' GROUP BY provider")})
+    spend["slot_lines"] += bud.waste_hold_lines(gates, now, lambda ts: at(ts, now, tz))   # tasks held by the waste guard
     spend["detail"] = gate_detail(g, now, tz, gates) if g else ""
     # The project caps once, with the 7 days' plan-paid spend beside the billed figure (budget.caps_line).
     spend["caps_line"] = bud.caps_line(db, gates or {}, p.config()["budget"], now, where=tz)
