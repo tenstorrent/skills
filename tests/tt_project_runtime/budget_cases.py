@@ -1089,7 +1089,7 @@ def test_runs_without_a_result_line_count_their_estimated_cost(env, tmp_path, mo
     assert started["budget_usd"] == pytest.approx(10.0 - first["cost_usd"]), "the retry got a fresh budget"
     stalled_run(2)
     g = bud.evaluate(p.db, p.config(), "claude", [])
-    assert g.level == "red" and any("failed or stalled" in r for r in g.reasons)
+    assert g.level != "red" and [h["task"] for h in g.waste_holds] == [tid], g.waste_holds
 
 
 
