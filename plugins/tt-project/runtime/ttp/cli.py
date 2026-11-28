@@ -219,8 +219,8 @@ def forward_listen(entry: dict, argv: list[str], name: str | None = None) -> int
             return 0        # the batch got here before the drop; --ack picks up from it
         now = time.time()
         if now - start >= LISTEN_CONNECTED_S or (rc != SSH_FAILED and rc >= SIGNAL_RC_BASE):
-            connected, down_since, told, delay = True, None, False, 5.0   # it was up: a new outage starts now
-        if down_since is None:   # the error that started this outage, if a working session dropped
+            connected, down_since, told, delay = True, None, False, 5.0   # it was up: a new down period starts now
+        if down_since is None:   # the error that started this down period, if a working session dropped
             down_since, drop = now, ((err, rc) if connected else None)
         if drop and sshfail.kind(drop[0], True) == "host" and not sshfail.offline(err):
             err, rc = drop      # a host rebooting times out while down: still its side, not this network
@@ -250,7 +250,7 @@ def _ssh_cmd(entry: dict, argv: list[str]) -> list[str]:
             "-o", "ServerAliveCountMax=4", "--", host, cmd]
 
 
-def _ssh(entry: dict, argv: list[str], capture: bool = False) -> subprocess.CompletedProcess:
+def _ssh_exec(entry: dict, argv: list[str], capture: bool = False) -> subprocess.CompletedProcess:
     return subprocess.run(_ssh_cmd(entry, argv), stdin=subprocess.DEVNULL if capture else None,
                           stdout=subprocess.PIPE if capture else None, stderr=subprocess.PIPE, text=True)
 
@@ -305,7 +305,7 @@ _USAGE_ERROR = re.compile(r"^[^\n:]+: error: ", re.M)   # argparse's error line 
 def _remote_ttp_version(entry: dict) -> str:
     """The ttp version on the project's machine (`ttp --version` there), or "unknown version"."""
     try:
-        r = _ssh(entry, ["--version"], capture=True)
+        r = _ssh_exec(entry, ["--version"], capture=True)
     except (OSError, subprocess.SubprocessError, SystemExit):
         return "unknown version"
     m = re.match(r"ttp (\S+)", (r.stdout or "").strip()) if r.returncode == 0 else None
@@ -318,7 +318,7 @@ def forward(entry: dict, argv: list[str], quiet: bool = False, shown: set[int] |
     listener), message lines already printed are not printed again. `failure` collects the stderr
     of a dropped connection (_dropped) instead of printing it: that caller explains the drop itself."""
     from . import sshfail
-    r = _ssh(entry, argv) if shown is None else _ssh_relay(entry, argv, shown)
+    r = _ssh_exec(entry, argv) if shown is None else _ssh_relay(entry, argv, shown)
     if shown is not None and REPLACED_MARK in (r.stderr or ""):
         # The far side said so before it went: whatever ssh reports (255, 143), this is no drop.
         sys.stderr.write(r.stderr)
@@ -368,9 +368,9 @@ def _drop_unrecognized(argv: list[str], r: subprocess.CompletedProcess) -> list[
 
 def _send_say(entry: dict, argv: list[str], client_id: str, capture: bool = False) -> subprocess.CompletedProcess:
     """`ttp say` on the project's machine, tagged with the client id it deduplicates on."""
-    r = _ssh(entry, [argv[0], f"--client-id={client_id}", *argv[1:]], capture)
+    r = _ssh_exec(entry, [argv[0], f"--client-id={client_id}", *argv[1:]], capture)
     if r.returncode == REFUSED_RC and "--client-id" in (r.stderr or ""):   # an older runtime there: send it untagged
-        r = _ssh(entry, argv, capture)
+        r = _ssh_exec(entry, argv, capture)
     if r.returncode == REFUSED_RC and "--broadcast" in (r.stderr or "") and "--broadcast" in argv:
         return _send_say(entry, _fold_broadcast(argv), client_id, capture)
     if r.returncode == REFUSED_RC and "--context" in (r.stderr or "") and "--context" in argv:
@@ -1136,7 +1136,7 @@ def remote_web(name: str, entry: dict, out: str | None) -> tuple[str, int]:
         return f"{there} (on {host})", weblink.UNVERIFIED
     m = weblink.LINK.search(there)
     if not m:
-        r = _ssh(entry, ["web", name], capture=True)
+        r = _ssh_exec(entry, ["web", name], capture=True)
         m = weblink.LINK.search(r.stdout or "")
         if not m:
             why = ((r.stderr or r.stdout or "").strip().splitlines() or [f"exit {r.returncode}"])[-1]
@@ -1222,7 +1222,7 @@ def connect_remote(name: str, entry: dict, argv: list[str]) -> int:
         return SSH_FAILED
     # The user's zone only from their workstation: in an ssh login here it is a server's, so none.
     home = [] if timefmt.in_ssh_login() else ["--home-tz", timefmt.detect_local(), "--home-from", hostname()]
-    r = _ssh(entry, [*argv, *home], capture=True)
+    r = _ssh_exec(entry, [*argv, *home], capture=True)
     while r.returncode == REFUSED_RC:   # an older runtime there: connect without what it lacks (one parse error names all)
         old_tz = bool(home) and "--home-tz" in (r.stderr or "")
         dropped = _drop_unrecognized(argv, r)
@@ -1230,7 +1230,7 @@ def connect_remote(name: str, entry: dict, argv: list[str]) -> int:
             break
         home = [] if old_tz else home
         argv = dropped if dropped is not None else argv
-        r = _ssh(entry, [*argv, *home], capture=True)
+        r = _ssh_exec(entry, [*argv, *home], capture=True)
     if r.returncode == SSH_FAILED:
         _unreachable(entry, r.stderr)
         return SSH_FAILED
@@ -1931,7 +1931,7 @@ def status_text(p: Project, verbose: bool = False) -> str:
     base = links_show_base(p, None)
     seen = attention(db, now, p)
     for m in [m for m in seen if m["kind"] == "ask"] + [m for m in seen if m["kind"] != "ask"][:6]:
-        text = " ".join(m["text"].split())   # an open ask in full, every one: the user acts on it (#2424)
+        text = " ".join(m["text"].split())   # an open ask in full, every one: the user acts on it
         text = links.for_user(p, text, links.TEXT, base=base)   # a terminal: plain-text links
         what = (f"ask {m['id']}" + (f"; {m['auto']}" if m.get("auto") else "")) if m["kind"] == "ask" else f"alert {m['id']}"
         lines.append(f"  needs you ({what}, {since(m['ts'], now)} ago): {text if m['kind'] == 'ask' else clip(text, 300)}")
@@ -2228,7 +2228,7 @@ def status_text(p: Project, verbose: bool = False) -> str:
         text = " ".join(m["text"].split())
         tag = f"cleared {at(m['cleared_at'], now, tz)}" if m.get("cleared_at") else m["state"]
         lines.append(f"  {at(m['ts'], now, tz)} ({tag}) {clip(text, 160)}")
-    import textwrap   # an open ask wraps onto indented lines, never cut (#2424)
+    import textwrap   # an open ask wraps onto indented lines, never cut
     return "\n".join("\n".join(textwrap.wrap(ln, STATUS_WIDTH, subsequent_indent="    ", break_long_words=False,
                                              break_on_hyphens=False)) if ln in whole else clip(ln) for ln in lines)
 
@@ -2325,7 +2325,7 @@ def cmd_paths(a) -> None:
         print("\n".join(f"{k}: {v}" for k, v in rows))
 
 
-def cmd_status(a) -> None:
+def cmd_project_status(a) -> None:
     if a.name:
         p = need(a.name, sys.argv[1:])
     else:
@@ -2822,7 +2822,7 @@ def cmd_ttr(a) -> None:
           + (f" on {a.alias}" if a.alias else ""))
 
 
-def cmd_hostcheck(a) -> None:
+def cmd_host_check(a) -> None:
     """One read-only check from a fixed catalogue on a host (hostcheck.py); exits with the check's code."""
     from . import hostcheck
     p = here()
@@ -3435,15 +3435,7 @@ def _note_to(a, run_dir: str) -> None:
     received note came in by (upstream.reply_route, upstream.peer_route), so a sender this machine does
     not know is still answered; with no route the note is refused, never dropped."""
     from . import upstream
-    base = os.environ.get("TTP_PROJECT")
-    me = Project(base) if base else None
-    if not me or not me.exists():
-        die("ttp note --to: this run has no project (TTP_PROJECT)")
-    from .outscan import problem, record
-    why = problem("ttp note --to", getattr(a, "sent_text", a.text), p=me)
-    if why:
-        record("ttp note --to", why, me)
-        die(why)
+    me = _note_sender(a)
     at = back = None
     routed = bool(getattr(a, "reply", None)) or "@" in a.to
     if routed:
@@ -3465,19 +3457,7 @@ def _note_to(a, run_dir: str) -> None:
         return _note_upstream(a, me)
     if not a.text.strip():
         die("empty note")
-    if not routed and not far and not local_project(a.to):
-        checked = []
-        if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.@+-]{0,79}", a.to):
-            at, checked = upstream.find_peer(a.to)
-        if not at:
-            got = upstream.senders(me, a.to)
-            how = (f". {a.to} sent this project note {got[0][0]}"
-                   + (f" from {got[0][1]['via']}" if got[0][1].get("via") else "")
-                   + f": answer it with `ttp note --reply {got[0][0]} \"<text>\"`, which takes the route it came by"
-                   + (f" (or `--to {a.to}@{got[0][1]['via']}`)" if got[0][1].get("via") else "")) if got else ""
-            die(f"unknown project {a.to}: not on this machine (`ttp list`), "
-                + (f"nor on the machines notes are sent on to: {'; '.join(checked)}" if checked
-                   else "and there is no other machine to ask (`ttp upstream --forward-status`)") + how)
+    at = _note_find_peer(a, me) if not routed and not far and not local_project(a.to) else at
     # A reply is marked with the note it answers (upstream.reply_text): its id and every copy keep it.
     reply = upstream._check_fp(a.reply) if getattr(a, "reply", None) else None
     try:
@@ -3488,10 +3468,7 @@ def _note_to(a, run_dir: str) -> None:
             f"or put the whole text in the hand-off as a follow-up")
     except upstream.NotePlaceholder as e:
         die(f"not sent: {e}. Nothing was filed or queued")
-    from . import taskfacts
-    # The tasks it names, as the records show them now: what it states of them may be stale.
-    from . import peerhold
-    # The target's pause or spend gate and resume time, before anyone waits on it.
+    from . import peerhold, taskfacts   # the tasks it names as the records show them now; the target's pause or gate
     held = "" if routed or far else peerhold.line(a.to, peerhold.of(a.to), me)
     if held:
         print(f"{held}: work waiting on its answer waits at least until then")
@@ -3513,17 +3490,8 @@ def _note_to(a, run_dir: str) -> None:
     if got == "full":
         die(f"not sent: {upstream.OUTBOX_MAX} notes of this project already wait to go to other projects. "
             f"Put it in the hand-off instead and keep working")
-    if got == "queued" and a.severity == "high":
-        print(f"note for {a.to} queued: number {place} in this project's outbox, ahead of the normal notes: this "
-              f"project already filed {upstream.HIGH_NOTES_PER_HOUR} high-severity notes in the last hour (their own "
-              f"allowance, apart from the {upstream.NOTES_PER_HOUR} others); its daemon files it as "
-              f"{upstream.note_id(a.to, text)} when that allows{sent}. Nothing to wait for: keep working")
-        return
     if got == "queued":
-        print(f"note for {a.to} queued: number {place} in this project's outbox (other projects get at most "
-              f"{upstream.NOTES_PER_HOUR} of its notes an hour); its daemon files it as "
-              f"{upstream.note_id(a.to, text)} when the limit allows{sent}. Nothing to wait for: keep working")
-        return
+        return _note_queued_line(a, place, text, sent)
     earlier = (upstream.repeat_of(me.state, me.name, int(task) if task.isdigit() else None, a.to, text,
                                   getattr(a, "confirms", None), severity=a.severity)
                if got == "duplicate" and not upstream._filed(upstream.note_id(a.to, text)) else None)
@@ -3533,6 +3501,59 @@ def _note_to(a, run_dir: str) -> None:
               f"{upstream.REPEAT_S // HOUR_S} h, so this one only repeats it. Nothing to wait for: keep working; "
               f"`ttp note --status {earlier}` shows whether {a.to} read it")
         return
+    _note_filed_line(a, me, far, at, back, got, text, sent)
+
+
+def _note_sender(a) -> Project:
+    """The project this run's `ttp note --to` speaks for, after the outgoing-text scan; dies when there is none or the text is refused."""
+    base = os.environ.get("TTP_PROJECT")
+    me = Project(base) if base else None
+    if not me or not me.exists():
+        die("ttp note --to: this run has no project (TTP_PROJECT)")
+    from .outscan import problem, record
+    why = problem("ttp note --to", getattr(a, "sent_text", a.text), p=me)
+    if why:
+        record("ttp note --to", why, me)
+        die(why)
+    return me
+
+
+def _note_find_peer(a, me: Project) -> str | None:
+    """The forward target that runs project `a.to`, which this machine's registry does not know; dies naming where it looked."""
+    from . import upstream
+    at, checked = None, []
+    if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.@+-]{0,79}", a.to):
+        at, checked = upstream.find_peer(a.to)
+    if not at:
+        got = upstream.senders(me, a.to)
+        how = (f". {a.to} sent this project note {got[0][0]}"
+               + (f" from {got[0][1]['via']}" if got[0][1].get("via") else "")
+               + f": answer it with `ttp note --reply {got[0][0]} \"<text>\"`, which takes the route it came by"
+               + (f" (or `--to {a.to}@{got[0][1]['via']}`)" if got[0][1].get("via") else "")) if got else ""
+        die(f"unknown project {a.to}: not on this machine (`ttp list`), "
+            + (f"nor on the machines notes are sent on to: {'; '.join(checked)}" if checked
+               else "and there is no other machine to ask (`ttp upstream --forward-status`)") + how)
+    return at
+
+
+def _note_queued_line(a, place, text: str, sent: str) -> None:
+    """What `ttp note --to` prints for a note that waits in this project's outbox."""
+    from . import upstream
+    if a.severity == "high":
+        print(f"note for {a.to} queued: number {place} in this project's outbox, ahead of the normal notes: this "
+              f"project already filed {upstream.HIGH_NOTES_PER_HOUR} high-severity notes in the last hour (their own "
+              f"allowance, apart from the {upstream.NOTES_PER_HOUR} others); its daemon files it as "
+              f"{upstream.note_id(a.to, text)} when that allows{sent}. Nothing to wait for: keep working")
+        return
+    print(f"note for {a.to} queued: number {place} in this project's outbox (other projects get at most "
+          f"{upstream.NOTES_PER_HOUR} of its notes an hour); its daemon files it as "
+          f"{upstream.note_id(a.to, text)} when the limit allows{sent}. Nothing to wait for: keep working")
+
+
+def _note_filed_line(a, me: Project, far: dict | None, at: str | None, back: str | None, got: str, text: str,
+                     sent: str) -> None:
+    """What `ttp note --to` prints for a note filed or already in the target's inbox, and a warning when its forward target is failing."""
+    from . import upstream
     print(f"note for {a.to} " + ("already in its inbox" if got == "duplicate" else "filed in its inbox")
           + f" as {upstream.note_id(a.to, text)}" + sent
           + (f"; high severity: filed at once on its own allowance ({upstream.high_used(me.name)} of "
@@ -5968,7 +5989,7 @@ def _untracked(git: list[str]) -> int:
     return sum(1 for e in r.stdout.split("\0") if e.startswith("?? "))
 
 
-def _run_task(p: Project | None) -> dict | None:
+def _running_task(p: Project | None) -> dict | None:
     task = os.environ.get("TTP_TASK") or ""
     try:
         return p.db.task(int(task)) if p and task.isdigit() else None
@@ -5985,7 +6006,7 @@ def _verified_scope(p: Project | None, top: Path, head: str, todo: list, say,
     longer an ancestor of `head` (rewritten history) verifies none: every check runs, and that is said.
     Checks without an if_changed scope always run, as they cover the whole tree."""
     from . import push, verified
-    t = _run_task(p)
+    t = _running_task(p)
     try:
         m = verified.scope(p.db, t, top, head, "checks", include_self=True) if t else None
     except Exception:
@@ -6012,7 +6033,7 @@ def _verified_scope(p: Project | None, top: Path, head: str, todo: list, say,
 def _mark_verified(p: Project | None, head: str, tree: str, cmds: list) -> None:
     """Record this run's task as verified through `head` (verified.py); a failure never fails the checks."""
     from . import verified
-    t = _run_task(p)
+    t = _running_task(p)
     if not t:
         return
     try:
@@ -7641,6 +7662,13 @@ def _checks_judge(a, p: Project | None, c, rc: int, output: str, cwd: str, env: 
         out.write(f"ttp checks: {line}\n")
     if v["flaky"]:
         _checks_quarantine(p, cfg, v, c, head, now, s["days"])
+    return _checks_judge_outcome(p, v, c, top, head, now, proven)
+
+
+def _checks_judge_outcome(p: Project, v: dict, c, top: str, head: str, now: float, proven: list | None) -> dict | None:
+    """What `_checks_judge` returns for verdict `v`: None when it blocks (a proven one is saved for the head's
+    tree and appended to `proven`), else `v` itself, undecided (gatejudge.undecided): the caller stops at exit 75."""
+    from . import gatejudge
     if gatejudge.blocks(v):
         if not gatejudge.proven(v):
             return None
@@ -7650,7 +7678,7 @@ def _checks_judge(a, p: Project | None, c, rc: int, output: str, cwd: str, env: 
         if proven is not None:
             proven.append(v)
         return None
-    return v   # undecided (gatejudge.undecided): the caller stops at exit 75
+    return v
 
 
 def _remote_select(c, pick: dict):
@@ -11880,7 +11908,7 @@ def cmd_ci(a) -> None:
     sys.exit(rc)
 
 
-def cmd_list(a) -> None:
+def cmd_list_projects(a) -> None:
     if getattr(a, "status", False):
         return cmd_overview(a)
     reg = load_registry().get("projects", {})
@@ -13784,27 +13812,55 @@ def cmd_chat_settable(key: str, value: str | None) -> None:
     print(f"{key}: accepted" + (f" as {json.dumps(val)}" if value is not None else "") + shell)
 
 
+def _config_account(a, run) -> None:
+    """`ttp config --account KEY [VALUE]`."""
+    if a.value is not None or a.add is not None:
+        die("usage: ttp config --account KEY [VALUE]")
+    from .coordinator import needs_users_word
+    if run and a.key is not None and needs_users_word(a.name):
+        # A run can be steered by text it reads; spend caps change only on the user's word.
+        _refuse_user_only_in_run(a.name)
+    if run and a.key not in (None, "") and a.name in ACCOUNT_USER_ONLY and not _account_off(a.name, a.key):
+        # The account's spill pool sends every project's code to those machines: only
+        # clearing it (removing, or their off value) is a run's.
+        _refuse_user_only_in_run(a.name)
+    if run and a.key is not None and (why := _no_spill_run_refusal(a.name, a.key)):
+        die(why)
+    from . import accountset
+    if a.name in accountset.KEYS and a.key is not None:
+        return cmd_account_cap(a.name, a.key, run)
+    return cmd_account_config(a.name, a.key)
+
+
+def _config_add(p, a) -> bool:
+    """`ttp config KEY --add VALUE`: sets `a.value` to the list with the item added; True when it was already there."""
+    if a.value is not None or not a.key:
+        die("usage: ttp config [NAME] KEY --add VALUE")
+    node = p.config()
+    for part in a.key.split("."):
+        node = node.get(part) if isinstance(node, dict) else None
+    from .project import key_type_problem
+    if node is None and key_type_problem(a.key, []) is None and key_type_problem(a.key, {}):
+        node = []   # a list key with no default, not set yet
+    if not isinstance(node, list):
+        die(f"{a.key} is not a list key: --add adds one item to a list")
+    try:
+        item = json.loads(a.add)
+    except ValueError:
+        item = a.add
+    if item in node:
+        print(f"{a.key} already has {json.dumps(item)}")
+        return True
+    a.value = json.dumps(node + [item])   # set through the same checks as a whole value
+    return False
+
+
 def cmd_config(a) -> None:
     run = in_run()
     if a.chat_settable:
         return cmd_chat_settable(a.name, a.key)
     if a.account:
-        if a.value is not None or a.add is not None:
-            die("usage: ttp config --account KEY [VALUE]")
-        from .coordinator import needs_users_word
-        if run and a.key is not None and needs_users_word(a.name):
-            # A run can be steered by text it reads; spend caps change only on the user's word.
-            _refuse_user_only_in_run(a.name)
-        if run and a.key not in (None, "") and a.name in ACCOUNT_USER_ONLY and not _account_off(a.name, a.key):
-            # The account's spill pool sends every project's code to those machines: only
-            # clearing it (removing, or their off value) is a run's.
-            _refuse_user_only_in_run(a.name)
-        if run and a.key is not None and (why := _no_spill_run_refusal(a.name, a.key)):
-            die(why)
-        from . import accountset
-        if a.name in accountset.KEYS and a.key is not None:
-            return cmd_account_cap(a.name, a.key, run)
-        return cmd_account_config(a.name, a.key)
+        return _config_account(a, run)
     if a.why:
         return cmd_config_why([w for w in (a.name, a.key, a.value) if w is not None], a.why)
     from .project import DEFAULT_CONFIG
@@ -13813,25 +13869,8 @@ def cmd_config(a) -> None:
         p, a.key, a.value = here(), a.name, a.key
     else:
         p = need(a.name, sys.argv[1:])
-    if a.add is not None:
-        if a.value is not None or not a.key:
-            die("usage: ttp config [NAME] KEY --add VALUE")
-        node = p.config()
-        for part in a.key.split("."):
-            node = node.get(part) if isinstance(node, dict) else None
-        from .project import key_type_problem
-        if node is None and key_type_problem(a.key, []) is None and key_type_problem(a.key, {}):
-            node = []   # a list key with no default, not set yet
-        if not isinstance(node, list):
-            die(f"{a.key} is not a list key: --add adds one item to a list")
-        try:
-            item = json.loads(a.add)
-        except ValueError:
-            item = a.add
-        if item in node:
-            print(f"{a.key} already has {json.dumps(item)}")
-            return
-        a.value = json.dumps(node + [item])   # set through the same checks as a whole value
+    if a.add is not None and _config_add(p, a):
+        return
     if a.value is None:
         node = p.config()   # the effective config: project.json over the defaults
         for part in (a.key or "").split(".") if a.key else []:
@@ -14907,6 +14946,77 @@ def _refresh_stable_copy(name: str) -> None:
           f"merges {have}. Refresh it with `{cmd}`, then rerun `ttp upgrade {name}`", file=sys.stderr)
 
 
+def _upgrade_project(a) -> Project:
+    """The project `ttp upgrade` works on; one on another machine is upgraded there and this call exits with its status."""
+    if a.project_dir:      # the daemon names its own folder: never another project of the same name
+        p = Project(a.project_dir)
+        if not p.exists() or p.name != a.name:
+            die(f"{a.project_dir} does not hold project {a.name!r}")
+    else:
+        entry = remote_entry(a.name)
+        if entry and not local_project(a.name):
+            from . import machines as mm
+            ship_runtime(entry.get("ssh") or entry["host"])      # the newer runtime becomes that machine's ttp
+            print(mm.push(entry.get("ssh") or entry["host"]))
+            sys.exit(forward(entry, sys.argv[1:]))
+        p = need(a.name, sys.argv[1:])
+    return p
+
+
+def _refresh_local_services(a) -> int:
+    """Brings this machine's notifier, bridge sessions, kept tunnels and Codex's copy of tt-project onto the installed code; the bridge's exit status."""
+    from . import notifier
+    for ln in notifier.refresh(send_test=not a.auto):   # this machine's notifier on the installed code too
+        print(ln)
+    from . import bridge
+    bridge_out, bridge_rc = bridge.refresh_checked()   # and its bridge sessions
+    from . import tunnel
+    for ln in [*bridge_out, *tunnel.refresh_kept()]:   # and kept tunnels
+        print(ln)
+    from . import codexmarket
+    for ln in codexmarket.once():   # and Codex's copy of tt-project, once per release
+        print(ln)
+    return bridge_rc
+
+
+def _upgrade_refused_busy(p: Project, a) -> None:
+    """Dies for an upgrade whose lock another holds, after recording a held outcome for the daemon's own call."""
+    from . import locks, release
+    who = locks.holders_now([release.upgrade_lock(p)], p)
+    landing = bool(who) and "landing harness worktrees" in who[0]   # the daemon's (harnesstree)
+    if a.auto:
+        release.finish(p, "held", why="the daemon is landing harness worktrees" if landing
+                       else "another upgrade is running")
+    what = (f"the daemon is landing harness worktrees of {p.name}" if landing
+            else f"another upgrade of {p.name} is running")
+    die(f"upgrade refused: {what}" + (f" ({who[0]})" if who else "") + "; nothing was changed"
+        + ("; main is as it was and no restart is coming: rerun this --apply once it ends"
+           if a.apply is not None else ""), UPGRADE_BUSY)
+
+
+def _migrate_noindex(p: Project) -> Project:
+    """Moves state/ and worktrees/ under .noindex (macOS), linked from the old names; the project at its base."""
+    from . import noindex
+    try:      # macOS: state/ and worktrees/ under .noindex, linked from the old names
+        moved = noindex.migrate(p.base)
+    except OSError as e:     # the folders stay where they are and work as before; the next upgrade retries
+        moved = [f"noindex: not moved: {e}"]
+    for ln in moved:
+        print(ln)
+    if moved:
+        p = Project(p.base)
+    return p
+
+
+def _upgrade_holds(p: Project, a) -> None:
+    """The holds an upgrade honours before it takes its lock (a held release, a cycle or deploy hold), and the stable copy's refresh."""
+    _upgrade_held(p, a)
+    if not a.auto and a.apply is None:
+        _refresh_stable_copy(p.name)
+    _cycle_hold(cyclenotice_paths(p), a, p, auto_rec=p if a.auto else None)
+    _occupancy_hold(p, a, "deploy", auto_rec=p if a.auto else None)
+
+
 def cmd_upgrade(a) -> None:
     """Merge the installed template into a project's harness. The harness repo keeps pristine
     template snapshots on its `upstream` branch, so this is an ordinary three-way merge. `--auto` is
@@ -14920,62 +15030,20 @@ def cmd_upgrade(a) -> None:
     runs on and restarts when it takes the request a sandboxed caller left it), exit 1 = it failed or the
     runtime was rolled back. 75 never means main moved."""
     from . import locks, release
-    if a.project_dir:      # the daemon names its own folder: never another project of the same name
-        p = Project(a.project_dir)
-        if not p.exists() or p.name != a.name:
-            die(f"{a.project_dir} does not hold project {a.name!r}")
-    else:
-        entry = remote_entry(a.name)
-        if entry and not local_project(a.name):
-            from . import machines as mm
-            ship_runtime(entry.get("ssh") or entry["host"])      # the newer runtime becomes that machine's ttp
-            print(mm.push(entry.get("ssh") or entry["host"]))
-            sys.exit(forward(entry, sys.argv[1:]))
-        p = need(a.name, sys.argv[1:])
+    p = _upgrade_project(a)
     _log_upgrade_invoker(p, a)
     if a.hold or a.release or a.until or a.until_probe or a.why:
         return _release_hold(p, a)
-    _upgrade_held(p, a)
-    if not a.auto and a.apply is None:
-        _refresh_stable_copy(p.name)
-    _cycle_hold(cyclenotice_paths(p), a, p, auto_rec=p if a.auto else None)
-    _occupancy_hold(p, a, "deploy", auto_rec=p if a.auto else None)
-    from . import notifier
-    for ln in notifier.refresh(send_test=not a.auto):   # this machine's notifier on the installed code too
-        print(ln)
-    from . import bridge
-    bridge_out, bridge_rc = bridge.refresh_checked()   # and its bridge sessions
-    from . import tunnel
-    for ln in [*bridge_out, *tunnel.refresh_kept()]:   # and kept tunnels
-        print(ln)
-    from . import codexmarket
-    for ln in codexmarket.once():   # and Codex's copy of tt-project, once per release
-        print(ln)
+    _upgrade_holds(p, a)
+    bridge_rc = _refresh_local_services(a)
     held = locks.try_take([release.upgrade_lock(p)], f"ttp upgrade (pid {os.getpid()})", "ttp upgrade")
     if held is None:
-        who = locks.holders_now([release.upgrade_lock(p)], p)
-        landing = bool(who) and "landing harness worktrees" in who[0]   # the daemon's (harnesstree)
-        if a.auto:
-            release.finish(p, "held", why="the daemon is landing harness worktrees" if landing
-                           else "another upgrade is running")
-        what = (f"the daemon is landing harness worktrees of {p.name}" if landing
-                else f"another upgrade of {p.name} is running")
-        die(f"upgrade refused: {what}" + (f" ({who[0]})" if who else "") + "; nothing was changed"
-            + ("; main is as it was and no restart is coming: rerun this --apply once it ends"
-               if a.apply is not None else ""), UPGRADE_BUSY)
+        _upgrade_refused_busy(p, a)
     from . import upjournal
     try:
         upjournal.recover(p, restart=_restart_daemon)    # an earlier run cut short: finish or roll it back
         upjournal.begin(p, "apply" if a.apply is not None else "upgrade", a.auto)
-        from . import noindex
-        try:      # macOS: state/ and worktrees/ under .noindex, linked from the old names
-            moved = noindex.migrate(p.base)
-        except OSError as e:     # the folders stay where they are and work as before; the next upgrade retries
-            moved = [f"noindex: not moved: {e}"]
-        for ln in moved:
-            print(ln)
-        if moved:
-            p = Project(p.base)
+        p = _migrate_noindex(p)
         own = _own_run(p)
         if a.apply is not None and own and release.fenced(p, os.environ.get("TTP_TASK") or ""):
             die(f"--apply refused: a host-side upgrade took the template merge over from task "
@@ -16827,7 +16895,7 @@ def ttp_parser():
     s.set_defaults(fn=cmd_web)
     for name, fn, hlp in (("connect", cmd_connect, "attach this chat to a project and follow its alerts (--unfollow stops them); ends with its checked web app link "
                            "(exit 3: the link did not answer and the line says what is broken)"),
-                          ("status", cmd_status, "one-screen status"),
+                          ("status", cmd_project_status, "one-screen status"),
                           ("paths", cmd_paths, "the project's folders (state, runs, prechecks, pushes, worktrees, "
                            "locks, push lock, checks queue and env, ~/.tt-project, this run): look here, never "
                            "search / or the home folder"),
@@ -17375,7 +17443,7 @@ def ttp_parser():
     s.add_argument("check", help="reachable, uptime, unit-active, process-alive, file-exists, disk-free, git-head, "
                                  "git-log, git-show, lock-holder, broker-job, log-tail, tt-smi or squeue")
     s.add_argument("args", nargs=argparse.REMAINDER, help="the check's arguments (plain words)")
-    s.set_defaults(fn=cmd_hostcheck)
+    s.set_defaults(fn=cmd_host_check)
 
     s = sub.add_parser("selfchange", help="the coordinator's self-changes and per-wake metrics; review: measure "
                                           "the due ones, keep those that helped, revert the rest")
@@ -18023,7 +18091,7 @@ def ttp_parser():
     s = sub.add_parser("list", help="projects registered on this machine")
     s.add_argument("--status", action="store_true", help="one status line per project, as `ttp overview`")
     s.add_argument("--json", action="store_true", help="print JSON")
-    s.set_defaults(fn=cmd_list)
+    s.set_defaults(fn=cmd_list_projects)
     s = sub.add_parser("overview", help="every project on this machine: daemon, version, asks, waiting, running, "
                                         "spend today; other projects are only read")
     s.add_argument("--json", action="store_true", help="print JSON")
