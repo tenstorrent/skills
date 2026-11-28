@@ -130,11 +130,11 @@ def lane_problem(run_dir, head: str = "") -> str:
 
 
 def findings(v: dict, note: bool = False) -> list[str]:
-    """The verdict's finding texts: the blocking ones (a BLOCKING severity, or none given: a bare string too),
-    or with `note` the others (note, info, minor...: a leftover that can wait), which never fail the lane."""
+    """The verdict's finding texts: the blocking ones (a BLOCKING severity, or none given: a bare string too;
+    `level` reads as `severity`), or with `note` the others (note, info, minor...: a leftover that can wait), which never fail the lane."""
     out = []
     for x in v.get("findings") if isinstance(v.get("findings"), list) else []:
-        sev, text = (str(x.get("severity") or "").strip().lower(), x.get("text")) if isinstance(x, dict) else ("", x)
+        sev, text = (str(x.get("severity") or x.get("level") or "").strip().lower(), x.get("text")) if isinstance(x, dict) else ("", x)
         if str(text or "").strip() and (sev not in BLOCKING) == note:
             out.append(str(text)[:300])
     return out

@@ -341,6 +341,8 @@ def test_the_lane_fails_on_a_block_finding_or_one_with_no_severity_and_passes_wi
     run.mkdir()
     for findings, ok in (([block], False), ([note, block], False), (["bare string"], False),
                          ([{"text": "no severity"}], False), ([note], True), ([], True),
+                         ([{"level": "note", "text": "t"}], True), ([{"level": "block", "text": "t"}], False),
+                         ([{"level": "note", "text": "t"}, {"text": "neither key"}], False),
                          *(([{"severity": sev, "text": "t"}], False) for sev in ("blocker", "Critical", "high")),
                          *(([{"severity": sev, "text": "t"}], True) for sev in ("info", "minor", "low", "nit", "suggestion"))):
         (run / ponytail.FILE).write_text(json.dumps({"verdict": "pass", "head": "a" * 40, "findings": findings}))
