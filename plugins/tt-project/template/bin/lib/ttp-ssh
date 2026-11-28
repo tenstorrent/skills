@@ -71,6 +71,7 @@ for d in $PATH; do
     fi
 done
 IFS=$ifs
+unset TTP_SSH_CHAINED
 if [ -z "$real" ]; then
     for c in /usr/bin/ssh /usr/local/bin/ssh /opt/homebrew/bin/ssh; do
         [ -x "$c" ] && { real=$c; break; }
