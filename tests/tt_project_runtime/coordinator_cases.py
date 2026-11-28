@@ -976,7 +976,8 @@ def test_config_refuses_user_only_keys_inside_a_run(env, capsys, monkeypatch, va
     monkeypatch.setenv(var, "7")
     # A NEEDS_USER key can be account-level only (rollout.*): its refusal comes through `--account`
     from ttp import project
-    refused = [["config", "--account" if not project._is_section([k.split(".")[0]]) else "demo", k,
+    # a NEEDS_USER key that is not settable at project scope is an account-level setting
+    refused = [["config", "--account" if project.unknown_key_hint(k) else "demo", k,
                 json.dumps(["o/r"] if k == MERGE_KEY else 9)] for k in NEEDS_USER]
     refused += [["config", "demo", "budget", json.dumps({"daily_usd": 999})],          # parent key
                 ["config", "demo", "delivery", json.dumps({})],                        # wipes a user-only key
