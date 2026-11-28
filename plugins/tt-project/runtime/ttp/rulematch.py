@@ -154,7 +154,7 @@ def _tip(p, cfg: dict) -> str:
     return "HEAD"
 
 
-def remaining(p, db, old: str | None = None, name: str | None = None, items: list | None = None) -> list[str]:
+def remaining(p, old: str | None = None, name: str | None = None, items: list | None = None) -> list[str]:
     """Where the rule still stands, as 'where name: line': `items` (older()'s rows) checked as recorded, else
     every place that holds `old`: a memory entry or charter line naming it (in any unit), a config value or a code
     constant (a duration only beside `name`) or an env default the repo carries, at the push branch's tip."""
@@ -197,7 +197,7 @@ def gone(p, db, msg: int | None = None, old: str | None = None, name: str | None
     rec = db.kv(KV + str(msg)) if msg is not None else None
     if msg is not None and rec is None:
         return None
-    left = remaining(p, db, items=rec.get("items", [])) if rec is not None else remaining(p, db, old, name)
+    left = remaining(p, items=rec.get("items", [])) if rec is not None else remaining(p, old, name)
     if msg is not None and not left and db.kv(KV + str(msg) + GONE) is None:
         db.set_kv(KV + str(msg) + GONE, {"ts": time.time()})
     return left

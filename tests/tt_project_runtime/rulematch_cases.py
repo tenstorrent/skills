@@ -105,16 +105,16 @@ def _rm_retire(p):
 def test_rule_gone_lists_where_the_old_value_still_stands_in_any_unit(env):
     from ttp import rulematch as rm
     p = _rm_project(env)
-    left = rm.remaining(p, p.db, old="an hour", name="KEEPALIVE_S")
+    left = rm.remaining(p, old="an hour", name="KEEPALIVE_S")
     assert {"memory", "charter", "code"} <= {x.split()[0].rstrip(":") for x in left}
     assert any("KEEPALIVE_S" in x for x in left)
-    assert not [x for x in rm.remaining(p, p.db, old="3600 s", name="OTHER_CAP") if x.startswith(("code", "env", "config"))]
-    assert any("KEEPALIVE_S" in x for x in rm.remaining(p, p.db, old="60 min", name="KEEPALIVE_S"))
+    assert not [x for x in rm.remaining(p, old="3600 s", name="OTHER_CAP") if x.startswith(("code", "env", "config"))]
+    assert any("KEEPALIVE_S" in x for x in rm.remaining(p, old="60 min", name="KEEPALIVE_S"))
     (p.root / "run.env").write_text("KEEPALIVE_MIN=60\nQUIET=1\n")
     import subprocess
     subprocess.run(["git", "add", "run.env"], cwd=p.root, check=True)
     subprocess.run(["git", "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "e"], cwd=p.root, check=True)
-    assert any(x.startswith("env KEEPALIVE_MIN") for x in rm.remaining(p, p.db, old="1 hour", name="KEEPALIVE_MIN"))
+    assert any(x.startswith("env KEEPALIVE_MIN") for x in rm.remaining(p, old="1 hour", name="KEEPALIVE_MIN"))
 
 
 def test_rule_gone_is_gone_once_the_value_is_removed_and_marks_the_message(env):
@@ -125,7 +125,7 @@ def test_rule_gone_is_gone_once_the_value_is_removed_and_marks_the_message(env):
     _rm_retire(p)
     assert rm.gone(p, p.db, msg=mid) == []
     assert p.db.kv(rm.KV + str(mid) + rm.GONE)["ts"] > 0
-    assert rm.remaining(p, p.db, old="3600 s") == []
+    assert rm.remaining(p, old="3600 s") == []
 
 
 def test_rule_gone_digest_closes_the_line_and_reads_overdue_after_a_day(env):
