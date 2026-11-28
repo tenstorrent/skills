@@ -445,12 +445,14 @@ def _away_base() -> str | None:
     (its home from the password database: HOME is a temp folder under tests and `ttp checks`; the checkout holds a
     pytest file, so it cannot serve), made only when it is reached; None when none of them is away from the temp
     roots."""
-    from ttp import hoststate
-    cache = str(hoststate.real_home() / ".cache")
-    for root in (os.environ.get("XDG_RUNTIME_DIR", ""), f"/run/user/{os.getuid()}", cache):
-        if root == cache:
+    for root in (os.environ.get("XDG_RUNTIME_DIR", ""), f"/run/user/{os.getuid()}", None):
+        if root is None:
+            from ttp import hoststate
             try:
-                os.makedirs(cache, exist_ok=True)
+                root = str(hoststate.real_home() / ".cache")
+                os.makedirs(root, exist_ok=True)
+            except KeyError:                                         # no password-database entry for this account
+                root = ""
             except OSError:
                 pass
         if root and os.access(root, os.W_OK | os.X_OK) and _away_from_tmp(Path(root, "x")):
