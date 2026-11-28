@@ -1683,6 +1683,11 @@ def test_ack_wait_terminal_counts_a_reply_closing_the_request_without_a_run_but_
                  "The request was closed without a result.",
                  "Withdrawing your request: the fix landed elsewhere."):
         assert ackwait.terminal(text) is True and ackwait.closed(text), text
+    # a hypothetical about a possible new request is not more to come on this one
+    hypothetical = ("peer: your timing request (1a2b3c4d5e6f7a8b) is closed without a run. The bench schedule is off "
+                    "under a newer rule. Send a new request if you still need the number; it would run in a gap that "
+                    "rule allows.")
+    assert ackwait.terminal(hypothetical) is True and ackwait.closed(hypothetical)
     assert ackwait.packet_terminal(["[1/2] Acknowledged.", "[2/2] Closing your request without a run."]) is True
     for text in ("received, will run it soon", "I will close the request once the run is in", "status: queued",
                  "status: in progress; closing this request needs a run first, a result follows later",

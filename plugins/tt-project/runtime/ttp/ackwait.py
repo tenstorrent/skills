@@ -88,7 +88,7 @@ _CLOSED_RE = re.compile(r"\b(?:(?:closed|closes|closing|declined|declines|declin
                         r"withdrawing) (?:(?:the|this|that|your|my) )?(?:\w+ )?request|"
                         r"request (?:\([\w-]+\) )?(?:is |was |has been )?(?:closed|declined|withdrawn))\b", re.I)
 _TO_COME_RE = re.compile(r"\b(?:follows?|to come|yet|first|queued|once|later|soon|pending|in progress|under ?way|"
-                         r"now|would|will(?! not| never))\b|'ll\b", re.I)
+                         r"now|will(?! not| never))\b|'ll\b", re.I)
 _NO_RUN_RE = re.compile(r"\s*,?\s*(?:\w+\s+){0,3}?without (?:a |any )?(?:run|result|measurement)s?\b", re.I)
 _NEGATION = re.compile(r"\b(?:not|never|no|without|instead of|rather than|would)\b|n't\b", re.I)
 _PART_TAG_RE = re.compile(r"^\s*\[\d+/\d+\]\s*")
