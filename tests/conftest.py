@@ -440,23 +440,32 @@ def _away_from_tmp(path: Path) -> bool:
         (d / f).is_file() for d in real.parents for f in _PYTEST_FILES)
 
 
+def _away_base(uid: int | None = None) -> str | None:
+    """A writable folder for `away_from_tmp` tests: the runtime folder, else the user cache folder (the checkout
+    holds a pytest file, so it cannot serve); None when none of them is away from the temp roots."""
+    cache = os.environ.get("XDG_CACHE_HOME") or str(Path.home() / ".cache")
+    for root in (os.environ.get("XDG_RUNTIME_DIR", ""), f"/run/user/{os.getuid() if uid is None else uid}", cache):
+        if root and os.access(root, os.W_OK | os.X_OK) and _away_from_tmp(Path(root, "x")):
+            return root
+    return None
+
+
 @pytest.fixture
 def tmp_path(request, tmp_path):
     """pytest's tmp_path; for a test marked away_from_tmp, a fresh folder that is not under /tmp or
-    /var/tmp or /dev/shm and has no pytest file above it (_away_from_tmp), made in the runtime folder
-    when pytest's own temp root (a `ttp checks` TMPDIR, say) is under one of them: the checks that treat /tmp as
-    inside a worktree and those that look for a project root above one then see what they see anywhere."""
+    /var/tmp or /dev/shm and has no pytest file above it (_away_from_tmp), made in the runtime folder (else
+    the user cache folder) when pytest's own temp root (a `ttp checks` TMPDIR, say) is under one of them: the
+    checks that treat /tmp as inside a worktree and those that look for a project root above one then see
+    what they see anywhere."""
     if request.node.get_closest_marker("away_from_tmp") is None or _away_from_tmp(tmp_path):
         yield tmp_path
         return
     import shutil
     import tempfile
-    for root in (os.environ.get("XDG_RUNTIME_DIR", ""), f"/run/user/{os.getuid()}"):
-        if root and os.access(root, os.W_OK | os.X_OK) and _away_from_tmp(Path(root, "x")):
-            break
-    else:
-        pytest.fail("away_from_tmp needs a writable runtime folder outside the guard's temp roots with no pytest "
-                    f"file above it ($XDG_RUNTIME_DIR or /run/user/{os.getuid()})")
+    root = _away_base()
+    if root is None:
+        pytest.fail("away_from_tmp needs a writable folder outside the guard's temp roots with no pytest file "
+                    f"above it ($XDG_RUNTIME_DIR, /run/user/{os.getuid()} or the user cache folder)")
     own = tempfile.mkdtemp(prefix="ttp-away-", dir=root)
     try:
         yield Path(os.path.realpath(own))
@@ -983,7 +992,7 @@ def pytest_collection_modifyitems(config, items):
 @pytest.hookimpl(trylast=True)   # after pytest's own tmpdir plugin made the factory _use_tmpfs patches
 def pytest_configure(config):
     config.addinivalue_line("markers", f"{SMOKE_MARK}: in the smoke suite a landing waits for ({SMOKE_LIST.name})")
-    config.addinivalue_line("markers", "away_from_tmp: tmp_path is a folder outside /tmp and /var/tmp with no "
+    config.addinivalue_line("markers", "away_from_tmp: tmp_path is a folder outside glmguard._TMP with no "
                                        "pytest file above it, wherever pytest's own temp root is")
     config._ttp_started = time.monotonic()
     _use_tmpfs(config)

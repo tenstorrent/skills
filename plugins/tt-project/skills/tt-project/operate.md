@@ -98,6 +98,12 @@
   (daily peaks for the 5-hour window, the last two weekly finals), and one line for dollar caps.
   Pacing, gate reasons and top spenders are in the web app's Budget tab.
 
+## Reported profiles
+
+A worker reports a profile bucket only beside earlier A/B or ablation results of the same stage, with
+any contradiction explained, and the profiler's own overhead as its own bucket so profiled and
+unprofiled totals reconcile (the worker prompt says so). Send back a profile report that lacks either.
+
 ## Security notes
 
 - Only the user posts as the user. `ttp say` refuses inside a run: when the run's environment

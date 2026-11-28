@@ -772,6 +772,16 @@ def test_worker_prompt_limits_search_scope():
         assert cmd in text, cmd
 
 
+def test_a_reported_profile_bucket_is_checked_against_earlier_results_and_counts_profiler_overhead():
+    worker = " ".join((PLUGIN / "template" / "prompts" / "worker.md").read_text(encoding="utf-8").split())
+    for phrase in ("Before you report a profile bucket, set it beside earlier A/B or ablation results of the same stage",
+                   "Count the profiler's own overhead as its own bucket, so profiled and unprofiled totals reconcile"):
+        assert phrase in worker, phrase
+    operate = " ".join((PLUGIN / "skills" / "tt-project" / "operate.md").read_text(encoding="utf-8").split())
+    assert "the profiler's own overhead as its own bucket" in operate
+    assert "earlier A/B or ablation results of the same stage" in operate
+
+
 def test_unreadable_inputs_block_once_and_are_collected_up_front():
     # A worker that meets an OS-guarded or password-protected input blocks once with the cause;
     # the coordinator gathers such inputs (or passwords) in one ask instead of one per task.

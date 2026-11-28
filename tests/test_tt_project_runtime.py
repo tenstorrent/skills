@@ -17469,7 +17469,7 @@ def test_a_charter_and_memory_heavy_project_keeps_the_worker_prompt_under_its_ca
     mem_chars = sum(len(e["line"]) + 1 for e in p._memory_entries())
     assert len(charter) > 11_000 and mem_chars > 9_000, (len(charter), mem_chars)
     spec = "SPEC-MARKER: follow up on fact-03 and fact-07"
-    for kind, cap in (("code", 31_825 + 875 + 115 + 101 + 78 + 95 + 100 + 40 + 220 + 215 + 35 + 660 + 215 + 30 + 65 + 130), ("question", 24_670 + 875 + 101 + 78)):   # +875 both: the KNOWN PATHS block; code: +45 for where the harness hook runs; code: +128 for `probe_match` waits; code: +120 for the hand-off's measured `eta`; code: +135 for the `context_gaps` hand-off field; code: +265 for `then` wait stages; +155 both: a wake at the `ttp eta` expected finish; code: +20 for `ttp checks --result --passed`; +55 both: a fix confirmed by its ack alone; +265 both: relayed findings citing records; +30 both: the charter's source cites; code: +50 for the Galaxy reset rescan and recount, +15 for wait_kind user, +100 for `ttp detach --lock`, +150 for atomic script writes, +175 for `published`, +35 for the $TTP_TEST_SLOTS cap, +80 for the home-zone date, +400 for paid-model-API job guards, +125 for its spend cap, +110 for evidence manifests naming only immutable artifacts, +30 for the root .ignore line, +150 for one standing item per user step (`ttp notify --step`); +162 both: the Threads line (parallel subagents); code: +25 for the pytest -n clip and sandbox wrap; code: +115 for remote tests and slow polls run detached, freeing the slot; +78 both: ack a mid-run update with a `ttp note "update: ..."`; code: +95 for the split gate's `no_split` line; code: +100 for the de-slop line; code: +40 for the PR body form gh checks; code: +220 for ponytail mode; code: +215 for an urgent hand-off beside its smoke   # code: +35 for the own-stack landing line; code: +660 for the ponytail self-lane and size lines; code: +215 for its skill path and repository search; code: +30 for drafts carrying the AI tag and the Slack connector exemption; code: +65 for the `missing-entry:` note of a refused user-ordered step, +130 for the base-failing run of a new test
+    for kind, cap in (("code", 31_825 + 875 + 115 + 101 + 78 + 95 + 100 + 40 + 220 + 215 + 35 + 660 + 215 + 30 + 65 + 130 + 120), ("question", 24_670 + 875 + 101 + 78 + 120)):   # +875 both: the KNOWN PATHS block; code: +45 for where the harness hook runs; code: +128 for `probe_match` waits; code: +120 for the hand-off's measured `eta`; code: +135 for the `context_gaps` hand-off field; code: +265 for `then` wait stages; +155 both: a wake at the `ttp eta` expected finish; code: +20 for `ttp checks --result --passed`; +55 both: a fix confirmed by its ack alone; +265 both: relayed findings citing records; +30 both: the charter's source cites; code: +50 for the Galaxy reset rescan and recount, +15 for wait_kind user, +100 for `ttp detach --lock`, +150 for atomic script writes, +175 for `published`, +35 for the $TTP_TEST_SLOTS cap, +80 for the home-zone date, +400 for paid-model-API job guards, +125 for its spend cap, +110 for evidence manifests naming only immutable artifacts, +30 for the root .ignore line, +150 for one standing item per user step (`ttp notify --step`); +162 both: the Threads line (parallel subagents); code: +25 for the pytest -n clip and sandbox wrap; code: +115 for remote tests and slow polls run detached, freeing the slot; +78 both: ack a mid-run update with a `ttp note "update: ..."`; code: +95 for the split gate's `no_split` line; code: +100 for the de-slop line; code: +40 for the PR body form gh checks; code: +220 for ponytail mode; code: +215 for an urgent hand-off beside its smoke   # code: +35 for the own-stack landing line; code: +660 for the ponytail self-lane and size lines; code: +215 for its skill path and repository search; code: +30 for drafts carrying the AI tag and the Slack connector exemption; code: +65 for the `missing-entry:` note of a refused user-ordered step, +130 for the base-failing run of a new test, +120 for the profile-bucket line
         tid = p.db.add_task(f"{kind} task", spec, kind=kind, tier="light", origin="user")
         prompt = worker_prompt(p, p.db.task(tid), str(p.root), "ttp/t1-x" if kind == "code" else None)
         assert spec in prompt and str(tmp_path) in prompt
@@ -46227,11 +46227,25 @@ def _bind_deep_socket(tmp):
 def test_an_away_from_tmp_test_gets_a_folder_outside_tmp_with_no_pytest_file_above_it(tmp_path):
     real = Path(os.path.realpath(tmp_path))
     from ttp import glmguard
-    assert not any(d in {Path(p) for t in (*glmguard._TMP, "/tmp") for p in (t, os.path.realpath(t))}
+    assert not any(d in {Path(p) for t in glmguard._TMP for p in (t, os.path.realpath(t))}
                    for d in (real, *real.parents))
     assert not [d for d in real.parents for f in ("conftest.py", "pytest.ini", ".pytest.ini", "tox.ini", "setup.cfg",
                                                    "pyproject.toml", "setup.py") if (d / f).is_file()]
     assert tmp_path.is_dir()
+
+
+@pytest.mark.away_from_tmp
+def test_away_from_tmp_falls_back_to_the_user_cache_folder_without_a_runtime_folder(tmp_path, monkeypatch):
+    import conftest
+    cache = tmp_path / "cache"
+    cache.mkdir()
+    monkeypatch.setenv("XDG_RUNTIME_DIR", str(tmp_path / "missing"))
+    monkeypatch.setenv("XDG_CACHE_HOME", str(cache))
+    assert conftest._away_base(uid=2 ** 31) == str(cache)
+    assert conftest._away_from_tmp(cache / "x")
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "missing"))
+    monkeypatch.setenv("HOME", str(tmp_path / "missing"))
+    assert conftest._away_base(uid=2 ** 31) is None
 
 
 def test_short_tmp_root_is_short_in_production(env, monkeypatch):

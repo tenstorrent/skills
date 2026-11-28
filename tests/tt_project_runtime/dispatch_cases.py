@@ -2605,6 +2605,22 @@ def test_dispatch_pass_memo_keeps_root_reads_until_a_move(tmp_path, monkeypatch)
     assert n("symbolic-ref --quiet --short HEAD") == 5, "outside a pass every read runs"
 
 
+def test_cli_git_read_is_kept_by_the_dispatch_pass_unless_it_has_stdin(tmp_path, monkeypatch):
+    """cli._git passes `input` to gitmemo only for a call with stdin: any `input` keeps a read out of the pass."""
+    from ttp import cli, gitmemo
+    repo = tmp_path / "r"
+    subprocess.run(["git", "init", "-q", "-b", "main", str(repo)], check=True)
+    calls = _slow_git(tmp_path, monkeypatch, 0)
+    read = ("symbolic-ref", "--quiet", "--short", "HEAD")
+    assert read in gitmemo._PASS_READS
+    n = lambda: calls.read_text().count("symbolic-ref --quiet --short HEAD") if calls.exists() else 0
+    with gitmemo.dispatch_pass():
+        assert [cli._git(repo, *read) for _ in range(2)] == ["main", "main"]
+        assert n() == 1
+        assert cli._git(repo, *read, stdin="") == "main"
+        assert n() == 2
+
+
 def test_dispatch_holds_a_duplicate_of_an_open_or_recently_done_task_once(
         env, monkeypatch, tmp_path, reap_tmp_processes):
     """User (waste): one project ran 27 runs on duplicate same-title tasks. Just before dispatch, a

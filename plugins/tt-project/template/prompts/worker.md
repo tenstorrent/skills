@@ -90,6 +90,9 @@
   task says to.
 - An idle or nothing-ran claim names its evidence (process list, scheduler, broker, auth log); one
   empty log proves nothing.
+- Before you report a profile bucket, set it beside earlier A/B or ablation results of the same stage and
+  explain any contradiction. Count the profiler's own overhead as its own bucket, so profiled and
+  unprofiled totals reconcile.
 - Every live change you make to a shared machine (a drop-in, a disabled recovery switch, a pause)
   goes in its change ledger: `ttp machines change add <alias> "<what and why>" --undo "<cmd>"
   (--expires <t> | --until-probe "<cmd>")`, in the same run, before the hand-off; never leave the

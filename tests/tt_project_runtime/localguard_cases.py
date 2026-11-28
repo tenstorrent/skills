@@ -434,6 +434,33 @@ def test_an_upgrade_local_commit_hands_git_its_paths_on_stdin_and_writes_no_scra
     assert {odd, "plain.txt"} <= set(_git_out(p.harness, "ls-tree", "-r", "--name-only", "-z", "HEAD").split("\0"))
 
 
+def test_an_upgrade_beside_a_running_harness_task_hands_add_and_commit_their_paths_on_stdin(env, monkeypatch):
+    p = make(env)
+    from ttp import cli
+    now = time.time()
+    odd = "two words\nand a line.txt"
+    for n in (odd, "plain.txt"):
+        (p.harness / n).write_text("x\n")
+        os.utime(p.harness / n, (now - 7200, now - 7200))
+    (p.harness / "mine.txt").write_text("the running task's own\n")
+    tid = p.db.add_task("Add a check", "spec", kind="harness")
+    p.db.x("INSERT INTO runs(task,role,provider,started,status) VALUES(?,'worker','claude',?,'running')",
+           (tid, now - 3600))
+    real, seen = cli._git, []
+
+    def spy(cwd, *args, **kw):
+        if "--pathspec-file-nul" in args:
+            seen.append((args[args.index("add") if "add" in args else args.index("commit")], kw.get("stdin")))
+        return real(cwd, *args, **kw)
+    monkeypatch.setattr(cli, "_git", spy)
+    monkeypatch.setattr(cli.tempfile, "mkdtemp", lambda *a, **k: pytest.fail("a scratch folder was made"))
+    assert cli._commit_local_changes(p, ["-c", "user.name=t", "-c", "user.email=t@t"]) == ["mine.txt"]
+    paths = f"plain.txt\0{odd}\0"
+    assert seen == [("add", paths), ("commit", paths)]
+    assert {odd, "plain.txt"} <= set(_git_out(p.harness, "ls-tree", "-r", "--name-only", "-z", "HEAD").split("\0"))
+    assert "?? mine.txt" in _git_out(p.harness, "status", "--porcelain")
+
+
 def test_an_upgrade_local_commit_skips_a_file_removed_while_it_is_added_and_fails_on_a_real_error(env, monkeypatch):
     p = make(env)
     from ttp import cli

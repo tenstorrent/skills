@@ -697,8 +697,9 @@ def _copy_tree(src: Path, dst: Path) -> None:
 
 
 def _git(cwd: Path, *args: str, stdin: str | None = None) -> str:
+    kw = {} if stdin is None else {"input": stdin}     # any `input` keeps a read out of gitmemo's pass memo
     return gitmemo.run(["git", "-C", str(cwd), *args], capture_output=True, text=True, check=True,
-                       timeout=None, input=stdin).stdout.strip()
+                       timeout=None, **kw).stdout.strip()
 
 
 SOURCE_FILE = "SOURCE_COMMIT"      # in runtime/ttp/: the git commit (or content hash) `ttp setup` installed this runtime from
@@ -15400,17 +15401,13 @@ def _commit_local_changes(p: Project, ident: list[str]) -> list[str]:
     if old:
         # A plan file a running task edited stays its own: its digests are not refreshed here.
         old += [n for n in _refresh_plan_digests(p, old, set(left)) if n not in old]
-        spec = p.state / "upgrade-commit-paths"
-        spec.write_text("\0".join(old) + "\0")
-        try:
-            files = ["--pathspec-from-file", str(spec), "--pathspec-file-nul"]
-            _git(h, "--literal-pathspecs", "add", "-A", *files)
-            # --only: the worker's own staged files stay staged and out of this commit
-            done = sorted(names("diff", "--cached", "--name-only", "--no-renames", "-z", "HEAD") & set(old))
-            if done:
-                _commit_listing(p, ident, msg, done, kept_out, ["--literal-pathspecs"], ["--only", *files])
-        finally:
-            spec.unlink(missing_ok=True)
+        stdin = "\0".join(old) + "\0"
+        files = ["--pathspec-from-file=-", "--pathspec-file-nul"]
+        _git(h, "--literal-pathspecs", "add", "-A", *files, stdin=stdin)
+        # --only: the worker's own staged files stay staged and out of this commit
+        done = sorted(names("diff", "--cached", "--name-only", "--no-renames", "-z", "HEAD") & set(old))
+        if done:
+            _commit_listing(p, ident, msg, done, kept_out, ["--literal-pathspecs"], ["--only", *files], stdin)
     if left:
         print(f"left {len(left)} file(s) changed since harness task #{tid}'s run started for it to commit: "
               f"{', '.join(left[:10])}" + (f" and {len(left) - 10} more" if len(left) > 10 else ""))
@@ -15500,7 +15497,7 @@ def _capped_list(names: list[str], cap: int = 40) -> str:
 
 
 def _commit_listing(p: Project, ident: list[str], msg: str, files: list[str], kept_out: list[str],
-                    pre: list[str] | None = None, post: list[str] | None = None) -> str:
+                    pre: list[str] | None = None, post: list[str] | None = None, stdin: str | None = None) -> str:
     """Commit `files` (what is staged, or `post`'s paths) with a message that lists them and the runtime
     data kept out, then tell the open harness tasks that may own those edits. Returns the sha."""
     h = p.harness
@@ -15508,7 +15505,7 @@ def _commit_listing(p: Project, ident: list[str], msg: str, files: list[str], ke
     if kept_out:
         body += (f"\n\nRuntime data kept out (in .git/info/exclude; `git add -f` to commit one):\n"
                  f"{_capped_list(kept_out)}")
-    _git(h, *(pre or []), *ident, "commit", "-q", *(post or []), "-m", msg, "-m", body)
+    _git(h, *(pre or []), *ident, "commit", "-q", *(post or []), "-m", msg, "-m", body, stdin=stdin)
     sha = _git(h, "rev-parse", "HEAD")
     print(f"committed the harness's local changes as {sha[:12]} ({len(files)} file(s): "
           f"{', '.join(files[:10])}{f' and {len(files) - 10} more' if len(files) > 10 else ''})")
