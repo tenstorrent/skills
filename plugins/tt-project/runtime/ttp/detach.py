@@ -1041,9 +1041,20 @@ def _mask_log(rc: Path) -> bool:
     return True
 
 
+def live(run_dir: Path) -> bool:
+    """Whether a job this run's detached.json records is still running or queued (by state(), never the record)."""
+    try:
+        jobs = json.loads((Path(run_dir) / REGISTRY).read_text())
+    except (OSError, ValueError):
+        return False
+    return any(isinstance(j, dict) and j.get("status") not in CLOSED and j.get("rc")
+               and state(Path(j["rc"]))[0] in ("running", "queued") for j in jobs if isinstance(jobs, list))
+
+
 def close_records(p: Project, now: float | None = None) -> int:
     """The daemon's sweep (tend, at most once a minute): close every open record of the runs of the last
     CLOSE_DAYS days whose job is over. How many it closed."""
+    from .runner import release_tmp
     now = time.time() if now is None else now
     mark = p.state / "detach-closed.at"
     try:
@@ -1066,6 +1077,7 @@ def close_records(p: Project, now: float | None = None) -> int:
                     n += bool(close(Path(j["rc"]), now)) and j.get("status") not in CLOSED
                 except OSError:
                     continue
+        release_tmp(d.parent)
     return n
 
 

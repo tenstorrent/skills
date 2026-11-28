@@ -35709,7 +35709,7 @@ def test_a_detached_job_keeps_its_own_temp_dir_after_its_run_ends_and_it_goes_wh
     tmp = detach.tmp_dir(own)
     assert shorttmp.owned(tmp) and tmp.is_dir()
     runner.remove_tmp(run_dir, {"tmp_dir": str(run_dir / "tmp")})   # the run that started it ends
-    assert not (run_dir / "tmp").exists()
+    assert (run_dir / "tmp").exists(), "the run's own dir stays while its job runs"
     detach.tend(p)   # the sweep leaves a running job's dir alone
     assert own.is_dir()
     go.touch()

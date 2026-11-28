@@ -403,6 +403,9 @@ def end_leftovers_within(pgid: int, run_dir: Path) -> bool:
     return True
 
 
+TMP_KEPT = "tmp.kept"   # in a run folder: its temp dir was kept for a detached job still running
+
+
 def remove_files(paths: list[str]) -> None:
     for f in paths:
         try:
@@ -413,13 +416,27 @@ def remove_files(paths: list[str]) -> None:
 
 def remove_tmp(run_dir: Path, spec: dict) -> None:
     """Delete the run's private temp dir: run dirs are kept, so its scratch must not pile up there.
-    Only a dir directly inside the run dir, or a short one (shorttmp), is ever removed."""
-    from . import shorttmp
+    Only a dir directly inside the run dir, or a short one (shorttmp), is ever removed. It stays while a
+    job the run detached still runs (TMP_KEPT marks that): release_tmp removes it once the last one ends."""
+    from . import detach, shorttmp
+    if detach.live(run_dir):
+        (run_dir / TMP_KEPT).touch()
+        return
+    (run_dir / TMP_KEPT).unlink(missing_ok=True)
     tmp = spec.get("tmp_dir")
     if shorttmp.owned(tmp):
         shorttmp.remove(tmp)
     elif tmp and Path(tmp).parent.resolve() == run_dir.resolve() and not Path(tmp).is_symlink():
         shutil.rmtree(tmp, ignore_errors=True)
+
+
+def release_tmp(run_dir: Path) -> None:
+    """The daemon's sweep: remove the temp dir remove_tmp kept for a run once its detached jobs are over."""
+    if (run_dir / TMP_KEPT).exists():
+        try:
+            remove_tmp(run_dir, json.loads((run_dir / "run.json").read_text()))
+        except (OSError, ValueError, AttributeError):
+            pass
 
 
 def remove_private(run_dir: Path) -> None:

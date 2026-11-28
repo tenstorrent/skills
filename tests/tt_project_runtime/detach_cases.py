@@ -3779,3 +3779,44 @@ def test_detach_retry_runs_on_the_remote_host_and_odd_retry_options_start_nothin
     r = _ttp_run(p, "detach", "--check", "--retry", "1", str(remote / "drv.rc"), env=e)
     assert r.returncode != 0 and "go with the command" in r.stderr, r.stderr
 
+
+
+# A run's temp dir stays while a job the run detached still runs; the daemon's sweep removes it once the
+# last one is over (runner.remove_tmp keeps it and marks the run folder, detach.close_records releases it).
+def _run_with_tmp(p, rid="9"):
+    run_dir = p.runs / rid
+    (run_dir / "tmp").mkdir(parents=True)
+    (run_dir / "tmp" / "f").write_text("x")
+    spec = {"tmp_dir": str(run_dir / "tmp")}
+    (run_dir / "run.json").write_text(json.dumps(spec))
+    return run_dir, spec
+
+
+def test_run_temp_dir_is_kept_while_its_detached_job_runs_and_swept_after_it_ends(env, tmp_path):
+    from ttp import detach, runner
+    p = make(env)
+    run_dir, spec = _run_with_tmp(p)
+    rc = _detach_job(p, run_dir, env, "job", _until(tmp_path / "stop"))
+    assert _until_true(lambda: detach.started(rc).exists())
+    runner.remove_tmp(run_dir, spec)   # the run ends
+    runner.remove_private(run_dir)     # the daemon's fallback for a dead runner
+    assert (run_dir / "tmp" / "f").exists(), "kept while the job runs"
+    detach.close_records(p)
+    assert (run_dir / "tmp" / "f").exists(), "the sweep keeps it too while the job runs"
+    (tmp_path / "stop").touch()
+    assert _until_true(lambda: rc.exists() and detach.state(rc)[0] == "ended")
+    detach.close_records(p, now=time.time() + 120)
+    assert not (run_dir / "tmp").exists() and not (run_dir / runner.TMP_KEPT).exists(), "removed once it ended"
+
+
+def test_run_temp_dir_is_removed_at_run_end_when_no_detached_job_is_live(env, tmp_path):
+    from ttp import detach, runner
+    p = make(env)
+    run_dir, spec = _run_with_tmp(p)
+    runner.remove_tmp(run_dir, spec)
+    assert not (run_dir / "tmp").exists() and not (run_dir / runner.TMP_KEPT).exists()
+    other, spec = _run_with_tmp(p, "10")   # a job that already ended does not keep it
+    rc = _detach_job(p, other, env, "job", ["sh", "-c", "exit 0"])
+    assert _until_true(lambda: rc.exists() and detach.state(rc)[0] == "ended")
+    runner.remove_tmp(other, spec)
+    assert not (other / "tmp").exists()
