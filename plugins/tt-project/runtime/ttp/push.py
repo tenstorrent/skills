@@ -49,7 +49,7 @@ from pathlib import Path
 from typing import Any, Callable
 from urllib.parse import quote, unquote
 
-from . import (checkcap, checkdirs, checkspill, checkwait, checklane, cleantree, coordtools, envfault, gatejudge, gatetime, gitcache, ghroute, gitmemo, hoststate, landed, landmark, leakfile, locks, machines, outscan, ponytail, pooladmit, prbabysit, prguard, prhead, prsize, remotecheck, remoteload, repoid, runner, runnerenv, scratchhome,
+from . import (checkcap, checkdirs, checkspill, checkwait, checklane, cleantree, coordtools, envfault, gatejudge, gatetime, gitcache, ghroute, gitmemo, hoststate, landed, landgate, landmark, leakfile, locks, machines, outscan, ponytail, pooladmit, prbabysit, prguard, prhead, prsize, remotecheck, remoteload, repoid, runner, runnerenv, scratchhome,
                settinghold, setupfault, sharedchecks, shorttmp, syntaxfault, testslots, timefmt, verified, workerloss, worktree)
 from . import __version__
 from .budget import DOC_SUFFIXES, task_default_usd
@@ -2318,7 +2318,8 @@ def own_target(p: Project, repo: Path) -> tuple[str, str]:
         raise ValueError(f"{key} is in pr_babysit.no_post_prs: its branch {branch} is not pushed. Commit locally "
                          f"and tell the user; they push it")
     head = _git(repo, "rev-parse", "--verify", "-q", "HEAD^{commit}").stdout.strip()
-    if why := prsize.budget_gate(p, _task_row(p, task), branch, head):
+    if (why := prsize.budget_gate(p, _task_row(p, task), branch, head)) and not landgate.defer(
+            p, task, head, why, os.environ.get("TTP_RUN_DIR"), land=False, say=lambda m: print(m, file=sys.stderr)):
         raise ValueError(why)
     return remote, branch
 
@@ -3078,7 +3079,9 @@ def _resolve_target(p: Project, repo: Path, own: bool = False) -> tuple[str, str
                          f"its own commits (`git rebase --onto {upstream} {base}`) and rerun")
     if task and (why := code_run_landing(p, task, f"{remote}/{push_to}", d, repo)):
         raise ValueError(why)
-    if task and (why := ponytail_landing(p, task, f"{remote}/{push_to}", d, repo)):
+    if task and (why := ponytail_landing(p, task, f"{remote}/{push_to}", d, repo)) and not landgate.defer(
+            p, task, _git(repo, "rev-parse", "HEAD").stdout.strip(), why, os.environ.get("TTP_RUN_DIR"),
+            say=lambda m: print(m, file=sys.stderr)):
         raise ValueError(why)
     if m and task and m.group(1) == task:
         if (approved := (approval_marker(p, os.getpid()) or {}).get("sha")) and not task_may_self_land(p, task, p.config()) \

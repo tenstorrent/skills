@@ -194,8 +194,9 @@ def spec_line(cfg: dict, added: int | None, provider: str | None = None) -> str:
     over the landing limit, the size rule too."""
     pin = pinned(cfg, provider)
     line = (f"Ponytail lane (review.ponytail_lane): beside correctness, run a separate ponytail review. Start one "
-            f"fresh-context subagent {pin}, given only the change's spec and its diff, and "
-            f"have it read skill `tt-ponytail-review` at `{skill_file()}` and apply it. It fails the change on any "
+            f"fresh-context subagent {pin}, given only the change's spec (whole, with the user words it quotes) and "
+            f"its diff, and have it read skill `tt-ponytail-review` at `{skill_file()}` and apply it. Anything a "
+            f"user order quoted in the spec asks for is in scope, never a `block`. It fails the change on any "
             f"`block` finding (code that should not exist, a copied or vendored tree unless the spec has a line "
             f"`vendored: <user msg>`); a `note` (a small leftover that can wait) does not. Write its "
             f"verdict unedited to `$TTP_RUN_DIR/{FILE}` as {{\"verdict\": \"pass\" or \"fail\", \"head\": "
@@ -205,7 +206,8 @@ def spec_line(cfg: dict, added: int | None, provider: str | None = None) -> str:
             f"\"model\": \"<the model it ran on>\"; only with no subagent tool at all, run the lane yourself last and "
             f"set \"thread\": false. A fail fails this "
             f"review (its findings become the fix follow-ups); landing, the push queue and a draft PR's next "
-            f"step need both verdicts to pass.")
+            f"step need both verdicts to pass, unless `ttp checks` passed on that head: then the lane's findings "
+            f"and the size rule become follow-up tasks after landing, and only your correctness verdict gates it.")
     if added is not None and (cap := limit(cfg)) and added > cap:
         line += (f" Size: it adds {added} lines, over review.ponytail_land_lines ({cap}): it passes only with a "
                  f"`why this size:` line in its spec or hand-off.")

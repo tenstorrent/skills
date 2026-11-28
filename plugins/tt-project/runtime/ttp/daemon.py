@@ -46,6 +46,7 @@ from . import (   # one name per line: two changes adding names merge without a 
     glmassist,
     glmquota,
     handback,
+    landgate,
     prbabysit,
     precheckbind,
     rereap,
@@ -8098,12 +8099,13 @@ class Daemon:
         # stored failed, so its fix and re-review follow and nothing is approved, but the review itself
         # worked: it shows as changes_needed and spends no attempt (db.CHANGES_NEEDED).
         rejects = rstatus == "done" and task["kind"] == "review" and review_rejects(result)
+        kept = None   # checks passed on the head the lane read: its findings follow the landing (landgate)
         if rejects:
             rstatus, result = "failed", dict(result, status=CHANGES_NEEDED)
         elif rstatus == "done" and task["kind"] == "review" and own and (
                 lane := ponytail.gate(self.cfg, task, run_dir, result,
                                       push._reviewed_tasks(self.p, str(task["id"])) if ponytail.labelled(task) is not None
-                                      else []))[0]:
+                                      else []))[0] and not (kept := landgate.review_kept(self.p, task, run_dir, result, *lane)):
             # The ponytail lane failed it, or the change is over the size limit with no reason: its fixes
             # follow as for any failed review. No verdict at all is a form failure: nothing to fix.
             why, fix = lane
@@ -8115,6 +8117,7 @@ class Daemon:
                 # Only the size rule failed it (no lane finding, no reviewer follow-up): see reviewreuse.judged.
                 **({reviewreuse.SIZE_ONLY_KEY: True} if fix and not fups and not ponytail.lane_problem(run_dir) else {}),
                 **{REVIEW_FAILURE_KEY: "substantive" if fix else "approval"})
+        result = kept or result
         if rstatus in ("done", "failed") and task["kind"] == "review" and own and ponytail.labelled(task) is not None \
                 and (notes := ponytail.findings(ponytail.read(run_dir) or {}, note=True)):
             # Notes (small leftovers that can wait) never fail the change nor become fix tasks: one list on the hand-off.
@@ -20994,7 +20997,8 @@ class Daemon:
                 log(self.p, f"task {task['id']}: no review queued, head {head} has no commit of its own "
                             f"off the push branch (or each of its patches is already there)")
                 return None
-            if not ponytail.WHY.search(text) and (why := ponytail.size_problem(cfg, added, text, None)):
+            if not ponytail.WHY.search(text) and (why := ponytail.size_problem(cfg, added, text, None)) \
+                    and not landgate.defer(self.p, task, full, why):
                 self._size_refused(task, full, why)
                 return None
             lines.append(ponytail.spec_line(cfg, added, pin_of(task).get("provider")))
@@ -22068,7 +22072,7 @@ class Daemon:
                 return f"{head[:12]}: its added lines were not read ({ex})"
             why = (ponytail.lane_problem(run_dir, head) if ponytail.on(cfg) else "") or ponytail.size_problem(
                 cfg, added, ponytail.reason_text(task, result, codes), run_dir, head)
-            if why:
+            if why and not landgate.defer(self.p, task, head, why, run_dir):
                 if ponytail.on(cfg) and ponytail.labelled(task) is None:
                     labels = json.loads(task.get("labels") or "[]")
                     self.p.db.update_task(task["id"], labels=[*labels, ponytail.label(added)])

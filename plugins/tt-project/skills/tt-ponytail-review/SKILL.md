@@ -18,6 +18,8 @@ This is a report the user asked for, so give it in full.
 - Review what the user names: uncommitted or staged changes, a branch, a PR
   link, or files. Nothing named: the uncommitted changes, or the last commit
   if there are none.
+- When the change's spec quotes a user's order, what that order asks for is
+  in scope: never a finding against it.
 - Read the diff, then the code it touches: callers of every changed function,
   the functions it calls, the tests, the README.
 - Trace the real flow: where data comes in, what is stored, what goes out.
