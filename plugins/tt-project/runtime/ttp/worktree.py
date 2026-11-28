@@ -1410,7 +1410,10 @@ def unkeep(path: Path) -> None:
     except OSError:
         ours = False
     if ours:
-        _git(path, "worktree", "unlock", str(path), check=False)
+        try:   # best effort, as keep(): a removal after a failed unlock reports the lock itself
+            _git(path, "worktree", "unlock", str(path), check=False, timeout=30)
+        except (OSError, subprocess.SubprocessError):
+            pass
 
 
 def _repo_of(path: Path) -> Path | None:
