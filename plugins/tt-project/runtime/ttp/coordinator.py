@@ -1942,6 +1942,7 @@ NEEDS_USER["coordinator.routine.mode"] = "restriction"
 NEEDS_USER["guards.off"] = "restriction"
 
 
+NEEDS_USER["rollout.coordinator_max_level"] = "restriction"   # clearing it restores the default level
 NEEDS_USER["coordinator.session.tools"] = "restriction"   # read_only, its safe side, needs no word
 # The chain caps and the run stop limit spend as the budget keys do.
 NEEDS_USER.update(dict.fromkeys(("chains.max_usd", "chains.max_hops", "waste.max_runs"), "spend"))

@@ -876,15 +876,11 @@ COORD_MAX_KEY = "coordinator_max_level"   # rollout.*: the widest level a coordi
 
 def coordinator_project() -> str:
     """The name of the project whose coordinator session is calling, else "": the daemon's run row says so
-    (a task run has a TTP_TASK, and the row is the coordinator's and still running), never the env alone."""
-    from . import coordtools, project as project_mod
-    run = os.environ.get("TTP_RUN_ID") or ""
-    if os.environ.get("TTP_TASK") or os.environ.get(coordtools.ROLE_ENV) != "coordinator" or not run.isdigit():
-        return ""
+    (a live coordinator run, and no TTP_TASK), never the env alone."""
+    from . import jobstop, project as project_mod
     p = project_mod.here()
-    row = p.db.one("SELECT id FROM runs WHERE id=? AND role='coordinator' AND status='running'", (int(run),)) \
-        if p is not None else None
-    return p.name if row else ""
+    live = p is not None and not os.environ.get("TTP_TASK") and jobstop.coord_run(p, os.environ.get("TTP_RUN_ID"), True)
+    return p.name if live else ""
 
 
 def coordinator_max() -> int:
@@ -893,24 +889,22 @@ def coordinator_max() -> int:
     return cap if isinstance(cap, int) and not isinstance(cap, bool) and cap >= 0 else -1
 
 
-def coordinator_refusal(a, reason: str) -> str:
-    """Why a coordinator session may not `set` or `promote` as asked, else "": it names a reason and stays
-    within `coordinator_max`; auto and anything wider stay the user's."""
+def coordinator_refusal(a, reason: str) -> tuple[str, Any]:
+    """(why a coordinator session may not `set` or `promote` as asked, the level it then sets): it names a
+    reason and stays within `coordinator_max`; auto and anything wider stay the user's."""
     cap = coordinator_max()
     stays = (f"a coordinator sets or promotes a flag up to level {cap} (rollout.coordinator_max_level); "
              "level 2, auto, rings and waves stay the user's terminal: ring 2 needs the user's word")
     if a.action in ("ring", "waves"):
-        return stays
+        return stays, None
     if not reason:
-        return "a coordinator's change carries its --reason"
+        return "a coordinator's change carries its --reason", None
     try:
         cur = level(a.target) if a.action == "promote" else None
         to = parse_level(a.value) if a.action == "set" else (0 if cur == OFF else cur + 1 if cur != AUTO else AUTO)
     except ValueError:
-        return ""   # an unknown flag or level: the change itself says so
-    if to == AUTO or (to != OFF and to > cap):
-        return stays
-    return ""
+        return "", None   # an unknown flag or level: the change itself says so
+    return (stays, None) if to == AUTO or (to != OFF and to > cap) else ("", to)
 
 
 def rearm_refusal(a) -> tuple[str, dict]:
@@ -1004,7 +998,8 @@ def run(a) -> int:
             print(f"ttp rollout arm: {why}", flush=True)
             return 2
     elif coord:   # the coordinator session, a third class: set and promote within its level, on a reason; the rest refused
-        if why := coordinator_refusal(a, (a.reason or "").strip()):
+        why, to = coordinator_refusal(a, (a.reason or "").strip())
+        if why:
             print(f"ttp rollout {act}: {why}", flush=True)
             return 2
     elif in_run and act not in ("status", "rollback", "on", "fixed"):
@@ -1084,8 +1079,10 @@ def run(a) -> int:
             print(set_ring(a.target, a.value))
         elif act == "set":
             print(set_level(a.target, a.value, reason or "set by hand", by))
+        elif act == "promote" and coord:   # the level checked, even if the watch moved the flag meanwhile
+            print(set_level(a.target, to, reason, by, "promote"))
         elif act == "promote":
-            print(promote(a.target, reason, by))
+            print(promote(a.target, reason))
         elif act == "rollback" and in_run:   # one project, never a freeze; the whole flag is the user's
             _check(a.target)
             why = outage_refusal(reason)

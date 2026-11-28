@@ -13889,8 +13889,6 @@ def _config_account(a, run) -> None:
     if run and a.key is not None and needs_users_word(a.name):
         # A run can be steered by text it reads; spend caps change only on the user's word.
         _refuse_user_only_in_run(a.name)
-    if run and a.key is not None and a.name == "rollout.coordinator_max_level":
-        _refuse_user_only_in_run(a.name)   # clearing it would restore the default level: the user's switch alone
     if run and a.key not in (None, "") and a.name in ACCOUNT_USER_ONLY and not _account_off(a.name, a.key):
         # The account's spill pool sends every project's code to those machines: only
         # clearing it (removing, or their off value) is a run's.

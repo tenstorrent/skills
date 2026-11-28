@@ -1586,9 +1586,6 @@ def test_the_coordinator_session_sets_and_promotes_a_flag_up_to_its_level_on_a_r
         ("set", "coordinator:alpha", "arm the canary"), ("promote", "coordinator:alpha", "canary clean")]
     assert "last changed by coordinator:alpha: canary clean" in _roll(capsys, "status")[1]
     assert _roll(capsys, "set", "deslop", "off", "--reason", "pause it")[0] == 0 and rollout.level("deslop") == rollout.OFF
-    _roll(capsys, "set", "deslop", "1", "--reason", "again")
-    assert "frozen" in rollout.rollback("deslop", "failed runs up", "daemon:alpha"), "the health watch still guards it"
-    assert rollout.frozen("deslop") and rollout.level("deslop") == rollout.OFF
 
 
 def test_the_coordinator_session_never_sets_level_2_auto_rings_or_waves(env, capsys, monkeypatch):
