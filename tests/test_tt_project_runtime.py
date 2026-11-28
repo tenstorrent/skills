@@ -39476,7 +39476,7 @@ def test_setting_hold_reads_a_plain_or_the_before_ttp_push(spec, lands_it):
 
 @pytest.mark.parametrize("spec,lands_it", [
     ("Do not run tests. Land it with `ttp push`.", True),        # the negation ends with its sentence
-    ("Never edit the docs! Push it with `ttp push`.", True),
+    ("Land the .github/ci.yml fix with `ttp push`.", True),    # a word may start with a dot
     ("Run checks.py then land v0.2.1 with `ttp push`.", True),    # dots inside a word are no sentence end
     ("Do not land it with `ttp push`.", False),
 ])

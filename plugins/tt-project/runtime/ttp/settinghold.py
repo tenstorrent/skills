@@ -40,7 +40,7 @@ NOTE = "setting hold:"
 # A filler word may hold dots (a file name, a version) but never ends on one, so it stops at a sentence end.
 # The flags after the command say whether it is `--own`.
 _FLAGS = r"(?P<flags>(?:[ \t]+--?[\w-]+(?:=\S+)?)*)"
-_VERB = (r"\b(?:run|use|land|push|publish|deliver|ship)\b(?:[ \t]+(?!ttp\b)[\w#/-]+(?:\.[\w#/-]+)*){0,4}?"
+_VERB = (r"\b(?:run|use|land|push|publish|deliver|ship)\b(?:[ \t]+(?!ttp\b)[\w#/.-]*[\w#/-]){0,4}?"
          r"[ \t]+(?:with|using|via|through|by running)[ \t]+(?:(?:a[ \t]+)?plain[ \t]+|the[ \t]+)?"
          r"|\b(?:run|use)[ \t]+")
 INSTRUCTION = re.compile(rf"(?:{_VERB})`?ttp push\b{_FLAGS}", re.I)

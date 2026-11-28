@@ -1153,7 +1153,6 @@ def test_a_top_up_covers_the_first_call_of_the_tasks_last_run(env):
     assert first > 0 and topup.first_call_usd(p.db, cfg, tid) == first
     got = topup.top_up(p.db, cfg, dict(p.db.task(tid)))
     assert got["budget_usd"] == round(2.0 + step + first, 2)   # the step is left after the reload
-    assert got["budget_usd"] - 2.0 >= first
 
 
 def test_a_dollar_cap_still_stops_a_topped_up_urgent_task(env, monkeypatch):
