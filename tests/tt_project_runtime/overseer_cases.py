@@ -547,3 +547,38 @@ def test_an_urgent_task_dispatch_holds_for_its_own_reason_is_no_stall_while_a_sl
     assert "logged out" in h["urgent_hold"]
     h = overseer.measure(p, now + readywait.GAP_S + 60)   # the ready check stopped: a stall again
     assert h["urgent_held"] == 0 and h["failing"] and "free slot" in h["failing"][0]
+
+
+def _urgent_task_with_saved_wait(env, monkeypatch, cause, causes, last_ago):
+    """A project with one urgent task ready for 2000 s whose saved ready-wait is `causes`, last seen
+    `last_ago` s ago while held by `cause`; returns (project, now)."""
+    from ttp import overseer, readywait
+    monkeypatch.setattr(overseer, "capture_stacks", lambda p, now, why: None)
+    p = make(env)
+    p.db.x("UPDATE tasks SET status='done'")
+    tid = p.db.add_task("urgent fix", "urgent: the user is waiting", kind="code", priority=1)
+    now = time.time()
+    p.db.x("UPDATE tasks SET updated=?, created=? WHERE id=?", (now - 2000, now - 2000, tid))
+    (p.state / "heartbeat").write_text(json.dumps({"pid": 1}))
+    readywait.save(p.db, {tid: {"since": now - 2000, "first": now - 2000, "first_cause": cause, "last": now - last_ago,
+                                "cause": cause, "causes": causes}}, now)
+    return p, now
+
+
+def test_an_urgent_wait_counts_from_the_end_of_an_excused_hold(env, monkeypatch):
+    """A long hold the daemon excuses (here logged out) ended 30 s ago: only the free-slot wait since then
+    counts, so the first pass after it records no incident."""
+    from ttp import overseer
+    p, now = _urgent_task_with_saved_wait(env, monkeypatch, "dispatch", {"logged_out": 1800.0, "dispatch": 30.0}, 30)
+    h = overseer.measure(p, now)
+    assert h["urgent_held"] == 0 and 55 <= h["urgent_wait_s"] <= 70 and h["failing"] == []
+
+
+def test_an_urgent_task_held_by_the_project_cap_still_counts_as_a_wait(env, monkeypatch):
+    from ttp import overseer, readywait
+    p, now = _urgent_task_with_saved_wait(env, monkeypatch, "project_cap", {"project_cap": 600.0}, 30)
+    h = overseer.measure(p, now)
+    assert h["urgent_held"] == 0 and h["urgent_wait_s"] >= 629 and any("free slot" in x for x in h["failing"])
+    p, now = _urgent_task_with_saved_wait(env, monkeypatch, "logged_out", {"dispatch": 10.0}, 30)
+    h = overseer.measure(p, now)
+    assert h["urgent_held"] == 1 and readywait.LABELS["logged_out"] in h["urgent_hold"]

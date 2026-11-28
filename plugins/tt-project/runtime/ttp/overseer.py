@@ -50,6 +50,7 @@ import time
 from pathlib import Path
 
 from .project import Project, durable_append, durable_write
+from .readywait import GAP_S, LABELS, restore
 
 EVERY_S = 60            # one pass a minute: a few read-only queries and a stat per running run
 FAIL_S = 300            # results failing this long make an incident
@@ -81,6 +82,10 @@ def _age(now: float, ts) -> float | None:
     return max(0.0, now - float(ts)) if ts else None
 
 
+# A project_cap is no hold here: an urgent task takes burst slots past it, which the ready check does not count.
+UNEXCUSED = ("dispatch", "project_cap")
+
+
 def _hold(d, task: dict, since: float, cfg: dict, state: Path, now: float) -> str:
     """What keeps ready `task` out of dispatch, read from the database and the precheck folders only
     (module doc), or ''."""
@@ -105,12 +110,26 @@ def _hold(d, task: dict, since: float, cfg: dict, state: Path, now: float) -> st
                (task["id"], since))
     if ev:
         return (ev["text"] or "a resource it needs is held")[:80]
-    from .readywait import GAP_S, restore
-    seen = restore(d, now).get(task["id"])   # the hold the daemon's ready check saw last (its _start_hold);
-    # a project_cap is no hold here: an urgent task takes burst slots past it, which that check does not count
-    if seen and 0 <= now - seen["last"] <= GAP_S and seen["cause"] not in ("dispatch", "project_cap"):
-        return f"dispatch holds it ({seen['cause'].replace('_', ' ')})"
+    seen = _seen(d, task["id"], now)   # the hold the daemon's ready check saw last (its _start_hold)
+    if seen and seen["cause"] not in UNEXCUSED:
+        return f"dispatch holds it ({LABELS.get(seen['cause'], seen['cause'])})"
     return ""
+
+
+def _free_wait(d, task: dict, since: float, now: float) -> float:
+    """Seconds ready urgent `task` has waited while dispatch could start it: the unexcused causes of its
+    saved ready-wait plus the time since the last check, so an excused hold that ended starts no incident;
+    without a fresh sighting, the age since `since`."""
+    seen = _seen(d, task["id"], now)
+    if not seen:
+        return _age(now, since) or 0.0
+    return sum(seen["causes"].get(c, 0.0) for c in UNEXCUSED) + (now - seen["last"] if seen["cause"] in UNEXCUSED else 0.0)
+
+
+def _seen(d, tid: int, now: float) -> dict | None:
+    """The saved ready-wait sighting of task `tid` while the daemon's ready check still runs, else None."""
+    seen = restore(d, now).get(tid)
+    return seen if seen and 0 <= now - seen["last"] <= GAP_S else None
 
 
 def slept_since_boot() -> float | None:
@@ -174,7 +193,7 @@ def measure(p: Project, now: float | None = None, prev: dict | None = None) -> d
                 continue
             since = max(float(t["updated"] or t["created"] or now), float(t["not_before"] or 0))
             why = _hold(d, t, since, cfg, p.state, now)
-            (holds if why else waits).append(why or _age(now, since))
+            (holds if why else waits).append(why or _free_wait(d, t, since, now))
         h["urgent_ready"] = len(waits) + len(holds)
         h["urgent_held"], h["urgent_hold"] = len(holds), (holds[0] if holds else "")
         h["urgent_wait_s"] = max(waits) if waits and h["free_slots"] else 0.0
