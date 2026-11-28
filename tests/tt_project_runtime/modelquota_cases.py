@@ -170,3 +170,78 @@ def test_model_quota_stop_with_an_alternate_free_neither_pauses_nor_cools_the_en
     tid = p.db.add_task("build 2", "", kind="work", tier="light", priority=3, budget_usd=8.0, labels=[])
     _route_finish(p, d, tid, {"stopped": "quota", "bridge": {"last_fault": "rate_limit", "quota_until": end}})
     assert p.db.kv("limited:chat")["until"] == end
+
+
+def _mq_sitter(env, monkeypatch, on=True, **kw):
+    """The daemon's watcher (babysit.Babysitter) on a stub endpoint: every call answers skip; `asked` lists the models."""
+    from ttp import babysit, modelquota
+    p, d = _mq_setup(env, monkeypatch, on=on, **kw)
+    asked, lines = [], []
+
+    def post(s, messages, timeout):
+        asked.append(s["model"])
+        if modelquota.until(s["model"]):   # an empty bucket answers a quota 429, as _post raises it
+            raise babysit.QuotaWait("HTTP 429", modelquota.until(s["model"]))
+        return {"choices": [{"message": {"content": "skip"}}], "usage": {}}
+    assert isinstance(d.jev, babysit.Babysitter)
+    d.jev.post, d.jev.jev, d.jev.log, d.jev.lines = post, _BsJev(), lines.append, lines
+    return p, d, d.jev, asked
+
+
+def test_model_quota_an_empty_bucket_moves_a_watcher_call_to_a_listed_alternate_with_room(env, monkeypatch):
+    from ttp import modelquota
+    p, d, b, asked = _mq_sitter(env, monkeypatch)
+    assert b.decide("state", _BS_Q, purpose="wake_gate") == {"needed": {"noul": 0.0}} and asked == [_RT_MODEL]
+    modelquota.mark(_RT_MODEL)
+    asked.clear()
+    assert b.decide("state", _BS_Q, purpose="wake_gate") == {"needed": {"noul": 0.0}}
+    assert asked == ["alt-a"] and b.last_decision["model"] == "alt-a" and b.jev.calls == 0, "no call into the empty bucket"
+    assert b.decision("state", "wake?", purpose="wake_gate")["model"] == "alt-a" and b.pause.until == 0
+
+
+def test_model_quota_a_watcher_with_no_alternate_room_waits_for_the_reset_not_a_cool_down(env, monkeypatch, mock_chat):
+    from ttp import babysit, endpoint, modelquota
+    p, d, b, asked = _mq_sitter(env, monkeypatch)
+    end = time.time() + 2400
+    for m in (_RT_MODEL, "alt-a", "alt-b"):
+        modelquota.mark(m, {"reset": end - (m == "alt-b") * 600})
+    assert b.decide("state", _BS_Q, purpose="wake_gate") == {"needed": {"noul": 0.5}}, "Jev decides meanwhile"
+    assert asked == [] and b.pause.until == end - 600, "held to the earliest reset, not COOL_S"
+    assert b.decision("state", "wake?") is None and asked == [] and b.jev.calls == 1, "no repeated 429s"
+    # A real quota 429 marks the asked-for model's bucket and carries the 429's reset.
+    up = mock_chat((429, _QUOTA_BODY))
+    monkeypatch.setattr(endpoint, "credentials", lambda alias: ("k", up.url))
+    s = {"alias": "placeholder", "base_url": "", "model": "q-model"}
+    with pytest.raises(babysit.QuotaWait) as e:
+        babysit._post(s, [{"role": "user", "content": "hi"}], 5)
+    assert str(e.value) == "HTTP 429" and e.value.until == modelquota.until("q-model") > time.time()
+
+
+def test_model_quota_watcher_moves_never_reach_person_facing_runs(env, monkeypatch):
+    from ttp import modelquota, route
+    p, d, b, asked = _mq_sitter(env, monkeypatch)
+    modelquota.mark(_RT_MODEL)
+    assert b.decision("state", "wake?", purpose="wake_gate")["model"] == "alt-a"
+    for n, task in enumerate(({"reply_chat": "c1"}, {"kind": "question"})):
+        prov, _, note = _route_dispatch(p, d, monkeypatch, title=f"person {n}", **task)
+        assert prov != "chat" and "to" not in (note.get(route.KEY) or {}).get(modelquota.KEY, {}), (task, note)
+
+
+def test_model_quota_watcher_skips_an_unmeasured_flash_and_asks_the_core_provider_last(env, monkeypatch):
+    from ttp import modelquota
+    p, d, b, asked = _mq_sitter(env, monkeypatch, alternates=("x-flash", "alt-b"), served=("x-flash", "alt-b"))
+    modelquota.mark(_RT_MODEL)
+    assert b.decision("state", "wake?")["model"] == "alt-b" and asked == ["alt-b"], "flash only once measured"
+    modelquota.mark("alt-b")
+    asked.clear()
+    assert b.decide("state", _BS_Q) == {"needed": {"noul": 0.5}} and asked == [] and b.jev.calls == 1
+    assert "no listed alternate has room" in b.lines[-1] and b.lines[-1].endswith("; Jev decides"), b.lines
+
+
+def test_model_quota_flag_off_leaves_the_watcher_unchanged(env, monkeypatch):
+    from ttp import babysit, modelquota
+    p, d, b, asked = _mq_sitter(env, monkeypatch, on=False)
+    modelquota.mark(_RT_MODEL, {"reset": time.time() + 2400})
+    t0 = time.time()
+    assert b.decide("state", _BS_Q) == {"needed": {"noul": 0.5}} and asked == [_RT_MODEL], "asked as before"
+    assert t0 + babysit.COOL_S <= b.pause.until <= time.time() + babysit.COOL_S, "the 429 cools down as before"

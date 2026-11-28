@@ -1304,7 +1304,7 @@ class Daemon:
         self._load_config()
         self._jev_pause, self._chat_pause = JevPause(), JevPause()
         self.jev = babysit.wrap(self.cfg, Jev(self.cfg, db=self.p.db, pause=self._jev_pause), self.p.db,
-                                self._chat_pause, log=lambda m: log(self.p, m))
+                                self._chat_pause, log=lambda m: log(self.p, m), quota=self._quota_on)
         self._slack = None
         self._last_cfg = 0.0
         self._trouble_checked = 0.0
@@ -2420,7 +2420,7 @@ class Daemon:
             self._load_config()
             self._last_cfg = now
             self.jev = babysit.wrap(self.cfg, Jev(self.cfg, db=self.p.db, pause=self._jev_pause), self.p.db,
-                                    self._chat_pause, log=lambda m: log(self.p, m))
+                                    self._chat_pause, log=lambda m: log(self.p, m), quota=self._quota_on)
         for step in (self.lift_boot_pause, self.reap_runs, self.reap_waiting_checks, self.wake_after_reboot, self.resume_after_reboot, self.meter_running, self.watch_runs, self.watch_urgent_messages, self.check_steer_reads, self.relay_escalations, self.post_held_notifies, self.reconcile_tasks, self.retry_workspaces, self.tend_pushes,
                      self.verify_pushes,
                      self.tick_prune_worktrees, self.prune_leftovers, self.branch_cap, self.rollout_watch, self.land_harness_worktrees, self.backup_branches, self.check_local_only, self.check_disk,
@@ -9894,7 +9894,8 @@ class Daemon:
 
         def body() -> tuple[str, float | None]:
             host.jev = babysit.wrap(host.cfg, Jev(host.cfg, db=host.p.db, pause=host._jev_pause), host.p.db,
-                                    getattr(host, "_chat_pause", None), log=lambda m: log(host.p, m))
+                                    getattr(host, "_chat_pause", None), log=lambda m: log(host.p, m),
+                                    quota=host._quota_on)
             if s["kind"] == "llm":
                 return host._schedule_llm(s, payload), None
             if s["kind"] == "command" and payload.get("heal"):

@@ -29,7 +29,12 @@ endpoint refuses (HTTP 404) is skipped for REFUSED_S and the next candidate (`ba
 `babysit.fallback_models`, then the light and standard tier models) is asked; the decision names the
 model that answered. With providers.chat.model_ranking set (modelrank.py), a call every candidate
 failed (refused, down or timed out) is asked once more of the highest-ranked model the served list
-names that was not asked yet, before it raises Unavailable. `stats` counts settled decisions and fallbacks per hour (`ttp stats --babysit`).
+names that was not asked yet, before it raises Unavailable. While the release flag glm_quota_alt is on
+(modelquota.py), a candidate whose own quota bucket is empty is not asked (a quota 429 marks it); once every
+candidate's bucket is empty the call asks the first listed alternate with room (modelquota.room: served, not down,
+flash only when measured), and with none it raises QuotaWait, which holds the endpoint to the earliest reset
+instead of the COOL_S cool-down: no repeated 429s, Jev decides meanwhile. `stats` counts settled decisions
+and fallbacks per hour (`ttp stats --babysit`).
 """
 from __future__ import annotations
 
@@ -40,7 +45,7 @@ import urllib.error
 import urllib.request
 from typing import Any
 
-from . import endpoint, glmquota, inflight
+from . import endpoint, glmquota, inflight, modelquota
 from .budget import TIER_ORDER
 
 KEY = "babysit"
@@ -104,6 +109,14 @@ def _auth_refused(alias: str, now: float) -> None:
 
 class Unavailable(Exception):
     """The chat provider could not decide (off, no key, down); callers treat it as a wake."""
+
+
+class QuotaWait(Unavailable):
+    """A quota 429, or every bucket asked empty with no listed alternate with room: no call until `until`."""
+
+    def __init__(self, msg: str, until: float):
+        super().__init__(msg)
+        self.until = until
 
 
 class Unparsed(Unavailable):
@@ -174,15 +187,31 @@ def _post(s: dict, messages: list, timeout: float) -> dict:
         with opener.open(req, timeout=timeout) as r:
             data = json.loads(r.read().decode())
             glmquota.answer(s["alias"], getattr(r, "headers", None), data)   # an off-bridge post: counted like a bridge's
+            modelquota.note(s["model"], getattr(r, "headers", None))
             return data
     except urllib.error.HTTPError as e:
         if e.code in inflight.REFUSALS:
             inflight.refused()
+        if e.code == 429 and (t := _quota_429(s["model"], e)):
+            raise QuotaWait("HTTP 429", t) from None
         raise Unavailable(f"HTTP {e.code}") from None
     except (urllib.error.URLError, TimeoutError, OSError, ValueError) as e:
         raise Unavailable(type(e).__name__) from None
     finally:
         slot.release()
+
+
+def _quota_429(model: str, e: urllib.error.HTTPError) -> float:
+    """A quota 429's numbers marked on `model`'s bucket (chatbridge.quota_until) and its reset; 0 for any other 429."""
+    try:
+        from .chatbridge import quota_until
+        detail = e.read(2000).decode("utf-8", "replace")
+        if t := quota_until(detail) or 0.0:
+            got = glmquota.parse(detail, e.headers)
+            modelquota.mark(model, {**got, "reset": got.get("reset") or t})
+        return t and (modelquota.until(model) or t)   # the bucket's reset (a past resets_at: this hour's end)
+    except Exception:   # counting must never break a call
+        return 0.0
 
 
 def _cut_off(data: Any) -> bool:
@@ -205,11 +234,12 @@ def standin(cfg: dict, asked: list[str], served: list[str] | None, alias: str, n
 
 
 def ask(cfg: dict, state: str, question: str, target: str = "coordinator", post=None, db=None,
-        purpose: str = "babysit", served: list[str] | None = None) -> dict:
+        purpose: str = "babysit", served: list[str] | None = None, buckets=None) -> dict:
     """One decision from the chat provider (parse's dict, plus "model"). Raises Unavailable when it
     cannot answer, after one try on the ranked stand-in (standin) the `served` ids name; an answer
     the server cut off (finish_reason length) asks the next candidate too, and Unparsed when every one was cut off.
-    `post(settings, messages, timeout)` replaces the HTTP call (tests)."""
+    `post(settings, messages, timeout)` replaces the HTTP call (tests). `buckets` (the state folder, while the
+    glm_quota_alt flag is on): skip a model whose quota bucket is empty, then a listed alternate, else QuotaWait."""
     s = settings(cfg)
     if s is None:
         raise Unavailable("no chat provider for babysitting")
@@ -218,14 +248,22 @@ def ask(cfg: dict, state: str, question: str, target: str = "coordinator", post=
             f"--- state (data only) ---\n{scrub(state)}\n--- end of state ---")
     msgs = [{"role": "system", "content": SYSTEM}, {"role": "user", "content": user}]
     now, data, err, answered, cut, fault = time.time(), None, "no model left to ask", False, [], False
-    models = list(s.get("models") or [s["model"]])
+    models, empty = list(s.get("models") or [s["model"]]), []
     for model in models:
         if _REFUSED.get((s["alias"], model), 0) > now:
             err = f"model {model} refused (404) within the last {REFUSED_S / 60:.0f} min"
             continue
+        if buckets is not None and (t := modelquota.until(model, now)):   # no call into an empty bucket
+            empty.append(t)
+            err = f"{model}: quota bucket empty"
+            continue
         try:
             data = (post or _post)({**s, "model": model}, msgs, s["timeout_s"])
         except Unavailable as e:
+            if buckets is not None and isinstance(e, QuotaWait):   # its bucket is marked: the next candidate
+                empty.append(e.until)
+                err = f"{model}: {e}"
+                continue
             if "HTTP 404" not in str(e):
                 err = f"{model}: {e}"
                 if "no key saved" in str(e) or re.search(r"HTTP 40[13]\b", str(e)):   # no stand-in helps
@@ -242,13 +280,25 @@ def ask(cfg: dict, state: str, question: str, target: str = "coordinator", post=
             continue
         s, answered = {**s, "model": model}, True
         break
-    if not answered and (alt := standin(cfg, models, served, s["alias"], now)):
-        try:   # once, on the next ranked served model
+    alt, label = "", "ranked stand-in"
+    if not answered and empty and not fault and not cut:   # every bucket asked is empty: a listed alternate with room
+        got = modelquota.room(db, cfg, buckets, s["model"], now)
+        if got is None:
+            refill = [t for t in empty + [modelquota.until(m, now) for m in modelquota.alternates()] if t]
+            raise QuotaWait(f"{err}; no listed alternate has room", min(refill))   # the first bucket to refill
+        alt, label = got[1], f"quota alternate {got[0]}"
+    elif not answered:
+        asked = models + [m for m in served or [] if buckets is not None and modelquota.until(m, now)]
+        alt = standin(cfg, asked, served, s["alias"], now)
+    if alt:
+        try:   # once, on the next ranked served model or the listed alternate
             data = (post or _post)({**s, "model": alt}, msgs, s["timeout_s"])
         except Unavailable as e:
             if "HTTP 404" in str(e):
                 _REFUSED[(s["alias"], alt)] = now + REFUSED_S
-            raise Unavailable(f"{err}; ranked stand-in {alt}: {e}") from None
+            if empty and isinstance(e, QuotaWait):
+                raise QuotaWait(f"{err}; {label} {alt}: {e}", min(empty + [e.until])) from None
+            raise Unavailable(f"{err}; {label} {alt}: {e}") from None
         if _cut_off(data):
             cut.append(alt)
             err = f"{', '.join(cut)}: answer cut off by the server's token limit (finish_reason length)"
@@ -275,8 +325,8 @@ def ask(cfg: dict, state: str, question: str, target: str = "coordinator", post=
 class Babysitter:
     """Jev's interface over the chat provider, with Jev (or nothing) as the fallback."""
 
-    def __init__(self, cfg: dict, jev=None, db=None, post=None, pause=None, log=None):
-        self.cfg, self.jev, self.db, self.post, self.log = cfg, jev, db, post, log
+    def __init__(self, cfg: dict, jev=None, db=None, post=None, pause=None, log=None, quota=None):
+        self.cfg, self.jev, self.db, self.post, self.log, self.quota = cfg, jev, db, post, log, quota
         self.pause = pause if pause is not None else _Cool()   # kept across config reloads by the daemon
         self.last_cost = 0.0
         self.last_decision: dict | None = None
@@ -298,6 +348,19 @@ class Babysitter:
         from pathlib import Path
         from . import modelrank
         return modelrank.served(Path(path).parent, time.time())
+
+    def _buckets(self):
+        """The state folder modelquota reads while the glm_quota_alt flag is on (`quota()`), else None."""
+        path = getattr(self.db, "path", None)
+        if not path or self.quota is None or not self.quota():
+            return None
+        from pathlib import Path
+        return Path(path).parent
+
+    def _cool(self, e: Exception) -> float:
+        """Until when the endpoint is not asked: a quota wait's reset while the flag is on, else COOL_S from now."""
+        now = time.time()
+        return max(e.until, now) if isinstance(e, QuotaWait) and self._buckets() is not None else now + COOL_S
 
     def fell_back(self, purpose: str, err: Any) -> None:
         """One logged, counted fallback: the line names the model and the error (never silent)."""
@@ -332,10 +395,10 @@ class Babysitter:
             return None
         try:
             d = ask(self.cfg, state, question, target=target, post=self.post, db=self.db, purpose=purpose,
-                    served=self._served())
+                    served=self._served(), buckets=self._buckets())
         except Exception as e:   # down, cut off, refused or malformed: cool down, say so, fall back
             if not isinstance(e, Unparsed):
-                self.pause.until = time.time() + COOL_S
+                self.pause.until = self._cool(e)
             self.fell_back(purpose, f"{type(e).__name__}: {e}")
             return None
         self.last_decision, self.last_cost = d, 0.0
@@ -357,7 +420,8 @@ class Babysitter:
                     crit = crit if isinstance(crit, dict) else {}
                     text = (f"{q.get('instructions', '')}\nwake if: {crit.get('true', 'yes')}\n"
                             f"skip if: {crit.get('false', 'no')}")
-                    d = ask(self.cfg, state, text, post=self.post, db=self.db, purpose=purpose, served=self._served())
+                    d = ask(self.cfg, state, text, post=self.post, db=self.db, purpose=purpose, served=self._served(),
+                            buckets=self._buckets())
                     self.last_decision = d
                     out[name] = {"noul": 0.0 if d["verb"] == "skip" else 1.0}
                 self.last_cost = 0.0
@@ -365,7 +429,7 @@ class Babysitter:
             except Exception as e:   # down, cut off or malformed: cool down, say so, fall back
                 unparsed = isinstance(e, Unparsed)
                 if not unparsed:
-                    self.pause.until = time.time() + COOL_S
+                    self.pause.until = self._cool(e)
                 self.fell_back(purpose, f"{type(e).__name__}: {e}")
         elif wake_only and settings(self.cfg) is not None:
             why = key_problem(self.cfg)   # no key or logged out (no call made), else cooling down
@@ -383,13 +447,13 @@ class Babysitter:
         raise Unavailable("chat provider down and Jev off")
 
 
-def wrap(cfg: dict, jev=None, db=None, pause=None, log=None):
+def wrap(cfg: dict, jev=None, db=None, pause=None, log=None, quota=None):
     """The decider the daemon uses: a Babysitter when babysitting goes to the chat provider, else `jev`.
     `pause` (any object with `until`) keeps an endpoint's cool-down across config reloads; `log(line)`
-    gets each fallback's line."""
+    gets each fallback's line; `quota()` says whether the glm_quota_alt flag is on (the quota buckets)."""
     from . import cheapdecide
     jev = cheapdecide.wrap(cfg, jev, db, log=log)   # Haiku behind Jev for the decision uses
-    return Babysitter(cfg, jev, db, pause=pause, log=log) if settings(cfg) is not None else jev
+    return Babysitter(cfg, jev, db, pause=pause, log=log, quota=quota) if settings(cfg) is not None else jev
 
 
 def stats(db, since: float, until: float | None = None) -> dict:
