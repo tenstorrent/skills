@@ -66,7 +66,7 @@ from pathlib import Path
 
 from . import prguard
 from . import startbreaker
-from .db import DB, SEVERITY_RANK, TERMINAL_TASK_STATES
+from .db import CHAT_RANK, DB, SEVERITY_RANK, TERMINAL_TASK_STATES, chat_floor
 from .schedule import failing
 from . import anchors, obligations
 
@@ -899,7 +899,7 @@ def _take(data: dict, claim_key: str, key: str, owner: str, now: float, cleared:
     fresh = bool(held) and float(held.get("ts") or 0) > cleared
     if fresh and held.get("owner") != owner and owner_alive(str(held.get("owner"))):
         return False
-    keep = {k: held[k] for k in ("since", "reminded", "waiting") if k in held} if fresh else {}
+    keep = {k: held[k] for k in ("since", "reminded", "reminded_own", "waiting") if k in held} if fresh else {}
     data[claim_key] = {**keep, "owner": owner, "alert": key, "ts": now}
     return True
 
@@ -950,15 +950,16 @@ def machine_round(claim_key: str, key: str, owner: str, now: float, cleared: flo
             _take(data, claim_key, key, owner, now, cleared)
             data[claim_key].update(waiting=waiting, since=since)
         rec = data[claim_key]
-        sent = rec.get("reminded")
-        sent = sent if isinstance(sent, dict) else {rec["owner"]: int(sent or 0)}   # an older claim counted the claimer's only
         needers = [w for w in waiting.values() if w.get("need", True)]   # a report without `need` is from an older daemon
-        claimer = rec["owner"] == owner
-        due = due_reminders(since, now)
-        out = None
-        if (needers if claimer else info.get("need", True)) and due > int(sent.get(owner) or 0):
-            rec["reminded"] = {**sent, owner: due}
-            out = {"since": since, "reminder": due, "waiting": needers, "claimer": claimer}
+        claimer, due = rec["owner"] == owner, due_reminders(since, now)
+        own = dict(rec.get("reminded_own") or {})
+        if claimer and needers and due > int(rec.get("reminded") or 0):
+            rec["reminded"] = due   # sent to every chat, Slack and the desktop: once per reminder, whoever holds the claim
+        elif not claimer and info.get("need", True) and due > int(own.get(owner) or 0):
+            rec["reminded_own"] = {**own, owner: due}
+        else:
+            due = 0
+        out = {"since": since, "reminder": due, "waiting": needers, "claimer": claimer} if due else None
         from .project import write_json
         write_json(path, data, 0o600)
         return out
@@ -968,11 +969,15 @@ def machine_round(claim_key: str, key: str, owner: str, now: float, cleared: flo
         os.close(fd)
 
 
-def reminder_chats(db, claimer: bool) -> list[str | None]:
+def reminder_chats(db, cfg: dict, claimer: bool) -> list[str | None]:
     """Where a project posts a logout reminder: the claim's holder to every chat, Slack and the
-    desktop (None); another project to its own chats only, so the user gets one message on the
-    shared destinations and every project's own chat still hears of its work waiting."""
-    return [None] if claimer else [r["id"] for r in db.q("SELECT id FROM chats WHERE id!='slack'")]
+    desktop (None); another project to its own chats that take high alerts, so the user gets one
+    message on the shared destinations and every project's own chat still hears of its work waiting."""
+    if claimer:
+        return [None]
+    project = cfg["notify"].get("chat_min_severity")
+    return [c["id"] for c in db.q("SELECT id, min_severity FROM chats WHERE id!='slack'")
+            if CHAT_RANK[chat_floor(c["min_severity"], project)] <= SEVERITY_RANK["high"]]
 
 
 def release(claim_keys: list[str], cleared: float) -> None:

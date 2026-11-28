@@ -22905,9 +22905,10 @@ class Daemon:
                     f"{sum(int(x.get('queued') or 0) for x in waiting)} task(s) no other provider can run and "
                     f"{sum(int(x.get('events') or 0) for x in waiting)} high event(s) not handled yet. "
                     f"Log in once on that machine{f' ({hint})' if hint else ''}; work resumes by itself.")
-            for chat in alerts.reminder_chats(db, due["claimer"]):
+            to = alerts.reminder_chats(db, self.cfg, due["claimer"])
+            for chat in to:
                 db.post("out", text, chat=chat, kind="alert", severity="high", ref=key)
-            log(self.p, f"{key}: logout reminder {due['reminder']} sent")
+            log(self.p, f"{key}: logout reminder {due['reminder']} sent" if to else f"{key}: no chat takes the reminder")
 
     def coordinator_blocked(self) -> str | None:
         """Why no coordinator turn can run now (None when one can): its provider is logged out or
