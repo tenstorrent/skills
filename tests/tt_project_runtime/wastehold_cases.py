@@ -30,7 +30,7 @@ def test_one_cheap_failure_holds_no_task_but_a_repeated_failure_does(env):
     assert bud.waste_hold(g, p.db.task(loop))
 
 
-def test_a_failing_source_does_not_hold_its_urgent_or_user_ordered_task(env):
+def test_a_failing_source_does_not_hold_a_priority_task(env):
     p = make(env)
     from ttp import budget as bud
     now = time.time()
@@ -41,4 +41,4 @@ def test_a_failing_source_does_not_hold_its_urgent_or_user_ordered_task(env):
     assert {h["origin"] for h in g.waste_holds} - {None} == {"harness"}, (g.level, g.reasons, g.waste_holds)
     new = lambda **k: p.db.task(p.db.add_task("new", k.pop("spec", "s"), kind="work", tier="light", origin="harness", **k))
     assert bud.waste_hold(g, new())
-    assert not bud.waste_hold(g, new(spec="urgent: ordered")) and not bud.waste_hold(g, new(reply_chat="c1"))
+    assert not bud.waste_hold(g, new(spec="urgent: ordered"), True), "the daemon passes Daemon._priority_task"

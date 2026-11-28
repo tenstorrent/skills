@@ -36,7 +36,7 @@ from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 from typing import Any
 
-from . import ackwait, credits, urgent
+from . import ackwait, credits
 from . import globalcap as gcap
 from . import spendproj, timefmt
 from . import localspend  # noqa: F401  (adds this machine's other Claude Code spend to the global total)
@@ -544,12 +544,13 @@ def waste_holds(db: DB, b: dict, spans: list, virtual: bool, workers: int, now: 
     return out
 
 
-def waste_hold(gate: Gate | dict | None, task: dict) -> dict | None:
-    """The waste hold on `task` (its own, or its origin's when that is a failing loop's source), or None."""
+def waste_hold(gate: Gate | dict | None, task: dict, priority: bool = False) -> dict | None:
+    """The waste hold on `task` (its own, or its origin's when that is a failing loop's source), or None.
+    `priority`: the task is urgent or user-ordered (Daemon._priority_task), which a failing source never holds."""
     for h in (getattr(gate, "waste_holds", None) if not isinstance(gate, dict) else gate.get("waste_holds")) or []:
         if h.get("task") == task["id"]:
             return h
-        if h.get("origin") and h["origin"] == task["origin"] and not (urgent.is_urgent(task) or urgent.user_ordered(task)):
+        if h.get("origin") and h["origin"] == task["origin"] and not priority:
             return h   # a failing source's other tasks wait; an urgent or user-ordered one does not
     return None
 
