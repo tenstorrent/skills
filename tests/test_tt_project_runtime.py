@@ -31608,16 +31608,27 @@ def test_branch_index_finds_the_same_tasks_as_names_branch_one_by_one():
 def test_branch_index_scans_a_long_punctuation_run_in_linear_time(env):
     from ttp.db import BranchIndex
     index = BranchIndex([{"id": i, "branch": f"ttp/t{i}-fix-{'x' * (i % 40)}"} for i in range(600)])
-    spec = "=" * 10000 + " see ===ttp/t7-fix-xxxxxxx=== too"
-    t0 = time.perf_counter()
-    assert index.named(spec) == {7}
-    took = time.perf_counter() - t0
-    assert took < 0.1, f"BranchIndex.named took {took:.2f} s"
+
+    class Counted(dict):   # counts lookups, so the bound holds on any machine load
+        calls = 0
+
+        def get(self, key, default=None):
+            Counted.calls += 1
+            return super().get(key, default)
+
+    index.by_branch = Counted(index.by_branch)
+
+    def lookups(spec):
+        Counted.calls = 0
+        found = index.named(spec)
+        return found, Counted.calls
+
+    found, n = lookups("=" * 10000 + " see ===ttp/t7-fix-xxxxxxx=== too")
+    assert found == {7} and n < 100, n
     # Every start a branch could begin at: only the bound on a branch's length keeps this linear.
-    t0 = time.perf_counter()
-    assert index.named("t=" * 10000) == set()
-    took = time.perf_counter() - t0
-    assert took < 0.5, f"BranchIndex.named took {took:.2f} s"
+    (found, n), (found2, n2) = lookups("t=" * 10000), lookups("t=" * 20000)
+    assert found == found2 == set()
+    assert n <= 10000 * index.maxlen and n2 <= 2 * n + index.maxlen ** 2, (n, n2)
 
 
 def test_a_code_hand_off_with_more_to_decide_still_wakes_the_coordinator(env):

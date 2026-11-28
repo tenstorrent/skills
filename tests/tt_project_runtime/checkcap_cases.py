@@ -4049,6 +4049,11 @@ def test_ttp_checks_wait_record_and_probe_name_where_the_lane_count_comes_from(
     records, real = [], cli.write_json
     monkeypatch.setattr(cli, "write_json", lambda path, data, *a, **k: (
         records.append(dict(data)) if Path(path).name == cli.CHECKS_SLOT_WAIT else None, real(path, data, *a, **k))[1])
+    # The run's lane wait gets the whole window from its first try: on a loaded host the steps before it
+    # can spend the window, and a wait bound of 0 tries once without waiting or writing its record.
+    real_hold = testslots.suite_hold
+    monkeypatch.setattr(testslots, "suite_hold", lambda project_name, tell=None, wait_s=None, *a, **k: real_hold(
+        project_name, tell, None if wait_s is None else checkcap.FOREGROUND_WAIT_S, *a, **k))
     hold = testslots.suite_hold(p.name, repo=testslots.repo_key(repo))
     assert hold.files
     try:

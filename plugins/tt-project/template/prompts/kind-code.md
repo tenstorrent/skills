@@ -12,9 +12,8 @@
   hand-off check refuses. Fixing review findings: test each class of bug found, not only the reported case.
 - Run the full checks through `ttp checks`: the project's checks,
   plus after `--` only the repository's test and lint commands they do not already run, each
-  command quoted as one word (`-- 'pytest -q tests/a.py' 'ruff check .'`). It reuses
-  a pass for the same tree and commands. If they outlast a tool call,
-  run `ttp checks --detach -- <cmds>`: its output and exit code go to the run dir, never
+  command quoted as one word (`-- 'pytest -q tests/a.py' 'ruff check .'`).
+  If they outlast a tool call, run `ttp checks --detach -- <cmds>`: its output and exit code go to the run dir, never
   the worktree. Hand off `waiting` with the `retry_when` it prints (`ttp checks --result <run dir>`)
   and no `wake_tier`; failed checks wake you;
   that probe also wakes the task if the checks were killed. A foreground `ttp checks` ends with its
@@ -22,9 +21,9 @@
   (refused). If only recording the result is left, put it in `on_pass` (`"on_pass": {"status": "done", "summary": "..."}`): a pass on the
   same head records it model-free. No `on_pass`, `next_step`, PR or landing left: a pass records `done`.
 - Urgent (priority 1 or `urgent:`): once your CPU checks pass, hand off `done`; a device, cluster or
-  remote smoke runs beside the review (say in `summary` how to read it). The push still waits for required checks.
+  remote smoke runs beside the review. The push still waits for required checks.
 - While you iterate, run only the tests your change affects (a file, `pytest -k`, `file::test`),
-  never the full suite: each fix would cost a full run. Run `ttp checks`
+  never the full suite. Run `ttp checks`
   once at the end, committed, before the hand-off. A direct full-suite run is refused.
   Below the project root run pytest as `PYTHONPATH=$PWD python3 -m pytest --rootdir=. --confcutdir=.`.
 - Do the whole job in this change: every change the spec lists and the root cause. No unrelated rewrites.
@@ -37,10 +36,10 @@
   subagent {ponytail_pin} (refused: the tool's strongest), given only your spec and `git diff <base>..HEAD`,
   that reads skill `tt-ponytail-review` at `{ponytail_skill}` and applies it,
   searching the repository (`git grep`) for an existing function that already decides each rule or helper
-  the diff adds. Fix every `block` finding (reuse such a helper), commit, and say in `self_check` what it found.
+  the diff adds. Fix every `block` finding, commit, and say in `self_check` what it found.
 - Size: if your diff adds more than 400 lines (`git diff --numstat <base>..HEAD`, review.ponytail_land_lines),
   make it smaller or put the reason on its own line of the hand-off `summary`, starting
-  `why this size:`. The review fails the change without that line.
+  `why this size:`.
 - A change your spec keeps off the push branch (a `no_push:` line, or a plain ban on this change,
   not text about such bans): put `"no_push": "<why>"` in result.json, so its review is review only.
 - A change published in another repo (no diff here): hand off `"published": {"repo":
