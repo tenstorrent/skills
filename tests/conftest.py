@@ -442,12 +442,17 @@ def _away_from_tmp(path: Path) -> bool:
 
 def _away_base() -> str | None:
     """A writable folder for `away_from_tmp` tests: the runtime folder, else the account's own cache folder
-    (REAL_HOME, not the per-test HOME, which is under pytest's temp root; the checkout holds a pytest file, so
-    it cannot serve), made only when it is reached; None when none of them is away from the temp roots."""
-    cache = os.path.join(REAL_HOME, ".cache")
+    (its home from the password database: HOME is a temp folder under tests and `ttp checks`; the checkout holds a
+    pytest file, so it cannot serve), made only when it is reached; None when none of them is away from the temp
+    roots."""
+    from ttp import hoststate
+    cache = str(hoststate.real_home() / ".cache")
     for root in (os.environ.get("XDG_RUNTIME_DIR", ""), f"/run/user/{os.getuid()}", cache):
-        if root == cache and os.access(REAL_HOME, os.W_OK):
-            os.makedirs(cache, exist_ok=True)
+        if root == cache:
+            try:
+                os.makedirs(cache, exist_ok=True)
+            except OSError:
+                pass
         if root and os.access(root, os.W_OK | os.X_OK) and _away_from_tmp(Path(root, "x")):
             return root
     return None

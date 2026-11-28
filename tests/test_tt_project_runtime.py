@@ -46236,12 +46236,15 @@ def test_an_away_from_tmp_test_gets_a_folder_outside_tmp_with_no_pytest_file_abo
 @pytest.mark.away_from_tmp
 def test_away_from_tmp_falls_back_to_the_account_cache_folder_when_the_test_home_is_under_tmp(tmp_path, monkeypatch):
     import conftest
-    from ttp import glmguard
+    from ttp import glmguard, hoststate
     real_home = tmp_path / "account"
     real_home.mkdir()
-    temp_home = Path(glmguard._TMP[0]) / f"away-home-{os.getpid()}"
-    temp_home.mkdir()
-    monkeypatch.setattr(conftest, "REAL_HOME", str(real_home))
+    fake_tmp = tmp_path / "temp-root"                               # stands in for /tmp
+    temp_home = fake_tmp / "home"
+    temp_home.mkdir(parents=True)
+    monkeypatch.setattr(glmguard, "_TMP", (str(fake_tmp),))
+    monkeypatch.setattr(hoststate, "real_home", lambda: real_home)
+    monkeypatch.setattr(conftest, "REAL_HOME", str(temp_home))     # what expanduser("~") gives under the temp HOME
     monkeypatch.setattr(conftest.os, "getuid", lambda: 2 ** 31)     # no /run/user/<uid>
     monkeypatch.setenv("XDG_RUNTIME_DIR", str(tmp_path / "missing"))
     monkeypatch.setenv("HOME", str(temp_home))                      # what the per-test temp HOME does
@@ -46256,7 +46259,6 @@ def test_away_from_tmp_falls_back_to_the_account_cache_folder_when_the_test_home
         assert got.parent == real_home / ".cache"
     finally:
         gen.close()
-        shutil.rmtree(temp_home, ignore_errors=True)
     assert not got.exists()
 
 
