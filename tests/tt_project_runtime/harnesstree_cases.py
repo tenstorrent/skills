@@ -326,6 +326,13 @@ def _ht_write_during_merge(p, monkeypatch, write):
     return seen
 
 
+def _ht_write_done(seen, hang_s=600):
+    """Wait for the write `_ht_write_during_merge` started to end: the test reads git only after
+    its commit ran. A slow host only delays it; `hang_s` turns a write that never ends into a failure."""
+    seen["t"].join(hang_s)
+    assert not seen["t"].is_alive(), f"the write during the merge did not end in {hang_s} s"
+
+
 def test_a_memory_append_during_a_harness_merge_of_memory_md_waits_and_survives(env, monkeypatch):
     """Before: an append landing while land merged a branch that changed MEMORY.md made git refuse the
     merge (or lose the line); now the append waits for the merge and lands on the merged index."""
@@ -340,7 +347,7 @@ def test_a_memory_append_during_a_harness_merge_of_memory_md_waits_and_survives(
     got = {}
     seen = _ht_write_during_merge(p, monkeypatch, lambda q: got.setdefault("e", q.add_memory("learned mid-merge")))
     assert harnesstree.land(p, b) == "merged"
-    seen["t"].join(30)
+    _ht_write_done(seen)
     assert not seen.get("err") and seen["early"] is False   # the append waited for the merge
     index = (p.harness / "MEMORY.md").read_text()
     assert "(edited by the task)" in index and f"memory/{got['e'].name}" in index
@@ -360,7 +367,7 @@ def test_a_memory_retirement_during_a_harness_merge_of_memory_md_waits_for_it(en
     p.db.update_task(b, status="done")
     seen = _ht_write_during_merge(p, monkeypatch, lambda q: q.forget_memory(gone.stem, why="test"))
     assert harnesstree.land(p, b) == "merged"
-    seen["t"].join(30)
+    _ht_write_done(seen)
     assert not seen.get("err") and seen["early"] is False   # the rewrite waited for the merge
     index = (p.harness / "MEMORY.md").read_text()
     assert "(edited by the task)" in index and gone.name not in index and "older 3" in index
@@ -995,3 +1002,32 @@ def test_a_land_that_rewrites_the_runtime_holds_it_for_the_launcher(env, monkeyp
     assert harnesstree.land(p, tid) == "merged"
     assert mid == ["old"], "a launcher starting mid-merge ran the runtime from before the land"
     assert launch() == "new"
+
+
+def test_the_stale_git_lock_sweep_skips_the_runtime_copies_a_merge_keeps(env, monkeypatch):
+    """A merge keeps a copy of the runtime in the harness's .git for its launcher, its files' mtimes
+    kept; the runtime's own lock file there is no git lock. The sweep before each harness commit
+    neither moves it out of a live copy nor scans every process for its holder."""
+    p = make(env)
+    from ttp import gitlocks, project
+    gitdir = p.harness / ".git"
+    old = time.time() - 3600
+    kept = [gitdir / f"{project.RUNTIME_HOLD}.1.2" / "ttp" / "checks-python.lock",
+            gitdir / f".{project.RUNTIME_HOLD}.tmp.1" / "ttp" / "checks-python.lock"]
+    for f in kept:
+        f.parent.mkdir(parents=True)
+        f.write_text("x\n")
+        os.utime(f, (old, old))
+
+    def no_scan(*a, **k):
+        raise AssertionError("the sweep looked for holders of a runtime copy's lock")
+    monkeypatch.setattr(gitlocks, "holders", no_scan)
+    assert gitlocks.candidates(gitdir, time.time(), 600) == []
+    assert p.clear_stale_git_locks() == [] and all(f.exists() for f in kept)
+    p.add_memory("A commit beside a merge's runtime copy.")
+    assert all(f.exists() for f in kept) and not (gitdir / gitlocks.KEEP_DIR).exists()
+    # A real stale git lock beside them is still found.
+    left = gitdir / "index.lock"
+    left.write_text("x\n")
+    os.utime(left, (old, old))
+    assert gitlocks.candidates(gitdir, time.time(), 600) == [left]

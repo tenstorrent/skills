@@ -3121,7 +3121,7 @@ def tree_writes(harness: str | Path) -> Iterator[None]:
                 note_protected(f, after.get(f))
 
 
-RUNTIME_HOLD = "ttp-runtime-hold"   # in a harness's .git: each merge's copy of the runtime its launcher runs
+RUNTIME_HOLD = gitlocks.RUNTIME_HOLD   # in a harness's .git: each merge's copy of the runtime its launcher runs
 HOLD_PID = ".pid"                   # in one: the process holding it (the launcher ignores a dead one's)
 HOLD_PIDS = ".pids"                 # in one: each process a launcher started on it (it notes itself there)
 

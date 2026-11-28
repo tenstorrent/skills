@@ -9,7 +9,8 @@ when only it is set), far past any harness git command's timeout, and nothing ho
 has the file open (Linux) and no git process of this user runs in or names the repository. A git
 process whose working directory cannot be read counts as holding it. Stale locks are moved to
 `.git/ttp-stale-locks/<stamp>/`, never deleted. Project.clear_stale_git_locks runs this before each
-harness commit and in the daemon's harness sweep.
+harness commit and in the daemon's harness sweep. The copies of the runtime a merge keeps in `.git`
+for its launcher (`ttp-runtime-hold*`) are no git state: their own `*.lock` files are skipped.
 
 The project root's own repository gets a narrower sweep (clear_root_refs, run by the daemon's harness
 sweep): only ref locks (`refs/**/*.lock`, `packed-refs.lock`) in its common git dir, never index.lock,
@@ -37,6 +38,7 @@ STALE_S = 600.0
 ROOT_STALE_S = 3600.0
 KEEP_DIR = "ttp-stale-locks"
 _SKIP_DIRS = {"objects", "lfs", KEEP_DIR}
+RUNTIME_HOLD = "ttp-runtime-hold"   # each merge's runtime copy in .git (project.runtime_hold)
 
 
 def settings(cfg: dict) -> float:
@@ -80,7 +82,7 @@ def candidates(gdir: Path, now: float, min_age_s: float) -> list[Path]:
     out = []
     for top, dirs, files in os.walk(gdir):
         if Path(top) == gdir:
-            dirs[:] = [d for d in dirs if d not in _SKIP_DIRS]
+            dirs[:] = [d for d in dirs if d not in _SKIP_DIRS and not d.lstrip(".").startswith(RUNTIME_HOLD)]
         for f in files:
             if not f.endswith(".lock"):
                 continue
