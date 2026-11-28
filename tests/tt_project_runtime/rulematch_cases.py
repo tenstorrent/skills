@@ -251,3 +251,26 @@ def test_rulematch_a_shared_short_setting_name_alone_flags(env):
     p.add_memory("Keep ci.tag at 3 while soak tests run.", kind="decision")
     got = rm.older(p, p.db, "lower ci.tag for nightly builds")
     assert [g["value"] for g in got if g["where"] == "memory"] == ["ci.tag"], got
+
+
+def test_rule_gone_rematches_an_old_record_once_and_drops_items_the_matcher_no_longer_finds(env):
+    """A record stored by an older matcher (here a numeric-only item, value '2026') is re-matched once before it is
+    shown or counted: an item the current matcher no longer finds drops, a still-matched one keeps its line, and a
+    record left with no items gives no Course check line and no overdue count."""
+    from ttp import rulematch as rm
+    p = _rm_project(env)
+    p.add_memory("The dashboard budget review is due in 2026.", kind="decision")
+    stale = next({"where": "memory", "name": e["name"], "line": e["body"], "value": "2026"}
+                 for e in p._memory_entries() if "2026" in e["body"])
+    a, b = _rm_flag(p), _rm_flag(p, "the 2026 plan is fine")
+    real = p.db.kv(rm.KV + str(a))["items"]
+    old = time.time() - 2 * 86400 + 3600
+    for mid, items in ((a, [*real, stale]), (b, [stale])):
+        p.db.x("UPDATE kv SET value=?, ts=? WHERE key=?", (json.dumps({"msg": mid, "items": items}), old, rm.KV + str(mid)))
+    now = time.time()
+    assert rm.daily_line(p.db, now).endswith("overdue: 1")
+    assert p.db.kv(rm.KV + str(a)) == {"msg": a, "items": real, "matcher": rm.MATCHER}
+    assert p.db.kv(rm.KV + str(b))["items"] == []
+    assert p.db.one("SELECT ts FROM kv WHERE key=?", (rm.KV + str(a),))["ts"] == pytest.approx(old), "its age is kept"
+    lines = rm.digest_lines(p.db, now)
+    assert len(lines) == 1 and lines[0].startswith(f"- overdue: user msg {a} ") and "2026" not in lines[0]

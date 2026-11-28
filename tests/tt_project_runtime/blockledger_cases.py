@@ -227,7 +227,7 @@ def test_block_ledger_redirect_refusals_hold_no_minutes_and_count_once(env):
         json.dumps({"ts": now - 7100 + i, "rule": "scratch", "class": "redirect", "n": 1, "why": "x"}) + "\n" for i in range(2)))
     (d / "refusals.jsonl").write_text("".join(
         json.dumps({"ts": now - 7100 + i, "kind": "worker_role", "guard": "scratch", "class": "redirect"}) + "\n"
-        for i in range(2)) + json.dumps({"ts": now - 7050, "kind": "worker_role", "guard": "pytest_n"}) + "\n")
+        for i in range(2)) + json.dumps({"ts": now - 7050, "kind": "worker_role", "guard": "pytest_n", "class": "harmful"}) + "\n")
     rs = {r["rule"]: r for r in bl.rows(p.db, now - 86400, now) if r["source"] == "refusal"}
     assert set(rs) == {"scratch", "pytest_n"}
     assert (rs["scratch"]["n"], rs["scratch"]["minutes"]) == (2, 0.0)
@@ -264,3 +264,62 @@ def test_block_ledger_a_wait_on_another_tasks_landing_is_a_dependency_and_empty_
     assert (rs[a]["rule"], rs[b]["rule"]) == ("dependency", "dependency")
     assert bl.top(p.db, now) == []
     assert not bl.listed(bl.rows(p.db, now - 7200, now))
+
+
+DATE_GATE = 'test "$(date +%s)" -ge "$(date -d \'2026-11-29 07:00 PST\' +%s)" || exit 1'
+
+
+def test_block_ledger_a_fixed_date_clock_gate_is_a_planned_window_and_raises_no_own_wait(env):
+    """A probe that only compares now with a fixed date (`date -d '<text>' +%s`, `test` or `[ ]`, an optional
+    `|| exit 1`) is a planned window in the ledger, the unblock sweep and the queue-wait scan; one that also
+    runs another command stays a real wait on the task's own probe."""
+    from ttp import blockledger as bl, queuewait, unblock, unstarted
+    p = make(env)
+    now = time.time()
+    other = 'ttp landed --check && ' + DATE_GATE
+    for probe, ok in ((DATE_GATE, True), ('[ $(date +%s) -ge 1796673600 ]', True), ('test "$(date +%s)" -ge "1796673600"', True),
+                      (other, False), ('test "$(date +%s)" -ge "$(date -d "$(cat f)" +%s)"', False),
+                      (DATE_GATE + '; curl x', False)):
+        assert bool(unstarted.TIME_ONLY.match(probe)) is ok, probe
+        assert (unblock.classify_wait({"retry_when": probe}) == ("self", "planned window")) is ok, probe
+    a, b = _bl_task(p, "starts at seven", "queued", now), _bl_task(p, "runs a check", "queued", now)
+    p.db.set_kv(queuewait.KV, {"open": {"a": {"task": a, "queue": "own", "since": now - 3600, "probe": DATE_GATE},
+                                        "b": {"task": b, "queue": "own", "since": now - 3600, "probe": other}}})
+    rs = {r["task"]: r["rule"] for r in bl.rows(p.db, now - 7200, now) if r["source"] == "queue"}
+    assert rs == {a: "planned window", b: "queue:own"}
+    for probe, raised in ((DATE_GATE, False), (other, True)):
+        t = p.db.add_task(probe[:20], "urgent: user asked", kind="code")
+        p.db.update_task(t, not_before=now + 300, blocked_reason="waiting",
+                         result=json.dumps({"status": "waiting", "retry_when": probe, "waiting_since": now - 3600}))
+        got = [w for w in queuewait.collect(p, {"coordinator": {}, "budget": {}}, now, {"limit": 0, "running": [], "queued": []})
+               if w["task"] == t]
+        assert bool(got) is raised and all(w["queue"] == "own" for w in got), (probe, got)
+
+
+def test_block_ledger_worker_role_and_pyaudit_refusals_without_a_class_are_redirects(env):
+    """Worker-role, provenance and pyaudit refusals logged with no class showed the allowed way and the run went
+    on: 0 minutes, count kept, a safety guard, even when the run later hands off waiting for a planned retry.
+    A run handed back to Opus (glm_guard.json in its folder) still holds the time until the task next ran."""
+    from ttp import blockledger as bl
+    p = make(env)
+    now = time.time()
+
+    def run(handed_back, kind):
+        t = _bl_task(p, f"{kind} {handed_back}", "queued", now)
+        p.db.x("INSERT INTO runs(task,role,status,started,ended) VALUES(?,?,?,?,?)", (t, "worker", "ok", now - 7200, now - 7000))
+        p.db.x("INSERT INTO events(ts,source,kind,text,data,status,task) VALUES(?,?,?,?,?,?,?)",
+               (now - 7010, "t", "task_waiting", "x", json.dumps({"wait": "self", "why": "retry"}), "handled", t))
+        p.db.x("INSERT INTO runs(task,role,status,started,ended) VALUES(?,?,?,?,?)", (t, "worker", "ok", now - 3000, now - 2900))
+        d = p.state / "runs" / str(p.db.one("SELECT min(id) AS i FROM runs WHERE task=?", (t,))["i"])
+        d.mkdir(parents=True)
+        (d / "refusals.jsonl").write_text("".join(
+            json.dumps({"ts": now - 7100 + i, "kind": kind, "guard": f"g-{kind}"}) + "\n" for i in range(3)))
+        if handed_back:
+            (d / "glm_guard.json").write_text("{}")
+        return [r for r in bl.rows(p.db, now - 86400, now) if r["task"] == t]
+
+    for kind in ("worker_role", "pyaudit"):
+        [r] = run(False, kind)
+        assert (r["n"], r["minutes"], r["safety"]) == (3, 0.0, "guard"), r
+    [r] = run(True, "worker_role")
+    assert r["minutes"] > 60 and r["safety"] == "guard"

@@ -27,6 +27,7 @@ KV = "rulematch:"   # + message id: {"msg", "items": [older()'s rows]}
 GONE = ":gone"   # kv rulematch:<msg id>:gone {"ts"}: the rule is gone
 CHECKED = "rulematch-checked:"   # + message id: {"at", "left"}: the last overdue check of a message's rules
 CHECK_S = 3600
+MATCHER = 1   # bump when older() changes: each stored record is re-matched once by the new matcher
 MAX = 5
 OPEN_S = 48 * 3600
 OVERDUE_S = 24 * 3600
@@ -121,8 +122,8 @@ def _constants(p, cfg: dict, ref: str | None = None, pat: str = r"^\s*[A-Z][A-Z0
     return out
 
 
-def older(p, db, text: str) -> list[dict]:
-    """The older rules on `text`'s topic, most shared words first, at most MAX."""
+def older(p, db, text: str, cap: int | None = MAX) -> list[dict]:
+    """The older rules on `text`'s topic, most shared words first, at most `cap`."""
     said, anc, dur = _topic(db, text), _anchors(text), durations(text)
     if not said:
         return []
@@ -156,7 +157,7 @@ def older(p, db, text: str) -> list[dict]:
         if shared and (shared >= 2 or name in named or _seconds(v) in dur):   # a topic word in the name, and a second reason
             found.append((n, {"where": "code", "name": name, "line": f"{loc} {name} = {v}",
                                                 "value": v}))
-    return [x for _, x in sorted(found, key=lambda f: -f[0])[:MAX]]
+    return [x for _, x in sorted(found, key=lambda f: -f[0])[:cap]]
 
 
 def note(db, m: dict) -> None:
@@ -168,7 +169,7 @@ def note(db, m: dict) -> None:
         items = older(Project(Path(db.path).parent.parent), db, m.get("text") or "")
     except Exception:
         return
-    db.set_kv(KV + str(m["id"]), {"msg": int(m["id"]), "items": items})   # kept even with none: one look per message
+    db.set_kv(KV + str(m["id"]), {"msg": int(m["id"]), "items": items, "matcher": MATCHER})   # kept even with none: one look per message
 
 
 def _secs(name: str, v) -> int | None:
@@ -225,10 +226,31 @@ def remaining(p, old: str | None = None, name: str | None = None, items: list | 
     return out
 
 
+def _rematch(db, rec: dict) -> dict:
+    """`rec` keeping only the items the current matcher still finds for its message, or that stand nowhere now (so
+    `gone` still marks them), written back once with its age kept; a record left with no items is closed."""
+    if rec.get("matcher") == MATCHER or not rec.get("items"):
+        return rec
+    try:
+        from .project import Project
+        p = Project(Path(db.path).parent.parent)
+        m = db.one("SELECT text FROM messages WHERE id=?", (rec["msg"],))
+        if m is None:
+            return rec
+        found = {(i["where"], i["name"]) for i in older(p, db, m["text"] or "", cap=None)}
+        keep = [i for i in rec["items"] if (i["where"], i["name"]) in found or not remaining(p, items=[i])]
+    except Exception:
+        return rec
+    rec = {**rec, "items": keep, "matcher": MATCHER}
+    db.x("UPDATE kv SET value=? WHERE key=?", (json.dumps({k: v for k, v in rec.items() if k != "ts"}), KV + str(rec["msg"])))
+    return rec
+
+
 def gone(p, db, msg: int | None = None, old: str | None = None, name: str | None = None) -> list[str] | None:
     """`remaining` for message `msg` (its recorded rules) or the value `old`; with none left, a message's
     kv `rulematch:<id>:gone` is stored (once). None: no rules are recorded for `msg`, nothing is marked."""
     rec = db.kv(KV + str(msg)) if msg is not None else None
+    rec = _rematch(db, rec) if rec is not None else None
     if msg is not None and rec is None:
         return None
     left = remaining(p, items=rec.get("items", [])) if rec is not None else remaining(p, old, name)
@@ -238,7 +260,7 @@ def gone(p, db, msg: int | None = None, old: str | None = None, name: str | None
 
 
 def _records(db, now: float) -> list[dict]:
-    return [{**json.loads(r["value"] or "{}"), "ts": r["ts"]} for r in db.q(
+    return [_rematch(db, {**json.loads(r["value"] or "{}"), "ts": r["ts"]}) for r in db.q(
         "SELECT value, ts FROM kv WHERE key LIKE ? AND key NOT LIKE ? AND ts>=? ORDER BY ts", (KV + "%", "%" + GONE, now - OPEN_S))]
 
 

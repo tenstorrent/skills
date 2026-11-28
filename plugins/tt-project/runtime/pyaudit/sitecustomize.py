@@ -114,6 +114,16 @@ def _install(pol: dict) -> None:
             f = f.f_back
         return False
 
+    def harness():
+        """Whether the nearest caller that is the inline code or the harness's own ttp package is the package."""
+        own, f = os.path.join(pol["runtime"], "ttp") + os.sep, sys._getframe(2)
+        while f is not None:
+            fn = f.f_code.co_filename
+            if fn in ("<string>", "<stdin>") or fn.startswith(own):
+                return fn.startswith(own)
+            f = f.f_back
+        return False
+
     def write_why(path, tree=False, plain=False):
         """Why the code may not write `path` (with `tree`: remove or move it, and all under it)."""
         if tree and (hit := next((r for r in roots if r.startswith(path.rstrip("/") + "/")), None)):
@@ -128,6 +138,8 @@ def _install(pol: dict) -> None:
                 return glm["db_why"]
             if inside(path, glm["own"]) and os.path.basename(path) not in glm["records"]:
                 return None
+            if inside(path, glm.get("harness") or []) and harness():
+                return None   # the harness's own checks code (remotecheck under `ttp checks`), not the inline code
             return ttp().glm_write(path, glm)
         return None
 

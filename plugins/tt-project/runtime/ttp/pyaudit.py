@@ -35,9 +35,9 @@ def policy(env, cwd: str, run_dir: str, cfg: dict | None, zp: str) -> dict:
     pol = {"runtime": str(DIR.parent), "zip": zp,
            "tamper": TAMPER, "roots": roots, "secrets": secrets}
     if glmguard.glm_run(env) is not None:
-        uploads = str(checkcap.slot_dir() / "uploads")   # the checks code's upload lock files (remotecheck)
+        slots = checkcap.slot_dir()   # the checks code's upload locks and spill-down marks (remotecheck, checkspill)
         write = glmguard._roots(cwd, run_dir, glmguard._scratch(run_dir, env), env)
-        pol["glm"] = {"run_dir": run_dir, "roots": [*write, uploads],
+        pol["glm"] = {"run_dir": run_dir, "roots": write, "harness": [str(slots / "uploads"), str(slots / "spill-down")],
                       "own": glmguard._own_roots(cwd, run_dir, env), "home": home,
                       "harmless": list(sidefx.HARMLESS), "records": sorted(glmguard.RUN_RECORDS),
                       "db": glmguard.STATE_DB.pattern, "db_why": glmguard.STATE_DB_WHY}

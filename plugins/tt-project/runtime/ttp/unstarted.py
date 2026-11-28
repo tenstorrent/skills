@@ -67,7 +67,12 @@ EXTERNAL = re.compile(
     r"\bteam\b|\bdevice|\bbox\b|\bmachine|\bnode|\bbroker|\block\b|\bqueue|\bslot|\bcluster|\breserv|"
     r"\bquota|\bpause|\blull|\bidle\b|\bbusy\b|\bci\b|\bbuild\b|\bupstream|\bprovider|\blimit|\bcredit",
     re.I)
-TIME_ONLY = re.compile(r'^\s*(?:test|\[)\s+"?\$\(\s*date\s+\+%s\s*\)"?\s+-ge\s+\d+\s*\]?\s*$')
+# A bare clock gate: now (`date +%s`) -ge an epoch, plain or quoted, or a fixed date's (`date -d '<text>' +%s`), in
+# `test` or `[ ]`, with an optional `|| exit 1`. A probe that runs any other command is no clock gate.
+_NOW = r'"?\$\(\s*date\s+\+%s\s*\)"?'
+_AT = r'(?:"?\d+"?|"?\$\(\s*date\s+(?:-d\s*|--date[=\s])(?:\'[^\'$`\\]*\'|"[^"$`\\]*")\s+\+%s\s*\)"?)'
+TIME_ONLY = re.compile(rf'^\s*(?:test\s+{_NOW}\s+-ge\s+{_AT}|\[\s+{_NOW}\s+-ge\s+{_AT}\s+\])'
+                       r'(?:\s*\|\|\s*exit\s+1)?\s*$')
 
 
 def threshold(prio: int | None, p1: float, rest: float) -> float:

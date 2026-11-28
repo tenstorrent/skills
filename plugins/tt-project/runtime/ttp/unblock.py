@@ -154,7 +154,8 @@ def classify_wait(result: dict | None) -> tuple[str, str]:
     for why, rx in SELF_PROBES:
         if rx.search(probe):
             return "self", why
-    if PLANNED_WINDOW.search(str(r.get("waiting_for") or "")):
+    from .unstarted import TIME_ONLY
+    if TIME_ONLY.match(probe) or PLANNED_WINDOW.search(str(r.get("waiting_for") or "")):
         return "self", "planned window"
     return "external", "other"
 

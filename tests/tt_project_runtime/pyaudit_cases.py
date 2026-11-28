@@ -262,10 +262,26 @@ def test_pyaudit_on_the_glm_arm_lets_a_whole_remote_check_run_on_its_host(env, c
     assert "tt-project guard" not in r.stdout + r.stderr and _rc_left(tmp_path) == []
 
 
-def test_pyaudit_lets_a_glm_run_write_the_checks_upload_locks(env, cred_home):
-    """The checks code's own upload lock files (check-slots/uploads) are no write outside the worktree."""
-    from ttp import checkcap, pyaudit
-    pol = json.loads(_pa_env(cred_home, glm=True)[pyaudit.POLICY_ENV])
-    assert str(checkcap.slot_dir() / "uploads") in pol["glm"]["roots"]
-    assert not any(r.endswith("check-slots") for r in pol["glm"]["roots"]), "only the upload locks"
-    assert pyaudit.glm_write(str(checkcap.slot_dir() / "uploads" / "box1.lock"), pol["glm"]) is None
+def test_pyaudit_lets_only_the_harness_checks_code_write_its_check_slots(env, cred_home):
+    """The checks code's own upload locks and spill-down marks (check-slots/uploads, check-slots/spill-down) are
+    no write outside the worktree when the harness's ttp package writes them; the inline code's own write is."""
+    from ttp import checkcap, project, pyaudit
+    e = {**_pa_env(cred_home, glm=True), "TTP_HOME": str(project.HOME_DIR)}   # the child's slot folder too
+    pol = json.loads(e[pyaudit.POLICY_ENV])
+    assert not any(r.startswith(str(checkcap.slot_dir())) for r in pol["glm"]["roots"]), "no root for the code"
+    checkcap.slot_dir().mkdir(parents=True, exist_ok=True)   # the host's slot folder, as `ttp checks` keeps it
+    down = checkcap.slot_dir() / "spill-down" / "box1.json"
+    harness = f"""if 1:
+        import os
+        from ttp import checkspill, remotecheck
+        checkspill.down_add('box1', 'unreachable')
+        assert os.path.isfile({str(down)!r})
+        assert remotecheck.upload_slot('box1', 0).name.endswith('box1.0.lock')
+        checkspill.down_clear('box1')
+        assert not os.path.exists({str(down)!r})"""
+    r = _pa_run(e, harness, cred_home.work)
+    assert r.returncode == 0 and "tt-project guard" not in r.stderr, r.stderr[-1500:]
+    for code in (f"open({str(checkcap.slot_dir() / 'uploads' / 'x.lock')!r}, 'a')",
+                 f"import pathlib; pathlib.Path({str(down)!r}).write_text('{{}}')"):
+        r = _pa_run(e, code, cred_home.work)
+        assert r.returncode != 0 and "writes outside its worktree" in r.stderr, (code, r.stderr[-800:])

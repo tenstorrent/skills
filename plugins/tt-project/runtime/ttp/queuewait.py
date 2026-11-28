@@ -152,11 +152,13 @@ def collect(p, cfg: dict, now: float, host: dict | None = None, device: set | No
     for h, at in [*zip(host.get("queued") or [], host.get("queued_at") or []), *(host.get("parked") or [])]:
         if (tid := _task_of(h, name)) is not None and at:
             add(tid, "checks", "", at, checks)
-    from . import progress, urgent
+    from . import progress, unstarted, urgent
     from .coordinator import task_resources
     probes = progress.load(db).get("probes") or {}
 
     def own(t, since, probe):   # an urgent task's wait no queue explains: its probe, its last words and its resources
+        if unstarted.TIME_ONLY.match(str(probe or "")):
+            return   # a bare clock gate: a planned window, no queue to unblock
         add(t["id"], "own", ",".join(sorted(task_resources(t))), since,
             {"cap": None, "running": [], "queued": [], "probe": str(probe or "")[:300],
              "says": str((probes.get(str(t["id"])) or {}).get("reason") or "")[:200]})

@@ -37,7 +37,10 @@ REDIRECT = "redirect"   # glmguard.REDIRECTED: the refusal told the allowed way 
 WORK = frozenset({"own job", "planned window"})   # work in progress or a planned start: no blocked time
 NOT_TOP = WORK | {"dependency"}
 LANDED = re.compile(r"\blanded:#?(\d+)|\bttp\s+landed\s+--task\s+(\d+)|\blanding of task #(\d+)")
-GUARD_KINDS = frozenset({"no_device", "worker_role", "provenance", "user_site"})   # hook refusals of a safety guard
+GUARD_KINDS = frozenset({"no_device", "worker_role", "provenance", "user_site", "pyaudit"})   # refusals of a safety guard
+# Refusals that show the run the allowed way and let it go on (no class logged): redirects, unless the run was
+# handed back (glmguard.HIT in its folder) or the attempt was harmful.
+MOVES_ON = frozenset({"worker_role", "provenance", "pyaudit"})
 # Safety gates beyond selfblock.GATES: a held resource, a check, a review or push, a user message, a rule id.
 SAFE = (("held resource", re.compile(r"\bresource:\S+|\block\b", re.I)), ("check", re.compile(r"\bcheck:\S+")),
         ("review or push", re.compile(r"\b(?:review|pushing)\b", re.I)), ("user message", rulecite._MSG),
@@ -113,8 +116,10 @@ def _refusals(db: DB, since: float, until: float) -> list[dict]:
                   "AND COALESCE(ended, ?)>=?", (until, until, since)):
         end = _handed_next(db, r, until)
         by: dict = {}
+        run = Path(db.path).parent / "runs" / str(r["id"])
+        back = (run / "glm_guard.json").is_file()   # glmguard.HIT: the run was handed back to Opus
         for name in REFUSALS:
-            f = Path(db.path).parent / "runs" / str(r["id"]) / name
+            f = run / name
             for line in (f.read_text(errors="replace").splitlines() if f.is_file() else ()):
                 try:
                     rec = json.loads(line)
@@ -127,7 +132,8 @@ def _refusals(db: DB, since: float, until: float) -> list[dict]:
                 e = by.setdefault(kind, {"ts": ts, "n": {}, "guard": False, "moved": True})
                 e["ts"], e["n"][name] = min(e["ts"], ts), e["n"].get(name, 0) + 1
                 e["guard"] |= rec.get("class") == "harmful" or rec.get("kind") in GUARD_KINDS
-                e["moved"] &= rec.get("class") == REDIRECT
+                e["moved"] &= rec.get("class") == REDIRECT or (
+                    not back and rec.get("class") is None and rec.get("kind") in MOVES_ON)
         for kind, e in by.items():   # the hook and glmguard both log a GLM refusal: count it once
             stop = e["ts"] if e["moved"] else max(e["ts"], min(end or e["ts"], until))
             row = _row(kind, r["task"], "refusal", e["ts"], stop, "", "refusal", n=max(e["n"].values()))
