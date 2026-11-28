@@ -44,9 +44,6 @@ REMOTE_PIP_TIMEOUT_S = 15     # ... and waits this long per connection
 _ready: dict[str, dict] = {}   # key -> info, for this process
 
 
-NO_INSTALL = "no ready checks env; install off (checks.spill_install)"   # ensure(build=False) with none there
-
-
 class Unavailable(RuntimeError):
     """The pinned environment could not be built or used; the message says what to fix."""
 
@@ -316,10 +313,9 @@ def _read(link: Path) -> dict | None:
     return {**info, "path": str(link.resolve())} if r.returncode == 0 and isinstance(info, dict) else None
 
 
-def ensure(lock: Path | None = None, build: bool = True) -> dict:
+def ensure(lock: Path | None = None) -> dict:
     """The info of the env built from `lock` (default LOCK), building it first when there is none:
-    {key, lock, lock_sha256, python, pytest, path}. Unavailable when it cannot be built, or with `build`
-    false when no whole env of that key is there (NO_INSTALL)."""
+    {key, lock, lock_sha256, python, pytest, path}. Unavailable when it cannot be built."""
     if test := os.environ.get("TTP_TEST_CHECKS_PYTHON_ENV"):   # tests: a ready env of the suite's own
         if test not in _ready:
             _ready[test] = _read(Path(test)) or _fail(Path(test), "the test env is not whole")
@@ -337,8 +333,6 @@ def ensure(lock: Path | None = None, build: bool = True) -> dict:
     home = root()
     link = home / key
     if not (info := _read(link)):
-        if not build:
-            raise Unavailable(NO_INSTALL)
         home.mkdir(parents=True, exist_ok=True)
         with open(home / f".{key}.lock", "a") as fh:
             fcntl.flock(fh, fcntl.LOCK_EX)   # one build per key; the others wait and then reuse it
@@ -393,7 +387,7 @@ def apply(env: dict, lock: Path | None = None) -> dict:
             LOCK_ENV: str(Path(lock or LOCK).resolve())}
 
 
-def remote_lines(lock: Path | str | None, where: str, fail: str, build: bool = True) -> str:
+def remote_lines(lock: Path | str | None, where: str, fail: str) -> str:
     """Shell lines for another host (remotecheck): write this file and `lock` into folder
     `where` there, make or reuse the pinned env from them with that host's python3 (as ensure does
     here, under its TTP_HOME), and put it in force as apply does.
@@ -402,18 +396,16 @@ def remote_lines(lock: Path | str | None, where: str, fail: str, build: bool = T
     after pip's silent retries: REMOTE_PIP_RETRIES and REMOTE_PIP_TIMEOUT_S unless the host's own PIP_RETRIES
     and PIP_DEFAULT_TIMEOUT say otherwise. TTP_CHECKS_ENV_BIN names its bin, so a check behind a spill wrapper puts it first again
     (remotecheck.REFRONT). Then the check's throwaway HOME there, in `where`, when it has one here
-    (scratchhome.remote_lines). With `build` false the env must already be there: no pip runs, and a host
-    without one prints NO_INSTALL and runs `fail`. OSError when a file cannot be read."""
+    (scratchhome.remote_lines). OSError when a file cannot be read."""
     from . import scratchhome   # here only: this file also runs alone on the other host
     lock = Path(lock or LOCK)
     out, w = f"mkdir -p {shlex.quote(where)}\n", shlex.quote(where)
     for name, text in (("runnerenv.py", Path(__file__).read_text()), ("checks-python.lock", lock.read_text())):
         end = f"TTP_ENV_{secrets.token_hex(8)}"
         out += f"cat > {w}/{name} <<'{end}'\n{text.rstrip(chr(10))}\n{end}\n"
-    pip = (f"PIP_RETRIES=${{PIP_RETRIES:-{REMOTE_PIP_RETRIES}}} PIP_DEFAULT_TIMEOUT=${{PIP_DEFAULT_TIMEOUT:-{REMOTE_PIP_TIMEOUT_S}}} "
-           if build else "")
-    return (out + f'ttp_env=$({pip}python3 -I {w}/runnerenv.py {"" if build else "--no-install "}"$PWD"/{w}/checks-python.lock) || {{ '
-            f"echo 'ttp: the checks pinned Python env {'could not be made' if build else 'is not ready'} on this host; the check did not run' >&2; {fail}; }}\n"
+    pip = f"PIP_RETRIES=${{PIP_RETRIES:-{REMOTE_PIP_RETRIES}}} PIP_DEFAULT_TIMEOUT=${{PIP_DEFAULT_TIMEOUT:-{REMOTE_PIP_TIMEOUT_S}}} "
+    return (out + f'ttp_env=$({pip}python3 -I {w}/runnerenv.py "$PWD"/{w}/checks-python.lock) || {{ '
+            f"echo 'ttp: the checks pinned Python env could not be made on this host; the check did not run' >&2; {fail}; }}\n"
             'export PATH="$ttp_env/bin${PATH:+:$PATH}" PYTHONNOUSERSITE=1 TTP_CHECKS_ENV_BIN="$ttp_env/bin"\n'
             'unset PIP_USER\n' + scratchhome.remote_lines(where, fail))
 
@@ -459,12 +451,12 @@ def describe(info: dict) -> str:
             f"lock {str(info.get('lock_sha256', ''))[:12]} from {info.get('lock', '?')})")
 
 
-if __name__ == "__main__":   # on another host (remote_lines): print the env's folder, made first when missing (not with --no-install)
+if __name__ == "__main__":   # on another host (remote_lines): print the env's folder, made first when missing
     if sys.argv[1:] == ["--interpreter"]:   # _probe: this Python's base, sys.version and version_info
         print(json.dumps([_base_python(), sys.version, list(sys.version_info[:3])]))
         sys.exit(0)
     try:
-        print(ensure(Path(sys.argv[-1]), sys.argv[1] != "--no-install")["path"])
+        print(ensure(Path(sys.argv[1]))["path"])
     except Unavailable as e:
         print(f"ttp: {e}", file=sys.stderr)
         sys.exit(1)

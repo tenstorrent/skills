@@ -143,7 +143,6 @@ PRE_KEY = "spill_pre_cmd"   # checks.spill_pre_cmd: the project's own go/skip co
 PRE_TIMEOUT_S = 30
 PRE_SKIP_RC = 75   # the pre-run hook's "not now": the host is skipped this time, no error
 AFTER_KEY = "checks_spill_after_s"
-INSTALL_KEY = "spill_install"   # checks.spill_install: a spill host may build the pinned checks env (install)
 FIRST_KEY = "checks_spill_first"   # delivery.checks_spill_first: a spillable run tries the spill hosts before a place here (first)
 REMOTE_ONLY_KEY = "checks_remote_only"   # delivery.checks_remote_only: on a workstation a busy pool is waited for (remote_only)
 REMOTE_ONLY_ENV = "TTP_TEST_REMOTE_ONLY"   # tests: "1"/"0" instead of this machine's kind when the setting is unset
@@ -566,7 +565,13 @@ def off_list(project_dir: str, alias: str) -> str:
     """Why spill host `alias` may no longer take a check of the project at `project_dir`, or "": hosts() of
     its settings as they are now no longer lists it (taken off its list or the account's pool, or banned).
     A folder that is no project, or settings that cannot be read, say nothing (the pick checked them)."""
-    if (cfg := config_of(project_dir)) is None:
+    from .project import Project
+    try:
+        p = Project(project_dir)
+        if not p.exists():
+            return ""
+        cfg = p.config()
+    except Exception:
         return ""
     listed = hosts(cfg)
     if alias in listed:
@@ -700,17 +705,16 @@ def wrap_keeps_here(cmds: list, cfg: dict | None) -> str:
 
 
 def wrap_problems(checks: Any) -> list[str]:
-    """Config check of checks.wrap_needs_device, checks.spill_wrap_cmd, checks.spill_beside_device,
-    checks.spill_pre_cmd and checks.spill_install."""
+    """Config check of checks.wrap_needs_device, checks.spill_wrap_cmd, checks.spill_beside_device and
+    checks.spill_pre_cmd."""
     from . import push
     v = checks.get(NO_DEVICE_KEY) if isinstance(checks, dict) else None
     out = [] if v is None or isinstance(v, bool) else [f"checks.{NO_DEVICE_KEY}: {v!r} is not true or false"]
-    for key, of in ((BESIDE_KEY, beside_of), (INSTALL_KEY, install_of)):
-        if (b := checks.get(key) if isinstance(checks, dict) else None) is not None:
-            try:
-                of(b)
-            except ValueError as e:
-                out.append(str(e).replace("; nothing was changed", ""))
+    if (b := checks.get(BESIDE_KEY) if isinstance(checks, dict) else None) is not None:
+        try:
+            beside_of(b)
+        except ValueError as e:
+            out.append(str(e).replace("; nothing was changed", ""))
     try:
         pre_cmd_of(checks.get(PRE_KEY) if isinstance(checks, dict) else None)
     except ValueError as e:
@@ -749,35 +753,6 @@ def first_of(v: Any) -> bool:
     if t in ("0", "false", "no", "off"):
         return False
     raise ValueError(f"delivery.{FIRST_KEY}: {v!r} is not true or false; nothing was changed")
-
-
-def install_of(v: Any) -> bool:
-    """A `checks.spill_install` value set by `ttp config`: true or false."""
-    try:
-        return first_of(v)
-    except ValueError:
-        raise ValueError(f"checks.{INSTALL_KEY}: {v!r} is not true or false; nothing was changed") from None
-
-
-def may_install(cfg: dict | None) -> bool:
-    """Whether a spill host may build the pinned checks env from its package index (checks.spill_install;
-    unset or malformed: no). No: a host without a ready env takes no check (runnerenv.remote_lines)."""
-    checks = (cfg or {}).get("checks")
-    try:
-        return install_of(checks.get(INSTALL_KEY, False)) if isinstance(checks, dict) else False
-    except ValueError:
-        return False
-
-
-def config_of(project_dir: str) -> dict | None:
-    """The settings of the project at `project_dir` as they are now; None for a folder that is no project, or
-    settings that cannot be read."""
-    from .project import Project
-    try:
-        p = Project(project_dir)
-        return p.config() if p.exists() else None
-    except Exception:
-        return None
 
 
 def first(cfg: dict | None) -> bool:
@@ -2433,24 +2408,6 @@ def strike_settle(p, cfg: dict | None, head: str, passed_on: str = "", now: floa
     return took
 
 
-def no_install_off(project_dir: str, alias: str, now: float | None = None) -> None:
-    """Take `alias` off the spill pool of the project at `project_dir` for DOWN_RETRY_S: a spilled check found
-    no ready checks env there and checks.spill_install is off. Only this project; ends like any quarantine."""
-    from .project import Project
-    now = time.time() if now is None else now
-    try:
-        p = Project(project_dir)
-        with p.db.tx():
-            doc = _strikes(p.db)
-            h = doc["hosts"].setdefault(alias, {})
-            if isinstance(h.get("off"), dict) and float(h["off"].get("until") or 0) > now:
-                return   # a quarantine already holds it (its ledger entry, its probe): never shortened here
-            h["off"] = {"kind": "no-install", "since": now, "until": now + DOWN_RETRY_S, "n": 0}
-            p.db.set_kv(STRIKES_KV, doc)
-    except Exception:   # no project there, its db unwritable: the fault itself still says why
-        pass
-
-
 def quarantined(p, alias: str, now: float | None = None) -> str:
     """Why `alias` is quarantined for project `p`'s checks ("" when it is not). A quarantine past its end
     ends here as lift ends one (its event, its strikes reset), ledger entry or not; a health one ends only on a
@@ -2462,15 +2419,12 @@ def quarantined(p, alias: str, now: float | None = None) -> str:
         if not off:
             return ""
         if float(off.get("until") or 0) <= now and off.get("kind") != "health":
-            lift(p, alias, now, severity="" if off.get("kind") == "no-install" else "normal")   # retried quietly
+            lift(p, alias, now)
             return ""
     except Exception:
         return ""
     if off.get("kind") == "health":   # spillhealth: back once its health check passes
         return f"quarantined: its health check failed ({off.get('why')}); back once it passes, or with `ttp checks --spill-back {alias}`"
-    if off.get("kind") == "no-install":
-        from .runnerenv import NO_INSTALL
-        return f"{NO_INSTALL}; tried again at {timefmt.clock(now=float(off['until']))}"
     return (f"quarantined: {off.get('n')} spilled runs in a row failed there and passed elsewhere; back once a "
             f"known-good run of the base passes there (`ttp checks --spill-probe {alias}`) or with "
             f"`ttp checks --spill-back {alias}`, at the latest {timefmt.clock(now=float(off['until']))}")

@@ -471,8 +471,6 @@ USER_SETTABLE = {
     "delivery.checks_remote_only": lambda v: "auto" if (r := checkspill.remote_only_of(v)) is None else r,
     # Spill hosts (or "*") the project lets its checks run on beside a device job (checkspill.beside_device).
     "checks.spill_beside_device": lambda v: checkspill.beside_of(v),
-    # Whether a spill host may build the pinned checks env from its package index (checkspill.may_install; default false).
-    "checks.spill_install": lambda v: checkspill.install_of(v),
     # Strikes in a row (spilled runs failing where the head passes elsewhere) that quarantine a spill host.
     "checks.spill_quarantine_after": lambda v: checkspill.quarantine_after_of(v),
     # At most this many of the project's checks on one spill host at once (a suite that serializes per host).
