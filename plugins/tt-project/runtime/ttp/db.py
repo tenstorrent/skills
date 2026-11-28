@@ -122,6 +122,10 @@ CREATE TABLE IF NOT EXISTS events (
   text TEXT NOT NULL, data TEXT, status TEXT NOT NULL DEFAULT 'new', task INTEGER);
 CREATE INDEX IF NOT EXISTS events_status ON events(status);
 
+CREATE TABLE IF NOT EXISTS carry_state(
+  task INTEGER PRIMARY KEY, phase TEXT NOT NULL, round INTEGER NOT NULL DEFAULT 0, head TEXT, review_run INTEGER,
+  push_row INTEGER, batch TEXT, updated REAL NOT NULL, note TEXT);
+
 CREATE TABLE IF NOT EXISTS issues (
   id INTEGER PRIMARY KEY AUTOINCREMENT, fingerprint TEXT UNIQUE, source TEXT,
   first_seen REAL, last_seen REAL, count INTEGER DEFAULT 1, title TEXT,

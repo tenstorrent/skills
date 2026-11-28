@@ -62,6 +62,7 @@ FLAGS: dict[str, dict[str, Any]] = {
     # `judge`: the wave gate judges the flag with the named judge (wave_tick). glm_code's code-arm records
     # (codearm.ARM_KV) are judged by glmshare.judge_code: the code route's own rollback metrics. `ring_judge`: the
     # gate judges it at a ring level too (rollback only); any other flag only at auto.
+    "inline_review": {"key": "review.inline", "area": "review", "code": _code("carry.py")},
     "glm_code": {"key": "route.code_sonnet.glm_share", "area": "route", "code": _code("codearm.py"), "waves": True,
                  "judge": "codearm", "ring_judge": True, "arm": "glm"},
     # The project's routed work on GLM (glmwork.py); `waves`: it may run at auto, judged by glmshare.judge.

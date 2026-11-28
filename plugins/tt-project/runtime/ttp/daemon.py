@@ -40,6 +40,7 @@ from . import runtimeload   # first of its own: its LOADED_AT is when the daemon
 from . import (   # one name per line: two changes adding names merge without a conflict
     aitag,
     blindreview,
+    carry,
     deviceplan,
     glmassist,
     glmquota,
@@ -1695,6 +1696,11 @@ class Daemon:
                 log(self.p, f"closed {len(closed)} stray push batch file(s)")
         except Exception:
             log(self.p, "stray batch file close error: " + traceback.format_exc().replace("\n", " | ")[:2000])
+        try:   # carry tasks' phases follow the push queue's rows (carry.reconcile)
+            if moved := carry.reconcile(self.p.db):
+                log(self.p, f"carry: moved {len(moved)} task phase(s) forward to match the push queue")
+        except Exception:
+            log(self.p, "carry reconcile error: " + traceback.format_exc().replace("\n", " | ")[:2000])
         try:   # workers' start-up file index skips the project's bulky folders (indexignore)
             if did := indexignore.ensure(self.p):
                 log(self.p, did)

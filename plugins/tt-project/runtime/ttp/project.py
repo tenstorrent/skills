@@ -487,7 +487,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "review": {"light_max_lines": 80, "risky_paths": [], "light_paths": [], "auto": True, "auto_notes": "",
                "area_fail_cap": 3, "blocked_long_h": 12, "rule_blocks_min": 3, "sweep_after_s": 300,
                "unreviewed_per_pass": None, "unreviewed_max_age_h": 72, "unreviewed_wait_s": 1800,
-               "carried_hold_max_h": 24, "auto_fix_rounds": 1, "hop_max": 2,
+               "carried_hold_max_h": 24, "auto_fix_rounds": 1, "hop_max": 2, "inline": "ordered",
                "fork_target": 0.9,   # hourly.py: the share of worker and review runs started from a fork or resume
                # ponytail.py: a code change's review also runs the ponytail lane on ponytail_model (where its
                # provider can start it, else that provider's own strongest model: ponytail.lane_model); a change
