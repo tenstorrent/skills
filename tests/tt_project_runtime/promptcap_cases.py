@@ -12,7 +12,7 @@ def _capped_project(env, goals=0):
     blocks = "\n\n".join(f"Goal {i:02}: tune the {w} path in src/{w}.py. " + "g" * 600
                          for i, w in list(enumerate(["widget", "gadget", "sprocket", "flange"] * 8))[:goals])
     p.charter_path.write_text(
-        "# demo — charter\n\n## Goals\nShip a faster widget.\n\n" + blocks + "\n\n## Restrictions\n"
+        "# demo charter\n\n## Goals\nShip a faster widget.\n\n" + blocks + "\n\n## Restrictions\n"
         "- Push only to branch dev/widget. Never push to main. (user msg #1)\n"
         "- Keep content generic: no hostnames or credentials. (user msg #2)\n\n"
         "## Policies\n- Style: answers stay short and plain. [workers]\n\n## Resources\n- Box A: the benchmark box.\n")
