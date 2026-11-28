@@ -122,7 +122,7 @@ def test_block_ledger_counts_guard_refusals_queue_waits_and_the_block_log(env):
     assert all(r["end"] <= now - 3000 for r in bl.rows(p.db, now - 86400, now - 3000) if r["source"] == "refusal")
     assert by["queue:checks"]["minutes"] == 10.0
     assert (by["keep 60 min"]["minutes"], by["keep 60 min"]["source"]) == (5.0, "cli")
-    assert [e["rule"] for e in bl.top(rs, 1)] == [rs[0]["rule"]]
+    assert [e["rule"] for e in bl.by_rule(rs, 1)] == [rs[0]["rule"]]
 
 
 def test_block_ledger_share_counts_only_ordered_work_and_each_task_once(env):

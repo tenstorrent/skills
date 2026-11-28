@@ -9000,14 +9000,21 @@ def cmd_block_log(a) -> None:
 
 def cmd_blocked(a) -> None:
     """`ttp blocked [--days N] [--json]`: the top 10 rules by blocked minutes over the last N days (default 1)
-    with their safety class and tasks, and ordered work's blocked share against the 5% target."""
+    with their key, safety class and tasks, and ordered work's blocked share against the 5% target.
+    `ttp blocked --done KEY --how TEXT` records that the top blocker KEY was retired or rewritten."""
     from . import blockledger as bl
     p = here()
     if p is None:
         die("ttp blocked: no project here (run it in a project or its run)")
+    if a.done:
+        if not a.how:
+            die("ttp blocked --done: say what retired or rewrote it with --how TEXT")
+        bl.done(p.db, a.done, a.how)
+        print(f"ttp blocked: {a.done} done ({a.how})")
+        return
     now = time.time()
     rs = bl.rows(p.db, now - a.days * DAY_S, now)
-    out = {"share": bl.window_share(p.db, now - a.days * DAY_S, now, rs), "target": bl.TARGET, "top": bl.top(rs)}
+    out = {"share": bl.window_share(p.db, now - a.days * DAY_S, now, rs), "target": bl.TARGET, "top": bl.by_rule(rs)}
     if a.json:
         print(json.dumps(out))
         return
@@ -9015,7 +9022,7 @@ def cmd_blocked(a) -> None:
     print(f"blocked {s['share'] * 100:.1f}% of ordered work over {a.days:g} d (target {bl.TARGET * 100:g}%): "
           f"{s['blocked_min']:g} of {s['ordered_min']:g} min")
     for e in out["top"]:
-        print(f"  {e['minutes']:g} min  {e['rule']}  [{e['safety']}]  x{e['count']}  tasks {e['tasks'][:6] or '-'}")
+        print(f"  {e['minutes']:g} min  {e['rule']}  [{e['safety']}]  x{e['count']}  tasks {e['tasks'][:6] or '-'}  key {e['key']}")
 
 
 def cmd_checks_shard(a) -> None:
@@ -17602,6 +17609,8 @@ def ttp_parser():
                                        "ordered work's blocked share against the 5%% target (read-only)")
     s.add_argument("--days", type=float, default=1, help="look back this many days (default 1)")
     s.add_argument("--json", action="store_true", help="print the ledger as JSON")
+    s.add_argument("--done", metavar="KEY", help="record that the top blocker KEY was retired or rewritten (needs --how)")
+    s.add_argument("--how", help="what retired or rewrote it")
     s.set_defaults(fn=cmd_blocked)
     s = sub.add_parser("chat-load", help="this host's finished chat-provider calls over the trailing minutes: calls, "
                                          "refusals (429, 503, 529), errors and refusal rate, in total, by priority "

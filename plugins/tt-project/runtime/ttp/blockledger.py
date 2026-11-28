@@ -7,6 +7,10 @@ sources: the stuck intervals of tasks (unblock.intervals), guard refusals in eac
 blocked or waiting), queue-wait episodes (queuewait) and `state/blocklog.jsonl`, which `ttp block-log`
 appends to. `safety` names the safety gate that holds the time, else "convenience". `window_share` is the
 blocked share of ordered work's wall time (TARGET 5%): overlapping rows of one task count once.
+
+`top` lists the day's convenience rules with the most minutes (safety rows are listed apart and never
+retire items); `digest_lines` shows each as a 'top blocker' until `ttp blocked --done <key> --how TEXT`
+(kv `blockledger:done:<key>`), and 'came back' when a done rule holds time again within BACK_S.
 """
 from __future__ import annotations
 
@@ -20,6 +24,9 @@ from .db import DB
 
 LOG = "blocklog.jsonl"
 TARGET = 0.05
+DONE = "blockledger:done:"   # + key_of(rule): {"how"}, stamped by the kv row's ts
+BACK_S = 7 * 86400
+SHOWN = 5
 REFUSALS = ("refusals.jsonl", "glm_refusals.jsonl")
 GUARD_KINDS = frozenset({"no_device", "worker_role", "provenance", "user_site"})   # hook refusals of a safety guard
 # Safety gates beyond selfblock.GATES: a held resource, a check, a review or push, a user message, a rule id.
@@ -45,9 +52,16 @@ def rule_of(reason: str) -> str:
     return " ".join(re.findall(r"[a-z]+", words)[:6]) or "unknown"
 
 
+PLUGIN = re.compile(r"\b(?:task|run)[ _-]budget|budget_usd|over (?:its |the )?(?:task )?budget|change size|"
+                    r"lines? over|too (?:large|big)|lean[- ]code|ponytail", re.I)
+CAPS = re.compile(r"\b(?:project|account|dollar|spend)[ _-]caps?\b", re.I)   # the dollar caps stay safety gates
+
+
 def safety_of(reason: str, kind: str = "") -> str:
     if kind == "review":
         return "review or push"
+    if PLUGIN.search(reason) and not CAPS.search(reason):
+        return "convenience"   # the plugin's own task budget, change size and lean-code gates are ours to retire
     for name, rx in (*selfblock.GATES, *SAFE):
         if rx.search(reason):
             return name
@@ -165,11 +179,18 @@ def window_share(db: DB, start: float, end: float, rs: list[dict] | None = None)
             "ordered_min": round(wall, 1)}
 
 
-def top(rs: list[dict], n: int = 10) -> list[dict]:
-    """The n rules with the most minutes: {rule, minutes, count, safety, tasks}."""
+def key_of(rule: str) -> str:
+    """The one-word key `ttp blocked --done` takes: the rule id, else the rule's words joined by '-'."""
+    m = rulecite._ID.search(rule)
+    return m.group(0) if m else re.sub(r"[^a-z0-9]+", "-", rule.lower()).strip("-")[:40]
+
+
+def by_rule(rs: list[dict], n: int = 10) -> list[dict]:
+    """The n rules with the most minutes: {rule, key, minutes, count, safety, tasks}."""
     by: dict = {}
     for r in rs:
-        e = by.setdefault(r["rule"], {"rule": r["rule"], "minutes": 0.0, "count": 0, "safety": r["safety"], "tasks": set()})
+        e = by.setdefault(r["rule"], {"rule": r["rule"], "key": key_of(r["rule"]), "minutes": 0.0, "count": 0,
+                                      "safety": r["safety"], "tasks": set()})
         e["minutes"] += r["minutes"]
         e["count"] += r.get("n", 1)
         e["tasks"] |= {r["task"]} if r["task"] is not None else set()
@@ -181,6 +202,47 @@ def daily_line(db: DB, now: float | None = None) -> str:
     now = time.time() if now is None else now
     rs = rows(db, now - 86400, now)
     s = window_share(db, now - 86400, now, rs)
-    t = top([r for r in rs if r["safety"] == "convenience"], 3)
+    t = by_rule([r for r in rs if r["safety"] == "convenience"], 3)
+    opened, back = status(db, now, rs)
     return (f"Blocked time: {s['share'] * 100:.1f}% of ordered work (target {TARGET * 100:g}%); top: "
-            + (", ".join(f"{e['rule']} {e['minutes']:g}m" for e in t) or "none"))
+            + (", ".join(f"{e['rule']} {e['minutes']:g}m" for e in t) or "none")
+            + f"; top blockers open: {len(opened)}, came back: {len(back)}")
+
+
+def top(db: DB, now: float | None = None, n: int = SHOWN, safety: bool = False, rs: list[dict] | None = None) -> list[dict]:
+    """The day's n rules with the most minutes: the convenience ones (retire or rewrite them), or with `safety`
+    the safety-gate ones, listed apart and never retire items."""
+    now = time.time() if now is None else now
+    rs = rows(db, now - 86400, now) if rs is None else rs
+    return by_rule([r for r in rs if (r["safety"] != "convenience") == safety], n)
+
+
+def done(db: DB, key: str, how: str) -> None:
+    db.set_kv(DONE + key, {"how": how})
+
+
+def status(db: DB, now: float, rs: list[dict] | None = None) -> tuple[list[dict], list[tuple[str, str]]]:
+    """(the day's top convenience rules not yet done, [(key, how)] of done ones that held time again within BACK_S)."""
+    marks = {r["key"][len(DONE):]: (r["ts"], json.loads(r["value"]).get("how", ""))
+             for r in db.q("SELECT key, value, ts FROM kv WHERE key LIKE ? AND ts>=?", (DONE + "%", now - BACK_S))}
+    opened = top(db, now, 50, rs=rs)
+    back = []
+    if marks:
+        since = min(ts for ts, _ in marks.values())
+        for r in rows(db, since, now):
+            k = key_of(r["rule"])
+            if k in marks and r["safety"] == "convenience" and r["minutes"] and r["end"] > marks[k][0] + 60:
+                back.append((k, marks[k][1]))
+                marks.pop(k)
+    gone = {k for k, _ in back} | set(marks)
+    return [e for e in opened if e["key"] not in gone], back
+
+
+def digest_lines(db: DB, now: float | None = None) -> list[str]:
+    """Course check lines: each top convenience blocker of the day until it is done, and each done one that came back."""
+    now = time.time() if now is None else now
+    opened, back = status(db, now)
+    return [f"- top blocker {e['key']}: {e['rule']} held {', '.join(f'#{t}' for t in e['tasks'][:4]) or 'work'} for "
+            f"{e['minutes']:g} min today; retire it (memory_forget / config_set / code task) or rewrite it, then "
+            f"`ttp blocked --done {e['key']} --how \"<what>\"`" for e in opened[:SHOWN]] + \
+           [f"- came back: {k} ({how} did not stop it)" for k, how in back[:SHOWN]]
