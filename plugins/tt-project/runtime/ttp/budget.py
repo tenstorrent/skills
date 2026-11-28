@@ -504,7 +504,8 @@ def waste_holds(db: DB, b: dict, spans: list, virtual: bool, workers: int, now: 
     whose own waste passes the per-worker limit (budget.hourly_waste_usd, on a plan
     budget.hourly_waste_runs) is held until its trailing hour is back under it. New tasks failing one
     after another show as the other tasks' waste passing the limit for `workers` together: each task
-    that wasted is held, and so is each loop source (LOOP_ORIGINS) among them, for its new tasks."""
+    that wasted is held, and so is each loop source (LOOP_ORIGINS) among them whose own tasks wasted more than
+    one worker's limit, for its new tasks."""
     setting = "hourly_waste_runs" if virtual else "hourly_waste_usd"
     per = float(b.get(setting, 4 if virtual else 8.0))
 
@@ -517,7 +518,6 @@ def waste_holds(db: DB, b: dict, spans: list, virtual: bool, workers: int, now: 
             by_task.setdefault(r["task"], []).append(r)
     over = {t for t, rs in by_task.items() if total(rs) > per}
     rest = [r for t, rs in by_task.items() if t not in over for r in rs]
-    loop = total(rest) > per * workers
     out = []
 
     def hold(rs: list, limit: float, measured: list, **who) -> None:
@@ -527,13 +527,16 @@ def waste_holds(db: DB, b: dict, spans: list, virtual: bool, workers: int, now: 
                     "until": round(rolls_under(measured, lambda x: total(x) > limit, now), 1)})
     for t in sorted(over):
         hold(by_task[t], per, by_task[t], task=t)
-    if loop:
+    if total(rest) > per * workers:
         ids = sorted(set(by_task) - over)
         for t in ids:
             hold(by_task[t], per * workers, rest, task=t)
-        for o in sorted({r["origin"] for r in db.q(f"SELECT origin FROM tasks WHERE id IN ({','.join('?' * len(ids))})",
-                                                   tuple(ids))} & set(LOOP_ORIGINS)):
-            hold(rest, per * workers, rest, origin=o)
+        origin = {r["id"]: r["origin"] for r in db.q(f"SELECT id, origin FROM tasks WHERE id IN ({','.join('?' * len(ids))})",
+                                                     tuple(ids))}
+        for o in sorted(set(origin.values()) & set(LOOP_ORIGINS)):
+            own = [r for r in rest if origin.get(r["task"]) == o]
+            if total(own) > per:   # a source that wasted more than one worker's limit itself; a little holds nothing
+                hold(own, per, own, origin=o)
     return out
 
 

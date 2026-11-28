@@ -17772,7 +17772,7 @@ class Daemon:
                 if self._stale_wait_event(task, prev, start, max_hold):
                     self._flag_never_passes(task, str(prev.get("retry_when") or ""), rc,
                                             (self._probe_out.get(tid) or ("",))[0], stale=True)
-            retry = waitpoll.capped(self.cfg, task, prev, _retry_s(prev), self._ordered(task))
+            retry = waitpoll.capped(self.cfg, task, prev, _retry_s(prev), task["id"] in self._ordered_ids)
             nb = now + retry if held else min(now + retry, start + max_hold)
             what = self._wait_what(tid, prev)
             says = "host unreachable" if rc == 255 else \

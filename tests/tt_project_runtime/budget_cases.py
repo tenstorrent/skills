@@ -1605,15 +1605,23 @@ def test_new_tasks_failing_one_after_another_hold_their_loop_source_not_a_user_o
     now = time.time()
     p.db.x("UPDATE tasks SET status='done'")
     ids = {o: p.db.add_task(f"from {o}", "s", kind="work", tier="light", origin=o) for o in ("daemon", "schedule", "user")}
-    for i, task in enumerate(ids.values()):
-        for j in range(2):   # $8 each: under the per-task limit, over it together for one worker
-            p.db.x("INSERT INTO runs(task,role,provider,status,started,ended,cost_usd) "
-                   "VALUES(?,'worker','claude','timeout',?,?,4.0)", (task, now - 3000 + i * 600 + j, now - 2400 + i * 600 + j))
+    twin = {o: p.db.add_task(f"again from {o}", "s", kind="work", tier="light", origin=o) for o in ids}
+    for i, task in enumerate([*ids.values(), *twin.values()]):
+        p.db.x("INSERT INTO runs(task,role,provider,status,started,ended,cost_usd) "   # $9 a source: over one worker's limit
+               "VALUES(?,'worker','claude','timeout',?,?,4.5)", (task, now - 3000 + i * 300, now - 2400 + i * 300))
     g = bud.evaluate(p.db, p.config(), "claude", [], now)
-    assert g.level == "green" and {h["task"] for h in g.waste_holds} - {None} == set(ids.values()), g.waste_holds
+    assert g.level == "green" and {h["task"] for h in g.waste_holds} - {None} == {*ids.values(), *twin.values()}, g.waste_holds
     assert {h["origin"] for h in g.waste_holds} - {None} == {"daemon", "schedule"}, g.waste_holds
     mine = lambda o: bud.waste_hold(g, p.db.task(p.db.add_task("new", "s", kind="work", tier="light", origin=o)))
     assert mine("daemon") and mine("schedule") and not mine("user"), "a new task of a loop source waits, a user's does not"
+    # a busy source whose own waste is small is no loop: only the source that wasted past a worker's limit waits
+    p.db.x("DELETE FROM runs")
+    small = p.db.add_task("daemon review", "s", kind="review", tier="light", origin="daemon")
+    for i, (task, cost) in enumerate(((small, 0.5), (ids["schedule"], 5.0), (twin["schedule"], 5.0), (ids["user"], 5.0))):
+        p.db.x("INSERT INTO runs(task,role,provider,status,started,ended,cost_usd) "
+               "VALUES(?,'worker','claude','timeout',?,?,?)", (task, now - 3000 + i * 600, now - 2700 + i * 600, cost))
+    g = bud.evaluate(p.db, p.config(), "claude", [], now)
+    assert {h["origin"] for h in g.waste_holds} - {None} == {"schedule"}, g.waste_holds
 
 
 
