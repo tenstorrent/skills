@@ -103,7 +103,7 @@ def reconcile(db) -> list[tuple[int, str, str]]:
     return moved
 
 
-def outcome(states: set[str], trim) -> str | None:
+def settle_kind(states: set[str], trim) -> str | None:
     """How one approval's row `states` settle a carry task: checkfix, rebase or landed; None leaves it to
     the review flow's own handling (a trim, a refusal, rows still waiting)."""
     from .pushq import LANDED_OUTCOMES
@@ -113,32 +113,32 @@ def outcome(states: set[str], trim) -> str | None:
             else LANDED if states <= set(LANDED_OUTCOMES) else None)
 
 
-def _rows(db, tid: int) -> tuple[list[dict], list[dict]]:
+def _approvals(db, tid: int) -> tuple[list[dict], list[dict]]:
     """A task's push rows and, of them, its newest approval's (the rows sharing one `created`)."""
     rows = db.q("SELECT * FROM push_queue WHERE task=? ORDER BY id", (tid,))
     return rows, [r for r in rows if rows and r["created"] == rows[-1]["created"]]
 
 
-def _finish(p, task: dict, b: dict, m: dict, now: float) -> None:
+def _land_done(p, task: dict, b: dict, m: dict, now: float) -> None:
     """The change is live: done as a landed review is (its hand-off, events and reply), phase `done`."""
     from . import pushq
-    rows, current = _rows(p.db, task["id"])
+    rows, current = _approvals(p.db, task["id"])
     if task["status"] != "pushing" or not any(r["status"] in pushq.LANDED_OUTCOMES for r in current):
         return
+    prev = load_result(task["result"])
     with p.db.tx():
-        pushq._settle_landed(p, task, b, m, load_result(task["result"]), str(load_result(task["result"]).get("summary") or ""),
-                             b["target"], rows, current, now)
+        pushq._settle_landed(p, task, b, m, prev, str(prev.get("summary") or ""), b["target"], rows, current, now)
         advance(p.db, task, DONE, batch=b["id"])
 
 
 def on_settle(p, task: dict, kind: str, b: dict, m: dict, now: float, deploy: bool) -> None:
-    """The push queue settled carry task `task` (`outcome`'s `kind`) in batch `b`. landed: phase `landed`,
+    """The push queue settled carry task `task` (`settle_kind`'s `kind`) in batch `b`. landed: phase `landed`,
     an owned obligation gets the sha as progress, then `deploy` (the batch's after_push follows) or done.
     rebase and checkfix: the owner is woken to fix it in place (the log's path and tail with it); past its
     attempts it goes `capped` and failed, to the coordinator."""
     from . import conflictfix, obligations, pushq
     db, tid, target = p.db, task["id"], b["target"]
-    rows, current = _rows(db, tid)
+    rows, current = _approvals(db, tid)
     row = next(r for r in reversed(current) if kind == LANDED and r["status"] in pushq.LANDED_OUTCOMES
                or r["status"] == ("conflict" if kind == REBASE else "check_failed"))
     at = {"push_row": row["id"], "batch": b["id"], "head": row["head"]}
@@ -148,7 +148,7 @@ def on_settle(p, task: dict, kind: str, b: dict, m: dict, now: float, deploy: bo
         if deploy:
             advance(db, tid, DEPLOY)
         else:
-            _finish(p, task, b, m, now)
+            _land_done(p, task, b, m, now)
         return
     extra: dict = {}
     if kind == REBASE:
@@ -187,9 +187,9 @@ def on_after(p, b: dict, m: dict, status: str, line: str, tail: str, now: float)
             continue
         if status in ("ok", "skipped", "superseded"):
             obligations.progress_for(db, task["id"], line)
-            _finish(p, task, b, m, now)
+            _land_done(p, task, b, m, now)
             continue
-        sha = next((r["pushed_sha"] for r in _rows(db, task["id"])[1] if r["batch"] == b["id"]), None)
+        sha = next((r["pushed_sha"] for r in _approvals(db, task["id"])[1] if r["batch"] == b["id"]), None)
         out = pushq._git(p, "diff-tree", "--no-commit-id", "--name-only", "-r", sha or "HEAD").stdout.split()
         named = [f for f in out if f in tail]
         pushq._event(db, task, "carry_deploy_failed", f"#{task['id']} {task['title']}: {line}"

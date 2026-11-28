@@ -2766,7 +2766,7 @@ def _settle(p: Project, tid: int, b: dict, m: dict, now: float) -> None:
         r = next(r for r in current if r["status"] == "check_failed")
         trim = conflictfix.cap_failure(str(_detail(r).get("tail") or ""), _delivery(p).get("push_cap_tests"))
     args = (p, task, b, m, prev, summary, target)
-    if carry.state(db, tid) and (kind := carry.outcome(states, trim)):
+    if carry.state(db, tid) and (kind := carry.settle_kind(states, trim)):
         return carry.on_settle(p, task, kind, b, m, now, _after_push_set(p, None))
     if trim:
         _settle_trimmed(*args, r, trim, trims)

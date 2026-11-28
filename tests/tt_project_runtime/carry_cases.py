@@ -203,7 +203,7 @@ def test_failed_push_checks_wake_the_owner_with_the_log_and_trimmed_ones_stay_qu
     assert (got["status"], phase) == ("queued", "checkfix")
     assert "/tmp/the-log" in got["result"] and "fix it in place" in got["result"]
     t2, b2 = _pushing(p, "check_failed", batch="b2")
-    assert carry.outcome({"check_failed"}, {"ids": []}) is None and carry.outcome({"refused"}, None) is None
+    assert carry.settle_kind({"check_failed"}, {"ids": []}) is None and carry.settle_kind({"refused"}, None) is None
     monkeypatch.setattr(conflictfix, "cap_failure", lambda tail, pat=None: {"ids": ["t"], "over": []})
     got, phase = _settle_it(p, t2, b2)
     assert (got["status"], phase) == ("queued", "queued"), "a trim keeps the phase and today's trim flow"
