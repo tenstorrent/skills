@@ -5,7 +5,7 @@ output mtime, Daemon._last_sign_of_life), so the gap from there to the task's ne
 cost of the loss: detection, requeue and dispatch. A run a reboot cut counts from this boot's daemon start
 instead (its note's daemon_at, else boot_at), so host downtime the harness cannot control is left out.
 `gaps` lists them; `summary` gives count, median and p90. A task that never got a next run counts as open
-until `now`."""
+until `now`, unless it is done: the lost run's own hand-off stood, so no replacement was due."""
 from __future__ import annotations
 
 import json
@@ -41,6 +41,8 @@ def gaps(db, since_s: float = 7 * 86400.0, now: float | None = None) -> list[dic
                   "AND role != 'coordinator' AND ended IS NOT NULL AND ended > ?", (now - since_s,)):
         nxt = db.one("SELECT started FROM runs WHERE task=? AND id>? AND role != 'coordinator' "
                      "ORDER BY id LIMIT 1", (r["task"], r["id"]))
+        if not nxt and db.one("SELECT 1 FROM tasks WHERE id=? AND status='done'", (r["task"],)):
+            continue
         start = float(nxt["started"]) if nxt and nxt["started"] else now
         out.append({"run": r["id"], "task": r["task"], "gap_s": max(0.0, start - _since(r)),
                     "open": not nxt})

@@ -1066,7 +1066,10 @@ END""")
         for b in out:
             for x in b.get("lost") or []:
                 if isinstance(x, dict) and "run" in x:
-                    x["kept"] = int(x["run"]) in kept
+                    # Kept: a later run resumed it, or its own hand-off stood (its task done, no later run).
+                    x["kept"] = int(x["run"]) in kept or bool(x.get("task") and self.one(
+                        "SELECT id FROM tasks t WHERE id=? AND status='done' AND NOT EXISTS "
+                        "(SELECT 1 FROM runs WHERE task=t.id AND id>?)", (x["task"], int(x["run"]))))
                     # Restarted: a later run of its task (a coordinator turn: a later turn) ran, fresh or resumed.
                     x["restarted"] = x["kept"] or bool(self.one(
                         "SELECT id FROM runs WHERE id>? AND task=? LIMIT 1", (int(x["run"]), x["task"]))

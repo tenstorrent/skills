@@ -159,3 +159,24 @@ def test_replacement_gaps_run_from_the_last_sign_of_life_to_the_next_worker_run(
     s = replacegap.summary(p.db, 86400.0, now)
     assert s["count"] == 2 and s["over_target"] == 1 and s["open"] == 1 and s["p90_s"] == 400.0
     assert replacegap.summary(p.db, 10.0, now)["count"] == 0
+
+
+def test_a_lost_run_whose_own_hand_off_stood_is_neither_waiting_for_a_replacement_nor_work_lost(env):
+    p = make(env)
+    from ttp import db as dbm, replacegap
+    now = 1_000_000.0
+    stood = p.db.add_task("stood", "s", kind="work", tier="light", origin="user")
+    waits = p.db.add_task("waits", "s", kind="work", tier="light", origin="user")
+    ins = "INSERT INTO runs(task,role,provider,started,ended,status,cost_usd) VALUES(?,?,?,?,?,?,?)"
+    a = p.db.x(ins, (stood, "worker", "fake", now - 900, now - 600, "lost", 2.5))
+    b = p.db.x(ins, (waits, "worker", "fake", now - 900, now - 600, "lost", 1.0))
+    p.db.x("UPDATE tasks SET status='done' WHERE id=?", (stood,))   # the daemon accepted its result.json
+    got = {g["task"]: g for g in replacegap.gaps(p.db, 86400.0, now)}
+    assert stood not in got and got[waits]["open"], got
+    assert replacegap.summary(p.db, 86400.0, now)["count"] == 1
+    lost = [{"run": a, "task": stood, "usd": 2.5}, {"run": b, "task": waits, "usd": 1.0}]
+    p.db.x("INSERT INTO events(ts,source,kind,text,data) VALUES(?,?,?,?,?)",
+           (now - 500, "host", "boot", "boot", json.dumps({"lost": lost, "lost_usd": 3.5})))
+    rows = p.db.boots(now - 86400)[0]["lost"]
+    assert [x["kept"] for x in rows] == [True, False]
+    assert dbm.host_line(p.db.boots(now - 86400)).endswith("1 not restarted, $1.00 of work lost")
