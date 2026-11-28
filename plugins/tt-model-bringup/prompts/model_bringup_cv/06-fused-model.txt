@@ -1,0 +1,16 @@
+/goal Use $graph-fusing and $tt-device-usage to fuse the correct functional graph for MODEL_NAME.
+
+As the user, I explicitly authorize subagents when a selected skill requires them.
+
+Use MODEL_CONTRACT and the accepted functional baseline. Preserve every raw-output and task-metric gate. Do not inspect forbidden read roots.
+
+Scope every Git command and file inventory to MODEL_DIR or an authorized upstream path. Never run repository-wide `git status`, `git diff`, `rg`, `find` or equivalent discovery.
+
+Completion requirements:
+- Inventory candidate composite and dedicated TTNN operations.
+- Measure every retained rewrite against the functional baseline.
+- Reject rewrites without correctness and latency evidence.
+- Rerun affected raw-output and task-metric checks.
+- Record before-and-after graph and latency evidence.
+- Run $stage-review; fix findings; obtain `clean-pass`.
+- Commit stage-owned changes locally; never push.

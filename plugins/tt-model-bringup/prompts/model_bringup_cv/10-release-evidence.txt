@@ -1,0 +1,19 @@
+/goal Prepare release evidence for MODEL_NAME from its accepted CV model contract.
+
+As the user, I explicitly authorize subagents when a selected skill requires them.
+
+Do not change model behavior in this stage. Do not inspect forbidden read roots. Summarize only measured evidence from accepted stages.
+
+Scope every Git command and file inventory to MODEL_DIR or an authorized upstream path. Never run repository-wide `git status`, `git diff`, `rg`, `find` or equivalent discovery.
+
+Completion requirements:
+- Reproduce the final correctness and task-metric gates.
+- Reproduce the final warmed performance result.
+- Record supported shapes, batches, state and topology.
+- Record host preprocessing and postprocessing boundaries.
+- Record unsupported operators, modes and serving limits.
+- Preserve configuration scope and supported configuration names.
+- Preserve license, commercial-use and redistribution disclosures.
+- Write a customer-readable readiness report under MODEL_DIR/doc/release/.
+- Run $stage-review; fix findings; obtain `clean-pass`.
+- Commit stage-owned changes locally; never push.

@@ -1,0 +1,17 @@
+/goal Use $functional-vision and $tt-device-usage to validate stateful inference for MODEL_NAME.
+
+As the user, I explicitly authorize subagents when a selected skill requires them.
+
+Use MODEL_CONTRACT. This stage applies only to temporal or iterative state. Do not inspect forbidden read roots.
+
+Scope every Git command and file inventory to MODEL_DIR or an authorized upstream path. Never run repository-wide `git status`, `git diff`, `rg`, `find` or equivalent discovery.
+
+Completion requirements:
+- Validate empty-state or initial-iteration behavior.
+- Validate the next frame or next iteration.
+- Validate scene reset or deterministic restart.
+- Compare every state tensor declared by the contract.
+- Fix seeds and schedules for iterative models.
+- Record ordered-sequence evidence and limitations.
+- Run $stage-review; fix findings; obtain `clean-pass`.
+- Commit stage-owned changes locally; never push.

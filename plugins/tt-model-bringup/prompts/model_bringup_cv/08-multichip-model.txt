@@ -1,0 +1,17 @@
+/goal Use $multichip and $tt-device-usage to parallelize MODEL_NAME only because MODEL_CONTRACT requests multichip.
+
+As the user, I explicitly authorize subagents when a selected skill requires them.
+
+Use the accepted single-chip baseline. Do not introduce multichip without a recorded capacity or throughput requirement. Do not inspect forbidden read roots.
+
+Scope every Git command and file inventory to MODEL_DIR or an authorized upstream path. Never run repository-wide `git status`, `git diff`, `rg`, `find` or equivalent discovery.
+
+Completion requirements:
+- Record the capacity or throughput justification.
+- Define tensor ownership and communication boundaries.
+- Compare outputs against the single-chip TTNN baseline.
+- Rerun state and task-metric gates.
+- Record per-device memory and communication evidence.
+- Report speedup and efficiency against single-chip.
+- Run $stage-review; fix findings; obtain `clean-pass`.
+- Commit stage-owned changes locally; never push.

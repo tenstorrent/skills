@@ -1,8 +1,8 @@
 {
   "name": "tt-model-bringup",
   "displayName": "Tenstorrent Model Bring-up",
-  "version": "0.1.22",
-  "description": "Bring Hugging Face text models to TTNN through eleven verified stages. Requires tt-autodebug. Codex multigoal setup automatically adds optional telemetry when tenstorrent/ar-dashboard is accessible.",
+  "version": "0.2.3",
+  "description": "Bring text, computer-vision, and multimodal models to TTNN through category-specific verified stages. Requires tt-autodebug. Codex multigoal setup automatically adds optional telemetry when tenstorrent/ar-dashboard is accessible.",
   "author": {
     "name": "Tenstorrent"
   },
