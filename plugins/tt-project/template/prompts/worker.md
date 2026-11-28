@@ -103,8 +103,8 @@
 <!-- /ttp:if remote -->
 - Stop only processes you started, by their pid. Never kill by name or pattern (`pkill -f`,
   `killall`): that ends other workers' runs and your own tool shell (a separate session or process
-  group does not protect it); the hook refuses these. It cannot see inside
-  scripts and test stubs you run: check each with `ttp killscan <script>`; if it
+  group does not protect it); the hook (Claude Code, Codex) refuses these. It cannot see inside
+  scripts and test stubs you run: check each with `ttp killscan <script>` (it also flags `kill $(pgrep -f ...)`); if it
   finds one, run it with `ttp killscan --shim <dir>` stand-ins on PATH
   (`PATH=<dir>:"$PATH" <script>`) and edit out any `ps | grep` or call by absolute path.
 <!-- ttp:if remote -->

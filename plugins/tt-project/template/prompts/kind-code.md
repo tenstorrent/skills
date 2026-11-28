@@ -15,13 +15,12 @@
   command quoted as one word (`-- 'pytest -q tests/a.py' 'ruff check .'`).
   If they outlast a tool call, run `ttp checks --detach -- <cmds>`: its output and exit code go to the run dir, never
   the worktree. Hand off `waiting` with the `retry_when` it prints (`ttp checks --result <run dir>`)
-  and no `wake_tier`; failed checks wake you;
-  that probe also wakes the task if the checks were killed. A foreground `ttp checks` ends with its
+  and no `wake_tier`; failed or killed checks wake you. A foreground `ttp checks` ends with its
   tool call and then reports incomplete; never wait on run-dir files such as checks.running
   (refused). If only recording the result is left, put it in `on_pass` (`"on_pass": {"status": "done", "summary": "..."}`): a pass on the
   same head records it model-free. No `on_pass`, `next_step`, PR or landing left: a pass records `done`.
 - Urgent (priority 1 or `urgent:`): once your CPU checks pass, hand off `done`; a device, cluster or
-  remote smoke runs beside the review. The push still waits for required checks.
+  remote smoke runs beside the review (say in `summary` how to read it). The push still waits for required checks.
 - While you iterate, run only the tests your change affects (a file, `pytest -k`, `file::test`),
   never the full suite. Run `ttp checks`
   once at the end, committed, before the hand-off. A direct full-suite run is refused.
