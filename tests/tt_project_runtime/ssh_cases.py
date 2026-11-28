@@ -1057,6 +1057,37 @@ def test_two_guards_that_run_their_body_as_a_child_each_run_once_and_reach_the_r
     assert (tmp_path / "guards").read_text().split() == ["g1", "g2"]
 
 
+def _launcher_with_check(folder, tmp_path, name):
+    """A project bin folder: the template launcher and library plus an ssh.local that logs its run and refuses 'prod'."""
+    folder.mkdir()
+    _copy_ssh_bin(folder)
+    (folder / "ssh.local").write_text(f'#!/bin/sh\necho {name} >> {tmp_path}/checks\n[ "$1" = prod ] && exit 9\nexit 0\n')
+    (folder / "ssh.local").chmod(0o755)
+
+
+def _real_ssh_calls(tmp_path):
+    log = tmp_path / "log"
+    return [l for l in (log.read_text().splitlines() if log.exists() else []) if " -O " not in f" {l} " and " -fN " not in f" {l} "]
+
+
+@pytest.mark.parametrize("both_checked", [False, True])
+def test_a_wrapper_copy_hands_the_call_to_a_launcher_folder_whose_ssh_local_check_runs_once(tmp_path, both_checked):
+    import subprocess
+    wbin, env = _launcher_dir(tmp_path)
+    if both_checked:                                   # the copy's own folder has a check too: neither runs twice
+        (wbin / "ssh.local").write_text(f'#!/bin/sh\necho a >> {tmp_path}/checks\nexit 0\n')
+        (wbin / "ssh.local").chmod(0o755)
+    _launcher_with_check(tmp_path / "p", tmp_path, "p")
+    env["PATH"] = f"{tmp_path / 'p'}:{wbin}:{tmp_path / 'rbin'}:/usr/bin:/bin"
+    run = lambda *a: subprocess.run(["sh", str(wbin / "ssh"), *a], env=env, capture_output=True, text=True, timeout=30)
+    r = run("prod", "true")
+    assert r.returncode == 9 and _real_ssh_calls(tmp_path) == []           # the project's check refuses; ssh never starts
+    (tmp_path / "checks").unlink()
+    r = run("host-a", "true")
+    assert r.returncode == 0 and len(_real_ssh_calls(tmp_path)) == 1
+    assert sorted((tmp_path / "checks").read_text().split()) == (["a", "p"] if both_checked else ["p"])
+
+
 def test_the_ssh_launcher_gives_ssh_local_no_stdin_and_keeps_the_callers_for_ssh(tmp_path):
     import subprocess
     wbin, env = _launcher_dir(tmp_path)

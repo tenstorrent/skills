@@ -55,15 +55,20 @@ for d in $PATH; do
     if [ -n "$d" ] && [ -x "$d/ssh" ] && ! [ "$d/ssh" -ef "$0" ] && ! [ "$d" -ef "$bindir" ]; then
         first=
         IFS= read -r first < "$d/ssh" 2>/dev/null
+        # Another wrapper copy is skipped, unless its folder has an ssh.local check: then it is a guard, chained below.
         case $first in
-        '#!'*) ! grep -qsF '# tt-project ssh wrapper' "$d/ssh" || continue ;;
+        '#!'*) ! grep -qsF '# tt-project ssh wrapper' "$d/ssh" || { [ -f "$d/lib/ttp-ssh" ] && [ -x "$d/ssh.local" ]; } || continue ;;
         esac
         real=$d/ssh
         if [ -f "$d/lib/ttp-ssh" ]; then
             # A project's own guard beside a wrapper body: it runs its checks and chains to its body, which finds the real ssh.
-            # Each guard folder runs once per call (the list is cleared before the real ssh starts, so nested calls get guards again).
-            case ":${TTP_SSH_CHAINED:-}:" in *":$d:"*) real=; continue ;; esac
-            TTP_SSH_CHAINED=${TTP_SSH_CHAINED:-}:$d
+            # Each guard folder runs once per call: the list holds the folders whose guard already ran, this body's own
+            # included, compared as files so any spelling of a folder matches (it is cleared before the real ssh starts,
+            # so nested calls get guards again).
+            for c in ${TTP_SSH_CHAINED:-}; do
+                [ -n "$c" ] && [ "$d" -ef "$c" ] && { real=; continue 2; }
+            done
+            TTP_SSH_CHAINED=${TTP_SSH_CHAINED:-}:$bindir:$d
             export TTP_SSH_CHAINED
             unset TTP_SSH_WRAPPER_PID
             exec "$real" "$@"
