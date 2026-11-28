@@ -182,20 +182,20 @@ def _findings(result: dict) -> str:
     return "\n".join([str(result.get("summary") or "")] + [f"- {f.get('title')}: {f.get('spec')}" for f in fups])[:6000]
 
 
-def pass_ends(daemon, task: dict, why: str = "") -> bool:
+def pass_ends(daemon, task: dict, why: str = "") -> str:
     """An inline review passed with no valid push approval. The carry ends (phase done, True) only when the change
-    needs no landing: no push branch, or a change kept off it. Else it fails closed: phase `plain`, one `carry_fallback`
-    event, False; the task goes to review and the daemon's Review #N backs it, as for any code task."""
+    needs no landing: no push branch, or a change kept off it ("done"). Else it fails closed: phase `plain`, one
+    `carry_fallback` event, and the task's new status is "review": the daemon's Review #N backs it."""
     from . import landed, push, pushq, worktree
     p, tid = daemon.p, task["id"]
     d = daemon.cfg.get("delivery") or {}
     if not landed.has_push_branch(p) or push.kept_off(task, worktree.diff_lines(p, [task["branch"]]), d, p):
         advance(p.db, tid, DONE)
-        return True
+        return "done"
     advance(p.db, tid, PLAIN)
     pushq._event(p.db, task, "carry_fallback", f"#{tid} {task['title']}: its inline review passed with no valid push "
                  f"approval ({why or 'none'}); it goes to the standard review", queued=False, severity="low")
-    return False
+    return "review"
 
 
 def failed(daemon, task: dict, result: dict, run_dir) -> tuple[str, dict]:

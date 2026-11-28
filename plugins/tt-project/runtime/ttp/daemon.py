@@ -8575,13 +8575,15 @@ class Daemon:
                     extra[pushq.JUDGED_KEY] = sorted(took | set(extra.get(pushq.JUDGED_KEY) or []))
                 for note in check.get("notes") or []:
                     log(self.p, f"task {task['id']}: {note}")
+        fell_back = False
         if carry_run and status == "ok" and not approval:   # an inline review's verdict: fixed in place, capped, or nothing to push
             if new == "failed":
                 new, more = carry.failed(self, task, result, run_dir)
                 extra.update(more)
                 not_before = time.time() if new == "queued" else not_before
             elif new == "done":
-                carry.pass_ends(self, task, push_note.strip(" .") or "no push list")
+                new = carry.pass_ends(self, task, push_note.strip(" .") or "no push list")
+                fell_back = new == "review"
             carry_run = carry_run and (carry.state(db, task["id"]) or {}).get("phase") != carry.PLAIN   # then the standard review flow
         # A push-conflict fix (conflictfix.py) costs no review attempt when it approves a new head. A
         # light one that ends any other way (done with nothing approved included; a refused account, a
@@ -8955,7 +8957,7 @@ class Daemon:
                      f"the chain's last hop gets the one review.")
         # An urgent or owed one's (an open obligation's owner) review is queued at once on a needs_review hand-off
         # too (no sweep_after_s wait); any other needs_review hand-off goes to the coordinator, unreviewed.
-        reviewable = new == "done" or new == "review" and (urgent.is_urgent(task)
+        reviewable = new == "done" or new == "review" and (fell_back or urgent.is_urgent(task)
                                                           or bool(obligations.owned_open(db, task["id"]))
                                                           or reviewnow.at_once(self.cfg, new, plain, result))
         # Accepted gap: _auto_review (and _fix_without_commits below) still run a few local ref-metadata git

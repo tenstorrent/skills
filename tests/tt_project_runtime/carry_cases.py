@@ -492,7 +492,7 @@ def test_a_carry_pass_with_no_valid_approval_falls_back_to_the_standard_review_n
     assert carry.state(s.p.db, s.code)["phase"] == "plain" and not s.p.db.q("SELECT * FROM push_queue")
     assert len(s.p.db.q("SELECT id FROM events WHERE kind='carry_fallback'")) == 1
     assert not carry.enabled(s.p.config(), s.p.db.task(s.code), s.p.db, s.p), "the standard flow takes the task"
-    assert s.p.db.task(s.code)["status"] == "done" and asked == [s.code], "the daemon's normal review is asked for"
+    assert s.p.db.task(s.code)["status"] == "review" and asked == [s.code], "it goes to review; the daemon's normal review is asked for"
 
 
 def test_a_carry_pass_of_a_change_that_needs_no_landing_ends_done(env, monkeypatch):
