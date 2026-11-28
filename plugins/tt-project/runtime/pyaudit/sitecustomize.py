@@ -49,8 +49,7 @@ def _install(pol: dict) -> None:
     roots, secrets = pol["roots"], pol["secrets"]
     glm = pol.get("glm")
     db = __import__("re").compile(glm["db"]) if glm else None
-    # the harness's own checks entry, as this Python started (read before any inline code can change sys.orig_argv)
-    entry = bool(glm) and list(getattr(sys, "orig_argv", None) or [])[1:3] == ["-c", glm["boot"]]
+    entry = compile(glm["boot"], "<string>", "exec") if glm and glm.get("boot") else None   # the checks entry's code
 
     import builtins
     import pathlib
@@ -117,17 +116,16 @@ def _install(pol: dict) -> None:
         return False
 
     def harness():
-        """Whether this process is the harness's own inline entry (`python -c <boot> ...`, never a run's code) and
-        the nearest caller that is the inline code or its ttp package is the package."""
-        if not entry:
-            return False
-        own, f = os.path.join(pol["runtime"], "ttp") + os.sep, sys._getframe(2)
-        while f is not None:
+        """Whether the outermost frame runs the harness's own checks entry (`python -c <boot> ...`, never a run's
+        code; inline code cannot change it) and the nearest caller that is the inline code or its ttp package is
+        the package."""
+        own, f, pkg = os.path.join(pol["runtime"], "ttp") + os.sep, sys._getframe(2), None
+        while f.f_back is not None:
             fn = f.f_code.co_filename
-            if fn in ("<string>", "<stdin>") or fn.startswith(own):
-                return fn.startswith(own)
+            if pkg is None and (fn in ("<string>", "<stdin>") or fn.startswith(own)):
+                pkg = fn.startswith(own)
             f = f.f_back
-        return False
+        return bool(pkg) and f.f_code == entry
 
     def write_why(path, tree=False, plain=False):
         """Why the code may not write `path` (with `tree`: remove or move it, and all under it)."""

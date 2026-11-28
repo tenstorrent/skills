@@ -277,14 +277,14 @@ def test_rule_gone_rematches_an_old_record_once_and_drops_items_the_matcher_no_l
 
 
 def test_rule_gone_rematch_replaces_a_stale_value_with_the_current_matchers_item(env):
-    """A stored item whose (where, name) the current matcher still finds is replaced by that item, so a value an
-    older matcher stored (here a number) does not stay shown."""
+    """Stored items whose (where, name) the current matcher still finds are replaced by its items, once each, so a
+    value an older matcher stored (here a number, kept twice under one key) does not stay shown."""
     from ttp import rulematch as rm
     p = _rm_project(env)
     p.add_memory("The dashboard budget review is due in 2026.", kind="decision")
     a = _rm_flag(p)
     real = p.db.kv(rm.KV + str(a))["items"]
-    stale = [{**i, "value": "2026", "line": "an older line"} for i in real]
+    stale = [{**i, "value": "2026", "line": f"an older line {n}"} for i in real for n in (1, 2)]
     assert real and stale != real
     p.db.x("UPDATE kv SET value=?, ts=? WHERE key=?",
            (json.dumps({"msg": a, "items": stale}), time.time() - 3600, rm.KV + str(a)))

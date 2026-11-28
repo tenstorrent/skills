@@ -237,9 +237,10 @@ def _rematch(db, rec: dict) -> dict:
         m = db.one("SELECT text FROM messages WHERE id=?", (rec["msg"],))
         if m is None:
             return rec
-        found = {(i["where"], i["name"]): i for i in older(p, db, m["text"] or "", cap=None)}
-        keep = [found.get((i["where"], i["name"]), i) for i in rec["items"]
-                if (i["where"], i["name"]) in found or not remaining(p, items=[i])]
+        found, had = older(p, db, m["text"] or "", cap=None), {(i["where"], i["name"]) for i in rec["items"]}
+        now = {(i["where"], i["name"]) for i in found}
+        keep = [i for i in found if (i["where"], i["name"]) in had] + \
+            [i for i in rec["items"] if (i["where"], i["name"]) not in now and not remaining(p, items=[i])]
     except Exception:
         return rec
     rec = {**rec, "items": keep, "matcher": MATCHER}
