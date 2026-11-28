@@ -7,7 +7,7 @@ dropped); a memory entry or charter item matches by half the topic words (two at
 config key or an UPPER_SNAKE constant by sharing two topic words or one beside a value equal to a
 duration in the message (a constant also beside a name a matched memory entry gives); a value alone never matches.
 A number, date, time, size, amount or id ('2026', '24 h', '100M', 'msg-12', '#7') is no topic term or anchor, an
-anchor's own words count once, and a memory or charter row shows the shared term as its value. Durations are normalised to seconds (`durations`), so 'an hour', '60 min' and '3600 s'
+alias alone does not match, and a memory or charter row shows the shared term as its value. Durations are normalised to seconds (`durations`), so 'an hour', '60 min' and '3600 s'
 name one value. `note` runs where correction.flag reads a message and stores kv `rulematch:<msg id>`;
 `digest_lines` shows it for OPEN_S, the window to retire or rewrite them. `ttp rule-gone` (`gone`, `remaining`)
 re-runs the sources for the old value in every unit; once none remains it stores kv `rulematch:<msg id>:gone`,
@@ -49,13 +49,13 @@ min mins m s ms d k kb mb gb tb jan feb mar apr may jun jul aug sep oct nov dec"
 
 
 def _numeric(tok: str) -> bool:
-    """Whether a word or alias is only a number, date, time, size, amount or id: its letter runs are all units or
-    id words ('msg-4555', 'nov-28', 'v2'), or it has none ('2026', '24h', '$8000')."""
-    return all(w in _ID_WORDS for w in re.findall(r"[a-z]+", tok.lower()))
+    """Whether a word or alias is only a number, date, time, size, amount or id: it has a digit and its letter runs
+    are all units or id words ('msg-4555', 'nov-28', 'v2'), or it has none ('2026', '24h', '$8000')."""
+    return bool(re.search(r"\d", tok)) and all(w in _ID_WORDS for w in re.findall(r"[a-z]+", tok.lower()))
 
 
 def _words(text: str) -> set[str]:
-    return {reask._stem(w) for w in correction.ask_words(text) if not _numeric(w)}
+    return {reask._stem(w) for w in correction.ask_words(text) if not _numeric(w) and not re.fullmatch(_WORD_UNIT, w)}
 
 
 def _anchors(text: str) -> set[str]:
@@ -69,10 +69,11 @@ def _topic(db, text: str) -> set[str]:
 
 def _same_topic(said: set[str], anc: set[str], item: str) -> tuple[int, set[str], set[str]]:
     """(the topic words `item` shares with the message, 0 when it is not on its topic; those words; shared anchors).
-    An anchor's own words count once: a shared alias needs another shared word."""
+    An alias's own words count once: a shared alias needs another shared word; a shared key or PR does not."""
     words, both = said & _words(item), anc & _anchors(item)
-    rest = words - _words(" ".join(a.partition(":")[2] for a in both))
-    near = len(words) >= 2 and len(words) >= 0.5 * len(said) or bool(rest and both)
+    rest = words - _words(" ".join(a[6:] for a in both if a.startswith("alias:")))
+    near = (len(words) >= 2 and len(words) >= 0.5 * len(said) or bool(rest and both)
+            or any(not a.startswith("alias:") for a in both))
     return (len(words) if near else 0), words, both
 
 

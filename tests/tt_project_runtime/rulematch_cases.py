@@ -197,6 +197,7 @@ _RM_HELD = "rig04 stays held while lent to the other group"
 @pytest.mark.parametrize("body", ["Chip resets on rig04 go to the summary, dated 2026-11-02.",
                                   "rig04 builds keep a cache of 83M per worker.",
                                   "rig04 cache warmups run every 24 h.",
+                                  "rig04 cache warmups run every 24 hours.",
                                   "rig04 disk budget is 16 GB per build.",
                                   "rig04 spend tally reached $8000 this quarter.",
                                   "rig04 nightly builds start at 09:18 PST."])
@@ -226,9 +227,11 @@ def test_rulematch_a_shared_alias_or_setting_name_still_flags_and_shows_it(env):
     assert rm.remaining(p, items=got)   # the shown term is what rule-gone looks for
     got = rm.older(p, p.db, "lower worker.slots for the soak runs")
     assert [g["value"] for g in got if g["where"] == "memory"] == ["worker.slots"], got
+    got = rm.older(p, p.db, "from tomorrow the nightly build should set worker.slots to four on every host")
+    assert [g["value"] for g in got if g["where"] == "memory"] == ["worker.slots"], got   # the setting name alone
 
 
 def test_rulematch_numeric_tokens_are_units_dates_and_ids_only():
     from ttp import rulematch as rm
     assert all(rm._numeric(t) for t in ("2026", "24h", "100m", "16gb", "msg-4555", "nov-28", "v2", "09:18"))
-    assert not any(rm._numeric(t) for t in ("rig04", "worker.slots", "gbh01", "cache"))
+    assert not any(rm._numeric(t) for t in ("rig04", "worker.slots", "gbh01", "cache", "issue", "note"))
