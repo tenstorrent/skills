@@ -16460,8 +16460,10 @@ class Daemon:
         return min(waitpoll.poll_s(self.cfg), PROBE_EVERY_S)
 
     def _ordered(self, task: dict) -> bool:
-        """Whether the task is one of an open user order: its waits are re-checked within waitpoll.ORDERED_CAP_S."""
-        return task["id"] in obligations.order_tasks(self.p.db)
+        """Whether the task is one of an open user order: its waits are re-checked within waitpoll.ORDERED_CAP_S.
+        Reads the orders afresh and keeps them for _probe_gap and _start_probe_due until the next probe_waiting."""
+        self._ordered_ids = obligations.order_tasks(self.p.db)
+        return task["id"] in self._ordered_ids
 
     def _probe_gap(self, tid: int) -> float:
         """How long after its last run a task's probe runs again: waiting.poll_s (waitpoll), or seconds

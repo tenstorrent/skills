@@ -496,7 +496,7 @@ def rolls_under(runs: list, over, now: float | None = None) -> float:
     return at
 
 
-LOOP_ORIGINS = ("schedule", "harness")   # sources that keep queuing new tasks: a failing loop's source
+LOOP_ORIGINS = ("schedule", "harness", "daemon")   # sources that keep queuing new tasks: a failing loop's source
 
 
 def waste_holds(db: DB, b: dict, spans: list, virtual: bool, workers: int, now: float) -> list[dict]:
