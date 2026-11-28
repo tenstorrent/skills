@@ -12947,7 +12947,8 @@ class Daemon:
         if triage and not msgs and not rerun and not hot and w is None and waketriage.on(self.cfg) and \
                 eventhold.can_wait(triage) and not any(e["kind"] in coord.UNBLOCK_KINDS for e in triage):
             try:   # the watcher model decides whether this routine batch needs the coordinator now
-                folded, line = waketriage.fold(db, self.cfg, triage, now)
+                folded, line = waketriage.fold(db, self.cfg, triage, now,
+                                                   buckets=self.p.state if self._quota_on() else None)
             except Exception:   # the triage only saves money: a failure runs the turn
                 folded, line = False, "coordinator wake triage failed: " + traceback.format_exc().replace("\n", " | ")[:1500]
             if line:

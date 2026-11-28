@@ -245,3 +245,19 @@ def test_model_quota_flag_off_leaves_the_watcher_unchanged(env, monkeypatch):
     t0 = time.time()
     assert b.decide("state", _BS_Q) == {"needed": {"noul": 0.5}} and asked == [_RT_MODEL], "asked as before"
     assert t0 + babysit.COOL_S <= b.pause.until <= time.time() + babysit.COOL_S, "the 429 cools down as before"
+
+
+def test_model_quota_coordinator_wake_triage_skips_an_empty_bucket_while_the_flag_is_on(env, monkeypatch):
+    from ttp import babysit, modelquota, waketriage
+    p, d = _mq_setup(env, monkeypatch)
+    asked = []
+    monkeypatch.setattr(babysit, "_post", lambda s, messages, timeout: (asked.append(s["model"]), {
+        "choices": [{"message": {"content": "skip"}}], "usage": {}})[1])
+    modelquota.mark(_RT_MODEL)
+    for n, (buckets, want) in enumerate(((None, _RT_MODEL), (p.state, "alt-a"))):
+        now = time.time()
+        p.db.x("INSERT INTO events(ts,source,kind,severity,text,status) VALUES(?,?,?,?,?,?)",
+               (now, "test", "task_done", "normal", f"done {n}", "queued"))
+        ev = dict(p.db.one("SELECT * FROM events ORDER BY id DESC LIMIT 1"))
+        assert waketriage.fold(p.db, d.cfg, [ev], now, buckets=buckets)[0] and asked[-1] == want, asked
+    assert d._quota_on(), "the daemon passes the state folder only while the flag is on"

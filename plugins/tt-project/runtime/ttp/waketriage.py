@@ -23,6 +23,8 @@ critical event, no ask_, charter_, obligation_, pause_, machine_, resource_, pro
 kind) and holds no unblock event (coordinator.UNBLOCK_KINDS)."""
 from __future__ import annotations
 
+import functools
+
 from . import babysit, cheapdecide
 
 KEY = "wake_triage"
@@ -98,11 +100,12 @@ def state(db, ids: list[int]) -> str:
     return "\n".join(lines)[:6000]
 
 
-def fold(db, cfg: dict, evs: list[dict], now: float, ask=None, haiku=None) -> tuple[bool, str]:
-    """(True, log line) when this batch folds into the next wake, else (False, log line or "")."""
+def fold(db, cfg: dict, evs: list[dict], now: float, ask=None, haiku=None, buckets=None) -> tuple[bool, str]:
+    """(True, log line) when this batch folds into the next wake, else (False, log line or "").
+    `buckets`: the state folder while glm_quota_alt is on, so the chat ask skips empty quota buckets."""
     injected = ask is not None
     fallback = not injected and fallback_on(cfg)
-    ask = ask or (_haiku_ask(haiku) if fallback else babysit.ask)
+    ask = ask or (_haiku_ask(haiku) if fallback else functools.partial(babysit.ask, buckets=buckets))
     ids = sorted(e["id"] for e in evs)
     seen = db.kv(KEY, {}) or {}
     age = now - min(e["ts"] for e in evs)
