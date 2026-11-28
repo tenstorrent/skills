@@ -250,7 +250,7 @@ def _ssh_cmd(entry: dict, argv: list[str]) -> list[str]:
             "-o", "ServerAliveCountMax=4", "--", host, cmd]
 
 
-def _ssh_exec(entry: dict, argv: list[str], capture: bool = False) -> subprocess.CompletedProcess:
+def _ssh(entry: dict, argv: list[str], capture: bool = False) -> subprocess.CompletedProcess:
     return subprocess.run(_ssh_cmd(entry, argv), stdin=subprocess.DEVNULL if capture else None,
                           stdout=subprocess.PIPE if capture else None, stderr=subprocess.PIPE, text=True)
 
@@ -305,7 +305,7 @@ _USAGE_ERROR = re.compile(r"^[^\n:]+: error: ", re.M)   # argparse's error line 
 def _remote_ttp_version(entry: dict) -> str:
     """The ttp version on the project's machine (`ttp --version` there), or "unknown version"."""
     try:
-        r = _ssh_exec(entry, ["--version"], capture=True)
+        r = _ssh(entry, ["--version"], capture=True)
     except (OSError, subprocess.SubprocessError, SystemExit):
         return "unknown version"
     m = re.match(r"ttp (\S+)", (r.stdout or "").strip()) if r.returncode == 0 else None
@@ -318,7 +318,7 @@ def forward(entry: dict, argv: list[str], quiet: bool = False, shown: set[int] |
     listener), message lines already printed are not printed again. `failure` collects the stderr
     of a dropped connection (_dropped) instead of printing it: that caller explains the drop itself."""
     from . import sshfail
-    r = _ssh_exec(entry, argv) if shown is None else _ssh_relay(entry, argv, shown)
+    r = _ssh(entry, argv) if shown is None else _ssh_relay(entry, argv, shown)
     if shown is not None and REPLACED_MARK in (r.stderr or ""):
         # The far side said so before it went: whatever ssh reports (255, 143), this is no drop.
         sys.stderr.write(r.stderr)
@@ -368,9 +368,9 @@ def _drop_unrecognized(argv: list[str], r: subprocess.CompletedProcess) -> list[
 
 def _send_say(entry: dict, argv: list[str], client_id: str, capture: bool = False) -> subprocess.CompletedProcess:
     """`ttp say` on the project's machine, tagged with the client id it deduplicates on."""
-    r = _ssh_exec(entry, [argv[0], f"--client-id={client_id}", *argv[1:]], capture)
+    r = _ssh(entry, [argv[0], f"--client-id={client_id}", *argv[1:]], capture)
     if r.returncode == REFUSED_RC and "--client-id" in (r.stderr or ""):   # an older runtime there: send it untagged
-        r = _ssh_exec(entry, argv, capture)
+        r = _ssh(entry, argv, capture)
     if r.returncode == REFUSED_RC and "--broadcast" in (r.stderr or "") and "--broadcast" in argv:
         return _send_say(entry, _fold_broadcast(argv), client_id, capture)
     if r.returncode == REFUSED_RC and "--context" in (r.stderr or "") and "--context" in argv:
@@ -1136,7 +1136,7 @@ def remote_web(name: str, entry: dict, out: str | None) -> tuple[str, int]:
         return f"{there} (on {host})", weblink.UNVERIFIED
     m = weblink.LINK.search(there)
     if not m:
-        r = _ssh_exec(entry, ["web", name], capture=True)
+        r = _ssh(entry, ["web", name], capture=True)
         m = weblink.LINK.search(r.stdout or "")
         if not m:
             why = ((r.stderr or r.stdout or "").strip().splitlines() or [f"exit {r.returncode}"])[-1]
@@ -1222,7 +1222,7 @@ def connect_remote(name: str, entry: dict, argv: list[str]) -> int:
         return SSH_FAILED
     # The user's zone only from their workstation: in an ssh login here it is a server's, so none.
     home = [] if timefmt.in_ssh_login() else ["--home-tz", timefmt.detect_local(), "--home-from", hostname()]
-    r = _ssh_exec(entry, [*argv, *home], capture=True)
+    r = _ssh(entry, [*argv, *home], capture=True)
     while r.returncode == REFUSED_RC:   # an older runtime there: connect without what it lacks (one parse error names all)
         old_tz = bool(home) and "--home-tz" in (r.stderr or "")
         dropped = _drop_unrecognized(argv, r)
@@ -1230,7 +1230,7 @@ def connect_remote(name: str, entry: dict, argv: list[str]) -> int:
             break
         home = [] if old_tz else home
         argv = dropped if dropped is not None else argv
-        r = _ssh_exec(entry, [*argv, *home], capture=True)
+        r = _ssh(entry, [*argv, *home], capture=True)
     if r.returncode == SSH_FAILED:
         _unreachable(entry, r.stderr)
         return SSH_FAILED
