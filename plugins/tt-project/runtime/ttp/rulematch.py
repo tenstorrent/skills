@@ -24,7 +24,8 @@ MAX = 5
 OPEN_S = 48 * 3600
 _UNITS = {"s": 1, "m": 60, "h": 3600, "d": 86400}   # by the unit's first letter
 _WORD_UNIT = r"seconds?|secs?|minutes?|mins?|hours?|hrs?|days?"
-_DURATION = re.compile(rf"\b(\d+(?:\.\d+)?)\s*({_WORD_UNIT}|[smhd])\b|\b(an?|one)\s+({_WORD_UNIT})\b", re.I)   # 'a' or 'an' only before a whole unit word
+_A_UNIT = r"minutes?|mins?|hours?|hrs?|days?"   # not 'a second', the ordinal
+_DURATION = re.compile(rf"\b(\d+(?:\.\d+)?)\s*({_WORD_UNIT}|[smhd])\b|\b(an?|one)\s+({_A_UNIT})\b", re.I)   # 'a' or 'an' only before a whole unit word
 _CONST = re.compile(r"^\s*([A-Z][A-Z0-9]*(?:_[A-Z0-9]+)+)\s*(?::[^=]+)?=\s*(.+?)\s*(?:#.*)?$")
 _NAME_IN_TEXT = re.compile(r"\b[A-Z][A-Z0-9]*(?:_[A-Z0-9]+)+\b")
 

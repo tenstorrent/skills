@@ -21,6 +21,7 @@ def test_rulematch_durations_name_one_value_in_any_unit():
     assert rm.durations("an hour") == rm.durations("60 min") == rm.durations("3600 s") == {3600}
     assert rm.durations("make it 5 min or 1.5 hours") == {300, 5400}
     assert rm.durations("fix the bugs and tests, as I am sure") == set()   # plain words are no durations
+    assert rm.durations("a second question: the report worker is slow") == set()
 
 
 def test_rulematch_lists_the_older_rules_on_the_topic_and_marks_restrictions(env):

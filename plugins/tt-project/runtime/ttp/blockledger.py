@@ -28,9 +28,12 @@ SAFE = (("held resource", re.compile(r"\bresource:\S+|\block\b", re.I)), ("check
         ("rule", re.compile(r"\bR-[0-9a-f]{4}")))
 
 
-def _why(text: str) -> str:
-    """The reason after 'blocked:' / 'waiting:' in a task event's text, which opens with the task's title."""
-    return re.split(r"(?:blocked|waiting)[: ]+", text, 1, re.I)[-1]
+def _why(text: str, tid: int, title: str) -> str:
+    """The reason of a task event's text, which opens with '#id title' and then ': ' or ' is blocked: '."""
+    rest = text.removeprefix(f"#{tid} {title}")
+    if rest == text:
+        return re.split(r"(?:blocked|waiting)[: ]+", text, 1, re.I)[-1]
+    return re.sub(r"^\s*(?:(?:is|→)?\s*(?:blocked|waiting)\b)?[\s:→]*", "", rest, flags=re.I)
 
 
 def rule_of(reason: str) -> str:
@@ -104,14 +107,14 @@ def rows(db: DB, cfg: dict | None, since: float, until: float | None = None) -> 
         ev = db.one("SELECT text FROM events WHERE task=? AND kind=? AND ts<=? ORDER BY ts DESC LIMIT 1",
                     (seg["task"], f"task_{seg['kind']}", start))
         task = db.task(seg["task"]) or {}
-        reason = _why((ev and ev["text"]) or task.get("blocked_reason") or seg["title"])   # not the title before it
+        reason = _why((ev and ev["text"]) or task.get("blocked_reason") or seg["title"], seg["task"], seg["title"])
         out.append(_row(rule_of(reason), seg["task"], seg["kind"], max(start, since), end, reason, "task"))
     out += _refusals(db, since, until)
     st = db.kv(queuewait.KV) or {}
     for e in [*(st.get("hist") or []), *(st.get("open") or {}).values()]:
-        end = float(e.get("end") or until)
+        end = min(float(e.get("end") or until), until)
         if end >= since and float(e["since"]) <= until:
-            out.append(_row(f"queue:{e['queue']}", e.get("task"), "queue", float(e["since"]), end, e["queue"], "queue"))
+            out.append(_row(f"queue:{e['queue']}", e.get("task"), "queue", max(float(e["since"]), since), end, e["queue"], "queue"))
     log = Path(db.path).parent / LOG
     for line in (log.read_text(errors="replace").splitlines() if log.is_file() else ()):
         try:
@@ -120,7 +123,7 @@ def rows(db: DB, cfg: dict | None, since: float, until: float | None = None) -> 
         except (ValueError, TypeError, KeyError):
             continue
         if isinstance(rec, dict) and since <= ts <= until + secs:
-            out.append(_row(str(rec["rule"]), rec.get("task"), "log", ts - secs, ts, str(rec.get("why") or ""),
+            out.append(_row(str(rec["rule"]), rec.get("task"), "log", max(ts - secs, since), ts, str(rec.get("why") or ""),
                             str(rec.get("source") or "log")))
     return sorted(out, key=lambda r: -r["minutes"])
 

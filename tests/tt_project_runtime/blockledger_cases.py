@@ -38,6 +38,20 @@ def test_block_ledger_counts_a_hold_that_began_before_the_window_and_ignores_the
     rs = {r["task"]: r for r in bl.rows(p.db, {}, now - 86400, now)}
     assert rs[old]["minutes"] == pytest.approx(24 * 60, abs=1) and rs[old]["start"] == pytest.approx(now - 86400, abs=1)
     assert rs[titled]["safety"] == "convenience"
+    p.db.x("UPDATE events SET text=? WHERE task=?", (f"#{titled} review the post-processing merge: keep the 60 min hold", titled))
+    plain = {r["task"]: r for r in bl.rows(p.db, {}, now - 86400, now)}[titled]   # the waiting event's form, no 'blocked'
+    assert plain["safety"] == "convenience" and plain["rule"].startswith("keep the min hold")
+
+
+def test_block_ledger_clips_queue_waits_and_log_rows_to_the_window(env):
+    from ttp import blockledger as bl, queuewait
+    p = make(env)
+    now = time.time()
+    t = _bl_task(p, "queued long", "queued", now)
+    p.db.set_kv(queuewait.KV, {"open": {"k": {"task": t, "queue": "checks", "since": now - 3 * 86400}}})
+    bl.append(p.db, "keep 60 min", t, 3 * 86400, "a long loss")
+    rs = bl.rows(p.db, {}, now - 3600, now)
+    assert {r["source"]: r["minutes"] for r in rs if r["source"] in ("queue", "cli")} == {"queue": 60.0, "cli": 60.0}
 
 
 def test_block_ledger_refusals_are_one_row_per_run_and_rule(env):
