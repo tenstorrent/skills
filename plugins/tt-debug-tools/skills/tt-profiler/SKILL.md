@@ -1,6 +1,6 @@
 ---
 name: tt-profiler
-description: Measure where device time goes on a Tenstorrent part — per-zone kernel timings from the Device Program Profiler, and host-plus-device traces through Tracy. Use when a kernel or op is slower than expected and you need cycles attributed to named scopes, when you want a profile_log_device.csv read, or when you need to instrument a kernel with DeviceZoneScopedN.
+description: Measure where device time goes on a Tenstorrent part — per-zone kernel timings from the streaming profiler (Blackhole) or, as the fallback, the Device Program Profiler, and host-plus-device traces through Tracy. Use when a kernel or op is slower than expected and you need cycles attributed to named scopes, when you want a profile_log_device.csv read, or when you need to instrument a kernel with DeviceZoneScopedN.
 metadata:
   tier: kernel
   upstream:
@@ -34,14 +34,29 @@ compiled into the kernel; the runtime reads their timestamps off the device and
 writes a CSV, and optionally streams the whole thing — host and device — into
 Tracy.
 
-Built by default. **Off at runtime**, so the overhead only arrives when you ask
-for it.
+## Which profiler
 
-On Blackhole, the [streaming profiler](https://github.com/tenstorrent/tt-metal/blob/main/tt_metal/tools/profiler/STREAMING_PROFILER_DETAILED.md)
-(`TT_METAL_STREAMING_PROFILER=1`, output via `TT_METAL_STREAMING_PROFILER_OPS_CSV` / `_ZONE_CSV`) drains continuously.
-It cannot run under `python -m tracy` with device profiling on (the default;
-`--no-device` turns it off): tracy then sets `TT_METAL_DEVICE_PROFILER=1`,
-and setting both is a fatal error at startup.
+Use the **streaming profiler** where the checkout has it: Blackhole only,
+`ls tt_metal/tools/profiler/STREAMING_PROFILER.md` shows whether it is there. It
+drains records continuously, so the device profiler's per-core buffer, its drain
+calls and its dropped-marker limit do not apply.
+
+```bash
+TT_METAL_STREAMING_PROFILER=1 TT_METAL_STREAMING_PROFILER_OPS_CSV=ops.csv pytest <test id>
+```
+
+A plain `TT_METAL_STREAMING_PROFILER=1` run writes nothing: pick an output
+(`_OPS_CSV`, `_ZONE_CSV`, `_TRACY=1` or a host callback). It uses idle Ethernet
+cores, and it cannot run under `python -m tracy` with device profiling on (the
+default; `--no-device` turns it off): tracy then sets
+`TT_METAL_DEVICE_PROFILER=1`, and setting both is a fatal error at startup.
+Options and the callback API:
+[STREAMING_PROFILER_DETAILED.md](https://github.com/tenstorrent/tt-metal/blob/main/tt_metal/tools/profiler/STREAMING_PROFILER_DETAILED.md).
+
+The **device profiler** below is the fallback: Wormhole, a checkout without the
+streaming profiler, or when you need the ops-perf CSV (tt-perf-report, perf
+counters, tt-npe), which `python -m tracy -p -r` builds with it. It is built by
+default and **off at runtime**, so the overhead only arrives when you ask for it.
 
 ## When to invoke
 
@@ -51,7 +66,7 @@ and setting both is a fatal error at startup.
 - You want to instrument a kernel with `DeviceZoneScopedN`.
 - You want host and device on one timeline.
 
-## Surface
+## Surface (device profiler)
 
 ```bash
 TT_METAL_DEVICE_PROFILER=1 ./build/programming_examples/profiler/test_full_buffer
@@ -126,8 +141,8 @@ not be set simultaneously.
 here follows `TT_METAL_LOGS_PATH`. Looking for it in the wrong place reads as "no
 data collected".
 
-**Results are read at device close.** Nothing lands until `CloseDevice`, and past
-roughly 1000 kernel runs the buffer needs draining sooner —
+**Device profiler: results are read at device close.** Nothing lands until
+`CloseDevice`, and past roughly 1000 kernel runs the buffer needs draining sooner —
 `detail::ReadDeviceProfilerResults(device)` after the program of interest.
 
 **`DeviceZoneScopedN` costs time.** Timings from heavily annotated code include

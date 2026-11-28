@@ -1,6 +1,9 @@
 # Capture paths and post-processing
 
-Three ways in, and they are not alternatives so much as layers.
+This page covers the device profiler, the fallback where the checkout has no
+streaming profiler (SKILL.md, "Which profiler"). Three ways in, and they are not
+alternatives so much as layers. The Tracy entry points (sections 2 and 3) also
+apply to streaming runs sent to Tracy.
 
 ## 1. The environment variable alone
 
@@ -80,12 +83,12 @@ which then reach both the CSV and the Tracy client.
 long-lived process — a serving job that never closes its device otherwise never
 writes a profile.
 
-If the host does not drain in time, the run log says `Profiler DRAM buffers were
-full, markers were dropped!` and `process_ops_logs` may stop with `Device data
-missing: Op <N> not present in ...`. Treat that as a failed capture. Size
-`--op-support-count` (it sets `TT_METAL_PROFILER_PROGRAM_SUPPORT_COUNT`) for the
-whole run — for traced replay, one replay, since the host cannot drain
-mid-trace — and read once at the end. On a mesh, never call `ReadDeviceProfiler`
-after every op: each call is a mesh-wide sync that inflates `OP TO OP LATENCY`
-and can grow the device log to tens of GB. Keep the count fixed between runs: it
-is a build define of every kernel, so a new value recompiles every kernel.
+Device profiler only (the streaming profiler has no such buffer): if the log
+says `Profiler DRAM buffers were full, markers were dropped!`, treat the capture
+as failed; `process_ops_logs` may also stop with `Device data missing: Op <N> not
+present in ...`. Size `--op-support-count` (it sets
+`TT_METAL_PROFILER_PROGRAM_SUPPORT_COUNT`) for the whole run, or one replay for
+traced replay, and read once at the end. On a mesh, never call
+`ReadDeviceProfiler` after every op: each call is a mesh-wide sync that inflates
+`OP TO OP LATENCY`. Keep the count fixed between runs: a new value recompiles
+every kernel.
