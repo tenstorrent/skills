@@ -116,7 +116,7 @@ def scan(p, now: float | None = None) -> list[dict]:
     now = time.time() if now is None else now
     db, holds, items = p.db, _holds(p.db), []
     for e in p._memory_entries():
-        if e["kind"] == "restriction" or e["end"] or not (e["standing"] or e["kind"] == "preference"):
+        if e["kind"] == "restriction" or (e["end"] and not e["auto"]) or not (e["standing"] or e["kind"] == "preference"):
             continue
         msgs = user_msgs(e["body"])
         created = _stamp_ts(e["created"])
