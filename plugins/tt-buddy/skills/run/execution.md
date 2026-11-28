@@ -81,6 +81,18 @@ TT_METAL_DISPATCH_TIMEOUT_COMMAND_TO_EXECUTE='"<workspace>/tt-metal/tools/tt-tri
 - **On hang:** report the triage artifact path.
 - Record it via `tt-buddy:note`.
 
+## Job-timeout envelope
+
+- `TT_METAL_OPERATION_TIMEOUT_SECONDS` catches only stuck device ops.
+- It misses host-side hangs: profiler flush, host readback, stuck wrapper.
+- For those, the job timeout is the only backstop.
+- Set it to ~2–3× the known warm runtime.
+- First run: add a one-time cold-compile budget.
+- Example: ~5-min run, ~15-min timeout.
+- NEVER leave it at the backend maximum.
+- Bound every wait or poll on the job by the same envelope.
+- Past it: load `recovery.md`.
+
 ## Failure handling
 
 Backend-specific rows: active backend mode file § Failure handling.
