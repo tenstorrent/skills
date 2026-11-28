@@ -5605,7 +5605,8 @@ def _cmd_checks(a) -> None:
                 # Its tree copy timed out: that host is kept off now, never a second full timeout there.
                 from . import remotecheck
                 slow = rc == remotecheck.FAULT_RC and not env_why and remotecheck.COPY_TIMEOUT in ran_out
-                guard = _guard_refused(ran_out)
+                guard = rc == remotecheck.FAULT_RC and \
+                    remotecheck.said_why(ran_out, spilled.host).startswith(remotecheck.GUARD_REFUSED)
             if guard and guard_retried:   # refused again: it would never start, so no verdict
                 write_json(Path(run_dir) / prguard.CHECKS_FILE, {"head": head, "worktree": top, "passed": False,
                                                                  "commands": todo, "skipped": skipped, "ts": time.time(),
@@ -6770,18 +6771,11 @@ def _spill_fail_verdict(spilled, passed, executed, timed_out, rc, failed, todo, 
         with open(log, "rb") as f:
             f.seek(start)
             text = f.read().decode("utf-8", errors="replace")
-            if push.env_problem(text, top) or _guard_refused(text):
+            if push.env_problem(text, top):
                 return []
     except OSError:
         pass
     return hosts
-
-
-def _guard_refused(text: str) -> bool:
-    """The checks log `text` says the run's own guard refused the spill ssh (remotecheck.GUARD_REFUSED): the
-    checks never ran there, a fault of this run's environment that is neither the host's nor the change's."""
-    from . import remotecheck
-    return remotecheck.GUARD_REFUSED in text
 
 
 def _occupancy_here(p) -> str:

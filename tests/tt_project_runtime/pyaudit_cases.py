@@ -244,3 +244,19 @@ def test_pyaudit_on_the_glm_arm_passes_the_remote_checks_ssh_command_line(env, c
         print('ok')"""
     r = _pa_run(e, code, cred_home.work)
     assert r.returncode == 0 and r.stdout == "ok\n", r.stderr[-800:]
+
+
+def test_pyaudit_on_the_glm_arm_lets_a_whole_remote_check_run_on_its_host(env, cred_home, tmp_path):
+    """Every command a remote check starts (login, tree copy, checkout, the check, cleanup) passes the GLM
+    arm's guard: the check runs on the host, never refused before its ssh starts."""
+    repo = _rc_repo(tmp_path)
+    bin_, remote = _rc_fake_ssh(tmp_path)
+    e = _pa_env(cred_home, glm=True)
+    e.update(PATH=f"{bin_}:{e['PATH']}", FAKE_REMOTE_TMP=str(remote))
+    code = """if 1:
+        import sys
+        from ttp import remotecheck
+        sys.exit(remotecheck.main(['--host', 'box1', '--', 'echo ran-there']))"""
+    r = _pa_run(e, code, repo)
+    assert r.returncode == 0 and "ran-there" in r.stdout, (r.stdout + r.stderr)[-1500:]
+    assert "tt-project guard" not in r.stdout + r.stderr and _rc_left(tmp_path) == []

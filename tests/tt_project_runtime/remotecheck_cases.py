@@ -6068,12 +6068,13 @@ def test_a_spill_ssh_the_runs_guard_refuses_is_an_environment_fault_never_the_ho
     assert remotecheck.GUARD_REFUSED in log.read_text() and "Not the host and not the change" in log.read_text()
     cfg = {"delivery": {"checks_spill_hosts": ["check-host-a", "check-host-b"], "checks_remote_only": True}}
     cfg_p = SimpleNamespace(config=lambda: cfg)
-    args = (SimpleNamespace(host="check-host-a"), False, True, False, 1, None, [], "check-host-b:fail")
-    # the same two failures count as the change's verdict with a plain log, and none with the guard's refusal
+    head, tail = (SimpleNamespace(host="check-host-a"), False, True, False), (None, [], "check-host-b:fail")
+    # the same two failures count as the change's verdict on a test's exit (one quoting the guard's words too),
+    # and none on the guard's refusal (FAULT_RC)
     plain = tmp_path / "plain.log"
-    plain.write_text("ttp remote check: sending x\nFAILED t.py::t\n")
-    assert cli._spill_fail_verdict(*args, str(plain), 0, str(repo), cfg_p) == ["check-host-b", "check-host-a"]
-    assert cli._spill_fail_verdict(*args, str(log), 0, str(repo), cfg_p) == []
+    plain.write_text(f"ttp remote check: sending x\nFAILED t.py::t - {remotecheck.GUARD_REFUSED}\n")
+    assert cli._spill_fail_verdict(*head, 1, *tail, str(plain), 0, str(repo), cfg_p) == ["check-host-b", "check-host-a"]
+    assert cli._spill_fail_verdict(*head, remotecheck.FAULT_RC, *tail, str(log), 0, str(repo), cfg_p) == []
 
 
 @pytest.mark.parametrize("refusals, passed", [(1, True), (2, None)])
@@ -6088,9 +6089,13 @@ def test_ttp_checks_runs_again_once_after_the_runs_guard_refused_the_spill_ssh_t
     p.set_config("delivery.push_checks", ["true"])
     starts = []
 
+    said = io.StringIO()
+    with contextlib.redirect_stdout(said):
+        remotecheck._fault("check-host-a", f"{remotecheck.GUARD_REFUSED}: not run")
+
     def argv(*a, **k):
         starts.append(a[1])
-        bad = f"echo {shlex.quote(remotecheck.GUARD_REFUSED + ': not run')} >&2; exit {remotecheck.FAULT_RC}"
+        bad = f"printf %s {shlex.quote(said.getvalue())}; exit {remotecheck.FAULT_RC}"
         return ["sh", "-c", bad if len(starts) <= refusals else "exit 0"]
     monkeypatch.setattr(remotecheck, "argv", argv)
     lane = _spill_lane(p, repo)

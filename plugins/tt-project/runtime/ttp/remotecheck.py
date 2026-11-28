@@ -651,7 +651,7 @@ def main(args: list[str]) -> int:
         try:
             rc, why = _attempt(host, top, head, env, extra, cmd, mark, wrap, wait, build, spill)
         except PermissionError as e:   # the run's guard refused a Popen: no ssh ran, so nothing says the host failed
-            if "guard" not in str(e):
+            if not str(e).startswith("tt-project guard:"):
                 raise
             return _fault(host, f"{GUARD_REFUSED}: {(str(e).strip().splitlines() or [''])[0][:300]}")
         if not why:
