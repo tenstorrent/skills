@@ -1,6 +1,8 @@
 # Capture paths and post-processing
 
-Three ways in, and they are not alternatives so much as layers.
+This page covers the device profiler, the fallback where the checkout has no
+streaming profiler (SKILL.md, "Which profiler"). Three ways in, and they are not
+alternatives so much as layers.
 
 ## 1. The environment variable alone
 
@@ -27,6 +29,10 @@ After a default capture run it starts a Tracy WASM web viewer in the background.
 Viewing that from another machine needs **both** ports forwarded — 8080 for HTTP
 and 8081 for the WebSocket — to the same ports on the remote loopback interface.
 Forwarding only 8080 gives a page that loads and never connects.
+
+The viewer outlives the run; later runs on the same port reuse it. Newer
+tt-metal turns it off with `--no-web-server` or `TRACY_NO_WEB_SERVER=1`; the
+058b93d pin lacks both.
 
 ## 3. `tracy-capture`
 
@@ -75,3 +81,13 @@ which then reach both the CSV and the Tracy client.
 `TT_METAL_PROFILER_MID_RUN_DUMP` is the environment-variable equivalent for a
 long-lived process — a serving job that never closes its device otherwise never
 writes a profile.
+
+Device profiler only (the streaming profiler has no such buffer): if the log
+says `Profiler DRAM buffers were full, markers were dropped!`, treat the capture
+as failed; `process_ops_logs` may also stop with `Device data missing: Op <N> not
+present in ...`. Size `--op-support-count` (it sets
+`TT_METAL_PROFILER_PROGRAM_SUPPORT_COUNT`) for the whole run, or one replay for
+traced replay, and read once at the end. On a mesh, never call
+`ReadDeviceProfiler` after every op: each call is a mesh-wide sync that inflates
+`OP TO OP LATENCY`. Keep the count fixed between runs: a new value recompiles
+every kernel.

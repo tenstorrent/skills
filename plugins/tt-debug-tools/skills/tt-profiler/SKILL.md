@@ -1,6 +1,6 @@
 ---
 name: tt-profiler
-description: Measure where device time goes on a Tenstorrent part — per-zone kernel timings from the Device Program Profiler, and host-plus-device traces through Tracy. Use when a kernel or op is slower than expected and you need cycles attributed to named scopes, when you want a profile_log_device.csv read, or when you need to instrument a kernel with DeviceZoneScopedN.
+description: Measure where device time goes on a Tenstorrent part — per-zone kernel timings from the streaming profiler (Blackhole) or, as the fallback, the Device Program Profiler, and host-plus-device traces through Tracy. Use when a kernel or op is slower than expected and you need cycles attributed to named scopes, when you want a profile_log_device.csv read, or when you need to instrument a kernel with DeviceZoneScopedN.
 metadata:
   tier: kernel
   upstream:
@@ -16,6 +16,15 @@ metadata:
     - repo: tenstorrent/tt-metal
       ref: 058b93d450f21b9b86a6ddf58f6f8f2c7744f8f1
       path: tt_metal/llrt/rtoptions.cpp
+    - repo: tenstorrent/tt-metal
+      ref: 8b53dfa87b68638895c1f48ad5eef24f62d54808
+      path: tools/tracy/perf_counter_multipass.py
+    - repo: tenstorrent/tt-metal
+      ref: 8b53dfa87b68638895c1f48ad5eef24f62d54808
+      path: tools/tracy/process_ops_logs.py
+    - repo: tenstorrent/tt-metal
+      ref: 5d54be8805315b56cb7d9f5a5050e86b95d5b74a
+      path: tt_metal/tools/profiler/STREAMING_PROFILER_DETAILED.md
 ---
 
 # tt-profiler
@@ -25,8 +34,31 @@ compiled into the kernel; the runtime reads their timestamps off the device and
 writes a CSV, and optionally streams the whole thing — host and device — into
 Tracy.
 
-Built by default. **Off at runtime**, so the overhead only arrives when you ask
-for it.
+## Which profiler
+
+Use the **streaming profiler** where the checkout has it: Blackhole only,
+`ls tt_metal/tools/profiler/STREAMING_PROFILER.md` shows whether it is there. It
+drains records continuously, so the device profiler's per-core buffer, its drain
+calls and its dropped-marker limit do not apply. On a long run the ops CSV can
+still miss frames, and the only sign is `missed N bytes of frames` in the log:
+check it before trusting per-op numbers.
+
+```bash
+TT_METAL_STREAMING_PROFILER=1 TT_METAL_STREAMING_PROFILER_OPS_CSV=ops.csv pytest <test id>
+```
+
+A plain `TT_METAL_STREAMING_PROFILER=1` run writes nothing: pick an output
+(`_OPS_CSV`, `_ZONE_CSV`, `_TRACY=1` or a host callback). It uses idle Ethernet
+cores, and it cannot run under `python -m tracy` with device profiling on (the
+default; `--no-device` turns it off): tracy then sets
+`TT_METAL_DEVICE_PROFILER=1`, and setting both is a fatal error at startup.
+Options and the callback API:
+[STREAMING_PROFILER_DETAILED.md](https://github.com/tenstorrent/tt-metal/blob/main/tt_metal/tools/profiler/STREAMING_PROFILER_DETAILED.md).
+
+The **device profiler** below is the fallback: Wormhole, a checkout without the
+streaming profiler, or when you need the ops-perf CSV (tt-perf-report, perf
+counters, tt-npe), which `python -m tracy -p -r` builds with it. It is built by
+default and **off at runtime**, so the overhead only arrives when you ask for it.
 
 ## When to invoke
 
@@ -36,7 +68,7 @@ for it.
 - You want to instrument a kernel with `DeviceZoneScopedN`.
 - You want host and device on one timeline.
 
-## Surface
+## Surface (device profiler)
 
 ```bash
 TT_METAL_DEVICE_PROFILER=1 ./build/programming_examples/profiler/test_full_buffer
@@ -51,13 +83,17 @@ TT_METAL_DEVICE_PROFILER=1 ./build/programming_examples/profiler/test_full_buffe
 Post-processing knobs — `_SUM`, `_ACCUMULATE`, `_SYNC`,
 `_DISABLE_DUMP_TO_FILES`, `_DISABLE_PUSH_TO_TRACY`, `_CPP_POST_PROCESS`,
 `_TRACE_TRACKING`, `_PROGRAM_SUPPORT_COUNT` — in `references/capture.md`, along
-with the Tracy entry points (`python -m tracy`, `tracy-capture`).
+with the Tracy entry points (`python -m tracy`, `tracy-capture`) and long runs,
+traced replay and many-chip meshes, where the buffer overflows.
 
 For the workflow question "which op dominates?" the answer is the ranked
 `tt-perf-report` on the ops-perf-results CSV that Tracy writes with
 `-p -r -v -m pytest`, one folder per run under
 `generated/profiler/reports/<timestamp>/`. Recipe, pandas fallback and the
-per-RISC bottleneck tags: `references/op-report.md`.
+per-RISC bottleneck tags, and profiling a warm forward rather than model load:
+`references/op-report.md`. For measured FPU, SFPU and Math utilisation per op
+(not the estimated `PM FPU UTIL (%)`): `references/perf-counters.md`. NoC, DRAM
+and Ethernet bandwidth columns, which need tt-npe: `references/noc-bandwidth.md`.
 
 In-kernel, after `#include <tools/profiler/kernel_profiler.hpp>`:
 
@@ -107,8 +143,8 @@ not be set simultaneously.
 here follows `TT_METAL_LOGS_PATH`. Looking for it in the wrong place reads as "no
 data collected".
 
-**Results are read at device close.** Nothing lands until `CloseDevice`, and past
-roughly 1000 kernel runs the buffer needs draining sooner —
+**Device profiler: results are read at device close.** Nothing lands until
+`CloseDevice`, and past roughly 1000 kernel runs the buffer needs draining sooner —
 `detail::ReadDeviceProfilerResults(device)` after the program of interest.
 
 **`DeviceZoneScopedN` costs time.** Timings from heavily annotated code include

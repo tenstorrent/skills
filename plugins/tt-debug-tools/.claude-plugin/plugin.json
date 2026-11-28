@@ -1,6 +1,6 @@
 {
   "name": "tt-debug-tools",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "Drive the Tenstorrent debug tools and read their output: tt-triage, dprint, watcher, asserts, etc.",
   "author": {
     "name": "tenstorrent"

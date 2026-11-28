@@ -43,6 +43,12 @@ are inflated. The test has to iterate at least twice; analyse only the
 second iteration. This is not a `tt-perf-report` flag — it is how the test
 must be written.
 
+Device columns also count one-time weight preparation (permutes, tilizes),
+which can lead a whole-process ranking though it ran once. To keep only the
+warm window, mark where it starts with a Tracy signpost
+(`from tracy import signpost`; `signpost(header="warm")`) or keep rows whose
+`HOST START TS` is after the warm-up.
+
 ## Analyse
 
 ```bash
