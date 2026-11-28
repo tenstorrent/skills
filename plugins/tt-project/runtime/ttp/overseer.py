@@ -106,8 +106,9 @@ def _hold(d, task: dict, since: float, cfg: dict, state: Path, now: float) -> st
     if ev:
         return (ev["text"] or "a resource it needs is held")[:80]
     from .readywait import GAP_S, restore
-    seen = restore(d, now).get(task["id"])   # the hold the daemon's ready check saw last (its _start_hold)
-    if seen and 0 <= now - seen["last"] <= GAP_S and seen["cause"] != "dispatch":
+    seen = restore(d, now).get(task["id"])   # the hold the daemon's ready check saw last (its _start_hold);
+    # a project_cap is no hold here: an urgent task takes burst slots past it, which that check does not count
+    if seen and 0 <= now - seen["last"] <= GAP_S and seen["cause"] not in ("dispatch", "project_cap"):
         return f"dispatch holds it ({seen['cause'].replace('_', ' ')})"
     return ""
 
