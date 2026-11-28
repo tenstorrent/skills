@@ -39,6 +39,11 @@
       "name": "tt-serve-model",
       "source": "./plugins/tt-serve-model",
       "description": "Diagnose a model launch and verify a running server on Tenstorrent hardware, deterministically and evidence-based."
+    },
+    {
+      "name": "tt-lora-train",
+      "source": "./plugins/tt-lora-train",
+      "description": "Train LoRA adapters on Tenstorrent hardware and prove the result with an honest metric and a baseline-parity table. Closes the ecosystem gap where training publishes loss curves but no downstream accuracy."
     }
   ]
 }

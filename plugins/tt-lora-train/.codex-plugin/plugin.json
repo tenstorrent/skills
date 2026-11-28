@@ -1,0 +1,39 @@
+{
+  "name": "tt-lora-train",
+  "version": "0.1.0",
+  "description": "Train LoRA adapters on Tenstorrent hardware and prove the result with an honest metric and a baseline-parity table. Use for LoRA fine-tuning on TT silicon, or for validating whether a TT-trained adapter matches a CUDA-trained baseline.",
+  "author": {
+    "name": "ASCENDED OS"
+  },
+  "homepage": "https://github.com/TsunamiDiamond/ASCENDED-OS",
+  "repository": "https://github.com/TsunamiDiamond/ASCENDED-OS",
+  "license": "Apache-2.0",
+  "keywords": [
+    "tenstorrent",
+    "tt-metal",
+    "tt-blacksmith",
+    "lora",
+    "training",
+    "parity"
+  ],
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "TT LoRA Training and Parity Proof",
+    "shortDescription": "Train LoRA on TT silicon and prove parity with an honest metric",
+    "longDescription": "Bring up LoRA training on Tenstorrent hardware through tt-blacksmith or tt-metal's tt-train, gate every result on a fixed-window honest metric and a held-out carve, and produce a baseline-parity table that names its own negatives. Closes the gap in the ecosystem where training publishes loss curves but no downstream accuracy.",
+    "developerName": "ASCENDED OS",
+    "category": "Developer Tools",
+    "capabilities": [
+      "LoRA fine-tuning on TT silicon",
+      "Fixed-window honest metric",
+      "Dual-gate validation",
+      "Baseline parity tables",
+      "Rank and tile-alignment accounting"
+    ],
+    "websiteURL": "https://github.com/TsunamiDiamond/ASCENDED-OS",
+    "defaultPrompt": [
+      "Use lora-train to bring up LoRA training on this Tenstorrent device and prove the result with an honest metric.",
+      "Use lora-train to compare a TT-trained LoRA against my CUDA-trained baseline on the same held-out carve."
+    ]
+  }
+}

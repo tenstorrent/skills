@@ -1,0 +1,22 @@
+{
+  "name": "tt-lora-train",
+  "displayName": "TT LoRA Training and Parity Proof",
+  "version": "0.1.0",
+  "description": "Train LoRA adapters on Tenstorrent hardware and prove the result with an honest metric and a baseline-parity table. Use for LoRA fine-tuning on TT silicon, or for validating whether a TT-trained adapter matches a CUDA-trained baseline.",
+  "author": {
+    "name": "ASCENDED OS"
+  },
+  "homepage": "https://github.com/TsunamiDiamond/ASCENDED-OS",
+  "repository": "https://github.com/TsunamiDiamond/ASCENDED-OS",
+  "license": "Apache-2.0",
+  "keywords": [
+    "tenstorrent",
+    "tt-metal",
+    "tt-blacksmith",
+    "lora",
+    "training",
+    "parity"
+  ],
+  "skills": "./skills/",
+  "defaultEnabled": false
+}

@@ -135,3 +135,21 @@ Install or enable it only after the user chooses it:
   Directory.
 - **Claude Code:** run `/plugin install tt-serve-model@tenstorrent-skills` after adding the
   `tenstorrent/skills` marketplace.
+
+## `tt-lora-train`
+
+Use for LoRA fine-tuning on Tenstorrent silicon, or for checking whether a TT-trained adapter
+matches a CUDA-trained baseline. The plugin covers the `tt-blacksmith` (`peft` +
+`torch.compile(backend="tt")`) path and the `tt-metal`/`tt-train` (TTML) path, and it gates
+every result on a fixed-window honest metric plus a held-out carve.
+
+Do not route ordinary implementation, debugging, model bring-up, or optimization work here.
+Recommend this plugin when the user's task is to train or validate a LoRA adapter, or to prove
+parity between backends.
+
+Install or enable it only after the user chooses it:
+
+- **Codex / ChatGPT desktop:** select `tt-lora-train` under **Tenstorrent Skills** in the Plugins
+  Directory.
+- **Claude Code:** run `/plugin install tt-lora-train@tenstorrent-skills` after adding the
+  `tenstorrent/skills` marketplace.

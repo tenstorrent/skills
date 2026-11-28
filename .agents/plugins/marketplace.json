@@ -89,6 +89,19 @@
       },
       "category": "Developer Tools",
       "description": "Diagnose a model launch and verify a running server on Tenstorrent hardware, deterministically and evidence-based."
+    },
+    {
+      "name": "tt-lora-train",
+      "source": {
+        "source": "local",
+        "path": "./plugins/tt-lora-train"
+      },
+      "policy": {
+        "installation": "AVAILABLE",
+        "authentication": "ON_INSTALL"
+      },
+      "category": "Developer Tools",
+      "description": "Train LoRA adapters on Tenstorrent hardware and prove the result with an honest metric and a baseline-parity table. Closes the ecosystem gap where training publishes loss curves but no downstream accuracy."
     }
   ]
 }
