@@ -13979,7 +13979,7 @@ class Daemon:
                     reroute: bool = True) -> str | None:
         """Why dispatch would not start this ready task now, or None when it would: 'held' (another
         live task's branch or worktree, _branch_clash, recorded in ctx["branch"][task id]; the disk
-        guard; a review's prechecks), 'paused' (a paused resource), 'logged_out', 'net' (its API host
+        guard; a review's prechecks; a waste hold, budget.waste_hold), 'paused' (a paused resource), 'logged_out', 'net' (its API host
         does not resolve), 'gate' (the budget gate or its provider's slots), 'optional', 'device'
         (device task slots), 'budget' (task budget spent), 'caps' (dollar caps) or 'resource' (busy,
         including `ttp lock` and device-lock aliases). With 'paused' or 'resource' it records what holds

@@ -5711,6 +5711,11 @@ def test_a_task_wasting_past_the_limit_is_held_and_no_other_task_is(env, monkeyp
         {k: g.as_dict() for k, g in d.gates.items()}, time.time(), str)), "the held task is shown with its setting"
 
 
+def test_the_web_app_shows_the_waste_holds_with_the_spend_lines():
+    from ttp import web
+    assert "h.spend.slot_lines" in (web.STATIC / "app.js").read_text(), "the budget line lists the held tasks"
+
+
 def test_on_a_plan_a_task_with_more_wasted_runs_than_the_limit_is_held_and_no_other_task_is(env, monkeypatch):
     p, d, a, b = _waste_hold_setup(env, monkeypatch, (0.1,) * 5)
     p.set_config("providers.fake.billing", "plan")
