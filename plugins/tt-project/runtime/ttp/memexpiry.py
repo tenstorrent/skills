@@ -101,13 +101,15 @@ def backfill(p, now: float | None = None) -> list[str]:
     if not w:
         return []
     paths = []
-    with p.memory_locked():
-        for e in p._memory_entries():
-            if e["kind"] in KINDS and not e["standing"] and not e["end"] and not e["kept"]:
-                paths.append(_write_end(p, e["name"], max(_stamp_ts(e["created"]) + w, now + BACKFILL_FLOOR_S), True))
-                done.append(e["name"])
-    if paths:
-        p.commit_harness(paths, f"memory: {len(paths)} entries get the default expiry")
+    try:
+        with p.memory_locked():
+            for e in p._memory_entries():
+                if e["kind"] in KINDS and not e["standing"] and not e["end"] and not e["kept"]:
+                    paths.append(_write_end(p, e["name"], max(_stamp_ts(e["created"]) + w, now + BACKFILL_FLOOR_S), True))
+                    done.append(e["name"])
+    finally:   # entries already rewritten are committed even when a later one fails
+        if paths:
+            p.commit_harness(paths, f"memory: {len(paths)} entries get the default expiry")
     return done
 
 

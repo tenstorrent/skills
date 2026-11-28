@@ -150,6 +150,27 @@ def test_memexpiry_backfill_of_many_entries_makes_one_harness_commit(env, monkey
     assert all(_mx_entry(p, n)["end"].get("expires") for n in names)
 
 
+def test_memexpiry_backfill_commits_the_entries_it_rewrote_when_a_later_one_fails(env, monkeypatch):
+    from ttp import memexpiry
+    p = make(env)
+    p.set_config("memory.default_expiry_days", 0)
+    for i in range(3):
+        p.add_memory(f"an entry from before the default {i}", kind="decision")
+    p.set_config("memory.default_expiry_days", 30)
+    commits, real, calls = [], memexpiry._write_end, []
+
+    def flaky(*a):
+        calls.append(1)
+        if len(calls) == 3:
+            raise OSError("disk full")
+        return real(*a)
+    monkeypatch.setattr(memexpiry, "_write_end", flaky)
+    monkeypatch.setattr(type(p), "commit_harness", lambda self, paths, msg, removed=(): commits.append(list(paths)))
+    with pytest.raises(OSError):
+        memexpiry.backfill(p)
+    assert len(commits) == 1 and len(commits[0]) == 2
+
+
 def test_memexpiry_uses_drops_ids_of_rules_and_entries_that_no_longer_exist(env):
     import time
     from ttp import memexpiry
