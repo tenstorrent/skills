@@ -229,6 +229,18 @@ def request_stop(run_dir: Path, why: str = "cancel") -> None:
     durable_write(run_dir / "STOP", why)
 
 
+LIVE_BUDGET = "budget_usd"   # in a run's directory: its task's raised budget (topup.reach_run)
+
+
+def live_budget(run_dir: Path, budget):
+    """The run's dollar limit: a raise written to LIVE_BUDGET since it started, else `budget`. Only raises."""
+    try:
+        raised = float((run_dir / LIVE_BUDGET).read_text().strip())
+    except (OSError, ValueError):
+        return budget
+    return max(raised, float(budget)) if budget is not None else budget
+
+
 def stop_runs(db, runs_dir: Path, task: int | None = None, why: str = "cancel") -> list[int]:
     """Request a stop for every running run (of one task, if given). Returns their run ids."""
     sql, args = "SELECT id, dir FROM runs WHERE status='running'", ()
@@ -804,6 +816,7 @@ def supervise(run_dir: Path) -> int:
                 threading.Thread(target=stop, args=("quota",), daemon=True).start()
             if budget is not None and now - st["budget"] >= BUDGET_EVERY_S:
                 st["budget"] = now
+                budget = live_budget(run_dir, budget)
                 try:
                     so_far = (bridge.cost_so_far() if hasattr(bridge, "cost_so_far")   # claudebridge: the CLI's own figures
                               else glmharness.cost_so_far(bridge, prov) if spec.get("harness")   # a mini run streams none

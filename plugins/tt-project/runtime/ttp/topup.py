@@ -23,8 +23,11 @@ Every other task keeps the plain budget hold (task_budget_exhausted). `budget.ur
 turns this off (default on).
 
 Any other task's budget is raised by the coordinator: a task_update `budget_usd` above its current
-budget, on a blocked or queued (waiting) task (raise_refusal), recorded as one RAISE_KIND event
-(record_raise); a task blocked on its spent budget is queued again by it. The dollar caps stay."""
+budget, on a blocked, queued (waiting) or running task (raise_refusal), recorded as one RAISE_KIND event
+(record_raise); a task blocked on its spent budget is queued again by it. A running task's runs get the
+new limit at once (reach_run: the runner's check rereads it); a run the agent's own fixed cap stopped
+after the raise goes back to the queue, no attempt spent, and goes on under it (raised_during). The
+dollar caps stay."""
 from __future__ import annotations
 
 import json
@@ -59,14 +62,14 @@ def eligible(task: dict | None, db=None, _seen: frozenset = frozenset()) -> bool
 
 
 RAISE_KIND = "task_budget_raise"
-RAISE_STATES = ("blocked", "queued")   # no task has status waiting (coordinator.NO_WAITING_STATUS)
+RAISE_STATES = ("blocked", "queued", "running")   # no task has status waiting (coordinator.NO_WAITING_STATUS)
 HOLD_REASON = "task budget exhausted"   # a task blocked on its spent budget (Daemon._dispatch)
 
 
 def raise_refusal(task: dict, usd) -> str:
     """Why a task_update `budget_usd` of `usd` is refused on `task`, or "" when it may raise it."""
     if task["status"] not in RAISE_STATES:
-        return f"its budget is raised only while it is blocked or queued (waiting), not {task['status']}"
+        return f"its budget is raised only while it is blocked, queued (waiting) or running, not {task['status']}"
     try:
         usd = float(usd)
     except (TypeError, ValueError):
@@ -85,6 +88,28 @@ def record_raise(db, task: dict, after: float) -> None:
     db.x("INSERT INTO events(ts,source,kind,severity,text,data,status,task) VALUES(?,?,?,?,?,?,?,?)",
          (time.time(), "coordinator", RAISE_KIND, "low", text,
           json.dumps({"before": before, "after": after}), "handled", task["id"]))
+
+
+def reach_run(db, runs_dir, task_id: int, usd: float) -> list[int]:
+    """Give each running run of the task its raised limit (runner.LIVE_BUDGET in its directory, which its
+    budget check rereads). Returns the run ids reached."""
+    from pathlib import Path
+    from .project import durable_write
+    from .runner import LIVE_BUDGET
+    ids = []
+    for r in db.q("SELECT id, dir FROM runs WHERE task=? AND status='running'", (task_id,)):
+        run_dir = Path(r["dir"]) if r["dir"] else Path(runs_dir) / str(r["id"])
+        if run_dir.is_dir():
+            durable_write(run_dir / LIVE_BUDGET, f"{float(usd):.2f}\n")
+            ids.append(r["id"])
+    return ids
+
+
+def raised_during(db, task: dict, run: dict) -> bool:
+    """Whether the coordinator raised the task's budget after `run` started, above what it had then."""
+    return bool(run.get("started")) and bool(db.q(
+        "SELECT 1 FROM events WHERE kind=? AND task=? AND ts>=? LIMIT 1",
+        (RAISE_KIND, task["id"], float(run["started"]))))
 
 
 def spent(task: dict) -> bool:

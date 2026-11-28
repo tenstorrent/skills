@@ -5566,9 +5566,9 @@ def test_a_run_started_on_the_daemon_s_first_tick_records_a_daemon_gap_not_a_dis
     assert "dispatch" not in rw["causes"] and rw["causes"].get("daemon_gap", 0) >= 3500, rw
 
 
-def test_task_update_raises_a_task_budget_only_upward_and_only_before_it_runs(env):
+def test_task_update_raises_a_task_budget_only_upward_and_only_before_it_ends(env):
     """task_update `budget_usd` raises the budget of a blocked or queued task (a budget hold is
-    queued again), recorded as one handled event; a lower budget or a running or ended task is refused."""
+    queued again), recorded as one handled event; a lower budget or an ended task is refused."""
     from ttp import coordinator as coord, topup
     p = make(env)
     held = p.db.add_task("spent", "s", budget_usd=2.0, status="blocked")
@@ -5581,7 +5581,7 @@ def test_task_update_raises_a_task_budget_only_upward_and_only_before_it_runs(en
     out = coord.apply(p, [{"type": "task_update", "id": held, "budget_usd": 4}])
     assert any("only raises a budget" in x for x in out), out
     assert p.db.task(held)["budget_usd"] == 6.0
-    for status in ("running", "done", "cancelled"):
+    for status in ("done", "cancelled"):
         tid = p.db.add_task(status, "s", budget_usd=2.0, status=status)
         out = coord.apply(p, [{"type": "task_update", "id": tid, "budget_usd": 9}])
         assert any(f"not {status}" in x for x in out), (status, out)

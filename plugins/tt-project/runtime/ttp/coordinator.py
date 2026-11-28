@@ -3757,6 +3757,8 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                 db.update_task(task["id"], **upd)
                 if raised_usd is not None:
                     topup.record_raise(db, task, raised_usd)
+                    if task["status"] == "running":   # its runs go on under the new limit at once
+                        topup.reach_run(db, p.runs, task["id"], raised_usd)
                 if cleared:   # the audit trail of who vouched for the task's source
                     db.x("INSERT INTO events(ts,source,kind,severity,text,data,status,task) VALUES(?,?,?,?,?,?,?,?)",
                          (time.time(), "coordinator", untrusted.CLEARED_KIND, "low",

@@ -40,6 +40,7 @@ from . import runtimeload   # first of its own: its LOADED_AT is when the daemon
 from . import (   # one name per line: two changes adding names merge without a conflict
     aitag,
     blindreview,
+    budgetcarry,
     carry,
     deviceplan,
     glmassist,
@@ -8129,6 +8130,9 @@ class Daemon:
                                              summary=f"Failed: credential files changed during the run "
                                                      f"({'; '.join(f'{p} {h}' for p, h in cred)[:400]}). Its "
                                                      f"hand-off said: {result.get('summary') or ''}"[:1500])
+        if own and not rstatus and turnsize.over_budget(status, usage) and \
+                (carried := budgetcarry.carry(self.p, task, self._branch_head(task))):
+            status, rstatus, result = "ok", "done", carried   # its checks passed: never stopped before landing
         summary = str((result.get("summary") if isinstance(result, dict) else None)
                       or (usage.final_text or usage.error or "")[:1500])
         if status in FREE_ENDS and rstatus in (None, "", route.BOUNCE) and r.get("id"):
@@ -8325,10 +8329,12 @@ class Daemon:
             new = {"done": "done", "blocked": "blocked", "failed": "failed", "needs_review": "review"}[rstatus]
         elif status in FREE_ENDS or reboot_lost:
             new = "queued"   # not an attempt: the account refused or the host went down, the task did not fail
-        elif turnsize.over_budget(status, usage) and topup.eligible(task, db) and topup.enabled(self.cfg):
+        elif turnsize.over_budget(status, usage) and (topup.eligible(task, db) and topup.enabled(self.cfg)
+                                                      or topup.raised_during(db, task, r)):
             # An urgent or user-ordered task stopped by its budget (the runner's check, or the agent's
             # own cap: a failed run with error_max_budget_usd) is topped up and continued at the next
-            # dispatch (topup.py), not failed, unless it repeats the run before its last top-up.
+            # dispatch (topup.py), not failed, unless it repeats the run before its last top-up. So is any
+            # task whose budget the coordinator raised mid-run: the agent's cap was fixed at launch.
             topup.mark_stop(db, r)
             guard = topup.runaway(db, task, r, self._branch_head(task), bool(rstatus))
             new = "failed" if guard else "queued"
