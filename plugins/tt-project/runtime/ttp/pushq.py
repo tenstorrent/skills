@@ -2844,18 +2844,9 @@ def _conflict_woke(m: dict, target: str, r: dict, current: list[dict]) -> str:
     return woke
 
 
-def _conflict_sent(db, tid: int) -> int:
-    """The approvals of task `tid` the queue sent back as conflicts (its conflict fixes cost no review attempt)."""
-    return db.one("SELECT COUNT(DISTINCT created) n FROM push_queue WHERE task=? AND status='conflict'", (tid,))["n"]
-
-
-def _conflict_mark(r: dict, m: dict, target: str, sent: int) -> dict:
-    """The conflictfix mark of conflicting row `r` (conflictfix.KEY in the woken task's result)."""
-    d = _detail(r)
-    raw = [str(f) for f in (d.get("files") or [])]
-    textual = bool(raw) and not raw[0].startswith("(the rebase") and not d.get("cmd")
-    return conflictfix.mark(str(r["head"] or ""), r["branch"] or "", target,
-                            str(d.get("onto") or m.get("tip") or ""), raw, textual, sent)
+def _approvals_sent(db, tid: int, status: str = "conflict") -> int:
+    """The approvals of task `tid` the queue sent back with `status` (conflict fixes cost no review attempt)."""
+    return db.one("SELECT COUNT(DISTINCT created) n FROM push_queue WHERE task=? AND status=?", (tid, status))["n"]
 
 
 def _settle_conflict(p: Project, task: dict, b: dict, m: dict, prev: dict, summary: str, target: str,
@@ -2868,7 +2859,7 @@ def _settle_conflict(p: Project, task: dict, b: dict, m: dict, prev: dict, summa
     woke = _conflict_woke(m, target, r, current)
     # Conflict fixes cost no review attempt (conflictfix.py): their own count is the approvals the
     # queue sent back, this one included.
-    sent = _conflict_sent(db, tid)
+    sent = _approvals_sent(db, tid)
     # From its second conflicting batch on, it leaves batching for one rebase task on a branch of its
     # own (auto_rebase), rather than another conflict fix tried again in a later batch.
     held = open_rebase(db, task, str(r["head"] or "")) if sent >= REBASE_AFTER else None
@@ -2890,7 +2881,10 @@ def _settle_conflict(p: Project, task: dict, b: dict, m: dict, prev: dict, summa
         if not rebase:
             _reply(db, task, "failed", text)
     else:
-        cf = _conflict_mark(r, m, target, sent)
+        raw = [str(f) for f in (d.get("files") or [])]
+        textual = bool(raw) and not raw[0].startswith("(the rebase") and not d.get("cmd")
+        cf = conflictfix.mark(str(r["head"] or ""), r["branch"] or "", target,
+                              str(d.get("onto") or m.get("tip") or ""), raw, textual, sent)
         _requeue(db, task, woke, {conflictfix.KEY: cf})
         _event(db, task, "task_requeued", f"#{tid} {task['title']}: {woke}; its review runs again to settle it"
                + ("" if cf.get("escalate") else " as a light conflict fix"), queued=False)

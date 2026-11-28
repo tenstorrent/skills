@@ -116,7 +116,7 @@ def settle_kind(states: set[str], trim) -> str | None:
 def _approvals(db, tid: int) -> tuple[list[dict], list[dict]]:
     """A task's push rows and, of them, its newest approval's (the rows sharing one `created`)."""
     rows = db.q("SELECT * FROM push_queue WHERE task=? ORDER BY id", (tid,))
-    return rows, [r for r in rows if rows and r["created"] == rows[-1]["created"]]
+    return rows, [r for r in rows if r["created"] == rows[-1]["created"]]
 
 
 def _land_done(p, task: dict, b: dict, m: dict, now: float) -> None:
@@ -131,33 +131,36 @@ def _land_done(p, task: dict, b: dict, m: dict, now: float) -> None:
         advance(p.db, task, DONE, batch=b["id"])
 
 
+def _progress(p, tid: int, evidence: str) -> None:
+    """`evidence` as progress on each open obligation task `tid` owns (no receipt: its owner or the coordinator closes it)."""
+    from . import obligations
+    for key in obligations.owned_open(p.db, tid):
+        obligations.record(p, key, "progress", evidence, tid)
+
+
 def on_settle(p, task: dict, kind: str, b: dict, m: dict, now: float, deploy: bool) -> None:
     """The push queue settled carry task `task` (`settle_kind`'s `kind`) in batch `b`. landed: phase `landed`,
     an owned obligation gets the sha as progress, then `deploy` (the batch's after_push follows) or done.
     rebase and checkfix: the owner is woken to fix it in place (the log's path and tail with it); past its
     attempts it goes `capped` and failed, to the coordinator."""
-    from . import conflictfix, obligations, pushq
+    from . import pushq
     db, tid, target = p.db, task["id"], b["target"]
     rows, current = _approvals(db, tid)
-    row = next(r for r in reversed(current) if kind == LANDED and r["status"] in pushq.LANDED_OUTCOMES
-               or r["status"] == ("conflict" if kind == REBASE else "check_failed"))
+    hit = pushq.LANDED_OUTCOMES if kind == LANDED else ("conflict",) if kind == REBASE else ("check_failed",)
+    row = next(r for r in reversed(current) if r["status"] in hit)
     at = {"push_row": row["id"], "batch": b["id"], "head": row["head"]}
     if kind == LANDED:
-        obligations.progress_for(db, tid, f"landed {pushq._short(row['pushed_sha'])} on {target} (batch {b['id']})")
+        _progress(p, tid, f"landed {pushq._short(row['pushed_sha'])} on {target} (batch {b['id']})")
         advance(db, tid, LANDED, **at)
         if deploy:
             advance(db, tid, DEPLOY)
         else:
             _land_done(p, task, b, m, now)
         return
-    extra: dict = {}
+    sent = pushq._approvals_sent(db, tid, "conflict" if kind == REBASE else "check_failed")
     if kind == REBASE:
-        sent = pushq._conflict_sent(db, tid)
         woke = pushq._conflict_woke(m, target, row, current) + "; rebase it in place on its own branch"
-        extra = {conflictfix.KEY: pushq._conflict_mark(row, m, target, sent)}
     else:
-        sent = db.one("SELECT COUNT(DISTINCT created) n FROM push_queue WHERE task=? AND status='check_failed'",
-                      (tid,))["n"]
         d = pushq._detail(row)
         woke = (f"the push checks failed on {row['branch'] or '?'} at {pushq._short(row['head'])} in batch {b['id']}: "
                 f"`{d.get('cmd') or 'the push checks'}`; log: {m.get('log') or '?'}\n{pushq._tail_of(m, d)}\n"
@@ -170,7 +173,7 @@ def on_settle(p, task: dict, kind: str, b: dict, m: dict, now: float, deploy: bo
         pushq._event(db, task, "task_failed", f"#{tid} {task['title']} -> failed: {text}", queued=True)
         return pushq._reply(db, task, "failed", text)
     advance(db, tid, kind, **at)
-    pushq._requeue(db, task, woke, extra)
+    pushq._requeue(db, task, woke)
     pushq._event(db, task, "task_requeued", f"#{tid} {task['title']}: {woke.splitlines()[0]}", queued=False)
 
 
@@ -179,19 +182,18 @@ def on_after(p, b: dict, m: dict, status: str, line: str, tail: str, now: float)
     task that landed in the batch: ok, skipped or superseded finishes it, `line` the obligation's progress;
     a failure raises `carry_deploy_failed` to the coordinator and wakes the owner only if the log names a
     file its landed commit touched."""
-    from . import obligations, pushq
+    from . import pushq
     db = p.db
     for s in db.q("SELECT task FROM carry_state WHERE batch=? AND phase IN (?,?)", (b["id"], LANDED, DEPLOY)):
         task = db.task(s["task"])
         if not task or task["status"] != "pushing":
             continue
         if status in ("ok", "skipped", "superseded"):
-            obligations.progress_for(db, task["id"], line)
+            _progress(p, task["id"], line)
             _land_done(p, task, b, m, now)
             continue
-        sha = next((r["pushed_sha"] for r in _approvals(db, task["id"])[1] if r["batch"] == b["id"]), None)
-        out = pushq._git(p, "diff-tree", "--no-commit-id", "--name-only", "-r", sha or "HEAD").stdout.split()
-        named = [f for f in out if f in tail]
+        head = next((r["head"] for r in _approvals(db, task["id"])[1] if r["batch"] == b["id"]), None)
+        named = [f for f in sorted(pushq._changed(p, m["tip"], head) or ()) if f in tail] if head and m.get("tip") else []
         pushq._event(db, task, "carry_deploy_failed", f"#{task['id']} {task['title']}: {line}"
                      + (f"; the log names {', '.join(named[:10])} from its change" if named else ""), queued=True)
         if named:

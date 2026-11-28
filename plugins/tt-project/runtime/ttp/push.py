@@ -3539,7 +3539,7 @@ REVIEW_TITLE = re.compile(r"\s*Review #(\d+)\b")   # a review's title names the 
 
 def _reviewed_tasks(p: Project, task: str | None) -> list[dict]:
     """The code tasks review `task` covers (its dependencies, auto_review: label and the `Review #<id>`
-    its title starts with), or []."""
+    its title starts with), or []; a carry task (carry.py) covers itself."""
     t = _task_row(p, task)
     if t and t.get("kind") != "review" and carry.state(p.db, t["id"]):
         return [t]   # a carry task is its own review

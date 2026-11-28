@@ -1596,20 +1596,6 @@ def owned_open(db, tid: int) -> list[str]:
     return [o["id"] for o in items(db) if _open(o) and str(tid) in o["owners"]]
 
 
-def progress_for(db, tid: int, evidence: str, now: float | None = None) -> list[str]:
-    """File `evidence` as progress on each open obligation task `tid` is a required owner of (no
-    receipt: the owner's hand-off or the coordinator closes it). The keys filed."""
-    now = time.time() if now is None else now
-    keys = owned_open(db, tid)
-    if keys:
-        with db.tx():
-            st = _load(db)
-            for k in keys:
-                _record_progress(st["items"][k]["owners"][str(tid)], " ".join(evidence.split())[:EVIDENCE_MAX], now)
-            db.set_kv(KV, st)
-    return keys
-
-
 def open_keys_by_task(db) -> dict[int, list[str]]:
     """Task id -> the open, undelivered obligation keys it owns (attached, or an order's or promise's
     task), in key order: the keys a task_update spec may name as its own (spec_check)."""

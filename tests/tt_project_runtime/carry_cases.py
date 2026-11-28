@@ -160,22 +160,21 @@ def test_a_landed_carry_task_waits_for_its_deploy_and_the_after_push_outcome_fin
 
 
 def test_a_failed_deploy_raises_one_event_and_wakes_the_owner_only_when_the_log_names_its_files(env, monkeypatch):
-    import subprocess
     from ttp import pushq
     p = make(env)
     p.set_config("delivery.after_push", "true")
     t, b = _pushing(p)
     _settle_it(p, t, b)
-    monkeypatch.setattr(pushq, "_git", lambda *a, **k: subprocess.CompletedProcess(a, 0, "src/mine.py\n", ""))
+    monkeypatch.setattr(pushq, "_changed", lambda p, tip, head: frozenset({"src/mine.py"}))
     monkeypatch.setattr(pushq, "_tail_of", lambda m, d=None, n=0: "boom in other.py")
-    pushq._after(p, b, {"pushed_sha": "b" * 40, "after_push": {"cmd": "deploy"}, "log": "l"}, "failed",
+    pushq._after(p, b, {"tip": "t" * 40, "after_push": {"cmd": "deploy"}, "log": "l"}, "failed",
                  lambda *a, **k: None, 3000.0)
     assert p.db.task(t["id"])["status"] == "pushing" and carry_phase(p, t) == "deploy", "not its files: no wake"
     assert len(p.db.q("SELECT id FROM events WHERE task=? AND kind='carry_deploy_failed' AND status='queued'", (t["id"],))) == 1
     t2, b2 = _pushing(p, batch="b2", after_push=None)
     p.db.x("UPDATE carry_state SET phase='deploy', batch='b2' WHERE task=?", (t2["id"],))
     monkeypatch.setattr(pushq, "_tail_of", lambda m, d=None, n=0: "Traceback in src/mine.py line 3")
-    pushq._after(p, b2, {"pushed_sha": "b" * 40, "after_push": {"cmd": "deploy"}, "log": "l"}, "failed", lambda *a, **k: None, 3000.0)
+    pushq._after(p, b2, {"tip": "t" * 40, "after_push": {"cmd": "deploy"}, "log": "l"}, "failed", lambda *a, **k: None, 3000.0)
     got = p.db.task(t2["id"])
     assert got["status"] == "queued" and "src/mine.py" in (got["result"] or ""), "woken with the log"
     assert carry_phase(p, t2) == "deploy", "reconcile never moves it back"
