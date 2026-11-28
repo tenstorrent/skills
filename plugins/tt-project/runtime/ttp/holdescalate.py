@@ -7,7 +7,7 @@ held resource or a pause the user set. Any other hold raises one `hold_escalate`
 the rule and the minutes, and, `coordinator.hold_proceed_min` (default 5; 0 escalate only) later, is
 cleared unless a safety cite was added meanwhile. A deferral is an outside wait when it starts
 itself: a `start_when` probe, or a start_after whose why or probe names a safety class by the same
-classifier the deferral check uses (convgate.safety_class). It is shown, never raised. A hold escalates once, though it is recorded again. A hold on an open task, an ask or a resource is left
+classifier the deferral check uses (convgate.stored_class). It is shown, never raised. A hold escalates once, though it is recorded again. A hold on an open task, an ask or a resource is left
 alone: the root blocker is the thing to name. selfblock.raise_due runs this once a minute."""
 from __future__ import annotations
 
@@ -46,7 +46,7 @@ def _hold(db: DB, t: dict, now: float) -> dict | None:
     if t["status"] == "queued" and (d := deferral(t)):
         reason = " ".join(str(d.get(k) or "") for k in ("why", "when")).strip() or "start_after"
         return {"kind": "deferred", "start": d.get("since") or float(t["created"] or now), "reason": reason,
-                "probe": bool(d.get("when")), "cls": convgate.safety_class(d.get("why"), d.get("when"))}
+                "probe": bool(d.get("when")), "cls": convgate.stored_class(t)}
     return None
 
 

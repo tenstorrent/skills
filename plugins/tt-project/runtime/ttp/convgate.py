@@ -183,6 +183,13 @@ def stored(task: dict) -> tuple[list, dict]:
     return (labels if isinstance(labels, list) else []), deferral(task)
 
 
+def stored_class(task: dict) -> str | None:
+    """The safety class a queued task's stored start gate names (its why, its probe, the class the
+    check recorded, a chain on a task's new file), else None for a convenience."""
+    labels, d = stored(task)
+    return safety_class(d.get("why"), d.get("when")) or kept_class(labels) or tie_class(labels, d.get("when"))
+
+
 # A checks or suite task: a work task with no branch (it changes nothing) whose title says so.
 SUITE = re.compile(r"\b(?:checks?|suites?|tests?|pytest|ci)\b", re.I)
 _OUTPUT = r"\b(?:output|results?|logs?|reports?|numbers|measurements?|artifacts?|findings)\b"

@@ -210,3 +210,18 @@ def test_a_start_after_deferral_with_no_outside_reason_still_proceeds(env):
     assert [d["did"] for d in he.run(p.db, {}, now + 301)] == ["proceeded"]
     task = p.db.task(t)
     assert "auto-proceeded" in (task["spec"] or "") and json.loads(task["labels"]) == []
+
+
+def test_a_start_after_deferral_the_check_kept_is_never_proceeded_without_a_stored_why(env):
+    """The deferral check records the class it kept (`start_safety`); a start_after held that way
+    stays an outside wait for hold-escalate though no why was stored (an older deferral, or a why
+    cut at START_WHY_CHARS before its cite)."""
+    from ttp import holdescalate as he
+    p = make(env)
+    now = time.time()
+    t = p.db.add_task("compare the before and after figures")
+    p.db.x("UPDATE tasks SET priority=1, labels=? WHERE id=?",
+           (json.dumps([f"start_after:{now + 8 * 3600:.0f}", "start_safety:the user's word",
+                        f"deferred_since:{now - 3600}"]), t))
+    assert [d["did"] for d in he.run(p.db, {}, now) + he.run(p.db, {}, now + 600)] == ["shown"]
+    assert p.db.task(t)["status"] == "queued" and "auto-proceeded" not in (p.db.task(t)["spec"] or "")

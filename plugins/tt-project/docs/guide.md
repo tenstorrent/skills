@@ -2381,7 +2381,7 @@ running work is interrupted only by the preemption below:
 - `ttp status` and the web app mark urgent tasks with how long each has waited.
 - Start gates: an urgent task whose dependencies are met never sleeps on a convenience gate. Its
   `start_after`, `start_when` or `landed:#<id>` chain stays only when the gate's `why` (or the probe)
-  names a safety class: data loss, a spend cap or provider window, a shared device or machine (lock,
+  names a safety class: data loss, data that must accumulate (a data or measurement window), a spend cap or provider window, a shared device or machine (lock,
   hold, pause, a lull for a restart, upgrade, reboot or power cycle), a charter Restriction (a guard,
   Restriction or charter rule), another person's work, the user's word (a cited user message or a
   `test -e <dir>/user-<x>` probe; it and a Restriction are filed before any device word), or a real dependency on another
