@@ -23,6 +23,7 @@ from . import (   # one name per line: two changes adding names merge without a 
     checkcap,
     checkdirs,
     batch,
+    carry,
     chatdigest,   # the chat's status pace: a routine hand-off waits for its next status post
     codearm,
     conflictfix,
@@ -2765,6 +2766,8 @@ def _settle(p: Project, tid: int, b: dict, m: dict, now: float) -> None:
         r = next(r for r in current if r["status"] == "check_failed")
         trim = conflictfix.cap_failure(str(_detail(r).get("tail") or ""), _delivery(p).get("push_cap_tests"))
     args = (p, task, b, m, prev, summary, target)
+    if carry.state(db, tid) and (kind := carry.outcome(states, trim)):
+        return carry.on_settle(p, task, kind, b, m, now, _after_push_set(p, None))
     if trim:
         _settle_trimmed(*args, r, trim, trims)
     elif "check_failed" in states:
@@ -2822,12 +2825,9 @@ def _settle_check_failed(p: Project, task: dict, b: dict, m: dict, prev: dict, s
     _reply(db, task, "failed", text)
 
 
-def _settle_conflict(p: Project, task: dict, b: dict, m: dict, prev: dict, summary: str, target: str,
-                    current: list[dict]) -> None:
-    """_settle for a review that conflicted with the target: a conflict fix runs, or from its second
-    conflicting batch one rebase task, or past its attempts it fails."""
-    db, tid = p.db, task["id"]
-    r = next(r for r in current if r["status"] == "conflict")
+def _conflict_woke(m: dict, target: str, r: dict, current: list[dict]) -> str:
+    """What a push conflict tells the task it wakes: the branch, the target, the files, the failing
+    checks and what already landed. Shared by `_settle_conflict` and `carry.on_settle`."""
     d = _detail(r)
     files = ", ".join(str(f) for f in (d.get("files") or [])[:20]) or "?"
     woke = (f"push conflict: {r['branch'] or '?'} at {r['head']} conflicts with {target} at "
@@ -2841,10 +2841,34 @@ def _settle_conflict(p: Project, task: dict, b: dict, m: dict, prev: dict, summa
     if done:
         woke += "; already landed: " + ", ".join(f"{x['branch'] or '?'} at {_short(x['head'])} ({x['status']} as "
                                                  f"{_short(x['pushed_sha'])})" for x in done)
+    return woke
+
+
+def _conflict_sent(db, tid: int) -> int:
+    """The approvals of task `tid` the queue sent back as conflicts (its conflict fixes cost no review attempt)."""
+    return db.one("SELECT COUNT(DISTINCT created) n FROM push_queue WHERE task=? AND status='conflict'", (tid,))["n"]
+
+
+def _conflict_mark(r: dict, m: dict, target: str, sent: int) -> dict:
+    """The conflictfix mark of conflicting row `r` (conflictfix.KEY in the woken task's result)."""
+    d = _detail(r)
+    raw = [str(f) for f in (d.get("files") or [])]
+    textual = bool(raw) and not raw[0].startswith("(the rebase") and not d.get("cmd")
+    return conflictfix.mark(str(r["head"] or ""), r["branch"] or "", target,
+                            str(d.get("onto") or m.get("tip") or ""), raw, textual, sent)
+
+
+def _settle_conflict(p: Project, task: dict, b: dict, m: dict, prev: dict, summary: str, target: str,
+                    current: list[dict]) -> None:
+    """_settle for a review that conflicted with the target: a conflict fix runs, or from its second
+    conflicting batch one rebase task, or past its attempts it fails."""
+    db, tid = p.db, task["id"]
+    r = next(r for r in current if r["status"] == "conflict")
+    d = _detail(r)
+    woke = _conflict_woke(m, target, r, current)
     # Conflict fixes cost no review attempt (conflictfix.py): their own count is the approvals the
     # queue sent back, this one included.
-    sent = db.one("SELECT COUNT(DISTINCT created) n FROM push_queue WHERE task=? AND status='conflict'",
-                  (tid,))["n"]
+    sent = _conflict_sent(db, tid)
     # From its second conflicting batch on, it leaves batching for one rebase task on a branch of its
     # own (auto_rebase), rather than another conflict fix tried again in a later batch.
     held = open_rebase(db, task, str(r["head"] or "")) if sent >= REBASE_AFTER else None
@@ -2866,10 +2890,7 @@ def _settle_conflict(p: Project, task: dict, b: dict, m: dict, prev: dict, summa
         if not rebase:
             _reply(db, task, "failed", text)
     else:
-        raw = [str(f) for f in (d.get("files") or [])]
-        textual = bool(raw) and not raw[0].startswith("(the rebase") and not d.get("cmd")
-        cf = conflictfix.mark(str(r["head"] or ""), r["branch"] or "", target,
-                              str(d.get("onto") or m.get("tip") or ""), raw, textual, sent)
+        cf = _conflict_mark(r, m, target, sent)
         _requeue(db, task, woke, {conflictfix.KEY: cf})
         _event(db, task, "task_requeued", f"#{tid} {task['title']}: {woke}; its review runs again to settle it"
                + ("" if cf.get("escalate") else " as a light conflict fix"), queued=False)
@@ -2910,7 +2931,7 @@ def _settle_landed(p: Project, task: dict, b: dict, m: dict, prev: dict, summary
            queued=False)
     landing = landing_facts(last.get("pushed_sha"), last.get("version"), last.get("target") or target)
     _reply(db, task, "done", _done_text(prev, result["summary"], tail), facts=landing)
-    covered = _covers(db, task, rows)
+    covered = _covers(db, task, rows) - {tid}   # a carry task is its own review: nothing else to close
     settle_reviewed(db, now, only=covered)
     post_held(db, covered, f"shipped by review #{tid}: {tail}", facts=landing)
 
@@ -3418,6 +3439,7 @@ def _after(p: Project, b: dict, m: dict, status: str, alert: Callable, now: floa
                                "after_finalized IS NULL", (status, now, b["id"])).rowcount:
             return
         what = f"{_short(m.get('pushed_sha'))}" + (f" as {m['version']}" if m.get("version") else "")
+        tail = ""
         since = float((m.get("after_deferred") or {}).get("deferred_since") or 0)
         if status == "ok":
             took = (float(ap.get("ended") or 0) - float(ap.get("started") or 0)) if ap.get("ended") else None
@@ -3439,6 +3461,7 @@ def _after(p: Project, b: dict, m: dict, status: str, alert: Callable, now: floa
                 how += f" in `{ap['cmd']}`"
             text = f"after_push of {what} (batch {b['id']}) {how}. The reviews stay done.\n{tail}"
             _event(db, None, "after_push_failed", text, queued=True, severity="high")
+        carry.on_after(p, b, m, status, f"after_push of {what} (batch {b['id']}): {status}", tail, now)
     if status == "failed" and _deploy_alerted(p, m, ap):
         return   # its deploy verdict already sent the one alert, naming each project behind
     if status in ("failed", "timeout", "killed"):

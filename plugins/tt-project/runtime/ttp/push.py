@@ -3541,6 +3541,8 @@ def _reviewed_tasks(p: Project, task: str | None) -> list[dict]:
     """The code tasks review `task` covers (its dependencies, auto_review: label and the `Review #<id>`
     its title starts with), or []."""
     t = _task_row(p, task)
+    if t and t.get("kind") != "review" and carry.state(p.db, t["id"]):
+        return [t]   # a carry task is its own review
     if not t or t.get("kind") != "review":
         return []
     ids = [i for i in dependency_ids(t) if i is not None]
@@ -6701,7 +6703,7 @@ def push_status_lines(p: Project) -> list[str]:
 # never inside a function: a push that outlives an upgrade of runtime/ must not import a newer batch
 # that calls into this older push (after_push would fail on a missing attribute). cli and pushpass
 # (for `ttp push --own` reusing a `ttp checks` pass) likewise: pushpass imports push at import time.
-from . import batch, cli, jobstop, pushpass, pushq, urgent, verdictcarry  # noqa: E402
+from . import batch, carry, cli, jobstop, pushpass, pushq, urgent, verdictcarry  # noqa: E402
 from . import detach as detachjob  # noqa: E402  (this module has its own `detach` function)
 
 # --- project-local imports below ---
