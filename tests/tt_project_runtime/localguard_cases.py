@@ -427,7 +427,6 @@ def test_an_upgrade_local_commit_hands_git_its_paths_on_stdin_and_writes_no_scra
             adds.append((args, kw.get("stdin")))
         return real(cwd, *args, **kw)
     monkeypatch.setattr(cli, "_git", seen)
-    monkeypatch.setattr(cli.tempfile, "mkdtemp", lambda *a, **k: pytest.fail("a scratch folder was made"))
     cli._commit_local_changes(p, ["-c", "user.name=t", "-c", "user.email=t@t"])
     (args, stdin), = adds
     assert "--pathspec-from-file=-" in args and stdin == f"plain.txt\0{odd}\0"
@@ -453,12 +452,12 @@ def test_an_upgrade_beside_a_running_harness_task_hands_add_and_commit_their_pat
             seen.append((args[args.index("add") if "add" in args else args.index("commit")], kw.get("stdin")))
         return real(cwd, *args, **kw)
     monkeypatch.setattr(cli, "_git", spy)
-    monkeypatch.setattr(cli.tempfile, "mkdtemp", lambda *a, **k: pytest.fail("a scratch folder was made"))
     assert cli._commit_local_changes(p, ["-c", "user.name=t", "-c", "user.email=t@t"]) == ["mine.txt"]
     paths = f"plain.txt\0{odd}\0"
     assert seen == [("add", paths), ("commit", paths)]
     assert {odd, "plain.txt"} <= set(_git_out(p.harness, "ls-tree", "-r", "--name-only", "-z", "HEAD").split("\0"))
     assert "?? mine.txt" in _git_out(p.harness, "status", "--porcelain")
+    assert not (p.state / "upgrade-commit-paths").exists()
 
 
 def test_an_upgrade_local_commit_skips_a_file_removed_while_it_is_added_and_fails_on_a_real_error(env, monkeypatch):

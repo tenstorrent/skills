@@ -441,14 +441,13 @@ def _away_from_tmp(path: Path) -> bool:
 
 
 def _away_base(uid: int | None = None) -> str | None:
-    """A writable folder for `away_from_tmp` tests: the runtime folder, else the user cache folder (the checkout
-    holds a pytest file, so it cannot serve); None when none of them is away from the temp roots."""
-    cache = os.environ.get("XDG_CACHE_HOME") or str(Path.home() / ".cache")
-    try:
-        os.makedirs(cache, exist_ok=True)
-    except OSError:
-        pass
+    """A writable folder for `away_from_tmp` tests: the runtime folder, else the account's own cache folder
+    (REAL_HOME, not the per-test HOME, which is under pytest's temp root; the checkout holds a pytest file, so
+    it cannot serve), made only when it is reached; None when none of them is away from the temp roots."""
+    cache = os.path.join(REAL_HOME, ".cache")
     for root in (os.environ.get("XDG_RUNTIME_DIR", ""), f"/run/user/{os.getuid() if uid is None else uid}", cache):
+        if root == cache:
+            os.makedirs(root, exist_ok=True)
         if root and os.access(root, os.W_OK | os.X_OK) and _away_from_tmp(Path(root, "x")):
             return root
     return None
@@ -458,7 +457,7 @@ def _away_base(uid: int | None = None) -> str | None:
 def tmp_path(request, tmp_path):
     """pytest's tmp_path; for a test marked away_from_tmp, a fresh folder that is not under /tmp or
     /var/tmp or /dev/shm and has no pytest file above it (_away_from_tmp), made in the runtime folder (else
-    the user cache folder) when pytest's own temp root (a `ttp checks` TMPDIR, say) is under one of them: the
+    the account's cache folder) when pytest's own temp root (a `ttp checks` TMPDIR, say) is under one of them: the
     checks that treat /tmp as inside a worktree and those that look for a project root above one then see
     what they see anywhere."""
     if request.node.get_closest_marker("away_from_tmp") is None or _away_from_tmp(tmp_path):
@@ -469,7 +468,7 @@ def tmp_path(request, tmp_path):
     root = _away_base()
     if root is None:
         pytest.fail("away_from_tmp needs a writable folder outside the guard's temp roots with no pytest file "
-                    f"above it ($XDG_RUNTIME_DIR, /run/user/{os.getuid()} or the user cache folder)")
+                    f"above it ($XDG_RUNTIME_DIR, /run/user/{os.getuid()} or the account's cache folder)")
     own = tempfile.mkdtemp(prefix="ttp-away-", dir=root)
     try:
         yield Path(os.path.realpath(own))

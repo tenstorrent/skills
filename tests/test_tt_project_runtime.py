@@ -46234,19 +46234,30 @@ def test_an_away_from_tmp_test_gets_a_folder_outside_tmp_with_no_pytest_file_abo
 
 
 @pytest.mark.away_from_tmp
-def test_away_from_tmp_falls_back_to_the_user_cache_folder_without_a_runtime_folder(tmp_path, monkeypatch):
+def test_away_from_tmp_falls_back_to_the_account_cache_folder_when_the_test_home_is_under_tmp(tmp_path, monkeypatch):
     import conftest
-    cache = tmp_path / "cache"
-    cache.mkdir()
+    from ttp import glmguard
+    real_home = tmp_path / "account"
+    real_home.mkdir()
+    temp_home = Path(glmguard._TMP[0]) / f"away-home-{os.getpid()}"
+    temp_home.mkdir()
+    monkeypatch.setattr(conftest, "REAL_HOME", str(real_home))
+    monkeypatch.setattr(conftest.os, "getuid", lambda: 2 ** 31)     # no /run/user/<uid>
     monkeypatch.setenv("XDG_RUNTIME_DIR", str(tmp_path / "missing"))
-    monkeypatch.setenv("XDG_CACHE_HOME", str(cache))
-    assert conftest._away_base(uid=2 ** 31) == str(cache)
-    assert conftest._away_from_tmp(cache / "x")
-    (tmp_path / "file").write_text("")
-    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "file"))
-    assert conftest._away_base(uid=2 ** 31) is None
-    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "new" / "cache"))
-    assert conftest._away_base(uid=2 ** 31) == str(tmp_path / "new" / "cache"), "a missing cache folder is made"
+    monkeypatch.setenv("HOME", str(temp_home))                      # what the per-test temp HOME does
+    monkeypatch.setenv("XDG_CACHE_HOME", str(temp_home / ".cache"))
+    request = types.SimpleNamespace(node=types.SimpleNamespace(get_closest_marker=lambda name: object()))
+    under_tmp = temp_home / "pytest-of-x"
+    under_tmp.mkdir()
+    gen = conftest.tmp_path._get_wrapped_function()(request, under_tmp)
+    try:
+        got = next(gen)
+        assert conftest._away_from_tmp(got) and got.is_dir()
+        assert got.parent == real_home / ".cache"
+    finally:
+        gen.close()
+        shutil.rmtree(temp_home, ignore_errors=True)
+    assert not got.exists()
 
 
 def test_short_tmp_root_is_short_in_production(env, monkeypatch):
