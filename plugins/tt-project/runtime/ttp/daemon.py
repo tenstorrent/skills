@@ -13905,6 +13905,8 @@ class Daemon:
         freeing: dict[str, int] = {}
         held = None
         said = self.__dict__.setdefault("_preempt_said", {})   # task id -> provider its "slot taken" line named
+        for k in set(said) - {t["id"] for t in ready}:
+            said.pop(k)   # started or gone: a later hold is a new state
         for t in ready:
             if fate.get(t["id"]) != "full" or not urgent.extra_ok(t, now):
                 said.pop(t["id"], None)   # no longer held by full slots: a later hold is a new state
@@ -13976,7 +13978,7 @@ class Daemon:
         unmet = db.unmet_dependencies(rest) if rest else {}
         carrying = {c["task"] for c in db.q("SELECT task FROM carry_state")} if unmet else set()
         classes: dict = {}
-        down = list(machine_ledger.outages(ctx["now"])) if rest else []
+        down = machine_ledger.outages(ctx["now"]) if rest else {}
         for r in rest:
             why = _queued_held_by(r, ctx["now"], unmet.get(r["id"]))
             held["carry" if why == "depends_on" and r["id"] in carrying else why] += 1

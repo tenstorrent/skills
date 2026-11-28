@@ -327,11 +327,12 @@ def test_block_ledger_worker_role_and_pyaudit_refusals_without_a_class_are_redir
 
 def test_block_ledger_probe_class_names_what_a_held_wait_is_on(env):
     from ttp import blockledger as bl
-    cls = lambda probe, down=(): bl.probe_class(probe, {}, down)
+    cls = lambda probe, down=None: bl.probe_class(probe, {}, down)
     assert cls("test -e /h/user-hold-x || exit 1") == "user_hold"
     assert cls("ttp detach --check /r/runs/9/suite.rc") == "own_job"
     assert cls("landed:#12") == cls("ttp landed --task 12") == "landing"
-    assert cls("ssh box7 true", ["box7"]) == "outage" and cls("ssh box70 true", ["box7"]) == "other"
+    assert cls("ssh box7 true", {"box7": {}}) == "outage" and cls("ssh box70 true", {"box7": {}}) == "other"
+    assert cls("test -e /tmp/box7-done", {"box7": {}}) == "other", "a file name is no machine"
     assert cls("test -e /tmp/some-marker") == "other"
 
 

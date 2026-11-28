@@ -85,17 +85,18 @@ def safety_of(reason: str, kind: str = "") -> str:
 STUCK = "stuck landing"   # a wait on a done change nothing open can land: blocked time, not an ordinary dependency
 
 
-def probe_class(probe: str, cfg: dict | None = None, down=()) -> str:
+def probe_class(probe: str, cfg: dict | None = None, down: dict | None = None) -> str:
     """The class of a held start_when or retry_when probe, for the scheduler log's split: user_hold (a user
     pause), own_job (the task's own detached job), landing (another task's landing), outage (it names a machine
-    in `down`, the aliases with a known outage), else other."""
+    in `down`, machine_ledger.outages: only an ssh target or lock resource counts), else other."""
     if userpause.is_probe(probe, cfg):
         return "user_hold"
     if queuewait.own_job(probe):
         return "own_job"
     if LANDED.search(probe):
         return "landing"
-    return "outage" if any(re.search(rf"\b{re.escape(a)}\b", probe) for a in down) else "other"
+    from . import progress
+    return "outage" if down and progress._outage_hosts(probe, down) else "other"
 
 
 def _wait_rule(data: dict, reason: str, db: DB | None = None, task: int | None = None) -> tuple[str, str] | None:
