@@ -185,9 +185,6 @@ def test_a_wait_on_a_done_unlanded_target_in_any_landing_form_is_a_dead_wait_nam
     the event names the target, the waiting tasks and the target's last review verdict. A longer probe is not."""
     import json
     from ttp import daemon as dm, deadwait
-    assert [deadwait.plain_ref(s) for s in ("landed:#7", "ttp landed --task 7", "ttp landed #7 || exit 1",
-                                            "ttp landed --task 7 && test -e x", "ttp landed --task", "", None)] \
-        == [7, 7, 7, None, None, None, None]
     p = make(env)
     p.set_config("delivery.push_branch", "origin/work")   # landed:#<id> is checkable here
     x, w = _dw_producer(p, "feature")

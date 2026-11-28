@@ -54,6 +54,7 @@ from . import (   # one name per line: two changes adding names merge without a 
 from . import rolerestore
 from . import stalegates
 from . import blockledger
+from . import eta
 from . import codearm
 from . import glmwork
 from . import coordroute
@@ -16518,17 +16519,16 @@ class Daemon:
         return landing and pushed is not None and pushed > last and now - last >= LANDED_REPROBE_S
 
     def _dead_landed_waits(self, deferred: list[dict], now: float) -> None:
-        """deadwait.check over the queued tasks whose start_when or retry_when is exactly `landed:#<id>` or
-        `ttp landed --task <id>`: one event per producer nothing can land. Saved task rows only, never the in-memory probe verdicts
+        """deadwait.check over the queued tasks whose start_when or retry_when is only landing waits
+        (eta.landing_waits): one event per producer nothing can land. Saved task rows only, never the in-memory probe verdicts
         (_start_rc), which are empty after a restart: a wait in a longer probe is not judged."""
         held: dict[int, list[dict]] = {}
         # Where no landing can be checked the wait is on the producer being done (landed.DONE_ENV):
         # nothing is held on a landing, and an earlier event clears.
         waiting = self.p.db.q("SELECT * FROM tasks WHERE status='queued' AND result LIKE '%retry_when%'")
         for t in {t["id"]: t for t in [*deferred, *waiting]}.values() if landed.can_check(self.p) else []:
-            for what, probe in self.task_probes(t):   # a start_when or a waiting hand-off's retry_when
-                if what != "waits_on when" and (x := deadwait.plain_ref(probe)):
-                    held.setdefault(x, []).append(t)
+            for x in eta.landing_waits(t):   # a start_when or a waiting hand-off's retry_when
+                held.setdefault(x, []).append(t)
         try:
             deadwait.check(self.p.db, self.cfg, held, now)
         except Exception:

@@ -6,17 +6,16 @@
   branches that are not one stack, a task cap): one `review_nofix` event per review, naming the
   review, its branch and what waits on it (Daemon._fix_failed_review says why). One with no fix
   follow-ups says the same in its own task_failed event, which already wakes the coordinator.
-- A start_when or retry_when that is exactly `landed:#X` or `ttp landed --task X` whose producer X is done,
+- A start_when or retry_when made only of landing waits on X (eta.landing_waits) whose producer X is done,
   its work not landed, and nothing open can land it: no open review, fix, rebase or continue hop carrying X's change (landed.carriers), no open task
   on X's branch, and no push queue row. One `landed_wait_dead` event per X names the held tasks;
   once a path appears, X lands or no queued task waits on it, it is cleared (handled), and a later
   dead end raises it again. The event names the producer's last review and its verdict. Saved database
-  facts only: a daemon restart (empty probe verdicts) or a broken probe exit neither clears nor re-raises it. A `landed:#X` inside a longer probe is not judged.
+  facts only: a daemon restart (empty probe verdicts) or a broken probe exit neither clears nor re-raises it. A landing wait inside a longer probe is not judged.
 """
 from __future__ import annotations
 
 import json
-import re
 import time
 
 from . import landed
@@ -34,15 +33,7 @@ STAMP_SQL = ("SELECT (SELECT count(*) || ':' || max(id) || ':' || max(updated) F
              "(SELECT count(*) || ':' || max(rowid) FROM task_superseded), "
              "(SELECT count(*) || ':' || total(task) || ':' || max(ts) FROM task_abandoned), "
              "(SELECT count(*) || ':' || max(rowid) FROM task_dropped)")
-# A probe that is only one landing wait (`landed:#X`, `ttp landed --task X`, an optional `|| exit 1` after it).
-_PLAIN = re.compile(r"\s*(?:landed:\s*#?|ttp\s+landed\s+(?:--task\s+|#))(\d+)\s*(?:\|\|\s*exit\s+1\s*)?")
 _last: dict[str, tuple] = {}   # db path -> (inputs, saved state after, when) of its last full check
-
-
-def plain_ref(probe: str | None) -> int | None:
-    """The task id a probe that is only a landing wait waits on, else None (a longer probe is not judged)."""
-    m = _PLAIN.fullmatch(probe or "")
-    return int(m.group(1)) if m else None
 
 
 def waiters(db, ids: set[int], skip: set[int] = frozenset()) -> list[dict]:
@@ -150,7 +141,8 @@ def stuck_by(db, x: int, rows: Rows | None = None) -> dict | None:
 
 
 def check(db, cfg: dict, held_by: dict[int, list[dict]], now: float) -> None:
-    """`held_by`: producer id -> the queued tasks whose start_when is `landed:#<it>`. Raises
+    """`held_by`: producer id -> the queued tasks whose start_when or retry_when is only landing waits
+    on it (eta.landing_waits). Raises
     one DEAD_EVENT per producer dead for `waiting.landed_wait_dead_s`, and clears it (handled, state
     dropped) once a path appears, the producer lands or nothing waits on it any more."""
     grace = float((cfg.get("waiting") or {}).get("landed_wait_dead_s", GRACE_S) or 0)
