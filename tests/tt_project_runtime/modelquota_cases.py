@@ -68,6 +68,14 @@ def test_model_quota_bucket_is_set_by_a_429_or_an_empty_header_and_clears_at_its
     modelquota.note("rq-model", {"x-ratelimit-remaining-tokens": "9", "x-ratelimit-reset-tokens": "5s",
                                  "x-ratelimit-remaining-requests": "0", "x-ratelimit-reset-requests": "2m"}, now=1e9)
     assert modelquota.until("rq-model", now=1e9) == 1e9 + 120
+    # The endpoint's own quota headers count too (no reset given: the end of this UTC hour), and a shorter reset
+    # never shortens a later mark (a daily 429 outlasts a header's hourly reset).
+    modelquota.note("tt-model", {"x-quota-remaining-llm_tokens": "0"}, now=7200.5)
+    assert modelquota.until("tt-model", now=7200.5) == 10800
+    modelquota.note("tt-model", {"x-ratelimit-remaining-requests": "0", "x-ratelimit-reset-requests": "5s"}, now=7200.5)
+    assert modelquota.until("tt-model", now=7200.5) == 10800
+    modelquota.note("neg-model", {"x-quota-remaining-llm_requests": "-3"}, now=7200.5)
+    assert modelquota.until("neg-model", now=7200.5) == 10800
 
 
 def test_model_quota_flag_off_by_default_and_routing_unchanged_while_off(env, monkeypatch):

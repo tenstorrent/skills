@@ -1,7 +1,7 @@
 """Per-model quota buckets on the chat endpoint (release flag `glm_quota_alt`, rollout.py; off by default).
 
-A quota 429 (chatbridge.quota_until) on a model, or an answer whose per-model rate-limit header says no tokens
-remain, marks that model's bucket empty until its reset, in one account-wide file (~/.tt-project/quota/_models.json,
+A quota 429 (chatbridge.quota_until) on a model, or an answer whose per-model rate-limit or quota header says
+none remain, marks that model's bucket empty until its reset, in one account-wide file (~/.tt-project/quota/_models.json,
 under a lock) every project on the host reads; an entry past its reset is ignored. The 429 body names a resource
 and a window, not a model: the bucket is the model the request asked for.
 
@@ -47,7 +47,8 @@ def _reset(headers, now: float, kind: str = "tokens") -> float:
 
 
 def mark(model: str, got: dict | None = None, now: float | None = None) -> None:
-    """`model`'s bucket is empty until got['reset'] (else the end of this UTC hour), with the 429's used/limit."""
+    """`model`'s bucket is empty until got['reset'] (else the end of this UTC hour; a later mark already there
+    stays), with the 429's used/limit."""
     if not model:
         return
     now = time.time() if now is None else now
@@ -55,18 +56,21 @@ def mark(model: str, got: dict | None = None, now: float | None = None) -> None:
     reset = float(got.get("reset") or 0)
     with glmquota._locked(FILE) as path:
         st = glmquota._read(path)
-        st[model] = {**(st.get(model) or {}), "until": reset if reset > now else _hour_end(now), "at": now,
+        m = st.get(model) or {}
+        st[model] = {**m, "until": max(reset if reset > now else _hour_end(now), float(m.get("until") or 0)), "at": now,
                      **{k: int(got[k]) for k in ("used", "limit") if isinstance(got.get(k), (int, float))}}
         glmquota._write(path, st)
 
 
 def note(model: str, headers, now: float | None = None) -> None:
-    """An answer's per-model rate-limit headers: none left marks `model`'s bucket empty until their reset."""
+    """An answer's per-model rate-limit headers (x-ratelimit-remaining-* or the endpoint's x-quota-remaining-llm_*):
+    none left marks `model`'s bucket empty until their reset."""
     if headers is None or not model:
         return
-    h = {str(k).lower(): str(v) for k, v in headers.items()}
+    h = {str(k).lower(): str(v).strip() for k, v in headers.items()}
     resets = [_reset(h, time.time() if now is None else now, kind) for kind in ("tokens", "requests")
-              if h.get(f"x-ratelimit-remaining-{kind}", "").strip() == "0"]
+              if any(re.fullmatch(r"-?\d+", v) and int(v) <= 0 for v in
+                     (h.get(f"x-ratelimit-remaining-{kind}", ""), h.get(f"x-quota-remaining-llm_{kind}", "")))]
     if resets:
         mark(model, {"reset": max(resets)}, now)
 
