@@ -1295,6 +1295,41 @@ def test_ci_wait_on_the_workstation_route_reads_the_pr_not_the_run_list(env, mon
     assert ciwait.probe(repo="o/r", branch="b")[0] == 75, "gh cannot answer"
 
 
+def test_ci_wait_on_the_workstation_route_waits_for_a_dispatched_run_and_reads_one_run_through_the_route(
+        env, monkeypatch):
+    """A draft PR's checks leave out a `workflow run` dispatch on its head: `--branch` reads the head's runs
+    with a `gh api` GET too and says not yet until they end; `--run <id>` asks `gh run view`, which the
+    workstation's allowlist takes, and answers done with the run's conclusion."""
+    from ttp import ciwait, ghqueue, ghroute
+    monkeypatch.setattr(ghroute, "route", lambda cfg=None, cwd=None: ghroute.WORKSTATION)
+    head = "a" * 40
+    skipped = {"name": "gate", "status": "COMPLETED", "conclusion": "SKIPPED"}
+    run = {"databaseId": 7, "name": "gate", "workflowName": "gate", "status": "in_progress", "conclusion": "",
+           "headSha": head, "headBranch": "b", "url": "u"}
+    calls = []
+
+    def gh(args):
+        calls.append(args)
+        assert ghqueue.allowed(args) == "", args
+        if args[:2] == ["pr", "view"]:
+            return {"headRefOid": head, "statusCheckRollup": [skipped]}
+        if args[0] == "api":
+            return {"workflow_runs": [{"name": run["name"], "status": run["status"]}]}
+        return dict(run) if args[:2] == ["run", "view"] else None
+    monkeypatch.setattr(ciwait, "_gh", gh)
+    rc, lines = ciwait.probe(repo="o/r", branch="b")
+    assert rc == 75 and "1 workflow runs" in lines[0] and "gate" in lines[0], (rc, lines)
+    assert calls[-1] == ["api", f"repos/o/r/actions/runs?head_sha={head}&per_page=100"], calls
+    run.update(status="completed", conclusion="failure")
+    rc, lines = ciwait.probe(repo="o/r", branch="b")
+    assert rc == 0 and lines[0].startswith("done:"), (rc, lines)
+    rc, lines = ciwait.probe(repo="o/r", run="7")
+    assert rc == 0 and lines == ["done: gate failure u"], (rc, lines)
+    assert calls[-1][:3] == ["run", "view", "7"], calls
+    run.update(status="queued", conclusion="")
+    assert ciwait.probe(repo="o/r", run="7", hang=False)[0] == 1, "the run not ended yet"
+
+
 def test_gh_workstation_publishes_one_own_branch_from_a_bundle_and_retires_it_with_its_tip_saved_first(env, monkeypatch):
     """`ttp push --publish <branch>` queues a git bundle of the branch's new commits over origin's refs;
     the workstation repeats allowed(), fetches the bundle's basis, unbundles and pushes `<sha>:<branch>`
@@ -1978,7 +2013,7 @@ def test_ci_wait_on_a_sha_finds_its_run_past_the_newest_page_and_never_calls_a_f
     from ttp import ciwait
     sha = "c" * 40
     mine = {"databaseId": 7, "status": "completed", "conclusion": "success", "headSha": sha,
-            "workflowName": "CI", "url": "u/7", "createdAt": "2026-01-01T00:00:00Z"}
+            "workflowName": "CI", "url": "u/7"}
     other = [{"databaseId": 100 + i, "status": "completed", "conclusion": "success", "headSha": f"{i:040x}",
               "workflowName": "CI", "url": f"u/{100 + i}", "createdAt": "2026-01-02T00:00:00Z"} for i in range(250)]
     runs, filtered, calls = [*other[:49], mine, *other[49:]], [True], []

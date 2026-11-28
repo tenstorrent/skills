@@ -223,6 +223,7 @@ No `result.json`, no credit.
 <!-- ttp:if wait -->
   GitHub CI: `ttp ci --repo <owner/repo> --branch <branch>` (or `--run <id>`) also exits 0 when a
   job hangs; on waking run it again and report any `hung:` line (to keep waiting, add `--no-hang`).
+  After a `workflow run` dispatch, `--branch` waits for the dispatched runs on the head too.
   Several steps (build, then device run): chain them in one detached driver script that writes a
   final marker, and point `retry_when` at it. The driver runs with `set -eo pipefail`, never pipes a
   step into tail/head, logs each step's exit code and writes the first non-zero one to the marker
