@@ -8987,6 +8987,37 @@ def cmd_said(a) -> None:
     print(f"{len(found)} message{'' if len(found) == 1 else 's'} found (newest first; the newest word on a topic wins)")
 
 
+def cmd_block_log(a) -> None:
+    """`ttp block-log <rule> [--task N] [--seconds S] [--why TEXT]`: append time lost to a rule outside a
+    task's blocked state to the project's blocked-time ledger (blockledger.py, `state/blocklog.jsonl`)."""
+    from . import blockledger
+    p = here()
+    if p is None:
+        die("ttp block-log: no project here (run it in a project or its run)")
+    blockledger.append(p.db, a.rule, a.task, a.seconds, a.why or "", "cli")
+    print(f"ttp block-log: recorded {a.rule!r} ({a.seconds:g} s)")
+
+
+def cmd_blocked(a) -> None:
+    """`ttp blocked [--days N] [--json]`: the top 10 rules by blocked minutes over the last N days (default 1)
+    with their safety class and tasks, and ordered work's blocked share against the 5% target."""
+    from . import blockledger as bl
+    p = here()
+    if p is None:
+        die("ttp blocked: no project here (run it in a project or its run)")
+    now = time.time()
+    rs = bl.rows(p.db, p.config(), now - a.days * DAY_S, now)
+    out = {"share": bl.window_share(p.db, p.config(), now - a.days * DAY_S, now), "target": bl.TARGET, "top": bl.top(rs)}
+    if a.json:
+        print(json.dumps(out))
+        return
+    s = out["share"]
+    print(f"blocked {s['share'] * 100:.1f}% of ordered work over {a.days:g} d (target {bl.TARGET * 100:g}%): "
+          f"{s['blocked_min']:g} of {s['ordered_min']:g} min")
+    for e in out["top"]:
+        print(f"  {e['minutes']:g} min  {e['rule']}  [{e['safety']}]  x{e['count']}  tasks {e['tasks'][:6] or '-'}")
+
+
 def cmd_checks_shard(a) -> None:
     """Run one shard of a project's own test pool as a check of this host (checkcap.shard): a pool behind
     checks.wrap_cmd, and its local fallback, start each shard as `ttp checks-shard -- <cmd>` on the host
@@ -16778,7 +16809,7 @@ COMMAND_GROUPS = (
                   "quarantine", "machines", "runs", "logs", "doctor")),
     ("inside a run", ("note", "advise", "steer", "urgent-reply", "notify", "progress", "checks", "checks-shard", "checks-yield", "lock",
                       "occupancy", "host-run", "detach", "devq", "push", "install-check", "land", "express", "clip", "sandbox", "pool-wait", "pool-admit",
-                      "pool-shard", "skill", "killscan", "svcscan", "leftover-procs", "said", "hostcheck", "paths")),
+                      "pool-shard", "skill", "killscan", "svcscan", "leftover-procs", "said", "block-log", "blocked", "hostcheck", "paths")),
     ("probes (retry_when, start_when)", ("landed", "alive", "eta", "ci", "ack-wait", "ssh-preflight", "broker-released",
                                          "deployed", "goal", "hours")),
     ("admin", ("setup", "upgrade", "start", "stop", "restart", "remove", "adopt", "prune", "secret", "consent",
@@ -17556,6 +17587,17 @@ def ttp_parser():
     s.add_argument("--notes", action="store_true",
                    help="also search the notes other projects sent here, each labelled as a note (data, not the user's words)")
     s.set_defaults(fn=cmd_said)
+    s = sub.add_parser("block-log", help="append time lost to a rule to the blocked-time ledger (`ttp blocked` reads it)")
+    s.add_argument("rule", help="the rule or gate that held the work (a rule id or a few words)")
+    s.add_argument("--task", type=int, help="the task it held")
+    s.add_argument("--seconds", type=float, default=0, help="how long it held the work")
+    s.add_argument("--why", help="what it held")
+    s.set_defaults(fn=cmd_block_log)
+    s = sub.add_parser("blocked", help="the blocked-time ledger: top rules by minutes blocked, their safety class and "
+                                       "ordered work's blocked share against the 5%% target (read-only)")
+    s.add_argument("--days", type=float, default=1, help="look back this many days (default 1)")
+    s.add_argument("--json", action="store_true", help="print the ledger as JSON")
+    s.set_defaults(fn=cmd_blocked)
     s = sub.add_parser("chat-load", help="this host's finished chat-provider calls over the trailing minutes: calls, "
                                          "refusals (429, 503, 529), errors and refusal rate, in total, by priority "
                                          "class and by project (read-only)")
