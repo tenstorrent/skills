@@ -39474,6 +39474,17 @@ def test_setting_hold_reads_a_plain_or_the_before_ttp_push(spec, lands_it):
     assert bool(lands({"kind": "code", "spec": spec})) is lands_it
 
 
+@pytest.mark.parametrize("spec,lands_it", [
+    ("Do not run tests. Land it with `ttp push`.", True),        # the negation ends with its sentence
+    ("Never edit the docs! Push it with `ttp push`.", True),
+    ("Run checks.py then land v0.2.1 with `ttp push`.", True),    # dots inside a word are no sentence end
+    ("Do not land it with `ttp push`.", False),
+])
+def test_setting_hold_negation_stops_at_a_sentence_end(spec, lands_it):
+    from ttp.settinghold import lands
+    assert bool(lands({"kind": "code", "spec": spec})) is lands_it
+
+
 @pytest.mark.parametrize("title,spec,held", [
     ("Fix ttp push retry on conflict", "", False),                       # a mention in a title
     ("Docs", "The README describes how `ttp push` works", False),        # prose
