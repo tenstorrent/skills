@@ -233,5 +233,21 @@ def test_rulematch_a_shared_alias_or_setting_name_still_flags_and_shows_it(env):
 
 def test_rulematch_numeric_tokens_are_units_dates_and_ids_only():
     from ttp import rulematch as rm
-    assert all(rm._numeric(t) for t in ("2026", "24h", "100m", "16gb", "msg-4555", "nov-28", "v2", "09:18"))
-    assert not any(rm._numeric(t) for t in ("rig04", "worker.slots", "gbh01", "cache", "issue", "note"))
+    assert all(rm._numeric(t) for t in ("2026", "24h", "100m", "16gb", "msg-12", "nov-28", "#12", "$8000", "09:18"))
+    assert not any(rm._numeric(t) for t in ("rig04", "worker.slots", "gbh01", "cache", "issue", "note", "t3k", "h100", "v100", "t3k-01"))
+
+
+def test_rulematch_a_machine_alias_with_a_letter_after_its_digit_still_flags(env):
+    from ttp import rulematch as rm
+    p = make(env)
+    p.add_memory("t3k reboots: use the remote reset first.", kind="decision")
+    got = rm.older(p, p.db, "t3k reboots now need a full power cycle; the remote reset leaves stale links and hangs every chip")
+    assert [g["value"] for g in got if g["where"] == "memory"], got
+
+
+def test_rulematch_a_shared_short_setting_name_alone_flags(env):
+    from ttp import rulematch as rm
+    p = make(env)
+    p.add_memory("Keep ci.tag at 3 while soak tests run.", kind="decision")
+    got = rm.older(p, p.db, "lower ci.tag for nightly builds")
+    assert [g["value"] for g in got if g["where"] == "memory"] == ["ci.tag"], got

@@ -44,14 +44,15 @@ def durations(text: str) -> set[int]:
     return {round(float(n or 1) * _UNITS[(u or w)[0].lower()]) for n, u, _, w in _DURATION.findall(text or "")}
 
 
-_ID_WORDS = set("""msg msgs message task tasks run runs ask issue note user id no v t r pst pdt utc cet gmt am pm h hr hrs
-min mins m s ms d k kb mb gb tb jan feb mar apr may jun jul aug sep oct nov dec""".split())   # ids, units and dates
+_ID_REF = re.compile(r"(msgs?|message|tasks?|runs?|ask|issue|note|user|id|no|pst|pdt|utc|cet|gmt|ms|jan|feb|mar|apr|may|jun|jul"
+                     r"|aug|sep|oct|nov|dec)[-_:.]\d[\w:.-]*", re.I)   # an id or date word, a separator, digits
 
 
 def _numeric(tok: str) -> bool:
-    """Whether a word or alias is only a number, date, time, size, amount or id: it has a digit and its letter runs
-    are all units or id words ('msg-4555', 'nov-28', 'v2'), or it has none ('2026', '24h', '$8000')."""
-    return bool(re.search(r"\d", tok)) and all(w in _ID_WORDS for w in re.findall(r"[a-z]+", tok.lower()))
+    """Whether a word or alias is only a number, date, time, size, amount or id: it starts with a digit, '$' or '#'
+    ('2026', '24h', '$8000', '#12'), or is an id or date word then digits ('msg-12', 'nov-28').
+    A letter-digit mix such as 't3k' or 'h100' is an alias."""
+    return bool(re.match(r"[$#]?\d", tok) or _ID_REF.fullmatch(tok))
 
 
 def _words(text: str) -> set[str]:
@@ -74,7 +75,7 @@ def _same_topic(said: set[str], anc: set[str], item: str) -> tuple[int, set[str]
     rest = words - _words(" ".join(a[6:] for a in both if a.startswith("alias:")))
     near = (len(words) >= 2 and len(words) >= 0.5 * len(said) or bool(rest and both)
             or any(not a.startswith("alias:") for a in both))
-    return (len(words) if near else 0), words, both
+    return (max(len(words), 1) if near else 0), words, both
 
 
 def _value(text: str, words: set[str], both: set[str]) -> str:
