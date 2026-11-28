@@ -287,7 +287,11 @@ def test_the_claimer_reminds_for_a_waiting_project_while_a_project_with_nothing_
     assert round_("b", True, 1001)["claimer"] is False
     got = round_("a", False, 1002)   # the claimer's own work runs elsewhere, but b's waits on the login
     assert got["claimer"] is True and [w["name"] for w in got["waiting"]] == ["b"]
-    assert round_("a", False, 1003) is None and round_("b", True, 1004) is None
+    old = alerts.claims_path()   # an older runtime's claimer rewrites the record keeping only the fields it knows
+    claim = json.loads(old.read_text())
+    old.write_text(json.dumps({k: {f: v[f] for f in ("owner", "alert", "ts", "since", "reminded", "waiting")}
+                               for k, v in claim.items()}))
+    assert round_("a", False, 1003) is None and round_("b", True, 1004) is None, "a project reminded its own chats twice"
     alive.discard("a")   # the claimer stops; b takes the claim and must not send what already went out
     assert round_("b", True, 1005) is None, "Slack and the desktop got the reminder again after a take-over"
     assert round_("b", True, 1000 + alerts.LOGOUT_REMIND_S[1])["claimer"] is True

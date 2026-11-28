@@ -899,7 +899,7 @@ def _take(data: dict, claim_key: str, key: str, owner: str, now: float, cleared:
     fresh = bool(held) and float(held.get("ts") or 0) > cleared
     if fresh and held.get("owner") != owner and owner_alive(str(held.get("owner"))):
         return False
-    keep = {k: held[k] for k in ("since", "reminded", "reminded_own", "waiting") if k in held} if fresh else {}
+    keep = {k: held[k] for k in ("since", "reminded", "waiting") if k in held} if fresh else {}
     data[claim_key] = {**keep, "owner": owner, "alert": key, "ts": now}
     return True
 
@@ -942,7 +942,8 @@ def machine_round(claim_key: str, key: str, owner: str, now: float, cleared: flo
         waiting = {o: w for o, w in ((held or {}).get("waiting") or {}).items()
                    if isinstance(w, dict) and now - float(w.get("ts") or 0) < WAITER_TTL
                    and (o == owner or owner_alive(o))}
-        waiting[owner] = {**info, "ts": now}
+        mine = ((held or {}).get("waiting") or {}).get(owner)   # a report that went stale keeps what it sent
+        waiting[owner] = {**info, "ts": now, "reminded": int((mine or {}).get("reminded") or 0)}
         since = min(float((held or {}).get("since") or raised), raised)
         if held and held.get("owner") != owner and owner_alive(str(held.get("owner"))):
             data[claim_key] = {**held, "waiting": waiting, "since": since}
@@ -952,11 +953,10 @@ def machine_round(claim_key: str, key: str, owner: str, now: float, cleared: flo
         rec = data[claim_key]
         needers = [w for w in waiting.values() if w.get("need", True)]   # a report without `need` is from an older daemon
         claimer, due = rec["owner"] == owner, due_reminders(since, now)
-        own = dict(rec.get("reminded_own") or {})
         if claimer and needers and due > int(rec.get("reminded") or 0):
             rec["reminded"] = due   # sent to every chat, Slack and the desktop: once per reminder, whoever holds the claim
-        elif not claimer and info.get("need", True) and due > int(own.get(owner) or 0):
-            rec["reminded_own"] = {**own, owner: due}
+        elif not claimer and info.get("need", True) and due > waiting[owner]["reminded"]:
+            waiting[owner]["reminded"] = due   # this project's own chats; it rides in its report, which every runtime keeps
         else:
             due = 0
         out = {"since": since, "reminder": due, "waiting": needers, "claimer": claimer} if due else None
@@ -977,7 +977,7 @@ def reminder_chats(db, cfg: dict, claimer: bool) -> list[str | None]:
         return [None]
     project = cfg["notify"].get("chat_min_severity")
     return [c["id"] for c in db.q("SELECT id, min_severity FROM chats WHERE id!='slack'")
-            if CHAT_RANK[chat_floor(c["min_severity"], project)] <= SEVERITY_RANK["high"]]
+            if CHAT_RANK.get(chat_floor(c["min_severity"], project), 1) <= SEVERITY_RANK["high"]]
 
 
 def release(claim_keys: list[str], cleared: float) -> None:
