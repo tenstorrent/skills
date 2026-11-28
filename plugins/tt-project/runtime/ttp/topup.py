@@ -7,7 +7,8 @@ was created for a user's order (origin 'user', or it answers a chat: reply_chat)
 obligation (obligations.owned_open), or is a review hop (chainprio.is_hop: `Review #`, `Fix review #`,
 `Re-review #`) of a task that qualifies. When dispatch finds
 such a task with its budget spent, the daemon raises its budget by its tier's default
-(budget.task_default_usd) and starts it in the same tick, with no coordinator turn
+(budget.task_default_usd) plus what its last run's first call cost (first_call_usd: a resumed run reloads
+its context there, so a smaller top-up would be spent before any work) and starts it in the same tick, with no coordinator turn
 (Daemon._dispatch). A run of one stopped by its budget mid-run goes back to the queue, not to failed,
 so the next tick tops it up and continues it (Daemon._finish_worker); a budget stop is either the
 runner's check (run status 'budget') or the agent's own cap (a failed run, error_max_budget_usd:
@@ -34,7 +35,7 @@ import json
 import time
 
 from . import urgent
-from .budget import task_default_usd
+from .budget import estimate_cost, task_default_usd
 
 KIND = "task_budget_topup"
 SETTING = "urgent_topup"   # budget.urgent_topup
@@ -128,11 +129,28 @@ def count(db, tid: int) -> int:
     return int(db.q("SELECT COUNT(*) n FROM events WHERE kind=? AND task=?", (KIND, tid))[0]["n"] or 0)
 
 
+def first_call_usd(db, cfg: dict, tid: int) -> float:
+    """What the first model call of the task's last worker run that recorded one cost, priced at the
+    project's own rate from its cache telemetry (budget.estimate_cost); 0.0 when none did."""
+    row = db.one("SELECT provider, model, note FROM runs WHERE task=? AND role='worker' "
+                 "AND note LIKE '%first_context%' ORDER BY id DESC LIMIT 1", (tid,))
+    try:
+        tel = json.loads((row or {}).get("note") or "{}").get("cache_telemetry") or {}
+        first, read = int(tel.get("first_context") or 0), int(tel.get("first_cache_read") or 0)
+    except (ValueError, TypeError, AttributeError):
+        return 0.0
+    if first <= 0:
+        return 0.0
+    read = min(max(read, 0), first)
+    return round(estimate_cost(db, cfg, row["provider"] or "", row["model"] or "",
+                               {"cache_read": read, "cache_write": first - read}), 2)
+
+
 def top_up(db, cfg: dict, task: dict, head: str = "", now: float | None = None) -> dict:
-    """Raise task's budget by its tier's default; record it (one event, one low notice). Returns the
-    task with its new budget_usd."""
+    """Raise task's budget by its tier's default plus its last run's first-call cost (first_call_usd);
+    record it (one event, one low notice). Returns the task with its new budget_usd."""
     now = time.time() if now is None else now
-    step = float(task_default_usd(cfg, task.get("tier") or "standard"))
+    step = float(task_default_usd(cfg, task.get("tier") or "standard")) + first_call_usd(db, cfg, task["id"])
     before = float(task.get("budget_usd") or 0)
     after = round(max(before, float(task.get("spent_usd") or 0)) + step, 2)
     n = count(db, task["id"]) + 1
