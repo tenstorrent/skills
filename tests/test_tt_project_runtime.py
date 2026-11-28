@@ -27490,7 +27490,6 @@ DURABLE_EXEMPT = {
     ("cli.py", "os.replace(tmp, lock)"): "names a process, which a reboot ends",
     ("cli.py", 'open(log, "w")'): "the output of `ttp clip`, for reading; the command's exit code is passed on",
     ("cli.py", 'with open(log, "ab") as out:'): "a detached model bench's stdout log, for reading; its scores are written by the bench itself",
-    ("cli.py", "spec.write_text"): "the upgrade commit's scratch pathspec list, deleted right after; a lost one only redoes the commit",
     ("cli.py", "os.replace(p+'.tmp',p)"): "runs on another machine, inside a command string",
     ("machines.py", "os.replace(p+'.tmp',p)"): "runs on another machine, inside a command string",
     ("cpuquota.py", "mark.write_text(why)"): "the said-once marker of the CPU-quota fallback: lost, the line is said again",
