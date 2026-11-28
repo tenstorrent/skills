@@ -3,8 +3,8 @@
 from __future__ import annotations
 
 
-def _carry_task(p, title, spec="s", kind="code"):
-    return p.db.task(p.db.add_task(title, spec, kind=kind, origin="user"))
+def _carry_task(p, title, spec="s", kind="code", **kw):
+    return p.db.task(p.db.add_task(title, spec, kind=kind, origin="user", **kw))
 
 
 def test_carry_is_selected_by_mode_and_by_what_makes_a_task_ordered(env):
@@ -13,6 +13,7 @@ def test_carry_is_selected_by_mode_and_by_what_makes_a_task_ordered(env):
     plain, urgent = _carry_task(p, "plain"), _carry_task(p, "urgent", "urgent: now\nfix it")
     owner, msged = _carry_task(p, "owner"), _carry_task(p, "msged")
     asked = _carry_task(p, "asked", "urgent: now", kind="question")
+    first, chatty = _carry_task(p, "first", priority=1), _carry_task(p, "chatty", reply_chat="c1")
     obligations.add_order(p, "do it", p.db.post("in", "do it", chat="c1"), [owner["id"]], action_class="change")
     mid = p.db.post("in", "do that", chat="c1")
     assert userorder.record(p.db, msged["id"], mid, ["rig"]) == ["rig"]
@@ -25,6 +26,7 @@ def test_carry_is_selected_by_mode_and_by_what_makes_a_task_ordered(env):
     assert sel("all", *every) == [True, True, True, True, False], "every code task, no other kind"
     assert sel("off", *every) == [False] * 5
     assert sel("nonsense", *every) == sel("ordered", *every), "an unknown mode reads as the default"
+    assert sel("ordered", first, chatty) == [True, True], "what urgent.is_urgent and urgent.user_ordered decide"
     assert not carry.selected(p.config(), None, p.db)
 
 

@@ -29,11 +29,11 @@ def mode(cfg: dict | None) -> str:
 
 
 def ordered(task: dict, db) -> bool:
-    """A task of an open user order, one a user message ordered on resources (userorder), or with an `urgent:` line."""
+    """A task urgent or user-ordered by the shared rules (urgent), of an open user order, or one a user message ordered on resources (userorder)."""
     from . import obligations, urgent, userorder
-    tid = task.get("id")
-    return (tid in obligations.order_tasks(db) or tid in {o.get("task") for o in userorder.active(db).values()}
-            or bool(urgent.LINE.search(str(task.get("spec") or ""))))
+    owners = obligations.order_tasks(db)
+    return (urgent.is_urgent(task) or urgent.user_ordered(task, owners)
+            or task.get("id") in {o.get("task") for o in userorder.active(db).values()})
 
 
 def selected(cfg: dict | None, task: dict | None, db) -> bool:
