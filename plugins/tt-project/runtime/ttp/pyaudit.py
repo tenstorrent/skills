@@ -24,7 +24,7 @@ TAMPER = ("a run's inline Python may not get around the guard's run-time judge (
 def policy(env, cwd: str, run_dir: str, cfg: dict | None, zp: str) -> dict:
     """What the judge refuses and why: the protected paths (pathguard's, the judge's own files), the credential
     files (credguard's, the project's secrets) and, for a run on the GLM arm, its write roots (glmguard's)."""
-    from . import checkcap, credguard, glmguard, pathguard, project, sidefx
+    from . import checkcap, credguard, glmguard, pathguard, project, remotecheck, sidefx
     base = set(pathguard.roots(env, {}))
     roots = {r: (pathguard.WHY if r in base else pathguard.PROJECT_WHY).format(hit=r)
              for r in pathguard.roots(env, cfg)}
@@ -38,6 +38,7 @@ def policy(env, cwd: str, run_dir: str, cfg: dict | None, zp: str) -> dict:
         slots = checkcap.slot_dir()   # the checks code's upload locks and spill-down marks (remotecheck, checkspill)
         write = glmguard._roots(cwd, run_dir, glmguard._scratch(run_dir, env), env)
         pol["glm"] = {"run_dir": run_dir, "roots": write, "harness": [str(slots / "uploads"), str(slots / "spill-down")],
+                      "boot": remotecheck._BOOT,
                       "own": glmguard._own_roots(cwd, run_dir, env), "home": home,
                       "harmless": list(sidefx.HARMLESS), "records": sorted(glmguard.RUN_RECORDS),
                       "db": glmguard.STATE_DB.pattern, "db_why": glmguard.STATE_DB_WHY}

@@ -49,6 +49,8 @@ def _install(pol: dict) -> None:
     roots, secrets = pol["roots"], pol["secrets"]
     glm = pol.get("glm")
     db = __import__("re").compile(glm["db"]) if glm else None
+    # the harness's own checks entry, as this Python started (read before any inline code can change sys.orig_argv)
+    entry = bool(glm) and list(getattr(sys, "orig_argv", None) or [])[1:3] == ["-c", glm["boot"]]
 
     import builtins
     import pathlib
@@ -115,7 +117,10 @@ def _install(pol: dict) -> None:
         return False
 
     def harness():
-        """Whether the nearest caller that is the inline code or the harness's own ttp package is the package."""
+        """Whether this process is the harness's own inline entry (`python -c <boot> ...`, never a run's code) and
+        the nearest caller that is the inline code or its ttp package is the package."""
+        if not entry:
+            return False
         own, f = os.path.join(pol["runtime"], "ttp") + os.sep, sys._getframe(2)
         while f is not None:
             fn = f.f_code.co_filename

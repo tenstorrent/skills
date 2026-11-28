@@ -253,35 +253,45 @@ def test_pyaudit_on_the_glm_arm_lets_a_whole_remote_check_run_on_its_host(env, c
     bin_, remote = _rc_fake_ssh(tmp_path)
     e = _pa_env(cred_home, glm=True)
     e.update(PATH=f"{bin_}:{e['PATH']}", FAKE_REMOTE_TMP=str(remote))
-    code = """if 1:
-        import sys
-        from ttp import remotecheck
-        sys.exit(remotecheck.main(['--host', 'box1', '--', 'echo ran-there']))"""
-    r = _pa_run(e, code, repo)
+    from ttp import remotecheck   # the harness's own entry: `python -c <boot> <runtime> --host ...`
+    r = subprocess.run([sys.executable, "-c", remotecheck._BOOT, str(RUNTIME), "--host", "box1", "--", "echo ran-there"],
+                       env=e, cwd=repo, capture_output=True, text=True, timeout=60)
     assert r.returncode == 0 and "ran-there" in r.stdout, (r.stdout + r.stderr)[-1500:]
-    assert "tt-project guard" not in r.stdout + r.stderr and _rc_left(tmp_path) == []
+    assert "tt-project guard" not in r.stdout + r.stderr and _rc_left(tmp_path) == [], r.stdout + r.stderr
 
 
-def test_pyaudit_lets_only_the_harness_checks_code_write_its_check_slots(env, cred_home):
+def test_pyaudit_lets_only_the_harness_checks_code_write_its_check_slots(env, cred_home, tmp_path):
     """The checks code's own upload locks and spill-down marks (check-slots/uploads, check-slots/spill-down) are
-    no write outside the worktree when the harness's ttp package writes them; the inline code's own write is."""
-    from ttp import checkcap, project, pyaudit
+    no write outside the worktree when the harness's `ttp checks` entry (`python -c <boot> ...`) writes them
+    through the ttp package; a run's own inline code is refused, also when it imports that package."""
+    from ttp import checkcap, project, pyaudit, remotecheck
     e = {**_pa_env(cred_home, glm=True), "TTP_HOME": str(project.HOME_DIR)}   # the child's slot folder too
     pol = json.loads(e[pyaudit.POLICY_ENV])
     assert not any(r.startswith(str(checkcap.slot_dir())) for r in pol["glm"]["roots"]), "no root for the code"
     checkcap.slot_dir().mkdir(parents=True, exist_ok=True)   # the host's slot folder, as `ttp checks` keeps it
     down = checkcap.slot_dir() / "spill-down" / "box1.json"
-    harness = f"""if 1:
-        import os
-        from ttp import checkspill, remotecheck
-        checkspill.down_add('box1', 'unreachable')
-        assert os.path.isfile({str(down)!r})
-        assert remotecheck.upload_slot('box1', 0).name.endswith('box1.0.lock')
-        checkspill.down_clear('box1')
-        assert not os.path.exists({str(down)!r})"""
-    r = _pa_run(e, harness, cred_home.work)
+    body = f"""from ttp import checkspill
+checkspill.down_add('box1', 'unreachable')
+assert os.path.isfile({str(down)!r})
+checkspill.down_clear('box1')
+assert not os.path.exists({str(down)!r})"""
+    shim = tmp_path / "boot" / "ttp"   # the entry's `main` is a stand-in; the writes are the real package's
+    shim.mkdir(parents=True)
+    init = str(RUNTIME / "ttp" / "__init__.py")
+    (shim / "__init__.py").write_text(f"exec(compile(open({init!r}).read(), {init!r}, 'exec'))\n"
+                                      f"__path__ = [{str(shim)!r}, {str(RUNTIME / 'ttp')!r}]\n")
+    real = str(RUNTIME / "ttp" / "remotecheck.py")   # the real module's code, its `main` replaced
+    (shim / "remotecheck.py").write_text(f"exec(compile(open({real!r}).read(), {real!r}, 'exec'))\n"
+                                         "def main(args):\n    " + body.replace("\n", "\n    ") + "\n    return 0\n")
+    r = subprocess.run([sys.executable, "-c", remotecheck._BOOT, str(shim.parent)], env=e, cwd=cred_home.work,
+                       capture_output=True, text=True, timeout=60)
     assert r.returncode == 0 and "tt-project guard" not in r.stderr, r.stderr[-1500:]
     for code in (f"open({str(checkcap.slot_dir() / 'uploads' / 'x.lock')!r}, 'a')",
-                 f"import pathlib; pathlib.Path({str(down)!r}).write_text('{{}}')"):
+                 f"import pathlib; pathlib.Path({str(down)!r}).write_text('{{}}')",
+                 f"import sys; from ttp import checkspill, remotecheck; sys.orig_argv[1:] = ['-c', remotecheck._BOOT]; "
+                 f"checkspill._down_file('box1').write_text('{{}}')"):
         r = _pa_run(e, code, cred_home.work)
         assert r.returncode != 0 and "writes outside its worktree" in r.stderr, (code, r.stderr[-800:])
+    _pa_run(e, "from ttp import checkspill, remotecheck; checkspill.down_add('box1', 'x'); remotecheck.upload_slot('box1', 0)",
+            cred_home.work)   # the package swallows the refusal: nothing is written
+    assert not down.exists() and not (checkcap.slot_dir() / "uploads" / "box1.0.lock").exists()

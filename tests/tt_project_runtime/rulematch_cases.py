@@ -274,3 +274,19 @@ def test_rule_gone_rematches_an_old_record_once_and_drops_items_the_matcher_no_l
     assert p.db.one("SELECT ts FROM kv WHERE key=?", (rm.KV + str(a),))["ts"] == pytest.approx(old), "its age is kept"
     lines = rm.digest_lines(p.db, now)
     assert len(lines) == 1 and lines[0].startswith(f"- overdue: user msg {a} ") and "2026" not in lines[0]
+
+
+def test_rule_gone_rematch_replaces_a_stale_value_with_the_current_matchers_item(env):
+    """A stored item whose (where, name) the current matcher still finds is replaced by that item, so a value an
+    older matcher stored (here a number) does not stay shown."""
+    from ttp import rulematch as rm
+    p = _rm_project(env)
+    p.add_memory("The dashboard budget review is due in 2026.", kind="decision")
+    a = _rm_flag(p)
+    real = p.db.kv(rm.KV + str(a))["items"]
+    stale = [{**i, "value": "2026", "line": "an older line"} for i in real]
+    assert real and stale != real
+    p.db.x("UPDATE kv SET value=?, ts=? WHERE key=?",
+           (json.dumps({"msg": a, "items": stale}), time.time() - 3600, rm.KV + str(a)))
+    assert rm.digest_lines(p.db, time.time()) is not None
+    assert p.db.kv(rm.KV + str(a))["items"] == real

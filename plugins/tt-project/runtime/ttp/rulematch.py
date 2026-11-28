@@ -227,8 +227,8 @@ def remaining(p, old: str | None = None, name: str | None = None, items: list | 
 
 
 def _rematch(db, rec: dict) -> dict:
-    """`rec` keeping only the items the current matcher still finds for its message, or that stand nowhere now (so
-    `gone` still marks them), written back once with its age kept; a record left with no items is closed."""
+    """`rec` keeping only the items the current matcher still finds for its message (as it finds them now), or that
+    stand nowhere now (so `gone` still marks them), written back once with its age kept; a record left with no items is closed."""
     if rec.get("matcher") == MATCHER or not rec.get("items"):
         return rec
     try:
@@ -237,8 +237,9 @@ def _rematch(db, rec: dict) -> dict:
         m = db.one("SELECT text FROM messages WHERE id=?", (rec["msg"],))
         if m is None:
             return rec
-        found = {(i["where"], i["name"]) for i in older(p, db, m["text"] or "", cap=None)}
-        keep = [i for i in rec["items"] if (i["where"], i["name"]) in found or not remaining(p, items=[i])]
+        found = {(i["where"], i["name"]): i for i in older(p, db, m["text"] or "", cap=None)}
+        keep = [found.get((i["where"], i["name"]), i) for i in rec["items"]
+                if (i["where"], i["name"]) in found or not remaining(p, items=[i])]
     except Exception:
         return rec
     rec = {**rec, "items": keep, "matcher": MATCHER}
