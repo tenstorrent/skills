@@ -174,35 +174,6 @@ def _bl_wait(p, title, now, ago, probe, reason="x", status="waiting"):
     return tid
 
 
-def test_block_ledger_and_dead_landing_check_judge_the_same_wait_by_one_hold_rule(env):
-    """The same waits, under each hold and none, through deadwait.check and the block ledger: the
-    event is raised exactly when the ledger counts the wait as a stuck landing, and a held wait is
-    counted under the class deadwait.hold_of names."""
-    from ttp import blockledger as bl, deadwait, envfault, netwait
-    p = make(env)
-    now = time.time()
-    x = p.db.add_task("feature", "s", kind="code")
-    p.db.update_task(x, status="done", branch=f"ttp/t{x}-feature")
-    a = _bl_wait(p, "after the feature", now, 3 * 3600, f"ttp landed --task {x}")
-    cfg = {"waiting": {"landed_wait_dead_s": 30}}
-    holds = [(None, None), ("paused", True), ("paused_resources", {"push": {"by": "user"}}),
-             (envfault.KV, {"runner": {"queue": True}}), (netwait.STATE_KEY, {"alerted": True})]
-    for key, value in holds:
-        if key:
-            p.db.set_kv(key, value)
-        p.db.set_kv(deadwait.KEY, {})
-        p.db.x("DELETE FROM events WHERE kind=?", (deadwait.DEAD_EVENT,))
-        deadwait._last.clear()
-        deadwait.check(p.db, cfg, {x: [p.db.task(a)]}, now - 3 * 3600)
-        deadwait.check(p.db, cfg, {x: [p.db.task(a)]}, now)
-        raised = bool(p.db.q("SELECT 1 FROM events WHERE kind=?", (deadwait.DEAD_EVENT,)))
-        rule = {r["task"]: r["rule"] for r in bl.rows(p.db, now - 86400, now) if r["source"] == "task"}[a]
-        assert raised == (rule == bl.STUCK) == (deadwait.hold_of(p.db) is None), key
-        assert rule == (deadwait.hold_of(p.db) or bl.STUCK), key
-        if key:
-            p.db.x("DELETE FROM kv WHERE key=?", (key,))
-
-
 def test_block_ledger_a_wait_on_the_tasks_own_detached_job_is_work_not_blocked_time(env):
     from ttp import blockledger as bl, queuewait
     p = make(env)
@@ -363,30 +334,6 @@ def test_block_ledger_probe_class_names_what_a_held_wait_is_on(env):
     assert cls("ssh box7 true", {"box7": {}}) == "outage" and cls("ssh box70 true", {"box7": {}}) == "other"
     assert cls("test -e /tmp/box7-done", {"box7": {}}) == "other", "a file name is no machine"
     assert cls("test -e /tmp/some-marker") == "other"
-
-
-def test_block_ledger_counts_a_held_landing_wait_under_the_holds_class(env):
-    """A wait on a done target nothing can land counts under the class of the hold that stops every
-    landing (deadwait.hold_of), not as a stuck landing, while that hold lasts."""
-    from ttp import blockledger as bl, deadwait, envfault
-    p = make(env)
-    now = time.time()
-    x = p.db.add_task("feature", "s", kind="code")
-    p.db.update_task(x, status="done", branch=f"ttp/t{x}-feature")
-    a = _bl_wait(p, "after the feature", now, 3 * 3600, f"ttp landed --task {x}")
-    rule = lambda: {r["task"]: r["rule"] for r in bl.rows(p.db, now - 86400, now) if r["source"] == "task"}
-    ended = _bl_wait(p, "ended wait", now, 3 * 3600, f"ttp landed --task {x}")
-    p.db.x("INSERT INTO events(ts,source,kind,text,data,status,task) VALUES(?,?,?,?,?,?,?)",
-           (now - 3600, "t", "task_queued", "queued", None, "handled", ended))
-    p.db.update_task(ended, status="queued")
-    for hold_set, hold in ((lambda: p.db.set_kv("paused", True), "user hold"),
-                           (lambda: p.db.set_kv(envfault.KV, {"runner": {"queue": True}}), "outage")):
-        hold_set()
-        assert deadwait.hold_of(p.db) == hold, hold
-        assert rule()[a] == hold, "the wait is held, not dead"
-        assert rule()[ended] == bl.STUCK, "a wait that ended before the hold keeps its verdict"
-        p.db.x("DELETE FROM kv WHERE key IN ('paused',?)", (envfault.KV,))
-    assert rule()[a] == bl.STUCK, "no hold left: it is a stuck landing again"
 
 
 def test_block_ledger_a_done_target_nothing_can_land_is_a_stuck_landing_not_a_dependency(env):

@@ -32455,7 +32455,7 @@ def test_a_landed_wait_with_no_path_to_landing_wakes_the_coordinator_once_and_cl
     d._dead_landed_waits(rows(), t0 + 2 * deadwait.GRACE_S)
     (ev,) = dead()
     assert ev["status"] == "queued" and f"#{a} (queued), #{b} (queued)" in ev["text"]
-    assert branch in ev["text"] and f"review #{rev['id']} failed" in ev["text"]
+    assert branch in ev["text"] and f"its last review #{rev['id']} is failed" in ev["text"]
     # A fix of the review appears: a path, so the event clears; a later dead end raises a new one.
     fix = p.db.add_task(f"Fix review #{rev['id']}: feature", "s", kind="code",
                         labels=[f"continues:{code}", f"review_fix:{rev['id']}"])
