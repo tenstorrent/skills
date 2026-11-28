@@ -180,3 +180,21 @@ def test_a_lost_run_whose_own_hand_off_stood_is_neither_waiting_for_a_replacemen
     rows = p.db.boots(now - 86400)[0]["lost"]
     assert [x["kept"] for x in rows] == [True, False]
     assert dbm.host_line(p.db.boots(now - 86400)).endswith("1 not restarted, $1.00 of work lost")
+
+
+def test_a_review_of_an_owner_takes_its_due_and_starts_before_a_routine_review(env, monkeypatch):
+    from ttp import obligations, rankinherit
+    rows = [dict(_rank_row(5), kind="review", labels='["auto_review:1"]'), dict(_rank_row(6), kind="review", title="Review #2: x"),
+            dict(_rank_row(7, [8]), kind="review", title="Review #1: again"), _rank_row(8), dict(_rank_row(9), title="Review #1")]
+    assert rankinherit.extend(rows, {1: 100.0}) == {1: 100.0, 5: 100.0, 7: 100.0, 8: 100.0}   # 9 is no review; 2 owns nothing
+    p = make(env)
+    p.db.x("UPDATE tasks SET status='done'")
+    owner = p.db.add_task("owner", "s", kind="code", tier="light", origin="user", priority=4)
+    other = p.db.add_task("other", "s", kind="code", tier="light", origin="user", priority=4)
+    p.db.x("UPDATE tasks SET status='done' WHERE id IN (?, ?)", (owner, other))
+    routine = p.db.add_task(f"Review #{other}: other", "s", kind="review", tier="light", origin="daemon", priority=2)
+    ordered = p.db.add_task(f"Review #{owner}: owner", "s", kind="review", tier="light", origin="daemon", priority=4)
+    monkeypatch.setattr(obligations, "owner_due", lambda db: {owner: time.time() + 600})
+    assert [t["id"] for t in p.db.ready_tasks()][:2] == [ordered, routine]
+    monkeypatch.setattr(obligations, "owner_due", lambda db: {})
+    assert [t["id"] for t in p.db.ready_tasks()][:2] == [routine, ordered]
