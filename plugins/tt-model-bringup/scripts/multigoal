@@ -241,6 +241,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("prompt_files", nargs="+", type=pathlib.Path)
     parser.add_argument("--repo", type=pathlib.Path, default=pathlib.Path.cwd())
     parser.add_argument("--codex-home", type=pathlib.Path)
+    parser.add_argument("--keep-stage-outputs", action="store_true",
+                        help="start the agentic-evals stage although doc/agentic_evals already holds files "
+                             "(relaunching the same run's stage); by default a run starts empty")
     parser.add_argument(
         "--codex-bin",
         default=os.environ.get("CODEX_BIN"),
@@ -1083,6 +1086,18 @@ def run_stage_checks(
     return status
 
 
+def require_independent_stage(args: argparse.Namespace, repo: pathlib.Path,
+                              replacements: list[tuple[str, str]], name: str) -> None:
+    """Goal 12 reads no earlier run's outputs: a fresh start needs an empty doc/agentic_evals."""
+    model_dir = replacement_value(replacements, "MODEL_DIR")
+    if not name.endswith("agentic-evals") or not model_dir or getattr(args, "keep_stage_outputs", False):
+        return
+    evals = repo / model_dir / "doc" / "agentic_evals"
+    if evals.is_dir() and any(evals.iterdir()):
+        raise SystemExit(f"{evals} already holds files from an earlier run; move it away so this run starts empty "
+                         "(or pass --keep-stage-outputs to relaunch this run's own stage)")
+
+
 def run_stage(
     client: AppServerClient,
     args: argparse.Namespace,
@@ -1130,6 +1145,7 @@ def run_stage(
         ],
     )
 
+    require_independent_stage(args, repo, replacements, name)
     terminal, _thread_id, turn_error = execute_goal(
         client,
         args,

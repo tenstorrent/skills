@@ -122,7 +122,8 @@ Return `more-work-needed` when evidence shows one of these:
   page-table handling, or model output correctness;
 - a release or serving stage has failed accuracy, API conformance, benchmark
   target, or missing/incomparable metric rows that are only disclosed, not
-  fixed or supported by a row-specific current issue waiver;
+  fixed or supported by a row-specific current issue waiver (stage 11 grid rows
+  its budget left, listed in `missing_rows` with a reason, are allowed);
 - a text LLM release has failed `meta_ifeval` or `meta_gpqa_cot` without a
   current linked issue proving the correct canonical implementation fails the
   same eval in the same way;
@@ -338,7 +339,8 @@ For datatype-sweep stages, also inspect:
   profiler/perf-report rows rather than JSON alone;
 - whether every material BFP4 matmul group considered or selected has a
   BFP4+LoFi candidate, or an exact TTNN/runtime blocker plus `$autofix`
-  evidence;
+  evidence, unless BFP4 is already rejected for that group. Higher precision
+  chosen for long-context accuracy or memory reasons is not a finding;
 - whether a "fastest evaluated config" claim is only true because an obvious
   legal precision/fidelity candidate was missing.
 
