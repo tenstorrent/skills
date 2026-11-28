@@ -816,14 +816,14 @@ def supervise(run_dir: Path) -> int:
                 threading.Thread(target=stop, args=("quota",), daemon=True).start()
             if budget is not None and now - st["budget"] >= BUDGET_EVERY_S:
                 st["budget"] = now
-                budget = live_budget(run_dir, budget)
+                limit = live_budget(run_dir, budget)
                 try:
                     so_far = (bridge.cost_so_far() if hasattr(bridge, "cost_so_far")   # claudebridge: the CLI's own figures
                               else glmharness.cost_so_far(bridge, prov) if spec.get("harness")   # a mini run streams none
                               else prov.cost_so_far(out_path, since=started, env=env))
                 except Exception:
                     so_far = None
-                if so_far is not None and so_far > float(budget):
+                if so_far is not None and so_far > float(limit):
                     threading.Thread(target=stop, args=("budget",), daemon=True).start()
             if inst["open"] and now - inst["at"] >= INSTRUCTIONS_EVERY_S:
                 inst["at"] = now
