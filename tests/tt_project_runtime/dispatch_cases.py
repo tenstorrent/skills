@@ -1748,7 +1748,7 @@ def test_a_queued_resume_wait_names_the_hold_true_now_not_a_spend_gate_that_clea
     d = Daemon(p.base)
     d.cfg = p.config()
     d.update_gates()
-    assert not d.gates[core].allow_new_work and "global daily cap reached" in d.gates[core].cause, d.gates[core]
+    assert not d.gates[core].allow_new_work and "project daily cap $2000 reached" in d.gates[core].cause, d.gates[core]
     now = time.time()
     tid, paused = (p.db.add_task(title, "s", kind="work", tier="light", origin="user", priority=3, **kw)
                    for title, kw in (("woken wait", {}), ("woken wait on a board", {"labels": ["resource:board"]})))
@@ -1762,7 +1762,7 @@ def test_a_queued_resume_wait_names_the_hold_true_now_not_a_spend_gate_that_clea
 
     first = check()
     assert [e["task"] for e in first] == [tid, paused]
-    assert "held by the spend gate (no new work at red: global daily cap" in first[0]["text"]
+    assert "held by the spend gate (no new work at red: project daily cap" in first[0]["text"]
     p.set_config("budget.global_daily_usd", 3000)   # the cap is raised before a turn read the observation
     d.cfg = p.config()
     d.update_gates()
@@ -1810,7 +1810,7 @@ def test_a_resume_wait_retired_for_a_passing_net_hold_is_raised_again_while_the_
     monkeypatch.setattr(Daemon, "_start_hold", real)
     back = check()
     assert [(e["id"], e["status"]) for e in back] == [(first[0]["id"], "queued")]
-    assert "held by the spend gate (no new work at red: global daily cap" in back[0]["text"], back[0]["text"]
+    assert "held by the spend gate (no new work at red: project daily cap" in back[0]["text"], back[0]["text"]
     assert check() == back   # stays one queued row, unchanged
 
 

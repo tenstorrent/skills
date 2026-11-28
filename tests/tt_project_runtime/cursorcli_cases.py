@@ -618,7 +618,8 @@ def test_cursor_workers_run_the_harness_guards_through_the_project_hooks_file(en
              shell("ls"), ["preToolUse", {"tool_name": "Read", "tool_input": {"file_path": str(tmp_path / "ok.txt")}}],
              ["preToolUse", {"tool_name": "ReadLints", "tool_input": {}}]]
     got, run_dir = _cursor_hooked(tmp_path, monkeypatch, calls, denied=[str(token)])
-    for i, why in enumerate(("draft", "web token", "name or pattern", "credentials", "credentials")):
+    # `env -i` wipes PATH, so the gh call trips the PATH-change refusal before the draft guard
+    for i, why in enumerate(("PATH as the run set it", "web token", "name or pattern", "credentials", "credentials")):
         [reply] = got[i]
         assert reply["permission"] == "deny" and why in reply["user_message"], (i, reply)
         assert reply["agent_message"] == reply["user_message"]

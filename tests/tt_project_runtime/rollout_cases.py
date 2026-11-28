@@ -1141,13 +1141,14 @@ def test_a_stuck_task_counts_against_a_glm_flag_only_when_its_own_glm_run_stalle
             f"{flag}: a task waiting in a live batch is not stuck"
 
 
-@pytest.mark.parametrize("flag", ["glm_code", "glm_work", "glm_device", "glm_coord", "eta_history", "deslop",
-                                  "coord_wake_settle", "pyaudit", "inline_review"])
+@pytest.mark.parametrize("flag", ["glm_code", "glm_work", "glm_device", "glm_coord", "glm_probes", "eta_history",
+                                  "deslop", "coord_wake_settle", "pyaudit", "inline_review"])
 def test_every_flag_s_health_watch_switches_off_only_its_own_project(env, flag):
-    # cells: glm_code, glm_work, glm_device, glm_coord, eta_history, deslop, coord_wake_settle, pyaudit, inline_review
+    # cells: glm_code, glm_work, glm_device, glm_coord, glm_probes, eta_history, deslop, coord_wake_settle, pyaudit,
+    # inline_review
     from ttp import rollout
-    assert set(rollout.FLAGS) == {"glm_code", "glm_work", "glm_device", "glm_coord", "eta_history", "deslop",
-                                  "coord_wake_settle", "pyaudit", "inline_review"}, "a new flag gets a cell here"
+    assert set(rollout.FLAGS) == {"glm_code", "glm_work", "glm_device", "glm_coord", "glm_probes", "eta_history",
+                                  "deslop", "coord_wake_settle", "pyaudit", "inline_review"}, "a new flag gets a cell here"
     p, d = _watch(env)
     rollout.set_ring(p.name, "1")
     rollout.set_ring("other", "1")

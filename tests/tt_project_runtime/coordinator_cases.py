@@ -974,7 +974,11 @@ def test_config_refuses_user_only_keys_inside_a_run(env, capsys, monkeypatch, va
     p.set_config("delivery.mirror_remotes", ["backup"])
     before = p.raw_config()
     monkeypatch.setenv(var, "7")
-    refused = [["config", "demo", k, json.dumps(["o/r"] if k == MERGE_KEY else 9)] for k in NEEDS_USER]
+    # A NEEDS_USER key can be account-level only (rollout.*): its refusal comes through `--account`
+    from ttp import project
+    project_sections = set(project.DEFAULT_CONFIG) | set(project.EXTRA_KEYS) | {"checks"}
+    refused = [["config", "--account" if k.split(".")[0] not in project_sections else "demo", k,
+                json.dumps(["o/r"] if k == MERGE_KEY else 9)] for k in NEEDS_USER]
     refused += [["config", "demo", "budget", json.dumps({"daily_usd": 999})],          # parent key
                 ["config", "demo", "delivery", json.dumps({})],                        # wipes a user-only key
                 ["config", "demo", MERGE_KEY, "o/r"],                                   # plain string
@@ -990,6 +994,7 @@ def test_config_refuses_user_only_keys_inside_a_run(env, capsys, monkeypatch, va
     assert p.raw_config() == before
     from ttp.project import load_account_settings
     assert "global_daily_usd" not in load_account_settings().get("budget", {})
+    assert not load_account_settings().get("rollout"), "the account-level refusal changed nothing either"
     cli.main(["config", "demo", "budget.daily_usd"])                     # reading works
     cli.main(["config", "--account", "budget.global_daily_usd"])
     capsys.readouterr()

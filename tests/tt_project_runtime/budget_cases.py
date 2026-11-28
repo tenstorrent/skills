@@ -4089,7 +4089,9 @@ def test_plan_and_unknown_billing_sessions_are_shown_apart_and_never_counted(env
     g = bud.evaluate(p.db, p.config(), "claude", [], now)
     assert g.level == "green" and g.numbers["global_today"] == 1.0 and g.numbers[f"global_{key}"] == 15.0, g.numbers
     word = "subscription plan" if key == "plan_usd" else "estimated, not billed"
-    assert f"$1.00 of $10 global; not counted: $15.00 {word}" in usage_line(g.numbers, now), usage_line(g.numbers, now)
+    line = usage_line(g.numbers, now)
+    assert "$1.00 of $10 project cap (below the account cap of $100)" in line and \
+           f"not counted: $15.00 {word}" in line, line
 
 
 def test_usage_billed_sessions_count_and_trip_the_cap(env, tmp_path, monkeypatch):
@@ -4103,7 +4105,7 @@ def test_usage_billed_sessions_count_and_trip_the_cap(env, tmp_path, monkeypatch
     assert "not counted" not in t["includes"], t["includes"]
     p.set_config("budget.global_daily_usd", 10)
     g = bud.evaluate(p.db, p.config(), "claude", [], now)
-    assert g.level == "red" and "global daily cap reached" in " ".join(g.reasons), (g.level, g.reasons)
+    assert g.level == "red" and "project daily cap $10 reached" in " ".join(g.reasons), (g.level, g.reasons)
     assert "not counted" not in usage_line(g.numbers, now)
 
 

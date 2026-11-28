@@ -160,13 +160,15 @@ def test_cwds_reads_a_ten_thousand_line_heredoc_quickly(env, tmp_path):
     segments = hook._segments(cmd, strip=False)
     t = time.perf_counter()
     cwds = credguard._cwds(segments, str(tmp_path), str(tmp_path / "home"))
-    assert time.perf_counter() - t < 0.2
+    # a linear scan takes ~0.15 s here; the bound leaves room for a loaded checks host while a
+    # quadratic scan of a 10,000-line heredoc would still blow past it
+    assert time.perf_counter() - t < 2.0
     assert str(tmp_path) in cwds
     from ttp import pyproof
     hops = "; ".join(f"cd a{i % 3}" for i in range(80))                         # each relative cd doubles the folders
     t = time.perf_counter()
     cwds = credguard._cwds(hook._segments(f"{hops}; cat x", strip=False), str(tmp_path), str(tmp_path / "home"))
-    assert time.perf_counter() - t < 0.2 and len(cwds) <= credguard.CWDS_CAP + 1 and str(tmp_path / "home") in cwds[1:]  # past the cap, read from HOME too
+    assert time.perf_counter() - t < 2.0 and len(cwds) <= credguard.CWDS_CAP + 1 and str(tmp_path / "home") in cwds[1:]  # past the cap, read from HOME too
     assert pyproof.rewrite(f"{hops}; python3 -c 'print(1)'", str(tmp_path)) is None
 
 
