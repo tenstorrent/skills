@@ -30,7 +30,7 @@ value for debugging.
 - A TTNN model hangs and you want the op named without reading device state.
 - A model's output is wrong and you need the *first* op that diverges rather
   than the last one you looked at.
-- You want per-op buffer or tensor reports.
+- You want per-op buffer or tensor reports. To read one, `tt-ttnn-visualizer`.
 
 Not this skill: device-side state — `tt-triage`, `tt-watcher`. Kernel-level
 values — `tt-dprint`.
@@ -83,8 +83,13 @@ TTNN_CONFIG_OVERRIDES='{"enable_fast_runtime_mode": false, "enable_comparison_mo
 
 ## Output
 
-Reports under `root_report_path`, default `generated/ttnn/reports`, named by
-`report_name`. Comparison mode logs a PCC per op and, with
+Reports under `root_report_path`, default `generated/ttnn/reports`, in a folder
+named from `report_name`. The report database is written at pytest teardown,
+only with `enable_logging` plus `enable_graph_report` (or comparison mode), so a
+hung run that is killed leaves none. Capturing it, outside pytest too, and
+reading it: `tt-ttnn-visualizer`.
+
+Comparison mode logs a PCC per op and, with
 `comparison_mode_should_raise_exception`, raises at the first op below
 `comparison_mode_pcc`.
 

@@ -59,6 +59,11 @@ For the workflow question "which op dominates?" the answer is the ranked
 `generated/profiler/reports/<timestamp>/`. Recipe, pandas fallback and the
 per-RISC bottleneck tags: `references/op-report.md`.
 
+With TT-NN Visualizer's MCP server registered, `tt-ttnn-visualizer` reads the
+same report folder through its MCP tools — bounded answers with signpost ranges
+and noise-aware diffs, and op ids that link to a memory report from the same
+run. `tt-perf-report` stays the fallback.
+
 In-kernel, after `#include <tools/profiler/kernel_profiler.hpp>`:
 
 ```c++
