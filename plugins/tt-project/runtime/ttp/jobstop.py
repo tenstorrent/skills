@@ -1159,12 +1159,7 @@ def waited_on(p: Project, rc: Path) -> int | None:
 
 def _live_jobs(run_dir: Path) -> list[Path]:
     """The .rc of each job in this run's registry that is not closed and still runs."""
-    try:
-        jobs = json.loads((Path(run_dir) / detach.REGISTRY).read_text())
-    except (OSError, ValueError):
-        return []   # a run without detached jobs has no registry
-    return [Path(j["rc"]) for j in (jobs if isinstance(jobs, list) else [])
-            if isinstance(j, dict) and j.get("rc") and j.get("status") not in detach.CLOSED and running(Path(j["rc"]))]
+    return [rc for rc in detach.open_jobs(run_dir) if running(rc)]
 
 
 def task_live_jobs(p: Project, task: int, now: float | None = None) -> list[Path]:

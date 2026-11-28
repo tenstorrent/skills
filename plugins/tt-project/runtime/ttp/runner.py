@@ -419,7 +419,7 @@ def remove_tmp(run_dir: Path, spec: dict) -> None:
     Only a dir directly inside the run dir, or a short one (shorttmp), is ever removed. It stays while a
     job the run detached still runs (TMP_KEPT marks that): release_tmp removes it once the last one ends."""
     from . import detach, shorttmp
-    if detach.live(run_dir):
+    if detach.has_live_job(run_dir):
         (run_dir / TMP_KEPT).touch()
         return
     (run_dir / TMP_KEPT).unlink(missing_ok=True)

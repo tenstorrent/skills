@@ -1041,14 +1041,19 @@ def _mask_log(rc: Path) -> bool:
     return True
 
 
-def live(run_dir: Path) -> bool:
-    """Whether a job this run's detached.json records is still running or queued (by state(), never the record)."""
+def open_jobs(run_dir: Path) -> list[Path]:
+    """The .rc of each job in this run's detached.json whose record is not closed."""
     try:
         jobs = json.loads((Path(run_dir) / REGISTRY).read_text())
     except (OSError, ValueError):
-        return False
-    return any(isinstance(j, dict) and j.get("status") not in CLOSED and j.get("rc")
-               and state(Path(j["rc"]))[0] in ("running", "queued") for j in jobs if isinstance(jobs, list))
+        return []   # a run without detached jobs has no registry
+    return [Path(j["rc"]) for j in (jobs if isinstance(jobs, list) else [])
+            if isinstance(j, dict) and j.get("rc") and j.get("status") not in CLOSED]
+
+
+def has_live_job(run_dir: Path) -> bool:
+    """Whether a job of this run is still running or queued (by state(), never the record)."""
+    return any(state(rc)[0] in ("running", "queued") for rc in open_jobs(run_dir))
 
 
 def close_records(p: Project, now: float | None = None) -> int:
