@@ -127,7 +127,7 @@
       "destination": "skills/datatype-sweep/SKILL.md",
       "blob": "457749253d5a2a220e7545c02f4e433cc984af12",
       "source_sha256": "25b874a7b6cf277e4e11d28c06c84056790b4ff61064defb24216ec1844d5764",
-      "packaged_sha256": "29bcb087ec2007dc0e5b3b20eae608051865b3ae99abf26c9602ccace250e973"
+      "packaged_sha256": "882f02a40b3adf686674135a6faa29b53babcd4e9e84e4f9fd9211e562dc4641"
     },
     {
       "source": ".agents/skills/datatype-sweep/agents/openai.yaml",
@@ -155,7 +155,7 @@
       "destination": "skills/functional-decoder/SKILL.md",
       "blob": "5ea84505c81347d6773fc8325c3115d31094e5d8",
       "source_sha256": "133caffc050d9bb0343a37509ce09a6b2a4e640294761e7226e52f8f82037b71",
-      "packaged_sha256": "bc27657687980b27b7a4424c9e83e3cf41c6dcea27db7fa149a8901351c77d04"
+      "packaged_sha256": "6111e5ca5a0319d4f176873be3b803d68b4a59104400566389dec4f42246167a"
     },
     {
       "source": ".agents/skills/functional-decoder/agents/openai.yaml",
@@ -183,7 +183,7 @@
       "destination": "skills/multichip/SKILL.md",
       "blob": "664b6e6b1383d948226185bfa7ba139b9ff1c9b2",
       "source_sha256": "a7430e0f96204dfcd0b70aa689ee88d8ddf61e37a9260ffdfae6ca799f6e6494",
-      "packaged_sha256": "ebbd90d2e4c82bbfb1fb0222d5b46a29049ec5a448cd65bf84a353e91e0ab25c"
+      "packaged_sha256": "70ca22e49f3e4d86bef3c7742a1a2eddc4b5b4a0589c858f0a08d4d1edc4da45"
     },
     {
       "source": ".agents/skills/multichip/agents/openai.yaml",
@@ -253,7 +253,7 @@
       "destination": "skills/tt-enable-tracing/SKILL.md",
       "blob": "379f135ff209af802207532f5ad1dc1a88a70627",
       "source_sha256": "2b708c499a67a0fccd6618d6f0c2956f532605b5643c6d70e18a5c70f5bbb1da",
-      "packaged_sha256": "b5bc74494a6e06ec6defef0dd7edec1bcc46e7f7e196f42a93171f319e693418"
+      "packaged_sha256": "6040bde79a8f5a8d33c30db3145ff5e0aa96f91fb2ccc9d4ca05f22b99f482f1"
     },
     {
       "source": ".agents/skills/tt-enable-tracing/advanced_perf_optimizations.md",
@@ -274,7 +274,7 @@
       "destination": "skills/vllm-integration/SKILL.md",
       "blob": "05d9e19f7cfbb596d209c504cc49e063b9361da1",
       "source_sha256": "a23a516ab0e8afc3a5dd6ddd72a42781997fb454872139e70605ecbd234e114c",
-      "packaged_sha256": "0e7fd95bc63326f0ac2d4f49952d7a306b80342b22e8b9ab29c79321f3e6c470"
+      "packaged_sha256": "673922dbfada81cb96113cb091aef5a884c1be38b99f3417391d800b39071393"
     },
     {
       "source": ".agents/skills/vllm-integration/agents/openai.yaml",
@@ -316,7 +316,7 @@
       "destination": "runtime/readiness_check/contract.py",
       "blob": "f9ec9dc321abcf1474e5845bf63c1139b02082db",
       "source_sha256": "2656dad613acad8df8a392cbfa336a722181138a6a755a4a0b9535fc1ea8494a",
-      "packaged_sha256": "42417eab48a87b6e9c31dee15ef68bac5c67970e487a295f78ee7f968ef93358"
+      "packaged_sha256": "c37268986b6f18f6bd1fc5a703f17ccdcb0188bfcfae15d48e64cd619ed8972a"
     },
     {
       "source": "models/common/readiness_check/contract_vllm.py",
@@ -330,7 +330,7 @@
       "destination": "runtime/readiness_check/generate.py",
       "blob": "645b6c947b04066a9c1f65671c0a0d18948c62c4",
       "source_sha256": "2d4b380d325f964aa2b1d65d51c6a8657802f7069082fa1cd78f144610aab347",
-      "packaged_sha256": "d8014f9fb34c94893e2daf1e502a3eec13de64ac8e176e6ef3af08f4f3cd2500"
+      "packaged_sha256": "8b5fe488cac177a8d0817c38ce421dfc5bb3972cb6a9da8107f215b277d14646"
     },
     {
       "source": "models/common/readiness_check/mesh_device.py",
@@ -435,14 +435,14 @@
       "destination": "skills/tti-release/scripts/check-evidence.sh",
       "blob": "9cf16e6d4a2a45ab49fc88337fae474010a05ff2",
       "source_sha256": "7f2e4e78a03f9de87daa6086626643b45c5331d7a25e5dfb1213e95e8712294b",
-      "packaged_sha256": "8be4fc14ba3bdfffabad5b2583e3880fa3d79b7940d9906000ba326bff7ddb1c"
+      "packaged_sha256": "42e8473a2c7e6ef4c1b6e4073d577b3de9c7c40542b97c359bbdc77dbe8975da"
     },
     {
       "source": ".agents/skills/tti-release/SKILL.md",
       "destination": "skills/tti-release/SKILL.md",
       "blob": "af09c19651cadaceb231edab4de3c9707801bc75",
       "source_sha256": "bec4650d82fd95793652014d078125ee9370528c09a3f95cfb381f4ef1447fef",
-      "packaged_sha256": "288f0eab0fdc5225f85609aa375616a79c075db3450469af1d0c12ae6c6df5ec"
+      "packaged_sha256": "28e2c6c448880aef5b33dedc69811ddf3a84e8c4fe6facf38ec2c50d03247f4e"
     },
     {
       "source": ".agents/skills/tti-release/agents/openai.yaml",

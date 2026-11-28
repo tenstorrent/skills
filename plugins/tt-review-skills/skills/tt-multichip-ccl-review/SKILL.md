@@ -37,7 +37,7 @@ device topology's physical ethernet link count:
 value on N300 has hung for 10+ minutes before timeout and needed a device reset.
 
 So: **flag any hardcoded `num_links`.** The safe pattern is to take it from a sibling model's
-`tt_ccl` module (`tt_transformers/tt/ccl.py` auto-detects). A literal that happens to be right for
+`tt_ccl` module (`ttt_compat/tt/ccl.py` auto-detects). A literal that happens to be right for
 the author's machine is still a finding, because it is wrong on every other part.
 
 ## Bias before a cross-device sum is multiplied by `num_devices`

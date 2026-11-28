@@ -3,13 +3,13 @@
 ## Unit test (single module)
 
 ```bash
-pytest models/tt_transformers/tests/test_mlp.py --timeout 300
+pytest models/ttt_compat/tests/test_mlp.py --timeout 300
 ```
 
 ## E2E demo
 
 ```bash
-pytest models/tt_transformers/demo/simple_text_demo.py -k "performance-ci-token-matching" --timeout 420
+pytest models/ttt_compat/demo/simple_text_demo.py -k "performance-ci-token-matching" --timeout 420
 ```
 
 ## Multi-device test

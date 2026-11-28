@@ -13,7 +13,11 @@ Set the model and mesh from current tt-metal model guidance:
 ```bash
 export MODEL_ID="<model-id-from-current-guidance>"
 export MESH_DEVICE="<mesh-from-current-guidance>"
+export HF_MODEL="<hf-name-or-local-checkpoint-path>"
 ```
+
+`models/ttt_compat` models read `HF_MODEL` as the checkpoint and tokenizer path
+and fail at load when it is unset. Other model families may differ.
 
 If `VLLM_PLUGINS` is set, include both `tt` and `tt_model_registry` in the
 existing allowlist.

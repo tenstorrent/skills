@@ -214,7 +214,7 @@ rules, and the do-not-flag guards that every other skill assumes and does not re
 
 | Skill | Reviews |
 |---|---|
-| `tt-vllm-serving-review` | Generator contracts, plugin registration, the `tt_data_parallel` ambiguity |
+| `tt-vllm-serving-review` | Generator contracts, plugin registration and contracts, the `tt_data_parallel` ambiguity |
 
 ### meta — catalogue maintenance
 
@@ -237,6 +237,7 @@ Primary author is the top contributor to that path by commit count.
 |---|---|---|
 | [`tenstorrent/tt-buddy`](https://github.com/tenstorrent/tt-buddy) — `skills/` | [@ppetrovicTT](https://github.com/ppetrovicTT) | The reviewer contract: evidence rule, severity taxonomy, read-past-the-diff discipline, the reviewer cast |
 | [`tenstorrent/tt-buddy`](https://github.com/tenstorrent/tt-buddy) — `knowledge/` | [@viktorpusTT](https://github.com/viktorpusTT) | CCL and matmul knowledge, vLLM recipes |
+| [`tenstorrent/vllm-tt-plugin`](https://github.com/tenstorrent/vllm-tt-plugin) — `AGENTS.md` | [@viktorpusTT](https://github.com/viktorpusTT), [@sanjaradylov](https://github.com/sanjaradylov) | Plugin entry points and model-capability rules |
 | [`tenstorrent/tt_ops_code_gen`](https://github.com/tenstorrent/tt_ops_code_gen) | [@mstaletovicTT](https://github.com/mstaletovicTT) | The eight-category structural kernel checklist, L1 footprint discipline, memory and precision references |
 | [`tt-metal`](https://github.com/tenstorrent/tt-metal) — `.agents` | [@yieldthought](https://github.com/yieldthought) | Optimization rules, multichip, tracing, datatype sweep, vLLM integration — and the Codex PR-review skill this catalogue's output format came from |
 | [`tt-metal`](https://github.com/tenstorrent/tt-metal) — `tt-llk/.claude` | [@ndivnicTT](https://github.com/ndivnicTT) | The LLK audit suite as a whole |

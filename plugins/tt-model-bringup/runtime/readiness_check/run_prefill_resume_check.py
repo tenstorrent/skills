@@ -68,7 +68,7 @@ DEFAULT_THRESHOLDS: Dict[str, float] = {
     "top1_min": 0.98,
     "control_min_window": 64,
 }
-BOOK_RELPATH = Path("models/tt_transformers/tests/tale-of-two-cities.txt.bz2")
+BOOK_RELPATH = Path("models/ttt_compat/tests/tale-of-two-cities.txt.bz2")
 CONTROL_NAMES: tuple[str, ...] = ("no_history", "fresh_suffix")
 STATUS_PASS = "pass"
 STATUS_FAIL = "fail"
