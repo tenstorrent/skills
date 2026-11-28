@@ -6,10 +6,15 @@ than the template (coordinator.prompt_drift_ratio, default 1.5; 0: off), lacks a
 template has, or still has a section the template dropped. `line` feeds `ttp doctor` and the daily
 review; `check` (daemon tick) queues one low event to the project's own coordinator per changed copy,
 suggesting it merge its copy toward the template. The harness never edits a project's prompts: each
-coordinator owns its own."""
+coordinator owns its own.
+
+`sizes` and `size_line` do the same for what a worker prompt weighs: the median bytes (system.md and prompt.md,
+less the binding restrictions and the task) per role over the last day, and the runs over worker.prompt_max_bytes;
+forked runs, whose context is the coordinator's, are left out."""
 from __future__ import annotations
 
 import hashlib
+import statistics
 import subprocess
 import time
 from pathlib import Path
@@ -131,3 +136,40 @@ def check(p: Project, now: float | None = None) -> str:
             state["flagged"] = digest
     p.db.set_kv(KEY, state)
     return text
+
+
+def counted_bytes(p: Project, run_dir: Path) -> int | None:
+    """What a finished run's prompt weighed against worker.prompt_max_bytes: system.md and prompt.md less the
+    binding restrictions block and the task's own section; None for a forked run or without both files."""
+    from . import ctxfork, prompts
+    try:
+        system, prompt = (run_dir / "system.md").read_text(), (run_dir / "prompt.md").read_text()
+    except OSError:
+        return None
+    if prompt.startswith(ctxfork.FORK_HEAD):
+        return None
+    task = prompt[prompt.find("# YOUR TASK #"):].split("\n# ", 1)[0] if "# YOUR TASK #" in prompt else ""
+    return len((system + prompt).encode()) - len(prompts.restrictions_block(p).encode()) - len(task.encode())
+
+
+def sizes(p: Project, now: float | None = None, days: float = 1) -> dict[str, dict]:
+    """{role: {"median", "runs", "over"}}: counted_bytes of the runs started in the last `days`; `over` is how many
+    passed worker.prompt_max_bytes (never with the cap 0)."""
+    from . import prompts
+    now, cap, got = time.time() if now is None else now, prompts.prompt_cap(p), {}
+    for r in p.db.q("SELECT role, dir, id FROM runs WHERE role!='coordinator' AND started>=?", (now - days * 86400,)):
+        if (n := counted_bytes(p, Path(r["dir"]) if r["dir"] else p.runs / str(r["id"]))) is not None:
+            got.setdefault(r["role"], []).append(n)
+    return {role: {"median": int(statistics.median(v)), "runs": len(v), "over": sum(cap > 0 and n > cap for n in v)}
+            for role, v in got.items()}
+
+
+def size_line(p: Project, now: float | None = None) -> str:
+    """One line for the daily review: the median prompt bytes per role and the runs over the cap; "" without runs."""
+    got = sizes(p, now)
+    if not got:
+        return ""
+    over = sum(x["over"] for x in got.values())
+    return ("worker prompt bytes, median over the last day: "
+            + ", ".join(f"{role} {x['median'] // 1024} KB ({x['runs']} runs)" for role, x in sorted(got.items()))
+            + (f"; {over} over worker.prompt_max_bytes: trim the memory and charter text they carry" if over else ""))

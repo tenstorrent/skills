@@ -688,6 +688,8 @@ def lines(db: DB, now: float | None = None, window_s: float = WINDOW_S, blocked_
         from . import promptdrift
         if drift := promptdrift.line(p):
             out.append(drift)
+        if sizes := promptdrift.size_line(p, now):
+            out.append(sizes)
         try:   # where landing time went and how accurate the ETAs were (landings.py, etaledger.py)
             from . import etaledger, landings
             out += landings.audit_lines(db, now, p=p)

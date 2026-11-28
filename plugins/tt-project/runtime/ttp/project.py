@@ -643,7 +643,9 @@ DEFAULT_CONFIG: dict[str, Any] = {
     # `run` runs from the project root with the hand-off in TTP_RESULT_JSON and `{result}`; exit 0
     # passes, 1 sends the run back with the output (handoff_check_max_sendbacks times, then the task
     # goes to review), anything else is a broken check: accepted, the coordinator told once.
-    "worker": {"handoff_checks": [], "handoff_check_max_sendbacks": 2},
+    # `prompt_max_bytes`: the most bytes a worker's prompt (system prompt and task prompt, not forked runs')
+    # carries past its binding restrictions and the task itself (prompts.prompt_cap; 0: no cap).
+    "worker": {"handoff_checks": [], "handoff_check_max_sendbacks": 2, "prompt_max_bytes": 60000},
     # The project's own tool guards (localguard.py): Python files, by path from the harness folder and
     # outside runtime/ and prompts/, each with refusal(cmd) (and optionally tool_refusal(tool, input)),
     # asked after the built-in guards on every worker and coordinator tool call. Never edit runtime/ files.
@@ -1749,6 +1751,9 @@ WORKER_PINNED_MIN_CHARS = WORKER_MEMORY_CHARS // 2
 # Likewise the charter's policies and other items for workers get what its Goals and Resources leave
 # of it, never less than this, and never less because pinned memory is large.
 WORKER_POLICY_MIN_CHARS = WORKER_MEMORY_CHARS // 2
+# Each Goals or Resources section of the charter shows workers this many chars whole; the blocks past it
+# are offered by the words they share with the task (prompts.worker_rules).
+WORKER_WHOLE_CHARS = WORKER_MEMORY_CHARS
 # Room for a worker's unpinned (task-ranked) memory past the pinned entries shown, whatever the
 # charter digest leaves: ranking always has room to show something.
 WORKER_RANKED_MIN_CHARS = 1500

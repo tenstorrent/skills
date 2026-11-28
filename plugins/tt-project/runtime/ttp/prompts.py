@@ -19,7 +19,7 @@ from .ponytail import pinned, skill_file
 from .project import rebase_replace
 from .project import (CORRECTIONS_HEADER, OWN_FLAG, WORKER_MEMORY_CHARS, WORKER_PINNED_MIN_CHARS, WORKER_RANKED_MIN_CHARS,
                       Project, code_tasks_may_push, own_push, push_allowed, push_queue_on, task_may_self_land, worker_memory,
-                      WORKER_POLICY_MIN_CHARS)
+                      WORKER_POLICY_MIN_CHARS, WORKER_WHOLE_CHARS, task_words)
 from .worktree import carried_branch, gets_worktree, own_worktree, project_venv, rebased_branch, recovery_note
 
 
@@ -497,6 +497,7 @@ def _worker_heads(p: Project, dropped: int, n: int) -> tuple[str, str]:
     return _CHARTER_HEAD.format(more=more, path=p.charter_path), _MEMORY_HEAD.format(n=n, path=p.memory_index)
 
 
+MEMORY_POINTERS_LISTED = 12   # pointers a worker's memory block lists by name; the rest are one count line
 # Heads the pointers to the memory pinned for workers that its prompt has no room for whole (see
 # Project.worker_memory_select): where each is in full; not a fault.
 _PINNED_MORE = "Shortened for room, each in full in {path}/<name>.md (read those your task touches):"
@@ -556,17 +557,24 @@ def worker_context(p: Project, task: dict | None = None,
     whole = lambda h: name(h).startswith(("goal", "resource")) or (not goals and name(h).startswith("brief"))
     heads = sum(len(x) + 2 for x in _worker_heads(p, 999, 99999))   # their longest
     keep = lambda h, x: goal_for_workers(x, name(h).startswith("resource"))
-    used = heads + sum(len(h) + len("\n\n".join(x for x in _blocks(b) if keep(h, x))) + 3
-                       for h, b in secs if whole(h))
-    out, dropped = [], 0
+    left, shown = [], {}   # the blocks of a Goals or Resources section past WORKER_WHOLE_CHARS; those that fit
+    for h, b in secs:
+        if whole(h):
+            size, shown[h] = 0, []
+            for x in (x for x in _blocks(b) if keep(h, x)):
+                if size + len(x) + 2 <= WORKER_WHOLE_CHARS:
+                    shown[h].append(x)
+                    size += len(x) + 2
+                else:
+                    left.append(x)
+    used = heads + sum(len(h) + len("\n\n".join(shown[h])) + 3 for h, b in secs if whole(h))
+    out, dropped = [], len(left)
     cap = max(WORKER_MEMORY_CHARS, used + WORKER_POLICY_MIN_CHARS)   # long Goals never squeeze the policies out
     for h, b in secs:
         if whole(h):
-            blocks = _blocks(b)
-            kept = [x for x in blocks if keep(h, x)]
-            dropped += len(blocks) - len(kept)
-            if kept:
-                out.append(h + "\n" + "\n\n".join(kept))
+            dropped += len(_blocks(b)) - len([x for x in _blocks(b) if keep(h, x)])
+            if shown[h]:
+                out.append(h + "\n" + "\n\n".join(shown[h]))
             continue
         if name(h).startswith("brief"):
             continue
@@ -595,7 +603,7 @@ def worker_context(p: Project, task: dict | None = None,
         mem, use = p.worker_memory_select(use["pinned_chars"] + WORKER_RANKED_MIN_CHARS - reserve, task, room,
                                           restated, entries)
     return text, mem, dict(use, charter_chars=heads + len(text), charter_dropped=dropped, limit=WORKER_MEMORY_CHARS,
-                           memory_limit=room)
+                           memory_limit=room, charter_left=left)
 
 
 # Task kinds whose workers never hand off `waiting` on a job of their own, so their prompt leaves out
@@ -752,13 +760,21 @@ def worker_rules(p: Project, task: dict) -> str:
             out.append(("" if last and last[0] == section else f"## {section or 'Worker rules'}\n")
                        + (cont + "\n" if cont else "") + (f"{fence}\n{body}\n```" if fence else body))
         last = (section, cont, fence)
-    shown = {e["name"] for e in worker_context(p, reserve=WORKER_RANKED_MIN_CHARS)[1]}
+    _, shown_mem, use = worker_context(p, reserve=WORKER_RANKED_MIN_CHARS)
+    shown = {e["name"] for e in shown_mem}
     mem, used = [], 0
     for e in worker_context(p, task)[1]:
         if e["name"] not in shown and used + len(e["line"]) + 1 <= WORKER_RANKED_MIN_CHARS:
             mem.append(e)
             used += len(e["line"]) + 1
+    want, charter, used = task_words(f"{task.get('title') or ''}\n{task.get('spec') or ''}"), [], 0
+    for x in sorted(use["charter_left"], key=lambda x: -len(task_words(x) & want)):   # the task's own goals
+        if task_words(x) & want and used + len(x) + 2 <= WORKER_WHOLE_CHARS // 2:
+            charter.append(x)
+            used += len(x) + 2
     parts = []
+    if charter:
+        parts.append(f"# {TASK_CHARTER_HEADER}\n" + "\n\n".join(charter))
     if out:
         parts.append(f"# {TASK_RULES_HEADER}\n" + "\n\n".join(out))
     if mem:
@@ -767,8 +783,29 @@ def worker_rules(p: Project, task: dict) -> str:
     return "\n\n".join(parts)
 
 
+PROMPT_MAX_BYTES = 60000
 TASK_RULES_HEADER = "TASK RULES (binding, as in the system prompt's section named)"
 TASK_MEMORY_HEADER = "MORE MEMORY FOR THIS TASK"
+TASK_CHARTER_HEADER = "MORE OF THE CHARTER FOR THIS TASK (Goals and Resources the digest above leaves out)"
+
+
+def prompt_cap(p: Project) -> int:
+    """worker.prompt_max_bytes: the bytes a worker's prompt may carry past the binding restrictions and the task
+    itself (default PROMPT_MAX_BYTES; 0: no cap)."""
+    try:
+        return int((p.config().get("worker") or {}).get("prompt_max_bytes", PROMPT_MAX_BYTES))
+    except (TypeError, ValueError):
+        return PROMPT_MAX_BYTES
+
+
+def _trim(text: str, cut: int) -> str:
+    """`text` less its last whole lines, enough that it ends `cut` bytes shorter with a line saying so."""
+    note = "\n(cut to fit worker.prompt_max_bytes; the rest is in the memory folder and the charter)"
+    lines, size = text.split("\n"), len(text.encode())
+    while lines and size > len(text.encode()) - cut - len(note.encode()):
+        size -= len(lines.pop().encode()) + 1
+    fence = "\n```" if sum(x.startswith("```") for x in lines) % 2 else ""
+    return "\n".join(lines) + fence + note
 
 
 def worker_corrections(p: Project) -> list[dict]:
@@ -795,15 +832,20 @@ def worker_system(p: Project, task: dict | None = None) -> str:
 def worker_memory_block(p: Project) -> str:
     """The user's corrections and the project memory for workers (worker_context's task-free choice),
     leading a run's own prompt: one new entry must not change the system prompt every worker and
-    reviewer shares, which would make each one's first call write the cache afresh."""
-    _, mem, use = worker_context(p, reserve=WORKER_RANKED_MIN_CHARS)   # the task's own: worker_rules
+    reviewer shares, which would make each one's first call write the cache afresh. Pointers past
+    MEMORY_POINTERS_LISTED are one count."""
+    _, mem, use = worker_context(p, reserve=WORKER_RANKED_MIN_CHARS)   # the rest of its own: worker_rules
     # The user's corrections come before the rest of memory, outside its budget (Project.user_corrections).
     fixed = worker_corrections(p)
     p.note_memory_shown([e["name"] for e in fixed + mem + use["pointers"]])
     parts = []
     if fixed:
         parts.append(f"# {CORRECTIONS_HEADER.upper()}\n" + "\n".join(e["line"] for e in fixed))
-    more = [_PINNED_MORE.format(path=p.memory_dir)] + [x["line"] for x in use["pointers"]] if use["pointers"] else []
+    ptrs = [x["line"] for x in use["pointers"]]
+    more = [_PINNED_MORE.format(path=p.memory_dir)] + ptrs[:MEMORY_POINTERS_LISTED] if ptrs else []
+    if len(ptrs) > MEMORY_POINTERS_LISTED:
+        more.append(f"{len(ptrs) - MEMORY_POINTERS_LISTED} more memory entries: `grep -il <word of your task> "
+                    f"{p.memory_dir}/*.md`")
     if mem or more:
         parts.append(_worker_heads(p, 0, len(p._memory_entries()))[1] + "\n".join([e["line"] for e in mem] + more))
     return "\n\n".join(parts)
@@ -982,13 +1024,14 @@ def worker_task(p: Project, task: dict, cwd: str, branch: str | None, wake: dict
     venv_line = (f"python venv: {venv} (the project's, already active: VIRTUAL_ENV and PATH; shared with other "
                  "workers, so do not install into it; its editable installs import the project root's code, not "
                  "yours; need other packages? make a venv of your own in the working directory)\n") if venv else ""
+    memory, rules = worker_memory_block(p), worker_rules(p, task)
     parts = [
         restart_block(p, prev),
         streamguard.prompt_block(prev),
         _sections(_raw(p, f"kind-{kind}.md"), cfg).replace("{ponytail_skill}", skill_file())
         .replace("{ponytail_pin}", pinned(cfg, provider or task.get("provider"))),
-        worker_memory_block(p),
-        worker_rules(p, task),
+        memory,
+        rules,
         f"# YOUR TASK #{task['id']}: {task['title']}\n"
         f"kind: {kind} · tier: {task['tier']}" + (f" · this run: {run_tier} wake" if wake else "")
         + f" · attempt {int(task['attempts'] or 0) + 1} of "
@@ -1020,10 +1063,28 @@ def worker_task(p: Project, task: dict, cwd: str, branch: str | None, wake: dict
         taskfacts.prompt_block(p, dict(task)),
         overlap.prompt_block(p, dict(task))]
     from . import blindreview
+    ctx = ""
     if not blindreview.is_blind_task(dict(task)):   # a blind review's records would name the arms it scores
-        parts.append(ctxblock.prompt_block(p, dict(task), "\n".join(parts), _system_memory(p), tag))
+        parts.append(ctx := ctxblock.prompt_block(p, dict(task), "\n".join(parts), _system_memory(p), tag))
     parts.append(restrictions_pointer(p))
-    return "\n\n".join(x for x in parts if x.strip())
+    return "\n\n".join(_fit(p, task, parts, [memory, ctx, rules]))
+
+
+def _fit(p: Project, task: dict, parts: list[str], flex: list[str]) -> list[str]:
+    """The non-empty `parts` of a worker's task prompt within prompt_cap together with worker_system: past it
+    the parts of `flex` (in the order given: the memory block, the context block, the task rules) lose their
+    last lines. The binding restrictions, worker.md's blocks and the task itself are never cut. Forked runs
+    are not cut: their context is added after this prompt."""
+    cap = prompt_cap(p)
+    spec = next(x for x in parts if x.startswith("# YOUR TASK #"))
+    over = cap and len("\n\n".join(parts).encode()) + len(worker_system(p, task).encode()) - cap \
+        - len(restrictions_block(p).encode()) - len(spec.encode())
+    for x in flex:
+        if over > 0 and x.strip():
+            i = next(i for i, y in enumerate(parts) if y is x)
+            parts[i] = _trim(x, over)
+            over -= len(x.encode()) - len(parts[i].encode())
+    return [x for x in parts if x.strip()]
 
 
 def outside_line(p: Project, task: dict) -> str:
@@ -1056,7 +1117,7 @@ def woke_text(woke, tag: str) -> str:
 
 
 def _system_memory(p: Project) -> set[str]:
-    """The memory entries worker_system shows (the context block leaves them out)."""
+    """The memory entries the task prompt's memory block shows (the context block leaves them out)."""
     try:
         return {e["name"] for e in worker_context(p, reserve=WORKER_RANKED_MIN_CHARS)[1]}
     except Exception:

@@ -18803,7 +18803,9 @@ def test_pinned_worker_memory_past_its_room_shows_the_task_s_entries_and_a_plain
     # The task's own entry comes whole in its own prompt; the shared system prompt keeps the oldest.
     whole = system + worker_rules(p, task)
     assert "WORKER-17 uses rack-17 " + "w" * 600 in whole and "WORKER-19 uses rack-19 " + "w" * 600 not in whole
-    assert system.rstrip().endswith("…") and f"\n[{pinned[19].stem}] WORKER-19 uses rack-19 www" in system
+    from ttp.prompts import MEMORY_POINTERS_LISTED
+    assert n > MEMORY_POINTERS_LISTED and str(n - MEMORY_POINTERS_LISTED) in system.rstrip().splitlines()[-1]
+    assert sum(x.startswith("[") and x.endswith("…") for x in system.splitlines()) == MEMORY_POINTERS_LISTED
     assert f"Shortened for room, each in full in {p.memory_dir}/<name>.md" in system
     assert "did not fit" not in system
     # No task: the oldest that fit, as before.
