@@ -166,3 +166,26 @@ def test_rule_gone_command_exits_by_whether_the_rule_stands(env, monkeypatch, ca
         cli.main(["rule-gone", "--old", "7 min"])
     assert e.value.code == 0
     assert "gone" in capsys.readouterr().out
+
+
+def test_rule_gone_unknown_message_is_an_error_not_a_gone_mark(env, monkeypatch, capsys):
+    from ttp import cli, rulematch as rm
+    p = _rm_project(env)
+    monkeypatch.chdir(p.root)
+    assert rm.gone(p, p.db, msg=9999) is None and p.db.kv(rm.KV + "9999" + rm.GONE) is None
+    with pytest.raises(SystemExit) as e:
+        cli.main(["rule-gone", "--msg", "9999"])
+    assert e.value.code and p.db.kv(rm.KV + "9999" + rm.GONE) is None
+
+
+def test_rule_gone_digest_checks_an_overdue_message_once_an_hour(env, monkeypatch):
+    from ttp import rulematch as rm
+    p = _rm_project(env)
+    _rm_flag(p)
+    late, calls = time.time() + rm.OVERDUE_S + 60, []
+    real = rm.gone
+    monkeypatch.setattr(rm, "gone", lambda *a, **k: calls.append(1) or real(*a, **k))
+    first = rm.digest_lines(p.db, late)
+    assert rm.digest_lines(p.db, late + 60) == first and len(calls) == 1
+    rm.digest_lines(p.db, late + rm.CHECK_S + 60)
+    assert len(calls) == 2

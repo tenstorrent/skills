@@ -23,6 +23,8 @@ from . import correction, prompts, reask, rulecite
 
 KV = "rulematch:"   # + message id: {"msg", "items": [older()'s rows]}
 GONE = ":gone"   # kv rulematch:<msg id>:gone {"ts"}: the rule is gone
+CHECKED = "rulematch-checked:"   # + message id: {"at", "left"}: the last overdue check of a message's rules
+CHECK_S = 3600
 MAX = 5
 OPEN_S = 48 * 3600
 OVERDUE_S = 24 * 3600
@@ -157,7 +159,7 @@ def remaining(p, db, old: str | None = None, name: str | None = None, items: lis
     every place that holds `old`: a memory entry or charter line naming it (in any unit), a config value or a code
     constant (a duration only beside `name`) or an env default the repo carries, at the push branch's tip."""
     cfg, ref = p.config(), _tip(p, p.config())
-    consts, env = _constants(p, cfg, ref), _constants(p, cfg, ref, r"^\s*[A-Z][A-Z0-9]*(_[A-Z0-9]+)+=", (":(exclude)*.py",))
+    consts = _constants(p, cfg, ref)
     if items is not None:
         mem = {e["name"]: e["body"] for e in p._memory_entries()}
         try:
@@ -181,6 +183,7 @@ def remaining(p, db, old: str | None = None, name: str | None = None, items: lis
     except OSError:
         pass
     key = (name or "").casefold()   # a duration in config or code counts only beside the name it was set under
+    env = _constants(p, cfg, ref, r"^\s*[A-Z][A-Z0-9]*(_[A-Z0-9]+)+=", (":(exclude)*.py",))
     out += [f"config {k} = {json.dumps(v)}" for k, v in _flat(cfg) if not isinstance(v, bool)
             and (str(v).casefold() == needle or (key and key in k.casefold() and _secs(k, v) in dur))]
     out += [f"{kind} {n}: {loc} = {v}" for kind, rows in (("code", consts), ("env", env)) for loc, n, v in rows
@@ -188,11 +191,13 @@ def remaining(p, db, old: str | None = None, name: str | None = None, items: lis
     return out
 
 
-def gone(p, db, msg: int | None = None, old: str | None = None, name: str | None = None) -> list[str]:
+def gone(p, db, msg: int | None = None, old: str | None = None, name: str | None = None) -> list[str] | None:
     """`remaining` for message `msg` (its recorded rules) or the value `old`; with none left, a message's
-    kv `rulematch:<id>:gone` is stored (once)."""
+    kv `rulematch:<id>:gone` is stored (once). None: no rules are recorded for `msg`, nothing is marked."""
     rec = db.kv(KV + str(msg)) if msg is not None else None
-    left = remaining(p, db, items=(rec or {}).get("items", [])) if rec is not None else remaining(p, db, old, name)
+    if msg is not None and rec is None:
+        return None
+    left = remaining(p, db, items=rec.get("items", [])) if rec is not None else remaining(p, db, old, name)
     if msg is not None and not left and db.kv(KV + str(msg) + GONE) is None:
         db.set_kv(KV + str(msg) + GONE, {"ts": time.time()})
     return left
@@ -224,11 +229,16 @@ def digest_lines(db, now: float | None = None) -> list[str]:
         if db.kv(KV + str(rec["msg"]) + GONE) is not None:
             continue
         if now - rec["ts"] >= OVERDUE_S and rec.get("items"):
-            from .project import Project
-            try:
-                left = gone(Project(Path(db.path).parent.parent), db, msg=rec["msg"])
-            except Exception:
-                left = [f"{i['where']} {i['name']}" for i in rec["items"][:MAX]]
+            seen = db.kv(CHECKED + str(rec["msg"]))   # the git greps run once an hour per message, not per digest
+            if seen and 0 <= now - float(seen["at"]) < CHECK_S:
+                left = seen["left"]
+            else:
+                from .project import Project
+                try:
+                    left = gone(Project(Path(db.path).parent.parent), db, msg=rec["msg"]) or []
+                except Exception:
+                    left = [f"{i['where']} {i['name']}" for i in rec["items"][:MAX]]
+                db.set_kv(CHECKED + str(rec["msg"]), {"at": now, "left": left[:MAX]})
             out += [f"- overdue: user msg {rec['msg']} rule still at {'; '.join(x.split(':')[0] for x in left[:MAX])}"] if left else []
             continue
         out += [f"- user msg {rec['msg']} may retire: {i['where']} {i['name']} = {i['value']}; retire or rewrite it "

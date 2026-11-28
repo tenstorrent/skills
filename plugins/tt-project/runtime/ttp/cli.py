@@ -9036,6 +9036,8 @@ def cmd_rule_gone(a) -> None:
     if (a.msg is None) == (a.old is None):
         die("ttp rule-gone: give --msg ID or --old TEXT")
     left = rulematch.gone(p, p.db, a.msg, a.old, a.name)
+    if left is None:
+        die(f"ttp rule-gone: no rules are recorded for message {a.msg}")
     print("\n".join(left) if left else "gone")
     raise SystemExit(1 if left else 0)
 
