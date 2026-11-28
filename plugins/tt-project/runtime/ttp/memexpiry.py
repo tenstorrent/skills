@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import re
 import time
+from pathlib import Path
 
 from . import ends, rulecite
 
@@ -37,14 +38,19 @@ def default_end(p, kind: str, standing: bool, now: float | None = None) -> dict:
     return {"expires": (time.time() if now is None else now) + w} if w and kind in KINDS and not standing else {}
 
 
-def _rewrite(p, name: str, expires: float, auto: bool | None = None) -> None:
+def _write_end(p, name: str, expires: float, auto: bool | None) -> Path:
+    """Rewrite the end in entry `name`'s front matter (caller holds the memory lock); returns its path."""
     path = p.memory_dir / f"{name}.md"
+    head, sep, body = path.read_text().partition("\n---\n")
+    lines = [x for x in head.splitlines() if not x.startswith(("expires:", "expires_auto:"))]
+    lines += [f"expires: {ends.stamp(expires)}"] + (["expires_auto: true"] if auto else [])
+    ends.durable_write(path, "\n".join(lines) + sep + body)
+    return path
+
+
+def _rewrite(p, name: str, expires: float, auto: bool | None = None) -> None:
     with p.memory_locked():
-        raw = path.read_text()
-        head, sep, body = raw.partition("\n---\n")
-        lines = [x for x in head.splitlines() if not x.startswith(("expires:", "expires_auto:"))]
-        lines += [f"expires: {ends.stamp(expires)}"] + (["expires_auto: true"] if auto else [])
-        ends.durable_write(path, "\n".join(lines) + sep + body)
+        path = _write_end(p, name, expires, auto)
     p.commit_harness([path], f"memory: [{name}] expires {ends.stamp(expires)[:10]}")
 
 
@@ -83,10 +89,9 @@ def cite(p, applied: list[dict], now: float | None = None) -> None:
 
 
 def _uses(p, now: float) -> dict:
-    uses = dict(p.db.kv(KEY, {}) or {})
-    for key in [e["name"] for e in p._memory_entries()] + [rid for rid, _ in rulecite.entries(p, now)]:
-        uses.setdefault(key, {"seen": now, "cited": 0})
-    return uses
+    stored = p.db.kv(KEY, {}) or {}
+    live = [e["name"] for e in p._memory_entries()] + [rid for rid, _ in rulecite.entries(p, now)]
+    return {key: stored.get(key) or {"seen": now, "cited": 0} for key in live}
 
 
 def backfill(p, now: float | None = None) -> list[str]:
@@ -95,10 +100,14 @@ def backfill(p, now: float | None = None) -> list[str]:
     now, w, done = time.time() if now is None else now, window_s(p), []
     if not w:
         return []
-    for e in p._memory_entries():
-        if e["kind"] in KINDS and not e["standing"] and not e["end"] and not e["kept"]:
-            _rewrite(p, e["name"], max(_stamp_ts(e["created"]) + w, now + BACKFILL_FLOOR_S), True)
-            done.append(e["name"])
+    paths = []
+    with p.memory_locked():
+        for e in p._memory_entries():
+            if e["kind"] in KINDS and not e["standing"] and not e["end"] and not e["kept"]:
+                paths.append(_write_end(p, e["name"], max(_stamp_ts(e["created"]) + w, now + BACKFILL_FLOOR_S), True))
+                done.append(e["name"])
+    if paths:
+        p.commit_harness(paths, f"memory: {len(paths)} entries get the default expiry")
     return done
 
 

@@ -135,3 +135,30 @@ def test_memexpiry_the_digest_lists_expiring_entries_and_reviews_unused_standing
     assert not [x for x in memexpiry.digest_lines(p, now + 31 * 86400 + 60) if x.startswith("- review:")]   # once a day
     memexpiry.cite(p, [{"why": f"per {duty}"}], now + 31 * 86400 + 90)
     assert not [x for x in memexpiry.digest_lines(p, now + 55 * 86400) if duty in x and "review" in x]
+
+
+def test_memexpiry_backfill_of_many_entries_makes_one_harness_commit(env, monkeypatch):
+    from ttp import memexpiry
+    p = make(env)
+    p.set_config("memory.default_expiry_days", 0)
+    names = [p.add_memory(f"an entry from before the default {i}", kind="decision").stem for i in range(5)]
+    p.set_config("memory.default_expiry_days", 30)
+    commits = []
+    monkeypatch.setattr(type(p), "commit_harness", lambda self, paths, msg, removed=(): commits.append(list(paths)))
+    assert sorted(memexpiry.backfill(p)) == sorted(names)
+    assert len(commits) == 1 and sorted(x.stem for x in commits[0]) == sorted(names)
+    assert all(_mx_entry(p, n)["end"].get("expires") for n in names)
+
+
+def test_memexpiry_uses_drops_ids_of_rules_and_entries_that_no_longer_exist(env):
+    import time
+    from ttp import memexpiry
+    p = make(env)
+    name = p.add_memory("a decision still in force", kind="decision").stem
+    now = time.time()
+    p.db.set_kv(memexpiry.KEY, {"R-dead": {"seen": 1, "cited": 0}, "gone-entry": {"seen": 1, "cited": 0},
+                                name: {"seen": 5, "cited": 6}})
+    uses = memexpiry._uses(p, now)
+    assert "R-dead" not in uses and "gone-entry" not in uses and uses[name] == {"seen": 5, "cited": 6}
+    assert not [x for x in memexpiry.digest_lines(p, now + 40 * 86400) if "R-dead" in x]
+    assert "R-dead" not in p.db.kv(memexpiry.KEY)
