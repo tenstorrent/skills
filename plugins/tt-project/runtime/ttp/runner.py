@@ -241,18 +241,20 @@ def live_budget(run_dir: Path, budget):
     return max(raised, float(budget)) if budget is not None else budget
 
 
-def stop_runs(db, runs_dir: Path, task: int | None = None, why: str = "cancel") -> list[int]:
-    """Request a stop for every running run (of one task, if given). Returns their run ids."""
+def running_dirs(db, runs_dir: Path, task: int | None = None) -> list[tuple[int, Path]]:
+    """(run id, its directory) of every running run (of one task, if given) whose directory exists."""
     sql, args = "SELECT id, dir FROM runs WHERE status='running'", ()
     if task is not None:
         sql, args = sql + " AND task=?", (task,)
-    ids = []
-    for r in db.q(sql, args):
-        run_dir = Path(r["dir"]) if r["dir"] else runs_dir / str(r["id"])
-        if run_dir.is_dir():
-            request_stop(run_dir, why)
-            ids.append(r["id"])
-    return ids
+    dirs = ((r["id"], Path(r["dir"]) if r["dir"] else Path(runs_dir) / str(r["id"])) for r in db.q(sql, args))
+    return [(i, d) for i, d in dirs if d.is_dir()]
+
+
+def stop_runs(db, runs_dir: Path, task: int | None = None, why: str = "cancel") -> list[int]:
+    """Request a stop for every running run (of one task, if given). Returns their run ids."""
+    for _, run_dir in (found := running_dirs(db, runs_dir, task)):
+        request_stop(run_dir, why)
+    return [i for i, _ in found]
 
 
 def stop_reason(run_dir: Path) -> str | None:

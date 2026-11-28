@@ -93,16 +93,11 @@ def record_raise(db, task: dict, after: float) -> None:
 def reach_run(db, runs_dir, task_id: int, usd: float) -> list[int]:
     """Give each running run of the task its raised limit (runner.LIVE_BUDGET in its directory, which its
     budget check rereads). Returns the run ids reached."""
-    from pathlib import Path
     from .project import durable_write
-    from .runner import LIVE_BUDGET
-    ids = []
-    for r in db.q("SELECT id, dir FROM runs WHERE task=? AND status='running'", (task_id,)):
-        run_dir = Path(r["dir"]) if r["dir"] else Path(runs_dir) / str(r["id"])
-        if run_dir.is_dir():
-            durable_write(run_dir / LIVE_BUDGET, f"{float(usd):.2f}\n")
-            ids.append(r["id"])
-    return ids
+    from .runner import LIVE_BUDGET, running_dirs
+    for _, run_dir in (found := running_dirs(db, runs_dir, task_id)):
+        durable_write(run_dir / LIVE_BUDGET, f"{float(usd):.2f}\n")
+    return [i for i, _ in found]
 
 
 def raised_during(db, task: dict, run: dict) -> bool:
