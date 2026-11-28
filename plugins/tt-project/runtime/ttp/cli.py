@@ -12575,8 +12575,15 @@ def cmd_memory(a) -> None:
     if a.settle is not None:
         _memory_settle(p, a)
         return
+    if a.renew:
+        from . import memexpiry
+        try:
+            print(f"renewed [{memexpiry.renew(p, a.renew, a.days)}]")
+        except ValueError as e:
+            sys.exit(str(e))
+        return
     if not a.text and not a.forget:
-        sys.exit("give the memory's text, or --forget <entry>, or --search <words>")
+        sys.exit("give the memory's text, or --forget <entry>, --renew <entry> or --search <words>")
     from . import coordtools
     if a.text and coordtools.coordinator_run():   # also past the hook (a command a coordinator tool started)
         sys.exit("ttp memory: a coordinator writes memory with the `memory_add` action (its `supersedes` too), which checks lines "
@@ -18294,6 +18301,9 @@ def ttp_parser():
     s.add_argument("text", nargs="?", help="the memory to add, one entry")
     s.add_argument("--kind", default="fact",
                    help="restriction, preference, resource, decision or fact (default fact)")
+    s.add_argument("--renew", metavar="ENTRY",
+                   help="give an expiring entry a fresh window (--days N, else memory.default_expiry_days)")
+    s.add_argument("--days", type=float, help="the window --renew gives, in days")
     s.add_argument("--forget", action="extend", nargs="+", metavar="ENTRY",
                    help="retire entries (names in [brackets]) to memory/archive/: several names after one "
                         "--forget, or the flag repeated, make one harness commit; an unknown name is "

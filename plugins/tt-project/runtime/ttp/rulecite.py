@@ -198,6 +198,8 @@ def check(p, applied: list[dict], turn=None, now: float | None = None) -> list[s
     turn-less apply marks nothing. Returns the flagged actions' descriptions."""
     db = p.db
     now = time.time() if now is None else now
+    from . import memexpiry
+    memexpiry.cite(p, applied, now)
     holds = [(a, k) for a in applied if (k := hold_type(a)) and not (k == "pause" and _users_pause(db, a))]
     recs = _records(db)
     for r in recs:

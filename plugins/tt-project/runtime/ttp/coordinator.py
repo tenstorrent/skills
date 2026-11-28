@@ -133,6 +133,7 @@ from . import (   # one name per line: two changes adding names merge without a 
 from . import untrusted
 from . import msgwake
 from . import branchcap
+from . import memexpiry
 from . import urgent
 from . import msgurgent
 from . import waketier
@@ -1591,7 +1592,7 @@ def digest_parts(p: Project, gates: dict, event_ids: list[int], msg_ids: list[in
         if long_due[0]:
             course_lines = (course_lines or [course.HEADER]) + long_due[0]
             course_id += "\n" + "\n".join(long_due[1])
-    if uncited := rulecite.digest_lines(db, now):
+    if uncited := rulecite.digest_lines(db, now) + safe_eta(lambda: memexpiry.digest_lines(p, now), []):
         course_lines = (course_lines or [course.HEADER]) + uncited
         course_id += "\nrulecite:" + uncited[0].split(" (why:")[0]
     if unplain := plainreply.digest_lines(db, now):
@@ -4071,7 +4072,8 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                                                           key, end)
                 added = p.add_memory(text, kind=a.get("memory_kind") or "fact", title=a.get("title"), key=key,
                                      end=end, standing=a.get("standing") is True, audience=audience,
-                                     reason=a.get("reason"), context=oldorders.context_for(db, text))
+                                     reason=a.get("reason"), context=oldorders.context_for(db, text),
+                                     default_end=a.get("permanent") is not True)
                 if (a.get("memory_kind") or "") == "restriction":
                     notes.append(_tell_running_workers(p, f"New binding restriction: {a['text'].strip()}", key,
                                                        messages if user_turn else ()))

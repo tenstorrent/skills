@@ -29,7 +29,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from . import detach, netwait, probespawn, timefmt
+from . import detach, memexpiry, netwait, probespawn, timefmt
 from .db import TERMINAL_TASK_STATES
 from .detach import failed_check
 from .project import Project, command_env, durable_append, durable_write, output_tail
@@ -488,6 +488,7 @@ class Ends:
     def __init__(self, p: Project, log=lambda msg: None):
         self.p, self.log = p, log
         self._checked = 0.0
+        self._backfilled = 0.0
         self._procs: dict[str, tuple[subprocess.Popen, float, str]] = {}
         self._errs: dict[int, Any] = {}   # id(proc) -> its stderr file
         self._probed: dict[str, float] = {}
@@ -504,6 +505,9 @@ class Ends:
             return []
         self._checked = now
         retired, broken = [], dict(self.p.db.kv(BROKEN_KEY) or {})
+        if now - self._backfilled >= 3600:   # entries written before the default expiry (memexpiry)
+            self._backfilled = now
+            memexpiry.backfill(self.p, now)
         items, at = temporaries(self.p), self._resume
         self._resume = None
         cut = next((n + 1 for n, x in enumerate(items) if x["key"] == at), 0)

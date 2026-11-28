@@ -717,7 +717,9 @@ DEFAULT_CONFIG: dict[str, Any] = {
     # Once a day the daemon archives (to memory/archive/, one harness commit, one low feed line) the
     # decision and fact entries, never standing ones, that every prompt has left out for at least
     # archive_hidden_days days (0 = off). `ttp memory <name> --search <words>` still finds them.
-    "memory": {"archive_hidden_days": 7},
+    # default_expiry_days: a decision, fact or preference entry written without an end expires after this many
+    # days unless it is renewed or cited (memexpiry.py; 0 = off).
+    "memory": {"archive_hidden_days": 7, "default_expiry_days": 30},
     # A new code task whose spec names files another open or unlanded code task adds or changes gets a
     # warning at task_add, and its worker the list of those branches (overlap.py). Never counted: the
     # `ignore` globs, hubs (tracked files over hub_bytes), folders and the files delivery.push_checks
@@ -2310,7 +2312,7 @@ class Project:
     def add_memory(self, text: str, kind: str = "fact", title: str | None = None, key: str | None = None,
                    end: dict | None = None, standing: bool = False, audience: str | None = None,
                    commit: bool = True, dry_run: bool = False, reason: str | None = None,
-                   context: str | None = None) -> Path:
+                   context: str | None = None, default_end: bool = True) -> Path:
         """One fact per file plus a one-line pointer in MEMORY.md, so the index stays cheap to load.
         A memory written again under the same `key` (a replayed coordinator turn) keeps its one
         file and line. `end` (see ends.from_action) makes it temporary: the daemon retires it then.
@@ -2320,9 +2322,11 @@ class Project:
         `commit` False leaves the harness commit to the caller (see supersede_memory). `dry_run`
         only returns the path it would write: no file, index line or commit. `reason` (why the rule
         was given) and `context` (the user's words around it) let an old order be re-read by its
-        intent once that reason is gone (see oldorders)."""
+        intent once that reason is gone (see oldorders). With no `end` a decision, fact or preference gets the
+        default expiry (see memexpiry; `default_end` False: none)."""
         from .ends import front_matter
         from .forbidden import check
+        from . import memexpiry
         from .oldorders import clean_context, one_line
         reason, context = one_line(reason), one_line(context)
         check(self, "memory", text, title or "", reason or "")   # before any write: nothing refused reaches git
@@ -2331,6 +2335,8 @@ class Project:
             kind = "preference"
         if not dry_run:
             self.memory_dir.mkdir(parents=True, exist_ok=True)
+        auto = not end and default_end
+        end = end or (memexpiry.default_end(self, kind, standing) if default_end else {})
         text = text.strip()
         title = (title or text.splitlines()[0])[:80]
         slug = re.sub(r"[^a-z0-9]+", "-", title.lower()).strip("-")[:48] or "note"
@@ -2352,6 +2358,7 @@ class Project:
         with self.memory_locked():   # the entry and its line, never split by a harness merge
             if not same:
                 durable_write(path, f"---\nkind: {kind}\ncreated: {_stamp(time.time())}\n{front_matter(end or {})}"
+                                    f"{'expires_auto: true' + chr(10) if auto and end else ''}"
                                     f"{'standing: true' + chr(10) if standing else ''}"
                                     f"{f'audience: {audience}' + chr(10) if audience in MEMORY_AUDIENCES else ''}"
                                     f"{f'reason: {reason}' + chr(10) if reason else ''}"
@@ -2416,11 +2423,12 @@ class Project:
             aud = re.search(r"^audience:[ \t]*(\S+)", head, re.M)
             why = re.search(r"^reason:[ \t]*(.*)$", head, re.M)
             ctx = re.search(r"^context:[ \t]*(.*)$", head, re.M)
-            ends = (" (standing)" if standing else "") + (f" ({describe(end, self)})" if end else "")
+            auto = bool(re.search(r"^expires_auto:[ \t]*true[ \t]*$", head, re.M))   # a default expiry stays off the prompt line
+            ends = (" (standing)" if standing else "") + (f" ({describe(end, self)})" if end and not auto else "")
             created = c.group(1) if c else _stamp(p.stat().st_mtime)
             out.append({"name": p.stem, "kind": kind, "line": f"[{p.stem}] {body.strip()}{ends}", "end": end,
                         "body": body.strip(),
-                        "standing": standing, "audience": aud.group(1) if aud else "", "created": created,
+                        "standing": standing, "auto": auto, "audience": aud.group(1) if aud else "", "created": created,
                         "reason": why.group(1).strip() if why else "", "context": ctx.group(1).strip() if ctx else "",
                         "order": (created, p.stem)})
         out.sort(key=lambda e: e.pop("order"))
@@ -2775,7 +2783,9 @@ class Project:
             except ValueError:
                 continue
             if not archived:
-                found.append(read_front_matter(_memory_parts((self.memory_dir / f"{name}.md").read_text())[0]))
+                head = _memory_parts((self.memory_dir / f"{name}.md").read_text())[0]
+                if not re.search(r"^expires_auto:[ \t]*true[ \t]*$", head, re.M):   # a default expiry is no one's choice
+                    found.append(read_front_matter(head))
         found = [e for e in found if e]
         return dict(min(found, key=lambda e: e.get("expires", math.inf))) if found else {}
 
@@ -2829,9 +2839,10 @@ class Project:
             bodies[name] = body
         if errors:
             raise ValueError("nothing changed: " + "\n".join(errors))
-        # Merged entries that all share one audience keep it.
+        # Merged entries that all share one audience keep it. Replacing entries whose only end is the default
+        # expiry renews it (memexpiry): the new entry gets a fresh window.
         added = self.add_memory(text, kind=kind, title=title, standing=standing, commit=False, dry_run=dry_run,
-                                end=end or ({} if permanent else self.superseded_end(olds)),
+                                end=end or ({} if permanent else self.superseded_end(olds)), default_end=not permanent,
                                 audience=None if audience == "default"
                                 else audience or (next(iter(auds)) if len(auds) == 1 else None))
         if dry_run:
