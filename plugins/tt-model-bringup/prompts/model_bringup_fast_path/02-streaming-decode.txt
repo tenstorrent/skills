@@ -1,0 +1,20 @@
+/goal Use $fast-path, $tt-enable-tracing, $vllm-integration, and $tt-device-usage for the HF_MODEL served model in the current tt-metal checkout.
+
+As the user, I explicitly authorize you to use subagents when a selected skill requests or recommends them.
+
+Build the DRAM-streaming fused batch-1 decode on the primary served mesh (the largest one the authorized hardware serves) and serve it as the batch-1 decode bucket. Start from the roofline plan in doc/fast_path/.
+
+Goal completion requirements:
+- One running request decodes through the `ttnn.generic_op` program set of the $fast-path streaming-decode reference: inputs, linear streams reading every DRAM bank, expert streams if the model routes experts, fused boundaries, and a terminal that streams the LM head and writes the next token on the device.
+- Each program matches the stock op it replaces before its layer is assembled, and each layer matches before the model, on real weights. Record PCC per op and per layer.
+- Stock decode stays for every condition the fused path does not cover (penalties, log-probs, grammar masks, unsupported sampling, other widths and meshes). Routing is explicit per step, and each fallback is exercised with a served request.
+- A switch (an environment variable or config key) turns the path off. The default turns it on only after the gates pass.
+- Decode-only weight copies fit the measured DRAM budget. The served KV pool keeps its block count and the context contract holds; a reduction needs hard-limit evidence and the largest feasible value.
+- Every program, constant and buffer is prepared before trace capture and traces live for the server's lifetime: the allocation tracker is clean and the program cache does not grow during a mixed served workload.
+- The device step is faster than before at a short context and at most 2% slower at a long one, with GB/s per chip and % of peak.
+- Teacher-forced accuracy at 512 or more fixed natural-text positions against the HF fp32 reference: top-1 and top-5 within 0.5 and 0.3 points of the stock path, PCC recorded.
+- Served c=1 TPOT through the real vLLM server is faster than before and served greedy outputs stay coherent. A TPOT more than 10% above the device step is host overhead to explain or remove.
+- Write doc/fast_path/streaming_decode.json in the schema of the $fast-path validation reference, the condition table and bytes table in doc/fast_path/README.md, and the work log. Run `python ${TT_MODEL_BRINGUP_ROOT}/scripts/check_fast_path.py --model-dir <model dir> --phase streaming_decode` until it exits 0.
+- $stage-review returns `clean-pass`; findings fixed/rereviewed. Local commit stage-owned touched-repo changes; never push; log SHAs.
+
+Unmet requirements, review findings, failed gates: work. Stop only after `$autofix` fails.

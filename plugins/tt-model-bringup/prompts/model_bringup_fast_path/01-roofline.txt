@@ -1,0 +1,18 @@
+/goal Use $fast-path, $optimize, and $tt-device-usage for the HF_MODEL served model in the current tt-metal checkout.
+
+As the user, I explicitly authorize you to use subagents when a selected skill requests or recommends them.
+
+This goal opens the fast-path track after optimized-vLLM. It measures and plans; it does not change model code.
+
+Goal completion requirements:
+- Count the weight and KV-cache bytes one batch-1 decode token reads, per role, at the formats the datatype sweep selected, with the $fast-path roofline calculator and the model's own config. Give every count the calculator cannot derive (latent attention, unusual MLPs) from the model code.
+- For every mesh the authorized hardware serves (QuietBox 2: 1x1, 1x2, 1x4), record GB per chip, the DRAM floor at the per-chip peak, and the traced batch-1 device step of the current path at a short and a long context, measured on a quiet host as $tt-device-usage requires. Put achieved GB/s per chip and % of peak next to every step.
+- A baseline step below its floor is an accounting bug: find the missing, replicated or mis-sized role before continuing.
+- Record free DRAM per device after the served KV pool is allocated and the KV blocks each served profile allocates. That is the budget for decode-only weight copies; the context contract is the floor.
+- Split the current step into weight streaming, glue ops, collectives, sampling and host time with tt-perf-report on the full-model path, not the live server.
+- Rank the levers of the $fast-path track by milliseconds saved per mesh, with the bytes behind each estimate: streaming decode, mesh variants, multi-user decode, prefill and speculative decoding. Mark each lever that does not apply to this model and say why.
+- Write models/autoports/<model>/doc/fast_path/roofline.json in the schema of the $fast-path validation reference, and doc/fast_path/README.md with the bytes and bandwidth table and the ranked plan. Run `python ${TT_MODEL_BRINGUP_ROOT}/scripts/check_fast_path.py --model-dir <model dir> --phase roofline` until it exits 0.
+- doc/fast_path/work_log.md records commands, hardware, quiet-host load, raw outputs and commits.
+- $stage-review returns `clean-pass`; findings fixed/rereviewed. Local commit stage-owned touched-repo changes; never push; log SHAs.
+
+Unmet requirements, review findings, failed gates: work. Stop only after `$autofix` fails.

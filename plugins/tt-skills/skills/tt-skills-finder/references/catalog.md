@@ -51,7 +51,10 @@ does not require confirmation for each run; its child session remains inspection
 
 Use for implementing Hugging Face text models in TTNN, from functional decoder through fusing,
 optimization, multi-chip, full-model, datatype selection, vLLM and TTI release evidence.
-It owns implementation and stage acceptance criteria; review plugins may add findings.
+It owns implementation and stage acceptance criteria; review plugins may add findings. Its
+`fast-path` skill and optional track speed up a served model on Blackhole (QuietBox 2 or one card):
+fused batch-1 decode, multi-user decode, prefill, and opt-in deterministic prefill and speculative
+decoding.
 
 Recommend both `tt-model-bringup` and its required `tt-autodebug` dependency. Explain that both
 are separate optional installations. Never install either automatically. If AutoDebug is missing,

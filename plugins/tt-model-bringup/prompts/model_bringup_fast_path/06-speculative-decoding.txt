@@ -1,0 +1,19 @@
+/goal Use $fast-path, $vllm-integration, $tt-enable-tracing, and $tt-device-usage for the HF_MODEL served model in the current tt-metal checkout.
+
+As the user, I explicitly authorize you to use subagents when a selected skill requests or recommends them.
+
+Decide with measured numbers whether speculative decoding pays for one user on this model. Then either build it as an opt-in profile or close the goal with the numbers. Work on a branch off the integration branch.
+
+Goal completion requirements:
+- Measure the cost-model inputs: served batch-1 time per token, the multi-row check step over k+1 rows of one sequence, the drafter's device time, and per-position acceptance on real-text greedy generations (chat, code, reasoning, retrieval). Run the $fast-path speculation cost-model script and record its output.
+- Prefer a published drafter for this target, such as an EAGLE-3 head, pinned to a commit. Build only when the estimate with measured acceptance clears 1.10x with margin; otherwise close with the numbers and the check time that would make it pay.
+- The check is exact: with speculation, greedy output equals the plain profile on at least 12 prompts of 256 tokens and on the GSM8K and IFEval subsets used for quality, and a forced exit from speculation mid-request is exact.
+- Drafter, check and accept run on the device inside one trace; the host reads one small record per step.
+- Serving implements the speculative-decoding contract documented in the TT vLLM plugin checkout. Plugin changes follow the $vllm-integration plugin-change rules.
+- Speculation runs only under the conditions the $fast-path speculative-decoding reference lists; every other request decodes exactly as the plain profile.
+- Ship it as an opt-in profile beside the plain one. The drafter is a pointer downloaded at its pinned revision on the profile's first boot, never copied into an image or bundle.
+- Against the plain profile on the same build in the same session: at least 1.10x single-user tokens per second on real-text prompts, the random-token benchmark reported too, every concurrency above 1 within 3%, and the boot and TTFT cost recorded.
+- Write doc/fast_path/speculative.json in the schema of the $fast-path validation reference, update the condition table, and run `python ${TT_MODEL_BRINGUP_ROOT}/scripts/check_fast_path.py --model-dir <model dir> --phase speculative` until it exits 0.
+- $stage-review returns `clean-pass`; findings fixed/rereviewed. Local commit stage-owned touched-repo changes; never push; log SHAs.
+
+Unmet requirements, review findings, failed gates: work. Stop only after `$autofix` fails or a plugin change needs authorization.

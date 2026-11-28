@@ -83,6 +83,13 @@ The eleven [goal templates](../../prompts/model_bringup_multigoal) run in order:
 For an optional standalone TTI release handoff once serving is ready, use
 [`tti-release`](../tti-release/SKILL.md).
 
+On Blackhole hardware (a QuietBox 2 or a single card), the optional
+[fast-path track](../../prompts/model_bringup_fast_path) runs after stage 10 and before stage 11, so
+the benchmark measures the final path. Its seven goals follow [`fast-path`](../fast-path/SKILL.md):
+roofline, streaming batch-1 decode, mesh variants, multi-user decode, prefill, speculative decoding
+and acceptance. Launch them as their own runner invocation with the same `HF_MODEL` and `MODEL_DIR`
+replacements, then continue with stage 11 using `--start-index 11`.
+
 When the authorized hardware is one chip, stages 4 and 5 are recorded as skipped by the
 operator in the run record and the full-model goal starts from `tt/optimized_decoder.py`;
 single-chip is then the target topology, not a fallback, and the later stages say so.

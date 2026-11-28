@@ -1,0 +1,18 @@
+/goal Use $fast-path, $optimize, $tt-enable-tracing, and $tt-device-usage for the HF_MODEL served model in the current tt-metal checkout.
+
+As the user, I explicitly authorize you to use subagents when a selected skill requests or recommends them.
+
+Extend the fused decode to several running requests on the primary mesh: a fused multi-row step for 2 to 8 rows that reads each weight once for all rows, and batched decode for 8 to 32 rows that streams the weights (for MoE, the union of routed experts) from the decode copies. Work on a branch off the integration branch.
+
+Goal completion requirements:
+- For an MoE model, first measure the distinct experts per layer of independent rows at each width from real-text routing with the $fast-path expert-union script, then fit step time as fixed plus slope times union and record the fit. A dense model records that every row reads the same weights.
+- Every row computes what the batch-1 step computes for that row: per-row norms, one op writing all rows' K/V into shared cache tiles, and per-row reduction order where exactness requires it. Prove each row against the batch-1 path.
+- Compute L1 and circular-buffer budgets per width before compiling. A width that does not fit is not prepared and falls back to stock.
+- Every prepared width is faster than the stock step at that width, width 1 is not slower, and accuracy at each width is within 0.5/0.3 points of width 1.
+- Served ladder at the benchmark input length and concurrency 1, 2, 4, 8, 16 and 32: every row at least 97% of before, with the gains where the new paths apply.
+- Widths, buckets and traces follow the trace-lifetime rule; the program cache does not grow during the served ladder.
+- Run the fast checks of the $fast-path validation reference before merging.
+- Write doc/fast_path/multi_user_decode.json in the schema of the $fast-path validation reference, update the condition table, and run `python ${TT_MODEL_BRINGUP_ROOT}/scripts/check_fast_path.py --model-dir <model dir> --phase multi_user_decode` until it exits 0.
+- $stage-review returns `clean-pass`; findings fixed/rereviewed. Local commit stage-owned touched-repo changes; never push; log SHAs.
+
+Unmet requirements, review findings, failed gates: work. Stop only after `$autofix` fails.
