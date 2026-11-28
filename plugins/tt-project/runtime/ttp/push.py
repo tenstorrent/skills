@@ -2319,7 +2319,7 @@ def own_target(p: Project, repo: Path) -> tuple[str, str]:
                          f"and tell the user; they push it")
     head = _git(repo, "rev-parse", "--verify", "-q", "HEAD^{commit}").stdout.strip()
     if (why := prsize.budget_gate(p, _task_row(p, task), branch, head)) and not landgate.defer(
-            p, task, head, why, os.environ.get("TTP_RUN_DIR"), land=False, say=lambda m: print(m, file=sys.stderr)):
+            p, task, head, why, land=False, say=lambda m: print(m, file=sys.stderr)):
         raise ValueError(why)
     return remote, branch
 
@@ -3080,7 +3080,7 @@ def _resolve_target(p: Project, repo: Path, own: bool = False) -> tuple[str, str
     if task and (why := code_run_landing(p, task, f"{remote}/{push_to}", d, repo)):
         raise ValueError(why)
     if task and (why := ponytail_landing(p, task, f"{remote}/{push_to}", d, repo)) and not landgate.defer(
-            p, task, _git(repo, "rev-parse", "HEAD").stdout.strip(), why, os.environ.get("TTP_RUN_DIR"),
+            p, task, _git(repo, "rev-parse", "HEAD").stdout.strip(), why,
             say=lambda m: print(m, file=sys.stderr)):
         raise ValueError(why)
     if m and task and m.group(1) == task:

@@ -22072,7 +22072,7 @@ class Daemon:
                 return f"{head[:12]}: its added lines were not read ({ex})"
             why = (ponytail.lane_problem(run_dir, head) if ponytail.on(cfg) else "") or ponytail.size_problem(
                 cfg, added, ponytail.reason_text(task, result, codes), run_dir, head)
-            if why and not landgate.defer(self.p, task, head, why, run_dir):
+            if why and not landgate.defer(self.p, task, head, why):
                 if ponytail.on(cfg) and ponytail.labelled(task) is None:
                     labels = json.loads(task.get("labels") or "[]")
                     self.p.db.update_task(task["id"], labels=[*labels, ponytail.label(added)])

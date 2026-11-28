@@ -3,6 +3,15 @@
 from __future__ import annotations
 
 
+def _lg_checks(p, tid, head, passed=True):
+    """A finished run of task `tid` that recorded a candidate `ttp checks` result on `head`."""
+    rid = p.db.x("INSERT INTO runs(task, role, status, started, note) VALUES(?,?,?,?,?)",
+                 (tid, "worker", "ok", time.time() - 60, "{}"))
+    (p.runs / str(rid)).mkdir(parents=True, exist_ok=True)
+    (p.runs / str(rid) / "checks.json").write_text(json.dumps(
+        {"head": head, "passed": passed, "commands": ["pytest -q"], "purpose": "candidate"}))
+
+
 def _lg_review(env, p, rid, verdict, checked_head=""):
     """Review `rid` handed off done with lane verdict `verdict`; with `checked_head`, its run recorded a
     candidate `ttp checks` pass on that head."""
@@ -15,8 +24,7 @@ def _lg_review(env, p, rid, verdict, checked_head=""):
     (run_dir / ponytail.FILE).write_text(json.dumps(verdict))
     (run_dir / "result.json").write_text(json.dumps({"status": "done", "summary": "correct"}))
     if checked_head:
-        (run_dir / "checks.json").write_text(json.dumps(
-            {"head": checked_head, "passed": True, "commands": ["pytest -q"], "purpose": "candidate"}))
+        _lg_checks(p, rid, checked_head)
     d = Daemon(p.base)
     d._finish_worker({"task": rid}, Usage(cost_usd=1.0), "ok", run_dir)
     d.reconcile_tasks()
@@ -64,20 +72,18 @@ def test_landgate_the_size_rule_on_a_checked_head_adds_explain_or_split(env, mon
     assert f["title"].startswith("Explain or split #") and "why this size" in f["spec"]
 
 
-def test_landgate_defer_needs_a_pass_on_that_head_and_adds_one_followup(env, tmp_path):
+def test_landgate_defer_needs_a_pass_on_that_head_and_adds_one_followup(env):
     from ttp import landgate
     p = make(env)
     tid = p.db.add_task("code", "s", kind="code", tier="light", origin="coordinator")
     why = "it adds 400 lines, over review.ponytail_land_lines (150)"
-    assert landgate.defer(p, tid, "abc123def4567", why, tmp_path) is None
-    (tmp_path / "checks.json").write_text(json.dumps(
-        {"head": "abc123def4567", "passed": False, "commands": ["pytest -q"], "purpose": "candidate"}))
-    assert landgate.defer(p, tid, "abc123def4567", why, tmp_path) is None
-    (tmp_path / "checks.json").write_text(json.dumps(
-        {"head": "abc123def4567", "passed": True, "commands": ["pytest -q"], "purpose": "candidate"}))
+    assert landgate.defer(p, tid, "abc123def4567", why) is None
+    _lg_checks(p, tid, "abc123def4567", passed=False)
+    assert landgate.defer(p, tid, "abc123def4567", why) is None
+    _lg_checks(p, tid, "abc123def4567")
     said = []
-    fid = landgate.defer(p, tid, "abc123def4567", why, tmp_path, land=False, say=said.append)
-    assert fid and landgate.defer(p, tid, "abc123def4567", why, tmp_path) == fid
+    fid = landgate.defer(p, tid, "abc123def4567", why, land=False, say=said.append)
+    assert fid and landgate.defer(p, tid, "abc123def4567", why) == fid
     f = p.db.task(fid)
     assert f["title"] == f"Explain or split #{tid}: it went on over the size rule"
     assert "start_when" not in f["labels"] and "not refused" in said[0]
