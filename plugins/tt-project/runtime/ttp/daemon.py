@@ -8353,6 +8353,8 @@ class Daemon:
         carry_run = r.get("role") == carry.ROLE and task["kind"] == "code"   # an inline review: never an attempt when it ends
         attempts = int(task["attempts"] or 0) + (0 if status in FREE_ENDS or waiting or reboot_lost
                                                   or rejects or topped or resumed or (carry_run and status == "ok") else 1)
+        if carry_run and status == "no_handoff" and r.get("id"):   # the run row said ok: runcap and the waste ledger count it
+            db.x("UPDATE runs SET status=? WHERE id=?", (status, r["id"]))
         if new == "failed" and not guard and attempts < int(task["max_attempts"] or 3) \
                 and status in ("failed", "lost", "timeout", "stalled", "no_handoff", "refused_wait", "role_miss"):
             new = "queued"
@@ -8578,8 +8580,9 @@ class Daemon:
                 new, more = carry.failed(self, task, result, run_dir)
                 extra.update(more)
                 not_before = time.time() if new == "queued" else not_before
-            elif new == "done" and not carry.pass_ends(self, task):
-                carry_run = False   # no valid approval and a landing to make: the standard review flow takes it
+            elif new == "done":
+                carry.pass_ends(self, task)
+            carry_run = carry_run and (carry.state(db, task["id"]) or {}).get("phase") != carry.PLAIN   # then the standard review flow
         # A push-conflict fix (conflictfix.py) costs no review attempt when it approves a new head. A
         # light one that ends any other way (done with nothing approved included; a refused account, a
         # lost host, a block or a needs_review aside) runs again at once at standard, also without an

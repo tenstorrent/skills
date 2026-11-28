@@ -214,7 +214,12 @@ def failed(daemon, task: dict, result: dict, run_dir) -> tuple[str, dict]:
     pushq._event(db, task, "task_changes_needed", f"#{tid} {task['title']}: inline review round {s['round']} failed: "
                  f"{text.splitlines()[0] if text else ''}", queued=False, severity="low")
     cap = int((daemon.cfg.get("review") or {}).get("auto_fix_rounds", AUTO_FIX_ROUNDS)) + 1
-    if int(s["round"]) >= cap or result.get("review_failure") in ("approval", "marker"):
+    if result.get("review_failure") in ("approval", "marker"):   # nothing for the author to fix: the standard review takes it
+        advance(db, tid, PLAIN, note=str(path))
+        pushq._event(db, task, "carry_fallback", f"#{tid} {task['title']}: its inline review's push approval failed "
+                     f"({text.splitlines()[0] if text else ''}); it goes to the standard review", queued=False, severity="low")
+        return "review", {}
+    if int(s["round"]) >= cap:
         advance(db, tid, CAPPED, note=str(path))
         pushq._event(db, task, "carry_capped", f"#{tid} {task['title']}: its inline review failed {s['round']} time(s); "
                      f"findings in {path}. Decide: scope it down, redesign it or accept the gaps", queued=True, severity="high")

@@ -432,7 +432,9 @@ def test_an_inline_pass_is_refused_from_the_authors_own_session_or_a_moved_branc
     _commit(s.path, "late.txt", "late\n")   # the reviewer (or someone) committed: the branch is not the reviewed head
     t, _ = _verdict(env, s, _REVIEW_PASS(s))
     assert not s.p.db.q("SELECT * FROM push_queue") and "moved during the review" in t["result"]
-    assert carry.state(s.p.db, s.code)["phase"] == "capped", "the second refusal is the approval's form failing: the coordinator's"
+    assert carry.state(s.p.db, s.code)["phase"] == "plain", "the second refusal falls back to the standard review"
+    assert len(s.p.db.q("SELECT id FROM events WHERE kind='carry_fallback'")) == 1
+    assert not s.p.db.q("SELECT id FROM events WHERE kind='carry_capped'")
 
 
 def test_a_failed_inline_review_fixes_in_place_and_its_re_review_lists_the_earlier_findings(env, monkeypatch):
@@ -500,3 +502,18 @@ def test_a_carry_pass_of_a_change_that_needs_no_landing_ends_done(env, monkeypat
     t, _ = _verdict(env, s, {"status": "done", "summary": "looks good"})
     assert carry.state(s.p.db, s.code)["phase"] == "done" and t["status"] == "done"
     assert not s.p.db.q("SELECT id FROM events WHERE kind='carry_fallback'")
+
+
+def test_an_inline_review_run_that_exits_ok_with_no_hand_off_still_counts_toward_the_run_cap(env, monkeypatch, tmp_path):
+    from ttp import runcap
+    from ttp.daemon import Daemon
+    from ttp.providers.base import RunUsage
+    s = _inline(env, monkeypatch)
+    s.p.db.x("INSERT INTO runs(task, role, started, ended, status) VALUES(?,?,?,?,?)", (s.code, "reviewer", 3.0, 4.0, "ok"))
+    rid = s.p.db.one("SELECT max(id) AS m FROM runs")["m"]
+    run_dir = tmp_path / "nohand"
+    run_dir.mkdir()
+    Daemon(s.p.base)._finish_worker({"task": s.code, "id": rid, "role": "reviewer", "note": "{}"},
+                                    RunUsage(cost_usd=0.1), "ok", run_dir)
+    assert s.p.db.one("SELECT status FROM runs WHERE id=?", (rid,))["status"] == "no_handoff"
+    assert rid in [r["id"] for r in runcap.runs(s.p.db, s.code)[0]]
