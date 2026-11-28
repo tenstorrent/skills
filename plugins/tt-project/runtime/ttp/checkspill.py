@@ -700,16 +700,17 @@ def wrap_keeps_here(cmds: list, cfg: dict | None) -> str:
 
 
 def wrap_problems(checks: Any) -> list[str]:
-    """Config check of checks.wrap_needs_device, checks.spill_wrap_cmd, checks.spill_beside_device and
-    checks.spill_pre_cmd."""
+    """Config check of checks.wrap_needs_device, checks.spill_wrap_cmd, checks.spill_beside_device,
+    checks.spill_pre_cmd and checks.spill_install."""
     from . import push
     v = checks.get(NO_DEVICE_KEY) if isinstance(checks, dict) else None
     out = [] if v is None or isinstance(v, bool) else [f"checks.{NO_DEVICE_KEY}: {v!r} is not true or false"]
-    if (b := checks.get(BESIDE_KEY) if isinstance(checks, dict) else None) is not None:
-        try:
-            beside_of(b)
-        except ValueError as e:
-            out.append(str(e).replace("; nothing was changed", ""))
+    for key, of in ((BESIDE_KEY, beside_of), (INSTALL_KEY, install_of)):
+        if (b := checks.get(key) if isinstance(checks, dict) else None) is not None:
+            try:
+                of(b)
+            except ValueError as e:
+                out.append(str(e).replace("; nothing was changed", ""))
     try:
         pre_cmd_of(checks.get(PRE_KEY) if isinstance(checks, dict) else None)
     except ValueError as e:
@@ -2441,8 +2442,10 @@ def no_install_off(project_dir: str, alias: str, now: float | None = None) -> No
         p = Project(project_dir)
         with p.db.tx():
             doc = _strikes(p.db)
-            doc["hosts"].setdefault(alias, {})["off"] = {"kind": "no-install", "since": now,
-                                                         "until": now + DOWN_RETRY_S, "n": 0}
+            h = doc["hosts"].setdefault(alias, {})
+            if isinstance(h.get("off"), dict) and float(h["off"].get("until") or 0) > now:
+                return   # a quarantine already holds it (its ledger entry, its probe): never shortened here
+            h["off"] = {"kind": "no-install", "since": now, "until": now + DOWN_RETRY_S, "n": 0}
             p.db.set_kv(STRIKES_KV, doc)
     except Exception:   # no project there, its db unwritable: the fault itself still says why
         pass

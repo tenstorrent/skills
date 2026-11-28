@@ -5915,6 +5915,13 @@ def test_spill_hosts_without_a_ready_checks_env_leave_only_this_projects_pool_wi
         got and got.close()
     assert checkspill.quarantined(p, "spill-a", now + checkspill.DOWN_RETRY_S + 1) == ""
     assert not _spill_events(p, "back in")
+    with p.db.tx():   # a longer quarantine already there (strikes, its ledger entry) is never cut short
+        doc = checkspill._strikes(p.db)
+        doc["hosts"]["ready"] = {"n": 3, "off": {"n": 3, "until": now + checkspill.QUARANTINE_MAX_S, "change": "c1"}}
+        p.db.set_kv(checkspill.STRIKES_KV, doc)
+    checkspill.no_install_off(str(p.root), "ready", now)
+    assert checkspill._strikes(p.db)["hosts"]["ready"]["off"].get("change") == "c1"
+    assert checkspill.wrap_problems({"spill_install": "maybe"}) and not checkspill.wrap_problems({"spill_install": True})
 
 def test_spill_host_observations_honour_an_observation_mute(env, tmp_path, monkeypatch):
     """A low spill-health line (the tunnel's) under a checks mute on 'Spill host' below normal is stored muted
