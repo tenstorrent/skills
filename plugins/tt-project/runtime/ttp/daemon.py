@@ -194,6 +194,7 @@ from . import downtime
 from . import effort
 from . import modelpick
 from . import modelrank
+from . import modelquota
 from . import modeltrip
 from . import modeldemote
 from . import effortab
@@ -6475,6 +6476,10 @@ class Daemon:
             # The endpoint's token quota is used up (chatbridge.quota_until): the provider's limit pause
             # holds new runs off it to the window's end (below), and the route entry and alert say so.
             usage.limit_note = f"token quota used up until {timefmt.long(quota, p)}"
+        # glm_quota_alt: the model's own bucket (modelquota.py) holds it, not a pause of the whole provider,
+        # while a listed alternate has room
+        q_alt = bool(quota) and self._quota_on() and \
+            bool(modelquota.room(db, self.cfg, p.state, r["model"] or "", time.time()))
         if exit_info.get("launch_auth"):
             # The chat bridge had no usable key (none saved, or saved for another URL): the provider's
             # auth gate holds it like a logout, never a launch failure that costs attempts.
@@ -6654,6 +6659,11 @@ class Daemon:
         swapped = ""   # the stand-in a mid-run swap finished on: runs.model, never the asked-for model's run
         if mid := (exit_info.get("bridge") or {}).get("mid_run"):
             swapped = self._rank_mid_run(r, note, mid, str((exit_info.get("bridge") or {}).get("model") or ""))
+        if r["provider"] == route.TO and (b := codearm.run_summary(exit_info.get("bridge"))):
+            try:   # the model's calls and server refusals, account-wide (modelquota.count: the flash rule)
+                modelquota.count(swapped or r["model"] or "", b["calls"], b["refusals"])
+            except Exception as e:
+                log(p, f"run {r['id']}: model quota counts not kept: {type(e).__name__}: {e}")
         if routed:
             note[route.KEY] = {**routed, **({"fallback": fell} if fell else {}), **({"salvaged": True} if salvaged else {}),
                                **({"cause": _route_cause(stopped or status, exit_info, usage, run_dir)} if own else
@@ -6698,7 +6708,7 @@ class Daemon:
                     route.served_ok(db, model := r["model"] or routed["model"]):   # it serves the model again
                 self.alert(f"route-model-served:{routed['to']}|{model}", route.served_notice(routed["to"], model),
                            severity="low", every_s=0)
-            elif fell and not own and not bounce:   # an endpoint fault cools the endpoint; a run's own end only its task
+            elif fell and not own and not bounce and not (fell == "quota" and q_alt):   # an endpoint fault cools it
                 route.cool(db, self.cfg, routed["to"], fell, r["id"], time.time())
         elif r["provider"] == modelrank.TO and isinstance(note.get(modelrank.KEY), dict) and r["model"] and \
                 route.fell_back(status, exit_info, usage.error) == "model_missing":
@@ -6857,7 +6867,7 @@ class Daemon:
                     batchrun.book(db, r["task"], usage.cost_usd)   # a batch run's members get their share
                     runtimeload.clear(p, r["id"])   # finished once: a restart after this never finishes it again
                 self._record_readings(db, r["provider"], read_as, usage, ended)
-                if usage.limited or quota:   # a quota's pause ends at its window's end, also after a hand-off
+                if (usage.limited or quota) and not q_alt:   # a quota's pause ends at its window's end, also after a hand-off
                     until = quota or time.time() + 3600
                     db.set_kv(f"limited:{r['provider']}", {"until": until, "note": usage.limit_note})
                     # Only an account out of funds needs the user; a usage or rate limit lifts by itself,
@@ -14396,29 +14406,54 @@ class Daemon:
         if core_only:
             return None
         why = "model_missing" if route.held(self.p.db, self.cfg, tier, model) else route.cooling(self.p.db, name, now)
-        if not why and name == route.TO:   # the endpoint's quota is short: this run starts on core (glmquota.py)
+        alt = self._quota_alt(task, model, cls, now) if not why and name == route.TO else None
+        if alt and alt.get("to"):   # its model's quota bucket is empty: a listed alternate with room (modelquota.py)
+            model = alt["to"]
+        elif alt:
+            why = "quota"
+        if not why and name == route.TO and not alt:   # the endpoint's quota is short: this run starts on core (glmquota.py)
             why = glmquota.paced(self.cfg, task, cls, now)
         where, key = (f"tier {tier}", tier) if rule_i is None else (f"tier {tier} rule {rule_i}", f"{tier}:rule{rule_i}")
         if pick:   # a model pick routes one tier to several models (modelpick.py): one switch per model
             key = f"{tier}:pick:{model}"
         mcls = "review" if task.get("kind") == "review" else tier   # its class for demotions (modeldemote.py)
         ranked = self._rank_pick(where, key, model, now, mcls) \
-            if name == modelrank.TO and why in ("", "model_missing") else None   # one switch record per rule
+            if name == modelrank.TO and why in ("", "model_missing") and not alt else None   # one switch record per rule
         if ranked:   # its model is down: the smartest model still served (modelrank.py)
             model, why = ranked[0], ""
-        elif name == modelrank.TO and not why and (up := self._rank_better(where, key, model, tier, now, mcls)):
+        elif name == modelrank.TO and not why and not alt and (up := self._rank_better(where, key, model, tier, now, mcls)):
             model, ranked = up, (up, {"from": model, "why": modelrank.BETTER})   # a smarter one is served
         if not why and self._logged_out(name) and not self._may_probe(name, now):
             why = "auth"   # the auth gate holds it; its one login check may be a routed run
         return {"tier": tier, "to": name, "model": model, **rule, "fallback": why or "none",
-                **({modelrank.KEY: ranked[1]} if ranked else {})}
+                **({modelrank.KEY: ranked[1]} if ranked else {}), **({modelquota.KEY: alt} if alt else {})}
+
+    def _quota_on(self) -> bool:
+        try:
+            return rollout.on(modelquota.FLAG, self.p.name, self.p.raw_config())
+        except Exception:
+            return False
+
+    def _quota_alt(self, task: dict, model: str, cls: str | None, now: float) -> dict | None:
+        """With the glm_quota_alt flag on, the route entry's modelquota record while `model`'s bucket is empty."""
+        if not self._quota_on():
+            return None
+        try:
+            return modelquota.route(self.p.db, self.cfg, self.p.state, model, task, cls, now,
+                                    lambda t: timefmt.long(t, self.p))
+        except Exception as e:   # quota routing must never hold a task back
+            log(self.p, f"task {task.get('id')}: model quota not checked: {type(e).__name__}: {e}")
+            return None
 
     def _required_model_down(self, task: dict, provider: str, now: float) -> str:
         """Why a task whose required model pin (failover.required) on chat is down (modelrank.down) waits,
-        else '': such a pin is never swapped for a ranked model."""
+        else '': such a pin is never swapped for a ranked model. With glm_quota_alt on, any model pin on chat
+        waits while that model's quota bucket is empty (modelquota.py)."""
         model = str(task.get("model") or "")
         if provider != route.TO or not model:
             return ""
+        if self._quota_on() and (t := modelquota.until(model, now)):   # never dispatched to an empty bucket
+            return f"its model {model}'s quota bucket on {route.TO} is empty until {timefmt.long(t, self.p)}"
         try:
             why = modelrank.down(self.p.db, self.cfg, self.p.state, model, now)
             return f"its required model {model} is down on {route.TO} ({why}); it waits until that is served again" \

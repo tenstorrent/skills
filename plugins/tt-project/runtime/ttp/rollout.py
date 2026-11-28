@@ -80,6 +80,9 @@ FLAGS: dict[str, dict[str, Any]] = {
     # outputs in its hand-off, and the hand-off check sends one without them back; glmshare reports both arms.
     "glm_probes": {"key": "glm.probes", "area": "route", "code": _code("codearm.py", "handoffcheck.py", "prompts.py", "glmshare.py"),
                    "arm": "glm"},
+    # Per-model quota buckets (modelquota.py): a run whose model's bucket is empty takes a listed alternate.
+    "glm_quota_alt": {"key": "route.glm_work.quota_alt", "area": "route", "arm": "glm",
+                      "code": _code("modelquota.py", "daemon.py", "chatbridge.py")},
     "eta_history": {"key": "eta.history", "area": "eta", "shadow": True,
                     "code": _code("etaledger.py", "costlevers.py", "cli.py")},
     "deslop": {"key": "deslop.enabled", "area": "review", "code": _code("deslop.py")},

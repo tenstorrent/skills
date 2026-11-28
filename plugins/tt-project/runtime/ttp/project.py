@@ -3527,7 +3527,8 @@ ACCOUNT_OFF_VALUE = {"checks.spill_hosts": [], "rollout.flags": {}}
 # whether the cap may lift by itself (glmquota.py).
 ACCOUNT_NESTED_KEYS = {"providers.chat.model_ranking", "providers.chat.rank_exclude", "providers.chat.class_ranking", "providers.chat.class_prefs", "providers.chat.ranking_source", "providers.chat.ranking_every_s",
                        "providers.chat.ranking_key_file", "providers.chat.served_every_s", "providers.chat.served_idle_s",
-                       "providers.chat.quota_hourly_cap", "providers.chat.quota_cap_lift"}
+                       "providers.chat.quota_hourly_cap", "providers.chat.quota_cap_lift",
+                       "providers.chat.quota_alternates"}
 HOST_WIDE_KEYS = {"checks.host_max", "route.host_max", "chat.max_inflight", "checks.spill_hosts", "checks.no_spill_hosts", "checks.dirty_max_mb", "checks.io_full_max",
                   "checks.push_priority_wait_s", "machine.max_workers"}
 

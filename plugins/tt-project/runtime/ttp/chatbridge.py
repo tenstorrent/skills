@@ -87,7 +87,7 @@ import urllib.request
 import uuid
 from datetime import datetime
 
-from . import endpoint, glmquota, inflight, redact, serverhealth
+from . import endpoint, glmquota, inflight, modelquota, redact, serverhealth
 from .providers.base import challenged
 
 UPSTREAM_TIMEOUT_S = 600
@@ -1332,11 +1332,12 @@ class Bridge:
         call = self.calls.begin()
         try:
             resp = self._open(req)
-            if self.quota:   # the org's remaining tokens this UTC hour, from the answer's header (glmquota.py)
-                try:
+            try:   # the org's remaining tokens this UTC hour (glmquota.py); the model's own bucket (modelquota.py)
+                if self.quota:
                     glmquota.note(self.quota["key"], getattr(resp, "headers", None))
-                except Exception:   # counting must never break a call
-                    pass
+                modelquota.note(self.model, getattr(resp, "headers", None))
+            except Exception:   # counting must never break a call
+                pass
         except BaseException as e:   # a 429 or 503 (the codes busy_wait waits out) is the server at capacity
             slot.release()
             code = getattr(e, "code", 0)
@@ -1429,6 +1430,7 @@ class Bridge:
                         if self.quota:
                             glmquota.sync(self.quota["key"], got, float(self.quota.get("window_s") or 3600),
                                           spent=True)
+                        modelquota.mark(self.model, self.quota_hit)
                     except Exception:   # counting must never break a call
                         pass
                 wait = None if quota else self._busy_wait(e, detail, tries, waited)   # waiting cannot help
