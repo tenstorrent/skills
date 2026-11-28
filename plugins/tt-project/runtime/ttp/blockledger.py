@@ -54,15 +54,17 @@ def rule_of(reason: str) -> str:
 
 PLUGIN = re.compile(r"\b(?:task|run)[ _-]budget|budget_usd|over (?:its |the )?(?:task )?budget|change size|"
                     r"lines? over|too (?:large|big)|lean[- ]code|ponytail", re.I)
+MONEY = selfblock.GATES[2][0]   # its words ("budget", "$") also read in the plugin's own task budget
 CAPS = re.compile(r"\b(?:project|account|dollar|spend)[ _-]caps?\b", re.I)   # the dollar caps stay safety gates
 
 
 def safety_of(reason: str, kind: str = "") -> str:
     if kind == "review":
         return "review or push"
-    if PLUGIN.search(reason) and not CAPS.search(reason):
-        return "convenience"   # the plugin's own task budget, change size and lean-code gates are ours to retire
-    for name, rx in (*selfblock.GATES, *SAFE):
+    gates = (*selfblock.GATES, *SAFE)
+    if PLUGIN.search(reason) and not CAPS.search(reason):   # the plugin's own task budget, change size and lean-code gates are ours to retire,
+        gates = tuple(g for g in gates if g[0] != MONEY)   # unless a pause, a held resource, a user message or the like also holds it
+    for name, rx in gates:
         if rx.search(reason):
             return name
     return "convenience"
@@ -231,7 +233,7 @@ def status(db: DB, now: float, rs: list[dict] | None = None) -> tuple[list[dict]
         since = min(ts for ts, _ in marks.values())
         for r in rows(db, since, now):
             k = key_of(r["rule"])
-            if k in marks and r["safety"] == "convenience" and r["minutes"] and r["end"] > marks[k][0] + 60:
+            if k in marks and r["safety"] == "convenience" and r["minutes"] and r["start"] > marks[k][0]:
                 back.append((k, marks[k][1]))
                 marks.pop(k)
     gone = {k for k, _ in back} | set(marks)

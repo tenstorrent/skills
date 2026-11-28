@@ -86,6 +86,10 @@ def test_block_ledger_refusals_are_one_row_per_run_and_rule(env):
     ("anything", "review", "review or push"),
     ("the user's pause stands", "blocked", "a pause or hold the user set"),
     ("the daily budget is spent", "blocked", "credential, money or a step only the user holds"),
+    ("task budget reached before the change landed", "blocked", "convenience"),
+    ("the project spend cap is reached", "blocked", "credential, money or a step only the user holds"),
+    ("resource:dev-box held, queue too large", "waiting", "held resource"),
+    ("task budget reached, paused by the user", "blocked", "a pause or hold the user set"),
     ("a keep constant of 60 minutes", "waiting", "convenience")])
 def test_block_ledger_safety_class(reason, kind, want):
     from ttp import blockledger as bl

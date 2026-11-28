@@ -55,7 +55,9 @@ def test_block_top_a_done_rule_that_holds_time_again_comes_back(env):
     t = _bt_hold(p, now, 120, "keep the 60 min hold for the nightly job")
     key = bl.top(p.db, now)[0]["key"]
     bl.done(p.db, key, "lowered it to 5 min")
-    p.db.x("UPDATE kv SET ts=? WHERE key=?", (now - 3600, bl.DONE + key))   # done an hour ago; still held now
+    p.db.x("UPDATE kv SET ts=? WHERE key=?", (now - 3600, bl.DONE + key))   # done an hour ago
+    assert not any("came back" in l for l in rulecite.digest_lines(p.db, now)), "a hold open across --done is not new"
+    p.db.x("UPDATE events SET ts=? WHERE task=?", (now - 1800, t))   # the hold began after it: the rule came back
     got = rulecite.digest_lines(p.db, now)
     assert f"- came back: {key} (lowered it to 5 min did not stop it)" in got
     assert not any(l.startswith("- top blocker") for l in got)
