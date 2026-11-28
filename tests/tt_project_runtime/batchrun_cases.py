@@ -56,9 +56,9 @@ def test_batch_pick_leaves_out_resourced_deep_pinned_and_held(env):
     got = batchrun.pick(p, p.config(), lead, [deep, dev, user_deep, pinned, own, fix, work, other_repo,
                                               spent, running, urgent, ok])
     assert [t["id"] for t in got] == [ok["id"]]
-    # User 11-12: urgent siblings queued together share an urgent lead's run (one branch, review, checks).
+    # Independent urgent siblings each start their own run: none waits behind another's steps.
     urgent_lead = dict(lead, priority=1)
-    assert [t["id"] for t in batchrun.pick(p, p.config(), urgent_lead, [urgent, ok])] == [912]
+    assert batchrun.pick(p, p.config(), urgent_lead, [urgent, ok]) == []
     # A deep lead takes deep (and user_deep) work too; the default takes up to 20.
     deep_lead = dict(lead, tier="deep")
     assert {t["id"] for t in batchrun.pick(p, p.config(), deep_lead, [deep, user_deep, ok])} == {900, 902, ok["id"]}
@@ -99,16 +99,16 @@ def test_batch_pick_keeps_urgent_and_routine_work_in_separate_runs(env):
     obligations.add_order(p, "fix it", mid, [owned["id"]], action_class="change")
     ordered = dict(owned, priority=2)   # a user order's task is urgent whatever its priority
     negated = row(109, priority=3, spec="urgent: none\nTidy.")   # a negated line: routine, as dispatch reads it
-    # (a) an urgent lead takes no routine task; (b) urgent tasks, whatever makes them urgent, share its run.
-    got = batchrun.pick(p, p.config(), p1, [p2, p3, p1b, flagged, ordered, negated])
-    assert ids(got) == sorted([102, 103, owned["id"]])
-    assert batchrun.pick(p, p.config(), p1, [p2, p3]) == []
+    # (a) an urgent lead takes no routine task; (b) independent urgent tasks, whatever makes them urgent,
+    # start their own runs; (c) one that waits on the lead (same orders) joins it, after it.
+    assert batchrun.pick(p, p.config(), p1, [p2, p3, p1b, flagged, ordered, negated]) == []
+    assert ids(batchrun.pick(p, p.config(), p1, [p2, p3, p1b, flagged], waiting={102: {101}})) == [102]
     # A task an urgent one waits on is urgent too (dispatch's inherited rank): it runs with urgent work only.
     need = p.db.add_task("prerequisite", "Fix it.", kind="code", tier="standard", priority=3, origin="coordinator")
     p.db.add_task("wants it", "Fix it.", kind="code", tier="standard", priority=1, origin="coordinator",
                   depends_on=json.dumps([need]))
     prereq = row(need, priority=3)
-    assert need in ids(batchrun.pick(p, p.config(), p1, [prereq, p3]))
+    assert need in ids(batchrun.pick(p, p.config(), p1, [prereq, p3], waiting={need: {101}}))
     assert need not in ids(batchrun.pick(p, p.config(), p3, [prereq, p3b]))
     # A routine lead takes no urgent task; (c) routine tasks batch as before, a negated `urgent:` line included.
     assert ids(batchrun.pick(p, p.config(), p3, [p1, flagged, ordered, p2, p3b, p3c, negated])) == [105, 107, 108, 109]
@@ -162,7 +162,7 @@ def test_batch_run_shares_one_worktree_and_branch(env, monkeypatch):
     d, started = _batch_daemon(p, monkeypatch)
     urgent = p.db.add_task("urgent fix", "Fix now.", kind="code", tier="standard", origin="user", priority=1,
                            budget_usd=8.0)
-    mates = [t["id"] for t in _batch_tasks(p, 2, budget_usd=4.0, priority=1)]
+    mates = [t["id"] for t in _batch_tasks(p, 2, budget_usd=4.0, priority=1, depends_on=[urgent])]
     deep = p.db.add_task("big redesign", "Redo it.", kind="code", tier="deep", origin="coordinator")
     d.dispatch()
     lead_runs = [(a, k) for a, k in started if k["task"]["id"] == urgent]
@@ -206,7 +206,8 @@ def test_urgent_batch_run_never_pulls_in_a_routine_task_that_became_ready(env, m
     p = make(env)
     d, started = _batch_daemon(p, monkeypatch)
     lead = p.db.add_task("urgent fix", "Fix now.", kind="code", tier="standard", origin="user", priority=1)
-    mate = p.db.add_task("urgent mate", "Fix too.", kind="code", tier="standard", origin="user", priority=1)
+    mate = p.db.add_task("urgent mate", "Fix too.", kind="code", tier="standard", origin="user", priority=1,
+                         depends_on=[lead])
     d.dispatch()
     assert batchrun.view(p.db, lead) == {"id": f"b{lead}", "members": [mate]}
     late = p.db.add_task("routine fix", "Tidy up.", kind="code", tier="standard", origin="coordinator", priority=2)
@@ -459,6 +460,41 @@ def test_batch_never_leads_or_takes_a_task_with_a_branch_of_its_own():
     assert batchrun.own_branch(dict(plain, spec="pr_branch: feat/x"), recorded=False)
     for lb in ("pr_branch:feat/x", "pr_fix:acme/widgets#7", "continues:5"):
         assert batchrun.own_branch(dict(plain, labels=f'["{lb}"]'), recorded=False), lb
+    # A no_push line is a delivery route of its own: it never shares a run with push-queue work.
+    assert batchrun.own_branch(dict(plain, spec="Fix it.\n  no_push: local commits on the PR branch"), recorded=False)
+    assert not batchrun.own_branch(dict(plain, spec="Mention no_push: in the docs."), recorded=False)
+
+
+def test_batch_keeps_delivery_routes_and_separate_urgent_orders_apart(env):
+    # A no_push feature-branch task urgent for one user order, plus two push-queue tasks urgent for
+    # another: three runs, in parallel. Same-order urgent work that waits on the lead still joins it;
+    # small routine tasks still batch, a no_push one aside.
+    from ttp import batchrun, obligations
+    p = make(env)
+    a, b, c, d, e = _batch_tasks(p, 5)
+    order = lambda text, *tids: obligations.add_order(p, text, p.db.post("in", text, chat="c1"), list(tids),
+                                                      action_class="change")
+    order("land the PR work", a["id"])
+    order("routing live today", b["id"], c["id"], d["id"])
+    kept_off = dict(a, priority=1, spec="no_push: local commits only\nFix the PR.")
+    routing, lost = dict(b, priority=1), dict(c, priority=1)
+    ids = lambda got: [t["id"] for t in got]
+    assert batchrun.pick(p, p.config(), kept_off, [routing, lost]) == []
+    assert batchrun.pick(p, p.config(), routing, [kept_off, lost]) == []
+    assert batchrun.pick(p, p.config(), routing, [kept_off, lost], waiting={a["id"]: {b["id"]}}) == []
+    # A task of another order waiting on the lead stays out; one of the lead's own order joins after it.
+    other = dict(e, priority=1)
+    order("something else", e["id"])
+    assert batchrun.pick(p, p.config(), routing, [other], waiting={e["id"]: {b["id"]}}) == []
+    then = dict(d, priority=1)
+    assert ids(batchrun.pick(p, p.config(), routing, [then, other],
+                             waiting={d["id"]: {b["id"]}, e["id"]: {b["id"]}})) == [d["id"]]
+    # Routine work batches as before; a routine no_push task neither leads nor joins.
+    r1, r2, r3 = (dict(x, id=x["id"] + 100) for x in (a, b, c))
+    assert ids(batchrun.pick(p, p.config(), r1, [r2, r3])) == [r2["id"], r3["id"]]
+    kept_r = dict(r3, spec="no_push: notes only\nWrite it.")
+    assert ids(batchrun.pick(p, p.config(), r1, [r2, kept_r])) == [r2["id"]]
+    assert batchrun.pick(p, p.config(), kept_r, [r1, r2]) == []
 
 
 def test_batch_members_land_by_their_own_commits_or_rebased_copies_with_no_trailer(env, monkeypatch, tmp_path):

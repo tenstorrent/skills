@@ -1622,8 +1622,18 @@ def open_keys_by_task(db) -> dict[int, list[str]]:
 
 def order_tasks(db) -> set[int]:
     """The tasks of the open user orders (add_order), whether or not they are required owners."""
-    return {t for o in items(db) if _open(o) and (o.get("promise") or {}).get("order") is not None
-            for t in _owner_ids(o)}
+    return set(order_of(db))
+
+
+def order_of(db) -> dict[int, set]:
+    """Task id -> the user messages of the open orders (add_order) it serves."""
+    out: dict[int, set] = {}
+    for o in items(db):
+        mid = (o.get("promise") or {}).get("order")
+        if _open(o) and mid is not None:
+            for t in _owner_ids(o):
+                out.setdefault(t, set()).add(mid)
+    return out
 
 
 def owner_due(db) -> dict[int, float]:

@@ -14,7 +14,10 @@ priority; a task whose files a running task on another branch holds is left out;
 on another comes after it. The lead is whatever dispatch picked first (an urgent one leads): it never
 waits for a batch to fill. An urgent task (dispatch's rule: urgent.is_urgent, plus an open
 obligation's owner with its inherited prerequisites, or a task of a user order) shares a run only
-with urgent tasks, and a routine one only with routine ones. A batch
+with urgent tasks, and a routine one only with routine ones. An urgent lead takes only urgent tasks
+that already wait on it or on its other members and serve the same user orders (obligations.order_of):
+independent urgent tasks and another order's work start their own runs, in parallel. A task with a
+`no_push:` line is a delivery route of its own (own_branch), like a `pr_branch:` one. A batch
 runs its shared steps once, after every member's commit: one focused test gate, one device smoke and,
 where it delivers outside the push queue, one landing request (a PR or a push request) carrying every
 member's commits (prompt_block). Off with `dispatch.batch` false.
@@ -174,11 +177,13 @@ def fits(lead: dict, t: dict) -> bool:
 
 
 def own_branch(t: dict, recorded: bool = True) -> bool:
-    """`t` carries a branch of its own (a `pr_branch:` line or label, a PR fix, a continuation or, with
-    `recorded`, a branch on its record): it neither joins a batch nor leads one, so no other task's work
-    lands on a PR's or another task's branch. A lead's own recorded ttp/t<id> branch is its batch's."""
-    labels = task_labels(t)
-    return bool((recorded and t.get("branch")) or t.get("pr_url") or "pr_branch:" in (t.get("spec") or "")
+    """`t` carries a branch or delivery route of its own (a `pr_branch:` line or label, a `no_push:` line,
+    a PR fix, a continuation or, with `recorded`, a branch on its record): it neither joins a batch nor
+    leads one, so no other task's work lands on a PR's or another task's branch and work for the push
+    queue never shares a run with work kept off it. A lead's own recorded ttp/t<id> branch is its batch's."""
+    from .integrate import _NO_PUSH
+    labels, spec = task_labels(t), t.get("spec") or ""
+    return bool((recorded and t.get("branch")) or t.get("pr_url") or "pr_branch:" in spec or _NO_PUSH.search(spec)
                 or any(str(x).startswith(("pr_branch:", "pr_fix:", "continues:")) for x in labels))
 
 
@@ -221,12 +226,14 @@ def pick(p, cfg: dict, lead: dict, ready: list[dict], inflight: list[dict] | Non
     if n <= 0:
         return []
     mine = _paths(p, lead)
+    orders = obligations.order_of(p.db)
     try:   # a malformed obligation that breaks the inheritance still leaves the order tasks
-        owners = set(rankinherit.inherited_due(p.db)) | obligations.order_tasks(p.db)
+        owners = set(rankinherit.inherited_due(p.db)) | set(orders)
     except Exception:
-        owners = set(obligations.order_tasks(p.db))
+        owners = set(orders)
     hot = lambda t: urgent.is_urgent(t) or t["id"] in owners
     lead_urgent = hot(lead)
+    waiting = waiting or {}
     held: set[str] = set()
     for t in inflight or []:
         if t["id"] != lead["id"] and (t.get("branch") or "") != (lead.get("branch") or ""):
@@ -235,12 +242,13 @@ def pick(p, cfg: dict, lead: dict, ready: list[dict], inflight: list[dict] | Non
     for t in ready:
         if not eligible(lead, t) or hot(t) != lead_urgent:
             continue   # urgent work shares a run only with urgent work, never with routine tasks
+        if lead_urgent and (t["id"] not in waiting or orders.get(t["id"], set()) != orders.get(lead["id"], set())):
+            continue   # an urgent task never waits behind steps it does not need, nor another order's work
         ps = _paths(p, t)
         if ps & held:
             continue
         cands.append((0 if ps & mine else 1, t.get("priority") or 3, t["id"], t))
     chosen = [c[3] for c in sorted(cands, key=lambda c: c[:3])][:n]
-    waiting = waiting or {}
     while True:   # a waiting member whose prerequisite was left out (cap, held) leaves too
         ids = {lead["id"]} | {m["id"] for m in chosen}
         keep = [m for m in chosen if set(waiting.get(m["id"]) or ()) <= ids]
