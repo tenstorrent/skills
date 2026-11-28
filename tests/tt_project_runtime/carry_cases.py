@@ -470,3 +470,11 @@ def test_a_second_failed_inline_review_caps_the_task_for_the_coordinator(env, mo
     ev, = s.p.db.q("SELECT * FROM events WHERE kind='carry_capped'")
     assert str(run_dir / "result.json") in ev["text"] and ev["status"] == "queued" and ev["severity"] == "high"
     assert int(t["attempts"]) == 1
+
+
+def test_an_author_failure_of_a_carry_task_is_no_failed_review_for_the_cap(env, monkeypatch):
+    from ttp import reviewcap
+    s = _inline(env, monkeypatch)
+    s.p.db.x("INSERT INTO events(ts,source,kind,severity,text,status,task) VALUES(?,?,?,?,?,?,?)",
+             (time.time(), "daemon", "task_failed", "normal", "the author timed out", "handled", s.code))
+    assert s.code not in reviewcap.failed_reviews(s.p.db, 0)

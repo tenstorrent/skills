@@ -164,13 +164,13 @@ def check_approval(daemon, task: dict, session: str, entries, cfg: dict) -> dict
     s = state(daemon.p.db, task["id"])
     if not s or s["phase"] != REVIEW:
         return {"invalid": "its task is no longer in review"}
-    if session and session in {session_of(a) for a in _authors(daemon.p.db, task["id"])}:
-        return {"invalid": "its review ran in the author's own session, not an independent one"}
+    if not session or session in {session_of(a) for a in _authors(daemon.p.db, task["id"])}:
+        return {"invalid": "its review ran in the author's own session (or has none), not an independent one"}
     if (now := daemon._branch_head(task)) != s["head"]:
         return {"invalid": f"the branch is at {str(now)[:12] or 'no commit'}, not the reviewed {str(s['head'])[:12]}: "
                            "it moved during the review"}
     # What the review's spec says it reviewed ("branch at head", as a Review task's does) is what pushq may approve.
-    named = dict(task, spec=f"{task.get('spec') or ''}\nReviewed: {task.get('branch')} at {s['head']}")
+    named = dict(task, depends_on="[]", spec=f"{task.get('spec') or ''}\nReviewed: {task.get('branch')} at {s['head']}")
     return pushq.check_approval(daemon.p, named, entries, cfg=cfg)
 
 
@@ -200,7 +200,7 @@ def failed(daemon, task: dict, result: dict, run_dir) -> tuple[str, dict]:
         pushq._event(db, task, "carry_capped", f"#{tid} {task['title']}: its inline review failed {s['round']} time(s); "
                      f"findings in {path}. Decide: scope it down, redesign it or accept the gaps", queued=True, severity="high")
         return "review", {}
-    woke = f"its review (round {s['round']}) failed; findings below and in {path}. Fix them on your own branch, then hand off done"
+    woke = f"its review (round {s['round']}) failed; findings in the last Update block of your spec and in {path}. Fix them on your own branch, then hand off done"
     db.update_task(tid, spec=f"{task['spec'] or ''}\n\n{UPDATE} {s['round']}: findings)\n{text}\nReview result: {path}")
     advance(db, tid, FIX)
     extra = {"woke": woke}
