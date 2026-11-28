@@ -30284,7 +30284,7 @@ def test_gh_found_through_command_v_is_still_the_guarded_one(env, tmp_path):
     assert (tmp_path / "gh.log").read_text() == ""
 
 
-def _run_tried(p, key, action="ready", refused=True, ago=0.0, run="41", task="5"):
+def _run_tried(p, key, action="ready", refused=False, ago=0.0, run="41", task="5"):
     """A run's gh call that marked `key` ready (or requested reviewers on it), as the harness's gh logs it."""
     from ttp import prguard
     with open(prguard.gh_log_path(p.state), "a") as f:

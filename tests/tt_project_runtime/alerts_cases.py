@@ -1387,6 +1387,30 @@ def test_pr_watch_records_a_pr_the_user_took_out_of_draft_as_their_approval(env,
 
 
 
+def test_pr_watch_blames_no_run_for_a_refused_call_and_the_read_guard_names_no_draft_rule(env, monkeypatch):
+    """A refused gh call never wrote: a PR that left draft with only refused calls behind it is the user's
+    approval. The refusal of a gh call not by its name says every call, reads included, goes through the
+    harness's gh, not that the call would take a PR out of draft."""
+    from ttp import hook, prguard, watchers
+    from ttp.daemon import Daemon
+    p = make(env)
+    url = "https://github.com/acme/widgets/pull/7"
+    p.db.x("INSERT INTO tasks(title,kind,status,pr_url,created) VALUES(?,?,?,?,?)", ("t", "code", "done", url, time.time()))
+    draft = {url: True}
+    monkeypatch.setattr(watchers, "_gh", lambda args, cwd: None if args[0] == "api" else
+                        {"url": args[2], "state": "OPEN", "title": "t", "headRefOid": HEAD, "isDraft": draft[args[2]]})
+    p.db.set_kv("pr_signatures", {})
+    d = Daemon(p.base)
+    watchers.watch_prs(d)
+    _run_tried(p, "acme/widgets#7", refused=True)
+    draft[url] = False
+    watchers.watch_prs(d)
+    assert p.db.kv(prguard.UNAPPROVED_KEY) == {} and not p.db.q("SELECT id FROM events WHERE kind='pr_unapproved_ready'")
+    assert len(p.db.q("SELECT id FROM events WHERE kind='pr_ready_by_user'")) == 1
+    why = hook.draft_bypass("/usr/bin/gh api repos/acme/widgets/pulls/7")   # a read, by a path
+    assert why and "reads included" in why and "leaves draft" not in why
+
+
 def test_pr_watch_alerts_when_a_run_took_a_pr_out_of_draft(env, monkeypatch):
     """A PR left draft without approval and the runs' gh log shows a run marking it ready (or
     requesting reviewers, or a call whose PR it could not tell): a high alert names the run, the
@@ -1410,7 +1434,7 @@ def test_pr_watch_alerts_when_a_run_took_a_pr_out_of_draft(env, monkeypatch):
                       if alerts.active(p.db, m["ref"], m["ts"], time.time()))
 
     watchers.watch_prs(d)
-    _run_tried(p, "acme/widgets#7", run="41", task="5")                       # refused, then got around it
+    _run_tried(p, "acme/widgets#7", run="41", task="5")                       # a call that ran
     _run_tried(p, "acme/widgets#8", action="reviewers", refused=False, run="42", task="6")
     _run_tried(p, None, run="43", task="6")                                   # its PR could not be identified
     for url in urls.values():
@@ -1419,7 +1443,7 @@ def test_pr_watch_alerts_when_a_run_took_a_pr_out_of_draft(env, monkeypatch):
     watchers.watch_prs(d)
     shown = alerting()
     assert [r for r, _ in shown] == [f"pr-ready:acme/widgets#{n}" for n in (7, 8, 9)]
-    assert "run 41 of task #5 marked it ready" in shown[0][1] and "refused" in shown[0][1]
+    assert "run 41 of task #5 marked it ready" in shown[0][1] and "gh exited 0" in shown[0][1]
     assert "run 42 of task #6 requested reviewers" in shown[1][1] and "run 43" in shown[2][1]
     assert all("Nothing on the PR was changed" in t for _, t in shown)
     ev = p.db.q("SELECT text, severity, status FROM events WHERE kind='pr_unapproved_ready' ORDER BY id")

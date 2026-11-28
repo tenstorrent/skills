@@ -260,3 +260,11 @@ def test_pyaudit_on_the_glm_arm_lets_a_whole_remote_check_run_on_its_host(env, c
     r = _pa_run(e, code, repo)
     assert r.returncode == 0 and "ran-there" in r.stdout, (r.stdout + r.stderr)[-1500:]
     assert "tt-project guard" not in r.stdout + r.stderr and _rc_left(tmp_path) == []
+
+
+def test_pyaudit_lets_a_glm_run_write_the_checks_upload_locks(env, cred_home):
+    """The checks code's own upload lock files (check-slots/uploads) are no write outside the worktree."""
+    from ttp import checkcap, pyaudit
+    pol = json.loads(_pa_env(cred_home, glm=True)[pyaudit.POLICY_ENV])
+    assert str(checkcap.slot_dir() / "uploads") in pol["glm"]["roots"]
+    assert not any(r.endswith("check-slots") for r in pol["glm"]["roots"]), "only the upload locks"

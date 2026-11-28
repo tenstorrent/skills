@@ -1058,13 +1058,12 @@ def draft_bypass(text: str, path_changed: bool = False, trusted: bool = True) ->
     full = text
     commands, text = _split(text)
     if PATH_GH_RE.search(text):
-        return ("call gh by its name only: the harness's gh checks that a PR leaves draft only with the "
-                "user's recorded approval")
+        return "call gh by its name only: every gh call, reads included, goes through the harness's gh"
     if (GUARDED_RE.search(text) and ((OTHER_GH_RE.search(text) and GH_WORD_RE.search(text)) or VAR_GH_RE.search(text))
             or (path_changed or path_change(text, trusted and _project_trusted(full)))
             and (GH_ARGV_RE.search(text) or _gh_writes(commands, text))):
-        return ("call gh by its name, with PATH as the run set it: the harness's gh comes first and checks "
-                "that a PR leaves draft only with the user's recorded approval")
+        return ("call gh by its name, with PATH as the run set it: every gh call, reads included, goes through "
+                "the harness's gh first")
     if _api_draft_change(text, full):
         return ("create or update PRs with gh, not a direct GitHub API call: a PR leaves draft only with "
                 "the user's recorded approval")
@@ -1238,8 +1237,8 @@ def _scripts(segments: list[list[str]], cwd: str) -> list[Path]:
 
 
 def _log_bypass(cmd: str) -> None:
-    """Record a denied draft-guard bypass in the gh guard log as the run's refused 'ready' call, so
-    pr-watch counts it as the run's doing, never as the user's own approval. The run dir is
+    """Record a denied draft-guard bypass in the gh guard log as the run's refused 'ready' call: evidence
+    only, since it never ran, so pr-watch blames a run only for a PR write it ran. The run dir is
     <state>/runs/<id>."""
     from . import prguard
     prguard.log_call(Path(os.environ["TTP_RUN_DIR"]).parent.parent, [("ready", [])], ["hook-denied", cmd],
@@ -1458,8 +1457,16 @@ CALL = {"id": "", "stage": "before"}
 
 # The refusal the current pre_tool_use call logs: whether a guard logged it itself (full_suite, no_device,
 # user_site, a local guard), and else its kind, `provenance` for a guard on untrusted input, `worker_role`
-# for the others. localfault.GUARD_KINDS counts these two as the run's own fault, not its resource's.
-_refusal = {"logged": False, "kind": "worker_role"}
+# for the others. localfault.GUARD_KINDS counts these two as the run's own fault, not its resource's. `guard`
+# names the guard (and `cls` a GLM rule's class) so blockledger keys the refusal by it.
+_refusal = {"logged": False, "kind": "worker_role", "guard": "", "cls": ""}
+
+
+def _guard(name: str, why: str | None) -> str | None:
+    """`why` of the guard `name`: its refusal is logged under that name."""
+    if why:
+        _refusal["guard"] = name
+    return why
 
 
 def _provenance(why: str | None) -> str | None:
@@ -1554,14 +1561,15 @@ def pre_tool_use(payload: dict, stage: str = "before") -> tuple[dict | None, Non
     if not os.environ.get("TTP_RUN_DIR"):
         return None, None
     CALL.update(id=str(payload.get("tool_use_id") or payload.get("call_id") or payload.get("id") or ""), stage=stage)
-    _refusal.update(logged=False, kind="worker_role")
+    _refusal.update(logged=False, kind="worker_role", guard="", cls="")
     judged = _proven(payload)
     out = _staged(payload, judged) if payload.get("tool_name") == "Bash" else None
     out, _ = (out, None) if out else _pre_tool_use(judged)
     spec = (out or {}).get("hookSpecificOutput") or {}
     if spec.get("permissionDecision") == "deny" and not _refusal["logged"]:
         _log_refusal(_refusal_command(payload), kind=_refusal["kind"],
-                     reason=str(spec.get("permissionDecisionReason") or ""))
+                     reason=str(spec.get("permissionDecisionReason") or ""),
+                     **{k: _refusal[v] for k, v in (("guard", "guard"), ("class", "cls")) if _refusal[v]})
     return out, None
 
 
@@ -1571,12 +1579,15 @@ def _pre_tool_use(payload: dict) -> tuple[dict | None, None]:
         return _deny(glmguard.drafted(os.environ.get("TTP_RUN_DIR"), d)), None
     if glmguard.glm_run() is not None and (why := glmguard.tool_refusal(payload)):   # every route to the chat model
         # a redirect (the reason and the allowed way; the run goes on) or a hand-back to Opus (no model call)
+        rule, cls, _ = glmguard.classify(why)
+        _refusal.update(guard=rule, cls=cls)
         return _deny(glmguard.refused(os.environ.get("TTP_RUN_DIR"), why)), None
     if why := _device_plan(payload):
         return _deny(why), None
     if why := _provenance(untrusted.mark_refusal(str(payload.get("tool_name") or ""), payload.get("tool_input") or {})):
         return _deny(why), None   # the run's untrusted-input mark, marked or not
-    if why := pathguard.refusal(payload):   # a write into a credential folder or a protected path, on any tool
+    # a write into a credential folder or a protected path, on any tool
+    if why := _guard("protected_path", pathguard.refusal(payload)):
         from . import ruleguard
         ruleguard.fire("protected_paths", why)
         return _deny(why), None
@@ -1589,7 +1600,7 @@ def _pre_tool_use(payload: dict) -> tuple[dict | None, None]:
     if payload.get("tool_name") in ("Read", "Grep", "Glob"):   # a credential store's contents (credguard)
         from . import credguard
         args, cwd = payload.get("tool_input") or {}, str(payload.get("cwd") or os.getcwd())
-        why = credguard.tool_refusal(str(payload["tool_name"]), args, cwd)
+        why = _guard("credential_read", credguard.tool_refusal(str(payload["tool_name"]), args, cwd))
         if not why:   # a run reading untrusted input: a credential file outside its worktree
             from . import untrusted
             why = _provenance(untrusted.tool_refusal(str(payload["tool_name"]), args, cwd))
@@ -1607,7 +1618,7 @@ def _pre_tool_use(payload: dict) -> tuple[dict | None, None]:
     cmd = str((payload.get("tool_input") or {}).get("command") or "")
     commands, scan = _split(cmd)
     segments = _segments(commands)
-    why = draft_bypass(cmd)
+    why = _guard("gh_anon", draft_bypass(cmd))
     bypass = bool(why)
     if not why and (any(os.path.basename(s[0]) == "ttp" and s[1:2] == ["say"] for s in segments)
                     or (re.search(r"/api/say\b", cmd) and HTTP_CLIENT_RE.search(cmd))):
@@ -1621,7 +1632,7 @@ def _pre_tool_use(payload: dict) -> tuple[dict | None, None]:
     if not why and "***" in cmd:   # a patch in the command (`apply_patch <<EOF`), relative paths too
         why = harness_gh_patch(payload)
     if not why:
-        why = store_refusal(cmd, str(payload.get("cwd") or os.getcwd()))
+        why = _guard("credential_store", store_refusal(cmd, str(payload.get("cwd") or os.getcwd())))
     if not why:   # the run's own credentials and proxy stay in the run (runguard.py)
         from . import runguard
         why = runguard.refusal(cmd, _all_segments(commands) + _segments(commands, strip=False))
@@ -1645,7 +1656,7 @@ def _pre_tool_use(payload: dict) -> tuple[dict | None, None]:
                 pass
     if not why:
         from . import killguard
-        why = killguard.refusal(cmd, str(payload.get("cwd") or os.getcwd()))
+        why = _guard("kill", killguard.refusal(cmd, str(payload.get("cwd") or os.getcwd())))
     if not why:   # a PR body's form, and gh writes where the first gh is not the wrapper (ghhold.py)
         why = gh_form(segments, str(payload.get("cwd") or os.getcwd()))
     if not why:   # a curl or wget post to others (aitag)
@@ -1665,17 +1676,17 @@ def _pre_tool_use(payload: dict) -> tuple[dict | None, None]:
     if bypass:
         _log_bypass(cmd)
     if not why:
-        why = idle_wait(cmd)
+        why = _guard("sleep_wait", idle_wait(cmd))
     if not why:
         why = full_suite(cmd, segments, str(payload.get("cwd") or os.getcwd()))
     if not why:
-        why = too_many_workers(cmd)
+        why = _guard("pytest_n", too_many_workers(cmd))
     if not why:
-        why = too_many_build_jobs(cmd)
+        why = _guard("build_jobs", too_many_build_jobs(cmd))
     if not why:
         why = device_command(commands, cmd)
     if not why:
-        why = held_machine(cmd)
+        why = _guard("held_machine", held_machine(cmd))
     if not why:
         why = local_guard(payload)
     if not why:

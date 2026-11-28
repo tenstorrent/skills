@@ -6,10 +6,14 @@ sources: the stuck intervals of tasks (unblock.intervals), guard refusals in eac
 `refusals.jsonl` / `glm_refusals.jsonl` (minutes: until the task next ran, when that run handed off
 blocked or waiting), queue-wait episodes (queuewait) and `state/blocklog.jsonl`, which `ttp block-log`
 appends to. `safety` names the safety gate that holds the time, else "convenience". `window_share` is the
-blocked share of ordered work's wall time (TARGET 5%): overlapping rows of one task count once.
+blocked share of ordered work's wall time (TARGET 5%): overlapping rows of one task count once, and rows of
+WORK (a wait on the task's own detached job, a clock-gated planned window) are no blocked time. A wait on
+another task's landing is rule "dependency", a review hold rule "review"; a redirect refusal (the run was
+told the allowed way and went on) holds 0 minutes but keeps its count. Refusals are keyed by the guard's name.
 
 `top` lists the day's convenience rules with the most minutes (safety rows are listed apart and never
-retire items); `digest_lines` shows each as a 'top blocker' until `ttp blocked --done <key> --how TEXT`
+retire items; `listed` leaves out NOT_TOP and 0-minute rows); `digest_lines` shows each as a
+'top blocker' until `ttp blocked --done <key> --how TEXT`
 (kv `blockledger:done:<key>`), and 'came back' when a done rule holds time again within BACK_S.
 """
 from __future__ import annotations
@@ -21,6 +25,7 @@ from pathlib import Path
 
 from . import obligations, queuetrim, queuewait, rulecite, selfblock, unblock
 from .db import DB
+from .util import loads_dict
 
 LOG = "blocklog.jsonl"
 TARGET = 0.05
@@ -28,6 +33,11 @@ DONE = "blockledger:done:"   # + key_of(rule): {"how"}, stamped by the kv row's 
 BACK_S = 7 * 86400
 SHOWN = 5
 REFUSALS = ("refusals.jsonl", "glm_refusals.jsonl")
+REDIRECT = "redirect"   # glmguard.REDIRECTED: the refusal told the allowed way and the run went on
+WORK = frozenset({"own job", "planned window"})   # work in progress or a planned start: no blocked time
+NOT_TOP = WORK | {"dependency"}
+CLOCK = re.compile(r"(?:\btest|\[\[?)\s+\"?\$\(\s*date\s+\+%s\s*\)\"?\s+-ge\s+\d+")   # a retry_when clock gate
+LANDED = re.compile(r"\blanded:#?(\d+)|\bttp\s+landed\s+--task\s+(\d+)|\blanding of task #(\d+)")
 GUARD_KINDS = frozenset({"no_device", "worker_role", "provenance", "user_site"})   # hook refusals of a safety guard
 # Safety gates beyond selfblock.GATES: a held resource, a check, a review or push, a user message, a rule id.
 SAFE = (("held resource", re.compile(r"\bresource:\S+|\block\b", re.I)), ("check", re.compile(r"\bcheck:\S+")),
@@ -70,6 +80,13 @@ def safety_of(reason: str, kind: str = "") -> str:
     return "convenience"
 
 
+def _wait_rule(probe: str, reason: str) -> tuple[str, str] | None:
+    """(rule, reason) of a wait its probe or reason places: another task's landing, a clock-gated window."""
+    if m := LANDED.search(probe) or LANDED.search(reason):
+        return "dependency", f"needs #{next(g for g in m.groups() if g)}"
+    return ("planned window", reason) if CLOCK.search(probe) else None
+
+
 def _row(rule, task, kind, start, end, reason, source, **extra) -> dict:
     return {"rule": rule, "task": task, "kind": kind, "start": start, "end": end,
             "minutes": round(max(0.0, end - start) / 60, 1), "safety": safety_of(f"{rule} {reason}", kind),
@@ -102,16 +119,26 @@ def _refusals(db: DB, since: float, until: float) -> list[dict]:
                     continue
                 if not isinstance(rec, dict) or not since <= ts <= until:
                     continue
-                kind = str(rec.get("kind") or rec.get("rule") or "refusal")
-                e = by.setdefault(kind, {"ts": ts, "n": 0, "guard": False})
-                e["ts"], e["n"] = min(e["ts"], ts), e["n"] + 1
+                kind = str(rec.get("guard") or rec.get("kind") or rec.get("rule") or "refusal")
+                e = by.setdefault(kind, {"ts": ts, "n": {}, "guard": False, "moved": True})
+                e["ts"], e["n"][name] = min(e["ts"], ts), e["n"].get(name, 0) + 1
                 e["guard"] |= rec.get("class") == "harmful" or rec.get("kind") in GUARD_KINDS
-        for kind, e in by.items():
-            row = _row(kind, r["task"], "refusal", e["ts"], max(e["ts"], min(end or e["ts"], until)), "", "refusal", n=e["n"])
+                e["moved"] &= rec.get("class") == REDIRECT
+        for kind, e in by.items():   # the hook and glmguard both log a GLM refusal: count it once
+            stop = e["ts"] if e["moved"] else max(e["ts"], min(end or e["ts"], until))
+            row = _row(kind, r["task"], "refusal", e["ts"], stop, "", "refusal", n=max(e["n"].values()))
             if e["guard"]:
                 row["safety"] = "guard"   # a safety guard's refusal is no rule to retire
             out.append(row)
     return out
+
+
+def _own_job(db: DB, e: dict) -> bool:
+    """Whether a queue wait the task's own probe explains waits only on its own detached jobs (`ttp detach --check`)."""
+    ev = db.one("SELECT data FROM events WHERE task=? AND kind='task_waiting' AND ts BETWEEN ? AND ? "
+                "ORDER BY ts DESC LIMIT 1", (e.get("task"), float(e["since"]) - 600, float(e["since"]) + 60))
+    got = unblock.wait_probes(loads_dict(ev and ev["data"]).get("probe"))
+    return bool(got and got[0] and not got[1])
 
 
 def rows(db: DB, since: float, until: float | None = None) -> list[dict]:
@@ -120,17 +147,20 @@ def rows(db: DB, since: float, until: float | None = None) -> list[dict]:
     out = []
     for seg in unblock.overlapping(db, since, until):
         start, end = seg["start"], min(seg.get("end") or until, until)
-        ev = db.one("SELECT text FROM events WHERE task=? AND kind=? AND ts<=? ORDER BY ts DESC LIMIT 1",
+        ev = db.one("SELECT text, data FROM events WHERE task=? AND kind=? AND ts<=? ORDER BY ts DESC LIMIT 1",
                     (seg["task"], f"task_{seg['kind']}", start))
         task = db.task(seg["task"]) or {}
         reason = _why((ev and ev["text"]) or task.get("blocked_reason") or seg["title"], seg["task"], seg["title"])
-        out.append(_row(rule_of(reason), seg["task"], seg["kind"], max(start, since), end, reason, "task"))
+        rule, why = ("review", reason) if seg["kind"] == "review" else \
+            _wait_rule(str(loads_dict(ev and ev["data"]).get("probe") or ""), reason) or (rule_of(reason), reason)
+        out.append(_row(rule, seg["task"], seg["kind"], max(start, since), end, why, "task"))
     out += _refusals(db, since, until)
     st = db.kv(queuewait.KV) or {}
     for e in [*(st.get("hist") or []), *(st.get("open") or {}).values()]:
         end = min(float(e.get("end") or until), until)
         if end >= since and float(e["since"]) <= until:
-            out.append(_row(f"queue:{e['queue']}", e.get("task"), "queue", max(float(e["since"]), since), end, e["queue"], "queue"))
+            rule = "own job" if e["queue"] == "own" and _own_job(db, e) else f"queue:{e['queue']}"
+            out.append(_row(rule, e.get("task"), "queue", max(float(e["since"]), since), end, e["queue"], "queue"))
     log = Path(db.path).parent / LOG
     for line in (log.read_text(errors="replace").splitlines() if log.is_file() else ()):
         try:
@@ -174,7 +204,7 @@ def window_share(db: DB, start: float, end: float, rs: list[dict] | None = None)
                for t in db.q("SELECT * FROM tasks") if t["id"] in ordered) / 60
     by: dict = {}
     for r in rows(db, start, end) if rs is None else rs:
-        if r["task"] in ordered and r["minutes"]:
+        if r["task"] in ordered and r["minutes"] and r["rule"] not in WORK:
             by.setdefault(r["task"], []).append((max(r["start"], start), min(r["end"], end)))
     blocked = sum(_union_min(v) for v in by.values())
     return {"share": round(blocked / wall, 4) if wall else 0.0, "blocked_min": round(blocked, 1),
@@ -204,7 +234,7 @@ def daily_line(db: DB, now: float | None = None) -> str:
     now = time.time() if now is None else now
     rs = rows(db, now - 86400, now)
     s = window_share(db, now - 86400, now, rs)
-    t = by_rule([r for r in rs if r["safety"] == "convenience"], 3)
+    t = top(db, now, 3, rs=rs)
     opened, back = status(db, now, rs)
     return (f"Blocked time: {s['share'] * 100:.1f}% of ordered work (target {TARGET * 100:g}%); top: "
             + (", ".join(f"{e['rule']} {e['minutes']:g}m" for e in t) or "none")
@@ -216,7 +246,12 @@ def top(db: DB, now: float | None = None, n: int = SHOWN, safety: bool = False, 
     the safety-gate ones, listed apart and never retire items."""
     now = time.time() if now is None else now
     rs = rows(db, now - 86400, now) if rs is None else rs
-    return by_rule([r for r in rs if (r["safety"] != "convenience") == safety], n)
+    return by_rule([r for r in listed(rs) if (r["safety"] != "convenience") == safety], n)
+
+
+def listed(rs: list[dict]) -> list[dict]:
+    """The rows a top-blockers list names: real blocked minutes, no work, planned window or dependency."""
+    return [r for r in rs if r["minutes"] and r["rule"] not in NOT_TOP]
 
 
 def done(db: DB, key: str, how: str) -> None:
@@ -231,9 +266,9 @@ def status(db: DB, now: float, rs: list[dict] | None = None) -> tuple[list[dict]
     back = []
     if marks:
         since = min(ts for ts, _ in marks.values())
-        for r in rows(db, since, now):
+        for r in listed(rows(db, since, now)):
             k = key_of(r["rule"])
-            if k in marks and r["safety"] == "convenience" and r["minutes"] and r["start"] > marks[k][0]:
+            if k in marks and r["safety"] == "convenience" and r["start"] > marks[k][0]:
                 back.append((k, marks[k][1]))
                 marks.pop(k)
     gone = {k for k, _ in back} | set(marks)

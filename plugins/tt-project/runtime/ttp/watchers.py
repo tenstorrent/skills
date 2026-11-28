@@ -6,9 +6,10 @@
   merge. Emits events straight to the coordinator (they are already specific and actionable).
   It never puts a PR back in draft and never touches its reviewers: the user may share the
   harness's GitHub account, and their own actions there win. A PR that leaves draft without the
-  user's recorded approval (prguard) is checked against the runs' gh log: if a run marked it ready
-  or requested reviewers on it, a high alert names the run; otherwise the user did it on GitHub and
-  that is recorded as their approval, with one line in the feed. Open PRs' findings
+  user's recorded approval (prguard) is checked against the runs' gh log: if a run's gh call that
+  ran (never one the guard refused) marked it ready or requested reviewers on it, a high alert
+  names the run; otherwise the user did it on GitHub and that is recorded as their approval,
+  with one line in the feed. Open PRs' findings
   (failing CI, bot review comments neither fixed nor answered) are recorded for prguard and are
   work: the coordinator hears when a PR has some (to queue a fix task) and when it is clean (to ask
   the user for a review). A bot's re-post of a finding it already made (after each push, say) is one
@@ -983,8 +984,9 @@ def watch_prs(daemon, payload: dict | None = None) -> str:
 
 def _check_unapproved(daemon, t: dict, pr: dict, sig: dict, before: set, flagged: dict, drafts: dict) -> None:
     """Handle a PR that is out of draft without the user's recorded approval. Nothing here changes
-    the PR. If the runs' gh log (prguard.GH_LOG) shows a run marking it ready or requesting reviewers
-    on it since it was last seen in draft, a restriction is at risk: raise a high alert naming the run
+    the PR. If the runs' gh log (prguard.GH_LOG) shows a run's gh marking it ready or requesting
+    reviewers on it since it was last seen in draft (a call that ran: a refused one never wrote), a
+    restriction is at risk: raise a high alert naming the run
     and, the first time, queue an event for the coordinator. The flag (and the alert) clears once the
     PR is back in draft, closed, merged or approved. Otherwise the user took it out of draft on GitHub:
     record that as their approval and log one feed line."""
@@ -1006,7 +1008,7 @@ def _check_unapproved(daemon, t: dict, pr: dict, sig: dict, before: set, flagged
     shown = pr.get("url") or url
     if "run" not in (flagged.get(key) or {}):   # a flag from before the gh log is judged again
         since = float(drafts.get(key) or now - DAY) - GH_LOG_MARGIN_S
-        calls = prguard.worker_calls(daemon.p.state, key, since)
+        calls = [c for c in prguard.worker_calls(daemon.p.state, key, since) if not c.get("refused")]
         if not calls:
             flagged.pop(key, None)
             prguard.approve_from_github(db, key, pr.get("headRefOid"), now)
@@ -1017,7 +1019,7 @@ def _check_unapproved(daemon, t: dict, pr: dict, sig: dict, before: set, flagged
             return
         last = ([c for c in calls if key in (c.get("prs") or [])] or calls)[-1]   # one that names it first
         did = "marked it ready" if last.get("action") == "ready" else "requested reviewers on it"
-        how = "the harness's gh refused it" if last.get("refused") else f"gh exited {last.get('rc')}"
+        how = f"gh exited {last.get('rc')}"
         run = f"run {last.get('run')}" + (f" of task #{last['task']}" if last.get("task") else "")
         flagged[key] = {"task": t["id"], "url": shown, "run": last.get("run"), "since": now, "seen": now,
                         "why": f"{run} {did} ({how}): {str(last.get('cmd') or '')[:160]}"}

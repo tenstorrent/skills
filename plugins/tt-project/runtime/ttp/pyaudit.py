@@ -24,7 +24,7 @@ TAMPER = ("a run's inline Python may not get around the guard's run-time judge (
 def policy(env, cwd: str, run_dir: str, cfg: dict | None, zp: str) -> dict:
     """What the judge refuses and why: the protected paths (pathguard's, the judge's own files), the credential
     files (credguard's, the project's secrets) and, for a run on the GLM arm, its write roots (glmguard's)."""
-    from . import credguard, glmguard, pathguard, project, sidefx
+    from . import checkcap, credguard, glmguard, pathguard, project, sidefx
     base = set(pathguard.roots(env, {}))
     roots = {r: (pathguard.WHY if r in base else pathguard.PROJECT_WHY).format(hit=r)
              for r in pathguard.roots(env, cfg)}
@@ -35,7 +35,9 @@ def policy(env, cwd: str, run_dir: str, cfg: dict | None, zp: str) -> dict:
     pol = {"runtime": str(DIR.parent), "zip": zp,
            "tamper": TAMPER, "roots": roots, "secrets": secrets}
     if glmguard.glm_run(env) is not None:
-        pol["glm"] = {"run_dir": run_dir, "roots": glmguard._roots(cwd, run_dir, glmguard._scratch(run_dir, env), env),
+        uploads = str(checkcap.slot_dir() / "uploads")   # the checks code's upload lock files (remotecheck)
+        write = glmguard._roots(cwd, run_dir, glmguard._scratch(run_dir, env), env)
+        pol["glm"] = {"run_dir": run_dir, "roots": [*write, uploads],
                       "own": glmguard._own_roots(cwd, run_dir, env), "home": home,
                       "harmless": list(sidefx.HARMLESS), "records": sorted(glmguard.RUN_RECORDS),
                       "db": glmguard.STATE_DB.pattern, "db_why": glmguard.STATE_DB_WHY}
@@ -88,9 +90,11 @@ def child_refusal(cmd: str, cwd: str) -> str | None:
 
 def logged(ev: str, args, why: str) -> None:
     """Log one refusal of the judge to the run's refusals.jsonl, as the hook logs its own."""
-    from . import hook
+    from . import glmguard, hook
     hook.CALL.update(id="", stage=FLAG)
-    hook._log_refusal(f"{ev} {args!r}", kind=FLAG, reason=why)
+    rule, cls, _ = glmguard.classify(why)   # a redirect (a database read by hand) is keyed by its rule
+    hook._log_refusal(f"{ev} {args!r}", kind=FLAG, reason=why,
+                      **({"guard": rule, "class": cls} if cls == glmguard.REDIRECTED else {}))
 
 
 def glm_write(path: str, glm: dict) -> str | None:

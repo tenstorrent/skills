@@ -9014,7 +9014,8 @@ def cmd_blocked(a) -> None:
         return
     now = time.time()
     rs = bl.rows(p.db, now - a.days * DAY_S, now)
-    out = {"share": bl.window_share(p.db, now - a.days * DAY_S, now, rs), "target": bl.TARGET, "top": bl.by_rule(rs)}
+    out = {"share": bl.window_share(p.db, now - a.days * DAY_S, now, rs), "target": bl.TARGET,
+           "top": bl.by_rule(bl.listed(rs))}
     if a.json:
         print(json.dumps(out))
         return

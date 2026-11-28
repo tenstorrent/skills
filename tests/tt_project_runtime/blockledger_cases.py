@@ -163,3 +163,99 @@ def test_block_log_and_blocked_commands_and_the_daily_line(env, capsys, monkeypa
     assert {e["safety"] for e in out["top"]} == {"convenience"}
     cli.cmd_blocked(types.SimpleNamespace(days=1.0, json=False, done=None, how=None))
     assert "of ordered work over 1 d (target 5%)" in capsys.readouterr().out
+
+
+def _bl_wait(p, title, now, ago, probe, reason="x", status="waiting"):
+    """A task stuck since `ago` s with its task_waiting event's retry_when probe."""
+    tid = _bl_task(p, title, status, now, priority=1)
+    p.db.x("INSERT INTO events(ts,source,kind,text,data,status,task) VALUES(?,?,?,?,?,?,?)",
+           (now - ago, "t", "task_waiting", f"#{tid} {title} is waiting: {reason}",
+            json.dumps({"wait": reason, "probe": probe}), "handled", tid))
+    return tid
+
+
+def test_block_ledger_a_wait_on_the_tasks_own_detached_job_is_work_not_blocked_time(env):
+    from ttp import blockledger as bl, queuewait
+    p = make(env)
+    now = time.time()
+    t = _bl_wait(p, "runs its suite", now, 3600, "ttp detach --check /r/runs/9/suite2.rc && ttp detach --check /r/x.rc")
+    o = _bl_wait(p, "waits on a box", now, 3600, "ssh box true")
+    p.db.x("UPDATE tasks SET created=? WHERE id IN (?,?)", (now - 7200, t, o))
+    p.db.set_kv(queuewait.KV, {"hist": [{"task": t, "queue": "own", "since": now - 3590, "end": now - 600}],
+                               "open": {"k": {"task": o, "queue": "own", "since": now - 3590}}})
+    rs = [r for r in bl.rows(p.db, now - 7200, now) if r["source"] == "queue"]
+    assert {r["task"]: r["rule"] for r in rs} == {t: "own job", o: "queue:own"}
+    assert [e["rule"] for e in bl.top(p.db, now) if e["rule"] in ("own job", "queue:own")] == ["queue:own"]
+    share = bl.window_share(p.db, now - 7200, now, rs)
+    assert share["blocked_min"] == pytest.approx(60, abs=1), "only the other task's wait counts"
+
+
+def test_block_ledger_review_rows_and_clock_gated_windows(env):
+    from ttp import blockledger as bl
+    p = make(env)
+    now = time.time()
+    r = _bl_task(p, "in review", "review", now, priority=1, blocked_ago=1800, kind="task_review", reason="held by R-ab12")
+    w = _bl_wait(p, "lands at night", now, 3600,
+                 "bash -c 'L=x; [ $(date +%s) -ge 1796673600 ] && exit 0; test -e out || exit 1'",
+                 reason="for landing on the push branch")
+    p.db.x("UPDATE tasks SET created=? WHERE id IN (?,?)", (now - 7200, r, w))
+    rs = {x["task"]: x for x in bl.rows(p.db, now - 7200, now) if x["source"] == "task"}
+    assert (rs[r]["rule"], rs[w]["rule"]) == ("review", "planned window")
+    assert "planned window" not in [e["rule"] for e in bl.top(p.db, now)]
+    assert bl.window_share(p.db, now - 7200, now)["blocked_min"] == pytest.approx(30, abs=1)
+
+
+def test_block_ledger_redirect_refusals_hold_no_minutes_and_count_once(env):
+    """A GLM redirect is logged by both glmguard and the hook: one row under the guard's name, its count
+    kept, 0 minutes; a refusal that stops the run still holds time until the task next ran."""
+    from ttp import blockledger as bl
+    p = make(env)
+    now = time.time()
+    t = _bl_task(p, "redirected", "queued", now)
+    p.db.x("INSERT INTO runs(task,role,status,started,ended) VALUES(?,?,?,?,?)", (t, "worker", "ok", now - 7200, now - 7000))
+    p.db.x("INSERT INTO events(ts,source,kind,text,data,status,task) VALUES(?,?,?,?,?,?,?)",
+           (now - 7010, "t", "task_blocked", "x", None, "handled", t))   # the run handed off blocked
+    p.db.x("INSERT INTO runs(task,role,status,started,ended) VALUES(?,?,?,?,?)", (t, "worker", "ok", now - 3000, now - 2900))
+    d = p.state / "runs" / str(p.db.one("SELECT min(id) AS i FROM runs WHERE task=?", (t,))["i"])
+    d.mkdir(parents=True)
+    (d / "glm_refusals.jsonl").write_text("".join(
+        json.dumps({"ts": now - 7100 + i, "rule": "scratch", "class": "redirect", "n": 1, "why": "x"}) + "\n" for i in range(2)))
+    (d / "refusals.jsonl").write_text("".join(
+        json.dumps({"ts": now - 7100 + i, "kind": "worker_role", "guard": "scratch", "class": "redirect"}) + "\n"
+        for i in range(2)) + json.dumps({"ts": now - 7050, "kind": "worker_role", "guard": "pytest_n"}) + "\n")
+    rs = {r["rule"]: r for r in bl.rows(p.db, now - 86400, now) if r["source"] == "refusal"}
+    assert set(rs) == {"scratch", "pytest_n"}
+    assert (rs["scratch"]["n"], rs["scratch"]["minutes"]) == (2, 0.0)
+    assert rs["pytest_n"]["minutes"] > 60
+    top = [e["rule"] for e in bl.top(p.db, now, safety=True)]   # worker-role refusals are a safety guard
+    assert "pytest_n" in top and "scratch" not in top
+
+
+def test_the_hook_logs_the_refusing_guards_name(env, monkeypatch):
+    """Refusals keep their kind (localfault reads it) and name the guard, which blockledger keys them by."""
+    from ttp import hook
+    from ttp.hook import REFUSALS_FILE
+    p = make(env)
+    run_dir = p.base / "guard-names"
+    run_dir.mkdir()
+    monkeypatch.setenv("TTP_RUN_DIR", str(run_dir))
+    monkeypatch.setenv("TTP_WAITS_IDLE", "1")
+    monkeypatch.setenv("TTP_TEST_SLOTS", "4")
+    for cmd in ("sleep 600", "python3 -m pytest -n 16 tests/a.py"):
+        out, _ = hook.pre_tool_use({"tool_name": "Bash", "tool_input": {"command": cmd}, "cwd": str(p.base)})
+        assert out["hookSpecificOutput"]["permissionDecision"] == "deny", cmd
+    rows = [json.loads(x) for x in (run_dir / REFUSALS_FILE).read_text().splitlines()]
+    assert [(r["kind"], r["guard"]) for r in rows] == [("worker_role", "sleep_wait"), ("worker_role", "pytest_n")]
+
+
+def test_block_ledger_a_wait_on_another_tasks_landing_is_a_dependency_and_empty_rows_are_not_listed(env):
+    from ttp import blockledger as bl
+    p = make(env)
+    now = time.time()
+    a = _bl_wait(p, "after the fix", now, 1800, "ttp landed --task 4242", reason="for landing of task on relay")
+    b = _bl_task(p, "deferred", "blocked", now, blocked_ago=1800, reason="start_when landed:#4243")
+    _bl_task(p, "just now", "blocked", now, blocked_ago=1, reason="keep the 60 min hold")
+    rs = {r["task"]: r for r in bl.rows(p.db, now - 7200, now) if r["source"] == "task"}
+    assert (rs[a]["rule"], rs[b]["rule"]) == ("dependency", "dependency")
+    assert bl.top(p.db, now) == []
+    assert not bl.listed(bl.rows(p.db, now - 7200, now))
