@@ -1014,6 +1014,28 @@ def test_the_ssh_library_chains_from_a_projects_own_guard_in_the_bin_folder(tmp_
     assert r.returncode == 0 and "ControlMaster=auto" in (tmp_path / "log").read_text()   # real ssh, not the guard again
 
 
+def test_a_wrapper_copy_skips_a_chaining_guard_folder_when_it_looks_for_the_real_ssh(tmp_path):
+    import subprocess
+    wbin, env = _launcher_dir(tmp_path)
+    gbin = tmp_path / "gbin"
+    gbin.mkdir()
+    _copy_ssh_bin(gbin)
+    (gbin / "ssh").write_text('#!/bin/sh\nexec sh "${0%/*}/lib/ttp-ssh" "$@"\n')       # the project's guard, no marker
+    env["PATH"] = f"{gbin}:{tmp_path / 'rbin'}:/usr/bin:/bin"
+    r = subprocess.run(["sh", str(wbin / "ssh"), "-V", "host-a"], env=env, capture_output=True, text=True, timeout=30)
+    assert r.returncode == 0 and "-V" in (tmp_path / "log").read_text()
+
+
+def test_the_ssh_launcher_gives_ssh_local_no_stdin_and_keeps_the_callers_for_ssh(tmp_path):
+    import subprocess
+    wbin, env = _launcher_dir(tmp_path)
+    (wbin / "ssh.local").write_text(f'#!/bin/sh\ncat > {tmp_path}/hookin\n')
+    (wbin / "ssh.local").chmod(0o755)
+    (tmp_path / "rbin" / "ssh").write_text(f'#!/bin/sh\ncase " $* " in *" -O "*|*" -fN "*) exit 0 ;; esac\ncat > {tmp_path}/sshin\n')
+    r = subprocess.run([str(wbin / "ssh"), "host-a", "true"], env=env, input="data", capture_output=True, text=True, timeout=30)
+    assert r.returncode == 0 and (tmp_path / "hookin").read_text() == "" and (tmp_path / "sshin").read_text() == "data"
+
+
 def test_sshmux_leaves_ssh_to_a_projects_own_guard_in_bin_ssh(tmp_path, monkeypatch):
     from ttp import sshmux
     root = tmp_path / "harness"

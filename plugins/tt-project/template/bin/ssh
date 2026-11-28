@@ -4,7 +4,7 @@
 # tt-project ssh wrapper (launcher): runs the wrapper body, lib/ttp-ssh, which shares one connection per host.
 # Kept short so it rarely changes: a project that replaces this file with its own guard does not conflict
 # when the body changes. Its guard can instead be bin/ssh.local, run here first as a check with ssh's
-# arguments (a non-zero exit refuses the call; it never starts ssh), or call lib/ttp-ssh itself.
+# arguments (stdin is /dev/null; a non-zero exit refuses the call; it never starts ssh), or call lib/ttp-ssh itself.
 case $0 in */*) here=${0%/*} ;; *) here=. ;; esac
-[ -x "$here/ssh.local" ] && { "$here/ssh.local" "$@" || exit $?; }
+[ -x "$here/ssh.local" ] && { "$here/ssh.local" "$@" </dev/null || exit $?; }
 exec sh "$here/lib/ttp-ssh" "$@"

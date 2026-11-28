@@ -52,7 +52,7 @@ bindir=${0%/*}/..
 ifs=$IFS
 IFS=:
 for d in $PATH; do
-    if [ -n "$d" ] && [ -x "$d/ssh" ] && ! [ "$d/ssh" -ef "$0" ] && ! [ "$d" -ef "$bindir" ]; then
+    if [ -n "$d" ] && [ -x "$d/ssh" ] && ! [ "$d/ssh" -ef "$0" ] && ! [ "$d" -ef "$bindir" ] && ! [ -f "$d/lib/ttp-ssh" ]; then
         first=
         IFS= read -r first < "$d/ssh" 2>/dev/null
         case $first in
