@@ -2459,7 +2459,7 @@ def quarantined(p, alias: str, now: float | None = None) -> str:
         if not off:
             return ""
         if float(off.get("until") or 0) <= now and off.get("kind") != "health":
-            lift(p, alias, now)
+            lift(p, alias, now, severity="" if off.get("kind") == "no-install" else "normal")   # retried quietly
             return ""
     except Exception:
         return ""

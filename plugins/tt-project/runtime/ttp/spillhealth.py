@@ -4,8 +4,9 @@
 list and the account pool), so no host keeps getting runs it can only fail.
 
 The check, over ssh within PROBE_TIMEOUT_S: python3 is there, the pinned checks env is made or reused
-there (runnerenv.remote_lines; only reused unless the project sets checks.spill_install, so a host without a
-ready one fails with that reason, never a config fault), and `<spill_wrap_cmd> python3 -c 'import pytest'` exits 0. A wrapper that
+there (runnerenv.remote_lines; with checks.spill_install off only reused, and a host without a ready one is
+not failed here: that env is the default lock's, a check run there tests the project's own and takes the host
+out of its pool when it is missing, checkspill.no_install_off), and `<spill_wrap_cmd> python3 -c 'import pytest'` exits 0. A wrapper that
 refuses the run (it writes the file remotecheck.WRAP_REFUSED_ENV names, then exits FAULT_RC) is busy, not
 failing. No model and no claude CLI runs there. A wrapper given as a path relative to the project's tree
 cannot run without a copy of its commit, so the import then runs without it.
@@ -98,8 +99,8 @@ def check(host: str, wrap: list[str], build: bool = True) -> dict:
         return {"state": "ok", "why": ""}
     if r.returncode == 75:
         return {"state": "busy", "why": "its spill wrapper refused the run"}
-    if r.returncode == 6:   # the project's setting, not a host fault (apply: never a config fault)
-        return {"state": "fail", "why": runnerenv.NO_INSTALL, "no_install": True}
+    if r.returncode == 6:   # no ready env of the default lock, install off: the check run judges the project's own
+        return {"state": "ok", "why": ""}
     why = {255: "ssh failed", 4: "no python3", 5: "the pinned checks env could not be made",
            127: "the spill wrapper is missing", 76: "it exited 75 without writing its refusal file"}.get(r.returncode, f"`import pytest` exited {r.returncode}")
     return {"state": "fail", "why": f"{why}: {tail}" if tail else why}
@@ -184,7 +185,7 @@ def apply(p, cfg: dict | None, now: float | None = None) -> list[str]:
                     checkspill._event(p.db, now, "spill-health-bridge:back", "low",
                                       f"The workstation tunnel is back: {p.name}'s spill hosts behind it can be "
                                       f"reached again.")
-        rest = {h: r for h, r in failing.items() if h not in tun and not r.get("no_install")}
+        rest = {h: r for h, r in failing.items() if h not in tun}
         if len(rest) >= checkspill.CONFIG_FAULT_HOSTS and len(failing) == len(res):   # fewer: each its own host
             with p.db.tx():
                 if not _told(p.db, "spill-health-config", now):
@@ -192,7 +193,7 @@ def apply(p, cfg: dict | None, now: float | None = None) -> list[str]:
                     checkspill._event(p.db, now, "spill-health-config", "high",
                                       f"Every spill host failed its health check at once ({', '.join(sorted(rest))}): "
                                       f"a config fault, so none was taken out. {why}")
-            failing = {h: r for h, r in failing.items() if h in tun or r.get("no_install")}
+            failing = {h: r for h, r in failing.items() if h in tun}
     for host, r in res.items():
         with p.db.tx():
             doc = checkspill._strikes(p.db)

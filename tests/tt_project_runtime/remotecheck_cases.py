@@ -5888,36 +5888,33 @@ def test_a_spill_host_without_a_ready_checks_env_installs_nothing_unless_the_pro
     assert rc == remotecheck.FAULT_RC and "pinned Python env could not be made there" in checkspill.down_why("check-host-b")
 
 
-def test_spill_hosts_without_a_ready_checks_env_leave_the_pool_with_the_reason_and_no_config_fault(
+def test_spill_hosts_without_a_ready_checks_env_leave_only_this_projects_pool_with_the_reason(
         env, tmp_path, monkeypatch):
-    """cells: spill_install_health. With checks.spill_install off the health probe fails a host with no ready env
-    (exit 6, no pip there) naming NO_INSTALL; apply takes each such host out with that reason in the status
-    line, never as the every-host config fault, and pick uses the host whose env is ready."""
+    """cells: spill_install_health. With checks.spill_install off the health probe never fails a host for a missing
+    env (it can only see the default lock's, and a host ready for the project's own lock must stay usable); a
+    check run that finds none (checkspill.no_install_off) takes the host out of this project's pool with the
+    reason in the status line, a passing probe does not bring it back early, and its end is quiet."""
     from ttp import checkspill, runnerenv, spillhealth
-    hosts = ["spill-a", "spill-b", "ready"]
+    hosts = ["spill-a", "ready"]
     p, repo, run, remote = _spill_setup(env, tmp_path, monkeypatch, hosts, charter=hosts)
     monkeypatch.chdir(tmp_path)
     with monkeypatch.context() as m:
         m.setenv("TTP_TEST_CHECKS_PYTHON_ENV", str(tmp_path / "none"))
-        got = spillhealth.check("spill-a", [], False)
-    assert got["state"] == "fail" and got.get("no_install") and got["why"] == runnerenv.NO_INSTALL, got
-    res = {h: {"state": "fail", "why": runnerenv.NO_INSTALL, "no_install": True} for h in hosts[:2]}
-    monkeypatch.setattr(spillhealth, "check", lambda h, w, *_: res.get(h, {"state": "ok", "why": ""}))
+        assert spillhealth.check("spill-a", [], False) == {"state": "ok", "why": ""}
+    monkeypatch.setattr(spillhealth, "check", lambda h, w, *_: {"state": "ok", "why": ""})
     cfg, now = p.config(), time.time()
+    checkspill.no_install_off(str(p.root), "spill-a", now)
     spillhealth.probe(spillhealth.targets(cfg), now)
-    assert spillhealth.apply(p, cfg, now) == hosts[:2]
-    assert all("install off" in checkspill.quarantined(p, h) for h in hosts[:2])
-    assert not _spill_events(p, "a config fault") and not checkspill.quarantined(p, "ready")
+    assert spillhealth.apply(p, cfg, now) == []
+    assert runnerenv.NO_INSTALL in checkspill.quarantined(p, "spill-a", now) and not checkspill.quarantined(p, "ready")
     told = []
     got = checkspill.pick(p, cfg, told.append, "pytest -q")
     try:
         assert got is not None and got.host == "ready", told
     finally:
         got and got.close()
-    res["ready"] = dict(res["spill-a"])   # every host unready: still each its own, no config fault
-    t = now + spillhealth.EVERY_S + 1
-    spillhealth.probe(spillhealth.targets(cfg), t)
-    assert spillhealth.apply(p, cfg, t) == ["ready"] and not _spill_events(p, "a config fault")
+    assert checkspill.quarantined(p, "spill-a", now + checkspill.DOWN_RETRY_S + 1) == ""
+    assert not _spill_events(p, "back in")
 
 def test_spill_host_observations_honour_an_observation_mute(env, tmp_path, monkeypatch):
     """A low spill-health line (the tunnel's) under a checks mute on 'Spill host' below normal is stored muted
