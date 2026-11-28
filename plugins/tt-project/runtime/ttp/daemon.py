@@ -7918,6 +7918,8 @@ class Daemon:
         task = db.task(r["task"]) if r["task"] else None
         if not task:
             return
+        if r.get("role") == carry.ROLE and task["kind"] == "code":
+            carry.drop_tree(self.p, task)   # an inline review's own worktree ends with its run
         landed.reconcile_pushes(self.p, task["id"])
         relay_worker_notifies(self.p, task, run_dir, handoff)
         relay_glm_drafts(self.p, task, run_dir)
@@ -8349,7 +8351,7 @@ class Daemon:
         else:
             new = "failed"
         attempts = int(task["attempts"] or 0) + (0 if status in FREE_ENDS or waiting or reboot_lost
-                                                  or rejects or topped or resumed else 1)
+                                                  or rejects or topped or resumed or (r.get("role") == carry.ROLE and task["kind"] == "code" and new == "done") else 1)
         if new == "failed" and not guard and attempts < int(task["max_attempts"] or 3) \
                 and status in ("failed", "lost", "timeout", "stalled", "no_handoff", "refused_wait", "role_miss"):
             new = "queued"
@@ -8949,10 +8951,18 @@ class Daemon:
         # `changes` line: a code task, or a work task whose branch changes anything.
         # Its git reads get a short timeout of their own (gitmemo.FINISH_REVIEW_GIT_S): a slow one marks the
         # review pending for the next tick (retry_unread_reviews), never the transaction's whole budget.
+        # A carry task's review is a run of the task itself: it goes back to the queue with that run due.
+        inline = reviewable and not split and not requeued and r.get("role") != carry.ROLE \
+            and carry.enabled(self.cfg, task, db, self.p) and self._code_change(task)
         with gitmemo.bounded(gitmemo.FINISH_REVIEW_GIT_S):
-            review = self._auto_review(dict(task, **upd), summary) \
-                if reviewable and not split and not requeued \
-                and self._code_change(task) else None
+            if inline and carry.inline_review(self, dict(task, **upd), summary):
+                db.update_task(task["id"], status="queued", not_before=None)
+                text += "\nIts review runs next as a run of this task (carry), not as a Review task."
+                review = None
+            else:
+                review = self._auto_review(dict(task, **upd), summary) \
+                    if reviewable and not split and not requeued and not inline \
+                    and self._code_change(task) else None
         # A fix of a failed review that adds no commit to the head that review saw leaves its re-review
         # nothing new to check: the re-review is blocked, never run on the same head, and the coordinator
         # decides.
@@ -13553,6 +13563,10 @@ class Daemon:
                 continue
             if task["kind"] == "review":
                 task, review_pick = self._size_review(task)
+            carry_rev = carry.review_due(db, task) if task["kind"] == "code" else None
+            owner = task
+            if carry_rev:   # a carry task's review run: the task as a review sees it, started fresh below
+                task = carry.review_view(task, carry_rev)
             picked = self._pick_effort(task, provider)
             if picked:
                 task = dict(task, tier=picked["tier"])
@@ -13612,10 +13626,11 @@ class Daemon:
                 gate = ctx["gate"]
                 remaining, cost = self._start_cost(task)
             # Before _workdir_for, which would make a missing worktree afresh.
-            lost = self._resumable(task, run_prov)
+            lost = None if carry_rev else self._resumable(task, run_prov)
             try:
                 found = startcheck.check(self.p, task)   # a dangling worktree or a lost base clone blocks
-                cwd, branch = self._workdir_for(task)
+                cwd, branch = (carry.review_tree(self.p, owner, carry_rev), owner.get("branch")) if carry_rev \
+                    else self._workdir_for(task)
             except Exception as e:
                 self._workspace_failed(task, e)
                 self._unreserve(task)
@@ -13753,6 +13768,8 @@ class Daemon:
                                         resume=lost["session"] if lost else None,
                                         min_effort=None if tierfloor.wake_keeps_effort(task, run_cls)
                                         else (need or {}).get("effort") or None)
+                if carry_rev:
+                    carry.advance(db, owner, carry.REVIEW, review_run=run_id)
                 self._wake_direct_started(task)   # counted and logged once, for the run that started
                 if dab:   # route.device_ab_shadow: read only shadow runs of this task, off by default; never hold it
                     try:
@@ -20679,6 +20696,8 @@ class Daemon:
         record checks first, git last. `heads` ({branch: head}, worktree.branch_heads) is the pass's one
         batched read of every head; None reads this task's head on its own."""
         db, d, tid = self.p.db, self.cfg.get("delivery") or {}, t["id"]
+        if carry.state(db, tid):
+            return "a carry task reviews inline"
         result = load_result(t["result"])
         if t["status"] == "queued":
             if result.get("status") != "waiting":
@@ -20843,7 +20862,7 @@ class Daemon:
         owner = self._continuation_owner(task)
         return f"open task #{owner['id']} continues it" if owner else ""
 
-    def _auto_review(self, task: dict, summary: str, add: bool = True) -> tuple[int, bool] | None:
+    def _auto_review(self, task: dict, summary: str, add: bool = True, spec_only: bool = False) -> tuple[int, bool] | dict | None:
         """The review of a finished code task, queued here the way the coordinator would, so a
         routine hand-off needs no coordinator turn: (review id, whether it was added now). An open
         review that already covers the task (queued ahead by the coordinator, or a still queued
@@ -20862,6 +20881,8 @@ class Daemon:
         rules = cfg.get("review") or {}
         if not rules.get("auto", True) or not (d.get("review_before_pr", True) or d.get("push_branch")):
             return None
+        if not spec_only and carry.state(db, task["id"]):
+            return None   # a carry task's review is a run of the task itself (carry.inline_review builds its prompt)
         if self._landed_elsewhere(task):
             return None
         if landed.abandoned(db, task["id"]):
@@ -20873,7 +20894,7 @@ class Daemon:
             branch = task.get("branch")
             if ext and branch and worktree.diff_lines(self.p, [branch]):
                 ext = None   # a change in the project's own git is reviewed there, as before
-            for t in db.q("SELECT * FROM tasks WHERE kind='review' AND status NOT IN ('done','failed','cancelled')"):
+            for t in [] if spec_only else db.q("SELECT * FROM tasks WHERE kind='review' AND status NOT IN ('done','failed','cancelled')"):
                 # A re-review covers a fix branch built on the branch it names only while it is still
                 # queued: it reads that branch's head when it starts, and a running one approves only
                 # the head it read, so later commits there get their own review.
@@ -20944,7 +20965,7 @@ class Daemon:
             return None
         if not changes and not ext:
             return None
-        if coord.next_task_slot(db, coord.task_cap(cfg, True), review=True) is not None:
+        if not spec_only and coord.next_task_slot(db, coord.task_cap(cfg, True), review=True) is not None:
             # The review cap is full: the review is pending, retried each tick until the cap allows it
             # (retry_unread_reviews), not left to the unreviewed sweep's next pass.
             if add and task.get("id"):
@@ -21173,6 +21194,8 @@ class Daemon:
             + ([f"pr_branch:{elsewhere}"] if own_step else []) + reviewhold.labels(full, held) \
             + ([extchange.HEAD_LABEL + ext["head"]] if ext else []) \
             + ([chaincap.SPLIT_REVIEW_LABEL + own_split] if stall else []) + ([lane] if lane else [])
+        if spec_only:   # a carry task's inline review: the prompt and what the review task would carry (carry.inline_review)
+            return {"title": title, "spec": "\n".join(lines), "tier": tier, "labels": labels, "head": full}
         # Read again where the review is added: a cancel or a continuation since the read above wins.
         with db.tx():
             if stale := self._stale_source(task):

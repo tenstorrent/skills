@@ -23,6 +23,7 @@ PHASES = (CHANGE, REVIEW, FIX, QUEUED, LANDED, DEPLOY, DONE, REBASE, CHECKFIX, C
 EVENT = "carry_phase"
 MODES = ("ordered", "all", "off")
 FIELDS = ("round", "head", "review_run", "push_row", "batch", "note")
+ROLE = "reviewer"   # runs.role of an inline review: the role of every independent review, with its guards (no edits)
 # How far along the chain a phase is: reconcile only moves a task to a later one.
 _RANK = {CHANGE: 0, REVIEW: 1, FIX: 1, REBASE: 1, CHECKFIX: 1, QUEUED: 2, LANDED: 3, DEPLOY: 4, DONE: 5}
 
@@ -83,6 +84,60 @@ def advance(db, task: dict | int, phase: str, **fields) -> dict:
                  (now, "daemon", EVENT, "low", f"carry task #{tid}: {before or 'start'} -> {phase}",
                   json.dumps(data), "handled", tid))
     return state(db, tid)
+
+
+def pin_ref(task_id: int, rnd: int) -> str:
+    return f"refs/ttp/review/t{task_id}/r{rnd}"
+
+
+def begin_review(p, task: dict, head: str, note: str | None = None) -> None:
+    """Pin `head` for round n+1 at its ref and put `task` in `review` with no run yet: the dispatcher starts
+    that run next. The ref keeps the reviewed commit whatever the branch does meanwhile."""
+    from . import worktree
+    old = state(p.db, task["id"])
+    rnd = int(old["round"] or 0) + 1 if old else 1
+    worktree._git(p.root, "update-ref", pin_ref(task["id"], rnd), head)
+    advance(p.db, task, REVIEW, round=rnd, head=head, review_run=None, note=note)
+
+
+def review_due(db, task: dict) -> dict | None:
+    """The state of a queued carry task whose next run is its review (a run that ended with no verdict is run again), else None."""
+    s = state(db, task["id"])
+    return s if s and s["phase"] == REVIEW and s["head"] and task.get("status") == "queued" else None
+
+
+def review_tree(p, task: dict, s: dict) -> str:
+    """A detached worktree of the review's own at the pinned ref (made afresh), never the author's."""
+    from . import worktree
+    path = p.worktrees / f"t{task['id']}-review"
+    drop_tree(p, task)
+    worktree._git(p.root, "worktree", "add", "--detach", str(path), pin_ref(task["id"], int(s["round"])))
+    return str(path)
+
+
+def drop_tree(p, task: dict) -> None:
+    from . import worktree
+    if (path := p.worktrees / f"t{task['id']}-review").exists():
+        worktree.remove_path(p.root, path, force=True)
+
+
+def inline_review(daemon, task: dict, summary: str) -> bool:
+    """Put `task` in `review` for a review run of its own, in place of a `Review #N` task: its prompt, from the builder
+    every review uses (daemon._auto_review), is kept in the carry state and its head pinned. False when there is nothing
+    to review (the old flow's no-review cases)."""
+    got = daemon._auto_review(task, summary, spec_only=True)
+    if not isinstance(got, dict):
+        return False
+    begin_review(daemon.p, task, got["head"], note=json.dumps({k: got[k] for k in ("title", "spec", "tier", "labels")}))
+    return True
+
+
+def review_view(task: dict, s: dict) -> dict:
+    """`task` as its review run sees it: a review task with the stored prompt, so the review's routing, tier, prompt and
+    role come out of the ordinary dispatch. Only its run is new: the row, id, branch and budget stay the task's."""
+    got = json.loads(s["note"] or "{}")
+    return dict(task, kind="review", spec=got.get("spec", ""), tier=got.get("tier") or "standard", title=got.get("title") or task["title"],
+                labels=json.dumps(got.get("labels") or []), attempts=0)
 
 
 def reconcile(db) -> list[tuple[int, str, str]]:

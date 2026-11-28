@@ -268,3 +268,103 @@ def test_a_queued_carry_task_waiting_on_depends_on_is_held_as_carry(env):
     d._log_slot_fill(0, [], {}, {"now": 1000.0}, "claude")
     line = json.loads(schedlog.path(p).read_text().splitlines()[-1])
     assert line["held"]["carry"] == 1 and line["held"]["depends_on"] == 1
+
+
+def _carry_finish(env, p, title="carried"):
+    p.set_config("review.inline", "all")
+    _with_origin(env, clone=False)
+    return _finish_code(env, p, title, {"app.py": 20})
+
+
+def _carry_dispatch(p, d, monkeypatch):
+    from ttp import budget as bud
+    started = []
+    monkeypatch.setattr(d, "start_run", lambda role, prompt, provider, tier, cwd, **k: started.append(
+        (role, prompt, provider, tier, cwd, k)) or 4242)
+    for prov in (d.cfg.get("core_provider", "claude"), "chat", "codex"):
+        d.gates[prov] = bud.Gate(prov, regime="windows", max_parallel=6)
+    d.dispatch()
+    return started
+
+
+def test_a_carry_tasks_done_hand_off_queues_no_review_task_but_pins_its_head_for_a_review_run(env):
+    from ttp import carry
+    p = make(env)
+    tid, branch, done, reviews = _carry_finish(env, p)
+    assert reviews == [] and not p.db.q("SELECT id FROM tasks WHERE kind='review'"), "no Review # task"
+    t, s = p.db.task(tid), carry.state(p.db, tid)
+    assert t["status"] == "queued" and int(t["attempts"]) == 1, "back in the queue; the author's run is its one attempt"
+    head = _git_out(p.root, "rev-parse", branch).strip()
+    assert (s["phase"], s["round"], s["head"], s["review_run"]) == ("review", 1, head, None)
+    assert _git_out(p.root, "rev-parse", carry.pin_ref(tid, 1)).strip() == head, "the reviewed commit is pinned"
+    spec = json.loads(s["note"])
+    assert f"Independently review the change of code task #{tid}" in spec["spec"] and head[:12] in spec["spec"]
+
+
+def test_a_non_carry_task_still_gets_its_review_task(env):
+    from ttp import carry
+    p = make(env)
+    _with_origin(env, clone=False)
+    tid, _, _, reviews = _finish_code(env, p, "plain", {"app.py": 20})
+    assert len(reviews) == 1 and reviews[0]["title"] == f"Review #{tid}: plain" and carry.state(p.db, tid) is None
+    assert p.db.task(tid)["status"] == "done"
+
+
+def test_the_carry_review_run_is_a_fresh_reviewer_run_of_the_same_task_at_the_pinned_head(env, monkeypatch):
+    from pathlib import Path
+    from ttp import carry
+    from ttp.daemon import Daemon
+    p = make(env)
+    tid, branch, _, _ = _carry_finish(env, p)
+    head = carry.state(p.db, tid)["head"]
+    _git_out(p.root, "update-ref", f"refs/heads/{branch}", _git_out(p.root, "rev-parse", f"{head}~1").strip())   # the branch moves on
+    d = Daemon(p.base)
+    (role, prompt, prov, tier, cwd, k), = _carry_dispatch(p, d, monkeypatch)
+    assert role == "reviewer" and k["task"]["id"] == tid and k.get("resume") is None
+    assert f"Independently review the change of code task #{tid}" in prompt
+    assert _git_out(Path(cwd), "rev-parse", "HEAD").strip() == head and cwd.endswith(f"t{tid}-review"), "a worktree of its own"
+    assert carry.state(p.db, tid)["review_run"] == 4242 and p.db.task(tid)["status"] == "running"
+    assert not p.db.q("SELECT id FROM tasks WHERE kind='review'")
+    # Its run ends: the worktree goes, no attempt is spent and no second review starts.
+    run_dir = env["tmp"] / "carry-review-run"
+    run_dir.mkdir()
+    (run_dir / "result.json").write_text(json.dumps({"status": "done", "summary": "approved"}))
+    from ttp.providers.base import RunUsage
+    d._finish_worker({"task": tid, "role": "reviewer"}, RunUsage(cost_usd=0.5), "ok", run_dir)
+    assert not Path(cwd).exists() and int(p.db.task(tid)["attempts"]) == 1
+    assert carry.state(p.db, tid)["round"] == 1 and not p.db.q("SELECT id FROM tasks WHERE kind='review'")
+
+
+def test_a_finished_review_task_still_spends_its_attempt(env):
+    from ttp.daemon import Daemon
+    from ttp.providers.base import RunUsage
+    p = make(env)
+    _with_origin(env, clone=False)
+    _, _, _, reviews = _finish_code(env, p, "plain", {"app.py": 20})
+    rid = reviews[0]["id"]
+    run_dir = env["tmp"] / "plain-review-run"
+    run_dir.mkdir()
+    (run_dir / "result.json").write_text(json.dumps({"status": "done", "summary": "approved"}))
+    before = int(p.db.task(rid)["attempts"])
+    Daemon(p.base)._finish_worker({"task": rid, "role": "reviewer"}, RunUsage(cost_usd=0.5), "ok", run_dir)
+    assert int(p.db.task(rid)["attempts"]) == before + 1
+
+
+@pytest.mark.parametrize("ending", ["failed", "timeout", "no_handoff"])
+def test_a_failing_carry_review_run_counts_an_attempt_and_stops_after_max_attempts(env, monkeypatch, ending, tmp_path):
+    from ttp.daemon import Daemon
+    from ttp.providers.base import RunUsage
+    p = make(env)
+    tid, _, _, _ = _carry_finish(env, p, ending)
+    d = Daemon(p.base)
+    attempts = int(p.db.task(tid)["attempts"])
+    runs = 0
+    while p.db.task(tid)["status"] == "queued" and runs < 10:
+        _carry_dispatch(p, d, monkeypatch)
+        run_dir = tmp_path / f"run{runs}"
+        run_dir.mkdir()
+        d._finish_worker({"task": tid, "role": "reviewer", "note": "{}"}, RunUsage(cost_usd=0.1), ending, run_dir)
+        runs += 1
+    t = p.db.task(tid)
+    assert t["status"] != "queued" and runs == int(t["max_attempts"] or 3) - attempts, "bounded by max_attempts"
+    assert int(t["attempts"]) == int(t["max_attempts"] or 3)
