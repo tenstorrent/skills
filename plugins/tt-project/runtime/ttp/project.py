@@ -1001,7 +1001,7 @@ def _known_keys(path: list[str]) -> set[str] | None:
         # wrap_needs_device: false says the commands behind wrap_cmd need no device, so they may spill (checkspill).
         # spill_wrap_cmd: the wrapper a check runs behind on a spill host (push.spill_wrap_of; default "", none).
         # spill_beside_device: spill hosts a device job keeps no spill off (checkspill.beside_device; default none).
-        # spill_install: true lets a spill host build the pinned checks env from its package index (checkspill.install;
+        # spill_install: true lets a spill host build the pinned checks env from its package index (checkspill.may_install;
         # default false: a host without a ready env takes no check).
         # spill_quarantine_after: strikes in a row that quarantine a spill host (checkspill.strike_settle; default 3).
         # spill_runs_per_host: the project's checks one spill host takes at once (checkspill.runs_per_host; default
