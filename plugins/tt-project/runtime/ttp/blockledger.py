@@ -23,7 +23,7 @@ import re
 import time
 from pathlib import Path
 
-from . import obligations, queuetrim, queuewait, rulecite, selfblock, unblock, unstarted
+from . import glmguard, obligations, queuetrim, queuewait, rulecite, selfblock, unblock, unstarted
 from .db import DB
 from .util import loads_dict
 
@@ -117,7 +117,7 @@ def _refusals(db: DB, since: float, until: float) -> list[dict]:
         end = _handed_next(db, r, until)
         by: dict = {}
         run = Path(db.path).parent / "runs" / str(r["id"])
-        back = (run / "glm_guard.json").is_file()   # glmguard.HIT: the run was handed back to Opus
+        back = (run / glmguard.HIT).is_file()   # the run was handed back to Opus
         for name in REFUSALS:
             f = run / name
             for line in (f.read_text(errors="replace").splitlines() if f.is_file() else ()):
