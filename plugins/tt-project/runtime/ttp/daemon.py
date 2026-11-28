@@ -6785,7 +6785,7 @@ class Daemon:
             note["not_waste"] = "resume"   # nothing ran: the task starts fresh (_finish_worker)
             if ctxfork.forked(note):   # its next start skips the fork (ctxfork.prepare)
                 note["resume_error"] = str(usage.error or f"exit {exit_info.get('rc')}")[:200]
-        elif status in ("failed", "budget") and r["role"] != "coordinator" and \
+        elif status == "failed" and r["role"] != "coordinator" and \
                 ctxfork.budget_misread(note, str(usage.extra.get("subtype") or ""),
                                        ctxfork.compacted(run_dir / "output.jsonl")[1],
                                        float(usage.cost_usd or 0), _run_cap(run_dir)):
