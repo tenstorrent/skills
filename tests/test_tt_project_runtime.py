@@ -28307,8 +28307,10 @@ def test_detached_ttp_checks_keep_their_output_and_marker_out_of_the_worktree():
         text = " ".join((prompts / name).read_text().split())
         assert "`ttp checks --detach -- <cmds>`" in text and "the `retry_when` it prints" in text, name
         assert "never the worktree" in text, name
-        # kind-code.md merges the wake line into "failed or killed checks wake you"; kind-review.md keeps its own
-        assert "also wakes the task if the checks were killed" in text or "failed or killed checks wake you" in text, name
+        # each file's own wake wording: kind-code.md merges it into one sentence, kind-review.md keeps its own
+        wake = "failed or killed checks wake you" if name == "kind-code.md" \
+            else "also wakes the task if the checks were killed"
+        assert wake in text, name
         assert "setsid nohup sh -c 'ttp checks" not in text and "<log>" not in text and "> <marker>" not in text, name
     worker = " ".join((prompts / "worker.md").read_text().split())
     assert "Never kill by name or pattern (`pkill -f`, `killall`)" in worker
