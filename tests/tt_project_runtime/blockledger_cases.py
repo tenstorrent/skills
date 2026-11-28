@@ -181,15 +181,17 @@ def test_block_ledger_a_wait_on_the_tasks_own_detached_job_is_work_not_blocked_t
     t = _bl_wait(p, "runs its suite", now, 3600, "ttp detach --check /r/runs/9/suite2.rc && ttp detach --check /r/x.rc")
     o = _bl_wait(p, "waits on a box", now, 3600, "ssh box true")
     p.db.x("UPDATE tasks SET created=? WHERE id IN (?,?)", (now - 7200, t, o))
-    jobs = queuewait.own_job("ttp detach --check /r/runs/9/suite2.rc && ttp detach --check /r/x.rc")
-    assert jobs and not queuewait.own_job("ssh box true") and not queuewait.own_job("")
-    p.db.set_kv(queuewait.KV, {"hist": [{"task": t, "queue": "own", "since": now - 3590, "end": now - 600, "job": jobs}],
-                               "open": {"k": {"task": o, "queue": "own", "since": now - 3590, "job": False}}})
+    d = _bl_wait(p, "waits on a landing", now, 3600, "")
+    job = "ttp detach --check /r/runs/9/suite2.rc && ttp detach --check /r/x.rc"
+    p.db.x("UPDATE tasks SET created=? WHERE id=?", (now - 7200, d))
+    p.db.set_kv(queuewait.KV, {"hist": [{"task": t, "queue": "own", "since": now - 3590, "end": now - 600, "probe": job}],
+                               "open": {"k": {"task": o, "queue": "own", "since": now - 3590, "probe": "ssh box true"},
+                                        "l": {"task": d, "queue": "own", "since": now - 3590, "probe": "landed:#4244"}}})
     rs = [r for r in bl.rows(p.db, now - 7200, now) if r["source"] == "queue"]
-    assert {r["task"]: r["rule"] for r in rs} == {t: "own job", o: "queue:own"}
+    assert {r["task"]: r["rule"] for r in rs} == {t: "own job", o: "queue:own", d: "dependency"}
     assert [e["rule"] for e in bl.top(p.db, now) if e["rule"] in ("own job", "queue:own")] == ["queue:own"]
     share = bl.window_share(p.db, now - 7200, now, rs)
-    assert share["blocked_min"] == pytest.approx(60, abs=1), "only the other task's wait counts"
+    assert share["blocked_min"] == pytest.approx(60 + 60, abs=1), "the box and the landing waits count"
 
 
 def test_block_ledger_review_rows_and_clock_gated_windows(env):

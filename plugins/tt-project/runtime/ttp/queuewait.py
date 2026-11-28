@@ -122,7 +122,7 @@ def collect(p, cfg: dict, now: float, host: dict | None = None, device: set | No
     worker and never counts as a slot holder. A checks wait needs an open task with a live wait record (its
     label queued or parked on the host, its own run's checks waiting for a slot: _checks_waiting, or dispatch's
     hold) while the host queue has someone waiting: finished checks or 0 queued raise nothing."""
-    from .db import TERMINAL_TASK_STATES, load_result
+    from .db import TERMINAL_TASK_STATES, deferral, load_result
     db, name, out = p.db, p.name, {}
     host = host or {}
     device = set(device or ())
@@ -156,9 +156,9 @@ def collect(p, cfg: dict, now: float, host: dict | None = None, device: set | No
     from .coordinator import task_resources
     probes = progress.load(db).get("probes") or {}
 
-    def own(t, since, probe=""):   # an urgent task's wait no queue explains: its probe's last words and its resources
+    def own(t, since, probe):   # an urgent task's wait no queue explains: its probe, its last words and its resources
         add(t["id"], "own", ",".join(sorted(task_resources(t))), since,
-            {"cap": None, "running": [], "queued": [], "job": own_job(probe),
+            {"cap": None, "running": [], "queued": [], "probe": str(probe or "")[:300],
              "says": str((probes.get(str(t["id"])) or {}).get("reason") or "")[:200]})
 
     for t in map(dict, db.q("SELECT * FROM tasks WHERE status='queued'")):
@@ -167,7 +167,7 @@ def collect(p, cfg: dict, now: float, host: dict | None = None, device: set | No
                 or t["not_before"] is None:
             if urgent.is_urgent(t) and (rec := probes.get(str(t["id"]))) and now - float(rec.get("last") or 0) < 900:
                 # its start_when probe still says not yet
-                own(t, float(rec.get("first") or now))
+                own(t, float(rec.get("first") or now), deferral(t).get("when"))
             continue
         got = classify(prev.get("retry_when") or "", t["blocked_reason"] or "", device)
         if got is None and urgent.is_urgent(t):
@@ -546,7 +546,7 @@ def scan(p, cfg: dict, now: float | None = None, host: dict | None = None, devic
                                      "opened": int(now), "seen": now, "acted": None,
                                      **({"dir": w["dir"]} if w.get("dir") else {})})
         if w["queue"] == "own":
-            rec["job"] = bool(w.get("job"))   # its current probe: the blocked-time ledger counts no own-job wait
+            rec["probe"] = w.get("probe") or ""   # its current probe: the blocked-time ledger's rule for it
         if rec.get("acted"):
             continue
         k = key(w)

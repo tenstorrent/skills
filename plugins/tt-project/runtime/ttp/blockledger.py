@@ -80,9 +80,11 @@ def safety_of(reason: str, kind: str = "") -> str:
 
 
 def _wait_rule(data: dict, reason: str) -> tuple[str, str] | None:
-    """(rule, reason) of a wait its task_waiting `data` or reason places: another task's landing, a planned
-    window (a bare clock-gate probe, or the hand-off's own planned window: unblock.classify_wait)."""
+    """(rule, reason) of a wait its task_waiting `data` or reason places: the task's own detached job, another
+    task's landing, a planned window (a bare clock-gate probe, or the hand-off's own: unblock.classify_wait)."""
     probe = str(data.get("probe") or "")
+    if queuewait.own_job(probe):
+        return "own job", reason
     if m := LANDED.search(probe) or LANDED.search(reason):
         return "dependency", f"needs #{next(g for g in m.groups() if g)}"
     window = unstarted.TIME_ONLY.match(probe) or data.get("why") == "planned window"
@@ -153,8 +155,10 @@ def rows(db: DB, since: float, until: float | None = None) -> list[dict]:
     for e in [*(st.get("hist") or []), *(st.get("open") or {}).values()]:
         end = min(float(e.get("end") or until), until)
         if end >= since and float(e["since"]) <= until:
-            rule = "own job" if e["queue"] == "own" and e.get("job") else f"queue:{e['queue']}"
-            out.append(_row(rule, e.get("task"), "queue", max(float(e["since"]), since), end, e["queue"], "queue"))
+            rule, why = f"queue:{e['queue']}", e["queue"]
+            if e["queue"] == "own":   # an urgent task's own probe: its detached job, another task's landing, a clock
+                rule, why = _wait_rule({"probe": e.get("probe")}, why) or (rule, why)
+            out.append(_row(rule, e.get("task"), "queue", max(float(e["since"]), since), end, why, "queue"))
     log = Path(db.path).parent / LOG
     for line in (log.read_text(errors="replace").splitlines() if log.is_file() else ()):
         try:
