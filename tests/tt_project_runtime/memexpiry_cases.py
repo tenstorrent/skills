@@ -183,3 +183,18 @@ def test_memexpiry_uses_drops_ids_of_rules_and_entries_that_no_longer_exist(env)
     assert "R-dead" not in uses and "gone-entry" not in uses and uses[name] == {"seen": 5, "cited": 6}
     assert not [x for x in memexpiry.digest_lines(p, now + 40 * 86400) if "R-dead" in x]
     assert "R-dead" not in p.db.kv(memexpiry.KEY)
+
+
+def test_memexpiry_uses_keeps_rule_times_while_the_charter_cannot_be_read(env):
+    import time
+    from ttp import memexpiry
+    p = make(env)
+    now = time.time()
+    p.db.set_kv(memexpiry.KEY, {"R-ab12": {"seen": 5, "cited": 6}, "P-cd34": {"seen": 7, "cited": 0}})
+    saved = p.charter_path.read_text()
+    p.charter_path.unlink()
+    assert memexpiry._uses(p, now) == {"R-ab12": {"seen": 5, "cited": 6}, "P-cd34": {"seen": 7, "cited": 0}}
+    memexpiry.digest_lines(p, now)
+    assert p.db.kv(memexpiry.KEY)["R-ab12"] == {"seen": 5, "cited": 6}
+    p.charter_path.write_text(saved)
+    assert "R-ab12" not in memexpiry._uses(p, now)

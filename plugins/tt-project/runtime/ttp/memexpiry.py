@@ -91,7 +91,11 @@ def cite(p, applied: list[dict], now: float | None = None) -> None:
 def _uses(p, now: float) -> dict:
     stored = p.db.kv(KEY, {}) or {}
     live = [e["name"] for e in p._memory_entries()] + [rid for rid, _ in rulecite.entries(p, now)]
-    return {key: stored.get(key) or {"seen": now, "cited": 0} for key in live}
+    try:
+        p.charter_path.read_text()
+    except OSError:   # an unread charter lists no rules: keep their stored times rather than restart them
+        live += [k for k in stored if re.match(r"[RP]-[0-9a-f]{4}$", k)]
+    return {key: stored.get(key) or {"seen": now, "cited": 0} for key in dict.fromkeys(live)}
 
 
 def backfill(p, now: float | None = None) -> list[str]:
