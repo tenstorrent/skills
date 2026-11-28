@@ -4609,7 +4609,7 @@ def _cmd_checks(a) -> None:
             die("no project found for the check gap probe")
         sys.exit(0 if checkgaps.ready(p, a.gap, getattr(a, "gap_config", None)) else 1)
     if a.result:
-        sys.exit(_checks_passed(Path(a.result)) if a.passed else _checks_result(Path(a.result)))
+        sys.exit(_checks_passed(Path(a.result)) if a.passed else _checks_result(Path(a.result), bool(getattr(a, "json", False))))
     if getattr(a, "reap", False):
         from . import leftoverchecks
         p = here()
@@ -6454,7 +6454,7 @@ def _checks_lane_status(as_json: bool) -> int:
     # Every live run in one list, those with no lane too (a spilled push batch, a wait for the host-wide slot).
     runs = checksqueue.live_runs(repos, spilled, checksqueue.queued(p))
     if as_json:
-        print(json.dumps({"project": p.name, "slots": checklane.slots(p.config()),
+        print(json.dumps({"project": p.name, "slots": checklane.slots(p.config()), "limits": checklane.limits(p),
                           "project_max": checklane.project_cap(p.config()), "this_repo": here_repo,
                           "runs": runs, "repos": repos, "spilled": spilled, "push": push_rows,
                           "no_spill_hosts": checkspill.no_spill(),
@@ -6468,6 +6468,7 @@ def _checks_lane_status(as_json: bool) -> int:
     else:
         print("\n".join(checksqueue.live_runs_lines(runs)))
         print(checklane.status_text(p.name, p.config(), here_repo, names=names, db=p.db))
+        print(checklane.limits_line(checklane.limits(p)))
         if push_rows:
             print("push checks host-wide (push priority slot, or an ordinary turn after it stayed held):")
             print("\n".join(f"  {line}" for line in checkcap.push_lines(rows=push_rows)))
@@ -8225,16 +8226,21 @@ def _checks_env_ok(p: Project | None, sigs: list | None = None) -> int:
     return 1 if still else 0
 
 
-def _checks_killed(run_dir: Path) -> str:
-    """Why the checks recorded in `run_dir` were killed, as their checks.json says, else ""."""
+def _checks_record(run_dir: Path) -> dict:
+    """The checks.json of the checks recorded in `run_dir`, {} when missing or an earlier run's."""
     from . import prguard
     try:
         rec = json.loads((run_dir / prguard.CHECKS_FILE).read_text())
     except (OSError, ValueError):
-        return ""
+        return {}
     if not isinstance(rec, dict) or float(rec.get("ts") or 0) < float(_read_checks_pid(run_dir).get("ts") or 0):
-        return ""   # an earlier run's record
-    return str(rec.get("killed") or "")
+        return {}   # an earlier run's record
+    return rec
+
+
+def _checks_killed(run_dir: Path) -> str:
+    """Why the checks recorded in `run_dir` were killed, as their checks.json says, else ""."""
+    return str(_checks_record(run_dir).get("killed") or "")
 
 
 def _checks_settle(run_dir: Path, head: str | None) -> int:
@@ -8384,7 +8390,57 @@ def _checks_wait_line(run_dir: Path, info: dict) -> str:
     return f"ttp checks: running (pid {info['pid']})"
 
 
-def _checks_result(run_dir: Path) -> int:
+def _checks_phase(run_dir: Path) -> str:
+    """Where the run's checks are, read after _checks_report settled them: queued (for the daemon), not_started,
+    parked, following, waiting_lane, waiting_spill, waiting_slot (admission), running, waiting_runner, finished,
+    cut_wall_cap, cut_silent (stopped by checks.wall_cap_s or a check's silence limit), dropped, killed or none."""
+    from . import detach, envfault
+    from .util import read_dict
+    rc_file = run_dir / CHECKS_RC
+    if detach.pending(rc_file):
+        return "queued"
+    rc = rc_file.read_text().strip() if rc_file.exists() else None
+    if rc == "75" and envfault.marker_open(run_dir):
+        return "waiting_runner"
+    if isinstance(cut := _checks_record(run_dir).get("timed_out") if rc is not None else None, dict):
+        return "cut_silent" if cut.get("silent_s") else "cut_wall_cap"   # checkwall: a timeout, not a verdict
+    if rc == "killed":
+        return "not_started" if detach.lost(rc_file).exists() else "dropped" if _checks_dropped(run_dir) else "killed"
+    if rc is not None:
+        return "finished"
+    fg = read_dict(run_dir / CHECKS_RUNNING)
+    info = _read_checks_pid(run_dir) or ({"pid": fg["pid"]} if fg.get("pid") and "ended" not in fg else {})
+    if not info or not _checks_alive(info):
+        return "none"
+    wait = read_dict(run_dir / CHECKS_SLOT_WAIT)
+    for key, phase in (("parked", "parked"), ("follows", "following"), ("suite", "waiting_lane"), ("spill", "waiting_spill")):
+        if wait.get(key):
+            return phase
+    return "waiting_slot" if (run_dir / CHECKS_SLOT_WAIT).exists() else "running"
+
+
+def _checks_result(run_dir: Path, as_json: bool = False) -> int:
+    """_checks_report, then the run's phase (_checks_phase) and the project's effective checks timeouts
+    (checklane.limits): one line after the report, or with `as_json` one JSON object of them all."""
+    import contextlib
+    import io
+    from . import checklane
+    if as_json:
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            rc = _checks_report(run_dir)
+    else:
+        rc = _checks_report(run_dir)
+    lim = checklane.limits(here(run_dir) or here())
+    phase = _checks_phase(run_dir)
+    if as_json:
+        print(json.dumps({"exit": rc, "phase": phase, "limits": lim, "lines": buf.getvalue().splitlines()}, indent=2))
+    else:
+        print(f"ttp checks: phase {phase}; {checklane.limits_line(lim)}")
+    return rc
+
+
+def _checks_report(run_dir: Path) -> int:
     """`retry_when` probe of the run's checks, detached or foreground: 0 once checks.rc exists or the
     checks died without writing it (it then writes `killed` there), or a foreground run ended
     (_checks_foreground); 1 while they run."""
@@ -13775,6 +13831,11 @@ def cmd_config(a) -> None:
         node = p.config()   # the effective config: project.json over the defaults
         for part in (a.key or "").split(".") if a.key else []:
             node = node.get(part, {}) if isinstance(node, dict) else None
+        if node == {} and (a.key or "").startswith("checks.") and a.key[7:] in ("max_wait_s", "wall_cap_s", "stall_s"):
+            from . import checklane   # unset timeouts read as the value in force (account, learned or default)
+            lim = checklane.limits(p)[a.key[7:]]
+            node = lim["s"]
+            print(f"{a.key}: not set in the project; in force: {node:g} s ({lim['from']})", file=sys.stderr)
         print(json.dumps(node, indent=1))
         return
     try:
@@ -17106,7 +17167,7 @@ def ttp_parser():
     s.add_argument("--slot-status", action="store_true",
                    help="run nothing (also `ttp checks status`): print each repository's checks lanes, their "
                         "holders (pid, task, run, age, alive) and the waiters in queue order; never queues")
-    s.add_argument("--json", action="store_true", help="with --slot-status or status: as JSON")
+    s.add_argument("--json", action="store_true", help="with --slot-status, status or --result: as JSON")
     s.add_argument("--preempt", metavar="RUN",
                    help="run nothing: ask run RUN's checks to give up their host-wide checks slot and queue again "
                         "at their place, as an urgent waiter would (logged with who asked); refused for push "

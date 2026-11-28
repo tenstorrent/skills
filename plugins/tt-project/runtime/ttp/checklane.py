@@ -143,6 +143,36 @@ def max_wait_s(cfg: dict | None) -> float:
     return _seconds(cfg, "max_wait_s", MAX_WAIT_S)
 
 
+def stall_s(cfg: dict | None) -> float | None:
+    """checks.stall_s as set (_hung's silence limit for a lane holder), None when unset or not a number >= 0."""
+    try:
+        v = float(setting(cfg, "stall_s"))
+    except (TypeError, ValueError):
+        return None
+    return v if v >= 0 else None
+
+
+def limits(p) -> dict:
+    """The effective checks timeouts for project `p` (None: the account's or defaults), each {"s", "from"}:
+    checks.max_wait_s (a lane wait), checks.wall_cap_s (checkwall.cap) and checks.stall_s (_hung)."""
+    from . import checkwall
+    cfg = p.config() if p else None
+    wall, how = checkwall.cap(p)
+    stall = stall_s(cfg)
+    return {"max_wait_s": {"s": max_wait_s(cfg),
+                           "from": "checks.max_wait_s" if _seconds(cfg, "max_wait_s", -1.0) >= 0 else "default"},
+            "wall_cap_s": {"s": wall, "from": how},
+            "stall_s": {"s": HANG_LOG_MIN_S, "from": "default: this, or one usual passing run if longer"}
+            if stall is None else {"s": stall, "from": "checks.stall_s"}}
+
+
+def limits_line(lim: dict) -> str:
+    def one(k: str) -> str:
+        s = float(lim[k]["s"])
+        return f"{k} {s:g} s ({lim[k]['from']})" + (" off" if s == 0 and k != "max_wait_s" else "")
+    return "limits: " + ", ".join(one(k) for k in ("max_wait_s", "wall_cap_s", "stall_s"))
+
+
 def wait_event_s(cfg: dict | None) -> float:
     return _seconds(cfg, "wait_event_s", WAIT_EVENT_S)
 
@@ -1137,12 +1167,7 @@ def _hung(h: dict, now: float, cfg: dict | None, stat=None) -> bool | None:
     if not log or not isinstance(since, (int, float)):
         return None
     st = (stat or _log_mtime)(str(log))
-    limit = ((cfg or {}).get("checks") or {}).get("stall_s") if isinstance((cfg or {}).get("checks"), dict) else None
-    try:
-        limit = float(limit) if limit is not None and float(limit) >= 0 else None
-    except (TypeError, ValueError):
-        limit = None
-    if limit is None:
+    if (limit := stall_s(cfg)) is None:
         est = (h.get("cost") or {}).get("est_s") if isinstance(h.get("cost"), dict) else None
         limit = max(HANG_LOG_MIN_S, float(est) if isinstance(est, (int, float)) and est > 0 else 0.0)
     return bool(limit > 0 and now - max(float(since), st if st else 0.0) >= limit)

@@ -137,3 +137,63 @@ def test_a_hand_off_waiting_on_the_checks_running_marker_is_refused(env, monkeyp
         else:
             assert "retry_when" not in res and res["retry_when_refused"] == probe, res
             assert len(refused) == 1 and "ttp checks --result" in refused[0]["text"], refused
+
+
+def _result_json(run, capsys) -> tuple[int, dict]:
+    from ttp import cli
+    capsys.readouterr()
+    with pytest.raises(SystemExit) as e:
+        cli.main(["checks", "--result", str(run), "--json"])
+    return e.value.code, json.loads(capsys.readouterr().out)
+
+
+def test_checks_result_and_config_show_the_effective_timeouts_unset_and_overridden(env, tmp_path, monkeypatch, capsys):
+    """Unset checks timeouts read as the values in force, never {}; a project's own value wins."""
+    from ttp import checklane, checkwall, cli
+    p, repo, run, git = _checks_repo(env, tmp_path, monkeypatch)
+    (run / "checks.rc").write_text("0\n")
+    code, rec = _result_json(run, capsys)
+    assert code == 0 and rec["phase"] == "finished" and rec["exit"] == 0, rec
+    lim = rec["limits"]
+    assert lim["max_wait_s"] == {"s": checklane.MAX_WAIT_S, "from": "default"}, lim
+    assert lim["wall_cap_s"]["s"] == checkwall.DEFAULT_S and lim["wall_cap_s"]["from"].startswith("default"), lim
+    assert lim["stall_s"]["s"] == checklane.HANG_LOG_MIN_S and lim["stall_s"]["from"].startswith("default"), lim
+    code, out = _result(run, capsys)
+    assert f"ttp checks: phase finished; limits: max_wait_s {checklane.MAX_WAIT_S:g} s (default)" in out, out
+    cli.main(["config", p.name, "checks.max_wait_s"])
+    assert json.loads(capsys.readouterr().out) == checklane.MAX_WAIT_S
+    p.set_config("checks.max_wait_s", 120)
+    p.set_config("checks.wall_cap_s", 600)
+    p.set_config("checks.stall_s", 0)
+    code, rec = _result_json(run, capsys)
+    assert rec["limits"] == {"max_wait_s": {"s": 120.0, "from": "checks.max_wait_s"},
+                             "wall_cap_s": {"s": 600.0, "from": "checks.wall_cap_s"},
+                             "stall_s": {"s": 0.0, "from": "checks.stall_s"}}, rec
+    assert "stall_s 0 s (checks.stall_s) off" in _result(run, capsys)[1]
+    cli.main(["config", p.name, "checks.wall_cap_s"])
+    assert json.loads(capsys.readouterr().out) == 600
+
+
+def test_checks_result_says_the_admission_phase_of_a_queued_a_running_and_a_cut_run(env, tmp_path, monkeypatch, capsys):
+    from ttp.runner import proc_start
+    p, repo, run, git = _checks_repo(env, tmp_path, monkeypatch)
+    me = os.getpid()
+    (run / "checks.pid").write_text(json.dumps({"pid": me, "started": proc_start(me), "ts": time.time() - 5}))
+    (run / "checks-slot.wait").write_text(json.dumps({"since": time.time(), "pid": me}))
+    code, rec = _result_json(run, capsys)
+    assert code == 1 and rec["phase"] == "waiting_slot", rec
+    assert any("queued for a host-wide checks slot" in line for line in rec["lines"]), rec
+    (run / "checks-slot.wait").write_text(json.dumps({"since": time.time(), "pid": me, "suite": str(tmp_path / "lane")}))
+    assert _result_json(run, capsys)[1]["phase"] == "waiting_lane"
+    (run / "checks-slot.wait").unlink()
+    code, out = _result(run, capsys)
+    assert code == 1 and f"running (pid {me})" in out and "ttp checks: phase running; limits:" in out, out
+    # Stopped at the wall-time cap or a silence limit: a timeout, told apart from a plain failure.
+    (run / "checks.rc").write_text("1\n")
+    assert _result_json(run, capsys)[1]["phase"] == "finished"
+    (run / "checks.json").write_text(json.dumps({"ts": time.time(), "passed": False,
+                                                 "timed_out": {"check": "pytest", "cap_s": 600, "how": "checks.wall_cap_s"}}))
+    assert _result_json(run, capsys)[1]["phase"] == "cut_wall_cap"
+    (run / "checks.json").write_text(json.dumps({"ts": time.time(), "passed": False,
+                                                 "timed_out": {"check": "pytest", "silent_s": 900}}))
+    assert _result_json(run, capsys)[1]["phase"] == "cut_silent"
