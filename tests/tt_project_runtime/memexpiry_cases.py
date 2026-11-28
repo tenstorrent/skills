@@ -98,6 +98,16 @@ def test_memexpiry_backfill_gives_old_entries_an_end_with_a_one_week_floor(env):
     assert memexpiry.backfill(p) == []
 
 
+def test_memexpiry_backfill_leaves_an_entry_written_permanent(env):
+    from ttp import memexpiry
+    p = make(env)
+    kept = p.add_memory("a rule that stays for good", kind="decision", default_end=False).stem
+    p.set_config("memory.default_expiry_days", 0)
+    other = p.add_memory("an entry from before the default", kind="decision").stem
+    p.set_config("memory.default_expiry_days", 30)
+    assert memexpiry.backfill(p) == [other] and _mx_entry(p, kept)["end"] == {}
+
+
 def test_memexpiry_the_daemon_archives_an_entry_at_its_expiry(env):
     import time
     from ttp import ends, memexpiry

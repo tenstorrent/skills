@@ -90,13 +90,14 @@ def _uses(p, now: float) -> dict:
 
 
 def backfill(p, now: float | None = None) -> list[str]:
-    """Entries of an expiring kind without an end get one; returns their names."""
+    """Entries of an expiring kind without an end get one, except those written permanent; returns their names."""
+    from .project import _stamp_ts
     now, w, done = time.time() if now is None else now, window_s(p), []
     if not w:
         return []
     for e in p._memory_entries():
-        if e["kind"] in KINDS and not e["standing"] and not e["end"]:
-            _rewrite(p, e["name"], max(ends.parse_time(e["created"]) + w, now + BACKFILL_FLOOR_S), True)
+        if e["kind"] in KINDS and not e["standing"] and not e["end"] and not e["kept"]:
+            _rewrite(p, e["name"], max(_stamp_ts(e["created"]) + w, now + BACKFILL_FLOOR_S), True)
             done.append(e["name"])
     return done
 

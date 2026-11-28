@@ -2359,6 +2359,7 @@ class Project:
             if not same:
                 durable_write(path, f"---\nkind: {kind}\ncreated: {_stamp(time.time())}\n{front_matter(end or {})}"
                                     f"{'expires_auto: true' + chr(10) if auto and end else ''}"
+                                    f"{'no_expiry: true' + chr(10) if not end and not default_end else ''}"
                                     f"{'standing: true' + chr(10) if standing else ''}"
                                     f"{f'audience: {audience}' + chr(10) if audience in MEMORY_AUDIENCES else ''}"
                                     f"{f'reason: {reason}' + chr(10) if reason else ''}"
@@ -2424,11 +2425,12 @@ class Project:
             why = re.search(r"^reason:[ \t]*(.*)$", head, re.M)
             ctx = re.search(r"^context:[ \t]*(.*)$", head, re.M)
             auto = bool(re.search(r"^expires_auto:[ \t]*true[ \t]*$", head, re.M))   # a default expiry stays off the prompt line
+            kept = bool(re.search(r"^no_expiry:[ \t]*true[ \t]*$", head, re.M))   # written permanent: never given a default end
             ends = (" (standing)" if standing else "") + (f" ({describe(end, self)})" if end and not auto else "")
             created = c.group(1) if c else _stamp(p.stat().st_mtime)
             out.append({"name": p.stem, "kind": kind, "line": f"[{p.stem}] {body.strip()}{ends}", "end": end,
                         "body": body.strip(),
-                        "standing": standing, "auto": auto, "audience": aud.group(1) if aud else "", "created": created,
+                        "standing": standing, "auto": auto, "kept": kept, "audience": aud.group(1) if aud else "", "created": created,
                         "reason": why.group(1).strip() if why else "", "context": ctx.group(1).strip() if ctx else "",
                         "order": (created, p.stem)})
         out.sort(key=lambda e: e.pop("order"))
