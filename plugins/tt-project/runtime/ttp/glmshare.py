@@ -197,7 +197,7 @@ def probes_on_since(p) -> float:
     ring = rollout.ring_of(p.name)
 
     def covered(v) -> bool:
-        return v == rollout.AUTO or (v in (0, 1, 2) and not isinstance(v, bool) and ring is not None and ring <= v)
+        return v in (0, 1, 2) and not isinstance(v, bool) and ring is not None and ring <= v
     return max((float(r.get("ts") or 0) for r in rollout.ledger("glm_probes")
                 if r.get("kind") in ("set", "promote", "arm") and covered(r.get("to")) and not covered(r.get("from"))),
                default=0.0)
